@@ -19,6 +19,12 @@ template <class T>
 struct LRUElement {
   explicit LRUElement() : next_(nullptr), prev_(nullptr), refs_(0) {}
 
+  // No copying allowed
+  LRUElement(const LRUElement&) = delete;
+  LRUElement& operator=(const LRUElement&) = delete;
+  LRUElement(LRUElement&&) = delete;
+  LRUElement& operator=(LRUElement&&) = delete;
+
   virtual ~LRUElement() { assert(!refs_); }
 
   T* next_;
@@ -33,6 +39,13 @@ struct LRUElement {
 template <class T>
 class LRUList {
  public:
+  LRUList() = default;
+  // No copying allowed
+  LRUList(const LRUList&) = delete;
+  LRUList& operator=(const LRUList&) = delete;
+  LRUList(LRUList&&) = delete;
+  LRUList& operator=(LRUList&&) = delete;
+
   virtual ~LRUList() {
     MutexLock _(&lock_);
     assert(!head_);

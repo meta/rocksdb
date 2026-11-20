@@ -413,6 +413,8 @@ void ErrorHandler::HandleKnownErrors(const Status& bg_err,
 //       to a soft error. Note that, it includes the case that IO error happens
 //       in SST or manifest write during flush. Auto resume will be called.
 //    c) all other errors are mapped to hard error. Auto resume will be called.
+//    If auto resume is disabled (max_bgerror_resume_count <= 0), all of the
+//    above are mapped to hard error and wait for a manual DB::Resume().
 // 3) for other cases, HandleKnownErrors(const Status& bg_err,
 //    BackgroundErrorReason reason) will be called to handle other error cases
 //    such as delegating to SstFileManager to handle no space error.
@@ -523,7 +525,8 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
                 {} /* int_histograms */);
     ROCKS_LOG_INFO(db_options_.info_log,
                    "ErrorHandler: Set background retryable IO error\n");
-    if (BackgroundErrorReason::kCompaction == reason) {
+    const bool auto_resume_enabled = db_options_.max_bgerror_resume_count > 0;
+    if (BackgroundErrorReason::kCompaction == reason && auto_resume_enabled) {
       // We map the retryable IO error during compaction to soft error. Since
       // compaction can reschedule by itself. We will not set the BG error in
       // this case
@@ -543,8 +546,14 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
     }
 
     Status::Severity severity;
-    if (BackgroundErrorReason::kFlushNoWAL == reason ||
-        BackgroundErrorReason::kManifestWriteNoWAL == reason) {
+    if (!auto_resume_enabled) {
+      // Without auto resume, nothing retries or recovers from the error on the
+      // user's behalf, so stop writes until the user calls DB::Resume(). This
+      // includes compaction and no-WAL flush errors, which would otherwise be
+      // retried by compaction or tolerated as soft errors.
+      severity = Status::Severity::kHardError;
+    } else if (BackgroundErrorReason::kFlushNoWAL == reason ||
+               BackgroundErrorReason::kManifestWriteNoWAL == reason) {
       // When the BG Retryable IO error reason is flush without WAL,
       // We map it to a soft error. At the same time, all the background work
       // should be stopped except the BG work from recovery. Therefore, we
@@ -569,7 +578,7 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
       return;
     }
     CheckAndSetRecoveryAndBGError(bg_err, context);
-    bool auto_recovery = db_options_.max_bgerror_resume_count > 0;
+    bool auto_recovery = auto_resume_enabled;
     EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason,
                                           &new_bg_io_err, db_mutex_,
                                           &auto_recovery);
@@ -580,7 +589,7 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
 }
 
 void ErrorHandler::AddFilesToQuarantine(
-    autovector<const autovector<uint64_t>*> files_to_quarantine) {
+    const autovector<const autovector<uint64_t>*>& files_to_quarantine) {
   db_mutex_->AssertHeld();
   std::ostringstream quarantine_files_oss;
   bool is_first_one = true;

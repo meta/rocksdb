@@ -191,9 +191,11 @@ class Cache : public Customizable {
   // No copying allowed
   Cache(const Cache&) = delete;
   Cache& operator=(const Cache&) = delete;
+  Cache(Cache&&) = delete;
+  Cache& operator=(Cache&&) = delete;
 
   // Destroys all remaining entries by calling the associated "deleter"
-  virtual ~Cache() {}
+  ~Cache() override {}
 
   static const char* Type() { return "Cache"; }
 
@@ -214,7 +216,7 @@ class Cache : public Customizable {
 
  public:  // functions
   // The type of the Cache
-  virtual const char* Name() const = 0;
+  const char* Name() const override = 0;
 
   // The Insert and Lookup APIs below are intended to allow cached objects
   // to be demoted/promoted between the primary block cache and a secondary
@@ -435,7 +437,7 @@ class Cache : public Customizable {
   // Prerequisite: no entry is referenced.
   virtual void EraseUnRefEntries() = 0;
 
-  virtual std::string GetPrintableOptions() const { return ""; }
+  std::string GetPrintableOptions() const override { return ""; }
 
   // Check for any warnings or errors in the operation of the cache and
   // report them to the logger. This is intended only to be called
@@ -656,7 +658,7 @@ class CacheWrapper : public Cache {
     target_->ApplyToAllEntries(callback, opts);
   }
 
-  virtual void ApplyToHandle(
+  void ApplyToHandle(
       Cache* cache, Handle* handle,
       const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
                                const CacheItemHelper* helper)>& callback)

@@ -1208,6 +1208,34 @@ rocksdb_block_based_options_clear_user_defined_index_factory(
 extern ROCKSDB_LIBRARY_API const char*
 rocksdb_block_based_options_get_user_defined_index_factory_name(
     const rocksdb_block_based_table_options_t* options, size_t* name_len);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_block_based_options_set_use_udi_as_primary_index(
+    rocksdb_block_based_table_options_t* opt, unsigned char v);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_block_based_options_get_use_udi_as_primary_index(
+    rocksdb_block_based_table_options_t* opt);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_block_based_options_set_fail_if_no_udi_on_open(
+    rocksdb_block_based_table_options_t* opt, unsigned char v);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_block_based_options_get_fail_if_no_udi_on_open(
+    rocksdb_block_based_table_options_t* opt);
+/* EXPERIMENTAL: selects which index tiers an SST is written with and which one
+ * reads use by default. Takes a rocksdb_block_based_table_index_mode_* value.
+ * An explicit index_mode wins over the deprecated
+ * use_udi_as_primary_index / fail_if_no_udi_on_open setters regardless of the
+ * order they are called in. */
+extern ROCKSDB_LIBRARY_API void rocksdb_block_based_options_set_index_mode(
+    rocksdb_block_based_table_options_t* opt, int v);
+extern ROCKSDB_LIBRARY_API int rocksdb_block_based_options_get_index_mode(
+    rocksdb_block_based_table_options_t* opt);
+enum {
+  rocksdb_block_based_table_index_mode_standard_only = 0,
+  rocksdb_block_based_table_index_mode_standard_default = 1,
+  rocksdb_block_based_table_index_mode_custom_default = 2,
+  rocksdb_block_based_table_index_mode_custom_only = 3,
+  rocksdb_block_based_table_index_mode_standard_required = 4,
+};
 enum {
   rocksdb_block_based_table_index_type_binary_search = 0,
   rocksdb_block_based_table_index_type_hash_search = 1,
@@ -1242,6 +1270,13 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_sst_file_manager(
 #include "c_api_gen/c_generated_jobinfo_auto.h.inc"
 #include "c_api_gen/c_generated_jobinfo_metadata_subset.h.inc"
 #include "c_api_gen/c_generated_metadata_structs_auto.h.inc"
+/* Compatibility aliases for the captured compaction pool selection. */
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_compactionjobinfo_t* info);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_subcompactionjobinfo_t* info);
 extern ROCKSDB_LIBRARY_API rocksdb_compactionjobinfo_t*
 rocksdb_compactionjobinfo_create(void);
 extern ROCKSDB_LIBRARY_API void rocksdb_compactionjobinfo_destroy(
@@ -1255,6 +1290,14 @@ rocksdb_table_properties_has_key_largest_seqno(
     const rocksdb_table_properties_t* props);
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_table_properties_has_key_smallest_seqno(
+    const rocksdb_table_properties_t* props);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_table_properties_has_referenced_blob_bytes(
+    const rocksdb_table_properties_t* props);
+/* Returns zero when the property is unknown; use the has accessor to
+ * distinguish unknown from a known zero value. */
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_table_properties_referenced_blob_bytes(
     const rocksdb_table_properties_t* props);
 extern ROCKSDB_LIBRARY_API size_t
 rocksdb_table_properties_user_collected_properties_count(
@@ -2376,6 +2419,20 @@ extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_clear_table_index_factory(
 extern ROCKSDB_LIBRARY_API const char*
 rocksdb_readoptions_get_table_index_factory_name(const rocksdb_readoptions_t*,
                                                  size_t* name_len);
+/* EXPERIMENTAL: overrides, for this read only, which index the SST is read
+ * through. Takes a rocksdb_readoptions_read_index_* value.
+ * rocksdb_readoptions_set_table_index_factory_from_string() also sets this to
+ * prefer_custom as a side effect, so call this after it if you want a
+ * different selection. */
+extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_read_index(
+    rocksdb_readoptions_t*, int v);
+extern ROCKSDB_LIBRARY_API int rocksdb_readoptions_get_read_index(
+    const rocksdb_readoptions_t*);
+enum {
+  rocksdb_readoptions_read_index_default = 0,
+  rocksdb_readoptions_read_index_builtin = 1,
+  rocksdb_readoptions_read_index_prefer_custom = 2,
+};
 
 /* Write options */
 
@@ -3391,6 +3448,20 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_multi_get_cf(
     size_t num_keys, const char* const* keys_list,
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_batched_multi_get_cf(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_transactiondb_batched_multi_get_cf_slice(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input);
+
 #include "c_api_gen/c_generated_transactiondb_subset.h.inc"
 
 extern ROCKSDB_LIBRARY_API rocksdb_iterator_t*

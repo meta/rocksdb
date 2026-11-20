@@ -434,12 +434,19 @@ DEFINE_SYNC_AND_ASYNC(void, Version::MultiGet)
   // blob_file => [[blob_idx, it], ...]
   std::unordered_map<uint64_t, BlobReadContexts> blob_ctxs;
   MultiGetRange keys_with_blobs_range(*range, range->begin(), range->end());
+#if defined(WITHOUT_COROUTINES)
+  // Posix async IO support depends on the calling thread because its io_uring
+  // instances are thread-local. Check on the thread executing MultiGet rather
+  // than caching the result when the Version is constructed.
+  const bool use_async_io = using_coroutines() && read_options.async_io &&
+                            CheckFSFeatureSupport(env_->GetFileSystem().get(),
+                                                  FSSupportedOps::kAsyncIO);
+#endif  // WITHOUT_COROUTINES
 #if defined(WITHOUT_COROUTINES) && defined(USE_COROUTINES)
   // optimize_multiget_for_io overlaps reads across levels via blockingWait; it
   // is only used by the synchronous variant. The coroutine variant overlaps
   // within a level via co_await below.
-  if (read_options.async_io && read_options.optimize_multiget_for_io &&
-      using_coroutines() && use_async_io_) {
+  if (use_async_io && read_options.optimize_multiget_for_io) {
     s = MultiGetAsync(read_options, range, &blob_ctxs);
   } else
 #endif  // WITHOUT_COROUTINES && USE_COROUTINES
@@ -468,8 +475,8 @@ DEFINE_SYNC_AND_ASYNC(void, Version::MultiGet)
 #ifdef WITH_COROUTINES
       if (fp.GetHitFileLevel() == 0 || !fp.RemainingOverlapInLevel()) {
 #else
-      if (!read_options.async_io || !using_coroutines() || !use_async_io_ ||
-          fp.GetHitFileLevel() == 0 || !fp.RemainingOverlapInLevel()) {
+      if (!use_async_io || fp.GetHitFileLevel() == 0 ||
+          !fp.RemainingOverlapInLevel()) {
 #endif
         if (f) {
           bool skip_filters =

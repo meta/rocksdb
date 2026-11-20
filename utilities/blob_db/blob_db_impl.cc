@@ -25,6 +25,7 @@
 #include "monitoring/instrumented_mutex.h"
 #include "monitoring/statistics_impl.h"
 #include "monitoring/thread_status_util.h"
+#include "options/options_helper.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
@@ -135,6 +136,26 @@ Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {
     return Status::NotSupported("No blob directory in options");
   }
 
+  // Validate the user declarations before the internal wrappers hide them.
+  Status s = ValidateCompactionFilterOptions(cf_options_);
+  if (!s.ok()) {
+    return s;
+  }
+  CompactionFilter::MergeOrder order;
+  s = GetCompactionFilterMergeOrder(
+      cf_options_.compaction_filter,
+      cf_options_.compaction_filter
+          ? nullptr
+          : cf_options_.compaction_filter_factory.get(),
+      TableFileCreationReason::kCompaction, &order);
+  if (!s.ok()) {
+    return s;
+  }
+  if (order == CompactionFilter::MergeOrder::kMergeBeforeFilter) {
+    return Status::NotSupported(
+        "Merge-before-filter is not supported by stacked BlobDB");
+  }
+
   // Temporarily disable compactions in the base DB during open; save the user
   // defined value beforehand so we can restore it once BlobDB is initialized.
   // Note: this is only needed if garbage collection is enabled.
@@ -143,8 +164,6 @@ Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {
   if (bdb_options_.enable_garbage_collection) {
     cf_options_.disable_auto_compactions = true;
   }
-
-  Status s;
 
   // Create info log.
   if (db_options_.info_log == nullptr) {
@@ -1791,15 +1810,8 @@ bool BlobDBImpl::VisibleToActiveSnapshot(
   // [earliest_sequence, obsolete_sequence). But doing so will make the
   // implementation more complicated.
   SequenceNumber obsolete_sequence = bfile->GetObsoleteSequence();
-  SequenceNumber oldest_snapshot = kMaxSequenceNumber;
-  {
-    // Need to lock DBImpl mutex before access snapshot list.
-    InstrumentedMutexLock l(db_impl_->mutex());
-    auto& snapshots = db_impl_->snapshots();
-    if (!snapshots.empty()) {
-      oldest_snapshot = snapshots.oldest()->GetSequenceNumber();
-    }
-  }
+  const SequenceNumber oldest_snapshot = db_impl_->snapshots().OldestOr(
+      []() { return kMaxSequenceNumber; }, nullptr);
   bool visible = oldest_snapshot < obsolete_sequence;
   if (visible) {
     ROCKS_LOG_INFO(db_options_.info_log,
@@ -2048,7 +2060,9 @@ Status DestroyBlobDB(const std::string& dbname, const Options& options,
       uint64_t number;
       FileType type;
       if (ParseFileName(f, &number, &type) && type == kBlobFile) {
-        Status del = DeleteDBFile(&soptions, blobdir + "/" + f, blobdir, true,
+        std::string path = blobdir;
+        path.append("/").append(f);
+        Status del = DeleteDBFile(&soptions, path, blobdir, true,
                                   /*force_fg=*/false);
         if (status.ok() && !del.ok()) {
           status = del;
@@ -2085,6 +2099,7 @@ void BlobDBImpl::TEST_AddDummyBlobFile(uint64_t blob_file_number,
 std::vector<std::shared_ptr<BlobFile>> BlobDBImpl::TEST_GetBlobFiles() const {
   ReadLock l(&mutex_);
   std::vector<std::shared_ptr<BlobFile>> blob_files;
+  blob_files.reserve(blob_files_.size());
   for (auto& p : blob_files_) {
     blob_files.emplace_back(p.second);
   }
@@ -2095,6 +2110,7 @@ std::vector<std::shared_ptr<BlobFile>> BlobDBImpl::TEST_GetLiveImmNonTTLFiles()
     const {
   ReadLock l(&mutex_);
   std::vector<std::shared_ptr<BlobFile>> live_imm_non_ttl_files;
+  live_imm_non_ttl_files.reserve(live_imm_non_ttl_blob_files_.size());
   for (const auto& pair : live_imm_non_ttl_blob_files_) {
     live_imm_non_ttl_files.emplace_back(pair.second);
   }

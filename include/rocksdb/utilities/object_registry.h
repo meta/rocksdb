@@ -44,7 +44,12 @@ class ObjectLibrary {
   // Base class for an Entry in the Registry.
   class Entry {
    public:
-    virtual ~Entry() {}
+    Entry() = default;
+    Entry(const Entry&) = default;
+    Entry& operator=(const Entry&) = default;
+    Entry(Entry&&) = default;
+    Entry& operator=(Entry&&) = default;
+    virtual ~Entry() = default;
     virtual bool Matches(const std::string& target) const = 0;
     virtual const char* Name() const = 0;
   };

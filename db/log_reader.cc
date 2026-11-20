@@ -913,6 +913,16 @@ void FragmentBufferedReader::UnmarkEOF() {
   UnmarkEOFInternal();
 }
 
+void FragmentBufferedReader::StartAtRecordEnd(uint64_t offset) {
+  assert(end_of_buffer_offset_ == 0);
+  assert(buffer_.empty());
+  assert(!eof_ && !read_error_ && !in_fragmented_record_);
+  end_of_buffer_offset_ = offset;
+  eof_ = true;
+  // The remainder is less than kBlockSize, so it fits in size_t.
+  eof_offset_ = static_cast<size_t>(offset % kBlockSize);
+}
+
 bool FragmentBufferedReader::TryReadMore(size_t* drop_size, uint8_t* error) {
   if (!eof_ && !read_error_) {
     // Last read was a full read, so this is a trailer to skip
@@ -1061,7 +1071,7 @@ bool FragmentBufferedReader::TryReadFragment(Slice* fragment, size_t* drop_size,
                                     uncompressed_size);
       }
     } while (remaining > 0 || uncompressed_size == kBlockSize);
-    *fragment = Slice(std::move(uncompressed_record_));
+    *fragment = Slice(uncompressed_record_);
     *fragment_type_or_err = type;
     return true;
   }

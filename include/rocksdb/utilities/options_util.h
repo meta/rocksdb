@@ -58,6 +58,11 @@ struct ConfigOptions;
 // examples/options_file_example.cc demonstrates how to use this function
 // to open a RocksDB instance.
 //
+// When MANIFEST tracking selects the OPTIONS file, a partially completed
+// multi-column-family operation can leave extra column families in the file.
+// This function filters those entries against live MANIFEST membership. A
+// selected file that omits a live column family is reported as corruption.
+//
 // @return the function returns an OK status when it went successfully.  If
 //     the specified "dbpath" does not contain any option file, then a
 //     Status::NotFound will be returned.  A return value other than
@@ -80,7 +85,12 @@ Status LoadOptionsFromFile(const ConfigOptions& config_options,
                            std::vector<ColumnFamilyDescriptor>* cf_descs,
                            std::shared_ptr<Cache>* cache = {});
 
-// Returns the latest options file name under the specified db path.
+// Returns the highest-numbered legacy OPTIONS file without reading MANIFEST.
+// If the highest file enables MANIFEST tracking, returns the committed file,
+// skipping uncommitted tracked files. RepairDB output with no usable commit
+// falls back to the highest OPTIONS file. The returned file can contain a safe
+// superset of live MANIFEST column families; LoadLatestOptions performs the
+// membership filtering.
 Status GetLatestOptionsFileName(const std::string& dbpath, Env* env,
                                 std::string* options_file_name);
 

@@ -48,6 +48,11 @@ extern const uint64_t kPlainTableMagicNumber;
 
 extern const uint64_t kCuckooTableMagicNumber;
 
+// Reads the trailing SST format signature without decoding the footer.
+Status ReadTableMagicNumber(const IOOptions& io_options,
+                            FSRandomAccessFile& file, uint64_t file_size,
+                            uint64_t* magic_number);
+
 // BlockHandle is a pointer to the extent of a file that stores a data
 // block or a meta block.
 class BlockHandle {
@@ -180,13 +185,6 @@ inline uint32_t ChecksumModifierForContext(uint32_t base_context_checksum,
   return modifier & all_or_nothing;
 }
 
-// Latest format_version supported for both reading and writing new SST files in
-// block-based format. Newer "draft" format_versions that are still in
-// development are not published: they are exercised only in tests, gated behind
-// the TEST-only TEST_AllowUnsupportedFormatVersion() hook, and are neither
-// readable nor writable in production until finalized by bumping this constant.
-constexpr uint32_t kLatestBbtFormatVersion = 8;
-
 // Sentinel for "no format_version known yet," e.g. a Footer that has not been
 // populated by DecodeFrom. Deliberately larger than any real version so that
 // accidentally treating it as one is caught by the FormatVersionUses*
@@ -213,7 +211,7 @@ static_assert(kMinSupportedBbtFormatVersionForWrite >=
 inline bool IsSupportedFormatVersionForRead(uint64_t magic, uint32_t version) {
   if (magic == kBlockBasedTableMagicNumber) {
     return version >= kMinSupportedBbtFormatVersionForRead &&
-           version <= kLatestBbtFormatVersion;
+           version <= BlockBasedTableOptions::kLatestSupportedFormatVersion;
   } else if (magic == kPlainTableMagicNumber) {
     return version == 0;
   } else if (magic == kCuckooTableMagicNumber) {
@@ -226,7 +224,7 @@ inline bool IsSupportedFormatVersionForRead(uint64_t magic, uint32_t version) {
 inline bool IsSupportedFormatVersionForWrite(uint64_t magic, uint32_t version) {
   if (magic == kBlockBasedTableMagicNumber) {
     return version >= kMinSupportedBbtFormatVersionForWrite &&
-           version <= kLatestBbtFormatVersion;
+           version <= BlockBasedTableOptions::kLatestSupportedFormatVersion;
   } else if (magic == kPlainTableMagicNumber) {
     return version == 0;
   } else if (magic == kCuckooTableMagicNumber) {
@@ -300,6 +298,13 @@ inline bool FormatVersionUsesCommonKeyPrefix(uint32_t version) {
   return version >= 8;
 }
 
+// Incompatible features are stored in checked footer bytes for format_version
+// >= 6. Older readers reject any non-zero feature bits.
+inline constexpr uint64_t kFooterFeatureRequireUserDefinedIndex = uint64_t{1}
+                                                                  << 0;
+inline constexpr uint64_t kKnownFooterFeatures =
+    kFooterFeatureRequireUserDefinedIndex;
+
 // Footer encapsulates the fixed information stored at the tail end of every
 // SST file. In general, it should only include things that cannot go
 // elsewhere under the metaindex block. For example, checksum_type is
@@ -315,6 +320,7 @@ class Footer {
     table_magic_number_ = kNullTableMagicNumber;
     format_version_ = kInvalidFormatVersion;
     base_context_checksum_ = 0;
+    incompatible_features_ = 0;
     metaindex_handle_ = BlockHandle::NullBlockHandle();
     index_handle_ = BlockHandle::NullBlockHandle();
     checksum_type_ = kInvalidChecksumType;
@@ -347,6 +353,12 @@ class Footer {
 
   // See ChecksumModifierForContext()
   uint32_t base_context_checksum() const { return base_context_checksum_; }
+
+  uint64_t incompatible_features() const { return incompatible_features_; }
+
+  bool HasIncompatibleFeature(uint64_t feature) const {
+    return (incompatible_features_ & feature) != 0;
+  }
 
   // Block handle for metaindex block.
   const BlockHandle& metaindex_handle() const { return metaindex_handle_; }
@@ -394,6 +406,7 @@ class Footer {
   uint64_t table_magic_number_ = kNullTableMagicNumber;
   uint32_t format_version_ = kInvalidFormatVersion;
   uint32_t base_context_checksum_ = 0;
+  uint64_t incompatible_features_ = 0;
   BlockHandle metaindex_handle_;
   BlockHandle index_handle_;
   int checksum_type_ = kInvalidChecksumType;
@@ -424,7 +437,17 @@ class FooterBuilder {
                uint64_t footer_offset, ChecksumType checksum_type,
                const BlockHandle& metaindex_handle,
                const BlockHandle& index_handle = BlockHandle::NullBlockHandle(),
-               uint32_t base_context_checksum = 0);
+               uint32_t base_context_checksum = 0) {
+    return Build(table_magic_number, format_version, footer_offset,
+                 checksum_type, metaindex_handle, index_handle,
+                 base_context_checksum, /*incompatible_features=*/0);
+  }
+
+  Status Build(uint64_t table_magic_number, uint32_t format_version,
+               uint64_t footer_offset, ChecksumType checksum_type,
+               const BlockHandle& metaindex_handle,
+               const BlockHandle& index_handle, uint32_t base_context_checksum,
+               uint64_t incompatible_features);
 
   // After Builder, get a Slice for the serialized Footer, backed by this
   // FooterBuilder.
@@ -435,7 +458,7 @@ class FooterBuilder {
 
  private:
   Slice slice_;
-  std::array<char, Footer::kMaxEncodedLength> data_;
+  std::array<char, Footer::kMaxEncodedLength> data_{};
 };
 
 // Set to true to allow unit testing of writing unsupported block-based table
@@ -508,7 +531,7 @@ struct BlockContents {
   BlockContents() {}
 
   // Does not take ownership of the underlying data bytes.
-  BlockContents(const Slice& _data) : data(_data) {}
+  explicit BlockContents(const Slice& _data) : data(_data) {}
 
   // Takes ownership of the underlying data bytes.
   BlockContents(CacheAllocationPtr&& _data, size_t _size)
@@ -565,6 +588,8 @@ struct BlockContents {
     AssertSingleOwner();
     return *this;
   }
+
+  ~BlockContents() = default;
 };
 
 // The `data` points to serialized block contents read in from file, which

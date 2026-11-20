@@ -35,4 +35,4 @@ New RocksDB release - 3.5!
   4. OptimizeForPointLookup() takes one parameter for block cache size. It now builds hash index, bloom filter, and block cache.
 
 
-[https://github.com/facebook/rocksdb/releases/tag/v3.5](https://github.com/facebook/rocksdb/releases/tag/rocksdb-3.5)
+[https://github.com/meta/rocksdb/releases/tag/v3.5](https://github.com/meta/rocksdb/releases/tag/rocksdb-3.5)

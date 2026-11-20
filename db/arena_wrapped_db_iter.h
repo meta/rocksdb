@@ -42,6 +42,13 @@ class ArenaWrappedDBIter : public Iterator {
       std::unique_ptr<ColumnFamilyData, ColumnFamilyDataUnrefDeleter>;
 
  public:
+  ArenaWrappedDBIter() = default;
+  // No copying allowed
+  ArenaWrappedDBIter(const ArenaWrappedDBIter&) = delete;
+  ArenaWrappedDBIter& operator=(const ArenaWrappedDBIter&) = delete;
+  ArenaWrappedDBIter(ArenaWrappedDBIter&&) = delete;
+  ArenaWrappedDBIter& operator=(ArenaWrappedDBIter&&) = delete;
+
   ~ArenaWrappedDBIter() override {
     if (db_iter_ != nullptr) {
       DestroyDBIter();

@@ -1,1 +1,0 @@
-Fixed full recovery from retryable background errors to atomically advance WAL replay boundaries for all column families, preventing partial recovery of multi-column-family write batches after a failed recovery flush.

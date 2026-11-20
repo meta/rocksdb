@@ -21,7 +21,12 @@ class Slice;
 // Comparator and some internal data structures.
 class CompareInterface {
  public:
-  virtual ~CompareInterface() {}
+  CompareInterface() = default;
+  CompareInterface(const CompareInterface&) = default;
+  CompareInterface& operator=(const CompareInterface&) = default;
+  CompareInterface(CompareInterface&&) = default;
+  CompareInterface& operator=(CompareInterface&&) = default;
+  virtual ~CompareInterface() = default;
 
   // Three-way comparison.  Returns value:
   //   < 0 iff "a" < "b",
@@ -53,6 +58,14 @@ class Comparator : public Customizable, public CompareInterface {
     if (this != &rhs) {
       timestamp_size_ = rhs.timestamp_size_;
     }
+    return *this;
+  }
+
+  Comparator(Comparator&& orig) noexcept
+      : timestamp_size_(orig.timestamp_size_) {}
+
+  Comparator& operator=(Comparator&& rhs) noexcept {
+    timestamp_size_ = rhs.timestamp_size_;
     return *this;
   }
 

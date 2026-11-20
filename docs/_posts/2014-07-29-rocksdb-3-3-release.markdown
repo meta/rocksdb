@@ -7,7 +7,7 @@ redirect_from:
   - /blog/1301/rocksdb-3-3-release/
 ---
 
-Check out new RocksDB release on [GitHub](https://github.com/facebook/rocksdb/releases/tag/rocksdb-3.3)!
+Check out new RocksDB release on [GitHub](https://github.com/meta/rocksdb/releases/tag/rocksdb-3.3)!
 
 New Features in RocksDB 3.3:
 

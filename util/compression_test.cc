@@ -2300,18 +2300,18 @@ class CostAwareTestFlushBlockPolicy : public FlushBlockPolicy {
   int window_;
   int num_keys_;
   const BlockBuilder& data_block_builder_;
-  IOCPUCostPredictor* predictor_;
+  IOCPUCostPredictor* predictor_ = nullptr;
 };
 class CostAwareTestFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
  public:
   explicit CostAwareTestFlushBlockPolicyFactory(const int window)
       : window_(window) {}
 
-  virtual const char* Name() const override {
+  const char* Name() const override {
     return "CostAwareTestFlushBlockPolicyFactory";
   }
 
-  virtual FlushBlockPolicy* NewFlushBlockPolicy(
+  FlushBlockPolicy* NewFlushBlockPolicy(
       const BlockBasedTableOptions& /*table_options*/,
       const BlockBuilder& data_block_builder) const override {
     (void)data_block_builder;
@@ -2333,8 +2333,8 @@ class DBCompressionCostPredictor : public DBTestBase {
     options.statistics->set_stats_level(StatsLevel::kExceptTimeForMutex);
     BlockBasedTableOptions bbto;
     bbto.enable_index_compression = false;
-    bbto.flush_block_policy_factory.reset(
-        new CostAwareTestFlushBlockPolicyFactory(10));
+    bbto.flush_block_policy_factory =
+        std::make_shared<CostAwareTestFlushBlockPolicyFactory>(10);
     options.table_factory.reset(NewBlockBasedTableFactory(bbto));
     DestroyAndReopen(options);
   }

@@ -17,6 +17,7 @@
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "logging/logging.h"
+#include "options/options_parser.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -198,7 +199,8 @@ Status DBImpl::GetCurrentWalFile(std::unique_ptr<WalFile>* current_wal_file) {
 
 Status DBImpl::AppendColumnFamilyDropsToManifest(
     const std::string& manifest_path, uint64_t manifest_size,
-    const std::vector<uint32_t>& cf_ids) {
+    const std::vector<uint32_t>& cf_ids,
+    uint64_t committed_options_file_number) {
   const WriteOptions write_options;
   // Snapshot manifest_preallocation_size_ under the DB mutex per VersionSet's
   // contract (the field is mutated by SetDBOptions under this mutex).
@@ -208,21 +210,44 @@ Status DBImpl::AppendColumnFamilyDropsToManifest(
     preallocation_size = versions_->manifest_preallocation_size_;
   }
   return versions_->AppendColumnFamilyDropsToManifest(
-      manifest_path, manifest_size, cf_ids, write_options, preallocation_size);
+      manifest_path, manifest_size, cf_ids, write_options, preallocation_size,
+      committed_options_file_number);
+}
+
+Status DBImpl::CreateOptionsFileForSubsetCheckpoint(
+    const std::string& checkpoint_dir,
+    const SubsetCheckpointOptionsSnapshot& options_snapshot) {
+  if (options_snapshot.options_file_number == 0) {
+    return Status::OK();
+  }
+
+  // The snapshot's CF options are shallow copies that share live pointer
+  // sub-options (e.g. RibbonFilterPolicy, whose bloom_before_level is mutated
+  // in place by SetOptions). Hold options_mutex_, as WriteOptionsFile does, so
+  // SetOptions cannot change them between writing the file and verifying it.
+  InstrumentedMutexLock ol(&options_mutex_);
+
+  const std::string options_path =
+      OptionsFileName(checkpoint_dir, options_snapshot.options_file_number);
+  return PersistRocksDBOptions(
+      WriteOptions(), options_snapshot.db_options, options_snapshot.cf_names,
+      options_snapshot.cf_options, options_path, fs_.get());
 }
 
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
   return GetLiveFilesStorageInfoImpl(opts, /*include_cf_ids=*/{}, files,
-                                     /*excluded_cf_ids=*/nullptr);
+                                     /*excluded_cf_ids=*/nullptr,
+                                     /*options_snapshot=*/nullptr);
 }
 
 Status DBImpl::GetLiveFilesStorageInfoForSubsetCheckpoint(
     const LiveFilesStorageInfoOptions& opts,
     const std::vector<uint32_t>& include_cf_ids,
     std::vector<LiveFileStorageInfo>* files,
-    std::vector<uint32_t>* excluded_cf_ids) {
+    std::vector<uint32_t>* excluded_cf_ids,
+    SubsetCheckpointOptionsSnapshot* options_snapshot) {
   // Internal contract: caller must coalesce ids and always include the default
   // CF (it cannot be dropped, so a subset checkpoint without it would produce
   // an unopenable DB). CheckpointImpl enforces this before calling here.
@@ -230,15 +255,17 @@ Status DBImpl::GetLiveFilesStorageInfoForSubsetCheckpoint(
   assert(std::find(include_cf_ids.begin(), include_cf_ids.end(),
                    default_cf_handle_->GetID()) != include_cf_ids.end());
   assert(excluded_cf_ids != nullptr);
+  assert(options_snapshot != nullptr);
   return GetLiveFilesStorageInfoImpl(opts, include_cf_ids, files,
-                                     excluded_cf_ids);
+                                     excluded_cf_ids, options_snapshot);
 }
 
 Status DBImpl::GetLiveFilesStorageInfoImpl(
     const LiveFilesStorageInfoOptions& opts,
     const std::vector<uint32_t>& include_cf_ids,
     std::vector<LiveFileStorageInfo>* files,
-    std::vector<uint32_t>* excluded_cf_ids) {
+    std::vector<uint32_t>* excluded_cf_ids,
+    SubsetCheckpointOptionsSnapshot* options_snapshot) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
@@ -246,6 +273,7 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
 
   const bool cf_subset = !include_cf_ids.empty();
   assert(!cf_subset || excluded_cf_ids != nullptr);
+  assert(!cf_subset || options_snapshot != nullptr);
   const std::unordered_set<uint32_t> include_cf_id_set(include_cf_ids.begin(),
                                                        include_cf_ids.end());
   // Tracks which requested ids remain to be observed as live under the DB
@@ -413,6 +441,29 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
         "Requested column family id was not live at checkpoint time");
   }
 
+  if (cf_subset) {
+    assert(options_snapshot != nullptr);
+    assert(excluded_cf_ids != nullptr);
+    *options_snapshot = SubsetCheckpointOptionsSnapshot();
+    if (!excluded_cf_ids->empty()) {
+      options_snapshot->options_file_number = versions_->NewFileNumber();
+      options_snapshot->commit_options_file_number =
+          versions_->has_committed_options_file_number();
+      options_snapshot->db_options =
+          BuildDBOptions(immutable_db_options_, mutable_db_options_);
+      ColumnFamilySet* column_family_set = versions_->GetColumnFamilySet();
+      assert(column_family_set != nullptr);
+      for (auto* cfd : *column_family_set) {
+        assert(cfd != nullptr);
+        if (!cfd->IsDropped() &&
+            include_cf_id_set.find(cfd->GetID()) != include_cf_id_set.end()) {
+          options_snapshot->cf_names.push_back(cfd->GetName());
+          options_snapshot->cf_options.push_back(cfd->GetLatestCFOptions());
+        }
+      }
+    }
+  }
+
   // Capture some final info before releasing mutex
   const uint64_t manifest_number = versions_->manifest_file_number();
   uint64_t manifest_size = versions_->manifest_file_size();
@@ -424,12 +475,36 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     }
   }
   const uint64_t options_number = versions_->options_file_number();
-  const uint64_t options_size = versions_->options_file_size_;
   const uint64_t min_log_num = MinLogNumberToKeep();
   // Ensure consistency with manifest for track_and_verify_wals_in_manifest
   const uint64_t max_log_num = cur_wal_number_;
 
+  if (options_number != 0) {
+    // A concurrent SetOptions() may otherwise delete this OPTIONS file before
+    // its size is read below, even when the caller has not disabled deletions.
+    DisableFileDeletionsWithLock().PermitUncheckedError();
+  }
   mutex_.Unlock();
+
+  uint64_t options_size = 0;
+  if (options_number != 0) {
+    // File deletions must be disabled by callers while they copy this snapshot.
+    // The number belongs to the MANIFEST/CF snapshot captured above, while the
+    // immutable file's size can be read without holding the DB mutex.
+    TEST_SYNC_POINT("DBImpl::GetLiveFilesStorageInfo:BeforeOptionsFileSize");
+    Status options_s = GetEnv()->GetFileSize(
+        OptionsFileName(GetName(), options_number), &options_size);
+    {
+      // Not EnableFileDeletions(): read-only DB implementations override it to
+      // return NotSupported without undoing DisableFileDeletionsWithLock().
+      InstrumentedMutexLock l(&mutex_);
+      assert(disable_delete_obsolete_files_ > 0);
+      --disable_delete_obsolete_files_;
+    }
+    if (!options_s.ok()) {
+      return options_s;
+    }
+  }
 
   std::string manifest_fname = DescriptorFileName(manifest_number);
   {  // MANIFEST

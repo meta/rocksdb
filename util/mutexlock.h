@@ -38,6 +38,8 @@ class MutexLock {
   // No copying allowed
   MutexLock(const MutexLock&) = delete;
   void operator=(const MutexLock&) = delete;
+  MutexLock(MutexLock&&) = delete;
+  void operator=(MutexLock&&) = delete;
 
   ~MutexLock() { this->mu_->Unlock(); }
 
@@ -56,6 +58,8 @@ class ReadLock {
   // No copying allowed
   ReadLock(const ReadLock&) = delete;
   void operator=(const ReadLock&) = delete;
+  ReadLock(ReadLock&&) = delete;
+  void operator=(ReadLock&&) = delete;
 
   ~ReadLock() { this->mu_->ReadUnlock(); }
 
@@ -73,6 +77,8 @@ class TryReadLock {
   // No copying allowed
   TryReadLock(const TryReadLock&) = delete;
   void operator=(const TryReadLock&) = delete;
+  TryReadLock(TryReadLock&&) = delete;
+  void operator=(TryReadLock&&) = delete;
 
   ~TryReadLock() {
     if (owns_) {
@@ -96,6 +102,8 @@ class ReadUnlock {
   // No copying allowed
   ReadUnlock(const ReadUnlock&) = delete;
   ReadUnlock& operator=(const ReadUnlock&) = delete;
+  ReadUnlock(ReadUnlock&&) = delete;
+  ReadUnlock& operator=(ReadUnlock&&) = delete;
 
   ~ReadUnlock() { mu_->ReadUnlock(); }
 
@@ -114,6 +122,8 @@ class WriteLock {
   // No copying allowed
   WriteLock(const WriteLock&) = delete;
   void operator=(const WriteLock&) = delete;
+  WriteLock(WriteLock&&) = delete;
+  void operator=(WriteLock&&) = delete;
 
   ~WriteLock() { this->mu_->WriteUnlock(); }
 
@@ -134,6 +144,8 @@ class TryWriteLock {
   // No copying allowed
   TryWriteLock(const TryWriteLock&) = delete;
   void operator=(const TryWriteLock&) = delete;
+  TryWriteLock(TryWriteLock&&) = delete;
+  void operator=(TryWriteLock&&) = delete;
 
   ~TryWriteLock() {
     if (owns_) {

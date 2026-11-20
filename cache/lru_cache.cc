@@ -129,6 +129,7 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
       high_pri_pool_capacity_(0),
       low_pri_pool_ratio_(low_pri_pool_ratio),
       low_pri_pool_capacity_(0),
+      lru_(),
       table_(max_upper_hash_bits, allocator),
       usage_(0),
       lru_usage_(0),
@@ -574,7 +575,7 @@ LRUHandle* LRUCacheShard::CreateStandalone(const Slice& key, uint32_t hash,
 
     if (strict_capacity_limit_ && (usage_ + e->total_charge) > capacity_) {
       if (allow_uncharged) {
-        e->total_charge = 0;
+        e->total_charge = LRUHandle::kUnchargedStandaloneTotalCharge;
       } else {
         free(e);
         e = nullptr;

@@ -29,7 +29,7 @@ class ExpectedState {
  public:
   explicit ExpectedState(size_t max_key, size_t num_column_families);
 
-  virtual ~ExpectedState() {}
+  virtual ~ExpectedState() = default;
 
   // Requires external locking preventing concurrent execution with any other
   // member function.

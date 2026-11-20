@@ -32,8 +32,10 @@ class Iterator : public IteratorBase {
   // No copying allowed
   Iterator(const Iterator&) = delete;
   void operator=(const Iterator&) = delete;
+  Iterator(Iterator&&) = delete;
+  void operator=(Iterator&&) = delete;
 
-  virtual ~Iterator() override {}
+  ~Iterator() override {}
 
   // Return the value for the current entry.  If the entry is a plain key-value,
   // return the value as-is; if it is a wide-column entity, return the value of
@@ -106,6 +108,10 @@ class Iterator : public IteratorBase {
   // other target key, the iterator should disregard the scan_opts from that
   // point onwards and behave like a normal iterator. Its the user's
   // responsibility to again call Prepare().
+  //
+  // For an iterator from DB::NewIterator(), Prepare() discards any current
+  // position, and Valid() returns false until the iterator is positioned
+  // again, e.g. by Seek().
   //
   // If Prepare() is called, it overrides the iterate_upper_bound in
   // ReadOptions

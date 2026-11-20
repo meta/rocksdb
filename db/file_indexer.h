@@ -121,17 +121,19 @@ class FileIndexer {
     IndexLevel() : num_index(0), index_units(nullptr) {}
   };
 
-  void CalculateLB(
-      const std::vector<FileMetaData*>& upper_files,
-      const std::vector<FileMetaData*>& lower_files, IndexLevel* index_level,
-      std::function<int(const FileMetaData*, const FileMetaData*)> cmp_op,
-      std::function<void(IndexUnit*, int32_t)> set_index);
+  void CalculateLB(const std::vector<FileMetaData*>& upper_files,
+                   const std::vector<FileMetaData*>& lower_files,
+                   IndexLevel* index_level,
+                   const std::function<int(const FileMetaData*,
+                                           const FileMetaData*)>& cmp_op,
+                   const std::function<void(IndexUnit*, int32_t)>& set_index);
 
-  void CalculateRB(
-      const std::vector<FileMetaData*>& upper_files,
-      const std::vector<FileMetaData*>& lower_files, IndexLevel* index_level,
-      std::function<int(const FileMetaData*, const FileMetaData*)> cmp_op,
-      std::function<void(IndexUnit*, int32_t)> set_index);
+  void CalculateRB(const std::vector<FileMetaData*>& upper_files,
+                   const std::vector<FileMetaData*>& lower_files,
+                   IndexLevel* index_level,
+                   const std::function<int(const FileMetaData*,
+                                           const FileMetaData*)>& cmp_op,
+                   const std::function<void(IndexUnit*, int32_t)>& set_index);
 
   autovector<IndexLevel> next_level_index_;
   int32_t* level_rb_;

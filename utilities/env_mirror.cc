@@ -9,6 +9,8 @@
 
 #include "rocksdb/utilities/env_mirror.h"
 
+#include <utility>
+
 namespace ROCKSDB_NAMESPACE {
 
 // An implementation of Env that mirrors all work over two backend
@@ -17,7 +19,7 @@ class SequentialFileMirror : public SequentialFile {
  public:
   std::unique_ptr<SequentialFile> a_, b_;
   std::string fname;
-  explicit SequentialFileMirror(std::string f) : fname(f) {}
+  explicit SequentialFileMirror(std::string f) : fname(std::move(f)) {}
 
   Status Read(size_t n, Slice* result, char* scratch) override {
     Slice aslice;
@@ -65,7 +67,7 @@ class RandomAccessFileMirror : public RandomAccessFile {
  public:
   std::unique_ptr<RandomAccessFile> a_, b_;
   std::string fname;
-  explicit RandomAccessFileMirror(std::string f) : fname(f) {}
+  explicit RandomAccessFileMirror(std::string f) : fname(std::move(f)) {}
 
   Status Read(uint64_t offset, size_t n, Slice* result,
               char* scratch) const override {
@@ -96,7 +98,8 @@ class RandomAccessFileMirror : public RandomAccessFile {
   }
 
   Status GetFileSize(uint64_t* file_size) override {
-    uint64_t asize = 0, bsize = 0;
+    uint64_t asize = 0;
+    uint64_t bsize = 0;
     Status as = a_->GetFileSize(&asize);
     Status bs = b_->GetFileSize(&bsize);
     assert(as == bs);
@@ -111,7 +114,7 @@ class WritableFileMirror : public WritableFile {
   std::unique_ptr<WritableFile> a_, b_;
   std::string fname;
   explicit WritableFileMirror(std::string f, const EnvOptions& options)
-      : WritableFile(options), fname(f) {}
+      : WritableFile(options), fname(std::move(f)) {}
 
   Status Append(const Slice& data) override {
     Status as = a_->Append(data);

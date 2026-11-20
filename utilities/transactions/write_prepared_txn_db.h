@@ -70,7 +70,7 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
     Init(txn_db_options);
   }
 
-  virtual ~WritePreparedTxnDB();
+  ~WritePreparedTxnDB() override;
 
   Status Initialize(const std::vector<size_t>& compaction_enabled_cf_indices,
                     const std::vector<ColumnFamilyHandle*>& handles) override;
@@ -115,6 +115,12 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
                          PinnableSlice* value,
                          OutputMetadata* output_metadata) override;
 
+  using DB::GetEntityWithMetadata;
+  Status GetEntityWithMetadata(const ReadOptions& options,
+                               ColumnFamilyHandle* column_family,
+                               const Slice& key, PinnableWideColumns* columns,
+                               OutputMetadata* output_metadata) override;
+
   using DB::MultiGet;
   DECLARE_SYNC_AND_ASYNC_OVERRIDE(void, MultiGet,
                                   const ReadOptions& _read_options,
@@ -132,6 +138,19 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
                             Status* statuses,
                             MultiGetOutputMetadata* output_metadata,
                             const bool sorted_input) override;
+
+  using DB::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& options, size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input) override;
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override;
 
   using DB::NewIterator;
   Iterator* NewIterator(const ReadOptions& _read_options,
@@ -212,7 +231,8 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
     // commit cache, ii) delayed prepared, commit cache again. In this way if
     // the first query to commit cache missed the commit, the 2nd will catch it.
     bool was_empty;
-    SequenceNumber max_evicted_seq_lb, max_evicted_seq_ub;
+    SequenceNumber max_evicted_seq_lb;
+    SequenceNumber max_evicted_seq_ub;
     CommitEntry64b dont_care;
     auto indexed_seq = prep_seq % COMMIT_CACHE_SIZE;
     size_t repeats = 0;
@@ -607,6 +627,13 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
     friend class WritePreparedTxnDB;
 
    public:
+    PreparedHeap() = default;
+    // No copying allowed
+    PreparedHeap(const PreparedHeap&) = delete;
+    PreparedHeap& operator=(const PreparedHeap&) = delete;
+    PreparedHeap(PreparedHeap&&) = delete;
+    PreparedHeap& operator=(PreparedHeap&&) = delete;
+
     ~PreparedHeap() {
       if (!TEST_CRASH_) {
         assert(heap_.empty());
@@ -895,7 +922,15 @@ class WritePreparedTxnReadCallback : public ReadCallback {
     (void)backed_by_snapshot_;  // to silence unused private field warning
   }
 
-  virtual ~WritePreparedTxnReadCallback() {
+  // No copying allowed
+  WritePreparedTxnReadCallback(const WritePreparedTxnReadCallback&) = delete;
+  WritePreparedTxnReadCallback& operator=(const WritePreparedTxnReadCallback&) =
+      delete;
+  WritePreparedTxnReadCallback(WritePreparedTxnReadCallback&&) = delete;
+  WritePreparedTxnReadCallback& operator=(WritePreparedTxnReadCallback&&) =
+      delete;
+
+  ~WritePreparedTxnReadCallback() override {
     // If it is not backed by snapshot, the caller must check validity
     assert(valid_checked_ || backed_by_snapshot_ == kBackedByDBSnapshot);
   }

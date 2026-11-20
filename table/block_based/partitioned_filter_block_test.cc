@@ -405,7 +405,8 @@ INSTANTIATE_TEST_CASE_P(
     FormatVersions, PartitionedFilterBlockTest,
     testing::Combine(
         testing::ValuesIn(std::set<uint32_t>{
-            2, 3, 4, 5, test::kDefaultFormatVersion, kLatestBbtFormatVersion}),
+            2, 3, 4, 5, test::kDefaultFormatVersion,
+            BlockBasedTableOptions::kLatestSupportedFormatVersion}),
         testing::ValuesIn(test::GetUDTTestModes()), testing::Bool()));
 
 TEST_P(PartitionedFilterBlockTest, EmptyBuilder) {

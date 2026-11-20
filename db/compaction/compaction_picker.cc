@@ -236,7 +236,10 @@ void CompactionPicker::GetRange(const CompactionInputFiles& inputs1,
   } else if (inputs2.empty()) {
     GetRange(inputs1, smallest, largest);
   } else {
-    InternalKey smallest1, smallest2, largest1, largest2;
+    InternalKey smallest1;
+    InternalKey smallest2;
+    InternalKey largest1;
+    InternalKey largest2;
     GetRange(inputs1, &smallest1, &largest1);
     GetRange(inputs2, &smallest2, &largest2);
     *smallest =
@@ -286,7 +289,8 @@ bool CompactionPicker::ExpandInputsToCleanCut(const std::string& /*cf_name*/,
     return true;
   }
 
-  InternalKey smallest, largest;
+  InternalKey smallest;
+  InternalKey largest;
 
   // Keep expanding inputs until we are sure that there is a "clean cut"
   // boundary between the files in input and the surrounding files.
@@ -360,7 +364,8 @@ bool CompactionPicker::FilesRangeOverlapWithCompaction(
 
   // TODO: Intra L0 compactions can have the ranges overlapped, but the input
   //  files cannot be overlapped in the order of L0 files.
-  InternalKey smallest, largest;
+  InternalKey smallest;
+  InternalKey largest;
   GetRange(inputs, &smallest, &largest, Compaction::kInvalidLevel);
   if (proximal_level != Compaction::kInvalidLevel) {
     if (ioptions_.compaction_style == kCompactionStyleUniversal) {
@@ -370,7 +375,8 @@ bool CompactionPicker::FilesRangeOverlapWithCompaction(
         return true;
       }
     } else {
-      InternalKey proximal_smallest, proximal_largest;
+      InternalKey proximal_smallest;
+      InternalKey proximal_largest;
       GetRange(inputs, &proximal_smallest, &proximal_largest, level);
       if (RangeOverlapWithCompaction(proximal_smallest.user_key(),
                                      proximal_largest.user_key(),
@@ -546,7 +552,8 @@ bool CompactionPicker::SetupOtherInputs(
     assert(vstorage->NumLevelFiles(l) == 0);
   }
 
-  InternalKey smallest, largest;
+  InternalKey smallest;
+  InternalKey largest;
 
   // Get the range one last time.
   GetRange(*inputs, &smallest, &largest);
@@ -579,7 +586,8 @@ bool CompactionPicker::SetupOtherInputs(
     CompactionInputFiles expanded_inputs;
     expanded_inputs.level = input_level;
     // Get closed interval of output level
-    InternalKey all_start, all_limit;
+    InternalKey all_start;
+    InternalKey all_limit;
     GetRange(*inputs, *output_level_inputs, &all_start, &all_limit);
     bool try_overlapping_inputs = true;
     if (only_expand_towards_right) {
@@ -605,7 +613,8 @@ bool CompactionPicker::SetupOtherInputs(
     if (try_overlapping_inputs && expanded_inputs.size() > inputs->size() &&
         !AreFilesInCompaction(expanded_inputs.files) &&
         output_level_inputs_size + expanded_inputs_size < limit) {
-      InternalKey new_start, new_limit;
+      InternalKey new_start;
+      InternalKey new_limit;
       GetRange(expanded_inputs, &new_start, &new_limit);
       CompactionInputFiles expanded_output_level_inputs;
       expanded_output_level_inputs.level = output_level;
@@ -655,7 +664,8 @@ void CompactionPicker::GetGrandparents(
     VersionStorageInfo* vstorage, const CompactionInputFiles& inputs,
     const CompactionInputFiles& output_level_inputs,
     std::vector<FileMetaData*>* grandparents) {
-  InternalKey start, limit;
+  InternalKey start;
+  InternalKey limit;
   GetRange(inputs, output_level_inputs, &start, &limit);
   // Compute the set of grandparent files that overlap this compaction
   // (parent == level+1; grandparent == level+2 or the first
@@ -754,6 +764,7 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
         compact_range_options.blob_garbage_collection_policy,
         compact_range_options.blob_garbage_collection_age_cutoff);
 
+    c->SetSkipMissingBlobFiles(compact_range_options.skip_missing_blob_files);
     RegisterCompaction(c);
     vstorage->ComputeCompactionScore(ioptions_, mutable_cf_options,
                                      full_history_ts_low);
@@ -827,7 +838,8 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
 
   // for BOTTOM LEVEL compaction only, use max_file_num_to_ignore to filter out
   // files that are created during the current compaction.
-  if ((compact_range_options.bottommost_level_compaction ==
+  if ((compact_range_options.skip_missing_blob_files ||
+       compact_range_options.bottommost_level_compaction ==
            BottommostLevelCompaction::kForceOptimized ||
        compact_range_options.bottommost_level_compaction ==
            BottommostLevelCompaction::kIfHaveCompactionFilter) &&
@@ -850,15 +862,15 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
     if (inputs_shrunk.empty()) {
       return nullptr;
     }
-    if (inputs.size() != inputs_shrunk.size()) {
-      inputs.files.swap(inputs_shrunk);
-    }
     // set covering_the_whole_range to false if there is any file that need to
     // be compacted in the range of inputs[skip_input_index+1, inputs.size())
     for (size_t i = skip_input_index + 1; i < inputs.size(); ++i) {
       if (inputs[i]->fd.GetNumber() < max_file_num_to_ignore) {
         covering_the_whole_range = false;
       }
+    }
+    if (inputs.size() != inputs_shrunk.size()) {
+      inputs.files.swap(inputs_shrunk);
     }
   }
 
@@ -946,6 +958,8 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
       compact_range_options.blob_garbage_collection_policy,
       compact_range_options.blob_garbage_collection_age_cutoff);
 
+  compaction->SetSkipMissingBlobFiles(
+      compact_range_options.skip_missing_blob_files);
   TEST_SYNC_POINT_CALLBACK("CompactionPicker::CompactRange:Return", compaction);
   RegisterCompaction(compaction);
 
@@ -1303,7 +1317,8 @@ bool CompactionPicker::GetOverlappingL0Files(
   // Two level 0 compaction won't run at the same time, so don't need to worry
   // about files on level 0 being compacted.
   assert(level0_compactions_in_progress()->empty());
-  InternalKey smallest, largest;
+  InternalKey smallest;
+  InternalKey largest;
   GetRange(*start_level_inputs, &smallest, &largest);
   // Note that the next call will discard the file we placed in
   // c->inputs_[0] earlier and replace it with an overlapping set

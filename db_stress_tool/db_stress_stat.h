@@ -25,28 +25,27 @@ namespace ROCKSDB_NAMESPACE {
 
 class Stats {
  private:
-  uint64_t start_;
-  uint64_t finish_;
-  double seconds_;
-  long done_;
-  long gets_;
-  long prefixes_;
-  long writes_;
-  long deletes_;
-  size_t single_deletes_;
-  long iterator_size_sums_;
-  long founds_;
-  long iterations_;
-  long seek_to_first_after_seek_;
-  long range_deletions_;
-  long covered_by_range_deletions_;
-  long errors_;
-  long verified_errors_;
-  long num_compact_files_succeed_;
-  long num_compact_files_failed_;
-  int next_report_;
-  size_t bytes_;
-  uint64_t last_op_finish_;
+  uint64_t start_ = 0;
+  uint64_t finish_ = 0;
+  double seconds_ = 0;
+  long done_ = 0;
+  long gets_ = 0;
+  long prefixes_ = 0;
+  long writes_ = 0;
+  long deletes_ = 0;
+  size_t single_deletes_ = 0;
+  long iterator_size_sums_ = 0;
+  long founds_ = 0;
+  long iterations_ = 0;
+  long range_deletions_ = 0;
+  long covered_by_range_deletions_ = 0;
+  long errors_ = 0;
+  long verified_errors_ = 0;
+  long num_compact_files_succeed_ = 0;
+  long num_compact_files_failed_ = 0;
+  int next_report_ = 0;
+  size_t bytes_ = 0;
+  uint64_t last_op_finish_ = 0;
   HistogramImpl hist_;
 
  public:
@@ -64,7 +63,6 @@ class Stats {
     iterator_size_sums_ = 0;
     founds_ = 0;
     iterations_ = 0;
-    seek_to_first_after_seek_ = 0;
     range_deletions_ = 0;
     covered_by_range_deletions_ = 0;
     errors_ = 0;
@@ -89,7 +87,6 @@ class Stats {
     iterator_size_sums_ += other.iterator_size_sums_;
     founds_ += other.founds_;
     iterations_ += other.iterations_;
-    seek_to_first_after_seek_ += other.seek_to_first_after_seek_;
     range_deletions_ += other.range_deletions_;
     covered_by_range_deletions_ = other.covered_by_range_deletions_;
     errors_ += other.errors_;
@@ -98,8 +95,12 @@ class Stats {
     seconds_ += other.seconds_;
     num_compact_files_succeed_ += other.num_compact_files_succeed_;
     num_compact_files_failed_ += other.num_compact_files_failed_;
-    if (other.start_ < start_) start_ = other.start_;
-    if (other.finish_ > finish_) finish_ = other.finish_;
+    if (other.start_ < start_) {
+      start_ = other.start_;
+    }
+    if (other.finish_ > finish_) {
+      finish_ = other.finish_;
+    }
   }
 
   void Stop() {
@@ -121,20 +122,21 @@ class Stats {
     done_++;
     if (FLAGS_progress_reports) {
       if (done_ >= next_report_) {
-        if (next_report_ < 1000)
+        if (next_report_ < 1000) {
           next_report_ += 100;
-        else if (next_report_ < 5000)
+        } else if (next_report_ < 5000) {
           next_report_ += 500;
-        else if (next_report_ < 10000)
+        } else if (next_report_ < 10000) {
           next_report_ += 1000;
-        else if (next_report_ < 50000)
+        } else if (next_report_ < 50000) {
           next_report_ += 5000;
-        else if (next_report_ < 100000)
+        } else if (next_report_ < 100000) {
           next_report_ += 10000;
-        else if (next_report_ < 500000)
+        } else if (next_report_ < 500000) {
           next_report_ += 50000;
-        else
+        } else {
           next_report_ += 100000;
+        }
         fprintf(stdout, "... finished %ld ops%30s\r", done_, "");
       }
     }
@@ -156,9 +158,6 @@ class Stats {
   }
 
   void AddIterations(long n) { iterations_ += n; }
-
-  // SeekToFirst() after Seek() on one iterator under prefix_same_as_start.
-  void AddSeekToFirstAfterSeek(long n) { seek_to_first_after_seek_ += n; }
 
   void AddDeletes(long n) { deletes_ += n; }
 
@@ -206,10 +205,6 @@ class Stats {
     fprintf(stdout, "%-12s: Iterator size sum is %ld\n", "",
             iterator_size_sums_);
     fprintf(stdout, "%-12s: Iterated %ld times\n", "", iterations_);
-    fprintf(stdout,
-            "%-12s: SeekToFirst() after Seek() under "
-            "prefix_same_as_start %ld times\n",
-            "", seek_to_first_after_seek_);
     fprintf(stdout, "%-12s: Deleted %ld key-ranges\n", "", range_deletions_);
     fprintf(stdout, "%-12s: Range deletions covered %ld keys\n", "",
             covered_by_range_deletions_);

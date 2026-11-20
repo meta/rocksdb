@@ -38,4 +38,4 @@ Here we presents the improvements observed in MyRocks with sysbench and linkbenc
 
 Here are also the detailed results for [In-Memory Sysbench](https://gist.github.com/maysamyabandeh/bdb868091b2929a6d938615fdcf58424) and [SSD Sysbench](https://gist.github.com/maysamyabandeh/ff94f378ab48925025c34c47eff99306) curtesy of [@mdcallag](https://github.com/mdcallag).
 
-Learn more [here](https://github.com/facebook/rocksdb/wiki/WritePrepared-Transactions).
+Learn more [here](https://github.com/meta/rocksdb/wiki/WritePrepared-Transactions).

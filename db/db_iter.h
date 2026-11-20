@@ -9,6 +9,7 @@
 
 #pragma once
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -122,8 +123,6 @@ class DBIter final : public Iterator {
   // The purpose of this approach is to avoid perf regression happening
   // when multiple threads bump the atomic counters from a DBIter::Next().
   struct LocalStatistics {
-    explicit LocalStatistics() { ResetCounters(); }
-
     void ResetCounters() {
       next_count_ = 0;
       next_found_count_ = 0;
@@ -145,22 +144,24 @@ class DBIter final : public Iterator {
     }
 
     // Map to Tickers::NUMBER_DB_NEXT
-    uint64_t next_count_;
+    uint64_t next_count_ = 0;
     // Map to Tickers::NUMBER_DB_NEXT_FOUND
-    uint64_t next_found_count_;
+    uint64_t next_found_count_ = 0;
     // Map to Tickers::NUMBER_DB_PREV
-    uint64_t prev_count_;
+    uint64_t prev_count_ = 0;
     // Map to Tickers::NUMBER_DB_PREV_FOUND
-    uint64_t prev_found_count_;
+    uint64_t prev_found_count_ = 0;
     // Map to Tickers::ITER_BYTES_READ
-    uint64_t bytes_read_;
+    uint64_t bytes_read_ = 0;
     // Map to Tickers::NUMBER_ITER_SKIP
-    uint64_t skip_count_;
+    uint64_t skip_count_ = 0;
   };
 
   // No copying allowed
   DBIter(const DBIter&) = delete;
   void operator=(const DBIter&) = delete;
+  DBIter(DBIter&&) = delete;
+  void operator=(DBIter&&) = delete;
 
   ~DBIter() override {
     MarkMemtableForFlushForAvgTrigger();
@@ -239,14 +240,14 @@ class DBIter final : public Iterator {
 
   Status GetProperty(std::string prop_name, std::string* prop) override;
 
-  void Next() final override;
-  void Prev() final override;
+  void Next() final;
+  void Prev() final;
   // 'target' does not contain timestamp, even if user timestamp feature is
   // enabled.
-  void Seek(const Slice& target) final override;
-  void SeekForPrev(const Slice& target) final override;
-  void SeekToFirst() final override;
-  void SeekToLast() final override;
+  void Seek(const Slice& target) final;
+  void SeekForPrev(const Slice& target) final;
+  void SeekToFirst() final;
+  void SeekToLast() final;
   Env* env() const { return env_; }
   void set_sequence(uint64_t s) {
     sequence_ = s;
@@ -549,6 +550,22 @@ class DBIter final : public Iterator {
   bool MergeWithBlobBaseValue(const Slice& blob_index, const Slice& user_key);
   bool MergeWithWideColumnBaseValue(const Slice& entity, const Slice& user_key);
 
+  // True if the current entry, of `type`, reads as a deletion because its
+  // value, or every column of it, is stored in dropped blob files (see
+  // VersionStorageInfo::CheckDroppedBlobReferences()).
+  // REQUIRES: The current entry's value is prepared.
+  bool IsDeletedByDroppedBlobFiles(ValueType type) {
+    return UNLIKELY(!dropped_blob_files_.empty()) &&
+           (type == kTypeBlobIndex || type == kTypeWideColumnEntity) &&
+           CheckDeletedByDroppedBlobFiles(type);
+  }
+  bool CheckDeletedByDroppedBlobFiles(ValueType type);
+
+  // Replaces *entity with its columns not stored in dropped blob files, kept
+  // in *remaining_columns, if it has columns stored in them.
+  // REQUIRES: Not every column of *entity is stored in dropped blob files.
+  void RemoveDroppedBlobColumns(Slice* entity, std::string* remaining_columns);
+
   bool PrepareValueInternal() {
     // Capture this before PrepareValue(): PrepareValue() updates the wrapper
     // state to "prepared" on success. We still call PrepareValue()
@@ -614,6 +631,12 @@ class DBIter final : public Iterator {
              !expect_total_order_inner_iter_)) &&
            prefix_extractor_->InDomain(target);
   }
+
+  // Called at the start of Seek() and SeekForPrev(). Returns false, with
+  // status_ set, if target is outside the prefix extractor's domain under
+  // strict_prefix_same_as_start_. Otherwise sets unbounded_prefix_scan_ when
+  // target gives no prefix to bound a prefix seek.
+  bool CheckSeekTargetPrefix(const Slice& target);
 
   void ResetSeekState() {
     ReleaseTempPinnedData();
@@ -685,7 +708,7 @@ class DBIter final : public Iterator {
   // sequence number if the seqno to time mapping is available. For a
   // kTypeValuePreferredSeqno entry, this is the write time specified by the
   // user.
-  uint64_t saved_write_unix_time_;
+  uint64_t saved_write_unix_time_ = std::numeric_limits<uint64_t>::max();
   DirtyTracked<ValueColumnsState> value_columns_state_;
   Slice pinned_value_;
   Statistics* statistics_;
@@ -712,10 +735,18 @@ class DBIter final : public Iterator {
   MergeContext merge_context_;
   LocalStatistics local_stats_;
   PinnedIteratorsManager pinned_iters_mgr_;
+  // The read options a traced seek records (Tracer::IteratorSeek()).
+  TracedReadOptions trace_read_options_;
   DBImpl* trace_db_;
   uint32_t trace_cf_id_;
   bool has_trace_state_;
   port::RWMutex* ingest_sst_lock_;
+  // Number of the Version this iterator reads, or 0 if unknown.
+  const uint64_t version_number_;
+  // The dropped blob files of the Version this iterator reads, whose values
+  // read as deleted (see VersionStorageInfo::GetDroppedBlobFiles()). A copy,
+  // because a tailing iterator keeps reading after that Version is freed.
+  const std::vector<uint64_t> dropped_blob_files_;
   const Slice* const timestamp_ub_;
   const Slice* const timestamp_lb_;
   const size_t timestamp_size_;
@@ -737,6 +768,19 @@ class DBIter final : public Iterator {
   // user key.
   bool is_key_seqnum_zero_;
   const bool prefix_same_as_start_;
+  // prefix_same_as_start_ under DBOptions::prefix_seek_opt_in_only. Every scan
+  // must take its prefix from an in-domain seek key: SeekToFirst() and
+  // SeekToLast() set NotSupported, and Seek() and SeekForPrev() with a target
+  // outside the prefix extractor's domain set InvalidArgument.
+  const bool strict_prefix_same_as_start_;
+  // True while the current scan uses prefix seek in the child iterators but
+  // has no prefix to bound it: after SeekToFirst() without
+  // iterate_lower_bound, SeekToLast() without iterate_upper_bound, or a
+  // Seek()/SeekForPrev() target outside the prefix extractor's domain. Prefix
+  // seek in the child iterators can then skip live keys, so read-path range
+  // tombstone conversion is disabled so that a skipped live key cannot be
+  // covered by a new tombstone.
+  bool unbounded_prefix_scan_;
   // Means that we will pin all data blocks we read as long the Iterator
   // is not deleted, will be true if ReadOptions::pin_data is true
   const bool pin_thru_lifetime_;

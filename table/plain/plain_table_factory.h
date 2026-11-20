@@ -137,7 +137,6 @@ class TableBuilder;
 //
 class PlainTableFactory : public TableFactory {
  public:
-  ~PlainTableFactory() {}
   // user_key_len is the length of the user key. If it is set to be
   // kPlainTableVariableLength, then it means variable length. Otherwise, all
   // the keys need to have the fix length of this value. bloom_bits_per_key is
@@ -159,6 +158,9 @@ class PlainTableFactory : public TableFactory {
   // Method to allow CheckedCast to work for this class
   static const char* kClassName() { return kPlainTableName(); }
   const char* Name() const override { return kPlainTableName(); }
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override;
+
   using TableFactory::NewTableReader;
   Status NewTableReader(const ReadOptions& ro,
                         const TableReaderOptions& table_reader_options,

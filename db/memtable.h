@@ -337,10 +337,14 @@ class ReadOnlyMemTable {
   // - the per-memtable ingest seqno barrier already exceeds `seq` (an
   //   ingestion has committed an L0 file at a seq that this converted
   //   tombstone would shadow) or an ingestion is in progress.
+  // - `version_number`, the number of the Version the converting iterator
+  //   reads, is below the per-memtable ingest version barrier (the iterator
+  //   cannot see a file ingested while this memtable was active).
   // Returns true if the range tombstone was inserted, false if skipped.
   virtual bool AddLogicallyRedundantRangeTombstone(
       SequenceNumber /*seq*/, const Slice& /*start_key*/,
-      const Slice& /*end_key*/, port::RWMutex& /*ingest_sst_lock*/) {
+      const Slice& /*end_key*/, uint64_t /*version_number*/,
+      port::RWMutex& /*ingest_sst_lock*/) {
     return false;
   }
 
@@ -605,6 +609,8 @@ class MemTable final : public ReadOnlyMemTable {
   // No copying allowed
   MemTable(const MemTable&) = delete;
   MemTable& operator=(const MemTable&) = delete;
+  MemTable(MemTable&&) = delete;
+  MemTable& operator=(MemTable&&) = delete;
 
   ~MemTable() override;
 
@@ -897,7 +903,7 @@ class MemTable final : public ReadOnlyMemTable {
 
   bool AddLogicallyRedundantRangeTombstone(
       SequenceNumber seq, const Slice& start_key, const Slice& end_key,
-      port::RWMutex& ingest_sst_lock) override;
+      uint64_t version_number, port::RWMutex& ingest_sst_lock) override;
 
   // Monotonically raises ingest_seqno_barrier_ to `y` (no-op if `y` is not
   // greater than the current value). The conversion's barrier check
@@ -908,6 +914,13 @@ class MemTable final : public ReadOnlyMemTable {
   // callers, so the load-then-store pattern is race-free without needing
   // a CAS loop. Only IngestExternalFiles calls this.
   void BumpIngestSeqnoBarrier(SequenceNumber y);
+
+  // Monotonically raises ingest_version_barrier_ to `version_number`, the
+  // number of the Version that installed an ingestion.
+  //
+  // REQUIRES: DB mutex held by the caller. Only IngestExternalFiles calls
+  // this.
+  void BumpIngestVersionBarrier(uint64_t version_number);
 
   bool IsFragmentedRangeTombstonesConstructed() const override {
     return fragmented_range_tombstone_list_.get() != nullptr ||
@@ -972,6 +985,10 @@ class MemTable final : public ReadOnlyMemTable {
   // Seqno of the latest ingested external SST. See also
   // ColumnFamilyData::ingest_sst_lock_.
   RelaxedAtomic<SequenceNumber> ingest_seqno_barrier_{0};
+
+  // Number of the latest Version that installed an ingestion. See also
+  // ColumnFamilyData::ingest_sst_lock_.
+  RelaxedAtomic<uint64_t> ingest_version_barrier_{0};
 
   SequenceNumber creation_seq_;
 

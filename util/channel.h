@@ -19,8 +19,12 @@ class channel {
  public:
   explicit channel() : eof_(false) {}
 
+  ~channel() = default;
+
   channel(const channel&) = delete;
   void operator=(const channel&) = delete;
+  channel(channel&&) = delete;
+  void operator=(channel&&) = delete;
 
   void sendEof() {
     std::lock_guard<std::mutex> lk(lock_);

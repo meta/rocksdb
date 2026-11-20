@@ -16,7 +16,8 @@ namespace ROCKSDB_NAMESPACE {
 // can override these method with more performant solutions if they choose.
 Status WriteBatchBase::Put(ColumnFamilyHandle* column_family,
                            const SliceParts& key, const SliceParts& value) {
-  std::string key_buf, value_buf;
+  std::string key_buf;
+  std::string value_buf;
   Slice key_slice(key, &key_buf);
   Slice value_slice(value, &value_buf);
 
@@ -24,7 +25,8 @@ Status WriteBatchBase::Put(ColumnFamilyHandle* column_family,
 }
 
 Status WriteBatchBase::Put(const SliceParts& key, const SliceParts& value) {
-  std::string key_buf, value_buf;
+  std::string key_buf;
+  std::string value_buf;
   Slice key_slice(key, &key_buf);
   Slice value_slice(value, &value_buf);
 
@@ -60,7 +62,8 @@ Status WriteBatchBase::SingleDelete(const SliceParts& key) {
 Status WriteBatchBase::DeleteRange(ColumnFamilyHandle* column_family,
                                    const SliceParts& begin_key,
                                    const SliceParts& end_key) {
-  std::string begin_key_buf, end_key_buf;
+  std::string begin_key_buf;
+  std::string end_key_buf;
   Slice begin_key_slice(begin_key, &begin_key_buf);
   Slice end_key_slice(end_key, &end_key_buf);
   return DeleteRange(column_family, begin_key_slice, end_key_slice);
@@ -68,7 +71,8 @@ Status WriteBatchBase::DeleteRange(ColumnFamilyHandle* column_family,
 
 Status WriteBatchBase::DeleteRange(const SliceParts& begin_key,
                                    const SliceParts& end_key) {
-  std::string begin_key_buf, end_key_buf;
+  std::string begin_key_buf;
+  std::string end_key_buf;
   Slice begin_key_slice(begin_key, &begin_key_buf);
   Slice end_key_slice(end_key, &end_key_buf);
   return DeleteRange(begin_key_slice, end_key_slice);
@@ -76,7 +80,8 @@ Status WriteBatchBase::DeleteRange(const SliceParts& begin_key,
 
 Status WriteBatchBase::Merge(ColumnFamilyHandle* column_family,
                              const SliceParts& key, const SliceParts& value) {
-  std::string key_buf, value_buf;
+  std::string key_buf;
+  std::string value_buf;
   Slice key_slice(key, &key_buf);
   Slice value_slice(value, &value_buf);
 
@@ -84,7 +89,8 @@ Status WriteBatchBase::Merge(ColumnFamilyHandle* column_family,
 }
 
 Status WriteBatchBase::Merge(const SliceParts& key, const SliceParts& value) {
-  std::string key_buf, value_buf;
+  std::string key_buf;
+  std::string value_buf;
   Slice key_slice(key, &key_buf);
   Slice value_slice(value, &value_buf);
 

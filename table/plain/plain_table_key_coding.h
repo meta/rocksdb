@@ -67,6 +67,12 @@ class PlainTableFileReader {
   explicit PlainTableFileReader(const PlainTableReaderFileInfo* _file_info)
       : file_info_(_file_info), num_buf_(0) {}
 
+  // No copying allowed
+  PlainTableFileReader(const PlainTableFileReader&) = delete;
+  PlainTableFileReader& operator=(const PlainTableFileReader&) = delete;
+  PlainTableFileReader(PlainTableFileReader&&) = delete;
+  PlainTableFileReader& operator=(PlainTableFileReader&&) = delete;
+
   ~PlainTableFileReader() {
     // Should fix.
     status_.PermitUncheckedError();

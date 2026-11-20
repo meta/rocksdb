@@ -17,6 +17,8 @@ class IteratorBase : public Cleanable {
   // No copying allowed
   IteratorBase(const IteratorBase&) = delete;
   void operator=(const IteratorBase&) = delete;
+  IteratorBase(IteratorBase&&) = delete;
+  void operator=(IteratorBase&&) = delete;
 
   virtual ~IteratorBase() {}
 

@@ -49,6 +49,12 @@ class ForwardLevelIterator : public InternalIterator {
     status_.PermitUncheckedError();  // Allow uninitialized status through
   }
 
+  // No copying allowed
+  ForwardLevelIterator(const ForwardLevelIterator&) = delete;
+  ForwardLevelIterator& operator=(const ForwardLevelIterator&) = delete;
+  ForwardLevelIterator(ForwardLevelIterator&&) = delete;
+  ForwardLevelIterator& operator=(ForwardLevelIterator&&) = delete;
+
   ~ForwardLevelIterator() override {
     // Reset current pointer
     if (pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled()) {
@@ -87,7 +93,8 @@ class ForwardLevelIterator : public InternalIterator {
         /*arena=*/nullptr, /*skip_filters=*/false, /*level=*/-1,
         /*max_file_size_for_l0_meta_pin=*/0,
         /*smallest_compaction_key=*/nullptr,
-        /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+        /*largest_compaction_key=*/nullptr, allow_unprepared_value_,
+        /*seek_target=*/nullptr, /*prefix_filtered_table=*/nullptr);
     file_iter_->SetPinnedItersMgr(pinned_iters_mgr_);
     valid_ = false;
     if (!range_del_agg.IsEmpty()) {
@@ -702,11 +709,32 @@ bool ForwardIterator::IsValuePinned() const {
 }
 
 void ForwardIterator::RebuildIterators(bool refresh_sv) {
-  // Clean up
+  // The iterator can outlive its column family: the user can drop the column
+  // family and destroy its handle. Then a SuperVersion can hold the last
+  // reference to cfd_. Two cases:
+  //   1. sv_ is the column family's current SuperVersion. Destroying the
+  //      handle leaves the column family with only that SuperVersion's
+  //      reference, so ColumnFamilyData::UnrefAndTryDelete() releases the
+  //      current SuperVersion and its thread-local cache. The column family
+  //      has no SuperVersion to give out any more, and sv_ holds the last
+  //      reference to cfd_. So keep sv_ when it is still current. This also
+  //      saves a SuperVersion reference for a live column family, where
+  //      GetReferencedSuperVersion() would return the same SuperVersion. A
+  //      dropped column family never installs a new SuperVersion, so it always
+  //      takes this path.
+  //   2. sv_ is older. Then sv_ and the current SuperVersion each hold a
+  //      reference, so the current SuperVersion is still there. Take the new
+  //      SuperVersion before Cleanup() releases sv_, as RenewIterators() does,
+  //      so that releasing sv_ cannot free cfd_ first.
+  if (refresh_sv && sv_ != nullptr &&
+      sv_->version_number == cfd_->GetSuperVersionNumber()) {
+    refresh_sv = false;
+  }
+  SuperVersion* const new_sv =
+      refresh_sv ? cfd_->GetReferencedSuperVersion(db_) : nullptr;
   Cleanup(refresh_sv);
   if (refresh_sv) {
-    // New
-    sv_ = cfd_->GetReferencedSuperVersion(db_);
+    sv_ = new_sv;
   }
   ReadRangeDelAggregator range_del_agg(&cfd_->internal_comparator(),
                                        kMaxSequenceNumber /* upper_bound */);
@@ -754,7 +782,8 @@ void ForwardIterator::RebuildIterators(bool refresh_sv) {
         /*skip_filters=*/false, /*level=*/-1,
         MaxFileSizeForL0MetaPin(sv_->mutable_cf_options),
         /*smallest_compaction_key=*/nullptr,
-        /*largest_compaction_key=*/nullptr, allow_unprepared_value_));
+        /*largest_compaction_key=*/nullptr, allow_unprepared_value_,
+        /*seek_target=*/nullptr, /*prefix_filtered_table=*/nullptr));
   }
   BuildLevelIterators(vstorage, sv_);
   current_ = nullptr;
@@ -808,7 +837,8 @@ void ForwardIterator::RenewIterators() {
   const auto& l0_files = vstorage->LevelFiles(0);
   const auto* vstorage_new = svnew->current->storage_info();
   const auto& l0_files_new = vstorage_new->LevelFiles(0);
-  size_t iold, inew;
+  size_t iold;
+  size_t inew;
   bool found;
   std::vector<InternalIterator*> l0_iters_new;
   l0_iters_new.reserve(l0_files_new.size());
@@ -842,7 +872,8 @@ void ForwardIterator::RenewIterators() {
         /*skip_filters=*/false, /*level=*/-1,
         MaxFileSizeForL0MetaPin(svnew->mutable_cf_options),
         /*smallest_compaction_key=*/nullptr,
-        /*largest_compaction_key=*/nullptr, allow_unprepared_value_));
+        /*largest_compaction_key=*/nullptr, allow_unprepared_value_,
+        /*seek_target=*/nullptr, /*prefix_filtered_table=*/nullptr));
   }
 
   for (auto* f : l0_iters_) {
@@ -907,7 +938,8 @@ void ForwardIterator::ResetIncompleteIterators() {
         /*skip_filters=*/false, /*level=*/-1,
         MaxFileSizeForL0MetaPin(sv_->mutable_cf_options),
         /*smallest_compaction_key=*/nullptr,
-        /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+        /*largest_compaction_key=*/nullptr, allow_unprepared_value_,
+        /*seek_target=*/nullptr, /*prefix_filtered_table=*/nullptr);
     l0_iters_[i]->SetPinnedItersMgr(pinned_iters_mgr_);
   }
 

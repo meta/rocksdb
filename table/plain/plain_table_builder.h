@@ -51,9 +51,11 @@ class PlainTableBuilder : public TableBuilder {
   // No copying allowed
   PlainTableBuilder(const PlainTableBuilder&) = delete;
   void operator=(const PlainTableBuilder&) = delete;
+  PlainTableBuilder(PlainTableBuilder&&) = delete;
+  void operator=(PlainTableBuilder&&) = delete;
 
   // REQUIRES: Either Finish() or Abandon() has been called.
-  ~PlainTableBuilder();
+  ~PlainTableBuilder() override;
 
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.

@@ -12,7 +12,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class PreReleaseCallback {
  public:
-  virtual ~PreReleaseCallback() {}
+  virtual ~PreReleaseCallback() = default;
 
   // Will be called while on the write thread after the write to the WAL and
   // before the write to memtable. This is useful if any operation needs to be

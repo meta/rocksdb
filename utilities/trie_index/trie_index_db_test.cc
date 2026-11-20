@@ -14,6 +14,7 @@
 // DB path including CompactionIterator, memtable flush, and the UDI builder
 // wrapper's ValueType mapping and kTypeValuePreferredSeqno handling.
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +32,7 @@
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/wide_columns.h"
 #include "rocksdb/write_batch.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/coding.h"
@@ -146,11 +148,37 @@ MakeStressLikeSqfcFactory() {
   return factory;
 }
 
-// Parameterized on UDI mode: false = secondary, true = primary.
-// All tests run in both modes to ensure full coverage.
-class TrieIndexDBTest : public testing::TestWithParam<bool> {
+// Counts table builds that start the parallel compression pipeline. Tests that
+// configure parallel_threads > 1 check it so they fail, rather than passing
+// serially, if a builder declines the parallel protocol.
+class ParallelCompressionStartCounter {
+ public:
+  ParallelCompressionStartCounter() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlockBasedTableBuilder::MaybeStartParallelCompression:Started",
+        [this](void* /*arg*/) { started_.fetch_add(1); });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+  ~ParallelCompressionStartCounter() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+  int started() const { return started_.load(); }
+
+ private:
+  std::atomic<int> started_{0};
+};
+
+// Parameterized on IndexMode: kStandardDefault, kCustomDefault, and
+// kCustomOnly. All tests run in all three modes to ensure full coverage.
+class TrieIndexDBTest
+    : public testing::TestWithParam<BlockBasedTableOptions::IndexMode> {
  protected:
-  bool IsPrimaryMode() const { return GetParam(); }
+  bool IsPrimaryMode() const {
+    return GetParam() == BlockBasedTableOptions::IndexMode::kCustomDefault ||
+           GetParam() == BlockBasedTableOptions::IndexMode::kCustomOnly;
+  }
+  BlockBasedTableOptions::IndexMode GetIndexMode() const { return GetParam(); }
 
   void SetUp() override {
     trie_factory_ = std::make_shared<TrieIndexFactory>();
@@ -168,24 +196,44 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
 
   // Opens a DB using the parameterized UDI mode.
   Status OpenDB(int block_size = 0) {
-    return OpenDBImpl(block_size, IsPrimaryMode());
+    return OpenDBImpl(block_size, GetIndexMode());
+  }
+
+  void VerifySharedPrefixCompaction();
+
+  // Puts keys "key_000000" through "key_<num_keys - 1>", each with `value`,
+  // and returns them in key order.
+  std::vector<std::string> PutNumberedKeys(int num_keys,
+                                           const std::string& value) {
+    std::vector<std::string> keys;
+    keys.reserve(static_cast<size_t>(num_keys));
+    for (int i = 0; i < num_keys; i++) {
+      char key[16];
+      snprintf(key, sizeof(key), "key_%06d", i);
+      keys.emplace_back(key);
+      EXPECT_OK(db_->Put(WriteOptions(), keys.back(), value));
+    }
+    return keys;
   }
 
   // Explicitly opens as primary -- used by the backward compatibility test.
   Status OpenDBPrimary(int block_size = 0) {
-    return OpenDBImpl(block_size, /*udi_primary=*/true);
+    return OpenDBImpl(block_size,
+                      BlockBasedTableOptions::IndexMode::kCustomDefault);
   }
 
   // Explicitly opens as secondary -- used by the backward compatibility test.
   Status OpenDBSecondary(int block_size = 0) {
-    return OpenDBImpl(block_size, /*udi_primary=*/false);
+    return OpenDBImpl(block_size,
+                      BlockBasedTableOptions::IndexMode::kStandardDefault);
   }
 
-  Status OpenDBImpl(int block_size, bool udi_primary) {
+  Status OpenDBImpl(int block_size,
+                    BlockBasedTableOptions::IndexMode index_mode) {
     options_.create_if_missing = true;
     BlockBasedTableOptions table_options;
     table_options.user_defined_index_factory = trie_factory_;
-    table_options.use_udi_as_primary_index = udi_primary;
+    table_options.index_mode = index_mode;
     if (block_size > 0) {
       table_options.block_size = block_size;
     }
@@ -194,19 +242,24 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
     return DB::Open(options_, dbname_, &db_);
   }
 
-  // Returns a ReadOptions for the standard index. In secondary mode, this
-  // is a bare ReadOptions (no table_index_factory). In primary mode, this
-  // also returns a bare ReadOptions -- which routes through the trie anyway,
-  // making the dual-index comparison a trie-vs-trie sanity check.
-  ReadOptions StandardIndexReadOptions() const { return ReadOptions(); }
+  // Returns a ReadOptions that routes reads through the built-in binary
+  // search index. In secondary mode, this is the default. In primary mode,
+  // kBuiltin overrides the custom index routing.
+  ReadOptions StandardIndexReadOptions() const {
+    ReadOptions ro;
+    if (IsPrimaryMode()) {
+      ro.read_index = ReadOptions::ReadIndex::kBuiltin;
+    }
+    return ro;
+  }
 
   // Returns a ReadOptions that routes reads through the trie. In primary
-  // mode, a bare ReadOptions already uses the trie, so table_index_factory
-  // is not set. In secondary mode, table_index_factory is set explicitly.
+  // mode, a bare ReadOptions already uses the trie, so read_index
+  // is not set. In secondary mode, read_index is set explicitly.
   ReadOptions TrieIndexReadOptions() const {
     ReadOptions ro;
     if (!IsPrimaryMode()) {
-      ro.table_index_factory = trie_factory_.get();
+      ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     }
     return ro;
   }
@@ -223,8 +276,13 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
     return keys;
   }
 
-  // Collects all visible keys via forward scan using the standard index.
+  // Collects all visible keys via forward scan using the default index for
+  // the current mode: standard index for kStandardDefault/kCustomDefault, trie
+  // index for kCustomOnly (where standard-index reads fail loudly).
   std::vector<std::string> ScanAllKeys() {
+    if (GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomOnly) {
+      return ScanAllKeys(TrieIndexReadOptions());
+    }
     return ScanAllKeys(StandardIndexReadOptions());
   }
 
@@ -244,8 +302,10 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
   // Verifies that forward scan via SeekToFirst+Next AND reverse scan via
   // SeekToLast+Prev both produce the expected key set through both the
   // standard index and the trie index.
+  // In kCustomOnly mode, standard-index reads fail loudly because only a
+  // footer-satisfying stub exists, so we skip the standard index comparison.
   void VerifyScanBothIndexes(const std::vector<std::string>& expected_keys) {
-    {
+    if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
       SCOPED_TRACE("standard index forward");
       ASSERT_EQ(ScanAllKeys(StandardIndexReadOptions()), expected_keys);
     }
@@ -256,7 +316,7 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
     // Reverse scan must produce the reversed key set.
     std::vector<std::string> expected_reverse(expected_keys.rbegin(),
                                               expected_keys.rend());
-    {
+    if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
       SCOPED_TRACE("standard index reverse");
       ASSERT_EQ(ReverseScanAllKeys(StandardIndexReadOptions()),
                 expected_reverse);
@@ -272,7 +332,7 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
   // both indexes.
   void VerifyScanBothIndexes(
       const std::vector<std::pair<std::string, std::string>>& expected_kvs) {
-    {
+    if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
       SCOPED_TRACE("standard index forward");
       ASSERT_EQ(ScanAllKeyValues(StandardIndexReadOptions()), expected_kvs);
     }
@@ -283,7 +343,7 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
     // Reverse scan must produce the reversed pairs.
     std::vector<std::pair<std::string, std::string>> expected_reverse(
         expected_kvs.rbegin(), expected_kvs.rend());
-    {
+    if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
       SCOPED_TRACE("standard index reverse");
       ASSERT_EQ(ReverseScanAllKeyValues(StandardIndexReadOptions()),
                 expected_reverse);
@@ -295,12 +355,23 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
     }
   }
 
+  // Returns the list of ReadOptions to test through both indexes, skipping the
+  // standard index in kCustomOnly mode, where only a footer-satisfying stub
+  // exists and standard-index reads fail loudly.
+  std::vector<ReadOptions> BothIndexReadOptions() const {
+    if (GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomOnly) {
+      return {TrieIndexReadOptions()};
+    }
+    return {StandardIndexReadOptions(), TrieIndexReadOptions()};
+  }
+
   // Verifies that a point Get returns the expected value through both indexes.
   void VerifyGetBothIndexes(const std::string& key,
                             const std::string& expected_value) {
-    for (const auto& ro :
-         {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+    for (const auto& ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
       std::string value;
       ASSERT_OK(db_->Get(ro, key, &value));
       ASSERT_EQ(value, expected_value);
@@ -309,9 +380,10 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
 
   // Verifies that a point Get returns NotFound through both indexes.
   void VerifyGetNotFoundBothIndexes(const std::string& key) {
-    for (const auto& ro :
-         {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+    for (const auto& ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
       std::string value;
       ASSERT_TRUE(db_->Get(ro, key, &value).IsNotFound());
     }
@@ -320,9 +392,10 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
   // Verifies Get with a snapshot through both indexes.
   void VerifyGetBothIndexes(const Snapshot* snap, const std::string& key,
                             const std::string& expected_value) {
-    for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(base_ro.table_index_factory ? "trie index"
-                                               : "standard index");
+    for (auto base_ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
       base_ro.snapshot = snap;
       std::string value;
       ASSERT_OK(db_->Get(base_ro, key, &value));
@@ -333,9 +406,10 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
   // Verifies Get returns NotFound with a snapshot through both indexes.
   void VerifyGetNotFoundBothIndexes(const Snapshot* snap,
                                     const std::string& key) {
-    for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(base_ro.table_index_factory ? "trie index"
-                                               : "standard index");
+    for (auto base_ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
       base_ro.snapshot = snap;
       std::string value;
       ASSERT_TRUE(db_->Get(base_ro, key, &value).IsNotFound());
@@ -347,18 +421,20 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
   void VerifyScanBothIndexes(
       const Snapshot* snap,
       const std::vector<std::pair<std::string, std::string>>& expected_kvs) {
-    for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(base_ro.table_index_factory ? "trie index forward"
-                                               : "standard index forward");
+    for (auto base_ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index forward"
+                       : "builtin index forward");
       base_ro.snapshot = snap;
       ASSERT_EQ(ScanAllKeyValues(base_ro), expected_kvs);
     }
     // Reverse scan at the same snapshot must produce reversed pairs.
     std::vector<std::pair<std::string, std::string>> expected_reverse(
         expected_kvs.rbegin(), expected_kvs.rend());
-    for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(base_ro.table_index_factory ? "trie index reverse"
-                                               : "standard index reverse");
+    for (auto base_ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index reverse"
+                       : "builtin index reverse");
       base_ro.snapshot = snap;
       ASSERT_EQ(ReverseScanAllKeyValues(base_ro), expected_reverse);
     }
@@ -369,9 +445,10 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
   void VerifySeekBothIndexes(const std::string& seek_key,
                              const std::string& expected_key,
                              const std::string& expected_value) {
-    for (const auto& ro :
-         {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+    for (const auto& ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
       std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
       iter->Seek(seek_key);
       ASSERT_TRUE(iter->Valid());
@@ -386,9 +463,10 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
   void VerifySeekBothIndexes(const Snapshot* snap, const std::string& seek_key,
                              const std::string& expected_key,
                              const std::string& expected_value) {
-    for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(base_ro.table_index_factory ? "trie index"
-                                               : "standard index");
+    for (auto base_ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
       base_ro.snapshot = snap;
       std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
       iter->Seek(seek_key);
@@ -533,9 +611,10 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
   void VerifySeekForPrevBothIndexes(const std::string& target,
                                     const std::string& expected_key,
                                     const std::string& expected_value) {
-    for (const auto& ro :
-         {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+    for (const auto& ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
       std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
       iter->SeekForPrev(target);
       ASSERT_TRUE(iter->Valid());
@@ -547,9 +626,10 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
 
   // Verifies SeekForPrev returns invalid (target before all keys).
   void VerifySeekForPrevNotFoundBothIndexes(const std::string& target) {
-    for (const auto& ro :
-         {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+    for (const auto& ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
       std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
       iter->SeekForPrev(target);
       ASSERT_FALSE(iter->Valid());
@@ -611,10 +691,86 @@ class TrieIndexDBTest : public testing::TestWithParam<bool> {
 // Flush tests
 // ============================================================================
 
+TEST_P(TrieIndexDBTest, CompactionTailSizeIsUpperBound) {
+  options_.disable_auto_compactions = true;
+  options_.compression = kNoCompression;
+  options_.target_file_size_is_upper_bound = true;
+  ASSERT_OK(OpenDB(1));
+  const std::string key(1024, 'a');
+  for (const char* value : {"old", "new"}) {
+    ASSERT_OK(db_->Put(WriteOptions(), key, value));
+    ASSERT_OK(db_->Flush(FlushOptions()));
+  }
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  std::string value;
+  ASSERT_OK(db_->Get(TrieIndexReadOptions(), key, &value));
+  EXPECT_EQ(value, "new");
+}
+
+void TrieIndexDBTest::VerifySharedPrefixCompaction() {
+  options_.disable_auto_compactions = true;
+  options_.target_file_size_is_upper_bound = true;
+  options_.target_file_size_base = 256 << 10;
+  ASSERT_OK(OpenDB(512));
+  const std::string prefix(512, 'p');
+  constexpr int kKeyCount = 2048;
+  for (char version : {'a', 'b'}) {
+    for (int i = 0; i < kKeyCount; ++i) {
+      ASSERT_OK(db_->Put(WriteOptions(), prefix + MakeKeyBody(i),
+                         std::string(64, version)));
+    }
+    ASSERT_OK(db_->Flush(FlushOptions()));
+  }
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  // About 1.2 MiB of data (plus a similarly sized standard index in dual
+  // modes) should fit in a small number of 256 KiB SSTs. Charging the shared
+  // prefix once per block used to produce dozens.
+  EXPECT_GT(files.size(), 1U);
+  EXPECT_LE(files.size(), 12U);
+  for (const auto& file : files) {
+    EXPECT_LE(file.size, options_.target_file_size_base);
+  }
+  ASSERT_OK(db_->Close());
+  db_.reset();
+  ASSERT_OK(OpenDB(512));
+  for (int i = 0; i < kKeyCount; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyGetBothIndexes(prefix + MakeKeyBody(i), std::string(64, 'b')));
+  }
+}
+
+TEST_P(TrieIndexDBTest, SharedPrefixDoesNotCutCompactionFilesEarly) {
+  options_.compression = kNoCompression;
+  ASSERT_NO_FATAL_FAILURE(VerifySharedPrefixCompaction());
+}
+
+TEST_P(TrieIndexDBTest, SharedPrefixWithParallelCompression) {
+  if (!Zlib_Supported()) {
+    ROCKSDB_GTEST_SKIP("Zlib not linked into this build");
+    return;
+  }
+  options_.compression = kZlibCompression;
+  options_.compression_opts.parallel_threads = 4;
+  // Exercise the compression pipeline but retain uncompressed blocks so
+  // the file-size assertions match the serial case regardless of codec ratio.
+  options_.compression_opts.max_compressed_bytes_per_kb = 1;
+  ParallelCompressionStartCounter parallel_starts;
+  ASSERT_NO_FATAL_FAILURE(VerifySharedPrefixCompaction());
+  EXPECT_GT(parallel_starts.started(), 0);
+}
+
 TEST_P(TrieIndexDBTest, FlushWithAllOperationTypes) {
   // Write every supported operation type via the DB API, flush, and verify
-  // reads return correct results through both the standard binary search index
-  // and the trie UDI. This exercises the full path from memtable through
+  // reads return correct results through both the standard index and the trie
+  // UDI. This exercises the full path from memtable through
   // CompactionIterator, BlockBasedTableBuilder, and the UDI builder wrapper's
   // MapToUDIValueType for each internal ValueType.
   options_.merge_operator = MergeOperators::CreateStringAppendOperator();
@@ -667,7 +823,7 @@ TEST_P(TrieIndexDBTest, TimedPutFlush) {
   // preclude_last_level_data_seconds > 0. The UDI wrapper strips the packed
   // preferred seqno suffix via ParsePackedValueForValue() before forwarding
   // to the plugin builder. This test verifies that path end-to-end through
-  // both the standard binary search index and the trie UDI.
+  // both the standard index and the trie UDI.
   options_.merge_operator = MergeOperators::CreateStringAppendOperator();
   options_.compaction_style = kCompactionStyleUniversal;
   // Required for kTypeValuePreferredSeqno to survive the flush path: the
@@ -985,8 +1141,10 @@ TEST_P(TrieIndexDBTest, ReverseIteration) {
   ASSERT_NO_FATAL_FAILURE(VerifySeekForPrevNotFoundBothIndexes("key_00"));
 
   // Prev from a Seek position in the middle of the range -- both indexes.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     iter->Seek("key_05");
     ASSERT_TRUE(iter->Valid());
@@ -1125,6 +1283,8 @@ TEST_P(TrieIndexDBTest, IngestExternalFileWithTrieUDI) {
     sst_options.merge_operator = MergeOperators::CreateStringAppendOperator();
     BlockBasedTableOptions table_options;
     table_options.user_defined_index_factory = trie_factory_;
+    table_options.index_mode =
+        BlockBasedTableOptions::IndexMode::kStandardDefault;
     sst_options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
     SstFileWriter writer(EnvOptions(), sst_options);
@@ -1267,8 +1427,10 @@ TEST_P(TrieIndexDBTest, LargeMixedOperationsAcrossBlocks) {
   ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes(expected_visible));
 
   // Spot-check: Seek to every 10th visible key via both indexes.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     for (size_t i = 0; i < expected_visible.size(); i += 10) {
       iter->Seek(expected_visible[i]);
@@ -1471,18 +1633,17 @@ TEST_P(TrieIndexDBTest,
   const Slice lower_bound_slice(lower_bound);
   const Slice upper_bound_slice(upper_bound);
 
-  const auto build_read_options =
-      [&](const UserDefinedIndexFactory* table_index_factory) {
-        ReadOptions ro;
-        ro.snapshot = snapshot;
-        ro.auto_prefix_mode = true;
-        ro.allow_unprepared_value = true;
-        ro.auto_refresh_iterator_with_snapshot = true;
-        ro.iterate_lower_bound = &lower_bound_slice;
-        ro.iterate_upper_bound = &upper_bound_slice;
-        ro.table_index_factory = table_index_factory;
-        return ro;
-      };
+  const auto build_read_options = [&](ReadOptions::ReadIndex read_index) {
+    ReadOptions ro;
+    ro.snapshot = snapshot;
+    ro.auto_prefix_mode = true;
+    ro.allow_unprepared_value = true;
+    ro.auto_refresh_iterator_with_snapshot = true;
+    ro.iterate_lower_bound = &lower_bound_slice;
+    ro.iterate_upper_bound = &upper_bound_slice;
+    ro.read_index = read_index;
+    return ro;
+  };
 
   const std::vector<std::pair<std::string, std::string>> expected = {
       {before, large_value('a')},
@@ -1491,12 +1652,13 @@ TEST_P(TrieIndexDBTest,
       {expected_2, large_value('n')},
   };
 
-  const UserDefinedIndexFactory* table_index_factories[] = {
-      nullptr, trie_factory_.get()};
-  for (const auto* table_index_factory : table_index_factories) {
-    SCOPED_TRACE(table_index_factory == nullptr ? "standard index"
-                                                : "trie index");
-    const ReadOptions ro = build_read_options(table_index_factory);
+  const ReadOptions::ReadIndex read_indices[] = {
+      ReadOptions::ReadIndex::kDefault, ReadOptions::ReadIndex::kPreferCustom};
+  for (const auto read_index : read_indices) {
+    SCOPED_TRACE(read_index == ReadOptions::ReadIndex::kDefault
+                     ? "builtin index"
+                     : "custom index");
+    const ReadOptions ro = build_read_options(read_index);
     ASSERT_EQ(ScanAllKeyValues(ro), expected);
 
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
@@ -1520,6 +1682,7 @@ TEST_P(TrieIndexDBTest, AutoRefreshSnapshotNextAcrossSameUserKeyBoundaries) {
 
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode = GetIndexMode();
   table_options.block_size = 64;
   table_options.separate_key_value_in_data_block = true;
   options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -1552,7 +1715,7 @@ TEST_P(TrieIndexDBTest, AutoRefreshSnapshotNextAcrossSameUserKeyBoundaries) {
   std_ro.allow_unprepared_value = true;
 
   ReadOptions trie_ro = std_ro;
-  trie_ro.table_index_factory = trie_factory_.get();
+  trie_ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
 
   std::unique_ptr<Iterator> std_iter(db_->NewIterator(std_ro));
   std::unique_ptr<Iterator> trie_iter(db_->NewIterator(trie_ro));
@@ -1613,6 +1776,7 @@ TEST_P(TrieIndexDBTest,
 
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode = GetIndexMode();
   table_options.block_size = 64;
   table_options.separate_key_value_in_data_block = true;
   options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -1645,7 +1809,7 @@ TEST_P(TrieIndexDBTest,
   std_ro.allow_unprepared_value = true;
 
   ReadOptions trie_ro = std_ro;
-  trie_ro.table_index_factory = trie_factory_.get();
+  trie_ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
 
   std::unique_ptr<Iterator> std_iter(db_->NewIterator(std_ro));
   std::unique_ptr<Iterator> trie_iter(db_->NewIterator(trie_ro));
@@ -1704,6 +1868,7 @@ TEST_P(TrieIndexDBTest,
 
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode = GetIndexMode();
   table_options.block_size = 128;
   table_options.separate_key_value_in_data_block = true;
   options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -1747,7 +1912,7 @@ TEST_P(TrieIndexDBTest,
     ro.auto_refresh_iterator_with_snapshot = true;
     ro.table_filter = &range_filter;
     if (use_trie) {
-      ro.table_index_factory = trie_factory_.get();
+      ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     }
     if (use_coalescing) {
       return db_->NewCoalescingIterator(ro, {db_->DefaultColumnFamily()});
@@ -1832,8 +1997,10 @@ TEST_P(TrieIndexDBTest, MultiGetWithTrieUDI) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // MultiGet through both indexes.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
 
     std::vector<Slice> mg_keys = {"key_01",         "key_02", "key_03",
                                   "key_04",         "key_05", "key_06",
@@ -1917,6 +2084,7 @@ TEST_P(TrieIndexDBTest, MultipleColumnFamilies) {
 
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode = GetIndexMode();
   options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
   last_options_ = options_;
 
@@ -1943,16 +2111,20 @@ TEST_P(TrieIndexDBTest, MultipleColumnFamilies) {
   ASSERT_OK(db_->Flush(FlushOptions(), cf2));
 
   // Verify default CF.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::string value;
     ASSERT_OK(db_->Get(ro, "default_key", &value));
     ASSERT_EQ(value, "default_val");
   }
 
   // Verify cf_one through both indexes.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::string value;
     ASSERT_OK(db_->Get(ro, cf1, "cf1_key_a", &value));
     ASSERT_EQ(value, "cf1_val_a");
@@ -1961,8 +2133,10 @@ TEST_P(TrieIndexDBTest, MultipleColumnFamilies) {
   }
 
   // Verify cf_two through both indexes.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::string value;
     ASSERT_OK(db_->Get(ro, cf2, "cf2_key_x", &value));
     ASSERT_EQ(value, "cf2_val_x");
@@ -1972,8 +2146,10 @@ TEST_P(TrieIndexDBTest, MultipleColumnFamilies) {
   }
 
   // Forward scan on each CF via both indexes.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
 
     // cf_one scan.
     std::unique_ptr<Iterator> it1(db_->NewIterator(ro, cf1));
@@ -2073,12 +2249,13 @@ TEST_P(TrieIndexDBTest, BatchedPrefixScan) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // Phase 2: Prefix scan with both indexes.
-  for (int idx_type = 0; idx_type < 2; ++idx_type) {
-    ReadOptions base_ro =
-        idx_type == 0 ? StandardIndexReadOptions() : TrieIndexReadOptions();
-    SCOPED_TRACE(idx_type == 0 ? "standard index" : "trie index");
+  for (const auto& base_ro_template : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro_template.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "trie index"
+                     : "standard index");
 
     const Snapshot* snap = db_->GetSnapshot();
+    ReadOptions base_ro = base_ro_template;
     base_ro.snapshot = snap;
 
     uint64_t count = VerifyPrefixScanLockstep(base_ro, kNumPrefixes,
@@ -2169,12 +2346,13 @@ TEST_P(TrieIndexDBTest, BatchedPrefixScanWithOverwrites) {
   }
 
   // Now verify with both indexes.
-  for (int idx_type = 0; idx_type < 2; ++idx_type) {
-    ReadOptions base_ro =
-        idx_type == 0 ? StandardIndexReadOptions() : TrieIndexReadOptions();
-    SCOPED_TRACE(idx_type == 0 ? "standard index" : "trie index");
+  for (const auto& base_ro_template : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro_template.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "trie index"
+                     : "standard index");
 
     const Snapshot* snap = db_->GetSnapshot();
+    ReadOptions base_ro = base_ro_template;
     base_ro.snapshot = snap;
 
     uint64_t count = VerifyPrefixScanLockstep(base_ro, kNumPrefixes,
@@ -2298,37 +2476,42 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithTrieIndex) {
   // Forward prefix scans.
   {
     std::vector<std::string> expected = {"aaaa1", "aaaa2", "aaaa3", "aaaa4"};
-    ASSERT_EQ(PrefixScan(StandardIndexReadOptions(), "aaaa"), expected);
-    ASSERT_EQ(PrefixScan(TrieIndexReadOptions(), "aaaa"), expected);
+    for (const auto& ro : BothIndexReadOptions()) {
+      ASSERT_EQ(PrefixScan(ro, "aaaa"), expected);
+    }
   }
   {
     std::vector<std::string> expected = {"bbbb1", "bbbb2", "bbbb3"};
-    ASSERT_EQ(PrefixScan(StandardIndexReadOptions(), "bbbb"), expected);
-    ASSERT_EQ(PrefixScan(TrieIndexReadOptions(), "bbbb"), expected);
+    for (const auto& ro : BothIndexReadOptions()) {
+      ASSERT_EQ(PrefixScan(ro, "bbbb"), expected);
+    }
   }
   {
     std::vector<std::string> expected = {"cccc1"};
-    ASSERT_EQ(PrefixScan(StandardIndexReadOptions(), "cccc"), expected);
-    ASSERT_EQ(PrefixScan(TrieIndexReadOptions(), "cccc"), expected);
+    for (const auto& ro : BothIndexReadOptions()) {
+      ASSERT_EQ(PrefixScan(ro, "cccc"), expected);
+    }
   }
 
   // Reverse prefix scans.
   {
     std::vector<std::string> expected = {"aaaa4", "aaaa3", "aaaa2", "aaaa1"};
-    ASSERT_EQ(ReversePrefixScan(StandardIndexReadOptions(), "aaaa\xff"),
-              expected);
-    ASSERT_EQ(ReversePrefixScan(TrieIndexReadOptions(), "aaaa\xff"), expected);
+    for (const auto& ro : BothIndexReadOptions()) {
+      ASSERT_EQ(ReversePrefixScan(ro, "aaaa\xff"), expected);
+    }
   }
   {
     std::vector<std::string> expected = {"bbbb3", "bbbb2", "bbbb1"};
-    ASSERT_EQ(ReversePrefixScan(StandardIndexReadOptions(), "bbbb\xff"),
-              expected);
-    ASSERT_EQ(ReversePrefixScan(TrieIndexReadOptions(), "bbbb\xff"), expected);
+    for (const auto& ro : BothIndexReadOptions()) {
+      ASSERT_EQ(ReversePrefixScan(ro, "bbbb\xff"), expected);
+    }
   }
 
   // Direction switching within a prefix.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     iter->Seek("aaaa2");
     ASSERT_TRUE(iter->Valid());
@@ -2369,8 +2552,10 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithUpperBound) {
   std::string upper = "aaaa0025";
   Slice upper_bound(upper);
 
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.iterate_upper_bound = &upper_bound;
     std::vector<std::string> keys;
     std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
@@ -2383,8 +2568,10 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithUpperBound) {
     ASSERT_EQ(keys.back(), "aaaa0024");
   }
 
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.iterate_upper_bound = &upper_bound;
     std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
     iter->SeekToLast();
@@ -2393,8 +2580,10 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithUpperBound) {
     ASSERT_OK(iter->status());
   }
 
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.iterate_upper_bound = &upper_bound;
     std::vector<std::string> keys;
     std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
@@ -2430,51 +2619,45 @@ TEST_P(TrieIndexDBTest, PrefixIterationDirectionSwitchStress) {
 
   for (const char* pfx : prefixes) {
     SCOPED_TRACE(pfx);
-    std::vector<std::string> std_keys;
-    std::vector<std::string> trie_keys;
-    {
-      auto ro = StandardIndexReadOptions();
+    // Collect keys through each available index and verify consistency.
+    std::vector<std::string> ref_keys;
+    for (const auto& ro : BothIndexReadOptions()) {
+      std::vector<std::string> cur_keys;
       std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
       for (iter->Seek(pfx); iter->Valid(); iter->Next()) {
         if (iter->key().ToString().substr(0, 3) != std::string(pfx)) {
           break;
         }
-        std_keys.push_back(iter->key().ToString());
+        cur_keys.push_back(iter->key().ToString());
       }
       ASSERT_OK(iter->status());
-    }
-    {
-      auto ro = TrieIndexReadOptions();
-      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
-      for (iter->Seek(pfx); iter->Valid(); iter->Next()) {
-        if (iter->key().ToString().substr(0, 3) != std::string(pfx)) {
-          break;
-        }
-        trie_keys.push_back(iter->key().ToString());
+      if (ref_keys.empty()) {
+        ref_keys = cur_keys;
+      } else {
+        ASSERT_EQ(ref_keys, cur_keys);
       }
-      ASSERT_OK(iter->status());
     }
-    ASSERT_EQ(std_keys, trie_keys);
-    ASSERT_FALSE(std_keys.empty());
+    ASSERT_FALSE(ref_keys.empty());
 
-    size_t mid = std_keys.size() / 2;
-    for (const auto& ro :
-         {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-      SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+    size_t mid = ref_keys.size() / 2;
+    for (const auto& ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom"
+                       : "builtin");
       std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
-      iter->Seek(std_keys[mid]);
+      iter->Seek(ref_keys[mid]);
       ASSERT_TRUE(iter->Valid());
-      ASSERT_EQ(iter->key().ToString(), std_keys[mid]);
-      for (int i = 1; i <= 3 && mid + i < std_keys.size(); i++) {
+      ASSERT_EQ(iter->key().ToString(), ref_keys[mid]);
+      for (int i = 1; i <= 3 && mid + i < ref_keys.size(); i++) {
         iter->Next();
         ASSERT_TRUE(iter->Valid());
-        ASSERT_EQ(iter->key().ToString(), std_keys[mid + i]);
+        ASSERT_EQ(iter->key().ToString(), ref_keys[mid + i]);
       }
-      size_t pos = std::min(mid + 3, std_keys.size() - 1);
+      size_t pos = std::min(mid + 3, ref_keys.size() - 1);
       for (int i = 1; i <= 2 && pos >= 1; i++) {
         iter->Prev();
         ASSERT_TRUE(iter->Valid());
-        ASSERT_EQ(iter->key().ToString(), std_keys[pos - i]);
+        ASSERT_EQ(iter->key().ToString(), ref_keys[pos - i]);
       }
       ASSERT_OK(iter->status());
     }
@@ -2515,21 +2698,24 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithDeletesAndMerges) {
     return result;
   };
 
-  auto std_result = PrefixScan(StandardIndexReadOptions());
   auto trie_result = PrefixScan(TrieIndexReadOptions());
-  ASSERT_EQ(std_result, trie_result);
-  ASSERT_EQ(std_result.size(), 4u);
-  ASSERT_EQ(std_result[0].first, "aaa01");
-  ASSERT_EQ(std_result[1],
+  ASSERT_EQ(trie_result.size(), 4u);
+  ASSERT_EQ(trie_result[0].first, "aaa01");
+  ASSERT_EQ(trie_result[1],
             std::make_pair(std::string("aaa03"), std::string("v3,,m1")));
-  ASSERT_EQ(std_result[2],
+  ASSERT_EQ(trie_result[2],
             std::make_pair(std::string("aaa05"), std::string("v5,,m2")));
-  ASSERT_EQ(std_result[3].first, "aaa06");
+  ASSERT_EQ(trie_result[3].first, "aaa06");
+  if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ASSERT_EQ(PrefixScan(StandardIndexReadOptions()), trie_result);
+  }
 
-  auto std_rev = ReversePrefixScanKeys(StandardIndexReadOptions(), "aaa");
   auto trie_rev = ReversePrefixScanKeys(TrieIndexReadOptions(), "aaa");
-  ASSERT_EQ(std_rev, trie_rev);
-  ASSERT_EQ(std_rev.size(), 4u);
+  ASSERT_EQ(trie_rev.size(), 4u);
+  if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ASSERT_EQ(ReversePrefixScanKeys(StandardIndexReadOptions(), "aaa"),
+              trie_rev);
+  }
 }
 
 TEST_P(TrieIndexDBTest, PrefixIterationAfterCompaction) {
@@ -2556,8 +2742,10 @@ TEST_P(TrieIndexDBTest, PrefixIterationAfterCompaction) {
 
   for (const char* pfx : {"aaa", "bbb", "ccc"}) {
     SCOPED_TRACE(pfx);
-    ASSERT_EQ(PrefixScanKeys(StandardIndexReadOptions(), pfx),
-              PrefixScanKeys(TrieIndexReadOptions(), pfx));
+    auto trie_keys = PrefixScanKeys(TrieIndexReadOptions(), pfx);
+    if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+      ASSERT_EQ(PrefixScanKeys(StandardIndexReadOptions(), pfx), trie_keys);
+    }
   }
 }
 
@@ -2596,8 +2784,9 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithSnapshots) {
     return keys;
   };
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     ASSERT_EQ(PrefixScanAt(ro, snap1, "aaa"),
               (std::vector<std::string>{"aaa01", "aaa02"}));
     ASSERT_EQ(PrefixScanAt(ro, snap2, "aaa"),
@@ -2618,8 +2807,9 @@ TEST_P(TrieIndexDBTest, PrefixIterationEmptyPrefix) {
   ASSERT_OK(db_->Put(WriteOptions(), "ccc01", "v3"));
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     iter->Seek("bbb");
     if (iter->Valid()) {
@@ -2651,8 +2841,10 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithLowerBound) {
   std::string lower = "aaa0010";
   Slice lower_bound(lower);
 
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.iterate_lower_bound = &lower_bound;
     std::vector<std::string> keys;
     std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
@@ -2668,8 +2860,10 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithLowerBound) {
     ASSERT_EQ(keys.back(), "aaa0019");
   }
 
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.iterate_lower_bound = &lower_bound;
     std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
     iter->SeekToFirst();
@@ -2697,13 +2891,17 @@ TEST_P(TrieIndexDBTest, PrefixIterationWithDeleteRange) {
                              "aaa0005", "aaa0015"));
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  auto std_keys = PrefixScanKeys(StandardIndexReadOptions(), "aaa");
   auto trie_keys = PrefixScanKeys(TrieIndexReadOptions(), "aaa");
-  ASSERT_EQ(std_keys, trie_keys);
-  ASSERT_EQ(std_keys.size(), 10u);
+  ASSERT_EQ(trie_keys.size(), 10u);
+  if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ASSERT_EQ(PrefixScanKeys(StandardIndexReadOptions(), "aaa"), trie_keys);
+  }
 
-  ASSERT_EQ(ReversePrefixScanKeys(StandardIndexReadOptions(), "aaa"),
-            ReversePrefixScanKeys(TrieIndexReadOptions(), "aaa"));
+  auto trie_rev = ReversePrefixScanKeys(TrieIndexReadOptions(), "aaa");
+  if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ASSERT_EQ(ReversePrefixScanKeys(StandardIndexReadOptions(), "aaa"),
+              trie_rev);
+  }
 }
 
 TEST_P(TrieIndexDBTest, PrefixIterationMemtablePlusSST) {
@@ -2734,13 +2932,17 @@ TEST_P(TrieIndexDBTest, PrefixIterationMemtablePlusSST) {
     return result;
   };
 
-  auto std_result = PrefixScan(StandardIndexReadOptions());
   auto trie_result = PrefixScan(TrieIndexReadOptions());
-  ASSERT_EQ(std_result, trie_result);
-  ASSERT_EQ(std_result.size(), 5u);
+  ASSERT_EQ(trie_result.size(), 5u);
+  if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ASSERT_EQ(PrefixScan(StandardIndexReadOptions()), trie_result);
+  }
 
-  ASSERT_EQ(ReversePrefixScanKeys(StandardIndexReadOptions(), "aaa"),
-            ReversePrefixScanKeys(TrieIndexReadOptions(), "aaa"));
+  auto trie_rev = ReversePrefixScanKeys(TrieIndexReadOptions(), "aaa");
+  if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ASSERT_EQ(ReversePrefixScanKeys(StandardIndexReadOptions(), "aaa"),
+              trie_rev);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2770,8 +2972,10 @@ TEST_P(TrieIndexDBTest, LastBlockSeparatorNotShortened) {
   // "not found".
   std::string seek_target = std::string("9\xff\xff\x01", 4);
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
 
     iter->Seek(seek_target);
@@ -2781,8 +2985,10 @@ TEST_P(TrieIndexDBTest, LastBlockSeparatorNotShortened) {
   }
 
   // Also verify the actual last key is still findable.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
 
     iter->Seek(std::string("9\xff\xff", 3));
@@ -2814,8 +3020,10 @@ TEST_P(TrieIndexDBTest, LastBlockSeparatorWithDeletes) {
 
   // Now seeking for the deleted key should yield "5bbb" or nothing,
   // depending on the seek target. Both indexes must agree.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
 
     // Seek to the deleted key -- should skip it and land on nothing (it was
@@ -2839,8 +3047,10 @@ TEST_P(TrieIndexDBTest, LastBlockSeparatorWithDeletes) {
   // Compact to merge the tombstone, then verify again.
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
 
     iter->SeekToFirst();
@@ -2878,8 +3088,10 @@ TEST_P(TrieIndexDBTest, SingleEntrySST) {
   ASSERT_NO_FATAL_FAILURE(VerifySeekBothIndexes("a", "only_key", "only_val"));
 
   // Seek past the key -- should be invalid.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     iter->Seek("z");
     ASSERT_FALSE(iter->Valid());
@@ -2965,8 +3177,9 @@ TEST_P(TrieIndexDBTest, EmptyDBOperations) {
 
   // Get / Seek / SeekToFirst on empty memtable (no SSTs yet).
   ASSERT_NO_FATAL_FAILURE(VerifyGetNotFoundBothIndexes("anything"));
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     iter->SeekToFirst();
     ASSERT_FALSE(iter->Valid());
@@ -2985,8 +3198,9 @@ TEST_P(TrieIndexDBTest, EmptyDBOperations) {
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
 
   ASSERT_NO_FATAL_FAILURE(VerifyGetNotFoundBothIndexes("temp"));
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     iter->SeekToFirst();
     ASSERT_FALSE(iter->Valid());
@@ -3005,8 +3219,9 @@ TEST_P(TrieIndexDBTest, SeekEdgeCases) {
   }
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
 
     // Before first key.
@@ -3062,8 +3277,9 @@ TEST_P(TrieIndexDBTest, GetEntityWithTrieUDI) {
   ASSERT_OK(db_->Put(WriteOptions(), "regular_key", "regular_val"));
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
 
     // GetEntity on a PutEntity key.
     PinnableWideColumns result;
@@ -3124,8 +3340,9 @@ TEST_P(TrieIndexDBTest, OverlappingL0SSTs) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // Verify: latest writer wins for overlapping keys.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     auto kvs = ScanAllKeyValues(ro);
     ASSERT_EQ(kvs.size(), 100u);
     for (int i = 0; i < 100; i++) {
@@ -3144,8 +3361,9 @@ TEST_P(TrieIndexDBTest, OverlappingL0SSTs) {
 
   // Compact all L0 -> L1, re-verify.
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     ASSERT_EQ(ScanAllKeyValues(ro).size(), 100u);
   }
 }
@@ -3171,8 +3389,9 @@ TEST_P(TrieIndexDBTest, CompactRangeSubset) {
   ASSERT_OK(db_->CompactRange(cro, &begin_s, &end_s));
 
   // All 26 keys should still be readable.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     ASSERT_EQ(ScanAllKeys(ro).size(), 26u);
   }
   ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes("key_a", "val_0"));
@@ -3199,15 +3418,17 @@ TEST_P(TrieIndexDBTest, AllKeysDeletedCompaction) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // Before compaction: tombstones hide all keys.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     ASSERT_EQ(ScanAllKeys(ro).size(), 0u);
   }
 
   // After compaction: all tombstones and data are gone.
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     ASSERT_EQ(ScanAllKeys(ro).size(), 0u);
   }
 }
@@ -3239,8 +3460,9 @@ TEST_P(TrieIndexDBTest, BinaryKeyEdgeCases) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // Forward scan: all keys in order through both indexes.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     auto actual = ScanAllKeyValues(ro);
     ASSERT_EQ(actual.size(), kvs.size());
     for (size_t i = 0; i < kvs.size(); i++) {
@@ -3302,8 +3524,9 @@ TEST_P(TrieIndexDBTest, CompressionZlib) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // Forward scan.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     ASSERT_EQ(ScanAllKeys(ro).size(), 100u);
   }
 
@@ -3368,9 +3591,10 @@ TEST_P(TrieIndexDBTest, IteratorUpperBound) {
   }
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  for (const auto& base_ro :
-       {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (const auto& base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
 
     // Upper bound = "dd" -> should see aa, bb, cc only.
     std::string ub_str = "dd";
@@ -3429,9 +3653,10 @@ TEST_P(TrieIndexDBTest, IteratorSnapshotAndUpperBound) {
   ASSERT_OK(db_->Put(WriteOptions(), "key_e", "new_e"));
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  for (const auto& base_ro :
-       {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (const auto& base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
 
     std::string ub_str = "key_d";
     Slice ub(ub_str);
@@ -3488,8 +3713,9 @@ TEST_P(TrieIndexDBTest, ManySmallSSTs) {
   }
 
   // Verify all 100 keys are readable.
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     auto keys = ScanAllKeys(ro);
     ASSERT_EQ(keys.size(), 100u);
   }
@@ -3500,8 +3726,9 @@ TEST_P(TrieIndexDBTest, ManySmallSSTs) {
 
   // Compact everything into one SST, re-verify.
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie" : "standard");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault ? "custom"
+                                                                   : "builtin");
     ASSERT_EQ(ScanAllKeys(ro).size(), 100u);
   }
 }
@@ -3624,7 +3851,7 @@ TEST_P(TrieIndexDBTest, TransactionCommit) {
   options_.create_if_missing = true;
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
-  table_options.use_udi_as_primary_index = IsPrimaryMode();
+  table_options.index_mode = GetIndexMode();
   options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
   last_options_ = options_;
 
@@ -3658,7 +3885,7 @@ TEST_P(TrieIndexDBTest, TransactionRollback) {
   options_.create_if_missing = true;
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
-  table_options.use_udi_as_primary_index = IsPrimaryMode();
+  table_options.index_mode = GetIndexMode();
   options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
   last_options_ = options_;
 
@@ -3705,8 +3932,10 @@ TEST_P(TrieIndexDBTest, TotalOrderSeekWithPrefixExtractor) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // With total_order_seek=true, scan all keys across prefixes.
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.total_order_seek = true;
     auto keys = ScanAllKeys(base_ro);
     ASSERT_EQ(keys.size(), 4u);
@@ -3724,8 +3953,10 @@ TEST_P(TrieIndexDBTest, TotalOrderSeekWithPrefixExtractor) {
   }
 
   // auto_prefix_mode: let RocksDB decide per-seek.
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.auto_prefix_mode = true;
     std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
     iter->Seek("bbb_1");
@@ -3770,12 +4001,16 @@ TEST_P(TrieIndexDBTest, MultiLevelDeleteRangeRandomized) {
   };
 
   // Core correctness check: forward scan via both indexes must match.
+  // In kCustomOnly mode, standard-index reads fail loudly because only a
+  // footer-satisfying stub exists, so we verify the trie scan succeeds.
   auto verify_scan_consistency = [&]() {
-    auto standard_kvs = ScanAllKeyValues(StandardIndexReadOptions());
     auto trie_kvs = ScanAllKeyValues(TrieIndexReadOptions());
-    ASSERT_EQ(standard_kvs, trie_kvs)
-        << "Scan mismatch: standard=" << standard_kvs.size()
-        << " trie=" << trie_kvs.size();
+    if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+      auto standard_kvs = ScanAllKeyValues(StandardIndexReadOptions());
+      ASSERT_EQ(standard_kvs, trie_kvs)
+          << "Scan mismatch: standard=" << standard_kvs.size()
+          << " trie=" << trie_kvs.size();
+    }
   };
 
   // Phase 1: Populate bottommost level with baseline data.
@@ -3837,7 +4072,10 @@ TEST_P(TrieIndexDBTest, MultiLevelDeleteRangeRandomized) {
   // Phase 3: Snapshot, then delete a large range. The snapshot must
   // preserve the pre-deletion state while current reads see the deletion.
   const Snapshot* snap = db_->GetSnapshot();
-  auto snap_kvs = ScanAllKeyValues(StandardIndexReadOptions());
+  auto snap_kvs = ScanAllKeyValues(
+      GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomOnly
+          ? TrieIndexReadOptions()
+          : StandardIndexReadOptions());
 
   int big_start = rnd.Uniform(kMaxKey / 4);
   int big_end = big_start + kMaxKey / 3;
@@ -3872,13 +4110,22 @@ TEST_P(TrieIndexDBTest, MultiLevelDeleteRangeRandomized) {
   // Phase 6: Point lookups for a sample of keys -- both indexes must agree.
   for (int i = 0; i < kMaxKey; i += 7) {
     std::string key = format_key(i);
-    std::string std_val;
-    std::string trie_val;
-    Status s1 = db_->Get(StandardIndexReadOptions(), key, &std_val);
-    Status s2 = db_->Get(TrieIndexReadOptions(), key, &trie_val);
-    ASSERT_EQ(s1.code(), s2.code()) << "Status mismatch for " << key;
-    if (s1.ok()) {
-      ASSERT_EQ(std_val, trie_val) << "Value mismatch for " << key;
+    if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+      std::string std_val;
+      std::string trie_val;
+      Status s1 = db_->Get(StandardIndexReadOptions(), key, &std_val);
+      Status s2 = db_->Get(TrieIndexReadOptions(), key, &trie_val);
+      ASSERT_EQ(s1.code(), s2.code()) << "Status mismatch for " << key;
+      if (s1.ok()) {
+        ASSERT_EQ(std_val, trie_val) << "Value mismatch for " << key;
+      }
+    } else {
+      std::string trie_val;
+      // Just verify trie reads don't crash in kCustomOnly mode.
+      // The key may or may not exist (delete ranges active), so ignore
+      // NotFound but check for unexpected errors.
+      Status s = db_->Get(TrieIndexReadOptions(), key, &trie_val);
+      ASSERT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
     }
   }
 }
@@ -3979,8 +4226,10 @@ TEST_P(TrieIndexDBTest, PrevAfterSeekToFirstBothIndexes) {
   ASSERT_OK(db_->Put(WriteOptions(), "c", "3"));
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     iter->SeekToFirst();
     ASSERT_TRUE(iter->Valid());
@@ -3999,8 +4248,10 @@ TEST_P(TrieIndexDBTest, ForwardThenReverseDirection) {
   WriteSequentialKeys(0, 50);
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
 
     // Seek to middle, go forward a few, then reverse.
@@ -4045,8 +4296,10 @@ TEST_P(TrieIndexDBTest, SeekToLastSingleEntry) {
   ASSERT_OK(db_->Put(WriteOptions(), "only_key", "only_val"));
   ASSERT_OK(db_->Flush(FlushOptions()));
 
-  for (const auto& ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(ro.table_index_factory ? "trie index" : "standard index");
+  for (const auto& ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom index"
+                     : "builtin index");
     std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
     iter->SeekToLast();
     ASSERT_TRUE(iter->Valid());
@@ -4147,23 +4400,37 @@ TEST_P(TrieIndexDBTest, SeekForPrevVariableLengthKeys) {
 
   // SeekForPrev for every key -- trie must match standard index.
   for (const auto& key : keys) {
-    std::string std_result, trie_result;
-    {
-      std::unique_ptr<Iterator> iter(
-          db_->NewIterator(StandardIndexReadOptions()));
+    for (const auto& ro : BothIndexReadOptions()) {
+      SCOPED_TRACE(ro.read_index != ReadOptions::ReadIndex::kDefault
+                       ? "custom index"
+                       : "builtin index");
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
       iter->SeekForPrev(key);
       ASSERT_TRUE(iter->Valid());
-      std_result = iter->key().ToString();
       ASSERT_OK(iter->status());
     }
-    {
-      std::unique_ptr<Iterator> iter(db_->NewIterator(TrieIndexReadOptions()));
-      iter->SeekForPrev(key);
-      ASSERT_TRUE(iter->Valid());
-      trie_result = iter->key().ToString();
-      ASSERT_OK(iter->status());
+    if (GetIndexMode() != BlockBasedTableOptions::IndexMode::kCustomOnly) {
+      std::string std_result;
+      std::string trie_result;
+      {
+        std::unique_ptr<Iterator> iter(
+            db_->NewIterator(StandardIndexReadOptions()));
+        iter->SeekForPrev(key);
+        ASSERT_TRUE(iter->Valid());
+        std_result = iter->key().ToString();
+        ASSERT_OK(iter->status());
+      }
+      {
+        std::unique_ptr<Iterator> iter(
+            db_->NewIterator(TrieIndexReadOptions()));
+        iter->SeekForPrev(key);
+        ASSERT_TRUE(iter->Valid());
+        trie_result = iter->key().ToString();
+        ASSERT_OK(iter->status());
+      }
+      ASSERT_EQ(std_result, trie_result)
+          << "SeekForPrev(" << key << ") diverged";
     }
-    ASSERT_EQ(std_result, trie_result) << "SeekForPrev(" << key << ") diverged";
   }
 
   // SeekForPrev for keys between existing keys.
@@ -4172,7 +4439,15 @@ TEST_P(TrieIndexDBTest, SeekForPrevVariableLengthKeys) {
     int len = snprintf(buf, sizeof(buf), "k%04da", i);
     std::string target(buf, len);
 
-    std::string std_result, trie_result;
+    if (GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomOnly) {
+      // Just verify trie works in kCustomOnly mode.
+      std::unique_ptr<Iterator> iter(db_->NewIterator(TrieIndexReadOptions()));
+      iter->SeekForPrev(target);
+      ASSERT_OK(iter->status());
+      continue;
+    }
+    std::string std_result;
+    std::string trie_result;
     {
       std::unique_ptr<Iterator> iter(
           db_->NewIterator(StandardIndexReadOptions()));
@@ -4203,7 +4478,7 @@ TEST_P(TrieIndexDBTest, SeekForPrevVariableLengthKeys) {
 TEST_P(TrieIndexDBTest, PrimaryUDIBackwardCompatibility) {
   // Verifies that SSTs written with UDI as secondary (both indexes present)
   // can be read correctly when the DB is reopened with
-  // use_udi_as_primary_index. This is the upgrade path: old SSTs have both
+  // index_mode=kCustomDefault. This is the upgrade path: old SSTs have both
   // indexes, new config says "use UDI as primary for all reads."
   ASSERT_OK(OpenDBSecondary(/*block_size=*/128));
 
@@ -4219,7 +4494,7 @@ TEST_P(TrieIndexDBTest, PrimaryUDIBackwardCompatibility) {
   db_.reset();
   ASSERT_OK(OpenDBPrimary(/*block_size=*/128));
 
-  // Now all reads automatically use UDI -- no ReadOptions::table_index_factory.
+  // Now all reads automatically use UDI -- no ReadOptions::read_index needed.
   ReadOptions ro;
   std::vector<std::string> keys;
   std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
@@ -4243,6 +4518,13 @@ TEST_P(TrieIndexDBTest, MigrationFullPath) {
   // Tests the complete recommended migration path:
   // Step 1: No UDI -> Step 2: UDI secondary -> Step 3: Compact all SSTs ->
   // Step 4: UDI primary
+  // In kCustomOnly mode, standard-index reads fail loudly because only a
+  // footer-satisfying stub exists, so the mixed-mode migration path is not
+  // applicable.
+  if (GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ROCKSDB_GTEST_BYPASS("Not applicable in kCustomOnly mode");
+    return;
+  }
 
   // Step 1: Start without UDI. Write some data.
   ASSERT_OK(OpenDBWithoutUDI(/*block_size=*/128));
@@ -4286,7 +4568,7 @@ TEST_P(TrieIndexDBTest, MigrationFullPath) {
   // Step 4: Enable UDI as primary.
   ASSERT_OK(OpenDBPrimary(/*block_size=*/128));
 
-  // All reads go through UDI automatically -- no table_index_factory needed.
+  // All reads go through UDI automatically -- no read_index needed.
   ReadOptions ro;
   std::vector<std::string> keys;
   std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
@@ -4304,7 +4586,7 @@ TEST_P(TrieIndexDBTest, MigrationFullPath) {
 }
 
 TEST_P(TrieIndexDBTest, MigrationPrimaryRejectsPreUDISSTs) {
-  // Verifies that enabling use_udi_as_primary_index on a DB with SSTs
+  // Verifies that enabling index_mode=kCustomDefault on a DB with SSTs
   // that have no UDI block fails at open time (not silently).
   options_.disable_auto_compactions = true;
 
@@ -4340,14 +4622,14 @@ TEST_P(TrieIndexDBTest, RollbackFromPrimaryToSecondary) {
   // Rollback step 1: Reopen as secondary (with UDI factory still set).
   // Primary UDI routing is purely config-driven, so reopening as secondary
   // immediately reverts all reads to the standard index path. The trie is
-  // still accessible via explicit ReadOptions::table_index_factory.
+  // still accessible via explicit ReadOptions::read_index.
   ASSERT_OK(OpenDBSecondary(/*block_size=*/128));
 
   // Verify the primary-mode SST is readable through both paths.
   // Explicit trie read:
   ASSERT_OK(db_->Get(TrieIndexReadOptions(), "key_0015", &value));
   ASSERT_EQ(value, "val_0015");
-  // Standard index read (default ReadOptions, no table_index_factory):
+  // Standard index read (default ReadOptions, no read_index):
   ASSERT_OK(db_->Get(ReadOptions(), "key_0015", &value));
   ASSERT_EQ(value, "val_0015");
 
@@ -4385,10 +4667,62 @@ TEST_P(TrieIndexDBTest, RollbackFromPrimaryToSecondary) {
   ASSERT_EQ(ScanAllKeys(ReadOptions()), all_keys);
 }
 
+// An SST written in kCustomOnly has only a stub where the standard index would
+// be, so the trie is the only way to read it. Lowering index_mode afterwards
+// must not brick those files: both kCustomDefault and kStandardDefault keep
+// serving default reads by routing to the trie. Only an explicit kBuiltin
+// request fails, because there is no standard index to honor it with.
+TEST_F(TrieIndexDBTest, CustomOnlySSTsSurviveLoweredIndexMode) {
+  ASSERT_OK(OpenDBImpl(/*block_size=*/128,
+                       BlockBasedTableOptions::IndexMode::kCustomOnly));
+  WriteSequentialKeys(0, 30);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+
+  ReadOptions trie_ro;
+  trie_ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
+  const std::vector<std::string> expected_keys = ScanAllKeys(trie_ro);
+  ASSERT_EQ(expected_keys.size(), 30u);
+  ASSERT_OK(db_->Close());
+  db_.reset();
+
+  // Lower to kCustomDefault: the trie is still primary, so nothing changes.
+  ASSERT_OK(OpenDBImpl(/*block_size=*/128,
+                       BlockBasedTableOptions::IndexMode::kCustomDefault));
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), "key_0015", &value));
+  ASSERT_EQ(value, "val_0015");
+  ASSERT_EQ(ScanAllKeys(ReadOptions()), expected_keys);
+  ASSERT_OK(db_->Close());
+  db_.reset();
+
+  // Lower to kStandardDefault: the standard index is nominally primary, but
+  // these SSTs only carry a stub, so default reads still route to the trie.
+  ASSERT_OK(OpenDBImpl(/*block_size=*/128,
+                       BlockBasedTableOptions::IndexMode::kStandardDefault));
+  ASSERT_OK(db_->Get(ReadOptions(), "key_0015", &value));
+  ASSERT_EQ(value, "val_0015");
+  ASSERT_EQ(ScanAllKeys(ReadOptions()), expected_keys);
+
+  // An explicit standard-index read cannot be served by a stub.
+  ReadOptions builtin_ro;
+  builtin_ro.read_index = ReadOptions::ReadIndex::kBuiltin;
+  ASSERT_NOK(db_->Get(builtin_ro, "key_0015", &value));
+  std::unique_ptr<Iterator> iter(db_->NewIterator(builtin_ro));
+  iter->SeekToFirst();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_TRUE(iter->status().IsInvalidArgument());
+}
+
 TEST_P(TrieIndexDBTest, RollbackFromPrimaryWithoutCompactSucceeds) {
   // Verifies that removing UDI from primary-mode SSTs WITHOUT compacting
   // first still works. The standard index is always fully populated (even
   // in primary mode), so reads fall back to the standard index correctly.
+  // In kCustomOnly mode, standard-index reads fail loudly because only a
+  // footer-satisfying stub exists, so this rollback path is not applicable.
+  if (GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ROCKSDB_GTEST_BYPASS("Not applicable in kCustomOnly mode");
+    return;
+  }
   options_.disable_auto_compactions = true;
 
   // Write SSTs in primary mode.
@@ -4415,7 +4749,7 @@ TEST_P(TrieIndexDBTest, RollbackFromPrimaryWithoutCompactSucceeds) {
 TEST_P(TrieIndexDBTest, PrimaryModeTableProperties) {
   // Verifies primary-mode-specific behavior: the udi_is_primary_index table
   // property is set (informational, does not affect read routing), and
-  // reads work without setting ReadOptions::table_index_factory.
+  // reads work without setting ReadOptions::read_index.
   if (!IsPrimaryMode()) {
     ROCKSDB_GTEST_BYPASS("Only applicable in primary mode");
     return;
@@ -4434,7 +4768,7 @@ TEST_P(TrieIndexDBTest, PrimaryModeTableProperties) {
     ASSERT_EQ(p.second->udi_is_primary_index, 1u);
   }
 
-  // Reads work with default ReadOptions (no table_index_factory needed).
+  // Reads work with default ReadOptions (no read_index needed).
   ReadOptions ro;
   std::string value;
   ASSERT_OK(db_->Get(ro, "key1", &value));
@@ -4443,7 +4777,13 @@ TEST_P(TrieIndexDBTest, PrimaryModeTableProperties) {
 
 TEST_P(TrieIndexDBTest, EstimatedSizeNonZero) {
   // Verifies that TrieIndexBuilder::EstimatedSize() returns non-zero after
-  // adding entries, ensuring compaction file sizing works.
+  // adding entries, ensuring compaction file sizing works. In kCustomOnly
+  // mode, the standard index is a stub with zero size -- the trie's size is
+  // tracked separately in the meta block, not in the index_size property.
+  if (GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    ROCKSDB_GTEST_BYPASS("index_size property tracks standard index only");
+    return;
+  }
   ASSERT_OK(OpenDB(/*block_size=*/128));
 
   // Write enough data to produce multiple blocks.
@@ -4482,8 +4822,10 @@ TEST_P(TrieIndexDBTest, NonBoundarySeparatorSeekCorrectness) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // Seek for "acc" should find "acc" through both indexes.
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.snapshot = read_snap.snapshot();
     std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
     iter->Seek("acc");
@@ -4493,8 +4835,10 @@ TEST_P(TrieIndexDBTest, NonBoundarySeparatorSeekCorrectness) {
   }
 
   // Also verify point Get works.
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.snapshot = read_snap.snapshot();
     std::string value;
     ASSERT_OK(db_->Get(base_ro, "acc", &value));
@@ -4515,7 +4859,7 @@ TEST_P(TrieIndexDBTest, MultiCFCoalescingIterator) {
   options_.create_if_missing = true;
   BlockBasedTableOptions table_options;
   table_options.user_defined_index_factory = trie_factory_;
-  table_options.use_udi_as_primary_index = IsPrimaryMode();
+  table_options.index_mode = GetIndexMode();
   options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
   last_options_ = options_;
   ASSERT_OK(DB::Open(options_, dbname_, &db_));
@@ -4623,8 +4967,10 @@ TEST_P(TrieIndexDBTest, GetEntityWithExplicitSnapshotComparison) {
   ASSERT_OK(db_->Flush(FlushOptions()));
 
   // Read at snapshot through both indexes -- should see v1 data.
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.snapshot = snap;
 
     // GetEntity on PutEntity key at snapshot.
@@ -4650,8 +4996,10 @@ TEST_P(TrieIndexDBTest, GetEntityWithExplicitSnapshotComparison) {
   }
 
   // Read without snapshot -- should see v2 data.
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
 
     PinnableWideColumns result;
     ASSERT_OK(db_->GetEntity(base_ro, db_->DefaultColumnFamily(), "entity_key",
@@ -4692,8 +5040,10 @@ TEST_P(TrieIndexDBTest, ReverseIterationAcrossSameUserKeyBlocks) {
   VerifyScanBothIndexes(expected);
 
   // At an older snapshot, same_key should have the older value.
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     base_ro.snapshot = snapshots[3];
     std::string value;
     ASSERT_OK(db_->Get(base_ro, "same_key", &value));
@@ -4701,8 +5051,10 @@ TEST_P(TrieIndexDBTest, ReverseIterationAcrossSameUserKeyBlocks) {
   }
 
   // Reverse scan through trie should produce zzz, same_key, aaa.
-  for (auto base_ro : {StandardIndexReadOptions(), TrieIndexReadOptions()}) {
-    SCOPED_TRACE(base_ro.table_index_factory ? "trie" : "standard");
+  for (auto base_ro : BothIndexReadOptions()) {
+    SCOPED_TRACE(base_ro.read_index != ReadOptions::ReadIndex::kDefault
+                     ? "custom"
+                     : "builtin");
     std::unique_ptr<Iterator> iter(db_->NewIterator(base_ro));
     iter->SeekToLast();
     ASSERT_TRUE(iter->Valid());
@@ -4726,11 +5078,185 @@ TEST_P(TrieIndexDBTest, ReverseIterationAcrossSameUserKeyBlocks) {
   }
 }
 
-// Run all parameterized tests in both UDI modes:
-// - Secondary (false): UDI is secondary, reads require table_index_factory
-// - Primary (true): UDI is primary, all reads use the trie by default
-INSTANTIATE_TEST_CASE_P(SecondaryAndPrimaryUDI, TrieIndexDBTest,
-                        ::testing::Bool());
+// ============================================================================
+// Prefetch boundary comparison with custom index wrapper
+// ============================================================================
+
+TEST_P(TrieIndexDBTest, PrefetchWithCustomIndexWrapper) {
+  // Exercises the Prefetch() code path with the custom index wrapper active.
+  // In primary mode, Prefetch() uses the UDI wrapper whose key() returns an
+  // internal key (user key + 8-byte trailer). The Prefetch boundary comparison
+  // must use user_key() (not key()) when index_key_is_user_key=1 to avoid
+  // including the trailer in the comparison.
+  //
+  // This test writes keys with NO same-user-key boundaries (each key is
+  // unique), so index_key_is_user_key=1 in the SST properties. This is the
+  // condition that triggers the user-key comparison path in Prefetch.
+  if (GetIndexMode() == BlockBasedTableOptions::IndexMode::kStandardDefault) {
+    // In secondary mode, Prefetch uses the standard IndexBlockIter (the
+    // wrapper falls through for internal ReadOptions). The bug only
+    // manifests in primary mode where the wrapper intercepts all reads.
+    ROCKSDB_GTEST_BYPASS("Only applicable in primary modes");
+    return;
+  }
+  ASSERT_OK(OpenDB(/*block_size=*/256));
+
+  // Write unique keys (no same-user-key boundaries) to ensure
+  // index_key_is_user_key=1.
+  for (int i = 0; i < 500; i++) {
+    char key[32];
+    snprintf(key, sizeof(key), "prefetch_key_%06d", i);
+    ASSERT_OK(db_->Put(WriteOptions(), key, std::string(200, 'v')));
+  }
+  ASSERT_OK(db_->Flush(FlushOptions()));
+
+  // Verify SST properties. In kCustomDefault mode, index_key_is_user_key=1
+  // because the standard builder sees no same-user-key boundaries (all keys
+  // unique). In kCustomOnly mode, the standard index is a stub; this test only
+  // needs the custom-default assertion because primary mode is covered below by
+  // the reopen-time prefetch checks.
+  TablePropertiesCollection props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+  ASSERT_FALSE(props.empty());
+  if (GetIndexMode() == BlockBasedTableOptions::IndexMode::kCustomDefault) {
+    for (const auto& p : props) {
+      ASSERT_EQ(p.second->index_key_is_user_key, 1u)
+          << "kCustomDefault with unique keys: expected user-key-only "
+             "separators";
+    }
+  }
+
+  // Close and reopen to trigger Prefetch during Open.
+  ASSERT_OK(db_->Close());
+  db_.reset();
+  ASSERT_OK(OpenDB(/*block_size=*/256));
+
+  // Exercises the Prefetch code path with the custom index wrapper in
+  // primary mode. The wrapper's key() includes an 8-byte internal key
+  // trailer that Prefetch's boundary comparison must handle correctly
+  // via user_key(). An incorrect comparison would cause wrong prefetch
+  // boundaries (performance issue, not data correctness). Verify the
+  // reopen succeeds and all data is readable.
+  ReadOptions ro;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  iter->SeekToFirst();
+  int count = 0;
+  while (iter->Valid()) {
+    count++;
+    iter->Next();
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(count, 500);
+
+  // Also verify point lookups work (uses a different read path).
+  std::string value;
+  ASSERT_OK(db_->Get(ro, "prefetch_key_000000", &value));
+  ASSERT_EQ(value, std::string(200, 'v'));
+  ASSERT_OK(db_->Get(ro, "prefetch_key_000499", &value));
+  ASSERT_EQ(value, std::string(200, 'v'));
+}
+
+// End-to-end parallel compression: a DB with the trie UDI factory and
+// compression_opts.parallel_threads > 1 must start the parallel pipeline (the
+// trie builder opts into PrepareAddEntry / FinishAddEntry) and produce SSTs
+// that read back correctly in all three modes. Any divergence between the
+// parallel and serial trie construction surfaces as missing or extra keys.
+TEST_P(TrieIndexDBTest, ParallelCompressionWithTrieIndex) {
+  // Compression must be on for the parallel pipeline to actually run;
+  // with no compressor the table builder silently falls back to serial.
+  // Use Zlib because it's reliably linked across test build configs
+  // where Snappy / LZ4 / ZSTD may not be.
+  if (!Zlib_Supported()) {
+    ROCKSDB_GTEST_SKIP("Zlib not linked into this build");
+    return;
+  }
+  options_.compression = kZlibCompression;
+  options_.compression_opts.parallel_threads = 4;
+  options_.write_buffer_size = 1 << 20;  // small buffer -> multiple flushes
+
+  ASSERT_OK(OpenDB());
+
+  ParallelCompressionStartCounter parallel_starts;
+  // Enough keys to produce many data blocks -> many index entries flowing
+  // through the parallel pipeline.
+  const std::string value(200, 'v');
+  const std::vector<std::string> keys = PutNumberedKeys(500, value);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  EXPECT_GT(parallel_starts.started(), 0);
+
+  ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes(keys));
+  for (size_t i : {0, 7, 123, 250, 499}) {
+    ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes(keys[i], value));
+  }
+}
+
+// Trie + parallel compression on top of the kHashSearch built-in index.
+//
+// kCustomDefault / kCustomOnly restrict index_type to kBinarySearch /
+// kBinarySearchWithFirstKey (the UDI wrapper layout is incompatible with
+// hash / partitioned indexes). kStandardDefault has no such restriction,
+// so the trie can coexist with any built-in index_type. The
+// parameterized ParallelCompressionWithTrieIndex above covers the
+// kBinarySearch case; this test covers kHashSearch. kTwoLevelIndexSearch
+// is excluded because partition_filters constraints force
+// parallel_threads = 1.
+TEST_F(TrieIndexDBTest, ParallelCompressionWithHashStandardIndexAndTrieUdi) {
+  if (!Zlib_Supported()) {
+    ROCKSDB_GTEST_SKIP("Zlib not linked into this build");
+    return;
+  }
+
+  options_.create_if_missing = true;
+  options_.compression = kZlibCompression;
+  options_.compression_opts.parallel_threads = 4;
+  options_.write_buffer_size = 1 << 20;
+  options_.prefix_extractor.reset(NewFixedPrefixTransform(4));
+
+  BlockBasedTableOptions table_options;
+  table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
+  table_options.index_type = BlockBasedTableOptions::kHashSearch;
+  options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  last_options_ = options_;
+
+  ASSERT_OK(DB::Open(options_, dbname_, &db_));
+
+  ParallelCompressionStartCounter parallel_starts;
+  // Enough keys to fill multiple blocks -> multiple iterations through
+  // the parallel ring buffer for both the hash builder and the trie
+  // builder.
+  const std::string value(200, 'v');
+  const std::vector<std::string> keys = PutNumberedKeys(500, value);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  EXPECT_GT(parallel_starts.started(), 0);
+
+  // This test is not parameterized, so the mode-aware read helpers do not
+  // apply. Default reads use the hash index; kPreferCustom uses the trie.
+  std::vector<ReadOptions> read_options(2);
+  read_options[1].read_index = ReadOptions::ReadIndex::kPreferCustom;
+  for (const ReadOptions& ro : read_options) {
+    SCOPED_TRACE(ro.read_index == ReadOptions::ReadIndex::kPreferCustom
+                     ? "trie index"
+                     : "hash index");
+    ASSERT_EQ(ScanAllKeys(ro), keys);
+    for (size_t i : {0, 7, 123, 250, 499}) {
+      std::string v;
+      ASSERT_OK(db_->Get(ro, keys[i], &v));
+      ASSERT_EQ(v, value);
+    }
+  }
+}
+
+// Run all parameterized tests in all three custom UDI modes:
+// - kStandardDefault: UDI is secondary, reads require read_index
+// - kCustomDefault: UDI is primary, all reads use the trie by default
+// - kCustomOnly: UDI is primary, standard-index reads fail loudly
+INSTANTIATE_TEST_CASE_P(
+    AllIndexModes, TrieIndexDBTest,
+    ::testing::Values(BlockBasedTableOptions::IndexMode::kStandardDefault,
+                      BlockBasedTableOptions::IndexMode::kCustomDefault,
+                      BlockBasedTableOptions::IndexMode::kCustomOnly));
 
 }  // namespace trie_index
 }  // namespace ROCKSDB_NAMESPACE

@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <iomanip>
+#include <memory>
 
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
@@ -99,7 +100,7 @@ class CorruptionFS : public FileSystemWrapper {
         for (size_t i = 0; i < num_reqs; ++i) {
           FSReadRequest& req = reqs[i];
           if (fs_.fs_buffer_) {
-            // See https://github.com/facebook/rocksdb/pull/13195 for why we
+            // See https://github.com/meta/rocksdb/pull/13195 for why we
             // want to set up our test implementation for FSAllocationPtr this
             // way.
             char* internalData = new char[req.len];
@@ -224,8 +225,6 @@ class CorruptionFS : public FileSystemWrapper {
   }
 
   bool VerifyRetry() { return corrupt_len_ > 0 && corrupt_fname_.empty(); }
-
-  int read_count() { return read_count_; }
 
   int corruption_trigger() { return corruption_trigger_; }
 
@@ -819,9 +818,9 @@ class DBIOCorruptionTest
 
     base_env_ = env_;
     EXPECT_NE(base_env_, nullptr);
-    fs_.reset(new CorruptionFS(base_env_->GetFileSystem(),
-                               std::get<0>(GetParam()),
-                               std::get<2>(GetParam())));
+    fs_ = std::make_shared<CorruptionFS>(base_env_->GetFileSystem(),
+                                         std::get<0>(GetParam()),
+                                         std::get<2>(GetParam()));
     env_guard_ = NewCompositeEnv(fs_);
     options_.env = env_guard_.get();
     bbto.num_file_reads_for_auto_readahead = 0;
@@ -832,7 +831,7 @@ class DBIOCorruptionTest
     Reopen(options_);
   }
 
-  ~DBIOCorruptionTest() {
+  ~DBIOCorruptionTest() override {
     Close();
     db_ = nullptr;
   }

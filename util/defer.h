@@ -47,6 +47,8 @@ class Defer final {
   // Disallow copy.
   Defer(const Defer&) = delete;
   Defer& operator=(const Defer&) = delete;
+  Defer(Defer&&) = delete;
+  Defer& operator=(Defer&&) = delete;
 
  private:
   std::function<void()> fn_;
@@ -73,6 +75,8 @@ class SaveAndRestore {
   // No copies
   SaveAndRestore(const SaveAndRestore&) = delete;
   SaveAndRestore& operator=(const SaveAndRestore&) = delete;
+  SaveAndRestore(SaveAndRestore&&) = delete;
+  SaveAndRestore& operator=(SaveAndRestore&&) = delete;
 
  private:
   T* const obj_;

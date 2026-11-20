@@ -51,6 +51,7 @@ class SmallEnumSet {
   SmallEnumSet() : state_{} {}
 
   template <class... TRest>
+  // NOLINTNEXTLINE(google-explicit-constructor)
   /*implicit*/ constexpr SmallEnumSet(const ENUM_TYPE e, TRest... rest) {
     *this = SmallEnumSet(rest...).With(e);
   }
@@ -104,6 +105,8 @@ class SmallEnumSet {
     // move
     const_iterator(const_iterator&& that) noexcept = default;
     const_iterator& operator=(const_iterator&& that) noexcept = default;
+
+    ~const_iterator() = default;
 
     // equality
     bool operator==(const const_iterator& that) const {
@@ -323,9 +326,11 @@ class Interval {
 
   /* implicit */ Interval(const T& start, const T& end)
       : start_(start), end_(end) {}
+  // NOLINTNEXTLINE(google-explicit-constructor)
   /* implicit */ Interval(const T& start) : start_(start), end_(End::INF) {}
 
   // Add constructor that takes a pair
+  // NOLINTNEXTLINE(google-explicit-constructor)
   /* implicit */ Interval(const std::pair<T, T>& p)
       : start_(p.first), end_(p.second) {}
 

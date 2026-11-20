@@ -18,7 +18,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-typedef DeadlockInfoBufferTempl<RangeDeadlockPath> RangeDeadlockInfoBuffer;
+using RangeDeadlockInfoBuffer = DeadlockInfoBufferTempl<RangeDeadlockPath>;
 
 // A Range Lock Manager that uses PerconaFT's locktree library
 class RangeTreeLockManager : public RangeLockManagerBase,

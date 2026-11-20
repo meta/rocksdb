@@ -34,7 +34,7 @@ class RateLimiter {
   // For API compatibility, default to rate-limiting writes only.
   explicit RateLimiter(Mode mode = Mode::kWritesOnly) : mode_(mode) {}
 
-  virtual ~RateLimiter() {}
+  virtual ~RateLimiter() = default;
 
   // This API allows user to dynamically change rate limiter's bytes per second.
   // REQUIRED: bytes_per_second > 0

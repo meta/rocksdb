@@ -288,7 +288,7 @@ void DecompressorDict::Populate(Decompressor& from_decompressor, Slice dict) {
     dict_allocation_ = {};
     // Appropriately reject bad files with empty dictionary block.
     // It is longstanding not to write an empty dictionary block:
-    // https://github.com/facebook/rocksdb/blame/10.2.fb/table/block_based/block_based_table_builder.cc#L1841
+    // https://github.com/meta/rocksdb/blame/10.2.fb/table/block_based/block_based_table_builder.cc#L1841
     decompressor_ = std::make_unique<FailureDecompressor>(
         Status::Corruption("Decompression dictionary is empty"));
   } else {
@@ -460,8 +460,7 @@ class CompressorWithSimpleDictBase : public CompressorBase {
   }
 
   std::unique_ptr<Compressor> MaybeCloneSpecialized(
-      CacheEntryRole /*block_type*/,
-      DictConfigArgs&& dict_config) const final override {
+      CacheEntryRole /*block_type*/, DictConfigArgs&& dict_config) const final {
     if (auto* samples = std::get_if<DictSamples>(&dict_config)) {
       assert(samples->Verify());
       if (samples->empty()) {
@@ -880,7 +879,7 @@ class BuiltinLZ4CompressorV2WithDict : public CompressorWithSimpleDictBase {
 class BuiltinLZ4CompressorV2NoDict final
     : public BuiltinLZ4CompressorV2WithDict {
  public:
-  BuiltinLZ4CompressorV2NoDict(const CompressionOptions& opts)
+  explicit BuiltinLZ4CompressorV2NoDict(const CompressionOptions& opts)
       : BuiltinLZ4CompressorV2WithDict(opts, /*dict_data=*/{}) {}
 
   std::unique_ptr<Compressor> Clone() const override {
@@ -1706,6 +1705,16 @@ class BuiltinDecompressorV2OptimizeZstdWithDict final
         dict_(dict) {
   }
 #endif  // ROCKSDB_ZSTD_DDICT
+
+  // No copying allowed
+  BuiltinDecompressorV2OptimizeZstdWithDict(
+      const BuiltinDecompressorV2OptimizeZstdWithDict&) = delete;
+  BuiltinDecompressorV2OptimizeZstdWithDict& operator=(
+      const BuiltinDecompressorV2OptimizeZstdWithDict&) = delete;
+  BuiltinDecompressorV2OptimizeZstdWithDict(
+      BuiltinDecompressorV2OptimizeZstdWithDict&&) = delete;
+  BuiltinDecompressorV2OptimizeZstdWithDict& operator=(
+      BuiltinDecompressorV2OptimizeZstdWithDict&&) = delete;
 
   const char* Name() const override {
     return "BuiltinDecompressorV2OptimizeZstdWithDict";

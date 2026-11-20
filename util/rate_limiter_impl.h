@@ -31,7 +31,7 @@ class GenericRateLimiter : public RateLimiter {
                      const std::shared_ptr<SystemClock>& clock, bool auto_tuned,
                      int64_t single_burst_bytes);
 
-  virtual ~GenericRateLimiter();
+  ~GenericRateLimiter() override;
 
   // This API allows user to dynamically change rate limiter's bytes per second.
   void SetBytesPerSecond(int64_t bytes_per_second) override;

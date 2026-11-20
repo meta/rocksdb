@@ -1371,6 +1371,15 @@ public class OptionsTest {
   }
 
   @Test
+  public void trackOptionsFileNumberInManifest() {
+    try (final Options options = new Options()) {
+      assertThat(options.trackOptionsFileNumberInManifest()).isFalse();
+      assertThat(options.setTrackOptionsFileNumberInManifest(true)).isEqualTo(options);
+      assertThat(options.trackOptionsFileNumberInManifest()).isTrue();
+    }
+  }
+
+  @Test
   public void logReadaheadSize() {
     try (final Options options = new Options()) {
       assertThat(options.logReadaheadSize()).isEqualTo(0);

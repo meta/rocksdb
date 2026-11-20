@@ -44,18 +44,15 @@ class StringLogger : public Logger {
  private:
   std::string string_;
 };
-static std::unordered_map<std::string, OptionTypeInfo> struct_option_info = {
-    {"struct", OptionTypeInfo::Struct("struct", &simple_option_info, 0,
-                                      OptionVerificationType::kNormal,
-                                      OptionTypeFlags::kMutable)},
-};
-
-static std::unordered_map<std::string, OptionTypeInfo> imm_struct_option_info =
-    {
-        {"struct", OptionTypeInfo::Struct("struct", &simple_option_info, 0,
-                                          OptionVerificationType::kNormal,
-                                          OptionTypeFlags::kNone)},
-};
+static const std::unordered_map<std::string, OptionTypeInfo>&
+StructOptionInfo() {
+  static const std::unordered_map<std::string, OptionTypeInfo> info = {
+      {"struct", OptionTypeInfo::Struct("struct", &simple_option_info, 0,
+                                        OptionVerificationType::kNormal,
+                                        OptionTypeFlags::kMutable)},
+  };
+  return info;
+}
 
 class SimpleConfigurable : public TestConfigurable<Configurable> {
  public:
@@ -140,7 +137,8 @@ TEST_F(ConfigurableTest, ConfigureIgnoreTest) {
 }
 
 TEST_F(ConfigurableTest, ConfigureNestedOptionsTest) {
-  std::unique_ptr<Configurable> base, copy;
+  std::unique_ptr<Configurable> base;
+  std::unique_ptr<Configurable> copy;
   std::string opt_str;
   std::string mismatch;
 
@@ -206,24 +204,6 @@ TEST_F(ConfigurableTest, InvalidOptionTest) {
       configurable->ConfigureOption(config_options_, "bad-option", "bad"));
 }
 
-static std::unordered_map<std::string, OptionTypeInfo> validated_option_info = {
-    {"validated",
-     {0, OptionType::kBoolean, OptionVerificationType::kNormal,
-      OptionTypeFlags::kNone}},
-};
-static std::unordered_map<std::string, OptionTypeInfo> prepared_option_info = {
-    {"prepared",
-     {0, OptionType::kInt, OptionVerificationType::kNormal,
-      OptionTypeFlags::kMutable}},
-};
-static std::unordered_map<std::string, OptionTypeInfo>
-    dont_prepare_option_info = {
-        {"unique",
-         {0, OptionType::kConfigurable, OptionVerificationType::kNormal,
-          (OptionTypeFlags::kUnique | OptionTypeFlags::kDontPrepare)}},
-
-};
-
 class ValidatedConfigurable : public SimpleConfigurable {
  public:
   ValidatedConfigurable(const std::string& name, unsigned char mode,
@@ -231,6 +211,24 @@ class ValidatedConfigurable : public SimpleConfigurable {
       : SimpleConfigurable(name, TestConfigMode::kDefaultMode),
         validated(false),
         prepared(0) {
+    static const std::unordered_map<std::string, OptionTypeInfo>
+        validated_option_info = {
+            {"validated",
+             {0, OptionType::kBoolean, OptionVerificationType::kNormal,
+              OptionTypeFlags::kNone}},
+        };
+    static const std::unordered_map<std::string, OptionTypeInfo>
+        prepared_option_info = {
+            {"prepared",
+             {0, OptionType::kInt, OptionVerificationType::kNormal,
+              OptionTypeFlags::kMutable}},
+        };
+    static const std::unordered_map<std::string, OptionTypeInfo>
+        dont_prepare_option_info = {
+            {"unique",
+             {0, OptionType::kConfigurable, OptionVerificationType::kNormal,
+              (OptionTypeFlags::kUnique | OptionTypeFlags::kDontPrepare)}},
+        };
     RegisterOptions("Validated", &validated, &validated_option_info);
     RegisterOptions("Prepared", &prepared, &prepared_option_info);
     if ((mode & TestConfigMode::kUniqueMode) != 0) {
@@ -362,7 +360,7 @@ TEST_F(ConfigurableTest, MutableOptionsTest) {
         : SimpleConfigurable("mutable", TestConfigMode::kDefaultMode |
                                             TestConfigMode::kUniqueMode |
                                             TestConfigMode::kSharedMode) {
-      RegisterOptions("struct", &options_, &struct_option_info);
+      RegisterOptions("struct", &options_, &StructOptionInfo());
       RegisterOptions("imm", &options_, &imm_option_info);
     }
   };
@@ -519,7 +517,8 @@ TEST_F(ConfigurableTest, NestedRawConfigTest) {
 
 TEST_F(ConfigurableTest, MatchesTest) {
   std::string mismatch;
-  std::unique_ptr<Configurable> base, copy;
+  std::unique_ptr<Configurable> base;
+  std::unique_ptr<Configurable> copy;
   base.reset(SimpleConfigurable::Create(
       "simple", TestConfigMode::kDefaultMode | TestConfigMode::kNestedMode));
   copy.reset(SimpleConfigurable::Create(
@@ -534,7 +533,8 @@ TEST_F(ConfigurableTest, MatchesTest) {
   ASSERT_OK(base->ConfigureOption(config_options_, "shared", "int=44"));
   ASSERT_FALSE(base->AreEquivalent(config_options_, copy.get(), &mismatch));
   ASSERT_EQ(mismatch, "shared.int");
-  std::string c1value, c2value;
+  std::string c1value;
+  std::string c2value;
   ASSERT_OK(base->GetOption(config_options_, mismatch, &c1value));
   ASSERT_OK(copy->GetOption(config_options_, mismatch, &c2value));
   ASSERT_NE(c1value, c2value);
@@ -542,13 +542,14 @@ TEST_F(ConfigurableTest, MatchesTest) {
 
 static Configurable* SimpleStructFactory() {
   return SimpleConfigurable::Create(
-      "simple-struct", TestConfigMode::kDefaultMode, &struct_option_info);
+      "simple-struct", TestConfigMode::kDefaultMode, &StructOptionInfo());
 }
 
 TEST_F(ConfigurableTest, ConfigureStructTest) {
   std::unique_ptr<Configurable> base(SimpleStructFactory());
   std::unique_ptr<Configurable> copy(SimpleStructFactory());
-  std::string opt_str, value;
+  std::string opt_str;
+  std::string value;
   std::string mismatch;
   std::unordered_set<std::string> names;
 
@@ -576,7 +577,8 @@ TEST_F(ConfigurableTest, ConfigureStructTest) {
 }
 
 TEST_F(ConfigurableTest, ConfigurableEnumTest) {
-  std::unique_ptr<Configurable> base, copy;
+  std::unique_ptr<Configurable> base;
+  std::unique_ptr<Configurable> copy;
   base.reset(SimpleConfigurable::Create("e", TestConfigMode::kEnumMode));
   copy.reset(SimpleConfigurable::Create("e", TestConfigMode::kEnumMode));
 
@@ -592,18 +594,18 @@ TEST_F(ConfigurableTest, ConfigurableEnumTest) {
   ASSERT_NOK(base->ConfigureOption(config_options_, "unknown", "bad"));
 }
 
-static std::unordered_map<std::string, OptionTypeInfo> noserialize_option_info =
-    {
-        {"int",
-         {offsetof(struct TestOptions, i), OptionType::kInt,
-          OptionVerificationType::kNormal, OptionTypeFlags::kDontSerialize}},
-};
-
 TEST_F(ConfigurableTest, TestNoSerialize) {
+  const std::unordered_map<std::string, OptionTypeInfo>
+      noserialize_option_info = {
+          {"int",
+           {offsetof(struct TestOptions, i), OptionType::kInt,
+            OptionVerificationType::kNormal, OptionTypeFlags::kDontSerialize}},
+      };
   std::unique_ptr<Configurable> base;
   base.reset(SimpleConfigurable::Create("c", TestConfigMode::kDefaultMode,
                                         &noserialize_option_info));
-  std::string opts_str, value;
+  std::string opts_str;
+  std::string value;
   ASSERT_OK(base->ConfigureFromString(config_options_, "int=10"));
   ASSERT_OK(base->GetOptionString(config_options_, &opts_str));
   ASSERT_EQ(opts_str, "");
@@ -622,14 +624,17 @@ TEST_F(ConfigurableTest, TestNoCompare) {
         OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
   };
 
-  std::unique_ptr<Configurable> base, copy;
+  std::unique_ptr<Configurable> base;
+  std::unique_ptr<Configurable> copy;
   base.reset(SimpleConfigurable::Create("c", TestConfigMode::kDefaultMode,
                                         &nocomp_option_info));
   copy.reset(SimpleConfigurable::Create("c", TestConfigMode::kDefaultMode,
                                         &normal_option_info));
   ASSERT_OK(base->ConfigureFromString(config_options_, "int=10"));
   ASSERT_OK(copy->ConfigureFromString(config_options_, "int=20"));
-  std::string bvalue, cvalue, mismatch;
+  std::string bvalue;
+  std::string cvalue;
+  std::string mismatch;
   ASSERT_OK(base->GetOption(config_options_, "int", &bvalue));
   ASSERT_OK(copy->GetOption(config_options_, "int", &cvalue));
   ASSERT_EQ(bvalue, "10");
@@ -662,59 +667,67 @@ TEST_F(ConfigurableTest, NullOptionMapTest) {
   ASSERT_TRUE(base->AreEquivalent(config_options_, copy.get(), &str));
 }
 
-static std::unordered_map<std::string, ConfigTestFactoryFunc> TestFactories = {
-    {"Simple", []() { return SimpleConfigurable::Create("simple"); }},
-    {"Struct", []() { return SimpleStructFactory(); }},
-    {"Unique",
-     []() {
-       return SimpleConfigurable::Create(
-           "simple", TestConfigMode::kSimpleMode | TestConfigMode::kUniqueMode);
-     }},
-    {"Shared",
-     []() {
-       return SimpleConfigurable::Create(
-           "simple", TestConfigMode::kSimpleMode | TestConfigMode::kSharedMode);
-     }},
-    {"Nested",
-     []() {
-       return SimpleConfigurable::Create(
-           "simple", TestConfigMode::kSimpleMode | TestConfigMode::kNestedMode);
-     }},
-    {"Mutable",
-     []() {
-       return SimpleConfigurable::Create("simple",
-                                         TestConfigMode::kMutableMode |
-                                             TestConfigMode::kSimpleMode |
-                                             TestConfigMode::kNestedMode);
-     }},
-    {"ThreeDeep",
-     []() {
-       Configurable* simple = SimpleConfigurable::Create(
-           "Simple",
-           TestConfigMode::kUniqueMode | TestConfigMode::kDefaultMode);
-       auto* unique =
-           simple->GetOptions<std::unique_ptr<Configurable>>("SimpleUnique");
-       unique->reset(SimpleConfigurable::Create(
-           "Child",
-           TestConfigMode::kUniqueMode | TestConfigMode::kDefaultMode));
-       unique = unique->get()->GetOptions<std::unique_ptr<Configurable>>(
-           "ChildUnique");
-       unique->reset(
-           SimpleConfigurable::Create("Child", TestConfigMode::kDefaultMode));
-       return simple;
-     }},
-    {"DBOptions",
-     []() {
-       auto config = DBOptionsAsConfigurable(DBOptions());
-       return config.release();
-     }},
-    {"CFOptions",
-     []() {
-       auto config = CFOptionsAsConfigurable(ColumnFamilyOptions());
-       return config.release();
-     }},
-    {"BlockBased", []() { return NewBlockBasedTableFactory(); }},
-};
+static const std::unordered_map<std::string, ConfigTestFactoryFunc>&
+TestFactories() {
+  static const std::unordered_map<std::string, ConfigTestFactoryFunc>
+      factories = {
+          {"Simple", []() { return SimpleConfigurable::Create("simple"); }},
+          {"Struct", []() { return SimpleStructFactory(); }},
+          {"Unique",
+           []() {
+             return SimpleConfigurable::Create(
+                 "simple",
+                 TestConfigMode::kSimpleMode | TestConfigMode::kUniqueMode);
+           }},
+          {"Shared",
+           []() {
+             return SimpleConfigurable::Create(
+                 "simple",
+                 TestConfigMode::kSimpleMode | TestConfigMode::kSharedMode);
+           }},
+          {"Nested",
+           []() {
+             return SimpleConfigurable::Create(
+                 "simple",
+                 TestConfigMode::kSimpleMode | TestConfigMode::kNestedMode);
+           }},
+          {"Mutable",
+           []() {
+             return SimpleConfigurable::Create("simple",
+                                               TestConfigMode::kMutableMode |
+                                                   TestConfigMode::kSimpleMode |
+                                                   TestConfigMode::kNestedMode);
+           }},
+          {"ThreeDeep",
+           []() {
+             Configurable* simple = SimpleConfigurable::Create(
+                 "Simple",
+                 TestConfigMode::kUniqueMode | TestConfigMode::kDefaultMode);
+             auto* unique = simple->GetOptions<std::unique_ptr<Configurable>>(
+                 "SimpleUnique");
+             unique->reset(SimpleConfigurable::Create(
+                 "Child",
+                 TestConfigMode::kUniqueMode | TestConfigMode::kDefaultMode));
+             unique = unique->get()->GetOptions<std::unique_ptr<Configurable>>(
+                 "ChildUnique");
+             unique->reset(SimpleConfigurable::Create(
+                 "Child", TestConfigMode::kDefaultMode));
+             return simple;
+           }},
+          {"DBOptions",
+           []() {
+             auto config = DBOptionsAsConfigurable(DBOptions());
+             return config.release();
+           }},
+          {"CFOptions",
+           []() {
+             auto config = CFOptionsAsConfigurable(ColumnFamilyOptions());
+             return config.release();
+           }},
+          {"BlockBased", []() { return NewBlockBasedTableFactory(); }},
+      };
+  return factories;
+}
 
 class ConfigurableParamTest : public ConfigurableTest,
                               virtual public ::testing::WithParamInterface<
@@ -723,12 +736,12 @@ class ConfigurableParamTest : public ConfigurableTest,
   ConfigurableParamTest() {
     type_ = GetParam().first;
     configuration_ = GetParam().second;
-    assert(TestFactories.find(type_) != TestFactories.end());
+    assert(TestFactories().find(type_) != TestFactories().end());
     object_.reset(CreateConfigurable());
   }
 
   Configurable* CreateConfigurable() {
-    const auto& iter = TestFactories.find(type_);
+    const auto& iter = TestFactories().find(type_);
     return (iter->second)();
   }
 
@@ -740,9 +753,11 @@ class ConfigurableParamTest : public ConfigurableTest,
 
 void ConfigurableParamTest::TestConfigureOptions(
     const ConfigOptions& config_options) {
-  std::unique_ptr<Configurable> base, copy;
+  std::unique_ptr<Configurable> base;
+  std::unique_ptr<Configurable> copy;
   std::unordered_set<std::string> names;
-  std::string opt_str, mismatch;
+  std::string opt_str;
+  std::string mismatch;
 
   base.reset(CreateConfigurable());
   copy.reset(CreateConfigurable());
@@ -793,7 +808,8 @@ TEST_P(ConfigurableParamTest, GetDefaultOptionsTest) {
 }
 
 TEST_P(ConfigurableParamTest, ConfigureFromPropsTest) {
-  std::string opt_str, mismatch;
+  std::string opt_str;
+  std::string mismatch;
   std::unordered_set<std::string> names;
   std::unique_ptr<Configurable> copy(CreateConfigurable());
 

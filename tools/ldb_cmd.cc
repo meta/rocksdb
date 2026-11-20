@@ -6,6 +6,7 @@
 //
 #include "rocksdb/utilities/ldb_cmd.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,8 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,12 +26,15 @@
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
 #include "db/log_reader.h"
+#include "db/manifest_ops.h"
+#include "db/version_set.h"
 #include "db/version_util.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "db/write_batch_internal.h"
 #include "db_stress_tool/db_stress_compression_manager.h"
 #include "file/filename.h"
+#include "options/options_parser.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/experimental.h"
@@ -46,6 +52,7 @@
 #include "tools/ldb_cmd_impl.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
+#include "util/defer.h"
 #include "util/file_checksum_helper.h"
 #include "util/simple_mixed_compressor.h"
 #include "util/stderr_logger.h"
@@ -187,13 +194,13 @@ std::string WALFileIterator::GetNextWAL() {
   return ret;
 }
 
-void DumpWalFiles(Options options, const std::string& dir_or_file,
+void DumpWalFiles(const Options& options, const std::string& dir_or_file,
                   bool print_header, bool print_values,
                   bool only_print_seqno_gaps, bool is_write_committed,
                   const std::map<uint32_t, const Comparator*>& ucmps,
                   LDBCommandExecuteResult* exec_state);
 
-void DumpWalFile(Options options, const std::string& wal_file,
+void DumpWalFile(const Options& options, const std::string& wal_file,
                  bool print_header, bool print_values,
                  bool only_print_seqno_gaps, bool is_write_committed,
                  const std::map<uint32_t, const Comparator*>& ucmps,
@@ -201,9 +208,10 @@ void DumpWalFile(Options options, const std::string& wal_file,
                  std::optional<SequenceNumber>* prev_batch_seqno,
                  std::optional<uint32_t>* prev_batch_count);
 
-void DumpSstFile(Options options, std::string filename, bool output_hex,
-                 bool show_properties, bool decode_blob_index,
-                 std::string from_key = "", std::string to_key = "");
+void DumpSstFile(const Options& options, const std::string& filename,
+                 bool output_hex, bool show_properties, bool decode_blob_index,
+                 const std::string& from_key = "",
+                 const std::string& to_key = "");
 
 void DumpBlobFile(const std::string& filename, bool is_key_hex,
                   bool is_value_hex, bool dump_uncompressed_blobs);
@@ -1860,7 +1868,7 @@ Status GetLiveFilesChecksumInfoFromVersionSet(Options options,
                                               FileChecksumList* checksum_list) {
   EnvOptions sopt;
   Status s;
-  std::string dbname(db_path);
+  const std::string& dbname(db_path);
   std::shared_ptr<Cache> tc(NewLRUCache(options.max_open_files - 10,
                                         options.table_cache_numshardbits));
   // Notice we are using the default options not through SanitizeOptions(),
@@ -1882,6 +1890,7 @@ Status GetLiveFilesChecksumInfoFromVersionSet(Options options,
                                   immutable_db_options.fs.get());
   if (s.ok()) {
     std::vector<ColumnFamilyDescriptor> cf_list;
+    cf_list.reserve(cf_name_list.size());
     for (const auto& name : cf_name_list) {
       cf_list.emplace_back(name, ColumnFamilyOptions(options));
     }
@@ -2252,10 +2261,14 @@ void InternalDumpCommand::DoCommand() {
     exec_state_ = LDBCommandExecuteResult::Failed(st.ToString());
     return;
   }
-  std::string rtype1, rtype2, row, val;
+  std::string rtype1;
+  std::string rtype2;
+  std::string row;
+  std::string val;
   rtype2 = "";
   uint64_t c = 0;
-  uint64_t s1 = 0, s2 = 0;
+  uint64_t s1 = 0;
+  uint64_t s2 = 0;
 
   long long count = 0;
   for (auto& key_version : key_versions) {
@@ -2493,6 +2506,14 @@ void DBDumperCommand::DoCommand() {
         DumpBlobFile(path_, is_key_hex_, is_value_hex_,
                      dump_uncompressed_blobs_);
         break;
+      case kDBLockFile:
+      case kCurrentFile:
+      case kTempFile:
+      case kInfoLogFile:
+      case kMetaDatabase:
+      case kIdentityFile:
+      case kOptionsFile:
+      case kCompactionProgressFile:
       default:
         exec_state_ = LDBCommandExecuteResult::Failed(
             "File type not supported: " + path_);
@@ -2562,10 +2583,14 @@ void DBDumperCommand::DoDumpCommand() {
     bucket_size = time_range;  // Will have just 1 bucket by default
   }
   // cretaing variables for row count of each type
-  std::string rtype1, rtype2, row, val;
+  std::string rtype1;
+  std::string rtype2;
+  std::string row;
+  std::string val;
   rtype2 = "";
   uint64_t c = 0;
-  uint64_t s1 = 0, s2 = 0;
+  uint64_t s1 = 0;
+  uint64_t s2 = 0;
 
   // At this point, bucket_size=0 => time_range=0
   int num_buckets = (bucket_size >= time_range)
@@ -3115,7 +3140,7 @@ class InMemoryHandler : public WriteBatch::Handler {
   const std::map<uint32_t, const Comparator*> ucmps_;
 };
 
-void DumpWalFiles(Options options, const std::string& dir_or_file,
+void DumpWalFiles(const Options& options, const std::string& dir_or_file,
                   bool print_header, bool print_values,
                   bool only_print_seqno_gaps, bool is_write_committed,
                   const std::map<uint32_t, const Comparator*>& ucmps,
@@ -3172,7 +3197,7 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
   }
 }
 
-void DumpWalFile(Options options, const std::string& wal_file,
+void DumpWalFile(const Options& options, const std::string& wal_file,
                  bool print_header, bool print_values,
                  bool only_print_seqno_gaps, bool is_write_committed,
                  const std::map<uint32_t, const Comparator*>& ucmps,
@@ -3491,7 +3516,7 @@ MultiGetCommand::MultiGetCommand(
         "At least one <key> must be specified for multi_get.");
   } else {
     for (size_t i = 0; i < params.size(); ++i) {
-      std::string key = params.at(i);
+      const std::string& key = params.at(i);
       keys_.emplace_back(is_key_hex_ ? HexToString(key) : key);
     }
   }
@@ -3524,6 +3549,7 @@ void MultiGetCommand::DoCommand() {
   std::vector<Slice> key_slices;
   std::vector<PinnableSlice> values(num_keys);
   std::vector<Status> statuses(num_keys);
+  key_slices.reserve(keys_.size());
   for (const std::string& key : keys_) {
     key_slices.emplace_back(key);
   }
@@ -3626,7 +3652,7 @@ MultiGetEntityCommand::MultiGetEntityCommand(
         "command");
   } else {
     for (size_t i = 0; i < params.size(); i++) {
-      std::string key = params.at(i);
+      const std::string& key = params.at(i);
       keys_.emplace_back(is_key_hex_ ? HexToString(key) : key);
     }
   }
@@ -3660,6 +3686,7 @@ void MultiGetEntityCommand::DoCommand() {
   std::vector<Slice> key_slices;
   std::vector<PinnableWideColumns> results(num_keys);
   std::vector<Status> statuses(num_keys);
+  key_slices.reserve(keys_.size());
   for (const std::string& key : keys_) {
     key_slices.emplace_back(key);
   }
@@ -3763,8 +3790,8 @@ BatchPutCommand::BatchPutCommand(
         "Equal number of <key>s and <value>s must be specified for batchput.");
   } else {
     for (size_t i = 0; i < params.size(); i += 2) {
-      std::string key = params.at(i);
-      std::string value = params.at(i + 1);
+      const std::string& key = params.at(i);
+      const std::string& value = params.at(i + 1);
       key_values_.emplace_back(is_key_hex_ ? HexToString(key) : key,
                                is_value_hex_ ? HexToString(value) : value);
     }
@@ -4562,7 +4589,7 @@ void RepairCommand::Help(std::string& ret) {
 void RepairCommand::OverrideBaseOptions() {
   LDBCommand::OverrideBaseOptions();
   auto level = verbose_ ? InfoLogLevel::INFO_LEVEL : InfoLogLevel::WARN_LEVEL;
-  options_.info_log.reset(new StderrLogger(level));
+  options_.info_log = std::make_shared<StderrLogger>(level);
 }
 
 void RepairCommand::DoCommand() {
@@ -4748,9 +4775,9 @@ void RestoreCommand::DoCommand() {
 
 namespace {
 
-void DumpSstFile(Options options, std::string filename, bool output_hex,
-                 bool show_properties, bool decode_blob_index,
-                 std::string from_key, std::string to_key) {
+void DumpSstFile(const Options& options, const std::string& filename,
+                 bool output_hex, bool show_properties, bool decode_blob_index,
+                 const std::string& from_key, const std::string& to_key) {
   if (filename.length() <= 4 ||
       filename.rfind(".sst") != filename.length() - 4) {
     std::cout << "Invalid sst file name." << std::endl;
@@ -4966,8 +4993,6 @@ void DBLiveFilesMetadataDumperCommand::DoCommand() {
     assert(GetExecuteState().IsFailed());
     return;
   }
-  Status s;
-
   std::vector<ColumnFamilyMetaData> metadata;
   db_->GetAllColumnFamilyMetaData(&metadata);
   if (sort_by_filename_) {
@@ -5359,11 +5384,20 @@ void UnsafeRemoveSstFileCommand::DoCommand() {
 const std::string UpdateManifestCommand::ARG_VERBOSE = "verbose";
 const std::string UpdateManifestCommand::ARG_UPDATE_TEMPERATURES =
     "update_temperatures";
+const std::string UpdateManifestCommand::ARG_REBIND_OPTIONS_FILE =  // NOLINT
+    "rebind_options_file";
+const std::string UpdateManifestCommand::ARG_OPTIONS_FILE =  // NOLINT
+    "options_file";
+const std::string UpdateManifestCommand::ARG_FILE_NUMBER_PATHS =  // NOLINT
+    "file_number_paths";
 
 void UpdateManifestCommand::Help(std::string& ret) {
   ret.append("  ");
   ret.append(UpdateManifestCommand::Name());
   ret.append(" [--update_temperatures]");
+  ret.append(" [--rebind_options_file]");
+  ret.append(" [--options_file=OPTIONS-<number>]");
+  ret.append(" [--file_number_paths=<path1>,<path2>,...]");
   ret.append("  ");
   ret.append("    MUST NOT be used on a live DB.");
   ret.append("\n");
@@ -5374,37 +5408,378 @@ UpdateManifestCommand::UpdateManifestCommand(
     const std::map<std::string, std::string>& options,
     const std::vector<std::string>& flags)
     : LDBCommand(options, flags, false /* is_read_only */,
-                 BuildCmdLineOptions({ARG_VERBOSE, ARG_UPDATE_TEMPERATURES})) {
+                 BuildCmdLineOptions({ARG_VERBOSE, ARG_UPDATE_TEMPERATURES,
+                                      ARG_REBIND_OPTIONS_FILE, ARG_OPTIONS_FILE,
+                                      ARG_FILE_NUMBER_PATHS})) {
   verbose_ = IsFlagPresent(flags, ARG_VERBOSE) ||
              ParseBooleanOption(options, ARG_VERBOSE, false);
   update_temperatures_ =
       IsFlagPresent(flags, ARG_UPDATE_TEMPERATURES) ||
       ParseBooleanOption(options, ARG_UPDATE_TEMPERATURES, false);
+  rebind_options_file_ =
+      IsFlagPresent(flags, ARG_REBIND_OPTIONS_FILE) ||
+      ParseBooleanOption(options, ARG_REBIND_OPTIONS_FILE, false);
+  auto options_file_iter = options.find(ARG_OPTIONS_FILE);
+  if (options_file_iter != options.end()) {
+    options_file_ = options_file_iter->second;
+  }
+  auto file_number_paths_iter = options.find(ARG_FILE_NUMBER_PATHS);
+  if (file_number_paths_iter != options.end()) {
+    file_number_paths_ = StringSplit(file_number_paths_iter->second, ',');
+  }
 
-  if (!update_temperatures_) {
+  if (rebind_options_file_) {
+    // The repair must be able to inspect an explicitly selected OPTIONS file
+    // even when the currently bound file is missing or corrupt.
+    try_load_options_ = false;
+  }
+  if (!update_temperatures_ && !rebind_options_file_) {
     exec_state_ = LDBCommandExecuteResult::Failed(
-        "No action like --update_temperatures specified for update_manifest");
+        "No action like --update_temperatures or --rebind_options_file "
+        "specified for update_manifest");
+  } else if (rebind_options_file_ && options_file_.empty()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--rebind_options_file requires an explicit trusted "
+        "--options_file=OPTIONS-<number>");
+  } else if (!rebind_options_file_ && !options_file_.empty()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--options_file requires --rebind_options_file");
+  } else if (!rebind_options_file_ && !file_number_paths_.empty()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--file_number_paths requires --rebind_options_file");
+  } else if (std::any_of(
+                 file_number_paths_.begin(), file_number_paths_.end(),
+                 [](const std::string& path) { return path.empty(); })) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--file_number_paths cannot contain an empty path");
+  } else if (rebind_options_file_ && update_temperatures_) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "--rebind_options_file and --update_temperatures cannot be combined");
   }
 }
 
+namespace {
+Status RebindManifestToSelectedOptions(
+    const Options& base_options, const std::string& db_path,
+    const std::string& selected_options_name,
+    const std::vector<std::string>& file_number_paths) {
+  assert(base_options.env != nullptr);
+  Env& env = *base_options.env;
+  const auto& fs = env.GetFileSystem();
+  FileLock* db_lock = nullptr;
+  Status s = env.LockFile(LockFileName(db_path), &db_lock);
+  if (!s.ok()) {
+    return s;
+  }
+  assert(db_lock != nullptr);
+  Defer unlock_db([&]() { env.UnlockFile(db_lock).PermitUncheckedError(); });
+
+  OptionsFileManifestState recovered_manifest_state;
+  uint64_t manifest_next_file_number = 0;
+  uint64_t manifest_append_boundary = 0;
+  s = VersionSet::GetOptionsFileManifestState(
+      db_path, fs.get(), &recovered_manifest_state, &manifest_next_file_number,
+      &manifest_append_boundary);
+  if (!s.ok()) {
+    return s;
+  }
+  if (manifest_append_boundary == 0) {
+    return Status::Corruption("MANIFEST has no complete record to repair");
+  }
+
+  [[maybe_unused]] uint64_t selected_options_number = 0;
+  FileType selected_type;
+  if (selected_options_name.find_first_of("/\\") != std::string::npos ||
+      !ParseFileName(selected_options_name, &selected_options_number,
+                     &selected_type) ||
+      selected_type != kOptionsFile) {
+    return Status::InvalidArgument(
+        "--options_file must be a basename in OPTIONS-<number> format");
+  }
+
+  ConfigOptions config_options;
+  config_options.env = &env;
+  config_options.ignore_unknown_options = true;
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cfs;
+  s = LoadOptionsFromFile(config_options, db_path + "/" + selected_options_name,
+                          &loaded_db_options, &loaded_cfs);
+  if (!s.ok()) {
+    return s;
+  }
+  if (loaded_cfs.empty()) {
+    return Status::Corruption("OPTIONS file has no column families");
+  }
+  if (!loaded_db_options.track_options_file_number_in_manifest) {
+    return Status::InvalidArgument(
+        "Selected OPTIONS file does not enable MANIFEST tracking");
+  }
+
+  // OPTIONS does not persist DBOptions::db_paths or
+  // ColumnFamilyOptions::cf_paths. Callers using either must supply those
+  // roots through --file_number_paths. wal_dir is persisted and is included
+  // automatically. Failing closed on an unavailable root prevents the repair
+  // from allocating a number that is already in use outside the DB directory.
+  const std::string wal_dir =
+      loaded_db_options.wal_dir.empty() ? db_path : loaded_db_options.wal_dir;
+  std::set<std::string> allocation_roots = {db_path, wal_dir};
+  for (const DbPath& db_root : loaded_db_options.db_paths) {
+    if (!db_root.path.empty()) {
+      allocation_roots.insert(db_root.path);
+    }
+  }
+  for (const ColumnFamilyDescriptor& cf : loaded_cfs) {
+    for (const DbPath& cf_root : cf.options.cf_paths) {
+      if (!cf_root.path.empty()) {
+        allocation_roots.insert(cf_root.path);
+      }
+    }
+  }
+  allocation_roots.insert(file_number_paths.begin(), file_number_paths.end());
+  uint64_t highest_file_number =
+      recovered_manifest_state.has_committed_options_file_number
+          ? recovered_manifest_state.committed_options_file_number
+          : 0;
+  auto scan_file_numbers = [&](const std::string& path,
+                               bool allow_missing) -> Status {
+    std::vector<std::string> children;
+    Status scan_s = env.GetChildren(path, &children);
+    if (allow_missing && (scan_s.IsNotFound() || scan_s.IsPathNotFound())) {
+      return Status::OK();
+    }
+    if (!scan_s.ok()) {
+      return scan_s;
+    }
+    for (const auto& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(child, &number, &type)) {
+        highest_file_number = std::max(highest_file_number, number);
+      }
+    }
+    return Status::OK();
+  };
+  for (const std::string& path : allocation_roots) {
+    s = scan_file_numbers(path, /*allow_missing=*/false);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  s = scan_file_numbers(ArchivalDirectory(wal_dir), /*allow_missing=*/true);
+  if (!s.ok()) {
+    return s;
+  }
+  if (highest_file_number >= kFileNumberMask ||
+      manifest_next_file_number > kFileNumberMask) {
+    return Status::InvalidArgument("File number space exhausted");
+  }
+
+  std::vector<std::string> manifest_cfs;
+  s = VersionSet::ListColumnFamilies(&manifest_cfs, db_path, fs.get());
+  if (!s.ok()) {
+    return s;
+  }
+  std::vector<std::string> options_cfs;
+  options_cfs.reserve(loaded_cfs.size());
+  for (const auto& cf : loaded_cfs) {
+    options_cfs.push_back(cf.name);
+  }
+  std::sort(manifest_cfs.begin(), manifest_cfs.end());
+  std::sort(options_cfs.begin(), options_cfs.end());
+  if (!std::includes(options_cfs.begin(), options_cfs.end(),
+                     manifest_cfs.begin(), manifest_cfs.end())) {
+    return Status::InvalidArgument(
+        "Selected OPTIONS file is missing a MANIFEST column family");
+  }
+
+  // Bound recovery-created data files from the WAL contents. Every recovery
+  // L0 output contains at least one WriteBatch entry, and each blob-file
+  // output contains at least one blob entry, so twice the total entry count is
+  // a conservative upper bound for both kinds together. Count all live and
+  // archived WALs; including obsolete records only makes the repair safer.
+  struct WalCountReporter : public log::Reader::Reporter {
+    Status status;
+    void Corruption(size_t /*bytes*/, const Status& corruption,
+                    uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+      status.UpdateIfOk(corruption);
+    }
+  };
+  uint64_t wal_entry_count = 0;
+  for (const std::string& dir : {wal_dir, ArchivalDirectory(wal_dir)}) {
+    std::vector<std::string> wal_children;
+    s = env.GetChildren(dir, &wal_children);
+    if (s.IsNotFound() || s.IsPathNotFound()) {
+      s = Status::OK();
+      continue;
+    }
+    if (!s.ok()) {
+      return s;
+    }
+    for (const auto& child : wal_children) {
+      uint64_t wal_number = 0;
+      FileType type;
+      if (!ParseFileName(child, &wal_number, &type) || type != kWalFile) {
+        continue;
+      }
+      std::string wal_path = dir;
+      wal_path.push_back('/');
+      wal_path.append(child);
+      std::unique_ptr<SequentialFileReader> wal_file_reader;
+      s = SequentialFileReader::Create(
+          fs, wal_path, FileOptions(), &wal_file_reader,
+          /*dbg=*/nullptr, /*rate_limiter=*/nullptr);
+      if (!s.ok()) {
+        return s;
+      }
+      WalCountReporter reporter;
+      log::Reader reader(nullptr, std::move(wal_file_reader), &reporter,
+                         /*checksum=*/true, wal_number);
+      Slice record;
+      std::string scratch;
+      WriteBatch batch;
+      while (reader.ReadRecord(&record, &scratch)) {
+        if (record.size() < WriteBatchInternal::kHeader) {
+          return Status::Corruption("WAL record too small to bound recovery");
+        }
+        s = WriteBatchInternal::SetContents(&batch, record);
+        if (!s.ok()) {
+          return s;
+        }
+        const uint64_t count = WriteBatchInternal::Count(&batch);
+        if (count > kFileNumberMask - wal_entry_count) {
+          return Status::InvalidArgument("File number space exhausted");
+        }
+        wal_entry_count += count;
+      }
+      if (!reporter.status.ok()) {
+        return reporter.status;
+      }
+    }
+  }
+
+  const uint64_t new_options_number =
+      std::max(highest_file_number + 1, manifest_next_file_number);
+  // Repair cannot know the DBOptions or column-family descriptors that the
+  // next writable opener will supply. In addition to the two recovery/scan
+  // advances, reserve a WAL, fresh MANIFEST, persistent-stats recreation,
+  // final OPTIONS publication, asynchronous WAL precreation, and an initial
+  // flush. Also reserve a temporary/canonical OPTIONS pair plus a possible
+  // MANIFEST rollover for every column family that one open could create.
+  // Column-family IDs bound that count to uint32.
+  constexpr uint64_t kMaxMissingColumnFamilies =
+      std::numeric_limits<uint32_t>::max();
+  constexpr uint64_t kFileNumbersPerMissingColumnFamily = 3;
+  // Two recovery/scan advances, open WAL, recovery MANIFEST, up to six for
+  // persistent-stats drop/recreate, three for final OPTIONS publication,
+  // asynchronous WAL precreation, and table plus MANIFEST for an initial
+  // flush.
+  constexpr uint64_t kFixedWritableOpenFileNumberHeadroom = 16;
+  constexpr uint64_t kWritableOpenFileNumberHeadroom =
+      kFileNumbersPerMissingColumnFamily * kMaxMissingColumnFamilies +
+      kFixedWritableOpenFileNumberHeadroom;
+  static_assert(kWritableOpenFileNumberHeadroom < kFileNumberMask);
+  if (new_options_number > kFileNumberMask - kWritableOpenFileNumberHeadroom ||
+      wal_entry_count > (kFileNumberMask - new_options_number -
+                         kWritableOpenFileNumberHeadroom) /
+                            2) {
+    return Status::InvalidArgument("File number space exhausted");
+  }
+  const std::string temp_options =
+      TempOptionsFileName(db_path, new_options_number);
+  const std::string final_options =
+      OptionsFileName(db_path, new_options_number);
+  env.DeleteFile(temp_options).PermitUncheckedError();
+
+  std::string manifest_path;
+  [[maybe_unused]] uint64_t manifest_number = 0;
+  s = GetCurrentManifestPath(db_path, fs.get(), /*is_retry=*/false,
+                             &manifest_path, &manifest_number);
+  if (!s.ok()) {
+    return s;
+  }
+  Options loaded_options(loaded_db_options, loaded_cfs.front().options);
+  loaded_options.env = &env;
+  if (loaded_options.db_paths.empty()) {
+    loaded_options.db_paths.emplace_back(db_path, 0);
+  }
+  ImmutableDBOptions immutable_options(loaded_options);
+  MutableDBOptions mutable_options(loaded_options);
+  FileOptions file_options;
+  std::shared_ptr<Cache> table_cache = NewLRUCache(8 * 1024 * 1024);
+  WriteController write_controller(loaded_options.delayed_write_rate);
+  WriteBufferManager write_buffer_manager(loaded_options.db_write_buffer_size);
+  VersionSet versions(
+      db_path, &immutable_options, mutable_options, file_options,
+      table_cache.get(), &write_buffer_manager, &write_controller,
+      /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr, /*db_id=*/"",
+      /*db_session_id=*/"", loaded_options.daily_offpeak_time_utc,
+      /*error_handler=*/nullptr, /*unchanging=*/false);
+  // Parsing above verifies every live MANIFEST CF has options. Extra CFs are a
+  // safe partial-batch superset and are filtered by persisted-options APIs.
+  // Copy byte-for-byte so an older ldb does not discard option fields
+  // introduced by a newer binary.
+  s = CopyFile(fs.get(), db_path + "/" + selected_options_name,
+               Temperature::kUnknown, temp_options, Temperature::kUnknown,
+               /*size=*/0, loaded_db_options.use_fsync,
+               /*io_tracer=*/nullptr);
+  if (s.ok()) {
+    s = env.RenameFile(temp_options, final_options);
+  }
+  if (!s.ok()) {
+    env.DeleteFile(temp_options).PermitUncheckedError();
+    return s;
+  }
+  std::unique_ptr<FSDirectory> db_dir;
+  IOStatus io_s = fs->NewDirectory(db_path, IOOptions(), &db_dir, nullptr);
+  if (io_s.ok()) {
+    assert(db_dir != nullptr);
+    io_s = db_dir->FsyncWithDirOptions(IOOptions(), nullptr,
+                                       DirFsyncOptions(final_options));
+  }
+  if (!io_s.ok()) {
+    return io_s;
+  }
+
+  return versions.AppendColumnFamilyDropsToManifest(
+      manifest_path, manifest_append_boundary, /*cf_ids=*/{}, WriteOptions(),
+      loaded_options.manifest_preallocation_size, new_options_number);
+}
+}  // namespace
+
 void UpdateManifestCommand::DoCommand() {
   PrepareOptions();
+  if (!exec_state_.IsNotStarted()) {
+    return;
+  }
 
   auto level = verbose_ ? InfoLogLevel::INFO_LEVEL : InfoLogLevel::WARN_LEVEL;
-  options_.info_log.reset(new StderrLogger(level));
+  options_.info_log = std::make_shared<StderrLogger>(level);
 
-  experimental::UpdateManifestForFilesStateOptions opts;
-  opts.update_temperatures = update_temperatures_;
-  if (column_families_.empty()) {
-    column_families_.emplace_back(kDefaultColumnFamilyName, options_);
+  Status s;
+  if (rebind_options_file_) {
+    s = RebindManifestToSelectedOptions(options_, db_path_, options_file_,
+                                        file_number_paths_);
   }
-  Status s = experimental::UpdateManifestForFilesState(options_, db_path_,
-                                                       column_families_);
+  if (s.ok() && update_temperatures_) {
+    if (column_families_.empty()) {
+      column_families_.emplace_back(kDefaultColumnFamilyName, options_);
+    }
+    s = experimental::UpdateManifestForFilesState(options_, db_path_,
+                                                  column_families_);
+  }
 
   if (!s.ok()) {
-    exec_state_ = LDBCommandExecuteResult::Failed(
-        "failed to update manifest: " + s.ToString());
+    std::string error = "failed to update manifest: ";
+    error.append(s.ToString());
+    exec_state_ = LDBCommandExecuteResult::Failed(std::move(error));
+  } else if (rebind_options_file_) {
+    // Rebind is also exercised through ldb's stdout-oriented CLI test helper.
+    fprintf(stdout, "Manifest updates successful\n");
+    exec_state_ = LDBCommandExecuteResult::Succeed("");
   } else {
+    // Preserve the existing update_temperatures result contract. The command
+    // runner renders this nonempty result through its normal result channel,
+    // and programmatic callers can inspect it through GetExecuteState().
     exec_state_ =
         LDBCommandExecuteResult::Succeed("Manifest updates successful");
   }

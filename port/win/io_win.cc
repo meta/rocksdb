@@ -182,7 +182,7 @@ size_t GetUniqueIdFromFile(HANDLE /*hFile*/, char* /*id*/,
   //
   // TODO: this is a temporarily solution as it is safe but not optimal for
   // performance. For more details see discussion in
-  // https://github.com/facebook/rocksdb/pull/5844.
+  // https://github.com/meta/rocksdb/pull/5844.
   return 0;
 }
 

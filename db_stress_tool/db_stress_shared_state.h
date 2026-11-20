@@ -224,6 +224,12 @@ class SharedState {
 
   SharedState(Env* env, StressTest* stress_test);
 
+  // No copying allowed
+  SharedState(const SharedState&) = delete;
+  SharedState& operator=(const SharedState&) = delete;
+  SharedState(SharedState&&) = delete;
+  SharedState& operator=(SharedState&&) = delete;
+
   ~SharedState() {
 #ifndef NDEBUG
     if (FLAGS_read_fault_one_in || FLAGS_write_fault_one_in ||

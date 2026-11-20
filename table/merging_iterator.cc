@@ -72,7 +72,13 @@ class MergingIterator : public InternalIterator {
     }
   }
 
-  void considerStatus(Status s) {
+  // No copying allowed
+  MergingIterator(const MergingIterator&) = delete;
+  MergingIterator& operator=(const MergingIterator&) = delete;
+  MergingIterator(MergingIterator&&) = delete;
+  MergingIterator& operator=(MergingIterator&&) = delete;
+
+  void considerStatus(const Status& s) {
     if (!s.ok() && status_.ok()) {
       status_ = s;
     }

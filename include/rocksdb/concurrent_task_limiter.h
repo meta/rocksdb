@@ -21,7 +21,7 @@ namespace ROCKSDB_NAMESPACE {
 // NewConcurrentTaskLimiter. Any derived classes must be RocksDB internal.
 class ConcurrentTaskLimiter {
  public:
-  virtual ~ConcurrentTaskLimiter() {}
+  virtual ~ConcurrentTaskLimiter() = default;
 
   // Returns a name that identifies this concurrent task limiter.
   virtual const std::string& GetName() const = 0;

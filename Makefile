@@ -355,10 +355,6 @@ ARFLAGS = -X64 rs
 STRIPFLAGS = -X64 -x
 endif
 
-ifeq ($(PLATFORM), OS_SOLARIS)
-	PLATFORM_CXXFLAGS += -D _GLIBCXX_USE_C99
-endif
-
 ifeq ($(LIB_MODE),shared)
 # So that binaries are executable from build location, in addition to install location
 EXEC_LDFLAGS += -Wl,-rpath -Wl,'$$ORIGIN'
@@ -664,6 +660,7 @@ TESTS_PLATFORM_DEPENDENT := \
 	dynamic_bloom_test \
 	c_test \
 	checkpoint_test \
+	live_tuner_test \
 	sorted_run_builder_test \
 	crc32c_test \
 	coding_test \
@@ -1896,6 +1893,12 @@ backup_engine_test: $(OBJ_DIR)/utilities/backup/backup_engine_test.o $(TEST_LIBR
 checkpoint_test: $(OBJ_DIR)/utilities/checkpoint/checkpoint_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+live_tuner_test: $(OBJ_DIR)/utilities/live_tune/live_tuner_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+db_split_merge_test: $(OBJ_DIR)/utilities/db_split_merge_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 copy_engine_test: $(OBJ_DIR)/utilities/copy_engine/copy_engine_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -2205,7 +2208,13 @@ repair_test: $(OBJ_DIR)/db/repair_test.o $(TEST_LIBRARY) $(LIBRARY)
 ldb_cmd_test: $(OBJ_DIR)/tools/ldb_cmd_test.o $(TOOLS_LIBRARY) $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_stress_structured_key_value_test: $(OBJ_DIR)/db_stress_tool/db_stress_structured_key_value_test.o $(OBJ_DIR)/db_stress_tool/db_stress_structured_key_value.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 ldb: $(OBJ_DIR)/tools/ldb.o $(TOOLS_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+db_split_merge: $(OBJ_DIR)/tools/db_split_merge.o $(LIBRARY)
 	$(AM_LINK)
 
 iostats_context_test: $(OBJ_DIR)/monitoring/iostats_context_test.o $(TEST_LIBRARY) $(LIBRARY)
@@ -2407,9 +2416,7 @@ gen-pc:
 # Jni stuff
 # ---------------------------------------------------------------------------
 JAVA_INCLUDE = -I$(JAVA_HOME)/include/ -I$(JAVA_HOME)/include/linux
-ifeq ($(PLATFORM), OS_SOLARIS)
-	ARCH := $(shell isainfo -b)
-else ifeq ($(PLATFORM), OS_OPENBSD)
+ifeq ($(PLATFORM), OS_OPENBSD)
 	ifneq (,$(filter amd64 ppc64 ppc64le s390x arm64 aarch64 riscv64 sparc64 loongarch64, $(MACHINE)))
 		ARCH := 64
 	else
@@ -2489,12 +2496,6 @@ ifeq ($(PLATFORM), OS_FREEBSD)
 	JAVA_INCLUDE = -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/freebsd
 	ROCKSDBJNILIB = librocksdbjni-freebsd$(ARCH).so
 	ROCKSDB_JAR = rocksdbjni-$(ROCKSDB_JAVA_VERSION)-freebsd$(ARCH).jar
-endif
-ifeq ($(PLATFORM), OS_SOLARIS)
-	ROCKSDBJNILIB = librocksdbjni-solaris$(ARCH).so
-	ROCKSDB_JAR = rocksdbjni-$(ROCKSDB_MAJOR).$(ROCKSDB_MINOR).$(ROCKSDB_PATCH)-solaris$(ARCH).jar
-	JAVA_INCLUDE = -I$(JAVA_HOME)/include/ -I$(JAVA_HOME)/include/solaris
-	SHA256_CMD = digest -a sha256
 endif
 ifeq ($(PLATFORM), OS_AIX)
 	JAVA_INCLUDE = -I$(JAVA_HOME)/include/ -I$(JAVA_HOME)/include/aix

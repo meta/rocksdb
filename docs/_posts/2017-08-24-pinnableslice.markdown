@@ -5,7 +5,7 @@ author: maysamyabandeh
 category: blog
 ---
 
-The classic API for [DB::Get](https://github.com/facebook/rocksdb/blob/9e583711144f580390ce21a49a8ceacca338fcd5/include/rocksdb/db.h#L310) receives a std::string as argument to which it will copy the value. The memcpy overhead could be non-trivial when the value is large. The [new API](https://github.com/facebook/rocksdb/blob/9e583711144f580390ce21a49a8ceacca338fcd5/include/rocksdb/db.h#L322) receives a PinnableSlice instead, which avoids memcpy in most of the cases.
+The classic API for [DB::Get](https://github.com/meta/rocksdb/blob/9e583711144f580390ce21a49a8ceacca338fcd5/include/rocksdb/db.h#L310) receives a std::string as argument to which it will copy the value. The memcpy overhead could be non-trivial when the value is large. The [new API](https://github.com/meta/rocksdb/blob/9e583711144f580390ce21a49a8ceacca338fcd5/include/rocksdb/db.h#L322) receives a PinnableSlice instead, which avoids memcpy in most of the cases.
 
 ### What is PinnableSlice?
 
@@ -13,7 +13,7 @@ Similarly to Slice, PinnableSlice refers to some in-memory data so it does not i
 
 ### How good is it?
 
-Here are the improvements in throughput for an [in-memory benchmark](https://github.com/facebook/rocksdb/pull/1756#issuecomment-286201693):
+Here are the improvements in throughput for an [in-memory benchmark](https://github.com/meta/rocksdb/pull/1756#issuecomment-286201693):
 * value 1k byte: 14%
 * value 10k byte: 34%
 
@@ -34,4 +34,4 @@ while (!stopped) {
 }
 ```
 
-You can also [initialize the internal buffer](https://github.com/facebook/rocksdb/blob/9e583711144f580390ce21a49a8ceacca338fcd5/include/rocksdb/db.h#L314) of PinnableSlice by passing your own string in the constructor. [simple_example.cc](https://github.com/facebook/rocksdb/blob/main/examples/simple_example.cc) demonstrates that with more examples.
+You can also [initialize the internal buffer](https://github.com/meta/rocksdb/blob/9e583711144f580390ce21a49a8ceacca338fcd5/include/rocksdb/db.h#L314) of PinnableSlice by passing your own string in the constructor. [simple_example.cc](https://github.com/meta/rocksdb/blob/main/examples/simple_example.cc) demonstrates that with more examples.

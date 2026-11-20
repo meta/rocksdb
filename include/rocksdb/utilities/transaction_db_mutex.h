@@ -19,7 +19,7 @@ namespace ROCKSDB_NAMESPACE {
 // TransactionDBOptions.custom_mutex_factory.
 class TransactionDBMutex {
  public:
-  virtual ~TransactionDBMutex() {}
+  virtual ~TransactionDBMutex() = default;
 
   // Attempt to acquire lock.  Return OK on success, or other Status on failure.
   // If returned status is OK, TransactionDB will eventually call UnLock().
@@ -39,7 +39,7 @@ class TransactionDBMutex {
 
 class TransactionDBCondVar {
  public:
-  virtual ~TransactionDBCondVar() {}
+  virtual ~TransactionDBCondVar() = default;
 
   // Block current thread until condition variable is notified by a call to
   // Notify() or NotifyAll().  Wait() will be called with mutex locked.
@@ -82,7 +82,7 @@ class TransactionDBMutexFactory {
   // Create a TransactionDBCondVar object.
   virtual std::shared_ptr<TransactionDBCondVar> AllocateCondVar() = 0;
 
-  virtual ~TransactionDBMutexFactory() {}
+  virtual ~TransactionDBMutexFactory() = default;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

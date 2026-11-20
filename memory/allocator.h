@@ -25,7 +25,7 @@ class WriteBufferManager;
 
 class Allocator {
  public:
-  virtual ~Allocator() {}
+  virtual ~Allocator() = default;
 
   virtual char* Allocate(size_t bytes) = 0;
   virtual char* AllocateAligned(size_t bytes, size_t huge_page_size = 0,
@@ -41,6 +41,8 @@ class AllocTracker {
   // No copying allowed
   AllocTracker(const AllocTracker&) = delete;
   void operator=(const AllocTracker&) = delete;
+  AllocTracker(AllocTracker&&) = delete;
+  void operator=(AllocTracker&&) = delete;
 
   ~AllocTracker();
   void Allocate(size_t bytes);

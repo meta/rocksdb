@@ -48,7 +48,7 @@ class MemoryAllocatorWrapper : public MemoryAllocator {
  public:
   // Initialize an MemoryAllocatorWrapper that delegates all calls to *t
   explicit MemoryAllocatorWrapper(const std::shared_ptr<MemoryAllocator>& t);
-  ~MemoryAllocatorWrapper() override {}
+  ~MemoryAllocatorWrapper() override = default;
 
   // Return the target to which to forward all calls
   MemoryAllocator* target() const { return target_.get(); }

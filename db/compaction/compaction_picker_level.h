@@ -13,7 +13,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 // Picking compactions for leveled compaction. See wiki page
-// https://github.com/facebook/rocksdb/wiki/Leveled-Compaction
+// https://github.com/meta/rocksdb/wiki/Leveled-Compaction
 // for description of Leveled compaction.
 class LevelCompactionPicker : public CompactionPicker {
  public:

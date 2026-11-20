@@ -24,6 +24,9 @@ class BlockBuilder {
  public:
   BlockBuilder(const BlockBuilder&) = delete;
   void operator=(const BlockBuilder&) = delete;
+  BlockBuilder(BlockBuilder&&) = delete;
+  void operator=(BlockBuilder&&) = delete;
+  ~BlockBuilder() = default;
 
   explicit BlockBuilder(int block_restart_interval, bool use_delta_encoding,
                         bool use_value_delta_encoding,

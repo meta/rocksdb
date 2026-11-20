@@ -13,7 +13,7 @@ class DB;
 
 class WriteCallback {
  public:
-  virtual ~WriteCallback() {}
+  virtual ~WriteCallback() = default;
 
   // Will be called while on the write thread before the write executes.  If
   // this function returns a non-OK status, the write will be aborted and this

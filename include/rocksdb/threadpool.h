@@ -21,7 +21,7 @@ namespace ROCKSDB_NAMESPACE {
  * */
 class ThreadPool {
  public:
-  virtual ~ThreadPool() {}
+  virtual ~ThreadPool() = default;
 
   // Wait for all threads to finish.
   // Discard those threads that did not start

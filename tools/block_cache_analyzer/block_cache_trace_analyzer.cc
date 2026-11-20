@@ -205,6 +205,16 @@ std::string block_type_to_string(TraceType type) {
       return "RangeDeletion";
     case kBlockTraceUncompressionDictBlock:
       return "UncompressionDict";
+    case kTraceNone:
+    case kTraceBegin:
+    case kTraceEnd:
+    case kTraceWrite:
+    case kTraceGet:
+    case kTraceIteratorSeek:
+    case kTraceIteratorSeekForPrev:
+    case kIOTracer:
+    case kTraceMultiGet:
+    case kTraceMax:
     default:
       break;
   }
@@ -242,6 +252,7 @@ std::string caller_to_string(TableReaderCaller caller) {
       return "SSTFileReader";
     case kUncategorized:
       return "Uncategorized";
+    case kMaxBlockCacheLookupCaller:
     default:
       break;
   }
@@ -249,7 +260,7 @@ std::string caller_to_string(TableReaderCaller caller) {
   return "InvalidCaller";
 }
 
-TableReaderCaller string_to_caller(std::string caller_str) {
+TableReaderCaller string_to_caller(const std::string& caller_str) {
   if (caller_str == "Get") {
     return kUserGet;
   } else if (caller_str == "MultiGet") {
@@ -290,6 +301,16 @@ bool is_user_access(TableReaderCaller caller) {
     case kUserApproximateSize:
     case kUserVerifyChecksum:
       return true;
+    case kSSTDumpTool:
+    case kExternalSSTIngestion:
+    case kRepair:
+    case kPrefetch:
+    case kCompaction:
+    case kCompactionRefill:
+    case kFlush:
+    case kSSTFileReader:
+    case kUncategorized:
+    case kMaxBlockCacheLookupCaller:
     default:
       break;
   }
@@ -576,6 +597,7 @@ void BlockCacheTraceAnalyzer::WriteSkewness(
   TraverseBlocks(block_callback, &labels);
   std::map<std::string, std::map<uint64_t, uint64_t>> label_bucket_naccesses;
   std::vector<std::pair<std::string, uint64_t>> pairs;
+  pairs.reserve(label_naccesses.size());
   for (auto const& itr : label_naccesses) {
     pairs.emplace_back(itr);
   }
@@ -660,9 +682,13 @@ void BlockCacheTraceAnalyzer::WriteCorrelationFeaturesToFile(
     auto it = label_predictions.find(label_feature_vectors.first);
     assert(it != label_predictions.end());
     const Predictions& future = it->second;
-    const std::string output_path = output_dir_ + "/" + label + "_" +
-                                    label_feature_vectors.first + "_" +
-                                    kFileNameSuffixCorrelation;
+    std::string output_path = output_dir_;
+    output_path.append("/")
+        .append(label)
+        .append("_")
+        .append(label_feature_vectors.first)
+        .append("_")
+        .append(kFileNameSuffixCorrelation);
     std::ofstream out(output_path);
     if (!out.is_open()) {
       return;
@@ -673,6 +699,7 @@ void BlockCacheTraceAnalyzer::WriteCorrelationFeaturesToFile(
         "access");
     out << header << std::endl;
     std::vector<uint32_t> indexes;
+    indexes.reserve(past.num_accesses_since_last_access.size());
     for (uint32_t i = 0; i < past.num_accesses_since_last_access.size(); i++) {
       indexes.push_back(i);
     }
@@ -753,12 +780,11 @@ std::string BlockCacheTraceAnalyzer::BuildLabel(
 }
 
 void BlockCacheTraceAnalyzer::TraverseBlocks(
-    std::function<void(const std::string& /*cf_name*/, uint64_t /*fd*/,
-                       uint32_t /*level*/, TraceType /*block_type*/,
-                       const std::string& /*block_key*/,
-                       uint64_t /*block_key_id*/,
-                       const BlockAccessInfo& /*block_access_info*/)>
-        block_callback,
+    const std::function<
+        void(const std::string& /*cf_name*/, uint64_t /*fd*/,
+             uint32_t /*level*/, TraceType /*block_type*/,
+             const std::string& /*block_key*/, uint64_t /*block_key_id*/,
+             const BlockAccessInfo& /*block_access_info*/)>& block_callback,
     std::set<std::string>* labels) const {
   for (auto const& cf_aggregates : cf_aggregates_map_) {
     // Stats per column family.
@@ -1005,7 +1031,7 @@ void BlockCacheTraceAnalyzer::WriteReuseDistance(
 
 void BlockCacheTraceAnalyzer::UpdateReuseIntervalStats(
     const std::string& label, const std::vector<uint64_t>& time_buckets,
-    const std::map<uint64_t, uint64_t> timeline,
+    const std::map<uint64_t, uint64_t>& timeline,
     std::map<std::string, std::map<uint64_t, uint64_t>>* label_time_num_reuses,
     uint64_t* total_num_reuses) const {
   assert(label_time_num_reuses);
@@ -1452,6 +1478,7 @@ BlockCacheTraceAnalyzer::BlockCacheTraceAnalyzer(
       compute_reuse_distance_(compute_reuse_distance),
       mrc_only_(mrc_only),
       is_human_readable_trace_file_(is_human_readable_trace_file),
+      header_{},
       cache_simulator_(std::move(cache_simulator)) {}
 
 void BlockCacheTraceAnalyzer::ComputeReuseDistance(
@@ -2091,13 +2118,13 @@ std::vector<CacheConfiguration> parse_cache_config_file(
     if (config_strs.size() < 4) {
       fprintf(stderr, "Invalid cache simulator configuration %s\n",
               line.c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     if (kSupportedCacheNames.find(" " + config_strs[0] + " ") ==
         std::string::npos) {
       fprintf(stderr, "Invalid cache name %s. Supported cache names are %s\n",
               line.c_str(), kSupportedCacheNames.c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     cache_config.cache_name = config_strs[0];
     cache_config.num_shard_bits = ParseUint32(config_strs[1]);
@@ -2107,7 +2134,7 @@ std::vector<CacheConfiguration> parse_cache_config_file(
       if (capacity == 0) {
         fprintf(stderr, "Invalid cache capacity %s, %s\n",
                 config_strs[i].c_str(), line.c_str());
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       cache_config.cache_capacities.push_back(capacity);
     }
@@ -2133,7 +2160,7 @@ int block_cache_trace_analyzer_tool(int argc, char** argv) {
   ParseCommandLineFlags(&argc, &argv, true);
   if (FLAGS_block_cache_trace_path.empty()) {
     fprintf(stderr, "block cache trace path is empty\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   uint64_t warmup_seconds =
       FLAGS_cache_sim_warmup_seconds > 0 ? FLAGS_cache_sim_warmup_seconds : 0;
@@ -2150,7 +2177,7 @@ int block_cache_trace_analyzer_tool(int argc, char** argv) {
     if (!s.ok()) {
       fprintf(stderr, "Cannot initialize cache simulators %s\n",
               s.ToString().c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
   BlockCacheTraceAnalyzer analyzer(
@@ -2162,7 +2189,7 @@ int block_cache_trace_analyzer_tool(int argc, char** argv) {
   if (!s.IsIncomplete() && !s.ok()) {
     // Read all traces.
     fprintf(stderr, "Cannot process the trace %s\n", s.ToString().c_str());
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   fprintf(stdout, "Status: %s\n", s.ToString().c_str());
   analyzer.WriteMissRatioCurves();

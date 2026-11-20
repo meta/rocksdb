@@ -73,6 +73,11 @@ class BlockReadAmpBitmap {
 
     RecordTick(GetStatistics(), READ_AMP_TOTAL_READ_BYTES, block_size);
   }
+  // No copying allowed
+  BlockReadAmpBitmap(const BlockReadAmpBitmap&) = delete;
+  BlockReadAmpBitmap& operator=(const BlockReadAmpBitmap&) = delete;
+  BlockReadAmpBitmap(BlockReadAmpBitmap&&) = delete;
+  BlockReadAmpBitmap& operator=(BlockReadAmpBitmap&&) = delete;
 
   ~BlockReadAmpBitmap() { delete[] bitmap_; }
 
@@ -109,8 +114,9 @@ class BlockReadAmpBitmap {
   size_t ApproximateMemoryUsage() const {
 #ifdef ROCKSDB_MALLOC_USABLE_SIZE
     return malloc_usable_size((void*)this);
-#endif  // ROCKSDB_MALLOC_USABLE_SIZE
+#else
     return sizeof(*this);
+#endif  // ROCKSDB_MALLOC_USABLE_SIZE
   }
 
  private:
@@ -139,6 +145,15 @@ class BlockReadAmpBitmap {
   uint32_t rnd_;
 };
 
+// Whether and how iterators on a block use the prefix-optimized seek, which
+// strips the block's common prefix from the target once and then compares
+// the remaining bytes, in bytewise or reverse bytewise order.
+enum class PrefixOptimizedSeek : uint8_t {
+  kNone,
+  kBytewise,
+  kReverseBytewise,
+};
+
 // class Block is the uncompressed and "parsed" form for blocks containing
 // key-value pairs. (See BlockContents comments for more on terminology.)
 // This includes the in-memory representation of data blocks, index blocks
@@ -148,7 +163,7 @@ class BlockReadAmpBitmap {
 // compressed blocks in general, filter blocks/partitions, or compression
 // dictionaries.
 //
-// See https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format
+// See https://github.com/meta/rocksdb/wiki/Rocksdb-BlockBasedTable-Format
 // for details of the format and the various block types.
 //
 // TODO: Rename to ParsedKvBlock?
@@ -163,6 +178,8 @@ class Block {
   // No copying allowed
   Block(const Block&) = delete;
   void operator=(const Block&) = delete;
+  Block(Block&&) = delete;
+  void operator=(Block&&) = delete;
 
   ~Block();
 
@@ -288,6 +305,21 @@ class Block {
   // by NewMetaIterator will verify per key-value checksum for any key it read.
   void InitializeMetaIndexBlockProtectionInfo(uint8_t protection_bytes_per_key);
 
+  // For a data or index block using the format_version >= 8 common user-key
+  // prefix, determines whether the block's last user key is shorter than the
+  // common prefix (see last_user_key_shorter_than_common_prefix_), so that
+  // iterators on it seek by comparing full keys. Only needed for blocks read
+  // with ReverseBytewiseComparator (see
+  // BlockCreateContext::check_common_prefix). To be called before creating
+  // iterators, after any Initialize*ProtectionInfo(). The index block
+  // parameters are as for NewIndexIterator().
+  void InitializeDataBlockCommonPrefixCheck();
+  void InitializeIndexBlockCommonPrefixCheck(const Comparator* raw_ucmp,
+                                             bool key_includes_seq,
+                                             bool value_is_full,
+                                             bool index_has_first_key,
+                                             bool value_delta_escape);
+
   static void GenerateKVChecksum(char* checksum_ptr, uint8_t checksum_len,
                                  const Slice& key, const Slice& value) {
     ProtectionInfo64().ProtectKV(key, value).Encode(checksum_len, checksum_ptr);
@@ -301,6 +333,9 @@ class Block {
   // Returns a detailed error status by re-processing the footer.
   // Should only be called when size() == 0 (error marker).
   Status GetCorruptionStatus() const;
+  // Which prefix-optimized seek, if any, iterators on this block use with
+  // raw_ucmp (see BlockIter::prefix_optimized_seek_).
+  PrefixOptimizedSeek GetPrefixOptimizedSeek(const Comparator* raw_ucmp) const;
 
   BlockContents contents_;
   // Normal state: offset in data_ of restart array.
@@ -319,7 +354,17 @@ class Block {
   // on demand as Slice(data(), common_prefix_size_).
   uint32_t common_prefix_size_{0};
   uint8_t protection_bytes_per_key_{0};
-  bool is_uniform_{false};
+  // Flags are bit-fields (initialized in the constructor) so that they share a
+  // byte and do not grow Block, which is allocated for every cached block.
+  bool is_uniform_ : 1;
+  // Whether the last key has a user key shorter than the common prefix. Short
+  // of exogenous corruption, this was only possible when storing internal keys
+  // and the common prefix was allowed to extend beyond the user key portion,
+  // which RocksDB 11.10 through 11.13 could do with ReverseBytewiseComparator.
+  // The prefix-optimized seek (see BlockIter::prefix_optimized_seek_) can miss
+  // keys in such blocks, so iterators on them compare full keys instead. See
+  // Initialize*BlockCommonPrefixCheck().
+  bool last_user_key_shorter_than_common_prefix_ : 1;
   DataBlockHashIndex data_block_hash_index_;
 
   // Pointer to values section, nullptr if not using separated KV
@@ -356,6 +401,13 @@ class Block {
 template <class TValue>
 class BlockIter : public InternalIteratorBase<TValue> {
  public:
+  BlockIter() = default;
+  // No copying allowed
+  BlockIter(const BlockIter&) = delete;
+  BlockIter& operator=(const BlockIter&) = delete;
+  BlockIter(BlockIter&&) = delete;
+  BlockIter& operator=(BlockIter&&) = delete;
+
   // Makes Valid() return false, status() return `s`, and Seek()/Prev()/etc do
   // nothing. Calls cleanup functions.
   virtual void Invalidate(const Status& s) {
@@ -378,41 +430,43 @@ class BlockIter : public InternalIteratorBase<TValue> {
     return valid;
   }
 
-  void SeekToFirst() override final {
+  void SeekToFirst() final {
 #ifndef NDEBUG
-    if (TEST_Corrupt_Callback("BlockIter::SeekToFirst")) return;
+    if (TEST_Corrupt_Callback("BlockIter::SeekToFirst")) {
+      return;
+    }
 #endif
     SeekToFirstImpl();
     UpdateKey();
   }
 
-  void SeekToLast() override final {
+  void SeekToLast() final {
     SeekToLastImpl();
     UpdateKey();
   }
 
-  void Seek(const Slice& target) override final {
+  void Seek(const Slice& target) final {
     SeekImpl(target);
     UpdateKey();
   }
 
-  void SeekForPrev(const Slice& target) override final {
+  void SeekForPrev(const Slice& target) final {
     SeekForPrevImpl(target);
     UpdateKey();
   }
 
-  void Next() override final {
+  void Next() final {
     NextImpl();
     UpdateKey();
   }
 
-  bool NextAndGetResult(IterateResult* result) override final {
+  bool NextAndGetResult(IterateResult* result) final {
     // This does not need to call `UpdateKey()` as the parent class only has
     // access to the `UpdateKey()`-invoking functions.
     return InternalIteratorBase<TValue>::NextAndGetResult(result);
   }
 
-  void Prev() override final {
+  void Prev() final {
     PrevImpl();
     UpdateKey();
   }
@@ -463,23 +517,23 @@ class BlockIter : public InternalIteratorBase<TValue> {
 
   void SetCacheHandle(Cache::Handle* handle) { cache_handle_ = handle; }
 
-  Cache::Handle* cache_handle() { return cache_handle_; }
+  Cache::Handle* cache_handle() const { return cache_handle_; }
 
  protected:
   InternalKeyComparator icmp_;
-  const char* data_;       // underlying block contents
-  uint32_t num_restarts_;  // Number of uint32_t entries in restart array
+  const char* data_ = nullptr;  // underlying block contents
+  uint32_t num_restarts_ = 0;   // Number of uint32_t entries in restart array
 
-  const char* values_section_;
+  const char* values_section_ = nullptr;
   // Slice of current entry in the data section. Does not contain value if
   // values_section_ exists
   Slice entry_;
 
   // Index of restart block in which current_ or current_-1 falls
-  uint32_t restart_index_;
-  uint32_t restarts_;  // Offset of restart array (list of fixed32)
+  uint32_t restart_index_ = 0;
+  uint32_t restarts_ = 0;  // Offset of restart array (list of fixed32)
   // current_ is offset in data_ of current entry.  >= restarts_ if !Valid
-  uint32_t current_;
+  uint32_t current_ = 0;
   // Cached result of GetKeysEndOffset(). Computed once in InitializeBase()
   // since values_section_, data_, and restarts_ do not change afterward.
   uint32_t keys_end_offset_{0};
@@ -491,7 +545,7 @@ class BlockIter : public InternalIteratorBase<TValue> {
   Status status_;
   // Key to be exposed to users.
   Slice key_;
-  SequenceNumber global_seqno_;
+  SequenceNumber global_seqno_ = 0;
   // Size of the user-defined timestamp.
   size_t ts_sz_ = 0;
   // If user-defined timestamp is enabled but not persisted. A min timestamp
@@ -504,25 +558,39 @@ class BlockIter : public InternalIteratorBase<TValue> {
   // data blocks, index block for partitioned filter blocks, index block for
   // partitioned index blocks. In summary, this only applies to block whose key
   // are real user keys or internal keys created from user keys.
-  bool pad_min_timestamp_;
+  bool pad_min_timestamp_ = false;
 
   // Per key-value checksum related states
-  const char* kv_checksum_;
+  const char* kv_checksum_ = nullptr;
   // Index of the next entry to be parsed (used for checksum verification
   // and to determine if we're at a restart point for separated KV storage)
-  int32_t cur_entry_idx_;
-  uint32_t block_restart_interval_;
+  int32_t cur_entry_idx_ = 0;
+  uint32_t block_restart_interval_ = 0;
   // Byte length of the block's common user-key prefix (stored once at offset
   // 0), 0 if unused. See has_common_prefix()/common_prefix(). Only set for
   // DataBlockIter.
   uint32_t common_prefix_size_ = 0;
-  uint8_t protection_bytes_per_key_;
+  uint8_t protection_bytes_per_key_ = 0;
 
-  bool key_pinned_;
+  bool key_pinned_ = false;
   // Whether the block data is guaranteed to outlive this iterator, and
   // as long as the cleanup functions are transferred to another class,
   // e.g. PinnableSlice, the pointer to the bytes will still be valid.
-  bool block_contents_pinned_;
+  bool block_contents_pinned_ = false;
+  // Whether and how seeks use the prefix-optimized search, which strips the
+  // block's common prefix from the target once (see StripSeekTargetPrefix())
+  // and then compares the remaining bytes, rather than comparing full keys.
+  // Requires that the block stores a common prefix, that the comparator is
+  // BytewiseComparator or ReverseBytewiseComparator, and that no user key in
+  // the block is shorter than the common prefix (see
+  // Block::last_user_key_shorter_than_common_prefix_). Decided when the
+  // iterator is initialized, keeping comparator identity checks off the seek
+  // path and letting it compare without virtual calls (see
+  // CompareKeyForPrefixOptimizedSeek()).
+  PrefixOptimizedSeek prefix_optimized_seek_ = PrefixOptimizedSeek::kNone;
+  bool use_prefix_optimized_seek() const {
+    return prefix_optimized_seek_ != PrefixOptimizedSeek::kNone;
+  }
 
   // Common user-key prefix feature (format_version >= 8): the common prefix
   // (common_prefix_size_ bytes) is stored once at the block start (offset 0).
@@ -725,7 +793,7 @@ class BlockIter : public InternalIteratorBase<TValue> {
   // function callback, which is hard to retrieve. When multiple value
   // PinnableSlices reference the block, they need the cache handle in order
   // to bump up the ref count
-  Cache::Handle* cache_handle_;
+  Cache::Handle* cache_handle_ = nullptr;
 
  public:
   // Return the offset in data_ just past the end of the current entry.
@@ -804,14 +872,21 @@ class BlockIter : public InternalIteratorBase<TValue> {
   void FindKeyAfterBinarySeekSuffix(const Slice& target_suffix, uint32_t index,
                                     bool skip_linear_scan);
   // Compares the current (full) key against `target_suffix`, skipping the
-  // common prefix bytes on the current key. REQUIRES: has_common_prefix().
+  // common prefix bytes on the current key. REQUIRES:
+  // use_prefix_optimized_seek().
   int CompareCurrentKeySuffix(const Slice& target_suffix) const {
     Slice full = raw_key_.GetKey();
     assert(full.size() >= common_prefix_size_);
     Slice suffix(full.data() + common_prefix_size_,
                  full.size() - common_prefix_size_);
-    return CompareKey(suffix, target_suffix);
+    return CompareKeyForPrefixOptimizedSeek(suffix, target_suffix);
   }
+  // Same result as CompareKey() for an iterator using the prefix-optimized
+  // seek, whose comparator is known to be BytewiseComparator or
+  // ReverseBytewiseComparator, but without the virtual Comparator::Compare()
+  // call. REQUIRES: use_prefix_optimized_seek().
+  inline int CompareKeyForPrefixOptimizedSeek(const Slice& a,
+                                              const Slice& b) const;
 };
 
 class DataBlockIter final : public BlockIter<Slice> {
@@ -827,7 +902,8 @@ class DataBlockIter final : public BlockIter<Slice> {
                   DataBlockHashIndex* data_block_hash_index,
                   uint8_t protection_bytes_per_key, const char* kv_checksum,
                   uint32_t block_restart_interval, const char* values_section,
-                  const Slice& common_prefix) {
+                  const Slice& common_prefix,
+                  PrefixOptimizedSeek prefix_optimized_seek) {
     InitializeBase(raw_ucmp, data, restarts, num_restarts, global_seqno,
                    block_contents_pinned, user_defined_timestamps_persisted,
                    protection_bytes_per_key, kv_checksum,
@@ -837,6 +913,7 @@ class DataBlockIter final : public BlockIter<Slice> {
     last_bitmap_offset_ = current_ + 1;
     data_block_hash_index_ = data_block_hash_index;
     common_prefix_size_ = static_cast<uint32_t>(common_prefix.size());
+    prefix_optimized_seek_ = prefix_optimized_seek;
   }
 
   Slice value() const override {
@@ -853,7 +930,9 @@ class DataBlockIter final : public BlockIter<Slice> {
   // Returns if `target` may exist.
   inline bool SeekForGet(const Slice& target) {
 #ifndef NDEBUG
-    if (TEST_Corrupt_Callback("DataBlockIter::SeekForGet")) return true;
+    if (TEST_Corrupt_Callback("DataBlockIter::SeekForGet")) {
+      return true;
+    }
 #endif
     if (!data_block_hash_index_) {
       SeekImpl(target);
@@ -916,7 +995,7 @@ class DataBlockIter final : public BlockIter<Slice> {
   std::vector<CachedPrevEntry> prev_entries_;
   int32_t prev_entries_idx_ = -1;
 
-  DataBlockHashIndex* data_block_hash_index_;
+  DataBlockHashIndex* data_block_hash_index_ = nullptr;
 
   bool SeekForGetImpl(const Slice& target);
 };
@@ -982,7 +1061,8 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
       const char* kv_checksum, uint32_t block_restart_interval,
       const char* values_section,
       BlockBasedTableOptions::BlockSearchType index_block_search_type,
-      bool value_delta_escape, const Slice& common_prefix) {
+      bool value_delta_escape, const Slice& common_prefix,
+      PrefixOptimizedSeek prefix_optimized_seek) {
     InitializeBase(raw_ucmp, data, restarts, num_restarts,
                    kDisableGlobalSequenceNumber, block_contents_pinned,
                    user_defined_timestamps_persisted, protection_bytes_per_key,
@@ -994,6 +1074,7 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
     have_first_key_ = have_first_key;
     index_search_type_ = index_block_search_type;
     common_prefix_size_ = static_cast<uint32_t>(common_prefix.size());
+    prefix_optimized_seek_ = prefix_optimized_seek;
     if (have_first_key_ && global_seqno != kDisableGlobalSequenceNumber) {
       global_seqno_state_.reset(new GlobalSeqnoState(global_seqno));
     } else {
@@ -1058,11 +1139,11 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
   void SeekToLastImpl() override;
 
  private:
-  bool value_delta_encoded_;
+  bool value_delta_encoded_ = false;
   // format_version >= 8 value-delta codec (reserves an in-value escape). Only
   // consulted when value_delta_encoded_ and the entry is a non-restart entry.
-  bool value_delta_escape_;
-  bool have_first_key_;  // value includes first_internal_key
+  bool value_delta_escape_ = false;
+  bool have_first_key_ = false;  // value includes first_internal_key
   BlockPrefixIndex* prefix_index_;
   // Whether the value is delta encoded. In that case the value is assumed to be
   // BlockHandle. The first value in each restart interval is the full encoded

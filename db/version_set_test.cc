@@ -14,7 +14,10 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <memory>
+#include <set>
 #include <tuple>
+#include <utility>
 
 #include "db/blob/blob_log_writer.h"
 #include "db/db_impl/db_impl.h"
@@ -245,7 +248,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelStatic) {
   ASSERT_EQ(0, logger_->log_count);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_1) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic1) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -258,7 +261,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_1) {
   ASSERT_EQ(vstorage_.base_level(), 5);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_2) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic2) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -273,7 +276,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_2) {
   ASSERT_EQ(vstorage_.base_level(), 4);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_3) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic3) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -289,7 +292,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_3) {
   ASSERT_EQ(vstorage_.base_level(), 4);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_4) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic4) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -308,7 +311,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_4) {
   ASSERT_EQ(vstorage_.base_level(), 3);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_5) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic5) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -374,7 +377,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicLargeLevel) {
   ASSERT_EQ(0, logger_->log_count);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_1) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0Case1) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 40000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -405,7 +408,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_1) {
   ASSERT_EQ(vstorage_.CompactionScoreLevel(0), 0);
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_2) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0Case2) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 10000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -440,7 +443,7 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_2) {
   ASSERT_EQ(4, vstorage_.CompactionScoreLevel(1));
 }
 
-TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0_3) {
+TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamicWithLargeL0Case3) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 20000;
   mutable_cf_options_.max_bytes_for_level_multiplier = 5;
@@ -1165,7 +1168,7 @@ class VersionSetTestBase {
   const static std::string kColumnFamilyName2;
   const static std::string kColumnFamilyName3;
   const static int kNumColumnFamilies = 4;
-  int num_initial_edits_;
+  int num_initial_edits_ = 0;
 
   explicit VersionSetTestBase(const std::string& name)
       : env_(nullptr),
@@ -1180,6 +1183,7 @@ class VersionSetTestBase {
         shutting_down_(false),
         table_factory_(std::make_shared<mock::MockTableFactory>()) {
     EXPECT_OK(test::CreateEnvFromSystem(ConfigOptions(), &env_, &env_guard_));
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     if (env_ == Env::Default() && getenv("MEM_ENV")) {
       env_guard_.reset(NewMemEnv(Env::Default()));
       env_ = env_guard_.get();
@@ -1199,12 +1203,12 @@ class VersionSetTestBase {
     cf_options_.table_factory = table_factory_;
     mutable_cf_options_.table_factory = table_factory_;
 
-    versions_.reset(new VersionSet(
+    versions_ = std::make_shared<VersionSet>(
         dbname_, &imm_db_options_, mutable_db_options_, env_options_,
         table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*read_only=*/false);
     reactive_versions_ = std::make_shared<ReactiveVersionSet>(
         dbname_, &imm_db_options_, mutable_db_options_, env_options_,
         table_cache_.get(), &write_buffer_manager_, &write_controller_,
@@ -1215,7 +1219,7 @@ class VersionSetTestBase {
   }
 
   virtual ~VersionSetTestBase() {
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "DB is still at %s\n", dbname_.c_str());
     } else {
       Options options;
@@ -1396,12 +1400,12 @@ class VersionSetTestBase {
   }
 
   void ReopenDB() {
-    versions_.reset(new VersionSet(
+    versions_ = std::make_shared<VersionSet>(
         dbname_, &imm_db_options_, mutable_db_options_, env_options_,
         table_cache_.get(), &write_buffer_manager_, &write_controller_,
         /*block_cache_tracer=*/nullptr, /*io_tracer=*/nullptr,
         /*db_id=*/"", /*db_session_id=*/"", /*daily_offpeak_time_utc=*/"",
-        /*error_handler=*/nullptr, /*read_only=*/false));
+        /*error_handler=*/nullptr, /*read_only=*/false);
     EXPECT_OK(versions_->Recover(column_families_, false));
   }
 
@@ -1480,7 +1484,7 @@ class VersionSetTestBase {
     return cfd;
   }
 
-  Env* mem_env_;
+  Env* mem_env_ = nullptr;
   Env* env_;
   std::shared_ptr<Env> env_guard_;
   std::shared_ptr<FileSystem> fs_;
@@ -1598,6 +1602,7 @@ TEST_F(VersionSetTest, FailedEditReleasesEveryWriterInTheBatch) {
   std::vector<int> callback_calls(edits.size(), 0);
   std::vector<Status::Code> callback_codes(edits.size(), Status::kOk);
   std::vector<std::function<void(const Status&)>> manifest_wcbs;
+  manifest_wcbs.reserve(edits.size());
   for (size_t i = 0; i < edits.size(); ++i) {
     manifest_wcbs.emplace_back([&, i](const Status& cb_status) {
       ++callback_calls[i];
@@ -1866,6 +1871,71 @@ TEST_F(VersionSetTest, PersistBlobFileStateInNewManifest) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
+// ManifestTailer relies on this layout to know when a new MANIFEST has listed
+// a column family's files, and when it has listed every column family.
+TEST_F(VersionSetTest, NewManifestListsColumnFamilyFilesInRecordSettingLog) {
+  NewDB();
+
+  std::vector<SstInfo> file_infos;
+  uint64_t file_number = 100;
+  for (const auto& cf : column_families_) {
+    for (const char* key : {"a", "b"}) {
+      file_infos.emplace_back(file_number, cf.name, key, /*lvl=*/1,
+                              /*_epoch_number=*/file_number);
+      ++file_number;
+    }
+  }
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles(file_infos, &file_metas);
+
+  std::map<uint32_t, std::set<uint64_t>> live_files;
+  for (size_t i = 0; i < file_infos.size(); ++i) {
+    ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetColumnFamily(
+        file_infos[i].column_family);
+    ASSERT_NE(nullptr, cfd);
+    VersionEdit edit;
+    edit.SetColumnFamily(cfd->GetID());
+    edit.AddFile(file_infos[i].level, file_metas[i]);
+    mutex_.Lock();
+    const Status s = versions_->LogAndApply(cfd, read_options_, write_options_,
+                                            &edit, &mutex_, nullptr);
+    mutex_.Unlock();
+    ASSERT_OK(s);
+    live_files[cfd->GetID()].insert(file_infos[i].file_number);
+  }
+
+  CreateNewManifest();
+
+  std::string manifest_path;
+  GetManifestPath(&manifest_path);
+  std::unique_ptr<SequentialFileReader> file_reader;
+  ASSERT_OK(SequentialFileReader::Create(fs_, manifest_path, FileOptions(),
+                                         &file_reader, /*dbg=*/nullptr,
+                                         /*rate_limiter=*/nullptr));
+  log::Reader reader(/*info_log=*/nullptr, std::move(file_reader),
+                     /*reporter=*/nullptr, /*checksum=*/true, /*log_num=*/0);
+  std::map<uint32_t, std::set<uint64_t>> listed_files;
+  bool snapshot_ended = false;
+  Slice record;
+  std::string scratch;
+  while (!snapshot_ended && reader.ReadRecord(&record, &scratch)) {
+    VersionEdit edit;
+    ASSERT_OK(edit.DecodeFrom(record));
+    snapshot_ended = edit.HasNextFile();
+    const uint32_t cf_id = edit.GetColumnFamily();
+    if (snapshot_ended || edit.IsColumnFamilyAdd() || !edit.HasLogNumber() ||
+        listed_files.count(cf_id) > 0) {
+      continue;
+    }
+    std::set<uint64_t>& files = listed_files[cf_id];
+    for (const auto& [level, meta] : edit.GetNewFiles()) {
+      files.insert(meta.fd.GetNumber());
+    }
+  }
+  ASSERT_TRUE(snapshot_ended);
+  ASSERT_EQ(live_files, listed_files);
+}
+
 TEST_F(VersionSetTest, AddLiveBlobFiles) {
   // Initialize the database and add a blob file.
   NewDB();
@@ -1993,7 +2063,8 @@ TEST_F(VersionSetTest, ObsoleteBlobFile) {
     constexpr uint64_t min_pending_output = blob_file_number;
 
     versions_->GetObsoleteFiles(&table_files, &blob_files, &manifest_files,
-                                min_pending_output);
+                                min_pending_output,
+                                std::numeric_limits<uint64_t>::max());
 
     ASSERT_TRUE(blob_files.empty());
   }
@@ -2007,7 +2078,8 @@ TEST_F(VersionSetTest, ObsoleteBlobFile) {
     constexpr uint64_t min_pending_output = blob_file_number + 1;
 
     versions_->GetObsoleteFiles(&table_files, &blob_files, &manifest_files,
-                                min_pending_output);
+                                min_pending_output,
+                                std::numeric_limits<uint64_t>::max());
 
     ASSERT_EQ(blob_files.size(), 1);
     ASSERT_EQ(blob_files[0].GetBlobFileNumber(), blob_file_number);
@@ -2021,7 +2093,8 @@ TEST_F(VersionSetTest, ObsoleteBlobFile) {
     constexpr uint64_t min_pending_output = blob_file_number + 1;
 
     versions_->GetObsoleteFiles(&table_files, &blob_files, &manifest_files,
-                                min_pending_output);
+                                min_pending_output,
+                                std::numeric_limits<uint64_t>::max());
 
     ASSERT_TRUE(blob_files.empty());
   }
@@ -3170,7 +3243,7 @@ class VersionSetAtomicGroupTest : public VersionSetTestBase,
 
  protected:
   std::vector<ColumnFamilyDescriptor> column_families_;
-  SequenceNumber last_seqno_;
+  SequenceNumber last_seqno_ = 0;
   std::vector<VersionEdit> edits_;
   bool first_in_atomic_group_ = false;
   bool last_in_atomic_group_ = false;
@@ -3959,7 +4032,7 @@ TEST_P(VersionSetTestDropOneCF, HandleDroppedColumnFamilyInAtomicGroup) {
   // Drop one column family
   VersionEdit drop_cf_edit;
   drop_cf_edit.DropColumnFamily();
-  const std::string cf_to_drop_name(GetParam());
+  const std::string& cf_to_drop_name(GetParam());
   auto cfd_to_drop =
       versions_->GetColumnFamilySet()->GetColumnFamily(cf_to_drop_name);
   ASSERT_NE(nullptr, cfd_to_drop);
@@ -4149,6 +4222,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest0) {
   const std::vector<std::string> cf_names = std::get<2>(GetParam());
 
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4191,6 +4265,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromIncompleteManifest1) {
   bool read_only = std::get<1>(GetParam());
   const std::vector<std::string>& cf_names = std::get<2>(GetParam());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4237,6 +4312,7 @@ TEST_P(VersionSetTestEmptyDb, OpenFromInCompleteManifest2) {
   bool read_only = std::get<1>(GetParam());
   const std::vector<std::string>& cf_names = std::get<2>(GetParam());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4294,6 +4370,7 @@ TEST_P(VersionSetTestEmptyDb, OpenManifestWithUnknownCF) {
   bool read_only = std::get<1>(GetParam());
   const std::vector<std::string>& cf_names = std::get<2>(GetParam());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4350,6 +4427,7 @@ TEST_P(VersionSetTestEmptyDb, OpenCompleteManifest) {
   bool read_only = std::get<1>(GetParam());
   const std::vector<std::string>& cf_names = std::get<2>(GetParam());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cf_names.size());
   for (const auto& cf_name : cf_names) {
     column_families.emplace_back(cf_name, cf_options_);
   }
@@ -4517,7 +4595,7 @@ class VersionSetTestMissingFiles : public VersionSetTestBase,
 
   std::shared_ptr<InternalKeyComparator> internal_comparator_;
   std::vector<ColumnFamilyDescriptor> column_families_;
-  SequenceNumber last_seqno_;
+  SequenceNumber last_seqno_ = 0;
   std::unique_ptr<log::Writer> log_writer_;
 };
 
@@ -4656,6 +4734,7 @@ TEST_F(VersionSetTestMissingFiles, NoFileMissing) {
 
   PrepareManifest(&column_families_, &last_seqno_, &log_writer_);
   std::vector<std::pair<int, FileMetaData>> added_files;
+  added_files.reserve(file_metas.size());
   for (const auto& meta : file_metas) {
     added_files.emplace_back(0, meta);
   }
@@ -4733,8 +4812,8 @@ class BestEffortsRecoverIncompleteVersionTest
              std::string _blob)
         : file_number(_file_number),
           file_missing(_file_missing),
-          key(_key),
-          blob(_blob) {}
+          key(std::move(_key)),
+          blob(std::move(_blob)) {}
   };
 
   void CreateDummyBlobFiles(const std::vector<BlobInfo>& infos,

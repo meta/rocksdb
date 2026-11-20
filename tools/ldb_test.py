@@ -2,6 +2,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
 import glob
+import fcntl
 import os
 import os.path
 import re
@@ -80,11 +81,8 @@ class LDBTestCase(unittest.TestCase):
         Allows full flexibility in testing; for example: missing db param.
         """
         try:
-
             my_check_output(
-                './ldb %s >/dev/null 2>&1 |grep -v "Created bg \
-                thread"'
-                % params,
+                './ldb %s >/dev/null 2>&1 |grep -v "Created bg thread"' % params,
                 shell=True,
             )
         except Exception:
@@ -92,6 +90,14 @@ class LDBTestCase(unittest.TestCase):
         self.fail(
             "Exception should have been raised for command with params: %s" % params
         )
+
+    def assertRunErrorFull(self, params):
+        """Asserts that ldb itself, rather than an output filter, exits nonzero."""
+        try:
+            my_check_output("./ldb %s >/dev/null 2>&1" % params, shell=True)
+        except Exception:
+            return
+        self.fail("ldb should have failed for command with params: %s" % params)
 
     def assertRunOK(self, params, expectedOutput, unexpected=False):
         """
@@ -108,6 +114,10 @@ class LDBTestCase(unittest.TestCase):
         Uses the default test db.
         """
         self.assertRunFAILFull("{} {}".format(self.dbParam(self.DB_NAME), params))
+
+    def assertRunError(self, params):
+        """Uses the default test DB and requires a nonzero ldb exit status."""
+        self.assertRunErrorFull("{} {}".format(self.dbParam(self.DB_NAME), params))
 
     def testSimpleStringPutGet(self):
         print("Running testSimpleStringPutGet...")
@@ -178,6 +188,265 @@ class LDBTestCase(unittest.TestCase):
         # non-existent key, while delete does not
 
         self.assertRunOK("checkconsistency", "OK")
+
+    def testRebindOptionsFileInManifest(self):
+        self.assertRunOK("put --create_if_missing key value", "OK")
+        db_path = os.path.join(self.TMP_DIR, self.DB_NAME)
+        default_only_options = os.path.basename(
+            max(glob.glob(os.path.join(db_path, "OPTIONS-*")))
+        )
+        with open(
+            os.path.join(db_path, default_only_options), "r", encoding="utf-8"
+        ) as options_file:
+            default_only_contents = options_file.read()
+        self.assertRunOK("create_column_family repair_extra", "OK")
+        selected_options = os.path.basename(
+            max(glob.glob(os.path.join(db_path, "OPTIONS-*")))
+        )
+        selected_options_path = os.path.join(db_path, selected_options)
+        self.assertRunError(
+            "update_manifest --rebind_options_file --options_file={}".format(
+                selected_options
+            )
+        )
+        with open(selected_options_path, "r+", encoding="utf-8") as options_file:
+            options_contents = options_file.read()
+            self.assertIn(
+                "track_options_file_number_in_manifest=false", options_contents
+            )
+            options_contents = options_contents.replace(
+                "track_options_file_number_in_manifest=false",
+                "track_options_file_number_in_manifest=true",
+            )
+            options_file.seek(0)
+            options_file.write(options_contents)
+            options_file.truncate()
+        with open(selected_options_path, "rb") as selected_options_file:
+            selected_options_contents = selected_options_file.read()
+
+        # Missing a live MANIFEST CF is unsafe even when the selected snapshot
+        # enables tracking.
+        missing_options = "OPTIONS-{}".format(
+            int(selected_options.split("-")[1]) + 1000000
+        )
+        missing_options_path = os.path.join(db_path, missing_options)
+        with open(missing_options_path, "w", encoding="utf-8") as options_file:
+            options_file.write(
+                default_only_contents.replace(
+                    "track_options_file_number_in_manifest=false",
+                    "track_options_file_number_in_manifest=true",
+                )
+            )
+        self.assertRunError(
+            "update_manifest --rebind_options_file --options_file={}".format(
+                missing_options
+            )
+        )
+        os.remove(missing_options_path)
+
+        # A selected snapshot with an extra CF is the safe state left by a
+        # partial batch. Drop that CF from MANIFEST while retaining this file.
+        self.assertRunOK("drop_column_family repair_extra", "OK")
+        with open(selected_options_path, "wb") as selected_options_file:
+            selected_options_file.write(selected_options_contents)
+
+        self.assertRunError("update_manifest --rebind_options_file")
+        self.assertRunError(
+            "update_manifest --rebind_options_file "
+            "--options_file={} --update_temperatures".format(selected_options)
+        )
+
+        # The repair is an offline mutation and must reject a live writer.
+        with open(os.path.join(db_path, "LOCK"), "a") as lock_file:
+            fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertRunError(
+                "update_manifest --rebind_options_file --options_file={}".format(
+                    selected_options
+                )
+            )
+            fcntl.lockf(lock_file, fcntl.LOCK_UN)
+
+        # Repair must leave room for recovery plus caller-dependent writable
+        # open allocations, including the maximum number of missing CFs.
+        max_file_number = (1 << 62) - 1
+        max_missing_column_families = (1 << 32) - 1
+        writable_open_headroom = 3 * max_missing_column_families + 16
+        exhausted_options = "OPTIONS-{}".format(
+            max_file_number - writable_open_headroom
+        )
+        exhausted_options_path = os.path.join(db_path, exhausted_options)
+        shutil.copyfile(
+            os.path.join(db_path, selected_options), exhausted_options_path
+        )
+        self.assertRunError(
+            "update_manifest --rebind_options_file --options_file={}".format(
+                selected_options
+            )
+        )
+        os.remove(exhausted_options_path)
+
+        # A torn physical tail must be removed before the new edit is appended;
+        # otherwise log replay stops before the repaired commit.
+        with open(os.path.join(db_path, "CURRENT"), encoding="utf-8") as current:
+            manifest_name = current.read().strip()
+        manifest_path = os.path.join(db_path, manifest_name)
+        with open(manifest_path, "ab") as manifest:
+            manifest.write(b"\x01\x02\x03\x04")
+
+        self.assertRunOK(
+            "update_manifest --rebind_options_file --options_file={}".format(
+                selected_options
+            ),
+            "Manifest updates successful",
+        )
+        rebound_options_path = max(
+            glob.glob(os.path.join(db_path, "OPTIONS-*")),
+            key=lambda path: int(os.path.basename(path).split("-")[1]),
+        )
+        rebound_options = os.path.basename(rebound_options_path)
+        self.assertNotEqual(selected_options, rebound_options)
+        with open(selected_options_path, "rb") as selected_options_file:
+            self.assertEqual(selected_options_contents, selected_options_file.read())
+        with open(rebound_options_path, "rb") as rebound_options_file:
+            self.assertEqual(selected_options_contents, rebound_options_file.read())
+
+        rebound_options_number = int(rebound_options.split("-")[1])
+        scan_output = my_check_output(
+            ["./ldb", self.dbParam(self.DB_NAME), "scan", "--try_load_options"]
+        )
+        scan_output = "\n".join(
+            line for line in scan_output.splitlines() if "Created bg thread" not in line
+        )
+        self.assertEqual("key ==> value", scan_output.strip())
+        dump = my_check_output(
+            "./ldb manifest_dump --verbose --path={}".format(manifest_path),
+            shell=True,
+        )
+        committed_options_numbers = [
+            int(number)
+            for number in re.findall(r"CommittedOptionsFileNumber: ([0-9]+)", dump)
+        ]
+        self.assertTrue(committed_options_numbers)
+        self.assertEqual(rebound_options_number, committed_options_numbers[-1])
+
+        # OPTIONS does not serialize DB/CF data roots. Operators provide those
+        # roots explicitly so repair cannot reuse a file number already present
+        # outside the DB directory.
+        external_path = os.path.join(self.TMP_DIR, "external_data")
+        os.mkdir(external_path)
+        external_file_number = 123456
+        open(
+            os.path.join(external_path, "{:06d}.sst".format(external_file_number)),
+            "a",
+        ).close()
+        self.assertRunOK(
+            "update_manifest --rebind_options_file --options_file={} "
+            "--file_number_paths={}".format(selected_options, external_path),
+            "Manifest updates successful",
+        )
+        rebound_options_number = max(
+            int(os.path.basename(path).split("-")[1])
+            for path in glob.glob(os.path.join(db_path, "OPTIONS-*"))
+        )
+        self.assertGreater(rebound_options_number, external_file_number)
+        self.assertRunError(
+            "update_manifest --rebind_options_file --options_file={} "
+            "--file_number_paths={}".format(
+                selected_options, os.path.join(self.TMP_DIR, "missing_data_root")
+            )
+        )
+
+        # A recoverable WAL can create L0/blob outputs before the normal open
+        # allocations. The same boundary that is safe for a clean DB must be
+        # rejected when it cannot accommodate those recovery outputs.
+        recovery_headroom_db = os.path.join(
+            self.TMP_DIR, "rebind_recovery_headroom_db"
+        )
+        self.assertRunOKFull(
+            "put --db={} --create_if_missing key value".format(
+                recovery_headroom_db
+            ),
+            "OK",
+        )
+        recovery_selected = os.path.basename(
+            max(glob.glob(os.path.join(recovery_headroom_db, "OPTIONS-*")))
+        )
+        recovery_selected_path = os.path.join(
+            recovery_headroom_db, recovery_selected
+        )
+        with open(recovery_selected_path, "r+", encoding="utf-8") as options_file:
+            options_contents = options_file.read().replace(
+                "track_options_file_number_in_manifest=false",
+                "track_options_file_number_in_manifest=true",
+            )
+            options_file.seek(0)
+            options_file.write(options_contents)
+            options_file.truncate()
+        recovery_boundary_options = "OPTIONS-{}".format(
+            max_file_number - writable_open_headroom - 1
+        )
+        shutil.copyfile(
+            os.path.join(recovery_headroom_db, recovery_selected),
+            os.path.join(recovery_headroom_db, recovery_boundary_options),
+        )
+        self.assertRunErrorFull(
+            "update_manifest --db={} --rebind_options_file --options_file={}".format(
+                recovery_headroom_db, recovery_selected
+            )
+        )
+
+        # The immediately lower clean boundary is repairable and must survive
+        # writable-open allocations that depend on persisted DBOptions.
+        headroom_db = os.path.join(self.TMP_DIR, "rebind_headroom_db")
+        headroom_dump = os.path.join(self.TMP_DIR, "rebind_headroom_dump")
+        self.assertTrue(self.dumpDb("--db={}".format(db_path), headroom_dump))
+        self.assertTrue(
+            self.loadDb(
+                "--db={} --create_if_missing --disable_wal".format(headroom_db),
+                headroom_dump,
+            )
+        )
+        headroom_selected = os.path.basename(
+            max(glob.glob(os.path.join(headroom_db, "OPTIONS-*")))
+        )
+        headroom_selected_path = os.path.join(headroom_db, headroom_selected)
+        with open(headroom_selected_path, "r+", encoding="utf-8") as options_file:
+            options_contents = options_file.read()
+            self.assertIn("async_wal_precreate=false", options_contents)
+            self.assertIn("persist_stats_to_disk=false", options_contents)
+            self.assertIn("max_manifest_file_size=1073741824", options_contents)
+            options_contents = options_contents.replace(
+                "async_wal_precreate=false", "async_wal_precreate=true"
+            ).replace(
+                "persist_stats_to_disk=false", "persist_stats_to_disk=true"
+            ).replace(
+                "max_manifest_file_size=1073741824", "max_manifest_file_size=1"
+            ).replace(
+                "track_options_file_number_in_manifest=false",
+                "track_options_file_number_in_manifest=true",
+            )
+            options_file.seek(0)
+            options_file.write(options_contents)
+            options_file.truncate()
+        safe_boundary_options = "OPTIONS-{}".format(
+            max_file_number - writable_open_headroom - 1
+        )
+        shutil.copyfile(
+            headroom_selected_path,
+            os.path.join(headroom_db, safe_boundary_options),
+        )
+        self.assertRunOKFull(
+            "update_manifest --db={} --rebind_options_file --options_file={}".format(
+                headroom_db, headroom_selected
+            ),
+            "Manifest updates successful",
+        )
+        self.assertRunOKFull(
+            "put --db={} writable_open verified".format(headroom_db), "OK"
+        )
+        self.assertRunOKFull(
+            "create_column_family --db={} new_cf".format(headroom_db), "OK"
+        )
 
     def dumpDb(self, params, dumpFile):
         return 0 == run_err_null("./ldb dump {} > {}".format(params, dumpFile))

@@ -81,20 +81,21 @@ std::string TmpDir(Env* env) {
   return dir;
 }
 
-std::string PerThreadDBPath(std::string dir, std::string name) {
+std::string PerThreadDBPath(const std::string& dir, const std::string& name) {
   size_t tid = std::hash<std::thread::id>()(std::this_thread::get_id());
   return dir + "/" + name + "_" + GetPidStr() + "_" + std::to_string(tid);
 }
 
-std::string PerThreadDBPath(std::string name) {
+std::string PerThreadDBPath(const std::string& name) {
   return PerThreadDBPath(test::TmpDir(), name);
 }
 
-std::string PerThreadDBPath(Env* env, std::string name) {
+std::string PerThreadDBPath(Env* env, const std::string& name) {
   return PerThreadDBPath(test::TmpDir(env), name);
 }
 
 int RandomSeed() {
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   const char* env = getenv("TEST_RANDOM_SEED");
   int result = (env != nullptr ? atoi(env) : 301);
   if (result <= 0) {
@@ -104,6 +105,7 @@ int RandomSeed() {
 }
 
 bool HasBigMem() {
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   const char* env = getenv("ROCKSDB_BIGMEM_TESTS");
   if (env != nullptr && env[0] != '\0') {
     return true;

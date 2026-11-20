@@ -48,11 +48,13 @@ Status SstFileReader::Open(const std::string& file_path) {
   fopts.file_checksum_func_name = kNoFileChecksumFuncName;
   const auto& fs = r->options.env->GetFileSystem();
 #if USE_COROUTINES
-  if (r->options.read_io_executor_threads <= 0) {
+  if (r->options.read_io_executor_threads < 0) {
     return Status::InvalidArgument(
-        "read_io_executor_threads must be greater than zero");
+        "read_io_executor_threads must not be negative");
   }
-  fs->SetReadIOExecutorThreads(r->options.read_io_executor_threads);
+  if (r->options.read_io_executor_threads > 0) {
+    fs->SetReadIOExecutorThreads(r->options.read_io_executor_threads);
+  }
   r->read_executor = fs->GetReadExecutor();
 #endif  // USE_COROUTINES
 

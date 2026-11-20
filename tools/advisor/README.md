@@ -12,17 +12,17 @@ experts.
 ## Overview
 
 Experts share their wisdom as rules comprising of conditions and suggestions in the INI format (refer
-[rules.ini](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/rules.ini)).
+[rules.ini](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/rules.ini)).
 Users provide the Rocksdb configuration that they want to improve upon (as the
 familiar Rocksdb OPTIONS file —
-[example](https://github.com/facebook/rocksdb/blob/main/examples/rocksdb_option_file_example.ini))
+[example](https://github.com/meta/rocksdb/blob/main/examples/rocksdb_option_file_example.ini))
 and the path of the file which contains Rocksdb logs and statistics.
-The [Advisor](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/rule_parser_example.py)
+The [Advisor](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/rule_parser_example.py)
 creates appropriate DataSource objects (for Rocksdb
-[logs](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/db_log_parser.py),
-[options](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/db_options_parser.py),
-[statistics](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/db_stats_fetcher.py) etc.)
-and provides them to the [Rules Engine](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/rule_parser.py).
+[logs](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/db_log_parser.py),
+[options](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/db_options_parser.py),
+[statistics](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/db_stats_fetcher.py) etc.)
+and provides them to the [Rules Engine](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/rule_parser.py).
 The Rules uses rules from experts to parse data-sources and trigger appropriate rules.
 The Advisor's output gives information about which rules were triggered,
 why they were triggered and what each of them suggests. Each suggestion
@@ -48,9 +48,9 @@ python3 -m advisor.rule_parser_example --rules_spec=advisor/rules.ini --rocksdb_
 
 Most important amongst all the input that the Advisor needs, are the rules
 spec and starting Rocksdb configuration. The configuration is provided as the
-familiar Rocksdb Options file (refer [example](https://github.com/facebook/rocksdb/blob/main/examples/rocksdb_option_file_example.ini)).
+familiar Rocksdb Options file (refer [example](https://github.com/meta/rocksdb/blob/main/examples/rocksdb_option_file_example.ini)).
 The Rules spec is written in the INI format (more details in
-[rules.ini](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/rules.ini)).
+[rules.ini](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/rules.ini)).
 
 In brief, a Rule is made of conditions and is triggered when all its
 constituent conditions are triggered. When triggered, a Rule suggests changes
@@ -61,8 +61,8 @@ For example, a log Condition (with 'source=LOG') is triggered if a particular
 'regex' is found in the Rocksdb LOG files. As of now the Rules Engine
 supports 3 types of Conditions (and consequently data-sources):
 LOG, OPTIONS, TIME_SERIES. The TIME_SERIES data can be sourced from the
-Rocksdb [statistics](https://github.com/facebook/rocksdb/blob/main/include/rocksdb/statistics.h)
-or [perf context](https://github.com/facebook/rocksdb/blob/main/include/rocksdb/perf_context.h).
+Rocksdb [statistics](https://github.com/meta/rocksdb/blob/main/include/rocksdb/statistics.h)
+or [perf context](https://github.com/meta/rocksdb/blob/main/include/rocksdb/perf_context.h).
 
 For more information about the remaining command-line arguments, run:
 
@@ -87,7 +87,7 @@ scope: col_fam:
 ## Running the tests
 
 Tests for the code have been added to the
-[test/](https://github.com/facebook/rocksdb/tree/main/tools/advisor/test)
+[test/](https://github.com/meta/rocksdb/tree/main/tools/advisor/test)
 directory. For example, to run the unit tests for db_log_parser.py:
 
 ```shell

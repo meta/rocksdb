@@ -31,6 +31,12 @@ class StackableDB : public DB {
   explicit StackableDB(std::unique_ptr<DB>&& db)
       : db_(db.get()), shared_db_ptr_(std::move(db)) {}
 
+  // No copying allowed
+  StackableDB(const StackableDB&) = delete;
+  StackableDB& operator=(const StackableDB&) = delete;
+  StackableDB(StackableDB&&) = delete;
+  StackableDB& operator=(StackableDB&&) = delete;
+
   ~StackableDB() override {
     if (shared_db_ptr_ == nullptr) {
       delete db_;
@@ -133,6 +139,15 @@ class StackableDB : public DB {
     return db_->GetEntity(options, key, result);
   }
 
+  using DB::GetEntityWithMetadata;
+  Status GetEntityWithMetadata(const ReadOptions& options,
+                               ColumnFamilyHandle* column_family,
+                               const Slice& key, PinnableWideColumns* columns,
+                               OutputMetadata* output_metadata) override {
+    return db_->GetEntityWithMetadata(options, column_family, key, columns,
+                                      output_metadata);
+  }
+
   using DB::GetEntityLazy;
   Status GetEntityLazy(const ReadOptions& options,
                        ColumnFamilyHandle* column_family, const Slice& key,
@@ -194,6 +209,26 @@ class StackableDB : public DB {
                       const Slice* keys,
                       PinnableAttributeGroups* results) override {
     db_->MultiGetEntity(options, num_keys, keys, results);
+  }
+
+  using DB::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& options, size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input = false) override {
+    db_->MultiGetEntityWithMetadata(options, num_keys, column_families, keys,
+                                    results, statuses, output_metadata,
+                                    sorted_input);
+  }
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override {
+    db_->MultiGetEntityWithMetadata(options, num_keys, keys, results,
+                                    output_metadata);
   }
 
   using DB::MultiGetEntityLazy;

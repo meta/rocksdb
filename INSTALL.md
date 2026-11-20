@@ -153,7 +153,7 @@ most processors made since roughly 2013.
 
     * Build RocksDB from source:
         cd ~
-        git clone https://github.com/facebook/rocksdb.git
+        git clone https://github.com/meta/rocksdb.git
         cd rocksdb
         gmake static_lib
 
@@ -174,7 +174,7 @@ most processors made since roughly 2013.
 
         ```bash
         cd ~
-        git clone https://github.com/facebook/rocksdb.git
+        git clone https://github.com/meta/rocksdb.git
         cd rocksdb
         gmake static_lib
         ```
@@ -211,14 +211,3 @@ most processors made since roughly 2013.
              export LIBPATH=/opt/freeware/lib
              export JAVA_HOME=/usr/java8_64
              export PATH=/opt/freeware/bin:$PATH
-
-* **Solaris Sparc**
-    * Install GCC 11 and higher.
-    * Use these environment variables:
-
-             export CC=gcc
-             export EXTRA_CFLAGS=-m64
-             export EXTRA_CXXFLAGS=-m64
-             export EXTRA_LDFLAGS=-m64
-             export PORTABLE=1
-             export PLATFORM_LDFLAGS="-static-libstdc++ -static-libgcc"

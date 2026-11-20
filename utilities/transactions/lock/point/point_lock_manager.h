@@ -114,6 +114,8 @@ class PointLockManager : public LockManager {
   // No copying allowed
   PointLockManager(const PointLockManager&) = delete;
   PointLockManager& operator=(const PointLockManager&) = delete;
+  PointLockManager(PointLockManager&&) = delete;
+  PointLockManager& operator=(PointLockManager&&) = delete;
 
   ~PointLockManager() override {}
 
@@ -190,6 +192,7 @@ class PointLockManager : public LockManager {
 
   // Must be held when modifying wait_txn_map_ and rev_wait_txn_map_.
   std::mutex wait_txn_map_mutex_;
+  std::unique_ptr<SlowMutexTimer> wait_txn_map_timer_;
 
   // Maps from waitee -> number of waiters.
   HashMap<TransactionID, int> rev_wait_txn_map_;

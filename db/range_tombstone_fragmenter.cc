@@ -59,7 +59,8 @@ FragmentedRangeTombstoneList::FragmentedRangeTombstoneList(
   }
 
   // Sort the tombstones before fragmenting them.
-  std::vector<std::string> keys, values;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
   keys.reserve(num_unfragmented_tombstones_);
   values.reserve(num_unfragmented_tombstones_);
   // Reset the counter to zero for the next iteration over keys.

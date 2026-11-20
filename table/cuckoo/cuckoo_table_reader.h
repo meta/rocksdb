@@ -31,7 +31,7 @@ class CuckooTableReader : public TableReader {
                     uint64_t file_size, const Comparator* user_comparator,
                     uint64_t (*get_slice_hash)(const Slice&, uint32_t,
                                                uint64_t));
-  ~CuckooTableReader() {}
+  ~CuckooTableReader() override = default;
 
   std::shared_ptr<const TableProperties> GetTableProperties() const override {
     return table_props_;

@@ -67,6 +67,8 @@ class BlobSource {
 
   BlobSource(const BlobSource&) = delete;
   BlobSource& operator=(const BlobSource&) = delete;
+  BlobSource(BlobSource&&) = delete;
+  BlobSource& operator=(BlobSource&&) = delete;
 
   ~BlobSource();
 

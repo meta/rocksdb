@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
+#include <memory>
 
 #include "monitoring/statistics_impl.h"
 #include "rocksdb/convenience.h"
@@ -343,6 +344,11 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {BLOB_DB_LAZY_PARTIAL_READ_COUNT, "rocksdb.blobdb.lazy.partial.read.count"},
     {BLOB_DB_LAZY_PARTIAL_BYTES_SAVED,
      "rocksdb.blobdb.lazy.partial.bytes.saved"},
+    {REMOTE_COMPACT_INPUT_BLOB_FILE_COUNT,
+     "rocksdb.remote.compact.input.blob.file.count"},
+    {REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
+     "rocksdb.remote.compact.blob.result.declined.count"},
+    {BLOB_DB_DROPPED_BLOB_READ_COUNT, "rocksdb.blobdb.dropped.blob.read.count"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
@@ -467,7 +473,7 @@ Status Statistics::CreateFromString(const ConfigOptions& config_options,
   });
   Status s;
   if (id == "" || id == StatisticsImpl::kClassName()) {
-    result->reset(new StatisticsImpl(nullptr));
+    *result = std::make_shared<StatisticsImpl>(nullptr);
   } else if (id == kNullptrString) {
     result->reset();
   } else {

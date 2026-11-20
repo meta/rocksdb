@@ -92,11 +92,13 @@ struct ImmutableDBOptions {
   bool prefix_seek_opt_in_only;
   bool persist_stats_to_disk;
   bool write_dbid_to_manifest;
+  bool track_options_file_number_in_manifest;
   bool reuse_manifest_on_open;
   bool write_identity_file;
   size_t log_readahead_size;
   std::shared_ptr<FileChecksumGenFactory> file_checksum_gen_factory;
   bool best_efforts_recovery;
+  bool best_efforts_blob_db_repair;
   int max_bgerror_resume_count;
   uint64_t bgerror_resume_retry_interval;
   bool allow_data_in_errors;
@@ -123,6 +125,11 @@ struct ImmutableDBOptions {
 
   bool IsWalDirSameAsDBPath() const;
   bool IsWalDirSameAsDBPath(const std::string& path) const;
+  // Whether DB open recovers through VersionSet::TryRecover(), which both
+  // best_efforts_recovery and best_efforts_blob_db_repair use.
+  bool UsesBestEffortsRecoveryPath() const {
+    return best_efforts_recovery || best_efforts_blob_db_repair;
+  }
   const std::string& GetWalDir() const;
   const std::string& GetWalDir(const std::string& path) const;
 };
@@ -134,33 +141,35 @@ struct MutableDBOptions {
 
   void Dump(Logger* log) const;
 
-  int max_background_jobs;
-  int max_background_compactions;
-  uint32_t max_subcompactions;
-  bool avoid_flush_during_shutdown;
   size_t writable_file_max_buffer_size;
   uint64_t delayed_write_rate;
   uint64_t max_total_wal_size;
   uint64_t delete_obsolete_files_period_micros;
-  unsigned int stats_dump_period_sec;
-  unsigned int stats_persist_period_sec;
+  uint64_t mutex_hold_log_threshold_us;
   size_t stats_history_buffer_size;
-  int max_open_files;
   uint64_t bytes_per_sync;
   uint64_t wal_bytes_per_sync;
-  bool strict_bytes_per_sync;
   size_t compaction_readahead_size;
-  int max_background_flushes;
   uint64_t max_manifest_file_size;
-  int max_manifest_space_amp_pct;
   size_t manifest_preallocation_size;
+  uint64_t max_compaction_trigger_wakeup_seconds;
+  std::string daily_offpeak_time_utc;
+  int max_background_jobs;
+  int max_background_compactions;
+  uint32_t max_subcompactions;
+  unsigned int stats_dump_period_sec;
+  unsigned int stats_persist_period_sec;
+  int max_open_files;
+  int max_background_flushes;
+  int max_manifest_space_amp_pct;
+  int periodic_compaction_phase_recovery_percent;
+  bool avoid_flush_during_shutdown;
+  bool strict_bytes_per_sync;
   bool verify_manifest_content_on_close;
   bool optimize_manifest_for_recovery;
   bool fast_sst_open;
   bool remote_compaction_manifest_floor;
-  std::string daily_offpeak_time_utc;
-  uint64_t max_compaction_trigger_wakeup_seconds;
-  int periodic_compaction_phase_recovery_percent;
+  bool use_separate_remote_compaction_pool;
 };
 
 Status GetStringFromMutableDBOptions(const ConfigOptions& config_options,

@@ -1,1 +1,0 @@
-Added `WriteBufferFlushPolicy` and `WriteBufferManager` policy selection for flushing the oldest or largest column family, including configurable batched flushing of the largest column families across DBs sharing a manager, with C and Java bindings.

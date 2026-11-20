@@ -54,11 +54,13 @@ class CuckooTableFactory : public TableFactory {
  public:
   explicit CuckooTableFactory(
       const CuckooTableOptions& table_option = CuckooTableOptions());
-  ~CuckooTableFactory() {}
 
   // Method to allow CheckedCast to work for this class
   static const char* kClassName() { return kCuckooTableName(); }
   const char* Name() const override { return kCuckooTableName(); }
+
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override;
 
   using TableFactory::NewTableReader;
   Status NewTableReader(

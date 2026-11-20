@@ -24,7 +24,7 @@ class BoundedQueue {
       const size_t max_size = std::numeric_limits<size_t>::max())
       : cond_empty_(&lock_), max_size_(max_size) {}
 
-  virtual ~BoundedQueue() {}
+  virtual ~BoundedQueue() = default;
 
   void Push(T&& t) {
     MutexLock _(&lock_);

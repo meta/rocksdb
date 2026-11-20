@@ -44,7 +44,7 @@ size_t FaultInjectionSecondaryCache::ResultHandle::Size() { return size_; }
 
 void FaultInjectionSecondaryCache::ResultHandle::WaitAll(
     FaultInjectionSecondaryCache* cache,
-    std::vector<SecondaryCacheResultHandle*> handles) {
+    const std::vector<SecondaryCacheResultHandle*>& handles) {
   std::vector<SecondaryCacheResultHandle*> base_handles;
   for (SecondaryCacheResultHandle* hdl : handles) {
     FaultInjectionSecondaryCache::ResultHandle* handle =

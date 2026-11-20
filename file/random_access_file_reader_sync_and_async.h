@@ -462,28 +462,13 @@ DEFINE_SYNC_AND_ASYNC(IOStatus, RandomAccessFileReader::MultiRead)
       IOSTATS_CPU_TIMER_GUARD(cpu_read_nanos, clock_);
 #endif
       if (rate_limiter_priority != Env::IO_TOTAL && rate_limiter_ != nullptr) {
-        // TODO: ideally we should call `RateLimiter::RequestToken()` for
-        // allowed bytes to multi-read and then consume those bytes by
-        // satisfying as many requests in `MultiRead()` as possible, instead of
-        // what we do here, which can cause burst when the
-        // `total_multi_read_size` is big.
         size_t total_multi_read_size = 0;
         assert(fs_reqs != nullptr);
         for (size_t i = 0; i < num_fs_reqs; ++i) {
           FSReadRequest& req = fs_reqs[i];
           total_multi_read_size += req.len;
         }
-        size_t remaining_bytes = total_multi_read_size;
-        size_t request_bytes = 0;
-        while (remaining_bytes > 0) {
-          request_bytes = std::min(
-              static_cast<size_t>(rate_limiter_->GetSingleBurstBytes()),
-              remaining_bytes);
-          rate_limiter_->Request(request_bytes, rate_limiter_priority,
-                                 nullptr /* stats */,
-                                 RateLimiter::OpType::kRead);
-          remaining_bytes -= request_bytes;
-        }
+        ChargeRateLimiterForRead(opts, total_multi_read_size);
       }
       TEST_SYNC_POINT_CALLBACK(
           "RandomAccessFileReader::MultiRead:IODebugContext",

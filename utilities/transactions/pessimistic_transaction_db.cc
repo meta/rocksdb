@@ -36,6 +36,7 @@ PessimisticTransactionDB::PessimisticTransactionDB(
       lock_manager_(NewLockManager(this, txn_db_options)) {
   assert(db_impl_ != nullptr);
   info_log_ = db_impl_->GetDBOptions().info_log;
+  ConfigureSlowMutexLogging();
 }
 
 // Support initiliazing PessimisticTransactionDB from a stackable db
@@ -61,6 +62,17 @@ PessimisticTransactionDB::PessimisticTransactionDB(
       txn_db_options_(txn_db_options),
       lock_manager_(NewLockManager(this, txn_db_options)) {
   assert(db_impl_ != nullptr);
+  ConfigureSlowMutexLogging();
+}
+
+void PessimisticTransactionDB::ConfigureSlowMutexLogging() {
+  const std::shared_ptr<SlowMutexLoggingContext>& context =
+      db_impl_->GetSlowMutexLogging();
+  if (context == nullptr) {
+    return;
+  }
+  name_map_timer_.reset(new SlowMutexTimer(
+      context, "PessimisticTransactionDB::name_map_mutex_", &name_map_mutex_));
 }
 
 PessimisticTransactionDB::~PessimisticTransactionDB() {
@@ -736,7 +748,7 @@ void PessimisticTransactionDB::ReinitializeTransaction(
 
 Transaction* PessimisticTransactionDB::GetTransactionByName(
     const TransactionName& name) {
-  std::lock_guard<std::mutex> lock(name_map_mutex_);
+  SlowMutexLock lock(&name_map_mutex_, name_map_timer_.get());
   return GetTransactionByNameLocked(name);
 }
 
@@ -754,7 +766,7 @@ void PessimisticTransactionDB::GetAllPreparedTransactions(
     std::vector<Transaction*>* transv) {
   assert(transv);
   transv->clear();
-  std::lock_guard<std::mutex> lock(name_map_mutex_);
+  SlowMutexLock lock(&name_map_mutex_, name_map_timer_.get());
   for (auto it = transactions_.begin(); it != transactions_.end(); ++it) {
     if (it->second->GetState() == Transaction::PREPARED) {
       transv->push_back(it->second);
@@ -778,7 +790,7 @@ Status PessimisticTransactionDB::RegisterTransaction(Transaction* txn) {
   assert(txn);
   assert(txn->GetName().length() > 0);
   assert(txn->GetState() == Transaction::STARTED);
-  std::lock_guard<std::mutex> lock(name_map_mutex_);
+  SlowMutexLock lock(&name_map_mutex_, name_map_timer_.get());
   if (!transactions_.insert({txn->GetName(), txn}).second) {
     return Status::InvalidArgument("Duplicate txn name " + txn->GetName());
   }
@@ -787,7 +799,7 @@ Status PessimisticTransactionDB::RegisterTransaction(Transaction* txn) {
 
 void PessimisticTransactionDB::UnregisterTransaction(Transaction* txn) {
   assert(txn);
-  std::lock_guard<std::mutex> lock(name_map_mutex_);
+  SlowMutexLock lock(&name_map_mutex_, name_map_timer_.get());
   auto it = transactions_.find(txn->GetName());
   assert(it != transactions_.end());
   transactions_.erase(it);

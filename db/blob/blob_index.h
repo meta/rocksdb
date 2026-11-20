@@ -55,6 +55,10 @@ class BlobIndex {
 
   BlobIndex(const BlobIndex&) = default;
   BlobIndex& operator=(const BlobIndex&) = default;
+  BlobIndex(BlobIndex&&) = default;
+  BlobIndex& operator=(BlobIndex&&) = default;
+
+  ~BlobIndex() = default;
 
   bool IsInlined() const { return type_ == Type::kInlinedTTL; }
 
@@ -102,7 +106,9 @@ class BlobIndex {
 
   Status DecodeFrom(Slice slice) {
     const char* kErrorMessage = "Error while decoding blob index";
-    assert(slice.size() > 0);
+    if (slice.empty()) {
+      return Status::Corruption(kErrorMessage, "Empty blob index");
+    }
     type_ = static_cast<Type>(*slice.data());
     if (type_ >= Type::kUnknown) {
       return Status::Corruption(kErrorMessage,

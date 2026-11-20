@@ -25,7 +25,7 @@ struct OffpeakTimeOption {
 
   OffpeakTimeOption();
   explicit OffpeakTimeOption(const std::string& offpeak_time_string);
-  std::string daily_offpeak_time_utc = "";
+  std::string daily_offpeak_time_utc;
   int daily_offpeak_start_time_utc = 0;
   int daily_offpeak_end_time_utc = 0;
 

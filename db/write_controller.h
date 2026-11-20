@@ -102,9 +102,9 @@ class WriteController {
   // Next time that we can add more credit of bytes
   uint64_t next_refill_time_;
   // Write rate set when initialization or by `DBImpl::SetDBOptions`
-  uint64_t max_delayed_write_rate_;
+  uint64_t max_delayed_write_rate_ = 0;
   // Current write rate (bytes / second)
-  uint64_t delayed_write_rate_;
+  uint64_t delayed_write_rate_ = 0;
 
   std::unique_ptr<RateLimiter> low_pri_rate_limiter_;
 };
@@ -122,27 +122,29 @@ class WriteControllerToken {
   // no copying allowed
   WriteControllerToken(const WriteControllerToken&) = delete;
   void operator=(const WriteControllerToken&) = delete;
+  WriteControllerToken(WriteControllerToken&&) = delete;
+  void operator=(WriteControllerToken&&) = delete;
 };
 
 class StopWriteToken : public WriteControllerToken {
  public:
   explicit StopWriteToken(WriteController* controller)
       : WriteControllerToken(controller) {}
-  virtual ~StopWriteToken();
+  ~StopWriteToken() override;
 };
 
 class DelayWriteToken : public WriteControllerToken {
  public:
   explicit DelayWriteToken(WriteController* controller)
       : WriteControllerToken(controller) {}
-  virtual ~DelayWriteToken();
+  ~DelayWriteToken() override;
 };
 
 class CompactionPressureToken : public WriteControllerToken {
  public:
   explicit CompactionPressureToken(WriteController* controller)
       : WriteControllerToken(controller) {}
-  virtual ~CompactionPressureToken();
+  ~CompactionPressureToken() override;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

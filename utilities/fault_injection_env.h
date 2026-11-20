@@ -16,6 +16,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 
 #include "file/filename.h"
 #include "rocksdb/env.h"
@@ -73,7 +74,7 @@ class TestWritableFile : public WritableFile {
   explicit TestWritableFile(const std::string& fname,
                             std::unique_ptr<WritableFile>&& f,
                             FaultInjectionTestEnv* env);
-  virtual ~TestWritableFile();
+  ~TestWritableFile() override;
   Status Append(const Slice& data) override;
   Status Append(const Slice& data,
                 const DataVerificationInfo& /*verification_info*/) override {
@@ -109,7 +110,7 @@ class TestRandomRWFile : public RandomRWFile {
   explicit TestRandomRWFile(const std::string& fname,
                             std::unique_ptr<RandomRWFile>&& f,
                             FaultInjectionTestEnv* env);
-  virtual ~TestRandomRWFile();
+  ~TestRandomRWFile() override;
   Status Write(uint64_t offset, const Slice& data) override;
   Status Read(uint64_t offset, size_t n, Slice* result,
               char* scratch) const override;
@@ -131,8 +132,8 @@ class TestDirectory : public Directory {
  public:
   explicit TestDirectory(FaultInjectionTestEnv* env, std::string dirname,
                          Directory* dir)
-      : env_(env), dirname_(dirname), dir_(dir) {}
-  ~TestDirectory() {}
+      : env_(env), dirname_(std::move(dirname)), dir_(dir) {}
+  ~TestDirectory() override = default;
 
   Status Fsync() override;
   Status Close() override;
@@ -147,7 +148,12 @@ class FaultInjectionTestEnv : public EnvWrapper {
  public:
   explicit FaultInjectionTestEnv(Env* base)
       : EnvWrapper(base), filesystem_active_(true) {}
-  virtual ~FaultInjectionTestEnv() { error_.PermitUncheckedError(); }
+  // No copying allowed
+  FaultInjectionTestEnv(const FaultInjectionTestEnv&) = delete;
+  FaultInjectionTestEnv& operator=(const FaultInjectionTestEnv&) = delete;
+  FaultInjectionTestEnv(FaultInjectionTestEnv&&) = delete;
+  FaultInjectionTestEnv& operator=(FaultInjectionTestEnv&&) = delete;
+  ~FaultInjectionTestEnv() override { error_.PermitUncheckedError(); }
 
   static const char* kClassName() { return "FaultInjectionTestEnv"; }
   const char* Name() const override { return kClassName(); }
@@ -205,7 +211,7 @@ class FaultInjectionTestEnv : public EnvWrapper {
 
   // For every file that is not fully synced, make a call to `func` with
   // FileState of the file as the parameter.
-  Status DropFileData(std::function<Status(Env*, FileState)> func);
+  Status DropFileData(const std::function<Status(Env*, FileState)>& func);
 
   Status DropUnsyncedFileData();
 
@@ -231,7 +237,7 @@ class FaultInjectionTestEnv : public EnvWrapper {
     return filesystem_active_;
   }
   void SetFilesystemActiveNoLock(
-      bool active, Status error = Status::Corruption("Not active")) {
+      bool active, const Status& error = Status::Corruption("Not active")) {
     error.PermitUncheckedError();
     filesystem_active_ = active;
     if (!active) {
@@ -239,8 +245,8 @@ class FaultInjectionTestEnv : public EnvWrapper {
     }
     error.PermitUncheckedError();
   }
-  void SetFilesystemActive(bool active,
-                           Status error = Status::Corruption("Not active")) {
+  void SetFilesystemActive(
+      bool active, const Status& error = Status::Corruption("Not active")) {
     error.PermitUncheckedError();
     MutexLock l(&mutex_);
     SetFilesystemActiveNoLock(active, error);

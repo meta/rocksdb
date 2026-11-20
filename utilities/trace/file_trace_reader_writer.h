@@ -16,7 +16,7 @@ class WritableFileWriter;
 class FileTraceReader : public TraceReader {
  public:
   explicit FileTraceReader(std::unique_ptr<RandomAccessFileReader>&& reader);
-  ~FileTraceReader();
+  ~FileTraceReader() override;
 
   Status Read(std::string* data) override;
   Status Close() override;
@@ -35,7 +35,7 @@ class FileTraceReader : public TraceReader {
 class FileTraceWriter : public TraceWriter {
  public:
   explicit FileTraceWriter(std::unique_ptr<WritableFileWriter>&& file_writer);
-  ~FileTraceWriter();
+  ~FileTraceWriter() override;
 
   Status Write(const Slice& data) override;
   Status Close() override;

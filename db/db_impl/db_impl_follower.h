@@ -19,7 +19,7 @@ class DBImplFollower : public DBImplSecondary {
  public:
   DBImplFollower(const DBOptions& db_options, std::unique_ptr<Env>&& env,
                  const std::string& dbname, std::string src_path);
-  ~DBImplFollower();
+  ~DBImplFollower() override;
 
   Status Close() override;
 

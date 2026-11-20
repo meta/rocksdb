@@ -527,7 +527,8 @@ TEST_F(RepairTest, RepairColumnFamilyOptions) {
   const int kNumCfs = 2;
   const int kEntriesPerCf = 2;
 
-  Options opts(CurrentOptions()), rev_opts(CurrentOptions());
+  Options opts(CurrentOptions());
+  Options rev_opts(CurrentOptions());
   opts.comparator = BytewiseComparator();
   rev_opts.comparator = ReverseBytewiseComparator();
 

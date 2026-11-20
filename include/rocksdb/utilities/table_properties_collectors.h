@@ -38,7 +38,7 @@ class CompactOnDeletionCollectorFactory
                                     double deletion_ratio,
                                     uint64_t min_file_size = 0);
 
-  ~CompactOnDeletionCollectorFactory() override {}
+  ~CompactOnDeletionCollectorFactory() override = default;
 
   TablePropertiesCollector* CreateTablePropertiesCollector(
       TablePropertiesCollectorFactory::Context context) override;
@@ -121,7 +121,7 @@ class CompactForTieringCollectorFactory
   // for what entry is eligible.
   CompactForTieringCollectorFactory(double compaction_trigger_ratio);
 
-  ~CompactForTieringCollectorFactory() override {}
+  ~CompactForTieringCollectorFactory() override = default;
 
   TablePropertiesCollector* CreateTablePropertiesCollector(
       TablePropertiesCollectorFactory::Context context) override;

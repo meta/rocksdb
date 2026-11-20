@@ -57,6 +57,7 @@ class SequentialFileReader {
   std::vector<std::shared_ptr<EventListener>> listeners_{};
   RateLimiter* rate_limiter_;
   bool verify_and_reconstruct_read_;
+  IOType io_type_ = IOType::kUnknown;
 
  public:
   explicit SequentialFileReader(
@@ -95,8 +96,12 @@ class SequentialFileReader {
                          std::unique_ptr<SequentialFileReader>* reader,
                          IODebugContext* dbg, RateLimiter* rate_limiter);
 
+  ~SequentialFileReader() = default;
+
   SequentialFileReader(const SequentialFileReader&) = delete;
   SequentialFileReader& operator=(const SequentialFileReader&) = delete;
+  SequentialFileReader(SequentialFileReader&&) = delete;
+  SequentialFileReader& operator=(SequentialFileReader&&) = delete;
 
   // `rate_limiter_priority` is used to charge the internal rate limiter when
   // enabled. The special value `Env::IO_TOTAL` makes this operation bypass the
@@ -111,6 +116,14 @@ class SequentialFileReader {
                 Env::IOPriority rate_limiter_priority);
 
   IOStatus Skip(uint64_t n);
+
+  // Sets IOOptions::type for each later Read(). The default is
+  // IOType::kUnknown, except that Create() uses file_opts.io_options.type. A
+  // reader constructed from an already open file does not see the FileOptions
+  // used to open it, so a caller that opened the file with
+  // FileOptions::io_options.type set calls this too, to give the reads the
+  // same type.
+  void SetIOType(IOType io_type) { io_type_ = io_type; }
 
   FSSequentialFile* file() { return file_.get(); }
 

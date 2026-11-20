@@ -88,27 +88,31 @@ class BlobFilePartitionManager {
                                      const Slice& key,
                                      const WideColumns& columns) const;
 
-  // Move the current active partition files into the next immutable
-  // memtable-generation batch. Called from SwitchMemtable() while DB mutex is
-  // held. No I/O is performed here.
-  void RotateCurrentGeneration();
+  // Move the current active partition files into the generation of the
+  // memtable `memtable_id`, which just became immutable. Called from
+  // SwitchMemtable() while DB mutex is held. No I/O is performed here.
+  void RotateCurrentGeneration(uint64_t memtable_id);
 
-  // Seal the first `num_generations` queued immutable generations and return
-  // all blob additions and initial-garbage updates that must be registered
-  // with the matching flush. Generations stay queued until
-  // CommitPreparedGenerations() is called. If `generation_blob_file_numbers`
-  // is non-null, it receives the sealed blob file numbers for each prepared
-  // generation in the same FIFO order.
+  // Seal the queued generations of the memtables `memtable_ids` and return all
+  // blob additions and initial-garbage updates that must be registered with
+  // the flush of those memtables. Concurrent flushes pick different
+  // memtables, so generations are matched by memtable ID, not by queue
+  // position. Generations stay queued until CommitFlushedGenerations() removes
+  // them. If `generation_blob_file_numbers` is non-null, it receives the
+  // sealed blob file numbers for each memtable, in `memtable_ids` order.
   Status PrepareFlushAdditions(const WriteOptions& write_options,
-                               size_t num_generations,
+                               const std::vector<uint64_t>& memtable_ids,
                                std::vector<BlobFileAddition>* additions,
                                std::vector<BlobFileGarbage>* garbages,
                                std::vector<std::vector<uint64_t>>*
                                    generation_blob_file_numbers = nullptr);
 
-  // Remove the first `num_generations` prepared immutable generations after
-  // their blob-file additions and garbage edits were committed to MANIFEST.
-  void CommitPreparedGenerations(size_t num_generations);
+  // Remove the generations of the memtables older than
+  // `earliest_unflushed_memtable_id`, whose flush results are installed, and
+  // stop tracking their sealed files as manager-owned. A flush that finishes
+  // before an older one is installed with it, or rolled back if it fails, so
+  // the flush that prepared a generation cannot remove it on its own.
+  void CommitFlushedGenerations(uint64_t earliest_unflushed_memtable_id);
 
   // In v1 flush-on-write mode each AddRecord flushes to the OS immediately, so
   // there is nothing extra to do for the non-sync write path.
@@ -179,6 +183,11 @@ class BlobFilePartitionManager {
   };
 
   struct DeferredFile {
+    DeferredFile() = default;
+    DeferredFile(DeferredFile&&) = default;
+    DeferredFile& operator=(DeferredFile&&) = default;
+    ~DeferredFile();
+
     // Blob writer moved out of an active partition at memtable rotation.
     std::unique_ptr<BlobLogWriter> writer;
     // Metadata preserved until flush preparation seals the file.
@@ -188,6 +197,10 @@ class BlobFilePartitionManager {
     // Failed transformed writes already appended before the file is sealed.
     uint64_t garbage_blob_count = 0;
     uint64_t garbage_blob_bytes = 0;
+    // Set once sealing fails. The writer cannot be finalized again, and
+    // memtables still reference the file, so every flush of its generation
+    // fails with this status.
+    Status seal_status;
   };
 
   struct SealedFile {
@@ -200,6 +213,8 @@ class BlobFilePartitionManager {
   };
 
   struct GenerationBatch {
+    // The memtable that became immutable when this generation was rotated.
+    uint64_t memtable_id = 0;
     // Files that were still open when the memtable became immutable.
     std::deque<DeferredFile> deferred_files;
     // Files already sealed for this memtable generation.
@@ -208,17 +223,24 @@ class BlobFilePartitionManager {
 
   // Clears all active-file bookkeeping from a partition after sealing.
   void ResetPartitionState(Partition* partition);
+  // Returns the queued generation of `memtable_id`, or null.
+  GenerationBatch* FindPendingGeneration(uint64_t memtable_id);
+  // Moves a partition's open file out of the partition and resets it.
+  DeferredFile DetachPartitionFile(Partition* partition);
   // Marks a blob file as manager-owned until it is committed or abandoned.
   void AddFilePartitionMapping(uint64_t file_number, uint32_t partition_idx);
-  // Stops tracking a blob file after open/seal failure.
+  // Stops tracking a blob file after open failure.
   void RemoveFilePartitionMapping(uint64_t file_number);
 
   // Opens a new active blob file for one partition.
   Status OpenNewBlobFile(Partition* partition, uint32_t column_family_id,
                          CompressionType compression, uint32_t partition_idx);
   // Finalizes one active partition file and returns the MANIFEST addition.
+  // Sets `*space_limit_reached` if the SstFileManager's max allowed space is
+  // reached; the seal still succeeds.
   Status SealActiveBlobFile(const WriteOptions& write_options,
-                            Partition* partition, SealedFile* sealed_file);
+                            Partition* partition, SealedFile* sealed_file,
+                            bool* space_limit_reached);
   // Finalizes one deferred file that was carried over to flush preparation.
   Status SealDeferredFile(const WriteOptions& write_options,
                           DeferredFile* deferred, SealedFile* sealed_file);
@@ -227,7 +249,8 @@ class BlobFilePartitionManager {
   Status FinalizeBlobFile(const WriteOptions& write_options,
                           BlobLogWriter* writer, uint64_t file_number,
                           uint64_t blob_count, uint64_t total_blob_bytes,
-                          BlobFileAddition* addition);
+                          BlobFileAddition* addition,
+                          bool* space_limit_reached);
   // Appends one initial-garbage record to the flush output if any failed
   // transformed writes targeted the sealed blob file.
   static void AddSealedFileGarbage(const SealedFile& sealed_file,
@@ -286,6 +309,8 @@ class BlobFilePartitionManager {
   mutable port::Mutex mutex_;
   // Files already sealed while the current mutable memtable was active.
   std::vector<SealedFile> current_generation_sealed_files_;
+  // Files whose seal failed while the current mutable memtable was active.
+  std::vector<DeferredFile> current_generation_failed_files_;
   // FIFO immutable memtable generations waiting to be flushed.
   std::deque<GenerationBatch> pending_generations_;
 

@@ -149,7 +149,8 @@ class SkipListRep : public MemTableRep {
         static_cast<uint64_t>(std::sqrt(1.0 * num_entries))) {
       Random* rnd = Random::GetTLSInstance();
       iter.SeekToFirst();
-      uint64_t counter = 0, num_samples_left = target_sample_size;
+      uint64_t counter = 0;
+      uint64_t num_samples_left = target_sample_size;
       for (; iter.Valid() && (num_samples_left > 0); iter.Next(), counter++) {
         // Add entry to sample set with probability
         // num_samples_left/(num_entries - counter).

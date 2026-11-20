@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "port/lang.h"
 #include "port/port.h"
@@ -170,7 +171,7 @@ struct Posix_IOHandle {
                  uint64_t _offset, size_t _len, char* _scratch,
                  bool _use_direct_io, size_t _alignment)
       : iu(_iu),
-        cb(_cb),
+        cb(std::move(_cb)),
         cb_arg(_cb_arg),
         offset(_offset),
         len(_len),
@@ -181,7 +182,7 @@ struct Posix_IOHandle {
         is_being_aborted(false),
         req_count(0) {}
 
-  struct iovec iov;
+  struct iovec iov{};
   struct io_uring* iu;
   std::function<void(FSReadRequest&, void*)> cb;
   void* cb_arg;
@@ -217,7 +218,7 @@ inline void UpdateResult(struct io_uring_cqe* cqe, const std::string& file_name,
     } else if (bytes_read == 0) {
       /// cqe->res == 0 can means EOF, or can mean partial results. See
       // comment
-      // https://github.com/facebook/rocksdb/pull/6441#issuecomment-589843435
+      // https://github.com/meta/rocksdb/pull/6441#issuecomment-589843435
       // Fall back to pread in this case.
       if (use_direct_io && !IsSectorAligned(finished_len, alignment)) {
         // Bytes reads don't fill sectors. Should only happen at the end
@@ -284,15 +285,15 @@ inline void FinalizeAsyncRead(struct io_uring* iu, struct io_uring_cqe* cqe,
 // synchronization.
 class LogicalBlockSizeCache {
  public:
-  LogicalBlockSizeCache(
+  explicit LogicalBlockSizeCache(
       std::function<size_t(int)> get_logical_block_size_of_fd =
           PosixHelper::GetLogicalBlockSizeOfFd,
       std::function<Status(const std::string&, size_t*)>
           get_logical_block_size_of_directory =
               PosixHelper::GetLogicalBlockSizeOfDirectory)
-      : get_logical_block_size_of_fd_(get_logical_block_size_of_fd),
+      : get_logical_block_size_of_fd_(std::move(get_logical_block_size_of_fd)),
         get_logical_block_size_of_directory_(
-            get_logical_block_size_of_directory) {}
+            std::move(get_logical_block_size_of_directory)) {}
 
   // Takes the following actions:
   // 1. Increases reference count of the directories;
@@ -360,7 +361,7 @@ class PosixSequentialFile : public FSSequentialFile {
  public:
   PosixSequentialFile(const std::string& fname, FILE* file, int fd,
                       size_t logical_block_size, const EnvOptions& options);
-  virtual ~PosixSequentialFile();
+  ~PosixSequentialFile() override;
 
   IOStatus Read(size_t n, const IOOptions& opts, Slice* result, char* scratch,
                 IODebugContext* dbg) override;
@@ -441,7 +442,7 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
                         ThreadLocalPtr* thread_local_multi_read_io_urings
 #endif
   );
-  virtual ~PosixRandomAccessFile();
+  ~PosixRandomAccessFile() override;
 
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& opts, Slice* result,
                 char* scratch, IODebugContext* dbg) const override;
@@ -462,11 +463,10 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
     return logical_sector_size_;
   }
 
-  virtual IOStatus ReadAsync(FSReadRequest& req, const IOOptions& opts,
-                             std::function<void(FSReadRequest&, void*)> cb,
-                             void* cb_arg, void** io_handle,
-                             IOHandleDeleter* del_fn,
-                             IODebugContext* dbg) override;
+  IOStatus ReadAsync(FSReadRequest& req, const IOOptions& opts,
+                     std::function<void(FSReadRequest&, void*)> cb,
+                     void* cb_arg, void** io_handle, IOHandleDeleter* del_fn,
+                     IODebugContext* dbg) override;
 
 #if USE_COROUTINES && FOLLY_HAS_LIBURING
   bool SubmitReadAsync(FSReadRequest& req, const IOOptions& opts,
@@ -474,7 +474,7 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
                        IODebugContext* dbg) override;
 #endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
 
-  virtual IOStatus GetFileSize(uint64_t* result) override;
+  IOStatus GetFileSize(uint64_t* result) override;
 };
 
 class PosixWritableFile : public FSWritableFile {
@@ -499,7 +499,7 @@ class PosixWritableFile : public FSWritableFile {
                              size_t logical_block_size,
                              const EnvOptions& options,
                              uint64_t initial_file_size);
-  virtual ~PosixWritableFile();
+  ~PosixWritableFile() override;
 
   // Need to implement this so the file is truncated correctly
   // with direct I/O
@@ -555,12 +555,12 @@ class PosixMmapReadableFile : public FSRandomAccessFile {
  public:
   PosixMmapReadableFile(const int fd, const std::string& fname, void* base,
                         size_t length, const EnvOptions& options);
-  virtual ~PosixMmapReadableFile();
+  ~PosixMmapReadableFile() override;
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& opts, Slice* result,
                 char* scratch, IODebugContext* dbg) const override;
   void Hint(AccessPattern pattern) override;
   IOStatus InvalidateCache(size_t offset, size_t length) override;
-  virtual IOStatus GetFileSize(uint64_t* result) override;
+  IOStatus GetFileSize(uint64_t* result) override;
 };
 
 class PosixMmapFile : public FSWritableFile {
@@ -595,7 +595,7 @@ class PosixMmapFile : public FSWritableFile {
  public:
   PosixMmapFile(const std::string& fname, int fd, size_t page_size,
                 const EnvOptions& options, uint64_t initial_file_size);
-  ~PosixMmapFile();
+  ~PosixMmapFile() override;
 
   // Means Close() will properly take care of truncate
   // and it does not need any additional information
@@ -626,7 +626,7 @@ class PosixRandomRWFile : public FSRandomRWFile {
  public:
   explicit PosixRandomRWFile(const std::string& fname, int fd,
                              const EnvOptions& options);
-  virtual ~PosixRandomRWFile();
+  ~PosixRandomRWFile() override;
 
   IOStatus Write(uint64_t offset, const Slice& data, const IOOptions& opts,
                  IODebugContext* dbg) override;
@@ -647,13 +647,13 @@ class PosixRandomRWFile : public FSRandomRWFile {
 struct PosixMemoryMappedFileBuffer : public MemoryMappedFileBuffer {
   PosixMemoryMappedFileBuffer(void* _base, size_t _length)
       : MemoryMappedFileBuffer(_base, _length) {}
-  virtual ~PosixMemoryMappedFileBuffer();
+  ~PosixMemoryMappedFileBuffer() override;
 };
 
 class PosixDirectory : public FSDirectory {
  public:
   explicit PosixDirectory(int fd, const std::string& directory_name);
-  ~PosixDirectory();
+  ~PosixDirectory() override;
   IOStatus Fsync(const IOOptions& opts, IODebugContext* dbg) override;
 
   IOStatus Close(const IOOptions& opts, IODebugContext* dbg) override;

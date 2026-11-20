@@ -1,1 +1,0 @@
-The `FSWritableFile` passed to `ExternalTableFactory::NewTableBuilder()` now reports logical file size including RocksDB-buffered data and exposes the underlying file's direct-I/O mode and required buffer alignment.

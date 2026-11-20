@@ -57,12 +57,16 @@ class LookupKey {
   char space_[200];  // Avoid allocation for short keys
 
   // No copying allowed
-  LookupKey(const LookupKey&);
-  void operator=(const LookupKey&);
+  LookupKey(const LookupKey&) = delete;
+  void operator=(const LookupKey&) = delete;
+  LookupKey(LookupKey&&) = delete;
+  void operator=(LookupKey&&) = delete;
 };
 
 inline LookupKey::~LookupKey() {
-  if (start_ != space_) delete[] start_;
+  if (start_ != space_) {
+    delete[] start_;
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

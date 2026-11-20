@@ -86,6 +86,9 @@ class EmbeddedBlobResolvingIterator : public InternalIterator {
   EmbeddedBlobResolvingIterator(const EmbeddedBlobResolvingIterator&) = delete;
   EmbeddedBlobResolvingIterator& operator=(
       const EmbeddedBlobResolvingIterator&) = delete;
+  EmbeddedBlobResolvingIterator(EmbeddedBlobResolvingIterator&&) = delete;
+  EmbeddedBlobResolvingIterator& operator=(EmbeddedBlobResolvingIterator&&) =
+      delete;
 
   bool Valid() const override { return iter_->Valid() && status_.ok(); }
 

@@ -30,7 +30,7 @@ struct SuperVersion;
 struct SuperVersionContext {
   struct WriteStallNotification {
     WriteStallInfo write_stall_info;
-    const ImmutableOptions* immutable_options;
+    const ImmutableOptions* immutable_options = nullptr;
   };
 
   autovector<SuperVersion*> superversions_to_free;
@@ -43,7 +43,7 @@ struct SuperVersionContext {
   explicit SuperVersionContext(bool create_superversion = false)
       : new_superversion(create_superversion ? new SuperVersion() : nullptr) {}
 
-  explicit SuperVersionContext(SuperVersionContext&& other) noexcept
+  SuperVersionContext(SuperVersionContext&& other) noexcept
       : superversions_to_free(std::move(other.superversions_to_free)),
 #ifndef ROCKSDB_DISABLE_STALL_NOTIFICATION
         write_stall_notifications(std::move(other.write_stall_notifications)),
@@ -53,6 +53,7 @@ struct SuperVersionContext {
   // No copies
   SuperVersionContext(const SuperVersionContext& other) = delete;
   void operator=(const SuperVersionContext& other) = delete;
+  void operator=(SuperVersionContext&& other) = delete;
 
   void NewSuperVersion() {
     new_superversion = std::unique_ptr<SuperVersion>(new SuperVersion());
@@ -244,7 +245,11 @@ struct JobContext {
 
   // Used for remote compaction. To prevent OPTIONS files from getting
   // purged by PurgeObsoleteFiles() of the primary host
-  uint64_t min_options_file_number;
+  uint64_t min_options_file_number = 0;
+  // Exact OPTIONS file committed by the current MANIFEST. Unlike
+  // min_options_file_number, this protects one authoritative file even when
+  // higher-numbered uncommitted OPTIONS files exist.
+  uint64_t manifest_options_file_number = 0;
   uint64_t log_number = 0;
   uint64_t prev_log_number = 0;
 
@@ -269,12 +274,17 @@ struct JobContext {
 
   explicit JobContext(int _job_id, bool create_superversion = false) {
     job_id = _job_id;
-    superversion_contexts.emplace_back(
-        SuperVersionContext(create_superversion));
+    superversion_contexts.emplace_back(create_superversion);
   }
 
   // Delete the default constructor
   JobContext() = delete;
+
+  // No copying allowed
+  JobContext(const JobContext&) = delete;
+  JobContext& operator=(const JobContext&) = delete;
+  JobContext(JobContext&&) = delete;
+  JobContext& operator=(JobContext&&) = delete;
 
   // For non-empty JobContext Clean() has to be called at least once before
   // before destruction (see asserts in ~JobContext()). Should be called with

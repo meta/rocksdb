@@ -14,7 +14,7 @@ namespace ROCKSDB_NAMESPACE {
 // An interface for converting a slice to a readable string
 class SliceFormatter {
  public:
-  virtual ~SliceFormatter() {}
+  virtual ~SliceFormatter() = default;
   virtual std::string Format(const Slice& s) const = 0;
 };
 
@@ -36,7 +36,7 @@ class LDBTool {
   // memory leaks being reported because of the default Options() etc. not being
   // destroyed.
   void Run(
-      int argc, char** argv, Options db_options = Options(),
+      int argc, char** argv, const Options& db_options = Options(),
       const LDBOptions& ldb_options = LDBOptions(),
       const std::vector<ColumnFamilyDescriptor>* column_families = nullptr);
 

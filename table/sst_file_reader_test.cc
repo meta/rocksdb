@@ -9,6 +9,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <utility>
 
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
@@ -69,9 +70,10 @@ class SstFileReaderTest : public testing::Test {
     EXPECT_NE(nullptr, base_env);
     env_ = base_env;
     options_.env = env_;
+    options_.read_io_executor_threads = 1;
   }
 
-  ~SstFileReaderTest() {
+  ~SstFileReaderTest() override {
     if (env_->FileExists(sst_name_).ok()) {
       EXPECT_OK(env_->DeleteFile(sst_name_));
     }
@@ -366,6 +368,7 @@ const uint64_t kNumKeys = 100;
 
 TEST_F(SstFileReaderTest, Basic) {
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsString(i));
   }
@@ -539,6 +542,10 @@ TEST_F(SstFileReaderTest, EmbeddedBlobRoundTrip) {
   std::shared_ptr<const TableProperties> props = reader.GetTableProperties();
   ASSERT_NE(props, nullptr);
   EXPECT_EQ(props->index_value_is_delta_encoded, 0);
+  ASSERT_TRUE(props->referenced_blob_bytes.has_value());
+  // Embedded blob records live in the SST and do not consume external blob
+  // file space.
+  EXPECT_EQ(*props->referenced_blob_bytes, 0U);
 
   EmbeddedBlobStats stats;
   GetEmbeddedBlobStats(&reader, &stats);
@@ -934,9 +941,12 @@ TEST_F(SstFileReaderTest, EmbeddedBlobValueDeltaEscapeFv8) {
     }
   };
 
-  std::vector<std::string> got7, got8;
-  bool delta7 = false, delta8 = false;
-  int escapes7 = 0, escapes8 = 0;
+  std::vector<std::string> got7;
+  std::vector<std::string> got8;
+  bool delta7 = false;
+  bool delta8 = false;
+  int escapes7 = 0;
+  int escapes8 = 0;
   build_and_read(7, &delta7, &escapes7, &got7);
   build_and_read(/*format_version=*/8, &delta8, &escapes8, &got8);
 
@@ -944,6 +954,7 @@ TEST_F(SstFileReaderTest, EmbeddedBlobValueDeltaEscapeFv8) {
   ASSERT_EQ(static_cast<int>(got8.size()), static_cast<int>(expected.size()));
   ASSERT_EQ(got7, got8);
   std::vector<std::string> expected_values;
+  expected_values.reserve(expected.size());
   for (const auto& kv : expected) {
     expected_values.push_back(kv.second);
   }
@@ -1140,6 +1151,7 @@ TEST_F(SstFileReaderTest, ParseTableIteratorKeyRejectsShortKey) {
 TEST_F(SstFileReaderTest, Uint64Comparator) {
   options_.comparator = test::Uint64Comparator();
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsUint64(i));
   }
@@ -1151,6 +1163,7 @@ TEST_F(SstFileReaderTest, ReadOptionsOutOfScope) {
   // outliving it.
   options_.comparator = test::Uint64Comparator();
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsUint64(i));
   }
@@ -1173,6 +1186,7 @@ TEST_F(SstFileReaderTest, ReadOptionsOutOfScope) {
 
 TEST_F(SstFileReaderTest, ReadFileWithGlobalSeqno) {
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsString(i));
   }
@@ -1238,7 +1252,7 @@ class SstFileReaderTimestampTest : public testing::Test {
     sst_name_ = test::PerThreadDBPath("sst_file_ts");
   }
 
-  ~SstFileReaderTimestampTest() {
+  ~SstFileReaderTimestampTest() override {
     EXPECT_OK(options_.env->DeleteFile(sst_name_));
   }
 
@@ -1264,7 +1278,7 @@ class SstFileReaderTimestampTest : public testing::Test {
 
   struct OutputKeyValueDesc : public KeyValueDesc {
     OutputKeyValueDesc(std::string k, std::string ts, std::string v)
-        : KeyValueDesc(std::move(k), std::string(ts), std::string(v)) {}
+        : KeyValueDesc(std::move(k), std::move(ts), std::move(v)) {}
   };
 
   void CreateFile(const std::vector<InputKeyValueDesc>& descs,
@@ -1514,12 +1528,13 @@ class SstFileReaderTimestampNotPersistedTest
     sst_name_ = test::PerThreadDBPath("sst_file_ts_not_persisted");
   }
 
-  ~SstFileReaderTimestampNotPersistedTest() = default;
+  ~SstFileReaderTimestampNotPersistedTest() override = default;
 };
 
 TEST_F(SstFileReaderTimestampNotPersistedTest, Basic) {
   std::vector<InputKeyValueDesc> input_descs;
 
+  input_descs.reserve(kNumKeys);
   for (uint64_t k = 0; k < kNumKeys; k++) {
     input_descs.emplace_back(
         /* key */ EncodeAsString(k), /* timestamp */ EncodeAsUint64(0),
@@ -1532,6 +1547,7 @@ TEST_F(SstFileReaderTimestampNotPersistedTest, Basic) {
   CreateFile(input_descs, &external_sst_file_info);
   std::vector<OutputKeyValueDesc> output_descs;
 
+  output_descs.reserve(kNumKeys);
   for (uint64_t k = 0; k < kNumKeys; k++) {
     output_descs.emplace_back(/* key */ EncodeAsString(k),
                               /* timestamp */ EncodeAsUint64(0),
@@ -1612,6 +1628,7 @@ TEST_F(SstFileReaderTimestampNotPersistedTest, IncompatibleTimestampFormat) {
 
 TEST_F(SstFileReaderTest, VerifyNumEntriesBasic) {
   std::vector<std::string> keys;
+  keys.reserve(kNumKeys);
   for (uint64_t i = 0; i < kNumKeys; i++) {
     keys.emplace_back(EncodeAsUint64(i));
   }
@@ -1646,6 +1663,7 @@ TEST_F(SstFileReaderTest, VerifyNumEntriesCorruption) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
   std::vector<std::string> keys;
+  keys.reserve(num_keys);
   for (uint64_t i = 0; i < num_keys; i++) {
     keys.emplace_back(EncodeAsUint64(i));
   }

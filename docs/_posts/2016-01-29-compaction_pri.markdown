@@ -7,11 +7,11 @@ redirect_from:
   - /blog/2921/compaction_pri/
 ---
 
-The most popular compaction style of RocksDB is level-based compaction, which is an improved version of LevelDB's compaction algorithm. Page 9- 16 of this [slides](https://github.com/facebook/rocksdb/blob/gh-pages/talks/2015-09-29-HPTS-Siying-RocksDB.pdf) gives an illustrated introduction of this compaction style. The basic idea that: data is organized by multiple levels with exponential increasing target size. Except a special level 0, every level is key-range partitioned into many files. When size of a level exceeds its target size, we pick one or more of its files, and merge the file into the next level.
+The most popular compaction style of RocksDB is level-based compaction, which is an improved version of LevelDB's compaction algorithm. Page 9- 16 of this [slides](https://github.com/meta/rocksdb/blob/gh-pages/talks/2015-09-29-HPTS-Siying-RocksDB.pdf) gives an illustrated introduction of this compaction style. The basic idea that: data is organized by multiple levels with exponential increasing target size. Except a special level 0, every level is key-range partitioned into many files. When size of a level exceeds its target size, we pick one or more of its files, and merge the file into the next level.
 
 <!--truncate-->
 
-Which file to pick to compact is an interesting question. LevelDB only uses one thread for compaction and it always picks files in round robin manner. We implemented multi-thread compaction in RocksDB by picking multiple files from the same level and compact them in parallel. We had to move away from LevelDB's file picking approach. Recently, we created an option [options.compaction_pri](https://github.com/facebook/rocksdb/blob/d6c838f1e130d8860407bc771fa6d4ac238859ba/include/rocksdb/options.h#L83-L93), which indicated three different algorithms to pick files to compact.
+Which file to pick to compact is an interesting question. LevelDB only uses one thread for compaction and it always picks files in round robin manner. We implemented multi-thread compaction in RocksDB by picking multiple files from the same level and compact them in parallel. We had to move away from LevelDB's file picking approach. Recently, we created an option [options.compaction_pri](https://github.com/meta/rocksdb/blob/d6c838f1e130d8860407bc771fa6d4ac238859ba/include/rocksdb/options.h#L83-L93), which indicated three different algorithms to pick files to compact.
 
 Why do we need to multiple algorithms to choose from? Because there are different factors to consider when picking the files, and we now don't yet know how to balance them automatically, so we expose it to users to choose. Here are factors to consider:
 
@@ -37,7 +37,7 @@ Our default compaction priority **kByCompensatedSize** considers the case. If nu
 
 **Efficiency of compaction filter**
 
-Usually people use [compaction filters](https://github.com/facebook/rocksdb/blob/v4.1/include/rocksdb/options.h#L201-L226) to clean up old data to free up space. Picking files to compact may impact space efficiency. We don't yet have a a compaction priority to optimize this case. In some of our use cases, we solved the problem in a different way: we have an external service checking modify time of all SST files. If any of the files is too old, we force the single file to compaction by calling DB::CompactFiles() using the single file. In this way, we can provide a time bound of data passing through compaction filters.
+Usually people use [compaction filters](https://github.com/meta/rocksdb/blob/v4.1/include/rocksdb/options.h#L201-L226) to clean up old data to free up space. Picking files to compact may impact space efficiency. We don't yet have a a compaction priority to optimize this case. In some of our use cases, we solved the problem in a different way: we have an external service checking modify time of all SST files. If any of the files is too old, we force the single file to compaction by calling DB::CompactFiles() using the single file. In this way, we can provide a time bound of data passing through compaction filters.
 
 
 In all, there three choices of compaction priority modes optimizing different scenarios. if you have a new use case, we suggest you start with `options.compaction_pri=kOldestSmallestSeqFirst` (note it is not the default one for backward compatible reason). If you want to further optimize your use case, you can try other two use cases if your use cases apply.

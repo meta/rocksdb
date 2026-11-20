@@ -219,7 +219,7 @@ namespace {
 template <typename T>
 struct PrefixVarintTestCase {
   T value;
-  uint32_t length;
+  uint32_t length = 0;
   std::string encoded;
 };
 

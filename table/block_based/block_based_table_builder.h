@@ -49,9 +49,11 @@ class BlockBasedTableBuilder : public TableBuilder {
   // No copying allowed
   BlockBasedTableBuilder(const BlockBasedTableBuilder&) = delete;
   BlockBasedTableBuilder& operator=(const BlockBasedTableBuilder&) = delete;
+  BlockBasedTableBuilder(BlockBasedTableBuilder&&) = delete;
+  BlockBasedTableBuilder& operator=(BlockBasedTableBuilder&&) = delete;
 
   // REQUIRES: Either Finish() or Abandon() has been called.
-  ~BlockBasedTableBuilder();
+  ~BlockBasedTableBuilder() override;
 
   // Resets this thread's AutoSkip inter-file estimate carryover (see
   // CompressionOptions::auto_skip). Tools that build many independent files on
@@ -65,6 +67,13 @@ class BlockBasedTableBuilder : public TableBuilder {
   //           comparator.
   // REQUIRES: Finish(), Abandon() have not been called
   void Add(const Slice& key, const Slice& value) override;
+
+  // Keeps block-based builders behind the retry-capable TableBuilder contract
+  // even though the current format accepts every row. Future format-specific
+  // boundary policies can then ask callers to cut the file without changing
+  // compaction's Add() assumptions.
+  TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
+                               TableBuilderAddContext* context) override;
 
   // Return non-ok iff some error has been detected.
   Status status() const override;
@@ -216,6 +225,9 @@ class BlockBasedTableBuilder : public TableBuilder {
   struct Rep;
   class BlockBasedTablePropertiesCollectorFactory;
   class BlockBasedTablePropertiesCollector;
+  // Adapter that bridges built-in index writer callbacks to
+  // BlockBasedTableBuilder's private write helpers.
+  class IndexBlockWriterImpl;
   std::unique_ptr<Rep> rep_;
   struct WorkingAreaPair;
   struct ParallelCompressionRep;

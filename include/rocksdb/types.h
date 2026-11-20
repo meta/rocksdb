@@ -80,8 +80,8 @@ enum EntryType {
 struct ParsedEntryInfo {
   Slice user_key;
   Slice timestamp;
-  SequenceNumber sequence;
-  EntryType type;
+  SequenceNumber sequence = 0;
+  EntryType type = kEntryPut;
 };
 
 enum class WriteStallCause {

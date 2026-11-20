@@ -63,7 +63,8 @@ std::vector<int> SortList::Merge(std::vector<int>& left,
                                  std::vector<int>& right) const {
   // Fill the resultant vector with sorted results from both vectors
   std::vector<int> result;
-  unsigned left_it = 0, right_it = 0;
+  unsigned left_it = 0;
+  unsigned right_it = 0;
 
   while (left_it < left.size() && right_it < right.size()) {
     // If the left value is smaller than the right it goes next

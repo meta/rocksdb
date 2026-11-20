@@ -7,7 +7,7 @@ redirect_from:
   - /blog/371/rocksdb-2-8-release/
 ---
 
-Check out the new RocksDB 2.8 release on [Github](https://github.com/facebook/rocksdb/releases/tag/2.8.fb).
+Check out the new RocksDB 2.8 release on [Github](https://github.com/meta/rocksdb/releases/tag/2.8.fb).
 
 RocksDB 2.8. is mostly focused on improving performance for in-memory workloads. We are seeing read QPS as high as 5M (we will write a separate blog post on this).
 
@@ -15,7 +15,7 @@ RocksDB 2.8. is mostly focused on improving performance for in-memory workloads.
 
 Here is the summary of new features:
 
-  * Added a new table format called PlainTable, which is optimized for RAM storage (ramfs or tmpfs). You can read more details about it on [our wiki](https://github.com/facebook/rocksdb/wiki/PlainTable-Format).
+  * Added a new table format called PlainTable, which is optimized for RAM storage (ramfs or tmpfs). You can read more details about it on [our wiki](https://github.com/meta/rocksdb/wiki/PlainTable-Format).
 
 
   * New prefixed memtable format HashLinkedList, which is optimized for cases where there are only a few keys for each prefix.
@@ -37,4 +37,4 @@ Here is the summary of new features:
 
 
 
-We have also introduced small incompatible API changes (mostly for advanced users). You can see full release notes in our [HISTORY.my](https://github.com/facebook/rocksdb/blob/2.8.fb/HISTORY.md) file.
+We have also introduced small incompatible API changes (mostly for advanced users). You can see full release notes in our [HISTORY.my](https://github.com/meta/rocksdb/blob/2.8.fb/HISTORY.md) file.

@@ -24,6 +24,8 @@ class AttributeGroupIteratorImpl : public AttributeGroupIterator {
   AttributeGroupIteratorImpl(const AttributeGroupIteratorImpl&) = delete;
   AttributeGroupIteratorImpl& operator=(const AttributeGroupIteratorImpl&) =
       delete;
+  AttributeGroupIteratorImpl(AttributeGroupIteratorImpl&&) = delete;
+  AttributeGroupIteratorImpl& operator=(AttributeGroupIteratorImpl&&) = delete;
 
   bool Valid() const override { return impl_.Valid(); }
   void SeekToFirst() override { impl_.SeekToFirst(); }

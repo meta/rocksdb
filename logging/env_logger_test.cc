@@ -34,7 +34,7 @@ class EnvLoggerTest : public testing::Test {
 
   EnvLoggerTest() : env_(Env::Default()) {}
 
-  ~EnvLoggerTest() = default;
+  ~EnvLoggerTest() override = default;
 
   std::shared_ptr<Logger> CreateLogger() {
     std::shared_ptr<Logger> result;
@@ -137,6 +137,7 @@ TEST_F(EnvLoggerTest, ConcurrentLogging) {
   std::vector<port::Thread> threads;
   const int kNumThreads = 5;
   // Create threads.
+  threads.reserve(kNumThreads);
   for (int ii = 0; ii < kNumThreads; ++ii) {
     threads.emplace_back(cb);
   }

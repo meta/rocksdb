@@ -26,6 +26,8 @@ class CoalescingIterator : public Iterator {
   // No copy allowed
   CoalescingIterator(const CoalescingIterator&) = delete;
   CoalescingIterator& operator=(const CoalescingIterator&) = delete;
+  CoalescingIterator(CoalescingIterator&&) = delete;
+  CoalescingIterator& operator=(CoalescingIterator&&) = delete;
 
   bool Valid() const override { return impl_.Valid(); }
   void SeekToFirst() override { impl_.SeekToFirst(); }

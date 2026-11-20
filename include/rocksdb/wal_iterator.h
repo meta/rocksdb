@@ -40,7 +40,7 @@ enum WalFileType {
 class WalFile {
  public:
   WalFile() {}
-  virtual ~WalFile() {}
+  virtual ~WalFile() = default;
 
   // Returns log file's pathname relative to the main db dir
   // Eg. For a live-log-file = /000003.log
@@ -210,7 +210,7 @@ struct BatchResult {
 class WalIterator {
  public:
   WalIterator() {}
-  virtual ~WalIterator() {}
+  virtual ~WalIterator() = default;
 
   // An iterator is either positioned at a WriteBatch or not valid.
   // This method returns true if the iterator is valid.

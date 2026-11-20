@@ -21,7 +21,7 @@ class InternalKeyComparator;
 struct TwoLevelIteratorState {
   TwoLevelIteratorState() {}
 
-  virtual ~TwoLevelIteratorState() {}
+  virtual ~TwoLevelIteratorState() = default;
   virtual InternalIteratorBase<IndexValue>* NewSecondaryIterator(
       const BlockHandle& handle) = 0;
 };

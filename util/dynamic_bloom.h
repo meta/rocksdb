@@ -46,7 +46,7 @@ class DynamicBloom {
                         uint32_t num_probes = 6, size_t huge_page_tlb_size = 0,
                         Logger* logger = nullptr);
 
-  ~DynamicBloom() {}
+  ~DynamicBloom() = default;
 
   // Assuming single thread adding to the DynamicBloom
   void Add(const Slice& key);

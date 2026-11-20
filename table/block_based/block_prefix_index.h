@@ -41,6 +41,12 @@ class BlockPrefixIndex {
                        const Slice& prefixes, const Slice& prefix_meta,
                        BlockPrefixIndex** prefix_index);
 
+  // No copying allowed
+  BlockPrefixIndex(const BlockPrefixIndex&) = delete;
+  BlockPrefixIndex& operator=(const BlockPrefixIndex&) = delete;
+  BlockPrefixIndex(BlockPrefixIndex&&) = delete;
+  BlockPrefixIndex& operator=(BlockPrefixIndex&&) = delete;
+
   ~BlockPrefixIndex() {
     delete[] buckets_;
     delete[] block_array_buffer_;

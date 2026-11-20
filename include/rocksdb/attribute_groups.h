@@ -126,6 +126,8 @@ class AttributeGroupIterator : public IteratorBase {
   // No copy allowed
   AttributeGroupIterator(const AttributeGroupIterator&) = delete;
   AttributeGroupIterator& operator=(const AttributeGroupIterator&) = delete;
+  AttributeGroupIterator(AttributeGroupIterator&&) = delete;
+  AttributeGroupIterator& operator=(AttributeGroupIterator&&) = delete;
 
   virtual const IteratorAttributeGroups& attribute_groups() const = 0;
 };

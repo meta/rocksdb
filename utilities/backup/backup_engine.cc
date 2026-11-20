@@ -23,6 +23,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "env/composite_env_wrapper.h"
@@ -130,6 +131,12 @@ class BackupEngineImpl {
                    bool read_only = false);
   ~BackupEngineImpl();
 
+  // No copying allowed
+  BackupEngineImpl(const BackupEngineImpl&) = delete;
+  BackupEngineImpl& operator=(const BackupEngineImpl&) = delete;
+  BackupEngineImpl(BackupEngineImpl&&) = delete;
+  BackupEngineImpl& operator=(BackupEngineImpl&&) = delete;
+
   IOStatus CreateNewBackupWithMetadata(const CreateBackupOptions& options,
                                        DB* db, const std::string& app_metadata,
                                        BackupID* new_backup_id_ptr);
@@ -210,6 +217,10 @@ class BackupEngineImpl {
 
     FileInfo(const FileInfo&) = delete;
     FileInfo& operator=(const FileInfo&) = delete;
+    FileInfo(FileInfo&&) = delete;
+    FileInfo& operator=(FileInfo&&) = delete;
+
+    ~FileInfo() = default;
 
     int refs;
     // Relative path from backup dir
@@ -371,6 +382,8 @@ class BackupEngineImpl {
 
     BackupMeta(const BackupMeta&) = delete;
     BackupMeta& operator=(const BackupMeta&) = delete;
+    BackupMeta(BackupMeta&&) = delete;
+    BackupMeta& operator=(BackupMeta&&) = delete;
 
     ~BackupMeta() = default;
 
@@ -389,7 +402,6 @@ class BackupEngineImpl {
     void SetSequenceNumber(uint64_t sequence_number) {
       sequence_number_ = sequence_number;
     }
-    uint64_t GetSequenceNumber() const { return sequence_number_; }
 
     const std::string& GetAppMetadata() const { return app_metadata_; }
 
@@ -406,14 +418,6 @@ class BackupEngineImpl {
     IOStatus Delete(bool delete_meta = true);
 
     bool Empty() const { return files_.empty(); }
-
-    std::shared_ptr<FileInfo> GetFile(const std::string& filename) const {
-      auto it = file_infos_->find(filename);
-      if (it == file_infos_->end()) {
-        return nullptr;
-      }
-      return it->second;
-    }
 
     const std::vector<std::shared_ptr<FileInfo>>& GetFiles() const {
       return files_;
@@ -588,14 +592,12 @@ class BackupEngineImpl {
 
   struct BackupAfterCopyOrCreateWorkItem {
     std::future<WorkItemResult> result;
-    bool shared;
-    bool needed_to_copy;
-    Env* backup_env;
+    bool shared = false;
+    bool needed_to_copy = false;
+    Env* backup_env = nullptr;
     std::string dst_path_tmp;
     std::string dst_path;
     std::string dst_relative;
-    BackupAfterCopyOrCreateWorkItem()
-        : shared(false), needed_to_copy(false), backup_env(nullptr) {}
 
     BackupAfterCopyOrCreateWorkItem(
         BackupAfterCopyOrCreateWorkItem&& o) noexcept {
@@ -613,6 +615,8 @@ class BackupEngineImpl {
       dst_relative = std::move(o.dst_relative);
       return *this;
     }
+
+    ~BackupAfterCopyOrCreateWorkItem() = default;
 
     BackupAfterCopyOrCreateWorkItem(std::future<WorkItemResult>&& _result,
                                     bool _shared, bool _needed_to_copy,
@@ -634,7 +638,7 @@ class BackupEngineImpl {
   struct ComputeChecksumWorkItem {
     std::future<WorkItemResult> result;
     std::string file_path;
-    uint64_t file_number;
+    uint64_t file_number = 0;
 
     ComputeChecksumWorkItem(std::future<WorkItemResult>&& _result,
                             const std::string& _file_path,
@@ -665,7 +669,6 @@ class BackupEngineImpl {
     std::string from_file;
     std::string to_file;
     std::string checksum_hex;
-    RestoreAfterCopyOrCreateWorkItem() {}
     RestoreAfterCopyOrCreateWorkItem(std::future<WorkItemResult>&& _result,
                                      const std::string& _from_file,
                                      const std::string& _to_file,
@@ -674,17 +677,6 @@ class BackupEngineImpl {
           from_file(_from_file),
           to_file(_to_file),
           checksum_hex(_checksum_hex) {}
-    RestoreAfterCopyOrCreateWorkItem(
-        RestoreAfterCopyOrCreateWorkItem&& o) noexcept {
-      *this = std::move(o);
-    }
-
-    RestoreAfterCopyOrCreateWorkItem& operator=(
-        RestoreAfterCopyOrCreateWorkItem&& o) noexcept {
-      result = std::move(o.result);
-      checksum_hex = std::move(o.checksum_hex);
-      return *this;
-    }
   };
 
   bool initialized_;
@@ -1299,6 +1291,14 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
               src_env_options = db_env_->OptimizeForBlobFileRead(
                   src_raw_env_options, ImmutableDBOptions(db_options));
               break;
+            case kDBLockFile:
+            case kCurrentFile:
+            case kTempFile:
+            case kInfoLogFile:
+            case kMetaDatabase:
+            case kIdentityFile:
+            case kOptionsFile:
+            case kCompactionProgressFile:
             default:
               // Other backed up files (like options file) are not read by live
               // DB, so don't need to worry about avoiding mixing buffered and
@@ -1769,6 +1769,8 @@ IOStatus BackupEngineImpl::RestoreDBFromBackup(
         "backup directories!");
   }
 
+  const std::string db_dir_prefix = db_dir + "/";
+  const std::string wal_dir_prefix = wal_dir + "/";
   if (options.keep_log_files) {
     // delete non-matching files in db_dir, but keep all the log files
     DeleteChildren(db_dir, files_to_keep, 1 << kWalFile);
@@ -1777,6 +1779,7 @@ IOStatus BackupEngineImpl::RestoreDBFromBackup(
     std::vector<std::string> archive_files;
     db_fs_->GetChildren(archive_dir, io_options_, &archive_files, nullptr)
         .PermitUncheckedError();  // ignore errors
+    const std::string archive_dir_prefix = archive_dir + "/";
     for (const auto& f : archive_files) {
       uint64_t number;
       FileType type;
@@ -1786,7 +1789,7 @@ IOStatus BackupEngineImpl::RestoreDBFromBackup(
                        "Moving log file from archive/ to wal_dir: %s",
                        f.c_str());
         IOStatus io_s = db_fs_->RenameFile(
-            archive_dir + "/" + f, wal_dir + "/" + f, io_options_, nullptr);
+            archive_dir_prefix + f, wal_dir_prefix + f, io_options_, nullptr);
         if (!io_s.ok()) {
           // if we can't move log file from archive_dir to wal_dir,
           // we should fail, since it might mean data loss
@@ -1837,7 +1840,7 @@ IOStatus BackupEngineImpl::RestoreDBFromBackup(
     // 3. Construct the final path
     // kWalFile lives in wal_dir and all the rest live in db_dir
     if (type == kWalFile) {
-      dst = wal_dir + "/" + dst;
+      dst = wal_dir_prefix + dst;
       if (options_.sync && !wal_dir_for_fsync) {
         io_s = db_fs_->NewDirectory(wal_dir, io_options_, &wal_dir_for_fsync,
                                     nullptr);
@@ -1846,7 +1849,7 @@ IOStatus BackupEngineImpl::RestoreDBFromBackup(
         }
       }
     } else {
-      dst = db_dir + "/" + dst;
+      dst = db_dir_prefix + dst;
       if (options_.sync && !db_dir_for_fsync) {
         io_s = db_fs_->NewDirectory(db_dir, io_options_, &db_dir_for_fsync,
                                     nullptr);
@@ -1860,7 +1863,8 @@ IOStatus BackupEngineImpl::RestoreDBFromBackup(
     // process is interrupted.
     if (type == kCurrentFile) {
       final_current_file = dst;
-      dst = temporary_current_file = dst + ".tmp";
+      dst.append(".tmp");
+      temporary_current_file = dst;
     }
 
     ROCKS_LOG_INFO(options_.info_log, "Restoring %s to %s\n", file.c_str(),
@@ -1988,8 +1992,8 @@ IOStatus BackupEngineImpl::VerifyBackup(BackupID backup_id,
                             std::to_string(file_info->size) +
                             " while found file size is " +
                             std::to_string(curr_abs_path_to_size[abs_path]));
-      return IOStatus::Corruption("File corrupted: File size mismatch for " +
-                                  abs_path + ": " + size_info);
+      return IOStatus::Corruption(
+          "File corrupted: File size mismatch for " + abs_path, size_info);
     }
     if (verify_with_checksum && !file_info->checksum_hex.empty()) {
       const std::string filename = file_info->GetDbFileName();
@@ -2298,7 +2302,7 @@ IOStatus BackupEngineImpl::AddBackupFileWorkItem(
         src_dir.empty() ? "" : src_path, *copy_dest_path, src_temperature,
         Temperature::kUnknown /*dst_temp*/, contents, db_env_, backup_env_,
         src_env_options, options_.sync, false /* use_fsync */, rate_limiter,
-        size_limit, stats, progress_callback, src_checksum_func_name,
+        size_limit, stats, std::move(progress_callback), src_checksum_func_name,
         checksum_hex, db_id, db_session_id);
     BackupAfterCopyOrCreateWorkItem after_copy_or_create_work_item(
         copy_or_create_work_item.result.get_future(), shared, need_to_copy,
@@ -2452,6 +2456,7 @@ void BackupEngineImpl::InferDBFilesToRetainInRestore(
   std::vector<ComputeChecksumWorkItem> backup_files_compute_checksum_work_items;
   std::vector<ComputeChecksumWorkItem> db_files_compute_checksum_work_items;
   std::unordered_map<uint64_t, std::string> backup_file_num_to_checksum;
+  const std::string db_dir_prefix = db_dir + "/";
   for (const auto& f : children) {
     uint64_t number;
     FileType type;
@@ -2473,7 +2478,7 @@ void BackupEngineImpl::InferDBFilesToRetainInRestore(
     }
 
     uint64_t size_bytes = 0;
-    std::string db_file_path = db_dir + "/" + f;
+    std::string db_file_path = db_dir_prefix + f;
     IOStatus io_st = db_fs_->GetFileSize(db_file_path, io_options_, &size_bytes,
                                          nullptr /* dbg */);
     if (!io_st.ok()) {
@@ -2501,7 +2506,7 @@ void BackupEngineImpl::InferDBFilesToRetainInRestore(
         continue;
       }
 
-      const std::string checksum_hex = "";
+      const std::string checksum_hex;
       std::string shared_file_name = GenerateSharedFileWithDbSessionIdAndSize(
           f, size_bytes, db_session_id);
       bool found = false;
@@ -2680,6 +2685,7 @@ void BackupEngineImpl::DeleteChildren(
   db_fs_->GetChildren(dir, io_options_, &children, nullptr)
       .PermitUncheckedError();  // ignore errors
 
+  const std::string dir_prefix = dir + "/";
   for (const auto& f : children) {
     uint64_t number;
     FileType type;
@@ -2692,7 +2698,7 @@ void BackupEngineImpl::DeleteChildren(
       // don't delete this file type.
       continue;
     }
-    db_fs_->DeleteFile(dir + "/" + f, io_options_, nullptr)
+    db_fs_->DeleteFile(dir_prefix + f, io_options_, nullptr)
         .PermitUncheckedError();  // ignore errors
   }
 }
@@ -3069,6 +3075,7 @@ IOStatus BackupEngineImpl::BackupMeta::LoadFromFile(
   }
   std::vector<std::shared_ptr<FileInfo>> files;
   bool footer_present = false;
+  const std::string backup_dir_prefix = backup_dir + "/";
   while (backup_meta_reader->ReadLine(
       &line, Env::IO_LOW /* rate_limiter_priority */)) {
     std::vector<std::string> components = StringSplit(line, ' ');
@@ -3158,7 +3165,7 @@ IOStatus BackupEngineImpl::BackupMeta::LoadFromFile(
       excluded_files_.emplace_back(filename);
     } else {
       // Verify file exists, with expected size
-      std::string abs_path = backup_dir + "/" + filename;
+      std::string abs_path = backup_dir_prefix + filename;
       auto e = abs_path_to_size.find(abs_path);
       if (e == abs_path_to_size.end()) {
         return IOStatus::Corruption(

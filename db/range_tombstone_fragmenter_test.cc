@@ -21,7 +21,8 @@ static auto bytewise_icmp = InternalKeyComparator(BytewiseComparator());
 
 std::unique_ptr<InternalIterator> MakeRangeDelIter(
     const std::vector<RangeTombstone>& range_dels) {
-  std::vector<std::string> keys, values;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
   for (const auto& range_del : range_dels) {
     auto key_and_value = range_del.Serialize();
     keys.push_back(key_and_value.first.Encode().ToString());
@@ -69,7 +70,7 @@ void VerifyVisibleTombstones(
 struct SeekTestCase {
   Slice seek_target;
   RangeTombstone expected_position;
-  bool out_of_range;
+  bool out_of_range = false;
 };
 
 void VerifySeek(FragmentedRangeTombstoneIterator* iter,

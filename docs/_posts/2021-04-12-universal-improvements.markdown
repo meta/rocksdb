@@ -14,7 +14,7 @@ We call for help for making following improvements.
 
 ### How Universal Compaction Works
 
-In universal, whole levels are compacted together to satisfy two conditions (See [wiki page](https://github.com/facebook/rocksdb/wiki/Universal-Compaction) for more details):
+In universal, whole levels are compacted together to satisfy two conditions (See [wiki page](https://github.com/meta/rocksdb/wiki/Universal-Compaction) for more details):
 
 1. total size / bottommost level size > a threshold, or
 2. total number of sorted runs (non-0 levels + L0 files) is within a threshold
@@ -43,4 +43,4 @@ But I believe the benefits would outweight the limitations. Reducing temporary s
 
 ### Interested in Help?
 
-Compaction is the core of LSM-tree, but its improvements are far overdue. If you are a user of universal compaction and would be able to benefit from those improvements, we will be happy to work with you on speeding up the project and bring them to RocksDB sooner. Feel free to communicate with us in [this issue](https://github.com/facebook/rocksdb/issues/8181).
+Compaction is the core of LSM-tree, but its improvements are far overdue. If you are a user of universal compaction and would be able to benefit from those improvements, we will be happy to work with you on speeding up the project and bring them to RocksDB sooner. Feel free to communicate with us in [this issue](https://github.com/meta/rocksdb/issues/8181).

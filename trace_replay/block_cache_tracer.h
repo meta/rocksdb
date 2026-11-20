@@ -67,7 +67,8 @@ class BlockCacheTraceHelper {
 // 6. BlockBasedTable::ApproximateOffsetOf. (kCompaction or
 // kUserApproximateSize).
 struct BlockCacheLookupContext {
-  BlockCacheLookupContext(const TableReaderCaller& _caller) : caller(_caller) {}
+  explicit BlockCacheLookupContext(const TableReaderCaller& _caller)
+      : caller(_caller) {}
   BlockCacheLookupContext(const TableReaderCaller& _caller, uint64_t _get_id,
                           bool _get_from_user_specified_snapshot)
       : caller(_caller),
@@ -118,7 +119,7 @@ class BlockCacheTraceWriterImpl : public BlockCacheTraceWriter {
   BlockCacheTraceWriterImpl(SystemClock* clock,
                             const BlockCacheTraceWriterOptions& trace_options,
                             std::unique_ptr<TraceWriter>&& trace_writer);
-  ~BlockCacheTraceWriterImpl() = default;
+  ~BlockCacheTraceWriterImpl() override = default;
   // No copy and move.
   BlockCacheTraceWriterImpl(const BlockCacheTraceWriterImpl&) = delete;
   BlockCacheTraceWriterImpl& operator=(const BlockCacheTraceWriterImpl&) =
@@ -142,7 +143,7 @@ class BlockCacheTraceWriterImpl : public BlockCacheTraceWriter {
 };
 
 // Write a trace record in human readable format, see
-// https://github.com/facebook/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
+// https://github.com/meta/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
 // for details.
 class BlockCacheHumanReadableTraceWriter {
  public:
@@ -164,7 +165,7 @@ class BlockCacheHumanReadableTraceWriter {
 // BlockCacheTraceWriter using a user provided TraceReader.
 class BlockCacheTraceReader {
  public:
-  BlockCacheTraceReader(std::unique_ptr<TraceReader>&& reader);
+  explicit BlockCacheTraceReader(std::unique_ptr<TraceReader>&& reader);
   virtual ~BlockCacheTraceReader() = default;
   // No copy and move.
   BlockCacheTraceReader(const BlockCacheTraceReader&) = delete;
@@ -181,13 +182,14 @@ class BlockCacheTraceReader {
 };
 
 // Read a trace record in human readable format, see
-// https://github.com/facebook/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
+// https://github.com/meta/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
 // for detailed.
 class BlockCacheHumanReadableTraceReader : public BlockCacheTraceReader {
  public:
-  BlockCacheHumanReadableTraceReader(const std::string& trace_file_path);
+  explicit BlockCacheHumanReadableTraceReader(
+      const std::string& trace_file_path);
 
-  ~BlockCacheHumanReadableTraceReader();
+  ~BlockCacheHumanReadableTraceReader() override;
 
   Status ReadHeader(BlockCacheTraceHeader* header);
 

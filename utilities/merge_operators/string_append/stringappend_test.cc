@@ -72,8 +72,8 @@ std::unique_ptr<DB> OpenTtlDb(const std::string& delim) {
 class StringLists {
  public:
   // Constructor: specifies the rocksdb db
-  /* implicit */
-  StringLists(UnownedPtr<DB> db) : db_(db), merge_option_(), get_option_() {
+  explicit StringLists(UnownedPtr<DB> db)
+      : db_(db), merge_option_(), get_option_() {
     assert(db);
   }
 
@@ -337,8 +337,12 @@ TEST_P(StringAppendOperatorTest, VariousKeys) {
   slists.Append("b", "2");
   slists.Append("c", "asdasd");
 
-  std::string a, b, c;
-  bool sa, sb, sc;
+  std::string a;
+  std::string b;
+  std::string c;
+  bool sa;
+  bool sb;
+  bool sc;
   sa = slists.Get("a", &a);
   sb = slists.Get("b", &b);
   sc = slists.Get("c", &c);
@@ -463,7 +467,9 @@ TEST_P(StringAppendOperatorTest, PersistentVariousKeys) {
     slists.Append("b", "2");
     slists.Append("c", "asdasd");
 
-    std::string a, b, c;
+    std::string a;
+    std::string b;
+    std::string c;
     ASSERT_TRUE(slists.Get("a", &a));
     ASSERT_TRUE(slists.Get("b", &b));
     ASSERT_TRUE(slists.Get("c", &c));
@@ -489,7 +495,9 @@ TEST_P(StringAppendOperatorTest, PersistentVariousKeys) {
     // The previous changes should be on disk (L0)
     // The most recent changes should be in memory (MemTable)
     // Hence, this will test both Get() paths.
-    std::string a, b, c;
+    std::string a;
+    std::string b;
+    std::string c;
     ASSERT_TRUE(slists.Get("a", &a));
     ASSERT_TRUE(slists.Get("b", &b));
     ASSERT_TRUE(slists.Get("c", &c));
@@ -505,7 +513,9 @@ TEST_P(StringAppendOperatorTest, PersistentVariousKeys) {
     StringLists slists(db.get());
 
     // All changes should be on disk. This will test VersionSet Get()
-    std::string a, b, c;
+    std::string a;
+    std::string b;
+    std::string c;
     ASSERT_TRUE(slists.Get("a", &a));
     ASSERT_TRUE(slists.Get("b", &b));
     ASSERT_TRUE(slists.Get("c", &c));
@@ -521,7 +531,9 @@ TEST_P(StringAppendOperatorTest, PersistentFlushAndCompaction) {
   {
     auto db = OpenDb("\n");
     StringLists slists(db.get());
-    std::string a, b, c;
+    std::string a;
+    std::string b;
+    std::string c;
 
     // Append, Flush, Get
     slists.Append("c", "asdasd");
@@ -560,7 +572,9 @@ TEST_P(StringAppendOperatorTest, PersistentFlushAndCompaction) {
   {
     auto db = OpenDb("\n");
     StringLists slists(db.get());
-    std::string a, b, c;
+    std::string a;
+    std::string b;
+    std::string c;
 
     // Get (Quick check for persistence of previous database)
     ASSERT_TRUE(slists.Get("a", &a));

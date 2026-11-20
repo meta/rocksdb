@@ -1,0 +1,1 @@
+Fixed a crash (`std::terminate()`) when `SstFileManager::SetDeleteRateBytesPerSecond()` was called concurrently from multiple threads while delete rate limiting was still disabled, which could create two background deletion threads and destroy one that was still joinable.

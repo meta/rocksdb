@@ -33,7 +33,7 @@ struct ConfigOptions;
 // including data loss, unreported corruption, deadlocks, and more.
 class SliceTransform : public Customizable {
  public:
-  virtual ~SliceTransform() {}
+  ~SliceTransform() override = default;
 
   // Return the name of this transformation.
   const char* Name() const override = 0;
@@ -65,7 +65,7 @@ class SliceTransform : public Customizable {
   // prefix size of 4.
   //
   // Wiki documentation here:
-  // https://github.com/facebook/rocksdb/wiki/Prefix-Seek
+  // https://github.com/meta/rocksdb/wiki/Prefix-Seek
   //
   virtual bool InDomain(const Slice& key) const = 0;
 

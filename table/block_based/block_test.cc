@@ -416,6 +416,7 @@ TEST_F(BlockTest, BlockReadAmpBitmap) {
 
     // Generate some random entries
     std::vector<size_t> random_entry_offsets;
+    random_entry_offsets.reserve(1000);
     for (int i = 0; i < 1000; i++) {
       random_entry_offsets.push_back(rnd.Next() % block_size);
     }
@@ -1959,8 +1960,8 @@ TEST_P(DataBlockKVChecksumCorruptionTest, CorruptEntry) {
         });
 
     // Purely for reducing the number of lines of code.
-    typedef std::unique_ptr<DataBlockIter> IterPtr;
-    typedef void(IterAPI)(IterPtr & iter, std::string&);
+    using IterPtr = std::unique_ptr<DataBlockIter>;
+    using IterAPI = void(IterPtr & iter, std::string&);
 
     std::string seek_key = keys[kNumRecords / 2];
     auto test_seek = [&](IterAPI iter_api) {
@@ -1977,7 +1978,7 @@ TEST_P(DataBlockKVChecksumCorruptionTest, CorruptEntry) {
     test_seek([](IterPtr& iter, std::string& k) { iter->SeekForPrev(k); });
     test_seek([](IterPtr& iter, std::string& k) { iter->SeekForGet(k); });
 
-    typedef void (DataBlockIter::*IterStepAPI)();
+    using IterStepAPI = void (DataBlockIter::*)();
     auto test_step = [&](IterStepAPI iter_api, std::string& k) {
       IterPtr biter = GenerateDataBlockIter(keys, values, kNumRecords);
       SyncPoint::GetInstance()->DisableProcessing();
@@ -2090,8 +2091,8 @@ TEST_P(IndexBlockKVChecksumCorruptionTest, CorruptEntry) {
             ++value[0];
           });
 
-      typedef std::unique_ptr<IndexBlockIter> IterPtr;
-      typedef void(IterAPI)(IterPtr & iter, std::string&);
+      using IterPtr = std::unique_ptr<IndexBlockIter>;
+      using IterAPI = void(IterPtr & iter, std::string&);
       std::string seek_key = first_keys[kNumRecords / 2];
       auto test_seek = [&](IterAPI iter_api) {
         std::unique_ptr<IndexBlockIter> biter = GenerateIndexBlockIter(
@@ -2105,7 +2106,7 @@ TEST_P(IndexBlockKVChecksumCorruptionTest, CorruptEntry) {
       test_seek([](IterPtr& iter, std::string&) { iter->SeekToLast(); });
       test_seek([](IterPtr& iter, std::string& k) { iter->Seek(k); });
 
-      typedef void (IndexBlockIter::*IterStepAPI)();
+      using IterStepAPI = void (IndexBlockIter::*)();
       auto test_step = [&](IterStepAPI iter_api, std::string& k) {
         std::unique_ptr<IndexBlockIter> biter = GenerateIndexBlockIter(
             separators, block_handles, first_keys, kNumRecords, seqno);
@@ -2172,9 +2173,9 @@ TEST_P(MetaIndexBlockKVChecksumCorruptionTest, CorruptEntry) {
           ++value[10];
         });
 
-    typedef std::unique_ptr<MetaBlockIter> IterPtr;
-    typedef void(IterAPI)(IterPtr & iter, std::string&);
-    typedef void (MetaBlockIter::*IterStepAPI)();
+    using IterPtr = std::unique_ptr<MetaBlockIter>;
+    using IterAPI = void(IterPtr & iter, std::string&);
+    using IterStepAPI = void (MetaBlockIter::*)();
     std::string seek_key = keys[kNumRecords / 2];
     auto test_seek = [&](IterAPI iter_api) {
       IterPtr biter = GenerateMetaIndexBlockIter(keys, values, kNumRecords);

@@ -94,6 +94,7 @@ struct BitFields {
     Reference& operator=(const Reference&) = default;
     Reference(Reference&&) = default;
     Reference& operator=(Reference&&) = default;
+    ~Reference() = default;
 
     void operator=(typename BitFieldT::V value) { bf_.Set<BitFieldT>(value); }
     void operator+=(typename BitFieldT::V value) {

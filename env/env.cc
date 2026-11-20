@@ -9,6 +9,7 @@
 
 #include "rocksdb/env.h"
 
+#include <memory>
 #include <sstream>
 #include <thread>
 
@@ -378,10 +379,7 @@ class LegacyFileSystemWrapper : public FileSystem {
   static const char* kClassName() { return "LegacyFileSystem"; }
   const char* Name() const override { return kClassName(); }
 
-  // Return the target to which this Env forwards all calls
-  Env* target() const { return target_; }
-
-  // The following text is boilerplate that forwards all methods to target()
+  // The following text is boilerplate that forwards all methods to target_
   IOStatus NewSequentialFile(const std::string& f, const FileOptions& file_opts,
                              std::unique_ptr<FSSequentialFile>* r,
                              IODebugContext* /*dbg*/) override {
@@ -724,7 +722,7 @@ Status Env::CreateFromUri(const ConfigOptions& config_options,
     std::shared_ptr<FileSystem> fs;
     Status s = FileSystem::CreateFromString(config_options, fs_uri, &fs);
     if (s.ok()) {
-      guard->reset(new CompositeEnvWrapper(*result, fs));
+      *guard = std::make_shared<CompositeEnvWrapper>(*result, fs);
       *result = guard->get();
     }
     return s;
@@ -739,6 +737,8 @@ std::string Env::PriorityToString(Env::Priority priority) {
       return "Low";
     case Env::Priority::HIGH:
       return "High";
+    case Env::Priority::READ:
+      return "Read";
     case Env::Priority::USER:
       return "User";
     case Env::Priority::TOTAL:
@@ -870,7 +870,8 @@ std::string Env::GenerateUniqueId() {
     // We already tried GenerateRfcUuid so no need to try it again in
     // GenerateRawUniqueId
     constexpr bool exclude_port_uuid = true;
-    uint64_t upper, lower;
+    uint64_t upper;
+    uint64_t lower;
     GenerateRawUniqueId(&upper, &lower, exclude_port_uuid);
 
     // Set 4-bit version to 4
@@ -1234,8 +1235,8 @@ Status NewEnvLogger(const std::string& fname, Env* env,
   // TODO: Tune the buffer size.
   options.writable_file_max_buffer_size = 1024 * 1024;
   std::unique_ptr<FSWritableFile> writable_file;
-  const auto status = env->GetFileSystem()->NewWritableFile(
-      fname, options, &writable_file, nullptr);
+  auto status = env->GetFileSystem()->NewWritableFile(fname, options,
+                                                      &writable_file, nullptr);
   if (!status.ok()) {
     return status;
   }

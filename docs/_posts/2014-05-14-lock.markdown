@@ -9,7 +9,7 @@ redirect_from:
 
 In this post, we briefly introduce the recent improvements we did to RocksDB to improve the issue of lock contention costs.
 
-RocksDB has a simple thread synchronization mechanism (See [RocksDB Architecture Guide](https://github.com/facebook/rocksdb/wiki/Rocksdb-Architecture-Guide)  to understand terms used below, like SST tables or mem tables). SST tables are immutable after being written and mem tables are lock-free data structures supporting single writer and multiple readers. There is only one single major lock, the DB mutex (DBImpl.mutex_) protecting all the meta operations, including:
+RocksDB has a simple thread synchronization mechanism (See [RocksDB Architecture Guide](https://github.com/meta/rocksdb/wiki/Rocksdb-Architecture-Guide)  to understand terms used below, like SST tables or mem tables). SST tables are immutable after being written and mem tables are lock-free data structures supporting single writer and multiple readers. There is only one single major lock, the DB mutex (DBImpl.mutex_) protecting all the meta operations, including:
 
 <!--truncate-->
 
@@ -30,7 +30,7 @@ To solve this problem, we created a meta-meta data structure called “[super ve
 
 2. We replace some reference counters to stc::atomic objects, so that decreasing reference count of an object usually doesn’t need to be inside the mutex any more.
 
-3. Make fetching super version and reference counting lock-free in read queries. After consolidating reference counting to one single super version and removing the locking for decreasing reference counts, in read case, we only acquire mutex for one thing: fetch the latest super version and increase the reference count for that (dereference the counter is done in an atomic decrease). We designed and implemented a (mostly) lock-free approach to do it. See [details](https://github.com/facebook/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Lei-Lockless-Get.pdf). We will write a separate blog post for that.
+3. Make fetching super version and reference counting lock-free in read queries. After consolidating reference counting to one single super version and removing the locking for decreasing reference counts, in read case, we only acquire mutex for one thing: fetch the latest super version and increase the reference count for that (dereference the counter is done in an atomic decrease). We designed and implemented a (mostly) lock-free approach to do it. See [details](https://github.com/meta/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Lei-Lockless-Get.pdf). We will write a separate blog post for that.
 
 4. Avoid disk I/O inside the mutex. As we know, each disk I/O to hard drives takes several milliseconds. It can be even longer if file system journal is involved or I/Os are queued. Even occasional disk I/O within mutex can cause huge performance outliers.
 We identified in two situations, we might do disk I/O inside mutex and we removed them:
@@ -48,9 +48,9 @@ Object creation can be slow because it involves malloc (in our case). Malloc som
 When I said there was only one single major lock, I was lying. In RocksDB, all LRU caches had exclusive mutexes within to protect writes to the LRU lists, which are done in both of read and write operations. LRU caches are used in block cache and table cache. Both of them are accessed more frequently than DB data structures. Lock contention of these two locks are as intense as the DB mutex. Even if LRU cache is sharded into ShardedLRUCache, we can still see lock contentions, especially table caches. We further address this issue in two way:
 (1) Bypassing table caches. A table cache maintains list of SST table’s read handlers. Those handlers contain SST files’ descriptors, table metadata, and possibly data indexes, as well as bloom filters. When the table handler needs to be evicted based on LRU, those information is cleared. When the SST table needs to be read and its table handler is not in LRU cache, the table is opened and those metadata is loaded. In some cases, users want to tune the system in a way that table handler evictions should never happen. It is common for high-throughput, low-latency servers. We introduce a mode where table cache is bypassed in read queries. In this mode, all table handlers are cached and accessed directly, so there is no need to query and adjust table caches for reading the database. It is the users’ responsibility to reserve enough resource for it. This mode can be turned on by setting options.max_open_files=-1.
 
-(2) [New PlainTable format](//github.com/facebook/rocksdb/wiki/PlainTable-Format) (optimized for SST in ramfs/tmpfs) does not organize data by blocks. Data are located by memory addresses so no block cache is needed.
+(2) [New PlainTable format](//github.com/meta/rocksdb/wiki/PlainTable-Format) (optimized for SST in ramfs/tmpfs) does not organize data by blocks. Data are located by memory addresses so no block cache is needed.
 
-With all of those improvements, lock contention is not a bottleneck anymore, which is shown in our [memory-only benchmark](https://github.com/facebook/rocksdb/wiki/RocksDB-In-Memory-Workload-Performance-Benchmarks) . Furthermore, lock contentions are not causing some huge (50 milliseconds+) latency outliers they used to cause.
+With all of those improvements, lock contention is not a bottleneck anymore, which is shown in our [memory-only benchmark](https://github.com/meta/rocksdb/wiki/RocksDB-In-Memory-Workload-Performance-Benchmarks) . Furthermore, lock contentions are not causing some huge (50 milliseconds+) latency outliers they used to cause.
 
 ### Comments
 

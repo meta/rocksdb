@@ -1,0 +1,1 @@
+`OptimisticTransactionDB` now returns `NotSupported` at open and when creating a column family with `inplace_update_support = true`. In-place updates do not advance the sequence number that commit-time validation checks, so transactions conflicting with them could commit.

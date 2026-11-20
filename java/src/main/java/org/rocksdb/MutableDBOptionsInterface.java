@@ -188,7 +188,7 @@ public interface MutableDBOptionsInterface<T extends MutableDBOptionsInterface<T
    * <p>
    *  The RocksDB wiki has some discussion about how the WAL interacts
    *  with memtables and flushing of column families, at
-   * <a href="https://github.com/facebook/rocksdb/wiki/Column-Families">...</a>
+   * <a href="https://github.com/meta/rocksdb/wiki/Column-Families">...</a>
    *  </p>
    * <p>If set to 0 (default), we will dynamically choose the WAL size limit to
    * be [sum of all write_buffer_size * max_write_buffer_number] * 4</p>
@@ -215,7 +215,7 @@ public interface MutableDBOptionsInterface<T extends MutableDBOptionsInterface<T
    * <p>
    *  The RocksDB wiki has some discussion about how the WAL interacts
    *  with memtables and flushing of column families, at
-   * <a href="https://github.com/facebook/rocksdb/wiki/Column-Families">...</a>
+   * <a href="https://github.com/meta/rocksdb/wiki/Column-Families">...</a>
    *  </p>
    * <p>If set to 0 (default), we will dynamically choose the WAL size limit to
    * be [sum of all write_buffer_size * max_write_buffer_number] * 4</p>

@@ -173,7 +173,7 @@ void Java_org_rocksdb_TtlDB_closeDatabase(JNIEnv* /* env */, jclass,
   // ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
 
   // TODO(AR) this is disabled until
-  // https://github.com/facebook/rocksdb/issues/4818 is resolved!
+  // https://github.com/meta/rocksdb/issues/4818 is resolved!
 }
 
 /*

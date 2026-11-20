@@ -28,7 +28,6 @@ class IteratorWrapperBase {
       : iter_(nullptr) {
     Set(_iter);
   }
-  ~IteratorWrapperBase() {}
   InternalIteratorBase<TValue>* iter() const { return iter_; }
   void SetRangeDelReadSeqno(SequenceNumber read_seqno) {
     if (iter_) {
@@ -216,7 +215,7 @@ class IteratorWrapperBase {
 
   InternalIteratorBase<TValue>* iter_;
   IterateResult result_;
-  bool valid_;
+  bool valid_ = false;
 
 #ifdef ROCKSDB_ASSERT_STATUS_CHECKED
   mutable bool status_checked_after_invalid_ = true;

@@ -18,6 +18,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class CopyEngine;
 class RateLimiter;
+struct SubsetCheckpointOptionsSnapshot;
 
 class CheckpointImpl : public Checkpoint {
  public:
@@ -59,18 +60,17 @@ class CheckpointImpl : public Checkpoint {
   // Checkpoint logic can be customized by providing callbacks for link, copy,
   // or create.
   Status CreateCustomCheckpoint(
-      std::function<Status(const std::string& src_dirname,
-                           const std::string& fname, FileType type,
-                           const Temperature temperature)>
-          link_file_cb,
-      std::function<Status(const std::string& src_dirname,
-                           const std::string& fname, uint64_t size_limit_bytes,
-                           FileType type, const std::string& checksum_func_name,
-                           const std::string& checksum_val,
-                           const Temperature src_temperature)>
+      const std::function<Status(const std::string& src_dirname,
+                                 const std::string& fname, FileType type,
+                                 const Temperature temperature)>& link_file_cb,
+      const std::function<Status(
+          const std::string& src_dirname, const std::string& fname,
+          uint64_t size_limit_bytes, FileType type,
+          const std::string& checksum_func_name,
+          const std::string& checksum_val, const Temperature src_temperature)>&
           copy_file_cb,
-      std::function<Status(const std::string& fname,
-                           const std::string& contents, FileType type)>
+      const std::function<Status(const std::string& fname,
+                                 const std::string& contents, FileType type)>&
           create_file_cb,
       uint64_t* sequence_number, uint64_t log_size_for_flush,
       bool get_live_table_checksum = false, bool atomic_flush = false,
@@ -80,17 +80,35 @@ class CheckpointImpl : public Checkpoint {
       uint64_t* manifest_size = nullptr);
 
  private:
+  Status CreateCustomCheckpoint(
+      const std::function<Status(const std::string& src_dirname,
+                                 const std::string& fname, FileType type,
+                                 const Temperature temperature)>& link_file_cb,
+      const std::function<Status(
+          const std::string& src_dirname, const std::string& fname,
+          uint64_t size_limit_bytes, FileType type,
+          const std::string& checksum_func_name,
+          const std::string& checksum_val, const Temperature src_temperature)>&
+          copy_file_cb,
+      const std::function<Status(const std::string& fname,
+                                 const std::string& contents, FileType type)>&
+          create_file_cb,
+      uint64_t* sequence_number, uint64_t log_size_for_flush,
+      SubsetCheckpointOptionsSnapshot* options_snapshot,
+      bool get_live_table_checksum, bool atomic_flush,
+      const std::vector<uint32_t>& include_cf_ids,
+      std::vector<uint32_t>* excluded_cf_ids,
+      std::string* manifest_relative_filename, uint64_t* manifest_size);
+
   Status CleanStagingDirectory(const std::string& path, Logger* info_log);
 
   // Export logic customization by providing callbacks for link or copy.
   Status ExportFilesInMetaData(
       const DBOptions& db_options, const ColumnFamilyMetaData& metadata,
-      std::function<Status(const std::string& src_dirname,
-                           const std::string& fname)>
-          link_file_cb,
-      std::function<Status(const std::string& src_dirname,
-                           const std::string& fname)>
-          copy_file_cb);
+      const std::function<Status(const std::string& src_dirname,
+                                 const std::string& fname)>& link_file_cb,
+      const std::function<Status(const std::string& src_dirname,
+                                 const std::string& fname)>& copy_file_cb);
 
  private:
   DB* db_;

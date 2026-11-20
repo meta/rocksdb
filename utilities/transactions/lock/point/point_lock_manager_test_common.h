@@ -48,8 +48,8 @@ class MockColumnFamilyHandle : public ColumnFamilyHandle {
 
 // Verify no lock was held. Return true, if success. False, if there is. Set
 // error message on False.
-bool verifyNoLocksHeld(std::shared_ptr<LockManager>& locker,
-                       std::string& errmsg) {
+inline bool verifyNoLocksHeld(std::shared_ptr<LockManager>& locker,
+                              std::string& errmsg) {
   // Validate no lock was held at the end of the test
   auto lock_status = locker->GetPointLockStatus();
   // print the lock status for debugging

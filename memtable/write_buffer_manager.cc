@@ -503,6 +503,7 @@ struct WriteBufferManager::FlushInitiatorRegistry {
           // current callback; the callback count prevents queued work from
           // being stranded when the limit reaches zero.
           flush_handoff_executor->SetBackgroundThreads(0);
+          TEST_SYNC_POINT("WriteBufferManager::Run:HandoffWorkersRetired");
         }
         MutexLock lock(&sorter_wait_mu);
         while (!stopping &&
@@ -522,8 +523,10 @@ struct WriteBufferManager::FlushInitiatorRegistry {
       if (flush_handoff_executor->GetBackgroundThreads() == 0) {
         flush_handoff_executor->SetBackgroundThreads(
             static_cast<int>(WriteBufferManager::kMaxOutstandingFlushHandoffs));
+        TEST_SYNC_POINT("WriteBufferManager::Run:HandoffWorkersRestarted");
       }
       if (refresh_needed) {
+        TEST_SYNC_POINT("WriteBufferManager::Run:BeforeRefresh");
         uint64_t refresh_generation = 0;
         {
           MutexLock lock(&sorter_wait_mu);
@@ -549,6 +552,10 @@ struct WriteBufferManager::FlushInitiatorRegistry {
       }
       const bool work_cycle_complete = owner->ProcessFlushHandoffRequest();
       MutexLock lock(&sorter_wait_mu);
+      if (owner->flush_policy() !=
+          WriteBufferFlushPolicy::kFlushLargestAcrossDBs) {
+        continue;
+      }
       if (work_cycle_complete) {
         const uint64_t deadline = SystemClock::Default()->NowMicros() +
                                   WriteBufferManager::kFlushWorkCycleMicros;
@@ -606,6 +613,7 @@ struct WriteBufferManager::FlushInitiatorRegistry {
         while (!stopping && !cv.TimedWait(deadline)) {
         }
       } else {
+        TEST_SYNC_POINT("WriteBufferManager::Run:BeforeIdleWait");
         const uint64_t deadline = SystemClock::Default()->NowMicros() +
                                   kIdleRefreshInterval.count() * 1000;
         while (!stopping && !refresh_requested && !cv.TimedWait(deadline)) {
@@ -1192,6 +1200,7 @@ bool WriteBufferManager::ExpireFlushHandoffLease(uint64_t now_micros) {
   active_flush_handoff_deadline_micros_ = 0;
   flush_handoff_state_.store(FlushHandoffState::kIdle,
                              std::memory_order_release);
+  TEST_SYNC_POINT("WriteBufferManager::ExpireFlushHandoffLease:Expired");
   return true;
 }
 

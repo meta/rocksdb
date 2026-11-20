@@ -262,8 +262,10 @@ TEST_F(ObjRegistryTest, TestFactoryCount) {
   std::string msg;
   auto grand = ObjectRegistry::Default();
   auto local = ObjectRegistry::NewInstance();
-  std::unordered_set<std::string> grand_types, local_types;
-  std::vector<std::string> grand_names, local_names;
+  std::unordered_set<std::string> grand_types;
+  std::unordered_set<std::string> local_types;
+  std::vector<std::string> grand_names;
+  std::vector<std::string> local_names;
 
   // Check how many types we have on startup.
   // Grand should equal local
@@ -514,7 +516,9 @@ TEST_F(ObjRegistryTest, TestGetOrCreateManagedObject) {
         guard->reset(new MyCustomizable("MC", uri));
         return guard->get();
       });
-  std::shared_ptr<MyCustomizable> m_a, m_b, obj;
+  std::shared_ptr<MyCustomizable> m_a;
+  std::shared_ptr<MyCustomizable> m_b;
+  std::shared_ptr<MyCustomizable> obj;
   std::vector<std::shared_ptr<MyCustomizable>> objs;
 
   std::unordered_map<std::string, std::string> opt_map;

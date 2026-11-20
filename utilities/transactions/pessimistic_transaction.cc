@@ -48,6 +48,7 @@ PessimisticTransaction::PessimisticTransaction(
       waiting_cf_id_(0),
       waiting_key_(nullptr),
       lock_timeout_(0),
+      deadlock_timeout_us_(0),
       deadlock_detect_(false),
       deadlock_detect_depth_(0),
       skip_concurrency_control_(false) {
@@ -516,7 +517,7 @@ Status WriteCommittedTxn::Operate(ColumnFamilyHandle* column_family,
           column_family->GetID());
     }
   }
-  return operation();
+  return std::forward<TOperation>(operation)();
 }
 
 Status WriteCommittedTxn::SetReadTimestampForValidation(TxnTimestamp ts) {
@@ -1372,7 +1373,7 @@ Status PessimisticTransaction::CollapseKey(const ReadOptions& options,
                                            ColumnFamilyHandle* column_family) {
   auto* cfh = column_family ? column_family : db_impl_->DefaultColumnFamily();
   std::string value;
-  const auto status = GetForUpdate(options, cfh, key, &value, true, true);
+  auto status = GetForUpdate(options, cfh, key, &value, true, true);
   if (!status.ok()) {
     return status;
   }

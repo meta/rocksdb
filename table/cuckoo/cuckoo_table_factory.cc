@@ -10,8 +10,20 @@
 #include "rocksdb/utilities/options_type.h"
 #include "table/cuckoo/cuckoo_table_builder.h"
 #include "table/cuckoo/cuckoo_table_reader.h"
+#include "table/format.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+Status CuckooTableFactory::FileIsValidTable(const IOOptions& io_options,
+                                            FSRandomAccessFile& file,
+                                            uint64_t file_size,
+                                            bool* matches) const {
+  uint64_t magic_number;
+  Status status =
+      ReadTableMagicNumber(io_options, file, file_size, &magic_number);
+  *matches = status.ok() && magic_number == kCuckooTableMagicNumber;
+  return status;
+}
 
 Status CuckooTableFactory::NewTableReader(
     const ReadOptions& /*ro*/, const TableReaderOptions& table_reader_options,

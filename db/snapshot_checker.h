@@ -19,14 +19,14 @@ enum class SnapshotCheckerResult : int {
 // Callback class that control GC of duplicate keys in flush/compaction.
 class SnapshotChecker {
  public:
-  virtual ~SnapshotChecker() {}
+  virtual ~SnapshotChecker() = default;
   virtual SnapshotCheckerResult CheckInSnapshot(
       SequenceNumber sequence, SequenceNumber snapshot_sequence) const = 0;
 };
 
 class DisableGCSnapshotChecker : public SnapshotChecker {
  public:
-  virtual ~DisableGCSnapshotChecker() {}
+  ~DisableGCSnapshotChecker() override = default;
   SnapshotCheckerResult CheckInSnapshot(
       SequenceNumber /*sequence*/,
       SequenceNumber /*snapshot_sequence*/) const override {
@@ -46,7 +46,7 @@ class WritePreparedTxnDB;
 class WritePreparedSnapshotChecker : public SnapshotChecker {
  public:
   explicit WritePreparedSnapshotChecker(WritePreparedTxnDB* txn_db);
-  virtual ~WritePreparedSnapshotChecker() {}
+  ~WritePreparedSnapshotChecker() override = default;
 
   SnapshotCheckerResult CheckInSnapshot(
       SequenceNumber sequence, SequenceNumber snapshot_sequence) const override;

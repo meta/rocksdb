@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <string>
+#include <utility>
 
 #include "monitoring/instrumented_mutex.h"
 #include "port/port.h"
@@ -23,7 +24,7 @@ class RepeatableThread {
   RepeatableThread(std::function<void()> function,
                    const std::string& thread_name, SystemClock* clock,
                    uint64_t delay_us, uint64_t initial_delay_us = 0)
-      : function_(function),
+      : function_(std::move(function)),
         thread_name_("rocksdb:" + thread_name),
         clock_(clock),
         delay_us_(delay_us),
@@ -37,6 +38,12 @@ class RepeatableThread {
 #endif
         thread_([this] { thread(); }) {
   }
+
+  // No copying allowed
+  RepeatableThread(const RepeatableThread&) = delete;
+  RepeatableThread& operator=(const RepeatableThread&) = delete;
+  RepeatableThread(RepeatableThread&&) = delete;
+  RepeatableThread& operator=(RepeatableThread&&) = delete;
 
   void cancel() {
     {
@@ -61,7 +68,7 @@ class RepeatableThread {
   // time and trigger RepeatableThread. See repeatable_thread_test for example.
   //
   // Note: only support one caller of this method.
-  void TEST_WaitForRun(std::function<void()> callback = nullptr) {
+  void TEST_WaitForRun(const std::function<void()>& callback = nullptr) {
     InstrumentedMutexLock l(&mutex_);
     while (!waiting_) {
       cond_var_.Wait();

@@ -5,19 +5,26 @@
 
 #include "rocksdb/utilities/options_util.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cinttypes>
+#include <memory>
 #include <unordered_map>
 
+#include "db/db_impl/db_impl.h"
 #include "env/mock_env.h"
+#include "file/file_util.h"
 #include "file/filename.h"
 #include "options/options_parser.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/table.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/random.h"
+#include "utilities/fault_injection_env.h"
+#include "utilities/fault_injection_fs.h"
 
 #ifndef GFLAGS
 bool FLAGS_enable_print = false;
@@ -36,6 +43,26 @@ class OptionsUtilTest : public testing::Test {
   }
 
  protected:
+  Options NewTestOptions(bool track_options_file_number) const {
+    Options options;
+    options.env = env_.get();
+    options.create_if_missing = true;
+    options.track_options_file_number_in_manifest = track_options_file_number;
+    return options;
+  }
+
+  void CreateAndCloseDb(const Options& options) {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(options, dbname_, &db));
+  }
+
+  void PersistDefaultOptions(const Options& options, uint64_t file_number) {
+    ASSERT_OK(PersistRocksDBOptions(
+        WriteOptions(), DBOptions(options), {kDefaultColumnFamilyName},
+        {ColumnFamilyOptions(options)}, OptionsFileName(dbname_, file_number),
+        env_->GetFileSystem().get()));
+  }
+
   std::unique_ptr<Env> env_;
   std::string dbname_;
   Random rnd_;
@@ -215,7 +242,6 @@ class DummySliceTransform : public SliceTransform {
 
   // determine whether this is a valid src upon the function applies
   bool InDomain(const Slice& /*src*/) const override { return false; }
-
 };
 
 }  // namespace
@@ -271,7 +297,7 @@ TEST_F(OptionsUtilTest, SanityCheck) {
     ASSERT_NOK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
-    cf_descs[0].options.merge_operator.reset(new DummyMergeOperator());
+    cf_descs[0].options.merge_operator = std::make_shared<DummyMergeOperator>();
     ASSERT_NOK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
@@ -291,7 +317,8 @@ TEST_F(OptionsUtilTest, SanityCheck) {
     ASSERT_OK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
-    cf_descs[1].options.prefix_extractor.reset(new DummySliceTransform());
+    cf_descs[1].options.prefix_extractor =
+        std::make_shared<DummySliceTransform>();
     ASSERT_OK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
@@ -312,7 +339,8 @@ TEST_F(OptionsUtilTest, SanityCheck) {
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
     // It's okay to change prefix_extractor from nullptr to non-nullptr
-    cf_descs[0].options.prefix_extractor.reset(new DummySliceTransform());
+    cf_descs[0].options.prefix_extractor =
+        std::make_shared<DummySliceTransform>();
     ASSERT_OK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
@@ -341,7 +369,7 @@ TEST_F(OptionsUtilTest, SanityCheck) {
         cf_descs[3].options.table_factory;
 
     ASSERT_NE(table_factory, nullptr);
-    cf_descs[3].options.table_factory.reset(new DummyTableFactory());
+    cf_descs[3].options.table_factory = std::make_shared<DummyTableFactory>();
     ASSERT_NOK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
 
@@ -425,6 +453,136 @@ TEST_F(OptionsUtilTest, LatestOptionsNotFound) {
   ASSERT_OK(options.env->DeleteDir(dbname_));
 }
 
+TEST_F(OptionsUtilTest, LegacyHighestOptionsDoesNotReadManifest) {
+  Options options = NewTestOptions(false);
+  CreateAndCloseDb(options);
+
+  bool manifest_read = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "GetLatestOptionsFileName:BeforeManifestReplay",
+      [&](void*) { manifest_read = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::string selected_name;
+  ASSERT_OK(GetLatestOptionsFileName(dbname_, env_.get(), &selected_name));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_FALSE(manifest_read);
+
+  ConfigOptions config_options;
+  config_options.env = env_.get();
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cfs;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                              &loaded_cfs));
+  ASSERT_FALSE(loaded_db_options.track_options_file_number_in_manifest);
+  ASSERT_OK(DestroyDB(dbname_, options));
+}
+
+TEST_F(OptionsUtilTest, LegacyOpenDoesNotInspectOptionsFile) {
+  Options options = NewTestOptions(false);
+  CreateAndCloseDb(options);
+  options.create_if_missing = false;
+
+  bool inspected_options_file = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ResolveOptionsFileNumber:InspectTrackingMarker",
+      [&](void*) { inspected_options_file = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CreateAndCloseDb(options);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_FALSE(inspected_options_file);
+  ASSERT_OK(DestroyDB(dbname_, options));
+}
+
+TEST_F(OptionsUtilTest, TrackingMarkerParticipatesInCompatibilityCheck) {
+  Options tracked = NewTestOptions(true);
+  CreateAndCloseDb(tracked);
+
+  ConfigOptions config_options;
+  config_options.env = env_.get();
+  DBOptions persisted;
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &persisted, &cf_descs));
+  ASSERT_TRUE(persisted.track_options_file_number_in_manifest);
+  ASSERT_OK(
+      CheckOptionsCompatibility(config_options, dbname_, persisted, cf_descs));
+
+  DBOptions disabled = persisted;
+  disabled.track_options_file_number_in_manifest = false;
+  ASSERT_NOK(
+      CheckOptionsCompatibility(config_options, dbname_, disabled, cf_descs));
+  ASSERT_OK(DestroyDB(dbname_, tracked));
+}
+
+TEST_F(OptionsUtilTest, ReadOnlyUsesRecoveredCommitAndMakesNoChanges) {
+  Options options = NewTestOptions(true);
+  CreateAndCloseDb(options);
+
+  OptionsFileManifestState manifest_state;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &manifest_state));
+  ASSERT_TRUE(manifest_state.has_committed_options_file_number);
+  const uint64_t committed_number =
+      manifest_state.committed_options_file_number;
+  PersistDefaultOptions(options, committed_number + 1000000);
+
+  std::vector<std::string> files_before;
+  ASSERT_OK(env_->GetChildren(dbname_, &files_before));
+
+  std::unique_ptr<DB> read_only_db;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &read_only_db));
+  auto* read_only_impl =
+      static_cast_with_check<DBImpl>(read_only_db->GetRootDB());
+  ASSERT_TRUE(
+      read_only_impl->GetVersionSet()->has_committed_options_file_number());
+  ASSERT_EQ(committed_number,
+            read_only_impl->GetVersionSet()->options_file_number());
+  read_only_db.reset();
+
+  std::vector<std::string> files_after;
+  ASSERT_OK(env_->GetChildren(dbname_, &files_after));
+  std::sort(files_before.begin(), files_before.end());
+  std::sort(files_after.begin(), files_after.end());
+  ASSERT_EQ(files_before, files_after);
+  ASSERT_OK(DestroyDB(dbname_, options));
+}
+
+TEST_F(OptionsUtilTest, BestEffortsReadOnlyUsesRecoveredManifest) {
+  Options options = NewTestOptions(false);
+  CreateAndCloseDb(options);
+
+  std::string current_manifest;
+  ASSERT_OK(ReadFileToString(env_.get(), CurrentFileName(dbname_),
+                             &current_manifest));
+  ASSERT_FALSE(current_manifest.empty());
+  if (current_manifest.back() == '\n') {
+    current_manifest.pop_back();
+  }
+  uint64_t manifest_number = 0;
+  FileType manifest_type = kTempFile;
+  ASSERT_TRUE(
+      ParseFileName(current_manifest, &manifest_number, &manifest_type));
+  ASSERT_EQ(kDescriptorFile, manifest_type);
+  const std::string stale_current_target = dbname_ + "/" + current_manifest;
+  const std::string surviving_manifest =
+      DescriptorFileName(dbname_, manifest_number + 1);
+  ASSERT_OK(env_->RenameFile(stale_current_target, surviving_manifest));
+  ASSERT_TRUE(env_->FileExists(stale_current_target).IsNotFound());
+
+  Options best_efforts_options = options;
+  best_efforts_options.create_if_missing = false;
+  best_efforts_options.best_efforts_recovery = true;
+  std::unique_ptr<DB> read_only_db;
+  ASSERT_OK(DB::OpenForReadOnly(best_efforts_options, dbname_, &read_only_db));
+  read_only_db.reset();
+  ASSERT_OK(DestroyDB(dbname_, options));
+}
+
 TEST_F(OptionsUtilTest, LoadLatestOptions) {
   Options options;
   options.OptimizeForSmallDb();
@@ -495,6 +653,259 @@ TEST_F(OptionsUtilTest, LoadLatestOptions) {
   }
   db.reset();
   ASSERT_OK(DestroyDB(dbname_, options, cf_descs));
+}
+
+TEST_F(OptionsUtilTest, ManifestSelectsCommittedOptionsFile) {
+  DBOptions db_options;
+  db_options.env = env_.get();
+  db_options.create_if_missing = true;
+  db_options.track_options_file_number_in_manifest = true;
+  db_options.max_manifest_file_size = 1;
+  ColumnFamilyOptions cf_options;
+  Options options(db_options, cf_options);
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname_, &db));
+
+  ColumnFamilyHandle* new_cf = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(cf_options, "one", &new_cf));
+  ASSERT_NE(nullptr, new_cf);
+
+  std::string committed_name;
+  ASSERT_OK(GetLatestOptionsFileName(dbname_, env_.get(), &committed_name));
+  uint64_t committed_number = 0;
+  FileType type = kTempFile;
+  ASSERT_TRUE(ParseFileName(committed_name, &committed_number, &type));
+  ASSERT_EQ(kOptionsFile, type);
+
+  // An unrelated MANIFEST rotation must carry the committed number into its
+  // snapshot.
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+  std::string selected_after_manifest_rotation;
+  ASSERT_OK(GetLatestOptionsFileName(dbname_, env_.get(),
+                                     &selected_after_manifest_rotation));
+  ASSERT_EQ(committed_name, selected_after_manifest_rotation);
+
+  // Generic cleanup must retain the MANIFEST-selected file.
+  auto* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  db_impl->TEST_DeleteObsoleteFiles();
+  ASSERT_OK(db_impl->TEST_WaitForPurge());
+  ASSERT_OK(env_->FileExists(dbname_ + "/" + committed_name));
+
+  std::string selected_name;
+  ASSERT_OK(GetLatestOptionsFileName(dbname_, env_.get(), &selected_name));
+  ASSERT_EQ(committed_name, selected_name);
+
+  ConfigOptions config_options;
+  config_options.env = env_.get();
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cf_descs;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                              &loaded_cf_descs));
+  ASSERT_TRUE(loaded_db_options.track_options_file_number_in_manifest);
+  ASSERT_EQ(2U, loaded_cf_descs.size());
+  ASSERT_EQ("one", loaded_cf_descs[1].name);
+  const std::vector<ColumnFamilyDescriptor> explicit_cf_descs = loaded_cf_descs;
+
+  delete new_cf;
+  new_cf = nullptr;
+  db.reset();
+
+  std::vector<std::string> files_before_read_only_open;
+  ASSERT_OK(env_->GetChildren(dbname_, &files_before_read_only_open));
+  std::vector<ColumnFamilyHandle*> read_only_handles;
+  std::unique_ptr<DB> read_only_db;
+  ASSERT_OK(DB::OpenForReadOnly(db_options, dbname_, loaded_cf_descs,
+                                &read_only_handles, &read_only_db));
+  for (auto* handle : read_only_handles) {
+    delete handle;
+  }
+  read_only_db.reset();
+  std::vector<std::string> files_after_read_only_open;
+  ASSERT_OK(env_->GetChildren(dbname_, &files_after_read_only_open));
+  std::sort(files_before_read_only_open.begin(),
+            files_before_read_only_open.end());
+  std::sort(files_after_read_only_open.begin(),
+            files_after_read_only_open.end());
+  ASSERT_EQ(files_before_read_only_open, files_after_read_only_open);
+
+  // Corruption in the selected file is terminal.
+  ASSERT_OK(CreateFile(env_->GetFileSystem(), dbname_ + "/" + committed_name,
+                       "not an OPTIONS file", /*use_fsync=*/false));
+  ASSERT_NOK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                               &loaded_cf_descs));
+
+  // If the committed file is missing, the highest remaining tracked snapshot
+  // is not usable when it lacks a MANIFEST-live column family.
+  ASSERT_OK(env_->DeleteFile(dbname_ + "/" + committed_name));
+  ASSERT_TRUE(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                                &loaded_cf_descs)
+                  .IsCorruption());
+
+  // DB::Open consumes the caller's complete options, not the operational
+  // OPTIONS snapshot. Read-only open uses the same RepairDB fallback and must
+  // not modify the DB directory.
+  std::vector<ColumnFamilyHandle*> explicit_handles;
+  std::unique_ptr<DB> explicit_db;
+  ASSERT_OK(DB::OpenForReadOnly(db_options, dbname_, explicit_cf_descs,
+                                &explicit_handles, &explicit_db));
+  for (auto* explicit_handle : explicit_handles) {
+    delete explicit_handle;
+  }
+  explicit_db.reset();
+  ASSERT_OK(DestroyDB(dbname_, options));
+}
+
+TEST_F(OptionsUtilTest, DisabledTrackingUsesLegacyWritesAndCanReenable) {
+  Options tracked = NewTestOptions(true);
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(tracked, dbname_, &db));
+  auto* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_TRUE(db_impl->GetVersionSet()->has_committed_options_file_number());
+  const uint64_t initial_committed_number =
+      db_impl->GetVersionSet()->options_file_number();
+  db.reset();
+
+  Options legacy = tracked;
+  legacy.create_if_missing = false;
+  legacy.track_options_file_number_in_manifest = false;
+  ASSERT_OK(DB::Open(legacy, dbname_, &db));
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_OK(db->SetDBOptions(
+        {{"stats_dump_period_sec", std::to_string(1001 + i)}}));
+  }
+  db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_FALSE(db_impl->GetVersionSet()->has_committed_options_file_number());
+  const uint64_t legacy_number =
+      db_impl->GetVersionSet()->options_file_number();
+  ASSERT_GT(legacy_number, initial_committed_number);
+  db.reset();
+
+  OptionsFileManifestState protocol_state;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &protocol_state));
+  ASSERT_TRUE(protocol_state.has_committed_options_file_number);
+  ASSERT_EQ(initial_committed_number,
+            protocol_state.committed_options_file_number);
+
+  std::string selected_name;
+  ASSERT_OK(GetLatestOptionsFileName(dbname_, env_.get(), &selected_name));
+  ASSERT_EQ(OptionsFileName(legacy_number), selected_name);
+
+  tracked.create_if_missing = false;
+  ASSERT_OK(DB::OpenForReadOnly(tracked, dbname_, &db));
+  db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_FALSE(db_impl->GetVersionSet()->has_committed_options_file_number());
+  ASSERT_EQ(legacy_number, db_impl->GetVersionSet()->options_file_number());
+  db.reset();
+
+  ASSERT_OK(DB::Open(tracked, dbname_, &db));
+  ASSERT_OK(env_->FileExists(OptionsFileName(dbname_, legacy_number)));
+  ColumnFamilyHandle* new_cf = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(), "one", &new_cf));
+  ASSERT_NE(nullptr, new_cf);
+  db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_TRUE(db_impl->GetVersionSet()->has_committed_options_file_number());
+  const uint64_t reenabled_number =
+      db_impl->GetVersionSet()->options_file_number();
+  ASSERT_GT(reenabled_number, legacy_number);
+  ASSERT_OK(db->DestroyColumnFamilyHandle(new_cf));
+  db.reset();
+
+  ASSERT_OK(GetLatestOptionsFileName(dbname_, env_.get(), &selected_name));
+  ASSERT_EQ(OptionsFileName(reenabled_number), selected_name);
+  ConfigOptions config_options;
+  config_options.env = env_.get();
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cfs;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                              &loaded_cfs));
+  ASSERT_EQ(2U, loaded_cfs.size());
+  ASSERT_EQ("one", loaded_cfs[1].name);
+  ASSERT_OK(DestroyDB(dbname_, tracked));
+}
+
+TEST_F(OptionsUtilTest, TrackedOrphanIsIgnoredUnlessCommitIsMissing) {
+  Options legacy_options = NewTestOptions(false);
+  CreateAndCloseDb(legacy_options);
+
+  Options options = NewTestOptions(true);
+  options.create_if_missing = false;
+  CreateAndCloseDb(options);
+
+  OptionsFileManifestState manifest_state;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &manifest_state));
+  ASSERT_TRUE(manifest_state.has_committed_options_file_number);
+  const uint64_t committed_number =
+      manifest_state.committed_options_file_number;
+  const uint64_t orphan_number = committed_number + 1000000;
+  PersistDefaultOptions(options, orphan_number);
+
+  std::string selected_name;
+  ASSERT_OK(GetLatestOptionsFileName(dbname_, env_.get(), &selected_name));
+  ASSERT_EQ(OptionsFileName(committed_number), selected_name);
+
+  ASSERT_OK(env_->DeleteFile(OptionsFileName(dbname_, committed_number)));
+  ASSERT_OK(GetLatestOptionsFileName(dbname_, env_.get(), &selected_name));
+  // An older legacy snapshot does not supersede a missing newer commit.
+  ASSERT_EQ(OptionsFileName(orphan_number), selected_name);
+
+  ASSERT_OK(DestroyDB(dbname_, options));
+}
+
+TEST_F(OptionsUtilTest, WritableOpenDeletesRejectedTrackedOrphan) {
+  Options options = NewTestOptions(true);
+  CreateAndCloseDb(options);
+
+  OptionsFileManifestState manifest_state;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &manifest_state));
+  ASSERT_TRUE(manifest_state.has_committed_options_file_number);
+  const uint64_t orphan_number =
+      manifest_state.committed_options_file_number + 1000000;
+  PersistDefaultOptions(options, orphan_number);
+
+  options.create_if_missing = false;
+  CreateAndCloseDb(options);
+  ASSERT_TRUE(
+      env_->FileExists(OptionsFileName(dbname_, orphan_number)).IsNotFound());
+  ASSERT_OK(DestroyDB(dbname_, options));
+}
+
+TEST_F(OptionsUtilTest, TrackedManifestFailureSetsBackgroundError) {
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+  Options options = NewTestOptions(true);
+  options.env = fault_env.get();
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname_, &db));
+
+  bool inject_error = true;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifest", [&](void*) {
+        if (inject_error) {
+          inject_error = false;
+          fault_fs->SetThreadLocalErrorContext(
+              FaultInjectionIOType::kWrite, /*seed=*/0, /*one_in=*/1,
+              /*retryable=*/false, /*has_data_loss=*/false);
+          fault_fs->EnableThreadLocalErrorInjection(
+              FaultInjectionIOType::kWrite);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_NOK(db->SetDBOptions({{"stats_dump_period_sec", "1001"}}));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+
+  auto* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  ASSERT_TRUE(db_impl->TEST_GetBGError().IsIOError());
+  db.reset();
+  ASSERT_OK(DestroyDB(dbname_, options));
 }
 
 static void WriteOptionsFile(Env* env, const std::string& path,

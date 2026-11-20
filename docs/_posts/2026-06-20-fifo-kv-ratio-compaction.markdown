@@ -5,7 +5,7 @@ author: xbw
 category: blog
 ---
 
-RocksDB 11.0 added `CompactionOptionsFIFO::max_data_files_size` and `CompactionOptionsFIFO::use_kv_ratio_compaction` for a specific but important shape of workload: FIFO compaction, integrated BlobDB, large values, point lookups, and data that naturally expires by TTL or by a bounded data-size budget. The implementation was added in [pull request #14326](https://github.com/facebook/rocksdb/pull/14326).
+RocksDB 11.0 added `CompactionOptionsFIFO::max_data_files_size` and `CompactionOptionsFIFO::use_kv_ratio_compaction` for a specific but important shape of workload: FIFO compaction, integrated BlobDB, large values, point lookups, and data that naturally expires by TTL or by a bounded data-size budget. The implementation was added in [pull request #14326](https://github.com/meta/rocksdb/pull/14326).
 
 The goal is to keep FIFO's low write amplification while reducing the read overhead caused by many small L0 files. The new picker uses the observed ratio between SST bytes and blob bytes to choose a stable target SST size, then moves L0 files through size tiers until they reach that target.
 

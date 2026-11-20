@@ -413,6 +413,15 @@ Status GetMutableOptionsFromStrings(
     const std::unordered_map<std::string, std::string>& options_map,
     Logger* info_log, MutableCFOptions* new_options);
 
+// Returns true if applying options_map to base_options changes no option.
+// Returns false if options_map does not parse, or if it names an option that
+// MutableCFOptions does not store by value, such as table_factory or one of
+// its fields. MutableCFOptions compares such objects by pointer, and setting
+// one of their fields can change the shared object in place.
+bool MutableCFOptionsUnchangedByMap(
+    const MutableCFOptions& base_options,
+    const std::unordered_map<std::string, std::string>& options_map);
+
 #ifndef NDEBUG
 std::vector<std::string> TEST_GetImmutableInMutableCFOptions();
 extern bool TEST_allowSetOptionsImmutableInMutable;

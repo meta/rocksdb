@@ -31,7 +31,7 @@ struct PointLockRequest {
 // Request for locking a range of keys.
 struct RangeLockRequest {
   // The id of the key's column family.
-  ColumnFamilyId column_family_id;
+  ColumnFamilyId column_family_id = 0;
 
   // The range to be locked
   Endpoint start_endp;
@@ -63,7 +63,7 @@ enum class UntrackStatus {
 // intention. Not thread-safe.
 class LockTracker {
  public:
-  virtual ~LockTracker() {}
+  virtual ~LockTracker() = default;
 
   // Whether supports locking a specific key.
   virtual bool IsPointLockSupported() const = 0;
@@ -154,7 +154,7 @@ class LockTracker {
 
   class ColumnFamilyIterator {
    public:
-    virtual ~ColumnFamilyIterator() {}
+    virtual ~ColumnFamilyIterator() = default;
 
     // Whether there are remaining column families.
     virtual bool HasNext() const = 0;
@@ -175,7 +175,7 @@ class LockTracker {
 
   class KeyIterator {
    public:
-    virtual ~KeyIterator() {}
+    virtual ~KeyIterator() = default;
 
     // Whether there are remaining keys.
     virtual bool HasNext() const = 0;
@@ -201,7 +201,7 @@ class LockTrackerFactory {
  public:
   // Caller owns the returned pointer.
   virtual LockTracker* Create() const = 0;
-  virtual ~LockTrackerFactory() {}
+  virtual ~LockTrackerFactory() = default;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

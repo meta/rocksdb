@@ -230,12 +230,6 @@ case "$TARGET_OS" in
         PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -lpthread -lrt -ldl"
         # PORT_FILES=port/linux/linux_specific.cc
         ;;
-    SunOS)
-        PLATFORM=OS_SOLARIS
-        COMMON_FLAGS="$COMMON_FLAGS -fno-builtin-memcmp -D_REENTRANT -DOS_SOLARIS -m64"
-        PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -lpthread -lrt -static-libstdc++ -static-libgcc -m64"
-        # PORT_FILES=port/sunos/sunos_specific.cc
-        ;;
     AIX)
         PLATFORM=OS_AIX
         CC=gcc

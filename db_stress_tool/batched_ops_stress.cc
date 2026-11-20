@@ -18,7 +18,7 @@ class BatchedOpsStressTest : public StressTest {
   BatchedOpsStressTest(int db_index, const std::string& db_path,
                        const std::string& ev_path, const std::string& sec_path)
       : StressTest(db_index, db_path, ev_path, sec_path) {}
-  virtual ~BatchedOpsStressTest() = default;
+  ~BatchedOpsStressTest() override = default;
 
   bool IsStateTracked() const override { return false; }
 
@@ -265,7 +265,7 @@ class BatchedOpsStressTest : public StressTest {
                          key_slices.data(), values.data(), statuses.data());
       }
       for (size_t i = 0; i < num_prefixes; i++) {
-        Status s = statuses[i];
+        const Status& s = statuses[i];
         if (!s.ok() && !s.IsNotFound()) {
           fprintf(stderr, "multiget error: %s\n", s.ToString().c_str());
           thread->stats.AddErrors(1);

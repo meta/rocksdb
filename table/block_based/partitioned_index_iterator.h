@@ -39,7 +39,7 @@ class PartitionedIndexIterator : public InternalIteratorBase<IndexValue> {
             table_->get_rep()->table_options.initial_auto_readahead_size) {
   }
 
-  ~PartitionedIndexIterator() override {}
+  ~PartitionedIndexIterator() override = default;
 
   void Seek(const Slice& target) override;
   void SeekForPrev(const Slice&) override {
@@ -48,7 +48,7 @@ class PartitionedIndexIterator : public InternalIteratorBase<IndexValue> {
   }
   void SeekToFirst() override;
   void SeekToLast() override;
-  void Next() final override;
+  void Next() final;
   bool NextAndGetResult(IterateResult*) override {
     assert(false);
     return false;

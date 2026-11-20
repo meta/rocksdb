@@ -116,6 +116,7 @@ inline void RecordIOStats(Statistics* stats, Temperature file_temperature,
             file_io_stats_by_temperature.unknown_non_last_level_read_count, 1);
       }
       break;
+    case Temperature::kLastTemperature:
     default:
       break;
   }
@@ -204,6 +205,26 @@ IOStatus RandomAccessFileReader::PrepareIOOptions(const ReadOptions& ro,
   }
 }
 
+void RandomAccessFileReader::ChargeRateLimiterForRead(const IOOptions& opts,
+                                                      size_t bytes) const {
+  if (opts.rate_limiter_priority == Env::IO_TOTAL || rate_limiter_ == nullptr) {
+    return;
+  }
+  // TODO: ideally we should call `RateLimiter::RequestToken()` for allowed
+  // bytes and then consume those bytes by satisfying as many requests as
+  // possible, instead of what we do here, which can cause burst when `bytes`
+  // is big.
+  size_t remaining_bytes = bytes;
+  while (remaining_bytes > 0) {
+    const size_t request_bytes =
+        std::min(static_cast<size_t>(rate_limiter_->GetSingleBurstBytes()),
+                 remaining_bytes);
+    rate_limiter_->Request(request_bytes, opts.rate_limiter_priority,
+                           nullptr /* stats */, RateLimiter::OpType::kRead);
+    remaining_bytes -= request_bytes;
+  }
+}
+
 // Notes for when direct_io is enabled:
 // Unless req.offset, req.len, req.scratch are all already aligned,
 // RandomAccessFileReader creates an aligned request and aligned buffer for the
@@ -238,7 +259,7 @@ IOStatus RandomAccessFileReader::ReadAsync(
                 std::placeholders::_1, std::placeholders::_2);
 
   ReadAsyncInfo* read_async_info = new ReadAsyncInfo(
-      cb, cb_arg, (clock_ != nullptr ? clock_->NowMicros() : 0));
+      std::move(cb), cb_arg, (clock_ != nullptr ? clock_->NowMicros() : 0));
 
   if (ShouldNotifyListeners()) {
     read_async_info->fs_start_ts_ = FileOperationInfo::StartNow();
@@ -262,9 +283,11 @@ IOStatus RandomAccessFileReader::ReadAsync(
   read_async_info->is_aligned_ = is_aligned;
 
   uint64_t elapsed = 0;
+  size_t read_bytes = req.len;
   if (use_direct_io() && is_aligned == false) {
     FSReadRequest aligned_req = Align(req, alignment);
     aligned_req.status.PermitUncheckedError();
+    read_bytes = aligned_req.len;
 
     AlignedBuffer* aligned_read_buffer =
         direct_io_buffer != nullptr ? direct_io_buffer : &read_async_info->buf_;
@@ -303,6 +326,11 @@ IOStatus RandomAccessFileReader::ReadAsync(
                          io_handle, del_fn, dbg);
   }
   RecordTick(stats_, READ_ASYNC_MICROS, elapsed);
+  // Charged only once the read is submitted: callers fall back to Read() on
+  // NotSupported, and Read() charges for itself.
+  if (s.ok()) {
+    ChargeRateLimiterForRead(opts, read_bytes);
+  }
 
 // Suppress false positive clang analyzer warnings.
 // Memory is not released if file_->ReadAsync returns !s.ok(), because

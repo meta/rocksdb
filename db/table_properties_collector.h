@@ -19,7 +19,7 @@ namespace ROCKSDB_NAMESPACE {
 // Base class for internal table properties collector.
 class InternalTblPropColl {
  public:
-  virtual ~InternalTblPropColl() {}
+  virtual ~InternalTblPropColl() = default;
   virtual Status Finish(UserCollectedProperties* properties) = 0;
 
   virtual const char* Name() const = 0;
@@ -41,7 +41,7 @@ class InternalTblPropColl {
 // Factory for internal table properties collector.
 class InternalTblPropCollFactory {
  public:
-  virtual ~InternalTblPropCollFactory() {}
+  virtual ~InternalTblPropCollFactory() = default;
   // has to be thread-safe
   virtual InternalTblPropColl* CreateInternalTblPropColl(
       uint32_t column_family_id, int level_at_creation, int num_levels,
@@ -66,7 +66,7 @@ class UserKeyTablePropertiesCollector : public InternalTblPropColl {
   explicit UserKeyTablePropertiesCollector(TablePropertiesCollector* collector)
       : collector_(collector) {}
 
-  virtual ~UserKeyTablePropertiesCollector() {}
+  ~UserKeyTablePropertiesCollector() override = default;
 
   Status InternalAdd(const Slice& key, const Slice& value,
                      uint64_t file_size) override;

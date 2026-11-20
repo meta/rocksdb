@@ -5,6 +5,7 @@
 
 #include "db/db_impl/db_impl_readonly.h"
 
+#include <algorithm>
 #include <optional>
 
 #include "db/arena_wrapped_db_iter.h"
@@ -53,6 +54,38 @@ void DBImplReadOnly::MultiGetWithMetadata(
   DBImpl::MultiGet(options, num_keys, mutable_column_families, keys, values,
                    timestamps != nullptr ? timestamps->data() : nullptr,
                    statuses, sorted_input);
+}
+
+void DBImplReadOnly::MultiGetEntityWithMetadata(
+    const ReadOptions& options, size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableWideColumns* results, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, bool sorted_input) {
+  const Status s = InitMultiGetEntityOutputMetadata(num_keys, output_metadata);
+  if (!s.ok()) {
+    std::fill_n(statuses, num_keys, s);
+    return;
+  }
+  MultiGetEntityWithoutNewerVersionTracking(this, options, num_keys,
+                                            column_families, keys, results,
+                                            statuses, sorted_input);
+}
+
+void DBImplReadOnly::MultiGetEntityWithMetadata(
+    const ReadOptions& options, size_t num_keys, const Slice* keys,
+    PinnableAttributeGroups* results, MultiGetOutputMetadata* output_metadata) {
+  const size_t total_count = CountAttributeGroups(num_keys, results);
+  const Status s =
+      InitMultiGetEntityOutputMetadata(total_count, output_metadata);
+  if (!results) {
+    s.PermitUncheckedError();
+    return;
+  }
+  if (!s.ok()) {
+    SetAttributeGroupsStatus(num_keys, results, s);
+    return;
+  }
+  MultiGetEntity(options, num_keys, keys, results);
 }
 
 Iterator* DBImplReadOnly::NewIterator(const ReadOptions& _read_options,

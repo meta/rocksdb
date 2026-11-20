@@ -1,1 +1,0 @@
-Fixed `SstFileManager` trash accounting leaking the size of a queued trash file that disappeared before deletion (for example because its directory was renamed). The leaked bytes stayed in the total trash size until restart, which could push every later deletion past `max_trash_db_ratio` and make it immediate instead of rate limited.

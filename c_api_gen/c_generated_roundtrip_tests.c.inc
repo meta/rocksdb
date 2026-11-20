@@ -87,12 +87,6 @@ static void rocksdb_roundtrip_test_rocksdb_block_based_options(void) {
   rocksdb_block_based_options_set_enable_index_compression(obj, 0);
   CheckCondition(
       rocksdb_block_based_options_get_enable_index_compression(obj) == 0);
-  rocksdb_block_based_options_set_fail_if_no_udi_on_open(obj, 1);
-  CheckCondition(rocksdb_block_based_options_get_fail_if_no_udi_on_open(obj) ==
-                 1);
-  rocksdb_block_based_options_set_fail_if_no_udi_on_open(obj, 0);
-  CheckCondition(rocksdb_block_based_options_get_fail_if_no_udi_on_open(obj) ==
-                 0);
   rocksdb_block_based_options_set_format_version(obj, 1);
   CheckCondition(rocksdb_block_based_options_get_format_version(obj) == 1);
   rocksdb_block_based_options_set_format_version(obj, 0);
@@ -223,12 +217,6 @@ static void rocksdb_roundtrip_test_rocksdb_block_based_options(void) {
   CheckCondition(rocksdb_block_based_options_get_use_delta_encoding(obj) == 1);
   rocksdb_block_based_options_set_use_delta_encoding(obj, 0);
   CheckCondition(rocksdb_block_based_options_get_use_delta_encoding(obj) == 0);
-  rocksdb_block_based_options_set_use_udi_as_primary_index(obj, 1);
-  CheckCondition(
-      rocksdb_block_based_options_get_use_udi_as_primary_index(obj) == 1);
-  rocksdb_block_based_options_set_use_udi_as_primary_index(obj, 0);
-  CheckCondition(
-      rocksdb_block_based_options_get_use_udi_as_primary_index(obj) == 0);
   rocksdb_block_based_options_set_verify_compression(obj, 1);
   CheckCondition(rocksdb_block_based_options_get_verify_compression(obj) == 1);
   rocksdb_block_based_options_set_verify_compression(obj, 0);
@@ -321,6 +309,10 @@ static void rocksdb_roundtrip_test_rocksdb_compactoptions(void) {
   rocksdb_compactoptions_set_blob_garbage_collection_policy(obj, 0);
   CheckCondition(
       rocksdb_compactoptions_get_blob_garbage_collection_policy(obj) == 0);
+  rocksdb_compactoptions_set_skip_missing_blob_files(obj, 1);
+  CheckCondition(rocksdb_compactoptions_get_skip_missing_blob_files(obj) == 1);
+  rocksdb_compactoptions_set_skip_missing_blob_files(obj, 0);
+  CheckCondition(rocksdb_compactoptions_get_skip_missing_blob_files(obj) == 0);
   rocksdb_compactoptions_destroy(obj);
 }
 
@@ -493,6 +485,18 @@ static void rocksdb_roundtrip_test_rocksdb_flushwaloptions(void) {
   rocksdb_flushwaloptions_destroy(obj);
 }
 
+static void rocksdb_roundtrip_test_rocksdb_import_column_family_options(void) {
+  rocksdb_import_column_family_options_t* obj =
+      rocksdb_import_column_family_options_create();
+  rocksdb_import_column_family_options_set_reject_too_old_file(obj, 1);
+  CheckCondition(
+      rocksdb_import_column_family_options_get_reject_too_old_file(obj) == 1);
+  rocksdb_import_column_family_options_set_reject_too_old_file(obj, 0);
+  CheckCondition(
+      rocksdb_import_column_family_options_get_reject_too_old_file(obj) == 0);
+  rocksdb_import_column_family_options_destroy(obj);
+}
+
 static void rocksdb_roundtrip_test_rocksdb_ingestexternalfileoptions(void) {
   rocksdb_ingestexternalfileoptions_t* obj =
       rocksdb_ingestexternalfileoptions_create();
@@ -534,6 +538,12 @@ static void rocksdb_roundtrip_test_rocksdb_ingestexternalfileoptions(void) {
   CheckCondition(
       rocksdb_ingestexternalfileoptions_get_prefetch_lmax_index_and_filter_blocks(
           obj) == 0);
+  rocksdb_ingestexternalfileoptions_set_reject_too_old_file(obj, 1);
+  CheckCondition(
+      rocksdb_ingestexternalfileoptions_get_reject_too_old_file(obj) == 1);
+  rocksdb_ingestexternalfileoptions_set_reject_too_old_file(obj, 0);
+  CheckCondition(
+      rocksdb_ingestexternalfileoptions_get_reject_too_old_file(obj) == 0);
   rocksdb_ingestexternalfileoptions_set_verify_checksums_before_ingest(obj, 1);
   CheckCondition(
       rocksdb_ingestexternalfileoptions_get_verify_checksums_before_ingest(
@@ -649,6 +659,10 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_background_close_inactive_wals(obj) == 1);
   rocksdb_options_set_background_close_inactive_wals(obj, 0);
   CheckCondition(rocksdb_options_get_background_close_inactive_wals(obj) == 0);
+  rocksdb_options_set_best_efforts_blob_db_repair(obj, 1);
+  CheckCondition(rocksdb_options_get_best_efforts_blob_db_repair(obj) == 1);
+  rocksdb_options_set_best_efforts_blob_db_repair(obj, 0);
+  CheckCondition(rocksdb_options_get_best_efforts_blob_db_repair(obj) == 0);
   rocksdb_options_set_best_efforts_recovery(obj, 1);
   CheckCondition(rocksdb_options_get_best_efforts_recovery(obj) == 1);
   rocksdb_options_set_best_efforts_recovery(obj, 0);
@@ -913,6 +927,12 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_track_and_verify_wals(obj) == 1);
   rocksdb_options_set_track_and_verify_wals(obj, 0);
   CheckCondition(rocksdb_options_get_track_and_verify_wals(obj) == 0);
+  rocksdb_options_set_track_options_file_number_in_manifest(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_track_options_file_number_in_manifest(obj) == 1);
+  rocksdb_options_set_track_options_file_number_in_manifest(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_track_options_file_number_in_manifest(obj) == 0);
   rocksdb_options_set_two_write_queues(obj, 1);
   CheckCondition(rocksdb_options_get_two_write_queues(obj) == 1);
   rocksdb_options_set_two_write_queues(obj, 0);
@@ -931,6 +951,12 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_use_fsync(obj) == 1);
   rocksdb_options_set_use_fsync(obj, 0);
   CheckCondition(rocksdb_options_get_use_fsync(obj) == 0);
+  rocksdb_options_set_use_separate_remote_compaction_pool(obj, 1);
+  CheckCondition(rocksdb_options_get_use_separate_remote_compaction_pool(obj) ==
+                 1);
+  rocksdb_options_set_use_separate_remote_compaction_pool(obj, 0);
+  CheckCondition(rocksdb_options_get_use_separate_remote_compaction_pool(obj) ==
+                 0);
   rocksdb_options_set_use_session_tmp_dir_for_remote_compaction(obj, 1);
   CheckCondition(
       rocksdb_options_get_use_session_tmp_dir_for_remote_compaction(obj) == 1);
@@ -1085,6 +1111,12 @@ static void rocksdb_roundtrip_test_rocksdb_restore_options(void) {
 static void rocksdb_roundtrip_test_rocksdb_size_approximation_options(void) {
   rocksdb_size_approximation_options_t* obj =
       rocksdb_size_approximation_options_create();
+  rocksdb_size_approximation_options_set_allow_expensive_query(obj, 1);
+  CheckCondition(
+      rocksdb_size_approximation_options_get_allow_expensive_query(obj) == 1);
+  rocksdb_size_approximation_options_set_allow_expensive_query(obj, 0);
+  CheckCondition(
+      rocksdb_size_approximation_options_get_allow_expensive_query(obj) == 0);
   rocksdb_size_approximation_options_set_files_size_error_margin(obj, 1);
   CheckCondition(
       rocksdb_size_approximation_options_get_files_size_error_margin(obj) == 1);
@@ -1118,6 +1150,12 @@ static void rocksdb_roundtrip_test_rocksdb_trace_options(void) {
   CheckCondition(rocksdb_trace_options_get_filter(obj) == 1);
   rocksdb_trace_options_set_filter(obj, 0);
   CheckCondition(rocksdb_trace_options_get_filter(obj) == 0);
+  rocksdb_trace_options_set_include_read_write_options(obj, 1);
+  CheckCondition(rocksdb_trace_options_get_include_read_write_options(obj) ==
+                 1);
+  rocksdb_trace_options_set_include_read_write_options(obj, 0);
+  CheckCondition(rocksdb_trace_options_get_include_read_write_options(obj) ==
+                 0);
   rocksdb_trace_options_set_max_trace_file_size(obj, 1);
   CheckCondition(rocksdb_trace_options_get_max_trace_file_size(obj) == 1);
   rocksdb_trace_options_set_max_trace_file_size(obj, 0);
@@ -1393,6 +1431,7 @@ static void rocksdb_run_generated_roundtrip_tests(void) {
   rocksdb_roundtrip_test_rocksdb_fifo_compaction_options();
   rocksdb_roundtrip_test_rocksdb_flushoptions();
   rocksdb_roundtrip_test_rocksdb_flushwaloptions();
+  rocksdb_roundtrip_test_rocksdb_import_column_family_options();
   rocksdb_roundtrip_test_rocksdb_ingestexternalfileoptions();
   rocksdb_roundtrip_test_rocksdb_livefiles_storage_info_options();
   rocksdb_roundtrip_test_rocksdb_open_and_compact_options();

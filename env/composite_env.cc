@@ -219,8 +219,6 @@ class CompositeWritableFileWrapper : public WritableFile {
     return target_->Allocate(offset, len, io_opts, &dbg);
   }
 
-  std::unique_ptr<FSWritableFile>* target() { return &target_; }
-
  private:
   std::unique_ptr<FSWritableFile> target_;
 };

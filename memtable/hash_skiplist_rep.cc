@@ -81,6 +81,11 @@ class HashSkipListRep : public MemTableRep {
     explicit Iterator(Bucket* list, bool own_list = true,
                       Arena* arena = nullptr)
         : list_(list), iter_(list), own_list_(own_list), arena_(arena) {}
+    // No copying allowed
+    Iterator(const Iterator&) = delete;
+    Iterator& operator=(const Iterator&) = delete;
+    Iterator(Iterator&&) = delete;
+    Iterator& operator=(Iterator&&) = delete;
 
     ~Iterator() override {
       // if we own the list, we should also delete it
@@ -202,28 +207,6 @@ class HashSkipListRep : public MemTableRep {
    private:
     // the underlying memtable
     const HashSkipListRep& memtable_rep_;
-  };
-
-  class EmptyIterator : public MemTableRep::Iterator {
-    // This is used when there wasn't a bucket. It is cheaper than
-    // instantiating an empty bucket over which to iterate.
-   public:
-    EmptyIterator() = default;
-    bool Valid() const override { return false; }
-    const char* key() const override {
-      assert(false);
-      return nullptr;
-    }
-    void Next() override {}
-    void Prev() override {}
-    void Seek(const Slice& /*internal_key*/,
-              const char* /*memtable_key*/) override {}
-    void SeekForPrev(const Slice& /*internal_key*/,
-                     const char* /*memtable_key*/) override {}
-    void SeekToFirst() override {}
-    void SeekToLast() override {}
-
-   private:
   };
 };
 
@@ -369,7 +352,7 @@ class HashSkipListRepFactory : public MemTableRepFactory {
   const char* NickName() const override { return kNickName(); }
 
  private:
-  HashSkipListRepOptions options_;
+  HashSkipListRepOptions options_{};
 };
 
 }  // namespace

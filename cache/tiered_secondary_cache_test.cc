@@ -3,6 +3,8 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 //
+#include <memory>
+
 #include "cache/compressed_secondary_cache.h"
 #include "cache/secondary_cache_adapter.h"
 #include "db/db_test_util.h"
@@ -199,8 +201,8 @@ class DBTieredSecondaryCacheTest : public DBTestBase {
     opts.compressed_secondary_ratio = compressed_secondary_ratio_ =
         (double)compressed_capacity / opts.total_capacity;
     if (nvm_capacity > 0) {
-      nvm_sec_cache_.reset(
-          new TestSecondaryCache(nvm_capacity, ready_before_wait));
+      nvm_sec_cache_ =
+          std::make_shared<TestSecondaryCache>(nvm_capacity, ready_before_wait);
       opts.nvm_sec_cache = nvm_sec_cache_;
     }
     opts.adm_policy = adm_policy;
@@ -227,7 +229,7 @@ class DBTieredSecondaryCacheTest : public DBTestBase {
  private:
   std::shared_ptr<Cache> cache_;
   std::shared_ptr<TestSecondaryCache> nvm_sec_cache_;
-  double compressed_secondary_ratio_;
+  double compressed_secondary_ratio_ = 0.0;
 };
 
 // In this test, the block size is set to 4096. Each value is 1007 bytes, so
@@ -951,7 +953,7 @@ TEST_F(DBTieredSecondaryCacheTest, FSBufferTest) {
                            IODebugContext* dbg) override {
           for (size_t i = 0; i < num_reqs; ++i) {
             FSReadRequest& req = reqs[i];
-            // See https://github.com/facebook/rocksdb/pull/13195 for why we
+            // See https://github.com/meta/rocksdb/pull/13195 for why we
             // want to set up our test implementation for FSAllocationPtr this
             // way.
             char* internalData = new char[req.len];

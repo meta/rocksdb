@@ -641,7 +641,7 @@ struct AdvancedColumnFamilyOptions {
   // Compaction priority will take into account estimated bytes to be compacted
   // down to a level and favors compacting lower levels when there is a write
   // traffic spike (and hence more compaction debt). Refer to
-  // https://github.com/facebook/rocksdb/wiki/Leveled-Compactio#option-level_compaction_dynamic_level_bytes-and-levels-target-size
+  // https://github.com/meta/rocksdb/wiki/Leveled-Compactio#option-level_compaction_dynamic_level_bytes-and-levels-target-size
   // for more detailed description. See more implementation detail in:
   // VersionStorageInfo::ComputeCompactionScore().
   //
@@ -660,7 +660,7 @@ struct AdvancedColumnFamilyOptions {
   // - Since RocksDB v8.2, users can just restart DB with this option on, as
   //   long as num_levels is no smaller than number of non-empty levels in the
   //   LSM. Migration will be done automatically by RocksDB. See more in
-  //   https://github.com/facebook/rocksdb/wiki/Leveled-Compaction#migrating-from-level_compaction_dynamic_level_bytesfalse-to-level_compaction_dynamic_level_bytestrue
+  //   https://github.com/meta/rocksdb/wiki/Leveled-Compaction#migrating-from-level_compaction_dynamic_level_bytesfalse-to-level_compaction_dynamic_level_bytestrue
   //
   // Default: true
   bool level_compaction_dynamic_level_bytes = true;
@@ -752,7 +752,7 @@ struct AdvancedColumnFamilyOptions {
   // Default: a factory that provides a skip-list-based implementation of
   // MemTableRep.
   std::shared_ptr<MemTableRepFactory> memtable_factory =
-      std::shared_ptr<SkipListFactory>(new SkipListFactory);
+      std::make_shared<SkipListFactory>();
 
   // Block-based table related options are moved to BlockBasedTableOptions.
   // Related options that were originally here but now moved include:
@@ -852,7 +852,7 @@ struct AdvancedColumnFamilyOptions {
   // and it can only be populated through import and ingestion. It is intended
   // to protect "ingestion only" column families. This option is not currently
   // supported on the default column family because of error handling challenges
-  // analogous to https://github.com/facebook/rocksdb/issues/13429
+  // analogous to https://github.com/meta/rocksdb/issues/13429
   //
   // This option is not mutable with SetOptions(). It can be changed between
   // DB::Open() calls, but open will fail if recovering WAL writes to a CF with
@@ -923,6 +923,12 @@ struct AdvancedColumnFamilyOptions {
   // oldest_ancestor_time table properties in order, if they have valid
   // non-zero values; if not, the age is based on the file's last modified time
   // (given by the underlying Env).
+  //
+  // For a file added by IngestExternalFile() or CreateColumnFamilyWithImport(),
+  // the age is based on the creation time recorded in the file or import
+  // metadata (when known and not in the future), not on when it was added, so
+  // such a file can be compacted soon after it is added. See also
+  // IngestExternalFileOptions::reject_too_old_file.
   //
   // This option only supports block based table format for any compaction
   // style.
@@ -1231,6 +1237,16 @@ struct AdvancedColumnFamilyOptions {
   //  - read-only and secondary opens can read flushed/manifest-visible blob
   //    files, but do not resolve still-active direct-write blob files.
   //
+  // An SstFileManager max allowed space is a soft limit for direct-write blob
+  // files. Their bytes are already on disk when a file is sealed, so the seal
+  // and the write or flush that triggered it still succeed, the file is kept,
+  // and writes then stop with a SpaceLimit background error. A direct-write
+  // blob file is counted only once it is sealed, and memtables waiting for a
+  // flush are not flushed after the error, so usage can exceed the limit by up
+  // to about blob_file_size * blob_direct_write_partitions for each memtable
+  // not flushed yet (up to max_write_buffer_number). Blob files written by
+  // flush or compaction instead fail that job and are deleted.
+  //
   // Default: false
   //
   // Not dynamically changeable through the SetOptions() API.
@@ -1352,7 +1368,10 @@ struct AdvancedColumnFamilyOptions {
   // "BottommostFiles". Usually such compaction can happen as soon as a
   // relevant snapshot is released. This option allows user to delay
   // such compactions. A file is qualified for "BottommostFiles" compaction
-  // if it is at least "bottommost_file_compaction_delay" seconds old.
+  // if this DB has held it for at least "bottommost_file_compaction_delay"
+  // seconds, i.e. since the DB started writing it or, for an ingested or
+  // imported file, since the file was added to the DB (see
+  // SstFileMetaData::db_ownership_start_time).
   //
   // Default: 0 (no delay)
   // Dynamically changeable through the SetOptions() API.
@@ -1427,6 +1446,7 @@ struct AdvancedColumnFamilyOptions {
   // * prefix extractor reads that are neither total-order
   //   (ReadOptions::total_order_seek / ReadOptions::auto_prefix_mode) nor
   //   bounded by ReadOptions::prefix_same_as_start
+  // * reads with ReadOptions::read_tier other than kReadAllTier
   //
   // Even if the above restrictions are met, there are still scenarios where a
   // converted range tombstone may be discarded:
@@ -1439,7 +1459,8 @@ struct AdvancedColumnFamilyOptions {
   //     and the snapshot seq is at or above its min uncommitted seq.
   //   * An IngestExternalFile call is currently in flight on this column
   //     family OR the inserted range tombstone seqno would be lower than the
-  //     ingested file seqno.
+  //     ingested file seqno OR the iterator's Version predates a file
+  //     ingested while the active memtable was current.
   //
   // Read-write iterators using ReadOptions::table_filter are rejected while
   // this option is enabled, see more details in ReadOptions::table_filter

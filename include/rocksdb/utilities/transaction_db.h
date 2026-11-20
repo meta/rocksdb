@@ -55,19 +55,19 @@ class LockManagerHandle {
   // to use.
   virtual LockManager* getLockManager() = 0;
 
-  virtual ~LockManagerHandle() {}
+  virtual ~LockManagerHandle() = default;
 };
 
 // Same as class Endpoint, but use std::string to manage the buffer allocation
 struct EndpointWithString {
   std::string slice;
-  bool inf_suffix;
+  bool inf_suffix = false;
 };
 
 struct RangeDeadlockInfo {
-  TransactionID m_txn_id;
-  uint32_t m_cf_id;
-  bool m_exclusive;
+  TransactionID m_txn_id = 0;
+  uint32_t m_cf_id = 0;
+  bool m_exclusive = false;
 
   EndpointWithString m_start;
   EndpointWithString m_end;
@@ -80,7 +80,9 @@ struct RangeDeadlockPath {
 
   explicit RangeDeadlockPath(std::vector<RangeDeadlockInfo> path_entry,
                              const int64_t& dl_time)
-      : path(path_entry), limit_exceeded(false), deadlock_time(dl_time) {}
+      : path(std::move(path_entry)),
+        limit_exceeded(false),
+        deadlock_time(dl_time) {}
 
   // empty path, limit exceeded constructor and default constructor
   explicit RangeDeadlockPath(const int64_t& dl_time = 0, bool limit = false)
@@ -151,7 +153,7 @@ class RangeLockManagerHandle : public LockManagerHandle {
   virtual std::vector<RangeDeadlockPath> GetRangeDeadlockInfoBuffer() = 0;
   virtual void SetRangeDeadlockInfoBufferSize(uint32_t target_size) = 0;
 
-  ~RangeLockManagerHandle() override {}
+  ~RangeLockManagerHandle() override = default;
 };
 
 // A factory function to create a Range Lock Manager. The created object should
@@ -480,9 +482,9 @@ struct RangeLockInfo {
 };
 
 struct DeadlockInfo {
-  TransactionID m_txn_id;
-  uint32_t m_cf_id;
-  bool m_exclusive;
+  TransactionID m_txn_id = 0;
+  uint32_t m_cf_id = 0;
+  bool m_exclusive = false;
   std::string m_waiting_key;
 };
 
@@ -493,7 +495,9 @@ struct DeadlockPath {
 
   explicit DeadlockPath(std::vector<DeadlockInfo> path_entry,
                         const int64_t& dl_time)
-      : path(path_entry), limit_exceeded(false), deadlock_time(dl_time) {}
+      : path(std::move(path_entry)),
+        limit_exceeded(false),
+        deadlock_time(dl_time) {}
 
   // empty path, limit exceeded constructor and default constructor
   explicit DeadlockPath(const int64_t& dl_time = 0, bool limit = false)
@@ -635,6 +639,8 @@ class TransactionDB : public StackableDB {
   // No copying allowed
   TransactionDB(const TransactionDB&) = delete;
   void operator=(const TransactionDB&) = delete;
+  TransactionDB(TransactionDB&&) = delete;
+  void operator=(TransactionDB&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

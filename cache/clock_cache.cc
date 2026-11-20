@@ -975,7 +975,8 @@ void FixedHyperClockTable::Erase(const UniqueId64x2& hashed_key) {
         // Could be multiple entries in rare cases. Erase them all.
         // Optimistically increment acquire counter
         auto add_acquire = AcquireCounter::PlusTransformPromiseNoOverflow(1);
-        SlotMeta old_meta, meta;
+        SlotMeta old_meta;
+        SlotMeta meta;
         h->meta.Apply(add_acquire, &old_meta, &meta);
         // Check if it's an entry visible to lookups
         if (meta.IsVisible()) {
@@ -1738,7 +1739,8 @@ inline bool MatchAndRef(const UniqueId64x2* hashed_key, const ClockHandle& h,
   // Must be at least something to match
   assert(hashed_key || shift > 0);
 
-  SlotMeta old_meta, new_meta;
+  SlotMeta old_meta;
+  SlotMeta new_meta;
   // (Optimistically) increment acquire counter.
   auto add_acquire = AcquireCounter::PlusTransformPromiseNoOverflow(1);
   h.meta.Apply(add_acquire, &old_meta, &new_meta);
@@ -1855,6 +1857,12 @@ class AutoHyperClockTable::ChainRewriteLock {
     // already locked or end
     assert(saved_head_.IsLocked());
   }
+
+  // No copying allowed
+  ChainRewriteLock(const ChainRewriteLock&) = delete;
+  ChainRewriteLock& operator=(const ChainRewriteLock&) = delete;
+  ChainRewriteLock(ChainRewriteLock&&) = delete;
+  ChainRewriteLock& operator=(ChainRewriteLock&&) = delete;
 
   ~ChainRewriteLock() {
     if (!IsEnd()) {
@@ -3122,7 +3130,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
     if (probably_equal) {
       // Increment acquire counter for definitive check
       auto add_acquire = AcquireCounter::PlusTransformPromiseNoOverflow(1);
-      SlotMeta old_meta, new_meta;
+      SlotMeta old_meta;
+      SlotMeta new_meta;
       h->meta.Apply(add_acquire, &old_meta, &new_meta);
       // Check if it's a referencable (sharable) entry
       if (LIKELY(old_meta.IsShareable())) {

@@ -9,7 +9,7 @@
 // write their own extensions and plugins to take use the Options
 // framework in their custom implementations.
 //
-// See https://github.com/facebook/rocksdb/wiki/RocksDB-Configurable-Objects
+// See https://github.com/meta/rocksdb/wiki/RocksDB-Configurable-Objects
 // for more information on how to develop and use custom extensions
 
 #pragma once
@@ -1013,7 +1013,9 @@ Status ParseArray(const ConfigOptions& config_options,
   // Permit the caller to pass either bare `item1:item2` or wrapped
   // `{item1:item2}`. Either form parses identically.
   std::string stripped = OptionTypeInfo::StripOuterBraces(value);
-  size_t i = 0, start = 0, end = 0;
+  size_t i = 0;
+  size_t start = 0;
+  size_t end = 0;
   for (; status.ok() && i < kSize && start < stripped.size() &&
          end != std::string::npos;
        i++, start = end + 1) {
@@ -1089,7 +1091,7 @@ Status SerializeArray(const ConfigOptions& config_options,
       }
     }
   }
-  if (result.find("=") != std::string::npos) {
+  if (result.find('=') != std::string::npos) {
     *value = "{" + result + "}";
   } else if (printed > 1 && result.at(0) == '{') {
     *value = "{" + result + "}";
@@ -1225,7 +1227,7 @@ Status SerializeVector(const ConfigOptions& config_options,
       }
     }
   }
-  if (result.find("=") != std::string::npos) {
+  if (result.find('=') != std::string::npos) {
     *value = "{" + result + "}";
   } else if (printed > 1 && result.at(0) == '{') {
     *value = "{" + result + "}";

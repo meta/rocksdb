@@ -72,7 +72,7 @@ class SimulatedHybridRaf : public FSRandomAccessFileOwnerWrapper {
         rate_limiter_(rate_limiter),
         temperature_(temperature) {}
 
-  ~SimulatedHybridRaf() override {}
+  ~SimulatedHybridRaf() override = default;
 
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
                 Slice* result, char* scratch,

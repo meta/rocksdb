@@ -8,6 +8,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 
@@ -82,6 +83,51 @@ enum TracePayloadType : char {
   kMultiGetSize = 8,
   kMultiGetCFIDs = 9,
   kMultiGetKeys = 10,
+  // TraceOptions::include_read_write_options. Encoded after the fields above,
+  // so a decoder that does not know them can skip them.
+  kWriteOptions = 11,
+  kGetReadOptions = 12,
+  kIterReadOptions = 13,
+  kMultiGetReadOptions = 14,
+};
+
+// The WriteOptions fields a query trace records with
+// TraceOptions::include_read_write_options.
+struct TracedWriteOptions {
+  TracedWriteOptions() = default;
+  explicit TracedWriteOptions(const WriteOptions& options);
+
+  // Appends a length-prefixed encoding: fields added later go at its end, and
+  // DecodeFrom() ignores what it does not know.
+  void EncodeTo(std::string* dst) const;
+  // Reads one encoding from the front of `input` into `*options`.
+  static Status DecodeFrom(Slice* input, WriteOptions* options);
+
+  bool sync = false;
+  bool disable_wal = false;
+  bool no_slowdown = false;
+  Env::IOPriority rate_limiter_priority = Env::IO_TOTAL;
+};
+
+// The ReadOptions fields a query trace records with
+// TraceOptions::include_read_write_options. An iterator keeps one for the
+// seeks it traces.
+struct TracedReadOptions {
+  TracedReadOptions() = default;
+  explicit TracedReadOptions(const ReadOptions& options);
+
+  // Same contract as TracedWriteOptions::EncodeTo() and DecodeFrom().
+  void EncodeTo(std::string* dst) const;
+  static Status DecodeFrom(Slice* input, ReadOptions* options);
+
+  uint64_t readahead_size = 0;
+  uint64_t max_skippable_internal_keys = 0;
+  uint64_t value_size_soft_limit = 0;
+  // Bit i holds the i-th boolean field of kReadOptionsFlags
+  // (trace_replay.cc).
+  uint32_t flags = 0;
+  ReadTier read_tier = kReadAllTier;
+  Env::IOPriority rate_limiter_priority = Env::IO_TOTAL;
 };
 
 class TracerHelper {
@@ -123,28 +169,34 @@ class Tracer {
          std::unique_ptr<TraceWriter>&& trace_writer);
   ~Tracer();
 
-  // Trace all write operations -- Put, Merge, Delete, SingleDelete, Write
-  Status Write(WriteBatch* write_batch);
+  // Trace all write operations -- Put, Merge, Delete, SingleDelete, Write.
+  // The options are recorded only with
+  // TraceOptions::include_read_write_options, as are the read options below.
+  Status Write(WriteBatch* write_batch, const TracedWriteOptions& options);
 
   // Trace Get operations.
-  Status Get(ColumnFamilyHandle* cfname, const Slice& key);
+  Status Get(ColumnFamilyHandle* cfname, const Slice& key,
+             const ReadOptions& read_options);
 
   // Trace Iterators.
   Status IteratorSeek(const uint32_t& cf_id, const Slice& key,
-                      const Slice& lower_bound, const Slice upper_bound);
+                      const Slice& lower_bound, const Slice upper_bound,
+                      const TracedReadOptions& read_options);
   Status IteratorSeekForPrev(const uint32_t& cf_id, const Slice& key,
-                             const Slice& lower_bound, const Slice upper_bound);
+                             const Slice& lower_bound, const Slice upper_bound,
+                             const TracedReadOptions& read_options);
 
   // Trace MultiGet
 
   Status MultiGet(const size_t num_keys, ColumnFamilyHandle** column_families,
-                  const Slice* keys);
+                  const Slice* keys, const ReadOptions& read_options);
 
   Status MultiGet(const size_t num_keys, ColumnFamilyHandle* column_family,
-                  const Slice* keys);
+                  const Slice* keys, const ReadOptions& read_options);
 
   Status MultiGet(const std::vector<ColumnFamilyHandle*>& column_family,
-                  const std::vector<Slice>& keys);
+                  const std::vector<Slice>& keys,
+                  const ReadOptions& read_options);
 
   // Returns true if the trace is over the configured max trace file limit.
   // False otherwise.
@@ -169,6 +221,12 @@ class Tracer {
   // Write a single trace using the provided TraceWriter to the underlying
   // system, say, a filesystem or a streaming service.
   Status WriteTrace(const Trace& trace);
+
+  // Shared by IteratorSeek() and IteratorSeekForPrev().
+  Status IteratorSeekImpl(TraceType trace_type, uint32_t cf_id,
+                          const Slice& key, const Slice& lower_bound,
+                          const Slice& upper_bound,
+                          const TracedReadOptions& read_options);
 
   // Helps in filtering and sampling of traces.
   // Returns true if a trace should be skipped, false otherwise.

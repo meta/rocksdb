@@ -22,8 +22,10 @@ class HistogramWindowingImpl : public Histogram {
 
   HistogramWindowingImpl(const HistogramWindowingImpl&) = delete;
   HistogramWindowingImpl& operator=(const HistogramWindowingImpl&) = delete;
+  HistogramWindowingImpl(HistogramWindowingImpl&&) = delete;
+  HistogramWindowingImpl& operator=(HistogramWindowingImpl&&) = delete;
 
-  ~HistogramWindowingImpl();
+  ~HistogramWindowingImpl() override;
 
   void Clear() override;
   bool Empty() const override;

@@ -84,9 +84,13 @@ class SimCache : public CacheWrapper {
   // Status of cache logging happening in background
   virtual Status GetActivityLoggingStatus() = 0;
 
- private:
-  SimCache(const SimCache&);
-  SimCache& operator=(const SimCache&);
+  ~SimCache() override = default;
+
+  // No copying allowed
+  SimCache(const SimCache&) = delete;
+  SimCache& operator=(const SimCache&) = delete;
+  SimCache(SimCache&&) = delete;
+  SimCache& operator=(SimCache&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

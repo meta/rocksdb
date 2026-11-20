@@ -27,7 +27,7 @@ class CacheWriteBuffer {
     assert(size_);
   }
 
-  virtual ~CacheWriteBuffer() {}
+  virtual ~CacheWriteBuffer() = default;
 
   void Append(const char* buf, const size_t size) {
     assert(pos_ + size <= size_);
@@ -84,6 +84,13 @@ class CacheWriteBufferAllocator {
     }
     bufs_.clear();
   }
+
+  // No copying allowed
+  CacheWriteBufferAllocator(const CacheWriteBufferAllocator&) = delete;
+  CacheWriteBufferAllocator& operator=(const CacheWriteBufferAllocator&) =
+      delete;
+  CacheWriteBufferAllocator(CacheWriteBufferAllocator&&) = delete;
+  CacheWriteBufferAllocator& operator=(CacheWriteBufferAllocator&&) = delete;
 
   CacheWriteBuffer* Allocate() {
     MutexLock _(&lock_);

@@ -148,7 +148,8 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
 
   std::vector<std::pair<std::string, std::string>> expected_key_value_pairs(
       number_of_blobs);
@@ -232,7 +233,8 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckMultipleFiles) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
 
   std::vector<std::pair<std::string, std::string>> expected_key_value_pairs(
       number_of_blobs);
@@ -319,7 +321,8 @@ TEST_F(BlobFileBuilderTest, InlinedValues) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
 
   for (size_t i = 0; i < number_of_blobs; ++i) {
     const std::string key = std::to_string(i);
@@ -373,7 +376,8 @@ TEST_F(BlobFileBuilderTest, Compression) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
 
   const std::string key("1");
   const std::string uncompressed_value(value_size, 'x');
@@ -452,7 +456,8 @@ TEST_F(BlobFileBuilderTest, CompressionError) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
 
   SyncPoint::GetInstance()->SetCallBack(
       "LegacyForceBuiltinCompression:TamperWithStatus", [](void* arg) {
@@ -532,7 +537,8 @@ TEST_F(BlobFileBuilderTest, Checksum) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
 
   const std::string key("1");
   const std::string value("deadbeef");
@@ -631,7 +637,8 @@ TEST_P(BlobFileBuilderIOErrorTest, IOError) {
       &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
       job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
-      BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
 
   SyncPoint::GetInstance()->SetCallBack(sync_point_, [this](void* arg) {
     Status* const s = static_cast<Status*>(arg);

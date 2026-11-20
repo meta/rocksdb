@@ -39,8 +39,13 @@ class EnvLogger : public Logger {
         file_(std::move(writable_file), fname, options, clock_),
         last_flush_micros_(0),
         flush_pending_(false) {}
+  // No copying allowed
+  EnvLogger(const EnvLogger&) = delete;
+  EnvLogger& operator=(const EnvLogger&) = delete;
+  EnvLogger(EnvLogger&&) = delete;
+  EnvLogger& operator=(EnvLogger&&) = delete;
 
-  ~EnvLogger() {
+  ~EnvLogger() override {
     if (!closed_) {
       closed_ = true;
       CloseHelper().PermitUncheckedError();
@@ -60,6 +65,12 @@ class EnvLogger : public Logger {
       IOSTATS_SET_DISABLE(true);
       logger.mutex_.Lock();
     }
+    // No copying allowed
+    FileOpGuard(const FileOpGuard&) = delete;
+    FileOpGuard& operator=(const FileOpGuard&) = delete;
+    FileOpGuard(FileOpGuard&&) = delete;
+    FileOpGuard& operator=(FileOpGuard&&) = delete;
+
     ~FileOpGuard() {
       logger_.mutex_.Unlock();
       IOSTATS_SET_DISABLE(false);
@@ -93,7 +104,7 @@ class EnvLogger : public Logger {
 
   Status CloseHelper() {
     FileOpGuard guard(*this);
-    const auto close_status = file_.Close(IOOptions());
+    auto close_status = file_.Close(IOOptions());
 
     if (close_status.ok()) {
       return close_status;
@@ -129,7 +140,7 @@ class EnvLogger : public Logger {
       port::TimeVal now_tv;
       port::GetTimeOfDay(&now_tv, nullptr);
       const time_t seconds = now_tv.tv_sec;
-      struct tm t;
+      struct tm t{};
       port::LocalTimeR(&seconds, &t);
       p += snprintf(p, limit - p, "%04d/%02d/%02d-%02d:%02d:%02d.%06d %llu ",
                     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,

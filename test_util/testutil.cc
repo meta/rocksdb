@@ -45,7 +45,7 @@ const std::set<uint32_t> kFooterFormatVersionsToTest{
     6U,
     // In case any interesting future changes
     kDefaultFormatVersion,
-    kLatestBbtFormatVersion,
+    BlockBasedTableOptions::kLatestSupportedFormatVersion,
     // Unpublished draft format_version 8 (index value-delta escape). Writing it
     // requires the TEST_AllowUnsupportedFormatVersion() opt-in, enabled by the
     // test files that instantiate parameterized suites over this set.
@@ -598,8 +598,9 @@ uint64_t GetFileNumber(const std::string& path) {
 
 Status CreateEnvFromSystem(const ConfigOptions& config_options, Env** result,
                            std::shared_ptr<Env>* guard) {
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   const char* env_uri = getenv("TEST_ENV_URI");
-  const char* fs_uri = getenv("TEST_FS_URI");
+  const char* fs_uri = getenv("TEST_FS_URI");  // NOLINT(concurrency-mt-unsafe)
   if (env_uri || fs_uri) {
     return Env::CreateFromUri(config_options,
                               (env_uri != nullptr) ? env_uri : "",

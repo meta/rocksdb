@@ -29,6 +29,10 @@ class CompressedSecondaryCacheResultHandle : public SecondaryCacheResultHandle {
       const CompressedSecondaryCacheResultHandle&) = delete;
   CompressedSecondaryCacheResultHandle& operator=(
       const CompressedSecondaryCacheResultHandle&) = delete;
+  CompressedSecondaryCacheResultHandle(CompressedSecondaryCacheResultHandle&&) =
+      delete;
+  CompressedSecondaryCacheResultHandle& operator=(
+      CompressedSecondaryCacheResultHandle&&) = delete;
 
   bool IsReady() override { return true; }
 

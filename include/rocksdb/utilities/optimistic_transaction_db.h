@@ -36,7 +36,7 @@ enum class OccValidationPolicy {
   // Isolation validation is processed single-threaded(since in the
   // write-group).
   // May suffer from high mutex contention, as per this link:
-  // https://github.com/facebook/rocksdb/issues/4402
+  // https://github.com/meta/rocksdb/issues/4402
   kValidateSerial = 0,
   // Validate parallelly before commit stage, BEFORE entering the write-group to
   // reduce mutex contention. Each txn acquires locks for its write-set
@@ -48,7 +48,7 @@ class OccLockBuckets {
  public:
   // Most details in internal derived class.
   // Users should not derive from this class.
-  virtual ~OccLockBuckets() {}
+  virtual ~OccLockBuckets() = default;
 
   virtual size_t ApproximateMemoryUsage() const = 0;
 
@@ -120,6 +120,8 @@ class OptimisticTransactionDB : public StackableDB {
 
   OptimisticTransactionDB(const OptimisticTransactionDB&) = delete;
   void operator=(const OptimisticTransactionDB&) = delete;
+  OptimisticTransactionDB(OptimisticTransactionDB&&) = delete;
+  void operator=(OptimisticTransactionDB&&) = delete;
 
  protected:
   // To Create an OptimisticTransactionDB, call Open()

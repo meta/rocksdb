@@ -215,10 +215,16 @@ class UpdateManifestCommand : public LDBCommand {
  private:
   bool verbose_;
   bool update_temperatures_;
+  bool rebind_options_file_;
+  std::string options_file_;
+  std::vector<std::string> file_number_paths_;
   // TODO future: checksum_func for populating checksums
 
   static const std::string ARG_VERBOSE;
   static const std::string ARG_UPDATE_TEMPERATURES;
+  static const std::string ARG_REBIND_OPTIONS_FILE;
+  static const std::string ARG_OPTIONS_FILE;
+  static const std::string ARG_FILE_NUMBER_PATHS;
 };
 
 class FileChecksumDumpCommand : public LDBCommand {

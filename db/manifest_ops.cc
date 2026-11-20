@@ -18,6 +18,7 @@ Status GetCurrentManifestPath(const std::string& dbname, FileSystem* fs,
   assert(manifest_file_number != nullptr);
 
   IOOptions opts;
+  opts.type = IOType::kMetadata;
   std::string fname;
   if (is_retry) {
     opts.verify_and_reconstruct_read = true;

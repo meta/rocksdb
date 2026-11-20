@@ -40,7 +40,7 @@ class DBImpl;
 class StatsHistoryIterator {
  public:
   StatsHistoryIterator() {}
-  virtual ~StatsHistoryIterator() {}
+  virtual ~StatsHistoryIterator() = default;
 
   virtual bool Valid() const = 0;
 

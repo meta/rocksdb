@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <deque>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -29,6 +30,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
+
+constexpr int kCfLifecycleOptionsFault = 1;
+constexpr int kCfLifecycleManifestFault = 2;
+constexpr int kExpectedCfLifecycleFaultExitCode = 86;
 
 // Finds a run of overwriteable keys strictly inside `file`'s key span, stopping
 // at `desired_width` keys. Runs shorter than two keys are not worth replacing
@@ -115,7 +120,7 @@ class NonBatchedOpsStressTest : public StressTest {
                           const std::string& sec_path)
       : StressTest(db_index, db_path, ev_path, sec_path) {}
 
-  virtual ~NonBatchedOpsStressTest() = default;
+  ~NonBatchedOpsStressTest() override = default;
 
   void VerifyDb(ThreadState* thread) const override {
     // This `ReadOptions` is for validation purposes. Ignore
@@ -346,6 +351,14 @@ class NonBatchedOpsStressTest : public StressTest {
                               "Secondary failed to catch up to the primary");
           }
 
+          ManagedSnapshot secondary_snapshot(secondary_db_.get());
+          if (secondary_snapshot.snapshot() == nullptr) {
+            VerificationAbort(shared, "Secondary failed to acquire a snapshot");
+            continue;
+          }
+          ReadOptions secondary_options = options;
+          secondary_options.snapshot = secondary_snapshot.snapshot();
+
           for (int64_t i = start; i < end; ++i) {
             if (thread->shared->HasVerificationFailedYet()) {
               break;
@@ -362,8 +375,8 @@ class NonBatchedOpsStressTest : public StressTest {
                   FaultInjectionIOType::kMetadataRead);
             }
 
-            s = DbStressGet(secondary_db_.get(), options, secondary_cfhs_[cf],
-                            key, &from_db);
+            s = DbStressGet(secondary_db_.get(), secondary_options,
+                            secondary_cfhs_[cf], key, &from_db);
 
             // Also exercise the lazy wide-column read path on the secondary
             // (self-checks lazy vs eager on the secondary, read at latest). A
@@ -385,7 +398,7 @@ class NonBatchedOpsStressTest : public StressTest {
                    static_cast<size_t>(i - start) <
                        pre_read_expected_values.size());
             VerifyValueRange(
-                static_cast<int>(cf), i, options, shared, from_db,
+                static_cast<int>(cf), i, secondary_options, shared, from_db,
                 /* msg_prefix */ "Secondary get verification, manifest: " +
                     std::to_string(manifest_num),
                 s, pre_read_expected_values[i - start]);
@@ -692,20 +705,82 @@ class NonBatchedOpsStressTest : public StressTest {
         }
         thread->shared->LockColumnFamily(cf);
         Status s = db_->DropColumnFamily(column_families_[cf]);
-        delete column_families_[cf];
         if (!s.ok()) {
           fprintf(stderr, "dropping column family error: %s\n",
                   s.ToString().c_str());
           thread->shared->SafeTerminate();
         }
+        delete column_families_[cf];
+        if (FLAGS_test_cf_lifecycle) {
+          column_families_[cf] = nullptr;
+          thread->shared->ClearColumnFamily(cf);
+        }
+
+        if (FLAGS_cf_lifecycle_fault_target != 0) {
+          assert(FLAGS_test_cf_lifecycle);
+          assert(db_fault_injection_fs_);
+          std::set<FileType> excluded = {
+              kWalFile,        kDBLockFile,   kTableFile,
+              kDescriptorFile, kCurrentFile,  kTempFile,
+              kInfoLogFile,    kMetaDatabase, kIdentityFile,
+              kOptionsFile,    kBlobFile,     kCompactionProgressFile,
+          };
+          if (FLAGS_cf_lifecycle_fault_target == kCfLifecycleOptionsFault) {
+            excluded.erase(kTempFile);
+            excluded.erase(kOptionsFile);
+          } else if (FLAGS_cf_lifecycle_fault_target ==
+                     kCfLifecycleManifestFault) {
+            excluded.erase(kDescriptorFile);
+          } else {
+            assert(false);
+          }
+          db_fault_injection_fs_->SetFileTypesExcludedFromFaultInjection(
+              excluded);
+          db_fault_injection_fs_->SetThreadLocalErrorContext(
+              FaultInjectionIOType::kWrite, thread->shared->GetSeed(), 1,
+              false /* retryable */, false /* has_data_loss */);
+          db_fault_injection_fs_->EnableThreadLocalErrorInjection(
+              FaultInjectionIOType::kWrite);
+        }
+
+        ColumnFamilyHandle* replacement = nullptr;
         s = db_->CreateColumnFamily(ColumnFamilyOptions(options_), new_name,
-                                    &column_families_[cf]);
-        column_family_names_[cf] = new_name;
-        thread->shared->ClearColumnFamily(cf);
+                                    &replacement);
+        if (FLAGS_cf_lifecycle_fault_target != 0) {
+          const int injected_errors =
+              db_fault_injection_fs_->GetAndResetInjectedThreadLocalErrorCount(
+                  FaultInjectionIOType::kWrite);
+          if (!s.ok() && injected_errors > 0 &&
+              FaultInjectionTestFS::IsInjectedError(s)) {
+            const char* target =
+                FLAGS_cf_lifecycle_fault_target == kCfLifecycleOptionsFault
+                    ? "options"
+                    : "manifest";
+            fprintf(stdout, "EXPECTED_CF_LIFECYCLE_FAULT target=%s\n", target);
+            fflush(stdout);
+            port::ImmediateExit(kExpectedCfLifecycleFaultExitCode);
+          }
+          fprintf(stderr,
+                  "targeted CF lifecycle fault was not observed: target=%d "
+                  "status=%s injected_errors=%d\n",
+                  FLAGS_cf_lifecycle_fault_target, s.ToString().c_str(),
+                  injected_errors);
+          fflush(stderr);
+          port::ImmediateExit(1);
+        }
         if (!s.ok()) {
           fprintf(stderr, "creating column family error: %s\n",
                   s.ToString().c_str());
           thread->shared->SafeTerminate();
+        }
+        column_families_[cf] = replacement;
+        column_family_names_[cf] = new_name;
+        if (!FLAGS_test_cf_lifecycle) {
+          thread->shared->ClearColumnFamily(cf);
+        }
+        if (FLAGS_test_cf_lifecycle) {
+          fprintf(stdout, "CF_LIFECYCLE_SUCCESS\n");
+          fflush(stdout);
         }
         thread->shared->UnlockColumnFamily(cf);
       }
@@ -2644,14 +2719,17 @@ class NonBatchedOpsStressTest : public StressTest {
     }
 
     std::vector<ExternalSstFileInfo> file_infos(data_file_count);
-    // Embedded blobs are only supported by block-based table format_version >=
-    // 7 (the default db_stress table factory is block-based).
+    const auto* block_based_table_options =
+        options_.table_factory->GetOptions<BlockBasedTableOptions>();
+    // Embedded blobs are supported only by a block-based table whose active
+    // format version is at least 7.
     const bool use_embedded_blobs =
         FLAGS_ingest_external_file_with_embedded_blobs &&
-        FLAGS_format_version >= 7;
-    // Set the embedded-blob threshold so that only the largest values generated
-    // by GenerateValue() (size kRandomValueMaxFactor * value_size_mult) are
-    // written as same-file blob records; smaller values stay inline.
+        block_based_table_options != nullptr &&
+        block_based_table_options->format_version >= 7;
+    // This threshold is the largest value size of the default value format.
+    // Structured values have other sizes, so any of them at least this large
+    // is written as a same-file blob record.
     SstFileWriterEmbeddedBlobOptions embedded_blob_options;
     embedded_blob_options.min_blob_size =
         static_cast<uint64_t>(kRandomValueMaxFactor) * FLAGS_value_size_mult;
@@ -2918,13 +2996,14 @@ class NonBatchedOpsStressTest : public StressTest {
     fprintf(stderr,
             "Iterator config: allow_unprepared_value=%d, "
             "auto_refresh_iterator_with_snapshot=%d, has_snapshot=%d, "
-            "use_multi_cf_iterator=%d, using_udi=%d, use_trie_index=%d\n",
+            "use_multi_cf_iterator=%d, use_trie_index=%d, index_mode=%d, "
+            "read_index=%d\n",
             static_cast<int>(ro.allow_unprepared_value),
             static_cast<int>(ro.auto_refresh_iterator_with_snapshot),
             static_cast<int>(ro.snapshot != nullptr),
             static_cast<int>(FLAGS_use_multi_cf_iterator),
-            static_cast<int>(ro.table_index_factory != nullptr),
-            static_cast<int>(FLAGS_use_trie_index));
+            static_cast<int>(FLAGS_use_trie_index), FLAGS_index_mode,
+            static_cast<int>(ro.read_index));
     fprintf(stderr, "Iterator value: %s\n",
             iter->value().ToString(true).c_str());
 
@@ -2980,28 +3059,30 @@ class NonBatchedOpsStressTest : public StressTest {
     };
 
     ReadOptions standard_ro = ro;
-    standard_ro.table_index_factory = nullptr;
+    standard_ro.read_index = ReadOptions::ReadIndex::kBuiltin;
+    ReadOptions trie_ro = ro;
+    trie_ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     dump_debug_iter("Debug standard direct", standard_ro,
                     /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/false);
-    dump_debug_iter("Debug trie direct", ro, /*use_multi_cf_iter=*/false,
+    dump_debug_iter("Debug trie direct", trie_ro, /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/false);
     dump_debug_iter("Debug standard direct", standard_ro,
                     /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/true);
-    dump_debug_iter("Debug trie direct", ro, /*use_multi_cf_iter=*/false,
+    dump_debug_iter("Debug trie direct", trie_ro, /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/true);
     if (FLAGS_use_multi_cf_iterator) {
       dump_debug_iter("Debug standard coalescing", standard_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/false);
-      dump_debug_iter("Debug trie coalescing", ro,
+      dump_debug_iter("Debug trie coalescing", trie_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/false);
       dump_debug_iter("Debug standard coalescing", standard_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/true);
-      dump_debug_iter("Debug trie coalescing", ro,
+      dump_debug_iter("Debug trie coalescing", trie_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/true);
     }
@@ -3065,7 +3146,8 @@ class NonBatchedOpsStressTest : public StressTest {
       // GetIntVal().
       ro.iterate_upper_bound = &max_key_slice;
     }
-    std::string ub_str, lb_str;
+    std::string ub_str;
+    std::string lb_str;
     std::function<bool(const TableProperties&)> table_filter;
     if (FLAGS_use_sqfc_for_range_queries) {
       ub_str = Key(ub);
@@ -3081,6 +3163,7 @@ class NonBatchedOpsStressTest : public StressTest {
     std::vector<ExpectedValue> pre_read_expected_values;
     std::vector<ExpectedValue> post_read_expected_values;
 
+    pre_read_expected_values.reserve(expected_values_size);
     for (int64_t i = 0; i < static_cast<int64_t>(expected_values_size); ++i) {
       pre_read_expected_values.push_back(
           shared->Get(rand_column_family, i + lb));
@@ -3108,6 +3191,7 @@ class NonBatchedOpsStressTest : public StressTest {
       iter = std::unique_ptr<Iterator>(db_->NewIterator(ro, cfh));
     }
 
+    post_read_expected_values.reserve(expected_values_size);
     for (int64_t i = 0; i < static_cast<int64_t>(expected_values_size); ++i) {
       post_read_expected_values.push_back(
           shared->Get(rand_column_family, i + lb));
@@ -3552,7 +3636,7 @@ class NonBatchedOpsStressTest : public StressTest {
 
   bool VerifyOrSyncValue(int cf, int64_t key, const ReadOptions& opts,
                          SharedState* shared, const std::string& value_from_db,
-                         std::string msg_prefix, const Status& s) const {
+                         const std::string& msg_prefix, const Status& s) const {
     if (shared->HasVerificationFailedYet()) {
       return false;
     }
@@ -3818,6 +3902,7 @@ class NonBatchedOpsStressTest : public StressTest {
           s = txn->Delete(cfh, k);
           break;
         }
+        case Op::NumberOfOps:
         default:
           assert(false);
       }

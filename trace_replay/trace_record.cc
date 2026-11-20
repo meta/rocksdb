@@ -45,6 +45,14 @@ WriteQueryTraceRecord::~WriteQueryTraceRecord() { rep_.clear(); }
 
 Slice WriteQueryTraceRecord::GetWriteBatchRep() const { return Slice(rep_); }
 
+const WriteOptions* WriteQueryTraceRecord::GetWriteOptions() const {
+  return write_options_.get();
+}
+
+void WriteQueryTraceRecord::SetWriteOptions(const WriteOptions& write_options) {
+  write_options_ = std::make_unique<WriteOptions>(write_options);
+}
+
 Status WriteQueryTraceRecord::Accept(
     Handler* handler, std::unique_ptr<TraceRecordResult>* result) {
   assert(handler != nullptr);
@@ -71,6 +79,14 @@ GetQueryTraceRecord::~GetQueryTraceRecord() { key_.clear(); }
 uint32_t GetQueryTraceRecord::GetColumnFamilyID() const { return cf_id_; }
 
 Slice GetQueryTraceRecord::GetKey() const { return Slice(key_); }
+
+const ReadOptions* GetQueryTraceRecord::GetReadOptions() const {
+  return read_options_.get();
+}
+
+void GetQueryTraceRecord::SetReadOptions(const ReadOptions& read_options) {
+  read_options_ = std::make_unique<ReadOptions>(read_options);
+}
 
 Status GetQueryTraceRecord::Accept(Handler* handler,
                                    std::unique_ptr<TraceRecordResult>* result) {
@@ -102,6 +118,14 @@ IteratorQueryTraceRecord::~IteratorQueryTraceRecord() = default;
 Slice IteratorQueryTraceRecord::GetLowerBound() const { return Slice(lower_); }
 
 Slice IteratorQueryTraceRecord::GetUpperBound() const { return Slice(upper_); }
+
+const ReadOptions* IteratorQueryTraceRecord::GetReadOptions() const {
+  return read_options_.get();
+}
+
+void IteratorQueryTraceRecord::SetReadOptions(const ReadOptions& read_options) {
+  read_options_ = std::make_unique<ReadOptions>(read_options);
+}
 
 // IteratorSeekQueryTraceRecord
 IteratorSeekQueryTraceRecord::IteratorSeekQueryTraceRecord(
@@ -169,13 +193,13 @@ MultiGetQueryTraceRecord::MultiGetQueryTraceRecord(
     std::vector<uint32_t> column_family_ids, std::vector<PinnableSlice>&& keys,
     uint64_t timestamp)
     : QueryTraceRecord(timestamp),
-      cf_ids_(column_family_ids),
+      cf_ids_(std::move(column_family_ids)),
       keys_(std::move(keys)) {}
 
 MultiGetQueryTraceRecord::MultiGetQueryTraceRecord(
     std::vector<uint32_t> column_family_ids,
     const std::vector<std::string>& keys, uint64_t timestamp)
-    : QueryTraceRecord(timestamp), cf_ids_(column_family_ids) {
+    : QueryTraceRecord(timestamp), cf_ids_(std::move(column_family_ids)) {
   keys_.reserve(keys.size());
   for (const std::string& key : keys) {
     PinnableSlice ps;
@@ -195,6 +219,14 @@ std::vector<uint32_t> MultiGetQueryTraceRecord::GetColumnFamilyIDs() const {
 
 std::vector<Slice> MultiGetQueryTraceRecord::GetKeys() const {
   return std::vector<Slice>(keys_.begin(), keys_.end());
+}
+
+const ReadOptions* MultiGetQueryTraceRecord::GetReadOptions() const {
+  return read_options_.get();
+}
+
+void MultiGetQueryTraceRecord::SetReadOptions(const ReadOptions& read_options) {
+  read_options_ = std::make_unique<ReadOptions>(read_options);
 }
 
 Status MultiGetQueryTraceRecord::Accept(

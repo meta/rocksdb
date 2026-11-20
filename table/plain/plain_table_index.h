@@ -70,12 +70,7 @@ class PlainTableIndex {
 
   explicit PlainTableIndex(Slice data) { InitFromRawData(data); }
 
-  PlainTableIndex()
-      : index_size_(0),
-        sub_index_size_(0),
-        num_prefixes_(0),
-        index_(nullptr),
-        sub_index_(nullptr) {}
+  PlainTableIndex() = default;
 
   // The function that executes the lookup the hash table.
   // The hash key is `prefix_hash`. The function fills the hash bucket
@@ -110,12 +105,12 @@ class PlainTableIndex {
   static const size_t kOffsetLen = sizeof(uint32_t);
 
  private:
-  uint32_t index_size_;
-  uint32_t sub_index_size_;
-  uint32_t num_prefixes_;
+  uint32_t index_size_ = 0;
+  uint32_t sub_index_size_ = 0;
+  uint32_t num_prefixes_ = 0;
 
-  uint32_t* index_;
-  char* sub_index_;
+  uint32_t* index_ = nullptr;
+  char* sub_index_ = nullptr;
 };
 
 // PlainTableIndexBuilder is used to create plain table index.
@@ -123,7 +118,7 @@ class PlainTableIndex {
 // used either to initialize PlainTableIndex or
 // to save index to sst file.
 // For more details about the index, please refer to:
-// https://github.com/facebook/rocksdb/wiki/PlainTable-Format
+// https://github.com/meta/rocksdb/wiki/PlainTable-Format
 // #wiki-in-memory-index-format
 // The class is used by PlainTableBuilder class.
 class PlainTableIndexBuilder {
@@ -172,6 +167,12 @@ class PlainTableIndexBuilder {
         : kNumRecordsPerGroup(num_records_per_group),
           current_group_(nullptr),
           num_records_in_current_group_(num_records_per_group) {}
+
+    // No copying allowed
+    IndexRecordList(const IndexRecordList&) = delete;
+    IndexRecordList& operator=(const IndexRecordList&) = delete;
+    IndexRecordList(IndexRecordList&&) = delete;
+    IndexRecordList& operator=(IndexRecordList&&) = delete;
 
     ~IndexRecordList() {
       for (size_t i = 0; i < groups_.size(); i++) {

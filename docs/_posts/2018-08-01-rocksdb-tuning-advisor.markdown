@@ -15,17 +15,17 @@ experts.
 ### Overview
 
 Experts share their wisdom as rules comprising of conditions and suggestions in the INI format (refer
-[rules.ini](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/rules.ini)).
+[rules.ini](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/rules.ini)).
 Users provide the Rocksdb configuration that they want to improve upon (as the
 familiar Rocksdb OPTIONS file —
-[example](https://github.com/facebook/rocksdb/blob/main/examples/rocksdb_option_file_example.ini))
+[example](https://github.com/meta/rocksdb/blob/main/examples/rocksdb_option_file_example.ini))
 and the path of the file which contains Rocksdb logs and statistics.
-The [Advisor](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/rule_parser_example.py)
+The [Advisor](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/rule_parser_example.py)
 creates appropriate DataSource objects (for Rocksdb
-[logs](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/db_log_parser.py),
-[options](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/db_options_parser.py),
-[statistics](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/db_stats_fetcher.py) etc.)
-and provides them to the [Rules Engine](https://github.com/facebook/rocksdb/blob/main/tools/advisor/advisor/rule_parser.py).
+[logs](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/db_log_parser.py),
+[options](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/db_options_parser.py),
+[statistics](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/db_stats_fetcher.py) etc.)
+and provides them to the [Rules Engine](https://github.com/meta/rocksdb/blob/main/tools/advisor/advisor/rule_parser.py).
 The Rules uses rules from experts to parse data-sources and trigger appropriate rules.
 The Advisor's output gives information about which rules were triggered,
 why they were triggered and what each of them suggests. Each suggestion
@@ -55,4 +55,4 @@ scope: col_fam:
 
 ### Read more
 
-For more information, refer to [advisor](https://github.com/facebook/rocksdb/tree/main/tools/advisor/README.md).
+For more information, refer to [advisor](https://github.com/meta/rocksdb/tree/main/tools/advisor/README.md).

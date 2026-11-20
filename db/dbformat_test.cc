@@ -52,7 +52,7 @@ static void TestKey(const std::string& key, uint64_t seq, ValueType vt) {
 
 class FormatTest : public testing::Test {};
 
-TEST_F(FormatTest, InternalKey_EncodeDecode) {
+TEST_F(FormatTest, InternalKeyEncodeDecode) {
   const char* keys[] = {"", "k", "hello", "longggggggggggggggggggggg"};
   const uint64_t seq[] = {1,
                           2,
@@ -217,9 +217,11 @@ TEST_P(IterKeySwapTest, SwapAndDestroy) {
   auto [a_key_len, a_copy, a_use_secondary, b_key_len, b_copy,
         b_use_secondary] = GetParam();
 
-  std::string expected_a, expected_b;
+  std::string expected_a;
+  std::string expected_b;
   // Storage for pinned keys -- must outlive the IterKeys.
-  std::string a_storage, b_storage;
+  std::string a_storage;
+  std::string b_storage;
   IterKey a;
   expected_a =
       PopulateKey(a, a_key_len, 'a', a_copy, a_use_secondary, a_storage);

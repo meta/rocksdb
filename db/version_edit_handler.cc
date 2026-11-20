@@ -373,6 +373,7 @@ void VersionEditHandler::CheckColumnFamilyId(const VersionEdit& edit,
 void VersionEditHandler::CheckIterationResult(const log::Reader& reader,
                                               Status* s) {
   assert(s != nullptr);
+  assert(version_set_ != nullptr);
   if (!s->ok()) {
     // Do nothing here.
   } else if (!version_edit_params_.HasLogNumber() ||
@@ -499,13 +500,18 @@ ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
     const ColumnFamilyOptions& cf_options, const VersionEdit& edit) {
   uint32_t cf_id = edit.GetColumnFamily();
   ColumnFamilyData* cfd = version_set_->CreateColumnFamily(
-      cf_options, read_options_, &edit, read_only_);
+      cf_options, read_options_, &edit, read_only_,
+      /*options_are_sanitized=*/false);
   assert(cfd != nullptr);
   cfd->set_initialized();
   assert(builders_.find(cf_id) == builders_.end());
-  builders_.emplace(cf_id, VersionBuilderUPtr(new BaseReferencedVersionBuilder(
-                               cfd, this, track_found_and_missing_files_,
-                               allow_incomplete_valid_version_)));
+  VersionBuilderUPtr builder(new BaseReferencedVersionBuilder(
+      cfd, cfd->current(), this, track_found_and_missing_files_,
+      allow_incomplete_valid_version_));
+  if (record_missing_blob_files_as_dropped_) {
+    builder->version_builder()->RecordMissingBlobFilesAsDropped();
+  }
+  builders_.emplace(cf_id, std::move(builder));
   return cfd;
 }
 
@@ -652,6 +658,11 @@ Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
           edit.GetLastCompactedManifestFileSize();
       version_set_->TuneMaxManifestFileSize();
     }
+    if (edit.HasCommittedOptionsFileNumber()) {
+      assert(version_set_ != nullptr);
+      version_set_->ApplyCommittedOptionsFileNumber(
+          edit.GetCommittedOptionsFileNumber());
+    }
     if (!version_edit_params_.HasPrevLogNumber()) {
       version_edit_params_.SetPrevLogNumber(0);
     }
@@ -722,15 +733,22 @@ VersionEditHandlerPointInTime::VersionEditHandlerPointInTime(
     bool read_only, std::vector<ColumnFamilyDescriptor> column_families,
     VersionSet* version_set, const std::shared_ptr<IOTracer>& io_tracer,
     const ReadOptions& read_options, bool allow_incomplete_valid_version,
-    bool trust_manifest_recovery, bool defer_sst_file_opening,
+    bool record_missing_blob_files_as_dropped, bool trust_manifest_recovery,
+    bool defer_sst_file_opening,
     EpochNumberRequirement epoch_number_requirement)
-    : VersionEditHandler(read_only, column_families, version_set,
+    : VersionEditHandler(read_only, std::move(column_families), version_set,
                          /*track_found_and_missing_files=*/true,
                          /*no_error_if_files_missing=*/true, io_tracer,
-                         read_options, allow_incomplete_valid_version,
+                         read_options, /*skip_load_table_files=*/false,
+                         allow_incomplete_valid_version,
                          epoch_number_requirement),
+      atomic_update_versions_missing_(0),
       trust_manifest_recovery_(trust_manifest_recovery),
-      defer_sst_file_opening_(defer_sst_file_opening) {}
+      defer_sst_file_opening_(defer_sst_file_opening) {
+  assert(!record_missing_blob_files_as_dropped ||
+         allow_incomplete_valid_version);
+  record_missing_blob_files_as_dropped_ = record_missing_blob_files_as_dropped;
+}
 
 VersionEditHandlerPointInTime::~VersionEditHandlerPointInTime() {
   for (const auto& cfid_and_version : atomic_update_versions_) {
@@ -882,6 +900,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
   auto builder_iter = builders_.find(cfd->GetID());
   assert(builder_iter != builders_.end());
   VersionBuilder* builder = builder_iter->second->version_builder();
+  const bool holds_point_in_time = BuilderHoldsPointInTime(cfd->GetID());
   const bool valid_pit_before_edit = builder->ValidVersionAvailable();
   s = builder->Apply(&edit);
   const bool valid_pit_after_edit = builder->ValidVersionAvailable();
@@ -889,13 +908,14 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
   // A new version will be created if:
   // 1) no error has occurred so far, and
   // 2) log_number_, next_file_number_ and last_sequence_ are known, and
-  // 3) not in an AtomicGroup
-  // 4) any of the following:
+  // 3) not in an AtomicGroup, and
+  // 4) the builder held a point in time of the MANIFEST before the edit, and
+  // 5) any of the following:
   //   a) a valid Version is available before applying the edit
   //      and a valid Version is not available after the edit.
   //   b) a valid Version is available after the edit and the
   //      caller explicitly request that a new version be created.
-  if (s.ok() && !missing_info && !in_atomic_group_ &&
+  if (s.ok() && !missing_info && !in_atomic_group_ && holds_point_in_time &&
       ((!valid_pit_after_edit && valid_pit_before_edit) ||
        (valid_pit_after_edit && force_create_version))) {
     // The Version to be created reflects the state *before* this edit. On a
@@ -927,8 +947,14 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
         if (negative_edge) {
           builder->RedoLastApply();
         }
-        if (s.IsCorruption()) {
-          // This point in time cannot be recovered; skip it and continue.
+        if (s.IsCorruption() ||
+            (s.IsPathNotFound() && no_error_if_files_missing_)) {
+          // This point in time cannot be recovered; skip it and continue. A
+          // PathNotFound is a file the primary compacted away before this
+          // handler opened it, which open_files_async makes reachable during a
+          // secondary's catch-up by leaving recovery-time files unpinned until
+          // the background opener reaches them. Treat it as missing rather than
+          // latching the error, the same tolerance LoadTables() applies.
           s = Status::OK();
         }
         builder->CommitLastApply();
@@ -1101,11 +1127,11 @@ Status ManifestTailer::Initialize() {
     assert(dummy_version);
     Version* base_version = dummy_version->Next();
     assert(base_version);
-    base_version->Ref();
     VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
         default_cfd, base_version, this, track_found_and_missing_files_,
         allow_incomplete_valid_version_));
     builder_iter->second = std::move(new_builder);
+    AwaitFileList(default_cfd->GetID());
 
     initialized_ = true;
   }
@@ -1114,11 +1140,45 @@ Status ManifestTailer::Initialize() {
 
 Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
                                         ColumnFamilyData** cfd) {
+  // RocksDB writes the DB ID in the first record of each MANIFEST while
+  // write_dbid_to_manifest is true. Catch-up switches to a new MANIFEST when
+  // CURRENT names another file, and it decides this from the file name alone.
+  // So the new MANIFEST can belong to another DB, for example one that was
+  // destroyed and created again at the same path, and its records do not
+  // continue the Versions that this instance built. Recovery at open sets the
+  // DB ID that this check compares with, so the check runs only in catch-up
+  // mode, and only when the MANIFEST that the instance opened had a DB ID.
+  if (Mode::kCatchUp == mode_ && edit.HasDbId() &&
+      version_edit_params_.HasDbId() &&
+      edit.GetDbId() != version_edit_params_.GetDbId()) {
+    return Status::Corruption(
+        "MANIFEST record has DB ID " + edit.GetDbId() +
+        ", but this instance opened DB ID " + version_edit_params_.GetDbId() +
+        ". The DB at this path was possibly created again. Reopen this "
+        "instance.");
+  }
   Status s = VersionEditHandler::ApplyVersionEdit(edit, cfd);
   if (s.ok()) {
     assert(cfd);
     if (*cfd) {
       cfds_changed_.insert(*cfd);
+      // VersionSet::WriteCurrentStateToManifest() lists a column family's
+      // files in the first record for it that sets a log number.
+      if (!edit.IsColumnFamilyAdd() && edit.HasLogNumber()) {
+        cfs_awaiting_file_list_.erase((*cfd)->GetID());
+      }
+    }
+    // The snapshot that opens a MANIFEST sets no next file number, and every
+    // record after it does. The snapshot leaves out only dropped column
+    // families, so the ones it did not add again never get a file list.
+    if (edit.HasNextFile()) {
+      for (uint32_t cf_id : cfs_awaiting_from_previous_manifest_) {
+        cfs_awaiting_file_list_.erase(cf_id);
+      }
+      cfs_awaiting_from_previous_manifest_.clear();
+      cfs_left_out_of_manifest_.insert(cfs_not_yet_in_manifest_.begin(),
+                                       cfs_not_yet_in_manifest_.end());
+      cfs_not_yet_in_manifest_.clear();
     }
   }
   return s;
@@ -1146,16 +1206,32 @@ Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
   assert(dummy_version);
   Version* base_version = dummy_version->Next();
   assert(base_version);
-  base_version->Ref();
   VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
       tmp_cfd, base_version, this, track_found_and_missing_files_));
   builder_iter->second = std::move(new_builder);
+  AwaitFileList(tmp_cfd->GetID());
 
 #ifndef NDEBUG
   auto version_iter = versions_.find(edit.GetColumnFamily());
   assert(version_iter == versions_.end());
 #endif  // !NDEBUG
   return Status::OK();
+}
+
+void ManifestTailer::AwaitFileList(uint32_t cf_id) {
+  cfs_awaiting_file_list_.insert(cf_id);
+  cfs_awaiting_from_previous_manifest_.erase(cf_id);
+  cfs_not_yet_in_manifest_.erase(cf_id);
+}
+
+bool ManifestTailer::NewestStateHasMissingFiles() {
+  for (const auto& builder : builders_) {
+    if (cfs_left_out_of_manifest_.count(builder.first) == 0 &&
+        !builder.second->version_builder()->ValidVersionAvailable()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void ManifestTailer::CheckIterationResult(const log::Reader& reader,

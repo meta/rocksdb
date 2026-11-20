@@ -23,6 +23,7 @@ IOStatus LineFileReader::Create(const std::shared_ptr<FileSystem>& fs,
     reader->reset(new LineFileReader(
         std::move(file), fname, nullptr,
         std::vector<std::shared_ptr<EventListener>>{}, rate_limiter));
+    (*reader)->SetIOType(file_opts.io_options.type);
   }
   return io_s;
 }

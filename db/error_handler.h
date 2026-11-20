@@ -42,7 +42,7 @@ struct DBRecoverContext {
         failed_wal_number(0),
         failed_wal_sequence(0),
         failed_wal_sequence_start(0) {}
-  DBRecoverContext(FlushReason reason)
+  explicit DBRecoverContext(FlushReason reason)
       : flush_reason(reason),
         flush_after_recovery(false),
         failed_wal_number(0),
@@ -124,7 +124,7 @@ class ErrorHandler {
   void EndAutoRecovery();
 
   void AddFilesToQuarantine(
-      autovector<const autovector<uint64_t>*> files_to_quarantine);
+      const autovector<const autovector<uint64_t>*>& files_to_quarantine);
 
   const autovector<uint64_t>& GetFilesToQuarantine() const {
     db_mutex_->AssertHeld();

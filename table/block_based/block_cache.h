@@ -106,10 +106,23 @@ struct BlockCreateContext : public Cache::CreateContext {
   Decompressor* decompressor = nullptr;
   const Comparator* raw_ucmp = nullptr;
   uint8_t protection_bytes_per_key = 0;
-  bool index_value_is_full;
-  bool index_has_first_key;
+  bool index_value_is_full = false;
+  bool index_has_first_key = false;
   // format_version >= 8 index value-delta escape codec (see IndexValue).
   bool index_value_delta_escape = false;
+  // Whether index keys are internal keys (vs. user keys). Only used to rule
+  // out index blocks whose last user key cannot be shorter than their common
+  // prefix (see Block::InitializeIndexBlockCommonPrefixCheck()). true is safe
+  // for correctness, but may cause false positives.
+  bool index_key_includes_seq = true;
+  // Whether to check whether the last user key of data and index blocks is
+  // shorter than their common prefix (see
+  // Block::last_user_key_shorter_than_common_prefix_). Set by
+  // BlockBasedTable::Open() when reading a table with
+  // ReverseBytewiseComparator, the only comparator using the prefix-optimized
+  // seek that orders a user key after longer user keys that extend it. Blocks
+  // of a table being built (e.g. for prepopulate_block_cache) never need it.
+  bool check_common_prefix = false;
   // Restart intervals from table properties (0 if not available)
   uint32_t data_block_restart_interval = 0;
   uint32_t index_block_restart_interval = 0;
@@ -181,7 +194,7 @@ using BlocklikeStatus = WithBlocklikeCheck<Status, TBlocklike>;
 // Helper for the uncache_aggressiveness option
 class UncacheAggressivenessAdvisor {
  public:
-  UncacheAggressivenessAdvisor(uint32_t uncache_aggressiveness) {
+  explicit UncacheAggressivenessAdvisor(uint32_t uncache_aggressiveness) {
     assert(uncache_aggressiveness > 0);
     allowance_ = std::min(uncache_aggressiveness, uint32_t{3});
     threshold_ = std::pow(0.99, uncache_aggressiveness - 1);

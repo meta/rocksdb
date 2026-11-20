@@ -41,6 +41,9 @@ class MetaIndexBuilder {
  public:
   MetaIndexBuilder(const MetaIndexBuilder&) = delete;
   MetaIndexBuilder& operator=(const MetaIndexBuilder&) = delete;
+  MetaIndexBuilder(MetaIndexBuilder&&) = delete;
+  MetaIndexBuilder& operator=(MetaIndexBuilder&&) = delete;
+  ~MetaIndexBuilder() = default;
 
   MetaIndexBuilder();
   void Add(const std::string& key, const BlockHandle& handle);
@@ -59,6 +62,9 @@ class PropertyBlockBuilder {
  public:
   PropertyBlockBuilder(const PropertyBlockBuilder&) = delete;
   PropertyBlockBuilder& operator=(const PropertyBlockBuilder&) = delete;
+  PropertyBlockBuilder(PropertyBlockBuilder&&) = delete;
+  PropertyBlockBuilder& operator=(PropertyBlockBuilder&&) = delete;
+  ~PropertyBlockBuilder() = default;
 
   PropertyBlockBuilder();
 

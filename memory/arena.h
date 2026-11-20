@@ -27,6 +27,8 @@ class Arena : public Allocator {
   // No copying allowed
   Arena(const Arena&) = delete;
   void operator=(const Arena&) = delete;
+  Arena(Arena&&) = delete;
+  void operator=(Arena&&) = delete;
 
   static constexpr size_t kInlineSize = 2048;
   static constexpr size_t kMinBlockSize = 4096;
@@ -41,7 +43,7 @@ class Arena : public Allocator {
   // page TLB first. If allocation fails, will fall back to normal case.
   explicit Arena(size_t block_size = kMinBlockSize,
                  AllocTracker* tracker = nullptr, size_t huge_page_size = 0);
-  ~Arena();
+  ~Arena() override;
 
   char* Allocate(size_t bytes) override;
 

@@ -1,1 +1,0 @@
-Opaque `PreparedFileInfo` metadata can now be serialized to a checksummed representation with `SerializePreparedFileInfo()` and restored with `DeserializePreparedFileInfo()` for reuse across processes.

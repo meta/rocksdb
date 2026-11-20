@@ -1,0 +1,1 @@
+A prefix seek (`prefix_same_as_start`, legacy prefix seek, or `auto_prefix_mode`) into an SST file below L0 now checks the file's prefix filter before creating the file's index and table iterators, so a seek the filter rules out skips that work. Files with range tombstones are not affected.

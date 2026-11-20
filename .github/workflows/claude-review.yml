@@ -8,7 +8,7 @@ name: Claude Code Review
 
 on:
   workflow_run:
-    workflows: ["facebook/rocksdb/pr-jobs"]
+    workflows: ["meta/rocksdb/pr-jobs"]
     types: [completed]
 
   # The early pull_request_target path is limited to same-repo PRs by the job

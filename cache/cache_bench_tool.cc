@@ -180,7 +180,7 @@ DEFINE_uint32(
 // than random." Even with this setting, file offsets are not randomized.
 DEFINE_bool(sck_randomize, false,
             "(-stress_cache_key) Randomize (hash) cache key");
-// See https://github.com/facebook/rocksdb/pull/9058
+// See https://github.com/meta/rocksdb/pull/9058
 DEFINE_bool(sck_footer_unique_id, false,
             "(-stress_cache_key) Simulate using proposed footer unique id");
 // ## END stress_cache_key sub-tool options ##
@@ -276,7 +276,8 @@ struct KeyGen {
       // location, so we fix hash bits starting at the bottom of that word.
       auto hi_hash = uint64_t{0x9e3779b97f4a7c13U} ^
                      (key_hash << 1 << (FLAGS_degenerate_hash_bits - 1));
-      uint64_t un_hi, un_lo;
+      uint64_t un_hi;
+      uint64_t un_lo;
       BijectiveUnhash2x64(hi_hash, key_hash, &un_hi, &un_lo);
       un_lo ^= BitwiseAnd(FLAGS_seed, INT32_MAX);
       EncodeFixed64(key_data, un_lo);
@@ -356,7 +357,7 @@ void ConfigureSecondaryCache(ShardedCacheOptions& opts) {
       fprintf(stderr,
               "No secondary cache registered matching string: %s status=%s\n",
               FLAGS_secondary_cache_uri.c_str(), s.ToString().c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     opts.secondary_cache = secondary_cache;
   }
@@ -390,7 +391,7 @@ class CacheBench {
                          kHundredthUint64 * FLAGS_erase_percent) {
     if (erase_threshold_ != 100U * kHundredthUint64) {
       fprintf(stderr, "Percentages must add to 100.\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     cache_ = MakeCache();
   }
@@ -409,7 +410,7 @@ class CacheBench {
     }
     if (FLAGS_cache_type == "clock_cache") {
       fprintf(stderr, "Old clock cache implementation has been removed.\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     } else if (EndsWith(FLAGS_cache_type, "hyper_clock_cache")) {
       HyperClockCacheOptions opts(
           FLAGS_cache_size, /*estimated_entry_charge=*/0, FLAGS_num_shard_bits);
@@ -427,7 +428,7 @@ class CacheBench {
         }
       } else {
         fprintf(stderr, "Cache type not supported.\n");
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
       ConfigureSecondaryCache(opts);
       return opts.MakeSharedCache();
@@ -441,13 +442,13 @@ class CacheBench {
       return NewLRUCache(opts);
     } else {
       fprintf(stderr, "Cache type not supported.\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
 
   void PopulateCache() {
     Random64 rnd(FLAGS_seed);
-    KeyGen keygen;
+    KeyGen keygen{};
     size_t max_occ = 0;
     size_t inserts_since_max_occ_increase = 0;
     size_t keys_since_last_not_found = 0;
@@ -476,7 +477,7 @@ class CacheBench {
       if (!handle) {
         fprintf(stderr, "Failed to lookup key just inserted.\n");
         assert(false);
-        exit(42);
+        exit(42);  // NOLINT(concurrency-mt-unsafe)
       } else {
         cache_->Release(handle);
       }
@@ -710,7 +711,7 @@ class CacheBench {
     // For this thread. Some round up, some round down, as appropriate
     size_t pin_count = (total_pin_count + thread->tid) / FLAGS_threads;
 
-    KeyGen gen;
+    KeyGen gen{};
     const auto clock = SystemClock::Default().get();
     uint64_t start_time = clock->NowMicros();
     StopWatchNano timer(clock);
@@ -809,7 +810,7 @@ class CacheBench {
     }
     if (FLAGS_early_exit) {
       MutexLock l(thread->shared->GetMutex());
-      exit(0);
+      exit(0);  // NOLINT(concurrency-mt-unsafe)
     }
     thread->shared->AddLookupStats(lookup_hits, lookup_misses, pinned.size());
     for (auto handle : pinned) {
@@ -819,7 +820,7 @@ class CacheBench {
     // Ensure computations on `result` are not optimized away.
     if (result == 1) {
       printf("You are extremely unlucky(2). Try again.\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     thread->duration_us = clock->NowMicros() - start_time;
   }
@@ -1230,7 +1231,7 @@ int cache_bench_tool(int argc, char** argv) {
 
   if (FLAGS_threads <= 0) {
     fprintf(stderr, "threads number <= 0\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   if (FLAGS_seed == 0) {

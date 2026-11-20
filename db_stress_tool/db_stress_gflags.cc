@@ -391,6 +391,17 @@ DEFINE_int32(clear_column_family_one_in, 1000000,
              "it again. If N == 0, never drop/create column families. "
              "When test_batches_snapshots is true, this flag has no effect");
 
+DEFINE_bool(test_cf_lifecycle, false,
+            "Run bounded column-family lifecycle stress. This mode uses two "
+            "column families so a failed replacement create can be recovered "
+            "without changing expected-state slot ordering.");
+
+DEFINE_int32(
+    cf_lifecycle_fault_target, 0,
+    "Target the replacement CreateColumnFamily persistence path with an "
+    "injected error: 0=none, 1=OPTIONS, 2=MANIFEST. Requires "
+    "--test_cf_lifecycle and tracked OPTIONS.");
+
 DEFINE_int32(
     get_live_files_apis_one_in, 1000000,
     "With a chance of 1/N, call GetLiveFiles(), GetLiveFilesMetaData() and "
@@ -463,6 +474,11 @@ DEFINE_bool(charge_blob_cache, false,
             "Setting for "
             "CacheEntryRoleOptions::charged of "
             "kBlobCache");
+
+DEFINE_bool(charge_readahead_buffer, false,
+            "Setting for "
+            "CacheEntryRoleOptions::charged of "
+            "kReadaheadBuffer");
 
 DEFINE_bool(
     decouple_partitioned_filters,
@@ -759,18 +775,57 @@ DEFINE_bool(use_trie_index, false,
             "Use trie-based user defined index (UDI) for SST files. "
             "Compatible with all operation types (Put, Delete, Merge, etc.) "
             "and all iteration directions (forward and reverse). "
-            "Combined with use_udi_as_primary_index to control whether the "
-            "UDI is the primary or secondary index.");
+            "Combined with index_mode to control the UDI role.");
 
-DEFINE_bool(use_udi_as_primary_index, false,
-            "When use_trie_index is enabled, use the UDI as the primary "
-            "index. All reads automatically go through the UDI (both "
-            "the standard index and UDI are always built). When false, "
-            "the UDI is a secondary index and reads require "
-            "ReadOptions::table_index_factory to be set.");
+DEFINE_int32(index_mode,
+             static_cast<int32_t>(
+                 ROCKSDB_NAMESPACE::BlockBasedTableOptions().index_mode),
+             "BlockBasedTableOptions::index_mode: 0=kStandardOnly, "
+             "1=kStandardDefault, 2=kCustomDefault, 3=kCustomOnly, "
+             "4=kStandardRequired. Values 2-4 require use_trie_index.");
+
+DEFINE_int32(read_index, -1,
+             "Per-read index selection (ReadOptions::read_index). -1=auto "
+             "(kPreferCustom when use_trie_index=1 and the custom index is "
+             "secondary, kDefault otherwise), 0=kDefault, 1=kBuiltin, "
+             "2=kPreferCustom. A value above 0 requires use_trie_index; "
+             "kBuiltin is incompatible with index_mode=3 (kCustomOnly).");
 
 DEFINE_bool(use_full_external_table, false,
             "Use the simple full external table test factory.");
+
+DEFINE_string(table_factory_uri, "",
+              "URI of a TableFactory to create with "
+              "TableFactory::CreateFromString(), such as one registered with "
+              "ObjectLibrary. Replaces the block-based table factory, so the "
+              "block-based table flags, the shared block cache and the filter "
+              "policy do not apply to it. A non-block-based factory requires "
+              "--compaction_ttl=0 and --periodic_compaction_seconds=0. Empty "
+              "means none.");
+
+DEFINE_bool(structured_key_value, false,
+            "Generate schema-like keys and versioned row values instead of "
+            "the default keys and values. See "
+            "db_stress_structured_key_value.h for the formats.");
+
+DEFINE_uint64(structured_keys_per_key_space, 4096,
+              "Number of consecutive key indexes in each key space of "
+              "structured_key_value.");
+
+DEFINE_uint64(structured_key_fanout, 16,
+              "Number of keys that share the first 8-byte field of a two-field "
+              "structured_key_value key.");
+
+DEFINE_string(structured_key_space_type_weights, "2,3,2",
+              "Comma-separated weights of the key-space types of "
+              "structured_key_value, at most 8. Type 0 key spaces have "
+              "single-field keys, the other types two-field keys.");
+
+DEFINE_string(structured_value_version_weights,
+              "1:30,2:30,3:20,4:3,5:8,6:4,7:3,128:2",
+              "Comma-separated version:weight pairs of the row versions of "
+              "structured_key_value values. Versions are in [1, 255], and a "
+              "version that is a multiple of 4 has an opaque layout.");
 
 DEFINE_bool(test_backward_scan, true,
             "Test backward iteration (Prev, SeekForPrev) in stress tests.");
@@ -1004,6 +1059,12 @@ DEFINE_int32(compact_range_one_in, 0,
              "If non-zero, then CompactRange() will be called once for every N "
              "operations on average.  0 indicates CompactRange() is disabled.");
 
+DEFINE_bool(
+    compact_range_skip_missing_blob_files, false,
+    "Enable missing blob reference repair in explicit CompactRange calls. "
+    "This deliberately deletes unavailable values whose external blob files "
+    "are absent from the input Version; FIFO compaction is unsupported.");
+
 DEFINE_int32(promote_l0_one_in, 0,
              "If non-zero, then PromoteL0() will be called once for every N "
              "operations on average.  0 indicates PromoteL0() is disabled.");
@@ -1115,6 +1176,9 @@ DEFINE_int32(remote_compaction_worker_interval, 10,
 DEFINE_bool(remote_compaction_failure_fall_back_to_local, true,
             "If true, remote compaction failures will be ignored and "
             "compactions will fall back to local and retried");
+
+DEFINE_bool(use_separate_remote_compaction_pool, false,
+            "Sets DBOptions.use_separate_remote_compaction_pool");
 
 DEFINE_uint32(
     openandcompact_max_secondary_open_retries,
@@ -1269,10 +1333,16 @@ DEFINE_bool(in_place_update, false, "On true, does inplace update in memtable");
 
 DEFINE_string(memtablerep, "skip_list", "");
 
+// db_stress_tool.cc further limits the prefix size to the shortest key of the
+// configured key generator.
 inline static bool ValidatePrefixSize(const char* flagname, int32_t value) {
-  if (value < -1 || value > 8) {
-    fprintf(stderr, "Invalid value for --%s: %d. -1 <= PrefixSize <= 8\n",
-            flagname, value);
+  if (value < -1 ||
+      value > static_cast<int32_t>(
+                  ROCKSDB_NAMESPACE::kStructuredSingleFieldKeySize)) {
+    fprintf(
+        stderr, "Invalid value for --%s: %d. -1 <= PrefixSize <= %d\n",
+        flagname, value,
+        static_cast<int32_t>(ROCKSDB_NAMESPACE::kStructuredSingleFieldKeySize));
     return false;
   }
   return true;
@@ -1314,6 +1384,10 @@ DEFINE_bool(write_dbid_to_manifest,
             ROCKSDB_NAMESPACE::Options().write_dbid_to_manifest,
             "Write DB_ID to manifest");
 
+DEFINE_bool(track_options_file_number_in_manifest,
+            ROCKSDB_NAMESPACE::Options().track_options_file_number_in_manifest,
+            "Publish the committed OPTIONS file number in MANIFEST");
+
 DEFINE_bool(optimize_manifest_for_recovery,
             ROCKSDB_NAMESPACE::Options().optimize_manifest_for_recovery,
             "Reduce recovery work after a clean shutdown");
@@ -1321,6 +1395,10 @@ DEFINE_bool(optimize_manifest_for_recovery,
 DEFINE_bool(write_identity_file,
             ROCKSDB_NAMESPACE::Options().write_identity_file,
             "Write DB_ID to IDENTITY file");
+
+DEFINE_bool(prefix_seek_opt_in_only,
+            ROCKSDB_NAMESPACE::Options().prefix_seek_opt_in_only,
+            "Set DBOptions::prefix_seek_opt_in_only");
 
 DEFINE_bool(reuse_manifest_on_open,
             ROCKSDB_NAMESPACE::Options().reuse_manifest_on_open,
@@ -1407,6 +1485,21 @@ DEFINE_bool(skip_verifydb, false,
 DEFINE_bool(enable_compaction_filter, false,
             "If true, configures a compaction filter that returns a kRemove "
             "decision for deleted keys.");
+
+DEFINE_bool(merge_before_compaction_filter, false,
+            "Make the compaction filter declare merge-before-filter order. "
+            "Requires enable_compaction_filter. Its decisions never change "
+            "what a reader sees.");
+
+DEFINE_uint32(merge_before_filter_change_one_in, 0,
+              "With merge_before_compaction_filter, return kChangeValue with "
+              "the same bytes for about 1 in N records. 0 disables it.");
+
+DEFINE_bool(merge_before_filter_remove_deleted, false,
+            "With merge_before_compaction_filter, remove records of keys that "
+            "are deleted in the expected state, and skip them in full "
+            "compactions. Requires the same no-snapshot settings as the "
+            "default-order compaction filter.");
 
 DEFINE_bool(paranoid_file_checks, true,
             "After writing every SST file, reopen it and read all the keys "
@@ -1560,6 +1653,11 @@ DEFINE_bool(
     "first verification succeeds. Expected state files from the last run will "
     "be preserved similarly under `FLAGS_expected_values_dir/unverified` when "
     "`--expected_values_dir` is nonempty.");
+
+DEFINE_uint64(mutex_hold_log_threshold_us,
+              ROCKSDB_NAMESPACE::Options().mutex_hold_log_threshold_us,
+              "Completed global mutex hold threshold in microseconds; 0 "
+              "disables hold logs.");
 
 DEFINE_uint64(stats_dump_period_sec,
               ROCKSDB_NAMESPACE::Options().stats_dump_period_sec,

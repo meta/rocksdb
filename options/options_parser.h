@@ -7,6 +7,8 @@
 
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "rocksdb/env.h"
@@ -47,7 +49,7 @@ Status PersistRocksDBOptions(const WriteOptions& write_options,
 class RocksDBOptionsParser {
  public:
   explicit RocksDBOptionsParser();
-  ~RocksDBOptionsParser() {}
+  ~RocksDBOptionsParser() = default;
   void Reset();
 
   // `file_readahead_size` is used for readahead for the option file.
@@ -75,11 +77,34 @@ class RocksDBOptionsParser {
   const ColumnFamilyOptions* GetCFOptions(const std::string& name) {
     return GetCFOptionsImpl(name);
   }
+
+  // The TableOptions section of a column family as written in the file, before
+  // parsing drops options and components config_options says to ignore.
+  struct TableOptionsSection {
+    std::string table_factory_id;
+    std::unordered_map<std::string, std::string> opt_map;
+  };
+  // Returns nullptr if the column family has no TableOptions section.
+  const TableOptionsSection* GetCFTableOptionsSection(
+      const std::string& cf_name) const {
+    std::unordered_map<std::string, TableOptionsSection>::const_iterator it =
+        cf_table_options_sections_.find(cf_name);
+    return it == cf_table_options_sections_.end() ? nullptr : &it->second;
+  }
+  // Whether a newer RocksDB than this one wrote the file. Parse() honors
+  // ConfigOptions::ignore_unknown_options only for such a file.
+  bool WrittenByNewerVersion() const;
   size_t NumColumnFamilies() { return cf_opts_.size(); }
   static Status VerifyRocksDBOptionsFromFile(
       const ConfigOptions& config_options, const DBOptions& db_opt,
       const std::vector<std::string>& cf_names,
       const std::vector<ColumnFamilyOptions>& cf_opts,
+      const std::string& file_name, FileSystem* fs);
+  static Status VerifyRocksDBOptionsFromFile(
+      const ConfigOptions& config_options, const DBOptions& db_opt,
+      const std::vector<std::string>& cf_names,
+      const std::vector<ColumnFamilyOptions>& cf_opts,
+      const std::unordered_set<std::string>& live_cf_names,
       const std::string& file_name, FileSystem* fs);
   static Status VerifyDBOptions(
       const ConfigOptions& config_options, const DBOptions& base_opt,
@@ -140,6 +165,8 @@ class RocksDBOptionsParser {
   std::vector<std::string> cf_names_;
   std::vector<ColumnFamilyOptions> cf_opts_;
   std::vector<std::unordered_map<std::string, std::string>> cf_opt_maps_;
+  std::unordered_map<std::string, TableOptionsSection>
+      cf_table_options_sections_;
   bool has_version_section_;
   bool has_db_options_;
   bool has_default_cf_options_;

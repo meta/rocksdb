@@ -19,7 +19,7 @@ class LDBCommandExecuteResult {
     EXEC_FAILED = 2,
   };
 
-  LDBCommandExecuteResult() : state_(EXEC_NOT_STARTED), message_("") {}
+  LDBCommandExecuteResult() : state_(EXEC_NOT_STARTED) {}
 
   LDBCommandExecuteResult(State state, std::string& msg)
       : state_(state), message_(msg) {}

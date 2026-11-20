@@ -24,6 +24,12 @@ class CacheActivityLogger {
   CacheActivityLogger()
       : activity_logging_enabled_(false), max_logging_size_(0) {}
 
+  // No copying allowed
+  CacheActivityLogger(const CacheActivityLogger&) = delete;
+  CacheActivityLogger& operator=(const CacheActivityLogger&) = delete;
+  CacheActivityLogger(CacheActivityLogger&&) = delete;
+  CacheActivityLogger& operator=(CacheActivityLogger&&) = delete;
+
   ~CacheActivityLogger() {
     MutexLock l(&mutex_);
 

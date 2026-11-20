@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
@@ -53,7 +54,7 @@ struct FileCreationBriefInfo {
 
 struct TableFileCreationBriefInfo : public FileCreationBriefInfo {
   // reason of creating the table.
-  TableFileCreationReason reason;
+  TableFileCreationReason reason = TableFileCreationReason::kFlush;
 };
 
 struct TableFileCreationInfo : public TableFileCreationBriefInfo {
@@ -61,7 +62,7 @@ struct TableFileCreationInfo : public TableFileCreationBriefInfo {
   explicit TableFileCreationInfo(TableProperties&& prop)
       : table_properties(prop) {}
   // the size of the file.
-  uint64_t file_size;
+  uint64_t file_size = 0;
   // Detailed properties of the created file.
   TableProperties table_properties;
   // The status indicating whether the creation was successful or not.
@@ -94,7 +95,7 @@ struct BlobFileCreationInfo : public BlobFileCreationBriefInfo {
                                   _reason),
         total_blob_count(_total_blob_count),
         total_blob_bytes(_total_blob_bytes),
-        status(_status),
+        status(std::move(_status)),
         file_checksum(_file_checksum),
         file_checksum_func_name(_file_checksum_func_name) {}
 
@@ -212,8 +213,8 @@ struct WriteStallInfo {
   std::string cf_name;
   // state of the write controller
   struct {
-    WriteStallCondition cur;
-    WriteStallCondition prev;
+    WriteStallCondition cur = WriteStallCondition::kDelayed;
+    WriteStallCondition prev = WriteStallCondition::kDelayed;
   } condition;
 };
 
@@ -225,7 +226,7 @@ struct FileDeletionInfo {
       : db_name(_db_name),
         file_path(_file_path),
         job_id(_job_id),
-        status(_status) {}
+        status(std::move(_status)) {}
   // The name of the database where the file was deleted.
   std::string db_name;
   // The path to the deleted file.
@@ -242,7 +243,7 @@ struct BlobFileDeletionInfo : public FileDeletionInfo {
   BlobFileDeletionInfo(const std::string& _db_name,
                        const std::string& _file_path, int _job_id,
                        Status _status)
-      : FileDeletionInfo(_db_name, _file_path, _job_id, _status) {}
+      : FileDeletionInfo(_db_name, _file_path, _job_id, std::move(_status)) {}
 };
 
 enum class FileOperationType {
@@ -274,8 +275,8 @@ struct FileOperationInfo {
   // Rocksdb try to provide file temperature information, but it's not
   // guaranteed.
   Temperature temperature;
-  uint64_t offset;
-  size_t length;
+  uint64_t offset = 0;
+  size_t length = 0;
   const Duration duration;
   const SystemTimePoint& start_ts;
   Status status;
@@ -407,6 +408,9 @@ struct SubcompactionJobInfo {
   // the job id, which is unique in the same thread.
   int job_id;
 
+  // The execution pool selected for the parent job.
+  bool separate_remote_compaction_pool_selected = false;
+
   // sub-compaction job id, which is only unique within the same compaction, so
   // use both 'job_id' and 'subcompaction_job_id' to identify a subcompaction
   // within an instance.
@@ -433,23 +437,27 @@ struct SubcompactionJobInfo {
 struct CompactionJobInfo {
   ~CompactionJobInfo() { status.PermitUncheckedError(); }
   // the id of the column family where the compaction happened.
-  uint32_t cf_id;
+  uint32_t cf_id = 0;
   // the name of the column family where the compaction happened.
   std::string cf_name;
   // the status indicating whether the compaction was successful or not.
   Status status;
   // the id of the thread that completed this compaction job.
-  uint64_t thread_id;
+  uint64_t thread_id = 0;
   // the job id, which is unique in the same thread.
-  int job_id;
+  int job_id = 0;
+
+  // The execution pool selected for this job, independent of later DB option
+  // updates.
+  bool separate_remote_compaction_pool_selected = false;
 
   // the number of L0 files in the CF right before and after the compaction
-  int num_l0_files;
+  int num_l0_files = 0;
 
   // the smallest input level of the compaction.
-  int base_input_level;
+  int base_input_level = 0;
   // the output level of the compaction.
-  int output_level;
+  int output_level = 0;
 
   // The following variables contain information about compaction inputs
   // and outputs. A file may appear in both the input and output lists
@@ -474,16 +482,16 @@ struct CompactionJobInfo {
   TablePropertiesCollection table_properties;
 
   // Reason to run the compaction
-  CompactionReason compaction_reason;
+  CompactionReason compaction_reason = CompactionReason::kUnknown;
 
   // Compression algorithm used for output files
-  CompressionType compression;
+  CompressionType compression = kNoCompression;
 
   // Statistics and other additional details on the compaction
   CompactionJobStats stats;
 
   // Compression algorithm used for blob output files.
-  CompressionType blob_compression_type;
+  CompressionType blob_compression_type = kNoCompression;
 
   // Information about blob files created during compaction in Integrated
   // BlobDB.
@@ -562,11 +570,16 @@ struct IOErrorInfo {
 // Point-in-time snapshot of background job pressure for one DB: how busy
 // compaction and flush are, and how close the DB is to write-stalling.
 struct BackgroundJobPressure {
-  // Compaction scheduling (LOW + BOTTOM priority combined)
+  // Scheduled compaction work, including remote coordinators and admitted
+  // local subcompactions.
   int compaction_scheduled = 0;
+  // Running compaction coordinators, including remote coordinators.
   int compaction_running = 0;
 
-  // Per-priority compaction breakdown
+  // Per-priority local pool usage. With the separate remote pool enabled,
+  // these count queued/running local subcompactions and exclude remote
+  // coordinators. Their running sum need not equal compaction_running, which
+  // counts coordinators rather than individual local subcompactions.
   int compaction_low_scheduled = 0;
   int compaction_low_running = 0;
   int compaction_bottom_scheduled = 0;
@@ -617,6 +630,14 @@ struct BackgroundJobPressure {
 // [Exceptions] Exceptions MUST NOT propagate out of overridden functions into
 // RocksDB, because RocksDB is not exception-safe. This could cause undefined
 // behavior including data loss, unreported corruption, deadlocks, and more.
+//
+// [File lifetime] RocksDB actively avoids deleting a file before a callback
+// that reports it returns, so that a callback can usually open, copy, or link
+// a file it is told about. This is best effort, not a guarantee. Exceptions
+// include OnTableFileDeleted() and OnBlobFileDeleted(), files that
+// OnCompactionCompleted() lists as inputs (including trivially moved files,
+// which are also listed as outputs), and files reported to
+// OnExternalFileIngested().
 class EventListener : public Customizable {
  public:
   static const char* Type() { return "EventListener"; }
@@ -977,7 +998,7 @@ class EventListener : public Customizable {
   // should not call blocking DB APIs or run for an extended period of time.
   virtual void OnDBShutdownBegin(DB* /*db*/) {}
 
-  ~EventListener() override {}
+  ~EventListener() override = default;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

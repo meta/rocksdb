@@ -30,6 +30,91 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+namespace {
+// Merge-before-filter runs only in compaction; flush, recovery and other table
+// creation paths do not run the merge-before-filter logic. No default case, so
+// that -Wswitch flags a new reason, which must also be added to
+// kAllTableFileCreationReasons.
+bool SupportsMergeBeforeFilter(TableFileCreationReason reason) {
+  switch (reason) {
+    case TableFileCreationReason::kCompaction:
+      return true;
+    case TableFileCreationReason::kFlush:
+    case TableFileCreationReason::kRecovery:
+    case TableFileCreationReason::kMisc:
+    case TableFileCreationReason::kSstFileWriter:
+      return false;
+  }
+  return false;
+}
+
+constexpr TableFileCreationReason kAllTableFileCreationReasons[] = {
+    TableFileCreationReason::kFlush, TableFileCreationReason::kCompaction,
+    TableFileCreationReason::kRecovery, TableFileCreationReason::kMisc,
+    TableFileCreationReason::kSstFileWriter};
+}  // namespace
+
+Status GetCompactionFilterMergeOrder(const CompactionFilter* filter,
+                                     const CompactionFilterFactory* factory,
+                                     TableFileCreationReason reason,
+                                     CompactionFilter::MergeOrder* order) {
+  using Order = CompactionFilter::MergeOrder;
+  const Order filter_order =
+      filter ? filter->GetMergeOrder() : Order::kFilterBeforeMerge;
+  const Order factory_order =
+      factory ? factory->GetMergeOrder() : Order::kFilterBeforeMerge;
+  if (factory && filter && filter_order != factory_order) {
+    return Status::InvalidArgument(
+        "Compaction filter/factory merge order mismatch");
+  }
+  *order = factory ? factory_order : filter_order;
+  if (*order == Order::kMergeBeforeFilter &&
+      !SupportsMergeBeforeFilter(reason)) {
+    return Status::InvalidArgument(
+        "Merge-before-filter is supported only during compaction");
+  }
+  return Status::OK();
+}
+
+bool DeclaresMergeBeforeFilter(const ColumnFamilyOptions& cf_opts) {
+  using Order = CompactionFilter::MergeOrder;
+  return (cf_opts.compaction_filter &&
+          cf_opts.compaction_filter->GetMergeOrder() ==
+              Order::kMergeBeforeFilter) ||
+         (cf_opts.compaction_filter_factory &&
+          cf_opts.compaction_filter_factory->GetMergeOrder() ==
+              Order::kMergeBeforeFilter);
+}
+
+Status MergeBeforeFilterTransactionError() {
+  return Status::NotSupported(
+      "Merge-before-filter does not support WritePrepared or WriteUnprepared "
+      "transactions");
+}
+
+Status ValidateCompactionFilterOptions(const ColumnFamilyOptions& cf_opts) {
+  if (!DeclaresMergeBeforeFilter(cf_opts)) {
+    return Status::OK();
+  }
+  const CompactionFilterFactory* factory =
+      cf_opts.compaction_filter_factory.get();
+  if (factory && factory->GetMergeOrder() ==
+                     CompactionFilter::MergeOrder::kMergeBeforeFilter) {
+    for (TableFileCreationReason reason : kAllTableFileCreationReasons) {
+      if (!SupportsMergeBeforeFilter(reason) &&
+          factory->ShouldFilterTableFileCreation(reason)) {
+        return Status::InvalidArgument(
+            "Merge-before-filter factory selects non-compaction creation");
+      }
+    }
+  }
+  if (cf_opts.comparator && cf_opts.comparator->timestamp_size() != 0) {
+    return Status::NotSupported(
+        "Merge-before-filter does not support user-defined timestamps");
+  }
+  return Status::OK();
+}
+
 ConfigOptions::ConfigOptions() : registry(ObjectRegistry::NewInstance()) {
   env = Env::Default();
 }
@@ -123,6 +208,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.allow_fallocate = immutable_db_options.allow_fallocate;
   options.is_fd_close_on_exec = immutable_db_options.is_fd_close_on_exec;
   options.stats_dump_period_sec = mutable_db_options.stats_dump_period_sec;
+  options.mutex_hold_log_threshold_us =
+      mutable_db_options.mutex_hold_log_threshold_us;
   options.stats_persist_period_sec =
       mutable_db_options.stats_persist_period_sec;
   options.persist_stats_to_disk = immutable_db_options.persist_stats_to_disk;
@@ -177,6 +264,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.avoid_unnecessary_blocking_io =
       immutable_db_options.avoid_unnecessary_blocking_io;
   options.write_dbid_to_manifest = immutable_db_options.write_dbid_to_manifest;
+  options.track_options_file_number_in_manifest =
+      immutable_db_options.track_options_file_number_in_manifest;
   options.write_identity_file = immutable_db_options.write_identity_file;
   options.reuse_manifest_on_open = immutable_db_options.reuse_manifest_on_open;
   options.prefix_seek_opt_in_only =
@@ -185,6 +274,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.file_checksum_gen_factory =
       immutable_db_options.file_checksum_gen_factory;
   options.best_efforts_recovery = immutable_db_options.best_efforts_recovery;
+  options.best_efforts_blob_db_repair =
+      immutable_db_options.best_efforts_blob_db_repair;
   options.max_bgerror_resume_count =
       immutable_db_options.max_bgerror_resume_count;
   options.bgerror_resume_retry_interval =
@@ -217,6 +308,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
       immutable_db_options.metadata_write_temperature;
   options.wal_write_temperature = immutable_db_options.wal_write_temperature;
   options.compaction_service = immutable_db_options.compaction_service;
+  options.use_separate_remote_compaction_pool =
+      mutable_db_options.use_separate_remote_compaction_pool;
   options.use_session_tmp_dir_for_remote_compaction =
       immutable_db_options.use_session_tmp_dir_for_remote_compaction;
   options.calculate_sst_write_lifetime_hint_set =
@@ -661,14 +754,28 @@ static bool ParseOptionHelper(void* opt_address, const OptionType& opt_type,
           compaction_stop_style_string_map, value,
           static_cast<CompactionStopStyle*>(opt_address));
     case OptionType::kEncodedString: {
-      std::string* output_addr = static_cast<std::string*>(opt_address);
-      (Slice(value)).DecodeHex(output_addr);
+      // DecodeHex() can write part of the result before it finds a bad digit,
+      // so keep the option unchanged until the whole value decodes.
+      std::string decoded;
+      if (!Slice(value).DecodeHex(&decoded)) {
+        return false;
+      }
+      *static_cast<std::string*>(opt_address) = std::move(decoded);
       break;
     }
     case OptionType::kTemperature: {
       return ParseEnum<Temperature>(temperature_string_map, value,
                                     static_cast<Temperature*>(opt_address));
     }
+    case OptionType::kEnv:
+    case OptionType::kEnum:
+    case OptionType::kStruct:
+    case OptionType::kVector:
+    case OptionType::kConfigurable:
+    case OptionType::kCustomizable:
+    case OptionType::kArray:
+    case OptionType::kStringMap:
+    case OptionType::kUnknown:
     default:
       return false;
   }
@@ -758,6 +865,15 @@ bool SerializeSingleOptionHelper(const void* opt_address,
           temperature_string_map, *static_cast<const Temperature*>(opt_address),
           value);
     }
+    case OptionType::kEnv:
+    case OptionType::kEnum:
+    case OptionType::kStruct:
+    case OptionType::kVector:
+    case OptionType::kConfigurable:
+    case OptionType::kCustomizable:
+    case OptionType::kArray:
+    case OptionType::kStringMap:
+    case OptionType::kUnknown:
     default:
       return false;
   }
@@ -1435,7 +1551,8 @@ static bool AreOptionsEqual(OptionType type, const void* this_offset,
     case OptionType::kInt32T:
       return IsOptionEqual<int32_t>(this_offset, that_offset);
     case OptionType::kInt64T: {
-      int64_t v1, v2;
+      int64_t v1;
+      int64_t v2;
       GetUnaligned(static_cast<const int64_t*>(this_offset), &v1);
       GetUnaligned(static_cast<const int64_t*>(that_offset), &v2);
       return (v1 == v2);
@@ -1445,13 +1562,15 @@ static bool AreOptionsEqual(OptionType type, const void* this_offset,
     case OptionType::kUInt32T:
       return IsOptionEqual<uint32_t>(this_offset, that_offset);
     case OptionType::kUInt64T: {
-      uint64_t v1, v2;
+      uint64_t v1;
+      uint64_t v2;
       GetUnaligned(static_cast<const uint64_t*>(this_offset), &v1);
       GetUnaligned(static_cast<const uint64_t*>(that_offset), &v2);
       return (v1 == v2);
     }
     case OptionType::kSizeT: {
-      size_t v1, v2;
+      size_t v1;
+      size_t v2;
       GetUnaligned(static_cast<const size_t*>(this_offset), &v1);
       GetUnaligned(static_cast<const size_t*>(that_offset), &v2);
       return (v1 == v2);
@@ -1479,6 +1598,15 @@ static bool AreOptionsEqual(OptionType type, const void* this_offset,
       return IsOptionEqual<std::string>(this_offset, that_offset);
     case OptionType::kTemperature:
       return IsOptionEqual<Temperature>(this_offset, that_offset);
+    case OptionType::kEnv:
+    case OptionType::kEnum:
+    case OptionType::kStruct:
+    case OptionType::kVector:
+    case OptionType::kConfigurable:
+    case OptionType::kCustomizable:
+    case OptionType::kArray:
+    case OptionType::kStringMap:
+    case OptionType::kUnknown:
     default:
       return false;
   }  // End switch

@@ -90,7 +90,7 @@ namespace ROCKSDB_NAMESPACE {
 // with merge operator created using CreateAggMergeOperator().
 class Aggregator {
  public:
-  virtual ~Aggregator() {}
+  virtual ~Aggregator() = default;
   // The input list is in reverse insertion order, with values[0] to be
   // the one inserted last and values.back() to be the one inserted first.
   // The oldest one might be from Get().

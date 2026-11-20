@@ -5,6 +5,8 @@
 
 #include "utilities/write_batch_with_index/write_batch_with_index_internal.h"
 
+#include <utility>
+
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/merge_helper.h"
@@ -176,7 +178,7 @@ Status BaseDeltaIterator::status() const {
   return delta_iterator_->status();
 }
 
-void BaseDeltaIterator::Invalidate(Status s) { status_ = s; }
+void BaseDeltaIterator::Invalidate(Status s) { status_ = std::move(s); }
 
 void BaseDeltaIterator::AssertInvariants() {
 #ifndef NDEBUG
@@ -569,6 +571,8 @@ WBWIIteratorImpl::Result WBWIIteratorImpl::FindLatestUpdate(
           break;  // ignore
         case kPutEntityRecord:
           return WBWIIteratorImpl::kFound;
+        case kDeleteRangeRecord:
+        case kUnknownRecord:
         default:
           assert(false);
           return WBWIIteratorImpl::kError;
@@ -697,7 +701,8 @@ int WriteBatchEntryComparator::operator()(
     return 1;
   }
 
-  Slice key1, key2;
+  Slice key1;
+  Slice key2;
   if (entry1->search_key == nullptr) {
     key1 = Slice(write_batch_->Data().data() + entry1->key_offset,
                  entry1->key_size);
@@ -751,7 +756,8 @@ const Comparator* WriteBatchEntryComparator::GetComparator(
 
 WriteEntry WBWIIteratorImpl::Entry() const {
   WriteEntry ret;
-  Slice blob, xid;
+  Slice blob;
+  Slice xid;
   const WriteBatchIndexEntry* iter_entry = skip_list_iter_.key();
   // this is guaranteed with Valid()
   assert(iter_entry != nullptr &&
@@ -976,7 +982,7 @@ WBWIIteratorImpl::Result WriteBatchWithIndexInternal::GetEntityFromBatch(
     static Status SetWideColumnValue(const Slice& entity, OutputType* output) {
       assert(output);
 
-      const Status s = output->SetWideColumnValue(entity);
+      Status s = output->SetWideColumnValue(entity);
       if (!s.ok()) {
         ClearOutput(output);
         return s;

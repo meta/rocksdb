@@ -68,7 +68,16 @@ class WriteUnpreparedTxnReadCallback : public ReadCallback {
     (void)backed_by_snapshot_;  // to silence unused private field warning
   }
 
-  virtual ~WriteUnpreparedTxnReadCallback() {
+  // No copying allowed
+  WriteUnpreparedTxnReadCallback(const WriteUnpreparedTxnReadCallback&) =
+      delete;
+  WriteUnpreparedTxnReadCallback& operator=(
+      const WriteUnpreparedTxnReadCallback&) = delete;
+  WriteUnpreparedTxnReadCallback(WriteUnpreparedTxnReadCallback&&) = delete;
+  WriteUnpreparedTxnReadCallback& operator=(WriteUnpreparedTxnReadCallback&&) =
+      delete;
+
+  ~WriteUnpreparedTxnReadCallback() override {
     // If it is not backed by snapshot, the caller must check validity
     assert(valid_checked_ || backed_by_snapshot_ == kBackedByDBSnapshot);
   }
@@ -113,7 +122,7 @@ class WriteUnpreparedTxn : public WritePreparedTxn {
                      const WriteOptions& write_options,
                      const TransactionOptions& txn_options);
 
-  virtual ~WriteUnpreparedTxn();
+  ~WriteUnpreparedTxn() override;
 
   using TransactionBaseImpl::Put;
   Status Put(ColumnFamilyHandle* column_family, const Slice& key,
@@ -223,7 +232,7 @@ class WriteUnpreparedTxn : public WritePreparedTxn {
   Status FlushWriteBatchToDBInternal(bool prepared);
   Status FlushWriteBatchWithSavePointToDB();
   Status RollbackToSavePointInternal();
-  Status HandleWrite(std::function<Status()> do_write);
+  Status HandleWrite(const std::function<Status()>& do_write);
 
   // For write unprepared, we check on every writebatch append to see if
   // write_batch_flush_threshold_ has been exceeded, and then call

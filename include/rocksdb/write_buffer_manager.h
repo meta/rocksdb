@@ -39,7 +39,7 @@ enum class WriteBufferFlushPolicy {
 // internal use only. Each DB instance contains ptr to StallInterface.
 class StallInterface {
  public:
-  virtual ~StallInterface() {}
+  virtual ~StallInterface() = default;
 
   virtual void Block() = 0;
 
@@ -70,6 +70,8 @@ class WriteBufferManager final {
   // No copying allowed
   WriteBufferManager(const WriteBufferManager&) = delete;
   WriteBufferManager& operator=(const WriteBufferManager&) = delete;
+  WriteBufferManager(WriteBufferManager&&) = delete;
+  WriteBufferManager& operator=(WriteBufferManager&&) = delete;
 
   ~WriteBufferManager();
 

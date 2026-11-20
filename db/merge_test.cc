@@ -224,6 +224,7 @@ class Counters {
     int result = get(key, &value);
     assert(result);
     if (result == 0) {
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       exit(1);  // Disable unused variable warning.
     }
     return value;
@@ -233,6 +234,7 @@ class Counters {
     int result = add(key, value);
     assert(result);
     if (result == 0) {
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       exit(1);  // Disable unused variable warning.
     }
   }
@@ -392,8 +394,10 @@ void testCountersWithFlushAndCompaction(Counters& counters,
   SyncPoint::GetInstance()->EnableProcessing();
 
   port::Thread set_options_thread([&]() {
+    // SetOptions() returns early for a request that changes no option, so set
+    // a harmless option to a new value to reach LogAndApply().
     ASSERT_OK(static_cast_with_check<DBImpl>(db.get())->SetOptions(
-        {{"disable_auto_compactions", "false"}}));
+        {{"report_bg_io_stats", "true"}}));
   });
   TEST_SYNC_POINT("testCountersWithCompactionAndFlush:BeforeCompact");
   port::Thread compact_thread([&]() {

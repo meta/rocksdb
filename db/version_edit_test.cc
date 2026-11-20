@@ -16,6 +16,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/coding.h"
+#include "util/random.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -29,13 +30,40 @@ static void TestEncodeDecode(const VersionEdit& edit) {
   // enable all other test cases continue to verify this invariant, while the
   // special case is separately covered in test
   // `EncodeDecodeNewFile4HandleFileBoundary`.
-  std::string encoded, encoded2;
+  std::string encoded;
+  std::string encoded2;
   edit.EncodeTo(&encoded, 0 /* ts_sz */);
   VersionEdit parsed;
   Status s = parsed.DecodeFrom(encoded);
   ASSERT_TRUE(s.ok()) << s.ToString();
   parsed.EncodeTo(&encoded2, 0 /* ts_sz */);
   ASSERT_EQ(encoded, encoded2);
+}
+
+static void TestOptionsFileNumberField(const char* field_name,
+                                       uint64_t file_number,
+                                       void (VersionEdit::*set)(uint64_t),
+                                       bool (VersionEdit::*has)() const,
+                                       uint64_t (VersionEdit::*get)() const) {
+  SCOPED_TRACE(field_name);
+  VersionEdit edit;
+  ASSERT_FALSE((edit.*has)());
+  (edit.*set)(file_number);
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded));
+
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_TRUE((decoded.*has)());
+  ASSERT_EQ(file_number, (decoded.*get)());
+  ASSERT_TRUE(decoded.ShouldEmitPerColumnFamilyRecoveryEdit(0));
+  const std::string expected =
+      std::string(field_name) + ": " + std::to_string(file_number);
+  ASSERT_NE(std::string::npos, decoded.DebugString().find(expected));
+  const std::string expected_json =
+      "\"" + std::string(field_name) + "\": " + std::to_string(file_number);
+  ASSERT_NE(std::string::npos, decoded.DebugJSON(1).find(expected_json));
 }
 
 class VersionEditTest : public testing::Test {};
@@ -102,7 +130,8 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   edit.SetLastSequence(kBig + 1000);
   TestEncodeDecode(edit);
 
-  std::string encoded, encoded2;
+  std::string encoded;
+  std::string encoded2;
   edit.EncodeTo(&encoded, 0 /* ts_sz */);
   VersionEdit parsed;
   Status s = parsed.DecodeFrom(encoded);
@@ -392,13 +421,37 @@ TEST_F(VersionEditTest, BlobFileAdditionAndGarbage) {
   TestEncodeDecode(edit);
 }
 
+TEST_F(VersionEditTest, DroppedBlobFiles) {
+  VersionEdit edit;
+  ASSERT_FALSE(edit.HasDroppedBlobFiles());
+
+  const std::vector<uint64_t> dropped_blob_files{5, uint64_t{1} << 40};
+  for (const uint64_t blob_file_number : dropped_blob_files) {
+    edit.AddDroppedBlobFile(blob_file_number);
+  }
+  ASSERT_TRUE(edit.HasDroppedBlobFiles());
+  TestEncodeDecode(edit);
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded, 0 /* ts_sz */));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_EQ(decoded.GetDroppedBlobFiles(), dropped_blob_files);
+  ASSERT_NE(decoded.DebugString().find("DroppedBlobFile: 5"),
+            std::string::npos);
+  ASSERT_NE(
+      decoded.DebugJSON(0).find("\"DroppedBlobFiles\": [5, 1099511627776]"),
+      std::string::npos);
+}
+
 TEST_F(VersionEditTest, AddWalEncodeDecode) {
   VersionEdit edit;
+  Random rnd(301);
   for (uint64_t log_number = 1; log_number <= 20; log_number++) {
     WalMetadata meta;
-    bool has_size = rand() % 2 == 0;
+    bool has_size = rnd.Uniform(2) == 0;
     if (has_size) {
-      meta.SetSyncedSizeInBytes(rand() % 1000);
+      meta.SetSyncedSizeInBytes(rnd.Uniform(1000));
     }
     edit.AddWal(log_number, meta);
   }
@@ -573,7 +626,8 @@ TEST_F(VersionEditTest, AddWalDebug) {
 
 TEST_F(VersionEditTest, DeleteWalEncodeDecode) {
   VersionEdit edit;
-  edit.DeleteWalsBefore(rand() % 100);
+  Random rnd(301);
+  edit.DeleteWalsBefore(rnd.Uniform(100));
   TestEncodeDecode(edit);
 }
 
@@ -616,6 +670,13 @@ TEST_F(VersionEditTest, FullHistoryTsLow) {
   TestEncodeDecode(edit);
 }
 
+TEST_F(VersionEditTest, OptionsFileNumbers) {
+  TestOptionsFileNumberField("CommittedOptionsFileNumber", 12345,
+                             &VersionEdit::SetCommittedOptionsFileNumber,
+                             &VersionEdit::HasCommittedOptionsFileNumber,
+                             &VersionEdit::GetCommittedOptionsFileNumber);
+}
+
 // Tests that if RocksDB is downgraded, the new types of VersionEdits
 // that have a tag larger than kTagSafeIgnoreMask can be safely ignored.
 TEST_F(VersionEditTest, IgnorableTags) {
@@ -637,6 +698,7 @@ TEST_F(VersionEditTest, IgnorableTags) {
     edit.AddWal(i + 1, WalMetadata(i + 2));
   }
   edit.SetDBId("db_id");
+  edit.SetCommittedOptionsFileNumber(12345);
   // Add unignorable entries.
   edit.SetPrevLogNumber(kPrevLogNumber);
   edit.SetLogNumber(kLogNumber);
@@ -646,6 +708,7 @@ TEST_F(VersionEditTest, IgnorableTags) {
   edit.SetNextFile(kNextFileNumber);
   // Add more ignorable entries.
   edit.SetFullHistoryTsLow("ts");
+  edit.AddDroppedBlobFile(7);
   // Add unignorable entry.
   edit.SetColumnFamily(kColumnFamilyId);
 
@@ -658,6 +721,8 @@ TEST_F(VersionEditTest, IgnorableTags) {
   // Check that all ignorable entries are ignored.
   ASSERT_FALSE(decoded.HasDbId());
   ASSERT_FALSE(decoded.HasFullHistoryTsLow());
+  ASSERT_FALSE(decoded.HasCommittedOptionsFileNumber());
+  ASSERT_FALSE(decoded.HasDroppedBlobFiles());
   ASSERT_FALSE(decoded.IsWalAddition());
   ASSERT_FALSE(decoded.IsWalDeletion());
   ASSERT_TRUE(decoded.GetWalAdditions().empty());
@@ -766,7 +831,7 @@ TEST(FileMetaDataTest, UpdateBoundariesBlobIndex) {
     ASSERT_EQ(meta.oldest_blob_file_number, expected_oldest_blob_file_number);
   }
 
-  // Corrupt blob index
+  // A corrupt blob index cannot safely provide dependency metadata.
   {
     constexpr char corrupt_blob_index[] = "!corrupt!";
     constexpr SequenceNumber seq = 205;
@@ -774,6 +839,17 @@ TEST(FileMetaDataTest, UpdateBoundariesBlobIndex) {
     ASSERT_TRUE(
         meta.UpdateBoundaries(key, corrupt_blob_index, seq, kTypeBlobIndex)
             .IsCorruption());
+    ASSERT_EQ(meta.oldest_blob_file_number, expected_oldest_blob_file_number);
+  }
+
+  // A corrupt wide-column entity cannot safely provide dependency metadata.
+  {
+    constexpr char corrupt_wide_column_entity[] = "!corrupt!";
+    constexpr SequenceNumber seq = 206;
+
+    ASSERT_TRUE(meta.UpdateBoundaries(key, corrupt_wide_column_entity, seq,
+                                      kTypeWideColumnEntity)
+                    .IsCorruption());
     ASSERT_EQ(meta.oldest_blob_file_number, expected_oldest_blob_file_number);
   }
 
@@ -786,7 +862,7 @@ TEST(FileMetaDataTest, UpdateBoundariesBlobIndex) {
     BlobIndex::EncodeBlob(&blob_index, kInvalidBlobFileNumber, offset, size,
                           kNoCompression);
 
-    constexpr SequenceNumber seq = 206;
+    constexpr SequenceNumber seq = 207;
 
     ASSERT_TRUE(meta.UpdateBoundaries(key, blob_index, seq, kTypeBlobIndex)
                     .IsCorruption());
@@ -894,6 +970,12 @@ class SubcompactionProgressTest : public VersionEditTest {
 
     ASSERT_EQ(actual.num_processed_input_records,
               expected.num_processed_input_records);
+
+    ASSERT_EQ(actual.has_blob_compaction_progress,
+              expected.has_blob_compaction_progress);
+    ASSERT_EQ(actual.blob_file_additions, expected.blob_file_additions);
+    ASSERT_EQ(actual.blob_file_garbages, expected.blob_file_garbages);
+    ASSERT_EQ(actual.next_blob_file_number, expected.next_blob_file_number);
 
     for (const bool is_proximal_level : {false, true}) {
       const SubcompactionProgressPerLevel&
@@ -1058,6 +1140,49 @@ TEST_F(SubcompactionProgressTest, OutputFilesDeltaEncodeDecode) {
   ASSERT_FALSE(builder.HasAccumulatedSubcompactionProgress());
 }
 
+TEST_F(SubcompactionProgressTest, BlobProgressDeltaEncodeDecode) {
+  SubcompactionProgress initial_progress =
+      CreateSubcompactionProgress("key_100", 100, 40, 0, {1});
+  initial_progress.has_blob_compaction_progress = true;
+  initial_progress.blob_file_additions.emplace_back(100, 2, 200, "", "");
+  initial_progress.blob_file_garbages.emplace_back(50, 1, 25);
+  initial_progress.next_blob_file_number = 101;
+
+  auto [initial_decoded_edit, initial_decoded_progress] =
+      EncodeDecodeProgress(initial_progress);
+  VerifyProgressEquality(initial_progress, initial_decoded_progress);
+
+  initial_progress.UpdateLastPersistedBlobFileAdditionsCount();
+  SubcompactionProgress updated_progress = initial_progress;
+  updated_progress.next_internal_key_to_compact = "key_200";
+  updated_progress.blob_file_additions.emplace_back(101, 3, 300, "", "");
+  updated_progress.blob_file_garbages = {BlobFileGarbage(50, 2, 50),
+                                         BlobFileGarbage(51, 1, 10)};
+  updated_progress.next_blob_file_number = 102;
+
+  auto [delta_decoded_edit, delta_decoded_progress] =
+      EncodeDecodeProgress(updated_progress);
+  ASSERT_TRUE(delta_decoded_progress.has_blob_compaction_progress);
+  ASSERT_EQ(delta_decoded_progress.blob_file_additions.size(), 1);
+  ASSERT_EQ(delta_decoded_progress.blob_file_additions.front(),
+            updated_progress.blob_file_additions.back());
+  ASSERT_EQ(delta_decoded_progress.blob_file_garbages,
+            updated_progress.blob_file_garbages);
+  ASSERT_EQ(delta_decoded_progress.next_blob_file_number, 102);
+
+  SubcompactionProgressBuilder builder;
+  ASSERT_TRUE(builder.ProcessVersionEdit(initial_decoded_edit));
+  ASSERT_TRUE(builder.ProcessVersionEdit(delta_decoded_edit));
+  const SubcompactionProgress& accumulated =
+      builder.GetAccumulatedSubcompactionProgress();
+  ASSERT_TRUE(accumulated.has_blob_compaction_progress);
+  ASSERT_EQ(accumulated.blob_file_additions,
+            updated_progress.blob_file_additions);
+  ASSERT_EQ(accumulated.blob_file_garbages,
+            updated_progress.blob_file_garbages);
+  ASSERT_EQ(accumulated.next_blob_file_number, 102);
+}
+
 TEST_F(SubcompactionProgressTest, UnknownTags) {
   SubcompactionProgress progress;
   std::string encoded;
@@ -1212,6 +1337,170 @@ TEST_F(VersionEditTest, FileOpenMetadataInApproximateMemoryUsage) {
 
   // The metadata should add to the memory usage
   ASSERT_GE(with_metadata_usage, base_usage + 500);
+}
+
+namespace {
+// Adds a file with no DB ownership fields set
+void AddTestFile(VersionEdit* edit, uint64_t file_number) {
+  static const uint64_t kBig = 1ull << 50;
+  edit->AddFile(
+      3, file_number, 0, 100, InternalKey("foo", kBig + 500, kTypeValue),
+      InternalKey("zoo", kBig + 600, kTypeDeletion), kBig + 500, kBig + 600,
+      false, Temperature::kUnknown, kInvalidBlobFileNumber,
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+      file_number /* epoch_number */, kUnknownFileChecksum,
+      kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
+}
+}  // namespace
+
+TEST_F(VersionEditTest, DbOwnershipEncodeDecode) {
+  // Includes a reserved bit, which must be preserved
+  const uint32_t kInfo =
+      DataFileProvenanceForOrigin(DataFileProvenance::Origin::kIngestion) |
+      kProvenanceMovedBetweenLevels | (uint32_t{1} << 20);
+  VersionEdit edit;
+  AddTestFile(&edit, 300);
+  AddTestFile(&edit, 301);
+  auto& new_files = edit.GetMutableNewFiles();
+  new_files[0].second.db_ownership_start_time = 1234567;
+  new_files[0].second.data_file_provenance = kInfo;
+  TestEncodeDecode(edit);
+
+  std::string encoded;
+  edit.EncodeTo(&encoded, 0 /* ts_sz */);
+  VersionEdit parsed;
+  ASSERT_OK(parsed.DecodeFrom(encoded));
+  const auto& parsed_files = parsed.GetNewFiles();
+  ASSERT_EQ(parsed_files.size(), 2u);
+  EXPECT_EQ(parsed_files[0].second.db_ownership_start_time, 1234567u);
+  EXPECT_EQ(parsed_files[0].second.data_file_provenance, kInfo);
+  EXPECT_EQ(parsed_files[1].second.db_ownership_start_time,
+            kUnknownDbOwnershipStartTime);
+  EXPECT_EQ(parsed_files[1].second.data_file_provenance, 0u);
+
+  // Fields are only written when known. (If written for 0, setting a small
+  // value would not change the encoded size.)
+  for (bool set_info : {false, true}) {
+    VersionEdit unknown_edit;
+    AddTestFile(&unknown_edit, 302);
+    std::string unknown_encoded;
+    unknown_edit.EncodeTo(&unknown_encoded, 0 /* ts_sz */);
+    if (set_info) {
+      unknown_edit.GetMutableNewFiles()[0].second.data_file_provenance = 1;
+    } else {
+      unknown_edit.GetMutableNewFiles()[0].second.db_ownership_start_time = 1;
+    }
+    std::string known_encoded;
+    unknown_edit.EncodeTo(&known_encoded, 0 /* ts_sz */);
+    // Tag, length, and one-byte value
+    EXPECT_EQ(known_encoded.size(), unknown_encoded.size() + 3);
+  }
+
+  // Older versions safely ignore the fields
+  EXPECT_EQ(0u, NewFileCustomTag::kDbOwnershipStartTime &
+                    NewFileCustomTag::kCustomTagNonSafeIgnoreMask);
+  EXPECT_EQ(0u, NewFileCustomTag::kDataFileProvenance &
+                    NewFileCustomTag::kCustomTagNonSafeIgnoreMask);
+
+  const std::string debug = edit.DebugString();
+  EXPECT_NE(debug.find(" db_ownership_start_time:1234567 "), std::string::npos)
+      << debug;
+  EXPECT_NE(debug.find(" data_file_provenance:ingestion+moved+raw:0x100103 "),
+            std::string::npos)
+      << debug;
+  const std::string json = edit.DebugJSON(0 /* edit_num */);
+  EXPECT_NE(json.find("\"DbOwnershipStartTime\": 1234567"), std::string::npos)
+      << json;
+  EXPECT_NE(
+      json.find("\"DataFileProvenance\": \"ingestion+moved+raw:0x100103\""),
+      std::string::npos)
+      << json;
+}
+
+TEST_F(VersionEditTest, DataFileProvenanceEncoding) {
+  using Origin = DataFileProvenance::Origin;
+  // The encoding is persisted, so must not change
+  const std::pair<Origin, uint32_t> kOrigins[] = {{Origin::kUnknown, 0},
+                                                  {Origin::kFlush, 1},
+                                                  {Origin::kCompaction, 2},
+                                                  {Origin::kIngestion, 3},
+                                                  {Origin::kImport, 4}};
+  for (const auto& [origin, origin_value] : kOrigins) {
+    for (uint32_t flags = 0; flags < 16; ++flags) {
+      SCOPED_TRACE("origin=" + std::to_string(origin_value) +
+                   " flags=" + std::to_string(flags));
+      DataFileProvenance info;
+      info.origin = origin;
+      info.moved_between_levels = (flags & 1) != 0;
+      info.temperature_changed_by_copy = (flags & 2) != 0;
+      info.temperature_updated_from_file_system = (flags & 4) != 0;
+      info.recorded_by_repair = (flags & 8) != 0;
+      const uint32_t encoded = info.Encode();
+      EXPECT_EQ(encoded, origin_value | (flags << 8));
+      EXPECT_EQ(DataFileProvenance::DecodeFrom(encoded), info);
+      // Reserved bits are ignored
+      EXPECT_EQ(DataFileProvenance::DecodeFrom(encoded | 0xfffff000U), info);
+    }
+  }
+  // Unrecognized origins decode as unknown, without affecting flags
+  const DataFileProvenance decoded =
+      DataFileProvenance::DecodeFrom(0x7f | kProvenanceRecordedByRepair);
+  EXPECT_EQ(decoded.origin, Origin::kUnknown);
+  EXPECT_TRUE(decoded.recorded_by_repair);
+  EXPECT_FALSE(decoded.moved_between_levels);
+}
+
+TEST_F(VersionEditTest, AddExistingFile) {
+  FileMetaData f(300, 0, 100, InternalKey("foo", 500, kTypeValue),
+                 InternalKey("zoo", 600, kTypeValue), 500, 600,
+                 true /* marked_for_compact */, Temperature::kWarm,
+                 7 /* oldest_blob_file */, 1000 /* oldest_ancestor_time */,
+                 2000 /* file_creation_time */, 3 /* epoch_number */,
+                 "checksum", "checksum_func", UniqueId64x2{11, 12},
+                 10 /* compensated_range_deletion_size */, 20 /* tail_size */,
+                 false /* user_defined_timestamps_persisted */, "min_ts",
+                 "max_ts");
+  f.file_open_metadata = "open_metadata";
+  f.db_ownership_start_time = 2500;
+  f.data_file_provenance =
+      DataFileProvenanceForOrigin(DataFileProvenance::Origin::kIngestion) |
+      kProvenanceTemperatureChangedByCopy | (uint32_t{1} << 20);
+  f.refs = 5;
+  f.being_compacted = true;
+
+  VersionEdit edit;
+  edit.AddExistingFile(4, f, kProvenanceMovedBetweenLevels);
+  ASSERT_EQ(edit.GetNewFiles().size(), 1u);
+  EXPECT_EQ(edit.GetNewFiles()[0].first, 4);
+  const FileMetaData& added = edit.GetNewFiles()[0].second;
+
+  // Persisted metadata is preserved; all of it is covered by comparing the
+  // encoded MANIFEST record, once the added flag is accounted for
+  VersionEdit expected_edit;
+  expected_edit.AddFile(4, f);
+  expected_edit.GetMutableNewFiles()[0].second.data_file_provenance |=
+      kProvenanceMovedBetweenLevels;
+  std::string expected_encoded;
+  expected_edit.EncodeTo(&expected_encoded, 0 /* ts_sz */);
+  std::string encoded;
+  edit.EncodeTo(&encoded, 0 /* ts_sz */);
+  EXPECT_EQ(encoded, expected_encoded);
+  EXPECT_EQ(added.db_ownership_start_time, 2500u);
+  EXPECT_EQ(added.data_file_provenance,
+            f.data_file_provenance | kProvenanceMovedBetweenLevels);
+
+  // In-memory-only state starts fresh
+  EXPECT_EQ(added.refs, 0);
+  EXPECT_FALSE(added.being_compacted);
+}
+
+TEST_F(VersionEditTest, TryGetDbOwnershipStartTime) {
+  FileMetaData f;
+  f.file_creation_time = 2000;
+  // Falls back on the file creation time when unknown
+  EXPECT_EQ(f.TryGetDbOwnershipStartTime(), 2000u);
+  f.db_ownership_start_time = 2500;
+  EXPECT_EQ(f.TryGetDbOwnershipStartTime(), 2500u);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

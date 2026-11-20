@@ -109,7 +109,7 @@ class Endpoint {
 // the actual snapshot gets created
 class TransactionNotifier {
  public:
-  virtual ~TransactionNotifier() {}
+  virtual ~TransactionNotifier() = default;
 
   // Implement this method to receive notification when a snapshot is
   // requested via SetSnapshotOnNextOperation.
@@ -138,6 +138,8 @@ class Transaction {
   // No copying allowed
   Transaction(const Transaction&) = delete;
   void operator=(const Transaction&) = delete;
+  Transaction(Transaction&&) = delete;
+  void operator=(Transaction&&) = delete;
 
   virtual ~Transaction() {}
 
@@ -777,7 +779,7 @@ class Transaction {
 
   // the log in which the prepared section for this txn resides
   // (for two phase commit)
-  uint64_t log_number_;
+  uint64_t log_number_ = 0;
   TransactionName name_;
 
   // Execution status of the transaction.

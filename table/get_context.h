@@ -138,6 +138,7 @@ class GetContext {
   // disabled.
   GetContext(GetContext&&) noexcept = default;
   GetContext& operator=(GetContext&&) noexcept = delete;
+  ~GetContext() = default;
 
   GetContext() = delete;
 

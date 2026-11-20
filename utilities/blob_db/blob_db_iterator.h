@@ -29,7 +29,7 @@ class BlobDBIterator : public Iterator {
         clock_(clock),
         statistics_(statistics) {}
 
-  virtual ~BlobDBIterator() = default;
+  ~BlobDBIterator() override = default;
 
   bool Valid() const override {
     if (!iter_->Valid()) {

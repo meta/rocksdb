@@ -19,6 +19,7 @@
 // synchronization on all accesses.
 
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -85,6 +86,23 @@ class ManifestTailer;
 class FilePickerMultiGet;
 class MultiScanArgs;
 
+// The OPTIONS publication state recovered from a MANIFEST.
+struct OptionsFileManifestState {
+  uint64_t committed_options_file_number = 0;
+  bool has_committed_options_file_number = false;
+  std::map<uint32_t, std::string> column_family_names;
+
+  void ApplyCommit(uint64_t number);
+  void ApplyColumnFamilyEdit(const VersionEdit& edit);
+};
+
+struct OptionsFileSelection {
+  uint64_t file_number = 0;
+  bool selected_by_manifest = false;
+  bool used_fallback = false;
+  std::vector<uint64_t> rejected_tracked_file_numbers;
+};
+
 // VersionEdit is always supposed to be valid and it is used to point at
 // entries in Manifest. Ideally it should not be used as a container to
 // carry around few of its fields as function params because it can cause
@@ -140,6 +158,8 @@ class VersionStorageInfo {
   // No copying allowed
   VersionStorageInfo(const VersionStorageInfo&) = delete;
   void operator=(const VersionStorageInfo&) = delete;
+  VersionStorageInfo(VersionStorageInfo&&) = delete;
+  void operator=(VersionStorageInfo&&) = delete;
   ~VersionStorageInfo();
 
   void Reserve(int level, size_t size) { files_[level].reserve(size); }
@@ -202,6 +222,9 @@ class VersionStorageInfo {
                               const MutableCFOptions& mutable_cf_options,
                               const std::string& full_history_ts_low);
 
+  // REQUIRES: DB mutex held
+  void RemoveFilesBeingCompactedFromCompactionCandidates();
+
   // Estimate est_comp_needed_bytes_
   void EstimateCompactionBytesNeeded(
       const MutableCFOptions& mutable_cf_options);
@@ -226,9 +249,9 @@ class VersionStorageInfo {
   //
   // Among bottommost files (assumes they've already been computed), marks the
   // ones that have keys that would be eliminated if recompacted, according to
-  // the seqnum of the oldest existing snapshot. Must be called every time
-  // oldest snapshot changes as that is when bottom-level files can become
-  // eligible for compaction.
+  // the seqnum of the oldest existing snapshot. It is recomputed when a new
+  // Version is installed and when deferred snapshot maintenance observes that
+  // the oldest snapshot crossed the next eligibility threshold.
   //
   // For columns with User Defined Timestamps (UDT), also checks that the
   // file's largest timestamp is below full_history_ts_low before marking,
@@ -470,6 +493,84 @@ class VersionStorageInfo {
     return std::shared_ptr<BlobFileMetaData>();
   }
 
+  // Blob files that best-efforts BlobDB repair (see
+  // DBOptions::best_efforts_blob_db_repair) recorded as dropped: they are not
+  // in this Version, but SST files in it might still reference them. Sorted
+  // and free of duplicates. A number is forgotten once it is in the Version or
+  // is older than every SST file's oldest referenced blob file, so no SST file
+  // can reference it.
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  const std::vector<uint64_t>& GetDroppedBlobFiles() const {
+    return dropped_blob_files_;
+  }
+
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  bool IsDroppedBlobFile(uint64_t blob_file_number) const {
+    return std::binary_search(dropped_blob_files_.begin(),
+                              dropped_blob_files_.end(), blob_file_number);
+  }
+
+  // True if `blob_index` references a dropped blob file. Inlined, TTL and
+  // same-file blob indexes never do.
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  bool IsDroppedBlobIndex(const BlobIndex& blob_index) const {
+    return IsDroppedBlobIndex(dropped_blob_files_, blob_index);
+  }
+
+  // Like the member function, for the dropped blob files in
+  // `dropped_blob_files`, which must be sorted and free of duplicates.
+  static bool IsDroppedBlobIndex(
+      const std::vector<uint64_t>& dropped_blob_files,
+      const BlobIndex& blob_index) {
+    return !blob_index.IsInlined() && !blob_index.HasTTL() &&
+           !blob_index.IsSameFile() &&
+           std::binary_search(dropped_blob_files.begin(),
+                              dropped_blob_files.end(),
+                              blob_index.file_number());
+  }
+
+  // How a read treats a value that references dropped blob files.
+  enum class DroppedBlobRead {
+    // The value references no dropped blob file.
+    kUnaffected,
+    // A wide-column entity reads as its columns not stored in dropped blob
+    // files.
+    kRemainingColumns,
+    // A blob value stored in a dropped blob file, or a wide-column entity
+    // with every column stored in one, reads as deleted.
+    kDeleted,
+  };
+
+  // Decides how reads treat `value`, an entry of `type`, given the dropped
+  // blob files. Compactions rewrite such entries the same way (see
+  // MissingBlobRepairIterator). For kRemainingColumns, also serializes the
+  // remaining columns into *remaining_columns if it is not null. A value of
+  // another type, or one that fails to decode, is kUnaffected, so that reading
+  // it reports the decoding error.
+  // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
+  DroppedBlobRead CheckDroppedBlobReferences(
+      ValueType type, const Slice& value,
+      std::string* remaining_columns) const {
+    return CheckDroppedBlobReferences(dropped_blob_files_, type, value,
+                                      remaining_columns);
+  }
+
+  // Like the member function, for the dropped blob files in
+  // `dropped_blob_files`, which must be sorted and free of duplicates.
+  static DroppedBlobRead CheckDroppedBlobReferences(
+      const std::vector<uint64_t>& dropped_blob_files, ValueType type,
+      const Slice& value, std::string* remaining_columns);
+
+  // REQUIRES: `dropped_blob_files` is sorted and free of duplicates.
+  void SetDroppedBlobFiles(std::vector<uint64_t>&& dropped_blob_files) {
+    assert(
+        std::is_sorted(dropped_blob_files.begin(), dropped_blob_files.end()));
+    assert(std::adjacent_find(dropped_blob_files.begin(),
+                              dropped_blob_files.end()) ==
+           dropped_blob_files.end());
+    dropped_blob_files_ = std::move(dropped_blob_files);
+  }
+
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   struct BlobStats {
     uint64_t total_file_size = 0;
@@ -673,6 +774,10 @@ class VersionStorageInfo {
     return bottommost_files_mark_threshold_;
   }
 
+  SequenceNumber oldest_snapshot_seqnum() const {
+    return oldest_snapshot_seqnum_;
+  }
+
   SequenceNumber standalone_range_tombstone_files_mark_threshold() const {
     return standalone_range_tombstone_files_mark_threshold_;
   }
@@ -738,6 +843,9 @@ class VersionStorageInfo {
   // Vector of blob files in version sorted by blob file number.
   BlobFiles blob_files_;
 
+  // See GetDroppedBlobFiles().
+  std::vector<uint64_t> dropped_blob_files_;
+
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.
   int base_level_;
@@ -787,9 +895,9 @@ class VersionStorageInfo {
 
   autovector<std::pair<int, FileMetaData*>> read_triggered_compaction_files_;
 
-  // Threshold for needing to mark another bottommost file. Maintain it so we
-  // can quickly check when releasing a snapshot whether more bottommost files
-  // became eligible for compaction. It's defined as the min of the max nonzero
+  // Threshold for needing to mark another bottommost file. Deferred snapshot
+  // maintenance uses it to avoid recomputing marks until the oldest snapshot
+  // can make another file eligible. It's defined as the min of the max nonzero
   // seqnums of unmarked bottommost files.
   SequenceNumber bottommost_files_mark_threshold_ = kMaxSequenceNumber;
 
@@ -914,6 +1022,9 @@ struct ObsoleteFileInfo {
 
     return *this;
   }
+
+  ~ObsoleteFileInfo() = default;
+
   void DeleteMetadata() {
     if (file_metadata_cache_res_mgr) {
       Status s = file_metadata_cache_res_mgr->UpdateCacheReservation(
@@ -1096,31 +1207,45 @@ class Version {
   // Returns the version number of this version
   uint64_t GetVersionNumber() const { return version_number_; }
 
-  // REQUIRES: lock is held
   // On success, "tp" will contains the table properties of the file
-  // specified in "file_meta".  If the file name of "file_meta" is
-  // known ahead, passing it by a non-null "fname" can save a
-  // file-name conversion.
+  // specified in "file_meta", which is at "level" of this version (-1 if
+  // unknown, only with !allow_table_open). If the file name of "file_meta" is
+  // known ahead, passing it by a non-null "fname" can save a file-name
+  // conversion.
+  //
+  // The properties come from the file's TableReader if it is in the table
+  // cache. Otherwise, if allow_table_open and the table cache is unbounded
+  // (max_open_files == -1), this opens the file's TableReader into the table
+  // cache, where it stays. Such files are normally opened anyway: during
+  // DB::Open or LogAndApply, or by the open_files_async background opener.
+  // Otherwise, or if that open fails, the properties block is read directly
+  // from the file. A table open does more I/O than reading the properties
+  // block, so callers holding the DB mutex should pass
+  // allow_table_open = false.
   Status GetTableProperties(const ReadOptions& read_options,
                             std::shared_ptr<const TableProperties>* tp,
-                            const FileMetaData* file_meta,
+                            const FileMetaData* file_meta, int level,
+                            bool allow_table_open,
                             const std::string* fname = nullptr) const;
 
   // On success, *props will be populated with all SSTables' table properties.
   // The keys of `props` are the sst file name, the values of `props` are the
-  // tables' properties, represented as std::shared_ptr.
-  Status GetPropertiesOfAllTables(const ReadOptions& read_options,
-                                  TablePropertiesCollection* props) const;
+  // tables' properties, represented as std::shared_ptr. allow_table_open is
+  // as for GetTableProperties().
   Status GetPropertiesOfAllTables(const ReadOptions& read_options,
                                   TablePropertiesCollection* props,
-                                  int level) const;
+                                  bool allow_table_open) const;
+  Status GetPropertiesOfAllTables(const ReadOptions& read_options,
+                                  TablePropertiesCollection* props, int level,
+                                  bool allow_table_open) const;
   Status GetPropertiesOfTablesInRange(const ReadOptions& read_options,
                                       const autovector<UserKeyRange>& ranges,
-                                      TablePropertiesCollection* props) const;
+                                      TablePropertiesCollection* props,
+                                      bool allow_table_open) const;
   Status GetPropertiesOfTablesByLevel(
       const ReadOptions& read_options,
-      std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level)
-      const;
+      std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level,
+      bool allow_table_open) const;
 
   // Print summary of range delete tombstones in SST files into out_str,
   // with maximum max_entries_to_print entries printed out.
@@ -1201,8 +1326,13 @@ class Version {
   // The helper function of UpdateAccumulatedStats, which may fill the missing
   // fields of file_meta from its associated TableProperties.
   // Returns true if it does initialize FileMetaData.
+  // populate_referenced_blob_bytes may be true only before file_meta becomes
+  // visible to concurrent readers: GetApproximateSizes reads that count
+  // without synchronization. Use false when initializing already-published
+  // input statistics on a secondary instance.
   bool MaybeInitializeFileMetaData(const ReadOptions& read_options,
-                                   FileMetaData* file_meta);
+                                   FileMetaData* file_meta,
+                                   bool populate_referenced_blob_bytes);
 
   // Update the accumulated stats associated with the current version.
   // This accumulated stats will be used in compaction.
@@ -1259,7 +1389,6 @@ class Version {
   // used for debugging and logging purposes only.
   uint64_t version_number_;
   std::shared_ptr<IOTracer> io_tracer_;
-  bool use_async_io_;
 
   Version(ColumnFamilyData* cfd, VersionSet* vset, const FileOptions& file_opt,
           const MutableCFOptions& mutable_cf_options,
@@ -1273,6 +1402,8 @@ class Version {
   // No copying allowed
   Version(const Version&) = delete;
   void operator=(const Version&) = delete;
+  Version(Version&&) = delete;
+  void operator=(Version&&) = delete;
 };
 
 class BaseReferencedVersionBuilder;
@@ -1317,6 +1448,8 @@ class VersionSet {
   // No copying allowed
   VersionSet(const VersionSet&) = delete;
   void operator=(const VersionSet&) = delete;
+  VersionSet(VersionSet&&) = delete;
+  void operator=(VersionSet&&) = delete;
 
   virtual ~VersionSet();
 
@@ -1364,6 +1497,16 @@ class VersionSet {
                        dir_contains_current_file, new_descriptor_log,
                        column_family_options, {manifest_wcb}, pre_cb);
   }
+
+  // The live DB creation path has already sanitized these options for its
+  // OPTIONS snapshot. Reuse that exact value when installing the new column
+  // family so persistence and the in-memory configuration cannot drift.
+  Status LogAndApplyColumnFamilyAddWithSanitizedOptions(
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      VersionEdit* edit, InstrumentedMutex* mu,
+      FSDirectory* dir_contains_current_file,
+      const ColumnFamilyOptions& sanitized_options);
+
   // The batch version. If edit_list.size() > 1, caller must ensure that
   // no edit in the list column family add or drop
   Status LogAndApply(
@@ -1435,6 +1578,10 @@ class VersionSet {
   // of their files (if missing)
   void RecoverEpochNumbers();
 
+  // Logs the dropped blob files (see VersionStorageInfo::GetDroppedBlobFiles())
+  // of each column family's current Version.
+  void LogDroppedBlobFiles() const;
+
   // Reads a manifest file and returns a list of column families in
   // column_families.
   static Status ListColumnFamilies(std::vector<std::string>* column_families,
@@ -1442,6 +1589,25 @@ class VersionSet {
   static Status ListColumnFamiliesFromManifest(
       const std::string& manifest_path, FileSystem* fs,
       std::vector<std::string>* column_families);
+
+  // Replays CURRENT's MANIFEST and returns its committed OPTIONS file number.
+  static Status GetOptionsFileManifestState(
+      const std::string& dbname, FileSystem* fs,
+      OptionsFileManifestState* manifest_state);
+  static Status GetOptionsFileManifestState(
+      const std::string& dbname, FileSystem* fs,
+      OptionsFileManifestState* manifest_state, uint64_t* next_file_number,
+      uint64_t* last_valid_manifest_record_end);
+
+  // Resolves OPTIONS files against recovered MANIFEST state. A legacy file
+  // (tracking absent or false) supersedes an older committed file. Tracked
+  // files without a matching commit are skipped. If no committed or legacy
+  // file exists, falls back to the highest tracked file for RepairDB output.
+  static Status ResolveOptionsFileNumber(
+      const std::string& dbname, FileSystem* fs,
+      const OptionsFileManifestState& manifest_state,
+      const std::vector<std::string>& filenames,
+      bool inspect_options_file_tracking, OptionsFileSelection* selection);
 
   // Try to reduce the number of levels. This call is valid when
   // only one level from the new max level to the old
@@ -1472,6 +1638,22 @@ class VersionSet {
 
   uint64_t options_file_number() const { return options_file_number_; }
 
+  // True when options_file_number() was committed by the current MANIFEST.
+  bool has_committed_options_file_number() const {
+    return has_committed_options_file_number_;
+  }
+
+  OptionsFileManifestState options_file_manifest_state() const {
+    OptionsFileManifestState state;
+    state.committed_options_file_number = options_file_number_;
+    state.has_committed_options_file_number =
+        has_committed_options_file_number_;
+    return state;
+  }
+
+  virtual void ApplyCommittedOptionsFileNumber(uint64_t number);
+  void ApplyLegacyOptionsFileNumber(uint64_t number);
+
   uint64_t pending_manifest_file_number() const {
     return pending_manifest_file_number_;
   }
@@ -1490,6 +1672,23 @@ class VersionSet {
   // Fetch And Add n new file number
   uint64_t FetchAddFileNumber(uint64_t n) {
     return next_file_number_.fetch_add(n);
+  }
+
+  // Atomically allocate `count` consecutive file numbers for a caller that
+  // needs to hand a collision-free range to another process. Returns false if
+  // the range would overflow.
+  bool TryAllocateFileNumberRange(uint64_t count, uint64_t* first) {
+    if (count == 0 || first == nullptr) {
+      return false;
+    }
+    uint64_t next = next_file_number_.load();
+    while (next <= std::numeric_limits<uint64_t>::max() - count) {
+      if (next_file_number_.compare_exchange_weak(next, next + count)) {
+        *first = next;
+        return true;
+      }
+    }
+    return false;
   }
 
   // Return the last sequence number.
@@ -1656,14 +1855,35 @@ class VersionSet {
       std::vector<ObsoleteFileInfo>& sst_delete_candidates,
       std::vector<ObsoleteBlobFileInfo>& blob_delete_candidates) const;
 
+  using ReferencedBlobBytesByFile =
+      std::unordered_map<uint64_t, std::optional<uint64_t>>;
+  // Optional blob outputs and their required lookup for one pinned Version.
+  // Before traversal, references must contain one captured property result
+  // (including unknown on failure/absence) for every SST without an engaged
+  // FileMetaData::referenced_blob_bytes. The map and Version must outlive this
+  // context and must not change during traversal. GetReferencedBlobBytes does
+  // no I/O and gives the census and range traversal the same classification.
+  struct BlobSizeAccounting {
+    explicit BlobSizeAccounting(
+        const ReferencedBlobBytesByFile& file_references)
+        : references(file_references) {}
+    std::optional<uint64_t> GetReferencedBlobBytes(
+        const FileMetaData& file) const;
+    const ReferencedBlobBytesByFile& references;
+    uint64_t referenced_blob_bytes = 0;
+    uint64_t unknown_sst_bytes = 0;
+  };
+
   // Return the approximate size of data to be scanned for range [start, end)
-  // in levels [start_level, end_level). If end_level == -1 it will search
-  // through all non-empty levels
+  // in levels [start_level, end_level). If end_level == -1, search all nonempty
+  // levels. A non-null blob_accounting resets and fills both blob outputs;
+  // omit it for the SST-only calculation.
   uint64_t ApproximateSize(const SizeApproximationOptions& options,
                            const ReadOptions& read_options, Version* v,
                            const Slice& start, const Slice& end,
                            int start_level, int end_level,
-                           TableReaderCaller caller);
+                           TableReaderCaller caller,
+                           BlobSizeAccounting* blob_accounting = nullptr);
 
   // Return the size of the current manifest file
   uint64_t manifest_file_size() const { return manifest_file_size_; }
@@ -1704,10 +1924,14 @@ class VersionSet {
     obsolete_blob_files_.emplace_back(blob_file_number, std::move(path));
   }
 
+  // Obsolete blob files numbered at or above `min_pending_output`, and
+  // obsolete SST files numbered at or above `min_listener_pending_output`, are
+  // left for a later call.
   void GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
                         std::vector<ObsoleteBlobFileInfo>* blob_files,
                         std::vector<std::string>* manifest_filenames,
-                        uint64_t min_pending_output);
+                        uint64_t min_pending_output,
+                        uint64_t min_listener_pending_output);
 
   // REQUIRES: DB mutex held
   uint64_t GetObsoleteSstFilesSize() const;
@@ -1787,19 +2011,24 @@ class VersionSet {
   unsigned TEST_GetMaxManifestSpaceAmpPct() {
     return max_manifest_space_amp_pct_;
   }
+  void TEST_ClearCommittedOptionsFileNumber() {
+    has_committed_options_file_number_ = false;
+  }
   size_t TEST_GetManifestPreallocationSize() {
     return manifest_preallocation_size_;
   }
 
   // Appends a kColumnFamilyDrop record for each id in cf_ids to the MANIFEST
   // file at manifest_path, whose valid content length is manifest_size bytes.
-  // Intended for post-processing a checkpoint's copied MANIFEST so that column
-  // families whose SST/blob files were not copied are recorded as dropped and
-  // thus not opened during recovery.
+  // Column-family drops ensure CFs whose files were not copied are not opened
+  // during recovery. When committed_options_file_number is nonzero, it is
+  // committed in the last appended record so the copied MANIFEST also matches
+  // the subset-specific OPTIONS snapshot.
   Status AppendColumnFamilyDropsToManifest(
       const std::string& manifest_path, uint64_t manifest_size,
       const std::vector<uint32_t>& cf_ids, const WriteOptions& write_options,
-      uint64_t manifest_preallocation_size);
+      uint64_t manifest_preallocation_size,
+      uint64_t committed_options_file_number);
 
  protected:
   struct ManifestWriter;
@@ -1836,7 +2065,7 @@ class VersionSet {
                            const Slice& end, TableReaderCaller caller);
 
   struct MutableCFState {
-    uint64_t log_number;
+    uint64_t log_number = 0;
     std::string full_history_ts_low;
 
     explicit MutableCFState() = default;
@@ -1848,7 +2077,9 @@ class VersionSet {
   Status WriteCurrentStateToManifest(
       const WriteOptions& write_options,
       const std::unordered_map<uint32_t, MutableCFState>& curr_state,
-      const VersionEdit& wal_additions, log::Writer* log, IOStatus& io_s);
+      const VersionEdit& wal_additions,
+      const OptionsFileManifestState& options_file_manifest_state,
+      log::Writer* log, IOStatus& io_s);
 
   // Reopen the existing MANIFEST file for append at the end of Recover()
   // when reuse_manifest_on_open is set, so the next LogAndApply appends
@@ -1859,8 +2090,17 @@ class VersionSet {
 
   // FileOptions for MANIFEST writes -- applies the FS's
   // OptimizeForManifestWrite tuning, then re-applies the user-configured
-  // temperature so a custom FS can't override it.
+  // temperature so a custom FS can't override it. Sets
+  // io_options.type = IOType::kManifest, which WritableFileWriter applies to
+  // each IO it issues.
   FileOptions GetFileOptionsForManifestWrite() const;
+
+  // FileOptions for opening a MANIFEST to read it -- applies the FS's
+  // OptimizeForManifestRead tuning and sets io_options.type =
+  // IOType::kManifest. That type applies only to the open; call
+  // SequentialFileReader::SetIOType(IOType::kManifest) on the reader so that
+  // each read carries it too.
+  FileOptions GetFileOptionsForManifestRead() const;
 
   // Create a log::Writer over the given FSWritableFile with all standard
   // MANIFEST setup applied (preallocation block size, checksum-handoff
@@ -1881,7 +2121,8 @@ class VersionSet {
 
   ColumnFamilyData* CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                        const ReadOptions& read_options,
-                                       const VersionEdit* edit, bool read_only);
+                                       const VersionEdit* edit, bool read_only,
+                                       bool options_are_sanitized);
 
   Status VerifyFileMetadata(const ReadOptions& read_options,
                             ColumnFamilyData* cfd, const std::string& fpath,
@@ -1913,6 +2154,7 @@ class VersionSet {
   uint64_t manifest_file_number_;
   uint64_t options_file_number_;
   uint64_t options_file_size_;
+  bool has_committed_options_file_number_;
   uint64_t pending_manifest_file_number_;
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
@@ -1983,16 +2225,16 @@ class VersionSet {
   uint64_t last_compacted_manifest_file_size_;
 
   // Auto-tuned max allowed size for the current manifest file
-  uint64_t tuned_max_manifest_file_size_;
+  uint64_t tuned_max_manifest_file_size_ = 0;
 
   // Saved copy of max_manifest_file_size in (Mutable)DBOptions
-  uint64_t min_max_manifest_file_size_;
+  uint64_t min_max_manifest_file_size_ = 0;
   // Saved, sanitized copy from (Mutable)DBOptions
-  unsigned max_manifest_space_amp_pct_;
+  unsigned max_manifest_space_amp_pct_ = 0;
   // Saved copy from (Mutable)DBOptions
-  size_t manifest_preallocation_size_;
+  size_t manifest_preallocation_size_ = 0;
   // Saved copy from (Mutable)DBOptions
-  bool verify_manifest_content_on_close_;
+  bool verify_manifest_content_on_close_ = false;
 
   // Obsolete files, or during DB shutdown any files not referenced by what's
   // left of the in-memory LSM state.
@@ -2025,8 +2267,19 @@ class VersionSet {
                                FSDirectory* dir_contains_current_file,
                                bool new_descriptor_log,
                                const ColumnFamilyOptions* new_cf_options,
+                               bool new_cf_options_are_sanitized,
                                const ReadOptions& read_options,
                                const WriteOptions& write_options);
+
+  Status LogAndApplyImpl(
+      const autovector<ColumnFamilyData*>& column_family_datas,
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      const autovector<autovector<VersionEdit*>>& edit_lists,
+      InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
+      bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
+      bool new_cf_options_are_sanitized,
+      const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
+      const std::function<Status()>& pre_cb, int max_file_opening_threads);
 
   void LogAndApplyCFHelper(VersionEdit* edit,
                            SequenceNumber* max_last_sequence);
@@ -2060,6 +2313,10 @@ class ReactiveVersionSet : public VersionSet {
     return Status::OK();
   }
 
+  // Secondary and follower live-file snapshots keep their legacy behavior.
+  // They do not publish an OPTIONS file selected from primary MANIFEST state.
+  void ApplyCommittedOptionsFileNumber(uint64_t /*number*/) override {}
+
   Status ReadAndApply(
       InstrumentedMutex* mu,
       std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
@@ -2077,7 +2334,7 @@ class ReactiveVersionSet : public VersionSet {
   // or blob files. Only used by the DB::OpenAndCompact remote-compaction path.
   void SetTrustManifestRecovery(bool v) { trust_manifest_recovery_ = v; }
 
-  // Returns the column family's log number as of the Version currently
+  // Returns the column family's log number
   // installed for it, i.e. the log number that the MANIFEST records that
   // Version was built from had put in effect. Data written to WALs older than
   // the returned number has been flushed by the primary into files the
@@ -2091,6 +2348,13 @@ class ReactiveVersionSet : public VersionSet {
   //
   // REQUIRES: db mutex
   uint64_t GetInstalledVersionLogNumber(uint32_t cf_id) const;
+
+  // Returns whether the newest state that the MANIFEST records read so far
+  // describe lists, for any column family, a file that could not be found or
+  // verified, so that no Version of that state can be installed.
+  //
+  // REQUIRES: db mutex
+  bool NewestStateHasMissingFiles();
 
 #ifndef NDEBUG
   uint64_t TEST_read_edits_in_atomic_group() const;
@@ -2108,6 +2372,21 @@ class ReactiveVersionSet : public VersionSet {
       log::Reader::Reporter* reporter,
       std::unique_ptr<log::FragmentBufferedReader>* manifest_reader);
 
+  // Opens the MANIFEST at `manifest_path` with a new reader that reports to
+  // `reporter`.
+  Status NewManifestReader(
+      const std::string& manifest_path, log::Reader::Reporter* reporter,
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader);
+
+  // Replaces `*manifest_reader`, which a failed read stopped, with a new reader
+  // of the same MANIFEST that starts at
+  // ManifestTailer::GetLastValidRecordEnd(). Returns Corruption if the file
+  // now belongs to another DB. On any failure, keeps the old reader, so that
+  // the next call tries again.
+  Status ReopenManifestAfterReadError(
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+      Status* manifest_read_status);
+
  private:
   std::unique_ptr<ManifestTailer> manifest_tailer_;
   // When true, MANIFEST recovery trusts the manifest and does not stat/open SST
@@ -2115,6 +2394,20 @@ class ReactiveVersionSet : public VersionSet {
   // VersionEditHandlerPointInTime::trust_manifest_recovery_). Set only for the
   // DB::OpenAndCompact remote-compaction path.
   bool trust_manifest_recovery_ = false;
+  // Resume after a failed MANIFEST read. Any other tailer error is final, and
+  // ReadAndApply() returns it without reading more records. A log reader never
+  // reads again after a failed read, so:
+  // 1. A catch-up that stopped at a failed read sets this flag and returns
+  //    IOError. The tailer has applied every record and every complete atomic
+  //    group before ManifestTailer::GetLastValidRecordEnd(), and none of an
+  //    atomic group that the failed read cut.
+  // 2. The next catch-up uses the reader from MaybeSwitchManifest() if CURRENT
+  //    names another MANIFEST. Otherwise ReopenManifestAfterReadError() makes
+  //    a new reader that starts at that offset. If that fails, the call returns
+  //    the error and keeps this flag.
+  // 3. ManifestTailer::PrepareToResumeAfterReadError() clears the read error
+  //    and the cut atomic group, which the new reader reads again.
+  bool resume_after_manifest_read_error_ = false;
   // Defers initial SecondaryDB SST validation and opening until after
   // OpenAsSecondary returns. Catch-up remains synchronous.
   const bool defer_sst_file_opening_;
@@ -2137,8 +2430,10 @@ class ReactiveVersionSet : public VersionSet {
   }
 
   // No copy allowed
-  ReactiveVersionSet(const ReactiveVersionSet&);
-  ReactiveVersionSet& operator=(const ReactiveVersionSet&);
+  ReactiveVersionSet(const ReactiveVersionSet&) = delete;
+  ReactiveVersionSet& operator=(const ReactiveVersionSet&) = delete;
+  ReactiveVersionSet(ReactiveVersionSet&&) = delete;
+  ReactiveVersionSet& operator=(ReactiveVersionSet&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

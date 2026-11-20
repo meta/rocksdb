@@ -31,7 +31,7 @@ class ColumnFamilyData;
 
 class ColumnFamilyMemTables {
  public:
-  virtual ~ColumnFamilyMemTables() {}
+  virtual ~ColumnFamilyMemTables() = default;
   virtual bool Seek(uint32_t column_family_id) = 0;
   // returns true if the update to memtable should be ignored
   // (useful when recovering from log whose updates have already
@@ -289,6 +289,12 @@ class LocalSavePoint {
 #endif
   {
   }
+
+  // No copying allowed
+  LocalSavePoint(const LocalSavePoint&) = delete;
+  LocalSavePoint& operator=(const LocalSavePoint&) = delete;
+  LocalSavePoint(LocalSavePoint&&) = delete;
+  LocalSavePoint& operator=(LocalSavePoint&&) = delete;
 
 #ifndef NDEBUG
   ~LocalSavePoint() { assert(committed_); }

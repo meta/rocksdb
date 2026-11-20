@@ -85,7 +85,8 @@ TEST(DataBlockHashIndex, DataBlockHashTestSmall) {
 
     size_t estimated_size = builder.EstimateSize();
 
-    std::string buffer("fake"), buffer2;
+    std::string buffer("fake");
+    std::string buffer2;
     size_t original_size = buffer.size();
     estimated_size += original_size;
     builder.Finish(buffer);
@@ -124,7 +125,8 @@ TEST(DataBlockHashIndex, DataBlockHashTest) {
 
   size_t estimated_size = builder.EstimateSize();
 
-  std::string buffer("fake content"), buffer2;
+  std::string buffer("fake content");
+  std::string buffer2;
   size_t original_size = buffer.size();
   estimated_size += original_size;
   builder.Finish(buffer);
@@ -212,7 +214,8 @@ TEST(DataBlockHashIndex, DataBlockHashTestCollision) {
 
   size_t estimated_size = builder.EstimateSize();
 
-  std::string buffer("some other fake content to take up space"), buffer2;
+  std::string buffer("some other fake content to take up space");
+  std::string buffer2;
   size_t original_size = buffer.size();
   estimated_size += original_size;
   builder.Finish(buffer);
@@ -253,7 +256,8 @@ TEST(DataBlockHashIndex, DataBlockHashTestLarge) {
 
   size_t estimated_size = builder.EstimateSize();
 
-  std::string buffer("filling stuff"), buffer2;
+  std::string buffer("filling stuff");
+  std::string buffer2;
   size_t original_size = buffer.size();
   estimated_size += original_size;
   builder.Finish(buffer);

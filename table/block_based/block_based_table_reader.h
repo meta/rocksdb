@@ -114,7 +114,7 @@ Status CopyBufferToReadScopedBlockContents(
 
 // Reader class for BlockBasedTable format.
 // For the format of BlockBasedTable refer to
-// https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format.
+// https://github.com/meta/rocksdb/wiki/Rocksdb-BlockBasedTable-Format.
 // This is the default table type. Data is chucked into fixed size blocks and
 // each block in-turn stores entries. When storing data, we can compress and/or
 // encode data efficiently within a block, which often results in a much smaller
@@ -148,6 +148,8 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   // @param skip_filters Disables loading/accessing the filter block. Overrides
   //    prefetch_index_and_filter_in_cache, so filter will be skipped if both
   //    are set.
+  // @param readahead_cache_res_mgr if not null, readahead buffers created for
+  //    this table charge their memory to it.
   // @param force_direct_prefetch if true, always prefetching to RocksDB
   //    buffer, rather than calling RandomAccessFile::Prefetch().
   // @param avoid_shared_metadata_cache if true, open-time index/filter/
@@ -160,8 +162,8 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
       std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
       uint8_t block_protection_bytes_per_key,
       std::unique_ptr<TableReader>* table_reader, uint64_t tail_size,
-      std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr =
-          nullptr,
+      std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr,
+      std::shared_ptr<AtomicCacheReservationManager> readahead_cache_res_mgr,
       const std::shared_ptr<const SliceTransform>& prefix_extractor = nullptr,
       UnownedPtr<CompressionManager> compression_manager = nullptr,
       bool prefetch_index_and_filter_in_cache = true, bool skip_filters = false,
@@ -197,6 +199,18 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
                                 TableReaderCaller caller,
                                 size_t compaction_readahead_size = 0,
                                 bool allow_unprepared_value = false) override;
+
+  // Checks the prefix filter for seek_target before building the iterator,
+  // so that a filtered seek costs neither an index iterator nor a table
+  // iterator. Tables with range tombstones are not checked here, which leaves
+  // seeks over them, and their interplay with range tombstones, unchanged.
+  InternalIterator* NewIteratorForSeek(const ReadOptions&,
+                                       const SliceTransform* prefix_extractor,
+                                       Arena* arena, bool skip_filters,
+                                       TableReaderCaller caller,
+                                       size_t compaction_readahead_size,
+                                       bool allow_unprepared_value,
+                                       const Slice& seek_target) override;
 
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& read_options) override;
@@ -392,7 +406,7 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
 
   void MarkObsolete(uint32_t uncache_aggressiveness) override;
 
-  ~BlockBasedTable();
+  ~BlockBasedTable() override;
 
   bool TEST_FilterBlockInCache() const;
   bool TEST_IndexBlockInCache() const;
@@ -533,6 +547,17 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   friend class MockedBlockBasedTable;
   friend class BlockBasedTableReaderTestVerifyChecksum_ChecksumMismatch_Test;
   BlockCacheTracer* const block_cache_tracer_;
+
+  // NewIterator(), or NewIteratorForSeek() when seek_target is non-null.
+  // seek_target comes last so that both callers pass their arguments through
+  // in place.
+  InternalIterator* NewIteratorImpl(const ReadOptions& read_options,
+                                    const SliceTransform* prefix_extractor,
+                                    Arena* arena, bool skip_filters,
+                                    TableReaderCaller caller,
+                                    size_t compaction_readahead_size,
+                                    bool allow_unprepared_value,
+                                    const Slice* seek_target);
 
   void UpdateCacheHitMetrics(BlockType block_type, GetContext* get_context,
                              size_t usage) const;
@@ -680,7 +705,9 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
       bool force_direct_prefetch, TailPrefetchStats* tail_prefetch_stats,
       const bool prefetch_all, const bool preload_all,
       std::unique_ptr<FilePrefetchBuffer>* prefetch_buffer, Statistics* stats,
-      uint64_t tail_size, Logger* const logger);
+      uint64_t tail_size, Logger* const logger,
+      const std::shared_ptr<AtomicCacheReservationManager>&
+          readahead_cache_res_mgr);
   Status ReadMetaIndexBlock(const ReadOptions& ro,
                             FilePrefetchBuffer* prefetch_buffer,
                             std::unique_ptr<Block>* metaindex_block,
@@ -802,6 +829,12 @@ struct BlockBasedTable::Rep {
         user_defined_timestamps_persisted(_user_defined_timestamps_persisted),
         fs_prefetch_support(CheckFSFeatureSupport(
             _ioptions.fs.get(), FSSupportedOps::kFSPrefetch)) {}
+  // No copying allowed
+  Rep(const Rep&) = delete;
+  Rep& operator=(const Rep&) = delete;
+  Rep(Rep&&) = delete;
+  Rep& operator=(Rep&&) = delete;
+
   ~Rep() { status.PermitUncheckedError(); }
   const ImmutableOptions& ioptions;
   const EnvOptions& env_options;
@@ -815,6 +848,12 @@ struct BlockBasedTable::Rep {
 
   // Footer contains the fixed table information
   Footer footer;
+
+  // Declared before index_reader so both outlive the custom index reader.
+  CachableEntry<Block_kUserDefinedIndex> udi_block;
+  // This table's view of udi_block, passed to IndexFactory::NewReader(). The
+  // reader may retain or advance it without changing a shared cached block.
+  Slice udi_index_contents;
 
   std::unique_ptr<IndexReader> index_reader;
   std::unique_ptr<FilterBlockReader> filter;
@@ -921,7 +960,9 @@ struct BlockBasedTable::Rep {
   std::unique_ptr<CacheReservationManager::CacheReservationHandle>
       table_reader_cache_res_handle = nullptr;
 
-  CachableEntry<Block_kUserDefinedIndex> udi_block;
+  // If set, readahead buffers created for this table charge their memory to
+  // it. Shared by all tables of the same table factory.
+  std::shared_ptr<AtomicCacheReservationManager> readahead_cache_res_mgr;
 
   SequenceNumber get_global_seqno(BlockType block_type) const {
     return (block_type == BlockType::kFilterPartitionIndex ||
@@ -956,6 +997,9 @@ struct BlockBasedTable::Rep {
         readahead_params, !ioptions.allow_mmap_reads /* enable */,
         false /* track_min_offset */, ioptions.fs.get(), ioptions.clock,
         ioptions.stats, readaheadsize_cb, usage));
+    if (readahead_cache_res_mgr) {
+      (*fpb)->SetCacheReservationManager(readahead_cache_res_mgr);
+    }
   }
 
   void CreateFilePrefetchBufferIfNotExists(

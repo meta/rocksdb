@@ -197,7 +197,7 @@ TEST_P(AnyLockManagerTest, Deadlock) {
   delete txn1;
 }
 
-TEST_P(AnyLockManagerTest, GetWaitingTxns_MultipleTxns) {
+TEST_P(AnyLockManagerTest, GetWaitingTxnsMultipleTxns) {
   MockColumnFamilyHandle cf(1);
   locker_->AddColumnFamily(&cf);
 

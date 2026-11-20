@@ -19,6 +19,10 @@ namespace ROCKSDB_NAMESPACE {
 struct Entry {
   Entry() : ptr(nullptr) {}
   Entry(const Entry& e) : ptr(e.ptr.load(std::memory_order_relaxed)) {}
+  Entry(Entry&& e) noexcept : ptr(e.ptr.load(std::memory_order_relaxed)) {}
+  Entry& operator=(const Entry&) = delete;
+  Entry& operator=(Entry&&) = delete;
+  ~Entry() = default;
   std::atomic<void*> ptr;
 };
 
@@ -74,7 +78,7 @@ class ThreadLocalPtr::StaticMeta {
   // prevents unref handler from running during this call, but clients must
   // still provide external synchronization since the owning thread can
   // access the values without internal locking, e.g., via Get() and Reset().
-  void Fold(uint32_t id, FoldFunc func, void* res);
+  void Fold(uint32_t id, const FoldFunc& func, void* res);
 
   // Register the UnrefHandler for id
   void SetHandler(uint32_t id, UnrefHandler handler);
@@ -314,6 +318,13 @@ ThreadLocalPtr::StaticMeta::StaticMeta()
 // This is not required on Windows.
 #if !defined(OS_WIN)
   static struct A {
+    A() = default;
+    // No copying allowed
+    A(const A&) = delete;
+    A& operator=(const A&) = delete;
+    A(A&&) = delete;
+    A& operator=(A&&) = delete;
+
     ~A() {
       if (tls_) {
         OnThreadExit(tls_);
@@ -425,7 +436,8 @@ void ThreadLocalPtr::StaticMeta::Scrape(uint32_t id, autovector<void*>* ptrs,
   }
 }
 
-void ThreadLocalPtr::StaticMeta::Fold(uint32_t id, FoldFunc func, void* res) {
+void ThreadLocalPtr::StaticMeta::Fold(uint32_t id, const FoldFunc& func,
+                                      void* res) {
   MutexLock l(Mutex());
   for (ThreadData* t = head_.next; t != &head_; t = t->next) {
     if (id < t->entries.size()) {
@@ -512,7 +524,7 @@ void ThreadLocalPtr::Scrape(autovector<void*>* ptrs, void* const replacement) {
   Instance()->Scrape(id_, ptrs, replacement);
 }
 
-void ThreadLocalPtr::Fold(FoldFunc func, void* res) {
+void ThreadLocalPtr::Fold(const FoldFunc& func, void* res) {
   Instance()->Fold(id_, func, res);
 }
 

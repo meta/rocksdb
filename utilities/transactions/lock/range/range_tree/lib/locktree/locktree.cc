@@ -221,7 +221,11 @@ static uint64_t row_lock_size_in_tree(const row_lock &lock) {
 static void remove_row_lock_from_tree(concurrent_tree::locked_keyrange *lkr,
                                       const row_lock &lock, TXNID txnid,
                                       locktree_manager *mgr) {
-  const uint64_t mem_released = row_lock_size_in_tree(lock);
+  // Each owner of a shared lock was charged for it. Removing the lock for all
+  // owners releases all of those charges.
+  const uint64_t num_charges =
+      (txnid == TXNID_ANY && lock.owners != nullptr) ? lock.owners->size() : 1;
+  const uint64_t mem_released = row_lock_size_in_tree(lock) * num_charges;
   lkr->remove(lock.range, txnid);
   if (mgr != nullptr) {
     mgr->note_mem_released(mem_released);
@@ -870,12 +874,13 @@ void locktree::escalate(lt_escalate_cb after_escalate_callback,
       // first, find the index of the next row lock that
       //  - belongs to a different txnid, or
       //  - belongs to several txnids, or
-      //  - is a shared lock (we could potentially merge those but
-      //    currently we don't), or
+      //  - is a shared lock or follows one (we could potentially merge
+      //    those but currently we don't), or
       //  - is across a lock escalation barrier.
       int next_txnid_index = current_index + 1;
 
       while (next_txnid_index < num_extracted &&
+             !extracted_buf[current_index].is_shared &&
              (extracted_buf[current_index].txnid ==
               extracted_buf[next_txnid_index].txnid) &&
              !extracted_buf[next_txnid_index].is_shared &&

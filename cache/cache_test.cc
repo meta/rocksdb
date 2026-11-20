@@ -948,6 +948,25 @@ TEST_P(CacheTest, GetChargeAndDeleter) {
   cache_->Release(h1);
 }
 
+TEST_P(LRUCacheTest, UnchargedStandaloneGetCharge) {
+  auto cache = NewCache(1000, 0, true, kFullChargeCacheMetadata);
+  Cache::Handle* pinned = nullptr;
+  ASSERT_OK(
+      cache->Insert(EncodeKey(1), EncodeValue(1), &kHelper, 800, &pinned));
+
+  ASSERT_EQ(nullptr, cache->CreateStandalone(EncodeKey(2), EncodeValue(2),
+                                             &kHelper, 500, false));
+
+  Cache::Handle* h = cache->CreateStandalone(EncodeKey(2), EncodeValue(2),
+                                             &kHelper, 500, true);
+  ASSERT_NE(h, nullptr);
+  EXPECT_EQ(0, cache->GetCharge(h));
+  EXPECT_EQ(0, cache->GetUsage(h));
+
+  cache->Release(h);
+  cache->Release(pinned);
+}
+
 namespace {
 bool AreTwoCacheKeysOrdered(Cache* cache) {
   std::vector<std::string> keys;

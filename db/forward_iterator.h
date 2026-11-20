@@ -55,7 +55,7 @@ class ForwardIterator : public InternalIterator {
   ForwardIterator(DBImpl* db, const ReadOptions& read_options,
                   ColumnFamilyData* cfd, SuperVersion* current_sv = nullptr,
                   bool allow_unprepared_value = false);
-  virtual ~ForwardIterator();
+  ~ForwardIterator() override;
 
   void SeekForPrev(const Slice& /*target*/) override {
     status_ = Status::NotSupported("ForwardIterator::SeekForPrev()");

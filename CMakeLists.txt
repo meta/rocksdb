@@ -522,8 +522,6 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
       set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=lld")
     endif()
   endif()
-elseif(CMAKE_SYSTEM_NAME MATCHES "SunOS")
-  add_definitions(-DOS_SOLARIS)
 elseif(CMAKE_SYSTEM_NAME MATCHES "kFreeBSD")
   add_definitions(-DOS_GNU_KFREEBSD)
 elseif(CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
@@ -650,6 +648,9 @@ if(USE_FOLLY)
     exec_program(ls ARGS -d ${FOLLY_INST_PATH}/../glog* OUTPUT_VARIABLE
     GLOG_INST_PATH)
     set(Boost_DIR ${BOOST_INST_PATH}/lib/cmake/Boost-1.83.0)
+    # Boost's per-library CMake configs find their dependencies (e.g.
+    # boost_assert) only through the package search path.
+    set(CMAKE_PREFIX_PATH ${BOOST_INST_PATH} ${CMAKE_PREFIX_PATH})
     if(EXISTS ${FMT_INST_PATH}/lib64)
       set(fmt_DIR ${FMT_INST_PATH}/lib64/cmake/fmt)
     else()
@@ -696,7 +697,13 @@ if(USE_FOLLY)
     exec_program(sed ARGS -i 's/gflags_shared//g'
     ${FOLLY_INST_PATH}/lib/cmake/folly/folly-targets.cmake)
 
+    # folly-config.cmake only checks for gflags under a target name that this
+    # install doesn't define, then falls back to our Findgflags.cmake, which
+    # mistakes the gflags_static target name for a library path. gflags is
+    # resolved below instead.
+    set(CMAKE_DISABLE_FIND_PACKAGE_gflags TRUE)
     include(${FOLLY_INST_PATH}/lib/cmake/folly/folly-config.cmake)
+    unset(CMAKE_DISABLE_FIND_PACKAGE_gflags)
 
     # Fix gflags library name for debug builds. The getdeps gflags shared
     # library is versioned (e.g. libgflags_debug.so.2.3), so resolve the
@@ -900,6 +907,7 @@ set(SOURCES
         memtable/hash_linklist_rep.cc
         memtable/hash_skiplist_rep.cc
         memtable/skiplistrep.cc
+        memtable/sorted_hash_rep.cc
         memtable/vectorrep.cc
         memtable/wbwi_memtable.cc
         memtable/write_buffer_manager.cc
@@ -993,6 +1001,7 @@ set(SOURCES
         tools/trace_analyzer_tool.cc
         trace_replay/block_cache_tracer.cc
         trace_replay/io_tracer.cc
+        trace_replay/trace_analyzer.cc
         trace_replay/trace_record_handler.cc
         trace_replay/trace_record_result.cc
         trace_replay/trace_record.cc
@@ -1013,6 +1022,7 @@ set(SOURCES
         util/dynamic_bloom.cc
         util/hash.cc
         util/io_dispatcher_imp.cc
+        util/io_prefetch_scheduler.cc
         util/murmurhash.cc
         util/random.cc
         util/rate_limiter.cc
@@ -1042,7 +1052,10 @@ set(SOURCES
         utilities/cassandra/format.cc
         utilities/cassandra/merge_operator.cc
         utilities/checkpoint/checkpoint_impl.cc
+        utilities/live_tune/live_tune_options_helper.cc
+        utilities/live_tune/live_tuner.cc
         utilities/compaction_filters.cc
+        utilities/db_split_merge.cc
         utilities/sorted_run_builder/sorted_run_builder.cc
         utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc
         utilities/counted_fs.cc
@@ -1499,6 +1512,7 @@ if(WITH_TESTS)
         db/db_compaction_test.cc
         db/db_compaction_abort_test.cc
         db/db_clip_test.cc
+        utilities/db_split_merge_test.cc
         db/db_dynamic_level_test.cc
         db/db_encryption_test.cc
         db/db_etc2_test.cc
@@ -1573,6 +1587,7 @@ if(WITH_TESTS)
         db/write_batch_test.cc
         db/write_callback_test.cc
         db/write_controller_test.cc
+        db_stress_tool/db_stress_structured_key_value_test.cc
         env/env_test.cc
         env/io_posix_test.cc
         env/mock_env_test.cc
@@ -1649,6 +1664,7 @@ if(WITH_TESTS)
         utilities/cassandra/cassandra_row_merge_test.cc
         utilities/cassandra/cassandra_serialize_test.cc
         utilities/checkpoint/checkpoint_test.cc
+        utilities/live_tune/live_tuner_test.cc
         utilities/copy_engine/copy_engine_test.cc
         utilities/sorted_run_builder/sorted_run_builder_test.cc
         utilities/env_timed_test.cc
@@ -1694,6 +1710,13 @@ if(WITH_TESTS)
       utilities/cassandra/test_utils.cc
   )
   enable_testing()
+  # Time limit, in seconds, for each test that ctest runs from the test
+  # binaries: one gtest case, or the whole c_test program. Without a limit, one
+  # hung test blocks ctest until the CI job is canceled (6 hours on GitHub
+  # Actions). The slowest case seen in recent nightly runs took about 68
+  # seconds (ExternalSSTFileTest.IngestFileWithGlobalSeqnoRandomized), so 600
+  # seconds leaves about 9 times margin for slower or busy hosts.
+  set(ROCKSDB_CTEST_TIMEOUT_SECONDS 600)
   add_custom_target(rocksdb_check COMMAND ${CMAKE_CTEST_COMMAND})
   set(TESTUTILLIB testutillib${ARTIFACT_SUFFIX})
   add_library(${TESTUTILLIB} STATIC ${TESTUTIL_SOURCE})
@@ -1729,13 +1752,18 @@ if(WITH_TESTS)
           # longer fails the build.
           gtest_discover_tests(${exename}
                                DISCOVERY_TIMEOUT 120
-                               DISCOVERY_MODE PRE_TEST)
+                               DISCOVERY_MODE PRE_TEST
+                               PROPERTIES TIMEOUT ${ROCKSDB_CTEST_TIMEOUT_SECONDS})
         else()
-          gtest_discover_tests(${exename} DISCOVERY_TIMEOUT 120)
+          gtest_discover_tests(${exename} DISCOVERY_TIMEOUT 120
+                               PROPERTIES TIMEOUT ${ROCKSDB_CTEST_TIMEOUT_SECONDS})
         endif()
         add_dependencies(rocksdb_check ${exename}${ARTIFACT_SUFFIX})
       endif()
   endforeach(sourcefile ${TESTS})
+  # The structured key-value codec of db_stress depends only on RocksDB.
+  target_sources(db_stress_structured_key_value_test${ARTIFACT_SUFFIX} PRIVATE
+    db_stress_tool/db_stress_structured_key_value.cc)
 
   if(WIN32)
     # C executables must link to a shared object
@@ -1753,6 +1781,8 @@ if(WITH_TESTS)
     add_executable(c_test db/c_test.c)
     target_link_libraries(c_test ${ROCKSDB_LIB_FOR_C} testharness)
     add_test(NAME c_test COMMAND c_test${ARTIFACT_SUFFIX})
+    set_tests_properties(c_test PROPERTIES
+                         TIMEOUT ${ROCKSDB_CTEST_TIMEOUT_SECONDS})
     add_dependencies(rocksdb_check c_test)
   endif()
 endif()

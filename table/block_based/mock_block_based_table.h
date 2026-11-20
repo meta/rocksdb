@@ -32,7 +32,7 @@ class MockBlockBasedTableTester {
 
   explicit MockBlockBasedTableTester(const FilterPolicy* filter_policy)
       : MockBlockBasedTableTester(
-            std::shared_ptr<const FilterPolicy>(filter_policy)) {};
+            std::shared_ptr<const FilterPolicy>(filter_policy)) {}
 
   explicit MockBlockBasedTableTester(
       std::shared_ptr<const FilterPolicy> filter_policy)

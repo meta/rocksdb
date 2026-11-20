@@ -184,6 +184,12 @@ struct PerfContextInt {
 PerfContext perf_context;
 #else
 thread_local PerfContext perf_context;
+thread_local constinit PerfContext* perf_context_fast_ptr = nullptr;
+
+PerfContext* InitPerfContextFastPtr() {
+  perf_context_fast_ptr = &perf_context;
+  return perf_context_fast_ptr;
+}
 #endif
 
 PerfContext* get_perf_context() {
@@ -212,12 +218,12 @@ PerfContext* get_perf_context() {
 }
 
 PerfContext::~PerfContext() {
-#if !defined(NPERF_CONTEXT) && !defined(OS_SOLARIS)
+#if !defined(NPERF_CONTEXT)
   ClearPerLevelPerfContext();
 #endif
 }
 
-PerfContext::PerfContext(const PerfContext& other) {
+PerfContext::PerfContext(const PerfContext& other) : PerfContextBase() {
 #ifdef NPERF_CONTEXT
   (void)other;
 #else

@@ -157,7 +157,8 @@ TEST_F(DBFlushTest, FlushInLowPriThreadPool) {
   env_->SetBackgroundThreads(0, Env::HIGH);
 
   std::thread::id tid;
-  int num_flushes = 0, num_compactions = 0;
+  int num_flushes = 0;
+  int num_compactions = 0;
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::BGWorkFlush", [&](void* /*arg*/) {
         if (tid == std::thread::id()) {
@@ -802,7 +803,7 @@ class TestFlushListener : public EventListener {
   std::vector<DB*> flushed_dbs_;
   int slowdown_count;
   int stop_count;
-  bool db_closing;
+  bool db_closing = false;
   std::atomic_bool db_closed;
   TableFileCreationInfo prev_fc_info_;
 
@@ -1017,7 +1018,9 @@ TEST_F(DBFlushTest, MemPurgeBasic) {
   std::string KEY7 = "IamKey7";
   std::string KEY8 = "IamKey8";
   std::string KEY9 = "IamKey9";
-  std::string RNDKEY1, RNDKEY2, RNDKEY3;
+  std::string RNDKEY1;
+  std::string RNDKEY2;
+  std::string RNDKEY3;
   const std::string NOT_FOUND = "NOT_FOUND";
 
   // Heavy overwrite workload,
@@ -1026,8 +1029,18 @@ TEST_F(DBFlushTest, MemPurgeBasic) {
   const size_t NUM_REPEAT = 100;
   const size_t RAND_KEYS_LENGTH = 57;
   const size_t RAND_VALUES_LENGTH = 10240;
-  std::string p_v1, p_v2, p_v3, p_v4, p_v5, p_v6, p_v7, p_v8, p_v9, p_rv1,
-      p_rv2, p_rv3;
+  std::string p_v1;
+  std::string p_v2;
+  std::string p_v3;
+  std::string p_v4;
+  std::string p_v5;
+  std::string p_v6;
+  std::string p_v7;
+  std::string p_v8;
+  std::string p_v9;
+  std::string p_rv1;
+  std::string p_rv2;
+  std::string p_rv3;
 
   // Insert a very first set of keys that will be
   // mempurged at least once.
@@ -1394,7 +1407,14 @@ TEST_F(DBFlushTest, MemPurgeDeleteAndDeleteRange) {
   const size_t NUM_REPEAT = 100;
   const size_t RAND_VALUES_LENGTH = 10240;
 
-  std::string key, value, p_v1, p_v2, p_v3, p_v3b, p_v4, p_v5;
+  std::string key;
+  std::string value;
+  std::string p_v1;
+  std::string p_v2;
+  std::string p_v3;
+  std::string p_v3b;
+  std::string p_v4;
+  std::string p_v5;
   int count = 0;
   const int EXPECTED_COUNT_FORLOOP = 3;
   const int EXPECTED_COUNT_END = 4;
@@ -1597,7 +1617,15 @@ TEST_F(DBFlushTest, MemPurgeAndCompactionFilter) {
   Random rnd(53);
   const size_t NUM_REPEAT = 1000;
   const size_t RAND_VALUES_LENGTH = 10240;
-  std::string p_v1, p_v2, p_v3, p_v4, p_v5, p_v6, p_v7, p_v8, p_v9;
+  std::string p_v1;
+  std::string p_v2;
+  std::string p_v3;
+  std::string p_v4;
+  std::string p_v5;
+  std::string p_v6;
+  std::string p_v7;
+  std::string p_v8;
+  std::string p_v9;
 
   p_v1 = rnd.RandomString(RAND_VALUES_LENGTH);
   p_v2 = rnd.RandomString(RAND_VALUES_LENGTH);
@@ -1687,11 +1715,13 @@ TEST_F(DBFlushTest, DISABLED_MemPurgeWALSupport) {
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
     std::vector<std::string> keys;
+    keys.reserve(KVSIZE);
     for (size_t k = 0; k < KVSIZE; k++) {
       keys.push_back("IamKey" + std::to_string(k));
     }
 
-    std::string RNDKEY, RNDVALUE;
+    std::string RNDKEY;
+    std::string RNDVALUE;
     const std::string NOT_FOUND = "NOT_FOUND";
 
     // Heavy overwrite workload,
@@ -1700,7 +1730,8 @@ TEST_F(DBFlushTest, DISABLED_MemPurgeWALSupport) {
     const size_t NUM_REPEAT = 100;
     const size_t RAND_KEY_LENGTH = 4096;
     const size_t RAND_VALUES_LENGTH = 1024;
-    std::vector<std::string> values_default(KVSIZE), values_pikachu(KVSIZE);
+    std::vector<std::string> values_default(KVSIZE);
+    std::vector<std::string> values_pikachu(KVSIZE);
 
     // Insert a very first set of keys that will be
     // mempurged at least once.
@@ -1888,7 +1919,8 @@ TEST_F(DBFlushTest, MemPurgeCorrectLogNumberAndSSTFileCreation) {
   const uint64_t NUM_RAND_INSERTS = 500;
   const uint64_t RAND_VALUES_LENGTH = 10240;
 
-  std::string key, value;
+  std::string key;
+  std::string value;
   std::vector<std::string> values(9, "");
 
   // Keys used to check that no SST file disappeared.
@@ -3159,7 +3191,7 @@ TEST_P(DBAtomicFlushTest, AtomicFlushRollbackSomeJobs) {
   Destroy(options);
 }
 
-TEST_P(DBAtomicFlushTest, FlushMultipleCFs_DropSomeBeforeRequestFlush) {
+TEST_P(DBAtomicFlushTest, FlushMultipleCFsDropSomeBeforeRequestFlush) {
   bool atomic_flush = GetParam();
   if (!atomic_flush) {
     return;
@@ -3188,7 +3220,7 @@ TEST_P(DBAtomicFlushTest, FlushMultipleCFs_DropSomeBeforeRequestFlush) {
 }
 
 TEST_P(DBAtomicFlushTest,
-       FlushMultipleCFs_DropSomeAfterScheduleFlushBeforeFlushJobRun) {
+       FlushMultipleCFsDropSomeAfterScheduleFlushBeforeFlushJobRun) {
   bool atomic_flush = GetParam();
   if (!atomic_flush) {
     return;
@@ -3452,7 +3484,8 @@ TEST_P(DBAtomicFlushTest, BgThreadNoWaitAfterManifestError) {
       {"BgFlushThr2:WaitToCommit", "BgFlushThr1:BeforeWriteManifest"},
   });
 
-  std::thread::id bg_flush_thr1, bg_flush_thr2;
+  std::thread::id bg_flush_thr1;
+  std::thread::id bg_flush_thr2;
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::BackgroundCallFlush:start", [&](void*) {
         if (bg_flush_thr1 == std::thread::id()) {
@@ -3866,7 +3899,7 @@ TEST_F(DBFlushTest, DBStuckAfterAtomicFlushError) {
   // Resume starts and waits for background job to finish, i.e., Flush1
   // Fill memtable again, trigger Flush2 for mem0
   // Flush2 will get error status, and not rollback mem0, see code in
-  // https://github.com/facebook/rocksdb/blob/b927ba5936216861c2c35ab68f50ba4a78e65747/db/db_impl/db_impl_compaction_flush.cc#L725
+  // https://github.com/meta/rocksdb/blob/b927ba5936216861c2c35ab68f50ba4a78e65747/db/db_impl/db_impl_compaction_flush.cc#L725
   //
   // DB is stuck since mem0 can never be picked now
   //
@@ -4227,9 +4260,14 @@ TEST_F(DBFlushTest, SuperBlockAlignmentValueDeltaEscape) {
 
   for (bool separate_kv : {false, true}) {
     SCOPED_TRACE("separate_kv=" + std::to_string(separate_kv));
-    std::vector<std::string> get7, iter7, get8, iter8;
-    int pad7 = 0, pad8 = 0;
-    bool delta7 = false, delta8 = false;
+    std::vector<std::string> get7;
+    std::vector<std::string> iter7;
+    std::vector<std::string> get8;
+    std::vector<std::string> iter8;
+    int pad7 = 0;
+    int pad8 = 0;
+    bool delta7 = false;
+    bool delta8 = false;
     build_and_read(7, separate_kv, &get7, &iter7, &pad7, &delta7);
     build_and_read(/*format_version=*/8, separate_kv, &get8, &iter8, &pad8,
                    &delta8);
@@ -4396,7 +4434,8 @@ TEST_F(DBFlushTest, FlushAfterReadPathRangeTombstoneInsertion) {
         // already immutable. Without the fix, this succeeds and creates
         // an entry count mismatch.
         cfh->cfd()->mem()->AddLogicallyRedundantRangeTombstone(
-            1 /* seq */, "b", "f", cfh->cfd()->GetIngestSstLock());
+            1 /* seq */, "b", "f", 0 /* version_number */,
+            cfh->cfd()->GetIngestSstLock());
       });
   SyncPoint::GetInstance()->EnableProcessing();
 

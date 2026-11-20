@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -475,6 +476,9 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                     result.preclude_last_level_data_seconds > 0)) {
     // With no writes coming in, we don't need periodic SeqnoToTime entries.
     // Existing SST files may or may not have that info associated with them.
+    // Remote compaction runs in a secondary (read-only) instance but writes
+    // files, so it restores both from the primary. See
+    // DBImplSecondary::CompactWithoutInstallation().
     ROCKS_LOG_WARN(
         db_options.info_log.get(),
         "preserve_internal_time_seconds and preclude_last_level_data_seconds "
@@ -613,7 +617,8 @@ ColumnFamilyData::ColumnFamilyData(
     const FileOptions* file_options, ColumnFamilySet* column_family_set,
     BlockCacheTracer* const block_cache_tracer,
     const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
-    const std::string& db_session_id, bool read_only, bool fast_sst_open)
+    const std::string& db_session_id, bool read_only,
+    bool options_are_sanitized, bool fast_sst_open)
     : id_(id),
       name_(name),
       dummy_versions_(_dummy_versions),
@@ -623,11 +628,16 @@ ColumnFamilyData::ColumnFamilyData(
       dropped_(false),
       flush_skip_reschedule_(false),
       internal_comparator_(cf_options.comparator),
-      initial_cf_options_(SanitizeCfOptions(db_options, read_only, cf_options)),
+      initial_cf_options_(
+          options_are_sanitized
+              ? cf_options
+              : SanitizeCfOptions(db_options, read_only, cf_options)),
       ioptions_(db_options, initial_cf_options_),
       mutable_cf_options_(initial_cf_options_),
       is_delete_range_supported_(
           cf_options.table_factory->IsDeleteRangeSupported()),
+      is_table_builder_supported_(
+          cf_options.table_factory->IsTableBuilderSupported()),
       write_buffer_manager_(write_buffer_manager),
       mem_(nullptr),
       imm_(ioptions_.min_write_buffer_number_to_merge,
@@ -733,10 +743,11 @@ ColumnFamilyData::ColumnFamilyData(
       // TODO(hx235): Add a `ConcurrentCacheReservationManager` at DB scope
       // responsible for reservation of `ObsoleteFileInfo` so that we can keep
       // this `file_metadata_cache_res_mgr_` nonconcurrent
-      file_metadata_cache_res_mgr_.reset(new ConcurrentCacheReservationManager(
-          std::make_shared<
-              CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>>(
-              bbto->block_cache)));
+      file_metadata_cache_res_mgr_ =
+          std::make_shared<ConcurrentCacheReservationManager>(
+              std::make_shared<
+                  CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>>(
+                  bbto->block_cache));
     }
   }
 }
@@ -1018,13 +1029,16 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
     int num_unflushed_memtables, int num_l0_files,
     uint64_t num_compaction_needed_bytes,
     const MutableCFOptions& mutable_cf_options,
-    const ImmutableCFOptions& immutable_cf_options) {
+    const ImmutableCFOptions& immutable_cf_options,
+    bool table_builder_supported) {
+  const bool auto_compactions =
+      table_builder_supported && !mutable_cf_options.disable_auto_compactions;
   if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
     return {WriteStallCondition::kStopped, WriteStallCause::kMemtableLimit};
-  } else if (!mutable_cf_options.disable_auto_compactions &&
+  } else if (auto_compactions &&
              num_l0_files >= mutable_cf_options.level0_stop_writes_trigger) {
     return {WriteStallCondition::kStopped, WriteStallCause::kL0FileCountLimit};
-  } else if (!mutable_cf_options.disable_auto_compactions &&
+  } else if (auto_compactions &&
              mutable_cf_options.hard_pending_compaction_bytes_limit > 0 &&
              num_compaction_needed_bytes >=
                  mutable_cf_options.hard_pending_compaction_bytes_limit) {
@@ -1036,12 +1050,12 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
              num_unflushed_memtables - 1 >=
                  immutable_cf_options.min_write_buffer_number_to_merge) {
     return {WriteStallCondition::kDelayed, WriteStallCause::kMemtableLimit};
-  } else if (!mutable_cf_options.disable_auto_compactions &&
+  } else if (auto_compactions &&
              mutable_cf_options.level0_slowdown_writes_trigger >= 0 &&
              num_l0_files >=
                  mutable_cf_options.level0_slowdown_writes_trigger) {
     return {WriteStallCondition::kDelayed, WriteStallCause::kL0FileCountLimit};
-  } else if (!mutable_cf_options.disable_auto_compactions &&
+  } else if (auto_compactions &&
              mutable_cf_options.soft_pending_compaction_bytes_limit > 0 &&
              num_compaction_needed_bytes >=
                  mutable_cf_options.soft_pending_compaction_bytes_limit) {
@@ -1063,7 +1077,7 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
     auto write_stall_condition_and_cause = GetWriteStallConditionAndCause(
         imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
         vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
-        ioptions());
+        ioptions(), is_table_builder_supported_);
     write_stall_condition = write_stall_condition_and_cause.first;
     auto write_stall_cause = write_stall_condition_and_cause.second;
 
@@ -1269,7 +1283,8 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
-  return !mutable_cf_options_.disable_auto_compactions &&
+  return is_table_builder_supported_ &&
+         !mutable_cf_options_.disable_auto_compactions &&
          compaction_picker_->NeedsCompaction(current_->storage_info());
 }
 
@@ -1530,8 +1545,18 @@ Status ColumnFamilyData::ValidateOptions(
   if (s.ok()) {
     s = CheckCFPathsSupported(db_options, cf_options);
   }
+  if (s.ok() && cf_options.memtable_factory != nullptr) {
+    s = cf_options.memtable_factory->ValidateOptions(db_options, cf_options);
+  }
   if (!s.ok()) {
     return s;
+  }
+
+  if (!cf_options.table_factory->IsTableBuilderSupported() &&
+      !cf_options.disallow_memtable_writes) {
+    return Status::InvalidArgument(
+        "A table factory that cannot build tables requires "
+        "disallow_memtable_writes");
   }
 
   if (cf_options.ttl > 0 && cf_options.ttl != kDefaultTtl) {
@@ -1734,8 +1759,19 @@ Status ColumnFamilyData::SetOptions(
   if (s.ok()) {
     mutable_cf_options_ = MutableCFOptions(cf_opts);
     mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+    options_install_pending_ = true;
   }
   return s;
+}
+
+bool ColumnFamilyData::SetOptionsIsNoOp(
+    const DBOptions& db_opts,
+    const std::unordered_map<std::string, std::string>& options_map) const {
+  // SetOptions() validates the resulting options, so a request that changes
+  // nothing must pass the same check to return the same status.
+  return !IsDropped() && !options_install_pending_ &&
+         MutableCFOptionsUnchangedByMap(mutable_cf_options_, options_map) &&
+         ValidateOptions(db_opts, GetLatestCFOptions()).ok();
 }
 
 Status ColumnFamilyData::AddDirectories(
@@ -1838,7 +1874,7 @@ ColumnFamilySet::ColumnFamilySet(
           ColumnFamilyData::kDummyColumnFamilyDataId, "", nullptr, nullptr,
           nullptr, ColumnFamilyOptions(), *db_options, &file_options_, nullptr,
           block_cache_tracer, io_tracer, db_id, db_session_id,
-          /*read_only*/ true)),
+          /*read_only=*/true, /*options_are_sanitized=*/false)),
       default_cfd_cache_(nullptr),
       db_name_(dbname),
       db_options_(db_options),
@@ -2007,12 +2043,13 @@ void ColumnFamilySet::EndBulkFlushableMemAccountingUpdate() {
 // under a DB mutex AND write thread
 ColumnFamilyData* ColumnFamilySet::CreateColumnFamily(
     const std::string& name, uint32_t id, Version* dummy_versions,
-    const ColumnFamilyOptions& options, bool read_only) {
+    const ColumnFamilyOptions& options, bool read_only,
+    bool options_are_sanitized) {
   assert(column_families_.find(name) == column_families_.end());
   ColumnFamilyData* new_cfd = new ColumnFamilyData(
       id, name, dummy_versions, table_cache_, write_buffer_manager_, options,
       *db_options_, &file_options_, this, block_cache_tracer_, io_tracer_,
-      db_id_, db_session_id_, read_only, fast_sst_open_);
+      db_id_, db_session_id_, read_only, options_are_sanitized, fast_sst_open_);
   column_families_.insert({name, id});
   column_family_data_.insert({id, new_cfd});
   auto ucmp = new_cfd->user_comparator();

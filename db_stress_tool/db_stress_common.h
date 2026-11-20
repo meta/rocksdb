@@ -42,6 +42,7 @@
 #include "db_stress_tool/db_stress_listener.h"
 #include "db_stress_tool/db_stress_shared_state.h"
 #include "db_stress_tool/db_stress_status.h"
+#include "db_stress_tool/db_stress_structured_key_value.h"
 #include "db_stress_tool/db_stress_test_base.h"
 #include "logging/logging.h"
 #include "monitoring/histogram.h"
@@ -82,6 +83,9 @@ using GFLAGS_NAMESPACE::SetUsageMessage;
 
 DECLARE_uint64(seed);
 DECLARE_bool(read_only);
+DECLARE_bool(merge_before_compaction_filter);
+DECLARE_uint32(merge_before_filter_change_one_in);
+DECLARE_bool(merge_before_filter_remove_deleted);
 DECLARE_int64(max_key);
 DECLARE_double(hot_key_alpha);
 DECLARE_int32(max_key_len);
@@ -149,6 +153,8 @@ DECLARE_int32(universal_max_merge_width);
 DECLARE_int32(universal_max_size_amplification_percent);
 DECLARE_int32(universal_max_read_amp);
 DECLARE_int32(clear_column_family_one_in);
+DECLARE_bool(test_cf_lifecycle);
+DECLARE_int32(cf_lifecycle_fault_target);
 DECLARE_int32(get_live_files_apis_one_in);
 DECLARE_bool(checkpoint_atomic_flush);
 DECLARE_int32(get_all_column_family_metadata_one_in);
@@ -164,6 +170,7 @@ DECLARE_bool(charge_filter_construction);
 DECLARE_bool(charge_table_reader);
 DECLARE_bool(charge_file_metadata);
 DECLARE_bool(charge_blob_cache);
+DECLARE_bool(charge_readahead_buffer);
 DECLARE_bool(decouple_partitioned_filters);
 DECLARE_int32(top_level_index_pinning);
 DECLARE_int32(partition_pinning);
@@ -195,8 +202,15 @@ DECLARE_int32(optimize_key_common_prefix);
 DECLARE_int32(index_block_search_type);
 DECLARE_double(uniform_cv_threshold);
 DECLARE_bool(use_trie_index);
-DECLARE_bool(use_udi_as_primary_index);
 DECLARE_bool(use_full_external_table);
+DECLARE_string(table_factory_uri);
+DECLARE_bool(structured_key_value);
+DECLARE_uint64(structured_keys_per_key_space);
+DECLARE_uint64(structured_key_fanout);
+DECLARE_string(structured_key_space_type_weights);
+DECLARE_string(structured_value_version_weights);
+DECLARE_int32(index_mode);
+DECLARE_int32(read_index);
 DECLARE_bool(test_backward_scan);
 DECLARE_string(db);
 DECLARE_string(secondaries_base);
@@ -218,6 +232,7 @@ DECLARE_bool(statistics);
 DECLARE_bool(sync);
 DECLARE_bool(use_fsync);
 DECLARE_uint64(stats_dump_period_sec);
+DECLARE_uint64(mutex_hold_log_threshold_us);
 DECLARE_uint64(max_compaction_trigger_wakeup_seconds);
 DECLARE_int32(periodic_compaction_phase_recovery_percent);
 DECLARE_uint64(bytes_per_sync);
@@ -250,6 +265,7 @@ DECLARE_int32(ingest_external_file_atomic_replace_one_in);
 DECLARE_bool(ingest_external_file_with_embedded_blobs);
 DECLARE_int32(compact_files_one_in);
 DECLARE_int32(compact_range_one_in);
+DECLARE_bool(compact_range_skip_missing_blob_files);
 DECLARE_int32(promote_l0_one_in);
 DECLARE_int32(mark_for_compaction_one_file_in);
 DECLARE_int32(flush_one_in);
@@ -308,8 +324,10 @@ DECLARE_bool(use_full_merge_v1);
 DECLARE_int32(sync_wal_one_in);
 DECLARE_bool(avoid_unnecessary_blocking_io);
 DECLARE_bool(write_dbid_to_manifest);
+DECLARE_bool(track_options_file_number_in_manifest);
 DECLARE_bool(optimize_manifest_for_recovery);
 DECLARE_bool(write_identity_file);
+DECLARE_bool(prefix_seek_opt_in_only);
 DECLARE_bool(reuse_manifest_on_open);
 DECLARE_bool(avoid_flush_during_recovery);
 DECLARE_bool(enforce_write_buffer_manager_during_recovery);
@@ -484,6 +502,7 @@ DECLARE_bool(track_and_verify_wals);
 DECLARE_int32(remote_compaction_worker_threads);
 DECLARE_int32(remote_compaction_worker_interval);
 DECLARE_bool(remote_compaction_failure_fall_back_to_local);
+DECLARE_bool(use_separate_remote_compaction_pool);
 DECLARE_uint32(openandcompact_max_secondary_open_retries);
 DECLARE_int32(allow_resumption_one_in);
 DECLARE_bool(auto_refresh_iterator_with_snapshot);
@@ -528,17 +547,20 @@ extern enum ROCKSDB_NAMESPACE::CompressionType compression_type_e;
 extern enum ROCKSDB_NAMESPACE::CompressionType bottommost_compression_type_e;
 extern enum ROCKSDB_NAMESPACE::ChecksumType checksum_type_e;
 
-enum RepFactory { kSkipList, kHashSkipList, kVectorRep };
+enum RepFactory { kSkipList, kHashSkipList, kVectorRep, kSortedHash };
 
 inline enum RepFactory StringToRepFactory(const char* ctype) {
   assert(ctype);
 
-  if (!strcasecmp(ctype, "skip_list"))
+  if (!strcasecmp(ctype, "skip_list")) {
     return kSkipList;
-  else if (!strcasecmp(ctype, "prefix_hash"))
+  } else if (!strcasecmp(ctype, "prefix_hash")) {
     return kHashSkipList;
-  else if (!strcasecmp(ctype, "vector"))
+  } else if (!strcasecmp(ctype, "vector")) {
     return kVectorRep;
+  } else if (!strcasecmp(ctype, "sorted_hash")) {
+    return kSortedHash;
+  }
 
   fprintf(stdout, "Cannot parse memreptable %s\n", ctype);
   return kSkipList;
@@ -630,7 +652,7 @@ inline std::string TemperatureToString(
   return iter->second;
 }
 
-inline std::vector<std::string> SplitString(std::string src) {
+inline std::vector<std::string> SplitString(const std::string& src) {
   std::vector<std::string> ret;
   if (src.empty()) {
     return ret;
@@ -690,9 +712,10 @@ struct KeyGenContext {
 };
 extern KeyGenContext key_gen_ctx;
 
-// Generate a variable length key string from the given int64 val. The
-// order of the keys is preserved. The key could be anywhere from 8 to
-// max_key_len * 8 bytes.
+// Generate a key string from the given int64 val. With
+// --structured_key_value, StructuredKey() returns a 12- or 20-byte key (see
+// db_stress_structured_key_value.h). Otherwise, the order of the keys is
+// preserved and the key can be anywhere from 8 to max_key_len * 8 bytes.
 // The algorithm picks the length based on the
 // offset of the val within a configured window and the distribution of the
 // number of keys of various lengths in that window. For example, if x, y, x are
@@ -701,6 +724,9 @@ extern KeyGenContext key_gen_ctx;
 // {(x-1),0}..{(x-1),(y-1)},{(x-1),(y-1),0}..{(x-1),(y-1),(z-1)} and so on.
 // Additionally, a trailer of 0-7 bytes could be appended.
 inline std::string Key(int64_t val) {
+  if (FLAGS_structured_key_value) {
+    return StructuredKey(static_cast<uint64_t>(val));
+  }
   uint64_t window = key_gen_ctx.window;
   size_t levels = key_gen_ctx.weights.size();
   std::string key;
@@ -739,6 +765,9 @@ inline std::string Key(int64_t val) {
 
 // Given a string key, map it to an index into the expected values buffer
 inline bool GetIntVal(std::string big_endian_key, uint64_t* key_p) {
+  if (FLAGS_structured_key_value) {
+    return StructuredKeyToIndex(big_endian_key, key_p);
+  }
   size_t size_key = big_endian_key.size();
   std::vector<uint64_t> prefixes;
 
@@ -781,6 +810,10 @@ inline bool GetIntVal(std::string big_endian_key, uint64_t* key_p) {
 // expected values buffer.
 inline bool GetFirstIntValInPrefix(std::string big_endian_prefix,
                                    uint64_t* key_p) {
+  if (FLAGS_structured_key_value) {
+    *key_p = StructuredKeyLowerBound(big_endian_prefix);
+    return true;
+  }
   size_t size_key = big_endian_prefix.size();
   // Pad with zeros to make it a multiple of 8. This function may be called
   // with a prefix, in which case we return the first index that falls

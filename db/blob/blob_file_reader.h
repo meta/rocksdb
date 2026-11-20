@@ -53,6 +53,8 @@ class BlobFileReader {
 
   BlobFileReader(const BlobFileReader&) = delete;
   BlobFileReader& operator=(const BlobFileReader&) = delete;
+  BlobFileReader(BlobFileReader&&) = delete;
+  BlobFileReader& operator=(BlobFileReader&&) = delete;
 
   ~BlobFileReader();
 

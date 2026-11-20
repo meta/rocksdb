@@ -7,9 +7,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <atomic>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -24,10 +26,49 @@
 #include "rocksdb/io_dispatcher.h"
 #include "rocksdb/iostats_context.h"
 #include "rocksdb/perf_context.h"
+#include "rocksdb/persistent_cache.h"
 #include "table/block_based/flush_block_policy_impl.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/merge_operators/string_append/stringappend2.h"
+
+#ifdef OS_LINUX
+namespace {
+struct QueryAbortState {
+  int check_count = 0;
+  int abort_after_check_count = -1;
+};
+
+QueryAbortState& GetQueryAbortState() {
+  static thread_local QueryAbortState state;
+  return state;
+}
+
+class ScopedQueryAbort {
+ public:
+  explicit ScopedQueryAbort(int abort_after_check_count) {
+    QueryAbortState& state = GetQueryAbortState();
+    state.check_count = 0;
+    state.abort_after_check_count = abort_after_check_count;
+  }
+
+  ~ScopedQueryAbort() { GetQueryAbortState().abort_after_check_count = -1; }
+
+  int check_count() const { return GetQueryAbortState().check_count; }
+};
+}  // namespace
+
+extern "C" bool RocksDbThreadYieldAndCheckAbort() {
+  QueryAbortState& state = GetQueryAbortState();
+  if (state.abort_after_check_count < 0) {
+    return false;
+  }
+  ++state.check_count;
+  return state.abort_after_check_count > 0 &&
+         state.check_count >= state.abort_after_check_count;
+}
+#endif  // OS_LINUX
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -44,6 +85,241 @@ class DBIteratorBaseTest : public DBTestBase {
   DBIteratorBaseTest()
       : DBTestBase("db_iterator_test", /*env_do_fsync=*/true) {}
 };
+
+#ifdef OS_LINUX
+TEST_F(DBIteratorBaseTest, PrefixSameAsStartDirectionChange) {
+  // prefix_same_as_start uses prefix seek even with total_order_seek=true (as
+  // forced by prefix_seek_opt_in_only) or auto_prefix_mode. On Next() after
+  // Prev(), the inner iterator stands on a key with another prefix (bbbb1).
+  // DBIter must reseek it to the current key; moving it without a reseek
+  // seeks the other children to bbbb1, where a prefix filter drops the child
+  // holding kkkk1 and kkkk3.
+  struct ReadCase {
+    const char* name;
+    bool opt_in;
+    bool total_order_seek;
+    bool auto_prefix_mode;
+  };
+  const std::vector<ReadCase> read_cases = {
+      {"prefix_same_as_start", false, false, false},
+      {"+total_order_seek", false, true, false},
+      {"+auto_prefix_mode", false, false, true},
+      {"+prefix_seek_opt_in_only", true, false, false},
+  };
+  for (bool memtable_bloom : {false, true}) {
+    for (const ReadCase& rc : read_cases) {
+      SCOPED_TRACE(std::string(rc.name) +
+                   (memtable_bloom ? " memtable_bloom" : " sst_filter"));
+      Options options = CurrentOptions();
+      options.disable_auto_compactions = true;
+      options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+      options.prefix_seek_opt_in_only = rc.opt_in;
+      BlockBasedTableOptions table_options;
+      if (memtable_bloom) {
+        options.memtable_prefix_bloom_size_ratio = 0.1;
+      } else {
+        table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+        table_options.whole_key_filtering = false;
+      }
+      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      DestroyAndReopen(options);
+      // The child that gets filtered has prefix kkkk only: the SST for the
+      // SST filter case, the memtable for the memtable bloom case.
+      const std::vector<std::string> kkkk_only = {"kkkk1", "kkkk3"};
+      const std::vector<std::string> mixed = {"bbbb1", "kkkk2"};
+      for (const std::string& key : memtable_bloom ? mixed : kkkk_only) {
+        ASSERT_OK(Put(key, "v"));
+      }
+      ASSERT_OK(Flush());
+      for (const std::string& key : memtable_bloom ? kkkk_only : mixed) {
+        ASSERT_OK(Put(key, "v"));
+      }
+
+      ReadOptions ro;
+      ro.prefix_same_as_start = true;
+      ro.total_order_seek = rc.total_order_seek;
+      ro.auto_prefix_mode = rc.auto_prefix_mode;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      iter->Seek("kkkk1");
+      std::vector<std::string> keys;
+      // Seek, Next, Prev, then Next until the end of the prefix.
+      for (int step = 0; iter->Valid(); ++step) {
+        keys.push_back(iter->key().ToString());
+        if (step == 1) {
+          iter->Prev();
+        } else {
+          iter->Next();
+        }
+      }
+      ASSERT_OK(iter->status());
+      const std::vector<std::string> expected = {"kkkk1", "kkkk2", "kkkk1",
+                                                 "kkkk2", "kkkk3"};
+      EXPECT_EQ(expected, keys);
+    }
+  }
+}
+
+TEST_F(DBIteratorBaseTest, PrefixSameAsStartWithExplicitBounds) {
+  // prefix_same_as_start implies a bound at the end of the seek prefix. With
+  // or without auto_prefix_mode, the iterator returns only keys within both
+  // that implied bound and the explicit iterate_lower_bound /
+  // iterate_upper_bound, whichever is narrower.
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+  for (const char* key : {"kkkj9", "kkkk1", "kkkk5"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+  ASSERT_OK(Flush());
+  for (const char* key : {"kkkk3", "kkkl1"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+
+  struct BoundCase {
+    const char* name;
+    const char* bound;
+    std::vector<std::string> expected;
+  };
+  const std::vector<BoundCase> forward_cases = {
+      {"upper bound inside prefix", "kkkk4", {"kkkk1", "kkkk3"}},
+      {"upper bound past prefix", "kkkm", {"kkkk1", "kkkk3", "kkkk5"}},
+  };
+  const std::vector<BoundCase> backward_cases = {
+      {"lower bound inside prefix", "kkkk2", {"kkkk5", "kkkk3"}},
+      {"lower bound before prefix", "kkkj", {"kkkk5", "kkkk3", "kkkk1"}},
+  };
+  for (bool auto_prefix_mode : {false, true}) {
+    ReadOptions ro;
+    ro.prefix_same_as_start = true;
+    ro.auto_prefix_mode = auto_prefix_mode;
+    for (const BoundCase& bc : forward_cases) {
+      SCOPED_TRACE(std::string(bc.name) +
+                   (auto_prefix_mode ? " auto_prefix_mode" : ""));
+      Slice upper_bound(bc.bound);
+      ro.iterate_upper_bound = &upper_bound;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      std::vector<std::string> keys;
+      for (iter->Seek("kkkk1"); iter->Valid(); iter->Next()) {
+        keys.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+      EXPECT_EQ(bc.expected, keys);
+    }
+    ro.iterate_upper_bound = nullptr;
+    for (const BoundCase& bc : backward_cases) {
+      SCOPED_TRACE(std::string(bc.name) +
+                   (auto_prefix_mode ? " auto_prefix_mode" : ""));
+      Slice lower_bound(bc.bound);
+      ro.iterate_lower_bound = &lower_bound;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      std::vector<std::string> keys;
+      for (iter->SeekForPrev("kkkk5"); iter->Valid(); iter->Prev()) {
+        keys.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+      EXPECT_EQ(bc.expected, keys);
+    }
+    ro.iterate_lower_bound = nullptr;
+  }
+}
+
+TEST_F(DBIteratorBaseTest, PrevChecksQueryAbort) {
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("c", "vc"));
+
+  for (int abort_after_check_count = 1; abort_after_check_count <= 2;
+       ++abort_after_check_count) {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->Seek("c");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+
+    ScopedQueryAbort abort(abort_after_check_count);
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsAborted());
+  }
+}
+
+TEST_F(DBIteratorBaseTest, ForwardMergeChecksQueryAbort) {
+  Options options = CurrentOptions();
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("b", "base"));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(db_->Merge(WriteOptions(), "b", "operand"));
+  }
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/0);
+    iter->Seek("b");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key(), "b");
+    ASSERT_EQ(iter->value(), "base,operand,operand,operand,operand");
+    ASSERT_EQ(abort.check_count(), 4);
+  }
+
+  iter.reset(db_->NewIterator(ReadOptions()));
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/3);
+    iter->Seek("b");
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsAborted());
+    ASSERT_EQ(abort.check_count(), 3);
+  }
+}
+
+TEST_F(DBIteratorBaseTest, PrevReseekMergeChecksQueryAbort) {
+  Options options = CurrentOptions();
+  options.max_sequential_skip_in_iterations = 2;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "base"));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(db_->Merge(WriteOptions(), "b", "operand"));
+  }
+  ASSERT_OK(Put("c", "vc"));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->Seek("c");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/0);
+    iter->Prev();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key(), "b");
+    // One check reaches "b", two trigger the reseek, four scan merge
+    // operands, and three finish positioning before "b".
+    ASSERT_EQ(abort.check_count(), 10);
+  }
+
+  iter.reset(db_->NewIterator(ReadOptions()));
+  iter->Seek("c");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/4);
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsAborted());
+    ASSERT_EQ(abort.check_count(), 4);
+  }
+}
+#endif  // OS_LINUX
 
 TEST_F(DBIteratorBaseTest, APICallsWithPerfContext) {
   // Set up the DB
@@ -228,6 +504,9 @@ TEST_F(DBIteratorBaseTest, PrepareWithMultiScanAllowsSingleUnboundedRange) {
   ASSERT_OK(Put("c", "vc"));
   ASSERT_OK(Flush());
   MoveFilesToLevel(1);
+  // L0 table iterators receive the unbounded Prepare() directly.
+  ASSERT_OK(Put("d", "vd"));
+  ASSERT_OK(Flush());
 
   MultiScanArgs scan_opts(BytewiseComparator());
   scan_opts.insert(Slice("b"));
@@ -240,7 +519,7 @@ TEST_F(DBIteratorBaseTest, PrepareWithMultiScanAllowsSingleUnboundedRange) {
   for (iter->Seek("b"); iter->Valid(); iter->Next()) {
     keys.push_back(iter->key().ToString());
   }
-  ASSERT_EQ(keys, std::vector<std::string>({"b", "c"}));
+  ASSERT_EQ(keys, std::vector<std::string>({"b", "c", "d"}));
   ASSERT_FALSE(iter->Valid());
   ASSERT_OK(iter->status());
 }
@@ -476,6 +755,133 @@ TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesNonIntersectingMemTables) {
   ASSERT_OK(db_->ContinueBackgroundWork());
 }
 
+// Prepare() on an iterator that is already positioned must discard that
+// position and yield the same results as on a fresh iterator. The test needs
+// an L0 file, because L0 table iterators receive Prepare() directly from the
+// merging iterator rather than through LevelIterator, so they are positioned
+// on a data block.
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanAfterPositioning) {
+  // Other tests can leave counting disabled on this thread.
+  const PerfLevel prev_perf_level = GetPerfLevel();
+  SetPerfLevel(kEnableCount);
+  Defer restore_perf_level(
+      [prev_perf_level]() { SetPerfLevel(prev_perf_level); });
+
+  constexpr int kNumKeys = 200;
+  std::vector<std::string> keys;
+  for (int i = 0; i <= kNumKeys; ++i) {
+    keys.push_back(Key(i));
+  }
+  const std::string l1_value(50, '1');
+  const std::string l0_value(50, '0');
+  const std::vector<std::pair<int, int>> ranges = {{10, 20}, {120, 140}};
+
+  struct Case {
+    const char* name;
+    std::function<void(Iterator*)> position;
+    bool reverse;
+  };
+  const std::vector<Case> cases = {
+      {"Seek inside a range", [&](Iterator* it) { it->Seek(keys[15]); }, false},
+      {"Seek outside the ranges", [&](Iterator* it) { it->Seek(keys[190]); },
+       false},
+      {"Seek then Next",
+       [&](Iterator* it) {
+         it->Seek(keys[5]);
+         for (int i = 0; i < 10; ++i) {
+           it->Next();
+         }
+       },
+       false},
+      {"SeekToFirst", [](Iterator* it) { it->SeekToFirst(); }, false},
+      {"SeekToLast", [](Iterator* it) { it->SeekToLast(); }, false},
+      {"SeekForPrev", [&](Iterator* it) { it->SeekForPrev(keys[130]); }, false},
+      {"Seek then reverse MultiScan", [&](Iterator* it) { it->Seek(keys[15]); },
+       true},
+  };
+
+  for (bool first_key_index : {false, true}) {
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.compression = kNoCompression;
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 256;
+    if (first_key_index) {
+      table_options.index_type =
+          BlockBasedTableOptions::IndexType::kBinarySearchWithFirstKey;
+    }
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Put(keys[i], l1_value));
+    }
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(1);
+    for (int i = 0; i < kNumKeys; i += 7) {
+      ASSERT_OK(Put(keys[i], l0_value));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_EQ(1, NumTableFilesAtLevel(0));
+    ASSERT_EQ(1, NumTableFilesAtLevel(1));
+
+    for (bool pin_data : {false, true}) {
+      for (const Case& c : cases) {
+        SCOPED_TRACE(std::string(c.name) +
+                     " first_key_index=" + std::to_string(first_key_index) +
+                     " pin_data=" + std::to_string(pin_data));
+        Slice lower_bound = keys[0];
+        Slice upper_bound = keys[kNumKeys];
+        ReadOptions read_options;
+        read_options.pin_data = pin_data;
+        read_options.iterate_lower_bound = &lower_bound;
+        read_options.iterate_upper_bound = &upper_bound;
+        std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+        c.position(iter.get());
+        ASSERT_TRUE(iter->Valid());
+        ASSERT_OK(iter->status());
+
+        MultiScanArgs scan_opts(BytewiseComparator());
+        scan_opts.reverse = c.reverse;
+        for (const auto& range : ranges) {
+          scan_opts.insert(keys[range.first], keys[range.second]);
+        }
+        get_perf_context()->Reset();
+        iter->Prepare(scan_opts);
+        ASSERT_OK(iter->status());
+        ASSERT_FALSE(iter->Valid());
+        // The L0 table iterator took the MultiScan path.
+        ASSERT_GT(get_perf_context()->multiscan_prepare_count, 0);
+
+        std::vector<std::pair<std::string, std::string>> expected;
+        std::vector<std::pair<std::string, std::string>> actual;
+        for (const auto& range : ranges) {
+          lower_bound = keys[range.first];
+          upper_bound = keys[range.second];
+          if (c.reverse) {
+            for (int i = range.second - 1; i >= range.first; --i) {
+              expected.emplace_back(keys[i], i % 7 == 0 ? l0_value : l1_value);
+            }
+            for (iter->SeekForPrev(upper_bound); iter->Valid(); iter->Prev()) {
+              actual.emplace_back(iter->key().ToString(),
+                                  iter->value().ToString());
+            }
+          } else {
+            for (int i = range.first; i < range.second; ++i) {
+              expected.emplace_back(keys[i], i % 7 == 0 ? l0_value : l1_value);
+            }
+            for (iter->Seek(lower_bound); iter->Valid(); iter->Next()) {
+              actual.emplace_back(iter->key().ToString(),
+                                  iter->value().ToString());
+            }
+          }
+          ASSERT_OK(iter->status());
+        }
+        ASSERT_EQ(expected, actual);
+      }
+    }
+  }
+}
+
 // Test param:
 //   bool: whether to pass read_callback to NewIterator().
 class DBIteratorTest : public DBIteratorBaseTest,
@@ -572,7 +978,8 @@ TEST_P(DBIteratorTest, PersistedTierOnIterator) {
 
 TEST_P(DBIteratorTest, NonBlockingIteration) {
   do {
-    ReadOptions non_blocking_opts, regular_opts;
+    ReadOptions non_blocking_opts;
+    ReadOptions regular_opts;
     anon::OptionsOverride options_override;
     options_override.full_block_cache = true;
     Options options = CurrentOptions(options_override);
@@ -1092,8 +1499,8 @@ TEST_F(DBIteratorTest, ReseekUponDirectionChange) {
   options.create_if_missing = true;
   options.prefix_extractor.reset(NewFixedPrefixTransform(1));
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(
-      new StringAppendTESTOperator(/*delim_char=*/' '));
+  options.merge_operator = std::make_shared<StringAppendTESTOperator>(
+      /*delim_char=*/' ');
   DestroyAndReopen(options);
   ASSERT_OK(Put("foo", "value"));
   ASSERT_OK(Put("bar", "value"));
@@ -2189,6 +2596,599 @@ TEST_P(DBIteratorTest, PinnedDataIteratorMultipleFiles) {
   delete iter;
 }
 
+// The PinnedDataIteratorImmortalMmap* tests below are heavy (thousands of
+// seeks plus full scans over a multi-level DB), so they are skipped under
+// Valgrind like the neighbouring PinnedDataIteratorRandomized tests.
+#if !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
+namespace {
+// Forces TableReaderOptions::immortal, like a wrapping factory may do for a
+// DB whose table files never go away.
+class ImmortalTableFactory : public TableFactory {
+ public:
+  explicit ImmortalTableFactory(std::shared_ptr<TableFactory> inner)
+      : inner_(std::move(inner)) {}
+  const char* Name() const override { return "ImmortalTableFactory"; }
+  using TableFactory::NewTableReader;
+  Status NewTableReader(const ReadOptions& ro, const TableReaderOptions& tro,
+                        std::unique_ptr<RandomAccessFileReader>&& file,
+                        uint64_t file_size,
+                        std::unique_ptr<TableReader>* table_reader,
+                        bool prefetch_index_and_filter) const override {
+    TableReaderOptions immortal_tro(tro);
+    immortal_tro.immortal = true;
+    return inner_->NewTableReader(ro, immortal_tro, std::move(file), file_size,
+                                  table_reader, prefetch_index_and_filter);
+  }
+  TableBuilder* NewTableBuilder(const TableBuilderOptions& tbo,
+                                WritableFileWriter* file) const override {
+    return inner_->NewTableBuilder(tbo, file);
+  }
+  std::unique_ptr<TableFactory> Clone() const override {
+    return std::make_unique<ImmortalTableFactory>(inner_->Clone());
+  }
+
+ private:
+  std::shared_ptr<TableFactory> inner_;
+};
+
+// Uncompressed persistent cache keeping about half of the blocks. Blocks
+// read back from it are heap-owned; the others keep coming from the file.
+class UncompressedPersistentCache : public PersistentCache {
+ public:
+  Status Insert(const Slice& key, const char* data, size_t size) override {
+    MutexLock l(&mu_);
+    if (std::hash<std::string>()(key.ToString()) % 2 == 0) {
+      data_[key.ToString()].assign(data, size);
+    }
+    return Status::OK();
+  }
+  Status Lookup(const Slice& key, std::unique_ptr<char[]>* data,
+                size_t* size) override {
+    MutexLock l(&mu_);
+    auto it = data_.find(key.ToString());
+    if (it == data_.end()) {
+      return Status::NotFound();
+    }
+    data->reset(new char[it->second.size()]);
+    memcpy(data->get(), it->second.data(), it->second.size());
+    *size = it->second.size();
+    return Status::OK();
+  }
+  bool IsCompressed() override { return false; }
+  StatsType Stats() override { return StatsType(); }
+  std::string GetPrintableOptions() const override { return ""; }
+  uint64_t NewId() override { return next_id_++; }
+
+ private:
+  port::Mutex mu_;
+  std::map<std::string, std::string> data_;
+  std::atomic<uint64_t> next_id_{1};
+};
+
+// Shared setup of the PinnedDataIteratorImmortalMmap* tests.
+constexpr int kImmortalKeys = 3000;
+constexpr int kImmortalKeysPerFile = 100;
+constexpr int kImmortalSeeks = 2000;
+constexpr int kImmortalRangeDelBegin = 1500;
+constexpr int kImmortalRangeDelEnd = 1560;
+
+// Counts how LevelIterator disposes of the file iterators it leaves and how
+// many data blocks BlockBasedTableIterator delegates to the
+// PinnedIteratorsManager.
+struct PinCounters {
+  std::atomic<int> pinned_file_iters{0};
+  std::atomic<int> dropped_file_iters{0};
+  std::atomic<int> delegated_blocks{0};
+  // Dropped iterators must never hold a cleanup (table cache handle).
+  std::atomic<int> dropped_with_cleanups{0};
+
+  PinCounters() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelIterator::SetFileIterator:PinIterator",
+        [this](void*) { pinned_file_iters++; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelIterator::SetFileIterator:DeleteIterator", [this](void* arg) {
+          if (arg != nullptr) {
+            dropped_file_iters++;
+            if (static_cast<InternalIterator*>(arg)->HasCleanups()) {
+              dropped_with_cleanups++;
+            }
+          }
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlockBasedTableIterator::ResetDataIter:DelegateBlock",
+        [this](void*) { delegated_blocks++; });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+  ~PinCounters() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+  void Reset() {
+    pinned_file_iters = 0;
+    dropped_file_iters = 0;
+    delegated_blocks = 0;
+    dropped_with_cleanups = 0;
+  }
+};
+
+// Writes Key(0) .. Key(kImmortalKeys - 1) interleaved into L3, L2 and L1
+// (key i goes to level (i % 3) + 1), several files per level, calling
+// before_level(level) first, e.g. to reopen with other table options. One L1
+// file also holds a range tombstone (within its own key range, so the files
+// still move down without being compacted) that deletes keys of all three
+// levels. true_data receives the surviving keys.
+void WriteInterleavedLevels(DBTestBase* t, Random* rnd,
+                            const std::function<void(int level)>& before_level,
+                            std::map<std::string, std::string>* true_data) {
+  for (int level = 3; level >= 1; level--) {
+    before_level(level);
+    for (int i = level - 1; i < kImmortalKeys; i += 3) {
+      if (level == 1 && i == kImmortalRangeDelEnd) {
+        ASSERT_OK(t->db_->DeleteRange(WriteOptions(),
+                                      t->db_->DefaultColumnFamily(),
+                                      DBTestBase::Key(kImmortalRangeDelBegin),
+                                      DBTestBase::Key(kImmortalRangeDelEnd)));
+        true_data->erase(
+            true_data->lower_bound(DBTestBase::Key(kImmortalRangeDelBegin)),
+            true_data->lower_bound(DBTestBase::Key(kImmortalRangeDelEnd)));
+      }
+      std::string k = DBTestBase::Key(i);
+      std::string v = test::CompressibleString(rnd, 0.5, 100);
+      ASSERT_OK(t->Put(k, v));
+      (*true_data)[k] = v;
+      if ((i / 3) % kImmortalKeysPerFile == kImmortalKeysPerFile - 1) {
+        ASSERT_OK(t->Flush());
+      }
+    }
+    ASSERT_OK(t->Flush());
+    t->MoveFilesToLevel(level);
+  }
+  for (int level = 1; level <= 3; level++) {
+    ASSERT_GT(t->NumTableFilesAtLevel(level), 4);
+  }
+  ASSERT_EQ(kImmortalKeys - (kImmortalRangeDelEnd - kImmortalRangeDelBegin),
+            true_data->size());
+}
+
+// A key/value pair as the iterator returned it, plus copies to compare
+// against after the iterator moved on (and, under ASan, to detect slices
+// into freed memory). Unpinned keys live in DBIter's buffer and are not
+// saved; values are always pinned.
+struct SavedEntry {
+  Slice key, value;
+  std::string key_copy, value_copy;
+};
+
+// Checks the iterator's current entry against true_data and the expected
+// is-key-pinned property (nullptr: varies by block), then saves it.
+// is-value-pinned is only reported in the forward direction.
+void CheckAndSave(Iterator* iter,
+                  const std::map<std::string, std::string>& true_data,
+                  const char* expected_keys_pinned, bool forward,
+                  std::vector<SavedEntry>* saved) {
+  ASSERT_TRUE(iter->Valid());
+  std::string prop;
+  ASSERT_OK(iter->GetProperty("rocksdb.iterator.is-key-pinned", &prop));
+  if (expected_keys_pinned != nullptr) {
+    ASSERT_EQ(expected_keys_pinned, prop);
+  }
+  const bool key_pinned = prop == "1";
+  if (forward) {
+    ASSERT_OK(iter->GetProperty("rocksdb.iterator.is-value-pinned", &prop));
+    ASSERT_EQ("1", prop);
+  }
+  auto it = true_data.find(iter->key().ToString());
+  ASSERT_TRUE(it != true_data.end());
+  ASSERT_EQ(it->second, iter->value().ToString());
+  saved->push_back({key_pinned ? iter->key() : Slice(), iter->value(),
+                    key_pinned ? iter->key().ToString() : "",
+                    iter->value().ToString()});
+}
+
+// Random seeks with Next/Prev/Prev around each, then a full forward and a
+// full backward scan, saving every entry.
+void SeekAndScanAll(Iterator* iter, Random* rnd,
+                    const std::map<std::string, std::string>& true_data,
+                    const char* expected_keys_pinned,
+                    std::vector<SavedEntry>* saved) {
+  for (int i = 0; i < kImmortalSeeks; i++) {
+    // kImmortalKeys - 1 so that Next() stays valid.
+    iter->Seek(
+        DBTestBase::Key(static_cast<int>(rnd->Uniform(kImmortalKeys - 1))));
+    ASSERT_NO_FATAL_FAILURE(
+        CheckAndSave(iter, true_data, expected_keys_pinned, true, saved));
+    iter->Next();
+    ASSERT_NO_FATAL_FAILURE(
+        CheckAndSave(iter, true_data, expected_keys_pinned, true, saved));
+    iter->Prev();
+    iter->Prev();
+    if (iter->Valid()) {
+      ASSERT_NO_FATAL_FAILURE(
+          CheckAndSave(iter, true_data, expected_keys_pinned, false, saved));
+    }
+  }
+  size_t n = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), n++) {
+    ASSERT_NO_FATAL_FAILURE(
+        CheckAndSave(iter, true_data, expected_keys_pinned, true, saved));
+  }
+  ASSERT_EQ(true_data.size(), n);
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+    ASSERT_NO_FATAL_FAILURE(
+        CheckAndSave(iter, true_data, expected_keys_pinned, false, saved));
+  }
+  ASSERT_OK(iter->status());
+}
+
+void VerifySaved(const std::vector<SavedEntry>& saved) {
+  ASSERT_GT(saved.size(), 0u);
+  for (const SavedEntry& s : saved) {
+    ASSERT_EQ(s.key_copy, s.key.ToString());
+    ASSERT_EQ(s.value_copy, s.value.ToString());
+  }
+}
+}  // namespace
+
+// LevelIterator drops old file iterators instead of pinning them only for
+// immortal tables (ReadOnly with max_open_files=-1, or an immortal factory)
+// without table cache handles or first-key indexes, while positioned on no
+// block or on a block in the immortal source (mmap, uncompressed, no cache
+// handle). Owned blocks it left earlier (here: persistent cache hits, mixed
+// with mmap blocks in the same iterator) are delegated to the
+// PinnedIteratorsManager. Every other setup must keep pinning. Run under ASan
+// to check that saved slices stay valid.
+//
+// These tests use TEST_F(DBIteratorBaseTest) rather than the parameterized
+// DBIteratorTest fixture of their neighbours: the read_callback parameter is
+// irrelevant here and would only double an already heavy test's runtime.
+TEST_F(DBIteratorBaseTest, PinnedDataIteratorImmortalMmapNoPin) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_BYPASS("Test requires mmap reads");
+    return;
+  }
+  PinCounters counters;
+
+  // kPinNone: all dropped. kPinSome: pinned while on an owned block.
+  // kPinMost: most pinned, some dropped (e.g. exhausted ones). kPinAll: never
+  // dropped.
+  enum Pins { kPinNone, kPinSome, kPinMost, kPinAll };
+  struct Mode {
+    bool read_only, mmap, block_cache, persistent_cache, immortal_factory,
+        fill_cache;
+    int max_open_files;
+    Pins pins;
+    // Expected is-key-pinned, or nullptr if it varies by block.
+    const char* keys_pinned;
+  };
+  // {read_only, mmap, block_cache, persistent_cache, immortal_factory,
+  //  fill_cache, max_open_files, pins, keys_pinned}
+  const std::vector<Mode> kModes = {
+      // Immortal, mmap: dropped. The reader does not insert unowned (mmap,
+      // uncompressed) blocks into the block cache, so also with a cache.
+      {true, true, false, false, false, true, -1, kPinNone, "1"},
+      {true, true, true, false, false, true, -1, kPinNone, "1"},
+      {false, true, false, false, true, true, -1, kPinNone, "1"},
+      // fill_cache=false charges a placeholder for each block to the block
+      // cache through a cleanup on the block iterator; dropping the block
+      // releases it right away instead of keeping it until the iterator dies.
+      {true, true, true, false, false, false, -1, kPinNone, "1"},
+      // Immortal, mmap blocks mixed with owned persistent cache hits.
+      {true, true, false, true, false, true, -1, kPinSome, nullptr},
+      // Immortal, cached or heap-owned blocks.
+      {true, false, true, false, false, true, -1, kPinMost, "1"},
+      {true, false, false, false, false, true, -1, kPinMost, "0"},
+      // Not immortal: cached blocks pin through the handle; unowned mmap
+      // blocks are not pinned at all.
+      {false, false, true, false, false, true, -1, kPinAll, "1"},
+      {false, true, false, false, false, true, -1, kPinAll, "0"},
+      // Immortal with table cache handles (only files whose readers were
+      // preloaded into FileMetaData have none and are dropped).
+      {false, true, false, false, true, true, 20, kPinMost, "1"},
+  };
+  // Keys taken from index values: always pin.
+  const std::vector<Mode> kFirstKeyModes = {
+      {true, true, false, false, false, true, -1, kPinAll, "1"}};
+  for (bool first_key_index : {false, true}) {
+    Options options = CurrentOptions();
+    options.compression = kNoCompression;
+    options.disable_auto_compactions = true;
+    options.level_compaction_dynamic_level_bytes = false;
+    BlockBasedTableOptions table_options;
+    table_options.use_delta_encoding = false;
+    table_options.block_size = 1024;
+    if (first_key_index) {
+      table_options.index_type =
+          BlockBasedTableOptions::IndexType::kBinarySearchWithFirstKey;
+    }
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+
+    std::map<std::string, std::string> true_data;
+    Random rnd(301);
+    ASSERT_NO_FATAL_FAILURE(
+        WriteInterleavedLevels(this, &rnd, [](int /*level*/) {}, &true_data));
+
+    const std::vector<Mode>& modes = first_key_index ? kFirstKeyModes : kModes;
+    for (const Mode& mode : modes) {
+      SCOPED_TRACE(
+          "first_key_index=" + std::to_string(first_key_index) +
+          " read_only=" + std::to_string(mode.read_only) +
+          " mmap=" + std::to_string(mode.mmap) +
+          " block_cache=" + std::to_string(mode.block_cache) +
+          " persistent_cache=" + std::to_string(mode.persistent_cache) +
+          " immortal_factory=" + std::to_string(mode.immortal_factory) +
+          " fill_cache=" + std::to_string(mode.fill_cache) +
+          " max_open_files=" + std::to_string(mode.max_open_files));
+      options.allow_mmap_reads = mode.mmap;
+      options.max_open_files = mode.max_open_files;
+      std::shared_ptr<Cache> block_cache =
+          mode.block_cache ? NewLRUCache(32 << 20) : nullptr;
+      table_options.no_block_cache = !mode.block_cache;
+      table_options.block_cache = block_cache;
+      table_options.persistent_cache =
+          mode.persistent_cache
+              ? std::make_shared<UncompressedPersistentCache>()
+              : nullptr;
+      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      if (mode.immortal_factory) {
+        options.table_factory =
+            std::make_shared<ImmortalTableFactory>(options.table_factory);
+      }
+      if (mode.read_only) {
+        ASSERT_OK(ReadOnlyReopen(options));
+      } else {
+        Reopen(options);
+      }
+      counters.Reset();
+
+      ReadOptions ro;
+      ro.pin_data = true;
+      ro.fill_cache = mode.fill_cache;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      std::vector<SavedEntry> saved;
+      ASSERT_NO_FATAL_FAILURE(SeekAndScanAll(iter.get(), &rnd, true_data,
+                                             mode.keys_pinned, &saved));
+#ifndef NDEBUG
+      ASSERT_EQ(0, counters.dropped_with_cleanups.load());
+#endif
+      if (!mode.fill_cache) {
+        // Placeholder charges of dropped blocks were released; only the
+        // blocks the live file iterators are on (one per level) may be
+        // charged, far below what pinning every block visited would cost.
+        ASSERT_NE(nullptr, block_cache);
+        ASSERT_LT(block_cache->GetUsage(), 16u << 10);
+      }
+      ASSERT_NO_FATAL_FAILURE(VerifySaved(saved));
+#ifndef NDEBUG
+      if (mode.pins == kPinAll || mode.pins == kPinMost) {
+        // Most seeks switch files at least once.
+        ASSERT_GT(counters.pinned_file_iters.load(), kImmortalSeeks / 2);
+        if (mode.pins == kPinAll) {
+          ASSERT_EQ(0, counters.dropped_file_iters.load());
+        } else {
+          ASSERT_GT(counters.dropped_file_iters.load(), 0);
+        }
+      } else if (mode.pins == kPinSome) {
+        // Owned blocks were delegated; iterators on an owned block were
+        // pinned, the others dropped.
+        ASSERT_GT(counters.delegated_blocks.load(), 0);
+        ASSERT_GT(counters.pinned_file_iters.load(), 0);
+        ASSERT_GT(counters.dropped_file_iters.load(), 0);
+      } else {
+        ASSERT_EQ(0, counters.pinned_file_iters.load());
+        ASSERT_EQ(0, counters.delegated_blocks.load());
+        ASSERT_GT(counters.dropped_file_iters.load(), kImmortalSeeks / 2);
+      }
+#endif
+    }
+  }
+}
+
+// The same column family with table options that changed between flushes:
+// L3 is plain (dropped), L2 has a first-key index (pinned), L1 has delta
+// encoding, a hash index and compression (its decompressed blocks are
+// heap-owned and delegated; keys are not pinned). Each file iterator is
+// judged by its own table's properties.
+TEST_F(DBIteratorBaseTest, PinnedDataIteratorImmortalMmapMixedTableOptions) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_BYPASS("Test requires mmap reads");
+    return;
+  }
+  PinCounters counters;
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level_compaction_dynamic_level_bytes = false;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 1024;
+  table_options.no_block_cache = true;
+  DestroyAndReopen(options);
+
+  CompressionType l1_compression = kNoCompression;
+  for (CompressionType type : GetSupportedCompressions()) {
+    if (type != kNoCompression) {
+      l1_compression = type;
+      break;
+    }
+  }
+  std::map<std::string, std::string> true_data;
+  Random rnd(301);
+  ASSERT_NO_FATAL_FAILURE(WriteInterleavedLevels(
+      this, &rnd,
+      [&](int level) {
+        switch (level) {
+          case 3:
+            options.compression = kNoCompression;
+            table_options.use_delta_encoding = false;
+            break;
+          case 2:
+            table_options.index_type =
+                BlockBasedTableOptions::IndexType::kBinarySearchWithFirstKey;
+            break;
+          case 1:
+            options.compression = l1_compression;
+            table_options.index_type =
+                BlockBasedTableOptions::IndexType::kBinarySearch;
+            table_options.use_delta_encoding = true;
+            table_options.data_block_index_type =
+                BlockBasedTableOptions::kDataBlockBinaryAndHash;
+            break;
+        }
+        options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+        Reopen(options);
+      },
+      &true_data));
+
+  options.allow_mmap_reads = true;
+  options.max_open_files = -1;
+  ASSERT_OK(ReadOnlyReopen(options));
+  counters.Reset();
+
+  ReadOptions ro;
+  ro.pin_data = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  std::vector<SavedEntry> saved;
+  ASSERT_NO_FATAL_FAILURE(SeekAndScanAll(iter.get(), &rnd, true_data,
+                                         /*expected_keys_pinned=*/nullptr,
+                                         &saved));
+#ifndef NDEBUG
+  ASSERT_EQ(0, counters.dropped_with_cleanups.load());
+  ASSERT_GT(counters.pinned_file_iters.load(), 0);
+  ASSERT_GT(counters.dropped_file_iters.load(), 0);
+  if (l1_compression != kNoCompression) {
+    ASSERT_GT(counters.delegated_blocks.load(), 0);
+  }
+#endif
+  ASSERT_NO_FATAL_FAILURE(VerifySaved(saved));
+}
+
+// A MultiScan iterator owns the ReadSet its blocks were read into, so it is
+// pinned like before even over an immortal mmap table.
+TEST_F(DBIteratorBaseTest, PinnedDataIteratorImmortalMmapMultiScan) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_BYPASS("Test requires mmap reads");
+    return;
+  }
+  PinCounters counters;
+
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.disable_auto_compactions = true;
+  options.level_compaction_dynamic_level_bytes = false;
+  BlockBasedTableOptions table_options;
+  table_options.use_delta_encoding = false;
+  table_options.block_size = 1024;
+  table_options.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  std::map<std::string, std::string> true_data;
+  Random rnd(301);
+  ASSERT_NO_FATAL_FAILURE(
+      WriteInterleavedLevels(this, &rnd, [](int /*level*/) {}, &true_data));
+
+  options.allow_mmap_reads = true;
+  options.max_open_files = -1;
+  options.statistics = CreateDBStatistics();
+  ASSERT_OK(ReadOnlyReopen(options));
+  counters.Reset();
+
+  // Disjoint ranges, each spanning several files of every level; the second
+  // one covers the range tombstone. MultiScanArgs keeps Slices of the bounds.
+  const std::vector<std::pair<std::string, std::string>> kRanges = {
+      {Key(10), Key(400)}, {Key(1450), Key(1700)}, {Key(2200), Key(2990)}};
+  MultiScanArgs scan_opts(BytewiseComparator());
+  for (const auto& range : kRanges) {
+    scan_opts.insert(range.first, range.second);
+  }
+  ReadOptions ro;
+  ro.pin_data = true;
+  // A prepared iterator expects the upper bound to follow the ranges.
+  Slice upper_bound;
+  ro.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  iter->Prepare(scan_opts);
+  ASSERT_OK(iter->status());
+  std::vector<SavedEntry> saved;
+  for (const auto& range : kRanges) {
+    const std::string& limit = range.second;
+    upper_bound = limit;
+    auto expected = true_data.lower_bound(range.first);
+    for (iter->Seek(range.first); iter->Valid(); iter->Next(), ++expected) {
+      ASSERT_LT(iter->key().compare(limit), 0);
+      ASSERT_TRUE(expected != true_data.end());
+      ASSERT_EQ(expected->first, iter->key().ToString());
+      ASSERT_NO_FATAL_FAILURE(CheckAndSave(iter.get(), true_data,
+                                           /*expected_keys_pinned=*/nullptr,
+                                           /*forward=*/true, &saved));
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(expected == true_data.end() || expected->first >= limit);
+  }
+  // LevelIterator prepares its file iterators as it opens them.
+  ASSERT_GT(options.statistics->getTickerCount(MULTISCAN_PREPARE_CALLS), 0u);
+  ASSERT_EQ(0u, options.statistics->getTickerCount(MULTISCAN_PREPARE_ERRORS));
+#ifndef NDEBUG
+  ASSERT_EQ(0, counters.dropped_with_cleanups.load());
+  // Every file iterator the scan left was prepared and is pinned.
+  ASSERT_GT(counters.pinned_file_iters.load(), 0);
+  ASSERT_EQ(0, counters.dropped_file_iters.load());
+#endif
+  ASSERT_NO_FATAL_FAILURE(VerifySaved(saved));
+}
+
+// An immortal mmap table whose data-block keys are delta encoded: the values
+// still point into the mapping (so the file iterators are dropped), but keys
+// that are not at a restart point are reconstructed into the DBIter's buffer
+// and are not pinned. Checks that dropping the iterators while pinning leaves
+// both the saved values (pinned, in the mapping) and keys (copied out) valid.
+TEST_F(DBIteratorBaseTest, PinnedDataIteratorImmortalMmapDeltaEncodedKeys) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_BYPASS("Test requires mmap reads");
+    return;
+  }
+  PinCounters counters;
+
+  Options options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.disable_auto_compactions = true;
+  options.level_compaction_dynamic_level_bytes = false;
+  BlockBasedTableOptions table_options;
+  table_options.use_delta_encoding = true;
+  table_options.index_type = BlockBasedTableOptions::IndexType::kBinarySearch;
+  table_options.block_size = 1024;
+  table_options.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  std::map<std::string, std::string> true_data;
+  Random rnd(301);
+  ASSERT_NO_FATAL_FAILURE(
+      WriteInterleavedLevels(this, &rnd, [](int /*level*/) {}, &true_data));
+
+  options.allow_mmap_reads = true;
+  options.max_open_files = -1;
+  ASSERT_OK(ReadOnlyReopen(options));
+  counters.Reset();
+
+  ReadOptions ro;
+  ro.pin_data = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  std::vector<SavedEntry> saved;
+  // is-key-pinned varies: restart-point keys are stored in full (pinned),
+  // delta-encoded keys are not.
+  ASSERT_NO_FATAL_FAILURE(SeekAndScanAll(iter.get(), &rnd, true_data,
+                                         /*expected_keys_pinned=*/nullptr,
+                                         &saved));
+#ifndef NDEBUG
+  ASSERT_EQ(0, counters.dropped_with_cleanups.load());
+  ASSERT_GT(counters.dropped_file_iters.load(), 0);
+#endif
+  ASSERT_NO_FATAL_FAILURE(VerifySaved(saved));
+}
+#endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
+
 TEST_P(DBIteratorTest, PinnedDataIteratorMergeOperator) {
   Options options = CurrentOptions();
   BlockBasedTableOptions table_options;
@@ -2725,6 +3725,7 @@ TEST_P(DBIteratorTest, IteratorWithLocalStatistics) {
     total_bytes += bytes;
   };
 
+  threads.reserve(10 + 15);
   for (int i = 0; i < 10; i++) {
     threads.emplace_back(reader_func_next);
   }
@@ -3828,6 +4829,71 @@ INSTANTIATE_TEST_CASE_P(DBIteratorTestInstance, DBIteratorTest,
 // Tests how DBIter work with ReadCallback
 class DBIteratorWithReadCallbackTest : public DBIteratorTest {};
 
+#ifdef OS_LINUX
+TEST_F(DBIteratorWithReadCallbackTest,
+       PrevReseekVisibilityScanChecksQueryAbort) {
+  class TestReadCallback : public ReadCallback {
+   public:
+    explicit TestReadCallback(SequenceNumber max_visible_seq)
+        : ReadCallback(max_visible_seq) {}
+
+    bool IsVisibleFullCheck(SequenceNumber seq) override {
+      return seq <= max_visible_seq_;
+    }
+  };
+
+  Options options = CurrentOptions();
+  options.max_sequential_skip_in_iterations = 2;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("b", "visible"));
+  }
+  ASSERT_OK(Put("c", "vc"));
+  TestReadCallback callback(db_->GetLatestSequenceNumber());
+  ASSERT_OK(Put("b", "hidden"));
+
+  auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
+      db_->DefaultColumnFamily());
+  auto* cfd = cfh->cfd();
+  DBImpl* db_impl = dbfull();
+  SuperVersion* super_version = cfd->GetReferencedSuperVersion(db_impl);
+  std::unique_ptr<Iterator> iter(
+      db_impl->NewIteratorImpl(ReadOptions(), cfh, super_version,
+                               db_->GetLatestSequenceNumber(), &callback));
+  iter->Seek("c");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/0);
+    iter->Prev();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key(), "b");
+    // One check reaches "b", two trigger the reseek, one skips the invisible
+    // value, and two finish positioning before "b".
+    ASSERT_EQ(abort.check_count(), 6);
+  }
+
+  super_version = cfd->GetReferencedSuperVersion(db_impl);
+  iter.reset(db_impl->NewIteratorImpl(ReadOptions(), cfh, super_version,
+                                      db_->GetLatestSequenceNumber(),
+                                      &callback));
+  iter->Seek("c");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(iter->status());
+  {
+    ScopedQueryAbort abort(/*abort_after_check_count=*/4);
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_TRUE(iter->status().IsAborted());
+    ASSERT_EQ(abort.check_count(), 4);
+  }
+}
+#endif  // OS_LINUX
+
 TEST_F(DBIteratorWithReadCallbackTest, ReadCallback) {
   class TestReadCallback : public ReadCallback {
    public:
@@ -4027,7 +5093,7 @@ TEST_F(DBIteratorTest, IteratorRefreshReturnSV) {
 
 TEST_F(DBIteratorTest, ErrorWhenReadFile) {
   // This is to test a bug that is fixed in
-  // https://github.com/facebook/rocksdb/pull/11782.
+  // https://github.com/meta/rocksdb/pull/11782.
   //
   // Ingest error when reading from a file, and
   // see if Iterator handles it correctly.
@@ -4073,7 +5139,9 @@ TEST_F(DBIteratorTest, ErrorWhenReadFile) {
   db_->GetLiveFilesMetaData(&files);
   // Get file names for F1, F2 and F3.
   // These are file names, not full paths.
-  std::string f1, f2, f3;
+  std::string f1;
+  std::string f2;
+  std::string f3;
   for (auto& file_meta : files) {
     if (file_meta.level == 6) {
       f3 = file_meta.name;
@@ -5069,6 +6137,8 @@ TEST_P(DBMultiScanIteratorTest, FailureTest) {
   scan_options.insert(key_ranges[0], key_ranges[1]);
   scan_options.insert(key_ranges[2], key_ranges[3]);
   scan_options.max_prefetch_size = 4500;
+  scan_options.rolling_prefetch = true;
+  scan_options.rolling_prefetch_window_size = 4500;
   ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
   std::unique_ptr<Iterator> iter(dbfull()->NewIterator(ro, cfh));
   ASSERT_NE(iter, nullptr);
@@ -5139,6 +6209,10 @@ TEST_P(DBMultiScanIteratorTest, OutOfL0FileRange) {
   ro.iterate_upper_bound = &ub;
   ro.fill_cache = GetParam();
   MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.use_async_io = true;
+  scan_options.max_prefetch_size = 64 << 10;
+  scan_options.rolling_prefetch = true;
+  scan_options.rolling_prefetch_window_size = 128 << 10;
   scan_options.insert(key_ranges[0], key_ranges[1]);
   scan_options.insert(key_ranges[2], key_ranges[3]);
   ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
@@ -5284,8 +6358,7 @@ TEST_P(DBMultiScanIteratorTest, FragmentedRangeTombstones) {
           if (kiter != kvs.end()) {
             kvs.erase(kiter);
           }
-          auto res =
-              kvs.emplace(std::make_pair(Key(i), rnd->RandomString(2 << 10)));
+          auto res = kvs.emplace(Key(i), rnd->RandomString(2 << 10));
           ASSERT_OK(writer->Put(res.first->first, res.first->second));
         }
         ASSERT_OK(writer->Finish());
@@ -5547,6 +6620,8 @@ TEST_P(DBMultiScanIteratorTest, ReversePrefetchAcrossMultipleRanges) {
   MultiScanArgs scan_options(BytewiseComparator());
   scan_options.use_async_io = false;
   scan_options.reverse = true;
+  scan_options.rolling_prefetch = true;
+  scan_options.rolling_prefetch_window_size = 64 << 10;
   scan_options.io_dispatcher = tracking_dispatcher;
   std::vector<std::string> key_ranges(
       {Key(100), Key(200), Key(500), Key(600), Key(800), Key(900)});
@@ -7167,10 +8242,10 @@ TEST_P(ReadPathRangeTombstoneTest,
 
 TEST_P(ReadPathRangeTombstoneTest, PrefixFilterOutOfDomainSeek) {
   // With an out-of-domain seek target, prefix_same_as_start cannot establish
-  // a seek-prefix bound. The iterator therefore behaves like an unrestricted
-  // scan while still avoiding Transform() on the short seek target, so the
-  // valid run [bbbb, bbdd) should be converted even though it spans multiple
-  // distinct prefixes.
+  // a seek-prefix bound. The iterator scans past the seek prefix while the
+  // child iterators still use prefix seek, which can skip live keys, so the
+  // run [bbbb, bbdd) must not be converted. The scan must still avoid
+  // Transform() on the short seek target.
   Options options = CurrentOptions();
   options.min_tombstones_for_range_conversion = 2;
   options.statistics = CreateDBStatistics();
@@ -7210,8 +8285,7 @@ TEST_P(ReadPathRangeTombstoneTest, PrefixFilterOutOfDomainSeek) {
     }
   }
   ASSERT_OK(it->status());
-  ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
-  AssertRange(0, "bbbb", "bbdd");
+  ASSERT_TRUE(attempted_insert_ranges_.empty());
 }
 
 TEST_P(ReadPathRangeTombstoneTest, TableFilterNotAllowed) {
@@ -7356,8 +8430,9 @@ TEST_P(ReadPathRangeTombstoneTest, NoInsertionOnBlockCacheTierIncomplete) {
     ASSERT_TRUE(iter->status().IsIncomplete());
   }
 
-  // No range tombstone should have been inserted despite meeting threshold,
-  // because the iterator terminated with Incomplete (cache miss).
+  // No range tombstone should have been inserted despite meeting threshold:
+  // conversion is disabled for kBlockCacheTier, and the iterator terminated
+  // with Incomplete (cache miss).
   ASSERT_EQ(attempted_insert_ranges_.size(), 0);
   ASSERT_EQ(
       options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
@@ -7369,6 +8444,154 @@ TEST_P(ReadPathRangeTombstoneTest, NoInsertionOnBlockCacheTierIncomplete) {
   } else {
     ASSERT_EQ(Get("a"), "va");
   }
+}
+
+TEST_P(ReadPathRangeTombstoneTest, NoInsertionFromMemtableTierIterator) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  // "c" is live and only exists in an SST file, which a kMemtableTier
+  // iterator does not read.
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("d"));
+  ASSERT_OK(Put("e", "ve"));
+
+  {
+    ReadOptions ro;
+    ro.read_tier = kMemtableTier;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    std::vector<std::string> seen;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString());
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        seen.insert(seen.begin(), iter->key().ToString());
+      }
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(seen, std::vector<std::string>({"a", "e"}));
+  }
+
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(Get("c"), "vc");
+}
+
+TEST_P(ReadPathRangeTombstoneTest, PartialTierReadsAfterConversion) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  BlockBasedTableOptions table_options;
+  table_options.flush_block_policy_factory =
+      std::make_shared<FlushBlockEveryKeyPolicyFactory>();
+  std::shared_ptr<Cache> block_cache = NewLRUCache(1 << 20);
+  table_options.block_cache = block_cache;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  // Conversion starts disabled so the reads recorded before it do not insert.
+  DestroyAndReopen(options);
+
+  for (char c = 'a'; c <= 'h'; c++) {
+    ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("c"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("a", "va2"));
+  ASSERT_OK(Delete("d"));
+  ASSERT_OK(Put("e", "ve2"));
+  ASSERT_OK(Delete("e"));
+
+  auto scan = [&](ReadTier tier) {
+    ReadOptions ro;
+    ro.read_tier = tier;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    std::vector<std::string> out;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        out.push_back(iter->key().ToString() + "=" + iter->value().ToString());
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        out.insert(out.begin(),
+                   iter->key().ToString() + "=" + iter->value().ToString());
+      }
+    }
+    out.push_back(iter->status().ToString());
+    return out;
+  };
+  // kMemtableTier only affects iterators, so point reads compare
+  // kBlockCacheTier with kReadAllTier.
+  auto gets = [&](ReadTier tier) {
+    ReadOptions ro;
+    ro.read_tier = tier;
+    std::vector<std::string> out;
+    for (char c = 'a'; c <= 'h'; c++) {
+      std::string value;
+      Status s = db_->Get(ro, std::string(1, c), &value);
+      out.push_back(std::string(1, c) + ":" + (s.ok() ? value : s.ToString()));
+    }
+    return out;
+  };
+
+  const auto cold_cache_scan_before = scan(kBlockCacheTier);
+  const auto cold_cache_gets_before = gets(kBlockCacheTier);
+  const std::string incomplete =
+      Status::Incomplete("no blocking io").ToString();
+  ASSERT_EQ(cold_cache_scan_before.back(), incomplete);
+  ASSERT_EQ(cold_cache_gets_before[1], "b:" + incomplete);
+  ASSERT_EQ(cold_cache_gets_before[2], "c:" + incomplete);
+
+  // A full scan with conversion disabled reads every block into the cache.
+  const std::vector<std::string> full_view = {"a=va2", "f=vf", "g=vg", "h=vh",
+                                              "OK"};
+  ASSERT_EQ(scan(kReadAllTier), full_view);
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+
+  const auto mem_scan_before = scan(kMemtableTier);
+  ASSERT_EQ(mem_scan_before, std::vector<std::string>({"a=va2", "OK"}));
+  const auto warm_cache_scan_before = scan(kBlockCacheTier);
+  ASSERT_EQ(warm_cache_scan_before, full_view);
+  const auto warm_cache_gets_before = gets(kBlockCacheTier);
+  const auto full_gets = gets(kReadAllTier);
+  ASSERT_EQ(warm_cache_gets_before, full_gets);
+
+  ASSERT_OK(db_->SetOptions({{"min_tombstones_for_range_conversion", "2"}}));
+  // A complete kBlockCacheTier scan does not convert. Only kReadAllTier does.
+  ASSERT_EQ(scan(kBlockCacheTier), warm_cache_scan_before);
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0);
+  ASSERT_EQ(scan(kReadAllTier), full_view);
+  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+  AssertRange(0, "b", "f");
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      1);
+
+  ASSERT_EQ(scan(kMemtableTier), mem_scan_before);
+  ASSERT_EQ(scan(kBlockCacheTier), warm_cache_scan_before);
+  ASSERT_EQ(gets(kBlockCacheTier), warm_cache_gets_before);
+
+  // With a cold cache, Gets of the covered keys "b" and "c" now stop at the
+  // memtable range tombstone and return the full-tier NotFound instead of
+  // Incomplete. No read returns a different value.
+  block_cache->EraseUnRefEntries();
+  ASSERT_EQ(scan(kBlockCacheTier), cold_cache_scan_before);
+  auto expected_cold_cache_gets = cold_cache_gets_before;
+  expected_cold_cache_gets[1] = full_gets[1];
+  expected_cold_cache_gets[2] = full_gets[2];
+  ASSERT_EQ(gets(kBlockCacheTier), expected_cold_cache_gets);
 }
 
 TEST_P(ReadPathRangeTombstoneTest, SkipInsertionWhenCoveredByExistingRange) {
@@ -8064,6 +9287,361 @@ TEST_P(ReadPathRangeTombstoneTest,
   ASSERT_EQ(snap_value, "vc");
 
   db_->ReleaseSnapshot(snap);
+}
+
+// An ingested file that gets no new sequence number is invisible to an
+// iterator created before the ingestion. That iterator must not convert the
+// deleted keys around the file into a range tombstone that covers it.
+TEST_P(ReadPathRangeTombstoneTest, IngestedFileSurvivesOlderIterator) {
+  enum class IngestMode { kSeqnoZero, kIngestBehind, kDbGenerated };
+  for (IngestMode mode : {IngestMode::kSeqnoZero, IngestMode::kIngestBehind,
+                          IngestMode::kDbGenerated}) {
+    SCOPED_TRACE("ingest mode " + std::to_string(static_cast<int>(mode)));
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    options.cf_allow_ingest_behind = mode == IngestMode::kIngestBehind;
+    DestroyAndReopen(options);
+
+    std::string file = dbname_ + "/ingest_c.sst";
+    SequenceNumber expected_file_seqno = 0;
+    if (mode == IngestMode::kDbGenerated) {
+      const std::string src_path = dbname_ + "_src";
+      ASSERT_OK(DestroyDB(src_path, options));
+      std::unique_ptr<DB> src;
+      ASSERT_OK(DB::Open(options, src_path, &src));
+      ASSERT_OK(src->Put(WriteOptions(), "c", "vc"));
+      ASSERT_OK(src->Flush(FlushOptions()));
+      std::vector<LiveFileMetaData> src_files;
+      src->GetLiveFilesMetaData(&src_files);
+      ASSERT_EQ(src_files.size(), 1);
+      expected_file_seqno = src_files[0].largest_seqno;
+      ASSERT_GT(expected_file_seqno, 0);
+      file = src_files[0].directory + "/" + src_files[0].relative_filename;
+      ASSERT_OK(src->Close());
+    } else {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("c", "vc"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    for (const char* key : {"a", "b", "d", "e", "f", "g"}) {
+      ASSERT_OK(Put(key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Delete("d"));
+    // The iterator sequence number must be above the DB-generated file's.
+    ASSERT_OK(Delete("f"));
+    ASSERT_GT(db_->GetLatestSequenceNumber(), expected_file_seqno);
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+
+    // "c" falls between the deleted keys and overlaps no key in the DB.
+    IngestExternalFileOptions ifo;
+    ifo.ingest_behind = mode == IngestMode::kIngestBehind;
+    ifo.allow_db_generated_files = mode == IngestMode::kDbGenerated;
+    ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    bool found = false;
+    for (const auto& f : files) {
+      if (f.smallestkey == "c") {
+        found = true;
+        ASSERT_EQ(f.level, options.num_levels - 1);
+        ASSERT_EQ(f.largest_seqno, expected_file_seqno);
+      }
+    }
+    ASSERT_TRUE(found);
+    ASSERT_EQ(Get("c"), "vc");
+
+    // The iterator predates the ingestion, so it sees b and d as one run of
+    // deleted keys.
+    attempted_insert_ranges_.clear();
+    if (Forward()) {
+      iter->SeekToFirst();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "a");
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "e");
+    } else {
+      iter->SeekToLast();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "g");
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "e");
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "a");
+    }
+    ASSERT_OK(iter->status());
+    iter.reset();
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+    AssertRange(0, "b", "e");
+
+    EXPECT_EQ(Get("c"), "vc");
+    VerifyIteration({"a", "c", "e", "g"});
+    ASSERT_OK(Flush());
+    Reopen(options);
+    EXPECT_EQ(Get("c"), "vc");
+  }
+}
+
+// NewIterator() references the SuperVersion before it reads the sequence
+// number. An ingestion plus a write in between gives the iterator a sequence
+// number above the ingested files' while its SuperVersion lacks them. It must
+// not convert the deleted keys around those files into a range tombstone.
+TEST_P(ReadPathRangeTombstoneTest,
+       IngestedFileSurvivesIteratorWithOlderSuperVersion) {
+  for (bool new_seqno : {false, true}) {
+    SCOPED_TRACE(new_seqno ? "ingested with a new seqno"
+                           : "ingested with seqno zero");
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    for (const char* key : {"a", "b", "d", "e"}) {
+      ASSERT_OK(Put(key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Delete("d"));
+    // The memtable stays empty, so the ingestion does not switch it.
+    ASSERT_OK(Flush());
+
+    // "c" alone overlaps no key, so it gets seqno zero. Adding "b" overlaps
+    // the deleted "b" in L0, so the file gets a new seqno.
+    const std::string file = dbname_ + "/ingest.sst";
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    if (new_seqno) {
+      ASSERT_OK(writer.Put("b", "vb2"));
+    }
+    ASSERT_OK(writer.Put("c", "vc"));
+    ASSERT_OK(writer.Finish());
+
+    SyncPoint::GetInstance()->LoadDependency(
+        {{"DBImpl::NewIterator:1",
+          "ReadPathRangeTombstoneTest::OlderSuperVersion:Ingest"},
+         {"ReadPathRangeTombstoneTest::OlderSuperVersion:Written",
+          "DBImpl::NewIterator:2"}});
+    std::unique_ptr<Iterator> iter;
+    port::Thread reader([&]() { iter.reset(db_->NewIterator(ReadOptions())); });
+    TEST_SYNC_POINT("ReadPathRangeTombstoneTest::OlderSuperVersion:Ingest");
+    ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+    ASSERT_OK(Put("z", "vz"));
+    TEST_SYNC_POINT("ReadPathRangeTombstoneTest::OlderSuperVersion:Written");
+    reader.join();
+    SyncPoint::GetInstance()->ClearTrace();
+    SyncPoint::GetInstance()->LoadDependency({});
+
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    bool found = false;
+    for (const auto& f : files) {
+      if (f.largestkey == "c") {
+        found = true;
+        ASSERT_EQ(f.largest_seqno > 0, new_seqno);
+      }
+    }
+    ASSERT_TRUE(found);
+
+    // The iterator reads past the write of "z" but not the ingested file.
+    attempted_insert_ranges_.clear();
+    std::vector<std::string> seen;
+    if (Forward()) {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString());
+      }
+    } else {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        seen.insert(seen.begin(), iter->key().ToString());
+      }
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(seen, std::vector<std::string>({"a", "e", "z"}));
+    iter.reset();
+    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
+    AssertRange(0, "b", "e");
+
+    EXPECT_EQ(Get("c"), "vc");
+    EXPECT_EQ(Get("b"), new_seqno ? "vb2" : "NOT_FOUND");
+    ASSERT_OK(Flush());
+    Reopen(options);
+    EXPECT_EQ(Get("c"), "vc");
+  }
+}
+
+// One IngestExternalFiles() call installs files in two column families. Each
+// column family's older iterator must refuse its conversion.
+TEST_P(ReadPathRangeTombstoneTest, AtomicIngestionSurvivesOlderIterators) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  std::vector<std::string> files;
+  for (int cf = 0; cf < 2; cf++) {
+    files.push_back(dbname_ + "/ingest_c" + std::to_string(cf) + ".sst");
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(files.back()));
+    ASSERT_OK(writer.Put("c", "vc"));
+    ASSERT_OK(writer.Finish());
+    for (const char* key : {"a", "b", "d", "e"}) {
+      ASSERT_OK(Put(cf, key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush(cf));
+    ASSERT_OK(Delete(cf, "b"));
+    ASSERT_OK(Delete(cf, "d"));
+  }
+  std::unique_ptr<Iterator> it0(db_->NewIterator(ReadOptions(), handles_[0]));
+  std::unique_ptr<Iterator> it1(db_->NewIterator(ReadOptions(), handles_[1]));
+  std::vector<IngestExternalFileArg> args(2);
+  for (int cf = 0; cf < 2; cf++) {
+    args[cf].column_family = handles_[cf];
+    args[cf].external_files = {files[cf]};
+  }
+  ASSERT_OK(db_->IngestExternalFiles(args));
+
+  attempted_insert_ranges_.clear();
+  for (auto* it : {it0.get(), it1.get()}) {
+    if (Forward()) {
+      for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      }
+    } else {
+      for (it->SeekToLast(); it->Valid(); it->Prev()) {
+      }
+    }
+    ASSERT_OK(it->status());
+  }
+  it0.reset();
+  it1.reset();
+  EXPECT_EQ(attempted_insert_ranges_.size(), 2);
+  EXPECT_EQ(Get(0, "c"), "vc");
+  EXPECT_EQ(Get(1, "c"), "vc");
+}
+
+// An iterator created after an ingestion sees the ingested files, so the
+// barrier must still let it convert.
+TEST_P(ReadPathRangeTombstoneTest, IteratorCreatedAfterIngestionConverts) {
+  for (bool seqno_zero : {true, false}) {
+    SCOPED_TRACE(seqno_zero ? "ingested with seqno zero"
+                            : "ingested with a new seqno");
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    options.statistics = CreateDBStatistics();
+    DestroyAndReopen(options);
+
+    // "x" alone overlaps no key, so it gets seqno zero. Adding "e" overlaps
+    // the flushed "e", so the file gets a new seqno.
+    const std::string file = dbname_ + "/ingest_x.sst";
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    if (!seqno_zero) {
+      ASSERT_OK(writer.Put("e", "ve2"));
+    }
+    ASSERT_OK(writer.Put("x", "vx"));
+    ASSERT_OK(writer.Finish());
+    for (const char* key : {"a", "b", "c", "d", "e"}) {
+      ASSERT_OK(Put(key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Delete("c"));
+    ASSERT_OK(Delete("d"));
+    IngestExternalFileOptions ifo;
+    ifo.allow_blocking_flush = false;
+    ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+
+    {
+      std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+      for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      }
+      ASSERT_OK(it->status());
+    }
+    EXPECT_EQ(TestGetTickerCount(options, READ_PATH_RANGE_TOMBSTONES_INSERTED),
+              1);
+    VerifyIteration({"a", "e", "x"});
+    EXPECT_EQ(Get("e"), seqno_zero ? "ve" : "ve2");
+  }
+}
+
+// A conversion that runs before an ingestion leaves a range tombstone in the
+// memtable over the gap where the file lands. The ingestion must either fail
+// or make the file visible, whatever the ingestion options.
+TEST_P(ReadPathRangeTombstoneTest, IngestionAfterConversionIsNeverHidden) {
+  enum class IngestMode {
+    kNoGlobalSeqnoNoFlush,
+    kNoGlobalSeqno,
+    kGlobalSeqno,
+    kDbGenerated
+  };
+  for (IngestMode mode :
+       {IngestMode::kNoGlobalSeqnoNoFlush, IngestMode::kNoGlobalSeqno,
+        IngestMode::kGlobalSeqno, IngestMode::kDbGenerated}) {
+    SCOPED_TRACE("ingest mode " + std::to_string(static_cast<int>(mode)));
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    options.statistics = CreateDBStatistics();
+    DestroyAndReopen(options);
+
+    std::string file = dbname_ + "/ingest_c.sst";
+    if (mode == IngestMode::kDbGenerated) {
+      const std::string src_path = dbname_ + "_src";
+      ASSERT_OK(DestroyDB(src_path, options));
+      std::unique_ptr<DB> src;
+      ASSERT_OK(DB::Open(options, src_path, &src));
+      ASSERT_OK(src->Put(WriteOptions(), "c", "vc"));
+      ASSERT_OK(src->Flush(FlushOptions()));
+      std::vector<LiveFileMetaData> src_files;
+      src->GetLiveFilesMetaData(&src_files);
+      ASSERT_EQ(src_files.size(), 1);
+      file = src_files[0].directory + "/" + src_files[0].relative_filename;
+      ASSERT_OK(src->Close());
+    } else {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("c", "vc"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    for (const char* key : {"a", "b", "d", "e"}) {
+      ASSERT_OK(Put(key, std::string("v") + key));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Delete("d"));
+    attempted_insert_ranges_.clear();
+    VerifyIteration({"a", "e"});
+    ASSERT_EQ(TestGetTickerCount(options, READ_PATH_RANGE_TOMBSTONES_INSERTED),
+              1);
+    AssertRange(0, "b", "e");
+
+    IngestExternalFileOptions ifo;
+    ifo.allow_global_seqno = mode == IngestMode::kGlobalSeqno;
+    ifo.allow_blocking_flush = mode != IngestMode::kNoGlobalSeqnoNoFlush;
+    ifo.allow_db_generated_files = mode == IngestMode::kDbGenerated;
+    Status s = db_->IngestExternalFile({file}, ifo);
+    if (mode == IngestMode::kGlobalSeqno) {
+      ASSERT_OK(s);
+    } else {
+      ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    }
+
+    const std::string expected_c = s.ok() ? "vc" : "NOT_FOUND";
+    EXPECT_EQ(Get("c"), expected_c);
+    VerifyIteration(s.ok() ? std::vector<std::string>{"a", "c", "e"}
+                           : std::vector<std::string>{"a", "e"});
+    ASSERT_OK(Flush());
+    Reopen(options);
+    EXPECT_EQ(Get("c"), expected_c);
+  }
 }
 
 // SeekForPrev uses the reverse path: PrevInternal -> FindValueForCurrentKey.

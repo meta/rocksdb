@@ -8,14 +8,18 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <memory>
 
 #include "db/db_test_util.h"
+#include "db/log_format.h"
+#include "db/log_writer.h"
 #include "db/read_callback.h"
 #include "db/version_edit.h"
 #include "env/fs_readonly.h"
+#include "file/writable_file_writer.h"
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -27,6 +31,7 @@
 #include "rocksdb/utilities/replayer.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/testutil.h"
+#include "trace_replay/trace_replay.h"
 #include "util/defer.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
@@ -38,6 +43,16 @@ class DBTest2 : public DBTestBase {
  public:
   DBTest2() : DBTestBase("db_etc2_test", /*env_do_fsync=*/true) {}
 };
+
+std::vector<SequenceNumber> GetAllSnapshotsForTest(
+    DBImpl* db, SequenceNumber* oldest_write_conflict_snapshot,
+    SequenceNumber max_seq, SequenceNumber* oldest_snapshot) {
+  std::vector<SequenceNumber> snapshots =
+      db->snapshots().GetAll(oldest_write_conflict_snapshot, max_seq);
+  *oldest_snapshot = db->snapshots().OldestOr(
+      [db]() { return db->GetLastPublishedSequence(); }, nullptr);
+  return snapshots;
+}
 
 TEST_F(DBTest2, OpenForReadOnly) {
   std::unique_ptr<DB> db_ptr;
@@ -51,8 +66,9 @@ TEST_F(DBTest2, OpenForReadOnly) {
   // There should not be any subdirectories -- this is not checked here
   std::vector<std::string> files;
   ASSERT_OK(env_->GetChildren(dbname, &files));
+  const std::string dbname_prefix = dbname + "/";
   for (auto& f : files) {
-    ASSERT_OK(env_->DeleteFile(dbname + "/" + f));
+    ASSERT_OK(env_->DeleteFile(dbname_prefix + f));
   }
   // <dbname> should be empty now and we should be able to delete it
   ASSERT_OK(env_->DeleteDir(dbname));
@@ -82,8 +98,9 @@ TEST_F(DBTest2, OpenForReadOnlyWithColumnFamilies) {
   // There should not be any subdirectories -- this is not checked here
   std::vector<std::string> files;
   ASSERT_OK(env_->GetChildren(dbname, &files));
+  const std::string dbname_prefix = dbname + "/";
   for (auto& f : files) {
-    ASSERT_OK(env_->DeleteFile(dbname + "/" + f));
+    ASSERT_OK(env_->DeleteFile(dbname_prefix + f));
   }
   // <dbname> should be empty now and we should be able to delete it
   ASSERT_OK(env_->DeleteDir(dbname));
@@ -133,6 +150,27 @@ TEST_F(DBTest2, ReadOnlyDBWalInDbPathInitialized) {
   db_ptr.reset();
 }
 
+TEST_F(DBTest2, WaitForCompactAfterSnapshotReleaseOnReadOnlyDB) {
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = 100;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(Flush());
+  Close();
+
+  std::unique_ptr<DB> read_only_db;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &read_only_db));
+  const Snapshot* snapshot = read_only_db->GetSnapshot();
+  ASSERT_NE(snapshot, nullptr);
+  read_only_db->ReleaseSnapshot(snapshot);
+
+  WaitForCompactOptions wait_options;
+  wait_options.timeout = std::chrono::seconds(1);
+  ASSERT_OK(read_only_db->WaitForCompact(wait_options));
+}
+
 class PartitionedIndexTestListener : public EventListener {
  public:
   void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& info) override {
@@ -180,7 +218,7 @@ class PrefixFullBloomWithReverseComparator
   PrefixFullBloomWithReverseComparator()
       : DBTestBase("prefix_bloom_reverse", /*env_do_fsync=*/true) {}
   void SetUp() override { if_cache_filter_ = GetParam(); }
-  bool if_cache_filter_;
+  bool if_cache_filter_ = false;
 };
 
 TEST_P(PrefixFullBloomWithReverseComparator,
@@ -325,8 +363,8 @@ class DBTestSharedWriteBufferAcrossCFs
     use_old_interface_ = std::get<0>(GetParam());
     cost_cache_ = std::get<1>(GetParam());
   }
-  bool use_old_interface_;
-  bool cost_cache_;
+  bool use_old_interface_ = false;
+  bool cost_cache_ = false;
 };
 
 TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
@@ -362,9 +400,10 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   if (use_old_interface_) {
     options.db_write_buffer_size = 120000;  // this is the real limit
   } else if (!cost_cache_) {
-    options.write_buffer_manager.reset(new WriteBufferManager(114285));
+    options.write_buffer_manager = std::make_shared<WriteBufferManager>(114285);
   } else {
-    options.write_buffer_manager.reset(new WriteBufferManager(114285, cache));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(114285, cache);
   }
   options.write_buffer_size = 500000;  // this is never hit
   CreateAndReopenWithCF({"pikachu", "dobrynia", "nikitich"}, options);
@@ -566,7 +605,7 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
   options.write_buffer_size = 500000;  // this is never hit
   // Use a write buffer total size so that the soft limit is about
   // 105000.
-  options.write_buffer_manager.reset(new WriteBufferManager(120000));
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(120000);
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
   ASSERT_OK(DestroyDB(dbname2, options));
@@ -662,7 +701,7 @@ TEST_F(DBTest2, TestWriteBufferNoLimitWithCache) {
   options.write_buffer_size = 50000;  // this is never hit
   // Use a write buffer total size so that the soft limit is about
   // 105000.
-  options.write_buffer_manager.reset(new WriteBufferManager(0, cache));
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(0, cache);
   Reopen(options);
 
   ASSERT_OK(Put("foo", "bar"));
@@ -739,12 +778,12 @@ TEST_F(DBTest2, WalFilterTest) {
   // Create 3 batches with two keys each
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   // Test with all WAL processing options
   for (int option = 0;
@@ -840,6 +879,7 @@ TEST_F(DBTest2, WalFilterTest) {
         }
         break;
       }
+      case WalFilter::WalProcessingOption::kWalProcessingOptionMax:
       default:
         FAIL();  // unhandled case
     }
@@ -933,12 +973,12 @@ TEST_F(DBTest2, WalFilterTestWithChangeBatch) {
 
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1025,12 +1065,12 @@ TEST_F(DBTest2, WalFilterTestWithChangeBatchExtraKeys) {
 
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1121,8 +1161,7 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
           // (i.e. isn't flushed to SST file(s) for column_family_id)
           // add it to the cf_wal_keys_ map for verification.
           if (log_number_ >= log_number_for_cf) {
-            cf_wal_keys_[column_family_id].push_back(
-                std::string(key.data(), key.size()));
+            cf_wal_keys_[column_family_id].emplace_back(key.data(), key.size());
           }
           return Status::OK();
         }
@@ -1152,12 +1191,12 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
 
   std::vector<std::vector<std::string>> batch_keys_pre_flush(3);
 
-  batch_keys_pre_flush[0].push_back("key1");
-  batch_keys_pre_flush[0].push_back("key2");
-  batch_keys_pre_flush[1].push_back("key3");
-  batch_keys_pre_flush[1].push_back("key4");
-  batch_keys_pre_flush[2].push_back("key5");
-  batch_keys_pre_flush[2].push_back("key6");
+  batch_keys_pre_flush[0].emplace_back("key1");
+  batch_keys_pre_flush[0].emplace_back("key2");
+  batch_keys_pre_flush[1].emplace_back("key3");
+  batch_keys_pre_flush[1].emplace_back("key4");
+  batch_keys_pre_flush[2].emplace_back("key5");
+  batch_keys_pre_flush[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1181,12 +1220,12 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
   // Do some more writes
   std::vector<std::vector<std::string>> batch_keys_post_flush(3);
 
-  batch_keys_post_flush[0].push_back("key7");
-  batch_keys_post_flush[0].push_back("key8");
-  batch_keys_post_flush[1].push_back("key9");
-  batch_keys_post_flush[1].push_back("key10");
-  batch_keys_post_flush[2].push_back("key11");
-  batch_keys_post_flush[2].push_back("key12");
+  batch_keys_post_flush[0].emplace_back("key7");
+  batch_keys_post_flush[0].emplace_back("key8");
+  batch_keys_post_flush[1].emplace_back("key9");
+  batch_keys_post_flush[1].emplace_back("key10");
+  batch_keys_post_flush[2].emplace_back("key11");
+  batch_keys_post_flush[2].emplace_back("key12");
 
   // Write given keys in given batches
   for (size_t i = 0; i < batch_keys_post_flush.size(); i++) {
@@ -1357,7 +1396,8 @@ TEST_F(DBTest2, DuplicateSnapshot) {
   options = CurrentOptions(options);
   std::vector<const Snapshot*> snapshots;
   DBImpl* dbi = dbfull();
-  SequenceNumber oldest_ww_snap, first_ww_snap;
+  SequenceNumber oldest_ww_snap;
+  SequenceNumber first_ww_snap;
 
   ASSERT_OK(Put("k", "v"));  // inc seq
   snapshots.push_back(db_->GetSnapshot());
@@ -1373,15 +1413,607 @@ TEST_F(DBTest2, DuplicateSnapshot) {
   snapshots.push_back(db_->GetSnapshot());
 
   {
-    InstrumentedMutexLock l(dbi->mutex());
-    auto seqs = dbi->snapshots().GetAll(&oldest_ww_snap);
+    SequenceNumber oldest_snapshot = 0;
+    std::vector<SequenceNumber> seqs = GetAllSnapshotsForTest(
+        dbi, &oldest_ww_snap, kMaxSequenceNumber, &oldest_snapshot);
     ASSERT_EQ(seqs.size(), 4);  // duplicates are not counted
     ASSERT_EQ(oldest_ww_snap, first_ww_snap);
+    ASSERT_EQ(oldest_snapshot, snapshots.front()->GetSequenceNumber());
   }
 
   for (auto s : snapshots) {
     db_->ReleaseSnapshot(s);
   }
+}
+
+TEST_F(DBTest2, SnapshotWithoutDBMutex) {
+  // Creating and releasing a snapshot must not need the DB mutex when no
+  // compaction marking is needed. If they did, this would self-deadlock.
+  ASSERT_OK(Put("k", "v1"));
+  auto* dbi = dbfull();
+  dbi->TEST_LockMutex();
+  const Snapshot* s1 = db_->GetSnapshot();
+  const Snapshot* s2 = db_->GetSnapshot();
+  ASSERT_NE(s1, nullptr);
+  ASSERT_NE(s2, nullptr);
+  ASSERT_EQ(s1->GetSequenceNumber(), s2->GetSequenceNumber());
+  db_->ReleaseSnapshot(s2);
+  db_->ReleaseSnapshot(s1);
+  dbi->TEST_UnlockMutex();
+
+  uint64_t num_snapshots = 0;
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kNumSnapshots, &num_snapshots));
+  ASSERT_EQ(num_snapshots, 0);
+}
+
+TEST_F(DBTest2, SnapshotsInMultipleShards) {
+  // Force snapshots into different shards of the snapshot list and check
+  // that readers merge them correctly.
+  auto* dbi = dbfull();
+  uint32_t next_shard = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ShardedSnapshotList::New:Shard",
+      [&](void* arg) { *static_cast<uint32_t*>(arg) = next_shard; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("k", "v"));
+  next_shard = 5;
+  const Snapshot* s1 = db_->GetSnapshot();
+  const SequenceNumber seq_a = s1->GetSequenceNumber();
+  ASSERT_OK(Put("k", "v"));
+  next_shard = 2;
+  const Snapshot* s2 = dbi->GetSnapshotForWriteConflictBoundary();
+  const Snapshot* s3 = db_->GetSnapshot();
+  const SequenceNumber seq_b = s2->GetSequenceNumber();
+  ASSERT_EQ(s3->GetSequenceNumber(), seq_b);
+  next_shard = 7;
+  const Snapshot* s4 = db_->GetSnapshot();
+  ASSERT_EQ(s4->GetSequenceNumber(), seq_b);
+  ASSERT_OK(Put("k", "v"));
+  next_shard = dbi->snapshots().num_shards() - 1;
+  const Snapshot* s5 = db_->GetSnapshot();
+  const SequenceNumber seq_c = s5->GetSequenceNumber();
+  ASSERT_LT(seq_a, seq_b);
+  ASSERT_LT(seq_b, seq_c);
+
+  const ShardedSnapshotList& list = dbi->snapshots();
+  SequenceNumber oldest_ww = 0;
+  SequenceNumber oldest_snapshot = 0;
+  ASSERT_EQ(GetAllSnapshotsForTest(dbi, &oldest_ww, kMaxSequenceNumber,
+                                   &oldest_snapshot),
+            std::vector<SequenceNumber>({seq_a, seq_b, seq_c}));
+  ASSERT_EQ(oldest_snapshot, seq_a);
+  ASSERT_EQ(oldest_ww, seq_b);
+  ASSERT_EQ(GetAllSnapshotsForTest(dbi, &oldest_ww, seq_b, &oldest_snapshot),
+            std::vector<SequenceNumber>({seq_a, seq_b}));
+  ASSERT_EQ(oldest_snapshot, seq_a);
+  ASSERT_EQ(oldest_ww, seq_b);
+  ASSERT_EQ(GetAllSnapshotsForTest(dbi, &oldest_ww, seq_a, &oldest_snapshot),
+            std::vector<SequenceNumber>({seq_a}));
+  ASSERT_EQ(oldest_snapshot, seq_a);
+  ASSERT_EQ(oldest_ww, kMaxSequenceNumber);
+  ASSERT_FALSE(list.empty());
+  ASSERT_EQ(list.count(), 5);
+  ASSERT_EQ(list.OldestOr([dbi]() { return dbi->GetLastPublishedSequence(); },
+                          nullptr),
+            seq_a);
+  ASSERT_EQ(list.OldestOr([]() { return kMaxSequenceNumber; }, nullptr), seq_a);
+  ASSERT_EQ(list.GetOldestSnapshotSequence(), static_cast<int64_t>(seq_a));
+  ASSERT_EQ(list.GetOldestSnapshotTime(), s1->GetUnixTime());
+  uint64_t value = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumSnapshots, &value));
+  ASSERT_EQ(value, 5);
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kOldestSnapshotSequence, &value));
+  ASSERT_EQ(value, seq_a);
+
+  uint64_t release_count = 0;
+  ASSERT_EQ(list.OldestOr([dbi]() { return dbi->GetLastPublishedSequence(); },
+                          &release_count),
+            seq_a);
+  ASSERT_EQ(release_count, 0);
+  db_->ReleaseSnapshot(s1);
+  ASSERT_EQ(list.OldestOr([dbi]() { return dbi->GetLastPublishedSequence(); },
+                          &release_count),
+            seq_b);
+  ASSERT_EQ(release_count, 1);
+  ASSERT_EQ(list.OldestOr([]() { return kMaxSequenceNumber; }, nullptr), seq_b);
+  db_->ReleaseSnapshot(s2);
+  ASSERT_EQ(GetAllSnapshotsForTest(dbi, &oldest_ww, kMaxSequenceNumber,
+                                   &oldest_snapshot),
+            std::vector<SequenceNumber>({seq_b, seq_c}));
+  ASSERT_EQ(oldest_snapshot, seq_b);
+  ASSERT_EQ(oldest_ww, kMaxSequenceNumber);
+  db_->ReleaseSnapshot(s3);
+  db_->ReleaseSnapshot(s4);
+  ASSERT_EQ(list.OldestOr([dbi]() { return dbi->GetLastPublishedSequence(); },
+                          &release_count),
+            seq_c);
+  ASSERT_EQ(release_count, 4);
+  db_->ReleaseSnapshot(s5);
+
+  ASSERT_TRUE(list.empty());
+  ASSERT_EQ(list.count(), 0);
+  ASSERT_EQ(list.OldestOr([dbi]() { return dbi->GetLastPublishedSequence(); },
+                          &release_count),
+            dbi->GetLastPublishedSequence());
+  ASSERT_EQ(release_count, 5);
+  ASSERT_EQ(list.OldestOr([]() { return SequenceNumber{42}; }, nullptr), 42);
+  ASSERT_EQ(list.GetOldestSnapshotSequence(), 0);
+  ASSERT_EQ(list.GetOldestSnapshotTime(), 0);
+  ASSERT_TRUE(GetAllSnapshotsForTest(dbi, &oldest_ww, kMaxSequenceNumber,
+                                     &oldest_snapshot)
+                  .empty());
+  ASSERT_EQ(oldest_snapshot, dbi->GetLastPublishedSequence());
+  ASSERT_EQ(oldest_ww, kMaxSequenceNumber);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBTest2, OldestSnapshotTimeUsesMinimumShardHeadTime) {
+  // With equal sequence numbers in different shards, report the minimum wall
+  // clock among the shard heads. This remains approximate when the clock moves.
+  env_->SetMockSleep();
+  Options options = CurrentOptions();
+  options.env = env_;
+  Reopen(options);
+  ASSERT_OK(Put("k", "v"));
+  uint32_t next_shard = 3;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ShardedSnapshotList::New:Shard",
+      [&](void* arg) { *static_cast<uint32_t*>(arg) = next_shard; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Snapshot* a = db_->GetSnapshot();
+  env_->MockSleepForSeconds(100);
+  next_shard = 1;
+  const Snapshot* b = db_->GetSnapshot();
+  env_->MockSleepForSeconds(-200);
+  next_shard = 0;
+  const Snapshot* c = db_->GetSnapshot();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(a->GetSequenceNumber(), b->GetSequenceNumber());
+  ASSERT_EQ(a->GetSequenceNumber(), c->GetSequenceNumber());
+  ASSERT_GT(b->GetUnixTime(), a->GetUnixTime());
+  ASSERT_LT(c->GetUnixTime(), a->GetUnixTime());
+
+  uint64_t value = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kOldestSnapshotTime, &value));
+  ASSERT_EQ(value, static_cast<uint64_t>(c->GetUnixTime()));
+  db_->ReleaseSnapshot(c);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kOldestSnapshotTime, &value));
+  ASSERT_EQ(value, static_cast<uint64_t>(a->GetUnixTime()));
+  db_->ReleaseSnapshot(a);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kOldestSnapshotTime, &value));
+  ASSERT_EQ(value, static_cast<uint64_t>(b->GetUnixTime()));
+  db_->ReleaseSnapshot(b);
+}
+
+TEST_F(DBTest2, ExactOldestScanAfterGetAllShardRace) {
+  ASSERT_OK(Put("k", "v1"));
+  DBImpl* dbi = dbfull();
+  uint32_t next_shard = 0;
+  const Snapshot* missed_snapshot = nullptr;
+  const Snapshot* observed_snapshot = nullptr;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ShardedSnapshotList::New:Shard",
+      [&](void* arg) { *static_cast<uint32_t*>(arg) = next_shard; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "ShardedSnapshotList::GetAll:AfterShard", [&](void* arg) {
+        const uint32_t shard = *static_cast<uint32_t*>(arg);
+        if (shard != 0 || missed_snapshot != nullptr) {
+          return;
+        }
+        ASSERT_OK(Put("k", "v2"));
+        next_shard = 0;
+        missed_snapshot = db_->GetSnapshot();
+        ASSERT_OK(Put("k", "v3"));
+        next_shard = 1;
+        observed_snapshot = db_->GetSnapshot();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  SequenceNumber oldest_ww = 0;
+  std::vector<SequenceNumber> snapshots =
+      dbi->snapshots().GetAll(&oldest_ww, kMaxSequenceNumber);
+  const SequenceNumber oldest_snapshot = dbi->snapshots().OldestOr(
+      [dbi]() { return dbi->GetLastPublishedSequence(); }, nullptr);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_NE(missed_snapshot, nullptr);
+  ASSERT_NE(observed_snapshot, nullptr);
+  ASSERT_EQ(snapshots, std::vector<SequenceNumber>(
+                           {observed_snapshot->GetSequenceNumber()}));
+  ASSERT_EQ(oldest_snapshot, missed_snapshot->GetSequenceNumber());
+
+  db_->ReleaseSnapshot(missed_snapshot);
+  db_->ReleaseSnapshot(observed_snapshot);
+}
+
+TEST_F(DBTest2, TimestampedSnapshotReadsSequenceWithShardLocked) {
+  // Pause after shard selection but before locking it, then create a regular
+  // snapshot in that shard. The timestamped snapshot must read its sequence
+  // only after acquiring the shard lock, so it can append without scanning
+  // backwards while holding the DB mutex.
+  auto* dbi = dbfull();
+  ASSERT_OK(Put("k", "v1"));
+  const SequenceNumber ts_seq = dbi->GetLatestSequenceNumber();
+  const Snapshot* regular = nullptr;
+  bool in_callback = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ShardedSnapshotList::New:Shard", [&](void* arg) {
+        *static_cast<uint32_t*>(arg) = 0;
+        if (regular == nullptr && !in_callback) {
+          in_callback = true;
+          ASSERT_OK(Put("k", "v2"));
+          regular = db_->GetSnapshot();
+          in_callback = false;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto ret = dbi->CreateTimestampedSnapshot(kMaxSequenceNumber, /*ts=*/1);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(ret.first);
+  ASSERT_NE(regular, nullptr);
+  ASSERT_EQ(regular->GetSequenceNumber(), ts_seq + 1);
+  ASSERT_EQ(ret.second->GetSequenceNumber(), regular->GetSequenceNumber());
+
+  const ShardedSnapshotList& list = dbi->snapshots();
+  ASSERT_EQ(list.GetOldestSnapshotSequence(), static_cast<int64_t>(ts_seq + 1));
+  ASSERT_EQ(list.OldestOr([dbi]() { return dbi->GetLastPublishedSequence(); },
+                          nullptr),
+            ts_seq + 1);
+  SequenceNumber oldest_ww = 0;
+  SequenceNumber oldest_snapshot = 0;
+  ASSERT_TRUE(GetAllSnapshotsForTest(dbi, &oldest_ww, ts_seq, &oldest_snapshot)
+                  .empty());
+  ASSERT_EQ(oldest_snapshot, ts_seq + 1);
+  ASSERT_EQ(oldest_ww, kMaxSequenceNumber);
+  ASSERT_EQ(GetAllSnapshotsForTest(dbi, &oldest_ww, kMaxSequenceNumber,
+                                   &oldest_snapshot),
+            std::vector<SequenceNumber>({ts_seq + 1}));
+  ASSERT_EQ(oldest_ww, ts_seq + 1);
+
+  db_->ReleaseSnapshot(regular);
+  size_t remaining = 0;
+  ret.second.reset();
+  dbi->ReleaseTimestampedSnapshotsOlderThan(/*ts=*/2, &remaining);
+  ASSERT_EQ(remaining, 0);
+  ASSERT_TRUE(list.empty());
+}
+
+TEST_F(DBTest2, ExplicitTimestampedSnapshotPublishesSequenceUnderShardLock) {
+  auto* dbi = dbfull();
+  ASSERT_OK(Put("k", "v"));
+  const SequenceNumber snapshot_seq = dbi->GetLatestSequenceNumber() + 1;
+
+  port::Mutex mu;
+  port::CondVar cv(&mu);
+  bool reader_started = false;
+  bool reader_at_shard = false;
+  const Snapshot* regular = nullptr;
+  port::Thread reader;
+  SyncPoint::GetInstance()->SetCallBack("ShardedSnapshotList::New:Shard",
+                                        [&](void* arg) {
+                                          *static_cast<uint32_t*>(arg) = 0;
+                                          if (reader_started) {
+                                            MutexLock l(&mu);
+                                            reader_at_shard = true;
+                                            cv.SignalAll();
+                                          }
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CreateTimestampedSnapshot:BeforeSequencePublish", [&](void*) {
+        reader_started = true;
+        reader = port::Thread([&]() { regular = db_->GetSnapshot(); });
+        MutexLock l(&mu);
+        while (!reader_at_shard) {
+          cv.Wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto ret = dbi->CreateTimestampedSnapshot(snapshot_seq, /*ts=*/1);
+  reader.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(ret.first);
+  ASSERT_NE(regular, nullptr);
+  ASSERT_EQ(ret.second->GetSequenceNumber(), snapshot_seq);
+  ASSERT_EQ(regular->GetSequenceNumber(), snapshot_seq);
+  SequenceNumber oldest_ww = 0;
+  SequenceNumber oldest_snapshot = 0;
+  ASSERT_EQ(GetAllSnapshotsForTest(dbi, &oldest_ww, kMaxSequenceNumber,
+                                   &oldest_snapshot),
+            std::vector<SequenceNumber>({snapshot_seq}));
+  ASSERT_EQ(oldest_snapshot, snapshot_seq);
+  ASSERT_EQ(oldest_ww, snapshot_seq);
+
+  db_->ReleaseSnapshot(regular);
+  size_t remaining = 0;
+  ret.second.reset();
+  dbi->ReleaseTimestampedSnapshotsOlderThan(/*ts=*/2, &remaining);
+  ASSERT_EQ(remaining, 0);
+}
+
+TEST_F(DBTest2, SnapshotCreatedDuringIngestion) {
+  // Ingestion with snapshot_consistency checks in Run() whether any snapshot
+  // exists. Snapshot creation must wait while Run() executes, as it did when
+  // it took the DB mutex.
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+
+  SstFileWriter sst_file_writer{EnvOptions(), options};
+  const std::string external_file = dbname_ + "/ingest_snapshot.sst";
+  ASSERT_OK(sst_file_writer.Open(external_file));
+  ASSERT_OK(sst_file_writer.Put("z", "vz"));
+  ASSERT_OK(sst_file_writer.Finish());
+
+  port::Mutex mu;
+  port::CondVar cv(&mu);
+  bool reader_waiting = false;
+  bool reader_done = false;
+  const Snapshot* snapshot = nullptr;
+  port::Thread reader;
+  SyncPoint::GetInstance()->SetCallBack("ShardedSnapshotList::New:Wait",
+                                        [&](void*) {
+                                          MutexLock l(&mu);
+                                          reader_waiting = true;
+                                          cv.SignalAll();
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "ExternalSstFileIngestionJob::Run", [&](void*) {
+        reader = port::Thread([&]() {
+          snapshot = db_->GetSnapshot();
+          MutexLock l(&mu);
+          reader_done = true;
+          cv.SignalAll();
+        });
+        // Still inside Run(): the reader must be waiting, not done.
+        MutexLock l(&mu);
+        while (!reader_waiting && !reader_done) {
+          cv.Wait();
+        }
+        ASSERT_TRUE(reader_waiting);
+        ASSERT_FALSE(reader_done);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  IngestExternalFileOptions ifo;
+  ifo.snapshot_consistency = true;
+  ASSERT_OK(db_->IngestExternalFile({external_file}, ifo));
+  reader.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_NE(snapshot, nullptr);
+  db_->ReleaseSnapshot(snapshot);
+}
+
+TEST_F(DBTest2, SnapshotDuringIngestionManifestWrite) {
+  // Snapshot creation just before LogAndApply must still serialize on the DB
+  // mutex. Once LogAndApply releases it for the MANIFEST write, both that
+  // reader and a caller on the ingesting thread must be able to create a
+  // snapshot without waiting for ingestion to finish.
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+
+  SstFileWriter sst_file_writer{EnvOptions(), options};
+  const std::string external_file = dbname_ + "/ingest_manifest.sst";
+  ASSERT_OK(sst_file_writer.Open(external_file));
+  ASSERT_OK(sst_file_writer.Put("z", "vz"));
+  ASSERT_OK(sst_file_writer.Finish());
+
+  port::Mutex mu;
+  port::CondVar cv(&mu);
+  bool reader_retrying = false;
+  bool reader_done = false;
+  bool manifest_armed = false;
+  const Snapshot* reader_snapshot = nullptr;
+  const Snapshot* manifest_snapshot = nullptr;
+  port::Thread reader;
+  SyncPoint::GetInstance()->SetCallBack("ShardedSnapshotList::New:Wait",
+                                        [&](void*) {
+                                          MutexLock l(&mu);
+                                          reader_retrying = true;
+                                          cv.SignalAll();
+                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::IngestExternalFiles:BeforeLogAndApply", [&](void*) {
+        manifest_armed = true;
+        reader = port::Thread([&]() {
+          reader_snapshot = db_->GetSnapshot();
+          MutexLock l(&mu);
+          reader_done = true;
+          cv.SignalAll();
+        });
+        MutexLock l(&mu);
+        while (!reader_retrying && !reader_done) {
+          cv.Wait();
+        }
+        ASSERT_TRUE(reader_retrying);
+        ASSERT_FALSE(reader_done);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifest", [&](void*) {
+        if (manifest_armed) {
+          manifest_armed = false;
+          {
+            MutexLock l(&mu);
+            while (!reader_done) {
+              cv.Wait();
+            }
+          }
+          manifest_snapshot = db_->GetSnapshot();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(
+      db_->IngestExternalFile({external_file}, IngestExternalFileOptions()));
+  reader.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_NE(reader_snapshot, nullptr);
+  ASSERT_NE(manifest_snapshot, nullptr);
+  db_->ReleaseSnapshot(reader_snapshot);
+  db_->ReleaseSnapshot(manifest_snapshot);
+}
+
+TEST_F(DBTest2, SnapshotSupportTransitionIsLinearizable) {
+  Options options = CurrentOptions();
+  options.allow_concurrent_memtable_write = false;
+  DestroyAndReopen(options);
+
+  port::Mutex mu;
+  port::CondVar cv(&mu);
+  bool getter_paused = false;
+  bool resume_getter = false;
+  const Snapshot* snapshot = nullptr;
+  SyncPoint::GetInstance()->SetCallBack("ShardedSnapshotList::New:Shard",
+                                        [&](void*) {
+                                          MutexLock l(&mu);
+                                          getter_paused = true;
+                                          cv.SignalAll();
+                                          while (!resume_getter) {
+                                            cv.Wait();
+                                          }
+                                        });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  port::Thread getter([&]() { snapshot = db_->GetSnapshot(); });
+  {
+    MutexLock l(&mu);
+    while (!getter_paused) {
+      cv.Wait();
+    }
+  }
+
+  ColumnFamilyOptions cf_options(options);
+  cf_options.inplace_update_support = true;
+  ColumnFamilyHandle* handle = nullptr;
+  Status create_status =
+      db_->CreateColumnFamily(cf_options, "in_place", &handle);
+  {
+    MutexLock l(&mu);
+    resume_getter = true;
+    cv.SignalAll();
+  }
+  getter.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(create_status);
+  ASSERT_EQ(snapshot, nullptr);
+  delete handle;
+}
+
+TEST_F(DBTest2, SnapshotCreatedDuringSnapshotContextInit) {
+  // A compaction holds the DB mutex while it picks input files and reads the
+  // snapshot list. A snapshot created in that window (now possible, since
+  // GetSnapshot() does not take the DB mutex) is either included in the
+  // compaction's snapshot list, or has a sequence number no smaller than any
+  // key in the compaction input. Either way, it must keep seeing the values
+  // that were current when it was created.
+  // NonTrivial: before the compaction reads the snapshot list.
+  // BeforeInit: after the compaction reads the snapshot list.
+  for (const char* sync_point : {"DBImpl::BackgroundCompaction:NonTrivial",
+                                 "DBImpl::InitSnapshotContext:BeforeInit"}) {
+    SCOPED_TRACE(sync_point);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    ASSERT_OK(Put("a", "a1"));
+    ASSERT_OK(Put("b", "b1"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("a", "a2"));
+    ASSERT_OK(Delete("b"));
+    ASSERT_OK(Flush());
+
+    const Snapshot* snapshot = nullptr;
+    SyncPoint::GetInstance()->SetCallBack(sync_point, [&](void*) {
+      if (snapshot == nullptr) {
+        snapshot = db_->GetSnapshot();
+      }
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_NE(snapshot, nullptr);
+
+    ASSERT_OK(Put("a", "a3"));
+    ASSERT_OK(Put("b", "b3"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+    ReadOptions ro;
+    ro.snapshot = snapshot;
+    std::string value;
+    ASSERT_OK(db_->Get(ro, "a", &value));
+    ASSERT_EQ(value, "a2");
+    ASSERT_TRUE(db_->Get(ro, "b", &value).IsNotFound());
+    db_->ReleaseSnapshot(snapshot);
+  }
+}
+
+TEST_F(DBTest2, ConcurrentSnapshotsWithFlushAndCompaction) {
+  // Snapshot create/release from many threads while a writer flushes and
+  // compacts. Each snapshot must see a stable value. Mainly for TSAN.
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level0_file_num_compaction_trigger = 2;
+  Reopen(options);
+  ASSERT_OK(Put("k", "0"));
+
+  constexpr int kNumReaders = 8;
+  constexpr int kReadsPerReader = 200;
+  constexpr int kWrites = 100;
+  std::atomic<bool> writer_done{false};
+
+  std::vector<port::Thread> threads;
+  threads.emplace_back([&]() {
+    for (int i = 1; i <= kWrites; ++i) {
+      ASSERT_OK(Put("k", std::to_string(i)));
+      if (i % 10 == 0) {
+        ASSERT_OK(Flush());
+      }
+      if (i % 30 == 0) {
+        ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+      }
+    }
+    writer_done.store(true);
+  });
+  for (int t = 0; t < kNumReaders; ++t) {
+    threads.emplace_back([&]() {
+      for (int i = 0; i < kReadsPerReader || !writer_done.load(); ++i) {
+        const Snapshot* snapshot = db_->GetSnapshot();
+        ASSERT_NE(snapshot, nullptr);
+        ReadOptions ro;
+        ro.snapshot = snapshot;
+        std::string v1;
+        std::string v2;
+        ASSERT_OK(db_->Get(ro, "k", &v1));
+        ASSERT_OK(db_->Get(ro, "k", &v2));
+        ASSERT_EQ(v1, v2);
+        db_->ReleaseSnapshot(snapshot);
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  uint64_t num_snapshots = 0;
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kNumSnapshots, &num_snapshots));
+  ASSERT_EQ(num_snapshots, 0);
 }
 
 class PinL0IndexAndFilterBlocksTest
@@ -1430,8 +2062,8 @@ class PinL0IndexAndFilterBlocksTest
     table_options.block_cache->EraseUnRefEntries();
   }
 
-  bool infinite_max_files_;
-  bool disallow_preload_;
+  bool infinite_max_files_ = false;
+  bool disallow_preload_ = false;
 };
 
 TEST_P(PinL0IndexAndFilterBlocksTest,
@@ -1882,7 +2514,6 @@ TEST_F(DBTest2, TestPerfContextIterCpuTime) {
 }
 #endif  // OS_LINUX
 
-#if !defined OS_SOLARIS
 TEST_F(DBTest2, PersistentCache) {
   int num_iter = 80;
 
@@ -1896,8 +2527,8 @@ TEST_F(DBTest2, PersistentCache) {
   for (auto bsize : bsizes) {
     for (auto type : types) {
       BlockBasedTableOptions table_options;
-      table_options.persistent_cache.reset(
-          new MockPersistentCache(type, 10 * 1024));
+      table_options.persistent_cache =
+          std::make_shared<MockPersistentCache>(type, 10 * 1024);
       table_options.no_block_cache = true;
       table_options.block_cache = bsize ? NewLRUCache(bsize) : nullptr;
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -1945,7 +2576,6 @@ TEST_F(DBTest2, PersistentCache) {
     }
   }
 }
-#endif  // !defined OS_SOLARIS
 
 namespace {
 void CountSyncPoint() {
@@ -2083,7 +2713,6 @@ TEST_F(DBTest2, ReadAmpBitmap) {
   }
 }
 
-#ifndef OS_SOLARIS  // GetUniqueIdFromFile is not implemented
 TEST_F(DBTest2, ReadAmpBitmapLiveInCacheAfterDBClose) {
   {
     const int kIdBufLen = 100;
@@ -2196,7 +2825,6 @@ TEST_F(DBTest2, ReadAmpBitmapLiveInCacheAfterDBClose) {
     }
   }
 }
-#endif  // !OS_SOLARIS
 
 TEST_F(DBTest2, AutomaticCompactionOverlapManualCompaction) {
   Options options = CurrentOptions();
@@ -2217,7 +2845,7 @@ TEST_F(DBTest2, AutomaticCompactionOverlapManualCompaction) {
   cro.target_level = 2;
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
 
-  auto get_stat = [](std::string level_str, LevelStatType type,
+  auto get_stat = [](const std::string& level_str, LevelStatType type,
                      std::map<std::string, std::string> props) {
     auto prop_str =
         "compaction." + level_str + "." +
@@ -2380,10 +3008,12 @@ TEST_F(DBTest2, PausingManualCompaction1) {
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
-  std::vector<std::string> files_before_compact, files_after_compact;
+  std::vector<std::string> files_before_compact;
+  std::vector<std::string> files_after_compact;
   // Remember file name before compaction is triggered
   std::vector<LiveFileMetaData> files_meta;
   dbfull()->GetLiveFilesMetaData(&files_meta);
+  files_before_compact.reserve(files_meta.size());
   for (const auto& file : files_meta) {
     files_before_compact.push_back(file.name);
   }
@@ -2399,6 +3029,7 @@ TEST_F(DBTest2, PausingManualCompaction1) {
   // Get file names after compaction is stopped
   files_meta.clear();
   dbfull()->GetLiveFilesMetaData(&files_meta);
+  files_after_compact.reserve(files_meta.size());
   for (const auto& file : files_meta) {
     files_after_compact.push_back(file.name);
   }
@@ -2758,8 +3389,8 @@ class CancelCompactionListener : public EventListener {
 
   std::atomic<size_t> num_compaction_started_;
   std::atomic<size_t> num_compaction_ended_;
-  Status::Code code_;
-  Status::SubCode subcode_;
+  Status::Code code_ = Status::kOk;
+  Status::SubCode subcode_ = Status::kNone;
 };
 
 TEST_F(DBTest2, CancelManualCompactionWithListener) {
@@ -3513,6 +4144,40 @@ TEST_F(DBTest2, LiveFilesOmitObsoleteFiles) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_F(DBTest2, LiveFilesStorageInfoWithConcurrentSetOptions) {
+  // SetOptions() writes a new OPTIONS file and deletes all but the newest
+  // two. Without file deletions disabled by the caller, the OPTIONS file
+  // chosen by GetLiveFilesStorageInfo must still survive until its size is
+  // read.
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetLiveFilesStorageInfo:BeforeOptionsFileSize",
+      [&](void* /*arg*/) {
+        ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "true"}}));
+        ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  std::vector<LiveFileStorageInfo> infos;
+  ASSERT_OK(
+      db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(), &infos));
+  ASSERT_TRUE(dbfull()->IsFileDeletionsEnabled());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBTest2, LiveFilesStorageInfoReadOnlyKeepsDeletionsEnabled) {
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(ReadOnlyReopen(CurrentOptions()));
+
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> infos;
+  ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
+  ASSERT_TRUE(dbfull()->IsFileDeletionsEnabled());
+}
+
 TEST_F(DBTest2, TestNumPread) {
   Options options = CurrentOptions();
   bool prefetch_supported =
@@ -3791,7 +4456,8 @@ TEST_F(DBTest2, TraceAndReplay) {
 
   TraceExecutionResultHandler res_handler;
   std::function<void(Status, std::unique_ptr<TraceRecordResult>&&)> res_cb =
-      [&res_handler](Status exec_s, std::unique_ptr<TraceRecordResult>&& res) {
+      [&res_handler](const Status& exec_s,
+                     std::unique_ptr<TraceRecordResult>&& res) {
         ASSERT_TRUE(exec_s.ok() || exec_s.IsNotSupported());
         if (res != nullptr) {
           ASSERT_OK(res->Accept(&res_handler));
@@ -4352,6 +5018,554 @@ TEST_F(DBTest2, TraceReplayDefaultColumnFamilyWithoutHandles) {
     ASSERT_EQ("2", value);
   }
   ASSERT_OK(DestroyDB(dbname2, options));
+}
+
+// With TraceOptions::include_read_write_options, each query record holds the
+// options of its call and replay uses them; without it, records hold none.
+TEST_F(DBTest2, TraceRecordsReadWriteOptions) {
+  for (const bool include : {false, true}) {
+    for (const bool preserve_write_order : {false, true}) {
+      SCOPED_TRACE(
+          "include=" + std::to_string(include) +
+          " preserve_write_order=" + std::to_string(preserve_write_order));
+      DestroyAndReopen(CurrentOptions());
+      const std::string trace_filename = dbname_ + "/rocksdb.trace";
+      std::unique_ptr<TraceWriter> trace_writer;
+      ASSERT_OK(NewFileTraceWriter(env_, EnvOptions(), trace_filename,
+                                   &trace_writer));
+      TraceOptions trace_options;
+      trace_options.include_read_write_options = include;
+      trace_options.preserve_write_order = preserve_write_order;
+      ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+
+      WriteOptions write_options;
+      write_options.disableWAL = true;
+      write_options.no_slowdown = true;
+      ASSERT_OK(db_->Put(write_options, "a", "1"));
+      ReadOptions get_options;
+      get_options.fill_cache = false;
+      get_options.verify_checksums = false;
+      get_options.readahead_size = 4096;
+      get_options.read_tier = kBlockCacheTier;
+      std::string value;
+      ASSERT_OK(db_->Get(get_options, "a", &value));
+      std::vector<std::string> values;
+      for (const Status& s :
+           db_->MultiGet(get_options, {Slice("a")}, &values)) {
+        ASSERT_OK(s);
+      }
+      const Slice upper("b");
+      ReadOptions iter_options;
+      iter_options.fill_cache = false;
+      iter_options.total_order_seek = true;
+      iter_options.readahead_size = 8192;
+      iter_options.iterate_upper_bound = &upper;
+      {
+        std::unique_ptr<Iterator> iter(db_->NewIterator(iter_options));
+        iter->Seek("a");
+        iter->SeekForPrev("a");
+        ASSERT_OK(iter->status());
+      }
+      ASSERT_OK(db_->EndTrace());
+
+      auto check_get_options = [&](const ReadOptions* recorded) {
+        if (!include) {
+          ASSERT_EQ(recorded, nullptr);
+          return;
+        }
+        ASSERT_NE(recorded, nullptr);
+        ASSERT_FALSE(recorded->fill_cache);
+        ASSERT_FALSE(recorded->verify_checksums);
+        ASSERT_EQ(recorded->readahead_size, 4096u);
+        ASSERT_EQ(recorded->read_tier, kBlockCacheTier);
+      };
+      std::unique_ptr<TraceReader> trace_reader;
+      ASSERT_OK(NewFileTraceReader(env_, EnvOptions(), trace_filename,
+                                   &trace_reader));
+      std::unique_ptr<Replayer> replayer;
+      ASSERT_OK(db_->NewDefaultReplayer({db_->DefaultColumnFamily()},
+                                        std::move(trace_reader), &replayer));
+      ASSERT_OK(replayer->Prepare());
+      int records = 0;
+      std::unique_ptr<TraceRecord> record;
+      Status s;
+      while ((s = replayer->Next(&record)).ok()) {
+        ++records;
+        switch (record->GetTraceType()) {
+          case kTraceWrite: {
+            const WriteOptions* recorded =
+                dynamic_cast<WriteQueryTraceRecord*>(record.get())
+                    ->GetWriteOptions();
+            if (!include) {
+              ASSERT_EQ(recorded, nullptr);
+              break;
+            }
+            ASSERT_NE(recorded, nullptr);
+            ASSERT_TRUE(recorded->disableWAL);
+            ASSERT_TRUE(recorded->no_slowdown);
+            ASSERT_FALSE(recorded->sync);
+            break;
+          }
+          case kTraceGet:
+            check_get_options(dynamic_cast<GetQueryTraceRecord*>(record.get())
+                                  ->GetReadOptions());
+            break;
+          case kTraceMultiGet:
+            check_get_options(
+                dynamic_cast<MultiGetQueryTraceRecord*>(record.get())
+                    ->GetReadOptions());
+            break;
+          case kTraceIteratorSeek:
+          case kTraceIteratorSeekForPrev: {
+            auto* seek =
+                dynamic_cast<IteratorSeekQueryTraceRecord*>(record.get());
+            ASSERT_EQ(seek->GetUpperBound(), upper);
+            const ReadOptions* recorded = seek->GetReadOptions();
+            if (!include) {
+              ASSERT_EQ(recorded, nullptr);
+              break;
+            }
+            ASSERT_NE(recorded, nullptr);
+            ASSERT_FALSE(recorded->fill_cache);
+            ASSERT_TRUE(recorded->verify_checksums);
+            ASSERT_TRUE(recorded->total_order_seek);
+            ASSERT_EQ(recorded->readahead_size, 8192u);
+            break;
+          }
+          default:
+            FAIL() << "unexpected trace type " << record->GetTraceType();
+        }
+      }
+      ASSERT_TRUE(s.IsIncomplete()) << s.ToString();
+      ASSERT_EQ(records, 5);
+
+      // Replayed into another DB, the recorded disableWAL write writes no WAL.
+      Options options2 = CurrentOptions();
+      options2.create_if_missing = true;
+      options2.statistics = CreateDBStatistics();
+      const std::string dbname2 =
+          test::PerThreadDBPath(env_, "/db_replay_opts");
+      ASSERT_OK(DestroyDB(dbname2, options2));
+      std::unique_ptr<DB> db2;
+      ASSERT_OK(DB::Open(options2, dbname2, &db2));
+      TraceExecutionResultHandler res_handler;
+      ASSERT_OK(ReplayTraceFile(env_, trace_filename, db2.get(),
+                                {db2->DefaultColumnFamily()},
+                                /*num_threads=*/1, &res_handler));
+      ASSERT_EQ(1, res_handler.GetNumWrites());
+      ASSERT_EQ(include,
+                options2.statistics->getTickerCount(WAL_FILE_BYTES) == 0);
+      db2.reset();
+      ASSERT_OK(DestroyDB(dbname2, options2));
+    }
+  }
+}
+
+// A newer RocksDB may add query record fields under payload bits this one
+// does not know. They are encoded after the known fields, which still decode.
+TEST_F(DBTest2, TraceDecoderIgnoresUnknownRecordFields) {
+  const std::string trace_filename = dbname_ + "/rocksdb.trace";
+  std::unique_ptr<TraceWriter> trace_writer;
+  ASSERT_OK(
+      NewFileTraceWriter(env_, EnvOptions(), trace_filename, &trace_writer));
+  TraceOptions trace_options;
+  trace_options.include_read_write_options = true;
+  ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  ASSERT_OK(db_->Put(write_options, "a", "1"));
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  std::string value;
+  ASSERT_OK(db_->Get(read_options, "a", &value));
+  std::vector<std::string> values;
+  for (const Status& s : db_->MultiGet(read_options, {Slice("a")}, &values)) {
+    ASSERT_OK(s);
+  }
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    iter->Seek("a");
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_OK(db_->EndTrace());
+
+  std::unique_ptr<TraceReader> trace_reader;
+  ASSERT_OK(
+      NewFileTraceReader(env_, EnvOptions(), trace_filename, &trace_reader));
+  int decoded = 0;
+  std::string encoded;
+  while (trace_reader->Read(&encoded).ok()) {
+    Trace trace;
+    ASSERT_OK(TracerHelper::DecodeTrace(encoded, &trace));
+    if (trace.type != kTraceWrite && trace.type != kTraceGet &&
+        trace.type != kTraceMultiGet && trace.type != kTraceIteratorSeek) {
+      continue;
+    }
+    Trace extended = trace;
+    EncodeFixed64(&extended.payload[0],
+                  DecodeFixed64(trace.payload.data()) | (uint64_t{1} << 40));
+    extended.payload.append("a field from a newer version");
+    std::unique_ptr<TraceRecord> expected;
+    std::unique_ptr<TraceRecord> actual;
+    ASSERT_OK(TracerHelper::DecodeTraceRecord(&trace, kTraceFileMinorVersion,
+                                              &expected));
+    ASSERT_OK(TracerHelper::DecodeTraceRecord(&extended, kTraceFileMinorVersion,
+                                              &actual));
+    ASSERT_EQ(expected->GetTraceType(), actual->GetTraceType());
+    switch (trace.type) {
+      case kTraceWrite: {
+        auto* e = static_cast<WriteQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<WriteQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetWriteBatchRep(), a->GetWriteBatchRep());
+        ASSERT_NE(a->GetWriteOptions(), nullptr);
+        ASSERT_TRUE(a->GetWriteOptions()->disableWAL);
+        break;
+      }
+      case kTraceGet: {
+        auto* e = static_cast<GetQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<GetQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKey(), a->GetKey());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+      case kTraceMultiGet: {
+        auto* e = static_cast<MultiGetQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<MultiGetQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKeys(), a->GetKeys());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+      default: {
+        auto* e = static_cast<IteratorSeekQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<IteratorSeekQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKey(), a->GetKey());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+    }
+    ++decoded;
+  }
+  ASSERT_EQ(decoded, 4);
+}
+
+// A call that the live DB served without I/O (here from the memtable) needs
+// I/O on the replay target, so with its recorded read_tier=kBlockCacheTier it
+// returns Incomplete; a write with sync and disableWAL fails live and on
+// replay. Those are the calls' results: the replay reports them and goes on to
+// the records after them.
+TEST_F(DBTest2, TraceReplayContinuesPastRecordedOptionsOutcomes) {
+  for (const uint32_t num_threads : {1U, 2U}) {
+    SCOPED_TRACE("num_threads=" + std::to_string(num_threads));
+    DestroyAndReopen(CurrentOptions());
+    ASSERT_OK(Put("a", "1"));
+    const std::string trace_filename = dbname_ + "/rocksdb.trace";
+    std::unique_ptr<TraceWriter> trace_writer;
+    ASSERT_OK(
+        NewFileTraceWriter(env_, EnvOptions(), trace_filename, &trace_writer));
+    TraceOptions trace_options;
+    trace_options.include_read_write_options = true;
+    ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+    ReadOptions no_io;
+    no_io.read_tier = kBlockCacheTier;
+    std::string value;
+    ASSERT_OK(db_->Get(no_io, "a", &value));
+    std::vector<std::string> values;
+    for (const Status& s : db_->MultiGet(no_io, {Slice("a")}, &values)) {
+      ASSERT_OK(s);
+    }
+    {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(no_io));
+      iter->Seek("a");
+      ASSERT_OK(iter->status());
+    }
+    WriteOptions sync_without_wal;
+    sync_without_wal.sync = true;
+    sync_without_wal.disableWAL = true;
+    ASSERT_TRUE(db_->Put(sync_without_wal, "y", "1").IsInvalidArgument());
+    ASSERT_OK(Put("z", "2"));
+    ASSERT_OK(db_->EndTrace());
+
+    // The replay target holds "a" in an SST, with a cold block cache.
+    Options options2 = CurrentOptions();
+    options2.create_if_missing = true;
+    const std::string dbname2 = test::PerThreadDBPath(env_, "/db_replay_tier");
+    ASSERT_OK(DestroyDB(dbname2, options2));
+    std::unique_ptr<DB> db2;
+    ASSERT_OK(DB::Open(options2, dbname2, &db2));
+    ASSERT_OK(db2->Put(WriteOptions(), "a", "1"));
+    ASSERT_OK(db2->Flush(FlushOptions()));
+    ASSERT_TRUE(db2->Get(no_io, "a", &value).IsIncomplete());
+
+    TraceExecutionResultHandler res_handler;
+    ASSERT_OK(ReplayTraceFile(env_, trace_filename, db2.get(),
+                              {db2->DefaultColumnFamily()}, num_threads,
+                              &res_handler));
+    ASSERT_EQ(1, res_handler.GetNumGets());
+    ASSERT_EQ(1, res_handler.GetNumMultiGets());
+    ASSERT_EQ(1, res_handler.GetNumIterSeeks());
+    ASSERT_EQ(2, res_handler.GetNumWrites());
+    ASSERT_TRUE(db2->Get(ReadOptions(), "y", &value).IsNotFound());
+    ASSERT_OK(db2->Get(ReadOptions(), "z", &value));
+    ASSERT_EQ("2", value);
+    db2.reset();
+    ASSERT_OK(DestroyDB(dbname2, options2));
+  }
+}
+
+// Recorded options do not hide failures they do not cause: a DeleteRange on a
+// replay DB with row_cache (NotSupported) and a write to a column family the
+// replay DB lacks still fail the replay, as they do without the options.
+TEST_F(DBTest2, TraceReplayWithRecordedOptionsReturnsReplayErrors) {
+  for (const bool include : {false, true}) {
+    for (const uint32_t num_threads : {1U, 2U}) {
+      SCOPED_TRACE("include=" + std::to_string(include) +
+                   " num_threads=" + std::to_string(num_threads));
+      TraceOptions trace_options;
+      trace_options.include_read_write_options = include;
+      const std::string trace_filename = dbname_ + "/rocksdb.trace";
+      const std::string dbname2 =
+          test::PerThreadDBPath(env_, "/db_replay_errors");
+
+      // DeleteRange, replayed on a DB with row_cache.
+      DestroyAndReopen(CurrentOptions());
+      std::unique_ptr<TraceWriter> trace_writer;
+      ASSERT_OK(NewFileTraceWriter(env_, EnvOptions(), trace_filename,
+                                   &trace_writer));
+      ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+      ASSERT_OK(Put("a", "1"));
+      ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                 "a", "z"));
+      ASSERT_OK(db_->EndTrace());
+      Options row_cache_options = CurrentOptions();
+      row_cache_options.create_if_missing = true;
+      row_cache_options.row_cache = NewLRUCache(1 << 20);
+      ASSERT_OK(DestroyDB(dbname2, row_cache_options));
+      std::unique_ptr<DB> db2;
+      ASSERT_OK(DB::Open(row_cache_options, dbname2, &db2));
+      Status s = ReplayTraceFile(env_, trace_filename, db2.get(),
+                                 /*handles=*/{}, num_threads);
+      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+      db2.reset();
+      ASSERT_OK(DestroyDB(dbname2, row_cache_options));
+
+      // A write to a column family the replay DB does not have.
+      Options options = CurrentOptions();
+      DestroyAndReopen(options);
+      CreateAndReopenWithCF({"pikachu"}, options);
+      ASSERT_OK(NewFileTraceWriter(env_, EnvOptions(), trace_filename,
+                                   &trace_writer));
+      ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+      ASSERT_OK(Put(1, "a", "1"));
+      ASSERT_OK(db_->EndTrace());
+      options.create_if_missing = true;
+      ASSERT_OK(DestroyDB(dbname2, options));
+      ASSERT_OK(DB::Open(options, dbname2, &db2));
+      s = ReplayTraceFile(env_, trace_filename, db2.get(),
+                          {db2->DefaultColumnFamily()}, num_threads);
+      ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+      db2.reset();
+      ASSERT_OK(DestroyDB(dbname2, options));
+    }
+  }
+}
+
+// With a recorded allow_unprepared_value, a captured seek result still holds
+// the value: the replayer prepares a blob value before copying it.
+TEST_F(DBTest2, TraceReplayPreparesValuesOfCapturedSeekResults) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "payload"));
+  ASSERT_OK(Flush());  // The value is now in a blob file.
+  const std::string trace_filename = dbname_ + "/rocksdb.trace";
+  std::unique_ptr<TraceWriter> trace_writer;
+  ASSERT_OK(
+      NewFileTraceWriter(env_, EnvOptions(), trace_filename, &trace_writer));
+  TraceOptions trace_options;
+  trace_options.include_read_write_options = true;
+  ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+  ReadOptions lazy;
+  lazy.allow_unprepared_value = true;
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(lazy));
+    iter->Seek("a");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_TRUE(iter->value().empty());  // Not prepared yet.
+    ASSERT_TRUE(iter->PrepareValue());
+    ASSERT_EQ(iter->value(), "payload");
+  }
+  ASSERT_OK(db_->EndTrace());
+
+  std::unique_ptr<TraceReader> trace_reader;
+  ASSERT_OK(
+      NewFileTraceReader(env_, EnvOptions(), trace_filename, &trace_reader));
+  std::unique_ptr<Replayer> replayer;
+  ASSERT_OK(db_->NewDefaultReplayer({db_->DefaultColumnFamily()},
+                                    std::move(trace_reader), &replayer));
+  ASSERT_OK(replayer->Prepare());
+  int seeks = 0;
+  ASSERT_OK(replayer->Replay(
+      ReplayOptions(1, 1.0),
+      [&](const Status& exec_s, std::unique_ptr<TraceRecordResult>&& res) {
+        ASSERT_OK(exec_s);
+        auto* seek = dynamic_cast<IteratorTraceExecutionResult*>(res.get());
+        ASSERT_NE(seek, nullptr);
+        ++seeks;
+        ASSERT_OK(seek->GetStatus());
+        ASSERT_TRUE(seek->GetValid());
+        ASSERT_EQ(seek->GetValue(), "payload");
+      }));
+  ASSERT_EQ(seeks, 1);
+}
+
+// A seek with a recorded max_skippable_internal_keys returns Incomplete after
+// skipping that many entries, even with kReadAllTier. That is the seek's
+// result: the replay reports it and goes on.
+TEST_F(DBTest2, TraceReplayContinuesPastSkipLimitedSeek) {
+  auto write_tombstones = [](DB* db) {
+    for (const char* key : {"a", "b", "c"}) {
+      ASSERT_OK(db->Put(WriteOptions(), key, "1"));
+      ASSERT_OK(db->Delete(WriteOptions(), key));
+    }
+    ASSERT_OK(db->Put(WriteOptions(), "z", "1"));
+  };
+  for (const uint32_t num_threads : {1U, 2U}) {
+    SCOPED_TRACE("num_threads=" + std::to_string(num_threads));
+    DestroyAndReopen(CurrentOptions());
+    write_tombstones(db_.get());
+    const std::string trace_filename = dbname_ + "/rocksdb.trace";
+    std::unique_ptr<TraceWriter> trace_writer;
+    ASSERT_OK(
+        NewFileTraceWriter(env_, EnvOptions(), trace_filename, &trace_writer));
+    TraceOptions trace_options;
+    trace_options.include_read_write_options = true;
+    ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+    ReadOptions capped;
+    capped.max_skippable_internal_keys = 1;
+    {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(capped));
+      iter->Seek("a");
+      ASSERT_TRUE(iter->status().IsIncomplete()) << iter->status().ToString();
+    }
+    ASSERT_OK(Put("zz", "2"));
+    ASSERT_OK(db_->EndTrace());
+
+    Options options2 = CurrentOptions();
+    options2.create_if_missing = true;
+    const std::string dbname2 = test::PerThreadDBPath(env_, "/db_replay_skip");
+    ASSERT_OK(DestroyDB(dbname2, options2));
+    std::unique_ptr<DB> db2;
+    ASSERT_OK(DB::Open(options2, dbname2, &db2));
+    write_tombstones(db2.get());
+    TraceExecutionResultHandler res_handler;
+    ASSERT_OK(ReplayTraceFile(env_, trace_filename, db2.get(),
+                              {db2->DefaultColumnFamily()}, num_threads,
+                              &res_handler));
+    ASSERT_EQ(1, res_handler.GetNumIterSeeks());
+    ASSERT_EQ(1, res_handler.GetNumWrites());
+    std::string value;
+    ASSERT_OK(db2->Get(ReadOptions(), "zz", &value));
+    ASSERT_EQ("2", value);
+    db2.reset();
+    ASSERT_OK(DestroyDB(dbname2, options2));
+  }
+}
+
+// A tailing iterator does not support SeekForPrev(): the live call fails with
+// NotSupported, and so does the replayed one with the recorded tailing=true.
+// That is the seek's result: the replay reports it and goes on.
+TEST_F(DBTest2, TraceReplayContinuesPastTailingSeekForPrev) {
+  for (const uint32_t num_threads : {1U, 2U}) {
+    SCOPED_TRACE("num_threads=" + std::to_string(num_threads));
+    DestroyAndReopen(CurrentOptions());
+    ASSERT_OK(Put("a", "1"));
+    const std::string trace_filename = dbname_ + "/rocksdb.trace";
+    std::unique_ptr<TraceWriter> trace_writer;
+    ASSERT_OK(
+        NewFileTraceWriter(env_, EnvOptions(), trace_filename, &trace_writer));
+    TraceOptions trace_options;
+    trace_options.include_read_write_options = true;
+    ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+    ReadOptions tailing;
+    tailing.tailing = true;
+    {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(tailing));
+      iter->SeekForPrev("a");
+      ASSERT_TRUE(iter->status().IsNotSupported()) << iter->status().ToString();
+    }
+    ASSERT_OK(Put("zz", "2"));
+    ASSERT_OK(db_->EndTrace());
+
+    Options options2 = CurrentOptions();
+    options2.create_if_missing = true;
+    const std::string dbname2 = test::PerThreadDBPath(env_, "/db_replay_tail");
+    ASSERT_OK(DestroyDB(dbname2, options2));
+    std::unique_ptr<DB> db2;
+    ASSERT_OK(DB::Open(options2, dbname2, &db2));
+    ASSERT_OK(db2->Put(WriteOptions(), "a", "1"));
+    // A new tailing iterator over this fails until its first seek.
+    ASSERT_OK(
+        db2->DeleteRange(WriteOptions(), db2->DefaultColumnFamily(), "m", "n"));
+    TraceExecutionResultHandler res_handler;
+    ASSERT_OK(ReplayTraceFile(env_, trace_filename, db2.get(),
+                              {db2->DefaultColumnFamily()}, num_threads,
+                              &res_handler));
+    ASSERT_EQ(1, res_handler.GetNumIterSeeks());
+    ASSERT_EQ(1, res_handler.GetNumWrites());
+    std::string value;
+    ASSERT_OK(db2->Get(ReadOptions(), "zz", &value));
+    ASSERT_EQ("2", value);
+    db2.reset();
+    ASSERT_OK(DestroyDB(dbname2, options2));
+  }
+}
+
+// A secondary DB cannot create tailing iterators, so the replayed seek never
+// runs. Unlike the outcomes above, that is a replay error.
+TEST_F(DBTest2, TraceReplayReturnsSecondaryTailingSeekError) {
+  Options options = CurrentOptions();
+  options.max_open_files = -1;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const std::string trace_filename = dbname_ + "/rocksdb.trace";
+  std::unique_ptr<TraceWriter> trace_writer;
+  ASSERT_OK(
+      NewFileTraceWriter(env_, EnvOptions(), trace_filename, &trace_writer));
+  TraceOptions trace_options;
+  trace_options.include_read_write_options = true;
+  ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+  ReadOptions tailing;
+  tailing.tailing = true;
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(tailing));
+    iter->Seek("a");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_OK(db_->EndTrace());
+
+  const std::string secondary_path =
+      test::PerThreadDBPath(env_, "/db_replay_secondary");
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(DB::OpenAsSecondary(options, dbname_, secondary_path, &secondary));
+  for (const uint32_t num_threads : {1U, 2U}) {
+    SCOPED_TRACE("num_threads=" + std::to_string(num_threads));
+    TraceExecutionResultHandler res_handler;
+    for (TraceExecutionResultHandler* handler :
+         {&res_handler, static_cast<TraceExecutionResultHandler*>(nullptr)}) {
+      Status s = ReplayTraceFile(env_, trace_filename, secondary.get(),
+                                 {secondary->DefaultColumnFamily()},
+                                 num_threads, handler);
+      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    }
+  }
+  secondary.reset();
+  ASSERT_OK(DestroyDB(secondary_path, options));
 }
 
 TEST_F(DBTest2, TraceReplayReturnsExecutionError) {
@@ -5037,6 +6251,7 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
   std::vector<std::thread> open_threads;
   std::vector<std::unique_ptr<DB>> dbs(kNumDbs);
   options.create_if_missing = true;
+  open_threads.reserve(kNumDbs);
   for (int i = 0; i < kNumDbs; ++i) {
     open_threads.emplace_back(
         [&](int dbnum) {
@@ -6261,11 +7476,11 @@ TEST_F(DBTest2, VariousFileTemperatures) {
       }
     }
 
-    Temperature optimize_manifest_temperature;
-    Temperature optimize_wal_temperature;
-    Temperature expected_manifest_temperature;
-    Temperature expected_other_metadata_temperature;
-    Temperature expected_wal_temperature;
+    Temperature optimize_manifest_temperature = Temperature::kUnknown;
+    Temperature optimize_wal_temperature = Temperature::kUnknown;
+    Temperature expected_manifest_temperature = Temperature::kUnknown;
+    Temperature expected_other_metadata_temperature = Temperature::kUnknown;
+    Temperature expected_wal_temperature = Temperature::kUnknown;
     std::array<RelaxedAtomic<int>, kNumberFileTypes> counts;
   };
 
@@ -7834,7 +9049,7 @@ TEST_F(DBTest2, MultiGetBlockCacheTierSkipsColdSstData) {
   ASSERT_TRUE(statuses[1].IsIncomplete());
 }
 
-TEST_F(DBTest2, GetFileChecksumsFromCurrentManifest_CRC32) {
+TEST_F(DBTest2, GetFileChecksumsFromCurrentManifestCRC32) {
   Options opts = CurrentOptions();
   opts.create_if_missing = true;
   opts.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
@@ -7904,6 +9119,163 @@ TEST_F(DBTest2, GetFileChecksumsFromCurrentManifest_CRC32) {
     ASSERT_EQ(live_files[i].file_checksum, stored_checksum);
     ASSERT_EQ(live_files[i].file_checksum_func_name, stored_func_name);
   }
+}
+
+// The DB ID is read from the MANIFEST file of an open DB, from the new MANIFEST
+// file that a reopen writes, and from a MANIFEST file of a closed DB.
+TEST_F(DBTest2, GetDbIdentityFromManifest) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  std::string db_id;
+  ASSERT_OK(db_->GetDbIdentity(db_id));
+  ASSERT_FALSE(db_id.empty());
+  // The function does not write, so it works on a read-only file system.
+  std::shared_ptr<FileSystem> read_only_fs =
+      std::make_shared<ReadOnlyFileSystem>(env_->GetFileSystem());
+  const auto expect_db_id = [&](uint64_t manifest_number) {
+    std::string read_db_id;
+    ASSERT_OK(experimental::GetDbIdentityFromManifest(
+        read_only_fs.get(), DescriptorFileName(dbname_, manifest_number),
+        &read_db_id));
+    ASSERT_EQ(db_id, read_db_id);
+  };
+
+  const uint64_t first_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  expect_db_id(first_manifest);
+
+  Reopen(options);
+  const uint64_t second_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  ASSERT_NE(first_manifest, second_manifest);
+  expect_db_id(second_manifest);
+
+  Close();
+  expect_db_id(second_manifest);
+}
+
+// A MANIFEST file with no DB ID gives NotFound, a record that fails its
+// checksum gives Corruption, and a missing file gives the file system error.
+TEST_F(DBTest2, GetDbIdentityFromManifestErrors) {
+  Options options = CurrentOptions();
+  options.write_dbid_to_manifest = false;
+  DestroyAndReopen(options);
+  const std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  FileSystem* fs = env_->GetFileSystem().get();
+  std::string db_id;
+
+  Status s = experimental::GetDbIdentityFromManifest(fs, manifest_path, &db_id);
+  ASSERT_EQ(Status::Code::kNotFound, s.code());
+  ASSERT_TRUE(db_id.empty());
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(fs, manifest_path, &contents));
+  ASSERT_GT(contents.size(), size_t{log::kHeaderSize});
+  contents[log::kHeaderSize] ^= 1;
+  const std::string damaged_path = manifest_path + ".damaged";
+  ASSERT_OK(WriteStringToFile(fs, contents, damaged_path));
+  s = experimental::GetDbIdentityFromManifest(fs, damaged_path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
+
+  s = experimental::GetDbIdentityFromManifest(
+      fs, DescriptorFileName(dbname_, 999999), &db_id);
+  ASSERT_EQ(Status::Code::kIOError, s.code());
+  ASSERT_EQ(Status::SubCode::kPathNotFound, s.subcode());
+}
+
+namespace {
+// Returns the contents of a log file in the MANIFEST file format with the given
+// records.
+std::string LogFileWithRecords(const std::vector<std::string>& records) {
+  test::StringSink* sink = new test::StringSink();
+  std::unique_ptr<FSWritableFile> sink_holder(sink);
+  log::Writer writer(std::make_unique<WritableFileWriter>(
+                         std::move(sink_holder), "manifest", FileOptions()),
+                     0 /* log_number */, false /* recycle_log_files */);
+  for (const std::string& record : records) {
+    EXPECT_OK(writer.AddRecord(WriteOptions(), record));
+  }
+  EXPECT_OK(writer.WriteBuffer(WriteOptions()));
+  return sink->contents_;
+}
+
+std::string EncodeVersionEdit(const VersionEdit& edit) {
+  std::string record;
+  EXPECT_TRUE(edit.EncodeTo(&record));
+  return record;
+}
+}  // namespace
+
+// The DB ID can be in a later record than the first. When a record in an
+// earlier log block fails its checksum, the function returns Corruption, not
+// the DB ID of the later record: it does not skip damaged data.
+TEST_F(DBTest2, GetDbIdentityFromManifestInLaterRecord) {
+  const std::string kDbId = "db-id-in-a-later-record";
+  // log::Reader drops the rest of a log block after a checksum failure and
+  // continues with the next block. The record with the DB ID must start in a
+  // block after the damaged one, so that the reader would return it if the
+  // function ignored the error. The first record has a column family name of
+  // 2 * log::kBlockSize bytes, so it fills blocks 0 and 1 and ends in block 2,
+  // where the record with the DB ID follows. The test changes the first payload
+  // byte of block 0.
+  VersionEdit first;
+  first.AddColumnFamily(std::string(2 * log::kBlockSize, 'c'));
+  VersionEdit second;
+  second.SetDBId(kDbId);
+  std::string contents =
+      LogFileWithRecords({EncodeVersionEdit(first), EncodeVersionEdit(second)});
+  FileSystem* fs = env_->GetFileSystem().get();
+  ASSERT_OK(env_->CreateDirIfMissing(dbname_));
+  const std::string path = dbname_ + "/manifest_with_later_db_id";
+  std::string db_id;
+
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  ASSERT_OK(experimental::GetDbIdentityFromManifest(fs, path, &db_id));
+  ASSERT_EQ(kDbId, db_id);
+
+  // One changed byte in the payload of the first record.
+  contents[log::kHeaderSize] ^= 1;
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  db_id.clear();
+  Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
+  ASSERT_TRUE(db_id.empty());
+}
+
+// An empty file, and a file truncated inside the header or the body of the
+// record with the DB ID, give NotFound: a truncated record at the end of the
+// file counts as the end of the file. A record that passes its checksum but
+// cannot be decoded gives Corruption.
+TEST_F(DBTest2, GetDbIdentityFromManifestTruncatedOrUndecodable) {
+  const std::string kDbId = "db-id";
+  VersionEdit edit;
+  edit.SetDBId(kDbId);
+  const std::string contents = LogFileWithRecords({EncodeVersionEdit(edit)});
+  ASSERT_GT(contents.size(), size_t{log::kHeaderSize});
+  FileSystem* fs = env_->GetFileSystem().get();
+  ASSERT_OK(env_->CreateDirIfMissing(dbname_));
+  const std::string path = dbname_ + "/manifest_copy";
+  std::string db_id;
+
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  ASSERT_OK(experimental::GetDbIdentityFromManifest(fs, path, &db_id));
+  ASSERT_EQ(kDbId, db_id);
+
+  for (size_t size :
+       {size_t{0}, size_t{log::kHeaderSize - 1}, contents.size() - 1}) {
+    SCOPED_TRACE("size=" + std::to_string(size));
+    ASSERT_OK(WriteStringToFile(fs, contents.substr(0, size), path));
+    db_id.clear();
+    Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+    ASSERT_EQ(Status::Code::kNotFound, s.code());
+    ASSERT_TRUE(db_id.empty());
+  }
+
+  // Tag 0 is not a VersionEdit tag.
+  ASSERT_OK(
+      WriteStringToFile(fs, LogFileWithRecords({std::string(1, '\0')}), path));
+  Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
 }
 
 // Parameterized by (allow_concurrent_memtable_write,

@@ -174,7 +174,7 @@ class BlobDB : public StackableDB {
                      std::vector<ColumnFamilyHandle*>* handles,
                      BlobDB** blob_db);
 
-  ~BlobDB() override {}
+  ~BlobDB() override = default;
 
  protected:
   explicit BlobDB();

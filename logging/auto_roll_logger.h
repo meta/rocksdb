@@ -30,6 +30,11 @@ class AutoRollLogger : public Logger {
                  size_t log_max_size, size_t log_file_time_to_roll,
                  size_t keep_log_file_num,
                  const InfoLogLevel log_level = InfoLogLevel::INFO_LEVEL);
+  // No copying allowed
+  AutoRollLogger(const AutoRollLogger&) = delete;
+  AutoRollLogger& operator=(const AutoRollLogger&) = delete;
+  AutoRollLogger(AutoRollLogger&&) = delete;
+  AutoRollLogger& operator=(AutoRollLogger&&) = delete;
 
   using Logger::Logv;
   void Logv(const char* format, va_list ap) override;
@@ -67,7 +72,7 @@ class AutoRollLogger : public Logger {
     }
   }
 
-  virtual ~AutoRollLogger() {
+  ~AutoRollLogger() override {
     if (logger_ && !closed_) {
       logger_->Close().PermitUncheckedError();
     }

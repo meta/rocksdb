@@ -21,8 +21,8 @@ struct PeriodicCompactionPhaseParams {
   // Stable per-(DB, CF) hash seeding the preferred phase.
   uint64_t seed_hash = 0;
   // Unix time (seconds) at which phasing took effect for this DB (DB::Open, or
-  // the last relevant SetDBOptions change). Used to spread the initial
-  // catch-up burst across [anchor_time, natural deadline].
+  // the last relevant SetDBOptions change). Used to spread out the initial
+  // catch-up burst.
   uint64_t anchor_time = 0;
   // Percent [0, 100] of the phase gap closed per trigger; 0 disables phasing.
   int recovery_percent = 0;
@@ -68,11 +68,19 @@ class PeriodicCompactionPhaser {
   // time becomes eligible for periodic compaction under `params`, NOT
   // accounting for the offpeak pull. When params.recovery_percent == 0 (phasing
   // disabled) this is file_modification_time + periodic_compaction_seconds
-  // (classic behavior); otherwise it is pulled earlier toward the preferred
-  // phase and is never later than the classic deadline.
+  // (classic behavior); otherwise it is steered earlier toward the preferred
+  // phase. It is never before params.anchor_time and, unless the file was
+  // already past due then, never later than the classic deadline. Catch-up
+  // after anchor_time is spread out so that many DBs anchoring at once (e.g.
+  // phasing enabled across a fleet) do not concentrate periodic compactions
+  // shortly after it.
   static uint64_t TriggerTime(uint64_t file_modification_time,
                               uint64_t periodic_compaction_seconds,
                               const PeriodicCompactionPhaseParams& params);
+
+  // Longest periodic_compaction_seconds (~68 years) to which phasing applies,
+  // to keep the arithmetic simple and direct.
+  static constexpr uint64_t kMaxPhasedPeriod = uint64_t{1} << 31;
 
   // Spreads a DB's column families quasi-uniformly around a DB-level base phase
   // via the golden-ratio additive (Weyl/Kronecker) recurrence: cf phase ==

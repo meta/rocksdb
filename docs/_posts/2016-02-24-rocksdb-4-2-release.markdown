@@ -38,4 +38,4 @@ New RocksDB release - 4.2!
   4. Remove DefaultCompactionFilterFactory.
 
 
-[https://github.com/facebook/rocksdb/releases/tag/v4.2](https://github.com/facebook/rocksdb/releases/tag/v4.2)
+[https://github.com/meta/rocksdb/releases/tag/v4.2](https://github.com/meta/rocksdb/releases/tag/v4.2)

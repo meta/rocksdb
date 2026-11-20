@@ -22,8 +22,6 @@ class TableBuilder;
 
 class AdaptiveTableFactory : public TableFactory {
  public:
-  ~AdaptiveTableFactory() {}
-
   explicit AdaptiveTableFactory(
       std::shared_ptr<TableFactory> table_factory_to_write,
       std::shared_ptr<TableFactory> block_based_table_factory,
@@ -31,6 +29,9 @@ class AdaptiveTableFactory : public TableFactory {
       std::shared_ptr<TableFactory> cuckoo_table_factory);
 
   const char* Name() const override { return "AdaptiveTableFactory"; }
+
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override;
 
   using TableFactory::NewTableReader;
   Status NewTableReader(

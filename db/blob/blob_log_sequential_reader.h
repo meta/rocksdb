@@ -43,6 +43,8 @@ class BlobLogSequentialReader {
   // No copying allowed
   BlobLogSequentialReader(const BlobLogSequentialReader&) = delete;
   BlobLogSequentialReader& operator=(const BlobLogSequentialReader&) = delete;
+  BlobLogSequentialReader(BlobLogSequentialReader&&) = delete;
+  BlobLogSequentialReader& operator=(BlobLogSequentialReader&&) = delete;
 
   ~BlobLogSequentialReader();
 

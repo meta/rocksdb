@@ -154,6 +154,7 @@ class RowValue {
   RowValue(RowValue&& /*that*/) noexcept = default;
   RowValue& operator=(const RowValue& /*that*/) = delete;
   RowValue& operator=(RowValue&& /*that*/) = default;
+  ~RowValue() = default;
 
   std::size_t Size() const;
   bool IsTombstone() const;

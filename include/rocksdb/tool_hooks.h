@@ -79,53 +79,49 @@ class DefaultHooks : public ToolHooks {
  public:
   DefaultHooks() = default;
   ~DefaultHooks() override = default;
-  virtual Status Open(const Options& db_options, const std::string& name,
-                      std::unique_ptr<DB>* dbptr) override;
-  virtual Status Open(
-      const DBOptions& db_options, const std::string& name,
-      const std::vector<ColumnFamilyDescriptor>& column_families,
-      std::vector<ColumnFamilyHandle*>* handles,
-      std::unique_ptr<DB>* dbptr) override;
-  virtual Status OpenForReadOnly(const Options& options,
-                                 const std::string& name,
-                                 std::unique_ptr<DB>* dbptr,
-                                 bool error_if_wal_file_exists) override;
-  virtual Status OpenForReadOnly(
+  Status Open(const Options& db_options, const std::string& name,
+              std::unique_ptr<DB>* dbptr) override;
+  Status Open(const DBOptions& db_options, const std::string& name,
+              const std::vector<ColumnFamilyDescriptor>& column_families,
+              std::vector<ColumnFamilyHandle*>* handles,
+              std::unique_ptr<DB>* dbptr) override;
+  Status OpenForReadOnly(const Options& options, const std::string& name,
+                         std::unique_ptr<DB>* dbptr,
+                         bool error_if_wal_file_exists) override;
+  Status OpenForReadOnly(
       const Options& options, const std::string& name,
       const std::vector<ColumnFamilyDescriptor>& column_families,
       std::vector<ColumnFamilyHandle*>* handles,
       std::unique_ptr<DB>* dbptr) override;
-  virtual Status OpenTransactionDB(const Options& db_options,
-                                   const TransactionDBOptions& txn_db_options,
-                                   const std::string& dbname,
-                                   TransactionDB** dbptr) override;
-  virtual Status OpenTransactionDB(
+  Status OpenTransactionDB(const Options& db_options,
+                           const TransactionDBOptions& txn_db_options,
+                           const std::string& dbname,
+                           TransactionDB** dbptr) override;
+  Status OpenTransactionDB(
       const DBOptions& db_options, const TransactionDBOptions& txn_db_options,
       const std::string& dbname,
       const std::vector<ColumnFamilyDescriptor>& column_families,
       std::vector<ColumnFamilyHandle*>* handles,
       TransactionDB** dbptr) override;
-  virtual Status OpenOptimisticTransactionDB(
-      const Options& options, const std::string& dbname,
-      OptimisticTransactionDB** dbptr) override;
-  virtual Status OpenOptimisticTransactionDB(
+  Status OpenOptimisticTransactionDB(const Options& options,
+                                     const std::string& dbname,
+                                     OptimisticTransactionDB** dbptr) override;
+  Status OpenOptimisticTransactionDB(
       const DBOptions& db_options, const std::string& dbname,
       const std::vector<ColumnFamilyDescriptor>& column_families,
       std::vector<ColumnFamilyHandle*>* handles,
       OptimisticTransactionDB** dbptr) override;
-  virtual Status OpenAsSecondary(const Options& options,
-                                 const std::string& name,
-                                 const std::string& secondary_path,
-                                 std::unique_ptr<DB>* dbptr) override;
-  virtual Status OpenAsFollower(const Options& options, const std::string& name,
-                                const std::string& leader_path,
-                                std::unique_ptr<DB>* dbptr) override;
-  virtual Status Open(const Options& options,
-                      const blob_db::BlobDBOptions& bdb_options,
-                      const std::string& dbname,
-                      blob_db::BlobDB** blob_db) override;
+  Status OpenAsSecondary(const Options& options, const std::string& name,
+                         const std::string& secondary_path,
+                         std::unique_ptr<DB>* dbptr) override;
+  Status OpenAsFollower(const Options& options, const std::string& name,
+                        const std::string& leader_path,
+                        std::unique_ptr<DB>* dbptr) override;
+  Status Open(const Options& options, const blob_db::BlobDBOptions& bdb_options,
+              const std::string& dbname, blob_db::BlobDB** blob_db) override;
 
-  virtual void Exit(int status) override { exit(status); }
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  void Exit(int status) override { exit(status); }
 };
 
 extern DefaultHooks defaultHooks;

@@ -92,6 +92,9 @@ Status ReplayerImpl::Replay(
   }
 
   Status s = Status::OK();
+  // Set when a record's execution (or decoding) fails, so that its status is
+  // returned even when it is Incomplete, which otherwise means trace end.
+  bool record_failed = false;
 
   if (options.num_threads <= 1) {
     // num_threads == 0 or num_threads == 1 uses single thread.
@@ -117,6 +120,7 @@ Status ReplayerImpl::Replay(
       std::unique_ptr<TraceRecord> record;
       s = TracerHelper::DecodeTraceRecord(&trace, trace_file_version_, &record);
       if (!s.ok() && !s.IsNotSupported()) {
+        record_failed = true;
         break;
       }
 
@@ -144,6 +148,7 @@ Status ReplayerImpl::Replay(
         s = Execute(record, &res);
         result_callback(s, std::move(res));
       }
+      record_failed = !s.ok();
     }
   } else {
     // Multi-threaded replay.
@@ -238,10 +243,11 @@ Status ReplayerImpl::Replay(
     thread_pool.WaitForJobsAndJoinAllThreads();
     if (!bg_s.ok()) {
       s = bg_s;
+      record_failed = true;
     }
   }
 
-  if (s.IsIncomplete()) {
+  if (s.IsIncomplete() && !record_failed) {
     // Reaching eof returns Incomplete status at the moment.
     // Could happen when killing a process without calling EndTrace() API.
     // TODO: Add better error handling.

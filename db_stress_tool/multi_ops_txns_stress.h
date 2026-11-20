@@ -197,7 +197,7 @@ class MultiOpsTxnsStressTest : public StressTest {
                          const std::string& sec_path)
       : StressTest(db_index, db_path, ev_path, sec_path) {}
 
-  ~MultiOpsTxnsStressTest() override {}
+  ~MultiOpsTxnsStressTest() override = default;
 
   void FinishInitDb(SharedState*) override;
 
@@ -318,6 +318,11 @@ class MultiOpsTxnsStressTest : public StressTest {
           high_(high),
           existing_uniq_(std::move(existing_uniq)),
           non_existing_uniq_(std::move(non_existing_uniq)) {}
+    // No copying allowed
+    KeyGenerator(const KeyGenerator&) = delete;
+    KeyGenerator& operator=(const KeyGenerator&) = delete;
+    KeyGenerator(KeyGenerator&&) = delete;
+    KeyGenerator& operator=(KeyGenerator&&) = delete;
     ~KeyGenerator() {
       assert(!existing_uniq_.empty());
       assert(!non_existing_uniq_.empty());
@@ -425,7 +430,7 @@ class MultiOpsTxnsStressListener : public EventListener {
     assert(stress_test_);
   }
 
-  ~MultiOpsTxnsStressListener() override {}
+  ~MultiOpsTxnsStressListener() override = default;
 
   void OnDBShutdownBegin(DB* /*db*/) override { shutting_down_.Store(true); }
 

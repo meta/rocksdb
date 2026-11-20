@@ -98,7 +98,8 @@ TEST_F(DBClipTest, TestClipRange) {
     ASSERT_OK(Flush());
   }
   ASSERT_EQ("10", FilesPerLevel(0));
-  auto begin_key = Key(251), end_key = Key(751);
+  auto begin_key = Key(251);
+  auto end_key = Key(751);
   ASSERT_OK(
       db_->ClipColumnFamily(db_->DefaultColumnFamily(), begin_key, end_key));
 
@@ -158,7 +159,8 @@ TEST_F(DBClipTest, TestClipRange) {
   }
   ASSERT_EQ("5,5,3", FilesPerLevel(0));
 
-  auto begin_key_2 = Key(222), end_key_2 = Key(888);
+  auto begin_key_2 = Key(222);
+  auto end_key_2 = Key(888);
 
   ASSERT_OK(db_->ClipColumnFamily(db_->DefaultColumnFamily(), begin_key_2,
                                   end_key_2));
@@ -190,6 +192,49 @@ TEST_F(DBClipTest, TestClipRange) {
       in_range = true;
     }
     ASSERT_TRUE(in_range);
+  }
+}
+
+TEST_F(DBClipTest, SingleEmptyUserKey) {
+  struct TestCase {
+    const Comparator* comparator;
+    const char* begin_key;
+    const char* end_key;
+    bool keep_empty_key;
+  };
+  const TestCase cases[] = {
+      {BytewiseComparator(), "b", "d", false},
+      {BytewiseComparator(), "", "z", true},
+      {ReverseBytewiseComparator(), "d", "", false},
+  };
+  for (const TestCase& test_case : cases) {
+    for (int level : {0, 1}) {
+      SCOPED_TRACE(test_case.comparator->Name());
+      SCOPED_TRACE(test_case.begin_key);
+      SCOPED_TRACE(level);
+      Options options = CurrentOptions();
+      options.comparator = test_case.comparator;
+      options.disable_auto_compactions = true;
+      DestroyAndReopen(options);
+
+      ASSERT_OK(db_->ClipColumnFamily(db_->DefaultColumnFamily(),
+                                      test_case.begin_key, test_case.end_key));
+      ASSERT_EQ("NOT_FOUND", Get(""));
+      ASSERT_OK(Put("", "empty-key-value"));
+      ASSERT_OK(Flush());
+      if (level != 0) {
+        MoveFilesToLevel(level);
+      }
+      ASSERT_EQ(1, NumTableFilesAtLevel(level));
+
+      ASSERT_OK(db_->ClipColumnFamily(db_->DefaultColumnFamily(),
+                                      test_case.begin_key, test_case.end_key));
+      const std::string expected =
+          test_case.keep_empty_key ? "empty-key-value" : "NOT_FOUND";
+      ASSERT_EQ(expected, Get(""));
+      Reopen(options);
+      ASSERT_EQ(expected, Get(""));
+    }
   }
 }
 

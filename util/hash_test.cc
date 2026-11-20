@@ -303,7 +303,8 @@ TEST(HashTest, Hash128Misc) {
       EXPECT_EQ(here, Hash128(str.data(), size));
       EXPECT_EQ(here, GetSliceHash128(Slice(str.data(), size)));
       {
-        uint64_t hi, lo;
+        uint64_t hi;
+        uint64_t lo;
         Hash2x64(str.data(), size, &hi, &lo);
         EXPECT_EQ(Lower64of128(here), lo);
         EXPECT_EQ(Upper64of128(here), hi);
@@ -311,11 +312,13 @@ TEST(HashTest, Hash128Misc) {
       if (size == 16) {
         const uint64_t in_hi = DecodeFixed64(str.data() + 8);
         const uint64_t in_lo = DecodeFixed64(str.data());
-        uint64_t hi, lo;
+        uint64_t hi;
+        uint64_t lo;
         BijectiveHash2x64(in_hi, in_lo, &hi, &lo);
         EXPECT_EQ(Lower64of128(here), lo);
         EXPECT_EQ(Upper64of128(here), hi);
-        uint64_t un_hi, un_lo;
+        uint64_t un_hi;
+        uint64_t un_lo;
         BijectiveUnhash2x64(hi, lo, &un_hi, &un_lo);
         EXPECT_EQ(in_lo, un_lo);
         EXPECT_EQ(in_hi, un_hi);
@@ -333,7 +336,8 @@ TEST(HashTest, Hash128Misc) {
         EXPECT_NE(here, seeded);
         // Must match seeded Hash2x64
         {
-          uint64_t hi, lo;
+          uint64_t hi;
+          uint64_t lo;
           Hash2x64(str.data(), size, var_seed, &hi, &lo);
           EXPECT_EQ(Lower64of128(seeded), lo);
           EXPECT_EQ(Upper64of128(seeded), hi);
@@ -341,11 +345,13 @@ TEST(HashTest, Hash128Misc) {
         if (size == 16) {
           const uint64_t in_hi = DecodeFixed64(str.data() + 8);
           const uint64_t in_lo = DecodeFixed64(str.data());
-          uint64_t hi, lo;
+          uint64_t hi;
+          uint64_t lo;
           BijectiveHash2x64(in_hi, in_lo, var_seed, &hi, &lo);
           EXPECT_EQ(Lower64of128(seeded), lo);
           EXPECT_EQ(Upper64of128(seeded), hi);
-          uint64_t un_hi, un_lo;
+          uint64_t un_hi;
+          uint64_t un_lo;
           BijectiveUnhash2x64(hi, lo, var_seed, &un_hi, &un_lo);
           EXPECT_EQ(in_lo, un_lo);
           EXPECT_EQ(in_hi, un_hi);

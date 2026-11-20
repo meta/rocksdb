@@ -2,6 +2,7 @@
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -143,7 +144,7 @@ TEST_F(DBMergeOperatorTest, LimitMergeOperands) {
 TEST_F(DBMergeOperatorTest, MergeErrorOnRead) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.env = env_;
   Reopen(options);
   ASSERT_OK(Merge("k1", "v1"));
@@ -156,7 +157,7 @@ TEST_F(DBMergeOperatorTest, MergeErrorOnRead) {
 TEST_F(DBMergeOperatorTest, MergeErrorOnWrite) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.max_successive_merges = 3;
   options.env = env_;
   Reopen(options);
@@ -172,7 +173,7 @@ TEST_F(DBMergeOperatorTest, MergeErrorOnWrite) {
 TEST_F(DBMergeOperatorTest, MergeErrorOnIteration) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.env = env_;
 
   DestroyAndReopen(options);
@@ -228,7 +229,7 @@ TEST_F(DBMergeOperatorTest, MergeOperatorFailsWithMustMerge) {
   // only by APIs that do not require merging, such as `GetMergeOperands()`.
   const int kNumOperands = 3;
   Options options = CurrentOptions();
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.env = env_;
   Reopen(options);
 
@@ -440,6 +441,29 @@ TEST_F(DBMergeOperatorTest, MergeOperandThresholdExceeded) {
         ASSERT_EQ(values[i], keys[i].ToString() + std::to_string(i + 1));
       }
     }
+
+    // Check GetMergeOperands(). The base value is returned as the first
+    // operand, so it counts toward the threshold too.
+    {
+      for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t num_operands = i + 2;
+        std::vector<PinnableSlice> values(num_operands);
+        GetMergeOperandsOptions merge_operands_info;
+        merge_operands_info.expected_max_number_of_operands =
+            static_cast<int>(num_operands);
+        int num_operands_found = 0;
+        const Status status = db_->GetMergeOperands(
+            read_options, db_->DefaultColumnFamily(), keys[i], values.data(),
+            &merge_operands_info, &num_operands_found);
+        ASSERT_OK(status);
+        ASSERT_EQ(status.IsOkMergeOperandThresholdExceeded(),
+                  threshold.has_value() && num_operands > threshold.value());
+        ASSERT_EQ(static_cast<int>(num_operands), num_operands_found);
+        for (size_t j = 0; j < num_operands; ++j) {
+          ASSERT_EQ(values[j], keys[i].ToString() + std::to_string(j));
+        }
+      }
+    }
   };
 
   // Test the case when the feature is disabled as well as various thresholds.
@@ -461,7 +485,7 @@ TEST_F(DBMergeOperatorTest, DataBlockBinaryAndHash) {
   // DataBlockBinaryAndHash.
   Options options = CurrentOptions();
   options.create_if_missing = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
   options.env = env_;
   BlockBasedTableOptions table_options;
   table_options.block_restart_interval = 16;
@@ -883,7 +907,7 @@ class PerConfigMergeOperatorPinningTest
     std::tie(disable_block_cache_, option_config_) = GetParam();
   }
 
-  bool disable_block_cache_;
+  bool disable_block_cache_ = false;
 };
 
 INSTANTIATE_TEST_CASE_P(

@@ -36,6 +36,7 @@ enum class PeriodicTaskType : uint8_t {
 class PeriodicTaskScheduler {
  public:
   explicit PeriodicTaskScheduler() = default;
+  ~PeriodicTaskScheduler() = default;
 
   PeriodicTaskScheduler(const PeriodicTaskScheduler&) = delete;
   PeriodicTaskScheduler(PeriodicTaskScheduler&&) = delete;

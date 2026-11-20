@@ -42,8 +42,8 @@ namespace {
 
 struct Entry {
   std::string key;
-  ValueType type;  // kTypeValue, kTypeDeletion, kTypeMerge
-  uint64_t sequence;
+  ValueType type = kTypeValue;  // kTypeValue, kTypeDeletion, kTypeMerge
+  uint64_t sequence = 0;
   std::string ikey;  // internal key, made from `key`, `sequence` and `type`
   std::string value;
   // If false, we'll pretend that this entry doesn't exist.

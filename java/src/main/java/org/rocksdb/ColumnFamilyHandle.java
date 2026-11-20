@@ -42,7 +42,7 @@ public class ColumnFamilyHandle extends RocksObject {
    * TODO(AR) - Potentially a better design would be to cache the active Java Column Family Objects
    * in RocksDB, and return the same Java Object instead of instantiating a new one here. This could
    * also help us to improve the Java API semantics for Java users. See for example
-   * <a href="https://github.com/facebook/rocksdb/issues/2687">...</a>.
+   * <a href="https://github.com/meta/rocksdb/issues/2687">...</a>.
    *
    * @param nativeHandle native handle to the column family.
    */

@@ -49,6 +49,8 @@ class FilterBlockBuilder {
   // No copying allowed
   FilterBlockBuilder(const FilterBlockBuilder&) = delete;
   void operator=(const FilterBlockBuilder&) = delete;
+  FilterBlockBuilder(FilterBlockBuilder&&) = delete;
+  void operator=(FilterBlockBuilder&&) = delete;
 
   virtual ~FilterBlockBuilder() {}
 
@@ -140,6 +142,8 @@ class FilterBlockReader {
 
   FilterBlockReader(const FilterBlockReader&) = delete;
   FilterBlockReader& operator=(const FilterBlockReader&) = delete;
+  FilterBlockReader(FilterBlockReader&&) = delete;
+  FilterBlockReader& operator=(FilterBlockReader&&) = delete;
 
   /**
    * Normally filters are built on only the user keys and the InternalKey is not

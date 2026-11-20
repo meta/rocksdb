@@ -225,14 +225,14 @@ The common standard for foreign memory opens up the possibility of efficient int
 
 1. Panama/FFI (in [Preview](https://openjdk.org/jeps/424)) is a highly capable technology for (re)building the RocksDB Java API, although the supported language level of RocksDB and the planned release schedule for Panama mean that it could not replace JNI in production for some time to come.
 2. Panama/FFI would seem to offer comparable performance to JNI;  there is no strong performance argument *for* a re-implementation of a standalone RocksDB Java API. But the opportunity to provide a natural pinnable slice-based API gives a lot of flexibility; not least because an efficient API could be built mostly in Java with only a small underlying layer implementing the pinnable slice interface.
-3. Panama/FFI can remove some boilerplate (native method declarations) and allow Java programs to access `C` libraries without stub code, but calling a `C++`-based library still requires `C` stubs; a possible approach would be to use the RocksDB `C` API as the basis for a rebuilt Java API. This would allow us to remove all the existing JNI boilerplate, and concentrate support effort on the `C` API. An alternative approach would be to build a robust API based on [Reference Counting](https://github.com/facebook/rocksdb/pull/10736), but using FFI. 
+3. Panama/FFI can remove some boilerplate (native method declarations) and allow Java programs to access `C` libraries without stub code, but calling a `C++`-based library still requires `C` stubs; a possible approach would be to use the RocksDB `C` API as the basis for a rebuilt Java API. This would allow us to remove all the existing JNI boilerplate, and concentrate support effort on the `C` API. An alternative approach would be to build a robust API based on [Reference Counting](https://github.com/meta/rocksdb/pull/10736), but using FFI. 
 4. Panama/FFI really shines as a foreign memory standard for a Java API that can allow efficient interoperation between RocksDB Java clients and other (Java and native) components of a system. Foreign Memory gives us a model for how to efficiently return data from RocksDB; as pinnable slices with their contents presented in `MemorySegment`s. If we focus on designing an API *for native interoperability* we think this can be highly productive in opening RocksDB to new uses and opportunities in future.
 
 ## Appendix
 
 ### Code and Data
 
-The [Experimental Pull Request](https://github.com/facebook/rocksdb/pull/11095/files) contains the source code implemented,
+The [Experimental Pull Request](https://github.com/meta/rocksdb/pull/11095/files) contains the source code implemented,
 together with further data plots and the source CSV files for all data plots.
 
 ### Running

@@ -29,7 +29,8 @@ void Multiplier(void* arg1, void* arg2) {
 
 // the first Cleanup is on stack and the rest on heap, so test with both cases
 TEST_F(CleanableTest, Register) {
-  int n2 = 2, n3 = 3;
+  int n2 = 2;
+  int n3 = 3;
   int res = 1;
   {
     Cleanable c1;
@@ -82,7 +83,10 @@ TEST_F(CleanableTest, Register) {
 // the first Cleanup is on stack and the rest on heap,
 // so test all the combinations of them
 TEST_F(CleanableTest, Delegation) {
-  int n2 = 2, n3 = 3, n5 = 5, n7 = 7;
+  int n2 = 2;
+  int n3 = 3;
+  int n5 = 5;
+  int n7 = 7;
   int res = 1;
   {
     Cleanable c2;
@@ -286,7 +290,8 @@ void MarkInitializedForClangAnalyze(T& t) {
 
 TEST_F(CleanableTest, SharedWrapCleanables) {
   int val = 5;
-  Cleanable c1, c2;
+  Cleanable c1;
+  Cleanable c2;
   c1.RegisterCleanup(&Decrement, &val, nullptr);
   c1.RegisterCleanup(&Decrement, &val, nullptr);
   ASSERT_TRUE(c1.HasCleanups());
@@ -350,7 +355,8 @@ TEST_F(CleanableTest, SharedWrapCleanables) {
 
 TEST_F(CleanableTest, CleanableWrapShared) {
   int val = 5;
-  SharedCleanablePtr scp1, scp2;
+  SharedCleanablePtr scp1;
+  SharedCleanablePtr scp2;
   scp1.Allocate();
   scp1->RegisterCleanup(&Decrement, &val, nullptr);
   scp1->RegisterCleanup(&Decrement, &val, nullptr);
@@ -363,7 +369,8 @@ TEST_F(CleanableTest, CleanableWrapShared) {
   {
     Cleanable c1;
     {
-      Cleanable c2, c3;
+      Cleanable c2;
+      Cleanable c3;
       scp1.RegisterCopyWith(&c1);
       scp1.MoveAsCleanupTo(&c2);
       ASSERT_TRUE(c1.HasCleanups());

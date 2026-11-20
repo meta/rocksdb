@@ -37,6 +37,9 @@ A held SuperVersion reference pins `mem`, `imm`, and `current` (Version). This h
 
 Monitoring snapshot age via `rocksdb.oldest-snapshot-time` DB property is important in production to detect these retention issues.
 
+The explicit snapshot list's locking and maintenance design is documented in
+[Explicit Snapshot Concurrency](12_snapshot_concurrency.md).
+
 ## Thread-Local Caching
 
 To avoid contention on the DB mutex for every read, SuperVersion pointers are cached in thread-local storage via `ThreadLocalPtr` (`local_sv_`).

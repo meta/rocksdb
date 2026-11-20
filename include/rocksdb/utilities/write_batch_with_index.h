@@ -54,7 +54,7 @@ struct WriteEntry {
 // Iterator of one column family out of a WriteBatchWithIndex.
 class WBWIIterator {
  public:
-  virtual ~WBWIIterator() {}
+  virtual ~WBWIIterator() = default;
 
   virtual bool Valid() const = 0;
 

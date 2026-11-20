@@ -71,6 +71,8 @@ class Reader {
   // No copying allowed
   Reader(const Reader&) = delete;
   void operator=(const Reader&) = delete;
+  Reader(Reader&&) = delete;
+  void operator=(Reader&&) = delete;
 
   virtual ~Reader();
 
@@ -256,6 +258,13 @@ class FragmentBufferedReader : public Reader {
                   uint64_t* record_checksum = nullptr) override;
   void UnmarkEOF() override;
 
+  // Makes a new reader read on from `offset`, as if it had read the file up to
+  // `offset` and found EOF there. `offset` must be the end of a record in the
+  // file, and the caller must have skipped file() to `offset`. Call it before
+  // the first ReadRecord(). The first read completes the block that holds
+  // `offset`, as UnmarkEOF() does after an EOF in the middle of a block.
+  void StartAtRecordEnd(uint64_t offset);
+
  private:
   std::string fragments_;
   bool in_fragmented_record_;
@@ -266,8 +275,10 @@ class FragmentBufferedReader : public Reader {
   bool TryReadMore(size_t* drop_size, uint8_t* error);
 
   // No copy allowed
-  FragmentBufferedReader(const FragmentBufferedReader&);
-  void operator=(const FragmentBufferedReader&);
+  FragmentBufferedReader(const FragmentBufferedReader&) = delete;
+  void operator=(const FragmentBufferedReader&) = delete;
+  FragmentBufferedReader(FragmentBufferedReader&&) = delete;
+  void operator=(FragmentBufferedReader&&) = delete;
 };
 
 }  // namespace log

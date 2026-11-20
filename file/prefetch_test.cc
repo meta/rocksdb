@@ -3,6 +3,9 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <memory>
+
+#include "cache/cache_reservation_manager.h"
 #include "db/db_test_util.h"
 #include "file/file_prefetch_buffer.h"
 #include "file/file_util.h"
@@ -204,7 +207,7 @@ INSTANTIATE_TEST_CASE_P(PrefetchTest, PrefetchTest,
                         ::testing::Combine(::testing::Bool(),
                                            ::testing::Bool()));
 
-std::string BuildKey(int num, std::string postfix = "") {
+std::string BuildKey(int num, const std::string& postfix = "") {
   return "my_key_" + std::to_string(num) + postfix;
 }
 
@@ -1593,13 +1596,16 @@ class PrefetchTrimReadaheadTestParam
     // To force keys with different prefixes are in different data blocks of the
     // file for testing purpose
     table_options.block_size = 1;
-    table_options.flush_block_policy_factory.reset(
-        new FlushBlockBySizePolicyFactory());
+    table_options.flush_block_policy_factory =
+        std::make_shared<FlushBlockBySizePolicyFactory>();
   }
 
-  void RunSeekToFirstAfterSeekIgnoresStalePrefix(bool async_io) {
-    const bool auto_readahead_size = std::get<1>(GetParam());
+  // Shared setup of the Run*() tests below.
+  static constexpr int kNumKeysUnderPrefix = 40;
 
+  // A mock file system, wrapped in an Env. With `async_io`, it advertises
+  // async IO so that `ReadOptions::async_io` takes the async path.
+  std::unique_ptr<Env> NewTrimTestEnv(bool async_io) {
     std::shared_ptr<MockFS> fs =
         async_io ? std::make_shared<AsyncIOMockFS>(
                        FileSystem::Default(), false /* support_prefetch */,
@@ -1607,32 +1613,36 @@ class PrefetchTrimReadaheadTestParam
                  : std::make_shared<MockFS>(FileSystem::Default(),
                                             false /* support_prefetch */,
                                             true /* small_buffer_alignment */);
-    std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
-    // Close the DB before the local `env` is destroyed, even if an assertion
-    // below exits early: ~DBTestBase() closes it after `env` is already gone.
-    Defer close_db_on_exit([this]() { Close(); });
+    return std::make_unique<CompositeEnvWrapper>(env_, fs);
+  }
 
-    Options options;
-    SetGenericOptions(env.get(), options);
+  // Reopens the DB on `env` with one L0 file: kNumKeysUnderPrefix keys under
+  // kPrefix, then one key under each of the prefixes "c_prefix_" to
+  // "l_prefix_", each key in its own data block. `*block_cache` is set to the
+  // table's block cache, so that each scan can start equally cold: a warm
+  // cache serves every block without touching the file, which suppresses
+  // readahead.
+  void OpenWithOneL0File(Env* env, bool with_prefix_filter, Options* options,
+                         std::shared_ptr<Cache>* block_cache) {
+    SetGenericOptions(env, *options);
     BlockBasedTableOptions table_options;
     SetBlockBasedTableOptions(table_options);
-    // An explicit cache so both scans below start equally cold: a warm cache
-    // serves every block without touching the file, which suppresses readahead
-    // and would make the comparison meaningless.
-    std::shared_ptr<Cache> block_cache = NewLRUCache(8 * 1024 * 1024);
-    table_options.block_cache = block_cache;
-    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    *block_cache = NewLRUCache(8 * 1024 * 1024);
+    table_options.block_cache = *block_cache;
+    if (with_prefix_filter) {
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    }
+    options->table_factory.reset(NewBlockBasedTableFactory(table_options));
 
-    ASSERT_OK(TryReopen(options));
+    ASSERT_OK(TryReopen(*options));
 
-    constexpr int kNumKeysUnderPrefix = 40;
     constexpr int kNumOtherPrefixes = 10;
     WriteBatch batch;
     for (int i = 0; i < kNumKeysUnderPrefix; i++) {
       ASSERT_OK(batch.Put(kPrefix + Key(i), rnd.RandomString(100)));
     }
     // Keys under other prefixes, so that a trim against a prefix other than
-    // "a_prefix_" has somewhere to stop short of.
+    // kPrefix has somewhere to stop short of.
     for (int i = 0; i < kNumOtherPrefixes; i++) {
       const std::string diff_prefix =
           std::string(1, char('c' + i)) + kPrefix.substr(1);
@@ -1641,18 +1651,47 @@ class PrefetchTrimReadaheadTestParam
     ASSERT_OK(db_->Write(WriteOptions(), &batch));
     ASSERT_OK(db_->Flush(FlushOptions()));
 
-    // The file must stay in L0 so the merging iterator holds and reuses this
-    // table iterator across Seek()/SeekToFirst() instead of rebuilding it,
-    // which would discard the stale member and hide the bug.
+    // The file must stay in L0 so the merging iterator holds and reuses one
+    // table iterator across positioning calls instead of rebuilding it, which
+    // would discard whatever an earlier call left behind.
     ASSERT_EQ(1, NumTableFilesAtLevel(0));
+  }
 
+  ReadOptions TrimTestReadOptions(bool async_io) const {
     ReadOptions ro;
     ro.prefix_same_as_start = true;
-    ro.auto_readahead_size = auto_readahead_size;
+    ro.auto_readahead_size = std::get<1>(GetParam());
     ro.async_io = async_io;
     // Small enough that the scan exhausts the buffer and re-prefetches, so the
     // trimming prefix is consulted repeatedly rather than once for the file.
     ro.readahead_size = 1024;
+    return ro;
+  }
+
+  // Steps `iter` from where it is to the end, and returns the number of keys.
+  int CountKeysFromHere(Iterator* iter) {
+    int num_keys = 0;
+    for (; iter->Valid(); iter->Next()) {
+      EXPECT_EQ(kPrefix, iter->key().ToString().substr(0, kPrefix.size()));
+      ++num_keys;
+    }
+    EXPECT_OK(iter->status());
+    return num_keys;
+  }
+
+  void RunSeekToFirstAfterSeekIgnoresStalePrefix(bool async_io) {
+    const bool auto_readahead_size = std::get<1>(GetParam());
+
+    std::unique_ptr<Env> env = NewTrimTestEnv(async_io);
+    // Close the DB before the local `env` is destroyed, even if an assertion
+    // below exits early: ~DBTestBase() closes it after `env` is already gone.
+    Defer close_db_on_exit([this]() { Close(); });
+
+    Options options;
+    std::shared_ptr<Cache> block_cache;
+    ASSERT_NO_FATAL_FAILURE(OpenWithOneL0File(
+        env.get(), false /* with_prefix_filter */, &options, &block_cache));
+    const ReadOptions ro = TrimTestReadOptions(async_io);
 
     // The `async_io` variant reaches the key-loss form of the bug only because
     // `FilePrefetchBuffer` has a second buffer, prefetched with
@@ -1668,23 +1707,14 @@ class PrefetchTrimReadaheadTestParam
       SyncPoint::GetInstance()->ClearAllCallBacks();
     });
 
-    auto count_from_seek_to_first = [this](Iterator* iter) {
-      int num_keys = 0;
-      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-        EXPECT_EQ(kPrefix, iter->key().ToString().substr(0, kPrefix.size()));
-        ++num_keys;
-      }
-      EXPECT_OK(iter->status());
-      return num_keys;
-    };
-
     // Control: SeekToFirst() on an iterator with nothing stale, cold cache.
     block_cache->EraseUnRefEntries();
     ASSERT_OK(options.statistics->Reset());
     int num_keys_control = 0;
     {
       auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
-      num_keys_control = count_from_seek_to_first(iter.get());
+      iter->SeekToFirst();
+      num_keys_control = CountKeysFromHere(iter.get());
     }
     const uint64_t trimmed_control =
         options.statistics->getTickerCount(READAHEAD_TRIMMED);
@@ -1706,7 +1736,8 @@ class PrefetchTrimReadaheadTestParam
       ASSERT_EQ(0, options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS));
       ASSERT_EQ(0, options.statistics->getTickerCount(READAHEAD_TRIMMED));
 
-      num_keys_after_seek = count_from_seek_to_first(iter.get());
+      iter->SeekToFirst();
+      num_keys_after_seek = CountKeysFromHere(iter.get());
     }
     const uint64_t trimmed_after_seek =
         options.statistics->getTickerCount(READAHEAD_TRIMMED);
@@ -1731,6 +1762,131 @@ class PrefetchTrimReadaheadTestParam
     // Last, so the two assertions above stay the ones that report a
     // regression: the `async_io` variant is only worth having while it reaches
     // the extra-buffer prefetch path, and the synchronous one must not.
+    if (async_io) {
+      ASSERT_GT(extra_prefetch_buff_cnt, 0);
+    } else {
+      ASSERT_EQ(0, extra_prefetch_buff_cnt);
+    }
+  }
+
+  void RunFilteredSeekLeavesNextPositioningUnchanged(bool async_io) {
+    const bool auto_readahead_size = std::get<1>(GetParam());
+    const bool successor_index_keys =
+        std::get<0>(GetParam()) == BlockBasedTableOptions::IndexShorteningMode::
+                                       kShortenSeparatorsAndSuccessor;
+    // Whether the scans below must tune readahead, so that checking the prefix
+    // it trims against cannot pass vacuously. Not with successor index keys:
+    // there the passing Seek() below reads the last data block, which leaves
+    // the prefetch buffer above the blocks that the scan reads, so the scan
+    // may read them without readahead.
+    const bool scans_must_tune_readahead =
+        auto_readahead_size && !successor_index_keys;
+
+    std::unique_ptr<Env> env = NewTrimTestEnv(async_io);
+    Defer close_db_on_exit([this]() { Close(); });
+
+    Options options;
+    std::shared_ptr<Cache> block_cache;
+    ASSERT_NO_FATAL_FAILURE(OpenWithOneL0File(
+        env.get(), true /* with_prefix_filter */, &options, &block_cache));
+    const ReadOptions ro = TrimTestReadOptions(async_io);
+
+    // The prefix that readahead tuning sees, each time it runs.
+    std::vector<std::string> trim_prefixes;
+    int extra_prefetch_buff_cnt = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlockBasedTableIterator::BlockCacheLookupForReadAheadSize:TrimPrefix",
+        [&trim_prefixes](void* arg) {
+          trim_prefixes.push_back(*static_cast<std::string*>(arg));
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "FilePrefetchBuffer::PrefetchAsync:ExtraPrefetching",
+        [&extra_prefetch_buff_cnt](void*) { ++extra_prefetch_buff_cnt; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Defer disable_sync_point([]() {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    });
+
+    auto filtered_seeks = [&options]() {
+      return options.statistics->getTickerCount(LAST_LEVEL_SEEK_FILTERED) +
+             options.statistics->getTickerCount(NON_LAST_LEVEL_SEEK_FILTERED);
+    };
+    auto data_block_reads = [&options]() {
+      return options.statistics->getTickerCount(BLOCK_CACHE_DATA_MISS) +
+             options.statistics->getTickerCount(BLOCK_CACHE_DATA_HIT);
+    };
+    // Its prefix passes the filter, so this Seek() sets the trimming prefix to
+    // "l_prefix_", which neither positioning call below may trim against.
+    const std::string passing_key =
+        std::string(1, 'l') + kPrefix.substr(1) + "zzz";
+    const std::string filtered_key = std::string(1, 'b') + kPrefix.substr(1);
+
+    struct Reposition {
+      std::function<void(Iterator*)> run;
+      // The prefix that readahead tuning must see after `run`.
+      std::string trim_prefix;
+    };
+    const std::vector<Reposition> repositions = {
+        {[this](Iterator* iter) { iter->Seek(kPrefix); }, kPrefix},
+        // No seek key, so no prefix to trim against.
+        {[](Iterator* iter) { iter->SeekToFirst(); }, ""}};
+    for (const Reposition& reposition : repositions) {
+      SCOPED_TRACE("trim prefix \"" + reposition.trim_prefix + "\"");
+      // From a cold cache, positions a fresh iterator with Seek(passing_key),
+      // then the filtered Seek() if `with_filtered_seek`, then `reposition`,
+      // and scans. Checks the prefix that readahead tuning sees during the
+      // reposition and scan, and reports their keys and readahead trims.
+      auto run = [&](bool with_filtered_seek, int* num_keys,
+                     uint64_t* trimmed) {
+        block_cache->EraseUnRefEntries();
+        ASSERT_OK(options.statistics->Reset());
+        std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+        iter->Seek(passing_key);
+        ASSERT_OK(iter->status());
+        ASSERT_FALSE(iter->Valid());
+        if (with_filtered_seek) {
+          const uint64_t data_block_reads_before = data_block_reads();
+          iter->Seek(filtered_key);
+          ASSERT_OK(iter->status());
+          ASSERT_FALSE(iter->Valid());
+          // The filter ruled this Seek() out before it read any data block,
+          // so it kept the trimming prefix of the Seek() before it.
+          ASSERT_EQ(1, filtered_seeks());
+          ASSERT_EQ(data_block_reads_before, data_block_reads());
+        }
+
+        const uint64_t trimmed_before =
+            options.statistics->getTickerCount(READAHEAD_TRIMMED);
+        trim_prefixes.clear();
+        reposition.run(iter.get());
+        *num_keys = CountKeysFromHere(iter.get());
+        *trimmed = options.statistics->getTickerCount(READAHEAD_TRIMMED) -
+                   trimmed_before;
+        if (scans_must_tune_readahead) {
+          ASSERT_FALSE(trim_prefixes.empty());
+          ASSERT_GT(*trimmed, 0);
+        }
+        for (const std::string& prefix : trim_prefixes) {
+          ASSERT_EQ(reposition.trim_prefix, prefix);
+        }
+      };
+
+      int num_keys_control = 0;
+      uint64_t trimmed_control = 0;
+      ASSERT_NO_FATAL_FAILURE(run(false /* with_filtered_seek */,
+                                  &num_keys_control, &trimmed_control));
+      int num_keys_after_filtered_seek = 0;
+      uint64_t trimmed_after_filtered_seek = 0;
+      ASSERT_NO_FATAL_FAILURE(run(true /* with_filtered_seek */,
+                                  &num_keys_after_filtered_seek,
+                                  &trimmed_after_filtered_seek));
+
+      ASSERT_EQ(kNumKeysUnderPrefix, num_keys_control);
+      ASSERT_EQ(num_keys_control, num_keys_after_filtered_seek);
+      ASSERT_EQ(trimmed_control, trimmed_after_filtered_seek);
+    }
+
     if (async_io) {
       ASSERT_GT(extra_prefetch_buff_cnt, 0);
     } else {
@@ -1862,6 +2018,32 @@ TEST_P(PrefetchTrimReadaheadTestParam,
   }
 
   RunSeekToFirstAfterSeekIgnoresStalePrefix(true /* async_io */);
+}
+
+// A Seek() that the prefix filter rules out reads no data block, so it leaves
+// the readahead-trimming prefix of the Seek() before it in place. The next
+// positioning call must replace that prefix before readahead tuning sees it:
+// Seek(kPrefix) must trim against kPrefix, and SeekToFirst() against no
+// prefix. It also has to return the same keys, and trim readahead as often, as
+// it would without the filtered Seek() in between.
+TEST_P(PrefetchTrimReadaheadTestParam,
+       FilteredSeekLeavesNextPositioningUnchanged) {
+  if (mem_env_ || encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-mem or non-encrypted environment");
+    return;
+  }
+
+  RunFilteredSeekLeavesNextPositioningUnchanged(false /* async_io */);
+}
+
+TEST_P(PrefetchTrimReadaheadTestParam,
+       FilteredSeekLeavesNextPositioningUnchangedAsyncIO) {
+  if (mem_env_ || encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-mem or non-encrypted environment");
+    return;
+  }
+
+  RunFilteredSeekLeavesNextPositioningUnchanged(true /* async_io */);
 }
 
 TEST_P(PrefetchTrimReadaheadTestParam, IterateUpperBoundAtEndOfIndex) {
@@ -2373,7 +2555,8 @@ TEST_P(PrefetchTest1, SeekWithExtraPrefetchAsyncIO) {
 
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &least, &greatest));
   Close();
-  int buff_prefetch_count = 0, extra_prefetch_buff_cnt = 0;
+  int buff_prefetch_count = 0;
+  int extra_prefetch_buff_cnt = 0;
   for (size_t i = 0; i < 3; i++) {
     table_options.num_file_reads_for_auto_readahead = i;
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -2948,7 +3131,7 @@ namespace {
 const int kMaxArgCount = 100;
 const size_t kArgBufferSize = 100000;
 
-void RunIOTracerParserTool(std::string trace_file) {
+void RunIOTracerParserTool(const std::string& trace_file) {
   std::vector<std::string> params = {"./io_tracer_parser",
                                      "-io_trace_file=" + trace_file};
 
@@ -2969,6 +3152,246 @@ void RunIOTracerParserTool(std::string trace_file) {
 }
 #endif  // GFLAGS
 }  // namespace
+
+class ReadaheadBufferChargeTest : public DBTestBase,
+                                  public ::testing::WithParamInterface<bool> {
+ public:
+  ReadaheadBufferChargeTest()
+      : DBTestBase("readahead_buffer_charge_test", /*env_do_fsync=*/false) {
+    // Release reservations right away, so the tests can check that the charge
+    // goes back to zero when the buffers are freed.
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlockBasedTableFactory::BlockBasedTableFactory:"
+        "ReadaheadReleaseDelayMicros",
+        [](void* arg) { *static_cast<uint64_t*>(arg) = 0; });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(ReadaheadBufferChargeTest, ReadaheadBufferChargeTest,
+                        ::testing::Bool());
+
+// Checks that readahead buffers of user scans and compactions are charged to
+// the block cache only when kReadaheadBuffer charging is enabled, and that the
+// charge is released when the buffers are freed.
+TEST_P(ReadaheadBufferChargeTest, ScanAndCompaction) {
+  const bool charged = GetParam();
+  constexpr size_t kReadaheadSize = 1024 * 1024;
+  // Without file system prefetch, compaction uses the internal readahead
+  // buffer.
+  std::shared_ptr<MockFS> fs = std::make_shared<MockFS>(
+      env_->GetFileSystem(), /*support_prefetch=*/false);
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
+  auto cache = std::make_shared<
+      TargetCacheChargeTrackingCache<CacheEntryRole::kReadaheadBuffer>>(
+      NewLRUCache(64 << 20));
+
+  Options options = CurrentOptions();
+  options.env = env.get();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.compaction_readahead_size = kReadaheadSize;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = cache;
+  table_options.cache_usage_options.options_overrides.insert(
+      {CacheEntryRole::kReadaheadBuffer,
+       {/*.charged = */ charged ? CacheEntryRoleOptions::Decision::kEnabled
+                                : CacheEntryRoleOptions::Decision::kDisabled}});
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  // Two overlapping files, so that the compaction below reads both.
+  Random rnd(301);
+  for (int file = 0; file < 2; ++file) {
+    for (int i = 0; i < 2000; ++i) {
+      ASSERT_OK(Put(Key(i), rnd.RandomString(1000)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_EQ(cache->GetCacheCharge(), 0);
+
+  {
+    ReadOptions ro;
+    ro.readahead_size = kReadaheadSize;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    int count = 0;
+    for (iter->SeekToFirst(); iter->Valid() && count < 100; iter->Next()) {
+      ++count;
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(count, 100);
+    if (charged) {
+      ASSERT_GE(cache->GetCacheCharge(), kReadaheadSize);
+    } else {
+      ASSERT_EQ(cache->GetCacheCharge(), 0);
+    }
+  }
+  ASSERT_EQ(cache->GetCacheCharge(), 0);
+
+  const size_t num_peaks_before_compaction =
+      cache->GetChargedCachePeaks().size();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(cache->GetCacheCharge(), 0);
+  const std::deque<size_t> peaks = cache->GetChargedCachePeaks();
+  if (charged) {
+    ASSERT_GT(peaks.size(), num_peaks_before_compaction);
+    ASSERT_GE(*std::max_element(peaks.begin() + num_peaks_before_compaction,
+                                peaks.end()),
+              kReadaheadSize);
+  } else {
+    ASSERT_TRUE(peaks.empty());
+  }
+  Close();
+}
+
+// Checks that the readahead buffers used when opening a table and by
+// VerifyChecksum() are charged only when charging is enabled, and that their
+// charge is released afterwards. Without file system prefetch, table open
+// reads the tail into an internal buffer. With it, that buffer is disabled and
+// partitioned index prefetch allocates its own buffer. Only the last step uses
+// a partitioned index, since otherwise its buffer could hide a missing charge
+// in the other steps.
+TEST_P(ReadaheadBufferChargeTest, TableOpenAndVerifyChecksum) {
+  const bool charged = GetParam();
+  std::shared_ptr<MockFS> no_prefetch_fs = std::make_shared<MockFS>(
+      env_->GetFileSystem(), /*support_prefetch=*/false);
+  std::unique_ptr<Env> no_prefetch_env(
+      new CompositeEnvWrapper(env_, no_prefetch_fs));
+  std::shared_ptr<MockFS> prefetch_fs = std::make_shared<MockFS>(
+      env_->GetFileSystem(), /*support_prefetch=*/true);
+  std::unique_ptr<Env> prefetch_env(new CompositeEnvWrapper(env_, prefetch_fs));
+  auto cache = std::make_shared<
+      TargetCacheChargeTrackingCache<CacheEntryRole::kReadaheadBuffer>>(
+      NewLRUCache(64 << 20));
+
+  Options options = CurrentOptions();
+  options.env = no_prefetch_env.get();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.max_open_files = -1;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = cache;
+  table_options.cache_usage_options.options_overrides.insert(
+      {CacheEntryRole::kReadaheadBuffer,
+       {/*.charged = */ charged ? CacheEntryRoleOptions::Decision::kEnabled
+                                : CacheEntryRoleOptions::Decision::kDisabled}});
+  Random rnd(301);
+  auto recreate_db = [&]() {
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+    for (int i = 0; i < 2000; ++i) {
+      ASSERT_OK(Put(Key(i), rnd.RandomString(1000)));
+    }
+    ASSERT_OK(Flush());
+  };
+  recreate_db();
+
+  // Runs `step` and checks that it charges at least `min_peak` bytes of
+  // readahead memory when charging is enabled and nothing otherwise, and that
+  // the charge is released by the time it returns.
+  auto check_step_charge = [&](const std::string& name, size_t min_peak,
+                               const std::function<void()>& step) {
+    SCOPED_TRACE(name);
+    const std::deque<size_t> peaks_before = cache->GetChargedCachePeaks();
+    step();
+    const std::deque<size_t> peaks = cache->GetChargedCachePeaks();
+    size_t max_peak = 0;
+    for (size_t i = peaks_before.size(); i < peaks.size(); ++i) {
+      max_peak = std::max(max_peak, peaks[i]);
+    }
+    if (charged) {
+      ASSERT_GE(max_peak, min_peak);
+    } else {
+      ASSERT_EQ(max_peak, 0);
+    }
+    ASSERT_EQ(cache->GetCacheCharge(), 0);
+  };
+
+  check_step_charge("tail prefetch", 1, [&]() { Reopen(options); });
+  // VerifyChecksum() opens new table readers, whose tail prefetch buffers are
+  // also charged. Its own 1 MiB readahead buffer is larger than any tail
+  // prefetch buffer, so the minimum peak shows that it is charged.
+  constexpr size_t kVerifyReadaheadSize = 1024 * 1024;
+  check_step_charge("verify checksum", kVerifyReadaheadSize, [&]() {
+    ReadOptions ro;
+    ro.readahead_size = kVerifyReadaheadSize;
+    ASSERT_OK(db_->VerifyChecksum(ro));
+  });
+
+  table_options.index_type =
+      BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
+  table_options.metadata_block_size = 1024;
+  options.env = prefetch_env.get();
+  recreate_db();
+  check_step_charge("partitioned index prefetch", 1,
+                    [&]() { Reopen(options); });
+  Close();
+}
+
+// With a strict single-shard block cache, checks how readahead charging affects
+// a scan with 1 MiB readahead, whose buffer needs five 256 KiB dummy entries.
+// With 512 KiB, the reservation fails and is given back, so the scan still
+// succeeds. With 1280 KiB, the reservation succeeds and takes the whole cache,
+// so inserting a data block fails with MemoryLimit, as with other charged
+// memory. Without charging, both scans succeed.
+TEST_P(ReadaheadBufferChargeTest, StrictCapacityLimit) {
+  const bool charged = GetParam();
+  constexpr size_t kReadaheadSize = 1024 * 1024;
+  constexpr size_t kFullyReservedCapacity = 1280 * 1024;
+  constexpr int kNumKeys = 2000;
+  for (size_t capacity : {size_t{512 * 1024}, kFullyReservedCapacity}) {
+    SCOPED_TRACE("capacity=" + std::to_string(capacity));
+    LRUCacheOptions cache_opts;
+    cache_opts.capacity = capacity;
+    cache_opts.num_shard_bits = 0;
+    cache_opts.strict_capacity_limit = true;
+    cache_opts.metadata_charge_policy = kDontChargeCacheMetadata;
+    auto cache = std::make_shared<
+        TargetCacheChargeTrackingCache<CacheEntryRole::kReadaheadBuffer>>(
+        cache_opts.MakeSharedCache());
+
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.disable_auto_compactions = true;
+    options.compression = kNoCompression;
+    BlockBasedTableOptions table_options;
+    table_options.block_cache = cache;
+    table_options.cache_index_and_filter_blocks = false;
+    table_options.cache_usage_options.options_overrides.insert(
+        {CacheEntryRole::kReadaheadBuffer,
+         {/*.charged = */ charged
+              ? CacheEntryRoleOptions::Decision::kEnabled
+              : CacheEntryRoleOptions::Decision::kDisabled}});
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+
+    Random rnd(301);
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Put(Key(i), rnd.RandomString(1000)));
+    }
+    ASSERT_OK(Flush());
+
+    ReadOptions ro;
+    ro.readahead_size = kReadaheadSize;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    int count = 0;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      ++count;
+    }
+    if (charged && capacity == kFullyReservedCapacity) {
+      ASSERT_TRUE(iter->status().IsMemoryLimit()) << iter->status().ToString();
+    } else {
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(count, kNumKeys);
+    }
+    ASSERT_LE(cache->GetCacheCharge(), capacity);
+    iter.reset();
+    ASSERT_EQ(cache->GetCacheCharge(), 0);
+  }
+  Close();
+}
 
 // Tests the default implementation of ReadAsync API with PosixFileSystem during
 // prefetching.
@@ -3459,6 +3882,101 @@ TEST_P(PrefetchTest, TraceReadAsyncWithCallbackWrapper) {
 }
 #endif  // GFLAGS
 
+namespace {
+// Reads `content` through a FilePrefetchBuffer charged to a cache reservation
+// manager. With a non-strict cache, checks that the charge always matches the
+// total buffer capacity. With a strict cache, checks that a failed reservation
+// is given back, so the charged memory is always fully reserved and the cache
+// never gets fuller than its capacity, while reads still return correct data.
+// Also checks that the charge is released when the buffer is destroyed.
+void VerifyFilePrefetchBufferCacheReservation(
+    const std::string& content, RandomAccessFileReader* reader,
+    const ReadaheadParams& readahead_params, bool for_compaction,
+    FileSystem* fs, SystemClock* clock, Statistics* stats) {
+  const uint32_t seed = static_cast<uint32_t>(clock->NowMicros());
+  // Also print the seed, since SCOPED_TRACE is not shown when an assertion
+  // aborts the test.
+  fprintf(stderr, "VerifyFilePrefetchBufferCacheReservation seed=%u\n", seed);
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  const bool use_async_prefetch = readahead_params.num_buffers > 1;
+
+  struct CacheConfig {
+    size_t capacity;
+    bool strict_capacity_limit;
+  };
+  // A strict cache without capacity rejects every reservation. A strict cache
+  // of one dummy entry (256 KiB) accepts small reservations and rejects the
+  // ones that need a second entry.
+  for (const CacheConfig& config :
+       {CacheConfig{64 << 20, false}, CacheConfig{0, true},
+        CacheConfig{256 << 10, true}}) {
+    SCOPED_TRACE("capacity=" + std::to_string(config.capacity) +
+                 " strict_capacity_limit=" +
+                 std::to_string(config.strict_capacity_limit));
+    LRUCacheOptions cache_opts;
+    cache_opts.capacity = config.capacity;
+    cache_opts.num_shard_bits = 0;
+    cache_opts.strict_capacity_limit = config.strict_capacity_limit;
+    cache_opts.metadata_charge_policy = kDontChargeCacheMetadata;
+    std::shared_ptr<Cache> cache = cache_opts.MakeSharedCache();
+    auto cache_res_mgr = std::make_shared<AtomicCacheReservationManager>(
+        std::make_shared<
+            CacheReservationManagerImpl<CacheEntryRole::kReadaheadBuffer>>(
+            cache),
+        nullptr /* clock */, 0 /* release_delay_micros */);
+    size_t max_charged = 0;
+    bool saw_uncharged_memory = false;
+    {
+      FilePrefetchBuffer fpb(readahead_params, true /* enable */,
+                             false /* track_min_offset */, fs, clock, stats);
+      fpb.SetCacheReservationManager(cache_res_mgr);
+      Slice result;
+      Status s;
+      uint64_t offset = 0;
+      while (offset < content.size()) {
+        // Table readers never read past the end of the file.
+        size_t len = std::min<size_t>(1 + rnd.Uniform(16 * 1024),
+                                      content.size() - offset);
+        bool could_read_from_cache = fpb.TryReadFromCache(
+            IOOptions(), reader, offset, len, &result, &s, for_compaction);
+        // Platforms that don't have IO uring may not support async IO.
+        if (use_async_prefetch && s.IsNotSupported()) {
+          return;
+        }
+        ASSERT_TRUE(could_read_from_cache);
+        ASSERT_OK(s);
+        ASSERT_EQ(result.ToString(), content.substr(offset, len));
+
+        const size_t charged = cache_res_mgr->GetTotalMemoryUsed();
+        const size_t reserved = cache_res_mgr->GetTotalReservedCacheSize();
+        const size_t buffer_capacity = fpb.TEST_GetTotalBufferCapacity();
+        if (config.strict_capacity_limit) {
+          ASSERT_LE(charged, buffer_capacity);
+          ASSERT_LE(reserved, config.capacity);
+          saw_uncharged_memory |= charged < buffer_capacity;
+        } else {
+          ASSERT_EQ(charged, buffer_capacity);
+        }
+        ASSERT_GE(reserved, charged);
+        max_charged = std::max(max_charged, charged);
+        // Mix back to back reads with forward skips.
+        offset += len + (rnd.OneIn(4) ? rnd.Uniform(128 * 1024) : 0);
+      }
+    }
+    if (config.strict_capacity_limit) {
+      ASSERT_TRUE(saw_uncharged_memory);
+    }
+    if (config.capacity > 0) {
+      ASSERT_GT(max_charged, 0);
+    }
+    ASSERT_EQ(cache_res_mgr->GetTotalMemoryUsed(), 0);
+    ASSERT_EQ(cache_res_mgr->GetTotalReservedCacheSize(), 0);
+    ASSERT_EQ(cache->GetUsage(), 0);
+  }
+}
+}  // namespace
+
 class FilePrefetchBufferTest : public testing::Test {
  public:
   void SetUp() override {
@@ -3506,7 +4024,7 @@ class FilePrefetchBufferTest : public testing::Test {
   Statistics* stats() { return stats_.get(); }
 
  private:
-  Env* env_;
+  Env* env_ = nullptr;
   std::shared_ptr<FileSystem> fs_;
   std::string test_dir_;
   std::shared_ptr<Statistics> stats_;
@@ -3810,6 +4328,27 @@ TEST_F(FilePrefetchBufferTest, ForCompaction) {
       0);
 }
 
+TEST_F(FilePrefetchBufferTest, CacheReservation) {
+  std::string fname = "file-prefetch-buffer-cache-reservation";
+  Random rand(0);
+  std::string content = rand.RandomString(4 * 1024 * 1024);
+  Write(fname, content);
+
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> r;
+  Read(fname, opts, &r);
+
+  ReadaheadParams readahead_params;
+  readahead_params.initial_readahead_size = 4096;
+  readahead_params.max_readahead_size = 256 * 1024;
+  for (bool for_compaction : {false, true}) {
+    SCOPED_TRACE("for_compaction=" + std::to_string(for_compaction));
+    ASSERT_NO_FATAL_FAILURE(VerifyFilePrefetchBufferCacheReservation(
+        content, r.get(), readahead_params, for_compaction, fs(),
+        SystemClock::Default().get(), stats()));
+  }
+}
+
 TEST_F(FilePrefetchBufferTest, PollErrorPropagation) {
   // This test verifies that Poll() errors in PollIfNeeded are properly
   // propagated rather than being silently ignored.
@@ -3954,7 +4493,7 @@ class FSBufferPrefetchTest
             // the read data. We can have the FSAllocationPtr point to a
             // wrapper around the result buffer in our test implementation so
             // that we can catch whenever we incorrectly make this assumption.
-            // See https://github.com/facebook/rocksdb/pull/13189 for more
+            // See https://github.com/meta/rocksdb/pull/13189 for more
             // context.
             char* internalData = new char[req.len];
             req.status = Read(req.offset, req.len, options, &req.result,
@@ -4028,7 +4567,7 @@ class FSBufferPrefetchTest
   SystemClock* clock() { return env_->GetSystemClock().get(); }
 
  private:
-  Env* env_;
+  Env* env_ = nullptr;
   std::shared_ptr<FileSystem> fs_;
   std::string test_dir_;
   std::shared_ptr<Statistics> stats_;
@@ -4485,6 +5024,31 @@ TEST_P(FSBufferPrefetchTest, FSBufferPrefetchRandomized) {
       offset += len;
     }
   }
+}
+
+TEST_P(FSBufferPrefetchTest, CacheReservation) {
+  std::string fname = "fs-buffer-prefetch-cache-reservation";
+  Random rand(0);
+  std::string content = rand.RandomString(4 * 1024 * 1024);
+  Write(fname, content);
+
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> r;
+  Read(fname, opts, &r);
+
+  bool use_async_prefetch = std::get<0>(GetParam());
+  bool for_compaction = std::get<1>(GetParam());
+  // Async IO is not enabled for compaction prefetching
+  if (use_async_prefetch && for_compaction) {
+    return;
+  }
+  ReadaheadParams readahead_params;
+  readahead_params.initial_readahead_size = 4096;
+  readahead_params.max_readahead_size = 256 * 1024;
+  readahead_params.num_buffers = use_async_prefetch ? 2 : 1;
+  VerifyFilePrefetchBufferCacheReservation(content, r.get(), readahead_params,
+                                           for_compaction, fs(), clock(),
+                                           stats());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

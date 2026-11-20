@@ -144,6 +144,11 @@ class FailureDecompressor : public Decompressor {
     assert(!status_.ok());
   }
   ~FailureDecompressor() override { status_.PermitUncheckedError(); }
+  // No copying allowed
+  FailureDecompressor(const FailureDecompressor&) = delete;
+  FailureDecompressor& operator=(const FailureDecompressor&) = delete;
+  FailureDecompressor(FailureDecompressor&&) = delete;
+  FailureDecompressor& operator=(FailureDecompressor&&) = delete;
 
   const char* Name() const override { return "FailureDecompressor"; }
 
@@ -181,7 +186,7 @@ struct DecompressorDict {
   std::unique_ptr<Decompressor> decompressor_;
 
   // Approximate owned memory usage
-  size_t memory_usage_;
+  size_t memory_usage_ = 0;
 
   DecompressorDict(std::string&& dict, Decompressor& from_decompressor)
       : dict_str_(std::move(dict)) {
@@ -212,6 +217,7 @@ struct DecompressorDict {
   // Disable copy
   DecompressorDict(const DecompressorDict&) = delete;
   DecompressorDict& operator=(const DecompressorDict&) = delete;
+  ~DecompressorDict() = default;
 
   // The object is self-contained if the string constructor is used, or the
   // Slice constructor is invoked with a non-null allocation. Otherwise, it
@@ -372,6 +378,8 @@ class CompressionContext : public Compressor::WorkingArea {
   ~CompressionContext() { DestroyNativeContext(); }
   CompressionContext(const CompressionContext&) = delete;
   CompressionContext& operator=(const CompressionContext&) = delete;
+  CompressionContext(CompressionContext&&) = delete;
+  CompressionContext& operator=(CompressionContext&&) = delete;
 };
 
 // This is like a working area, reusable for different dicts, etc.
@@ -397,6 +405,8 @@ class UncompressionContext : public Decompressor::WorkingArea {
   }
   UncompressionContext(const UncompressionContext&) = delete;
   UncompressionContext& operator=(const UncompressionContext&) = delete;
+  UncompressionContext(UncompressionContext&&) = delete;
+  UncompressionContext& operator=(UncompressionContext&&) = delete;
 
   ZSTDUncompressCachedData::ZSTDNativeContext GetZSTDContext() const {
     return uncomp_cached_data_.Get();
@@ -712,7 +722,6 @@ class ZSTDStreamingCompress final : public StreamingCompress {
     // Each compressed frame will have a checksum
     ZSTD_CCtx_setParameter(cctx_, ZSTD_c_checksumFlag, 1);
     assert(cctx_ != nullptr);
-    input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif
   }
   ~ZSTDStreamingCompress() override {
@@ -720,12 +729,17 @@ class ZSTDStreamingCompress final : public StreamingCompress {
     ZSTD_freeCCtx(cctx_);
 #endif
   }
+  // No copying allowed
+  ZSTDStreamingCompress(const ZSTDStreamingCompress&) = delete;
+  ZSTDStreamingCompress& operator=(const ZSTDStreamingCompress&) = delete;
+  ZSTDStreamingCompress(ZSTDStreamingCompress&&) = delete;
+  ZSTDStreamingCompress& operator=(ZSTDStreamingCompress&&) = delete;
   int Compress(const char* input, size_t input_size, char* output,
                size_t* output_pos) override;
   void Reset() override;
 #ifdef ZSTD
   ZSTD_CCtx* cctx_;
-  ZSTD_inBuffer input_buffer_;
+  ZSTD_inBuffer input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif
 };
 
@@ -737,7 +751,6 @@ class ZSTDStreamingUncompress final : public StreamingUncompress {
 #ifdef ZSTD
     dctx_ = ZSTD_createDCtx();
     assert(dctx_ != nullptr);
-    input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif
   }
   ~ZSTDStreamingUncompress() override {
@@ -745,6 +758,11 @@ class ZSTDStreamingUncompress final : public StreamingUncompress {
     ZSTD_freeDCtx(dctx_);
 #endif
   }
+  // No copying allowed
+  ZSTDStreamingUncompress(const ZSTDStreamingUncompress&) = delete;
+  ZSTDStreamingUncompress& operator=(const ZSTDStreamingUncompress&) = delete;
+  ZSTDStreamingUncompress(ZSTDStreamingUncompress&&) = delete;
+  ZSTDStreamingUncompress& operator=(ZSTDStreamingUncompress&&) = delete;
   int Uncompress(const char* input, size_t input_size, char* output,
                  size_t* output_size) override;
   void Reset() override;
@@ -752,7 +770,7 @@ class ZSTDStreamingUncompress final : public StreamingUncompress {
  private:
 #ifdef ZSTD
   ZSTD_DCtx* dctx_;
-  ZSTD_inBuffer input_buffer_;
+  ZSTD_inBuffer input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif
 };
 

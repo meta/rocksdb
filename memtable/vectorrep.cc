@@ -319,7 +319,7 @@ void VectorRep::Get(const LookupKey& k, void* callback_args,
     vector_rep = this;
   } else {
     vector_rep = nullptr;
-    bucket.reset(new Bucket(*bucket_));  // make a copy
+    bucket = std::make_shared<Bucket>(*bucket_);  // make a copy
   }
   VectorRep::Iterator iter(vector_rep, immutable_ ? bucket_ : bucket, compare_);
   rwlock_.ReadUnlock();
@@ -344,8 +344,7 @@ MemTableRep::Iterator* VectorRep::GetIterator(Arena* arena) {
       return new (mem) Iterator(this, bucket_, compare_);
     }
   } else {
-    std::shared_ptr<Bucket> tmp;
-    tmp.reset(new Bucket(*bucket_));  // make a copy
+    auto tmp = std::make_shared<Bucket>(*bucket_);  // make a copy
     if (arena == nullptr) {
       return new Iterator(nullptr, tmp, compare_);
     } else {

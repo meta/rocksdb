@@ -70,7 +70,8 @@ class SemiStructuredUniqueIdGen {
   T GenerateNext() {
     static_assert(sizeof(T) <= sizeof(uint64_t));
     static_assert(std::is_integral_v<T>);
-    uint64_t ignore, val;
+    uint64_t ignore;
+    uint64_t val;
     GenerateNext(&ignore, &val);
     return static_cast<T>(val);
   }
@@ -78,10 +79,10 @@ class SemiStructuredUniqueIdGen {
   uint64_t GetBaseUpper() const { return base_upper_; }
 
  private:
-  uint64_t base_upper_;
-  uint64_t base_lower_;
+  uint64_t base_upper_ = 0;
+  uint64_t base_lower_ = 0;
   std::atomic<uint64_t> counter_;
-  int64_t saved_process_id_;
+  int64_t saved_process_id_ = 0;
 };
 
 // A unique id generator that should provide reasonable security against

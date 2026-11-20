@@ -70,15 +70,14 @@ class AlignedBuffer {
                                          ExternalAllocation* out)>;
 
  private:
-  size_t alignment_;
+  size_t alignment_ = 0;
   FSAllocationPtr buf_;
-  size_t capacity_;
-  size_t cursize_;
-  char* bufstart_;
+  size_t capacity_ = 0;
+  size_t cursize_ = 0;
+  char* bufstart_ = nullptr;
 
  public:
-  AlignedBuffer()
-      : alignment_(), capacity_(0), cursize_(0), bufstart_(nullptr) {}
+  AlignedBuffer() = default;
 
   AlignedBuffer(AlignedBuffer&& o) noexcept { *this = std::move(o); }
 
@@ -94,6 +93,8 @@ class AlignedBuffer {
   AlignedBuffer(const AlignedBuffer&) = delete;
 
   AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+
+  ~AlignedBuffer() = default;
 
   static bool isAligned(const void* ptr, size_t alignment) {
     return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
@@ -172,9 +173,10 @@ class AlignedBuffer {
 
     size_t new_capacity = Roundup(requested_capacity, alignment_);
     char* new_buf = new char[new_capacity + alignment_];
-    char* new_bufstart = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(new_buf) + (alignment_ - 1)) &
-        ~static_cast<uintptr_t>(alignment_ - 1));
+    const size_t current_mod =
+        reinterpret_cast<uintptr_t>(new_buf) & (alignment_ - 1);
+    char* new_bufstart =
+        new_buf + (current_mod == 0 ? 0 : alignment_ - current_mod);
 
     if (copy_data) {
       assert(bufstart_ + copy_offset + copy_len <= bufstart_ + cursize_);
@@ -375,7 +377,7 @@ class GrowableBuffer {
   }
 
   Slice AsSlice() const { return Slice(data_, size_); }
-  operator Slice() const { return AsSlice(); }
+  explicit operator Slice() const { return AsSlice(); }
 
  private:
   char* data_ = nullptr;

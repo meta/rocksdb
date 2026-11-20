@@ -285,6 +285,12 @@ class MemTableList {
     current_->Ref();
   }
 
+  // No copying allowed
+  MemTableList(const MemTableList&) = delete;
+  MemTableList& operator=(const MemTableList&) = delete;
+  MemTableList(MemTableList&&) = delete;
+  MemTableList& operator=(MemTableList&&) = delete;
+
   // Should not delete MemTableList without making sure MemTableList::current()
   // is Unref()'d.
   ~MemTableList() {
@@ -443,10 +449,6 @@ class MemTableList {
     imm_trim_needed.compare_exchange_strong(
         expected, false, std::memory_order_relaxed, std::memory_order_relaxed);
   }
-
-  // Copying allowed
-  // MemTableList(const MemTableList&);
-  // void operator=(const MemTableList&);
 
   size_t* current_memory_usage() { return &current_memory_usage_; }
 

@@ -29,7 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#if defined(OS_LINUX) || defined(OS_SOLARIS) || defined(OS_ANDROID)
+#if defined(OS_LINUX) || defined(OS_ANDROID)
 #include <sys/statfs.h>
 #endif
 #include <sys/statvfs.h>
@@ -144,11 +144,9 @@ class PosixClock : public SystemClock {
   uint64_t NowNanos() override {
 #if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
     defined(OS_AIX)
-    struct timespec ts;
+    struct timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
-#elif defined(OS_SOLARIS)
-    return gethrtime();
 #elif defined(__MACH__)
     clock_serv_t cclock;
     mach_timespec_t ts;
@@ -166,7 +164,7 @@ class PosixClock : public SystemClock {
   uint64_t CPUMicros() override {
 #if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
     defined(OS_AIX) || (defined(__MACH__) && defined(__MAC_10_12))
-    struct timespec ts;
+    struct timespec ts{};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return (static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec) / 1000;
 #else
@@ -177,7 +175,7 @@ class PosixClock : public SystemClock {
   uint64_t CPUNanos() override {
 #if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
     defined(OS_AIX) || (defined(__MACH__) && defined(__MAC_10_12))
-    struct timespec ts;
+    struct timespec ts{};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
 #else
@@ -198,7 +196,7 @@ class PosixClock : public SystemClock {
 
   std::string TimeToString(uint64_t secondsSince1970) override {
     const time_t seconds = (time_t)secondsSince1970;
-    struct tm t;
+    struct tm t{};
     int maxsize = 64;
     std::string dummy;
     dummy.reserve(maxsize);
@@ -219,6 +217,11 @@ class PosixEnv : public CompositeEnv {
 
   struct JoinThreadsOnExit {
     explicit JoinThreadsOnExit(PosixEnv& _deflt) : deflt(_deflt) {}
+    // No copying allowed
+    JoinThreadsOnExit(const JoinThreadsOnExit&) = delete;
+    JoinThreadsOnExit& operator=(const JoinThreadsOnExit&) = delete;
+    JoinThreadsOnExit(JoinThreadsOnExit&&) = delete;
+    JoinThreadsOnExit& operator=(JoinThreadsOnExit&&) = delete;
     ~JoinThreadsOnExit() {
       for (const auto tid : deflt.threads_to_join_) {
         pthread_join(tid, nullptr);
@@ -234,12 +237,6 @@ class PosixEnv : public CompositeEnv {
     }
     PosixEnv& deflt;
   };
-
-  void SetFD_CLOEXEC(int fd, const EnvOptions* options) {
-    if ((options == nullptr || options->set_fd_cloexec) && fd > 0) {
-      fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-    }
-  }
 
 #ifndef ROCKSDB_NO_DYNAMIC_EXTENSION
   // Loads the named library into the result.
@@ -357,12 +354,12 @@ class PosixEnv : public CompositeEnv {
 
   // Allow increasing the number of worker threads.
   void SetBackgroundThreads(int num, Priority pri) override {
-    assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+    assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
     thread_pools_[pri].SetBackgroundThreads(num);
   }
 
   int GetBackgroundThreads(Priority pri) override {
-    assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+    assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
     return thread_pools_[pri].GetBackgroundThreads();
   }
 
@@ -373,12 +370,12 @@ class PosixEnv : public CompositeEnv {
 
   // Allow increasing the number of worker threads.
   void IncBackgroundThreadsIfNeeded(int num, Priority pri) override {
-    assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+    assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
     thread_pools_[pri].IncBackgroundThreadsIfNeeded(num);
   }
 
   void LowerThreadPoolIOPriority(Priority pool) override {
-    assert(pool >= Priority::BOTTOM && pool <= Priority::HIGH);
+    assert(pool >= Priority::BOTTOM && pool <= Priority::READ);
 #ifdef OS_LINUX
     thread_pools_[pool].LowerIOPriority();
 #else
@@ -387,12 +384,12 @@ class PosixEnv : public CompositeEnv {
   }
 
   void LowerThreadPoolCPUPriority(Priority pool) override {
-    assert(pool >= Priority::BOTTOM && pool <= Priority::HIGH);
+    assert(pool >= Priority::BOTTOM && pool <= Priority::READ);
     thread_pools_[pool].LowerCPUPriority(CpuPriority::kLow);
   }
 
   Status LowerThreadPoolCPUPriority(Priority pool, CpuPriority pri) override {
-    assert(pool >= Priority::BOTTOM && pool <= Priority::HIGH);
+    assert(pool >= Priority::BOTTOM && pool <= Priority::READ);
     thread_pools_[pool].LowerCPUPriority(pri);
     return Status::OK();
   }
@@ -406,7 +403,7 @@ class PosixEnv : public CompositeEnv {
   // Non-default instances simply maintain references to the backing
   // members in te default instance
   std::vector<ThreadPoolImpl> thread_pools_storage_;
-  pthread_mutex_t mu_storage_;
+  pthread_mutex_t mu_storage_{};
   std::vector<pthread_t> threads_to_join_storage_;
   bool allow_non_owner_access_storage_;
 
@@ -438,26 +435,27 @@ PosixEnv::PosixEnv()
 
 void PosixEnv::Schedule(void (*function)(void* arg1), void* arg, Priority pri,
                         void* tag, void (*unschedFunction)(void* arg)) {
-  assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   thread_pools_[pri].Schedule(function, arg, tag, unschedFunction);
 }
 
 int PosixEnv::UnSchedule(void* arg, Priority pri) {
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   return thread_pools_[pri].UnSchedule(arg);
 }
 
 unsigned int PosixEnv::GetThreadPoolQueueLen(Priority pri) const {
-  assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   return thread_pools_[pri].GetQueueLen();
 }
 
 int PosixEnv::ReserveThreads(int threads_to_reserved, Priority pri) {
-  assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   return thread_pools_[pri].ReserveThreads(threads_to_reserved);
 }
 
 int PosixEnv::ReleaseThreads(int threads_to_released, Priority pri) {
-  assert(pri >= Priority::BOTTOM && pri <= Priority::HIGH);
+  assert(pri >= Priority::BOTTOM && pri <= Priority::READ);
   return thread_pools_[pri].ReleaseThreads(threads_to_released);
 }
 

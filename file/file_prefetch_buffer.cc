@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cassert>
 
+#include "cache/cache_reservation_manager.h"
 #include "file/random_access_file_reader.h"
 #include "monitoring/histogram.h"
 #include "monitoring/iostats_context_imp.h"
@@ -72,6 +73,7 @@ void FilePrefetchBuffer::PrepareBufferForRead(
     buf->buffer_.AllocateNewBuffer(
         static_cast<size_t>(roundup_len), copy_data_to_new_buffer,
         aligned_useful_offset_in_buf, static_cast<size_t>(aligned_useful_len));
+    UpdateCacheReservation();
   } else if (aligned_useful_len > 0 && refit_tail) {
     // New buffer not needed. But memmove bytes from tail to the beginning
     // since aligned_useful_len is greater than 0.
@@ -87,6 +89,7 @@ void FilePrefetchBuffer::PrepareBufferForRead(
     buf->buffer_.AllocateNewBuffer(
         static_cast<size_t>(roundup_len), copy_data_to_new_buffer,
         aligned_useful_offset_in_buf, static_cast<size_t>(aligned_useful_len));
+    UpdateCacheReservation();
   }
 }
 
@@ -197,7 +200,9 @@ Status FilePrefetchBuffer::Prefetch(const IOOptions& opts,
   }
 
   size_t alignment = GetRequiredBufferAlignment(reader);
-  uint64_t rounddown_offset = offset, roundup_end = 0, aligned_useful_len = 0;
+  uint64_t rounddown_offset = offset;
+  uint64_t roundup_end = 0;
+  uint64_t aligned_useful_len = 0;
   size_t read_len = 0;
   // TODO: Enable file system buffer reuse optimization. Need to incorporate
   // overlap buffer logic here (similar to what is done in PrefetchInternal).
@@ -504,6 +509,7 @@ void FilePrefetchBuffer::HandleOverlappingSyncData(uint64_t offset,
     overlap_buf_->ClearBuffer();
     overlap_buf_->buffer_.Alignment(1);
     overlap_buf_->buffer_.AllocateNewBuffer(length);
+    UpdateCacheReservation();
     overlap_buf_->offset_ = offset;
     CopyDataToOverlapBuffer(buf, tmp_offset, tmp_length);
     UpdateStats(/*found_in_buffer=*/false, overlap_buf_->CurrentSize());
@@ -559,6 +565,7 @@ Status FilePrefetchBuffer::HandleOverlappingAsyncData(
     overlap_buf_->ClearBuffer();
     overlap_buf_->buffer_.Alignment(alignment);
     overlap_buf_->buffer_.AllocateNewBuffer(length);
+    UpdateCacheReservation();
     overlap_buf_->offset_ = offset;
     copy_to_overlap_buffer = true;
 
@@ -584,7 +591,8 @@ Status FilePrefetchBuffer::HandleOverlappingAsyncData(
       AllocateBuffer();
       BufferInfo* new_buf = GetLastBuffer();
       size_t read_len = 0;
-      uint64_t end_offset = start_offset, aligned_useful_len = 0;
+      uint64_t end_offset = start_offset;
+      uint64_t aligned_useful_len = 0;
 
       ReadAheadSizeTuning(new_buf, /*read_curr_block=*/false,
                           /*refit_tail=*/false, /*use_fs_buffer=*/false,
@@ -740,7 +748,9 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
 
   // Go for ReadAsync and Read (if needed).
   // offset and size alignment for first buffer with synchronous prefetching
-  uint64_t start_offset1 = offset, end_offset1 = 0, aligned_useful_len1 = 0;
+  uint64_t start_offset1 = offset;
+  uint64_t end_offset1 = 0;
+  uint64_t aligned_useful_len1 = 0;
   size_t read_len1 = 0;
 
   // For length == 0, skip the synchronous prefetching. read_len1 will be 0.
@@ -1015,7 +1025,9 @@ Status FilePrefetchBuffer::PrefetchAsync(const IOOptions& opts,
   size_t alignment = GetRequiredBufferAlignment(reader);
   size_t readahead_size = is_eligible_for_prefetching ? readahead_size_ / 2 : 0;
   size_t offset_to_read = static_cast<size_t>(offset);
-  uint64_t start_offset1 = offset, end_offset1 = 0, aligned_useful_len1 = 0;
+  uint64_t start_offset1 = offset;
+  uint64_t end_offset1 = 0;
+  uint64_t aligned_useful_len1 = 0;
   size_t read_len1 = 0;
 
   AllocateBufferIfEmpty();
@@ -1089,7 +1101,8 @@ Status FilePrefetchBuffer::PrefetchRemBuffers(const IOOptions& opts,
     AllocateBuffer();
     BufferInfo* new_buf = GetLastBuffer();
 
-    uint64_t end_offset2 = start_offset2, aligned_useful_len2 = 0;
+    uint64_t end_offset2 = start_offset2;
+    uint64_t aligned_useful_len2 = 0;
     size_t read_len2 = 0;
     ReadAheadSizeTuning(new_buf, /*read_curr_block=*/false,
                         /*refit_tail=*/false, /*use_fs_buffer=*/false,
@@ -1111,4 +1124,55 @@ Status FilePrefetchBuffer::PrefetchRemBuffers(const IOOptions& opts,
   return s;
 }
 
+void FilePrefetchBuffer::SetCacheReservationManager(
+    std::shared_ptr<AtomicCacheReservationManager> cache_res_mgr) {
+  assert(cache_res_mgr_ == nullptr);
+  cache_res_mgr_ = std::move(cache_res_mgr);
+  UpdateCacheReservation();
+}
+
+size_t FilePrefetchBuffer::TotalBufferCapacity() const {
+  size_t total_capacity =
+      overlap_buf_ != nullptr ? overlap_buf_->buffer_.Capacity() : 0;
+  for (const BufferInfo* buf : bufs_) {
+    total_capacity += buf->buffer_.Capacity();
+  }
+  for (const BufferInfo* buf : free_bufs_) {
+    total_capacity += buf->buffer_.Capacity();
+  }
+  return total_capacity;
+}
+
+void FilePrefetchBuffer::UpdateCacheReservation() {
+  if (cache_res_mgr_ == nullptr) {
+    return;
+  }
+  const size_t total_capacity = TotalBufferCapacity();
+  if (total_capacity == reserved_memory_) {
+    return;
+  }
+  if (total_capacity > reserved_memory_) {
+    // All or nothing, so a failed increase leaves no memory in the shared
+    // total that this buffer never charges or releases.
+    Status s = cache_res_mgr_->TryIncreaseCacheReservation(total_capacity -
+                                                           reserved_memory_);
+    if (!s.ok()) {
+      // Best effort: leave this increase uncharged. A later buffer allocation
+      // retries the charge.
+      return;
+    }
+  } else {
+    cache_res_mgr_->DecreaseCacheReservation(reserved_memory_ - total_capacity);
+  }
+  reserved_memory_ = total_capacity;
+}
+
+void FilePrefetchBuffer::ReleaseCacheReservation() {
+  if (reserved_memory_ == 0) {
+    return;
+  }
+  assert(cache_res_mgr_ != nullptr);
+  cache_res_mgr_->DecreaseCacheReservation(reserved_memory_);
+  reserved_memory_ = 0;
+}
 }  // namespace ROCKSDB_NAMESPACE

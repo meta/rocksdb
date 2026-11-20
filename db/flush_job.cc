@@ -35,6 +35,7 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
 #include "monitoring/thread_status_util.h"
+#include "options/options_helper.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -493,11 +494,20 @@ Status FlushJob::MemPurge() {
       ctx.reason = TableFileCreationReason::kFlush;
       compaction_filter =
           ioptions.compaction_filter_factory->CreateCompactionFilter(ctx);
-      if (compaction_filter != nullptr &&
+      CompactionFilter::MergeOrder order;
+      s = GetCompactionFilterMergeOrder(
+          compaction_filter.get(), ioptions.compaction_filter_factory.get(),
+          TableFileCreationReason::kFlush, &order);
+      if (s.ok() && compaction_filter != nullptr &&
           !compaction_filter->IgnoreSnapshots()) {
         s = Status::NotSupported(
             "CompactionFilter::IgnoreSnapshots() = false is not supported "
             "anymore.");
+      }
+      if (!s.ok()) {
+        // Destroy the application filter before restoring the caller's lock.
+        compaction_filter.reset();
+        db_mutex_->Lock();
         return s;
       }
     }
@@ -515,6 +525,7 @@ Status FlushJob::MemPurge() {
     assert(env);
     MergeHelper merge(env, (cfd_->internal_comparator()).user_comparator(),
                       (ioptions.merge_operator).get(), compaction_filter.get(),
+                      CompactionFilter::MergeOrder::kFilterBeforeMerge,
                       ioptions.logger,
                       true /* internal key corruption is not ok */,
                       job_context_->GetLatestSnapshotSequence(),
@@ -717,19 +728,26 @@ bool FlushJob::MemPurgeDecider(double threshold) {
   // Payload and useful_payload (in bytes).
   // The useful payload ratio of a given MemTable
   // is estimated to be useful_payload/payload.
-  uint64_t payload = 0, useful_payload = 0, entry_size = 0;
+  uint64_t payload = 0;
+  uint64_t useful_payload = 0;
+  uint64_t entry_size = 0;
 
   // Local variables used repetitively inside the for-loop
   // when iterating over the sampled entries.
-  Slice key_slice, value_slice;
+  Slice key_slice;
+  Slice value_slice;
   ParsedInternalKey res;
   SnapshotImpl min_snapshot;
   std::string vget;
-  Status mget_s, parse_s;
+  Status mget_s;
+  Status parse_s;
   MergeContext merge_context;
-  SequenceNumber max_covering_tombstone_seq = 0, sqno = 0,
-                 min_seqno_snapshot = 0;
-  bool get_res, can_be_useful_payload, not_in_next_mems;
+  SequenceNumber max_covering_tombstone_seq = 0;
+  SequenceNumber sqno = 0;
+  SequenceNumber min_seqno_snapshot = 0;
+  bool get_res;
+  bool can_be_useful_payload;
+  bool not_in_next_mems;
 
   // If estimated_useful_payload is > threshold,
   // then flush to storage, else MemPurge.
@@ -924,7 +942,8 @@ Status FlushJob::WriteLevel0Table() {
     ro.total_order_seek = true;
     ro.io_activity = Env::IOActivity::kFlush;
     Arena arena;
-    uint64_t total_num_input_entries = 0, total_num_deletes = 0;
+    uint64_t total_num_input_entries = 0;
+    uint64_t total_num_deletes = 0;
     uint64_t total_data_size = 0;
     size_t total_memory_usage = 0;
     uint64_t total_num_range_deletes = 0;
@@ -1025,6 +1044,9 @@ Status FlushJob::WriteLevel0Table() {
           &oldest_ancestor_time);
       meta_.oldest_ancestor_time = oldest_ancestor_time;
       meta_.file_creation_time = current_time;
+      meta_.db_ownership_start_time = current_time;
+      meta_.data_file_provenance =
+          DataFileProvenanceForOrigin(DataFileProvenance::Origin::kFlush);
 
       uint64_t memtable_payload_bytes = 0;
       uint64_t memtable_garbage_bytes = 0;
@@ -1041,9 +1063,8 @@ Status FlushJob::WriteLevel0Table() {
           output_compression_, mutable_cf_options_.compression_opts,
           cfd_->GetID(), cfd_->GetName(), 0 /* level */,
           current_time /* newest_key_time */, false /* is_bottommost */,
-          TableFileCreationReason::kFlush, oldest_key_time, current_time,
-          db_id_, db_session_id_, 0 /* target_file_size */,
-          meta_.fd.GetNumber(),
+          TableFileCreationReason::kFlush, oldest_key_time, db_id_,
+          db_session_id_, 0 /* target_file_size */, meta_.fd.GetNumber(),
           preclude_last_level_min_seqno_ == kMaxSequenceNumber
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),

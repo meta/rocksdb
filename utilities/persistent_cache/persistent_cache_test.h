@@ -33,7 +33,7 @@ namespace ROCKSDB_NAMESPACE {
 class PersistentCacheTierTest : public testing::Test {
  public:
   PersistentCacheTierTest();
-  virtual ~PersistentCacheTierTest() {
+  ~PersistentCacheTierTest() override {
     if (cache_) {
       Status s = cache_->Close();
       assert(s.ok());

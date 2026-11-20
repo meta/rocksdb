@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -102,6 +103,22 @@ INSTANTIATE_TEST_CASE_P(
         MySQLStyleTransactionTest_Params)));
 
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
+
+TEST_P(TransactionTest, PipelinedWriteRequiresSingleQueueWriteCommitted) {
+  // Pipelined write cannot be combined with two write queues or with
+  // WritePrepared/WriteUnprepared (seq_per_batch). The DB is rejected at open
+  // instead of opening and then failing every write.
+  options.enable_pipelined_write = true;
+  Status s = ReOpen();
+  if (options.unordered_write || options.two_write_queues) {
+    ASSERT_EQ(s.code(), Status::Code::kInvalidArgument);
+  } else if (txn_db_options.write_policy != WRITE_COMMITTED) {
+    ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+  } else {
+    ASSERT_OK(s);
+    ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  }
+}
 
 TEST_P(TransactionTest, TestUpperBoundUponDeletion) {
   // Reproduction from the original bug report, 11606
@@ -355,7 +372,7 @@ TEST_P(TransactionTest, SuccessTestPinnable) {
   delete txn;
 }
 
-TEST_P(TransactionTest, SwitchMemtableDuringPrepareAndCommit_WC) {
+TEST_P(TransactionTest, SwitchMemtableDuringPrepareAndCommitWC) {
   const TxnDBWritePolicy write_policy = std::get<2>(GetParam());
 
   if (write_policy != TxnDBWritePolicy::WRITE_COMMITTED) {
@@ -481,6 +498,42 @@ TEST_P(TransactionTest, AssumeExclusiveTracked) {
 
   ASSERT_OK(txn->Rollback());
   delete txn;
+}
+
+TEST_P(TransactionTest, InplaceUpdateSupportRequiresWriteCommitted) {
+  if (options.unordered_write) {
+    ROCKSDB_GTEST_BYPASS(
+        "unordered_write requires concurrent memtable writes, which "
+        "inplace_update_support does not support");
+    return;
+  }
+  // In-place updates are only accepted with WriteCommitted. WritePrepared and
+  // WriteUnprepared reject them both at open and when creating a column
+  // family.
+  const bool supported = txn_db_options.write_policy == WRITE_COMMITTED;
+  options.allow_concurrent_memtable_write = false;
+  ASSERT_OK(ReOpen());
+
+  ColumnFamilyOptions cf_options(options);
+  cf_options.inplace_update_support = true;
+  ColumnFamilyHandle* cfh = nullptr;
+  Status s = db->CreateColumnFamily(cf_options, "inplace", &cfh);
+  if (supported) {
+    ASSERT_OK(s);
+    ASSERT_OK(db->Put(WriteOptions(), cfh, "key", "value"));
+    ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
+  } else {
+    ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+  }
+
+  options.inplace_update_support = true;
+  s = ReOpen();
+  if (supported) {
+    ASSERT_OK(s);
+    ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  } else {
+    ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+  }
 }
 
 // This test clarifies the contract of ValidateSnapshot
@@ -871,7 +924,7 @@ TEST_P(TransactionTest, DeadlockCycleShared) {
         dlock_entry[dlock_entry.size() - 1].m_txn_id - offset_root;
 
     for (auto it = dlock_entry.rbegin(); it != dlock_entry.rend(); ++it) {
-      auto dl_node = *it;
+      const auto& dl_node = *it;
       ASSERT_EQ(dl_node.m_txn_id, offset_root + leaf_id);
       ASSERT_EQ(dl_node.m_cf_id, 0U);
       ASSERT_EQ(dl_node.m_waiting_key, std::to_string(curr_waiting_key));
@@ -1083,7 +1136,7 @@ TEST_P(TransactionStressTest, DeadlockCycle) {
 
     // Iterates backwards over path verifying decreasing txn_ids.
     for (auto it = dlock_entry.rbegin(); it != dlock_entry.rend(); ++it) {
-      auto dl_node = *it;
+      const auto& dl_node = *it;
       ASSERT_EQ(dl_node.m_txn_id, len + curr_txn_id - 1);
       ASSERT_EQ(dl_node.m_cf_id, 0u);
       ASSERT_EQ(dl_node.m_waiting_key, std::to_string(curr_waiting_key));
@@ -1152,6 +1205,7 @@ TEST_P(TransactionStressTest, DeadlockStress) {
   };
 
   std::vector<port::Thread> threads;
+  threads.reserve(NUM_TXN_THREADS);
   for (uint32_t i = 0; i < NUM_TXN_THREADS; i++) {
     threads.emplace_back(stress_thread, rnd.Next());
   }
@@ -1781,6 +1835,7 @@ TEST_P(TransactionTest, DISABLED_TwoPhaseMultiThreadTest) {
 
   // do all the writes
   std::vector<port::Thread> threads;
+  threads.reserve(NUM_TXN_THREADS);
   for (uint32_t i = 0; i < NUM_TXN_THREADS; i++) {
     threads.emplace_back(txn_write_thread);
   }
@@ -1996,7 +2051,8 @@ TEST_P(TransactionTest, TwoPhaseLogRollingTest) {
 
   Status s;
   std::string v;
-  ColumnFamilyHandle *cfa, *cfb;
+  ColumnFamilyHandle* cfa;
+  ColumnFamilyHandle* cfb;
 
   // Create 2 new column families
   ColumnFamilyOptions cf_options;
@@ -2147,7 +2203,8 @@ TEST_P(TransactionTest, TwoPhaseLogRollingTest2) {
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
 
   Status s;
-  ColumnFamilyHandle *cfa, *cfb;
+  ColumnFamilyHandle* cfa;
+  ColumnFamilyHandle* cfb;
 
   ColumnFamilyOptions cf_options;
   s = db->CreateColumnFamily(cf_options, "CFA", &cfa);
@@ -2329,12 +2386,16 @@ TEST_P(TransactionTest, TwoPhaseLogMultiMemtableFlush) {
  * hidden behind improperly summed sequence ids
  */
 TEST_P(TransactionTest, TwoPhaseOutOfOrderDelete) {
-  // WAL recycling incompatible with disableWAL (below)
-  options.recycle_log_file_num = 0;
+  // disableWAL (below) is not supported with WAL recycling for WritePrepared
+  // and WriteUnprepared
+  if (txn_db_options.write_policy != WRITE_COMMITTED) {
+    options.recycle_log_file_num = 0;
+  }
   ASSERT_OK(ReOpenNoDelete());
 
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
-  WriteOptions wal_on, wal_off;
+  WriteOptions wal_on;
+  WriteOptions wal_off;
   wal_on.sync = true;
   wal_on.disableWAL = false;
   wal_off.disableWAL = true;
@@ -2528,7 +2589,8 @@ TEST_P(TransactionTest, WriteConflictTest2) {
 
 TEST_P(TransactionTest, ReadConflictTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   TransactionOptions txn_options;
   std::string value;
   Status s;
@@ -2585,7 +2647,8 @@ TEST_P(TransactionTest, TxnOnlyTest) {
 
 TEST_P(TransactionTest, FlushTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
@@ -2633,7 +2696,7 @@ TEST_P(TransactionTest, FlushTest2) {
       case 0:
         break;
       case 1:
-        options.table_factory.reset(new mock::MockTableFactory());
+        options.table_factory = std::make_shared<mock::MockTableFactory>();
         break;
       case 2: {
         PlainTableOptions pt_opts;
@@ -2648,7 +2711,8 @@ TEST_P(TransactionTest, FlushTest2) {
     assert(db != nullptr);
 
     WriteOptions write_options;
-    ReadOptions read_options, snapshot_read_options;
+    ReadOptions read_options;
+    ReadOptions snapshot_read_options;
     TransactionOptions txn_options;
     std::string value;
 
@@ -2826,7 +2890,8 @@ TEST_P(TransactionTest, NoSnapshotTest) {
 
 TEST_P(TransactionTest, MultipleSnapshotTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
@@ -2943,12 +3008,14 @@ TEST_P(TransactionTest, MultipleSnapshotTest) {
 
 TEST_P(TransactionTest, ColumnFamiliesTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   TransactionOptions txn_options;
   std::string value;
   Status s;
 
-  ColumnFamilyHandle *cfa, *cfb;
+  ColumnFamilyHandle* cfa;
+  ColumnFamilyHandle* cfb;
   ColumnFamilyOptions cf_options;
 
   // Create 2 new column families
@@ -3180,7 +3247,8 @@ TEST_P(TransactionTest, WriteImportedColumnFamilyTest) {
 
 TEST_P(TransactionTest, MultiGetBatchedTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   TransactionOptions txn_options;
   std::string value;
   Status s;
@@ -3270,7 +3338,8 @@ TEST_P(TransactionTest, MultiGetBatchedTest) {
 // allocating an autovector of MergeContexts
 TEST_P(TransactionTest, MultiGetLargeBatchedTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
@@ -3278,6 +3347,7 @@ TEST_P(TransactionTest, MultiGetLargeBatchedTest) {
   ColumnFamilyOptions cf_options;
 
   std::vector<std::string> key_str;
+  key_str.reserve(100);
   for (int i = 0; i < 100; ++i) {
     key_str.emplace_back(std::to_string(i));
   }
@@ -3329,6 +3399,7 @@ TEST_P(TransactionTest, MultiGetLargeBatchedTest) {
 
   // MultiGet a lot of keys in order to force std::vector reallocations
   std::vector<Slice> keys;
+  keys.reserve(MultiGetContext::MAX_BATCH_SIZE + 32);
   for (int i = 0; i < MultiGetContext::MAX_BATCH_SIZE + 32; ++i) {
     keys.emplace_back(key_str[i]);
   }
@@ -3402,11 +3473,13 @@ TEST_P(TransactionTest, MultiGetSnapshot) {
 
 TEST_P(TransactionTest, ColumnFamiliesTest2) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
-  ColumnFamilyHandle *one, *two;
+  ColumnFamilyHandle* one;
+  ColumnFamilyHandle* two;
   ColumnFamilyOptions cf_options;
 
   // Create 2 new column families
@@ -3520,7 +3593,8 @@ TEST_P(TransactionTest, EmptyTest) {
 
 TEST_P(TransactionTest, PredicateManyPreceders) {
   WriteOptions write_options;
-  ReadOptions read_options1, read_options2;
+  ReadOptions read_options1;
+  ReadOptions read_options2;
   TransactionOptions txn_options;
   std::string value;
   Status s;
@@ -3588,7 +3662,9 @@ TEST_P(TransactionTest, PredicateManyPreceders) {
 
 TEST_P(TransactionTest, LostUpdate) {
   WriteOptions write_options;
-  ReadOptions read_options, read_options1, read_options2;
+  ReadOptions read_options;
+  ReadOptions read_options1;
+  ReadOptions read_options2;
   TransactionOptions txn_options;
   std::string value;
   Status s;
@@ -3958,7 +4034,8 @@ TEST_P(TransactionTest, Rollback) {
 
 TEST_P(TransactionTest, LockLimitTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   TransactionOptions txn_options;
   std::string value;
   Status s;
@@ -4108,7 +4185,8 @@ TEST_P(TransactionTest, IteratorTest) {
   }
 
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
@@ -4298,7 +4376,8 @@ TEST_P(TransactionTest, DisableIndexingTest) {
 
 TEST_P(TransactionTest, SavepointTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
@@ -5493,7 +5572,8 @@ TEST_P(TransactionTest, DeferSnapshotTest) {
 
 TEST_P(TransactionTest, DeferSnapshotTest2) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
@@ -5550,7 +5630,8 @@ TEST_P(TransactionTest, DeferSnapshotTest2) {
 
 TEST_P(TransactionTest, DeferSnapshotSavePointTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
@@ -5717,7 +5798,8 @@ TEST_P(TransactionTest, SetSnapshotOnNextOperationWithNotification) {
 
 TEST_P(TransactionTest, ClearSnapshotTest) {
   WriteOptions write_options;
-  ReadOptions read_options, snapshot_read_options;
+  ReadOptions read_options;
+  ReadOptions snapshot_read_options;
   std::string value;
   Status s;
 
@@ -5765,7 +5847,8 @@ TEST_P(TransactionTest, ClearSnapshotTest) {
 TEST_P(TransactionTest, ToggleAutoCompactionTest) {
   Status s;
 
-  ColumnFamilyHandle *cfa, *cfb;
+  ColumnFamilyHandle* cfa;
+  ColumnFamilyHandle* cfb;
   ColumnFamilyOptions cf_options;
 
   // Create 2 new column families
@@ -5821,7 +5904,7 @@ TEST_P(TransactionStressTest, ExpiredTransactionDataRace1) {
   // In this test, txn1 should succeed committing,
   // as the callback is called after txn1 starts committing.
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
-      {{"TransactionTest::ExpirableTransactionDataRace:1"}});
+      {{"TransactionTest::ExpirableTransactionDataRace:1", ""}});
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "TransactionTest::ExpirableTransactionDataRace:1", [&](void* /*arg*/) {
         WriteOptions write_options;
@@ -5972,6 +6055,9 @@ TEST_P(MySQLStyleTransactionTest, TransactionStressTest) {
     }
   };
 
+  threads.reserve(
+      num_workers + num_checkers +
+      (with_slow_threads_ ? num_slow_checkers + num_slow_workers : 0));
   for (uint32_t i = 0; i < num_workers; i++) {
     threads.emplace_back(call_inserter);
   }

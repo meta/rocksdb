@@ -24,13 +24,13 @@ PartitionedFilterBlockBuilder::PartitionedFilterBlockBuilder(
     const SliceTransform* _prefix_extractor, bool whole_key_filtering,
     FilterBitsBuilder* filter_bits_builder, int index_block_restart_interval,
     const bool use_value_delta_encoding, uint32_t format_version,
-    PartitionedIndexBuilder* const p_index_builder,
+    PartitionedIndexBuilder* const partitioned_index_builder,
     const uint32_t partition_size, size_t ts_sz,
     const bool persist_user_defined_timestamps,
     bool decouple_from_index_partitions, bool use_common_prefix)
     : FullFilterBlockBuilder(_prefix_extractor, whole_key_filtering,
                              filter_bits_builder),
-      p_index_builder_(p_index_builder),
+      partitioned_index_builder_(partitioned_index_builder),
       ts_sz_(ts_sz),
       decouple_from_index_partitions_(decouple_from_index_partitions),
       index_on_filter_block_builder_(
@@ -97,9 +97,9 @@ bool PartitionedFilterBlockBuilder::DecideCutAFilterBlock() {
     if (added >= keys_per_partition_) {
       // Currently only index builder is in charge of cutting a partition. We
       // keep requesting until it is granted.
-      p_index_builder_->RequestPartitionCut();
+      partitioned_index_builder_->RequestPartitionCut();
     }
-    return p_index_builder_->ShouldCutFilterBlock();
+    return partitioned_index_builder_->ShouldCutFilterBlock();
   }
 }
 
@@ -145,7 +145,7 @@ void PartitionedFilterBlockBuilder::CutAFilterBlock(const Slice* next_key,
     }
     AppendInternalKeyFooter(&ikey, /*seqno*/ 0, ValueType::kTypeDeletion);
   } else {
-    ikey = p_index_builder_->GetPartitionKey();
+    ikey = partitioned_index_builder_->GetPartitionKey();
   }
   filters_.push_back({std::move(ikey), std::move(filter_data), filter});
   completed_partitions_size_.FetchAddRelaxed(filter.size());
@@ -247,7 +247,7 @@ void PartitionedFilterBlockBuilder::UpdateFilterSizeEstimate(
   size_t filter_estimate = std::max(partitions_size, active_filter_estimate);
 
   // Estimate top-level partition index size
-  if (p_index_builder_->separator_is_key_plus_seq()) {
+  if (partitioned_index_builder_->separator_is_key_plus_seq()) {
     filter_estimate += index_on_filter_block_builder_.CurrentSizeEstimate();
   } else {
     filter_estimate +=
@@ -303,7 +303,7 @@ Status PartitionedFilterBlockBuilder::Finish(
     // NOTE: WriteBatch guarantees keys < 4GB; handle values are also small
     index_on_filter_block_builder_.Add(e.ikey, handle_encoding,
                                        handle_delta_encoding_slice);
-    if (!p_index_builder_->separator_is_key_plus_seq()) {
+    if (!partitioned_index_builder_->separator_is_key_plus_seq()) {
       index_on_filter_block_builder_without_seq_.Add(
           ExtractUserKey(e.ikey), handle_encoding, handle_delta_encoding_slice);
     }
@@ -329,7 +329,7 @@ Status PartitionedFilterBlockBuilder::Finish(
     if (UNLIKELY(filters_.empty())) {
       if (!index_on_filter_block_builder_.empty()) {
         // Simplest to just add them all at the end
-        if (p_index_builder_->separator_is_key_plus_seq()) {
+        if (partitioned_index_builder_->separator_is_key_plus_seq()) {
           *filter = index_on_filter_block_builder_.Finish();
         } else {
           *filter = index_on_filter_block_builder_without_seq_.Finish();
@@ -571,10 +571,14 @@ void PartitionedFilterBlockReader::MayMatch(
       range->AddSkipsFrom(subrange);
       start_iter_same_handle = iter;
     }
-    if (UNLIKELY(this_filter_handle.size() == 0)) {  // key is out of range
-      // Not reachable with current behavior of GetFilterPartitionHandle
-      assert(false);
-      range->SkipKey(iter);
+    if (UNLIKELY(this_filter_handle.size() == 0)) {
+      // Empty filter partition. Keys outside the prefix extractor's domain
+      // are never added to a prefix filter, so only other keys can be ruled
+      // out.
+      if (prefix_extractor == nullptr ||
+          prefix_extractor->InDomain(iter->ukey_without_ts)) {
+        range->SkipKey(iter);
+      }
       prev_filter_handle = BlockHandle::NullBlockHandle();
     } else {
       prev_filter_handle = this_filter_handle;

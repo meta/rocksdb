@@ -13,7 +13,7 @@ Parallel compression in RocksDB (`CompressionOptions::parallel_threads > 1`) all
 
 ## What's New: A Complete Reimplementation
 
-The parallel compression framework has been completely rewritten from the ground up in [pull request #13910](https://github.com/facebook/rocksdb/pull/13910) to address the core inefficiencies:
+The parallel compression framework has been completely rewritten from the ground up in [pull request #13910](https://github.com/meta/rocksdb/pull/13910) to address the core inefficiencies:
 
 ### Ring Buffer Architecture
 Instead of separate compression and write queues with complex thread coordination, the new implementation uses a ring buffer of blocks-in-progress that enables efficient work distribution across threads. This bounds working memory while enabling high throughput with minimal cross-thread synchronization.
@@ -62,7 +62,7 @@ For ZSTD compression level 8, the improvements are even more dramatic:
 
 ## Compression Algorithm Optimizations
 
-Alongside the parallel compression revamp, some optimizations have gone into the underlying compression implementations/integrations. Most notably, **LZ4HC received dramatic performance improvements** through better reuse of internal data structures between compression calls (detailed in [pull request #13805](https://github.com/facebook/rocksdb/pull/13805)). A small regression in LZ4 performance from that change was fixed in [pull request #14017](https://github.com/facebook/rocksdb/pull/14017).
+Alongside the parallel compression revamp, some optimizations have gone into the underlying compression implementations/integrations. Most notably, **LZ4HC received dramatic performance improvements** through better reuse of internal data structures between compression calls (detailed in [pull request #13805](https://github.com/meta/rocksdb/pull/13805)). A small regression in LZ4 performance from that change was fixed in [pull request #14017](https://github.com/meta/rocksdb/pull/14017).
 
 While **ZSTD remains the gold standard** for medium-to-high compression ratios in RocksDB, these LZ4HC optimizations make it an increasingly attractive option for read-heavy workloads where LZ4's faster decompression can provide overall performance benefits.
 

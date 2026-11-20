@@ -1,1 +1,0 @@
-Added `PutRangeDeletionBlock()`, `GetRangeDeletionBlock()`, and `IsDeleteRangeSupported()` to the external table interfaces so formats can opt in to range deletions using RocksDB's raw range-deletion metadata block.

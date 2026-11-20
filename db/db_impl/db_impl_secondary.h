@@ -45,6 +45,11 @@ class LogReaderContainer {
                                               reporter, true /*checksum*/,
                                               log_number);
   }
+  // No copying allowed
+  LogReaderContainer(const LogReaderContainer&) = delete;
+  LogReaderContainer& operator=(const LogReaderContainer&) = delete;
+  LogReaderContainer(LogReaderContainer&&) = delete;
+  LogReaderContainer& operator=(LogReaderContainer&&) = delete;
   log::FragmentBufferedReader* reader_;
   log::Reader::Reporter* reporter_;
   Status* status_;
@@ -56,10 +61,11 @@ class LogReaderContainer {
 
  private:
   struct LogReporter : public log::Reader::Reporter {
-    Env* env;
-    Logger* info_log;
+    Env* env = nullptr;
+    Logger* info_log = nullptr;
     std::string fname;
-    Status* status;  // nullptr if immutable_db_options_.paranoid_checks==false
+    // nullptr if immutable_db_options_.paranoid_checks==false
+    Status* status = nullptr;
     void Corruption(size_t bytes, const Status& s,
                     uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       ROCKS_LOG_WARN(info_log, "%s%s: dropping %d bytes; %s",
@@ -117,6 +123,19 @@ class DBImplSecondary : public DBImpl {
                             MultiGetOutputMetadata* output_metadata,
                             const bool sorted_input = false) override;
 
+  using DBImpl::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& options, size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input = false) override;
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override;
+
   using DBImpl::NewIterator;
   // Operations on the created iterators can return IOError due to files being
   // deleted by the primary. To avoid IOError in this case, application can
@@ -143,6 +162,8 @@ class DBImplSecondary : public DBImpl {
   Status NewIterators(const std::vector<ReadOptions>& read_options,
                       const std::vector<ColumnFamilyHandle*>& column_families,
                       std::vector<Iterator*>* iterators) override;
+
+  const Snapshot* GetSnapshot() override;
 
   using DBImpl::Put;
   Status Put(const WriteOptions& /*options*/,
@@ -278,6 +299,9 @@ class DBImplSecondary : public DBImpl {
   // method can take long time due to all the I/O and CPU costs.
   Status TryCatchUpWithPrimary() override;
 
+  // REQUIRES: mutex_ held
+  bool SecondaryHasMissingFiles() override;
+
   // Try to find log reader using log_number from log_readers_ map, initialize
   // if it doesn't exist
   Status MaybeInitLogReader(uint64_t log_number,
@@ -379,8 +403,10 @@ class DBImplSecondary : public DBImpl {
       std::vector<Iterator*>* iterators);
 
   // No copying allowed
-  DBImplSecondary(const DBImplSecondary&);
-  void operator=(const DBImplSecondary&);
+  DBImplSecondary(const DBImplSecondary&) = delete;
+  void operator=(const DBImplSecondary&) = delete;
+  DBImplSecondary(DBImplSecondary&&) = delete;
+  void operator=(DBImplSecondary&&) = delete;
 
   using DBImpl::Recover;
 
@@ -469,6 +495,7 @@ class DBImplSecondary : public DBImpl {
 
     // All output file numbers - for cleanup optimization
     std::vector<uint64_t> table_file_numbers;
+    std::vector<uint64_t> blob_file_numbers;
 
     bool HasLatestProgressFile() const {
       return latest_progress_filename.has_value();
@@ -480,6 +507,7 @@ class DBImplSecondary : public DBImpl {
       old_progress_filenames.clear();
       temp_progress_filenames.clear();
       table_file_numbers.clear();
+      blob_file_numbers.clear();
     }
   };
 
@@ -523,7 +551,7 @@ class DBImplSecondary : public DBImpl {
 
   Status PersistInitialCompactionProgress(
       log::Writer* compaction_progress_writer,
-      const CompactionProgress& compaction_progress);
+      CompactionProgress* compaction_progress);
 
   Status RenameCompactionProgressFile(const std::string& temp_file_path,
                                       std::string* final_file_path);

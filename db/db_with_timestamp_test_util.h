@@ -22,7 +22,7 @@ class DBBasicTestWithTimestampBase : public DBTestBase {
  protected:
   static std::string Key1(uint64_t k);
 
-  static std::string KeyWithPrefix(std::string prefix, uint64_t k);
+  static std::string KeyWithPrefix(const std::string& prefix, uint64_t k);
 
   static std::vector<Slice> ConvertStrToSlice(
       std::vector<std::string>& strings);

@@ -60,7 +60,7 @@ class FaultInjectionTest
   // When need to make sure data is persistent, call DB::CompactRange()
   bool sync_use_compact_;
 
-  bool sequential_order_;
+  bool sequential_order_ = false;
 
  public:
   enum ExpectedVerifResult { kValExpectFound, kValExpectNoError };
@@ -194,7 +194,8 @@ class FaultInjectionTest
   }
 
   void Build(const WriteOptions& write_options, int start_idx, int num_vals) {
-    std::string key_space, value_space;
+    std::string key_space;
+    std::string value_space;
     WriteBatch batch;
     for (int i = start_idx; i < start_idx + num_vals; i++) {
       Slice key = Key(i, &key_space);
@@ -205,7 +206,8 @@ class FaultInjectionTest
   }
 
   Status ReadValue(int i, std::string* val) const {
-    std::string key_space, value_space;
+    std::string key_space;
+    std::string value_space;
     Slice key = Key(i, &key_space);
     Value(i, &value_space);
     ReadOptions options;
@@ -354,7 +356,7 @@ class FaultInjectionTest
   }
 
  private:
-  Env* system_env_;
+  Env* system_env_ = nullptr;
   std::shared_ptr<Env> env_guard_;
 };
 
@@ -411,7 +413,8 @@ TEST_P(FaultInjectionTest, WriteOptionSyncTest) {
   WriteOptions write_options;
   write_options.sync = false;
 
-  std::string key_space, value_space;
+  std::string key_space;
+  std::string value_space;
   ASSERT_OK(
       db_->Put(write_options, Key(1, &key_space), Value(1, &value_space)));
   FlushOptions flush_options;
@@ -497,7 +500,8 @@ TEST_P(FaultInjectionTest, ManualLogSyncTest) {
   WriteOptions write_options;
   write_options.sync = false;
 
-  std::string key_space, value_space;
+  std::string key_space;
+  std::string value_space;
   ASSERT_OK(
       db_->Put(write_options, Key(1, &key_space), Value(1, &value_space)));
   FlushOptions flush_options;

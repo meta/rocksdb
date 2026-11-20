@@ -67,6 +67,8 @@ class WBWIMemTable final : public ReadOnlyMemTable {
   // No copying allowed
   WBWIMemTable(const WBWIMemTable&) = delete;
   WBWIMemTable& operator=(const WBWIMemTable&) = delete;
+  WBWIMemTable(WBWIMemTable&&) = delete;
+  WBWIMemTable& operator=(WBWIMemTable&&) = delete;
 
   ~WBWIMemTable() override { assert(refs_ == 0); }
 
@@ -266,6 +268,10 @@ class WBWIMemTableIterator final : public InternalIterator {
   // No copying allowed
   WBWIMemTableIterator(const WBWIMemTableIterator&) = delete;
   WBWIMemTableIterator& operator=(const WBWIMemTableIterator&) = delete;
+  WBWIMemTableIterator(WBWIMemTableIterator&&) = delete;
+  WBWIMemTableIterator& operator=(WBWIMemTableIterator&&) = delete;
+
+  ~WBWIMemTableIterator() override = default;
 
   bool Valid() const override { return valid_; }
 

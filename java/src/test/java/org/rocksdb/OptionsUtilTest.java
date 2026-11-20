@@ -264,6 +264,7 @@ public class OptionsUtilTest {
     final ColumnFamilyOptions defaultCFOptions = new ColumnFamilyOptions();
     defaultCFOptions.setTableFormatConfig(new BlockBasedTableConfig());
     final byte[] altCFName = "alt_cf".getBytes();
+    // block_align below requires every compression type to be disabled.
     final ColumnFamilyOptions altCFOptions =
         new ColumnFamilyOptions()
             .setWriteBufferSize(70 * 1024)
@@ -271,7 +272,8 @@ public class OptionsUtilTest {
             .setMaxBytesForLevelBase(53 * 1024 * 1024)
             .setLevel0FileNumCompactionTrigger(3)
             .setLevel0SlowdownWritesTrigger(51)
-            .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION);
+            .setCompressionType(CompressionType.NO_COMPRESSION)
+            .setBottommostCompressionType(CompressionType.NO_COMPRESSION);
 
     final BlockBasedTableConfig altCFTableConfig = new BlockBasedTableConfig();
     altCFTableConfig.setCacheIndexAndFilterBlocks(true);
@@ -282,8 +284,10 @@ public class OptionsUtilTest {
     altCFTableConfig.setDataBlockIndexType(DataBlockIndexType.kDataBlockBinaryAndHash);
     altCFTableConfig.setDataBlockHashTableUtilRatio(0.65);
     altCFTableConfig.setChecksumType(ChecksumType.kxxHash64);
-    altCFTableConfig.setNoBlockCache(true);
-    altCFTableConfig.setBlockSize(35 * 1024);
+    // Caching index and filter blocks requires a block cache.
+    altCFTableConfig.setNoBlockCache(false);
+    // block_align requires a power of two.
+    altCFTableConfig.setBlockSize(32 * 1024);
     altCFTableConfig.setBlockSizeDeviation(20);
     altCFTableConfig.setBlockRestartInterval(12);
     altCFTableConfig.setIndexBlockRestartInterval(6);

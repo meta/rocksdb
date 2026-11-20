@@ -23,10 +23,12 @@
 #include "port/malloc.h"
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/metadata.h"
 #include "table/table_reader.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/autovector.h"
+#include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -75,6 +77,8 @@ enum Tag : uint32_t {
   kPersistUserDefinedTimestamps,
   kSubcompactionProgress,
   kLastCompactedManifestFileSize,
+  kCommittedOptionsFileNumber,
+  kDroppedBlobFile,
 };
 
 enum SubcompactionProgressPerLevelCustomTag : uint32_t {
@@ -90,6 +94,7 @@ enum SubcompactionProgressCustomTag : uint32_t {
   kNumProcessedInputRecords = 3,
   kOutputLevelProgress = 4,
   kProximalOutputLevelProgress = 5,
+  kBlobCompactionProgress = 6,
   kSubcompactionProgressCustomTagSafeIgnoreMask = 1 << 16,
 };
 
@@ -114,6 +119,8 @@ enum NewFileCustomTag : uint32_t {
   kTailSize = 15,
   kUserDefinedTimestampsPersisted = 16,
   kFileOpenMetadata = 17,
+  kDbOwnershipStartTime = 18,
+  kDataFileProvenance = 19,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -129,10 +136,32 @@ constexpr uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
 constexpr uint64_t kUnknownOldestAncestorTime = 0;
 constexpr uint64_t kUnknownNewestKeyTime = 0;
 constexpr uint64_t kUnknownFileCreationTime = 0;
+constexpr uint64_t kUnknownDbOwnershipStartTime = 0;
 constexpr uint64_t kUnknownEpochNumber = 0;
 // If `Options::cf_allow_ingest_behind` is true, this epoch number
 // will be dedicated to files ingested behind.
 constexpr uint64_t kReservedEpochNumberForFileIngestedBehind = 1;
+
+// Bit layout of FileMetaData::data_file_provenance (decoded form:
+// DataFileProvenance), LSB first:
+//  * bits 0-7: DataFileProvenance::Origin (values above kImport reserved)
+//  * bits 8-11: the flags below
+//  * bits 12-31: reserved
+// Readers ignore bits they don't recognize, and code carrying a file's record
+// over (moves, MANIFEST rewrites, copies) preserves them, by updating the
+// packed value rather than re-encoding a decoded one.
+constexpr uint32_t kProvenanceOriginMask = 0xff;
+constexpr uint32_t kProvenanceMovedBetweenLevels = uint32_t{1} << 8;
+constexpr uint32_t kProvenanceTemperatureChangedByCopy = uint32_t{1} << 9;
+constexpr uint32_t kProvenanceTemperatureUpdatedFromFileSystem = uint32_t{1}
+                                                                 << 10;
+constexpr uint32_t kProvenanceRecordedByRepair = uint32_t{1} << 11;
+
+// Packed data_file_provenance for a file this DB got via `origin`, with no
+// flags.
+inline uint32_t DataFileProvenanceForOrigin(DataFileProvenance::Origin origin) {
+  return lossless_cast<uint32_t>(origin);
+}
 
 uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id);
 
@@ -205,17 +234,6 @@ struct FileDescriptor {
         smallest_seqno(_smallest_seqno),
         largest_seqno(_largest_seqno) {}
 
-  FileDescriptor(const FileDescriptor& fd) { *this = fd; }
-
-  FileDescriptor& operator=(const FileDescriptor& fd) {
-    pinned_reader = fd.pinned_reader;
-    packed_number_and_path_id = fd.packed_number_and_path_id;
-    file_size = fd.file_size;
-    smallest_seqno = fd.smallest_seqno;
-    largest_seqno = fd.largest_seqno;
-    return *this;
-  }
-
   uint64_t GetNumber() const {
     return packed_number_and_path_id & kFileNumberMask;
   }
@@ -229,11 +247,19 @@ struct FileDescriptor {
 struct FileSampledStats {
   FileSampledStats()
       : num_reads_sampled(0), num_collapsible_entry_reads_sampled(0) {}
+  ~FileSampledStats() = default;
   FileSampledStats(const FileSampledStats& other) { *this = other; }
   FileSampledStats& operator=(const FileSampledStats& other) {
     num_reads_sampled = other.num_reads_sampled.load();
     num_collapsible_entry_reads_sampled =
         other.num_collapsible_entry_reads_sampled.load();
+    return *this;
+  }
+  // std::atomic is not movable, so moving copies. Don't `= delete` these: that
+  // would delete FileMetaData's implicit move, making it copy every member.
+  FileSampledStats(FileSampledStats&& other) noexcept { *this = other; }
+  FileSampledStats& operator=(FileSampledStats&& other) noexcept {
+    *this = other;
     return *this;
   }
 
@@ -265,6 +291,9 @@ struct FileMetaData {
   uint64_t num_deletions = 0;
   uint64_t raw_key_size = 0;    // total uncompressed key size.
   uint64_t raw_value_size = 0;  // total uncompressed value size.
+  // Immutable after a pre-publication table-property statistics read.
+  // Unknown if that read was skipped, failed, or the SST lacks the property.
+  std::optional<uint64_t> referenced_blob_bytes;
   uint64_t num_range_deletions = 0;
   // This is computed during Flush/Compaction, and is added to
   // `compensated_file_size`. Currently, this estimates the size of keys in the
@@ -280,6 +309,12 @@ struct FileMetaData {
   bool marked_for_compaction = false;  // True if client asked us nicely to
                                        // compact this file.
   Temperature temperature = Temperature::kUnknown;
+
+  // How this DB got the file's contents and what has happened to the file
+  // since, packed as described by DataFileProvenance
+  // (include/rocksdb/metadata.h). 0 means unknown. Persisted in the MANIFEST
+  // only.
+  uint32_t data_file_provenance = 0;
 
   // Used only in BlobDB. The file number of the oldest blob file this SST file
   // refers to. 0 is an invalid value; BlobDB numbers the files starting from 1.
@@ -297,8 +332,15 @@ struct FileMetaData {
   // 0 means the information is not available.
   uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
 
-  // Unix time when the SST file is created.
+  // Unix time when the SST file's contents were built (by flush or
+  // compaction, in this DB or another, or by SstFileWriter). Preserved when
+  // the file is moved between levels or copied to another temperature.
   uint64_t file_creation_time = kUnknownFileCreationTime;
+
+  // Unix time when this DB began holding this physical file (this file
+  // number); see SstFileMetaData::db_ownership_start_time. Persisted in the
+  // MANIFEST only. kUnknownDbOwnershipStartTime if unknown.
+  uint64_t db_ownership_start_time = kUnknownDbOwnershipStartTime;
 
   // The order of a file being flushed or ingested/imported.
   // Compaction output file will be assigned with the minimum `epoch_number`
@@ -423,6 +465,18 @@ struct FileMetaData {
     return kUnknownFileCreationTime;
   }
 
+  // When this DB began holding this file, if recorded. Otherwise falls back on
+  // TryGetFileCreationTime(): for files recorded by older RocksDB versions,
+  // that was the time of ingestion, import or temperature-change copy for
+  // files that arrived that way, and is the creation time for files built by
+  // this DB.
+  uint64_t TryGetDbOwnershipStartTime() {
+    if (db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+      return db_ownership_start_time;
+    }
+    return TryGetFileCreationTime();
+  }
+
   // Tries to get the newest key time from the current file
   // Falls back on oldest ancestor time of previous (newer) file
   uint64_t TryGetNewestKeyTime(FileMetaData* prev_file = nullptr) {
@@ -510,8 +564,8 @@ struct FdWithKeyRange {
   FdWithKeyRange()
       : fd(), file_metadata(nullptr), smallest_key(), largest_key() {}
 
-  FdWithKeyRange(FileDescriptor _fd, Slice _smallest_key, Slice _largest_key,
-                 FileMetaData* _file_metadata)
+  FdWithKeyRange(const FileDescriptor& _fd, Slice _smallest_key,
+                 Slice _largest_key, FileMetaData* _file_metadata)
       : fd(_fd),
         file_metadata(_file_metadata),
         smallest_key(_smallest_key),
@@ -605,6 +659,15 @@ struct SubcompactionProgress {
 
   SubcompactionProgressPerLevel proximal_output_level_progress;
 
+  // Blob state is checkpointed together with the SSTs that can reference it.
+  // The additions are delta-encoded across progress records, while garbage is
+  // a cumulative snapshot. The next number is the first unused number in the
+  // worker's pre-allocated range.
+  bool has_blob_compaction_progress = false;
+  std::vector<BlobFileAddition> blob_file_additions;
+  std::vector<BlobFileGarbage> blob_file_garbages;
+  uint64_t next_blob_file_number = kInvalidBlobFileNumber;
+
   SubcompactionProgress() = default;
 
   void Clear() {
@@ -612,6 +675,19 @@ struct SubcompactionProgress {
     num_processed_input_records = 0;
     output_level_progress.Clear();
     proximal_output_level_progress.Clear();
+    has_blob_compaction_progress = false;
+    blob_file_additions.clear();
+    blob_file_garbages.clear();
+    next_blob_file_number = kInvalidBlobFileNumber;
+    last_persisted_blob_file_additions_count_ = 0;
+  }
+
+  void UpdateLastPersistedBlobFileAdditionsCount() {
+    last_persisted_blob_file_additions_count_ = blob_file_additions.size();
+  }
+
+  size_t GetLastPersistedBlobFileAdditionsCount() const {
+    return last_persisted_blob_file_additions_count_;
   }
 
   void EncodeTo(std::string* dst) const;
@@ -650,9 +726,15 @@ struct SubcompactionProgress {
     oss << ", output_level_progress=" << output_level_progress.ToString();
     oss << ", proximal_output_level_progress="
         << proximal_output_level_progress.ToString();
+    oss << ", blob_file_additions_count=" << blob_file_additions.size();
+    oss << ", blob_file_garbages_count=" << blob_file_garbages.size();
+    oss << ", next_blob_file_number=" << next_blob_file_number;
     oss << " }";
     return oss.str();
   }
+
+ private:
+  size_t last_persisted_blob_file_additions_count_ = 0;
 };
 
 class VersionEdit;
@@ -841,6 +923,15 @@ class VersionEdit {
     }
   }
 
+  // Add a file that is already in the LSM under the same file number, such as
+  // a file being moved to another level (paired with DeleteFile()) or recorded
+  // in a new MANIFEST, preserving all of its persisted metadata. In-memory-only
+  // state (refs, being_compacted, sampled stats, pinned table reader) starts
+  // fresh. `provenance_flags_to_set` are DataFileProvenance flag bits to set
+  // on the added file, recording what is happening to it (0 for none).
+  void AddExistingFile(int level, const FileMetaData& f,
+                       uint32_t provenance_flags_to_set);
+
   const NewFiles& GetNewFiles() const { return new_files_; }
 
   NewFiles& GetMutableNewFiles() { return new_files_; }
@@ -849,7 +940,7 @@ class VersionEdit {
   using CompactCursors = std::vector<std::pair<int, InternalKey>>;
   const CompactCursors& GetCompactCursors() const { return compact_cursors_; }
   void AddCompactCursor(int level, const InternalKey& cursor) {
-    compact_cursors_.push_back(std::make_pair(level, cursor));
+    compact_cursors_.emplace_back(level, cursor);
   }
   void SetCompactCursors(
       const std::vector<InternalKey>& compact_cursors_by_level) {
@@ -857,8 +948,7 @@ class VersionEdit {
     compact_cursors_.reserve(compact_cursors_by_level.size());
     for (int i = 0; i < (int)compact_cursors_by_level.size(); i++) {
       if (compact_cursors_by_level[i].Valid()) {
-        compact_cursors_.push_back(
-            std::make_pair(i, compact_cursors_by_level[i]));
+        compact_cursors_.emplace_back(i, compact_cursors_by_level[i]);
       }
     }
   }
@@ -918,6 +1008,17 @@ class VersionEdit {
     assert(blob_file_garbages_.empty());
     blob_file_garbages_ = std::move(blob_file_garbages);
   }
+
+  // Record a blob file that best-efforts BlobDB repair left out of the column
+  // family because it was missing, while SST files may still reference it (see
+  // VersionStorageInfo::GetDroppedBlobFiles()).
+  void AddDroppedBlobFile(uint64_t blob_file_number) {
+    dropped_blob_files_.push_back(blob_file_number);
+  }
+  const std::vector<uint64_t>& GetDroppedBlobFiles() const {
+    return dropped_blob_files_;
+  }
+  bool HasDroppedBlobFiles() const { return !dropped_blob_files_.empty(); }
 
   // Add a WAL (either just created or closed).
   // AddWal and DeleteWalsBefore cannot be called on the same VersionEdit.
@@ -1042,6 +1143,33 @@ class VersionEdit {
     return last_compacted_manifest_file_size_;
   }
 
+  // Records the exact OPTIONS file that describes the DB state after this
+  // edit. This tag is safely ignorable so older RocksDB binaries retain their
+  // legacy behavior of selecting the newest OPTIONS file by file number.
+  void SetCommittedOptionsFileNumber(uint64_t number) {
+    has_committed_options_file_number_ = true;
+    committed_options_file_number_ = number;
+  }
+  bool HasCommittedOptionsFileNumber() const {
+    return has_committed_options_file_number_;
+  }
+  uint64_t GetCommittedOptionsFileNumber() const {
+    return committed_options_file_number_;
+  }
+
+  // Marks a live OPTIONS-only MANIFEST write as DB-wide metadata that does not
+  // change an LSM Version. This is intentionally not encoded; recovery applies
+  // the persisted fields through VersionEditHandler instead.
+  void MarkOptionsFileManipulation() {
+    assert(NumEntries() == 0);
+    assert(!IsColumnFamilyManipulation());
+    assert(HasCommittedOptionsFileNumber());
+    is_options_file_manipulation_ = true;
+  }
+  bool IsOptionsFileManipulation() const {
+    return is_options_file_manipulation_;
+  }
+
   // Recovery-time per-column-family edits only need to be written when they
   // advance the CF's log number or carry some other manifest state.
   bool ShouldEmitPerColumnFamilyRecoveryEdit(uint64_t current_log_number) const;
@@ -1085,61 +1213,30 @@ class VersionEdit {
   static void EncodeFileBoundaries(std::string* dst, const FileMetaData& meta,
                                    size_t ts_sz);
 
-  int max_level_ = 0;
-  std::string db_id_;
-  std::string comparator_;
   uint64_t log_number_ = 0;
   uint64_t prev_log_number_ = 0;
   uint64_t next_file_number_ = 0;
-  uint32_t max_column_family_ = 0;
   // The most recent WAL log number that is deleted
   uint64_t min_log_number_to_keep_ = 0;
   SequenceNumber last_sequence_ = 0;
-  bool has_db_id_ = false;
-  bool has_comparator_ = false;
-  bool has_log_number_ = false;
-  bool has_prev_log_number_ = false;
-  bool has_next_file_number_ = false;
-  bool has_max_column_family_ = false;
-  bool has_min_log_number_to_keep_ = false;
-  bool has_last_sequence_ = false;
-  bool has_persist_user_defined_timestamps_ = false;
+  WalDeletion wal_deletion_;
+  uint64_t last_compacted_manifest_file_size_ = 0;
+  uint64_t committed_options_file_number_ = 0;
 
   // Compaction cursors for round-robin compaction policy
   CompactCursors compact_cursors_;
-
-  DeletedFiles deleted_files_;
   NewFiles new_files_;
-
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;
-
+  std::vector<uint64_t> dropped_blob_files_;
   WalAdditions wal_additions_;
-  WalDeletion wal_deletion_;
 
-  // Each version edit record should have column_family_ set
-  // If it's not set, it is default (0)
-  uint32_t column_family_ = 0;
-  // a version edit can be either column_family add or
-  // column_family drop. If it's column family add,
-  // it also includes column family name.
-  bool is_column_family_drop_ = false;
-  bool is_column_family_add_ = false;
-  bool is_foreground_operation_ = false;
+  std::string db_id_;
+  std::string comparator_;
   std::string column_family_name_;
-
-  uint32_t remaining_entries_ = 0;
-  bool is_in_atomic_group_ = false;
-  bool is_no_manifest_write_dummy_ = false;
-
   std::string full_history_ts_low_;
-  bool persist_user_defined_timestamps_ = true;
 
-  bool has_subcompaction_progress_ = false;
-  SubcompactionProgress subcompaction_progress_;
-
-  bool has_last_compacted_manifest_file_size_ = false;
-  uint64_t last_compacted_manifest_file_size_ = 0;
+  DeletedFiles deleted_files_;
 
   // Newly created table files and blob files are eligible for deletion if they
   // are not registered as live files after the background jobs creating them
@@ -1150,6 +1247,38 @@ class VersionEdit {
   // Since table files and blob files share the same file number space, we just
   // record the file number here.
   autovector<uint64_t> files_to_quarantine_;
+
+  SubcompactionProgress subcompaction_progress_;
+
+  int max_level_ = 0;
+  uint32_t max_column_family_ = 0;
+
+  // Each version edit record should have column_family_ set
+  // If it's not set, it is default (0)
+  uint32_t column_family_ = 0;
+  uint32_t remaining_entries_ = 0;
+
+  bool has_db_id_ = false;
+  bool has_comparator_ = false;
+  bool has_log_number_ = false;
+  bool has_prev_log_number_ = false;
+  bool has_next_file_number_ = false;
+  bool has_max_column_family_ = false;
+  bool has_min_log_number_to_keep_ = false;
+  bool has_last_sequence_ = false;
+  bool has_persist_user_defined_timestamps_ = false;
+  bool is_column_family_drop_ = false;
+  bool is_column_family_add_ = false;
+  bool is_foreground_operation_ = false;
+  bool is_in_atomic_group_ = false;
+  bool is_no_manifest_write_dummy_ = false;
+  bool persist_user_defined_timestamps_ = true;
+  bool has_subcompaction_progress_ = false;
+  bool has_last_compacted_manifest_file_size_ = false;
+  bool has_committed_options_file_number_ = false;
+
+  // Non-persisted marker for the live MANIFEST writer fast path.
+  bool is_options_file_manipulation_ = false;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

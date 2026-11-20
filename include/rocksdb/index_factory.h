@@ -174,6 +174,9 @@ class IndexFactoryBuilder {
   // readers receive only this block, so all reader-required state must be
   // included. The memory backing the returned Slice must remain valid until
   // this builder is destroyed.
+  // An empty buffer with OK status omits usable custom index contents. Modes
+  // that build the standard index preserve a zero-size custom meta block and
+  // fall back to the standard index. kCustomOnly rejects an empty buffer.
   virtual Status Finish(Slice* index_contents) = 0;
 
   // Returns the estimated size in bytes of the index built so far.
@@ -316,10 +319,15 @@ class IndexFactoryReader {
   virtual std::unique_ptr<IndexFactoryIterator> NewIterator(
       const ReadOptions& read_options) = 0;
 
-  // Approximate heap memory used by this reader (excluding the raw
-  // index block contents, which are tracked separately by the block
-  // cache or table reader).
+  // Approximate heap memory used by this reader, excluding the serialized
+  // index block. RocksDB charges that block separately, to the block cache or
+  // the owning table reader.
   virtual size_t ApproximateMemoryUsage() const = 0;
+
+  // A reader whose ApproximateMemoryUsage() includes the serialized index
+  // block's size can return true here. RocksDB then subtracts the block size
+  // from that estimate instead of charging the block twice.
+  virtual bool MemoryUsageIncludesIndexBlock() const { return false; }
 };
 
 // ---------------------------------------------------------------------------
@@ -367,8 +375,11 @@ class IndexFactory : public Customizable {
 
   // Create a reader for an existing serialized index block.
   // @param options         Configuration (comparator, etc.)
-  // @param index_contents  Raw bytes of the serialized index. The Slice
-  //                        must remain valid for the lifetime of the reader.
+  // @param index_contents  Raw bytes of the serialized index. This Slice and
+  //                        the bytes it references remain valid for the
+  //                        lifetime of the reader. The factory may advance
+  //                        the Slice; that does not affect other readers of
+  //                        the same block.
   virtual Status NewReader(const IndexFactoryOptions& options,
                            Slice& index_contents,
                            std::unique_ptr<IndexFactoryReader>& reader) const {

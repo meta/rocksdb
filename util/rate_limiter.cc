@@ -117,6 +117,8 @@ GenericRateLimiter::GenericRateLimiter(
       stop_(false),
       exit_cv_(&request_mutex_),
       requests_to_wait_(0),
+      total_requests_{},
+      total_bytes_through_{},
       available_bytes_(0),
       next_refill_us_(NowMicrosMonotonicLocked()),
       fairness_(fairness > 100 ? 100 : fairness),
@@ -125,12 +127,7 @@ GenericRateLimiter::GenericRateLimiter(
       auto_tuned_(auto_tuned),
       num_drains_(0),
       max_bytes_per_sec_(rate_bytes_per_sec),
-      tuned_time_(NowMicrosMonotonicLocked()) {
-  for (int i = Env::IO_LOW; i < Env::IO_TOTAL; ++i) {
-    total_requests_[i] = 0;
-    total_bytes_through_[i] = 0;
-  }
-}
+      tuned_time_(NowMicrosMonotonicLocked()) {}
 
 GenericRateLimiter::~GenericRateLimiter() {
   MutexLock g(&request_mutex_);

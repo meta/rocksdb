@@ -19,8 +19,10 @@ class DBImplReadOnly : public DBImpl {
   // No copying allowed
   DBImplReadOnly(const DBImplReadOnly&) = delete;
   void operator=(const DBImplReadOnly&) = delete;
+  DBImplReadOnly(DBImplReadOnly&&) = delete;
+  void operator=(DBImplReadOnly&&) = delete;
 
-  virtual ~DBImplReadOnly();
+  ~DBImplReadOnly() override;
 
   // Implementations of the DB interface
   using DBImpl::GetImpl;
@@ -35,6 +37,19 @@ class DBImplReadOnly : public DBImpl {
                             Status* statuses,
                             MultiGetOutputMetadata* output_metadata,
                             const bool sorted_input = false) override;
+
+  using DBImpl::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& options, size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input = false) override;
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override;
 
   using DBImpl::NewIterator;
   Iterator* NewIterator(const ReadOptions& _read_options,

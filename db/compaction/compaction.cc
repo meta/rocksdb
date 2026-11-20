@@ -214,7 +214,8 @@ bool Compaction::IsBottommostLevel(
   } else {
     output_l0_idx = -1;
   }
-  Slice smallest_key, largest_key;
+  Slice smallest_key;
+  Slice largest_key;
   GetBoundaryKeys(vstorage, inputs, &smallest_key, &largest_key);
   return !vstorage->RangeMightExistAfterSortedRun(smallest_key, largest_key,
                                                   output_level, output_l0_idx);
@@ -256,7 +257,8 @@ Status Compaction::InitInputTableProperties() {
       std::string file_name =
           TableFileName(immutable_options_.cf_paths, fmd->fd.GetNumber(),
                         fmd->fd.GetPathId());
-      s = input_version_->GetTableProperties(read_options, &tp, fmd,
+      s = input_version_->GetTableProperties(read_options, &tp, fmd, level(i),
+                                             /*allow_table_open=*/true,
                                              &file_name);
       if (s.ok()) {
         input_table_properties_[file_name] = tp;
@@ -554,6 +556,10 @@ bool Compaction::InputCompressionMatchesOutput() const {
 }
 
 bool Compaction::IsTrivialMove() const {
+  if (skip_missing_blob_files_) {
+    return false;
+  }
+
   // Avoid a move if there is lots of overlapping grandparent data.
   // Otherwise, the move could create a parent file that will require
   // a very expensive merge later on.
@@ -959,6 +965,38 @@ bool Compaction::DoesInputReferenceBlobFiles() const {
       assert(meta);
 
       if (meta->oldest_blob_file_number != kInvalidBlobFileNumber) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool Compaction::RepairsMissingBlobReferences() const {
+  if (skip_missing_blob_files_) {
+    return true;
+  }
+
+  assert(input_version_);
+  const VersionStorageInfo* storage_info = input_version_->storage_info();
+  assert(storage_info);
+
+  const std::vector<uint64_t>& dropped_blob_files =
+      storage_info->GetDroppedBlobFiles();
+  if (dropped_blob_files.empty()) {
+    return false;
+  }
+
+  // An SST file only references blob files at or above its oldest referenced
+  // blob file.
+  const uint64_t newest_dropped_blob_file = dropped_blob_files.back();
+  for (const CompactionInputFiles& level_inputs : inputs_) {
+    for (const FileMetaData* meta : level_inputs.files) {
+      assert(meta);
+
+      if (meta->oldest_blob_file_number != kInvalidBlobFileNumber &&
+          meta->oldest_blob_file_number <= newest_dropped_blob_file) {
         return true;
       }
     }

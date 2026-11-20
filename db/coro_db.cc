@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "folly/Executor.h"
+#include "folly/coro/CurrentExecutor.h"
 #include "folly/coro/Nothrow.h"
 #include "folly/executors/IOExecutor.h"
 #include "folly/io/async/EventBase.h"
@@ -41,8 +42,8 @@ folly::coro::Task<Status> CoroDB::CoGet(DB* db, const ReadOptions& options,
 
   Status status;
   if (coro_db == nullptr || read_event_base == nullptr) {
-    CoroutineStatsContextScope stats_scope(std::move(stats_config),
-                                           db->GetEnv());
+    CoroutineStatsContextScope stats_scope(
+        WithoutAsyncReadCPUTime(std::move(stats_config)), db->GetEnv());
     status = db->Get(options, column_family, key, value, timestamp);
   } else {
     auto task = [](CoroutineStatsConfig task_stats_config, Env* task_env,
@@ -57,8 +58,14 @@ folly::coro::Task<Status> CoroDB::CoGet(DB* db, const ReadOptions& options,
                                 task_value, task_timestamp));
     }(std::move(stats_config), db->GetEnv(), coro_db, options, column_family,
                                                 key, value, timestamp);
-    status = co_await folly::coro::co_nothrow(folly::coro::co_withExecutor(
-        folly::Executor::getKeepAliveToken(read_event_base), std::move(task)));
+    auto* current_executor = co_await folly::coro::co_current_executor;
+    if (current_executor == read_event_base) {
+      status = co_await folly::coro::co_nothrow(std::move(task));
+    } else {
+      status = co_await folly::coro::co_nothrow(folly::coro::co_withExecutor(
+          folly::Executor::getKeepAliveToken(read_event_base),
+          std::move(task)));
+    }
   }
   co_return status;
 }
@@ -104,8 +111,8 @@ folly::coro::Task<Status> CoroDB::CoGet(SstFileReader* reader,
 
   Status status;
   if (read_event_base == nullptr) {
-    CoroutineStatsContextScope stats_scope(std::move(stats_config),
-                                           rep->options.env);
+    CoroutineStatsContextScope stats_scope(
+        WithoutAsyncReadCPUTime(std::move(stats_config)), rep->options.env);
     status = reader->Get(options, key, value);
   } else {
     auto task = [](CoroutineStatsConfig task_stats_config, Env* task_env,
@@ -117,8 +124,14 @@ folly::coro::Task<Status> CoroDB::CoGet(SstFileReader* reader,
       co_return co_await folly::coro::co_nothrow(
           task_reader->rep_->GetCoroutine(task_options, task_key, task_value));
     }(std::move(stats_config), rep->options.env, reader, options, key, value);
-    status = co_await folly::coro::co_nothrow(folly::coro::co_withExecutor(
-        folly::Executor::getKeepAliveToken(read_event_base), std::move(task)));
+    auto* current_executor = co_await folly::coro::co_current_executor;
+    if (current_executor == read_event_base) {
+      status = co_await folly::coro::co_nothrow(std::move(task));
+    } else {
+      status = co_await folly::coro::co_nothrow(folly::coro::co_withExecutor(
+          folly::Executor::getKeepAliveToken(read_event_base),
+          std::move(task)));
+    }
   }
   co_return status;
 }
@@ -153,8 +166,8 @@ folly::coro::Task<Status> CoroDB::CoGetEntity(DB* db,
 
   Status status;
   if (coro_db == nullptr || read_event_base == nullptr) {
-    CoroutineStatsContextScope stats_scope(std::move(stats_config),
-                                           db->GetEnv());
+    CoroutineStatsContextScope stats_scope(
+        WithoutAsyncReadCPUTime(std::move(stats_config)), db->GetEnv());
     status = db->GetEntity(options, column_family, key, columns);
   } else {
     auto task =
@@ -197,8 +210,8 @@ folly::coro::Task<Status> CoroDB::CoGetEntity(DB* db,
 
   Status status;
   if (coro_db == nullptr || read_event_base == nullptr) {
-    CoroutineStatsContextScope stats_scope(std::move(stats_config),
-                                           db->GetEnv());
+    CoroutineStatsContextScope stats_scope(
+        WithoutAsyncReadCPUTime(std::move(stats_config)), db->GetEnv());
     status = db->GetEntity(options, key, result);
   } else {
     auto task =
@@ -265,8 +278,8 @@ folly::coro::Task<std::vector<Status>> CoroDB::CoMultiGet(
 
   std::vector<Status> statuses;
   if (read_event_base == nullptr) {
-    CoroutineStatsContextScope stats_scope(std::move(stats_config),
-                                           rep->options.env);
+    CoroutineStatsContextScope stats_scope(
+        WithoutAsyncReadCPUTime(std::move(stats_config)), rep->options.env);
     statuses = reader->MultiGet(options, keys, values);
   } else {
     auto task = [](CoroutineStatsConfig task_stats_config, Env* task_env,
@@ -316,8 +329,8 @@ folly::coro::Task<void> CoroDB::CoMultiGet(
   CoroutineStatsConfig stats_config = CaptureAndDisableCoroutineStatsConfig();
 
   if (coro_db == nullptr || read_event_base == nullptr) {
-    CoroutineStatsContextScope stats_scope(std::move(stats_config),
-                                           db->GetEnv());
+    CoroutineStatsContextScope stats_scope(
+        WithoutAsyncReadCPUTime(std::move(stats_config)), db->GetEnv());
     db->MultiGet(options, num_keys, column_families, keys, values, timestamps,
                  statuses, sorted_input);
   } else {

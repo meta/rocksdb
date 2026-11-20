@@ -27,9 +27,9 @@
     </licenses>
 
     <scm>
-        <connection>scm:git:https://github.com/facebook/rocksdb.git</connection>
-        <developerConnection>scm:git:https://github.com/facebook/rocksdb.git</developerConnection>
-        <url>scm:git:https://github.com/facebook/rocksdb.git</url>
+        <connection>scm:git:https://github.com/meta/rocksdb.git</connection>
+        <developerConnection>scm:git:https://github.com/meta/rocksdb.git</developerConnection>
+        <url>scm:git:https://github.com/meta/rocksdb.git</url>
     </scm>
 
     <organization>

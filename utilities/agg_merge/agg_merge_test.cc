@@ -117,7 +117,8 @@ TEST_F(AggMergeTest, TestUsingMergeOperator) {
   v1 = EncodeHelper::EncodeFuncAndInt("sum", 20);
   ASSERT_OK(Merge("bar4", v1));
   std::string aggregated_value = Get("bar4");
-  Slice func, payload;
+  Slice func;
+  Slice payload;
   ASSERT_TRUE(ExtractAggFuncAndValue(aggregated_value, func, payload));
   EXPECT_EQ(kErrorFuncName, func);
   std::vector<Slice> decoded_list;

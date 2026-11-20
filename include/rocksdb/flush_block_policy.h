@@ -29,7 +29,7 @@ class FlushBlockPolicy {
   // determine if table builder should flush current data block.
   virtual bool Update(const Slice& key, const Slice& value) = 0;
 
-  virtual ~FlushBlockPolicy() {}
+  virtual ~FlushBlockPolicy() = default;
 };
 
 class FlushBlockPolicyFactory : public Customizable {
@@ -53,7 +53,7 @@ class FlushBlockPolicyFactory : public Customizable {
       const BlockBasedTableOptions& table_options,
       const BlockBuilder& data_block_builder) const = 0;
 
-  virtual ~FlushBlockPolicyFactory() {}
+  ~FlushBlockPolicyFactory() override = default;
 };
 
 class FlushBlockBySizePolicyFactory : public FlushBlockPolicyFactory {

@@ -1,1 +1,0 @@
-Fixed `MultiGet()` with `ReadOptions::read_tier == kBlockCacheTier` reading data blocks from disk when `allow_mmap_reads` is false. Keys whose data block is not in the block cache now return `Status::Incomplete()`, the same as `Get()`.

@@ -34,7 +34,7 @@ class PessimisticTransactionDB : public TransactionDB {
   explicit PessimisticTransactionDB(StackableDB* db,
                                     const TransactionDBOptions& txn_db_options);
 
-  virtual ~PessimisticTransactionDB();
+  ~PessimisticTransactionDB() override;
 
   const Snapshot* GetSnapshot() override { return db_->GetSnapshot(); }
 
@@ -240,6 +240,7 @@ class PessimisticTransactionDB : public TransactionDB {
 
   Transaction* BeginInternalTransaction(const WriteOptions& options);
   Transaction* GetTransactionByNameLocked(const TransactionName& name);
+  void ConfigureSlowMutexLogging();
 
   std::shared_ptr<LockManager> lock_manager_;
 
@@ -255,6 +256,7 @@ class PessimisticTransactionDB : public TransactionDB {
 
   // map from name to two phase transaction instance
   std::mutex name_map_mutex_;
+  std::unique_ptr<SlowMutexTimer> name_map_timer_;
   std::unordered_map<TransactionName, Transaction*> transactions_;
 
   // Signal that we are testing a crash scenario. Some asserts could be relaxed
@@ -274,7 +276,7 @@ class WriteCommittedTxnDB : public PessimisticTransactionDB {
                                const TransactionDBOptions& txn_db_options)
       : PessimisticTransactionDB(db, txn_db_options) {}
 
-  virtual ~WriteCommittedTxnDB() {}
+  ~WriteCommittedTxnDB() override = default;
 
   Transaction* BeginTransaction(const WriteOptions& write_options,
                                 const TransactionOptions& txn_options,
@@ -326,6 +328,12 @@ class SnapshotCreationCallback : public PostMemTableCallback {
         snapshot_(snapshot) {
     assert(db_impl_);
   }
+
+  // No copying allowed
+  SnapshotCreationCallback(const SnapshotCreationCallback&) = delete;
+  SnapshotCreationCallback& operator=(const SnapshotCreationCallback&) = delete;
+  SnapshotCreationCallback(SnapshotCreationCallback&&) = delete;
+  SnapshotCreationCallback& operator=(SnapshotCreationCallback&&) = delete;
 
   ~SnapshotCreationCallback() override {
     snapshot_creation_status_.PermitUncheckedError();

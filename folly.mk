@@ -29,8 +29,10 @@ ifneq ($(strip $(FOLLY_PATH)),)
 	XZ_PATH = $(shell (ls -d $(FOLLY_PATH)/../xz*))
 	LIBSODIUM_PATH = $(shell (ls -d $(FOLLY_PATH)/../libsodium*))
 	FMT_PATH = $(shell (ls -d $(FOLLY_PATH)/../fmt*))
+	LIBUNWIND_PATH = $(shell (ls -d $(FOLLY_PATH)/../libunwind*))
 
 	# For some reason, some libraries are under either lib or lib64
+	BOOST_LIB_PATH = $(shell (ls -d $(BOOST_PATH)/lib*))
 	GLOG_LIB_PATH = $(shell (ls -d $(GLOG_PATH)/lib*))
 	FMT_LIB_PATH = $(shell (ls -d $(FMT_PATH)/lib*))
 	LIBEVENT_LIB_PATH = $(shell (ls -d $(LIBEVENT_PATH)/lib*))
@@ -47,7 +49,7 @@ ifneq ($(strip $(FOLLY_PATH)),)
 	# Add -ldl at the end as gcc resolves a symbol in a library by searching only in libraries specified later
 	# in the command line
 
-	PLATFORM_LDFLAGS += $(FOLLY_PATH)/lib/libfolly.a $(BOOST_PATH)/lib/libboost_context.a $(BOOST_PATH)/lib/libboost_filesystem.a $(BOOST_PATH)/lib/libboost_atomic.a $(BOOST_PATH)/lib/libboost_program_options.a $(BOOST_PATH)/lib/libboost_regex.a $(BOOST_PATH)/lib/libboost_system.a $(BOOST_PATH)/lib/libboost_thread.a $(LIBEVENT_LIB_PATH)/libevent.a $(LIBSODIUM_PATH)/lib/libsodium.a -ldl
+	PLATFORM_LDFLAGS += $(FOLLY_PATH)/lib/libfolly.a $(BOOST_LIB_PATH)/libboost_context.a $(BOOST_LIB_PATH)/libboost_filesystem.a $(BOOST_LIB_PATH)/libboost_atomic.a $(BOOST_LIB_PATH)/libboost_program_options.a $(BOOST_LIB_PATH)/libboost_thread.a $(LIBEVENT_LIB_PATH)/libevent.a $(LIBSODIUM_PATH)/lib/libsodium.a $(LIBUNWIND_PATH)/lib/libunwind.a -ldl
 ifneq ($(DEBUG_LEVEL),0)
 	PLATFORM_LDFLAGS += $(FMT_LIB_PATH)/libfmtd.a $(GLOG_LIB_PATH)/libglogd.so $(GFLAGS_PATH)/lib/libgflags_debug.so.2.3
 else
@@ -98,7 +100,7 @@ endif  # FMT_SOURCE_PATH
 	PLATFORM_LDFLAGS += -lglog
 endif
 
-FOLLY_COMMIT_HASH = 2a68075b77d958854d895e78fe6c41940dd49f3c
+FOLLY_COMMIT_HASH = 7ba92f0e29d24b453cee8ab27d117b1c7cc19589
 FOLLY_GETDEPS_CACHE_DIR = /tmp/rocksdb-getdeps-cache
 
 define restore_folly_getdeps_downloads
@@ -141,7 +143,7 @@ checkout_folly:
 	@# const mismatch
 	perl -pi -e 's/: environ/: (const char**)(environ)/' third-party/folly/folly/Subprocess.cpp
 	@# Pagure was decommissioned; use Debian's mirror of the release archive.
-	perl -pi -e 's|https://pagure.io/libaio/archive/libaio-0.3.113/libaio-libaio-0.3.113.tar.gz|https://deb.debian.org/debian/pool/main/liba/libaio/libaio_0.3.113.orig.tar.gz|; s|716c7059703247344eb066b54ecbc3ca2134f0103307192e6c2b7dab5f9528ab|2c44d1c5fd0d43752287c9ae1eb9c023f04ef848ea8d4aafa46e9aedb678200b|; s|subdir = libaio-libaio-0.3.113|subdir = libaio-0.3.113|' third-party/folly/build/fbcode_builder/manifests/libaio
+	perl -pi -e 's|https://releases.pagure.org/libaio/libaio-0.3.113.tar.gz|https://deb.debian.org/debian/pool/main/liba/libaio/libaio_0.3.113.orig.tar.gz|' third-party/folly/build/fbcode_builder/manifests/libaio
 	@# Restore cached downloads and handle unreliable mirrors with fallback
 	$(restore_folly_getdeps_downloads)
 	@# NOTE: boost and fmt source will be needed for any build including `USE_FOLLY_LITE` builds as those depend on those headers
@@ -152,6 +154,16 @@ checkout_folly:
 		done
 	@# Update cache with any new downloads
 	$(cache_folly_getdeps_downloads)
+	@# The boost source archive has a modular layout (headers under
+	@# libs/*/include), so assemble the merged boost/ header tree that
+	@# USE_FOLLY_LITE builds put on the include path. This avoids ~150
+	@# -isystem flags (one per boost library) on every folly-lite compile.
+	cd third-party/folly && \
+		BOOST_SRC=`ls -d $$($(PYTHON) build/fbcode_builder/getdeps.py show-source-dir boost)/boost*/` && \
+		mkdir -p "$${BOOST_SRC}boost" && \
+		for inc in "$${BOOST_SRC}"libs/*/include "$${BOOST_SRC}"libs/numeric/*/include; do \
+			cp -R "$$inc/boost/." "$${BOOST_SRC}boost/" || exit 1; \
+		done
 
 CXX_M_FLAGS = $(filter -m%, $(CXXFLAGS))
 
@@ -174,6 +186,8 @@ build_folly:
 	$(restore_folly_getdeps_downloads)
 	cd third-party/folly && \
 		CXXFLAGS=" $(CXX_M_FLAGS) -DHAVE_CXX11_ATOMIC " GETDEPS_USE_WGET=1 $(PYTHON) build/fbcode_builder/getdeps.py build $(FOLLY_BUILD_FLAGS)
+	@# Update cache with archives downloaded during the build
+	$(cache_folly_getdeps_downloads)
 	@# In the folly build, glog and gflags are only built as dynamic libraries,
 	@# not static. This patchelf command is needed to reliably have the glog
 	@# library find its dependency gflags, because apparently the rpath of the

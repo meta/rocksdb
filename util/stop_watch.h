@@ -42,6 +42,12 @@ class StopWatch {
         start_time_((stats_enabled_ || elapsed != nullptr) ? clock->NowMicros()
                                                            : 0) {}
 
+  // No copying allowed
+  StopWatch(const StopWatch&) = delete;
+  StopWatch& operator=(const StopWatch&) = delete;
+  StopWatch(StopWatch&&) = delete;
+  StopWatch& operator=(StopWatch&&) = delete;
+
   ~StopWatch() {
     if (elapsed_) {
       if (overwrite_) {

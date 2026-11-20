@@ -1,1 +1,0 @@
-Added `FullExternalTableFactory` and related full-mode external table APIs that preserve RocksDB internal keys, enabling external tables to support nonzero sequence numbers, point and single deletions, merge operands, blob indexes, wide-column entities, snapshots, live DB writes, and multi-level compactions.

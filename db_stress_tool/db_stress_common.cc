@@ -156,7 +156,10 @@ void InitializeHotKeyGenerator(double alpha) {
 // the closer to 0, the higher probability will be. To randomly distribute
 // the hot keys in [0, max_key], we use Random64 to shuffle it.
 int64_t GetOneHotKeyID(double rand_seed, int64_t max_key) {
-  int64_t low = 1, mid, high = zipf_sum_size, zipf = 0;
+  int64_t low = 1;
+  int64_t mid;
+  int64_t high = zipf_sum_size;
+  int64_t zipf = 0;
   while (low <= high) {
     mid = (low + high) / 2;
     if (sum_probs[mid] >= rand_seed && sum_probs[mid - 1] < rand_seed) {
@@ -891,6 +894,9 @@ std::vector<int64_t> GenerateNKeys(ThreadState* thread, int num_keys,
 }
 
 size_t GenerateValue(uint32_t rand, char* v, size_t max_sz) {
+  if (FLAGS_structured_key_value) {
+    return GenerateStructuredValue(rand, v, max_sz);
+  }
   size_t value_sz =
       ((rand % kRandomValueMaxFactor) + 1) * FLAGS_value_size_mult;
   assert(value_sz <= max_sz && value_sz >= sizeof(uint32_t));
@@ -1043,6 +1049,12 @@ class MyXXH64Checksum : public FileChecksumGenerator {
     state_ = XXH64_createState();
     XXH64_reset(state_, 0);
   }
+
+  // No copying allowed
+  MyXXH64Checksum(const MyXXH64Checksum&) = delete;
+  MyXXH64Checksum& operator=(const MyXXH64Checksum&) = delete;
+  MyXXH64Checksum(MyXXH64Checksum&&) = delete;
+  MyXXH64Checksum& operator=(MyXXH64Checksum&&) = delete;
 
   ~MyXXH64Checksum() override { XXH64_freeState(state_); }
 

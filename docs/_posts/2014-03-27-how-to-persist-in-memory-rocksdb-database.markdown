@@ -18,7 +18,7 @@ Every update to RocksDB is written to two places - one is an in-memory data stru
 Options::wal_dir is the directory where RocksDB stores write-ahead log files. If you configure this directory to be on flash or disk, you will not lose current log file on machine reboot.
 Options::WAL_ttl_seconds is the timeout when we delete the archived log files. If the timeout is non-zero, obsolete log files will be moved to `archive/` directory under Options::wal_dir. Those archived log files will only be deleted after the specified timeout.
 
-Let's assume Options::wal_dir is a directory on persistent storage and Options::WAL_ttl_seconds is set to one day. To fully recover the DB, we also need to backup the current snapshot of the database (containing table and metadata files) with a frequency of less than one day. RocksDB provides an utility that enables you to easily backup the snapshot of your database. You can learn more about it here: [How to backup RocksDB?](https://github.com/facebook/rocksdb/wiki/How-to-backup-RocksDB%3F)
+Let's assume Options::wal_dir is a directory on persistent storage and Options::WAL_ttl_seconds is set to one day. To fully recover the DB, we also need to backup the current snapshot of the database (containing table and metadata files) with a frequency of less than one day. RocksDB provides an utility that enables you to easily backup the snapshot of your database. You can learn more about it here: [How to backup RocksDB?](https://github.com/meta/rocksdb/wiki/How-to-backup-RocksDB%3F)
 
 You should configure the backup process to avoid backing up log files, since they are already stored in persistent storage. To do that, set BackupableDBOptions::backup_log_files to false.
 
@@ -51,4 +51,4 @@ To reiterate, here's what you have to do:
 
 
 
-[1] You might also want to consider using [PlainTable format](https://github.com/facebook/rocksdb/wiki/PlainTable-Format) for table files
+[1] You might also want to consider using [PlainTable format](https://github.com/meta/rocksdb/wiki/PlainTable-Format) for table files

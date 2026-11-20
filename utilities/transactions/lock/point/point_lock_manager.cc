@@ -9,10 +9,12 @@
 #include <cinttypes>
 #include <mutex>
 
+#include "db/db_impl/db_impl.h"
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/utilities/transaction_db_mutex.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
 #include "util/hash.h"
 #include "util/thread_local.h"
 #include "utilities/transactions/pessimistic_transaction_db.h"
@@ -111,6 +113,7 @@ struct LockInfo {
   }
 
   DECLARE_DEFAULT_MOVES(LockInfo);
+  ~LockInfo() = default;
 
   bool exclusive;
   autovector<TransactionID> txn_ids;
@@ -138,6 +141,13 @@ void DebugWakeUpWaiter(TransactionID txn_id, TransactionID waiter_id,
 
 // Key lock waiter context, used for free the lock automatically
 struct KeyLockWaiterContext {
+  KeyLockWaiterContext() = default;
+  // No copying allowed
+  KeyLockWaiterContext(const KeyLockWaiterContext&) = delete;
+  KeyLockWaiterContext& operator=(const KeyLockWaiterContext&) = delete;
+  KeyLockWaiterContext(KeyLockWaiterContext&&) = delete;
+  KeyLockWaiterContext& operator=(KeyLockWaiterContext&&) = delete;
+
   // When a lock waiter is aborted due to dead lock or time out, this function
   // is used to wake up the waiters after it, if they could proceed.
   void TryWakeUpNextWaiters(const LockInfo& lock_info, const std::string& key) {
@@ -335,6 +345,12 @@ struct LockMap {
     }
   }
 
+  // No copying allowed
+  LockMap(const LockMap&) = delete;
+  LockMap& operator=(const LockMap&) = delete;
+  LockMap(LockMap&&) = delete;
+  LockMap& operator=(LockMap&&) = delete;
+
   ~LockMap() {
     for (auto stripe : lock_map_stripes_) {
       delete stripe;
@@ -436,7 +452,16 @@ PointLockManager::PointLockManager(PessimisticTransactionDB* txn_db,
       dlock_buffer_(opt.max_num_deadlocks),
       mutex_factory_(opt.custom_mutex_factory
                          ? opt.custom_mutex_factory
-                         : std::make_shared<TransactionDBMutexFactoryImpl>()) {}
+                         : std::make_shared<TransactionDBMutexFactoryImpl>()) {
+  const std::shared_ptr<SlowMutexLoggingContext>& context =
+      static_cast_with_check<DBImpl>(txn_db->GetRootDB())
+          ->GetSlowMutexLogging();
+  if (context == nullptr) {
+    return;
+  }
+  wait_txn_map_timer_.reset(new SlowMutexTimer(
+      context, "PointLockManager::wait_txn_map_mutex_", &wait_txn_map_mutex_));
+}
 
 size_t LockMap::GetStripe(const std::string& key) const {
   assert(num_stripes_ > 0);
@@ -551,6 +576,7 @@ Status PointLockManager::TryLock(PessimisticTransaction* txn,
                                  ColumnFamilyId column_family_id,
                                  const std::string& key, Env* env,
                                  bool exclusive) {
+  SlowMutexLogScope defer_logs(wait_txn_map_timer_ != nullptr);
   // Lookup lock map for this column family id
   std::shared_ptr<LockMap> lock_map_ptr = GetLockMap(column_family_id);
   LockMap* lock_map = lock_map_ptr.get();
@@ -818,7 +844,7 @@ void PointLockManager::UnLockKey(PessimisticTransaction* txn,
 void PointLockManager::DecrementWaiters(
     const PessimisticTransaction* txn,
     const autovector<TransactionID>& wait_ids) {
-  std::lock_guard<std::mutex> lock(wait_txn_map_mutex_);
+  SlowMutexLock lock(&wait_txn_map_mutex_, wait_txn_map_timer_.get());
   DecrementWaitersImpl(txn, wait_ids);
 }
 
@@ -846,7 +872,7 @@ bool PointLockManager::IncrementWaiters(
       static_cast<size_t>(txn->GetDeadlockDetectDepth()));
   std::vector<TransactionID> queue_values(
       static_cast<size_t>(txn->GetDeadlockDetectDepth()));
-  std::lock_guard<std::mutex> lock(wait_txn_map_mutex_);
+  SlowMutexLock lock(&wait_txn_map_mutex_, wait_txn_map_timer_.get());
   assert(!wait_txn_map_.Contains(id));
 
   wait_txn_map_.Insert(id, {wait_ids, cf_id, exclusive, key});

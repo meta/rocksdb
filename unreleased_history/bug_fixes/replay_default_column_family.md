@@ -1,1 +1,0 @@
-Fixed trace replay (`DB::NewDefaultReplayer()`, db_bench `replay`) failing every read record (Get, MultiGet, iterator seek) on the default column family with `Corruption: Invalid Column Family ID` when the default column family handle was not passed, which is always the case in db_bench with `--num_column_families=1`.

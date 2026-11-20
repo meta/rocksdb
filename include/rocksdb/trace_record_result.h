@@ -109,6 +109,14 @@ class SingleValueTraceExecutionResult : public TraceExecutionResult {
                                   uint64_t start_timestamp,
                                   uint64_t end_timestamp, TraceType trace_type);
 
+  SingleValueTraceExecutionResult(const SingleValueTraceExecutionResult&) =
+      default;
+  SingleValueTraceExecutionResult& operator=(
+      const SingleValueTraceExecutionResult&) = default;
+  SingleValueTraceExecutionResult(SingleValueTraceExecutionResult&&) = default;
+  SingleValueTraceExecutionResult& operator=(
+      SingleValueTraceExecutionResult&&) = default;
+
   ~SingleValueTraceExecutionResult() override;
 
   // Return status of DB::Get().
@@ -132,6 +140,14 @@ class MultiValuesTraceExecutionResult : public TraceExecutionResult {
                                   std::vector<std::string> values,
                                   uint64_t start_timestamp,
                                   uint64_t end_timestamp, TraceType trace_type);
+
+  MultiValuesTraceExecutionResult(const MultiValuesTraceExecutionResult&) =
+      default;
+  MultiValuesTraceExecutionResult& operator=(
+      const MultiValuesTraceExecutionResult&) = default;
+  MultiValuesTraceExecutionResult(MultiValuesTraceExecutionResult&&) = default;
+  MultiValuesTraceExecutionResult& operator=(
+      MultiValuesTraceExecutionResult&&) = default;
 
   ~MultiValuesTraceExecutionResult() override;
 
@@ -160,6 +176,14 @@ class IteratorTraceExecutionResult : public TraceExecutionResult {
                                const std::string& key, const std::string& value,
                                uint64_t start_timestamp, uint64_t end_timestamp,
                                TraceType trace_type);
+
+  // No copying allowed
+  IteratorTraceExecutionResult(const IteratorTraceExecutionResult&) = delete;
+  IteratorTraceExecutionResult& operator=(const IteratorTraceExecutionResult&) =
+      delete;
+  IteratorTraceExecutionResult(IteratorTraceExecutionResult&&) = delete;
+  IteratorTraceExecutionResult& operator=(IteratorTraceExecutionResult&&) =
+      delete;
 
   ~IteratorTraceExecutionResult() override;
 

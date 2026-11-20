@@ -5,11 +5,16 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <cinttypes>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/blob/blob_index.h"
@@ -29,6 +34,7 @@ class BlobFileBuilder;
 class BlobFileCache;
 class BlobFetcher;
 class Version;
+class MissingBlobRepairIterator;
 class PrefetchBufferCollection;
 class FilePrefetchBuffer;
 class Version;
@@ -274,7 +280,8 @@ class CompactionIterator {
       const std::string* full_history_ts_low = nullptr,
       std::optional<SequenceNumber> preserve_seqno_min = {},
       const Version* input_version = nullptr,
-      Env::IOActivity blob_read_io_activity = Env::IOActivity::kCompaction);
+      Env::IOActivity blob_read_io_activity = Env::IOActivity::kCompaction,
+      std::optional<uint64_t> blob_gc_cutoff_file_number = {});
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(
@@ -296,7 +303,8 @@ class CompactionIterator {
       const std::string* full_history_ts_low = nullptr,
       std::optional<SequenceNumber> preserve_seqno_min = {},
       const Version* input_version = nullptr,
-      Env::IOActivity blob_read_io_activity = Env::IOActivity::kCompaction);
+      Env::IOActivity blob_read_io_activity = Env::IOActivity::kCompaction,
+      std::optional<uint64_t> blob_gc_cutoff_file_number = {});
 
   ~CompactionIterator();
 
@@ -309,15 +317,35 @@ class CompactionIterator {
                       Env::IOActivity io_activity,
                       bool allow_write_path_fallback);
 
+  // Install before the first seek; the normalizer must outlive this iterator.
+  void SetMissingBlobRepairIterator(const MissingBlobRepairIterator* iterator) {
+    assert(key_.empty());
+    missing_blob_repair_iterator_ = iterator;
+  }
+
+  static uint64_t ComputeBlobGarbageCollectionCutoffFileNumber(
+      const CompactionProxy* compaction);
+
   // Seek to the beginning of the compaction iterator output.
   //
   // REQUIRED: Call only once.
   void SeekToFirst();
 
+  // Positions at the first output without extracting/relocating blobs yet.
+  // CompactionJob uses this when an SST checkpoint may need to be persisted
+  // before the current key is added to a blob file.
+  void SeekToFirstWithoutPreparingOutput();
+
   // Produces the next record in the compaction.
   //
   // REQUIRED: SeekToFirst() has been called.
   void Next();
+
+  // Advances without extracting/relocating blobs for the new current key.
+  void NextWithoutPreparingOutput();
+
+  // Completes output preparation once for the current key.
+  void PrepareOutputIfNeeded();
 
   // Getters
   const Slice& key() const { return key_; }
@@ -348,6 +376,15 @@ class CompactionIterator {
     return at_next_ || merge_out_iter_.Valid();
   }
 
+  // Returns true if an earlier input entry for the current valid user key was
+  // consumed without being output.
+  //
+  // REQUIRED: Valid() must be true
+  bool HasConsumedEarlierEntriesOfCurrentKey() const {
+    assert(Valid());
+    return has_consumed_earlier_entries_of_current_key_;
+  }
+
   Status InputStatus() const { return input_.status(); }
 
   bool IsDeleteRangeSentinelKey() const { return is_range_del_; }
@@ -355,6 +392,8 @@ class CompactionIterator {
  private:
   // Processes the input stream to find the next output
   void NextFromInput();
+
+  void NextImpl();
 
   // Do final preparations before presenting the output to the callee.
   void PrepareOutput();
@@ -421,7 +460,16 @@ class CompactionIterator {
 
   // Invoke compaction filter if needed.
   // Return true on success, false on failures (e.g.: kIOError).
-  bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until);
+  bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until,
+                            bool merge_output);
+  bool SelectMergeOutput(uint8_t valid_context);
+  bool PrefilterUncombinedOutputs(uint8_t valid_context);
+  bool ProcessDeletion(SequenceNumber prev_snapshot,
+                       bool input_already_advanced);
+
+  bool DeletionIsObsolete();
+
+  Status OutputHasExternalBlobReferences(bool* has_external_refs) const;
 
   // Given a sequence number, return the sequence number of the
   // earliest snapshot that this sequence number is visible in.
@@ -456,8 +504,6 @@ class CompactionIterator {
     }
   }
 
-  static uint64_t ComputeBlobGarbageCollectionCutoffFileNumber(
-      const CompactionProxy* compaction);
   static std::unique_ptr<BlobFetcher> CreateBlobFetcherIfNeeded(
       const CompactionProxy* compaction, const Version* input_version,
       Env::IOActivity blob_read_io_activity);
@@ -465,6 +511,7 @@ class CompactionIterator {
   CreatePrefetchBufferCollectionIfNeeded(const CompactionProxy* compaction);
 
   SequenceIterWrapper input_;
+  const MissingBlobRepairIterator* missing_blob_repair_iterator_ = nullptr;
   const Comparator* cmp_;
   MergeHelper* merge_helper_;
   const std::vector<SequenceNumber>* snapshots_;
@@ -484,6 +531,7 @@ class CompactionIterator {
   BlobFileBuilder* blob_file_builder_;
   std::unique_ptr<CompactionProxy> compaction_;
   const CompactionFilter* compaction_filter_;
+  const CompactionFilter::MergeOrder merge_order_;
   const bool filter_supports_v4_;
   const std::atomic<bool>* shutting_down_;
   const std::atomic<bool>& manual_compaction_canceled_;
@@ -557,6 +605,8 @@ class CompactionIterator {
   // If false, the iterator holds a copy of the current compaction iterator
   // output (or current key in the underlying iterator during NextFromInput()).
   bool at_next_ = false;
+  // Whether an earlier input entry of the current user key was not output.
+  bool has_consumed_earlier_entries_of_current_key_ = false;
 
   // A copy of the current internal key.
   IterKey current_key_;
@@ -574,6 +624,17 @@ class CompactionIterator {
   bool clear_and_output_next_key_ = false;
 
   MergeOutputIterator merge_out_iter_;
+  // Merge-before-filter decisions for the current batch of uncombined
+  // operands. They are made before any operand is output, so
+  // kRemoveAndSkipUntil drops the whole batch, as in the legacy order.
+  struct UncombinedDecision {
+    bool keep = true;
+    bool changed = false;
+    std::string value;
+  };
+  std::vector<UncombinedDecision> uncombined_decisions_;
+  size_t uncombined_index_ = 0;
+  bool uncombined_prefiltered_ = false;
   Status merge_until_status_;
   // PinnedIteratorsManager used to pin input_ Iterator blocks while reading
   // merge operands and then releasing them after consuming them.
@@ -614,6 +675,7 @@ class CompactionIterator {
   // it) and PrepareOutput() can skip redundant work. Reset for each candidate
   // input record and whenever the filter rewrites the entity value.
   bool entity_deserialized_{false};
+  bool output_prepared_{false};
   // "level_ptrs" holds indices that remember which file of an associated
   // level we were last checking during the last call to compaction->
   // KeyNotExistsBeyondOutputLevel(). This allows future calls to the function
@@ -641,7 +703,16 @@ class CompactionIterator {
 
   void AdvanceInputIter() { input_.Next(); }
 
-  void SkipUntil(const Slice& skip_until) { input_.Seek(skip_until); }
+  // Advances past an input entry that will not be emitted as output.
+  void AdvanceInputIterWithoutOutput() {
+    has_consumed_earlier_entries_of_current_key_ = true;
+    input_.Next();
+  }
+
+  void SkipUntil(const Slice& skip_until) {
+    has_consumed_earlier_entries_of_current_key_ = true;
+    input_.Seek(skip_until);
+  }
 
   bool IsShuttingDown() {
     // This is a best-effort facility, so memory_order_relaxed is sufficient.

@@ -782,6 +782,15 @@ public class DBOptionsTest {
   }
 
   @Test
+  public void trackOptionsFileNumberInManifest() {
+    try (final DBOptions options = new DBOptions()) {
+      assertThat(options.trackOptionsFileNumberInManifest()).isFalse();
+      assertThat(options.setTrackOptionsFileNumberInManifest(true)).isEqualTo(options);
+      assertThat(options.trackOptionsFileNumberInManifest()).isTrue();
+    }
+  }
+
+  @Test
   public void logReadaheadSize() {
     try (final DBOptions options = new DBOptions()) {
       assertThat(options.logReadaheadSize()).isEqualTo(0);

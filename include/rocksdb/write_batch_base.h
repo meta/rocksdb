@@ -26,7 +26,12 @@ struct SliceParts;
 // indexed implementation.
 class WriteBatchBase {
  public:
-  virtual ~WriteBatchBase() {}
+  WriteBatchBase() = default;
+  WriteBatchBase(const WriteBatchBase&) = default;
+  WriteBatchBase& operator=(const WriteBatchBase&) = default;
+  WriteBatchBase(WriteBatchBase&&) = default;
+  WriteBatchBase& operator=(WriteBatchBase&&) = default;
+  virtual ~WriteBatchBase() = default;
 
   // Store the mapping "key->value" in the database.
   virtual Status Put(ColumnFamilyHandle* column_family, const Slice& key,

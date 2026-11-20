@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <iomanip>
 #include <memory>
+#include <utility>
 
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
@@ -187,7 +188,7 @@ class FileChecksumTestHelper {
 
  public:
   FileChecksumTestHelper(Options& options, DB* db, std::string db_name)
-      : options_(options), db_(db), dbname_(db_name) {}
+      : options_(options), db_(db), dbname_(std::move(db_name)) {}
   ~FileChecksumTestHelper() = default;
 
   // Verify the checksum information in Manifest.
@@ -248,13 +249,16 @@ class FileChecksumTestHelper {
       if (live_files[i].file_checksum != stored_checksum ||
           live_files[i].file_checksum_func_name != stored_func_name) {
         return Status::Corruption(
-            "Checksum does not match! The file: " +
-            std::to_string(live_files[i].file_number) +
-            ". In Manifest, checksum name: " + stored_func_name +
-            " and checksum " + stored_checksum +
-            ". However, expected checksum name: " +
-            live_files[i].file_checksum_func_name + " and checksum " +
-            live_files[i].file_checksum);
+            std::string("Checksum does not match! The file: ")
+                .append(std::to_string(live_files[i].file_number))
+                .append(". In Manifest, checksum name: ")
+                .append(stored_func_name)
+                .append(" and checksum ")
+                .append(stored_checksum)
+                .append(". However, expected checksum name: ")
+                .append(live_files[i].file_checksum_func_name)
+                .append(" and checksum ")
+                .append(live_files[i].file_checksum));
       }
     }
     return Status::OK();
@@ -948,6 +952,7 @@ TEST_F(LdbCmdTest, UnsafeRemoveSstFile) {
   db->GetLiveFilesMetaData(&sst_files);
 
   std::vector<uint64_t> numbers;
+  numbers.reserve(sst_files.size());
   for (auto& f : sst_files) {
     numbers.push_back(f.file_number);
   }
@@ -1119,15 +1124,15 @@ TEST_F(LdbCmdTest, FileTemperatureUpdateManifest) {
   // Close for update_manifest
   db.reset();
 
-  char arg1[] = "./ldb";
-  char arg2[1024];
-  snprintf(arg2, sizeof(arg2), "--db=%s", dbname.c_str());
-  char arg3[] = "update_manifest";
-  char arg4[] = "--update_temperatures";
-  char* argv[] = {arg1, arg2, arg3, arg4};
-
-  ASSERT_EQ(0,
-            LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
+  std::vector<std::string> args = {"update_manifest", "--db=" + dbname,
+                                   "--update_temperatures"};
+  std::unique_ptr<LDBCommand> command(LDBCommand::InitFromCmdLineArgs(
+      args, opts, LDBOptions(), /*column_families=*/nullptr));
+  ASSERT_NE(nullptr, command);
+  command->Run();
+  ASSERT_TRUE(command->GetExecuteState().IsSucceed());
+  ASSERT_EQ("Manifest updates successful",
+            command->GetExecuteState().ToString());
 
   // Re-open, get, and verify manifest temps (based on request)
   test_fs->PopRequestedSstFileTemperatures();

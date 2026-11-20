@@ -11,7 +11,7 @@ The RocksDB library provides a persistent key value store. Keys and values are a
 
 The library is maintained by the Facebook Database Engineering Team, and is based on [LevelDB](https://github.com/google/leveldb), by Sanjay Ghemawat and Jeff Dean at Google.
 
-This overview gives some simple examples of how RocksDB is used. For the story of why RocksDB was created in the first place, see [Dhruba Borthakur’s introductory talk](https://github.com/facebook/rocksdb/blob/gh-pages-old/intro.pdf?raw=true) from the Data @ Scale 2013 conference.
+This overview gives some simple examples of how RocksDB is used. For the story of why RocksDB was created in the first place, see [Dhruba Borthakur’s introductory talk](https://github.com/meta/rocksdb/blob/gh-pages-old/intro.pdf?raw=true) from the Data @ Scale 2013 conference.
 
 ## Opening A Database
 
@@ -69,10 +69,10 @@ if (s.ok()) s = db->Delete(rocksdb::WriteOptions(), key1);
 
 ## Further documentation
 
-These are just simple examples of how RocksDB is used. The full documentation is currently on the [GitHub wiki](https://github.com/facebook/rocksdb/wiki).
+These are just simple examples of how RocksDB is used. The full documentation is currently on the [GitHub wiki](https://github.com/meta/rocksdb/wiki).
 
 Here are some specific details about the RocksDB implementation:
 
-- [RocksDB Overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview)
-- [Immutable BlockBased Table file format](https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format)
-- [Log file format](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-File-Format)
+- [RocksDB Overview](https://github.com/meta/rocksdb/wiki/RocksDB-Overview)
+- [Immutable BlockBased Table file format](https://github.com/meta/rocksdb/wiki/Rocksdb-BlockBasedTable-Format)
+- [Log file format](https://github.com/meta/rocksdb/wiki/Write-Ahead-Log-File-Format)

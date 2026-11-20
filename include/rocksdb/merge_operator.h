@@ -52,7 +52,7 @@ class Logger;
 // including data loss, unreported corruption, deadlocks, and more.
 class MergeOperator : public Customizable {
  public:
-  virtual ~MergeOperator() {}
+  ~MergeOperator() override = default;
   static const char* Type() { return "MergeOperator"; }
   static Status CreateFromString(const ConfigOptions& opts,
                                  const std::string& id,
@@ -296,7 +296,7 @@ class MergeOperator : public Customizable {
   // Note: the merge operands are passed to this function in the reversed order
   // relative to how they were merged (passed to
   // FullMerge/FullMergeV2/FullMergeV3) for performance reasons, see also:
-  // https://github.com/facebook/rocksdb/issues/3865
+  // https://github.com/meta/rocksdb/issues/3865
   virtual bool ShouldMerge(const std::vector<Slice>& /*operands*/) const {
     return false;
   }
@@ -305,7 +305,7 @@ class MergeOperator : public Customizable {
 // The simpler, associative merge operator.
 class AssociativeMergeOperator : public MergeOperator {
  public:
-  ~AssociativeMergeOperator() override {}
+  ~AssociativeMergeOperator() override = default;
 
   // Gives the client a way to express the read -> modify -> write semantics
   // key:           (IN) The key that's associated with this merge operation.

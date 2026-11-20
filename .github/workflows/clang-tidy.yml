@@ -7,11 +7,11 @@ permissions: {}
 
 jobs:
   clang-tidy:
-    if: github.repository_owner == 'facebook'
+    if: github.repository_owner == 'meta'
     runs-on:
       labels: 4-core-ubuntu
     container:
-      image: ghcr.io/facebook/rocksdb_ubuntu:24.1
+      image: ghcr.io/meta/rocksdb_ubuntu:24.1
       options: --shm-size=8gb
     steps:
     - uses: actions/checkout@v4.1.0

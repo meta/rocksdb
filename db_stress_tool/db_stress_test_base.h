@@ -30,6 +30,7 @@ class Transaction;
 class TransactionDB;
 class OptimisticTransactionDB;
 class DbStressFSWrapper;
+class DbStressListener;
 class Iterator;
 struct TransactionDBOptions;
 using experimental::SstQueryFilterConfigsManager;
@@ -484,6 +485,7 @@ class StressTest {
     // - Both reuse_manifest_on_open=1 and optimize_manifest_for_recovery=1
     // - Not in best_efforts_recovery mode
     // - avoid_flush_during_recovery=true (no flush during recovery)
+    // - No WriteBufferManager limit enforced during recovery
     // - write_dbid_to_manifest=0 (no DB_ID write on open)
     // - metadata_write_fault_one_in=0 (no fault injection)
     // - open_metadata_write_fault_one_in=0 (no fault injection)
@@ -572,15 +574,15 @@ class StressTest {
     return Status::NotSupported("TestCustomOperations() must be overridden");
   }
 
-  void ProcessStatus(SharedState* shared, std::string msg, const Status& s,
-                     bool ignore_injected_error = true) const;
+  void ProcessStatus(SharedState* shared, const std::string& msg,
+                     const Status& s, bool ignore_injected_error = true) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg) const;
+  void VerificationAbort(SharedState* shared, const std::string& msg) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg, int cf,
+  void VerificationAbort(SharedState* shared, const std::string& msg, int cf,
                          int64_t key) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg, int cf,
+  void VerificationAbort(SharedState* shared, const std::string& msg, int cf,
                          int64_t key, Slice value_from_db,
                          Slice value_from_expected) const;
 
@@ -628,6 +630,11 @@ class StressTest {
 
   void CleanUpColumnFamilies();
 
+  Status VerifyOptionsFileStateBeforeOpen(
+      const std::vector<ColumnFamilyDescriptor>& cf_descriptors,
+      bool db_exists);
+  Status VerifyPersistedOptionsAfterOpen();
+
   void RecordManifestStateBeforeReopen();
   void VerifyManifestNotRewritten();
 
@@ -652,6 +659,10 @@ class StressTest {
   // Currently only used in MultiOpsTxnsStressTest
   std::atomic<DB*> db_aptr_;
 
+  // The DbStressListener in options_.listeners for the current open; null
+  // when the open path does not install one.
+  std::shared_ptr<DbStressListener> db_stress_listener_;
+
   Options options_;
   SystemClock* clock_;
   std::vector<ColumnFamilyHandle*> column_families_;
@@ -662,7 +673,7 @@ class StressTest {
   std::vector<std::string> options_index_;
   std::atomic<bool> db_preload_finished_;
   std::shared_ptr<SstQueryFilterConfigsManager::Factory> sqfc_factory_;
-  std::shared_ptr<UserDefinedIndexFactory> udi_factory_;
+  std::shared_ptr<IndexFactory> udi_factory_;
 
   std::unique_ptr<DB> secondary_db_;
   std::vector<ColumnFamilyHandle*> secondary_cfhs_;
@@ -675,6 +686,11 @@ class StressTest {
   uint64_t manifest_file_number_before_reopen_;
   uint64_t manifest_file_size_before_reopen_;
   std::string current_file_content_before_reopen_;
+  bool verify_options_manifest_tracking_ = false;
+  // True while a reopen holds auto compactions off so that a background
+  // compaction cannot append to the MANIFEST before
+  // VerifyManifestNotRewritten() measures it.
+  bool auto_compactions_paused_for_manifest_verify_ = false;
 };
 
 // Load options from OPTIONS file and populate `options`.
@@ -687,8 +703,7 @@ bool InitializeOptionsFromFile(Options& options);
 void InitializeOptionsFromFlags(
     const std::shared_ptr<Cache>& cache,
     const std::shared_ptr<const FilterPolicy>& filter_policy,
-    const std::shared_ptr<UserDefinedIndexFactory>& udi_factory,
-    Options& options);
+    const std::shared_ptr<IndexFactory>& udi_factory, Options& options);
 
 // Initialize `options` on which `InitializeOptionsFromFile()` and
 // `InitializeOptionsFromFlags()` have both been called already.

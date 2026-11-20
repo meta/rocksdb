@@ -35,8 +35,8 @@ class DBTestUniversalCompactionBase
     num_levels_ = std::get<0>(GetParam());
     exclusive_manual_compaction_ = std::get<1>(GetParam());
   }
-  int num_levels_;
-  bool exclusive_manual_compaction_;
+  int num_levels_ = 0;
+  bool exclusive_manual_compaction_ = false;
 };
 
 class DBTestUniversalCompaction : public DBTestUniversalCompactionBase {
@@ -1340,7 +1340,8 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionCFPathUse) {
 
   std::vector<Options> option_vector;
   option_vector.emplace_back(options);
-  ColumnFamilyOptions cf_opt1(options), cf_opt2(options);
+  ColumnFamilyOptions cf_opt1(options);
+  ColumnFamilyOptions cf_opt2(options);
   // Configure CF1 specific paths.
   cf_opt1.cf_paths.emplace_back(dbname_ + "cf1", 300 * 1024);
   cf_opt1.cf_paths.emplace_back(dbname_ + "cf1_2", 300 * 1024);

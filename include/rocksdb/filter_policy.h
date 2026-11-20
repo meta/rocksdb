@@ -99,7 +99,7 @@ struct FilterBuildingContext {
 // GetBuilderWithContext.
 class FilterPolicy : public Customizable {
  public:
-  virtual ~FilterPolicy();
+  ~FilterPolicy() override;
   static const char* Type() { return "FilterPolicy"; }
 
   // The name used for identifying whether a filter on disk is readable
@@ -146,7 +146,7 @@ class FilterPolicy : public Customizable {
 
 // Return a new filter policy that uses a bloom filter with approximately
 // the specified number of bits per key. See
-// https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter
+// https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter
 //
 // bits_per_key: average bits allocated per key in bloom filter. A good
 // choice is 9.9, which yields a filter with ~ 1% false positive rate.

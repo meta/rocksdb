@@ -21,6 +21,7 @@ RocksDB serves reads through a layered search path: memtables, then SST files or
 | 9. Merge Operator Resolution | [09_merge_resolution.md](09_merge_resolution.md) | MergeContext operand collection, full vs partial merge, resolution in Get/Iterator/Compaction paths, and snapshot boundary constraints. |
 | 10. Prefetching and Async I/O | [10_prefetching_and_async_io.md](10_prefetching_and_async_io.md) | FilePrefetchBuffer, auto-readahead for scans, adaptive readahead, async I/O integration, and MultiGet I/O coalescing. |
 | 11. ReadOptions and Tuning | [11_read_options_and_tuning.md](11_read_options_and_tuning.md) | Key ReadOptions fields, prefix seek modes, iterator bounds, read tiers, performance characteristics, and common read patterns. |
+| 12. Explicit Snapshot Concurrency | [12_snapshot_concurrency.md](12_snapshot_concurrency.md) | Sharded snapshot-list synchronization, conservative oldest-snapshot calculation, and maintenance scheduling. |
 
 ## Key Characteristics
 

@@ -41,6 +41,8 @@ class MultiCfIteratorImpl {
   // No copy allowed
   MultiCfIteratorImpl(const MultiCfIteratorImpl&) = delete;
   MultiCfIteratorImpl& operator=(const MultiCfIteratorImpl&) = delete;
+  MultiCfIteratorImpl(MultiCfIteratorImpl&&) = delete;
+  MultiCfIteratorImpl& operator=(MultiCfIteratorImpl&&) = delete;
 
   Slice key() const {
     assert(Valid());
@@ -182,6 +184,9 @@ class MultiCfIteratorImpl {
 
   template <typename BinaryHeap, typename ChildSeekFuncType>
   void SeekCommon(BinaryHeap& heap, ChildSeekFuncType child_seek_func) {
+    // Like any Iterator, a seek clears the error status of earlier calls.
+    status_.PermitUncheckedError();
+    status_ = Status::OK();
     reset_func_();
     heap.clear();
     int i = 0;
@@ -212,7 +217,7 @@ class MultiCfIteratorImpl {
     // It is possible for one or more child iters are at invalid keys due to
     // manual prefix iteration. For such cases, we consider the result of the
     // multi-cf-iter is also undefined.
-    // https://github.com/facebook/rocksdb/wiki/Prefix-Seek#manual-prefix-iterating
+    // https://github.com/meta/rocksdb/wiki/Prefix-Seek#manual-prefix-iterating
     // for details about manual prefix iteration
     if (heap.empty()) {
       return;

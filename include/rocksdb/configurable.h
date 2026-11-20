@@ -50,13 +50,18 @@ class Configurable {
     // Pointer to the object being registered, relative to `this` so that
     // RegisteredOptions are copyable from one Configurable to another of the
     // same type, assuming the option is a member of `this`.
-    intptr_t opt_offset;
+    intptr_t opt_offset = 0;
     // The map of options being registered
-    const std::unordered_map<std::string, OptionTypeInfo>* type_map;
+    const std::unordered_map<std::string, OptionTypeInfo>* type_map = nullptr;
   };
 
  public:
-  virtual ~Configurable() {}
+  Configurable() = default;
+  Configurable(const Configurable&) = default;
+  Configurable& operator=(const Configurable&) = default;
+  Configurable(Configurable&&) = default;
+  Configurable& operator=(Configurable&&) = default;
+  virtual ~Configurable() = default;
 
   // Returns the raw pointer of the named options that is used by this
   // object, or nullptr if this function is not supported.

@@ -116,7 +116,8 @@ Status BuildTable(
     // compaction path so the manifest learns about the new garbage.
     blob_garbage_meter.reset(new BlobGarbageMeter());
     blob_counting_iter.reset(
-        new BlobCountingIterator(iter, blob_garbage_meter.get()));
+        new BlobCountingIterator(iter, blob_garbage_meter.get(),
+                                 /*track_current_key_inflow=*/false));
     input = blob_counting_iter.get();
   }
 
@@ -161,6 +162,13 @@ Status BuildTable(
       context.reason = tboptions.reason;
       compaction_filter =
           ioptions.compaction_filter_factory->CreateCompactionFilter(context);
+      CompactionFilter::MergeOrder order;
+      s = GetCompactionFilterMergeOrder(
+          compaction_filter.get(), ioptions.compaction_filter_factory.get(),
+          tboptions.reason, &order);
+      if (!s.ok()) {
+        return s;
+      }
       if (compaction_filter != nullptr &&
           !compaction_filter->IgnoreSnapshots()) {
         s.PermitUncheckedError();
@@ -216,7 +224,8 @@ Status BuildTable(
     auto ucmp = tboptions.internal_comparator.user_comparator();
     MergeHelper merge(
         env, ucmp, ioptions.merge_operator.get(), compaction_filter.get(),
-        ioptions.logger, true /* internal key corruption is not ok */,
+        CompactionFilter::MergeOrder::kFilterBeforeMerge, ioptions.logger,
+        true /* internal key corruption is not ok */,
         snapshots.empty() ? 0 : snapshots.back(), snapshot_checker);
 
     std::unique_ptr<BlobFileBuilder> blob_file_builder(
@@ -229,7 +238,8 @@ Status BuildTable(
                   &(tboptions.write_options), tboptions.db_id,
                   tboptions.db_session_id, job_id, tboptions.column_family_id,
                   tboptions.column_family_name, write_hint, io_tracer,
-                  blob_callback, blob_creation_reason, &blob_file_paths,
+                  blob_callback, blob_creation_reason,
+                  ioptions.cf_paths.front().path, &blob_file_paths,
                   blob_file_additions)
             : nullptr);
 
@@ -335,7 +345,9 @@ Status BuildTable(
 
     if (s.ok()) {
       auto range_del_it = range_del_agg->NewIterator();
-      Slice last_tombstone_start_user_key{};
+      // The empty user key is a valid start key, so "no previous tombstone"
+      // needs its own state.
+      OptSlice last_tombstone_start_user_key;
       for (range_del_it->SeekToFirst(); range_del_it->Valid();
            range_del_it->Next()) {
         auto tombstone = range_del_it->Tombstone();
@@ -348,8 +360,8 @@ Status BuildTable(
         meta->UpdateBoundariesForRange(kv.first, tombstone_end, tombstone.seq_,
                                        tboptions.internal_comparator);
         if (version) {
-          if (last_tombstone_start_user_key.empty() ||
-              ucmp->CompareWithoutTimestamp(last_tombstone_start_user_key,
+          if (!last_tombstone_start_user_key ||
+              ucmp->CompareWithoutTimestamp(*last_tombstone_start_user_key,
                                             range_del_it->start_key()) < 0) {
             SizeApproximationOptions approx_opts;
             approx_opts.files_size_error_margin = 0.1;
@@ -390,7 +402,7 @@ Status BuildTable(
             std::min(meta->fd.smallest_seqno, smallest_preferred_seqno),
             meta->fd.largest_seqno);
         relevant_mapping.SetCapacity(kMaxSeqnoTimePairsPerSST);
-        relevant_mapping.Enforce(tboptions.file_creation_time);
+        relevant_mapping.Enforce(meta->file_creation_time);
       }
       builder->SetSeqnoTimeTableProperties(
           relevant_mapping,
@@ -512,7 +524,8 @@ Status BuildTable(
           MaxFileSizeForL0MetaPin(mutable_cf_options),
           /*smallest_compaction_key=*/nullptr,
           /*largest_compaction_key*/ nullptr,
-          /*allow_unprepared_value*/ false,
+          /*allow_unprepared_value*/ false, /*seek_target=*/nullptr,
+          /*prefix_filtered_table=*/nullptr,
           /*range_del_read_seqno=*/nullptr,
           /*range_del_iter=*/nullptr,
           /*maybe_pin_table_handle=*/false, file_open_metadata_ptr));

@@ -56,6 +56,13 @@ class CompactionMergingIterator : public InternalIterator {
     }
   }
 
+  // No copying allowed
+  CompactionMergingIterator(const CompactionMergingIterator&) = delete;
+  CompactionMergingIterator& operator=(const CompactionMergingIterator&) =
+      delete;
+  CompactionMergingIterator(CompactionMergingIterator&&) = delete;
+  CompactionMergingIterator& operator=(CompactionMergingIterator&&) = delete;
+
   void considerStatus(const Status& s) {
     if (!s.ok() && status_.ok()) {
       status_ = s;

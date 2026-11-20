@@ -1,4 +1,4 @@
-name: facebook/rocksdb/weekly
+name: meta/rocksdb/weekly
 on:
   schedule:
   - cron: 0 9 * * 0
@@ -6,15 +6,14 @@ on:
 permissions: {}
 jobs:
   build-linux-valgrind:
-    if: ${{ github.repository_owner == 'facebook' }}
+    if: ${{ github.repository_owner == 'meta' }}
     runs-on:
       labels: 16-core-ubuntu
     timeout-minutes: 840
     container:
-      image: ghcr.io/facebook/rocksdb_ubuntu:22.1
+      image: ghcr.io/meta/rocksdb_ubuntu:22.1
       options: --shm-size=32gb
     steps:
     - uses: actions/checkout@v4.1.0
     - uses: "./.github/actions/pre-steps"
     - run: make V=1 -j20 valgrind_test
-    - uses: "./.github/actions/post-steps"

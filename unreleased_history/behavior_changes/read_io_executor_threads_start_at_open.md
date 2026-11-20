@@ -1,0 +1,1 @@
+In builds with `USE_COROUTINES`, the default `FileSystem` now creates its async read threads when the DB is opened instead of on the first async read. Previously, if that first read came from a low-priority (`SCHED_IDLE`) thread, the read threads inherited its priority, and every later async read in the process ran at low priority.

@@ -28,7 +28,7 @@ class CountingLogger : public Logger {
  public:
   using Logger::Logv;
   void Logv(const char* /*format*/, va_list /*ap*/) override { log_count++; }
-  size_t log_count;
+  size_t log_count = 0;
 };
 
 class CompactionPickerTestBase : public testing::Test {
@@ -51,7 +51,7 @@ class CompactionPickerTestBase : public testing::Test {
   std::unordered_map<uint32_t, std::pair<FileMetaData*, int>> file_map_;
   // input files to compaction process.
   std::vector<CompactionInputFiles> input_files_;
-  int compaction_level_start_;
+  int compaction_level_start_ = 0;
 
   explicit CompactionPickerTestBase(const Comparator* _ucmp)
       : ucmp_(_ucmp),
@@ -2492,6 +2492,18 @@ TEST_F(CompactionPickerTest, FileTtlBoosterLargeNumLevels) {
   FileMetaData meta;
   meta.oldest_ancestor_time = kCurrentTime - 1023;
   ASSERT_EQ(1, booster.GetBoostScore(&meta));
+}
+
+TEST_F(CompactionPickerTest, FileTtlBoosterSmallTtl) {
+  // With a TTL below 32 seconds, boosting still starts after half the TTL.
+  const uint64_t kCurrentTime = 1000000;
+  FileTtlBooster booster(kCurrentTime, /*ttl=*/10,
+                         /*num_non_empty_levels=*/4, /*level=*/1);
+  FileMetaData meta;
+  meta.oldest_ancestor_time = kCurrentTime - 5;
+  ASSERT_EQ(1, booster.GetBoostScore(&meta));
+  meta.oldest_ancestor_time = kCurrentTime - 9;
+  ASSERT_EQ(5, booster.GetBoostScore(&meta));
 }
 
 TEST_F(CompactionPickerTest, FileTtlBooster) {
@@ -5527,17 +5539,18 @@ TEST_F(CompactionPickerTest, FIFORatioBasedCompactionFallbackToOldPath) {
 // ============================================================================
 
 TEST_F(CompactionPickerTest, FIFOOptionValidation) {
-  auto validate = [](std::function<void(ColumnFamilyOptions&)> configure) {
-    ColumnFamilyOptions cf_opts;
-    cf_opts.compaction_style = kCompactionStyleFIFO;
-    cf_opts.compaction_options_fifo.allow_compaction = true;
-    cf_opts.compaction_options_fifo.use_kv_ratio_compaction = true;
-    cf_opts.compaction_options_fifo.max_data_files_size =
-        1ULL * 1024 * 1024 * 1024;
-    cf_opts.num_levels = 1;
-    configure(cf_opts);
-    return ColumnFamilyData::ValidateOptions(DBOptions(), cf_opts);
-  };
+  auto validate =
+      [](const std::function<void(ColumnFamilyOptions&)>& configure) {
+        ColumnFamilyOptions cf_opts;
+        cf_opts.compaction_style = kCompactionStyleFIFO;
+        cf_opts.compaction_options_fifo.allow_compaction = true;
+        cf_opts.compaction_options_fifo.use_kv_ratio_compaction = true;
+        cf_opts.compaction_options_fifo.max_data_files_size =
+            1ULL * 1024 * 1024 * 1024;
+        cf_opts.num_levels = 1;
+        configure(cf_opts);
+        return ColumnFamilyData::ValidateOptions(DBOptions(), cf_opts);
+      };
 
   // These used to be InvalidArgument, now accepted (handled at runtime
   // in the picker with fallback to cost-based intra-L0 compaction):
@@ -6034,7 +6047,9 @@ class FIFORatioBasedCompactionPickingTest : public CompactionPickerTest {
         /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
         vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
 
-    if (!compaction) return {};
+    if (!compaction) {
+      return {};
+    }
 
     if (out_reason) {
       *out_reason = compaction->compaction_reason();
@@ -6080,7 +6095,9 @@ class FIFORatioBasedCompactionPickingTest : public CompactionPickerTest {
 
     size_t insert_pos = oldest_input_pos;
     for (size_t idx : sorted_indices) {
-      if (idx < oldest_input_pos) insert_pos--;
+      if (idx < oldest_input_pos) {
+        insert_pos--;
+      }
     }
     insert_pos = std::min(insert_pos, files.size());
     files.insert(files.begin() + insert_pos,
@@ -6104,10 +6121,13 @@ class FIFORatioBasedCompactionPickingTest : public CompactionPickerTest {
         sizes.push_back(f.size);
       }
     }
-    if (sizes.empty()) return {0, 0, 0, 0.0, 0.0};
+    if (sizes.empty()) {
+      return {0, 0, 0, 0.0, 0.0};
+    }
 
     uint64_t sum = 0;
-    uint64_t min_s = UINT64_MAX, max_s = 0;
+    uint64_t min_s = UINT64_MAX;
+    uint64_t max_s = 0;
     for (uint64_t s : sizes) {
       sum += s;
       min_s = std::min(min_s, s);
@@ -6244,7 +6264,8 @@ class FIFORatioBasedCompactionPickingTest : public CompactionPickerTest {
     if (!inputs.empty() && reason == CompactionReason::kFIFOReduceNumFiles) {
       // Compute target from the picker's perspective: we need to estimate
       // it the same way the picker does.
-      uint64_t total_sst = 0, total_blob = 0;
+      uint64_t total_sst = 0;
+      uint64_t total_blob = 0;
       for (const auto& f : files) {
         total_sst += f.size;
         total_blob += f.blob_size;

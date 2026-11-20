@@ -627,6 +627,12 @@ DEFINE_uint64(subcompactions, 1,
 static const bool FLAGS_subcompactions_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_subcompactions, &ValidateUint32Range);
 
+DEFINE_bool(
+    compact_range_skip_missing_blob_files, false,
+    "Enable offline missing blob reference repair for manual CompactRange "
+    "calls. Deliberately deletes unavailable values whose external blob files "
+    "are absent from the input Version; FIFO compaction is unsupported.");
+
 DEFINE_uint64(compact_all_parallelism, 1,
               "Maximum number of independent DBs compacted concurrently by "
               "the compactall benchmark.");
@@ -772,8 +778,27 @@ DEFINE_bool(index_with_first_key, false, "Include first key in the index");
 DEFINE_bool(use_trie_index, false,
             "Use trie-based user-defined index (UDI) for block-based tables. "
             "Builds a LOUDS-encoded succinct trie from separator keys, "
-            "providing space reduction compared to the default binary search "
-            "index. Requires BytewiseComparator.");
+            "providing space reduction compared to the standard index. "
+            "Requires BytewiseComparator.");
+
+DEFINE_int32(index_mode,
+             static_cast<int32_t>(
+                 ROCKSDB_NAMESPACE::BlockBasedTableOptions().index_mode),
+             "BlockBasedTableOptions::index_mode: 0=kStandardOnly, "
+             "1=kStandardDefault (trie built, standard index read by default), "
+             "2=kCustomDefault (trie read by default), 3=kCustomOnly (only the "
+             "trie is built), 4=kStandardRequired (like kStandardDefault, but "
+             "an SST without the trie is an error). Values 2-4 require "
+             "--use_trie_index.");
+
+DEFINE_int32(
+    read_index, -1,
+    "Per-read ReadOptions::ReadIndex override (only meaningful with "
+    "--use_trie_index=1). -1=auto (kPreferCustom for secondary UDI modes, "
+    "kDefault otherwise), 0=kDefault (use whatever index_mode says), "
+    "1=kBuiltin (force the standard index), "
+    "2=kPreferCustom (use the UDI when this SST has one, fall back to "
+    "standard otherwise).");
 
 DEFINE_bool(
     optimize_filters_for_memory,
@@ -964,6 +989,12 @@ DEFINE_bool(read_cache_direct_read, true,
 
 DEFINE_bool(use_keep_filter, false, "Whether to use a noop compaction filter");
 
+DEFINE_bool(merge_before_compaction_filter, false,
+            "Use merge-before-filter order for merge_filter_benchmark.");
+DEFINE_string(merge_filter_benchmark, "",
+              "Compaction filter for merge benchmarks: v2_keep, v4_keep, or "
+              "remove_operands (removes about 90% of operand keys).");
+
 static bool ValidateCacheNumshardbits(const char* flagname, int32_t value) {
   if (value >= 20) {
     fprintf(stderr, "Invalid value for --%s: %d, must be < 20\n", flagname,
@@ -995,6 +1026,9 @@ DEFINE_bool(finish_after_writes, false,
 DEFINE_bool(sync, false, "Sync all writes to disk");
 
 DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
+
+DEFINE_bool(use_separate_remote_compaction_pool, false,
+            "Sets DBOptions.use_separate_remote_compaction_pool");
 
 DEFINE_bool(disable_wal, false, "If true, do not write WAL for write.");
 
@@ -1436,6 +1470,11 @@ DEFINE_bool(charge_blob_cache, false,
             "CacheEntryRoleOptions::charged of "
             "CacheEntryRole::kBlobCache");
 
+DEFINE_bool(charge_readahead_buffer, false,
+            "Setting for "
+            "CacheEntryRoleOptions::charged of "
+            "CacheEntryRole::kReadaheadBuffer");
+
 DEFINE_uint64(backup_rate_limit, 0ull,
               "If non-zero, db_bench will rate limit reads and writes for DB "
               "backup. This "
@@ -1583,13 +1622,13 @@ ROCKSDB_NAMESPACE::ToolHooks* hooks_ = nullptr;
 // for db_stress in PR #14850 and need guard-context-aware handling.
 [[noreturn]] void db_bench_exit(int status) {
   if (hooks_ == nullptr) {
-    exit(status);
+    exit(status);  // NOLINT(concurrency-mt-unsafe)
   }
 
   hooks_->Exit(status);
 
   // We should exit here but in case they don't we exit anyway.
-  exit(-1);
+  exit(-1);  // NOLINT(concurrency-mt-unsafe)
 };
 
 static enum ROCKSDB_NAMESPACE::CompressionType StringToCompressionType(
@@ -2060,6 +2099,10 @@ DEFINE_bool(identity_as_first_hash, false,
             "the first hash function of cuckoo table becomes an identity "
             "function. This is only valid when key is 8 bytes");
 DEFINE_bool(dump_malloc_stats, true, "Dump malloc stats in LOG ");
+DEFINE_uint64(mutex_hold_log_threshold_us,
+              ROCKSDB_NAMESPACE::Options().mutex_hold_log_threshold_us,
+              "Completed global mutex hold threshold in microseconds; 0 "
+              "disables hold logs.");
 DEFINE_uint64(stats_dump_period_sec,
               ROCKSDB_NAMESPACE::Options().stats_dump_period_sec,
               "Gap between printing stats to log in seconds");
@@ -2217,6 +2260,15 @@ DEFINE_uint64(
     "Limits cumulative compressed data block size pinned per SST file. "
     "0 means unlimited.");
 
+DEFINE_bool(
+    multiscan_rolling_prefetch, false,
+    "Enable rolling prefetch with multiscan_rolling_prefetch_window_size-byte "
+    "windows and multiscan_max_prefetch_size as its maximum batch budget.");
+
+DEFINE_uint64(multiscan_rolling_prefetch_window_size, 0,
+              "Physical span and initial batch budget for rolling prefetch. "
+              "Must be nonzero when multiscan_rolling_prefetch is enabled.");
+
 DEFINE_bool(use_multiscan, true,
             "If true, multiscanrandom uses MultiScan API. If false, uses "
             "normal iterators (Seek + Next) for each range.");
@@ -2246,12 +2298,12 @@ static Status CreateMemTableRepFactory(
     std::shared_ptr<MemTableRepFactory>* factory) {
   Status s;
   if (!strcasecmp(FLAGS_memtablerep.c_str(), SkipListFactory::kNickName())) {
-    factory->reset(new SkipListFactory(FLAGS_skip_list_lookahead));
+    *factory = std::make_shared<SkipListFactory>(FLAGS_skip_list_lookahead);
   } else if (!strcasecmp(FLAGS_memtablerep.c_str(), "prefix_hash")) {
     factory->reset(NewHashSkipListRepFactory(FLAGS_hash_bucket_count));
   } else if (!strcasecmp(FLAGS_memtablerep.c_str(),
                          VectorRepFactory::kNickName())) {
-    factory->reset(new VectorRepFactory());
+    *factory = std::make_shared<VectorRepFactory>();
   } else if (!strcasecmp(FLAGS_memtablerep.c_str(), "hash_linkedlist")) {
     factory->reset(NewHashLinkListRepFactory(FLAGS_hash_bucket_count));
   } else {
@@ -2325,7 +2377,7 @@ class BaseDistribution {
 
 class FixedDistribution : public BaseDistribution {
  public:
-  FixedDistribution(unsigned int size)
+  explicit FixedDistribution(unsigned int size)
       : BaseDistribution(size, size), size_(size) {}
 
  private:
@@ -2611,7 +2663,7 @@ struct DBWithColumnFamilies {
 
   // stage: assume CF from 0 to stage * num_hot has be created. Need to create
   //        stage * num_hot + 1 to stage * (num_hot + 1).
-  void CreateNewCf(ColumnFamilyOptions options, int64_t stage) {
+  void CreateNewCf(const ColumnFamilyOptions& options, int64_t stage) {
     MutexLock l(&create_cf_mutex);
     if ((stage + 1) * num_hot <= num_created) {
       // Already created.
@@ -2657,6 +2709,12 @@ class ReporterAgent {
 
     reporting_thread_ = port::Thread([&]() { SleepAndReport(); });
   }
+
+  // No copying allowed
+  ReporterAgent(const ReporterAgent&) = delete;
+  ReporterAgent& operator=(const ReporterAgent&) = delete;
+  ReporterAgent(ReporterAgent&&) = delete;
+  ReporterAgent& operator=(ReporterAgent&&) = delete;
 
   ~ReporterAgent() {
     {
@@ -2804,17 +2862,17 @@ class Stats {
   };
 
   SystemClock* clock_;
-  int id_;
+  int id_ = -1;
   uint64_t start_ = 0;
-  uint64_t sine_interval_;
-  uint64_t finish_;
-  double seconds_;
-  uint64_t done_;
-  uint64_t last_report_done_;
-  uint64_t next_report_;
-  uint64_t bytes_;
-  uint64_t last_op_finish_;
-  uint64_t last_report_finish_;
+  uint64_t sine_interval_ = 0;
+  uint64_t finish_ = 0;
+  double seconds_ = 0;
+  uint64_t done_ = 0;
+  uint64_t last_report_done_ = 0;
+  uint64_t next_report_ = 0;
+  uint64_t bytes_ = 0;
+  uint64_t last_op_finish_ = 0;
+  uint64_t last_report_finish_ = 0;
   OperationHistograms hist_;
   std::shared_ptr<IntervalStatsState> interval_stats_;
   std::string message_;
@@ -3581,7 +3639,7 @@ inline void ArmFatalShutdownWatchdog() {
 struct SharedState {
   port::Mutex mu;
   port::CondVar cv;
-  int total;
+  int total = 0;
   int perf_level;
   std::shared_ptr<RateLimiter> write_rate_limiter;
   std::shared_ptr<RateLimiter> read_rate_limiter;
@@ -3592,9 +3650,9 @@ struct SharedState {
   //    (3) running
   //    (4) done
 
-  long num_initialized;
-  long num_done;
-  bool start;
+  long num_initialized = 0;
+  long num_done = 0;
+  bool start = false;
 
   // Cooperative fatal-error handling for worker threads. When a worker hits a
   // fatal error mid-operation it records the error here and unwinds (returns
@@ -3639,6 +3697,7 @@ struct SharedState {
     Duration& operator=(Duration&&) = default;
     Duration(const Duration&) = delete;
     Duration& operator=(const Duration&) = delete;
+    ~Duration() = default;
 
     int64_t GetStage() { return std::min(ops_, max_ops_ - 1) / ops_per_stage_; }
 
@@ -3729,7 +3788,7 @@ struct ThreadState {
   int tid;        // 0..n-1 when running in n threads
   Random64 rand;  // Has different seeds for different threads
   Stats stats;
-  SharedState* shared;
+  SharedState* shared = nullptr;
 
   explicit ThreadState(int index, int my_seed)
       : tid(index), rand(*seed_base + my_seed) {}
@@ -3789,18 +3848,18 @@ class Benchmark {
   int total_thread_count_;
   int64_t keys_per_prefix_;
   int64_t entries_per_batch_;
-  int64_t writes_before_delete_range_;
-  int64_t writes_per_range_tombstone_;
-  int64_t range_tombstone_width_;
-  int64_t max_num_range_tombstones_;
+  int64_t writes_before_delete_range_ = 0;
+  int64_t writes_per_range_tombstone_ = 0;
+  int64_t range_tombstone_width_ = 0;
+  int64_t max_num_range_tombstones_ = 0;
   ReadOptions read_options_;
   WriteOptions write_options_;
-  std::shared_ptr<ROCKSDB_NAMESPACE::UserDefinedIndexFactory> udi_factory_;
+  std::shared_ptr<ROCKSDB_NAMESPACE::IndexFactory> udi_factory_;
   Options open_options_;  // keep options around to properly destroy db later
   TraceOptions trace_options_;
   TraceOptions block_cache_trace_options_;
   int64_t reads_;
-  int64_t deletes_;
+  int64_t deletes_ = 0;
   double read_random_exp_range_;
   int64_t writes_;
   int64_t readwrites_;
@@ -3871,6 +3930,43 @@ class Benchmark {
   bool SanityCheck() {
     if (FLAGS_compression_ratio > 1) {
       fprintf(stderr, "compression_ratio should be between 0 and 1\n");
+      return false;
+    }
+    if (FLAGS_index_mode < 0 || FLAGS_index_mode > 4) {
+      fprintf(stderr, "--index_mode=%d out of range [0..4]\n",
+              FLAGS_index_mode);
+      return false;
+    }
+    if (!FLAGS_use_trie_index && FLAGS_index_mode > 1) {
+      fprintf(stderr,
+              "--index_mode=%d requires --use_trie_index=1; only "
+              "kStandardOnly (0) or kStandardDefault (1) is valid without a "
+              "UDI factory\n",
+              FLAGS_index_mode);
+      return false;
+    }
+    if (FLAGS_read_index < -1 || FLAGS_read_index > 2) {
+      fprintf(stderr, "--read_index=%d out of range [-1..2]\n",
+              FLAGS_read_index);
+      return false;
+    }
+    if (!FLAGS_use_trie_index && FLAGS_read_index > 0) {
+      // Without a UDI factory no custom index reader is ever installed, so a
+      // non-default read_index would silently do nothing. Reject it instead of
+      // reporting numbers from a setting that never took effect.
+      fprintf(stderr,
+              "--read_index=%d requires --use_trie_index=1; without a UDI "
+              "factory only auto (-1) or kDefault (0) has any effect\n",
+              FLAGS_read_index);
+      return false;
+    }
+    if (FLAGS_read_index == 1 && FLAGS_index_mode == 3) {
+      // kBuiltin against a kCustomOnly SST fails loudly by design: that file
+      // has only a standard-index stub.
+      fprintf(stderr,
+              "--read_index=1 (kBuiltin) is incompatible with "
+              "--index_mode=3 (kCustomOnly); those SSTs have only a "
+              "standard-index stub\n");
       return false;
     }
     return true;
@@ -4155,6 +4251,72 @@ class Benchmark {
     const char* Name() const override { return "KeepFilter"; }
   };
 
+  class MergeBenchmarkFilter : public CompactionFilter {
+   public:
+    MergeBenchmarkFilter(MergeOrder order, bool remove_operands)
+        : order_(order), remove_operands_(remove_operands) {}
+
+    MergeOrder GetMergeOrder() const override { return order_; }
+    const char* Name() const override { return "MergeBenchmarkFilterV2"; }
+
+    Decision FilterV2(int /*level*/, const Slice& key, ValueType type,
+                      const Slice& /*value*/, std::string* /*new_value*/,
+                      std::string* /*skip_until*/) const override {
+      return remove_operands_ && type == ValueType::kMergeOperand &&
+                     XXH64(key.data(), key.size(), 301) % 10 != 0
+                 ? Decision::kRemove
+                 : Decision::kKeep;
+    }
+
+   private:
+    const MergeOrder order_;
+    const bool remove_operands_;
+  };
+
+  class MergeBenchmarkFilterV4 : public MergeBenchmarkFilter {
+   public:
+    explicit MergeBenchmarkFilterV4(MergeOrder order)
+        : MergeBenchmarkFilter(order, false) {}
+
+    const char* Name() const override { return "MergeBenchmarkFilterV4"; }
+    bool SupportsFilterV4() const override { return true; }
+
+    Decision FilterV4(
+        int /*level*/, const Slice& /*key*/, ValueType /*type*/,
+        const Slice* /*value*/, const WideColumns* /*columns*/,
+        std::string* /*new_value*/,
+        std::vector<std::pair<std::string, std::string>>* /*new_columns*/,
+        std::string* /*skip_until*/,
+        WideColumnBlobResolver* /*resolver*/) const override {
+      return Decision::kKeep;
+    }
+  };
+
+  class MergeBenchmarkFilterFactory : public CompactionFilterFactory {
+   public:
+    MergeBenchmarkFilterFactory(CompactionFilter::MergeOrder order,
+                                const std::string& style)
+        : order_(order), style_(style) {}
+
+    CompactionFilter::MergeOrder GetMergeOrder() const override {
+      return order_;
+    }
+    const char* Name() const override { return "MergeBenchmarkFilterFactory"; }
+
+    std::unique_ptr<CompactionFilter> CreateCompactionFilter(
+        const CompactionFilter::Context& /*context*/) override {
+      if (style_ == "v4_keep") {
+        return std::make_unique<MergeBenchmarkFilterV4>(order_);
+      }
+      return std::make_unique<MergeBenchmarkFilter>(
+          order_, style_ == "remove_operands");
+    }
+
+   private:
+    const CompactionFilter::MergeOrder order_;
+    const std::string style_;
+  };
+
   static std::shared_ptr<MemoryAllocator> GetCacheAllocator() {
     std::shared_ptr<MemoryAllocator> allocator;
 
@@ -4390,11 +4552,17 @@ class Benchmark {
       }
     }
 
-    listener_.reset(new ErrorHandlerListener());
+    listener_ = std::make_shared<ErrorHandlerListener>();
     if (user_timestamp_size_ > 0) {
       mock_app_clock_.reset(new TimestampEmulator());
     }
   }
+
+  // No copying allowed
+  Benchmark(const Benchmark&) = delete;
+  Benchmark& operator=(const Benchmark&) = delete;
+  Benchmark(Benchmark&&) = delete;
+  Benchmark& operator=(Benchmark&&) = delete;
 
   void DeleteDBs() {
     // Caller MUST hold DbStateMutationGuard (proven by ownership flag).
@@ -4545,7 +4713,7 @@ class Benchmark {
     fprintf(stderr, "...Verified\n");
   }
 
-  void ErrorExit() {
+  [[noreturn]] void ErrorExit() {
     if (holds_db_use_guard_ || is_secondary_update_thread_) {
       // Neither kind of DB-user context can safely run the mutation cleanup
       // path:
@@ -4607,8 +4775,19 @@ class Benchmark {
       read_options_.auto_readahead_size = FLAGS_auto_readahead_size;
       read_options_.auto_refresh_iterator_with_snapshot =
           FLAGS_auto_refresh_iterator_with_snapshot;
-      if (FLAGS_use_trie_index && udi_factory_) {
-        read_options_.table_index_factory = udi_factory_.get();
+      const BlockBasedTableOptions::IndexMode index_mode =
+          static_cast<BlockBasedTableOptions::IndexMode>(FLAGS_index_mode);
+      if (FLAGS_read_index >= 0) {
+        read_options_.read_index =
+            static_cast<ReadOptions::ReadIndex>(FLAGS_read_index);
+      } else if (udi_factory_ &&
+                 (index_mode ==
+                      BlockBasedTableOptions::IndexMode::kStandardDefault ||
+                  index_mode ==
+                      BlockBasedTableOptions::IndexMode::kStandardRequired)) {
+        // Read through the trie when it is the secondary index, as
+        // --use_trie_index did before --index_mode existed.
+        read_options_.read_index = ReadOptions::ReadIndex::kPreferCustom;
       }
 
       void (Benchmark::*method)(ThreadState*) = nullptr;
@@ -4782,6 +4961,11 @@ class Benchmark {
                 FLAGS_io_dispatcher_max_prefetch_memory_bytes);
         fprintf(stderr, "multiscan_max_prefetch_size = %" PRIu64 "\n",
                 FLAGS_multiscan_max_prefetch_size);
+        fprintf(stderr, "multiscan_rolling_prefetch = %s\n",
+                FLAGS_multiscan_rolling_prefetch ? "true" : "false");
+        fprintf(stderr,
+                "multiscan_rolling_prefetch_window_size = %" PRIu64 "\n",
+                FLAGS_multiscan_rolling_prefetch_window_size);
         fprintf(stderr, "reverse_iterator = %s\n",
                 FLAGS_reverse_iterator ? "true" : "false");
         method = &Benchmark::MultiScan;
@@ -4797,6 +4981,11 @@ class Benchmark {
                 FLAGS_io_dispatcher_max_prefetch_memory_bytes);
         fprintf(stderr, "multiscan_max_prefetch_size = %" PRIu64 "\n",
                 FLAGS_multiscan_max_prefetch_size);
+        fprintf(stderr, "multiscan_rolling_prefetch = %s\n",
+                FLAGS_multiscan_rolling_prefetch ? "true" : "false");
+        fprintf(stderr,
+                "multiscan_rolling_prefetch_window_size = %" PRIu64 "\n",
+                FLAGS_multiscan_rolling_prefetch_window_size);
         fprintf(stderr, "multiscan_use_async_io = %s\n",
                 FLAGS_multiscan_use_async_io ? "true" : "false");
         fprintf(stderr, "use_multiscan = %s\n",
@@ -4921,7 +5110,7 @@ class Benchmark {
         fresh_db = true;
         method = &Benchmark::RandomReplaceKeys;
       } else if (name == "timeseries") {
-        timestamp_emulator_.reset(new TimestampEmulator());
+        timestamp_emulator_ = std::make_shared<TimestampEmulator>();
         if (FLAGS_expire_style == "compaction_filter") {
           filter.reset(new ExpiredTimeFilter(timestamp_emulator_));
           fprintf(stdout, "Compaction filter is used to remove expired data");
@@ -5741,6 +5930,7 @@ class Benchmark {
     options.dump_malloc_stats = FLAGS_dump_malloc_stats;
     options.stats_dump_period_sec =
         static_cast<unsigned int>(FLAGS_stats_dump_period_sec);
+    options.mutex_hold_log_threshold_us = FLAGS_mutex_hold_log_threshold_us;
     options.max_compaction_trigger_wakeup_seconds =
         FLAGS_max_compaction_trigger_wakeup_seconds;
     options.periodic_compaction_phase_recovery_percent =
@@ -5833,6 +6023,8 @@ class Benchmark {
     options.log_readahead_size = FLAGS_log_readahead_size;
     options.writable_file_max_buffer_size = FLAGS_writable_file_max_buffer_size;
     options.use_fsync = FLAGS_use_fsync;
+    options.use_separate_remote_compaction_pool =
+        FLAGS_use_separate_remote_compaction_pool;
     options.num_levels = FLAGS_num_levels;
     options.target_file_size_base = FLAGS_target_file_size_base;
     options.target_file_size_multiplier = FLAGS_target_file_size_multiplier;
@@ -6008,6 +6200,11 @@ class Benchmark {
            {/*.charged = */ FLAGS_charge_blob_cache
                 ? CacheEntryRoleOptions::Decision::kEnabled
                 : CacheEntryRoleOptions::Decision::kDisabled}});
+      block_based_options.cache_usage_options.options_overrides.insert(
+          {CacheEntryRole::kReadaheadBuffer,
+           {/*.charged = */ FLAGS_charge_readahead_buffer
+                ? CacheEntryRoleOptions::Decision::kEnabled
+                : CacheEntryRoleOptions::Decision::kDisabled}});
       block_based_options.block_size = FLAGS_block_size;
       block_based_options.block_restart_interval = FLAGS_block_restart_interval;
       block_based_options.index_block_restart_interval =
@@ -6034,7 +6231,7 @@ class Benchmark {
         } else {
           fprintf(stderr, "Unknown --optimize_key_common_prefix: %s\n",
                   FLAGS_optimize_key_common_prefix.c_str());
-          exit(1);
+          db_bench_exit(1);
         }
       }
       block_based_options.uniform_cv_threshold = FLAGS_uniform_cv_threshold;
@@ -6155,6 +6352,8 @@ class Benchmark {
         fprintf(stdout, "Integrated BlobDB: blob cache disabled\n");
       }
 
+      block_based_options.index_mode =
+          static_cast<BlockBasedTableOptions::IndexMode>(FLAGS_index_mode);
       if (FLAGS_use_trie_index) {
         udi_factory_ = std::make_shared<trie_index::TrieIndexFactory>();
         block_based_options.user_defined_index_factory = udi_factory_;
@@ -6462,9 +6661,37 @@ class Benchmark {
 
     if (options.file_checksum_gen_factory == nullptr) {
       if (FLAGS_file_checksum) {
-        options.file_checksum_gen_factory.reset(
-            new FileChecksumGenCrc32cFactory());
+        options.file_checksum_gen_factory =
+            std::make_shared<FileChecksumGenCrc32cFactory>();
       }
+    }
+
+    if (!FLAGS_merge_filter_benchmark.empty()) {
+      if (FLAGS_merge_filter_benchmark != "v2_keep" &&
+          FLAGS_merge_filter_benchmark != "v4_keep" &&
+          FLAGS_merge_filter_benchmark != "remove_operands") {
+        fprintf(stderr, "Invalid merge_filter_benchmark\n");
+        db_bench_exit(1);
+      }
+      if (options.compaction_filter ||
+          (options.compaction_filter_factory &&
+           !options.compaction_filter_factory->IsInstanceOf(
+               "MergeBenchmarkFilterFactory"))) {
+        fprintf(stderr,
+                "merge_filter_benchmark requires no configured filter\n");
+        db_bench_exit(1);
+      }
+      const CompactionFilter::MergeOrder order =
+          FLAGS_merge_before_compaction_filter
+              ? CompactionFilter::MergeOrder::kMergeBeforeFilter
+              : CompactionFilter::MergeOrder::kFilterBeforeMerge;
+      options.compaction_filter_factory =
+          std::make_shared<MergeBenchmarkFilterFactory>(
+              order, FLAGS_merge_filter_benchmark);
+      fprintf(stdout, "Merge benchmark filter=%s order=%s\n",
+              FLAGS_merge_filter_benchmark.c_str(),
+              FLAGS_merge_before_compaction_filter ? "merge-before-filter"
+                                                   : "legacy");
     }
 
     if (FLAGS_num_multi_db <= 1) {
@@ -6529,6 +6756,7 @@ class Benchmark {
         FLAGS_num_hot_column_families = FLAGS_num_column_families;
       }
       std::vector<ColumnFamilyDescriptor> column_families;
+      column_families.reserve(num_hot);
       for (size_t i = 0; i < num_hot; i++) {
         column_families.emplace_back(ColumnFamilyName(i),
                                      ColumnFamilyOptions(options));
@@ -6810,9 +7038,10 @@ class Benchmark {
       std::vector<std::string> children;
       Status list_status = FLAGS_env->GetChildren(output_directory, &children);
       if (list_status.ok()) {
+        const std::string dir_prefix = output_directory + "/";
         for (const auto& child : children) {
           if (child != "." && child != "..") {
-            std::string child_path = output_directory + "/" + child;
+            std::string child_path = dir_prefix + child;
             Status del_status = FLAGS_env->DeleteFile(child_path);
             if (!del_status.ok()) {
               fprintf(stderr, "Warning: Failed to delete file %s: %s\n",
@@ -7028,7 +7257,9 @@ class Benchmark {
     std::unique_ptr<const char[]> end_key_guard;
     Slice end_key = AllocateKey(&end_key_guard);
     double p = 0.0;
-    uint64_t num_overwrites = 0, num_unique_keys = 0, num_selective_deletes = 0;
+    uint64_t num_overwrites = 0;
+    uint64_t num_unique_keys = 0;
+    uint64_t num_selective_deletes = 0;
     // If user set overwrite_probability flag,
     // check if value is in [0.0,1.0].
     if (FLAGS_overwrite_probability > 0.0) {
@@ -7068,7 +7299,8 @@ class Benchmark {
     // done on the first set of keys S1. The next sequence can start as soon
     // as the last disposable entry in the set S1 of this sequence is
     // inserted, if the delay is non negligible"
-    bool skip_for_loop = false, is_disposable_entry = true;
+    bool skip_for_loop = false;
+    bool is_disposable_entry = true;
     std::vector<uint64_t> disposable_entries_index(num_key_gens, 0);
     std::vector<uint64_t> persistent_ent_and_del_index(num_key_gens, 0);
     const uint64_t kNumDispAndPersEntries =
@@ -7272,7 +7504,9 @@ class Benchmark {
           blob_db::BlobDB* blobdb =
               static_cast<blob_db::BlobDB*>(db_with_cfh->db);
           if (FLAGS_blob_db_max_ttl_range > 0) {
+            // NOLINTBEGIN(concurrency-mt-unsafe,cert-msc30-c,cert-msc50-cpp)
             int ttl = rand() % FLAGS_blob_db_max_ttl_range;
+            // NOLINTEND(concurrency-mt-unsafe,cert-msc30-c,cert-msc50-cpp)
             s = blobdb->PutWithTTL(write_options_, key, val, ttl);
           } else {
             s = blobdb->Put(write_options_, key, val);
@@ -7299,11 +7533,11 @@ class Benchmark {
           // start inserting the selective deletes) starting_idx = index in the
           // keygen of the rand_num to generate the key of the first KV entry to
           // delete (= key of the first selective delete).
-          disposable_entries_q[id].push(std::make_pair(
+          disposable_entries_q[id].emplace(
               FLAGS_env->NowMicros() +
                   FLAGS_disposable_entries_delete_delay /* timestamp */,
               disposable_entries_index[id] - kNumDispAndPersEntries
-              /*starting idx*/));
+              /*starting idx*/);
         }
         if (writes_per_range_tombstone_ > 0 &&
             num_written > writes_before_delete_range_ &&
@@ -7606,7 +7840,16 @@ class Benchmark {
       auto compactionOptions = CompactRangeOptions();
       compactionOptions.max_subcompactions =
           static_cast<uint32_t>(FLAGS_subcompactions);
-      db->CompactRange(compactionOptions, nullptr, nullptr);
+      compactionOptions.skip_missing_blob_files =
+          FLAGS_compact_range_skip_missing_blob_files;
+      const Status status =
+          db->CompactRange(compactionOptions, nullptr, nullptr);
+      if (!status.ok()) {
+        thread->shared->SetFatal(
+            status, "DoDeterministicCompact: CompactRange failed: " +
+                        status.ToString());
+        return status;
+      }
     } else {
       fprintf(stdout,
               "%-12s : skipped (-compaction_stype=kCompactionStyleNone)\n",
@@ -7643,7 +7886,8 @@ class Benchmark {
         level = static_cast<int>(max_level - i);
         SequenceNumber sorted_run_smallest_seqno = kMaxSequenceNumber;
         SequenceNumber sorted_run_largest_seqno = 0;
-        std::string sorted_run_smallest_key, sorted_run_largest_key;
+        std::string sorted_run_smallest_key;
+        std::string sorted_run_largest_key;
         bool first_key = true;
         for (const auto& fileMeta : sorted_runs[k][i]) {
           sorted_run_smallest_seqno =
@@ -8404,6 +8648,20 @@ class Benchmark {
   }
 
 #if USE_COROUTINES
+  template <typename IOExecutor>
+  static folly::Executor::KeepAlive<folly::EventBase>
+  GetEventBaseKeepAliveForCoroutineBenchmark(IOExecutor* executor) {
+    // Public builds can pin Folly before the owning acquisition API.
+    constexpr auto kHasEBKA = requires(IOExecutor& io_executor) {
+      io_executor.getEventBaseKeepAlive();
+    };
+    if constexpr (kHasEBKA) {
+      return executor->getEventBaseKeepAlive();
+    } else {
+      return folly::getKeepAliveToken(executor->getEventBase());
+    }
+  }
+
   folly::IOExecutor* GetReadExecutorForCoroutineBenchmark(
       DB* db, const char* benchmark_name, int pool_threads) {
     auto* fs = db->GetFileSystem();
@@ -8638,7 +8896,7 @@ class Benchmark {
     for (int j = 0; j < num_jobs; ++j) {
       futures.push_back(
           folly::coro::co_withExecutor(
-              folly::Executor::getKeepAliveToken(read_executor->getEventBase()),
+              GetEventBaseKeepAliveForCoroutineBenchmark(read_executor),
               ReadRandomCoroutineJob(db_choices, thread->rand.Next(), ops,
                                      &total_ops, &total_found, &total_bytes, j,
                                      job_perf_contexts_ptr))
@@ -8720,7 +8978,7 @@ class Benchmark {
     for (int j = 0; j < num_jobs; ++j) {
       futures.push_back(
           folly::coro::co_withExecutor(
-              folly::Executor::getKeepAliveToken(read_executor->getEventBase()),
+              GetEventBaseKeepAliveForCoroutineBenchmark(read_executor),
               MultiGetCoroutineJob(db, cfh, thread->rand.Next(), ops,
                                    &total_ops, &total_found, &total_bytes, j,
                                    job_perf_contexts_ptr))
@@ -8777,6 +9035,9 @@ class Benchmark {
       opts.io_coalesce_threshold = FLAGS_multiscan_coalesce_threshold;
       opts.use_async_io = FLAGS_multiscan_use_async_io;
       opts.max_prefetch_size = FLAGS_multiscan_max_prefetch_size;
+      opts.rolling_prefetch = FLAGS_multiscan_rolling_prefetch;
+      opts.rolling_prefetch_window_size =
+          FLAGS_multiscan_rolling_prefetch_window_size;
       opts.reverse = FLAGS_reverse_iterator;
       if (io_dispatcher) {
         opts.io_dispatcher = io_dispatcher;
@@ -8913,6 +9174,9 @@ class Benchmark {
         opts.io_coalesce_threshold = FLAGS_multiscan_coalesce_threshold;
         opts.use_async_io = FLAGS_multiscan_use_async_io;
         opts.max_prefetch_size = FLAGS_multiscan_max_prefetch_size;
+        opts.rolling_prefetch = FLAGS_multiscan_rolling_prefetch;
+        opts.rolling_prefetch_window_size =
+            FLAGS_multiscan_rolling_prefetch_window_size;
         opts.reverse = FLAGS_reverse_iterator;
         if (io_dispatcher) {
           opts.io_dispatcher = io_dispatcher;
@@ -9110,6 +9374,7 @@ class Benchmark {
       return origin;
     }
     int band_int = static_cast<int>(FLAGS_sine_a);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-msc30-c,cert-msc50-cpp)
     double delta = (rand() % band_int - band_int / 2) * noise_ratio;
     if (origin + delta < 0) {
       return origin;
@@ -9124,12 +9389,12 @@ class Benchmark {
    public:
     std::vector<int> type_;
     std::vector<double> ratio_;
-    int range_;
+    int range_ = 0;
 
     QueryDecider() = default;
     ~QueryDecider() = default;
 
-    Status Initiate(std::vector<double> ratio_input) {
+    Status Initiate(const std::vector<double>& ratio_input) {
       int range_max = 1000;
       double sum = 0.0;
       for (auto& ratio : ratio_input) {
@@ -9224,7 +9489,7 @@ class Benchmark {
 
         // Step 3. For each key-range, we calculate its position in the
         // [0, amplify] range, including the start, the size (keyrange_access)
-        KeyrangeUnit p_unit;
+        KeyrangeUnit p_unit{};
         p_unit.keyrange_start = keyrange_start;
         if (0.0 >= keyrange_p) {
           p_unit.keyrange_access = 0;
@@ -9269,7 +9534,8 @@ class Benchmark {
       int64_t keyrange_rand = ini_rand % keyrange_rand_max_;
 
       // Calculate and select one key-range that contains the new key
-      int64_t start = 0, end = static_cast<int64_t>(keyrange_set_.size());
+      int64_t start = 0;
+      int64_t end = static_cast<int64_t>(keyrange_set_.size());
       while (start + 1 < end) {
         int64_t mid = start + (end - start) / 2;
         assert(mid >= 0 && mid < static_cast<int64_t>(keyrange_set_.size()));
@@ -9282,7 +9548,8 @@ class Benchmark {
       int64_t keyrange_id = start;
 
       // Select one key in the key-range and compose the keyID
-      int64_t key_offset = 0, key_seed;
+      int64_t key_offset = 0;
+      int64_t key_seed;
       if (key_dist_a == 0.0 || key_dist_b == 0.0) {
         key_offset = ini_rand % keyrange_size_;
       } else {
@@ -9359,7 +9626,10 @@ class Benchmark {
     auto duration = thread->shared->MakeDuration(FLAGS_duration, reads_);
     while (!duration.Done(1)) {
       DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
-      int64_t ini_rand, rand_v, key_rand, key_seed;
+      int64_t ini_rand;
+      int64_t rand_v;
+      int64_t key_rand;
+      int64_t key_seed;
       ini_rand = GetRandomKey(&thread->rand);
       rand_v = ini_rand % FLAGS_num;
       double u = static_cast<double>(rand_v) / FLAGS_num;
@@ -11054,7 +11324,12 @@ class Benchmark {
     cro.bottommost_level_compaction =
         BottommostLevelCompaction::kForceOptimized;
     cro.max_subcompactions = static_cast<uint32_t>(FLAGS_subcompactions);
-    db->CompactRange(cro, nullptr, nullptr);
+    cro.skip_missing_blob_files = FLAGS_compact_range_skip_missing_blob_files;
+    const Status status = db->CompactRange(cro, nullptr, nullptr);
+    if (!status.ok()) {
+      thread->shared->SetFatal(
+          status, "Compact: CompactRange failed: " + status.ToString());
+    }
   }
 
   // Creates SST files with SstFileWriter and ingests them into the DB via
@@ -11379,6 +11654,8 @@ class Benchmark {
 
         CompactRangeOptions cro;
         cro.max_subcompactions = max_subcompactions;
+        cro.skip_missing_blob_files =
+            FLAGS_compact_range_skip_missing_blob_files;
         Status status = db->CompactRange(cro, nullptr, nullptr);
 
         const double elapsed_seconds =

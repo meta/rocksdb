@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -24,7 +25,7 @@ class DBWriteBufferManagerTest : public DBTestBase,
  public:
   DBWriteBufferManagerTest()
       : DBTestBase("db_write_buffer_manager_test", /*env_do_fsync=*/false) {}
-  bool cost_cache_;
+  bool cost_cache_ = false;
 };
 
 TEST_P(DBWriteBufferManagerTest, SharedBufferAcrossCFs1) {
@@ -36,11 +37,11 @@ TEST_P(DBWriteBufferManagerTest, SharedBufferAcrossCFs1) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
 
   WriteOptions wo;
@@ -79,11 +80,11 @@ TEST_P(DBWriteBufferManagerTest, SharedWriteBufferAcrossCFs2) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   WriteOptions wo;
   wo.disableWAL = true;
@@ -206,11 +207,11 @@ TEST_P(DBWriteBufferManagerTest, SharedWriteBufferLimitAcrossDB) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
@@ -323,11 +324,11 @@ TEST_P(DBWriteBufferManagerTest, SharedWriteBufferLimitAcrossDB1) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
@@ -388,7 +389,8 @@ TEST_P(DBWriteBufferManagerTest, SharedWriteBufferLimitAcrossDB1) {
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
-  bool s1 = true, s2 = true;
+  bool s1 = true;
+  bool s2 = true;
   // Write to multiple columns of db_.
   std::function<void(int)> write_cf = [&](int cf) {
     Status tmp = Put(cf, Key(3), DummyString(1), wo);
@@ -465,11 +467,11 @@ TEST_P(DBWriteBufferManagerTest, MixedSlowDownOptionsSingleDB) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   WriteOptions wo;
   wo.disableWAL = true;
@@ -530,7 +532,8 @@ TEST_P(DBWriteBufferManagerTest, MixedSlowDownOptionsSingleDB) {
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
-  bool s1 = true, s2 = true;
+  bool s1 = true;
+  bool s2 = true;
 
   std::function<void(int)> write_slow_down = [&](int cf) {
     int a = thread_num.fetch_add(1);
@@ -627,11 +630,11 @@ TEST_P(DBWriteBufferManagerTest, MixedSlowDownOptionsMultipleDB) {
   cost_cache_ = GetParam();
 
   if (cost_cache_) {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, cache, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, cache, true);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(100000, nullptr, true));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(100000, nullptr, true);
   }
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
@@ -694,7 +697,8 @@ TEST_P(DBWriteBufferManagerTest, MixedSlowDownOptionsMultipleDB) {
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
-  bool s1 = true, s2 = true;
+  bool s1 = true;
+  bool s2 = true;
   std::function<void(DB*)> write_slow_down = [&](DB* db) {
     int a = thread_num.fetch_add(1);
     std::string key = "foo" + std::to_string(a);
@@ -805,12 +809,12 @@ TEST_P(DBWriteBufferManagerTest, StopSwitchingMemTablesOnceFlushing) {
   ASSERT_LT(cache->GetUsage(), 256 << 10 /* 256KB */);
   cost_cache_ = GetParam();
   if (cost_cache_) {
-    options.write_buffer_manager.reset(new WriteBufferManager(
-        512 << 10 /* buffer_size (512KB) */, cache, false /* allow_stall */));
+    options.write_buffer_manager = std::make_shared<WriteBufferManager>(
+        512 << 10 /* buffer_size (512KB) */, cache, false /* allow_stall */);
   } else {
-    options.write_buffer_manager.reset(
-        new WriteBufferManager(512 << 10 /* buffer_size (512KB) */,
-                               nullptr /* cache */, false /* allow_stall */));
+    options.write_buffer_manager = std::make_shared<WriteBufferManager>(
+        512 << 10 /* buffer_size (512KB) */, nullptr /* cache */,
+        false /* allow_stall */);
   }
 
   Reopen(options);
@@ -1756,21 +1760,41 @@ TEST_F(DBWriteBufferManagerTest, WaitForCompactDrainsReservedWBMFlushHandoff) {
   std::unique_ptr<DB> other_db;
   ASSERT_OK(DB::Open(options, other_dbname, &other_db));
 
-  ASSERT_OK(other_db->Put(WriteOptions(), Key(1), DummyString(400 << 10)));
-  ASSERT_OK(Put(Key(1), DummyString(300 << 10), WriteOptions()));
+  // SetBufferSize(768 KB) below sets the mutable limit of the shared
+  // WriteBufferManager (WBM) to 7/8 of that, which is 672 KB. The WBM picks one
+  // DB at a time and hands it a flush (a "handoff"). other_db holds about 700
+  // KB of memtable data, so it stays above the limit by itself. If the WBM
+  // picks db_ (about 100 KB) first, memory stays above the limit and other_db
+  // is picked next.
+  ASSERT_OK(other_db->Put(WriteOptions(), Key(1), DummyString(700 << 10)));
+  ASSERT_OK(Put(Key(1), DummyString(100 << 10), WriteOptions()));
   options.write_buffer_manager->TEST_RefreshFlushInitiatorCandidate();
 
+  // Upper bound for each wait on another thread in this test. The waits
+  // normally end in milliseconds. 10 seconds leaves a wide margin for a loaded
+  // CI host and still turns a lost wakeup into a fast test failure instead of
+  // a hang.
+  constexpr auto kWaitLimit = std::chrono::seconds(10);
+  auto* const other_dbimpl = static_cast_with_check<DBImpl>(other_db.get());
   std::mutex handoff_mu;
   std::condition_variable handoff_cv;
   bool handoff_reserved = false;
   bool release_handoff = false;
+  // Block other_db's handoff on the WBM flush handoff executor thread until the
+  // main thread releases it. At this sync point the WBM has already reserved
+  // other_db (its handoff is pending), and this thread holds no
+  // WriteBufferManager lock or DB mutex. Blocking while a WBM lock is held
+  // would deadlock with the WBM calls of the main thread, such as
+  // SetBufferSize().
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "WriteBufferManager::GetNextCandidateForHandoff:CandidateSelected",
-      [&](void*) {
+      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         std::unique_lock<std::mutex> lock(handoff_mu);
         handoff_reserved = true;
         handoff_cv.notify_all();
-        handoff_cv.wait(lock, [&] { return release_handoff; });
+        handoff_cv.wait_for(lock, kWaitLimit, [&] { return release_handoff; });
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
   Defer cleanup_sync_points([&] {
@@ -1786,15 +1810,23 @@ TEST_F(DBWriteBufferManagerTest, WaitForCompactDrainsReservedWBMFlushHandoff) {
   options.write_buffer_manager->SetBufferSize(768 << 10);
   {
     std::unique_lock<std::mutex> lock(handoff_mu);
-    handoff_cv.wait(lock, [&] { return handoff_reserved; });
+    ASSERT_TRUE(handoff_cv.wait_for(lock, kWaitLimit, [&] {
+      return handoff_reserved;
+    })) << "no WBM handoff reached other_db";
   }
 
   std::mutex wait_mu;
   std::condition_variable wait_cv;
   bool wait_finished = false;
   Status wait_status;
+  WaitForCompactOptions wait_options;
+  // If WaitForCompact() does not finish within kWaitLimit, it returns TimedOut
+  // and ASSERT_OK(wait_status) below fails.
+  wait_options.timeout = kWaitLimit;
+  // No ASSERT may run between starting this thread and joining it, because an
+  // early return would destroy a joinable thread.
   port::Thread waiter([&] {
-    wait_status = other_db->WaitForCompact(WaitForCompactOptions());
+    wait_status = other_db->WaitForCompact(wait_options);
     std::lock_guard<std::mutex> lock(wait_mu);
     wait_finished = true;
     wait_cv.notify_all();
@@ -1915,6 +1947,7 @@ TEST_F(DBWriteBufferManagerTest,
   ASSERT_OK(DestroyDB(other_dbname, options));
   std::unique_ptr<DB> other_db;
   ASSERT_OK(DB::Open(options, other_dbname, &other_db));
+  auto* other_dbimpl = static_cast_with_check<DBImpl>(other_db.get());
 
   test::SleepingBackgroundTask sleeping_task_high;
   const int saved_high = env_->GetBackgroundThreads(Env::Priority::HIGH);
@@ -1941,9 +1974,19 @@ TEST_F(DBWriteBufferManagerTest,
   bool handoff_done = false;
   bool made_progress = true;
   bool already_flushing_rejected = false;
+  // Only other_db's handoff is parked and observed. While it is parked, its
+  // 20 ms lease can expire and the coordinator then hands off to db_, which
+  // must not be mistaken for the handoff under test. MadeProgress and
+  // AlreadyFlushing do not pass the DB, so they are matched by the thread
+  // that runs other_db's handoff.
+  std::thread::id other_handoff_thread;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void*) {
+      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         InstrumentedMutexLock l(&mu);
+        other_handoff_thread = std::this_thread::get_id();
         candidate_picked = true;
         cv.SignalAll();
         while (!release_handoff) {
@@ -1953,15 +1996,24 @@ TEST_F(DBWriteBufferManagerTest,
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::BackgroundCallWBMFlush:MadeProgress", [&](void* arg) {
         InstrumentedMutexLock l(&mu);
+        if (std::this_thread::get_id() != other_handoff_thread) {
+          return;
+        }
         made_progress = *static_cast<bool*>(arg);
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::FlushMemTableImpl:AlreadyFlushing", [&](void*) {
         InstrumentedMutexLock l(&mu);
+        if (std::this_thread::get_id() != other_handoff_thread) {
+          return;
+        }
         already_flushing_rejected = true;
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::BGWorkWBMFlush:done", [&](void*) {
+      "DBImpl::BGWorkWBMFlush:done", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         InstrumentedMutexLock l(&mu);
         handoff_done = true;
         cv.SignalAll();
@@ -2030,10 +2082,14 @@ TEST_F(DBWriteBufferManagerTest,
   ASSERT_OK(DestroyDB(other_dbname, options));
   std::unique_ptr<DB> other_db;
   ASSERT_OK(DB::Open(options, other_dbname, &other_db));
+  auto* other_dbimpl = static_cast_with_check<DBImpl>(other_db.get());
   ColumnFamilyHandle* other_cfh = nullptr;
   ASSERT_OK(other_db->CreateColumnFamily(ColumnFamilyOptions(), "victim",
                                          &other_cfh));
 
+  // Only other_db's handoff is parked and awaited. While it is parked, its
+  // 20 ms lease can expire and the coordinator then hands off to db_, which
+  // must not be mistaken for the handoff under test.
   InstrumentedMutex mu;
   InstrumentedCondVar cv(&mu);
   bool candidate_picked = false;
@@ -2041,7 +2097,10 @@ TEST_F(DBWriteBufferManagerTest,
   bool handoff_done = false;
   bool dropped_candidate_rejected = false;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void*) {
+      "DBImpl::BackgroundCallWBMFlush:AfterPick", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         InstrumentedMutexLock l(&mu);
         candidate_picked = true;
         cv.SignalAll();
@@ -2055,7 +2114,10 @@ TEST_F(DBWriteBufferManagerTest,
         dropped_candidate_rejected = true;
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::BGWorkWBMFlush:done", [&](void*) {
+      "DBImpl::BGWorkWBMFlush:done", [&](void* arg) {
+        if (arg != other_dbimpl) {
+          return;
+        }
         InstrumentedMutexLock l(&mu);
         handoff_done = true;
         cv.SignalAll();
@@ -2259,11 +2321,24 @@ TEST_P(DBWriteBufferManagerTest, FlushLargestAcrossDBsPicksAtomicFlushDB) {
   // Ignore any flush that may have happened during open/setup.
   recorder->Reset();
 
+  // If atomic_db has not switched its memtables before its handoff lease
+  // expires, as can happen on a heavily loaded host, the coordinator moves on
+  // to the next largest DB by design.
+  std::atomic<int> lease_expirations{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteBufferManager::ExpireFlushHandoffLease:Expired",
+      [&](void*) { lease_expirations.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
   options.write_buffer_manager->SetBufferSize(1 << 20);
 
   recorder->WaitForColumnFamilies(atomic_db.get(), 2);
-  EXPECT_FALSE(recorder->HasFlushed(db_.get()));
+  if (lease_expirations.load() == 0) {
+    EXPECT_FALSE(recorder->HasFlushed(db_.get()));
+  }
   EXPECT_EQ(0, recorder->ManualFlushes());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 
   for (auto* handle : atomic_handles) {
     ASSERT_OK(atomic_db->DestroyColumnFamilyHandle(handle));
@@ -2330,8 +2405,8 @@ TEST_F(DBWriteBufferManagerTest, RuntimeChangeableAllowStall) {
   constexpr int kBigValue = 10000;
 
   Options options = CurrentOptions();
-  options.write_buffer_manager.reset(
-      new WriteBufferManager(1, nullptr /* cache */, true /* allow_stall */));
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(
+      1, nullptr /* cache */, true /* allow_stall */);
   DestroyAndReopen(options);
 
   // Pause flush thread so that

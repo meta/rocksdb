@@ -80,6 +80,9 @@ class InlineSkipList {
   // No copying allowed
   InlineSkipList(const InlineSkipList&) = delete;
   InlineSkipList& operator=(const InlineSkipList&) = delete;
+  InlineSkipList(InlineSkipList&&) = delete;
+  InlineSkipList& operator=(InlineSkipList&&) = delete;
+  ~InlineSkipList() = default;
 
   // Allocates a key and a skip-list node, returning a pointer to the key
   // portion of the node.  This method is thread-safe if the allocator
@@ -705,7 +708,9 @@ template <class Comparator>
 typename InlineSkipList<Comparator>::Node*
 InlineSkipList<Comparator>::FindRandomEntry() const {
   // TODO(bjlemaire): consider adding PREFETCH calls.
-  Node *x = head_, *scan_node = nullptr, *limit_node = nullptr;
+  Node* x = head_;
+  Node* scan_node = nullptr;
+  Node* limit_node = nullptr;
 
   // We start at the max level.
   // FOr each level, we look at all the nodes at the level, and

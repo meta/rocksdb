@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "monitoring/instrumented_mutex.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -25,6 +26,8 @@ class LogsWithPrepTracker {
   void MarkLogAsContainingPrepSection(uint64_t log);
   // Return the earliest log file with outstanding prepare entries.
   uint64_t FindMinLogContainingOutstandingPrep();
+  void ConfigureSlowHoldLogging(
+      std::shared_ptr<SlowMutexLoggingContext> context);
   size_t TEST_PreparedSectionCompletedSize() {
     return prepared_section_completed_.size();
   }
@@ -43,6 +46,7 @@ class LogsWithPrepTracker {
   };
   std::vector<LogCnt> logs_with_prep_;
   std::mutex logs_with_prep_mutex_;
+  std::unique_ptr<SlowMutexTimer> logs_with_prep_timer_;
 
   // REQUIRES: prepared_section_completed_mutex_ held
   //
@@ -58,5 +62,6 @@ class LogsWithPrepTracker {
   // both logs_with_prep_ and prepared_section_completed_.
   std::unordered_map<uint64_t, uint64_t> prepared_section_completed_;
   std::mutex prepared_section_completed_mutex_;
+  std::unique_ptr<SlowMutexTimer> prepared_section_completed_timer_;
 };
 }  // namespace ROCKSDB_NAMESPACE

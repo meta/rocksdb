@@ -255,7 +255,7 @@ class WBWIIteratorImpl final : public WBWIIterator {
         iterate_lower_bound_(iterate_lower_bound),
         iterate_upper_bound_(iterate_upper_bound) {}
 
-  ~WBWIIteratorImpl() override {}
+  ~WBWIIteratorImpl() override = default;
 
   bool Valid() const override {
     return !out_of_bound_ && ValidRegardlessOfBoundLimit();
@@ -459,7 +459,7 @@ class WriteBatchWithIndexInternal {
                                         ResultTs... results) {
     const ImmutableOptions* ioptions = nullptr;
 
-    const Status s = CheckAndGetImmutableOptions(column_family, &ioptions);
+    Status s = CheckAndGetImmutableOptions(column_family, &ioptions);
     if (!s.ok()) {
       return s;
     }
@@ -483,7 +483,7 @@ class WriteBatchWithIndexInternal {
                                       ResultTs... results) {
     const ImmutableOptions* ioptions = nullptr;
 
-    const Status s = CheckAndGetImmutableOptions(column_family, &ioptions);
+    Status s = CheckAndGetImmutableOptions(column_family, &ioptions);
     if (!s.ok()) {
       return s;
     }

@@ -88,7 +88,8 @@ Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, OptSlice begin_key,
   const Comparator* ucmp = icmp.user_comparator();
   size_t ts_sz = ucmp->timestamp_size();
 
-  std::string begin_key_buf, end_key_buf;
+  std::string begin_key_buf;
+  std::string end_key_buf;
   auto [from, end] = MaybeAddTimestampsToRange(begin_key, end_key, ts_sz,
                                                &begin_key_buf, &end_key_buf);
   if (begin_key.has_value()) {

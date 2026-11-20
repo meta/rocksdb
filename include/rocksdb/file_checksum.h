@@ -54,7 +54,7 @@ struct FileChecksumGenContext {
 // including data loss, unreported corruption, deadlocks, and more.
 class FileChecksumGenerator {
  public:
-  virtual ~FileChecksumGenerator() {}
+  virtual ~FileChecksumGenerator() = default;
 
   // Update the current result after process the data. For different checksum
   // functions, the temporal results may be stored and used in Update to
@@ -79,7 +79,7 @@ class FileChecksumGenerator {
 // including data loss, unreported corruption, deadlocks, and more.
 class FileChecksumGenFactory : public Customizable {
  public:
-  ~FileChecksumGenFactory() override {}
+  ~FileChecksumGenFactory() override = default;
   static const char* Type() { return "FileChecksumGenFactory"; }
   static Status CreateFromString(
       const ConfigOptions& options, const std::string& value,
@@ -106,7 +106,7 @@ class FileChecksumGenFactory : public Customizable {
 // including data loss, unreported corruption, deadlocks, and more.
 class FileChecksumList {
  public:
-  virtual ~FileChecksumList() {}
+  virtual ~FileChecksumList() = default;
 
   // Clean the previously stored file checksum information.
   virtual void reset() = 0;

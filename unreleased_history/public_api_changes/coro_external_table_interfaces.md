@@ -1,1 +1,0 @@
-Added experimental coroutine capability interfaces for basic and full `ExternalTableReader` implementations. Coroutine-capable external readers can initiate file reads through `FSRandomAccessFile::SubmitReadAsync()`.

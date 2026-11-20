@@ -78,16 +78,19 @@ class InjectedErrorLog {
   };
 
   struct Entry {
-    uint64_t timestamp_us;
-    uint64_t thread_id;
+    uint64_t timestamp_us = 0;
+    uint64_t thread_id = 0;
     EntryDetail detail;
-    uint8_t detail_kind;
-    uint8_t detail_payload_size;
-    uint8_t retryable;
-    uint8_t data_loss;
-    char op_name[kMaxOpNameLen];
-    char file_name[kMaxFileNameLen];
-    char status_message[kMaxStatusMessageLen];
+    uint8_t detail_kind = kDetailNone;
+    uint8_t detail_payload_size = 0;
+    uint8_t retryable = 0;
+    uint8_t data_loss = 0;
+    char op_name[kMaxOpNameLen] = {};
+    char file_name[kMaxFileNameLen] = {};
+    char status_message[kMaxStatusMessageLen] = {};
+    // Explicit tail padding so the size does not depend on the alignment of
+    // uint64_t (4 bytes on i386, 8 bytes on most other targets).
+    uint8_t padding[4] = {};
   };
 
   static_assert(sizeof(Entry) == 256,
@@ -97,6 +100,8 @@ class InjectedErrorLog {
   ~InjectedErrorLog();
   InjectedErrorLog(const InjectedErrorLog&) = delete;
   InjectedErrorLog& operator=(const InjectedErrorLog&) = delete;
+  InjectedErrorLog(InjectedErrorLog&&) = delete;
+  InjectedErrorLog& operator=(InjectedErrorLog&&) = delete;
 
   void Record(const Slice& op_name, const Slice& file_name,
               const TaggedEntryDetail& detail, const IOStatus& status);
@@ -249,7 +254,7 @@ class TestFSWritableFile : public FSWritableFile {
                               std::unique_ptr<FSWritableFile>&& f,
                               FaultInjectionTestFS* fs,
                               bool reopened_for_write = false);
-  virtual ~TestFSWritableFile();
+  ~TestFSWritableFile() override;
   IOStatus Append(const Slice& data, const IOOptions&,
                   IODebugContext*) override;
   IOStatus Append(const Slice& data, const IOOptions& options,
@@ -305,7 +310,7 @@ class TestFSRandomRWFile : public FSRandomRWFile {
   explicit TestFSRandomRWFile(const std::string& fname,
                               std::unique_ptr<FSRandomRWFile>&& f,
                               FaultInjectionTestFS* fs);
-  virtual ~TestFSRandomRWFile();
+  ~TestFSRandomRWFile() override;
   IOStatus Write(uint64_t offset, const Slice& data, const IOOptions& options,
                  IODebugContext* dbg) override;
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
@@ -333,7 +338,7 @@ class TestFSRandomAccessFile : public FSRandomAccessFile {
   explicit TestFSRandomAccessFile(const std::string& fname,
                                   std::unique_ptr<FSRandomAccessFile>&& f,
                                   FaultInjectionTestFS* fs);
-  ~TestFSRandomAccessFile() override {}
+  ~TestFSRandomAccessFile() override = default;
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
                 Slice* result, char* scratch,
                 IODebugContext* dbg) const override;
@@ -389,7 +394,7 @@ class TestFSDirectory : public FSDirectory {
   explicit TestFSDirectory(FaultInjectionTestFS* fs, std::string dirname,
                            FSDirectory* dir)
       : fs_(fs), dirname_(std::move(dirname)), dir_(dir) {}
-  ~TestFSDirectory() {}
+  ~TestFSDirectory() override = default;
 
   IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override;
 
@@ -427,7 +432,12 @@ class FaultInjectionTestFS : public FileSystemWrapper {
         ingest_data_corruption_before_write_(false),
         checksum_handoff_func_type_(kCRC32c),
         injected_error_log_(injected_error_log_path) {}
-  virtual ~FaultInjectionTestFS() override { fs_error_.PermitUncheckedError(); }
+  // No copying allowed
+  FaultInjectionTestFS(const FaultInjectionTestFS&) = delete;
+  FaultInjectionTestFS& operator=(const FaultInjectionTestFS&) = delete;
+  FaultInjectionTestFS(FaultInjectionTestFS&&) = delete;
+  FaultInjectionTestFS& operator=(FaultInjectionTestFS&&) = delete;
+  ~FaultInjectionTestFS() override { fs_error_.PermitUncheckedError(); }
 
   static const char* kClassName() { return "FaultInjectionTestFS"; }
   const char* Name() const override { return kClassName(); }
@@ -610,7 +620,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     return filesystem_writable_;
   }
   void SetFilesystemActiveNoLock(
-      bool active, IOStatus error = IOStatus::Corruption("Not active")) {
+      bool active, const IOStatus& error = IOStatus::Corruption("Not active")) {
     error.PermitUncheckedError();
     filesystem_active_ = active;
     if (!active) {
@@ -618,7 +628,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     }
   }
   void SetFilesystemActive(
-      bool active, IOStatus error = IOStatus::Corruption("Not active")) {
+      bool active, const IOStatus& error = IOStatus::Corruption("Not active")) {
     MutexLock l(&mutex_);
     error.PermitUncheckedError();
     SetFilesystemActiveNoLock(active, error);
@@ -677,7 +687,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     return fs_error_;
   }
 
-  void SetFileSystemIOError(IOStatus io_error) {
+  void SetFileSystemIOError(const IOStatus& io_error) {
     MutexLock l(&mutex_);
     io_error.PermitUncheckedError();
     fs_error_ = io_error;
@@ -912,13 +922,13 @@ class FaultInjectionTestFS : public FileSystemWrapper {
 
   struct ErrorContext {
     Random rand;
-    int one_in;
-    int count;
+    int one_in = 0;
+    int count = 0;
     bool enable_error_injection;
     void* callstack;
     std::string message;
     int frames;
-    ErrorType type;
+    ErrorType type = kErrorTypeStatus;
     bool retryable;
     bool has_data_loss;
 
@@ -929,6 +939,11 @@ class FaultInjectionTestFS : public FileSystemWrapper {
           frames(0),
           retryable(false),
           has_data_loss(false) {}
+    // No copying allowed
+    ErrorContext(const ErrorContext&) = delete;
+    ErrorContext& operator=(const ErrorContext&) = delete;
+    ErrorContext(ErrorContext&&) = delete;
+    ErrorContext& operator=(ErrorContext&&) = delete;
     ~ErrorContext() {
       if (callstack) {
         free(callstack);

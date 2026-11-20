@@ -102,6 +102,11 @@ class Scan {
 
     ScanIterator() : db_iter_(nullptr), valid_(false) {}
 
+    ScanIterator(const ScanIterator&) = default;
+    ScanIterator& operator=(const ScanIterator&) = default;
+    ScanIterator(ScanIterator&&) = default;
+    ScanIterator& operator=(ScanIterator&&) = default;
+
     ~ScanIterator() {
       if (!status_.ok()) {
         fprintf(stderr, "ScanIterator status: %s\n",
@@ -180,6 +185,8 @@ class MultiScan {
    public:
     MultiScanIterator(const MultiScanIterator&) = delete;
     MultiScanIterator operator=(MultiScanIterator&) = delete;
+    MultiScanIterator(MultiScanIterator&&) = delete;
+    MultiScanIterator& operator=(MultiScanIterator&&) = delete;
 
     using self_type = MultiScanIterator;
     using value_type = Scan;
@@ -256,7 +263,7 @@ class MultiScan {
  private:
   ReadOptions read_options_;
   const MultiScanArgs scan_opts_;
-  DB* db_;
+  DB* db_{};
   ColumnFamilyHandle* cfh_{};
   Slice lower_bound_;
   Slice upper_bound_;

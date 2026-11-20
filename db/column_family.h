@@ -171,7 +171,7 @@ class ColumnFamilyHandleImpl : public ColumnFamilyHandle {
   ColumnFamilyHandleImpl(ColumnFamilyData* cfd, DBImpl* db,
                          InstrumentedMutex* mutex);
   // destroy without mutex
-  virtual ~ColumnFamilyHandleImpl();
+  ~ColumnFamilyHandleImpl() override;
   virtual ColumnFamilyData* cfd() const { return cfd_; }
   virtual DBImpl* db() const { return db_; }
 
@@ -209,15 +209,15 @@ class ColumnFamilyHandleInternal : public ColumnFamilyHandleImpl {
 struct SuperVersion {
   // Accessing members of this class is not thread-safe and requires external
   // synchronization (ie db mutex held or on write thread).
-  ColumnFamilyData* cfd;
-  ReadOnlyMemTable* mem;
-  MemTableListVersion* imm;
-  Version* current;
+  ColumnFamilyData* cfd = nullptr;
+  ReadOnlyMemTable* mem = nullptr;
+  MemTableListVersion* imm = nullptr;
+  Version* current = nullptr;
   // TODO: do we really need this in addition to what's in current Version?
   MutableCFOptions mutable_cf_options;
   // Version number of the current SuperVersion
-  uint64_t version_number;
-  WriteStallCondition write_stall_condition;
+  uint64_t version_number = 0;
+  WriteStallCondition write_stall_condition = WriteStallCondition::kNormal;
   // Each time `full_history_ts_low` collapses history, a new SuperVersion is
   // installed. This field tracks the effective `full_history_ts_low` for that
   // SuperVersion, to be used by read APIs for sanity checks. This field is
@@ -368,6 +368,12 @@ class ColumnFamilyData {
 
   bool is_delete_range_supported() { return is_delete_range_supported_; }
 
+  // False when the table factory cannot write tables, so the column family is
+  // never compacted.
+  bool is_table_builder_supported() const {
+    return is_table_builder_supported_;
+  }
+
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
@@ -375,6 +381,19 @@ class ColumnFamilyData {
   Status SetOptions(
       const DBOptions& db_options,
       const std::unordered_map<std::string, std::string>& options_map);
+  // REQUIRES: DB mutex held
+  // Returns true if the column family is not dropped, SetOptions(db_options,
+  // options_map) would succeed without changing any option, and options from
+  // an earlier SetOptions() are not still waiting for MarkOptionsInstalled().
+  // Can return false for a request that changes nothing, for example one that
+  // sets a table factory field.
+  bool SetOptionsIsNoOp(
+      const DBOptions& db_options,
+      const std::unordered_map<std::string, std::string>& options_map) const;
+  // REQUIRES: DB mutex held
+  // Call after the options from SetOptions() are in the current SuperVersion
+  // and every other user of them is updated.
+  void MarkOptionsInstalled() { options_install_pending_ = false; }
 
   InternalStats* internal_stats() { return internal_stats_.get(); }
 
@@ -549,12 +568,15 @@ class ColumnFamilyData {
     --num_in_flight_compactions_;
   }
 
+  // L0 files and pending compaction bytes stall writes only when the column
+  // family can be compacted automatically, which requires
+  // 'table_builder_supported' and no disable_auto_compactions.
   static std::pair<WriteStallCondition, WriteStallCause>
-  GetWriteStallConditionAndCause(
-      int num_unflushed_memtables, int num_l0_files,
-      uint64_t num_compaction_needed_bytes,
-      const MutableCFOptions& mutable_cf_options,
-      const ImmutableCFOptions& immutable_cf_options);
+  GetWriteStallConditionAndCause(int num_unflushed_memtables, int num_l0_files,
+                                 uint64_t num_compaction_needed_bytes,
+                                 const MutableCFOptions& mutable_cf_options,
+                                 const ImmutableCFOptions& immutable_cf_options,
+                                 bool table_builder_supported);
 
   // Recalculate some stall conditions, which are changed only during
   // compaction, adding new memtable and/or recalculation of compaction score.
@@ -654,17 +676,15 @@ class ColumnFamilyData {
 
  private:
   friend class ColumnFamilySet;
-  ColumnFamilyData(uint32_t id, const std::string& name,
-                   Version* dummy_versions, Cache* table_cache,
-                   WriteBufferManager* write_buffer_manager,
-                   const ColumnFamilyOptions& options,
-                   const ImmutableDBOptions& db_options,
-                   const FileOptions* file_options,
-                   ColumnFamilySet* column_family_set,
-                   BlockCacheTracer* const block_cache_tracer,
-                   const std::shared_ptr<IOTracer>& io_tracer,
-                   const std::string& db_id, const std::string& db_session_id,
-                   bool read_only, bool fast_sst_open = false);
+  ColumnFamilyData(
+      uint32_t id, const std::string& name, Version* dummy_versions,
+      Cache* table_cache, WriteBufferManager* write_buffer_manager,
+      const ColumnFamilyOptions& options, const ImmutableDBOptions& db_options,
+      const FileOptions* file_options, ColumnFamilySet* column_family_set,
+      BlockCacheTracer* const block_cache_tracer,
+      const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
+      const std::string& db_session_id, bool read_only,
+      bool options_are_sanitized, bool fast_sst_open = false);
 
   std::vector<std::string> GetDbPaths() const;
 
@@ -694,6 +714,12 @@ class ColumnFamilyData {
   MutableCFOptions mutable_cf_options_;
 
   const bool is_delete_range_supported_;
+  const bool is_table_builder_supported_;
+
+  // True from a successful SetOptions() until MarkOptionsInstalled(). A
+  // DB::SetOptions() call that fails on a later column family leaves it set
+  // for the column families it already changed.
+  bool options_install_pending_ = false;
 
   std::unique_ptr<TableCache> table_cache_;
   std::unique_ptr<BlobFileCache> blob_file_cache_;
@@ -850,7 +876,8 @@ class ColumnFamilySet {
   ColumnFamilyData* CreateColumnFamily(const std::string& name, uint32_t id,
                                        Version* dummy_version,
                                        const ColumnFamilyOptions& options,
-                                       bool read_only);
+                                       bool read_only,
+                                       bool options_are_sanitized);
 
   const UnorderedMap<uint32_t, size_t>& GetRunningColumnFamiliesTimestampSize()
       const {
@@ -951,6 +978,11 @@ class RefedColumnFamilySet {
     explicit iterator(ColumnFamilySet::iterator wrapped) : wrapped_(wrapped) {
       MaybeRef(*wrapped_);
     }
+    // No copying allowed
+    iterator(const iterator&) = delete;
+    iterator& operator=(const iterator&) = delete;
+    iterator(iterator&&) = delete;
+    iterator& operator=(iterator&&) = delete;
     ~iterator() { MaybeUnref(*wrapped_); }
     inline void MaybeRef(ColumnFamilyData* cfd) {
       if (cfd->GetID() != ColumnFamilyData::kDummyColumnFamilyDataId) {

@@ -37,9 +37,18 @@ class EnvMirror : public EnvWrapper {
  public:
   EnvMirror(Env* a, Env* b, bool free_a = false, bool free_b = false)
       : EnvWrapper(a), a_(a), b_(b), free_a_(free_a), free_b_(free_b) {}
-  ~EnvMirror() {
-    if (free_a_) delete a_;
-    if (free_b_) delete b_;
+  // No copying allowed
+  EnvMirror(const EnvMirror&) = delete;
+  EnvMirror& operator=(const EnvMirror&) = delete;
+  EnvMirror(EnvMirror&&) = delete;
+  EnvMirror& operator=(EnvMirror&&) = delete;
+  ~EnvMirror() override {
+    if (free_a_) {
+      delete a_;
+    }
+    if (free_b_) {
+      delete b_;
+    }
   }
 
   Status NewSequentialFile(const std::string& f,
@@ -75,7 +84,8 @@ class EnvMirror : public EnvWrapper {
 #endif
   Status GetChildren(const std::string& dir,
                      std::vector<std::string>* r) override {
-    std::vector<std::string> ar, br;
+    std::vector<std::string> ar;
+    std::vector<std::string> br;
     Status as = a_->GetChildren(dir, &ar);
     Status bs = b_->GetChildren(dir, &br);
     assert(as == bs);
@@ -115,7 +125,8 @@ class EnvMirror : public EnvWrapper {
     return as;
   }
   Status GetFileSize(const std::string& f, uint64_t* s) override {
-    uint64_t asize, bsize;
+    uint64_t asize;
+    uint64_t bsize;
     Status as = a_->GetFileSize(f, &asize);
     Status bs = b_->GetFileSize(f, &bsize);
     assert(as == bs);
@@ -126,7 +137,8 @@ class EnvMirror : public EnvWrapper {
 
   Status GetFileModificationTime(const std::string& fname,
                                  uint64_t* file_mtime) override {
-    uint64_t amtime, bmtime;
+    uint64_t amtime;
+    uint64_t bmtime;
     Status as = a_->GetFileModificationTime(fname, &amtime);
     Status bs = b_->GetFileModificationTime(fname, &bmtime);
     assert(as == bs);
@@ -156,11 +168,14 @@ class EnvMirror : public EnvWrapper {
   };
 
   Status LockFile(const std::string& f, FileLock** l) override {
-    FileLock *al, *bl;
+    FileLock* al;
+    FileLock* bl;
     Status as = a_->LockFile(f, &al);
     Status bs = b_->LockFile(f, &bl);
     assert(as == bs);
-    if (as.ok()) *l = new FileLockMirror(al, bl);
+    if (as.ok()) {
+      *l = new FileLockMirror(al, bl);
+    }
     return as;
   }
 

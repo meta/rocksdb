@@ -58,7 +58,7 @@ void LogBuffer::AddLogToBuffer(size_t max_log_size, const char* format,
 void LogBuffer::FlushBufferToLog() {
   for (BufferedLog* log : logs_) {
     const time_t seconds = log->now_tv.tv_sec;
-    struct tm t;
+    struct tm t{};
     if (port::LocalTimeR(&seconds, &t) != nullptr) {
       Log(log_level_, info_log_,
           "(Original Log Time %04d/%02d/%02d-%02d:%02d:%02d.%06d) %s",

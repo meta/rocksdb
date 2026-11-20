@@ -21,7 +21,79 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-namespace {}  // anonymous namespace
+namespace {
+// For DebugString() / DebugJSON(), e.g. "ingestion+moved+raw:0x1103" (the raw
+// value shows reserved bits that aren't decoded).
+std::string DataFileProvenanceToString(uint32_t encoded) {
+  const DataFileProvenance info = DataFileProvenance::DecodeFrom(encoded);
+  std::string r;
+  switch (info.origin) {
+    case DataFileProvenance::Origin::kUnknown:
+      r = "unknown_origin";
+      break;
+    case DataFileProvenance::Origin::kFlush:
+      r = "flush";
+      break;
+    case DataFileProvenance::Origin::kCompaction:
+      r = "compaction";
+      break;
+    case DataFileProvenance::Origin::kIngestion:
+      r = "ingestion";
+      break;
+    case DataFileProvenance::Origin::kImport:
+      r = "import";
+      break;
+  }
+  if (info.moved_between_levels) {
+    r += "+moved";
+  }
+  if (info.temperature_changed_by_copy) {
+    r += "+temperature_copied";
+  }
+  if (info.temperature_updated_from_file_system) {
+    r += "+temperature_updated";
+  }
+  if (info.recorded_by_repair) {
+    r += "+repaired";
+  }
+  char raw[24];
+  snprintf(raw, sizeof(raw), "+raw:0x%x", encoded);
+  r += raw;
+  return r;
+}
+}  // anonymous namespace
+
+uint32_t DataFileProvenance::Encode() const {
+  uint32_t encoded = DataFileProvenanceForOrigin(origin);
+  if (moved_between_levels) {
+    encoded |= kProvenanceMovedBetweenLevels;
+  }
+  if (temperature_changed_by_copy) {
+    encoded |= kProvenanceTemperatureChangedByCopy;
+  }
+  if (temperature_updated_from_file_system) {
+    encoded |= kProvenanceTemperatureUpdatedFromFileSystem;
+  }
+  if (recorded_by_repair) {
+    encoded |= kProvenanceRecordedByRepair;
+  }
+  return encoded;
+}
+
+DataFileProvenance DataFileProvenance::DecodeFrom(uint32_t encoded) {
+  DataFileProvenance info;
+  const uint32_t origin_value = encoded & kProvenanceOriginMask;
+  if (origin_value <= DataFileProvenanceForOrigin(Origin::kImport)) {
+    info.origin = static_cast<Origin>(origin_value);
+  }
+  info.moved_between_levels = (encoded & kProvenanceMovedBetweenLevels) != 0;
+  info.temperature_changed_by_copy =
+      (encoded & kProvenanceTemperatureChangedByCopy) != 0;
+  info.temperature_updated_from_file_system =
+      (encoded & kProvenanceTemperatureUpdatedFromFileSystem) != 0;
+  info.recorded_by_repair = (encoded & kProvenanceRecordedByRepair) != 0;
+  return info;
+}
 
 // After copying, we rely on the caller to ensure no double releases. Fragile,
 // but keeps copying cheap.
@@ -126,6 +198,22 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
 
 void VersionEdit::Clear() { *this = VersionEdit(); }
 
+void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
+                                  uint32_t provenance_flags_to_set) {
+  assert((provenance_flags_to_set & kProvenanceOriginMask) == 0);
+  AddFile(level, f.fd.GetNumber(), f.fd.GetPathId(), f.fd.GetFileSize(),
+          f.smallest, f.largest, f.fd.smallest_seqno, f.fd.largest_seqno,
+          f.marked_for_compaction, f.temperature, f.oldest_blob_file_number,
+          f.oldest_ancestor_time, f.file_creation_time, f.epoch_number,
+          f.file_checksum, f.file_checksum_func_name, f.unique_id,
+          f.compensated_range_deletion_size, f.tail_size,
+          f.user_defined_timestamps_persisted, f.min_timestamp, f.max_timestamp,
+          f.file_open_metadata);
+  FileMetaData& added = new_files_.back().second;
+  added.db_ownership_start_time = f.db_ownership_start_time;
+  added.data_file_provenance = f.data_file_provenance | provenance_flags_to_set;
+}
+
 bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
     uint64_t current_log_number) const {
   return (HasLogNumber() && GetLogNumber() > current_log_number) ||
@@ -134,7 +222,8 @@ bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
          HasLastSequence() || !GetCompactCursors().empty() || HasDbId() ||
          IsColumnFamilyManipulation() || IsInAtomicGroup() ||
          HasFullHistoryTsLow() || HasPersistUserDefinedTimestamps() ||
-         HasSubcompactionProgress();
+         HasSubcompactionProgress() || HasCommittedOptionsFileNumber() ||
+         HasDroppedBlobFiles();
 }
 
 bool VersionEdit::EncodeTo(std::string* dst,
@@ -262,6 +351,20 @@ bool VersionEdit::EncodeTo(std::string* dst,
     std::string varint_size;
     PutVarint64(&varint_size, last_compacted_manifest_file_size_);
     PutLengthPrefixedSlice(dst, Slice(varint_size));
+  }
+
+  if (has_committed_options_file_number_) {
+    PutVarint32(dst, kCommittedOptionsFileNumber);
+    std::string encoded;
+    PutVarint64(&encoded, committed_options_file_number_);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+
+  for (const uint64_t blob_file_number : dropped_blob_files_) {
+    PutVarint32(dst, kDroppedBlobFile);
+    std::string encoded;
+    PutVarint64(&encoded, blob_file_number);
+    PutLengthPrefixedSlice(dst, encoded);
   }
 
   return true;
@@ -399,6 +502,18 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
   if (!f.file_open_metadata.empty()) {
     PutVarint32(dst, NewFileCustomTag::kFileOpenMetadata);
     PutLengthPrefixedSlice(dst, Slice(f.file_open_metadata));
+  }
+  if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+    PutVarint32(dst, NewFileCustomTag::kDbOwnershipStartTime);
+    std::string varint_db_ownership_start_time;
+    PutVarint64(&varint_db_ownership_start_time, f.db_ownership_start_time);
+    PutLengthPrefixedSlice(dst, Slice(varint_db_ownership_start_time));
+  }
+  if (f.data_file_provenance != 0) {
+    PutVarint32(dst, NewFileCustomTag::kDataFileProvenance);
+    std::string varint_data_file_provenance;
+    PutVarint32(&varint_data_file_provenance, f.data_file_provenance);
+    PutLengthPrefixedSlice(dst, Slice(varint_data_file_provenance));
   }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
@@ -548,6 +663,16 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
         case kFileOpenMetadata:
           f.file_open_metadata = field.ToString();
           break;
+        case kDbOwnershipStartTime:
+          if (!GetVarint64(&field, &f.db_ownership_start_time)) {
+            return "invalid DB ownership start time";
+          }
+          break;
+        case kDataFileProvenance:
+          if (!GetVarint32(&field, &f.data_file_provenance)) {
+            return "invalid data file provenance";
+          }
+          break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
             // Should not proceed if cannot understand it
@@ -673,7 +798,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetInternalKey(&input, &key)) {
           // Here we re-use the output format of compact pointer in LevelDB
           // to persist compact_cursors_
-          compact_cursors_.push_back(std::make_pair(level, key));
+          compact_cursors_.emplace_back(level, key);
         } else {
           if (!msg) {
             msg = "compaction cursor";
@@ -702,7 +827,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetInternalKey(&input, &f.smallest) &&
             GetInternalKey(&input, &f.largest)) {
           f.fd = FileDescriptor(number, 0, file_size);
-          new_files_.push_back(std::make_pair(level, f));
+          new_files_.emplace_back(level, f);
         } else {
           if (!msg) {
             msg = "new-file entry";
@@ -723,7 +848,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetVarint64(&input, &largest_seqno)) {
           f.fd = FileDescriptor(number, 0, file_size, smallest_seqno,
                                 largest_seqno);
-          new_files_.push_back(std::make_pair(level, f));
+          new_files_.emplace_back(level, f);
         } else {
           if (!msg) {
             msg = "new-file2 entry";
@@ -747,7 +872,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetVarint64(&input, &largest_seqno)) {
           f.fd = FileDescriptor(number, path_id, file_size, smallest_seqno,
                                 largest_seqno);
-          new_files_.push_back(std::make_pair(level, f));
+          new_files_.emplace_back(level, f);
         } else {
           if (!msg) {
             msg = "new-file3 entry";
@@ -925,6 +1050,30 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         break;
       }
 
+      case kCommittedOptionsFileNumber: {
+        Slice encoded;
+        if (GetLengthPrefixedSlice(&input, &encoded) &&
+            GetVarint64(&encoded, &committed_options_file_number_) &&
+            encoded.empty()) {
+          has_committed_options_file_number_ = true;
+        } else {
+          msg = "committed options file number";
+        }
+        break;
+      }
+
+      case kDroppedBlobFile: {
+        Slice encoded;
+        uint64_t blob_file_number = 0;
+        if (GetLengthPrefixedSlice(&input, &encoded) &&
+            GetVarint64(&encoded, &blob_file_number) && encoded.empty()) {
+          dropped_blob_files_.push_back(blob_file_number);
+        } else {
+          msg = "dropped blob file";
+        }
+        break;
+      }
+
       default:
         if (tag & kTagSafeIgnoreMask) {
           // Tag from future which can be safely ignored.
@@ -1030,6 +1179,14 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     AppendNumberTo(&r, f.file_creation_time);
     r.append(" epoch_number:");
     AppendNumberTo(&r, f.epoch_number);
+    if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+      r.append(" db_ownership_start_time:");
+      AppendNumberTo(&r, f.db_ownership_start_time);
+    }
+    if (f.data_file_provenance != 0) {
+      r.append(" data_file_provenance:");
+      r.append(DataFileProvenanceToString(f.data_file_provenance));
+    }
     r.append(" file_checksum:");
     r.append(Slice(f.file_checksum).ToString(true));
     r.append(" file_checksum_func_name: ");
@@ -1104,6 +1261,14 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append("\n  LastCompactedManifestFileSize: ");
     AppendNumberTo(&r, last_compacted_manifest_file_size_);
   }
+  if (has_committed_options_file_number_) {
+    r.append("\n  CommittedOptionsFileNumber: ");
+    AppendNumberTo(&r, committed_options_file_number_);
+  }
+  for (const uint64_t blob_file_number : dropped_blob_files_) {
+    r.append("\n  DroppedBlobFile: ");
+    AppendNumberTo(&r, blob_file_number);
+  }
   r.append("\n}\n");
   return r;
 }
@@ -1167,6 +1332,13 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       jw << "OldestAncesterTime" << f.oldest_ancestor_time;
       jw << "FileCreationTime" << f.file_creation_time;
       jw << "EpochNumber" << f.epoch_number;
+      if (f.db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+        jw << "DbOwnershipStartTime" << f.db_ownership_start_time;
+      }
+      if (f.data_file_provenance != 0) {
+        jw << "DataFileProvenance"
+           << DataFileProvenanceToString(f.data_file_provenance);
+      }
       jw << "FileChecksum" << Slice(f.file_checksum).ToString(true);
       jw << "FileChecksumFuncName" << f.file_checksum_func_name;
       if (f.temperature != Temperature::kUnknown) {
@@ -1263,6 +1435,19 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
 
   if (has_last_compacted_manifest_file_size_) {
     jw << "LastCompactedManifestFileSize" << last_compacted_manifest_file_size_;
+  }
+
+  if (has_committed_options_file_number_) {
+    jw << "CommittedOptionsFileNumber" << committed_options_file_number_;
+  }
+
+  if (!dropped_blob_files_.empty()) {
+    jw << "DroppedBlobFiles";
+    jw.StartArray();
+    for (const uint64_t blob_file_number : dropped_blob_files_) {
+      jw << blob_file_number;
+    }
+    jw.EndArray();
   }
 
   jw.EndObject();
@@ -1440,6 +1625,30 @@ void SubcompactionProgress::EncodeTo(std::string* dst) const {
     proximal_output_level_progress.EncodeTo(&level_progress_data);
     PutLengthPrefixedSlice(dst, level_progress_data);
   }
+
+  if (has_blob_compaction_progress) {
+    PutVarint32(dst, SubcompactionProgressCustomTag::kBlobCompactionProgress);
+    std::string blob_progress_data;
+    PutVarint64(&blob_progress_data, next_blob_file_number);
+
+    const size_t first_addition = GetLastPersistedBlobFileAdditionsCount();
+    assert(first_addition <= blob_file_additions.size());
+    PutVarint64(&blob_progress_data,
+                blob_file_additions.size() - first_addition);
+    for (size_t i = first_addition; i < blob_file_additions.size(); ++i) {
+      std::string encoded_addition;
+      blob_file_additions[i].EncodeTo(&encoded_addition);
+      PutLengthPrefixedSlice(&blob_progress_data, encoded_addition);
+    }
+
+    PutVarint64(&blob_progress_data, blob_file_garbages.size());
+    for (const auto& garbage : blob_file_garbages) {
+      std::string encoded_garbage;
+      garbage.EncodeTo(&encoded_garbage);
+      PutLengthPrefixedSlice(&blob_progress_data, encoded_garbage);
+    }
+    PutLengthPrefixedSlice(dst, blob_progress_data);
+  }
   PutVarint32(dst,
               SubcompactionProgressCustomTag::kSubcompactionProgressTerminate);
 }
@@ -1493,6 +1702,63 @@ Status SubcompactionProgress::DecodeFrom(Slice* input) {
         break;
       }
 
+      case SubcompactionProgressCustomTag::kBlobCompactionProgress: {
+        has_blob_compaction_progress = true;
+        if (!GetVarint64(&field, &next_blob_file_number)) {
+          return Status::Corruption("SubcompactionProgress",
+                                    "invalid next blob file number");
+        }
+
+        uint64_t num_additions = 0;
+        if (!GetVarint64(&field, &num_additions) ||
+            num_additions > field.size()) {
+          return Status::Corruption("SubcompactionProgress",
+                                    "invalid blob file addition count");
+        }
+        blob_file_additions.reserve(static_cast<size_t>(num_additions));
+        for (uint64_t i = 0; i < num_additions; ++i) {
+          Slice encoded_addition;
+          if (!GetLengthPrefixedSlice(&field, &encoded_addition)) {
+            return Status::Corruption("SubcompactionProgress",
+                                      "invalid blob file addition");
+          }
+          BlobFileAddition addition;
+          Status s = addition.DecodeFrom(&encoded_addition);
+          if (!s.ok() || !encoded_addition.empty()) {
+            return Status::Corruption("SubcompactionProgress",
+                                      "invalid blob file addition metadata");
+          }
+          blob_file_additions.emplace_back(std::move(addition));
+        }
+
+        uint64_t num_garbages = 0;
+        if (!GetVarint64(&field, &num_garbages) ||
+            num_garbages > field.size()) {
+          return Status::Corruption("SubcompactionProgress",
+                                    "invalid blob file garbage count");
+        }
+        blob_file_garbages.reserve(static_cast<size_t>(num_garbages));
+        for (uint64_t i = 0; i < num_garbages; ++i) {
+          Slice encoded_garbage;
+          if (!GetLengthPrefixedSlice(&field, &encoded_garbage)) {
+            return Status::Corruption("SubcompactionProgress",
+                                      "invalid blob file garbage");
+          }
+          BlobFileGarbage garbage;
+          Status s = garbage.DecodeFrom(&encoded_garbage);
+          if (!s.ok() || !encoded_garbage.empty()) {
+            return Status::Corruption("SubcompactionProgress",
+                                      "invalid blob file garbage metadata");
+          }
+          blob_file_garbages.emplace_back(std::move(garbage));
+        }
+        if (!field.empty()) {
+          return Status::Corruption("SubcompactionProgress",
+                                    "trailing blob compaction progress data");
+        }
+        break;
+      }
+
       default:
         if ((custom_tag & SubcompactionProgressCustomTag::
                               kSubcompactionProgressCustomTagSafeIgnoreMask) !=
@@ -1537,6 +1803,18 @@ void SubcompactionProgressBuilder::MergeDeltaProgress(
   MaybeMergeDeltaProgressPerLevel(
       accumulated_subcompaction_progress_.proximal_output_level_progress,
       delta_progress.proximal_output_level_progress);
+
+  if (delta_progress.has_blob_compaction_progress) {
+    accumulated_subcompaction_progress_.has_blob_compaction_progress = true;
+    accumulated_subcompaction_progress_.next_blob_file_number =
+        delta_progress.next_blob_file_number;
+    accumulated_subcompaction_progress_.blob_file_additions.insert(
+        accumulated_subcompaction_progress_.blob_file_additions.end(),
+        delta_progress.blob_file_additions.begin(),
+        delta_progress.blob_file_additions.end());
+    accumulated_subcompaction_progress_.blob_file_garbages =
+        delta_progress.blob_file_garbages;
+  }
 }
 
 void SubcompactionProgressBuilder::MaybeMergeDeltaProgressPerLevel(

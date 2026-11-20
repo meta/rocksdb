@@ -27,7 +27,12 @@ public enum ThreadType {
   /**
    * RocksDB BG thread in bottom-pri thread pool
    */
-  BOTTOM_PRIORITY((byte)0x3);
+  BOTTOM_PRIORITY((byte) 0x3),
+
+  /**
+   * RocksDB BG thread in read thread pool.
+   */
+  READ_PRIORITY((byte) 0x4);
 
   private final byte value;
 

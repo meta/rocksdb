@@ -365,7 +365,8 @@ size_t DBImpl::TEST_GetWalPreallocateBlockSize(
   return GetWalPreallocateBlockSize(write_buffer_size);
 }
 
-void DBImpl::TEST_WaitForPeriodicTaskRun(std::function<void()> callback) const {
+void DBImpl::TEST_WaitForPeriodicTaskRun(
+    const std::function<void()>& callback) const {
   periodic_task_scheduler_.TEST_WaitForRun(callback);
 }
 

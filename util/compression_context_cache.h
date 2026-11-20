@@ -31,6 +31,8 @@ class CompressionContextCache {
   static void InitSingleton();
   CompressionContextCache(const CompressionContextCache&) = delete;
   CompressionContextCache& operator=(const CompressionContextCache&) = delete;
+  CompressionContextCache(CompressionContextCache&&) = delete;
+  CompressionContextCache& operator=(CompressionContextCache&&) = delete;
 
   ZSTDUncompressCachedData GetCachedZSTDUncompressData();
   void ReturnCachedZSTDUncompressData(int64_t idx);

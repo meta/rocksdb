@@ -31,6 +31,7 @@
 #include "memory/memory_usage.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
+#include "options/options_helper.h"
 #include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/comparator.h"
@@ -523,9 +524,9 @@ class MemTableIterator : public InternalIterator {
                // NOTE: checking extractor equivalence when not pointer
                // equivalent is arguably too expensive for memtable
                prefix_extractor_ == cf_prefix_extractor &&
-               (read_options.prefix_same_as_start ||
-                (!read_options.total_order_seek &&
-                 !read_options.auto_prefix_mode))) {
+               GetIteratorPrefixMode(read_options,
+                                     /*has_prefix_extractor=*/true) ==
+                   IteratorPrefixMode::kPrefix) {
       // Auto prefix mode is not implemented in memtable yet.
       assert(kind == kPointEntries);
       bloom_ = mem.bloom_filter_.get();
@@ -539,6 +540,8 @@ class MemTableIterator : public InternalIterator {
   // No copying allowed
   MemTableIterator(const MemTableIterator&) = delete;
   void operator=(const MemTableIterator&) = delete;
+  MemTableIterator(MemTableIterator&&) = delete;
+  void operator=(MemTableIterator&&) = delete;
 
   ~MemTableIterator() override {
 #ifndef NDEBUG
@@ -772,6 +775,8 @@ class TimestampStrippingIterator : public InternalIterator {
   // No copying allowed
   TimestampStrippingIterator(const TimestampStrippingIterator&) = delete;
   void operator=(const TimestampStrippingIterator&) = delete;
+  TimestampStrippingIterator(TimestampStrippingIterator&&) = delete;
+  void operator=(TimestampStrippingIterator&&) = delete;
 
   ~TimestampStrippingIterator() override {
     if (arena_mode_) {
@@ -968,7 +973,7 @@ void MemTable::ConstructFragmentedRangeTombstones() {
 
 bool MemTable::AddLogicallyRedundantRangeTombstone(
     SequenceNumber seq, const Slice& start_key, const Slice& end_key,
-    port::RWMutex& ingest_sst_lock) {
+    uint64_t version_number, port::RWMutex& ingest_sst_lock) {
   // Fast path: skip if already immutable.
   if (is_immutable_.LoadRelaxed()) {
     return false;
@@ -1012,6 +1017,11 @@ bool MemTable::AddLogicallyRedundantRangeTombstone(
   if (seq < ingest_seqno_barrier_.LoadRelaxed()) {
     return false;
   }
+  // The iterator's Version predates an ingestion, so the deleted run it saw
+  // can surround ingested keys that it cannot see.
+  if (version_number < ingest_version_barrier_.LoadRelaxed()) {
+    return false;
+  }
 
   MemTablePostProcessInfo post_process_info;
   Status s = Add(seq, kTypeRangeDeletion, start_key, end_key,
@@ -1027,6 +1037,12 @@ bool MemTable::AddLogicallyRedundantRangeTombstone(
 void MemTable::BumpIngestSeqnoBarrier(SequenceNumber y) {
   if (ingest_seqno_barrier_.LoadRelaxed() < y) {
     ingest_seqno_barrier_.StoreRelaxed(y);
+  }
+}
+
+void MemTable::BumpIngestVersionBarrier(uint64_t version_number) {
+  if (ingest_version_barrier_.LoadRelaxed() < version_number) {
+    ingest_version_barrier_.StoreRelaxed(version_number);
   }
 }
 

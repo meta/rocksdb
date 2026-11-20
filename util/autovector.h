@@ -63,8 +63,10 @@ class autovector {
     iterator_impl(TAutoVector* vect, size_t index)
         : vect_(vect), index_(index) {}
     iterator_impl(const iterator_impl&) = default;
-    ~iterator_impl() {}
+    iterator_impl(iterator_impl&&) = default;
+    ~iterator_impl() = default;
     iterator_impl& operator=(const iterator_impl&) = default;
+    iterator_impl& operator=(iterator_impl&&) = default;
 
     // -- Advancement
     // ++iterator

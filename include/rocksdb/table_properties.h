@@ -8,6 +8,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "rocksdb/customizable.h"
@@ -52,9 +53,11 @@ struct TablePropertiesNames {
   static const std::string kIndexKeyIsUserKey;
   static const std::string kIndexValueIsDeltaEncoded;
   static const std::string kUDIIsPrimaryIndex;
+  static const std::string kStandardIndexIsStub;
   static const std::string kFilterSize;
   static const std::string kRawKeySize;
   static const std::string kRawValueSize;
+  static const std::string kReferencedBlobBytes;
   static const std::string kNumDataBlocks;
   static const std::string kNumDataBlocksCompressionRejected;
   static const std::string kNumDataBlocksCompressionBypassed;
@@ -113,7 +116,7 @@ struct TablePropertiesNames {
 // including data loss, unreported corruption, deadlocks, and more.
 class TablePropertiesCollector {
  public:
-  virtual ~TablePropertiesCollector() {}
+  virtual ~TablePropertiesCollector() = default;
 
   // DEPRECATE User defined collector should implement AddUserKey(), though
   //           this old function still works for backward compatible reason.
@@ -207,7 +210,7 @@ class TablePropertiesCollectorFactory : public Customizable {
               _last_level_inclusive_max_seqno_threshold) {}
   };
 
-  ~TablePropertiesCollectorFactory() override {}
+  ~TablePropertiesCollectorFactory() override = default;
   static const char* Type() { return "TablePropertiesCollectorFactory"; }
   static Status CreateFromString(
       const ConfigOptions& options, const std::string& value,
@@ -296,8 +299,12 @@ struct TableProperties {
   // Whether delta encoding is used to encode the index values.
   uint64_t index_value_is_delta_encoded = 0;
   // Whether the UDI is the primary index for reads. The standard index is
-  // still fully populated alongside the UDI.
+  // fully populated alongside the UDI except in kCustomOnly mode, where it is
+  // a minimal stub.
   uint64_t udi_is_primary_index = 0;
+  // Whether the standard index is only a footer-satisfying stub and cannot
+  // serve reads. This is set for kCustomOnly SSTs.
+  uint64_t standard_index_is_stub = 0;
   // the size of filter block.
   uint64_t filter_size = 0;
   // total raw (uncompressed, undelineated) key size
@@ -355,7 +362,9 @@ struct TableProperties {
   uint64_t oldest_key_time = 0;
   // Timestamp of the newest key. 0 means unknown.
   uint64_t newest_key_time = 0;
-  // Actual SST file creation time. 0 means unknown.
+  // When the SST file was built (for block-based tables, when the builder
+  // finished, which is no earlier than when any entry was added to it). 0
+  // means unknown.
   uint64_t file_creation_time = 0;
   // Estimated size of data blocks if compressed using a relatively slower
   // compression algorithm (see `ColumnFamilyOptions::sample_for_compression`).
@@ -478,6 +487,14 @@ struct TableProperties {
   // user collected properties
   UserCollectedProperties user_collected_properties;
   UserCollectedProperties readable_properties;
+
+  // Total physical bytes referenced in separate blob files (excluding blobs
+  // embedded in the SST): compressed payload plus each record's key and header
+  // overhead. nullopt means the count was not recorded, the table format does
+  // not track it, or tracking was unavailable; an engaged zero means no such
+  // references. Add() sums recorded counts, so an aggregate with unknown inputs
+  // can be a partial sum; it stays nullopt if every input is unknown.
+  std::optional<uint64_t> referenced_blob_bytes;
 
   // convert this object to a human readable form
   //   @prop_delim: delimiter for each property.

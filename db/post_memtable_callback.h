@@ -17,7 +17,7 @@ namespace ROCKSDB_NAMESPACE {
 // sequence numbers to readers.
 class PostMemTableCallback {
  public:
-  virtual ~PostMemTableCallback() {}
+  virtual ~PostMemTableCallback() = default;
 
   virtual Status operator()(SequenceNumber seq, bool disable_memtable) = 0;
 };

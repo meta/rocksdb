@@ -61,11 +61,13 @@ class Status {
   bool operator==(const Status& rhs) const;
   bool operator!=(const Status& rhs) const;
 
+  // NOTE: AVOID NEW USES OF THIS FUNCTION
   // In case of intentionally swallowing an error, user must explicitly call
   // this function. That way we are easily able to search the code to find where
   // error swallowing occurs.
   inline void PermitUncheckedError() const { MarkChecked(); }
 
+  // NOTE: AVOID NEW USES OF THIS FUNCTION (slightly better than the previous)
   // Like PermitUncheckedError(), but documents that this Status is expected to
   // be OK and is permitted to go unread (e.g. a default-constructed member that
   // may legitimately never be checked when a feature is unused). Asserts the

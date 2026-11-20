@@ -2187,6 +2187,18 @@ jboolean Java_org_rocksdb_Options_writeDbidToManifest(JNIEnv*, jclass,
   return static_cast<jboolean>(opt->write_dbid_to_manifest);
 }
 
+void Java_org_rocksdb_Options_setTrackOptionsFileNumberInManifest(
+    JNIEnv*, jclass, jlong jhandle, jboolean jtrack) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
+  opt->track_options_file_number_in_manifest = static_cast<bool>(jtrack);
+}
+
+jboolean Java_org_rocksdb_Options_trackOptionsFileNumberInManifest(
+    JNIEnv*, jclass, jlong jhandle) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
+  return static_cast<jboolean>(opt->track_options_file_number_in_manifest);
+}
+
 /*
  * Class:     org_rocksdb_Options
  * Method:    setLogReadaheadSize
@@ -7815,6 +7827,18 @@ jboolean Java_org_rocksdb_DBOptions_writeDbidToManifest(JNIEnv*, jclass,
                                                         jlong jhandle) {
   auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
   return static_cast<jboolean>(opt->write_dbid_to_manifest);
+}
+
+void Java_org_rocksdb_DBOptions_setTrackOptionsFileNumberInManifest(
+    JNIEnv*, jclass, jlong jhandle, jboolean jtrack) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
+  opt->track_options_file_number_in_manifest = static_cast<bool>(jtrack);
+}
+
+jboolean Java_org_rocksdb_DBOptions_trackOptionsFileNumberInManifest(
+    JNIEnv*, jclass, jlong jhandle) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
+  return static_cast<jboolean>(opt->track_options_file_number_in_manifest);
 }
 
 /*

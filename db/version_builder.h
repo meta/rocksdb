@@ -77,6 +77,17 @@ class VersionBuilder {
 
   bool HasMissingFiles() const;
 
+  // Make blob files that are missing on disk never invalidate a Version.
+  // Instead, each such blob file is left out of the saved Version and recorded
+  // in it as a dropped blob file (see
+  // VersionStorageInfo::GetDroppedBlobFiles()), unless no SST file can
+  // reference it. Missing SST files are handled the same way with or without
+  // this, and a blob file left out because it is only linked to missing L0 SST
+  // files is recorded as dropped too.
+  // REQUIRES: track_found_and_missing_files and allow_incomplete_valid_version
+  // are true, and no edit has been applied yet.
+  void RecordMissingBlobFilesAsDropped();
+
   // When applying a sequence of VersionEdits, intermediate files are the ones
   // that are added and then deleted. Returns the tracked files and clears them
   // so that subsequent VersionEdits start with a clean state.
@@ -105,17 +116,12 @@ class VersionBuilder {
   std::unique_ptr<Rep> rep_;
 };
 
-// A wrapper of version builder which references the current version in
-// constructor and unref it in the destructor.
-// Both of the constructor and destructor need to be called inside DB Mutex.
+// A VersionBuilder wrapper that keeps the supplied base Version referenced.
+// Both construction and destruction require the DB mutex.
 class BaseReferencedVersionBuilder {
  public:
-  explicit BaseReferencedVersionBuilder(
-      ColumnFamilyData* cfd, VersionEditHandler* version_edit_handler = nullptr,
-      bool track_found_and_missing_files = false,
-      bool allow_incomplete_valid_version = false);
   BaseReferencedVersionBuilder(
-      ColumnFamilyData* cfd, Version* v,
+      ColumnFamilyData* cfd, Version* base_version,
       VersionEditHandler* version_edit_handler = nullptr,
       bool track_found_and_missing_files = false,
       bool allow_incomplete_valid_version = false);

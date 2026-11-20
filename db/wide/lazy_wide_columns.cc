@@ -73,6 +73,8 @@ class LazyResolveThreadOpScope {
   }
   LazyResolveThreadOpScope(const LazyResolveThreadOpScope&) = delete;
   LazyResolveThreadOpScope& operator=(const LazyResolveThreadOpScope&) = delete;
+  LazyResolveThreadOpScope(LazyResolveThreadOpScope&&) = delete;
+  LazyResolveThreadOpScope& operator=(LazyResolveThreadOpScope&&) = delete;
 };
 
 // Identity of a physical blob record, shared across the batch: two reads that
@@ -165,6 +167,12 @@ class LazyWideColumns::Rep {
   // Emplaced at finalize time (needs the Version). Absent for an unpopulated
   // (e.g. NotFound) result.
   std::optional<ReadPathBlobResolver> resolver_;
+
+  Rep() = default;
+  Rep(const Rep&) = delete;
+  Rep& operator=(const Rep&) = delete;
+  Rep(Rep&&) = delete;
+  Rep& operator=(Rep&&) = delete;
 
   ~Rep() {
     // Releasing the SuperVersion pin (pin_) can trigger obsolete-file cleanup

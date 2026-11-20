@@ -115,7 +115,14 @@ struct IOOptions {
   // rate_limiter_priority
   Env::IOPriority rate_limiter_priority;
 
-  // Type of data being read/written
+  // Type of data being read/written. This is a hint that a FileSystem may
+  // use, e.g. to give small metadata IO priority over bulk data IO. RocksDB
+  // sets IOType::kManifest for IO on MANIFEST files and IOType::kMetadata for
+  // IO on CURRENT, IDENTITY and OPTIONS files and their temporary files, both
+  // in FileOptions::io_options when opening such a file and in the IOOptions
+  // of later IO on it. Other IO, such as WAL, SST and blob file IO, and calls
+  // made through Env APIs (which take no IOOptions) may carry
+  // IOType::kUnknown.
   IOType type;
 
   // EXPERIMENTAL
@@ -280,6 +287,9 @@ struct FileOptions : EnvOptions {
         file_metadata(opts.file_metadata) {}
 
   FileOptions& operator=(const FileOptions&) = default;
+  FileOptions(FileOptions&&) = default;
+  FileOptions& operator=(FileOptions&&) = default;
+  ~FileOptions() = default;
 };
 
 // A structure to pass back some debugging information from the FileSystem
@@ -362,7 +372,7 @@ struct IODebugContext {
   std::string ToString() {
     std::ostringstream ss;
     ss << file_path << ", ";
-    for (auto counter : counters) {
+    for (const auto& counter : counters) {
       ss << counter.first << " = " << counter.second << ",";
     }
     ss << msg;
@@ -407,8 +417,9 @@ class FileSystem : public Customizable {
 
   // No copying allowed
   FileSystem(const FileSystem&) = delete;
+  FileSystem(FileSystem&&) = delete;
 
-  virtual ~FileSystem();
+  ~FileSystem() override;
 
   static const char* Type() { return "FileSystem"; }
   static const char* kDefaultName() { return "DefaultFileSystem"; }
@@ -860,10 +871,21 @@ class FileSystem : public Customizable {
     supported_ops |= (1 << FSSupportedOps::kFSPrefetch);
   }
 
+  // Returns false if this FileSystem never allocates space beyond a file's
+  // logical size (for example, via FSWritableFile::Allocate() or
+  // PrepareWrite()). RocksDB may then skip work whose only purpose is to
+  // release preallocated space, such as reopening and truncating the last
+  // WAL file during DB open. This should reflect the capability of the
+  // FileSystem rather than any per-file options or build configuration,
+  // since files may have been created by a prior process with different
+  // options or a different build. Defaults to true.
+  virtual bool IsPreallocationSupported() { return true; }
+
   // If you're adding methods here, remember to add them to EnvWrapper too.
 
  private:
   void operator=(const FileSystem&);
+  void operator=(FileSystem&&) = delete;
 };
 
 // A file abstraction for reading sequentially through a file
@@ -871,7 +893,7 @@ class FSSequentialFile {
  public:
   FSSequentialFile() {}
 
-  virtual ~FSSequentialFile() {}
+  virtual ~FSSequentialFile() = default;
 
   // Read up to "n" bytes from the file.  "scratch[0..n-1]" may be
   // written by this routine.  Sets "*result" to the data that was
@@ -937,11 +959,11 @@ using FSAllocationPtr = std::unique_ptr<void, std::function<void(void*)>>;
 // A read IO request structure for use in MultiRead and asynchronous Read APIs.
 struct FSReadRequest {
   // Input parameter that represents the file offset in bytes.
-  uint64_t offset;
+  uint64_t offset = 0;
 
   // Input parameter that represents the length to read in bytes. `result` only
   // returns fewer bytes if end of file is hit (or `status` is not OK).
-  size_t len;
+  size_t len = 0;
 
   // A buffer that MultiRead() can optionally place data in. It can
   // ignore this and allocate its own buffer.
@@ -950,7 +972,7 @@ struct FSReadRequest {
   // In case of asynchronous reads, its an output parameter and it will be
   // maintained until callback has been called. Scratch is allocated by RocksDB
   // and will be passed to underlying FileSystem.
-  char* scratch;
+  char* scratch = nullptr;
 
   // Output parameter set by MultiRead() to point to the start of the data
   // buffer.
@@ -991,7 +1013,7 @@ struct FSReadRequest {
   // WARNING: Do NOT assume that fs_scratch points to the start of the actual
   // char* data returned by the read. As the type signature suggests, fs_scratch
   // is a pointer to any arbitrary data type. Use result.data() to get a valid
-  // start to the real data. See https://github.com/facebook/rocksdb/pull/13189
+  // start to the real data. See https://github.com/meta/rocksdb/pull/13189
   // for more context.
   FSAllocationPtr fs_scratch;
 };
@@ -1001,7 +1023,7 @@ class FSRandomAccessFile {
  public:
   FSRandomAccessFile() {}
 
-  virtual ~FSRandomAccessFile() {}
+  virtual ~FSRandomAccessFile() = default;
 
   // Read up to "n" bytes from the file starting at "offset".
   // "scratch[0..n-1]" may be written by this routine.  Sets "*result"
@@ -1460,6 +1482,8 @@ class FSWritableFile {
   // No copying allowed
   FSWritableFile(const FSWritableFile&);
   void operator=(const FSWritableFile&);
+  FSWritableFile(FSWritableFile&&) = delete;
+  void operator=(FSWritableFile&&) = delete;
 
  protected:
   Env::IOPriority io_priority_;
@@ -1475,7 +1499,7 @@ class FSRandomRWFile {
   // For cases when Close() hasn't been called, many derived classes of
   // FSRandomRWFile will need to call Close() non-virtually in their destructor,
   // and ignore the result, to ensure resources are released.
-  virtual ~FSRandomRWFile() {}
+  virtual ~FSRandomRWFile() = default;
 
   // Indicates if the class makes use of direct I/O
   // If false you must pass aligned buffer to Write()
@@ -1545,6 +1569,8 @@ class FSMemoryMappedFileBuffer {
   // movable if desired, however, since
   FSMemoryMappedFileBuffer(const FSMemoryMappedFileBuffer&) = delete;
   FSMemoryMappedFileBuffer& operator=(const FSMemoryMappedFileBuffer&) = delete;
+  FSMemoryMappedFileBuffer(FSMemoryMappedFileBuffer&&) = delete;
+  FSMemoryMappedFileBuffer& operator=(FSMemoryMappedFileBuffer&&) = delete;
 
   void* GetBase() const { return base_; }
   size_t GetLen() const { return length_; }
@@ -1561,7 +1587,7 @@ class FSDirectory {
   // For cases when Close() hasn't been called, many derived classes of
   // FSDirectory will need to call Close() non-virtually in their destructor,
   // and ignore the result, to ensure resources are released.
-  virtual ~FSDirectory() {}
+  virtual ~FSDirectory() = default;
   // Fsync directory. Can be called concurrently from multiple threads.
   virtual IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) = 0;
 
@@ -1624,7 +1650,7 @@ class FileSystemWrapper : public FileSystem {
  public:
   // Initialize an EnvWrapper that delegates all calls to *t
   explicit FileSystemWrapper(const std::shared_ptr<FileSystem>& t);
-  ~FileSystemWrapper() override {}
+  ~FileSystemWrapper() override = default;
 
   // Return the target to which this Env forwards all calls
   FileSystem* target() const { return target_.get(); }
@@ -1850,6 +1876,10 @@ class FileSystemWrapper : public FileSystem {
     return target_->SupportedOps(supported_ops);
   }
 
+  bool IsPreallocationSupported() override {
+    return target_->IsPreallocationSupported();
+  }
+
  protected:
   std::shared_ptr<FileSystem> target_;
 };
@@ -1945,7 +1975,7 @@ class FSRandomAccessFileWrapper : public FSRandomAccessFile {
     return target_->GetTemperature();
   }
 
-  virtual IOStatus GetFileSize(uint64_t* result) override {
+  IOStatus GetFileSize(uint64_t* result) override {
     return target_->GetFileSize(result);
   }
   IOStatus GetFileOpenMetadata(std::string* metadata) override {
@@ -2179,7 +2209,8 @@ IOStatus WriteStringToFile(FileSystem* fs, const Slice& data,
 IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
                           std::string* data);
 
-// A utility routine: read contents of named file into *data
+// A utility routine: read contents of named file into *data. `opts.type` is
+// also used for opening the file.
 IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
                           const IOOptions& opts, std::string* data);
 

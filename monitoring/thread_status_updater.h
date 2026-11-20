@@ -102,7 +102,7 @@ class ThreadStatusUpdater {
   ThreadStatusUpdater() {}
 
   // Releases all ThreadStatusData of all active threads.
-  virtual ~ThreadStatusUpdater() {}
+  virtual ~ThreadStatusUpdater() = default;
 
   // Unregister the current thread.
   void UnregisterThread();

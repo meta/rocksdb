@@ -31,7 +31,7 @@ std::shared_ptr<FileSystem> NewEncryptedFS(
 // blocks). E.g. CTR (Counter operation mode) supports this requirement.
 class BlockAccessCipherStream {
  public:
-  virtual ~BlockAccessCipherStream() {}
+  virtual ~BlockAccessCipherStream() = default;
 
   // BlockSize returns the size of each block supported by this cipher stream.
   virtual size_t BlockSize() = 0;
@@ -66,7 +66,7 @@ class BlockAccessCipherStream {
 // including data loss, unreported corruption, deadlocks, and more.
 class BlockCipher : public Customizable {
  public:
-  virtual ~BlockCipher() {}
+  ~BlockCipher() override = default;
 
   // Creates a new BlockCipher from the input config_options and value
   // The value describes the type of provider (and potentially optional
@@ -113,7 +113,7 @@ class BlockCipher : public Customizable {
 // including data loss, unreported corruption, deadlocks, and more.
 class EncryptionProvider : public Customizable {
  public:
-  virtual ~EncryptionProvider() {}
+  ~EncryptionProvider() override = default;
 
   // Creates a new EncryptionProvider from the input config_options and value.
   // The value describes the type of provider (and potentially optional

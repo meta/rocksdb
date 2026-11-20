@@ -92,7 +92,7 @@ class PlainInternalKeyComparator : public InternalKeyComparator {
   explicit PlainInternalKeyComparator(const Comparator* c)
       : InternalKeyComparator(c) {}
 
-  virtual ~PlainInternalKeyComparator() {}
+  ~PlainInternalKeyComparator() override {}
 
   int Compare(const Slice& a, const Slice& b) const override {
     return user_comparator()->Compare(a, b);
@@ -148,10 +148,7 @@ class StringSink : public FSWritableFile {
   std::string contents_;
 
   explicit StringSink(Slice* reader_contents = nullptr)
-      : FSWritableFile(),
-        contents_(""),
-        reader_contents_(reader_contents),
-        last_flush_(0) {
+      : FSWritableFile(), reader_contents_(reader_contents), last_flush_(0) {
     if (reader_contents_ != nullptr) {
       *reader_contents_ = Slice(contents_.data(), 0);
     }
@@ -259,10 +256,7 @@ class RandomRWStringSink : public FSRandomRWFile {
 class OverwritingStringSink : public FSWritableFile {
  public:
   explicit OverwritingStringSink(Slice* reader_contents)
-      : FSWritableFile(),
-        contents_(""),
-        reader_contents_(reader_contents),
-        last_flush_(0) {}
+      : FSWritableFile(), reader_contents_(reader_contents), last_flush_(0) {}
 
   const std::string& contents() const { return contents_; }
 
@@ -295,7 +289,9 @@ class OverwritingStringSink : public FSWritableFile {
   }
   void Drop(size_t bytes) {
     contents_.resize(contents_.size() - bytes);
-    if (last_flush_ > contents_.size()) last_flush_ = contents_.size();
+    if (last_flush_ > contents_.size()) {
+      last_flush_ = contents_.size();
+    }
   }
 
   uint64_t GetFileSize(const IOOptions& /*options*/,
@@ -318,7 +314,7 @@ class StringSource : public FSRandomAccessFile {
         mmap_(mmap),
         total_reads_(0) {}
 
-  virtual ~StringSource() {}
+  ~StringSource() override {}
 
   uint64_t Size() const { return contents_.size(); }
 
@@ -812,8 +808,9 @@ struct CompressorCustomAlg : public CompressorWrapper {
 struct DecompressorCustomAlg : public DecompressorWrapper {
   using TypeSet = SmallEnumSet<CompressionType, kDisableCompressionOption>;
 
-  DecompressorCustomAlg(std::shared_ptr<Decompressor> wrapped =
-                            GetBuiltinV2CompressionManager()->GetDecompressor())
+  explicit DecompressorCustomAlg(
+      std::shared_ptr<Decompressor> wrapped =
+          GetBuiltinV2CompressionManager()->GetDecompressor())
       : DecompressorWrapper(std::move(wrapped)),
         dictionary_hash_(GetSliceHash(wrapped_->GetSerializedDict())),
         allowed_types_(TypeSet::All()) {}
@@ -900,7 +897,7 @@ class ChanglingMergeOperator : public MergeOperator {
  public:
   explicit ChanglingMergeOperator(const std::string& name)
       : name_(name + "MergeOperator") {}
-  ~ChanglingMergeOperator() {}
+  ~ChanglingMergeOperator() override {}
 
   void SetName(const std::string& name) { name_ = name; }
 
@@ -939,7 +936,7 @@ class ChanglingCompactionFilter : public CompactionFilter {
  public:
   explicit ChanglingCompactionFilter(const std::string& name)
       : name_(name + "CompactionFilter") {}
-  ~ChanglingCompactionFilter() {}
+  ~ChanglingCompactionFilter() override {}
 
   void SetName(const std::string& name) { name_ = name; }
 
@@ -975,7 +972,7 @@ class ChanglingCompactionFilterFactory : public CompactionFilterFactory {
  public:
   explicit ChanglingCompactionFilterFactory(const std::string& name)
       : name_(name + "CompactionFilterFactory") {}
-  ~ChanglingCompactionFilterFactory() {}
+  ~ChanglingCompactionFilterFactory() override {}
 
   void SetName(const std::string& name) { name_ = name; }
 

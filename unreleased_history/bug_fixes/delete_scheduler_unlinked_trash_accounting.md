@@ -1,1 +1,0 @@
-Fixed two more `SstFileManager` trash accounting leaks: retrying a failed trash deletion immediately (for example with rate limiting disabled) after the file had disappeared, and a trash file that was deleted but whose directory sync then failed. In both cases the file's size stayed in the total trash size and tracked size until restart.

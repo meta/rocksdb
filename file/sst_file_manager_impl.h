@@ -33,8 +33,10 @@ class SstFileManagerImpl : public SstFileManager {
   // No copy
   SstFileManagerImpl(const SstFileManagerImpl& sfm) = delete;
   SstFileManagerImpl& operator=(const SstFileManagerImpl& sfm) = delete;
+  SstFileManagerImpl(SstFileManagerImpl&&) = delete;
+  SstFileManagerImpl& operator=(SstFileManagerImpl&&) = delete;
 
-  ~SstFileManagerImpl();
+  ~SstFileManagerImpl() override;
 
   // DB will call OnAddFile whenever a new sst/blob file is added.
   Status OnAddFile(const std::string& file_path);
@@ -115,7 +117,7 @@ class SstFileManagerImpl : public SstFileManager {
 
   // Set a flag upon encountering disk full. May enqueue the ErrorHandler
   // instance for background polling and recovery
-  void StartErrorRecovery(ErrorHandler* db, Status bg_error);
+  void StartErrorRecovery(ErrorHandler* db, const Status& bg_error);
 
   // Remove the given Errorhandler instance from the recovery queue. Its
   // not guaranteed

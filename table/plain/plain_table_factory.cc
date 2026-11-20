@@ -14,6 +14,7 @@
 #include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
+#include "table/format.h"
 #include "table/plain/plain_table_builder.h"
 #include "table/plain/plain_table_reader.h"
 #include "util/string_util.h"
@@ -52,6 +53,18 @@ static std::unordered_map<std::string, OptionTypeInfo> plain_table_type_info = {
 PlainTableFactory::PlainTableFactory(const PlainTableOptions& options)
     : table_options_(options) {
   RegisterOptions(&table_options_, &plain_table_type_info);
+}
+
+Status PlainTableFactory::FileIsValidTable(const IOOptions& io_options,
+                                           FSRandomAccessFile& file,
+                                           uint64_t file_size,
+                                           bool* matches) const {
+  uint64_t magic_number;
+  Status status =
+      ReadTableMagicNumber(io_options, file, file_size, &magic_number);
+  *matches = status.ok() && (magic_number == kPlainTableMagicNumber ||
+                             magic_number == kLegacyPlainTableMagicNumber);
+  return status;
 }
 
 Status PlainTableFactory::NewTableReader(
@@ -203,6 +216,22 @@ static int RegisterBuiltinMemTableRepFactory(ObjectLibrary& library,
           guard->reset(NewHashSkipListRepFactory(hash_bucket_count));
         } else {
           guard->reset(NewHashSkipListRepFactory());
+        }
+        return guard->get();
+      });
+  library.AddFactory<MemTableRepFactory>(
+      AsPattern("SortedHashRepFactory", "sorted_hash"),
+      [](const std::string& uri, std::unique_ptr<MemTableRepFactory>* guard,
+         std::string* /*errmsg*/) {
+        // Expecting format: sorted_hash:<bucket_count>. Without a count,
+        // bucket_count must come from the options string and is validated
+        // when the column family is opened.
+        auto colon = uri.find(':');
+        if (colon != std::string::npos) {
+          size_t hash_bucket_count = ParseSizeT(uri.substr(colon + 1));
+          guard->reset(NewSortedHashRepFactory(hash_bucket_count));
+        } else {
+          guard->reset(NewSortedHashRepFactory(0));
         }
         return guard->get();
       });

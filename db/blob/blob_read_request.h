@@ -60,6 +60,9 @@ struct BlobReadRequest {
   BlobReadRequest() = default;
   BlobReadRequest(const BlobReadRequest& other) = default;
   BlobReadRequest& operator=(const BlobReadRequest& other) = default;
+  BlobReadRequest(BlobReadRequest&& other) = default;
+  BlobReadRequest& operator=(BlobReadRequest&& other) = default;
+  ~BlobReadRequest() = default;
 };
 
 using BlobFileReadRequests =

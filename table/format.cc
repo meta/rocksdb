@@ -30,6 +30,7 @@
 #include "table/persistent_cache_helper.h"
 #include "test_util/sync_point.h"
 #include "unique_id_impl.h"
+#include "util/aligned_buffer.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/compression.h"
@@ -46,6 +47,42 @@ const char* const kHostnameForDbHostId = "__hostname__";
 bool ShouldReportDetailedTime(Env* env, Statistics* stats) {
   return env != nullptr && stats != nullptr &&
          stats->get_stats_level() > kExceptDetailedTimers;
+}
+
+Status ReadTableMagicNumber(const IOOptions& io_options,
+                            FSRandomAccessFile& file, uint64_t file_size,
+                            uint64_t* magic_number) {
+  *magic_number = 0;
+  if (file_size < kMagicNumberLengthByte) {
+    return Status::OK();
+  }
+  char scratch[kMagicNumberLengthByte];
+  char* read_scratch = scratch;
+  uint64_t read_offset = file_size - kMagicNumberLengthByte;
+  size_t prefix_size = 0;
+  size_t read_size = kMagicNumberLengthByte;
+  AlignedBuffer aligned_buffer;
+  if (file.use_direct_io()) {
+    const size_t alignment = file.GetRequiredBufferAlignment();
+    const uint64_t aligned_offset = read_offset & ~(uint64_t{alignment} - 1);
+    prefix_size = static_cast<size_t>(read_offset - aligned_offset);
+    read_offset = aligned_offset;
+    read_size = Roundup(prefix_size + kMagicNumberLengthByte, alignment);
+    aligned_buffer.Alignment(alignment);
+    aligned_buffer.AllocateNewBuffer(read_size);
+    read_scratch = aligned_buffer.BufferStart();
+  }
+  Slice result;
+  Status status = file.Read(read_offset, read_size, io_options, &result,
+                            read_scratch, nullptr);
+  if (!status.ok()) {
+    return status;
+  }
+  if (result.size() < prefix_size + kMagicNumberLengthByte) {
+    return Status::Corruption("Truncated table format signature");
+  }
+  *magic_number = DecodeFixed64(result.data() + prefix_size);
+  return Status::OK();
 }
 
 void BlockHandle::EncodeTo(std::string* dst) const {
@@ -257,10 +294,10 @@ inline uint8_t BlockTrailerSizeForMagicNumber(uint64_t magic_number) {
 //        -> format_version >= 8
 //           - Top 16 bits are number of bytes gap between start of footer and
 //             end of metaindex block (space for future file checksum data)
-//      <zero padding> (24 bytes, reserved for future use)
+//      <zero padding> (16 bytes, reserved for future use)
+//      incompatible feature flags (uint64LE, 8 bytes)
 //        - Brings part2 size also to 40 bytes
-//        - Checked that last eight bytes == 0, so reserved for a future
-//          incompatible feature (but under format_version=6)
+//        - Unknown non-zero bits are rejected by readers
 // * Part3
 //   -> format_version == 0 (inferred from legacy magic number)
 //      legacy magic number (8 bytes)
@@ -275,10 +312,20 @@ Status FooterBuilder::Build(uint64_t magic_number, uint32_t format_version,
                             uint64_t footer_offset, ChecksumType checksum_type,
                             const BlockHandle& metaindex_handle,
                             const BlockHandle& index_handle,
-                            uint32_t base_context_checksum) {
+                            uint32_t base_context_checksum,
+                            uint64_t incompatible_features) {
   assert(magic_number != Footer::kNullTableMagicNumber);
   assert(IsSupportedFormatVersionForWrite(magic_number, format_version) ||
          TEST_AllowUnsupportedFormatVersion());
+  if (format_version < 6 && incompatible_features != 0) {
+    return Status::InvalidArgument(
+        "incompatible footer features require format_version >= 6");
+  }
+  if ((incompatible_features & ~kKnownFooterFeatures) != 0) {
+    return Status::InvalidArgument(
+        "unsupported incompatible footer features: " +
+        std::to_string(incompatible_features & ~kKnownFooterFeatures));
+  }
 
   char* part2;
   char* part3;
@@ -369,9 +416,13 @@ Status FooterBuilder::Build(uint64_t magic_number, uint32_t format_version,
     }
     cur += 4;
 
-    // Zero pad remainder (for future use)
-    std::fill_n(cur, 24U, char{0});
-    assert(cur + 24 == part3);
+    // Zero pad reserved bytes, then write incompatible feature flags. Older
+    // readers reject any non-zero flags.
+    std::fill_n(cur, 16U, char{0});
+    cur += 16;
+    EncodeFixed64(cur, incompatible_features);
+    cur += sizeof(uint64_t);
+    assert(cur == part3);
 
     // Compute checksum, add context
     uint32_t checksum = ComputeBuiltinChecksum(
@@ -466,7 +517,7 @@ Status Footer::DecodeFrom(Slice input, uint64_t input_offset,
     }
     // This is the most convenient place to compute the checksum
     if (checksum_type_ != kNoChecksum && format_version_ >= 6) {
-      std::array<char, kNewVersionsEncodedLength> copy_without_checksum;
+      std::array<char, kNewVersionsEncodedLength> copy_without_checksum{};
       std::copy_n(input.data(), kNewVersionsEncodedLength,
                   copy_without_checksum.data());
       EncodeFixed32(&copy_without_checksum[5], 0);  // Clear embedded checksum
@@ -487,7 +538,8 @@ Status Footer::DecodeFrom(Slice input, uint64_t input_offset,
                                 ext_magic.ToString(/*hex*/ true));
     }
     input.remove_prefix(4);
-    uint32_t stored_checksum = 0, metaindex_size = 0;
+    uint32_t stored_checksum = 0;
+    uint32_t metaindex_size = 0;
     bool success;
     success = GetFixed32(&input, &stored_checksum);
     assert(success);
@@ -526,14 +578,14 @@ Status Footer::DecodeFrom(Slice input, uint64_t input_offset,
     // 16 bytes of unchecked reserved padding
     input.remove_prefix(16U);
 
-    // 8 bytes of checked reserved padding (expected to be zero unless using a
-    // future feature).
-    uint64_t reserved = 0;
-    success = GetFixed64(&input, &reserved);
+    success = GetFixed64(&input, &incompatible_features_);
     assert(success);
-    if (UNLIKELY(reserved != 0)) {
+    const uint64_t unknown_features =
+        incompatible_features_ & ~kKnownFooterFeatures;
+    if (UNLIKELY(unknown_features != 0)) {
       return Status::NotSupported(
-          "File uses a future feature not supported in this version");
+          "File uses unsupported incompatible footer features: " +
+          std::to_string(unknown_features));
     }
     // End of part 2
     assert(input.data() == part3_ptr);
@@ -565,6 +617,10 @@ std::string Footer::ToString() const {
                 "\n  ");
   if (!IsLegacyFooterFormat(table_magic_number_)) {
     result.append("format version: " + std::to_string(format_version_) + "\n");
+    if (incompatible_features_ != 0) {
+      result.append("  incompatible features: " +
+                    std::to_string(incompatible_features_) + "\n");
+    }
   }
   return result;
 }
@@ -604,7 +660,7 @@ static Status ReadFooterFromFileInternal(
                               file->file_name());
   }
 
-  std::array<char, Footer::kMaxEncodedLength + 1> footer_buf;
+  std::array<char, Footer::kMaxEncodedLength + 1> footer_buf{};
   AlignedBuffer direct_io_buffer;
   Slice footer_input;
   uint64_t read_offset = (expected_file_size > Footer::kMaxEncodedLength)
@@ -717,7 +773,8 @@ uint32_t ComputeBuiltinChecksum(ChecksumType type, const char* data,
         return ModifyChecksumForLastByte(v, data[data_size - 1]);
       }
     }
-    default:  // including kNoChecksum
+    case kNoChecksum:
+    default:
       return 0;
   }
 }
@@ -760,7 +817,8 @@ uint32_t ComputeBuiltinChecksumWithLastByte(ChecksumType type, const char* data,
       uint32_t v = Lower32of64(XXH3_64bits(data, data_size));
       return ModifyChecksumForLastByte(v, last_byte);
     }
-    default:  // including kNoChecksum
+    case kNoChecksum:
+    default:
       return 0;
   }
 }

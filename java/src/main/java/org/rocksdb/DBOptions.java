@@ -1182,6 +1182,18 @@ public class DBOptions extends RocksObject
   }
 
   @Override
+  public DBOptions setTrackOptionsFileNumberInManifest(final boolean track) {
+    setTrackOptionsFileNumberInManifest(nativeHandle_, track);
+    return this;
+  }
+
+  @Override
+  public boolean trackOptionsFileNumberInManifest() {
+    assert (isOwningHandle());
+    return trackOptionsFileNumberInManifest(nativeHandle_);
+  }
+
+  @Override
   public DBOptions setLogReadaheadSize(final long logReadaheadSize) {
     setLogReadaheadSize(nativeHandle_, logReadaheadSize);
     return this;
@@ -1443,6 +1455,9 @@ public class DBOptions extends RocksObject
   private static native void setWriteDbidToManifest(
       final long handle, final boolean writeDbidToManifest);
   private static native boolean writeDbidToManifest(final long handle);
+  private static native void setTrackOptionsFileNumberInManifest(
+      final long handle, final boolean track);
+  private static native boolean trackOptionsFileNumberInManifest(final long handle);
   private static native void setLogReadaheadSize(final long handle, final long logReadaheadSize);
   private static native long logReadaheadSize(final long handle);
   private static native void setBestEffortsRecovery(

@@ -191,7 +191,8 @@ bool DbUndumpTool::Run(const UndumpOptions& undump_options,
   std::unique_ptr<char[]> valscratch(new char[last_valsize]);
 
   while (true) {
-    uint32_t keysize, valsize;
+    uint32_t keysize;
+    uint32_t valsize;
     ROCKSDB_NAMESPACE::Slice keyslice;
     ROCKSDB_NAMESPACE::Slice valslice;
 

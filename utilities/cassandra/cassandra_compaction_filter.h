@@ -43,7 +43,7 @@ class CassandraCompactionFilterFactory : public CompactionFilterFactory {
  public:
   explicit CassandraCompactionFilterFactory(bool purge_ttl_on_expiration,
                                             int32_t gc_grace_period_in_seconds);
-  ~CassandraCompactionFilterFactory() override {}
+  ~CassandraCompactionFilterFactory() override = default;
 
   std::unique_ptr<CompactionFilter> CreateCompactionFilter(
       const CompactionFilter::Context& context) override;

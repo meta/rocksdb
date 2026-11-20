@@ -55,8 +55,6 @@ namespace ROCKSDB_NAMESPACE {
  */
 class Customizable : public Configurable {
  public:
-  ~Customizable() override {}
-
   // Returns the name of this class of Customizable
   virtual const char* Name() const = 0;
 

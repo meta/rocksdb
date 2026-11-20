@@ -12,7 +12,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 // Represents the types of blocks used in the block based table format.
-// See https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format
+// See https://github.com/meta/rocksdb/wiki/Rocksdb-BlockBasedTable-Format
 // for details.
 // For code sanity, BlockType should imply a specific TBlocklike for
 // BlocklikeTraits.

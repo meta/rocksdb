@@ -41,6 +41,8 @@ class PessimisticTransaction : public TransactionBaseImpl {
   // No copying allowed
   PessimisticTransaction(const PessimisticTransaction&) = delete;
   void operator=(const PessimisticTransaction&) = delete;
+  PessimisticTransaction(PessimisticTransaction&&) = delete;
+  void operator=(PessimisticTransaction&&) = delete;
 
   ~PessimisticTransaction() override;
 
@@ -72,11 +74,17 @@ class PessimisticTransaction : public TransactionBaseImpl {
     std::lock_guard<std::mutex> lock(wait_mutex_);
     std::vector<TransactionID> ids(waiting_txn_ids_.size());
     if (timed_out_key_.has_value()) {
-      if (key) *key = timed_out_key_.value();
+      if (key) {
+        *key = timed_out_key_.value();
+      }
     } else {
-      if (key) *key = waiting_key_ ? *waiting_key_ : "";
+      if (key) {
+        *key = waiting_key_ ? *waiting_key_ : "";
+      }
     }
-    if (column_family_id) *column_family_id = waiting_cf_id_;
+    if (column_family_id) {
+      *column_family_id = waiting_cf_id_;
+    }
     std::copy(waiting_txn_ids_.begin(), waiting_txn_ids_.end(), ids.begin());
     return ids;
   }
@@ -245,6 +253,8 @@ class WriteCommittedTxn : public PessimisticTransaction {
   // No copying allowed
   WriteCommittedTxn(const WriteCommittedTxn&) = delete;
   void operator=(const WriteCommittedTxn&) = delete;
+  WriteCommittedTxn(WriteCommittedTxn&&) = delete;
+  void operator=(WriteCommittedTxn&&) = delete;
 
   ~WriteCommittedTxn() override {}
 

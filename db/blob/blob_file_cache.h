@@ -34,6 +34,10 @@ class BlobFileCache {
 
   BlobFileCache(const BlobFileCache&) = delete;
   BlobFileCache& operator=(const BlobFileCache&) = delete;
+  BlobFileCache(BlobFileCache&&) = delete;
+  BlobFileCache& operator=(BlobFileCache&&) = delete;
+
+  ~BlobFileCache() = default;
 
   // Returns a cached reader for `blob_file`, opening and caching it on miss.
   // Checksum metadata is forwarded to the FileSystem through FileOptions when

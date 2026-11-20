@@ -69,7 +69,7 @@ using LBA = LogicalBlockAddress;
 class Writer {
  public:
   explicit Writer(PersistentCacheTier* const cache) : cache_(cache) {}
-  virtual ~Writer() {}
+  virtual ~Writer() = default;
 
   // write buffer to file at the given offset
   virtual void Write(WritableFile* const file, CacheWriteBuffer* buf,
@@ -96,7 +96,7 @@ class BlockCacheFile : public LRUElement<BlockCacheFile> {
         dir_(dir),
         cache_id_(cache_id) {}
 
-  virtual ~BlockCacheFile() {}
+  ~BlockCacheFile() override = default;
 
   // append key/value to file and return LBA locator to user
   virtual bool Append(const Slice& /*key*/, const Slice& /*val*/,
@@ -148,7 +148,7 @@ class RandomAccessCacheFile : public BlockCacheFile {
                                  const std::shared_ptr<Logger>& log)
       : BlockCacheFile(env, dir, cache_id), log_(log) {}
 
-  virtual ~RandomAccessCacheFile() {}
+  ~RandomAccessCacheFile() override = default;
 
   // open file for reading
   bool Open(const bool enable_direct_reads);
@@ -181,7 +181,7 @@ class WriteableCacheFile : public RandomAccessCacheFile {
         writer_(writer),
         max_size_(max_size) {}
 
-  virtual ~WriteableCacheFile();
+  ~WriteableCacheFile() override;
 
   // create file on disk
   bool Create(const bool enable_direct_writes, const bool enable_direct_reads);
@@ -254,11 +254,14 @@ class ThreadedWriter : public Writer {
   struct IO {
     explicit IO(const bool signal) : signal_(signal) {}
     explicit IO(WritableFile* const file, CacheWriteBuffer* const buf,
-                const uint64_t file_off, const std::function<void()> callback)
+                const uint64_t file_off, const std::function<void()>& callback)
         : file_(file), buf_(buf), file_off_(file_off), callback_(callback) {}
 
     IO(const IO&) = default;
     IO& operator=(const IO&) = default;
+    IO(IO&&) = default;
+    IO& operator=(IO&&) = default;
+    ~IO() = default;
     size_t Size() const { return sizeof(IO); }
 
     WritableFile* file_ = nullptr;     // File to write to
@@ -270,7 +273,13 @@ class ThreadedWriter : public Writer {
 
   explicit ThreadedWriter(PersistentCacheTier* const cache, const size_t qdepth,
                           const size_t io_size);
-  virtual ~ThreadedWriter() { assert(threads_.empty()); }
+  ~ThreadedWriter() override { assert(threads_.empty()); }
+
+  // No copying allowed
+  ThreadedWriter(const ThreadedWriter&) = delete;
+  ThreadedWriter& operator=(const ThreadedWriter&) = delete;
+  ThreadedWriter(ThreadedWriter&&) = delete;
+  ThreadedWriter& operator=(ThreadedWriter&&) = delete;
 
   void Stop() override;
   void Write(WritableFile* const file, CacheWriteBuffer* buf,

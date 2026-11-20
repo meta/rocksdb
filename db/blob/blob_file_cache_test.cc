@@ -138,7 +138,7 @@ TEST_F(BlobFileCacheTest, GetBlobFileReader) {
   ASSERT_EQ(first.GetValue(), second.GetValue());
 }
 
-TEST_F(BlobFileCacheTest, GetBlobFileReader_Race) {
+TEST_F(BlobFileCacheTest, GetBlobFileReaderRace) {
   Options options;
   options.env = mock_env_.get();
   options.statistics = CreateDBStatistics();
@@ -289,7 +289,7 @@ TEST_F(BlobFileCacheTest, RefreshBlobFileReaderPrefersLargestObservedFileSize) {
   ASSERT_EQ(stale_reader.get(), nullptr);
 }
 
-TEST_F(BlobFileCacheTest, GetBlobFileReader_IOError) {
+TEST_F(BlobFileCacheTest, GetBlobFileReaderIOError) {
   Options options;
   options.env = mock_env_.get();
   options.statistics = CreateDBStatistics();
@@ -326,7 +326,7 @@ TEST_F(BlobFileCacheTest, GetBlobFileReader_IOError) {
   ASSERT_EQ(options.statistics->getTickerCount(NO_FILE_ERRORS), 1);
 }
 
-TEST_F(BlobFileCacheTest, GetBlobFileReader_CacheFull) {
+TEST_F(BlobFileCacheTest, GetBlobFileReaderCacheFull) {
   Options options;
   options.env = mock_env_.get();
   options.statistics = CreateDBStatistics();

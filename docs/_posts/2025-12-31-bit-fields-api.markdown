@@ -11,7 +11,7 @@ To address this in RocksDB, we have developed a reusable **BitFields API**, a ty
 
 ## The Problem: Managing Packed Bit Fields
 
-Consider HyperClockCache, an essentially lock-free cache implementation in RocksDB, which was [refactored to use this BitFields API](https://github.com/facebook/rocksdb/pull/14154). It is a hash table built on *slots* that can each hold a cache entry and relevant metadata. For atomic simplicity and efficiency, all the essential metadata for each slot is packed into a single 64-bit value:
+Consider HyperClockCache, an essentially lock-free cache implementation in RocksDB, which was [refactored to use this BitFields API](https://github.com/meta/rocksdb/pull/14154). It is a hash table built on *slots* that can each hold a cache entry and relevant metadata. For atomic simplicity and efficiency, all the essential metadata for each slot is packed into a single 64-bit value:
 - The reference count and eviction metadata are together encoded into *acquire* and *release* counters, 30 bits each.
 - The possible states of {*empty*, *under construction/destruction*, *occupied+visible*, and *occupied+invisible*} are encoded into three state bits (instead of two, for easier decoding and manipulation).
 - A *hit* bit is used for secondary cache integration.

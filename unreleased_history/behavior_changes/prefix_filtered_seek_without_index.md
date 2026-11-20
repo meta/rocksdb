@@ -1,0 +1,1 @@
+With `ReadOptions::read_tier = kBlockCacheTier`, a prefix seek into an SST file below L0 whose prefix filter rules out the seek now succeeds instead of returning `Status::Incomplete()` when that file's index block is not in the block cache.

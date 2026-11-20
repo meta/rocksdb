@@ -87,6 +87,10 @@ struct LRUHandle : public Cache::Handle {
     IM_IS_STANDALONE = (1 << 2),
   };
 
+  // total_charge sentinel for a standalone entry that added nothing to usage_
+  // (strict cache full, created with allow_uncharged).
+  static constexpr size_t kUnchargedStandaloneTotalCharge = 0;
+
   // Beginning of the key (MUST BE THE LAST FIELD IN THIS STRUCT!)
   char key_data[1];
 
@@ -196,6 +200,10 @@ struct LRUHandle : public Cache::Handle {
 
   inline size_t GetCharge(
       CacheMetadataChargePolicy metadata_charge_policy) const {
+    if (IsStandalone() && total_charge == kUnchargedStandaloneTotalCharge) {
+      // Documented to report 0; no metadata was charged.
+      return 0;
+    }
     size_t meta_charge = CalcuMetaCharge(metadata_charge_policy);
     assert(total_charge >= meta_charge);
     return total_charge - meta_charge;

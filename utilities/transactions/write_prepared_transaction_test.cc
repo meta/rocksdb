@@ -319,7 +319,8 @@ TEST(CommitEntry64b, BasicTest) {
         uint64_t p = base + i + d;
         for (uint64_t c : {p, p + d / 2, p + d}) {
           uint64_t index = p % INDEX_SIZE;
-          CommitEntry before(p, c), after;
+          CommitEntry before(p, c);
+          CommitEntry after;
           CommitEntry64b entry64b(before, FORMAT);
           ok = entry64b.Parse(index, &after, FORMAT);
           ASSERT_TRUE(ok);
@@ -569,6 +570,48 @@ TEST_P(WritePreparedTransactionTest, SnapshotNewerVersionMetadataNotSupported) {
       read_options, keys, &values, &multiget_output_metadata);
   ASSERT_TRUE(statuses[0].IsNotSupported());
 
+  PinnableWideColumns get_entity_result;
+  ASSERT_TRUE(db->GetEntityWithMetadata(read_options, "key", &get_entity_result,
+                                        &output_metadata)
+                  .IsNotSupported());
+
+  PinnableWideColumns entity_result;
+  Status entity_status;
+  db->MultiGetEntityWithMetadata(read_options, db->DefaultColumnFamily(),
+                                 keys.size(), keys.data(), &entity_result,
+                                 &entity_status, &multiget_output_metadata);
+  ASSERT_TRUE(entity_status.IsNotSupported()) << entity_status.ToString();
+
+  PinnableAttributeGroups attribute_groups;
+  attribute_groups.emplace_back(db->DefaultColumnFamily());
+  db->MultiGetEntityWithMetadata(read_options, keys.size(), keys.data(),
+                                 &attribute_groups, &multiget_output_metadata);
+  ASSERT_TRUE(attribute_groups[0].status().IsNotSupported())
+      << attribute_groups[0].status().ToString();
+
+  // Without an explicit snapshot, the base DB defaults forward to GetEntity /
+  // MultiGetEntity and leave newer_version_present false.
+  const WideColumns expected_columns{{kDefaultWideColumnName, "value"}};
+  ASSERT_OK(db->GetEntityWithMetadata(ReadOptions(), "key", &get_entity_result,
+                                      &output_metadata));
+  ASSERT_EQ(get_entity_result.columns(), expected_columns);
+  ASSERT_FALSE(*output_metadata.newer_version_present);
+
+  db->MultiGetEntityWithMetadata(ReadOptions(), db->DefaultColumnFamily(),
+                                 keys.size(), keys.data(), &entity_result,
+                                 &entity_status, &multiget_output_metadata);
+  ASSERT_OK(entity_status);
+  ASSERT_EQ(entity_result.columns(), expected_columns);
+  ASSERT_EQ(*multiget_output_metadata.newer_version_present,
+            std::vector<uint8_t>{0});
+
+  db->MultiGetEntityWithMetadata(ReadOptions(), keys.size(), keys.data(),
+                                 &attribute_groups, &multiget_output_metadata);
+  ASSERT_OK(attribute_groups[0].status());
+  ASSERT_EQ(attribute_groups[0].columns(), expected_columns);
+  ASSERT_EQ(*multiget_output_metadata.newer_version_present,
+            std::vector<uint8_t>{0});
+
   db->ReleaseSnapshot(snapshot);
 }
 
@@ -645,7 +688,7 @@ class SeqAdvanceConcurrentTest
         split_id_(std::get<4>(GetParam())),
         split_cnt_(std::get<5>(GetParam())) {
     special_env.skip_fsync_ = true;
-  };
+  }
 
  protected:
   // A test is split into split_cnt_ tests, each identified with split_id_ where
@@ -795,6 +838,8 @@ INSTANTIATE_TEST_CASE_P(
 
 #if USE_COROUTINES
 TEST_P(WritePreparedTransactionTest, CoroutineReadsDoNotExposeUncommittedData) {
+  options.read_io_executor_threads = 1;
+  ASSERT_OK(ReOpen());
   ASSERT_OK(db->Put(WriteOptions(), "key", "committed"));
   std::unique_ptr<Transaction> transaction(
       db->BeginTransaction(WriteOptions()));
@@ -832,7 +877,8 @@ TEST_P(WritePreparedTransactionTest, CommitMap) {
   ASSERT_NE(wp_db, nullptr);
   ASSERT_NE(wp_db->db_impl_, nullptr);
   size_t size = wp_db->COMMIT_CACHE_SIZE;
-  CommitEntry c = {5, 12}, e;
+  CommitEntry c = {5, 12};
+  CommitEntry e;
   bool evicted = wp_db->AddCommitEntry(c.prep_seq % size, c, &e);
   ASSERT_FALSE(evicted);
 
@@ -884,7 +930,10 @@ TEST_P(WritePreparedTransactionTest, MaybeUpdateOldCommitMap) {
   // nonexistence could be interpreted as committed in the snapshot while it is
   // not true. We keep such entries around by adding them to the
   // old_commit_map_.
-  uint64_t p /*prepare*/, c /*commit*/, s /*snapshot*/, ns /*next_snapshot*/;
+  uint64_t p /*prepare*/;
+  uint64_t c /*commit*/;
+  uint64_t s /*snapshot*/;
+  uint64_t ns /*next_snapshot*/;
   p = 10l, c = 15l, s = 20l, ns = 21l;
   MaybeUpdateOldCommitMapTestWithNext(p, c, s, ns, false);
   // If we do not expect the old commit map to be updated, try also with a next
@@ -1122,7 +1171,7 @@ TEST_P(WritePreparedTransactionTest, DoubleSnapshot) {
   wp_db->ReleaseSnapshot(snapshot3);
 }
 
-size_t UniqueCnt(std::vector<SequenceNumber> vec) {
+size_t UniqueCnt(const std::vector<SequenceNumber>& vec) {
   std::set<SequenceNumber> aset;
   for (auto i : vec) {
     aset.insert(i);
@@ -1721,7 +1770,8 @@ TEST_P(WritePreparedTransactionTest, SmallestUnCommittedSeq) {
   PinnableSlice pinnable_val;
   WriteOptions write_options;
   TransactionOptions txn_options;
-  std::vector<Transaction*> txns, committed_txns;
+  std::vector<Transaction*> txns;
+  std::vector<Transaction*> committed_txns;
 
   const int cnt = 100;
   for (int i = 0; i < cnt; i++) {
@@ -2322,7 +2372,7 @@ TEST_P(WritePreparedTransactionTest, IsInSnapshot) {
   }
 }
 
-void ASSERT_SAME(ReadOptions roptions, TransactionDB* db, Status exp_s,
+void ASSERT_SAME(ReadOptions roptions, TransactionDB* db, const Status& exp_s,
                  PinnableSlice& exp_v, Slice key) {
   Status s;
   PinnableSlice v;
@@ -2347,7 +2397,7 @@ void ASSERT_SAME(ReadOptions roptions, TransactionDB* db, Status exp_s,
   }
 }
 
-void ASSERT_SAME(TransactionDB* db, Status exp_s, PinnableSlice& exp_v,
+void ASSERT_SAME(TransactionDB* db, const Status& exp_s, PinnableSlice& exp_v,
                  Slice key) {
   ASSERT_SAME(ReadOptions(), db, exp_s, exp_v, key);
 }
@@ -2518,6 +2568,56 @@ TEST_P(WritePreparedTransactionTest, RollbackPreparedAfterCommitWriteFailure) {
   ASSERT_OK(ReOpenNoDelete());
 }
 
+TEST_P(WritePreparedTransactionTest, RollbackPreparedWithReadError) {
+  // Rolling back a prepared transaction reads the pre-transaction value of
+  // each written key. A retryable read IO error during that lookup must be
+  // returned to the caller with the transaction still PREPARED so that
+  // rollback can be retried.
+  BlockBasedTableOptions bbto;
+  bbto.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  ASSERT_OK(ReOpen());
+  fault_fs->SetFileTypesExcludedFromFaultInjection({FileType::kInfoLogFile});
+
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  TransactionOptions txn_options;
+  std::unique_ptr<Transaction> txn(
+      db->BeginTransaction(WriteOptions(), txn_options));
+  ASSERT_NE(nullptr, txn);
+  ASSERT_OK(txn->SetName("rollback_read_error"));
+  ASSERT_OK(txn->Delete("key"));
+  ASSERT_OK(txn->Prepare());
+
+  fault_fs->SetThreadLocalErrorContext(FaultInjectionIOType::kRead,
+                                       /*seed=*/0, /*one_in=*/1,
+                                       /*retryable=*/true,
+                                       /*has_data_loss=*/false);
+  fault_fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kRead);
+  const Status rollback_s = txn->Rollback();
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kRead);
+
+  ASSERT_NOK(rollback_s);
+  ASSERT_TRUE(rollback_s.IsIOError()) << rollback_s.ToString();
+  ASSERT_TRUE(FaultInjectionTestFS::IsInjectedError(rollback_s))
+      << rollback_s.ToString();
+  ASSERT_GE(fault_fs->GetAndResetInjectedThreadLocalErrorCount(
+                FaultInjectionIOType::kRead),
+            1);
+
+  ASSERT_OK(txn->Rollback());
+  txn.reset();
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ("value", value);
+
+  ASSERT_OK(ReOpenNoDelete());
+  ASSERT_OK(db->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ("value", value);
+}
+
 TEST_P(WritePreparedTransactionTest, DisableGCDuringRecovery) {
   // Use large buffer to avoid memtable flush after 1024 insertions
   options.write_buffer_size = 1024 * 1024;
@@ -2575,7 +2675,7 @@ TEST_P(WritePreparedTransactionTest, CompactionShouldKeepUncommittedKeys) {
   // Keep track of expected sequence number.
   SequenceNumber expected_seq = 0;
 
-  auto add_key = [&](std::function<Status()> func) {
+  auto add_key = [&](const std::function<Status()>& func) {
     ASSERT_OK(func());
     expected_seq++;
     if (options.two_write_queues) {
@@ -2993,7 +3093,7 @@ TEST_P(WritePreparedTransactionTest, ReleaseEarliestSnapshotDuringCompaction) {
 }
 
 TEST_P(WritePreparedTransactionTest,
-       ReleaseEarliestSnapshotDuringCompaction_WithSD) {
+       ReleaseEarliestSnapshotDuringCompactionWithSD) {
   constexpr size_t kSnapshotCacheBits = 7;  // same as default
   constexpr size_t kCommitCacheBits = 0;    // minimum commit cache
   UpdateTransactionDBOptions(kSnapshotCacheBits, kCommitCacheBits);
@@ -3045,7 +3145,7 @@ TEST_P(WritePreparedTransactionTest,
 }
 
 TEST_P(WritePreparedTransactionTest,
-       ReleaseEarliestSnapshotDuringCompaction_WithSD2) {
+       ReleaseEarliestSnapshotDuringCompactionWithSD2) {
   constexpr size_t kSnapshotCacheBits = 7;  // same as default
   constexpr size_t kCommitCacheBits = 0;    // minimum commit cache
   UpdateTransactionDBOptions(kSnapshotCacheBits, kCommitCacheBits);
@@ -3093,7 +3193,7 @@ TEST_P(WritePreparedTransactionTest,
 }
 
 TEST_P(WritePreparedTransactionTest,
-       ReleaseEarliestSnapshotDuringCompaction_WithDelete) {
+       ReleaseEarliestSnapshotDuringCompactionWithDelete) {
   constexpr size_t kSnapshotCacheBits = 7;  // same as default
   constexpr size_t kCommitCacheBits = 0;    // minimum commit cache
   UpdateTransactionDBOptions(kSnapshotCacheBits, kCommitCacheBits);
@@ -3184,7 +3284,7 @@ TEST_P(WritePreparedTransactionTest,
 }
 
 TEST_P(WritePreparedTransactionTest,
-       ReleaseEarliestWriteConflictSnapshot_SingleDelete) {
+       ReleaseEarliestWriteConflictSnapshotSingleDelete) {
   constexpr size_t kSnapshotCacheBits = 7;  // same as default
   constexpr size_t kCommitCacheBits = 0;    // minimum commit cache
   UpdateTransactionDBOptions(kSnapshotCacheBits, kCommitCacheBits);
@@ -4217,28 +4317,28 @@ TEST_P(WritePreparedTransactionTest, BasicRollbackDeletionTypeCb) {
 
 // Test that we can change write policy from WriteCommitted to WritePrepared
 // after a clean shutdown (which would empty the WAL)
-TEST_P(WritePreparedTransactionTest, WP_WC_DBBackwardCompatibility) {
+TEST_P(WritePreparedTransactionTest, WPWCDBBackwardCompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_COMMITTED, WRITE_PREPARED, empty_wal);
 }
 
 // Test that we fail fast if WAL is not emptied between changing the write
 // policy from WriteCommitted to WritePrepared
-TEST_P(WritePreparedTransactionTest, WP_WC_WALBackwardIncompatibility) {
+TEST_P(WritePreparedTransactionTest, WPWCWALBackwardIncompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_COMMITTED, WRITE_PREPARED, !empty_wal);
 }
 
 // Test that we can change write policy from WritePrepare back to WriteCommitted
 // after a clean shutdown (which would empty the WAL)
-TEST_P(WritePreparedTransactionTest, WC_WP_ForwardCompatibility) {
+TEST_P(WritePreparedTransactionTest, WCWPForwardCompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_PREPARED, WRITE_COMMITTED, empty_wal);
 }
 
 // Test that we fail fast if WAL is not emptied between changing the write
 // policy from WriteCommitted to WritePrepared
-TEST_P(WritePreparedTransactionTest, WC_WP_WALForwardIncompatibility) {
+TEST_P(WritePreparedTransactionTest, WCWPWALForwardIncompatibility) {
   bool empty_wal = true;
   CrossCompatibilityTest(WRITE_PREPARED, WRITE_COMMITTED, !empty_wal);
 }
@@ -4662,6 +4762,7 @@ TEST_P(WritePreparedTransactionTest, GetEntityCoroutine) {
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   if (getenv("CIRCLECI") || getenv("GITHUB_ACTIONS")) {
     // Looking for backtrace on "Resource temporarily unavailable" exceptions
     ::testing::FLAGS_gtest_catch_exceptions = false;

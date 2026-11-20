@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cassert>
+#include <optional>
 
 #include "db/blob/blob_garbage_meter.h"
 #include "rocksdb/rocksdb_namespace.h"
@@ -21,10 +22,14 @@ namespace ROCKSDB_NAMESPACE {
 class BlobCountingIterator : public InternalIterator {
  public:
   BlobCountingIterator(InternalIterator* iter,
-                       BlobGarbageMeter* blob_garbage_meter)
+                       BlobGarbageMeter* blob_garbage_meter,
+                       bool track_current_key_inflow)
       : iter_(iter), blob_garbage_meter_(blob_garbage_meter) {
     assert(iter_);
     assert(blob_garbage_meter_);
+    if (track_current_key_inflow) {
+      current_key_inflow_.emplace();
+    }
 
     UpdateAndCountBlobIfNeeded();
   }
@@ -127,23 +132,47 @@ class BlobCountingIterator : public InternalIterator {
     return iter_->IsDeleteRangeSentinelKey();
   }
 
+  const BlobGarbageMeter& GetCurrentKeyInflow() const {
+    assert(current_key_inflow_.has_value());
+    return *current_key_inflow_;
+  }
+
+  bool TracksCurrentKeyInflow() const {
+    return current_key_inflow_.has_value();
+  }
+
  private:
   void UpdateAndCountBlobIfNeeded() {
     assert(!iter_->Valid() || iter_->status().ok());
 
     if (!iter_->Valid()) {
       status_ = iter_->status();
+      if (current_key_inflow_.has_value()) {
+        current_key_inflow_->Clear();
+      }
       return;
     }
 
     TEST_SYNC_POINT(
         "BlobCountingIterator::UpdateAndCountBlobIfNeeded:ProcessInFlow");
 
+    if (current_key_inflow_.has_value()) {
+      current_key_inflow_->Clear();
+      TEST_SYNC_POINT(
+          "BlobCountingIterator::UpdateAndCountBlobIfNeeded:CurrentKeyInflow");
+      status_ = current_key_inflow_->ProcessInFlow(key(), value());
+      if (!status_.ok()) {
+        return;
+      }
+    }
+    TEST_SYNC_POINT(
+        "BlobCountingIterator::UpdateAndCountBlobIfNeeded:AggregateInflow");
     status_ = blob_garbage_meter_->ProcessInFlow(key(), value());
   }
 
   InternalIterator* iter_;
   BlobGarbageMeter* blob_garbage_meter_;
+  std::optional<BlobGarbageMeter> current_key_inflow_;
   Status status_;
 };
 

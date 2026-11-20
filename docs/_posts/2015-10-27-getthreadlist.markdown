@@ -138,7 +138,7 @@ bool enable_thread_tracking;
 ## The API
 
 
-The GetThreadList API is defined in [include/rocksdb/env.h](https://github.com/facebook/rocksdb/blob/main/include/rocksdb/env.h#L317-L318), which is an Env
+The GetThreadList API is defined in [include/rocksdb/env.h](https://github.com/meta/rocksdb/blob/main/include/rocksdb/env.h#L317-L318), which is an Env
 function:
 
 ```c++
@@ -151,7 +151,7 @@ that using the same Env.
 
 The `GetThreadList()` API simply returns a vector of `ThreadStatus`, each describes
 the current status of a thread. The `ThreadStatus` structure, defined in
-[include/rocksdb/thread_status.h](https://github.com/facebook/rocksdb/blob/main/include/rocksdb/thread_status.h), contains the following information:
+[include/rocksdb/thread_status.h](https://github.com/meta/rocksdb/blob/main/include/rocksdb/thread_status.h), contains the following information:
 
 ```c++
 // An unique ID for the thread.

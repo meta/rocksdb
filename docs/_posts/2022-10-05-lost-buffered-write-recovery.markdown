@@ -55,9 +55,9 @@ This coverage is included in our internal CI that periodically runs against the 
 
 ## Issues found
 
-* [False detection of corruption after system crash due to race condition with WAL sync and `track_and_verify_wals_in_manifest](https://github.com/facebook/rocksdb/pull/10185)
-* [Undetected hole in recovery after system crash due to race condition in WAL sync](https://github.com/facebook/rocksdb/pull/10560)
-* [Recovery failure after system crash due to missing directory sync for critical metadata file](https://github.com/facebook/rocksdb/pull/10573)
+* [False detection of corruption after system crash due to race condition with WAL sync and `track_and_verify_wals_in_manifest](https://github.com/meta/rocksdb/pull/10185)
+* [Undetected hole in recovery after system crash due to race condition in WAL sync](https://github.com/meta/rocksdb/pull/10560)
+* [Recovery failure after system crash due to missing directory sync for critical metadata file](https://github.com/meta/rocksdb/pull/10573)
 
 ## Solution details
 

@@ -177,11 +177,17 @@ class WritableFileWriter final : public FSWritableFile {
   uint32_t buffered_data_crc32c_checksum_;
   bool buffered_data_with_checksum_;
   Temperature temperature_;
+  IOType io_type_;
 
  public:
   // `initial_file_size` seeds size accounting when wrapping a reopened file
   // that will continue appending from its current end. Leave at 0 for newly
   // created files and reuse-from-offset-0 paths.
+  //
+  // Each IO this writer issues to `file`, including the close in the
+  // destructor, carries `options.io_options.type` as its IOOptions::type. A
+  // caller can override it per call by passing a type other than
+  // IOType::kUnknown.
   WritableFileWriter(
       std::unique_ptr<FSWritableFile>&& file, const std::string& _file_name,
       const FileOptions& options, SystemClock* clock = nullptr,
@@ -216,7 +222,8 @@ class WritableFileWriter final : public FSWritableFile {
         checksum_finalized_(false),
         perform_data_verification_(perform_data_verification),
         buffered_data_crc32c_checksum_(0),
-        buffered_data_with_checksum_(buffered_data_with_checksum) {
+        buffered_data_with_checksum_(buffered_data_with_checksum),
+        io_type_(options.io_options.type) {
     temperature_ = options.temperature;
     assert(!use_direct_io() || max_buffer_size_ > 0);
     TEST_SYNC_POINT_CALLBACK("WritableFileWriter::WritableFileWriter:0",
@@ -248,6 +255,10 @@ class WritableFileWriter final : public FSWritableFile {
   WritableFileWriter(const WritableFileWriter&) = delete;
 
   WritableFileWriter& operator=(const WritableFileWriter&) = delete;
+
+  WritableFileWriter(WritableFileWriter&&) = delete;
+
+  WritableFileWriter& operator=(WritableFileWriter&&) = delete;
 
   ~WritableFileWriter() override {
     IOOptions io_options;

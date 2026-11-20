@@ -32,9 +32,9 @@
     </licenses>
 
     <scm>
-        <connection>scm:git:git://github.com/facebook/rocksdb.git</connection>
-        <developerConnection>scm:git:git@github.com:facebook/rocksdb.git</developerConnection>
-        <url>http://github.com/facebook/rocksdb/</url>
+        <connection>scm:git:git://github.com/meta/rocksdb.git</connection>
+        <developerConnection>scm:git:git@github.com:meta/rocksdb.git</developerConnection>
+        <url>http://github.com/meta/rocksdb/</url>
     </scm>
 
     <properties>

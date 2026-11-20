@@ -480,7 +480,7 @@ class WriteBatch : public WriteBatchBase {
   WriteBatch(const WriteBatch& src);
   WriteBatch(WriteBatch&& src) noexcept;
   WriteBatch& operator=(const WriteBatch& src);
-  WriteBatch& operator=(WriteBatch&& src);
+  WriteBatch& operator=(WriteBatch&& src) noexcept;
 
   // marks this point in the WriteBatch as the last record to
   // be inserted into the WAL, provided the WAL is enabled

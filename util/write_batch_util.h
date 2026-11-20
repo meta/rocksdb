@@ -26,7 +26,7 @@ class ColumnFamilyCollector : public WriteBatch::Handler {
  public:
   explicit ColumnFamilyCollector() {}
 
-  ~ColumnFamilyCollector() override {}
+  ~ColumnFamilyCollector() override = default;
 
   Status PutCF(uint32_t column_family_id, const Slice&, const Slice&) override {
     return AddColumnFamilyId(column_family_id);

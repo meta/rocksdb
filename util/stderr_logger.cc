@@ -22,7 +22,7 @@ void StderrLogger::Logv(const char* format, va_list ap) {
   port::TimeVal now_tv;
   port::GetTimeOfDay(&now_tv, nullptr);
   const time_t seconds = now_tv.tv_sec;
-  struct tm t;
+  struct tm t{};
   port::LocalTimeR(&seconds, &t);
 
   // The string we eventually log has three parts: the context (time, thread),

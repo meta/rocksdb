@@ -13,7 +13,8 @@
 namespace ROCKSDB_NAMESPACE {
 
 struct CacheAllocationDeleter {
-  CacheAllocationDeleter(MemoryAllocator* a = nullptr) : allocator(a) {}
+  explicit CacheAllocationDeleter(MemoryAllocator* a = nullptr)
+      : allocator(a) {}
 
   void operator()(char* ptr) const {
     if (allocator) {
@@ -32,7 +33,7 @@ inline CacheAllocationPtr AllocateBlock(size_t size,
                                         MemoryAllocator* allocator) {
   if (allocator) {
     auto block = static_cast<char*>(allocator->Allocate(size));
-    return CacheAllocationPtr(block, allocator);
+    return CacheAllocationPtr(block, CacheAllocationDeleter(allocator));
   }
   return CacheAllocationPtr(new char[size]);
 }

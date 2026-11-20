@@ -8,6 +8,14 @@
 #include "rocksdb/table_properties.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// Prepared metadata omits referenced_blob_bytes because existing consumers
+// reject unknown serialized fields. The omission can be removed once every
+// prepared-metadata consumer tolerates unknown fields.
+Status SerializeTablePropertiesForPreparedFileInfo(const ConfigOptions& opts,
+                                                   const TableProperties& props,
+                                                   std::string* output);
+
 #ifndef NDEBUG
 void TEST_SetRandomTableProperties(TableProperties* props);
 #endif

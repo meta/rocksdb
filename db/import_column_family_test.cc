@@ -5,11 +5,14 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <functional>
+#include <utility>
 
+#include "db/blob/blob_constants.h"
 #include "db/db_test_util.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/sst_file_writer.h"
+#include "test_util/mock_time_env.h"
 #include "test_util/testutil.h"
 #include "util/random.h"
 
@@ -30,7 +33,7 @@ class ImportColumnFamilyTest : public DBTestBase {
     metadata_ptr2_ = nullptr;
   }
 
-  ~ImportColumnFamilyTest() {
+  ~ImportColumnFamilyTest() override {
     if (import_cfh_) {
       EXPECT_OK(db_->DropColumnFamily(import_cfh_));
       EXPECT_OK(db_->DestroyColumnFamilyHandle(import_cfh_));
@@ -67,8 +70,8 @@ class ImportColumnFamilyTest : public DBTestBase {
                                         SequenceNumber smallest_seqno,
                                         SequenceNumber largest_seqno) {
     LiveFileMetaData metadata;
-    metadata.name = name;
-    metadata.db_path = path;
+    metadata.name = std::move(name);
+    metadata.db_path = std::move(path);
     metadata.smallest_seqno = smallest_seqno;
     metadata.largest_seqno = largest_seqno;
     metadata.level = level;
@@ -390,7 +393,8 @@ TEST_F(ImportColumnFamilyTest, ImportExportedSSTFromAnotherCF) {
   delete metadata_ptr_;
   metadata_ptr_ = nullptr;
 
-  std::string value1, value2;
+  std::string value1;
+  std::string value2;
 
   for (int i = 0; i < 100; ++i) {
     ASSERT_OK(db_->Get(ReadOptions(), import_cfh_, Key(i), &value1));
@@ -548,7 +552,8 @@ TEST_F(ImportColumnFamilyTest,
   delete metadata_ptr_;
   metadata_ptr_ = nullptr;
 
-  std::string value1, value2;
+  std::string value1;
+  std::string value2;
   ReadOptions ro_latest;
   ReadOptions ro_snapshot;
   ro_snapshot.snapshot = snapshot;
@@ -812,7 +817,8 @@ TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilyTest) {
   ASSERT_OK(db_->CreateColumnFamilyWithImport(options, "toto", import_options,
                                               metadatas, &import_cfh_));
 
-  std::string value1, value2;
+  std::string value1;
+  std::string value2;
   for (int i = 0; i < 100; ++i) {
     ASSERT_OK(db_->Get(ReadOptions(), import_cfh_, Key(i), &value1));
     ASSERT_EQ(Get(1, Key(i)), value1);
@@ -920,7 +926,8 @@ TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilySeveralFilesWithOverlap) {
   ASSERT_OK(sfw_cf4.Put("K5", "V5"));
   ASSERT_OK(sfw_cf4.Finish());
 
-  ExportImportFilesMetaData metadata1, metadata2;
+  ExportImportFilesMetaData metadata1;
+  ExportImportFilesMetaData metadata2;
   metadata1.files.push_back(
       LiveFileMetaDataInit(file1_sst_name, sst_files_dir_, 1, 1, 2));
   metadata1.files.push_back(
@@ -1048,6 +1055,235 @@ TEST_F(ImportColumnFamilyTest, AssignEpochNumberToMultipleCF) {
   WaitForCompactOptions o;
   ASSERT_OK(db_->WaitForCompact(o));
   delete checkpoint1;
+}
+
+namespace {
+// MANIFEST record of the file in `cfh` whose smallest user key is `key`
+FileMetaData ManifestRecord(DBImpl* db, ColumnFamilyHandle* cfh,
+                            const std::string& key) {
+  std::vector<std::vector<FileMetaData>> metadata;
+  db->TEST_GetFilesMetaData(cfh, &metadata);
+  for (const auto& level : metadata) {
+    for (const auto& f : level) {
+      if (f.smallest.user_key() == key) {
+        return f;
+      }
+    }
+  }
+  ADD_FAILURE() << "No file starting with " << key;
+  return FileMetaData();
+}
+
+// MANIFEST {file_creation_time, oldest_ancestor_time} of the file in `cfh`
+// whose smallest user key is `key`
+std::pair<uint64_t, uint64_t> ManifestTimes(DBImpl* db, ColumnFamilyHandle* cfh,
+                                            const std::string& key) {
+  const FileMetaData f = ManifestRecord(db, cfh, key);
+  return {f.file_creation_time, f.oldest_ancestor_time};
+}
+}  // namespace
+
+TEST_F(ImportColumnFamilyTest, ImportKeepsExportedFileTimes) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  env_->SetMockSleep();
+  CreateAndReopenWithCF({"koko"}, options);
+
+  // Flush and then compact so that the file has an oldest ancestor time older
+  // than its file creation time
+  ASSERT_OK(Put(1, "a", "val"));
+  ASSERT_OK(Flush(1));
+  env_->MockSleepForSeconds(1000);
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, handles_[1], nullptr, nullptr));
+  const auto src_times = ManifestTimes(dbfull(), handles_[1], "a");
+  ASSERT_GT(src_times.second, 0U);
+  ASSERT_GE(src_times.first, src_times.second + 1000);
+
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  ASSERT_OK(checkpoint->ExportColumnFamily(handles_[1], export_files_dir_,
+                                           &metadata_ptr_));
+  delete checkpoint;
+  ASSERT_EQ(metadata_ptr_->files.size(), 1U);
+  EXPECT_EQ(metadata_ptr_->files[0].file_creation_time, src_times.first);
+  EXPECT_EQ(metadata_ptr_->files[0].oldest_ancestor_time, src_times.second);
+  // The source DB's ownership of the file is also exported...
+  EXPECT_EQ(metadata_ptr_->files[0].db_ownership_start_time, src_times.first);
+  EXPECT_EQ(DataFileProvenance::DecodeFrom(
+                metadata_ptr_->files[0].data_file_provenance)
+                .origin,
+            DataFileProvenance::Origin::kCompaction);
+
+  env_->MockSleepForSeconds(1000);
+  int64_t import_start = 0;
+  ASSERT_OK(env_->GetCurrentTime(&import_start));
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(options, "toto",
+                                              ImportColumnFamilyOptions(),
+                                              *metadata_ptr_, &import_cfh_));
+  EXPECT_EQ(ManifestTimes(dbfull(), import_cfh_, "a"), src_times);
+  // ...but this DB began holding the file when importing it
+  const FileMetaData imported = ManifestRecord(dbfull(), import_cfh_, "a");
+  EXPECT_GE(imported.db_ownership_start_time,
+            static_cast<uint64_t>(import_start));
+  DataFileProvenance expected_info;
+  expected_info.origin = DataFileProvenance::Origin::kImport;
+  EXPECT_EQ(DataFileProvenance::DecodeFrom(imported.data_file_provenance),
+            expected_info);
+}
+
+TEST_F(ImportColumnFamilyTest, ImportFileTimesAndRejectTooOldFile) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.periodic_compaction_seconds = 10000;
+  env_->SetMockSleep();
+  CreateAndReopenWithCF({"koko"}, options);
+
+  int64_t start = 0;
+  ASSERT_OK(env_->GetCurrentTime(&start));
+  const uint64_t now = static_cast<uint64_t>(start);
+  // Writes `key`.sst with SstFileWriter, recording creation time `write_time`
+  // (0 = unknown) in its table properties
+  auto write_file = [&](const std::string& key, uint64_t write_time) {
+    auto clock = std::make_shared<MockSystemClock>(env_->GetSystemClock());
+    clock->SetCurrentTime(write_time);
+    CompositeEnvWrapper writer_env(env_, clock);
+    Options writer_options = options;
+    writer_options.env = &writer_env;
+    SstFileWriter writer(EnvOptions(), writer_options);
+    ASSERT_OK(writer.Open(sst_files_dir_ + key + ".sst"));
+    ASSERT_OK(writer.Put(key, "val"));
+    ASSERT_OK(writer.Finish());
+  };
+  write_file("a", now);
+  write_file("b", now);
+  write_file("c", 0);
+  write_file("d", now - 10100);
+  // Times from the import metadata take precedence over the file's
+  LiveFileMetaData too_old =
+      LiveFileMetaDataInit("a.sst", sst_files_dir_, 0, 10, 19);
+  too_old.file_creation_time = now - 10100;
+  LiveFileMetaData future =
+      LiveFileMetaDataInit("b.sst", sst_files_dir_, 0, 20, 29);
+  future.file_creation_time = now + 5000;
+  future.oldest_ancestor_time = now + 5000;
+  // Neither the metadata nor the file has a time
+  LiveFileMetaData unknown_time =
+      LiveFileMetaDataInit("c.sst", sst_files_dir_, 0, 30, 39);
+  // Only the file has a time, which is too old
+  LiveFileMetaData too_old_in_file =
+      LiveFileMetaDataInit("d.sst", sst_files_dir_, 0, 40, 49);
+
+  ExportImportFilesMetaData metadata;
+  metadata.db_comparator_name = options.comparator->Name();
+  ImportColumnFamilyOptions import_options;
+  import_options.reject_too_old_file = true;
+
+  for (const LiveFileMetaData& rejected : {too_old, too_old_in_file}) {
+    SCOPED_TRACE(rejected.name);
+    metadata.files = {future, unknown_time, rejected};
+    Status s = db_->CreateColumnFamilyWithImport(
+        options, "toto", import_options, metadata, &import_cfh_);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_EQ(import_cfh_, nullptr);
+  }
+
+  // Future and unknown times are replaced with the import time
+  metadata.files = {future, unknown_time};
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(options, "toto", import_options,
+                                              metadata, &import_cfh_));
+  int64_t end = 0;
+  ASSERT_OK(env_->GetCurrentTime(&end));
+  for (const char* key : {"b", "c"}) {
+    SCOPED_TRACE(key);
+    const auto times = ManifestTimes(dbfull(), import_cfh_, key);
+    EXPECT_GE(times.first, now);
+    EXPECT_LE(times.first, static_cast<uint64_t>(end));
+    EXPECT_EQ(times.second, times.first);
+  }
+
+  // Without the option, too-old files are accepted with their times intact.
+  // An unknown oldest ancestor time falls back on the file creation time.
+  import_options.reject_too_old_file = false;
+  metadata.files = {too_old, too_old_in_file};
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(options, "yoyo", import_options,
+                                              metadata, &import_cfh2_));
+  for (const char* key : {"a", "d"}) {
+    SCOPED_TRACE(key);
+    EXPECT_EQ(ManifestTimes(dbfull(), import_cfh2_, key),
+              std::make_pair(now - 10100, now - 10100));
+  }
+}
+
+TEST_F(ImportColumnFamilyTest, ImportRejectsBlobFiles) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"koko"}, options);
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(1, Key(i), Key(i) + "_val"));
+  }
+  ASSERT_OK(Flush(1));
+
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  ASSERT_OK(checkpoint->ExportColumnFamily(handles_[1], export_files_dir_,
+                                           &metadata_ptr_));
+  ASSERT_NE(metadata_ptr_, nullptr);
+  delete checkpoint;
+
+  ImportColumnFamilyOptions import_options;
+
+  // Files without blob references can be imported into a column family with
+  // blob files enabled.
+  Options blob_options = options;
+  blob_options.enable_blob_files = true;
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(
+      blob_options, "toto", import_options, *metadata_ptr_, &import_cfh_));
+  ASSERT_NE(import_cfh_, nullptr);
+  for (int i = 0; i < 10; ++i) {
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), import_cfh_, Key(i), &value));
+    ASSERT_EQ(Key(i) + "_val", value);
+  }
+
+  // Write SST files that reference blob files. Export rejects them, so take
+  // their metadata from the live DB. Import never brings the blob files, so
+  // it is rejected before any file is copied.
+  ASSERT_OK(dbfull()->SetOptions(
+      handles_[1], {{"enable_blob_files", "true"}, {"min_blob_size", "0"}}));
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(1, Key(i), Key(i) + "_blob"));
+  }
+  ASSERT_OK(Flush(1));
+
+  ExportImportFilesMetaData blob_metadata;
+  blob_metadata.db_comparator_name = options.comparator->Name();
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  bool references_blob = false;
+  for (const auto& file : live_files) {
+    if (file.column_family_name != "koko") {
+      continue;
+    }
+    if (file.oldest_blob_file_number != kInvalidBlobFileNumber) {
+      references_blob = true;
+    }
+    blob_metadata.files.push_back(file);
+  }
+  ASSERT_TRUE(references_blob);
+
+  Status s = db_->CreateColumnFamilyWithImport(options, "yoyo", import_options,
+                                               blob_metadata, &import_cfh2_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(std::string(s.getState()).find("reference blob files"),
+            std::string::npos);
+  ASSERT_EQ(import_cfh2_, nullptr);
+
+  // The rejected import left no column family behind under the same name.
+  ASSERT_OK(db_->CreateColumnFamilyWithImport(options, "yoyo", import_options,
+                                              *metadata_ptr_, &import_cfh2_));
+  ASSERT_NE(import_cfh2_, nullptr);
 }
 }  // namespace ROCKSDB_NAMESPACE
 

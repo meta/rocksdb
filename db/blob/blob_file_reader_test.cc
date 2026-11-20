@@ -82,7 +82,7 @@ void WriteBlobFile(const ImmutableOptions& immutable_options,
       ASSERT_OK(LegacyForceBuiltinCompression(*compressor,
                                               /*working_area=*/nullptr,
                                               blobs[i], &compressed_blobs[i]));
-      blobs_to_write[i] = compressed_blobs[i];
+      blobs_to_write[i] = compressed_blobs[i].AsSlice();
       blob_sizes[i] = compressed_blobs[i].size();
     }
   }

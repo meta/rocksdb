@@ -22,7 +22,7 @@ class CompactionOutputs;
 using CompactionFileOpenFunc = std::function<Status(CompactionOutputs&)>;
 using CompactionFileCloseFunc =
     std::function<Status(const Status&, const ParsedInternalKey&, const Slice&,
-                         const CompactionIterator*, CompactionOutputs&)>;
+                         const CompactionIterator*, bool, CompactionOutputs&)>;
 
 // Files produced by subcompaction, most of the functions are used by
 // compaction_job Open/Close compaction file functions.
@@ -179,6 +179,11 @@ class CompactionOutputs {
 
   bool HasBuilder() const { return builder_ != nullptr; }
 
+  // Returns true if the last output file is still open.
+  bool HasUnfinishedOutput() const {
+    return !outputs_.empty() && !outputs_.back().finished;
+  }
+
   FileMetaData* GetMetaData() { return &current_output().meta; }
 
   bool HasOutput() const { return !outputs_.empty(); }
@@ -216,6 +221,12 @@ class CompactionOutputs {
     stats_.num_output_records = num_output_records;
   }
 
+  // Counts the bytes of output files that an earlier run of this compaction
+  // wrote and this run restored.
+  void AddRestoredBytesWritten(uint64_t bytes) {
+    stats_.bytes_written += bytes;
+  }
+
  private:
   friend class SubcompactionState;
 
@@ -245,6 +256,20 @@ class CompactionOutputs {
   // before processing the current key in compaction iterator.
   bool ShouldStopBefore(const CompactionIterator& c_iter);
 
+  // Returns true iff the SST partitioner requires a new output file to start
+  // at the current key. Only meaningful while an output file is open: the
+  // partitioner state describes the current file.
+  bool PartitionerRequiresCut(const CompactionIterator& c_iter) const;
+
+  // Returns true iff the current output file has a largest key and its user
+  // key equals `user_key`, ignoring timestamps.
+  bool LargestUserKeyEquals(const Slice& user_key);
+
+  // Re-establishes per-file state that depends on the first key accepted by a
+  // freshly opened builder. This keeps caller-requested file cuts equivalent to
+  // RocksDB's built-in file-boundary decisions for partition tracking.
+  void PrepareNewOutputForFirstKey(const CompactionIterator& c_iter);
+
   void Cleanup() {
     if (builder_ != nullptr) {
       // May happen if we get a shutdown call in the middle of compaction
@@ -273,7 +298,7 @@ class CompactionOutputs {
 
   // Add current key from compaction_iterator to the output file. If needed
   // close and open new compaction output with the functions provided.
-  Status AddToOutput(const CompactionIterator& c_iter,
+  Status AddToOutput(CompactionIterator& c_iter,
                      const CompactionFileOpenFunc& open_file_func,
                      const CompactionFileCloseFunc& close_file_func,
                      const ParsedInternalKey& prev_iter_output_internal_key);
@@ -297,7 +322,8 @@ class CompactionOutputs {
       const ParsedInternalKey empty_internal_key{};
       const Slice empty_key{};
       Status s = close_file_func(status, empty_internal_key, empty_key,
-                                 nullptr /* c_iter */, *this);
+                                 nullptr /* c_iter */,
+                                 /*post_prepare_retry=*/false, *this);
       if (!s.ok() && status.ok()) {
         status = s;
       }

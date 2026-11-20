@@ -13,9 +13,9 @@ class UtilMergeOperatorTest : public testing::Test {
  public:
   UtilMergeOperatorTest() = default;
 
-  std::string FullMergeV2(std::string existing_value,
+  std::string FullMergeV2(const std::string& existing_value,
                           std::vector<std::string> operands,
-                          std::string key = "") {
+                          const std::string& key = "") {
     std::string result;
     Slice result_operand(nullptr, 0);
 
@@ -34,7 +34,7 @@ class UtilMergeOperatorTest : public testing::Test {
   }
 
   std::string FullMergeV2(std::vector<std::string> operands,
-                          std::string key = "") {
+                          const std::string& key = "") {
     std::string result;
     Slice result_operand(nullptr, 0);
 
@@ -51,8 +51,8 @@ class UtilMergeOperatorTest : public testing::Test {
     return result;
   }
 
-  std::string PartialMerge(std::string left, std::string right,
-                           std::string key = "") {
+  std::string PartialMerge(const std::string& left, const std::string& right,
+                           const std::string& key = "") {
     std::string result;
 
     merge_operator_->PartialMerge(key, left, right, &result, nullptr);
@@ -60,7 +60,7 @@ class UtilMergeOperatorTest : public testing::Test {
   }
 
   std::string PartialMergeMulti(std::deque<std::string> operands,
-                                std::string key = "") {
+                                const std::string& key = "") {
     std::string result;
     std::deque<Slice> operands_slice(operands.begin(), operands.end());
 

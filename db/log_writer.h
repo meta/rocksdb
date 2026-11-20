@@ -92,6 +92,8 @@ class Writer {
   // No copying allowed
   Writer(const Writer&) = delete;
   void operator=(const Writer&) = delete;
+  Writer(Writer&&) = delete;
+  void operator=(Writer&&) = delete;
 
   ~Writer();
 
@@ -128,7 +130,7 @@ class Writer {
 
   size_t TEST_block_offset() const { return block_offset_; }
 
-  SequenceNumber GetLastSeqnoRecorded() const { return last_seqno_recorded_; };
+  SequenceNumber GetLastSeqnoRecorded() const { return last_seqno_recorded_; }
 
  private:
   std::unique_ptr<WritableFileWriter> dest_;

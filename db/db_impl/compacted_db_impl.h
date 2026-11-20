@@ -18,6 +18,8 @@ class CompactedDBImpl : public DBImpl {
   // No copying allowed
   CompactedDBImpl(const CompactedDBImpl&) = delete;
   void operator=(const CompactedDBImpl&) = delete;
+  CompactedDBImpl(CompactedDBImpl&&) = delete;
+  void operator=(CompactedDBImpl&&) = delete;
 
   ~CompactedDBImpl() override;
 
@@ -37,6 +39,12 @@ class CompactedDBImpl : public DBImpl {
                          PinnableSlice* value,
                          OutputMetadata* output_metadata) override;
 
+  using DB::GetEntityWithMetadata;
+  Status GetEntityWithMetadata(const ReadOptions& options,
+                               ColumnFamilyHandle* column_family,
+                               const Slice& key, PinnableWideColumns* columns,
+                               OutputMetadata* output_metadata) override;
+
   using DB::MultiGet;
   // Note that CompactedDBImpl::MultiGet is not the optimized version of
   // MultiGet to use.
@@ -55,6 +63,19 @@ class CompactedDBImpl : public DBImpl {
                             Status* statuses,
                             MultiGetOutputMetadata* output_metadata,
                             const bool sorted_input) override;
+
+  using DB::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& options, size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input) override;
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override;
 
   using DBImpl::Put;
   Status Put(const WriteOptions& /*options*/,

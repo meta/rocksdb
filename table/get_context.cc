@@ -14,6 +14,7 @@
 #include "db/merge_helper.h"
 #include "db/pinned_iterators_manager.h"
 #include "db/read_callback.h"
+#include "db/version_set.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "monitoring/file_read_sample.h"
@@ -442,6 +443,29 @@ bool GetContext::SaveValue(const ParsedInternalKey& parsed_key,
       // when we need to return timestamp to user. If a range tombstone has a
       // higher seqno than point tombstone, its timestamp should be returned.
       type = kTypeRangeDeletion;
+    }
+    const VersionStorageInfo* const storage_with_dropped_blob_files =
+        (type == kTypeBlobIndex || type == kTypeWideColumnEntity) &&
+                blob_fetcher_ != nullptr
+            ? blob_fetcher_->storage_with_dropped_blob_files()
+            : nullptr;
+    std::string remaining_columns;
+    if (UNLIKELY(storage_with_dropped_blob_files != nullptr)) {
+      switch (storage_with_dropped_blob_files->CheckDroppedBlobReferences(
+          type, unpacked_value, &remaining_columns)) {
+        case VersionStorageInfo::DroppedBlobRead::kUnaffected:
+          break;
+        case VersionStorageInfo::DroppedBlobRead::kRemainingColumns:
+          // The remaining columns are copied wherever they are kept.
+          unpacked_value = remaining_columns;
+          value_pinner = nullptr;
+          RecordTick(statistics_, BLOB_DB_DROPPED_BLOB_READ_COUNT);
+          break;
+        case VersionStorageInfo::DroppedBlobRead::kDeleted:
+          type = kTypeDeletion;
+          RecordTick(statistics_, BLOB_DB_DROPPED_BLOB_READ_COUNT);
+          break;
+      }
     }
     switch (type) {
       case kTypeValue:

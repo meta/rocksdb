@@ -27,7 +27,7 @@ class PersistentCache {
  public:
   using StatsType = std::vector<std::map<std::string, double>>;
 
-  virtual ~PersistentCache() {}
+  virtual ~PersistentCache() = default;
 
   // Insert to page cache
   //

@@ -20,7 +20,7 @@ KVVector MakeMockFile(std::initializer_list<KVPair> l) { return KVVector(l); }
 void SortKVVector(KVVector* kv_vector, const Comparator* ucmp) {
   InternalKeyComparator icmp(ucmp);
   std::sort(kv_vector->begin(), kv_vector->end(),
-            [icmp](KVPair a, KVPair b) -> bool {
+            [icmp](const KVPair& a, const KVPair& b) -> bool {
               return icmp.Compare(a.first, b.first) < 0;
             });
 }
@@ -44,7 +44,7 @@ class MockTableIterator : public InternalIterator {
     KVPair target_pair(target.ToString(), "");
     InternalKeyComparator icmp(BytewiseComparator());
     itr_ = std::lower_bound(table_.begin(), table_.end(), target_pair,
-                            [icmp](KVPair a, KVPair b) -> bool {
+                            [icmp](const KVPair& a, const KVPair& b) -> bool {
                               return icmp.Compare(a.first, b.first) < 0;
                             });
   }
@@ -53,7 +53,7 @@ class MockTableIterator : public InternalIterator {
     KVPair target_pair(target.ToString(), "");
     InternalKeyComparator icmp(BytewiseComparator());
     itr_ = std::upper_bound(table_.begin(), table_.end(), target_pair,
-                            [icmp](KVPair a, KVPair b) -> bool {
+                            [icmp](const KVPair& a, const KVPair& b) -> bool {
                               return icmp.Compare(a.first, b.first) < 0;
                             });
     Prev();
@@ -94,7 +94,7 @@ class MockTableBuilder : public TableBuilder {
   }
 
   // REQUIRES: Either Finish() or Abandon() has been called.
-  ~MockTableBuilder() = default;
+  ~MockTableBuilder() override = default;
 
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.
@@ -102,22 +102,22 @@ class MockTableBuilder : public TableBuilder {
   void Add(const Slice& key, const Slice& value) override {
     if (corrupt_mode_ == MockTableFactory::kCorruptValue) {
       // Corrupt the value
-      table_.push_back({key.ToString(), value.ToString() + " "});
+      table_.emplace_back(key.ToString(), value.ToString() + " ");
       corrupt_mode_ = MockTableFactory::kCorruptNone;
     } else if (corrupt_mode_ == MockTableFactory::kCorruptKey) {
-      table_.push_back({key.ToString() + " ", value.ToString()});
+      table_.emplace_back(key.ToString() + " ", value.ToString());
       corrupt_mode_ = MockTableFactory::kCorruptNone;
     } else if (corrupt_mode_ == MockTableFactory::kCorruptReorderKey) {
       if (prev_key_.empty()) {
         prev_key_ = key.ToString();
         prev_value_ = value.ToString();
       } else {
-        table_.push_back({key.ToString(), value.ToString()});
-        table_.push_back({prev_key_, prev_value_});
+        table_.emplace_back(key.ToString(), value.ToString());
+        table_.emplace_back(prev_key_, prev_value_);
         corrupt_mode_ = MockTableFactory::kCorruptNone;
       }
     } else {
-      table_.push_back({key.ToString(), value.ToString()});
+      table_.emplace_back(key.ToString(), value.ToString());
     }
   }
 
@@ -282,7 +282,8 @@ void MockTableFactory::AssertLatestFiles(
       std::cout << "Wrong content! Content of file, expect:" << std::endl;
       for (const auto& kv : *expect) {
         ParsedInternalKey ikey;
-        std::string key, value;
+        std::string key;
+        std::string value;
         std::tie(key, value) = kv;
         ASSERT_OK(ParseInternalKey(Slice(key), &ikey, true /* log_err_key */));
         std::cout << ikey.DebugString(true, false) << " -> " << value
@@ -291,7 +292,8 @@ void MockTableFactory::AssertLatestFiles(
       std::cout << "actual:" << std::endl;
       for (const auto& kv : it->second) {
         ParsedInternalKey ikey;
-        std::string key, value;
+        std::string key;
+        std::string value;
         std::tie(key, value) = kv;
         ASSERT_OK(ParseInternalKey(Slice(key), &ikey, true /* log_err_key */));
         std::cout << ikey.DebugString(true, false) << " -> " << value

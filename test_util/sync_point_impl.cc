@@ -12,7 +12,7 @@ KillPoint* KillPoint::GetInstance() {
   return &kp;
 }
 
-void KillPoint::TestKillRandom(std::string kill_point, int odds_weight,
+void KillPoint::TestKillRandom(const std::string& kill_point, int odds_weight,
                                const std::string& srcfile, int srcline) {
   if (rocksdb_kill_odds <= 0) {
     return;

@@ -40,7 +40,8 @@ Status DecodeSessionId(const std::string& db_session_id, uint64_t* upper,
   if (len > 24) {
     return Status::NotSupported("Too long db_session_id");
   }
-  uint64_t a = 0, b = 0;
+  uint64_t a = 0;
+  uint64_t b = 0;
   const char* buf = &db_session_id.front();
   bool success = ParseBaseChars<36>(&buf, len - 12U, &a);
   if (!success) {
@@ -103,7 +104,8 @@ Status GetSstInternalUniqueId(const std::string& db_id,
   // (It is possible that many DBs descended from one common DB id are copied
   // around and proliferate, in which case session id is critical, but it is
   // more common for different DBs to have different DB ids.)
-  uint64_t db_a, db_b;
+  uint64_t db_a;
+  uint64_t db_b;
   Hash2x64(db_id.data(), db_id.size(), session_upper, &db_a, &db_b);
 
   // Xor in file number for guaranteed uniqueness by file number for a given
@@ -129,7 +131,8 @@ constexpr uint64_t kLoOffsetForZero = 6417269962128484497U;
 }  // namespace
 
 void InternalUniqueIdToExternal(UniqueIdPtr in_out) {
-  uint64_t hi, lo;
+  uint64_t hi;
+  uint64_t lo;
   BijectiveHash2x64(in_out.ptr[1] + kHiOffsetForZero,
                     in_out.ptr[0] + kLoOffsetForZero, &hi, &lo);
   in_out.ptr[0] = lo;

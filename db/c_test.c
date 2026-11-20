@@ -240,6 +240,138 @@ static void CheckPinnableMultiGetError(
   CheckCondition(strstr(error, expected) != NULL);
 }
 
+static void CheckTxnDBBatchedMultiGet(rocksdb_transactiondb_t* db,
+                                      const rocksdb_readoptions_t* options,
+                                      rocksdb_column_family_handle_t* cf,
+                                      const char* expected_a) {
+  for (int sorted = 0; sorted <= 1; ++sorted) {
+    const char* keys[4] = {"b", "a", "b", "missing"};
+    const size_t sizes[4] = {1, 1, 1, 7};
+    const char* expected[4] = {"", expected_a, "", NULL};
+    if (sorted) {
+      keys[0] = "a";
+      keys[1] = "b";
+      expected[0] = expected_a;
+      expected[1] = "";
+    }
+    for (int slices = 0; slices <= 1; ++slices) {
+      rocksdb_pinnableslice_t* values[4];
+      char* errs[4];
+      if (slices) {
+        rocksdb_slice_t key_slices[4];
+        for (size_t i = 0; i < 4; ++i) {
+          key_slices[i].data = keys[i];
+          key_slices[i].size = sizes[i];
+        }
+        rocksdb_transactiondb_batched_multi_get_cf_slice(
+            db, options, cf, 4, key_slices, values, errs, sorted);
+      } else {
+        rocksdb_transactiondb_batched_multi_get_cf(db, options, cf, 4, keys,
+                                                   sizes, values, errs, sorted);
+      }
+      for (size_t i = 0; i < 4; ++i) {
+        CheckNoError(errs[i]);
+        if (expected[i] == NULL) {
+          CheckCondition(values[i] == NULL);
+        } else {
+          size_t size;
+          CheckCondition(values[i] != NULL);
+          const char* value = rocksdb_pinnableslice_value(values[i], &size);
+          CheckEqual(expected[i], value, size);
+        }
+        rocksdb_pinnableslice_destroy(values[i]);
+      }
+    }
+  }
+  rocksdb_transactiondb_batched_multi_get_cf(db, options, cf, 0, NULL, NULL,
+                                             NULL, NULL, false);
+  rocksdb_transactiondb_batched_multi_get_cf_slice(db, options, cf, 0, NULL,
+                                                   NULL, NULL, true);
+}
+
+static void TestTxnDBBatchedMultiGet(void) {
+  rocksdb_options_t* options = rocksdb_options_create();
+  rocksdb_readoptions_t* ro = rocksdb_readoptions_create();
+  rocksdb_writeoptions_t* wo = rocksdb_writeoptions_create();
+  rocksdb_transaction_options_t* to = rocksdb_transaction_options_create();
+  rocksdb_transactiondb_options_t* dbo = rocksdb_transactiondb_options_create();
+  char path[200];
+  char* err = NULL;
+  snprintf(path, sizeof(path), "%s/rocksdb_c_test-batched-txn-%" PRIu64,
+           GetTempDir(), GetTestId());
+  rocksdb_options_set_create_if_missing(options, 1);
+  rocksdb_transaction_options_set_skip_prepare(to, 0);
+  for (int policy = rocksdb_txndb_write_policy_write_committed;
+       policy <= rocksdb_txndb_write_policy_write_prepared; ++policy) {
+    rocksdb_destroy_db(options, path, &err);
+    CheckNoError(err);
+    rocksdb_transactiondb_options_set_write_policy(dbo, policy);
+    rocksdb_transactiondb_t* db =
+        rocksdb_transactiondb_open(options, dbo, path, &err);
+    CheckNoError(err);
+    rocksdb_column_family_handle_t* cf =
+        rocksdb_transactiondb_create_column_family(db, options, "batched",
+                                                   &err);
+    CheckNoError(err);
+    rocksdb_transactiondb_put_cf(db, wo, cf, "a", 1, "old", 3, &err);
+    CheckNoError(err);
+    rocksdb_transactiondb_put_cf(db, wo, cf, "b", 1, "", 0, &err);
+    CheckNoError(err);
+    CheckTxnDBBatchedMultiGet(db, ro, cf, "old");
+
+    rocksdb_transaction_t* txn = rocksdb_transaction_begin(db, wo, to, NULL);
+    rocksdb_transaction_set_name(txn, "batched", 7, &err);
+    CheckNoError(err);
+    rocksdb_transaction_put_cf(txn, cf, "a", 1, "new", 3, &err);
+    CheckNoError(err);
+    rocksdb_transaction_prepare(txn, &err);
+    CheckNoError(err);
+    // WRITE_PREPARED puts the new value in the base DB before commit. Reads
+    // must go through TransactionDB to keep that value invisible.
+    CheckTxnDBBatchedMultiGet(db, ro, cf, "old");
+    const rocksdb_snapshot_t* snapshot =
+        rocksdb_transactiondb_create_snapshot(db);
+    rocksdb_transaction_commit(txn, &err);
+    CheckNoError(err);
+    CheckTxnDBBatchedMultiGet(db, ro, cf, "new");
+    rocksdb_readoptions_set_snapshot(ro, snapshot);
+    CheckTxnDBBatchedMultiGet(db, ro, cf, "old");
+    rocksdb_readoptions_set_snapshot(ro, NULL);
+    rocksdb_transactiondb_release_snapshot(db, snapshot);
+    // A timestamp on a non-timestamped column family must return an error,
+    // rather than being reported as a missing key.
+    rocksdb_readoptions_set_timestamp(ro, "timestamp", 9);
+    for (int slices = 0; slices <= 1; ++slices) {
+      const char* keys[1] = {"a"};
+      const size_t sizes[1] = {1};
+      const rocksdb_slice_t key_slices[1] = {{"a", 1}};
+      rocksdb_pinnableslice_t* values[1];
+      char* errs[1];
+      if (slices) {
+        rocksdb_transactiondb_batched_multi_get_cf_slice(
+            db, ro, cf, 1, key_slices, values, errs, true);
+      } else {
+        rocksdb_transactiondb_batched_multi_get_cf(db, ro, cf, 1, keys, sizes,
+                                                   values, errs, true);
+      }
+      CheckCondition(values[0] == NULL);
+      CheckCondition(errs[0] != NULL);
+      rocksdb_free(errs[0]);
+    }
+    rocksdb_readoptions_set_timestamp(ro, NULL, 0);
+    rocksdb_transaction_destroy(txn);
+    rocksdb_column_family_handle_destroy(cf);
+    rocksdb_transactiondb_close(db);
+    rocksdb_destroy_db(options, path, &err);
+    CheckNoError(err);
+  }
+  rocksdb_transactiondb_options_destroy(dbo);
+  rocksdb_transaction_options_destroy(to);
+  rocksdb_writeoptions_destroy(wo);
+  rocksdb_readoptions_destroy(ro);
+  rocksdb_options_destroy(options);
+}
+
 static void CheckIter(rocksdb_iterator_t* iter, const char* key,
                       const char* val) {
   size_t len;
@@ -324,7 +456,6 @@ static void CheckPutCF(void* ptr, uint32_t cfid, const char* k, size_t klen,
       break;
     default:
       CheckCondition(false);
-      break;
   }
   (*state)++;
 }
@@ -343,7 +474,6 @@ static void CheckDelCF(void* ptr, uint32_t cfid, const char* k, size_t klen) {
       break;
     default:
       CheckCondition(false);
-      break;
   }
   (*state)++;
 }
@@ -365,7 +495,6 @@ static void CheckMergeCF(void* ptr, uint32_t cfid, const char* k, size_t klen,
       break;
     default:
       CheckCondition(false);
-      break;
   }
   (*state)++;
 }
@@ -3630,6 +3759,42 @@ int main(int argc, char** argv) {
             bbo, &factory_name_len);
     CheckCondition(factory_name == NULL);
     CheckCondition(factory_name_len == 0);
+    CheckCondition(
+        rocksdb_block_based_options_get_use_udi_as_primary_index(bbo) == 0);
+    rocksdb_block_based_options_set_use_udi_as_primary_index(bbo, 1);
+    CheckCondition(
+        rocksdb_block_based_options_get_use_udi_as_primary_index(bbo) == 1);
+    rocksdb_block_based_options_set_use_udi_as_primary_index(bbo, 0);
+    CheckCondition(
+        rocksdb_block_based_options_get_use_udi_as_primary_index(bbo) == 0);
+    CheckCondition(
+        rocksdb_block_based_options_get_fail_if_no_udi_on_open(bbo) == 0);
+    rocksdb_block_based_options_set_fail_if_no_udi_on_open(bbo, 1);
+    CheckCondition(
+        rocksdb_block_based_options_get_fail_if_no_udi_on_open(bbo) == 1);
+    rocksdb_block_based_options_set_fail_if_no_udi_on_open(bbo, 0);
+    CheckCondition(
+        rocksdb_block_based_options_get_fail_if_no_udi_on_open(bbo) == 0);
+
+    // index_mode defaults to standard_default and tracks the deprecated
+    // bools until it is set explicitly; after that an explicit value wins no
+    // matter what order the deprecated setters are called in.
+    CheckCondition(rocksdb_block_based_table_index_mode_standard_default ==
+                   rocksdb_block_based_options_get_index_mode(bbo));
+    rocksdb_block_based_options_set_use_udi_as_primary_index(bbo, 1);
+    CheckCondition(rocksdb_block_based_table_index_mode_custom_default ==
+                   rocksdb_block_based_options_get_index_mode(bbo));
+    rocksdb_block_based_options_set_index_mode(
+        bbo, rocksdb_block_based_table_index_mode_custom_only);
+    CheckCondition(rocksdb_block_based_table_index_mode_custom_only ==
+                   rocksdb_block_based_options_get_index_mode(bbo));
+    rocksdb_block_based_options_set_index_mode(
+        bbo, rocksdb_block_based_table_index_mode_standard_only);
+    rocksdb_block_based_options_set_fail_if_no_udi_on_open(bbo, 1);
+    CheckCondition(rocksdb_block_based_table_index_mode_standard_only ==
+                   rocksdb_block_based_options_get_index_mode(bbo));
+    rocksdb_block_based_options_set_use_udi_as_primary_index(bbo, 0);
+    rocksdb_block_based_options_set_fail_if_no_udi_on_open(bbo, 0);
 
     rocksdb_block_based_options_destroy(bbo);
   }
@@ -4677,6 +4842,24 @@ int main(int argc, char** argv) {
     CheckCondition(table_index_factory_name == NULL);
     CheckCondition(table_index_factory_name_len == 0);
 
+    // read_index: set_table_index_factory_from_string implies prefer_custom;
+    // clearing it returns to default; the explicit setter reaches builtin,
+    // which the legacy factory shim cannot express.
+    CheckCondition(rocksdb_readoptions_read_index_default ==
+                   rocksdb_readoptions_get_read_index(ro));
+    rocksdb_readoptions_set_read_index(ro,
+                                       rocksdb_readoptions_read_index_builtin);
+    CheckCondition(rocksdb_readoptions_read_index_builtin ==
+                   rocksdb_readoptions_get_read_index(ro));
+    rocksdb_readoptions_set_table_index_factory_from_string(ro, "trie_index",
+                                                            10, &err);
+    CheckNoError(err);
+    CheckCondition(rocksdb_readoptions_read_index_prefer_custom ==
+                   rocksdb_readoptions_get_read_index(ro));
+    rocksdb_readoptions_clear_table_index_factory(ro);
+    CheckCondition(rocksdb_readoptions_read_index_default ==
+                   rocksdb_readoptions_get_read_index(ro));
+
     // optimize_multiget_for_io defaults to true (1); flip to 0 to verify the
     // setter is wired through to the underlying C++ ReadOptions field.
     CheckCondition(1 == rocksdb_readoptions_get_optimize_multiget_for_io(ro));
@@ -5586,6 +5769,9 @@ int main(int argc, char** argv) {
     rocksdb_destroy_db(options, wp_dbname, &err);
     CheckNoError(err);
   }
+
+  StartPhase("transactiondb_batched_multi_get");
+  TestTxnDBBatchedMultiGet();
 
   StartPhase("transactions");
   {

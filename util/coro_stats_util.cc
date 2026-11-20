@@ -10,12 +10,14 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <utility>
 
 #include "folly/io/async/Request.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/env.h"
+#include "util/atomic.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
@@ -64,6 +66,7 @@ void DisableCoroutineStatsInTLS() {
   // PerfLevel gates per-level updates, so keep published per-level stats
   // readable until the next request installs its configuration.
   SetPerfLevel(PerfLevel::kDisable);
+  SetAsyncReadCPUTimeEnabled(false);
 }
 
 // Owns the counters collected by one request, moving them to and from TLS
@@ -74,7 +77,6 @@ class EnabledCoroutineStatsRequestData final : public folly::RequestData {
                                             Env* env)
       : stats_config_(std::move(stats_config)), env_(env) {
     assert(env_ != nullptr);
-    owner_thread_id_ = env_->GetThreadID();
     assert(CapturedPerfLevel() > PerfLevel::kUninitialized);
     assert(CapturedPerfLevel() < PerfLevel::kOutOfBounds);
 #ifndef NPERF_CONTEXT
@@ -93,7 +95,7 @@ class EnabledCoroutineStatsRequestData final : public folly::RequestData {
   // RequestContext may be restored on downstream workers, but these stats are
   // owned by the thread that created this object.
   void onSet() override {
-    if (!IsOwnerThread()) {
+    if (!IsActiveOnThisThread()) {
       return;
     }
     LoadThreadLocalStats();
@@ -102,7 +104,7 @@ class EnabledCoroutineStatsRequestData final : public folly::RequestData {
   }
 
   void onUnset() override {
-    if (!IsOwnerThread()) {
+    if (!IsActiveOnThisThread()) {
       return;
     }
     StopGetCpuTimer();
@@ -115,6 +117,11 @@ class EnabledCoroutineStatsRequestData final : public folly::RequestData {
   }
 
   PerfLevel CapturedPerfLevel() const { return stats_config_.perf_level; }
+
+  // Work scheduled during the call can capture its RequestContext and restore
+  // it after the call ends, when env_ may be destroyed and the owner thread
+  // collects stats for other work.
+  void End() { ended_.Store(true); }
 
   void StopGetCpuTimer() {
 #ifndef NPERF_CONTEXT
@@ -150,11 +157,19 @@ class EnabledCoroutineStatsRequestData final : public folly::RequestData {
 #endif
   }
 
-  bool IsOwnerThread() const { return env_->GetThreadID() == owner_thread_id_; }
+  bool IsActiveOnThisThread() const {
+    return !ended_.Load() && std::this_thread::get_id() == owner_thread_id_;
+  }
+
+  bool GetCpuTimeEnabled() const {
+    return PerfLevelAtLeast(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex) ||
+           (stats_config_.cpu_time_enabled &&
+            PerfLevelAtLeast(PerfLevel::kEnableCount));
+  }
 
   void StartGetCpuTimer() {
 #ifndef NPERF_CONTEXT
-    if (!PerfLevelAtLeast(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex)) {
+    if (!GetCpuTimeEnabled()) {
       return;
     }
     coroutine_stats_thread_local_state.data = this;
@@ -171,7 +186,8 @@ class EnabledCoroutineStatsRequestData final : public folly::RequestData {
 #ifndef NIOSTATS_CONTEXT
   IOStatsContext iostats_context_;
 #endif
-  uint64_t owner_thread_id_ = 0;
+  const std::thread::id owner_thread_id_ = std::this_thread::get_id();
+  Atomic<bool> ended_{false};
 };
 
 #ifndef NDEBUG
@@ -197,12 +213,19 @@ CoroutineStatsConfig CaptureCoroutineStatsConfig() {
 #ifndef NIOSTATS_CONTEXT
   stats_config.iostats_disabled = get_iostats_context()->disable_iostats;
 #endif
+  stats_config.cpu_time_enabled = GetAsyncReadCPUTimeEnabled();
   return stats_config;
 }
 
 CoroutineStatsConfig CaptureAndDisableCoroutineStatsConfig() {
   CoroutineStatsConfig stats_config = CaptureCoroutineStatsConfig();
   DisableCoroutineStatsInTLS();
+  return stats_config;
+}
+
+CoroutineStatsConfig WithoutAsyncReadCPUTime(
+    CoroutineStatsConfig stats_config) {
+  stats_config.cpu_time_enabled = false;
   return stats_config;
 }
 
@@ -247,6 +270,7 @@ CoroutineStatsContextScope::~CoroutineStatsContextScope() {
       static_cast<EnabledCoroutineStatsRequestData*>(request_data_);
   assert(GetCoroutineStatsData() == request_data);
   request_data->StopGetCpuTimer();
+  request_data->End();
 #ifndef NPERF_CONTEXT
   PerfContext request_perf_context = std::move(*get_perf_context());
 #endif

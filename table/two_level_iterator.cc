@@ -26,6 +26,12 @@ class TwoLevelIndexIterator : public InternalIteratorBase<IndexValue> {
       TwoLevelIteratorState* state,
       InternalIteratorBase<IndexValue>* first_level_iter);
 
+  // No copying allowed
+  TwoLevelIndexIterator(const TwoLevelIndexIterator&) = delete;
+  TwoLevelIndexIterator& operator=(const TwoLevelIndexIterator&) = delete;
+  TwoLevelIndexIterator(TwoLevelIndexIterator&&) = delete;
+  TwoLevelIndexIterator& operator=(TwoLevelIndexIterator&&) = delete;
+
   ~TwoLevelIndexIterator() override {
     first_level_iter_.DeleteIter(false /* is_arena_mode */);
     second_level_iter_.DeleteIter(false /* is_arena_mode */);
@@ -69,11 +75,6 @@ class TwoLevelIndexIterator : public InternalIteratorBase<IndexValue> {
   bool IsValuePinned() const override { return false; }
 
  private:
-  void SaveError(const Status& s) {
-    if (status_.ok() && !s.ok()) {
-      status_ = s;
-    }
-  }
   void SkipEmptyDataBlocksForward();
   void SkipEmptyDataBlocksBackward();
   void SetSecondLevelIterator(InternalIteratorBase<IndexValue>* iter);

@@ -26,6 +26,9 @@ const std::string& WriteStallCauseToHyphenString(WriteStallCause cause) {
       return kPendingCompactionBytes;
     case WriteStallCause::kWriteBufferManagerLimit:
       return kWriteBufferManagerLimit;
+    case WriteStallCause::kCFScopeWriteStallCauseEnumMax:
+    case WriteStallCause::kDBScopeWriteStallCauseEnumMax:
+    case WriteStallCause::kNone:
     default:
       break;
   }
@@ -41,6 +44,7 @@ const std::string& WriteStallConditionToHyphenString(
       return kDelayed;
     case WriteStallCondition::kStopped:
       return kStopped;
+    case WriteStallCondition::kNormal:
     default:
       break;
   }
@@ -83,6 +87,10 @@ InternalStats::InternalCFStatsType InternalCFStat(
       }
       break;
     }
+    case WriteStallCause::kCFScopeWriteStallCauseEnumMax:
+    case WriteStallCause::kWriteBufferManagerLimit:
+    case WriteStallCause::kDBScopeWriteStallCauseEnumMax:
+    case WriteStallCause::kNone:
     default:
       break;
   }
@@ -96,11 +104,19 @@ InternalStats::InternalDBStatsType InternalDBStat(
       switch (condition) {
         case WriteStallCondition::kStopped:
           return InternalStats::kIntStatsWriteBufferManagerLimitStopsCounts;
+        case WriteStallCondition::kDelayed:
+        case WriteStallCondition::kNormal:
         default:
           break;
       }
       break;
     }
+    case WriteStallCause::kMemtableLimit:
+    case WriteStallCause::kL0FileCountLimit:
+    case WriteStallCause::kPendingCompactionBytes:
+    case WriteStallCause::kCFScopeWriteStallCauseEnumMax:
+    case WriteStallCause::kDBScopeWriteStallCauseEnumMax:
+    case WriteStallCause::kNone:
     default:
       break;
   }

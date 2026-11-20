@@ -31,12 +31,12 @@ class PartitionedFilterBlockBuilder : public FullFilterBlockBuilder {
       const SliceTransform* prefix_extractor, bool whole_key_filtering,
       FilterBitsBuilder* filter_bits_builder, int index_block_restart_interval,
       const bool use_value_delta_encoding, uint32_t format_version,
-      PartitionedIndexBuilder* const p_index_builder,
+      PartitionedIndexBuilder* const partitioned_index_builder,
       const uint32_t partition_size, size_t ts_sz,
       const bool persist_user_defined_timestamps,
       bool decouple_from_index_partitions, bool use_common_prefix = false);
 
-  virtual ~PartitionedFilterBlockBuilder();
+  ~PartitionedFilterBlockBuilder() override;
 
   void Add(const Slice& key_without_ts) override;
   void AddWithPrevKey(const Slice& key_without_ts,
@@ -84,11 +84,9 @@ class PartitionedFilterBlockBuilder : public FullFilterBlockBuilder {
   void AddImpl(const Slice& key_without_ts, const Slice& prev_key_without_ts);
 
  private:  // data
-  // Currently we keep the same number of partitions for filters and indexes.
-  // This would allow for some potentioal optimizations in future. If such
-  // optimizations did not realize we can use different number of partitions and
-  // eliminate p_index_builder_
-  PartitionedIndexBuilder* const p_index_builder_;
+  // Supplies the separator format and, unless decoupled, partition boundaries.
+  // Never null: a partitioned filter is created alongside a partitioned index.
+  PartitionedIndexBuilder* const partitioned_index_builder_;
   const size_t ts_sz_;
   const bool decouple_from_index_partitions_;
 

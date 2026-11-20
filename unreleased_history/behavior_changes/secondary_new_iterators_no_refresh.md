@@ -1,1 +1,0 @@
-`Iterator::Refresh()` now returns `NotSupported` on iterators from a secondary DB's `DB::NewIterators()` only, because those iterators are pinned to one cross-column-family read view. Iterators from `DB::NewIterator()` are unaffected; to advance a batch, call `DB::NewIterators()` again after `TryCatchUpWithPrimary()`.

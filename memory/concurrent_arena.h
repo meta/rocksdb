@@ -48,6 +48,7 @@ class ConcurrentArena : public Allocator {
   explicit ConcurrentArena(size_t block_size = Arena::kMinBlockSize,
                            AllocTracker* tracker = nullptr,
                            size_t huge_page_size = 0);
+  ~ConcurrentArena() override = default;
 
   char* Allocate(size_t bytes) override {
     return AllocateImpl(bytes, false /*force_arena*/,
@@ -90,7 +91,7 @@ class ConcurrentArena : public Allocator {
 
  private:
   struct Shard {
-    char padding[40] ROCKSDB_FIELD_UNUSED;
+    char padding[40] ROCKSDB_FIELD_UNUSED{};
     mutable SpinMutex mutex;
     char* free_begin_;
     std::atomic<size_t> allocated_and_unused_;
@@ -100,7 +101,7 @@ class ConcurrentArena : public Allocator {
 
   static thread_local size_t tls_cpuid;
 
-  char padding0[56] ROCKSDB_FIELD_UNUSED;
+  char padding0[56] ROCKSDB_FIELD_UNUSED{};
 
   size_t shard_block_size_;
 
@@ -112,7 +113,7 @@ class ConcurrentArena : public Allocator {
   std::atomic<size_t> memory_allocated_bytes_;
   std::atomic<size_t> irregular_block_num_;
 
-  char padding1[56] ROCKSDB_FIELD_UNUSED;
+  char padding1[56] ROCKSDB_FIELD_UNUSED{};
 
   Shard* Repick();
 
@@ -210,6 +211,8 @@ class ConcurrentArena : public Allocator {
 
   ConcurrentArena(const ConcurrentArena&) = delete;
   ConcurrentArena& operator=(const ConcurrentArena&) = delete;
+  ConcurrentArena(ConcurrentArena&&) = delete;
+  ConcurrentArena& operator=(ConcurrentArena&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

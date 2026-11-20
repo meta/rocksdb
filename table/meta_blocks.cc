@@ -171,6 +171,14 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kOriginalFileNumber, props.orig_file_number);
   Add(TablePropertiesNames::kRawKeySize, props.raw_key_size);
   Add(TablePropertiesNames::kRawValueSize, props.raw_value_size);
+  bool skip_referenced_blob_bytes = false;
+  TEST_SYNC_POINT_CALLBACK(
+      "PropertyBlockBuilder::AddTableProperty:SkipReferencedBlobBytes",
+      &skip_referenced_blob_bytes);
+  if (props.referenced_blob_bytes.has_value() && !skip_referenced_blob_bytes) {
+    Add(TablePropertiesNames::kReferencedBlobBytes,
+        *props.referenced_blob_bytes);
+  }
   Add(TablePropertiesNames::kDataSize, props.data_size);
   Add(TablePropertiesNames::kUncompressedDataSize,
       props.uncompressed_data_size);
@@ -184,6 +192,10 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
       props.index_value_is_delta_encoded);
   if (props.udi_is_primary_index != 0) {
     Add(TablePropertiesNames::kUDIIsPrimaryIndex, props.udi_is_primary_index);
+  }
+  if (props.standard_index_is_stub != 0) {
+    Add(TablePropertiesNames::kStandardIndexIsStub,
+        props.standard_index_is_stub);
   }
   Add(TablePropertiesNames::kNumEntries, props.num_entries);
   Add(TablePropertiesNames::kNumFilterEntries, props.num_filter_entries);
@@ -405,6 +417,8 @@ Status ParsePropertiesBlock(
        &new_table_properties->index_value_is_delta_encoded},
       {TablePropertiesNames::kUDIIsPrimaryIndex,
        &new_table_properties->udi_is_primary_index},
+      {TablePropertiesNames::kStandardIndexIsStub,
+       &new_table_properties->standard_index_is_stub},
       {TablePropertiesNames::kFilterSize, &new_table_properties->filter_size},
       {TablePropertiesNames::kRawKeySize, &new_table_properties->raw_key_size},
       {TablePropertiesNames::kRawValueSize,
@@ -485,7 +499,17 @@ Status ParsePropertiesBlock(
       *global_seqno_value_offset = iter->ValueOffset();
     }
 
-    if (pos != predefined_uint64_properties.end()) {
+    if (key == TablePropertiesNames::kReferencedBlobBytes) {
+      uint64_t val;
+      if (GetVarint64(&raw_val, &val)) {
+        new_table_properties->referenced_blob_bytes = val;
+      } else {
+        ROCKS_LOG_ERROR(ioptions.logger,
+                        "Detect malformed value in properties "
+                        "meta-block:\tkey: %s\tval: %s",
+                        key.c_str(), raw_val.ToString().c_str());
+      }
+    } else if (pos != predefined_uint64_properties.end()) {
       if (key == TablePropertiesNames::kDeletedKeys ||
           key == TablePropertiesNames::kMergeOperands) {
         // Insert in user-collected properties for API backwards compatibility

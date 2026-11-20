@@ -156,7 +156,7 @@ class Env : public Customizable {
     std::string name;
 
     // Size of file in bytes
-    uint64_t size_bytes;
+    uint64_t size_bytes = 0;
 
     // EXPERIMENTAL - only provided by some implementations
     Temperature temperature = Temperature::kUnknown;
@@ -171,6 +171,8 @@ class Env : public Customizable {
   // No copying allowed
   Env(const Env&) = delete;
   void operator=(const Env&) = delete;
+  Env(Env&&) = delete;
+  void operator=(Env&&) = delete;
 
   ~Env() override;
 
@@ -437,8 +439,12 @@ class Env : public Customizable {
     return Status::NotSupported("LoadLibrary is not implemented in this Env");
   }
 
-  // Priority for scheduling job in thread pool
-  enum Priority { BOTTOM, LOW, HIGH, USER, TOTAL };
+  // BOTTOM through READ identify Env-managed thread pools. The READ pool is
+  // for work done on behalf of foreground reads; it has no threads until
+  // configured and runs at normal CPU and I/O priority unless lowered. USER is
+  // not a thread-pool priority; it is used to attribute work performed by user
+  // threads in internal statistics. TOTAL is a sentinel.
+  enum Priority { BOTTOM, LOW, HIGH, READ, USER, TOTAL };
 
   static std::string PriorityToString(Priority priority);
 
@@ -912,15 +918,15 @@ class SequentialFile {
 // A read IO request structure for use in MultiRead
 struct ReadRequest {
   // File offset in bytes
-  uint64_t offset;
+  uint64_t offset = 0;
 
   // Length to read in bytes. `result` only returns fewer bytes if end of file
   // is hit (or `status` is not OK).
-  size_t len;
+  size_t len = 0;
 
   // A buffer that MultiRead()  can optionally place data in. It can
   // ignore this and allocate its own buffer
-  char* scratch;
+  char* scratch = nullptr;
 
   // Output parameter set by MultiRead() to point to the data buffer, and
   // the number of valid bytes
@@ -1046,6 +1052,8 @@ class WritableFile {
   // No copying allowed
   WritableFile(const WritableFile&) = delete;
   void operator=(const WritableFile&) = delete;
+  WritableFile(WritableFile&&) = delete;
+  void operator=(WritableFile&&) = delete;
 
   // For cases when Close() hasn't been called, many derived classes of
   // WritableFile will need to call Close() non-virtually in their destructor,
@@ -1281,6 +1289,8 @@ class RandomRWFile {
   // No copying allowed
   RandomRWFile(const RandomRWFile&) = delete;
   RandomRWFile& operator=(const RandomRWFile&) = delete;
+  RandomRWFile(RandomRWFile&&) = delete;
+  RandomRWFile& operator=(RandomRWFile&&) = delete;
 
   // For cases when Close() hasn't been called, many derived classes of
   // RandomRWFile will need to call Close() non-virtually in their destructor,
@@ -1340,6 +1350,8 @@ class MemoryMappedFileBuffer {
   // movable if desired, however, since
   MemoryMappedFileBuffer(const MemoryMappedFileBuffer&) = delete;
   MemoryMappedFileBuffer& operator=(const MemoryMappedFileBuffer&) = delete;
+  MemoryMappedFileBuffer(MemoryMappedFileBuffer&&) = delete;
+  MemoryMappedFileBuffer& operator=(MemoryMappedFileBuffer&&) = delete;
 
   void* GetBase() const { return base_; }
   size_t GetLen() const { return length_; }
@@ -1355,7 +1367,7 @@ class Directory {
  public:
   // Many derived classes of Directory will need to call Close() in their
   // destructor, when not called already, to ensure resources are released.
-  virtual ~Directory() {}
+  virtual ~Directory() = default;
   // Fsync directory. Can be called concurrently from multiple threads.
   virtual Status Fsync() = 0;
   // Calling Close() before destroying a Directory is recommended to surface
@@ -1399,6 +1411,8 @@ class Logger {
   // No copying allowed
   Logger(const Logger&) = delete;
   void operator=(const Logger&) = delete;
+  Logger(Logger&&) = delete;
+  void operator=(Logger&&) = delete;
 
   virtual ~Logger();
 
@@ -1464,11 +1478,13 @@ class FileLock {
   // No copying allowed
   FileLock(const FileLock&) = delete;
   void operator=(const FileLock&) = delete;
+  FileLock(FileLock&&) = delete;
+  void operator=(FileLock&&) = delete;
 };
 
 class DynamicLibrary {
  public:
-  virtual ~DynamicLibrary() {}
+  virtual ~DynamicLibrary() = default;
 
   // Returns the name of the dynamic library.
   virtual const char* Name() const = 0;

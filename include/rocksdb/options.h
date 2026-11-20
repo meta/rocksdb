@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
@@ -100,7 +101,7 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Universal style compaction is focused on reducing Write Amplification
   // Factor for big data sets, but increases Space Amplification. You can learn
   // more about the different styles here:
-  // https://github.com/facebook/rocksdb/wiki/Rocksdb-Architecture-Guide
+  // https://github.com/meta/rocksdb/wiki/Rocksdb-Architecture-Guide
   // Make sure to also call IncreaseParallelism(), which will provide the
   // biggest performance gains.
   // Note: we might use more memory than memtable_memory_budget during high
@@ -471,28 +472,37 @@ struct CompactionServiceJobInfo {
   std::string db_session_id;
 
   // the id of the column family where the compaction happened.
-  uint32_t cf_id;
+  uint32_t cf_id = 0;
   // the name of the column family where the compaction happened.
   std::string cf_name;
 
-  uint64_t job_id;  // job_id is only unique within the current DB and session,
-                    // restart DB will reset the job_id. `db_id` and
-                    // `db_session_id` could help you build unique id across
-                    // different DBs and sessions.
+  uint64_t job_id = 0;  // job_id is only unique within the current DB and
+                        // session, restart DB will reset the job_id. `db_id`
+                        // and `db_session_id` could help you build unique id
+                        // across different DBs and sessions.
 
-  Env::Priority priority;
+  Env::Priority priority = Env::LOW;
 
   // Additional Compaction Details that can be useful in the CompactionService
-  CompactionReason compaction_reason;
-  bool is_full_compaction;
-  bool is_manual_compaction;
-  bool bottommost_level;
+  CompactionReason compaction_reason = CompactionReason::kUnknown;
+  bool is_full_compaction = false;
+  bool is_manual_compaction = false;
+  bool bottommost_level = false;
 
   // the smallest input level of the compaction.
   // (same as Compaction::start_level and CompactionJobInfo::base_input_level)
-  int base_input_level;
+  int base_input_level = 0;
   // the output level of the compaction.
-  int output_level;
+  int output_level = 0;
+
+  // The execution pool selected for this job, independent of later DB option
+  // updates.
+  bool separate_remote_compaction_pool_selected = false;
+
+  // True if the compaction filter uses
+  // CompactionFilter::MergeOrder::kMergeBeforeFilter, so the worker must
+  // support that order.
+  bool merge_before_filter = false;
 
   CompactionServiceJobInfo() {}
   CompactionServiceJobInfo(std::string db_name_, std::string db_id_,
@@ -524,7 +534,7 @@ struct CompactionServiceScheduleResponse {
   CompactionServiceJobStatus status;
   CompactionServiceScheduleResponse(std::string scheduled_job_id_,
                                     CompactionServiceJobStatus status_)
-      : scheduled_job_id(scheduled_job_id_), status(status_) {}
+      : scheduled_job_id(std::move(scheduled_job_id_)), status(status_) {}
   explicit CompactionServiceScheduleResponse(CompactionServiceJobStatus status_)
       : status(status_) {}
 };
@@ -538,6 +548,15 @@ class CompactionService : public Customizable {
 
   // Returns the name of this compaction service.
   const char* Name() const override = 0;
+
+  // Returns true if RocksDB may send compactions whose filter uses
+  // CompactionFilter::MergeOrder::kMergeBeforeFilter to this service. A
+  // worker that cannot honor the order (for example, an older RocksDB
+  // version) causes a local fallback after the remote attempt, before any
+  // output is imported. With the default (false), such compactions run
+  // locally. Called without the DB mutex; must be cheap, must not block, and
+  // must not call into the DB.
+  virtual bool SupportsMergeBeforeFilter() const { return false; }
 
   // Schedule compaction to be processed remotely.
   virtual CompactionServiceScheduleResponse Schedule(
@@ -553,9 +572,9 @@ class CompactionService : public Customizable {
   // the worker's DB::OpenAndCompact.
   //
   // DB::OpenAndCompact may return Status::Incomplete to *decline* a scheduled
-  // job rather than fail it -- currently when the MANIFEST floor check finds
-  // the worker recovered an older/stale view of the DB than the primary
-  // scheduled from (see DBOptions::remote_compaction_manifest_floor). Whether
+  // job rather than fail it -- for example, when the MANIFEST floor check finds
+  // a stale worker view, the reserved BlobDB file-number range is exhausted, or
+  // the worker's BlobDB capability/options do not match the primary's. Whether
   // to map that to kUseLocal (fall back to a local compaction) or kFailure
   // (surface it) is up to the integrator; both are valid. (Cancellation also
   // surfaces as Status::Incomplete, distinguishable by SubCode
@@ -796,11 +815,17 @@ struct DBOptions {
   // Default: 16
   int max_file_opening_threads = 16;
 
-  // Requested maximum number of threads in the shared read I/O executor.
-  // Opening a DB or SstFileReader can increase the executor to this size but
-  // cannot reduce it. Used exclusively for asynchronous read requests (e.g.
-  // GetAsync, MultiGetAsync).
-  int read_io_executor_threads = 1;
+  // Requested maximum number of threads in the shared read I/O executor, used
+  // only by asynchronous reads (e.g. GetAsync, MultiGetAsync, CoroDB::CoGet,
+  // CoroDB::CoMultiGet). Opening a DB or SstFileReader with a positive value
+  // creates the executor or grows it to this size, but never shrinks it. 0
+  // leaves the executor unchanged: until a DB or SstFileReader in the process
+  // opens with a positive value, the default FileSystem has no executor,
+  // starts no read threads or event loops, and the asynchronous read APIs fall
+  // back to synchronous reads. Negative values are rejected.
+  //
+  // Default: 0
+  int read_io_executor_threads = 0;
 
   // If true, SST files are opened and validated asynchronously in the
   // background after DB::Open or DB::OpenAsSecondary returns. This reduces DB
@@ -841,7 +866,7 @@ struct DBOptions {
   //
   // The RocksDB wiki has some discussion about how the WAL interacts
   // with memtables and flushing of column families.
-  // https://github.com/facebook/rocksdb/wiki/Column-Families
+  // https://github.com/meta/rocksdb/wiki/Column-Families
   //
   // This option takes effect only when there are more than one column
   // family as otherwise the wal size is dictated by the write_buffer_size.
@@ -896,7 +921,7 @@ struct DBOptions {
   // and the db data dir's absolute path will be used as the log file
   // name's prefix.
   // NOTE: not for WALs
-  std::string db_log_dir = "";
+  std::string db_log_dir;
 
   // This specifies the absolute dir path for write-ahead logs (WAL).
   // If it is empty, the log files will be in the same dir as data,
@@ -904,7 +929,7 @@ struct DBOptions {
   // If it is non empty, the log files will be in kept the specified dir.
   // When destroying the db,
   //   all log files in wal_dir and the dir itself is deleted
-  std::string wal_dir = "";
+  std::string wal_dir;
 
   // The periodicity when obsolete files get deleted. The default
   // value is 6 hours. The files that get out of scope by compaction
@@ -998,6 +1023,9 @@ struct DBOptions {
   // use.  This is more efficient because the blocks are already
   // allocated and fdatasync does not need to update the inode after
   // each write.
+  // With a WritePrepared or WriteUnprepared TransactionDB, writes with
+  // WriteOptions::disableWAL return Status::InvalidArgument when this is
+  // non-zero.
   // Default: 0
   size_t recycle_log_file_num = 0;
 
@@ -1239,6 +1267,15 @@ struct DBOptions {
   //
   // Dynamically changeable through SetDBOptions() API.
   unsigned int stats_dump_period_sec = 600;
+
+  // Minimum completed DB-wide mutex hold duration for sampled INFO logging,
+  // in microseconds. Requires Statistics::kAll and an info logger. Zero
+  // disables these hold probes without disabling existing statistics timers.
+  // Updates apply when a tracked ownership interval ends; previously untracked
+  // intervals cannot be reconstructed. Default: 0 (disabled). Set to 100000
+  // for a 100 ms investigation threshold.
+  // Dynamically changeable through SetDBOptions().
+  uint64_t mutex_hold_log_threshold_us = 0;
 
   // if not zero, dump rocksdb.stats to RocksDB every stats_persist_period_sec
   // Default: 600
@@ -1636,6 +1673,30 @@ struct DBOptions {
   // are phased out.
   bool write_dbid_to_manifest = true;
 
+  // EXPERIMENTAL: If true, each durable OPTIONS file is followed by a MANIFEST
+  // record committing its file number. For a column-family create or drop, the
+  // commit and membership edit are the same MANIFEST record.
+  //
+  // This value is persisted in OPTIONS files so readers can distinguish a
+  // tracked file that was durably renamed but not committed from a file written
+  // by a legacy or disabled writer. A higher file with this value false
+  // supersedes an older MANIFEST commit. A higher file with this value true is
+  // ignored until its number is committed.
+  //
+  // Older binaries safely ignore the MANIFEST field and retain their legacy
+  // highest-numbered-OPTIONS behavior. Rollback binaries must know this option
+  // before the feature is enabled so they can parse newly written OPTIONS
+  // files.
+  //
+  // The multi-column-family create/drop APIs preserve their existing partial
+  // success behavior while writing one complete OPTIONS snapshot per batch.
+  // A partial batch can leave the committed snapshot with extra column
+  // families; LoadLatestOptions and CheckOptionsCompatibility filter those
+  // entries against the live MANIFEST membership.
+  //
+  // Default: false
+  bool track_options_file_number_in_manifest = false;
+
   // It is expected that the Identity file will be obsoleted by recording
   // DB ID in the manifest (see write_dbid_to_manifest). Setting this to true
   // maintains the historical behavior of writing an Identity file, while
@@ -1652,6 +1713,12 @@ struct DBOptions {
   // When set to true, it is as if every iterator is created with
   // total_order_seek=true and only auto_prefix_mode=true and
   // prefix_same_as_start=true can take advantage of prefix seek optimizations.
+  // A prefix_same_as_start iterator still uses prefix seek, although
+  // total_order_seek is set (see ReadOptions::total_order_seek).
+  // Also, a prefix_same_as_start iterator returns Status::NotSupported from
+  // SeekToFirst() and SeekToLast(), and Status::InvalidArgument from Seek()
+  // and SeekForPrev() with a target outside the prefix extractor's domain
+  // (see ReadOptions::prefix_same_as_start).
   bool prefix_seek_opt_in_only = false;
 
   // The number of bytes to prefetch when reading the DB manifest and WAL files
@@ -1720,12 +1787,82 @@ struct DBOptions {
   // Default: false
   bool best_efforts_recovery = false;
 
+  // Best-efforts BlobDB repair is a recovery mode only for DBs that use
+  // integrated BlobDB (see ColumnFamilyOptions::enable_blob_files). It opens a
+  // DB whose SST files reference blob files that are missing or cannot be
+  // opened.
+  //
+  // Like best_efforts_recovery, opening a DB with this option can lose data.
+  // Unlike best_efforts_recovery, there is no guarantee that the DB recovers to
+  // a consistent point in time. The repair is purely best effort: it keeps
+  // whatever data the files present at open time still hold.
+  //
+  // Opening a DB with this option:
+  // 1. Replays the MANIFEST and handles missing SST files exactly like
+  //    best_efforts_recovery: it falls back to an older point in time, or
+  //    leaves out a missing suffix of L0 SST files. A missing SST file loses
+  //    keys and deletions, so keeping newer state could bring back older
+  //    values. A missing blob file never causes a fallback, because the keys
+  //    and sequence numbers that reference it are still in the SST files.
+  // 2. At the recovered point in time, leaves missing blob files out of each
+  //    column family, along with the blob files that only left-out L0 SST
+  //    files are linked to, as best_efforts_recovery does. It records the
+  //    ones that kept SST files might still reference as dropped blob files.
+  //    If both SST files and blob files are missing, step 1 picks the point in
+  //    time and this step drops the blob files missing at that point.
+  // 3. Like best_efforts_recovery, does not replay WAL files. It then writes
+  //    the dropped blob files to a new MANIFEST and opens the DB.
+  //
+  // Afterwards:
+  // * Every compaction, automatic or manual, that reads a value stored in a
+  //   dropped blob file discards it the same way as
+  //   CompactRangeOptions::skip_missing_blob_files: a lost value becomes a
+  //   deletion at its sequence number, so older versions of the key stay
+  //   hidden, and a wide-column entity keeps its surviving columns. Such
+  //   compactions run locally, bypassing DBOptions::compaction_service.
+  // * Reads return the same results before such a compaction runs: a value
+  //   stored in a dropped blob file reads as deleted (point lookups return
+  //   NotFound, iterators skip the key, and a merge on top of it merges with
+  //   no base value), and a wide-column entity reads as its surviving
+  //   columns. The BLOB_DB_DROPPED_BLOB_READ_COUNT ticker counts these reads.
+  // * Compactions do not fail for lack of garbage accounting in dropped blob
+  //   files.
+  // * A deletion written in place of a lost value can later meet a
+  //   SingleDelete of the same key in a compaction. With
+  //   enforce_single_del_contracts (the default), that compaction fails with
+  //   Corruption, so DBs that use SingleDelete should turn the check off.
+  // Recorded dropped blob files stay in effect after the DB is reopened
+  // without this option, as long as an SST file might reference them: until
+  // every SST file's oldest referenced blob file is newer. Blob garbage
+  // collection that relocates the older blobs ends this sooner. RocksDB
+  // versions without this option ignore the records and drop them when they
+  // write a new MANIFEST. A blob file that is missing but not recorded causes
+  // Corruption; only this option records dropped blob files.
+  //
+  // Requires enable_blob_files on at least one column family passed to
+  // DB::Open. A read-only DB applies the same recovery in memory but cannot
+  // record dropped blob files in the MANIFEST. Secondary and follower instances
+  // ignore this option. Legacy (stacked) BlobDB is not supported. Setting
+  // best_efforts_recovery as well has no additional effect.
+  //
+  // Unlike other DB options, this one is not saved in the OPTIONS file, so it
+  // applies only to the DB::Open it is passed to: options loaded with
+  // LoadLatestOptions() have it unset. Every open with it set skips WAL replay
+  // and records any blob file missing at that time as dropped, so set it only
+  // for an open that needs the repair.
+  //
+  // Default: false
+  bool best_efforts_blob_db_repair = false;
+
   // It defines how many times DB::Resume() is called by a separate thread when
   // background retryable IO Error happens. When background retryable IO
   // Error happens, SetBGError is called to deal with the error. If the error
   // can be auto-recovered (e.g., retryable IO Error during Flush or WAL write),
   // then db resume is called in background to recover from the error. If this
-  // value is 0 or negative, DB::Resume() will not be called automatically.
+  // value is 0 or negative, DB::Resume() will not be called automatically, and
+  // any background retryable IO error (including one during compaction, which
+  // would otherwise be retried by rescheduling the compaction) stops writes
+  // until the user calls DB::Resume().
   //
   // Default: INT_MAX
   int max_bgerror_resume_count = INT_MAX;
@@ -1777,6 +1914,27 @@ struct DBOptions {
   // backward/forward compatibility support for now. Some known issues are still
   // under development.
   std::shared_ptr<CompactionService> compaction_service = nullptr;
+
+  // When true and compaction_service is configured, remote jobs and
+  // subcompactions use one process-wide pool that grows on demand.
+  // Remote waits do not consume LOW/BOTTOM workers or the local compaction
+  // budget. Background local choices and fallbacks use those pools and count
+  // each subcompaction against the DB's background compaction limit.
+  // CompactFiles keeps synchronous local execution on the caller thread.
+  // On first use, the pool starts with at least one worker and otherwise the
+  // largest LOW + BOTTOM worker count among participating DBs. It grows for
+  // outstanding remote tasks across all DBs and
+  // returns to that baseline after at least 30 seconds of inactivity.
+  // When false, coordinators use LOW/BOTTOM and the existing background
+  // compaction budget; local subcompactions use the existing execution path.
+  // Dynamically changeable through SetDBOptions(). Each coordinator keeps the
+  // setting chosen when it was scheduled, including its local subcompactions.
+  // Disabling does not cancel jobs. After the inactivity period, workers
+  // return to the baseline of participating enabled DBs, or zero if none
+  // remain.
+  // Default: false. Not persisted in OPTIONS files. Set explicitly when opening
+  // the DB or through SetDBOptions().
+  bool use_separate_remote_compaction_pool = false;
 
   // Hardening for remote compaction (CompactionService / DB::OpenAndCompact).
   // When true (default), the primary includes in each remote compaction request
@@ -1834,7 +1992,7 @@ struct DBOptions {
   // will be removed in a future release.
   // Warning: do not set to false unless you are trying to migrate existing
   // data in which the contract of single delete
-  // (https://github.com/facebook/rocksdb/wiki/Single-Delete) is not enforced,
+  // (https://github.com/meta/rocksdb/wiki/Single-Delete) is not enforced,
   // thus has Delete mixed with SingleDelete for the same user key. Violation
   // of the contract leads to undefined behaviors with high possibility of data
   // inconsistency, e.g. deleted old data become visible again, etc.
@@ -1855,7 +2013,7 @@ struct DBOptions {
   // spans to the next day (e.g., 23:30-04:00). To make an entire day off-peak,
   // use "0:00-23:59". To make an entire day have no offpeak period, leave
   // this field blank. Default: Empty string (no offpeak).
-  std::string daily_offpeak_time_utc = "";
+  std::string daily_offpeak_time_utc;
 
   // Maximum interval in seconds between periodic compaction trigger checks.
   // The periodic trigger re-evaluates compaction scores for all column
@@ -1910,6 +2068,15 @@ struct DBOptions {
   // expedited but herd-avoiding -- so such a file may be rewritten up to a
   // quarter-interval past its (revised) deadline. To enforce the age limit
   // immediately at such a transition, trigger a manual compaction.
+  //
+  // Files not yet past due at a (re)anchor are steered toward their phase more
+  // gently for up to about two intervals afterward, so that many DBs
+  // anchoring at once (e.g. enabling phasing across a fleet) do not
+  // concentrate periodic compactions shortly after the change. Because DB open
+  // is also a (re)anchor, a DB reopened much more often than once per interval
+  // converges toward its phase more slowly; such re-anchoring is appropriate to
+  // reduce load spikes after some period with the DB closed, without
+  // compromising the periodic_compaction_seconds contract.
   //
   // 0 disables phasing entirely (exact legacy behavior; this is the kill
   // switch). 100 snaps to the preferred phase in a single cycle, which can
@@ -2113,14 +2280,22 @@ class MultiScanArgs {
     original_ranges_ = other.original_ranges_;
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
+    rolling_prefetch = other.rolling_prefetch;
+    rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
+    use_parallel_async_io_block_decompression =
+        other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
   }
   MultiScanArgs(MultiScanArgs&& other) noexcept
       : io_coalesce_threshold(other.io_coalesce_threshold),
         max_prefetch_size(other.max_prefetch_size),
+        rolling_prefetch(other.rolling_prefetch),
+        rolling_prefetch_window_size(other.rolling_prefetch_window_size),
         use_async_io(other.use_async_io),
+        use_parallel_async_io_block_decompression(
+            other.use_parallel_async_io_block_decompression),
         reverse(other.reverse),
         io_dispatcher(std::move(other.io_dispatcher)),
         comp_(other.comp_),
@@ -2131,7 +2306,11 @@ class MultiScanArgs {
     original_ranges_ = other.original_ranges_;
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
+    rolling_prefetch = other.rolling_prefetch;
+    rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
+    use_parallel_async_io_block_decompression =
+        other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
     return *this;
@@ -2143,7 +2322,11 @@ class MultiScanArgs {
       original_ranges_ = std::move(other.original_ranges_);
       io_coalesce_threshold = other.io_coalesce_threshold;
       max_prefetch_size = other.max_prefetch_size;
+      rolling_prefetch = other.rolling_prefetch;
+      rolling_prefetch_window_size = other.rolling_prefetch_window_size;
       use_async_io = other.use_async_io;
+      use_parallel_async_io_block_decompression =
+          other.use_parallel_async_io_block_decompression;
       reverse = other.reverse;
       io_dispatcher = std::move(other.io_dispatcher);
     }
@@ -2190,8 +2373,10 @@ class MultiScanArgs {
 
   void reserve(size_t size) { original_ranges_.reserve(size); }
 
+  // NOLINTNEXTLINE(google-explicit-constructor)
   operator std::vector<ScanOptions>*() { return &original_ranges_; }
 
+  // NOLINTNEXTLINE(google-explicit-constructor)
   operator const std::vector<ScanOptions>*() const { return &original_ranges_; }
 
   ~MultiScanArgs() {}
@@ -2207,7 +2392,11 @@ class MultiScanArgs {
   void CopyConfigFrom(const MultiScanArgs& other) {
     io_coalesce_threshold = other.io_coalesce_threshold;
     max_prefetch_size = other.max_prefetch_size;
+    rolling_prefetch = other.rolling_prefetch;
+    rolling_prefetch_window_size = other.rolling_prefetch_window_size;
     use_async_io = other.use_async_io;
+    use_parallel_async_io_block_decompression =
+        other.use_parallel_async_io_block_decompression;
     reverse = other.reverse;
     io_dispatcher = other.io_dispatcher;
   }
@@ -2226,10 +2415,31 @@ class MultiScanArgs {
   // Note that this limit is per file and applies to compressed block size.
   uint64_t max_prefetch_size = 0;
 
+  // Use max_prefetch_size as the maximum adaptive rolling batch size. The
+  // first batch is submitted by Prepare(), and touching a block in that batch
+  // submits the next batch. Iteration waits for submitted I/O at its boundary
+  // rather than falling back to an individual block read. Applied only to
+  // forward scans with use_async_io and a nonzero rolling window. Otherwise it
+  // is ignored, leaving max_prefetch_size with its ordinary one-shot semantics.
+  bool rolling_prefetch = false;
+
+  // Maximum requested physical span of one rolling prefetch window and the
+  // initial rolling batch budget. Must be nonzero. When max_prefetch_size is
+  // nonzero, the effective window is the smaller of the two and a foreground
+  // wait may grow the batch up to max_prefetch_size. Otherwise the batch stays
+  // fixed at this size.
+  uint64_t rolling_prefetch_window_size = 0;
+
   // Enable async I/O for multi-scan operations
   // When true, BlockBasedTableIterator will use ReadAsync() for reading blocks
   // When false, it will use synchronous MultiRead().
   bool use_async_io = false;
+
+  // EXPERIMENTAL: Materialize asynchronously read blocks in parallel using
+  // the Env::Priority::READ thread pool. If that pool has no workers,
+  // materialization remains inline. PerfContext counters for blocks
+  // materialized on pool threads are not attributed to the calling thread.
+  bool use_parallel_async_io_block_decompression = false;
 
   // Scan ranges in reverse order. Ranges are still specified in comparator
   // order as [start, limit), and reverse scans require bounded ranges.
@@ -2399,7 +2609,9 @@ struct ReadOptions {
   //
   // If prefix_extractor is not null, the Seek target and `iterate_lower_bound`
   // need to have the same prefix. This is because ordering is not guaranteed
-  // outside of prefix domain.
+  // outside of prefix domain. With prefix_same_as_start, `iterate_lower_bound`
+  // may have another prefix: the iterator stops at whichever of the bound and
+  // the start of the seek prefix it reaches first.
   //
   // In case of user_defined timestamp, if enabled, iterate_lower_bound should
   // point to key without timestamp part.
@@ -2431,9 +2643,16 @@ struct ReadOptions {
   // that were inserted into the database after the creation of the iterator.
   bool tailing = false;
 
-  // Enable a total order seek regardless of index format (e.g. hash index)
-  // used in the table. Some table format (e.g. plain table) may not support
-  // this option.
+  // For iterators: turns off the implicit prefix seek that iterators with
+  // default ReadOptions use when a prefix_extractor is set, so they return
+  // keys in total order. prefix_same_as_start and auto_prefix_mode are
+  // explicit requests and take precedence: with prefix_same_as_start (even
+  // with total_order_seek=true) the iterator uses prefix seek and returns only
+  // keys with the seek key's prefix, when the seek key is in the prefix
+  // extractor's domain; with auto_prefix_mode, results are as in total
+  // order. DBOptions::prefix_seek_opt_in_only forces this option on.
+  // Also forces a total order index seek regardless of index format (e.g.
+  // hash index). Some table formats (e.g. plain table) may not support this.
   // If true when calling Get(), we also skip prefix bloom when reading from
   // block based table, which only affects Get() performance.
   bool total_order_seek = false;
@@ -2441,6 +2660,7 @@ struct ReadOptions {
   // When true, by default use total_order_seek = true, and RocksDB can
   // selectively enable prefix seek mode if won't generate a different result
   // from total_order_seek, based on seek key, and iterator upper bound.
+  // prefix_same_as_start takes precedence over auto_prefix_mode.
   // BUG: Using Comparator::IsSameLengthImmediateSuccessor and
   // SliceTransform::FullLengthEnabled to enable prefix mode in cases where
   // prefix of upper bound differs from prefix of seek key has a flaw.
@@ -2459,6 +2679,17 @@ struct ReadOptions {
   // prefix_extractor, which is mutable. When SST files have been built with
   // the same prefix extractor, prefix filtering optimizations will be used
   // for both Seek and SeekForPrev.
+  //
+  // SeekToFirst() and SeekToLast() have no seek key to take the prefix from
+  // (with a bound, the prefix comes from the bound), and neither does a Seek()
+  // or SeekForPrev() target outside the prefix extractor's domain. Such scans
+  // are not well supported with prefix seek: they can skip keys, for example
+  // when range tombstones cross prefix boundaries. Use total order iteration
+  // or auto_prefix_mode, instead of prefix_same_as_start, for such scans. With
+  // DBOptions::prefix_seek_opt_in_only, SeekToFirst() and SeekToLast() leave
+  // the iterator !Valid() with status NotSupported, and Seek() and
+  // SeekForPrev() with an out-of-domain target leave it !Valid() with status
+  // InvalidArgument.
   bool prefix_same_as_start = false;
 
   // Keep the blocks loaded by the iterator pinned in memory as long as the
@@ -2572,37 +2803,46 @@ struct ReadOptions {
 
   // EXPERIMENTAL
   //
-  // Names which block-based-table index a read should use. This is a
-  // preparatory API for replacing direct table_index_factory selection in a
-  // follow-up change. Until that wiring lands, table_index_factory keeps its
-  // existing behavior and read_index is not consulted by table reading.
+  // Per-read index selection. Overrides the default read routing determined
+  // by BlockBasedTableOptions::index_mode.
+  //
+  //   kDefault: use whatever index_mode says.
+  //     kStandardOnly/kStandardDefault/kStandardRequired -> standard index.
+  //     kCustomDefault/kCustomOnly                       -> custom
+  //                                                        IndexFactory index.
+  //
+  //   kBuiltin: force the standard index for this read.
+  //     Useful for debugging, comparing results between indexes, or
+  //     temporary fallback. In kCustomOnly mode, the standard index
+  //     is a minimal stub -- reads fail loudly instead of returning an
+  //     OK empty result.
+  //
+  //   kPreferCustom: select the custom IndexFactory index when the SST has
+  //     one; fall back to the standard index for SSTs that don't (e.g.,
+  //     pre-UDI files still on disk during migration). Once the custom
+  //     reader is loaded for an SST the per-read selection is strict --
+  //     iterator-creation failures surface as Status::Corruption rather
+  //     than silently falling back.
+  //
+  // ReadIndex is a two-way selector because BlockBasedTable supports
+  // exactly two index read targets per SST: the standard index (selected
+  // by BlockBasedTableOptions::index_type) and at most one custom index
+  // from user_defined_index_factory.
   enum class ReadIndex : uint8_t {
-    // Use the column family's default index routing.
     kDefault = 0,
-    // Use the standard block-based-table index.
     kBuiltin = 1,
-    // Prefer the configured custom index when present.
     kPreferCustom = 2,
   };
   ReadIndex read_index = ReadIndex::kDefault;
 
   // EXPERIMENTAL
   //
-  // Specify an alternate index to use in the SST files instead of the native
-  // block based table index. The table_factory used for the column family
-  // must support building/reading this index.
-  //
-  // The UDI framework supports all iterator operations: forward scans
-  // (SeekToFirst, Seek, Next), reverse scans (SeekToLast, SeekForPrev, Prev),
-  // and point lookups (Get). Concrete UDI implementations may impose their
-  // own restrictions -- check the specific implementation's documentation.
-  //
-  // When BlockBasedTableOptions::use_udi_as_primary_index is true, this field
-  // does not need to be set -- all reads automatically use the UDI. If set
-  // while use_udi_as_primary_index is true, the UDI from
-  // BlockBasedTableOptions takes precedence. This field is only needed when
-  // the UDI is a secondary index and you want to explicitly select it for
-  // reads.
+  // Legacy selector for a secondary custom index. With read_index=kDefault,
+  // the table's custom index takes precedence when it is primary or the only
+  // usable index.
+  // Otherwise, except with kBuiltin, this factory's Name() must match the SST's
+  // custom index name; a mismatch fails reads with InvalidArgument. New code
+  // can leave this null and use read_index directly.
   const IndexFactory* table_index_factory = nullptr;
 
   // EXPERIMENTAL: Optional non-owning provider for data-block storage pinned by
@@ -2892,6 +3132,30 @@ struct CompactRangeOptions {
   // Default: false
   bool exclusive_manual_compaction = false;
 
+  // If true, discard values referencing integrated external blob files absent
+  // from each compaction's input Version. A lost scalar value becomes a
+  // deletion at its original sequence number and timestamp. Wide entities
+  // retain available columns and become deletions only when no columns remain.
+  // If the default column is lost but other columns survive, Get() returns OK
+  // with an empty value; GetEntity() returns the surviving columns.
+  //
+  // This option deliberately discards unavailable data. It is intended for
+  // offline repair after best-efforts recovery. Legacy BlobDB is unsupported.
+  // The check uses blob indices and Version metadata, so it does not detect
+  // files missing on disk whose metadata is still present. Filters, merges,
+  // and blob garbage collection can still require blob payload reads and
+  // propagate their errors.
+  //
+  // Applies only to this CompactRange call. Selected SST files are rewritten,
+  // including bottommost files even when bottommost_level_compaction is kSkip.
+  // The bottommost pass skips files already rewritten by this call when
+  // selecting inputs.
+  // Repair runs locally and bypasses DBOptions::compaction_service, which does
+  // not currently support this repair policy. FIFO compaction returns
+  // NotSupported.
+  // Default: false
+  bool skip_missing_blob_files = false;
+
   // If true, compacted files will be moved to the minimum level capable
   // of holding the data or given level (specified non-negative target_level).
   bool change_level = false;
@@ -3136,6 +3400,28 @@ struct IngestExternalFileOptions {
   // multiple files at once.
   int file_opening_threads = 1;
 
+  // If true, ingestion fails with Status::InvalidArgument (and no files are
+  // ingested) if any file is already too old for the column family to keep
+  // without recompaction or deletion. This avoids publishing data that, for
+  // example, should already have been processed by a compaction filter. A
+  // file is too old if
+  // * for leveled or universal compaction, the age of its contents, from the
+  //   creation time recorded in the file (see `periodic_compaction_seconds` on
+  //   how ingested files are aged), exceeds the effective
+  //   `periodic_compaction_seconds` (including any RocksDB-picked default and,
+  //   for universal compaction, the effect of `ttl`), or
+  // * for FIFO compaction, the age of its newest data, as estimated by FIFO
+  //   TTL compaction (from the newest key time recorded in the file, or else
+  //   its oldest ancestor time, or else its creation time), exceeds `ttl`, so
+  //   that FIFO compaction would already treat the file as expired.
+  // Nothing is rejected if the applicable `periodic_compaction_seconds` or
+  // `ttl` is 0 (disabled), and a file without the recorded time (e.g. from an
+  // older SstFileWriter) is not rejected. Leveled `ttl` is not considered
+  // because it does not limit how long data can be kept: it only moves data
+  // out of the levels above the last level, where an ingested file is then
+  // compacted down soon after ingestion.
+  bool reject_too_old_file = false;
+
   bool operator==(const IngestExternalFileOptions& rhs) const = default;
 };
 
@@ -3172,6 +3458,7 @@ struct IngestExternalFileArg {
   // * Checks for memtable overlap and possible blocking flush will apply
   //   to this range (not just the file ranges).
   // * Not compatible with ingest_behind=true.
+  // * Not supported with FIFO compaction.
   // * When options.snapshot_consistency = false, the range is cleared
   // similarly to DeleteFilesInRange. With universal compaction and a table
   // factory that supports range deletion, a partial overlap is handled by
@@ -3225,12 +3512,35 @@ struct TraceOptions {
   // Default: false. This means write records in the trace may be in an order
   // different from the WAL's order.
   bool preserve_write_order = false;
+  // When true, each query record also holds the options of its call, and
+  // replay uses them instead of default options:
+  // - writes: WriteOptions::sync, disableWAL, no_slowdown and
+  //   rate_limiter_priority;
+  // - Get, MultiGet and iterator seeks: ReadOptions::verify_checksums,
+  //   fill_cache, ignore_range_deletions, async_io, optimize_multiget_for_io,
+  //   tailing, total_order_seek, auto_prefix_mode, prefix_same_as_start,
+  //   pin_data, adaptive_readahead, background_purge_on_iterator_cleanup,
+  //   auto_readahead_size, allow_unprepared_value, read_tier,
+  //   rate_limiter_priority, readahead_size, max_skippable_internal_keys and
+  //   value_size_soft_limit.
+  // Other fields (snapshots, timestamps, deadlines, callbacks and other
+  // pointers) are not recorded. See WriteQueryTraceRecord::GetWriteOptions()
+  // and GetQueryTraceRecord::GetReadOptions().
+  //
+  // Off by default because older RocksDB versions do not know these record
+  // fields: their release builds ignore them, their debug builds assert.
+  bool include_read_write_options = false;
 };
 
 // ImportColumnFamilyOptions is used by ImportColumnFamily()
 struct ImportColumnFamilyOptions {
   // Can be set to true to move the files instead of copying them.
   bool move_files = false;
+  // Like IngestExternalFileOptions::reject_too_old_file, using the
+  // `file_creation_time` from the import metadata, or from the file itself if
+  // the metadata does not have one. If any file is rejected, the import fails
+  // with Status::InvalidArgument.
+  bool reject_too_old_file = false;
 };
 
 // Options used with DB::GetApproximateSizes()
@@ -3243,18 +3553,12 @@ struct SizeApproximationOptions {
   // If set to false, at least one of include_memtables or include_blob_files
   // must be true.
   bool include_files = true;
-  // Defines whether the returned size should include an approximation of
-  // blob file data in the key range. When enabled, the total blob file size
-  // is prorated by the ratio of SST data in the range to the total SST data:
-  //
-  //   blob_size_in_range ~= total_blob_size * (sst_in_range / total_sst)
-  //
-  // Limitations of this approximation:
-  // - Assumes blob data is distributed proportionally to SST data, which
-  //   may not hold if blob value sizes vary significantly across keys.
-  // - If there are no SST files (all data in memtables), the blob size
-  //   contribution will be 0 even if blob files exist on disk.
-  // Default: false (for backward compatibility).
+  // Include an approximation of separate blob-file bytes attributable to the
+  // key range. By default, the total physical blob-file size is prorated by
+  // the range's share of SST bytes. This assumes that blob bytes are
+  // distributed in proportion to SST bytes, which can be inaccurate when
+  // blob value sizes vary across key ranges. Set allow_expensive_query for
+  // per-file attribution. Default: false.
   bool include_blob_files = false;
   // When approximating the files total size that is used to store a keys range
   // using DB::GetApproximateSizes, allow approximation with an error margin of
@@ -3266,6 +3570,24 @@ struct SizeApproximationOptions {
   // If the value is non-positive - a more precise yet more CPU intensive
   // estimation is performed.
   double files_size_error_margin = -1.0;
+  // Allow estimation methods that can be much more expensive in exchange for
+  // accuracy: work, and possibly synchronous I/O, proportional to the number
+  // of SSTs in the column family, regardless of the requested ranges' sizes.
+  // Currently this only affects include_blob_files: every SST is visited,
+  // and table properties may be read for SSTs whose blob reference counts
+  // are not already in memory. Blob bytes are attributed using these counts
+  // and the estimated fraction of each SST in the range. SSTs that do not
+  // record blob reference counts (written by older versions, or by table
+  // formats other than block-based), or whose properties cannot be read,
+  // share the remaining live blob bytes in proportion to their SST bytes.
+  // Bytes left unreferenced after SST removal are distributed over ranges
+  // that still reference blobs. The estimate includes garbage and file
+  // overhead, so partitioning the key space approximately accounts for all
+  // live blob files. Garbage is not charged to the range that created it.
+  // Within each SST the distribution remains approximate, and superseded
+  // key versions can be counted more than once. Blob references still in
+  // memtables and blobs embedded in SSTs are excluded. Default: false.
+  bool allow_expensive_query = false;
 };
 
 struct CompactionServiceOptionsOverride {
@@ -3277,6 +3599,21 @@ struct CompactionServiceOptionsOverride {
   const CompactionFilter* compaction_filter = nullptr;
   std::shared_ptr<CompactionFilterFactory> compaction_filter_factory = nullptr;
   std::shared_ptr<const SliceTransform> prefix_extractor = nullptr;
+  // If null, the column family uses the table factory loaded from the OPTIONS
+  // file the primary referenced when it scheduled the compaction. That file is
+  // only guaranteed to see the result of DB::SetOptions() calls that have
+  // returned. In fact, a compaction that SetOptions() itself triggers can
+  // reference the previous OPTIONS file.
+  // As with other options in that file, table options the worker's RocksDB
+  // does not know are ignored only if a newer RocksDB wrote the file.
+  // OpenAndCompact() returns NotSupported if it cannot create the table factory
+  // or a component of it, such as a filter_policy, because it is not
+  // registered with the worker's object registry. Built-in components are
+  // always registered. A component the table factory replaces with its default
+  // instead, such as a BlockBasedTable flush_block_policy_factory, is not
+  // detected. OpenAndCompact() returns these errors without writing a result,
+  // so the primary sees a failed remote compaction rather than a fallback to
+  // local compaction. With paranoid_checks, that is a fatal background error.
   std::shared_ptr<TableFactory> table_factory;
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory = nullptr;
 

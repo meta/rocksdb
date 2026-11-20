@@ -17,7 +17,7 @@ namespace ROCKSDB_NAMESPACE {
 // latency. These callbacks may be called in the context of a different thread.
 class UserWriteCallback {
  public:
-  virtual ~UserWriteCallback() {}
+  virtual ~UserWriteCallback() = default;
 
   // This function will be called after the write is enqueued.
   virtual void OnWriteEnqueued() = 0;

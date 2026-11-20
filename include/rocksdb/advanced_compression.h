@@ -452,7 +452,7 @@ class CompressionManager
       public Customizable {
  public:
   CompressionManager() = default;
-  virtual ~CompressionManager() = default;
+  ~CompressionManager() override = default;
   static const char* Type() { return "CompressionManager"; }
 
   // *************** Creating various Compression Managers *************** //
@@ -554,9 +554,12 @@ class CompressorWrapper : public Compressor {
  public:
   explicit CompressorWrapper(std::unique_ptr<Compressor> compressor)
       : wrapped_(std::move(compressor)) {}
+  ~CompressorWrapper() override = default;
   // No copies
   CompressorWrapper(const CompressorWrapper&) = delete;
   CompressorWrapper& operator=(const CompressorWrapper&) = delete;
+  CompressorWrapper(CompressorWrapper&&) = delete;
+  CompressorWrapper& operator=(CompressorWrapper&&) = delete;
 
   DictConfig GetDictGuidance(CacheEntryRole block_type) const override {
     return wrapped_->GetDictGuidance(block_type);
@@ -623,9 +626,12 @@ class DecompressorWrapper : public Decompressor {
  public:
   explicit DecompressorWrapper(std::shared_ptr<Decompressor> decompressor)
       : wrapped_(std::move(decompressor)) {}
+  ~DecompressorWrapper() override = default;
   // No copies
   DecompressorWrapper(const DecompressorWrapper&) = delete;
   DecompressorWrapper& operator=(const DecompressorWrapper&) = delete;
+  DecompressorWrapper(DecompressorWrapper&&) = delete;
+  DecompressorWrapper& operator=(DecompressorWrapper&&) = delete;
 
   const char* Name() const override { return wrapped_->Name(); }
 

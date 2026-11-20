@@ -38,7 +38,7 @@ class PlainTableBloomV1 {
                     uint32_t locality, size_t huge_page_tlb_size,
                     Logger* logger);
 
-  ~PlainTableBloomV1() {}
+  ~PlainTableBloomV1() = default;
 
   // Assuming single threaded access to this function.
   void AddHash(uint32_t hash);

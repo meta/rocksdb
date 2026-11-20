@@ -685,6 +685,64 @@ Status WideColumnSerialization::ForEachBlobFileNumber(
   return Status::OK();
 }
 
+Status WideColumnSerialization::RemoveBlobColumns(
+    const Slice& input, const std::function<bool(const BlobIndex&)>& is_removed,
+    std::string* output, BlobColumnRemoval& removal) {
+  removal = BlobColumnRemoval::kNone;
+
+  // Most entities lose no column. Find out from the blob indexes alone before
+  // paying for a full deserialization.
+  bool any_removed = false;
+  Status s = ForEachBlobFileNumber(
+      input, [&is_removed, &any_removed](const BlobIndex& blob_index) {
+        any_removed |= is_removed(blob_index);
+        return Status::OK();
+      });
+  if (!s.ok() || !any_removed) {
+    return s;
+  }
+
+  WideColumns columns;
+  std::vector<std::pair<size_t, BlobIndex>> blob_columns;
+  s = Deserialize(input, columns, &blob_columns);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // Removing columns changes the positions of the remaining blob columns.
+  WideColumns remaining_columns;
+  std::vector<std::pair<size_t, BlobIndex>> remaining_blob_columns;
+  size_t blob_position = 0;
+  for (size_t i = 0; i < columns.size(); ++i) {
+    const BlobIndex* blob_index = nullptr;
+    if (blob_position < blob_columns.size() &&
+        blob_columns[blob_position].first == i) {
+      blob_index = &blob_columns[blob_position++].second;
+    }
+    if (blob_index != nullptr && is_removed(*blob_index)) {
+      continue;
+    }
+    if (blob_index != nullptr) {
+      remaining_blob_columns.emplace_back(remaining_columns.size(),
+                                          *blob_index);
+    }
+    remaining_columns.push_back(columns[i]);
+  }
+  if (remaining_columns.empty()) {
+    removal = BlobColumnRemoval::kAll;
+    return Status::OK();
+  }
+
+  removal = BlobColumnRemoval::kSome;
+  if (output == nullptr) {
+    return Status::OK();
+  }
+  output->clear();
+  return remaining_blob_columns.empty()
+             ? Serialize(remaining_columns, *output)
+             : SerializeV2(remaining_columns, remaining_blob_columns, *output);
+}
+
 Status WideColumnSerialization::GetVersion(const Slice& input,
                                            uint32_t& version) {
   Slice input_ref = input;

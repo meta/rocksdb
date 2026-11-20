@@ -15,7 +15,7 @@ RocksDB is a high-performance storage engine library widely used in various larg
 
 ## Key Details
 
-- **Incident Discovery**: After the bug bounty researcher changed the open source release note title to demonstrate the vulnerability, external users noticed this change and [notified](https://github.com/facebook/rocksdb/issues/12962) RocksDB. RocksDB then reached out to the Bug Bounty program to confirm this was the result of security research.
+- **Incident Discovery**: After the bug bounty researcher changed the open source release note title to demonstrate the vulnerability, external users noticed this change and [notified](https://github.com/meta/rocksdb/issues/12962) RocksDB. RocksDB then reached out to the Bug Bounty program to confirm this was the result of security research.
 - **No Malicious Abuse**: The investigation confirmed that no code or data was compromised. The change was public and visible on GitHub.
 - **Tag Reversion Clarification**: On August 21, a tag named "v9.5.2" was initially published pointing to an incorrect commit. This was unrelated to the bug described here and was promptly corrected by pointing the tag to the correct commit. The release binary remains safe to use, and this correction does not impact the security or integrity of the release.
 
@@ -25,7 +25,7 @@ We’ve taken the following steps to mitigate and remediate the issue:
 - It was confirmed that the GITHUB_TOKEN expired and is no longer in use.
 - The binary tagged for public release was examined to confirm that it was not compromised.
 - Action logs were cross-checked to ensure no other actions were taken with the compromised token, other than the release note title change and the failed attempts to merge self-approved pull requests to the main branch.
-- We have [scoped down](https://github.com/facebook/rocksdb/pull/12973) the access level of tokens generated for workflows to prevent similar issues. Additionally, we are developing better guidelines for bug bounty researchers to minimize disruptions during their research.
+- We have [scoped down](https://github.com/meta/rocksdb/pull/12973) the access level of tokens generated for workflows to prevent similar issues. Additionally, we are developing better guidelines for bug bounty researchers to minimize disruptions during their research.
 
 
 Thank you for your continued support and trust in RocksDB.

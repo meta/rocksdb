@@ -29,6 +29,16 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {
 
+// The write options a grouped writer was made with, for the query trace.
+TracedWriteOptions TracedOptionsOf(const WriteThread::Writer& writer) {
+  TracedWriteOptions options;
+  options.sync = writer.sync;
+  options.disable_wal = writer.disable_wal;
+  options.no_slowdown = writer.no_slowdown;
+  options.rate_limiter_priority = writer.rate_limiter_priority;
+  return options;
+}
+
 class BlobWriteRollbackGuard {
  public:
   explicit BlobWriteRollbackGuard(
@@ -86,7 +96,7 @@ class PutEntityFastPathWriteCallback final : public WriteCallback {
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
                    const Slice& key, const Slice& val) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -95,7 +105,7 @@ Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
 
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
                    const Slice& key, const Slice& ts, const Slice& val) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -105,7 +115,7 @@ Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
 Status DBImpl::PutEntity(const WriteOptions& options,
                          ColumnFamilyHandle* column_family, const Slice& key,
                          const WideColumns& columns) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -121,7 +131,7 @@ Status DBImpl::PutEntity(const WriteOptions& options, const Slice& key,
   }
 
   for (const AttributeGroup& ag : attribute_groups) {
-    const Status s = FailIfCfHasTs(ag.column_family());
+    Status s = FailIfCfHasTs(ag.column_family());
     if (!s.ok()) {
       return s;
     }
@@ -131,7 +141,7 @@ Status DBImpl::PutEntity(const WriteOptions& options, const Slice& key,
 
 Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
                      const Slice& key, const Slice& val) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -145,7 +155,7 @@ Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
 
 Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
                      const Slice& key, const Slice& ts, const Slice& val) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -154,7 +164,7 @@ Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
 
 Status DBImpl::Delete(const WriteOptions& write_options,
                       ColumnFamilyHandle* column_family, const Slice& key) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -164,7 +174,7 @@ Status DBImpl::Delete(const WriteOptions& write_options,
 Status DBImpl::Delete(const WriteOptions& write_options,
                       ColumnFamilyHandle* column_family, const Slice& key,
                       const Slice& ts) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -174,7 +184,7 @@ Status DBImpl::Delete(const WriteOptions& write_options,
 Status DBImpl::SingleDelete(const WriteOptions& write_options,
                             ColumnFamilyHandle* column_family,
                             const Slice& key) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -184,7 +194,7 @@ Status DBImpl::SingleDelete(const WriteOptions& write_options,
 Status DBImpl::SingleDelete(const WriteOptions& write_options,
                             ColumnFamilyHandle* column_family, const Slice& key,
                             const Slice& ts) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -194,7 +204,7 @@ Status DBImpl::SingleDelete(const WriteOptions& write_options,
 Status DBImpl::DeleteRange(const WriteOptions& write_options,
                            ColumnFamilyHandle* column_family,
                            const Slice& begin_key, const Slice& end_key) {
-  const Status s = FailIfCfHasTs(column_family);
+  Status s = FailIfCfHasTs(column_family);
   if (!s.ok()) {
     return s;
   }
@@ -205,7 +215,7 @@ Status DBImpl::DeleteRange(const WriteOptions& write_options,
                            ColumnFamilyHandle* column_family,
                            const Slice& begin_key, const Slice& end_key,
                            const Slice& ts) {
-  const Status s = FailIfTsMismatchCf(column_family, ts);
+  Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
   }
@@ -629,6 +639,9 @@ Status DBImpl::MaybeTransformBatchForBlobDirectWrite(
   Status s = BlobWriteBatchTransformer::TransformBatch(
       write_options, *batch, transformed_storage, partition_mgr_provider,
       settings_provider, &transformed, &batch_managers, &batch_rollbacks);
+  blob_direct_write_ctx->rollback_infos.insert(
+      blob_direct_write_ctx->rollback_infos.end(), batch_rollbacks.begin(),
+      batch_rollbacks.end());
   if (!s.ok()) {
     return s;
   }
@@ -636,9 +649,6 @@ Status DBImpl::MaybeTransformBatchForBlobDirectWrite(
     *batch = transformed_storage;
     blob_direct_write_ctx->touched_managers.insert(batch_managers.begin(),
                                                    batch_managers.end());
-    blob_direct_write_ctx->rollback_infos.insert(
-        blob_direct_write_ctx->rollback_infos.end(), batch_rollbacks.begin(),
-        batch_rollbacks.end());
   }
   return Status::OK();
 }
@@ -925,13 +935,15 @@ Status DBImpl::WriteImpl(
     return Status::InvalidArgument(
         "`WriteOptions::protection_bytes_per_key` must be zero or eight");
   } else if (write_options.disableWAL &&
-             immutable_db_options_.recycle_log_file_num > 0 &&
+             immutable_db_options_.recycle_log_file_num > 0 && seq_per_batch_ &&
              !(two_write_queues_ && disable_memtable)) {
     // Corruption detection in recycled WALs relies on sequential sequence
-    // numbers, but WritePreparedTxnDB uses disableWAL internally for split
-    // writes
+    // numbers. MaybeAddWalSeqnoGapFiller() bridges gaps left by disableWAL
+    // writes, except with seq_per_batch_ (WritePrepared and WriteUnprepared).
+    // WritePreparedTxnDB still uses disableWAL internally for split writes.
     return Status::InvalidArgument(
-        "WriteOptions::disableWAL option is not supported if "
+        "WriteOptions::disableWAL option is not supported with WritePrepared "
+        "or WriteUnprepared transactions if "
         "DBOptions::recycle_log_file_num > 0");
   }
   WriteBatch* trace_batch =
@@ -949,7 +961,8 @@ Status DBImpl::WriteImpl(
       // efficient to trace here than to add latency to a phase of the log/apply
       // pipeline.
       // TODO: maybe handle the tracing status?
-      tracer_->Write(trace_batch).PermitUncheckedError();
+      tracer_->Write(trace_batch, TracedWriteOptions(write_options))
+          .PermitUncheckedError();
     }
   }
   if (write_options.sync && write_options.disableWAL) {
@@ -1315,9 +1328,11 @@ Status DBImpl::WriteImpl(
           if (wbwi && !ingest_wbwi_for_commit) {
             // for transaction write, tracer only needs the commit marker which
             // is in writer->batch
-            tracer_->Write(wbwi->GetWriteBatch()).PermitUncheckedError();
+            tracer_->Write(wbwi->GetWriteBatch(), TracedOptionsOf(*writer))
+                .PermitUncheckedError();
           } else {
-            tracer_->Write(writer->trace_batch).PermitUncheckedError();
+            tracer_->Write(writer->trace_batch, TracedOptionsOf(*writer))
+                .PermitUncheckedError();
           }
         }
       }
@@ -1383,7 +1398,7 @@ Status DBImpl::WriteImpl(
         io_s = WriteGroupToWAL(write_group, wal_context.writer, wal_used,
                                wal_context.need_wal_sync,
                                wal_context.need_wal_dir_sync, last_sequence + 1,
-                               *wal_context.wal_file_number_size);
+                               seq_inc, *wal_context.wal_file_number_size);
       }
     } else {
       if (status.ok() && !write_options.disableWAL) {
@@ -1654,7 +1669,8 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
               continue;
             }
             // TODO: maybe handle the tracing status?
-            tracer_->Write(writer->trace_batch).PermitUncheckedError();
+            tracer_->Write(writer->trace_batch, TracedOptionsOf(*writer))
+                .PermitUncheckedError();
           }
         }
       }
@@ -1691,7 +1707,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       io_s = WriteGroupToWAL(wal_write_group, wal_context.writer, wal_used,
                              wal_context.need_wal_sync,
                              wal_context.need_wal_dir_sync, current_sequence,
-                             wal_file_number_size);
+                             total_count, wal_file_number_size);
       w.status = io_s;
     }
 
@@ -1939,7 +1955,8 @@ Status DBImpl::WriteImplWALOnly(
           continue;
         }
         // TODO: maybe handle the tracing status?
-        tracer_->Write(writer->trace_batch).PermitUncheckedError();
+        tracer_->Write(writer->trace_batch, TracedOptionsOf(*writer))
+            .PermitUncheckedError();
       }
     }
   }
@@ -2317,7 +2334,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             log::Writer* log_writer, uint64_t* wal_used,
                             uint64_t* log_size,
                             WalFileNumberSize& wal_file_number_size,
-                            SequenceNumber sequence) {
+                            SequenceNumber sequence, size_t seq_inc) {
   assert(log_size != nullptr);
 
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
@@ -2345,8 +2362,16 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   if (!io_s.ok()) {
     return io_s;
   }
-  io_s = log_writer->AddRecord(write_options, log_entry, sequence);
+  if (UNLIKELY(log_writer->GetLastSeqnoRecorded() == 0)) {
+    // First WriteBatch in this WAL
+    io_s = MaybeAddWalSeqnoGapFiller(write_options, log_writer, sequence);
+  }
+  if (io_s.ok()) {
+    io_s = log_writer->AddRecord(write_options, log_entry, sequence);
+  }
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:AfterAddRecord", &io_s);
+  // After a failed write, what recovery will read back is unknown
+  next_seq_after_last_wal_record_ = io_s.ok() ? sequence + seq_inc : 0;
 
   if (UNLIKELY(needs_locking)) {
     wal_write_mutex_.Unlock();
@@ -2362,10 +2387,25 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   return io_s;
 }
 
+IOStatus DBImpl::MaybeAddWalSeqnoGapFiller(const WriteOptions& write_options,
+                                           log::Writer* log_writer,
+                                           SequenceNumber sequence) {
+  const SequenceNumber expected_seq = next_seq_after_last_wal_record_;
+  if (immutable_db_options_.recycle_log_file_num == 0 || seq_per_batch_ ||
+      expected_seq == 0 || expected_seq >= sequence) {
+    return IOStatus::OK();
+  }
+  WriteBatch filler;
+  WriteBatchInternal::SetSequence(&filler, expected_seq);
+  TEST_SYNC_POINT("DBImpl::MaybeAddWalSeqnoGapFiller:Add");
+  return log_writer->AddRecord(
+      write_options, WriteBatchInternal::Contents(&filler), expected_seq);
+}
+
 IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
                                  log::Writer* log_writer, uint64_t* wal_used,
                                  bool need_wal_sync, bool need_wal_dir_sync,
-                                 SequenceNumber sequence,
+                                 SequenceNumber sequence, size_t seq_inc,
                                  WalFileNumberSize& wal_file_number_size) {
   IOStatus io_s;
   assert(!two_write_queues_);
@@ -2397,7 +2437,7 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence);
+                    &log_size, wal_file_number_size, sequence, seq_inc);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -2524,7 +2564,7 @@ IOStatus DBImpl::ConcurrentWriteGroupToWAL(
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, wal_used,
-                    &log_size, wal_file_number_size, sequence);
+                    &log_size, wal_file_number_size, sequence, seq_inc);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -2930,9 +2970,12 @@ Status DBImpl::DelayWrite(uint64_t num_bytes, WriteThread& write_thread,
     }
 
     // Don't wait if there's a background error that is not pending recovery
-    // since recovery might never be attempted.
+    // since recovery might never be attempted. Don't wait once the DB is
+    // stopped either: its recovery flush needs the write queue this writer
+    // holds.
     while ((error_handler_.GetBGError().ok() ||
-            error_handler_.IsRecoveryInProgress()) &&
+            (error_handler_.IsRecoveryInProgress() &&
+             !error_handler_.IsDBStopped())) &&
            write_controller_.IsStopped() &&
            !shutting_down_.load(std::memory_order_relaxed)) {
       if (write_options.no_slowdown) {
@@ -3295,7 +3338,8 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   // If file deletion is disabled, don't recycle logs since it'll result in
   // the file getting renamed
   if (creating_new_log && immutable_db_options_.recycle_log_file_num &&
-      !wal_recycle_files_.empty() && IsFileDeletionsEnabled()) {
+      !wal_recycle_files_.empty() && IsFileDeletionsEnabled() &&
+      !IsWalInLogs(wal_recycle_files_.front())) {
     recycle_log_number = wal_recycle_files_.front();
   }
   uint64_t new_log_number = cur_wal_number_;
@@ -3567,7 +3611,8 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   }
 
   if (cfd->blob_partition_manager() != nullptr) {
-    cfd->blob_partition_manager()->RotateCurrentGeneration();
+    TEST_SYNC_POINT("DBImpl::SwitchMemtable:BeforeRotateBlobGeneration");
+    cfd->blob_partition_manager()->RotateCurrentGeneration(cfd->mem()->GetID());
   }
 
   cfd->mem()->SetNextLogNumber(cur_wal_number_);
@@ -3590,7 +3635,8 @@ Status DBImpl::SwitchMemtableImpl(ColumnFamilyData* cfd, WriteContext* context,
   new_mem->Ref();
   cfd->SetMemtable(new_mem);
   UpdateWBMAccountingAfterMemtableSwitch(refresh_wbm_accounting);
-  InstallSuperVersionAndScheduleWork(cfd, &context->superversion_context);
+  InstallSuperVersionAndScheduleWork(cfd, &context->superversion_context,
+                                     /*defer_snapshot_refresh=*/false);
   MaybeScheduleAsyncWALPrecreate(preallocate_block_size);
 
   // Notify client that memtable is sealed, now that we have successfully
@@ -3673,7 +3719,7 @@ Status DB::PutEntity(const WriteOptions& options,
                    options.protection_bytes_per_key,
                    default_cf_ucmp->timestamp_size());
 
-  const Status s = batch.PutEntity(column_family, key, columns);
+  Status s = batch.PutEntity(column_family, key, columns);
   if (!s.ok()) {
     return s;
   }
@@ -3690,7 +3736,7 @@ Status DB::PutEntity(const WriteOptions& options, const Slice& key,
   WriteBatch batch(0 /* reserved_bytes */, 0 /* max_bytes */,
                    options.protection_bytes_per_key,
                    default_cf_ucmp->timestamp_size());
-  const Status s = batch.PutEntity(key, attribute_groups);
+  Status s = batch.PutEntity(key, attribute_groups);
   if (!s.ok()) {
     return s;
   }

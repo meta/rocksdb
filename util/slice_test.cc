@@ -205,7 +205,7 @@ TEST_F(PinnableSliceTest, Move) {
 class SmallEnumSetTest : public testing::Test {
  public:
   SmallEnumSetTest() = default;
-  ~SmallEnumSetTest() = default;
+  ~SmallEnumSetTest() override = default;
 };
 
 TEST_F(SmallEnumSetTest, SmallEnumSetTest1) {
@@ -516,6 +516,7 @@ TEST(SemaphoreTest, CountingSemaphore) {
   CountingSemaphore sem{0};
   int kCount = 5;
   std::vector<std::thread> threads;
+  threads.reserve(2 * kCount);
   for (int i = 0; i < kCount; ++i) {
     threads.emplace_back([&sem] { sem.Release(); });
   }
@@ -538,6 +539,7 @@ TEST(SemaphoreTest, BinarySemaphore) {
   BinarySemaphore sem{0};
   int kCount = 5;
   std::vector<std::thread> threads;
+  threads.reserve(kCount + 1);
   for (int i = 0; i < kCount; ++i) {
     threads.emplace_back([&sem] {
       sem.Acquire();
@@ -596,7 +598,8 @@ TEST(BitFieldsTest, BitFields) {
     ASSERT_EQ(state, relaxed.LoadRelaxed());
 
     auto transform1 = Field2::ClearTransform() + Field3::ClearTransform();
-    MyState before, after;
+    MyState before;
+    MyState after;
     relaxed.ApplyRelaxed(transform1, &before, &after);
     ASSERT_EQ(before, state);
     ASSERT_NE(after, state);
@@ -685,7 +688,8 @@ TEST(BitFieldsTest, BitFields) {
     ASSERT_EQ(state, acqrel.Load());
 
     auto transform1 = Field2::ClearTransform() + Field3::ClearTransform();
-    MyState before, after;
+    MyState before;
+    MyState after;
     acqrel.Apply(transform1, &before, &after);
     ASSERT_EQ(before, state);
     ASSERT_NE(after, state);
@@ -872,8 +876,9 @@ TEST(SstPartitionerFixedPrefixTest, PrefixConsistentWithShouldPartition) {
         continue;
       }
       for (const std::string& next : kKeys) {
-        SCOPED_TRACE("len=" + std::to_string(len) + " start=" + start +
-                     " next=" + next);
+        std::string trace = "len=" + std::to_string(len);
+        trace.append(" start=").append(start).append(" next=").append(next);
+        SCOPED_TRACE(trace);
         EXPECT_EQ(PrefixImpliesPartition(*prefix, next),
                   FixedPrefixShouldPartition(partitioner, start, next));
       }

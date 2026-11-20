@@ -9,6 +9,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
 import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.Set;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
@@ -17,6 +19,15 @@ import org.junit.rules.TemporaryFolder;
 public class StatisticsTest {
   @Rule
   public TemporaryFolder dbFolder = new TemporaryFolder();
+
+  @Test
+  public void tickerTypesHaveUniqueValuesAndRoundTrip() {
+    final Set<Byte> tickerValues = new HashSet<>();
+    for (final TickerType tickerType : TickerType.values()) {
+      assertThat(tickerValues.add(tickerType.getValue())).isTrue();
+      assertThat(TickerType.getTickerType(tickerType.getValue())).isEqualTo(tickerType);
+    }
+  }
 
   @Test
   public void createStatistics() throws RocksDBException {

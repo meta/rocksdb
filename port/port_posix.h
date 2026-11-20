@@ -30,14 +30,6 @@
 #define PLATFORM_IS_LITTLE_ENDIAN \
   (__DARWIN_BYTE_ORDER == __DARWIN_LITTLE_ENDIAN)
 #endif
-#elif defined(OS_SOLARIS)
-#include <sys/isa_defs.h>
-#ifdef _LITTLE_ENDIAN
-#define PLATFORM_IS_LITTLE_ENDIAN true
-#else
-#define PLATFORM_IS_LITTLE_ENDIAN false
-#endif
-#include <alloca.h>
 #elif defined(OS_AIX)
 #include <arpa/nameser_compat.h>
 #include <sys/types.h>
@@ -62,9 +54,9 @@
 #define PLATFORM_IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
 #endif
 
-#if defined(OS_MACOSX) || defined(OS_SOLARIS) || defined(OS_FREEBSD) ||      \
-    defined(OS_NETBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) || \
-    defined(OS_ANDROID) || defined(CYGWIN) || defined(OS_AIX)
+#if defined(OS_MACOSX) || defined(OS_FREEBSD) || defined(OS_NETBSD) ||        \
+    defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) || defined(OS_ANDROID) || \
+    defined(CYGWIN) || defined(OS_AIX)
 // Use fread/fwrite/fflush on platforms without _unlocked variants
 #define fread_unlocked fread
 #define fwrite_unlocked fwrite
@@ -101,6 +93,8 @@ class Mutex {
   // No copying
   Mutex(const Mutex&) = delete;
   void operator=(const Mutex&) = delete;
+  Mutex(Mutex&&) = delete;
+  void operator=(Mutex&&) = delete;
 
   ~Mutex();
 
@@ -132,6 +126,8 @@ class RWMutex {
   // No copying allowed
   RWMutex(const RWMutex&) = delete;
   void operator=(const RWMutex&) = delete;
+  RWMutex(RWMutex&&) = delete;
+  void operator=(RWMutex&&) = delete;
 
   ~RWMutex();
 

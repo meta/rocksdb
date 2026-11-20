@@ -208,7 +208,7 @@ High performance Java interaction with RocksDB ultimately requires architectural
    * recycle your own buffers where this makes sense
    * or make sure that you are supplying the ultimate destination buffer (your cache, or a target network buffer) as input to RocksDB `get()` and `put()` calls
 
-We are currently implementing a number of extra methods consistently across the Java fetch and store APIs to RocksDB in the PR [Java API consistency between RocksDB.put() , .merge() and Transaction.put() , .merge()](https://github.com/facebook/rocksdb/pull/11019) according to these principles.
+We are currently implementing a number of extra methods consistently across the Java fetch and store APIs to RocksDB in the PR [Java API consistency between RocksDB.put() , .merge() and Transaction.put() , .merge()](https://github.com/meta/rocksdb/pull/11019) according to these principles.
 
 ## Optimizations
 
@@ -216,7 +216,7 @@ We are currently implementing a number of extra methods consistently across the 
 
 Having analysed JNI performance as described, we reviewed the core of RocksJNI for opportunities to improve the performance. We noticed one thing in particular; some of the `get()` methods of the Java API had not been updated to take advantage of the new [`PinnableSlice`](http://rocksdb.org/blog/2017/08/24/pinnableslice.html) methods.
 
-Fixing this turned out to be a straightforward change, which has now been incorporated in the codebase [Improve Java API `get()` performance by reducing copies](https://github.com/facebook/rocksdb/pull/10970)
+Fixing this turned out to be a straightforward change, which has now been incorporated in the codebase [Improve Java API `get()` performance by reducing copies](https://github.com/meta/rocksdb/pull/10970)
 
 #### Performance Results
 

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/merge_context.h"
@@ -24,7 +25,7 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 std::string ValueWithWriteTime(std::string value, uint64_t write_time) {
   std::string result;
-  result = value;
+  result = std::move(value);
   PutFixed64(&result, write_time);
   return result;
 }
@@ -59,7 +60,8 @@ class MemTableListTest : public testing::Test {
       Status s = DB::Open(options, dbname, cf_descs, &handles, &db);
       EXPECT_OK(s);
 
-      ColumnFamilyOptions cf_opt1, cf_opt2;
+      ColumnFamilyOptions cf_opt1;
+      ColumnFamilyOptions cf_opt2;
       cf_opt1.cf_paths.emplace_back(dbname + "_one_1",
                                     std::numeric_limits<uint64_t>::max());
       cf_opt2.cf_paths.emplace_back(dbname + "_two_1",

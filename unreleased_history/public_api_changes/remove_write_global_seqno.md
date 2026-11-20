@@ -1,1 +1,0 @@
-Removed the deprecated `IngestExternalFileOptions::write_global_seqno` option and its C, Java, and `ldb` APIs, `TableProperties::external_sst_file_global_seqno_offset`, and the `file_offset` output from `ExternalTableReader::GetPropertiesBlock()`. Existing external SST files whose global sequence number was rewritten without updating the properties-block checksum remain readable.

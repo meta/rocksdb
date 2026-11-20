@@ -14,7 +14,7 @@ namespace ROCKSDB_NAMESPACE {
 // store multiple versions of a same user key due to snapshots, compaction not
 // happening yet, etc.
 struct KeyVersion {
-  KeyVersion() : user_key(""), value(""), sequence(0), type(0) {}
+  KeyVersion() : sequence(0), type(0) {}
 
   KeyVersion(const std::string& _user_key, const std::string& _value,
              SequenceNumber _sequence, int _type)

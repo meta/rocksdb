@@ -153,7 +153,7 @@ class WriteThread {
     Writer* link_older;  // read/write only before linking, or as leader
     Writer* link_newer;  // lazy, read/write only before linking, or as leader
 
-    bool ingest_wbwi;
+    bool ingest_wbwi = false;
 
     Writer()
         : batch(nullptr),
@@ -210,6 +210,12 @@ class WriteThread {
           link_older(nullptr),
           link_newer(nullptr),
           ingest_wbwi(_ingest_wbwi) {}
+
+    // No copying allowed
+    Writer(const Writer&) = delete;
+    Writer& operator=(const Writer&) = delete;
+    Writer(Writer&&) = delete;
+    Writer& operator=(Writer&&) = delete;
 
     ~Writer() {
       if (made_waitable) {

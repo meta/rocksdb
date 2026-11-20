@@ -379,6 +379,8 @@ class FastLocalBloomBitsBuilder : public XXPH3FilterBitsBuilder {
   // No Copy allowed
   FastLocalBloomBitsBuilder(const FastLocalBloomBitsBuilder&) = delete;
   void operator=(const FastLocalBloomBitsBuilder&) = delete;
+  FastLocalBloomBitsBuilder(FastLocalBloomBitsBuilder&&) = delete;
+  void operator=(FastLocalBloomBitsBuilder&&) = delete;
 
   ~FastLocalBloomBitsBuilder() override = default;
 
@@ -593,6 +595,8 @@ class FastLocalBloomBitsReader : public BuiltinFilterBitsReader {
   // No Copy allowed
   FastLocalBloomBitsReader(const FastLocalBloomBitsReader&) = delete;
   void operator=(const FastLocalBloomBitsReader&) = delete;
+  FastLocalBloomBitsReader(FastLocalBloomBitsReader&&) = delete;
+  void operator=(FastLocalBloomBitsReader&&) = delete;
 
   ~FastLocalBloomBitsReader() override = default;
 
@@ -674,6 +678,8 @@ class Standard128RibbonBitsBuilder : public XXPH3FilterBitsBuilder {
   // No Copy allowed
   Standard128RibbonBitsBuilder(const Standard128RibbonBitsBuilder&) = delete;
   void operator=(const Standard128RibbonBitsBuilder&) = delete;
+  Standard128RibbonBitsBuilder(Standard128RibbonBitsBuilder&&) = delete;
+  void operator=(Standard128RibbonBitsBuilder&&) = delete;
 
   ~Standard128RibbonBitsBuilder() override = default;
 
@@ -1034,6 +1040,8 @@ class Standard128RibbonBitsReader : public BuiltinFilterBitsReader {
   // No Copy allowed
   Standard128RibbonBitsReader(const Standard128RibbonBitsReader&) = delete;
   void operator=(const Standard128RibbonBitsReader&) = delete;
+  Standard128RibbonBitsReader(Standard128RibbonBitsReader&&) = delete;
+  void operator=(Standard128RibbonBitsReader&&) = delete;
 
   ~Standard128RibbonBitsReader() override = default;
 
@@ -1083,6 +1091,8 @@ class LegacyBloomBitsBuilder : public FilterBitsBuilder {
   // No Copy allowed
   LegacyBloomBitsBuilder(const LegacyBloomBitsBuilder&) = delete;
   void operator=(const LegacyBloomBitsBuilder&) = delete;
+  LegacyBloomBitsBuilder(LegacyBloomBitsBuilder&&) = delete;
+  void operator=(LegacyBloomBitsBuilder&&) = delete;
 
   ~LegacyBloomBitsBuilder() override;
 
@@ -1179,7 +1189,8 @@ Slice LegacyBloomBitsBuilder::Finish(std::unique_ptr<const char[]>* buf) {
     return FinishAlwaysFalse(buf);
   }
 
-  uint32_t total_bits, num_lines;
+  uint32_t total_bits;
+  uint32_t num_lines;
   char* data =
       ReserveSpace(static_cast<int>(num_entries), &total_bits, &num_lines);
   assert(data);
@@ -1202,7 +1213,7 @@ Slice LegacyBloomBitsBuilder::Finish(std::unique_ptr<const char[]>* buf) {
 
       if (est_fp_rate >= 1.50 * vs_fp_rate) {
         // For more details, see
-        // https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter
+        // https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter
         ROCKS_LOG_WARN(
             info_log_,
             "Using legacy SST/BBT Bloom filter with excessive key count "
@@ -1318,6 +1329,8 @@ class LegacyBloomBitsReader : public BuiltinFilterBitsReader {
   // No Copy allowed
   LegacyBloomBitsReader(const LegacyBloomBitsReader&) = delete;
   void operator=(const LegacyBloomBitsReader&) = delete;
+  LegacyBloomBitsReader(LegacyBloomBitsReader&&) = delete;
+  void operator=(LegacyBloomBitsReader&&) = delete;
 
   ~LegacyBloomBitsReader() override = default;
 
@@ -1536,7 +1549,7 @@ FilterBitsBuilder* BloomLikeFilterPolicy::GetLegacyBloomBuilderWithContext(
       adjective = "Significant";
     }
     // For more details, see
-    // https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter
+    // https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter
     ROCKS_LOG_WARN(context.info_log,
                    "Using legacy Bloom filter with high (%d) bits/key. "
                    "%s filter space and/or accuracy improvement is available "

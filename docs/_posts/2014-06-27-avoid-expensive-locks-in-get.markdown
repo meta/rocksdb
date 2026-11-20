@@ -24,7 +24,7 @@ At the beginning of `GetImpl()`, it used to do this:
 The lock is necessary because pointer super_version_ may be updated, the corresponding SuperVersion may be deleted while Ref() is in progress.
 
 
-`Ref()` simply increases the reference counter and returns “this” pointer. However, this simple operation posed big challenges for in-memory workload and stopped RocksDB from scaling read throughput beyond 8 cores. Running 32 read threads on a 32-core CPU leads to [70% system CPU usage](https://github.com/facebook/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Lei-Lockless-Get.pdf). This is outrageous!
+`Ref()` simply increases the reference counter and returns “this” pointer. However, this simple operation posed big challenges for in-memory workload and stopped RocksDB from scaling read throughput beyond 8 cores. Running 32 read threads on a 32-core CPU leads to [70% system CPU usage](https://github.com/meta/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Lei-Lockless-Get.pdf). This is outrageous!
 
 
 
@@ -51,7 +51,7 @@ The code looks something like this:
 
 
 
-The result is quite amazing. RocksDB can nicely [scale to 32 cores](https://github.com/facebook/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Lei-Lockless-Get.pdf) and most CPU time is spent in user land.
+The result is quite amazing. RocksDB can nicely [scale to 32 cores](https://github.com/meta/rocksdb/raw/gh-pages/talks/2014-03-27-RocksDB-Meetup-Lei-Lockless-Get.pdf) and most CPU time is spent in user land.
 
 
 

@@ -57,6 +57,8 @@ Env::IOActivity GetCurrentThreadIOActivityForMetadataRead() {
       return Env::IOActivity::kGetFileChecksumsFromCurrentManifest;
     case ThreadStatus::OperationType::OP_LAZY_RESOLVE:
       return Env::IOActivity::kLazyResolve;
+    case ThreadStatus::OperationType::OP_UNKNOWN:
+    case ThreadStatus::OperationType::NUM_OP_TYPES:
     default:
       return Env::IOActivity::kUnknown;
   }
@@ -120,6 +122,16 @@ uint64_t DBImpl::MinLogNumberToKeep() {
 }
 
 uint64_t DBImpl::MinLogNumberToRecycle() { return min_wal_number_to_recycle_; }
+
+bool DBImpl::IsWalInLogs(uint64_t wal_number) {
+  InstrumentedMutexLock wal_lock(&wal_write_mutex_);
+  for (const auto& wal : logs_) {
+    if (wal.number == wal_number) {
+      return true;
+    }
+  }
+  return false;
+}
 
 uint64_t DBImpl::MinObsoleteSstNumberToKeep() {
   mutex_.AssertHeld();
@@ -244,9 +256,14 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
   // Since job_context->min_pending_output is set, until file scan finishes,
   // mutex_ cannot be released. Otherwise, we might see no min_pending_output
   // here but later find newer generated unfinalized files while scanning.
+  assert(job_context != nullptr);
   job_context->min_pending_output = MinObsoleteSstNumberToKeep();
   job_context->files_to_quarantine = error_handler_.GetFilesToQuarantine();
   job_context->min_options_file_number = MinOptionsFileNumberToKeep();
+  job_context->manifest_options_file_number =
+      versions_->has_committed_options_file_number()
+          ? versions_->options_file_number()
+          : 0;
   job_context->min_blob_file_number_to_keep =
       versions_->current_next_file_number();
   for (auto* cfd : *versions_->GetColumnFamilySet()) {
@@ -262,9 +279,13 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
   // Get obsolete files.  This function will also update the list of
   // pending files in VersionSet().
   assert(versions_);
+  const uint64_t min_listener_pending_output =
+      listener_pending_outputs_.empty() ? std::numeric_limits<uint64_t>::max()
+                                        : *listener_pending_outputs_.begin();
   versions_->GetObsoleteFiles(
       &job_context->sst_delete_files, &job_context->blob_delete_files,
-      &job_context->manifest_delete_files, job_context->min_pending_output);
+      &job_context->manifest_delete_files, job_context->min_pending_output,
+      min_listener_pending_output);
 
   // Mark the elements in job_context->sst_delete_files and
   // job_context->blob_delete_files as "grabbed for purge" so that other threads
@@ -287,6 +308,13 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
 
   if (doing_the_full_scan) {
     versions_->AddLiveFiles(&job_context->sst_live, &job_context->blob_live);
+    // Preserve uncommitted ingestion files in this purge snapshot.
+    for (const auto& [first_file_number, num_files] :
+         pending_ingestion_outputs_) {
+      for (uint64_t i = 0; i < num_files; ++i) {
+        job_context->sst_live.push_back(first_file_number + i);
+      }
+    }
     InfoLogPrefix info_log_prefix(!immutable_db_options_.db_log_dir.empty(),
                                   dbname_);
     // PurgeObsoleteFiles will dedupe duplicate files.
@@ -308,7 +336,7 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
         // schedule for purge, we also skip it if we
         // are doing full scan in order to avoid double deletion of the same
         // file under race conditions. See
-        // https://github.com/facebook/rocksdb/issues/3573
+        // https://github.com/meta/rocksdb/issues/3573
         if (!ParseFileName(file, &number, info_log_prefix.prefix, &type) ||
             !ShouldPurge(number)) {
           continue;
@@ -431,7 +459,10 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
       // If it's already closed, then it's been fully synced. If
       // !background_close_inactive_wals then we need to Close it before
       // removing from logs_ but not blocking while holding wal_write_mutex_.
-      if (!immutable_db_options_.background_close_inactive_wals &&
+      // A WAL that may be recycled must also be closed before it leaves
+      // logs_, because it can be reused as soon as it is gone from there.
+      if ((!immutable_db_options_.background_close_inactive_wals ||
+           immutable_db_options_.recycle_log_file_num > 0) &&
           log.writer->file()) {
         // We are taking ownership of and pinning the front entry, so we can
         // expect it to be the same after releasing and re-acquiring the lock
@@ -548,6 +579,11 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
       candidate_files.size() + state.sst_delete_files.size() +
       state.blob_delete_files.size() + state.log_delete_files.size() +
       state.manifest_delete_files.size());
+  // SSTs that VersionSet reported as obsolete. Unlike files found only by a
+  // directory scan, these are known to be finished, so min_pending_output does
+  // not hold them back.
+  std::unordered_set<uint64_t> known_obsolete_sst_set;
+  known_obsolete_sst_set.reserve(state.sst_delete_files.size());
   // We may ignore the dbname when generating the file names.
   for (auto& file : state.sst_delete_files) {
     auto* handle = file.metadata->fd.pinned_reader.GetCacheHandle();
@@ -559,6 +595,7 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
     } else {
       // File is being deleted (actually obsolete)
       auto number = file.metadata->fd.GetNumber();
+      known_obsolete_sst_set.insert(number);
       candidate_files.emplace_back(MakeTableFileName(number), file.path);
       TableCache::ReleaseObsolete(table_cache_.get(), number, handle,
                                   file.uncache_aggressiveness);
@@ -675,11 +712,13 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
         keep = (number >= state.manifest_file_number);
         break;
       case kTableFile:
-        // If the second condition is not there, this makes
-        // DontDeletePendingOutputs fail
-        // FIXME: but should NOT keep if it came from sst_delete_files?
+        // A file found only by the directory scan and numbered at or above
+        // min_pending_output may be an unfinished output of a running job
+        // (see DontDeletePendingOutputs).
         keep = (sst_live_set.find(number) != sst_live_set.end()) ||
-               number >= state.min_pending_output;
+               (number >= state.min_pending_output &&
+                known_obsolete_sst_set.find(number) ==
+                    known_obsolete_sst_set.end());
         if (!keep) {
           // NOTE: sometimes redundant (if came from sst_delete_files)
           // We don't know which column family is applicable here so we don't
@@ -730,7 +769,8 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
         }
         break;
       case kOptionsFile:
-        keep = (number >= optsfile_num2);
+        keep = (number >= optsfile_num2) ||
+               (number == state.manifest_options_file_number);
         break;
       case kCompactionProgressFile:
         // Keep compaction progress files - they are managed
@@ -759,12 +799,12 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
       dir_to_sync = candidate_file.file_path;
     } else {
       dir_to_sync = (type == kWalFile) ? wal_dir : dbname_;
-      fname = dir_to_sync +
-              ((!dir_to_sync.empty() && dir_to_sync.back() == '/') ||
-                       (!to_delete.empty() && to_delete.front() == '/')
-                   ? ""
-                   : "/") +
-              to_delete;
+      fname = dir_to_sync;
+      if ((dir_to_sync.empty() || dir_to_sync.back() != '/') &&
+          (to_delete.empty() || to_delete.front() != '/')) {
+        fname.push_back('/');
+      }
+      fname.append(to_delete);
     }
 
     if (type == kWalFile && (immutable_db_options_.WAL_ttl_seconds > 0 ||
@@ -1133,9 +1173,12 @@ Status DBImpl::SetupDBId(const WriteOptions& write_options, bool read_only,
     // Check for the IDENTITY file and create it if not there or
     // broken or not matching manifest
     std::string db_id_in_file;
-    s = fs_->FileExists(IdentityFileName(dbname_), IOOptions(), nullptr);
+    IOOptions exists_opts;
+    exists_opts.type = IOType::kMetadata;
+    s = fs_->FileExists(IdentityFileName(dbname_), exists_opts, nullptr);
     if (s.ok()) {
       IOOptions opts;
+      opts.type = IOType::kMetadata;
       if (is_retry) {
         opts.verify_and_reconstruct_read = true;
       }
@@ -1202,6 +1245,9 @@ Status DBImpl::MaybeUpdateNextFileNumber(RecoveryContext* recovery_ctx) {
     if (!s.ok()) {
       break;
     }
+    if (path == NormalizePath(dbname_)) {
+      recovery_ctx->existing_db_files_ = files;
+    }
     for (const auto& fname : files) {
       uint64_t number = 0;
       FileType type;
@@ -1238,7 +1284,7 @@ Status DBImpl::MaybeUpdateNextFileNumber(RecoveryContext* recovery_ctx) {
   // requires the MANIFEST rewrite this emit triggers).
   const bool optimize_manifest_for_recovery =
       mutable_db_options_.optimize_manifest_for_recovery &&
-      !immutable_db_options_.best_efforts_recovery;
+      !immutable_db_options_.UsesBestEffortsRecoveryPath();
 
   if (!optimize_manifest_for_recovery ||
       manifest_relevant_file_advanced_counter) {

@@ -102,7 +102,7 @@ bool ReduceLevelTest::ReduceLevels(int target_level) {
   return is_succeed;
 }
 
-TEST_F(ReduceLevelTest, Last_Level) {
+TEST_F(ReduceLevelTest, LastLevel) {
   ASSERT_OK(OpenDB(true, 4));
   ASSERT_OK(Put("aaaa", "11111"));
   ASSERT_OK(Flush());
@@ -121,7 +121,7 @@ TEST_F(ReduceLevelTest, Last_Level) {
   CloseDB();
 }
 
-TEST_F(ReduceLevelTest, Top_Level) {
+TEST_F(ReduceLevelTest, TopLevel) {
   ASSERT_OK(OpenDB(true, 5));
   ASSERT_OK(Put("aaaa", "11111"));
   ASSERT_OK(Flush());
@@ -141,7 +141,7 @@ TEST_F(ReduceLevelTest, Top_Level) {
   CloseDB();
 }
 
-TEST_F(ReduceLevelTest, All_Levels) {
+TEST_F(ReduceLevelTest, AllLevels) {
   ASSERT_OK(OpenDB(true, 5));
   ASSERT_OK(Put("a", "a11111"));
   ASSERT_OK(Flush());

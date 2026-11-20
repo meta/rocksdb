@@ -14,6 +14,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rocksdb/convenience.h"
@@ -113,7 +114,7 @@ class LDBCommand {
 
   virtual void OverrideBaseCFOptions(ColumnFamilyOptions* cf_opts);
 
-  virtual void SetDBOptions(Options options) { options_ = options; }
+  virtual void SetDBOptions(Options options) { options_ = std::move(options); }
 
   virtual void SetColumnFamilies(
       const std::vector<ColumnFamilyDescriptor>* column_families) {
@@ -135,6 +136,12 @@ class LDBCommand {
   const std::vector<std::string>& TEST_GetFlags() { return flags_; }
 
   virtual bool NoDBOpen() { return false; }
+
+  // No copying allowed
+  LDBCommand(const LDBCommand&) = delete;
+  LDBCommand& operator=(const LDBCommand&) = delete;
+  LDBCommand(LDBCommand&&) = delete;
+  LDBCommand& operator=(LDBCommand&&) = delete;
 
   virtual ~LDBCommand() { CloseDB(); }
 

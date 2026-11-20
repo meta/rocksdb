@@ -37,6 +37,8 @@ class BlobLogWriter {
   // No copying allowed
   BlobLogWriter(const BlobLogWriter&) = delete;
   BlobLogWriter& operator=(const BlobLogWriter&) = delete;
+  BlobLogWriter(BlobLogWriter&&) = delete;
+  BlobLogWriter& operator=(BlobLogWriter&&) = delete;
 
   ~BlobLogWriter();
 
@@ -67,6 +69,8 @@ class BlobLogWriter {
   const WritableFileWriter* file() const { return dest_.get(); }
 
   uint64_t get_log_number() const { return log_number_; }
+
+  uint64_t get_file_size() const { return block_offset_; }
 
   Status Sync(const WriteOptions& write_options);
 

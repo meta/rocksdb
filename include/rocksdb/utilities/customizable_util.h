@@ -9,7 +9,7 @@
 // If not developing a new Type of customizable class, you probably
 // do not need the methods in this file.
 //
-// See https://github.com/facebook/rocksdb/wiki/RocksDB-Configurable-Objects
+// See https://github.com/meta/rocksdb/wiki/RocksDB-Configurable-Objects
 // for more information on how to develop and use customizable objects
 
 #pragma once

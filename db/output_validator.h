@@ -25,6 +25,13 @@ class OutputValidator {
   // criteria, e.g. key is ordered.
   Status Add(const Slice& key, const Slice& value);
 
+  // Add a key that has already been checked with CanAdd().
+  void AddValidated(const Slice& key, const Slice& value);
+
+  // Validate whether Add() would accept this key without updating the
+  // validator state.
+  Status CanAdd(const Slice& key) const;
+
   // Compare result of two key orders are the same. It can be used
   // to compare the keys inserted into a file, and what is read back.
   // Return true if the validation passes.

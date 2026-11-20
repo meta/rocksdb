@@ -56,7 +56,7 @@ static int PthreadCall(const char* label, int result) {
   return result;
 }
 
-Mutex::Mutex(bool adaptive) {
+Mutex::Mutex(bool adaptive) : mu_{} {
   (void)adaptive;
 #ifdef ROCKSDB_PTHREAD_ADAPTIVE_MUTEX
   if (!adaptive) {
@@ -106,7 +106,7 @@ void Mutex::AssertHeld() const {
 #endif
 }
 
-CondVar::CondVar(Mutex* mu) : mu_(mu) {
+CondVar::CondVar(Mutex* mu) : cv_{}, mu_(mu) {
   PthreadCall("init cv", pthread_cond_init(&cv_, nullptr));
 }
 
@@ -123,7 +123,7 @@ void CondVar::Wait() {
 }
 
 bool CondVar::TimedWait(uint64_t abs_time_us) {
-  struct timespec ts;
+  struct timespec ts{};
   ts.tv_sec = static_cast<time_t>(abs_time_us / 1000000);
   ts.tv_nsec = static_cast<suseconds_t>((abs_time_us % 1000000) * 1000);
 
@@ -149,7 +149,7 @@ void CondVar::SignalAll() {
   PthreadCall("broadcast", pthread_cond_broadcast(&cv_));
 }
 
-RWMutex::RWMutex() {
+RWMutex::RWMutex() : mu_{} {
   PthreadCall("init mutex", pthread_rwlock_init(&mu_, nullptr));
 }
 
@@ -236,7 +236,7 @@ void ImmediateExit(int code) { _exit(code); }
 
 int GetMaxOpenFiles() {
 #if defined(RLIMIT_NOFILE)
-  struct rlimit no_files_limit;
+  struct rlimit no_files_limit{};
   if (getrlimit(RLIMIT_NOFILE, &no_files_limit) != 0) {
     return -1;
   }
@@ -280,7 +280,7 @@ const size_t kPageSize = GetPageSize();
 
 void SetCpuPriority(ThreadId id, CpuPriority priority) {
 #ifdef OS_LINUX
-  sched_param param;
+  sched_param param{};
   param.sched_priority = 0;
   switch (priority) {
     case CpuPriority::kHigh:

@@ -55,6 +55,10 @@ rocksdb_table_properties_udi_is_primary_index(
     const rocksdb_table_properties_t* props);
 
 extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_table_properties_standard_index_is_stub(
+    const rocksdb_table_properties_t* props);
+
+extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_table_properties_filter_size(const rocksdb_table_properties_t* props);
 
 extern ROCKSDB_LIBRARY_API uint64_t

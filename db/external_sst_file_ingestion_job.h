@@ -150,6 +150,9 @@ struct IngestedFileInfo : public KeyRangeInfo {
   FileDescriptor fd;
   // file path that we picked for file inside the DB
   std::string internal_file_path;
+  // When the file was linked, copied or written into the DB directory, i.e.
+  // when this DB began holding it (FileMetaData::db_ownership_start_time)
+  uint64_t db_ownership_start_time = kUnknownDbOwnershipStartTime;
   // Global sequence number that we picked for the file inside the DB
   SequenceNumber assigned_seqno = 0;
   // Level inside the DB we picked for the external file.
@@ -214,13 +217,48 @@ struct FileBatchInfo : public KeyRangeInfo {
       : track_batch_range(_track_batch_range) {}
 };
 
+// Determines the file_creation_time and oldest_ancestor_time to record in the
+// MANIFEST for an ingested or imported file, from the times carried by the
+// file or its import metadata (0 = unknown) and the current time `now`
+// (0 = unknown). A known carried time is kept unless it is later than `now`,
+// which suggests an unreliable clock, so it is logged as a warning and
+// replaced by `now`. An unknown file_creation_time becomes `now`, and an
+// unknown oldest ancestor time becomes the resolved file_creation_time, an
+// upper bound on when the data was written.
+void ResolveExternalFileTimes(const std::string& file_path,
+                              uint64_t carried_file_creation_time,
+                              uint64_t carried_oldest_ancestor_time,
+                              uint64_t now, Logger* info_log,
+                              uint64_t* file_creation_time,
+                              uint64_t* oldest_ancestor_time);
+
+// Implements `reject_too_old_file` (IngestExternalFileOptions and
+// ImportColumnFamilyOptions) for one file, using the file's creation time
+// carried by the file or its import metadata, and the file's table properties
+// (times of 0 = unknown). Returns InvalidArgument (and logs a warning) if, as
+// of `now`,
+// * for leveled or universal compaction, the file's contents (per
+//   `file_creation_time`) are older than periodic_compaction_seconds, or
+// * for FIFO compaction, its newest data, estimated as FIFO TTL compaction
+//   does (the newest key time table property, else the oldest ancestor time
+//   table property, else `file_creation_time`), is older than ttl.
+// `mutable_cf_options` must be sanitized (as in a SuperVersion), so that these
+// are the effective limits.
+Status CheckExternalFileNotTooOld(const std::string& file_path,
+                                  uint64_t file_creation_time,
+                                  const TableProperties& table_properties,
+                                  uint64_t now,
+                                  CompactionStyle compaction_style,
+                                  const MutableCFOptions& mutable_cf_options,
+                                  Logger* info_log);
+
 class ExternalSstFileIngestionJob {
  public:
   ExternalSstFileIngestionJob(
       VersionSet* versions, ColumnFamilyData* cfd,
       const ImmutableDBOptions& db_options,
       const MutableDBOptions& mutable_db_options, const EnvOptions& env_options,
-      SnapshotList* db_snapshots,
+      const ShardedSnapshotList* db_snapshots,
       const IngestExternalFileOptions& ingestion_options,
       Directories* directories, EventLogger* event_logger,
       const std::shared_ptr<IOTracer>& io_tracer)
@@ -245,9 +283,23 @@ class ExternalSstFileIngestionJob {
     assert(ucmp_);
   }
 
-  ~ExternalSstFileIngestionJob() { UnregisterRange(); }
+  // No copying allowed
+  ExternalSstFileIngestionJob(const ExternalSstFileIngestionJob&) = delete;
+  ExternalSstFileIngestionJob& operator=(const ExternalSstFileIngestionJob&) =
+      delete;
+  ExternalSstFileIngestionJob(ExternalSstFileIngestionJob&&) = delete;
+  ExternalSstFileIngestionJob& operator=(ExternalSstFileIngestionJob&&) =
+      delete;
+
+  ~ExternalSstFileIngestionJob() {
+    UnregisterRange(/*restore_compaction_candidates=*/false);
+  }
 
   ColumnFamilyData* GetColumnFamilyData() const { return cfd_; }
+
+  const IngestExternalFileOptions& GetIngestionOptions() const {
+    return ingestion_options_;
+  }
 
   // Prepare the job by copying external files into the DB.
   Status Prepare(const std::vector<std::string>& external_files_paths,
@@ -275,13 +327,18 @@ class ExternalSstFileIngestionJob {
   Status Run();
 
   // Register key range involved in this ingestion job
-  // to prevent key range conflict with other ongoing compaction/file ingestion
+  // to prevent key range conflict with other ongoing compaction/file ingestion.
+  // Also marks the existing files this job deletes (atomic replace) as being
+  // compacted, so that no compaction picks them while LogAndApply() releases
+  // the DB mutex to write the MANIFEST.
   // REQUIRES: Mutex held
   void RegisterRange();
 
-  // Unregister key range registered for this ingestion job
+  // Unregister key range registered for this ingestion job, and clear the
+  // being-compacted mark set by RegisterRange() on replaced files.
+  // Restore compaction eligibility when the commit failed.
   // REQUIRES: Mutex held
-  void UnregisterRange();
+  void UnregisterRange(bool restore_compaction_candidates);
 
   // Update column family stats.
   // REQUIRES: Mutex held
@@ -403,9 +460,7 @@ class ExternalSstFileIngestionJob {
   // The uppermost level used by this batch of files is tracked too, so that it
   // can be used by the next batch.
   // REQUIRES: Mutex held
-  Status AssignLevelsForOneBatch(FileBatchInfo& batch,
-                                 SuperVersion* super_version,
-                                 bool force_global_seqno,
+  Status AssignLevelsForOneBatch(FileBatchInfo& batch, bool force_global_seqno,
                                  SequenceNumber* last_seqno,
                                  int* batch_uppermost_level,
                                  std::optional<int> prev_batch_uppermost_level);
@@ -416,9 +471,9 @@ class ExternalSstFileIngestionJob {
   // assigned to levels tha are higher than `prev_batch_uppermost_level`.
   // REQUIRES: Mutex held
   Status AssignLevelAndSeqnoForIngestedFile(
-      SuperVersion* sv, bool force_global_seqno,
-      CompactionStyle compaction_style, SequenceNumber last_seqno,
-      IngestedFileInfo* file_to_ingest, SequenceNumber* assigned_seqno,
+      bool force_global_seqno, CompactionStyle compaction_style,
+      SequenceNumber last_seqno, IngestedFileInfo* file_to_ingest,
+      SequenceNumber* assigned_seqno,
       std::optional<int> prev_batch_uppermost_level);
 
   // File that we want to ingest behind always goes to the lowest level;
@@ -448,6 +503,11 @@ class ExternalSstFileIngestionJob {
   // compactions.
   void CreateEquivalentFileIngestingCompactions();
 
+  // Add `file` at `level` to the files deleted by this job's atomic replace.
+  // Fails if `file` is already being compacted.
+  // REQUIRES: Mutex held
+  Status AddFileToReplace(int level, FileMetaData* file);
+
   // Remove all the internal files created, called when ingestion job fails.
   void DeleteInternalFiles();
 
@@ -460,7 +520,7 @@ class ExternalSstFileIngestionJob {
   const ImmutableDBOptions& db_options_;
   const MutableDBOptions& mutable_db_options_;
   const EnvOptions& env_options_;
-  SnapshotList* db_snapshots_;
+  const ShardedSnapshotList* db_snapshots_;
   autovector<IngestedFileInfo> files_to_ingest_;
   std::vector<FileBatchInfo> file_batches_to_ingest_;
   const IngestExternalFileOptions ingestion_options_;
@@ -488,6 +548,12 @@ class ExternalSstFileIngestionJob {
   std::vector<FileMetaData*> compaction_input_metdatas_;
   // Compactions equivalent to this ingestion job
   std::vector<Compaction*> file_ingesting_compactions_;
+
+  // Existing files deleted by atomic replace. Their version is retained until
+  // UnregisterRange() clears their being_compacted flags.
+  std::vector<FileMetaData*> files_to_replace_;
+  Version* files_to_replace_version_{nullptr};
+  bool files_to_replace_marked_{false};
 };
 
 }  // namespace ROCKSDB_NAMESPACE

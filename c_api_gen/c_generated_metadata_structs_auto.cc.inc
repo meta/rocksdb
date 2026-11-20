@@ -67,6 +67,11 @@ uint64_t rocksdb_table_properties_udi_is_primary_index(
   return props->rep.udi_is_primary_index;
 }
 
+uint64_t rocksdb_table_properties_standard_index_is_stub(
+    const rocksdb_table_properties_t* props) {
+  return props->rep.standard_index_is_stub;
+}
+
 uint64_t rocksdb_table_properties_filter_size(
     const rocksdb_table_properties_t* props) {
   return props->rep.filter_size;

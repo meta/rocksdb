@@ -44,6 +44,7 @@ class FlushedFileCollector : public EventListener {
   std::vector<std::string> GetFlushedFiles() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> result;
+    result.reserve(flushed_files_.size());
     for (const auto& fname : flushed_files_) {
       result.push_back(fname);
     }
@@ -351,7 +352,7 @@ TEST_F(CompactFilesTest, CompactionFilterWithGetSv) {
     const char* Name() const override { return "FilterWithGet"; }
 
    private:
-    DB* db_;
+    DB* db_ = nullptr;
   };
 
   std::shared_ptr<FilterWithGet> cf(new FilterWithGet());

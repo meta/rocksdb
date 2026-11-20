@@ -43,7 +43,7 @@ class IOTracerParserTest : public testing::Test {
     EXPECT_OK(DB::Open(options, dbname_, &db_));
   }
 
-  ~IOTracerParserTest() {
+  ~IOTracerParserTest() override {
     if (env_->FileExists(trace_file_path_).ok()) {
       EXPECT_OK(env_->DeleteFile(trace_file_path_));
     }

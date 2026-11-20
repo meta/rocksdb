@@ -36,7 +36,7 @@ class TieredSecondaryCache : public SecondaryCacheWrapper {
 #endif
   }
 
-  ~TieredSecondaryCache() override {}
+  ~TieredSecondaryCache() override = default;
 
   const char* Name() const override { return "TieredSecondaryCache"; }
 
@@ -75,7 +75,7 @@ class TieredSecondaryCache : public SecondaryCacheWrapper {
 
   class ResultHandle : public SecondaryCacheResultHandle {
    public:
-    ~ResultHandle() override {}
+    ~ResultHandle() override = default;
 
     bool IsReady() override {
       if (inner_handle_ && inner_handle_->IsReady()) {

@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/blob/blob_constants.h"
 #include "db/db_impl/db_impl.h"
 #include "db/wal_manager.h"
 #include "file/file_util.h"
@@ -309,7 +310,8 @@ Status CheckpointImpl::CleanStagingDirectory(
   if (s.ok()) {
     for (auto& subchild : subchildren) {
       Status del_s;
-      std::string subchild_path = full_private_path + "/" + subchild;
+      std::string subchild_path = full_private_path;
+      subchild_path.append("/").append(subchild);
       del_s = db_->GetEnv()->DeleteFile(subchild_path);
       ROCKS_LOG_INFO(info_log, "Delete file %s -- %s", subchild_path.c_str(),
                      del_s.ToString().c_str());
@@ -461,6 +463,7 @@ Status CheckpointImpl::CreateCheckpointImpl(
   // Populated by CreateCustomCheckpoint when include_cf_ids restricts the
   // checkpoint to a subset of column families.
   std::vector<uint32_t> excluded_cf_ids;
+  SubsetCheckpointOptionsSnapshot options_snapshot;
   std::string manifest_relative_filename;
   uint64_t manifest_size = 0;
   if (s.ok()) {
@@ -489,7 +492,7 @@ Status CheckpointImpl::CreateCheckpointImpl(
             return CreateFile(fs, full_private_path + "/" + fname, contents,
                               db_options.use_fsync);
           } /* create_file_cb */,
-          &sequence_number, log_size_for_flush,
+          &sequence_number, log_size_for_flush, &options_snapshot,
           /*get_live_table_checksum=*/false, /*atomic_flush=*/false,
           include_cf_ids, &excluded_cf_ids, &manifest_relative_filename,
           &manifest_size);
@@ -512,9 +515,16 @@ Status CheckpointImpl::CreateCheckpointImpl(
               "Subset checkpoint did not record a MANIFEST descriptor entry");
         } else {
           DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
-          s = db_impl->AppendColumnFamilyDropsToManifest(
-              full_private_path + "/" + manifest_relative_filename,
-              manifest_size, excluded_cf_ids);
+          s = db_impl->CreateOptionsFileForSubsetCheckpoint(full_private_path,
+                                                            options_snapshot);
+          if (s.ok()) {
+            s = db_impl->AppendColumnFamilyDropsToManifest(
+                full_private_path + "/" + manifest_relative_filename,
+                manifest_size, excluded_cf_ids,
+                options_snapshot.commit_options_file_number
+                    ? options_snapshot.options_file_number
+                    : 0);
+          }
         }
       }
 
@@ -573,20 +583,44 @@ Status CheckpointImpl::CreateCheckpointImpl(
 }
 
 Status CheckpointImpl::CreateCustomCheckpoint(
-    std::function<Status(const std::string& src_dirname,
-                         const std::string& src_fname, FileType type,
-                         const Temperature temperature)>
-        link_file_cb,
-    std::function<
-        Status(const std::string& src_dirname, const std::string& src_fname,
-               uint64_t size_limit_bytes, FileType type,
-               const std::string& checksum_func_name,
-               const std::string& checksum_val, const Temperature temperature)>
-        copy_file_cb,
-    std::function<Status(const std::string& fname, const std::string& contents,
-                         FileType type)>
+    const std::function<Status(const std::string& src_dirname,
+                               const std::string& src_fname, FileType type,
+                               const Temperature temperature)>& link_file_cb,
+    const std::function<Status(
+        const std::string& src_dirname, const std::string& src_fname,
+        uint64_t size_limit_bytes, FileType type,
+        const std::string& checksum_func_name, const std::string& checksum_val,
+        const Temperature temperature)>& copy_file_cb,
+    const std::function<Status(const std::string& fname,
+                               const std::string& contents, FileType type)>&
         create_file_cb,
     uint64_t* sequence_number, uint64_t log_size_for_flush,
+    bool get_live_table_checksum, bool atomic_flush,
+    const std::vector<uint32_t>& include_cf_ids,
+    std::vector<uint32_t>* excluded_cf_ids,
+    std::string* manifest_relative_filename, uint64_t* manifest_size) {
+  return CreateCustomCheckpoint(link_file_cb, copy_file_cb, create_file_cb,
+                                sequence_number, log_size_for_flush,
+                                /*options_snapshot=*/nullptr,
+                                get_live_table_checksum, atomic_flush,
+                                include_cf_ids, excluded_cf_ids,
+                                manifest_relative_filename, manifest_size);
+}
+
+Status CheckpointImpl::CreateCustomCheckpoint(
+    const std::function<Status(const std::string& src_dirname,
+                               const std::string& src_fname, FileType type,
+                               const Temperature temperature)>& link_file_cb,
+    const std::function<Status(
+        const std::string& src_dirname, const std::string& src_fname,
+        uint64_t size_limit_bytes, FileType type,
+        const std::string& checksum_func_name, const std::string& checksum_val,
+        const Temperature temperature)>& copy_file_cb,
+    const std::function<Status(const std::string& fname,
+                               const std::string& contents, FileType type)>&
+        create_file_cb,
+    uint64_t* sequence_number, uint64_t log_size_for_flush,
+    SubsetCheckpointOptionsSnapshot* options_snapshot,
     bool get_live_table_checksum, bool atomic_flush,
     const std::vector<uint32_t>& include_cf_ids,
     std::vector<uint32_t>* excluded_cf_ids,
@@ -605,9 +639,10 @@ Status CheckpointImpl::CreateCustomCheckpoint(
       s = db_->GetLiveFilesStorageInfo(opts, &infos);
     } else {
       assert(excluded_cf_ids != nullptr);
+      assert(options_snapshot != nullptr);
       DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
       s = db_impl->GetLiveFilesStorageInfoForSubsetCheckpoint(
-          opts, include_cf_ids, &infos, excluded_cf_ids);
+          opts, include_cf_ids, &infos, excluded_cf_ids, options_snapshot);
     }
     if (!s.ok()) {
       return s;
@@ -731,28 +766,42 @@ Status CheckpointImpl::ExportColumnFamily(
     if (s.ok()) {
       db_->GetColumnFamilyMetaData(handle, &db_metadata);
 
-      s = ExportFilesInMetaData(
-          db_options, db_metadata,
-          [&](const std::string& src_dirname, const std::string& fname) {
-            ROCKS_LOG_INFO(db_options.info_log, "[%s] HardLinking %s",
-                           cf_name.c_str(), fname.c_str());
-            return db_->GetEnv()->LinkFile(src_dirname + fname,
-                                           tmp_export_dir + fname);
-          } /*link_file_cb*/,
-          [&](const std::string& src_dirname, const std::string& fname) {
-            ROCKS_LOG_INFO(db_options.info_log, "[%s] Copying %s",
-                           cf_name.c_str(), fname.c_str());
-            // FIXME: temperature handling
-            return CopyFile(db_->GetFileSystem(), src_dirname + fname,
-                            Temperature::kUnknown, tmp_export_dir + fname,
-                            Temperature::kUnknown, 0, db_options.use_fsync,
-                            nullptr);
-          } /*copy_file_cb*/);
-
-      const auto enable_status = db_->EnableFileDeletions();
-      if (s.ok()) {
-        s = enable_status;
+      // Export only copies SST files, never blob files, so an SST that
+      // references blob files could never be imported. Reject before any
+      // file is linked or copied.
+      for (const auto& level_metadata : db_metadata.levels) {
+        for (const auto& file_metadata : level_metadata.files) {
+          if (s.ok() &&
+              file_metadata.oldest_blob_file_number != kInvalidBlobFileNumber) {
+            s = Status::NotSupported(
+                "ExportColumnFamily does not support files that reference "
+                "blob files: " +
+                file_metadata.name);
+          }
+        }
       }
+
+      if (s.ok()) {
+        s = ExportFilesInMetaData(
+            db_options, db_metadata,
+            [&](const std::string& src_dirname, const std::string& fname) {
+              ROCKS_LOG_INFO(db_options.info_log, "[%s] HardLinking %s",
+                             cf_name.c_str(), fname.c_str());
+              return db_->GetEnv()->LinkFile(src_dirname + fname,
+                                             tmp_export_dir + fname);
+            } /*link_file_cb*/,
+            [&](const std::string& src_dirname, const std::string& fname) {
+              ROCKS_LOG_INFO(db_options.info_log, "[%s] Copying %s",
+                             cf_name.c_str(), fname.c_str());
+              // FIXME: temperature handling
+              return CopyFile(db_->GetFileSystem(), src_dirname + fname,
+                              Temperature::kUnknown, tmp_export_dir + fname,
+                              Temperature::kUnknown, 0, db_options.use_fsync,
+                              nullptr);
+            } /*copy_file_cb*/);
+      }
+
+      s.UpdateIfOk(db_->EnableFileDeletions());
     }
   }
 
@@ -793,6 +842,14 @@ Status CheckpointImpl::ExportColumnFamily(
         live_file_metadata.largestkey = file_metadata.largestkey;
         live_file_metadata.oldest_blob_file_number =
             file_metadata.oldest_blob_file_number;
+        live_file_metadata.oldest_ancestor_time =
+            file_metadata.oldest_ancestor_time;
+        live_file_metadata.file_creation_time =
+            file_metadata.file_creation_time;
+        live_file_metadata.db_ownership_start_time =
+            file_metadata.db_ownership_start_time;
+        live_file_metadata.data_file_provenance =
+            file_metadata.data_file_provenance;
         live_file_metadata.epoch_number = file_metadata.epoch_number;
         live_file_metadata.level = level_metadata.level;
         live_file_metadata.smallest = file_metadata.smallest;
@@ -810,9 +867,15 @@ Status CheckpointImpl::ExportColumnFamily(
     std::vector<std::string> subchildren;
     const auto cleanup_dir =
         moved_to_user_specified_dir ? export_dir : tmp_export_dir;
-    db_->GetEnv()->GetChildren(cleanup_dir, &subchildren);
+    const auto children_status =
+        db_->GetEnv()->GetChildren(cleanup_dir, &subchildren);
+    if (!children_status.ok()) {
+      ROCKS_LOG_WARN(db_options.info_log, "Failed to list dir %s: %s",
+                     cleanup_dir.c_str(), children_status.ToString().c_str());
+    }
     for (const auto& subchild : subchildren) {
-      const auto subchild_path = cleanup_dir + "/" + subchild;
+      std::string subchild_path = cleanup_dir;
+      subchild_path.append("/").append(subchild);
       const auto status = db_->GetEnv()->DeleteFile(subchild_path);
       if (!status.ok()) {
         ROCKS_LOG_WARN(db_options.info_log, "Failed to cleanup file %s: %s",
@@ -830,12 +893,10 @@ Status CheckpointImpl::ExportColumnFamily(
 
 Status CheckpointImpl::ExportFilesInMetaData(
     const DBOptions& db_options, const ColumnFamilyMetaData& metadata,
-    std::function<Status(const std::string& src_dirname,
-                         const std::string& src_fname)>
-        link_file_cb,
-    std::function<Status(const std::string& src_dirname,
-                         const std::string& src_fname)>
-        copy_file_cb) {
+    const std::function<Status(const std::string& src_dirname,
+                               const std::string& src_fname)>& link_file_cb,
+    const std::function<Status(const std::string& src_dirname,
+                               const std::string& src_fname)>& copy_file_cb) {
   Status s;
   auto hardlink_file = true;
 

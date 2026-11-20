@@ -6,9 +6,12 @@
 #pragma once
 
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
 #include "logging/log_buffer.h"
 #include "rocksdb/env.h"
@@ -26,7 +29,8 @@ class JSONWriter {
     if (!first_element_) {
       stream_ << ", ";
     }
-    stream_ << "\"" << key << "\": ";
+    WriteString(key.c_str());
+    stream_ << ": ";
     state_ = kExpectValue;
     first_element_ = false;
   }
@@ -36,7 +40,7 @@ class JSONWriter {
     if (state_ == kInArray && !first_element_) {
       stream_ << ", ";
     }
-    stream_ << "\"" << value << "\"";
+    WriteString(value);
     if (state_ != kInArray) {
       state_ = kExpectKey;
     }
@@ -49,7 +53,15 @@ class JSONWriter {
     if (state_ == kInArray && !first_element_) {
       stream_ << ", ";
     }
-    stream_ << value;
+    if constexpr (std::is_floating_point_v<T>) {
+      if (!std::isfinite(value)) {
+        stream_ << "null";
+      } else {
+        stream_ << value;
+      }
+    } else {
+      stream_ << value;
+    }
     if (state_ != kInArray) {
       state_ = kExpectKey;
     }
@@ -123,6 +135,46 @@ class JSONWriter {
   }
 
  private:
+  void WriteString(const char* str) {
+    stream_ << '"';
+    for (const char* p = str; *p != '\0'; ++p) {
+      const char c = *p;
+      switch (c) {
+        case '"':
+          stream_ << "\\\"";
+          break;
+        case '\\':
+          stream_ << "\\\\";
+          break;
+        case '\b':
+          stream_ << "\\b";
+          break;
+        case '\f':
+          stream_ << "\\f";
+          break;
+        case '\n':
+          stream_ << "\\n";
+          break;
+        case '\r':
+          stream_ << "\\r";
+          break;
+        case '\t':
+          stream_ << "\\t";
+          break;
+        default:
+          if (static_cast<unsigned char>(c) < 0x20) {
+            char buf[7];
+            snprintf(buf, sizeof(buf), "\\u%04x",
+                     static_cast<unsigned char>(c));
+            stream_ << buf;
+          } else {
+            stream_ << c;
+          }
+      }
+    }
+    stream_ << '"';
+  }
+
   enum JSONWriterState {
     kExpectKey,
     kExpectValue,

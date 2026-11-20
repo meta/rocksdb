@@ -49,6 +49,7 @@ std::unordered_map<std::string, std::vector<uint64_t> > hash_map;
 void AddHashLookups(const std::string& s, uint64_t bucket_id,
                     uint32_t num_hash_fun) {
   std::vector<uint64_t> v;
+  v.reserve(num_hash_fun);
   for (uint32_t i = 0; i < num_hash_fun; i++) {
     v.push_back(bucket_id + i);
   }
@@ -200,9 +201,9 @@ class CuckooReaderTest : public testing::Test {
   std::vector<std::string> keys;
   std::vector<std::string> user_keys;
   std::vector<std::string> values;
-  uint64_t num_items;
+  uint64_t num_items = 0;
   std::string fname;
-  uint64_t file_size;
+  uint64_t file_size = 0;
   Options options;
   Env* env;
   FileOptions file_options;

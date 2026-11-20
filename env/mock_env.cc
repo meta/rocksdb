@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 
 #include "env/emulated_clock.h"
 #include "file/filename.h"
@@ -96,6 +97,8 @@ class MemFile {
   // No copying allowed.
   MemFile(const MemFile&) = delete;
   void operator=(const MemFile&) = delete;
+  MemFile(MemFile&&) = delete;
+  void operator=(MemFile&&) = delete;
 
   void Ref() {
     MutexLock lock(&mutex_);
@@ -260,6 +263,11 @@ class MockSequentialFile : public FSSequentialFile {
         pos_(0) {
     file_->Ref();
   }
+  // No copying allowed
+  MockSequentialFile(const MockSequentialFile&) = delete;
+  MockSequentialFile& operator=(const MockSequentialFile&) = delete;
+  MockSequentialFile(MockSequentialFile&&) = delete;
+  MockSequentialFile& operator=(MockSequentialFile&&) = delete;
 
   ~MockSequentialFile() override { file_->Unref(); }
 
@@ -301,6 +309,11 @@ class MockRandomAccessFile : public FSRandomAccessFile {
         use_mmap_read_(opts.use_mmap_reads) {
     file_->Ref();
   }
+  // No copying allowed
+  MockRandomAccessFile(const MockRandomAccessFile&) = delete;
+  MockRandomAccessFile& operator=(const MockRandomAccessFile&) = delete;
+  MockRandomAccessFile(MockRandomAccessFile&&) = delete;
+  MockRandomAccessFile& operator=(MockRandomAccessFile&&) = delete;
 
   ~MockRandomAccessFile() override { file_->Unref(); }
 
@@ -336,6 +349,11 @@ class MockRandomAccessFile : public FSRandomAccessFile {
 class MockRandomRWFile : public FSRandomRWFile {
  public:
   explicit MockRandomRWFile(MemFile* file) : file_(file) { file_->Ref(); }
+  // No copying allowed
+  MockRandomRWFile(const MockRandomRWFile&) = delete;
+  MockRandomRWFile& operator=(const MockRandomRWFile&) = delete;
+  MockRandomRWFile(MockRandomRWFile&&) = delete;
+  MockRandomRWFile& operator=(MockRandomRWFile&&) = delete;
 
   ~MockRandomRWFile() override { file_->Unref(); }
 
@@ -375,6 +393,11 @@ class MockWritableFile : public FSWritableFile {
         rate_limiter_(opts.rate_limiter) {
     file_->Ref();
   }
+  // No copying allowed
+  MockWritableFile(const MockWritableFile&) = delete;
+  MockWritableFile& operator=(const MockWritableFile&) = delete;
+  MockWritableFile(MockWritableFile&&) = delete;
+  MockWritableFile& operator=(MockWritableFile&&) = delete;
 
   ~MockWritableFile() override { file_->Unref(); }
 
@@ -518,8 +541,7 @@ class TestMemLogger : public Logger {
       port::TimeVal now_tv;
       port::GetTimeOfDay(&now_tv, nullptr);
       const time_t seconds = now_tv.tv_sec;
-      struct tm t;
-      memset(&t, 0, sizeof(t));
+      struct tm t{};
       struct tm* ret __attribute__((__unused__));
       ret = port::LocalTimeR(&seconds, &t);
       assert(ret);
@@ -914,8 +936,10 @@ bool MockFileSystem::RenameFileInternal(const std::string& src,
   } else {
     std::vector<std::string> children;
     if (GetChildrenInternal(src, &children)) {
+      const std::string src_prefix = src + "/";
+      const std::string dest_prefix = dest + "/";
       for (const auto& child : children) {
-        RenameFileInternal(src + "/" + child, dest + "/" + child);
+        RenameFileInternal(src_prefix + child, dest_prefix + child);
       }
     }
     DeleteFileInternal(dest);
@@ -980,7 +1004,7 @@ IOStatus MockFileSystem::NewLogger(const std::string& fname,
     file = iter->second;
   }
   std::unique_ptr<FSWritableFile> f(new MockWritableFile(file, FileOptions()));
-  result->reset(new TestMemLogger(std::move(f), clock_, io_opts, dbg));
+  *result = std::make_shared<TestMemLogger>(std::move(f), clock_, io_opts, dbg);
   return IOStatus::OK();
 }
 

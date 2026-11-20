@@ -20,7 +20,6 @@
 #include "db/db_test_util.h"
 #include "env/unique_id_gen.h"
 #include "port/stack_trace.h"
-#include "rocksdb/persistent_cache.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
@@ -135,7 +134,7 @@ class DBBlockCacheTest : public DBTestBase {
 
   const std::array<size_t, kNumCacheEntryRoles> GetCacheEntryRoleCountsBg() {
     // Verify in cache entry role stats
-    std::array<size_t, kNumCacheEntryRoles> cache_entry_role_counts;
+    std::array<size_t, kNumCacheEntryRoles> cache_entry_role_counts{};
     std::map<std::string, std::string> values;
     EXPECT_TRUE(db_->GetMapProperty(DB::Properties::kFastBlockCacheEntryStats,
                                     &values));
@@ -240,53 +239,6 @@ TEST_F(DBBlockCacheTest, TestWithoutCompressedBlockCache) {
 #ifdef SNAPPY
 
 namespace {
-class PersistentCacheFromCache : public PersistentCache {
- public:
-  PersistentCacheFromCache(std::shared_ptr<Cache> cache, bool read_only)
-      : cache_(cache), read_only_(read_only) {}
-
-  Status Insert(const Slice& key, const char* data,
-                const size_t size) override {
-    if (read_only_) {
-      return Status::NotSupported();
-    }
-    std::unique_ptr<char[]> copy{new char[size]};
-    std::copy_n(data, size, copy.get());
-    Status s = cache_.Insert(key, copy.get(), size);
-    if (s.ok()) {
-      copy.release();
-    }
-    return s;
-  }
-
-  Status Lookup(const Slice& key, std::unique_ptr<char[]>* data,
-                size_t* size) override {
-    auto handle = cache_.Lookup(key);
-    if (handle) {
-      char* ptr = cache_.Value(handle);
-      *size = cache_.get()->GetCharge(handle);
-      data->reset(new char[*size]);
-      std::copy_n(ptr, *size, data->get());
-      cache_.Release(handle);
-      return Status::OK();
-    } else {
-      return Status::NotFound();
-    }
-  }
-
-  bool IsCompressed() override { return false; }
-
-  StatsType Stats() override { return StatsType(); }
-
-  std::string GetPrintableOptions() const override { return ""; }
-
-  uint64_t NewId() override { return cache_.get()->NewId(); }
-
- private:
-  BasicTypedSharedCacheInterface<char[], CacheEntryRole::kMisc> cache_;
-  bool read_only_;
-};
-
 class ReadOnlyCacheWrapper : public CacheWrapper {
  public:
   using CacheWrapper::CacheWrapper;
@@ -809,7 +761,7 @@ TEST_F(DBBlockCacheTest, IndexAndFilterBlocksCachePriority) {
     options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
     BlockBasedTableOptions table_options;
     table_options.cache_index_and_filter_blocks = true;
-    table_options.block_cache.reset(new MockCache());
+    table_options.block_cache = std::make_shared<MockCache>();
     table_options.filter_policy.reset(NewBloomFilterPolicy(20));
     table_options.cache_index_and_filter_blocks_with_high_priority =
         priority == Cache::Priority::HIGH ? true : false;
@@ -969,7 +921,7 @@ TEST_F(DBBlockCacheTest, CacheCompressionDict) {
       options.target_file_size_base = kNumEntriesPerFile * kNumBytesPerEntry;
       BlockBasedTableOptions table_options;
       table_options.cache_index_and_filter_blocks = true;
-      table_options.block_cache.reset(new MockCache());
+      table_options.block_cache = std::make_shared<MockCache>();
       table_options.format_version = format_version;
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));
       DestroyAndReopen(options);
@@ -1681,8 +1633,8 @@ class DBBlockCacheKeyTest
     exclude_file_numbers_ = std::get<1>(GetParam());
   }
 
-  bool use_compressed_cache_;
-  bool exclude_file_numbers_;
+  bool use_compressed_cache_ = false;
+  bool exclude_file_numbers_ = false;
 };
 
 // Disable LinkFile so that we can physically copy a DB using Checkpoint.
@@ -1921,7 +1873,10 @@ TEST_F(CacheKeyTest, DBImplSessionIdStructure) {
   // counter."
   std::string session_id1 = DBImpl::GenerateDbSessionId(/*env*/ nullptr);
   std::string session_id2 = DBImpl::GenerateDbSessionId(/*env*/ nullptr);
-  uint64_t upper1, upper2, lower1, lower2;
+  uint64_t upper1;
+  uint64_t upper2;
+  uint64_t lower1;
+  uint64_t lower2;
   ASSERT_OK(DecodeSessionId(session_id1, &upper1, &lower1));
   ASSERT_OK(DecodeSessionId(session_id2, &upper2, &lower2));
   // Because generated in same process
@@ -1981,7 +1936,8 @@ struct CacheKeyDecoder {
   }
 
   void Decode(const CacheKey& key) {
-    uint64_t file_num_etc64, offset_etc64;
+    uint64_t file_num_etc64;
+    uint64_t offset_etc64;
     DeconstructNonemptyCacheKey(key, &file_num_etc64, &offset_etc64);
 
     // First decode session counter
@@ -2091,7 +2047,7 @@ TEST_F(CacheKeyTest, Encodings) {
   // result
   Random64 r{std::random_device{}()};
 
-  CacheKeyDecoder decoder;
+  CacheKeyDecoder decoder{};
   db_id_ = r.Next();
   base_session_upper_ = r.Next();
   base_session_lower_ = r.Next();
@@ -2149,10 +2105,10 @@ class DBBlockCachePinningTest
     unpartitioned_pinning_ = std::get<3>(GetParam());
   }
 
-  bool partition_index_and_filters_;
-  PinningTier top_level_index_pinning_;
-  PinningTier partition_pinning_;
-  PinningTier unpartitioned_pinning_;
+  bool partition_index_and_filters_ = false;
+  PinningTier top_level_index_pinning_ = PinningTier::kFallback;
+  PinningTier partition_pinning_ = PinningTier::kFallback;
+  PinningTier unpartitioned_pinning_ = PinningTier::kFallback;
 };
 
 #ifdef LZ4

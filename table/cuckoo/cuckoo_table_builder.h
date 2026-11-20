@@ -35,9 +35,11 @@ class CuckooTableBuilder : public TableBuilder {
   // No copying allowed
   CuckooTableBuilder(const CuckooTableBuilder&) = delete;
   void operator=(const CuckooTableBuilder&) = delete;
+  CuckooTableBuilder(CuckooTableBuilder&&) = delete;
+  void operator=(CuckooTableBuilder&&) = delete;
 
   // REQUIRES: Either Finish() or Abandon() has been called.
-  ~CuckooTableBuilder() {}
+  ~CuckooTableBuilder() override {}
 
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.
@@ -126,8 +128,8 @@ class CuckooTableBuilder : public TableBuilder {
   bool identity_as_first_hash_;
   uint64_t (*get_slice_hash_)(const Slice& s, uint32_t index,
                               uint64_t max_num_buckets);
-  std::string largest_user_key_ = "";
-  std::string smallest_user_key_ = "";
+  std::string largest_user_key_;
+  std::string smallest_user_key_;
 
   bool closed_;  // Either Finish() or Abandon() has been called.
 };

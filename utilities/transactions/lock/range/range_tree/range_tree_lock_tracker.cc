@@ -31,8 +31,10 @@ void RangeTreeLockTracker::Track(const PointLockRequest &lock_req) {
 }
 
 void RangeTreeLockTracker::Track(const RangeLockRequest &lock_req) {
-  DBT start_dbt, end_dbt;
-  std::string start_key, end_key;
+  DBT start_dbt;
+  DBT end_dbt;
+  std::string start_key;
+  std::string end_key;
 
   serialize_endpoint(lock_req.start_endp, &start_key);
   serialize_endpoint(lock_req.end_endp, &end_key);
@@ -145,7 +147,7 @@ void RangeLockList::ReplaceLocks(const toku::locktree *lt,
   it->second->create();
 
   toku::range_buffer::iterator iter(&buffer);
-  toku::range_buffer::iterator::record rec;
+  toku::range_buffer::iterator::record rec{};
   while (iter.current(&rec)) {
     it->second->append(rec.get_left_key(), rec.get_right_key());
     iter.next();
