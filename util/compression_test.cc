@@ -2937,6 +2937,40 @@ TEST_F(DBCompressionTest, UnifiedLZ4LZ4HCLevels) {
   }
 }
 
+TEST_F(DBCompressionTest, SnappyCompressBlockRoundTrip) {
+  auto mgr = GetBuiltinV2CompressionManager();
+  if (!mgr->SupportsCompressionType(kSnappyCompression)) {
+    ROCKSDB_GTEST_SKIP("Snappy not supported");
+    return;
+  }
+  auto decompressor = mgr->GetDecompressor();
+
+  // 4 KB of highly compressible bytes: Snappy calls GetAppendBuffer then calls
+  // Append with the same pointer. This triggered a valgrind memcheck warning:
+  // Source and destination overlap in memcpy
+  std::string input(4096, 'a');
+
+  CompressionOptions opts;
+  auto compressor = mgr->GetCompressor(opts, kSnappyCompression);
+  ASSERT_NE(compressor, nullptr);
+
+  std::string output(input.size() * 2 + 1024, '\0');
+  size_t out_size = output.size();
+  CompressionType actual = kNoCompression;
+  ASSERT_OK(compressor->CompressBlock(input, output.data(), &out_size, &actual,
+                                      nullptr));
+  ASSERT_EQ(actual, kSnappyCompression);
+  output.resize(out_size);
+
+  Decompressor::Args args;
+  args.compression_type = kSnappyCompression;
+  args.compressed_data = Slice(output);
+  ASSERT_OK(decompressor->ExtractUncompressedSize(args));
+  std::string recovered(args.uncompressed_size, '\0');
+  ASSERT_OK(decompressor->DecompressBlock(args, recovered.data()));
+  ASSERT_EQ(recovered, input);
+}
+
 TEST_F(DBCompressionTest, ZSTDLevelZeroMapsToMinusOne) {
   // ZSTD itself treats a requested compression level of 0 as "use the default
   // level" (historically 3). That makes level 0 a discontinuity in the

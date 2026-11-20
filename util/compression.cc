@@ -522,7 +522,11 @@ class BuiltinSnappyCompressorV2 final : public CompressorWithSimpleDictBase {
 
       void Append(const char* data, size_t n) override {
         if (pos_ + n <= output_size_) {
-          std::memcpy(output_ + pos_, data, n);
+          // if data is our buffer from GetAppendBuffer, skip memcpy (also
+          // avoids UB)
+          if (data != output_ + pos_) {
+            std::memcpy(output_ + pos_, data, n);
+          }
           pos_ += n;
         } else {
           // Virtual abort
