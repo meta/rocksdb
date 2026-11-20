@@ -1181,19 +1181,19 @@ void PosixRandomAccessFile::Hint(AccessPattern pattern) {
     return;
   }
   switch (pattern) {
-    case kNormal:
+    case AccessPattern::kNormal:
       Fadvise(fd_, 0, 0, POSIX_FADV_NORMAL);
       break;
-    case kRandom:
-      Fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
-      break;
-    case kSequential:
+    case AccessPattern::kSequential:
       Fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
       break;
-    case kWillNeed:
+    case AccessPattern::kRandom:
+      Fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+      break;
+    case AccessPattern::kWillNeed:
       Fadvise(fd_, 0, 0, POSIX_FADV_WILLNEED);
       break;
-    case kWontNeed:
+    case AccessPattern::kDontNeed:
       Fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
       break;
     default:
@@ -1385,19 +1385,19 @@ IOStatus PosixMmapReadableFile::Read(uint64_t offset, size_t n,
 
 void PosixMmapReadableFile::Hint(AccessPattern pattern) {
   switch (pattern) {
-    case kNormal:
+    case AccessPattern::kNormal:
       Madvise(mmapped_region_, length_, POSIX_MADV_NORMAL);
       break;
-    case kRandom:
-      Madvise(mmapped_region_, length_, POSIX_MADV_RANDOM);
-      break;
-    case kSequential:
+    case AccessPattern::kSequential:
       Madvise(mmapped_region_, length_, POSIX_MADV_SEQUENTIAL);
       break;
-    case kWillNeed:
+    case AccessPattern::kRandom:
+      Madvise(mmapped_region_, length_, POSIX_MADV_RANDOM);
+      break;
+    case AccessPattern::kWillNeed:
       Madvise(mmapped_region_, length_, POSIX_MADV_WILLNEED);
       break;
-    case kWontNeed:
+    case AccessPattern::kDontNeed:
       Madvise(mmapped_region_, length_, POSIX_MADV_DONTNEED);
       break;
     default:
