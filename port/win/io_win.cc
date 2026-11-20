@@ -1082,8 +1082,51 @@ WinMemoryMappedBuffer::~WinMemoryMappedBuffer() {
 //////////////////////////////////////////////////////////////////////////
 /// WinDirectory
 
+// The directory entry of a newly created file only becomes durable when
+// the parent directory handle is flushed. FlushFileBuffers documents
+// GENERIC_WRITE as the required access, so that is what we ask for first.
+// On a directory GENERIC_WRITE also carries FILE_ADD_SUBDIRECTORY, so a
+// directory ACL that allows creating files but not subdirectories rejects
+// the open with ERROR_ACCESS_DENIED even though RocksDB only ever needs to
+// create files there. Measured on Windows 11 / NTFS: FILE_WRITE_DATA
+// (FILE_ADD_FILE on a directory) is sufficient for FlushFileBuffers, while
+// FILE_WRITE_ATTRIBUTES alone is not. Keep the documented mask as the
+// primary path and retry with FILE_WRITE_DATA only when access was denied.
+// The handle kept by NewDirectory is access=0 (metadata only) and cannot be
+// flushed, which is why Fsync opens its own for the duration of the call,
+// mirroring fsync() on a POSIX directory fd.
 IOStatus WinDirectory::Fsync(const IOOptions& /*options*/,
                              IODebugContext* /*dbg*/) {
+  HANDLE handle = RX_CreateFile(
+      RX_FN(filename_).c_str(), GENERIC_WRITE,
+      FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+      OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS,  // make opening folders possible
+      NULL);
+  if (INVALID_HANDLE_VALUE == handle && GetLastError() == ERROR_ACCESS_DENIED) {
+    // Restricted directory ACL: fall back to the narrowest right that still
+    // lets FlushFileBuffers succeed (FILE_WRITE_DATA = FILE_ADD_FILE here).
+    handle = RX_CreateFile(
+        RX_FN(filename_).c_str(), FILE_WRITE_DATA,
+        FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  }
+  if (INVALID_HANDLE_VALUE == handle) {
+    auto lastError = GetLastError();
+    return IOErrorFromWindowsError("fsync folder: " + filename_,
+                                   lastError);
+  }
+  BOOL flushed = ::FlushFileBuffers(handle);
+  auto lastError = GetLastError();
+  BOOL closed = ::CloseHandle(handle);
+  if (!flushed) {
+    return IOErrorFromWindowsError("fsync folder: " + filename_,
+                                   lastError);
+  }
+  if (!closed) {
+    return IOErrorFromWindowsError("close folder: " + filename_,
+                                   GetLastError());
+  }
   return IOStatus::OK();
 }
 

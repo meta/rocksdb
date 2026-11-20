@@ -5094,6 +5094,116 @@ TEST_F(EnvTest, WriteStringToFileCloseFailureDeletesFile) {
   ASSERT_TRUE(exists.IsNotFound()) << exists.ToString();
 }
 
+TEST_F(EnvTest, DirectoryFsync) {
+  // Directory fsync used to be a no-op on Windows (the POSIX side has
+  // always really fsynced its directory fds). Exercise the API on the
+  // real filesystem through both entry points the callers use.
+  Env* env = Env::Default();
+  ASSERT_OK(env->CreateDirIfMissing(test_directory_));
+  const std::string dir = test_directory_ + "/dir_fsync_test";
+  ASSERT_OK(env->CreateDirIfMissing(dir));
+  std::unique_ptr<FSDirectory> d;
+  ASSERT_OK(env->GetFileSystem()->NewDirectory(dir, IOOptions(), &d,
+                                               /*dbg=*/nullptr));
+  ASSERT_OK(d->Fsync(IOOptions(), /*dbg=*/nullptr));
+  ASSERT_OK(d->FsyncWithDirOptions(IOOptions(), /*dbg=*/nullptr,
+                                   DirFsyncOptions(
+                                       DirFsyncOptions::kNewFileSynced)));
+  ASSERT_OK(d->FsyncWithDirOptions(IOOptions(), /*dbg=*/nullptr,
+                                   DirFsyncOptions(dir)));
+  d.reset();
+  ASSERT_OK(env->DeleteDir(dir));
+}
+
+#if defined(OS_WIN)
+TEST_F(EnvTest, DirectoryFsyncPropagatesErrors) {
+  // Pin that Fsync really attempts the flush and reports its failure.
+  // icacls denies write-data / append-data to Everyone; the metadata-only
+  // (access = 0) handle kept by NewDirectory still opens, but the
+  // GENERIC_WRITE handle Fsync needs now fails with ERROR_ACCESS_DENIED.
+  // The pre-change no-op returned OK unconditionally, so this test is red
+  // against it and green with the real flush. Mirrors the Windows
+  // error-propagation test in cockroachdb/pebble#6258.
+  Env* env = Env::Default();
+  ASSERT_OK(env->CreateDirIfMissing(test_directory_));
+  const std::string dir = test_directory_ + "/dir_fsync_denied";
+  ASSERT_OK(env->CreateDirIfMissing(dir));
+
+  const std::string quoted = "\"" + dir + "\"";
+  const std::string deny =
+      "icacls " + quoted + " /deny *S-1-1-0:(WD,AD) >NUL 2>&1";
+  const std::string reset = "icacls " + quoted + " /reset >NUL 2>&1";
+  // Restore the ACL at the end of this scope, so an assertion failure, a
+  // failed icacls call, or an early return cannot leave a write-denied
+  // directory behind; DeleteDir below then runs with the ACL restored.
+  struct ResetAcl {
+    std::string cmd;
+    ~ResetAcl() { std::system(cmd.c_str()); }
+  };
+
+  IOStatus s;
+  {
+    ResetAcl guard{reset};
+    ASSERT_EQ(0, std::system(deny.c_str()));
+    std::unique_ptr<FSDirectory> d;
+    ASSERT_OK(env->GetFileSystem()->NewDirectory(dir, IOOptions(), &d,
+                                                 /*dbg=*/nullptr));
+    s = d->Fsync(IOOptions(), /*dbg=*/nullptr);
+    d.reset();
+  }
+
+  ASSERT_OK(env->DeleteDir(dir));
+  ASSERT_NOK(s);
+}
+#endif  // OS_WIN
+
+#if defined(OS_WIN)
+TEST_F(EnvTest, DirectoryFsyncWithFileOnlyPermissions) {
+  // A database directory may grant "create files" but not "create
+  // subdirectories". GENERIC_WRITE on a directory also asks for
+  // FILE_ADD_SUBDIRECTORY, so a flush handle opened with the documented mask
+  // is refused there even though RocksDB only needs to create files. Fsync
+  // must still work, via the FILE_WRITE_DATA fallback.
+  Env* env = Env::Default();
+  ASSERT_OK(env->CreateDirIfMissing(test_directory_));
+  const std::string dir = test_directory_ + "/dir_fsync_file_only";
+  ASSERT_OK(env->CreateDirIfMissing(dir));
+
+  const std::string quoted = "\"" + dir + "\"";
+  const std::string reset = "icacls " + quoted + " /reset >NUL 2>&1";
+  struct ResetAcl {
+    std::string cmd;
+    ~ResetAcl() { std::system(cmd.c_str()); }
+  };
+
+  IOStatus s;
+  {
+    ResetAcl guard{reset};
+    // Everyone: allow create-file, deny create-subdirectory.
+    ASSERT_EQ(0, std::system(
+                     ("icacls " + quoted + " /grant *S-1-1-0:(WD) >NUL 2>&1")
+                         .c_str()));
+    ASSERT_EQ(0, std::system(
+                     ("icacls " + quoted + " /deny *S-1-1-0:(AD) >NUL 2>&1")
+                         .c_str()));
+    // Creating a file in the directory must still work: that is the
+    // permission RocksDB actually needs.
+    std::unique_ptr<WritableFile> f;
+    ASSERT_OK(env->NewWritableFile(dir + "/probe", &f, FileOptions()));
+    f.reset();
+    std::unique_ptr<FSDirectory> d;
+    ASSERT_OK(env->GetFileSystem()->NewDirectory(dir, IOOptions(), &d,
+                                                 /*dbg=*/nullptr));
+    s = d->Fsync(IOOptions(), /*dbg=*/nullptr);
+    d.reset();
+  }
+
+  ASSERT_OK(env->DeleteFile(dir + "/probe"));
+  ASSERT_OK(env->DeleteDir(dir));
+  ASSERT_OK(s);  // red if Fsync only ever tries GENERIC_WRITE
+}
+#endif  // OS_WIN
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
