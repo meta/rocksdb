@@ -699,6 +699,14 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_compaction_verify_record_count(obj) == 1);
   rocksdb_options_set_compaction_verify_record_count(obj, 0);
   CheckCondition(rocksdb_options_get_compaction_verify_record_count(obj) == 0);
+  rocksdb_options_set_compression_options_max_compressed_bytes_per_kb(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_compression_options_max_compressed_bytes_per_kb(
+          obj) == 1);
+  rocksdb_options_set_compression_options_max_compressed_bytes_per_kb(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_compression_options_max_compressed_bytes_per_kb(
+          obj) == 0);
   rocksdb_options_set_compression_options_max_dict_buffer_bytes(obj, 1);
   CheckCondition(
       rocksdb_options_get_compression_options_max_dict_buffer_bytes(obj) == 1);
