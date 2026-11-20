@@ -10,23 +10,24 @@
 #if defined(__linux__)
 #include <asm/hwcap.h>
 #endif
-#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
+#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT) || \
+    defined(ROCKSDB_AUXV_ELF_AUX_INFO_PRESENT)
 #include <sys/auxv.h>
-#endif
 #ifndef HWCAP_CRC32
 #define HWCAP_CRC32 (1 << 7)
 #endif
 #ifndef HWCAP_PMULL
 #define HWCAP_PMULL (1 << 4)
 #endif
-#if defined(__APPLE__)
+#elif defined(__APPLE__)
 #include <sys/sysctl.h>
-#endif
-#if defined(__OpenBSD__)
+#elif defined(__OpenBSD__)
+// clang-format off
 #include <machine/armreg.h>
 #include <machine/cpu.h>
-#include <sys/sysctl.h>
 #include <sys/types.h>
+#include <sys/sysctl.h>
+// clang-format on
 #endif
 
 #ifdef HAVE_ARM64_CRYPTO
@@ -52,11 +53,12 @@
 extern bool pmull_runtime_flag;
 
 uint32_t crc32c_runtime_check(void) {
-#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT) || defined(__FreeBSD__)
+#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT) || \
+    defined(ROCKSDB_AUXV_ELF_AUX_INFO_PRESENT)
   uint64_t auxv = 0;
 #if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
   auxv = getauxval(AT_HWCAP);
-#elif defined(__FreeBSD__)
+#elif defined(ROCKSDB_AUXV_ELF_AUX_INFO_PRESENT)
   elf_aux_info(AT_HWCAP, &auxv, sizeof(auxv));
 #endif
   return (auxv & HWCAP_CRC32) != 0;
@@ -81,11 +83,12 @@ uint32_t crc32c_runtime_check(void) {
 }
 
 bool crc32c_pmull_runtime_check(void) {
-#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT) || defined(__FreeBSD__)
+#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT) || \
+    defined(ROCKSDB_AUXV_ELF_AUX_INFO_PRESENT)
   uint64_t auxv = 0;
 #if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
   auxv = getauxval(AT_HWCAP);
-#elif defined(__FreeBSD__)
+#elif defined(ROCKSDB_AUXV_ELF_AUX_INFO_PRESENT)
   elf_aux_info(AT_HWCAP, &auxv, sizeof(auxv));
 #endif
   return (auxv & HWCAP_PMULL) != 0;
