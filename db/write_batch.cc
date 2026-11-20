@@ -3540,6 +3540,27 @@ Status WriteBatchInternal::Append(WriteBatch* dst, const WriteBatch* src,
   return Status::OK();
 }
 
+Status AppendWriteBatch(WriteBatch& write_batch,
+                        const WriteBatch& write_batch_to_append,
+                        bool wal_only) {
+  if (&write_batch == &write_batch_to_append) {
+    return Status::InvalidArgument("Cannot append a WriteBatch to itself");
+  }
+  if (write_batch.GetProtectionBytesPerKey() !=
+      write_batch_to_append.GetProtectionBytesPerKey()) {
+    return Status::InvalidArgument(
+        "WriteBatches have different protection bytes per key");
+  }
+  // Timestamp bookkeeping is not merged, so neither batch may use timestamps.
+  if (WriteBatchInternal::HasKeyWithTimestamp(write_batch) ||
+      WriteBatchInternal::HasKeyWithTimestamp(write_batch_to_append)) {
+    return Status::NotSupported(
+        "Cannot append WriteBatches with user-defined timestamps");
+  }
+  return WriteBatchInternal::Append(&write_batch, &write_batch_to_append,
+                                    wal_only);
+}
+
 size_t WriteBatchInternal::AppendedByteSize(size_t leftByteSize,
                                             size_t rightByteSize) {
   if (leftByteSize == 0 || rightByteSize == 0) {
