@@ -25,12 +25,14 @@ BaseDeltaIterator::BaseDeltaIterator(ColumnFamilyHandle* column_family,
                                      Iterator* base_iterator,
                                      WBWIIteratorImpl* delta_iterator,
                                      const Comparator* comparator,
-                                     const ReadOptions* read_options)
+                                     const ReadOptions* read_options,
+                                     bool fill_timestamps)
     : forward_(true),
       current_at_base_(true),
       equal_keys_(false),
       allow_unprepared_value_(
           read_options ? read_options->allow_unprepared_value : false),
+      fill_timestamps_(fill_timestamps),
       status_(Status::OK()),
       column_family_(column_family),
       base_iterator_(base_iterator),
@@ -165,7 +167,43 @@ Slice BaseDeltaIterator::key() const {
 }
 
 Slice BaseDeltaIterator::timestamp() const {
-  return current_at_base_ ? base_iterator_->timestamp() : Slice();
+  if (current_at_base_) {
+    return base_iterator_->timestamp();
+  }
+
+  if (!fill_timestamps_) {
+    // the batch entries do not include meaningful timestamps (i.e. the ts is
+    // presently unknown)
+    return Slice();
+  }
+
+  const Comparator* const ucmp =
+      column_family_ ? column_family_->GetComparator() : comparator_;
+  if (!ucmp) {
+    return Slice();
+  }
+
+  const size_t ts_sz = ucmp->timestamp_size();
+  if (ts_sz == 0) {
+    return Slice();
+  }
+
+  assert(DeltaValid());
+  const WriteBatchIndexEntry* iter_entry = delta_iterator_->GetRawEntry();
+  assert(iter_entry);
+
+  const ReadableWriteBatch* write_batch = delta_iterator_->GetWriteBatch();
+  assert(write_batch);
+
+  Slice raw_key, value_ignore, blob_ignore, xid_ignore;
+  WriteType type_ignore;
+  Status s = write_batch->GetEntryFromDataOffset(
+      iter_entry->offset, &type_ignore, &raw_key, &value_ignore, &blob_ignore,
+      &xid_ignore);
+  assert(s.ok());
+  assert(raw_key.size() >= ts_sz);
+  raw_key.remove_prefix(raw_key.size() - ts_sz);
+  return raw_key;
 }
 
 Status BaseDeltaIterator::status() const {
@@ -554,6 +592,11 @@ WBWIIteratorImpl::Result WBWIIteratorImpl::FindLatestUpdate(
         break;  // Unexpected error or we've reached a different next key
       }
 
+      // N.B. visibility *is not* evaluated for UDT-enabled CFs, even when
+      // require_timestamps is true. Instead, it is implied that reads are
+      // happening at max(ts). read_options ts-related settings instead control
+      // visibility of tuples in DB.
+
       switch (entry.type) {
         case kPutRecord:
           return WBWIIteratorImpl::kFound;
@@ -764,6 +807,7 @@ WriteEntry WBWIIteratorImpl::Entry() const {
          iter_entry->column_family == column_family_id_);
   auto s = write_batch_->GetEntryFromDataOffset(
       iter_entry->offset, &ret.type, &ret.key, &ret.value, &blob, &xid);
+  ret.timestamp = Slice();
   assert(s.ok());
   assert(ret.type == kPutRecord || ret.type == kPutEntityRecord ||
          ret.type == kDeleteRecord || ret.type == kSingleDeleteRecord ||
@@ -772,7 +816,10 @@ WriteEntry WBWIIteratorImpl::Entry() const {
   const Comparator* const ucmp = comparator_->GetComparator(column_family_id_);
   size_t ts_sz = ucmp->timestamp_size();
   if (ts_sz > 0) {
-    ret.key = StripTimestampFromUserKey(ret.key, ts_sz);
+    Slice rawKey = ret.key;
+    ret.key = StripTimestampFromUserKey(rawKey, ts_sz);
+    ret.timestamp = rawKey;
+    ret.timestamp.remove_prefix(ret.key.size());
   }
   return ret;
 }

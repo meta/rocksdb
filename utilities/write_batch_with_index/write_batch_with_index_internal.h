@@ -37,7 +37,7 @@ class BaseDeltaIterator : public Iterator {
   BaseDeltaIterator(ColumnFamilyHandle* column_family, Iterator* base_iterator,
                     WBWIIteratorImpl* delta_iterator,
                     const Comparator* comparator,
-                    const ReadOptions* read_options);
+                    const ReadOptions* read_options, bool fill_timestamps);
 
   ~BaseDeltaIterator() override;
 
@@ -97,6 +97,9 @@ class BaseDeltaIterator : public Iterator {
   bool current_at_base_;
   bool equal_keys_;
   bool allow_unprepared_value_;
+  // if set, the iterator will return Entrys with timestamps filled in.
+  // Otherwise the iterator returns the empty Slice for timestamp().
+  bool fill_timestamps_;
   Status status_;
   ColumnFamilyHandle* column_family_;
   std::unique_ptr<Iterator> base_iterator_;
@@ -368,6 +371,8 @@ class WBWIIteratorImpl final : public WBWIIterator {
   const WriteBatchIndexEntry* GetRawEntry() const {
     return skip_list_iter_.key();
   }
+
+  const ReadableWriteBatch* GetWriteBatch() const { return write_batch_; }
 
   bool MatchesKey(uint32_t cf_id, const Slice& key);
 
