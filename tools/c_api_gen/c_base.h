@@ -3664,6 +3664,16 @@ extern ROCKSDB_LIBRARY_API void rocksdb_disable_manual_compaction(
 
 extern ROCKSDB_LIBRARY_API void rocksdb_enable_manual_compaction(rocksdb_t* db);
 
+/* Aborts all running compactions, automatic and manual, and waits for them
+ * to finish or abort. New compactions are aborted until
+ * rocksdb_resume_all_compactions() has been called once for every call to
+ * this function. See DB::AbortAllCompactions(). */
+extern ROCKSDB_LIBRARY_API void rocksdb_abort_all_compactions(rocksdb_t* db);
+
+/* Undoes one rocksdb_abort_all_compactions() call. See
+ * DB::ResumeAllCompactions(). */
+extern ROCKSDB_LIBRARY_API void rocksdb_resume_all_compactions(rocksdb_t* db);
+
 extern ROCKSDB_LIBRARY_API rocksdb_statistics_histogram_data_t*
 rocksdb_statistics_histogram_data_create(void);
 extern ROCKSDB_LIBRARY_API void rocksdb_statistics_histogram_data_destroy(
