@@ -32,6 +32,7 @@ struct ReadOptions;
 struct TableProperties;
 class GetContext;
 class MultiGetContext;
+class SameFileBlobReader;
 
 // A Table (also referred to as SST) is a sorted map from strings to strings.
 // Tables are immutable and persistent.  A Table may be safely accessed from
@@ -41,6 +42,10 @@ class MultiGetContext;
 class TableReader {
  public:
   virtual ~TableReader() = default;
+
+  virtual const SameFileBlobReader* GetSameFileBlobReader() const {
+    return nullptr;
+  }
 
   // Returns a new iterator over the table contents.
   // The result of NewIterator() is initially invalid (caller must

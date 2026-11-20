@@ -210,6 +210,48 @@ class TraceAnalyzerTest : public testing::Test {
   Random rnd_;
 };
 
+TEST_F(TraceAnalyzerTest, EmptyTraceQpsProducesNoSamples) {
+  for (bool output_qps : {false, true}) {
+    SCOPED_TRACE(output_qps);
+    SpecialEnv clock_env(env_, /*time_elapse_only_sleep=*/true);
+    Options options;
+    options.create_if_missing = true;
+    options.env = &clock_env;
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(options, dbname_, &db));
+    std::string trace_path =
+        test_path_ + "/empty_trace_" + std::to_string(output_qps);
+    std::unique_ptr<TraceWriter> writer;
+    ASSERT_OK(
+        NewFileTraceWriter(&clock_env, env_options_, trace_path, &writer));
+    ASSERT_OK(db->StartTrace(TraceOptions(), std::move(writer)));
+    ASSERT_OK(db->EndTrace());
+    ASSERT_OK(db->Close());
+    std::string output_path =
+        test_path_ + "/empty_output_" + std::to_string(output_qps);
+    ASSERT_OK(env_->CreateDir(output_path));
+    TraceAnalyzerOptions analyzer_options;
+    analyzer_options.output_dir = output_path;
+    analyzer_options.output_prefix = "empty";
+    analyzer_options.output_qps_stats = output_qps;
+    TraceAnalyzer analyzer(trace_path, analyzer_options);
+    ASSERT_OK(analyzer.Analyze());
+    EXPECT_TRUE(analyzer.GetResult().operations.empty());
+    for (const char* suffix : {"-qps_stats.txt", "-cf_qps_stats.txt"}) {
+      const std::string path = output_path + "/empty" + suffix;
+      if (!output_qps) {
+        EXPECT_EQ(Status::kNotFound, env_->FileExists(path).code());
+        continue;
+      }
+      uint64_t size = 0;
+      ASSERT_OK(env_->GetFileSize(path, &size));
+      EXPECT_EQ(0, size);
+    }
+    db.reset();
+    ASSERT_OK(DestroyDB(dbname_, options));
+  }
+}
+
 TEST_F(TraceAnalyzerTest, Get) {
   std::string trace_path = test_path_ + "/trace";
   std::string output_path = test_path_ + "/get";
@@ -980,6 +1022,39 @@ TEST_F(TraceAnalyzerTest, LibraryResultWithoutOutputFiles) {
   zero_interval.value_interval = 0;
   TraceAnalyzer zero(trace_path, zero_interval);
   EXPECT_TRUE(zero.Analyze().IsInvalidArgument());
+}
+
+TEST_F(TraceAnalyzerTest, LibraryKeyStatsWithoutOutputFiles) {
+  const std::string trace_path = test_path_ + "/trace_library_keys";
+  GenerateTrace(trace_path);
+
+  TraceAnalyzerOptions options;
+  options.analyze_get = true;
+  options.output_key_stats = true;
+  options.output_prefix_cut = 1;
+  TraceAnalyzer analyzer(trace_path, options);
+  ASSERT_OK(analyzer.Analyze());
+  const TraceAnalyzerResult result = analyzer.GetResult();
+  ASSERT_EQ(result.operations.size(), 1u);
+  EXPECT_EQ(result.operations[0].type, "get");
+  EXPECT_EQ(result.operations[0].count, 2u);
+  EXPECT_EQ(result.operations[0].unique_keys, 2u);
+}
+
+TEST_F(TraceAnalyzerTest, LibraryCorrelationWithoutOutputFiles) {
+  const std::string trace_path = test_path_ + "/trace_library_correlation";
+  GenerateTrace(trace_path);
+
+  TraceAnalyzerOptions options;
+  options.analyze_get = true;
+  options.analyze_put = true;
+  options.print_correlation = "[get,put][put,get]";
+  TraceAnalyzer analyzer(trace_path, options);
+  ASSERT_OK(analyzer.Analyze());
+  const TraceAnalyzerResult result = analyzer.GetResult();
+  ASSERT_EQ(result.operations.size(), 2u);
+  EXPECT_EQ(result.total_gets, 2u);
+  EXPECT_EQ(result.total_write_batches, 1u);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

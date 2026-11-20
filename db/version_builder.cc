@@ -55,6 +55,7 @@ struct MutableScalars {
   // Whether there are invalid new files or invalid deletions on levels larger
   // than num_levels_.
   bool has_invalid_levels_ = false;
+  bool requires_source_priority_for_equal_sequences_ = false;
 
   // The fields below are only meaningful when track_found_and_missing_files_ is
   // enabled.
@@ -445,6 +446,9 @@ class VersionBuilder::Rep : public MutableScalars {
         track_found_and_missing_files_(track_found_and_missing_files),
         allow_incomplete_valid_version_(allow_incomplete_valid_version) {
     assert(ioptions_);
+
+    requires_source_priority_for_equal_sequences_ =
+        base_vstorage_->RequiresSourcePriorityForEqualSequences();
 
     levels_ = new LevelState[num_levels_];
     if (track_found_and_missing_files_) {
@@ -1381,6 +1385,10 @@ class VersionBuilder::Rep : public MutableScalars {
     if (track_found_and_missing_files_) {
       CaptureUndo(edit);
     }
+    if (edit->RequiresSourcePriorityForEqualSequences()) {
+      requires_source_priority_for_equal_sequences_ = true;
+      version_updated = true;
+    }
 
     // Note: we process the blob file related changes first because the
     // table file addition/deletion logic depends on the blob files
@@ -2043,6 +2051,8 @@ class VersionBuilder::Rep : public MutableScalars {
     }
 
     const uint64_t min_oldest_blob_file_num = SaveSSTFilesTo(vstorage);
+    vstorage->SetRequiresSourcePriorityForEqualSequences(
+        requires_source_priority_for_equal_sequences_);
 
     std::vector<uint64_t> dropped_blob_files;
     SaveBlobFilesTo(vstorage, min_oldest_blob_file_num, &dropped_blob_files);

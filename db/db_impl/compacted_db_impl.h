@@ -146,6 +146,12 @@ class CompactedDBImpl : public DBImpl {
     return Status::NotSupported("Not supported in compacted db mode.");
   }
 
+  using DB::ApplyLsmEdit;
+  Status ApplyLsmEdit(const LsmEditOptions& /*options*/,
+                      const std::vector<LsmEdit>& /*edits*/) override {
+    return Status::NotSupported("Not supported in compacted db mode.");
+  }
+
   using DB::CreateColumnFamilyWithImport;
   Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& /*options*/,

@@ -266,6 +266,12 @@ class StackableDB : public DB {
     return db_->CommitFileIngestionHandles(std::move(handles));
   }
 
+  using DB::ApplyLsmEdit;
+  Status ApplyLsmEdit(const LsmEditOptions& options,
+                      const std::vector<LsmEdit>& edits) override {
+    return db_->ApplyLsmEdit(options, edits);
+  }
+
   using DB::CreateColumnFamilyWithImport;
   Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,

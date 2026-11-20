@@ -68,6 +68,40 @@ static void TestOptionsFileNumberField(const char* field_name,
 
 class VersionEditTest : public testing::Test {};
 
+TEST_F(VersionEditTest, SourcePriorityRequirementIsNotIgnorable) {
+  VersionEdit edit;
+  EXPECT_FALSE(edit.RequiresSourcePriorityForEqualSequences());
+  edit.RequireSourcePriorityForEqualSequences();
+  edit.SetColumnFamily(7);
+  TestEncodeDecode(edit);
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded));
+  Slice input(encoded);
+  uint32_t tag;
+  uint32_t required;
+  ASSERT_TRUE(GetVarint32(&input, &tag));
+  ASSERT_TRUE(GetVarint32(&input, &required));
+  EXPECT_EQ(kRequireSourcePriorityForEqualSequences, tag);
+  EXPECT_EQ(0, tag & kTagSafeIgnoreMask);
+  EXPECT_EQ(1, required);
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  EXPECT_TRUE(decoded.RequiresSourcePriorityForEqualSequences());
+  EXPECT_EQ(7, decoded.GetColumnFamily());
+  decoded.Clear();
+  EXPECT_FALSE(decoded.RequiresSourcePriorityForEqualSequences());
+}
+
+TEST_F(VersionEditTest, RejectsInvalidSourcePriorityRequirement) {
+  for (uint32_t value : {0, 2}) {
+    std::string encoded;
+    PutVarint32(&encoded, kRequireSourcePriorityForEqualSequences);
+    PutVarint32(&encoded, value);
+    VersionEdit decoded;
+    ASSERT_TRUE(decoded.DecodeFrom(encoded).IsCorruption());
+  }
+}
+
 TEST_F(VersionEditTest, EncodeDecode) {
   static const uint64_t kBig = 1ull << 50;
   static const uint32_t kBig32Bit = 1ull << 30;
