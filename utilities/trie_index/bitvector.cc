@@ -209,13 +209,13 @@ void Bitvector::BuildFrom(const BitvectorBuilder& builder) {
   size_t rank_bytes = num_rank_samples_ * sizeof(uint32_t);
 
   // Phase 1: allocate words + rank LUT.
-  owned_data_.resize(words_bytes + rank_bytes, '\0');
+  owned_data_ = std::make_unique<char[]>(words_bytes + rank_bytes);
   if (num_words_ > 0) {
-    memcpy(&owned_data_[0], builder.Words().data(), words_bytes);
+    memcpy(owned_data_.get(), builder.Words().data(), words_bytes);
   }
-  words_ = reinterpret_cast<const uint64_t*>(owned_data_.data());
+  words_ = reinterpret_cast<const uint64_t*>(owned_data_.get());
   rank_lut_ =
-      reinterpret_cast<const uint32_t*>(owned_data_.data() + words_bytes);
+      reinterpret_cast<const uint32_t*>(owned_data_.get() + words_bytes);
   assert(reinterpret_cast<uintptr_t>(rank_lut_) % alignof(uint32_t) == 0);
 
   BuildRankLUT();
@@ -229,9 +229,12 @@ void Bitvector::BuildFrom(const BitvectorBuilder& builder) {
 
   size_t s1_bytes = num_select1_hints_ * sizeof(uint32_t);
   size_t s0_bytes = num_select0_hints_ * sizeof(uint32_t);
-  owned_data_.resize(words_bytes + rank_bytes + s1_bytes + s0_bytes, '\0');
+  std::unique_ptr<char[]> data =
+      std::make_unique<char[]>(words_bytes + rank_bytes + s1_bytes + s0_bytes);
+  memcpy(data.get(), owned_data_.get(), words_bytes + rank_bytes);
+  owned_data_ = std::move(data);
 
-  // Recompute all pointers after resize (string may have reallocated).
+  // Recompute all pointers after reallocating the aligned buffer.
   RecomputePointers();
   assert(reinterpret_cast<uintptr_t>(rank_lut_) % alignof(uint32_t) == 0);
 
