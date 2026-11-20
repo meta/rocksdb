@@ -447,15 +447,27 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
   // Grab any available capacity, and free up any more required.
   size_t old_usage = usage_.LoadRelaxed();
   size_t new_usage;
+  // Usage once enough is evicted
+  size_t target_usage;
   do {
-    new_usage = std::min(capacity, old_usage + total_charge);
+    target_usage = std::min(capacity, old_usage + total_charge);
+    // Never lower usage before evicting. Over capacity (e.g. after
+    // SetCapacity lowered it), usage taken down to capacity up front would
+    // leave out charges of entries still in the cache until the eviction
+    // below finishes, so erasing one meanwhile would underflow usage, and
+    // other inserts meanwhile could use capacity those entries still take.
+    new_usage = std::max(old_usage, target_usage);
     if (new_usage == old_usage) {
       // No change needed
       break;
     }
   } while (!usage_.CasWeakRelaxed(old_usage, new_usage));
-  // How much do we need to evict then?
-  size_t need_evict_charge = old_usage + total_charge - new_usage;
+  // How much do we need to evict then? Over capacity, the excess as well as
+  // total_charge.
+  size_t need_evict_charge = old_usage + total_charge - target_usage;
+  // The part of total_charge not yet in usage, which the evicted charge
+  // covers: all of it over capacity.
+  const size_t uncharged = old_usage + total_charge - new_usage;
   size_t request_evict_charge = need_evict_charge;
   if (UNLIKELY(need_evict_for_occupancy) && request_evict_charge == 0) {
     // Require at least 1 eviction.
@@ -465,12 +477,8 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
     EvictionData data;
     static_cast<Table*>(this)->Evict(request_evict_charge, state, &data);
     occupancy_.FetchSub(data.freed_count);
-    if (LIKELY(data.freed_charge > need_evict_charge)) {
-      assert(data.freed_count > 0);
-      // Evicted more than enough
-      usage_.FetchSubRelaxed(data.freed_charge - need_evict_charge);
-    } else if (data.freed_charge < need_evict_charge ||
-               (UNLIKELY(need_evict_for_occupancy) && data.freed_count == 0)) {
+    if (data.freed_charge < need_evict_charge ||
+        (UNLIKELY(need_evict_for_occupancy) && data.freed_count == 0)) {
       // Roll back to old usage minus evicted
       usage_.FetchSubRelaxed(data.freed_charge + (new_usage - old_usage));
       if (data.freed_charge < need_evict_charge) {
@@ -486,6 +494,10 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
     // If we needed to evict something and we are proceeding, we must have
     // evicted something.
     assert(data.freed_count > 0);
+    if (LIKELY(data.freed_charge > uncharged)) {
+      // Take off the evicted charge, less the part of total_charge it covers
+      usage_.FetchSubRelaxed(data.freed_charge - uncharged);
+    }
   }
   return Status::OK();
 }
