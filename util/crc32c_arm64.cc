@@ -5,7 +5,7 @@
 
 #include "util/crc32c_arm64.h"
 
-#if defined(HAVE_ARM64_CRC)
+#if defined(__ARM_FEATURE_CRC32)
 
 #if defined(__linux__)
 #include <asm/hwcap.h>
@@ -29,7 +29,7 @@
 #include <sys/types.h>
 #endif
 
-#ifdef HAVE_ARM64_CRYPTO
+#ifdef __ARM_FEATURE_CRC32
 /* unfolding to compute 8 * 3 = 24 bytes parallelly */
 #define CRC32C24BYTES(ITR)                                    \
   crc1 = crc32c_u64(crc1, *(buf64 + BLK_LENGTH + (ITR)));     \
@@ -125,8 +125,8 @@ uint32_t crc32c_arm64(uint32_t crc, unsigned char const* data, size_t len) {
    * Skip Crc32c Parallel computation if no crypto extension available.
    */
   if (pmull_runtime_flag) {
-/* Macro (HAVE_ARM64_CRYPTO) is used for compiling check  */
-#ifdef HAVE_ARM64_CRYPTO
+/* Macro __ARM_FEATURE_AES is required to support pmull instruction */
+#ifdef __ARM_FEATURE_AES
 /* Crc32c Parallel computation
  *   Algorithm comes from Intel whitepaper:
  *   crc-iscsi-polynomial-crc32-instruction-paper

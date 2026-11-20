@@ -169,6 +169,38 @@ TEST(CRC, Crc32cCombineBigSizeTest) {
   ASSERT_EQ(crc1_2, crc1_2_combine);
 }
 
+TEST(CRC, IsFastCrc32Supported) {
+  std::string output = IsFastCrc32Supported();
+
+  std::string test_detected_arch = "TODO: add arch defines to test";
+  bool test_fast_crc_supported = false;
+
+#if defined(__x86_64__) || defined(_M_X64)
+  test_detected_arch = "x86";
+
+#if defined(__SSE4_2__)
+  test_fast_crc_supported = true;
+#endif
+
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  test_detected_arch = "Arm64";
+
+#ifdef __ARM_FEATURE_CRC32
+  test_fast_crc_supported = true;
+#endif
+
+#endif
+
+  std::string supported_string = "Not supported";
+  if (test_fast_crc_supported) {
+    supported_string = "Supported";
+  }
+  std::string expected = supported_string = " on " + test_detected_arch;
+
+  ASSERT_NE(output.find(expected), std::string::npos)
+      << "expected=" << expected << "output=" << output;
+}
+
 }  // namespace ROCKSDB_NAMESPACE::crc32c
 
 // copied from folly
