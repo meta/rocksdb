@@ -3218,7 +3218,13 @@ class MemTableInserter : public WriteBatch::Handler {
                 ColumnFamilySet* const cf_set = vset->GetColumnFamilySet();
                 assert(cf_set);
                 ColumnFamilyData* cfd = cf_set->GetColumnFamily(cf);
-                assert(cfd);
+                if (cfd == nullptr) {
+                  // The column family was dropped after the transaction was
+                  // prepared. 0 makes UpdateTimestamps() skip its entries, and
+                  // Iterate() below ignores them like any other write to a
+                  // dropped column family during recovery.
+                  return static_cast<size_t>(0);
+                }
                 const auto* const ucmp = cfd->user_comparator();
                 assert(ucmp);
                 return ucmp->timestamp_size();
