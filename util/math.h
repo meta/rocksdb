@@ -152,12 +152,13 @@ int BitsSetToOneFallback(T v) {
   static_assert((kBits & (kBits - 1)) == 0, "must be power of two bits");
   // we static_cast these bit patterns in order to truncate them to the correct
   // size. Warning C4309 dislikes this technique, so disable it here.
+#pragma warning(push)
 #pragma warning(disable : 4309)
   v = static_cast<T>(v - ((v >> 1) & static_cast<T>(0x5555555555555555ull)));
   v = static_cast<T>((v & static_cast<T>(0x3333333333333333ull)) +
                      ((v >> 2) & static_cast<T>(0x3333333333333333ull)));
   v = static_cast<T>((v + (v >> 4)) & static_cast<T>(0x0F0F0F0F0F0F0F0Full));
-#pragma warning(default : 4309)
+#pragma warning(pop)
   for (int shift_bits = 8; shift_bits < kBits; shift_bits <<= 1) {
     v += static_cast<T>(v >> shift_bits);
   }
