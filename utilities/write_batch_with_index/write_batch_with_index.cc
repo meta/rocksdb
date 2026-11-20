@@ -249,6 +249,12 @@ Status WriteBatchWithIndex::Rep::ReBuildIndex() {
 
     s = ReadRecordFromWriteBatch(&input, &tag, &column_family_id, &key, &value,
                                  &blob, &xid, &unix_write_time);
+    auto* ucmp = comparator.GetComparator(column_family_id);
+    size_t ts_sz = ucmp ? ucmp->timestamp_size() : 0;
+    if (ts_sz > 0) {
+      assert(key.size() >= ts_sz);
+      key.remove_suffix(ts_sz);
+    }
     if (!s.ok()) {
       break;
     }
