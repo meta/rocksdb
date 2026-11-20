@@ -665,6 +665,33 @@ struct AdvancedColumnFamilyOptions {
   // Default: true
   bool level_compaction_dynamic_level_bytes = true;
 
+  // EXPERIMENTAL: Allow eligible leveled and multi-level universal compactions
+  // to retain non-overlapping portions of one SST as logical views over the
+  // immutable physical file. Existing views remain readable when disabled.
+  // With a compaction filter, all input keys are processed normally and only
+  // unchanged ranges are retained. This saves writes but requires reading the
+  // full input. Filtered view compactions run locally and conservatively
+  // reserve the full source file size against the retained-dead-byte limit.
+  // Without an active compaction filter, a compaction service runs only the
+  // rewritten key range on the remote worker; the primary retains the views.
+  // Compaction service
+  // workers must run a binary with SST view support (including opening
+  // databases that contain views) before this option is enabled, because an
+  // older worker cannot open such a database for remote compaction.
+  bool experimental_enable_sst_view_compaction = false;
+
+  // Minimum estimated bytes that must avoid rewriting for an SST-view
+  // compaction to be admitted.
+  uint64_t experimental_sst_view_min_bytes_saved = 64ULL << 20;
+
+  // Minimum fraction of the source SST retained by logical views.
+  double experimental_sst_view_min_reuse_ratio = 0.5;
+
+  // Maximum estimated bytes hidden inside live SST-view backings for this
+  // column family. New views are not created when the projected total exceeds
+  // this limit.
+  uint64_t experimental_sst_view_max_retained_dead_bytes = 1ULL << 30;
+
   // Default: 10.
   //
   // Dynamically changeable through SetOptions() API

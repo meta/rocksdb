@@ -454,6 +454,14 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->bloom_locality = ioptions.bloom_locality;
   cf_opts->level_compaction_dynamic_level_bytes =
       ioptions.level_compaction_dynamic_level_bytes;
+  cf_opts->experimental_enable_sst_view_compaction =
+      ioptions.experimental_enable_sst_view_compaction;
+  cf_opts->experimental_sst_view_min_bytes_saved =
+      ioptions.experimental_sst_view_min_bytes_saved;
+  cf_opts->experimental_sst_view_min_reuse_ratio =
+      ioptions.experimental_sst_view_min_reuse_ratio;
+  cf_opts->experimental_sst_view_max_retained_dead_bytes =
+      ioptions.experimental_sst_view_max_retained_dead_bytes;
   cf_opts->num_levels = ioptions.num_levels;
   cf_opts->optimize_filters_for_hits = ioptions.optimize_filters_for_hits;
   cf_opts->force_consistency_checks = ioptions.force_consistency_checks;
