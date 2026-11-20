@@ -375,9 +375,12 @@ Status WideColumnSerialization::DeserializeV2Impl(
   }
   input.remove_prefix(num_columns);
 
-  // Validate that sections 4-6 fit in the remaining input
-  const size_t metadata_size =
-      name_sizes_bytes + value_sizes_bytes + names_bytes;
+  // Validate that sections 4-6 fit in the remaining input. The three declared
+  // section sizes are independent varint32s, so sum them in 64 bits: a uint32_t
+  // sum wraps and lets a declared metadata size far larger than the input pass
+  // this check, after which the section pointers below land out of bounds.
+  const uint64_t metadata_size = lossless_cast<uint64_t>(name_sizes_bytes) +
+                                 value_sizes_bytes + names_bytes;
   if (input.size() < metadata_size) {
     return Status::Corruption("Error decoding wide column sections");
   }
