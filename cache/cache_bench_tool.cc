@@ -121,6 +121,10 @@ DEFINE_string(secondary_cache_uri, "",
 
 DEFINE_string(cache_type, "hyper_clock_cache", "Type of block cache.");
 
+DEFINE_string(cache_uri, "",
+              "Full URI for creating a custom cache object, used instead of "
+              "-cache_type. Its capacity must equal -cache_size.");
+
 DEFINE_bool(use_jemalloc_no_dump_allocator, false,
             "Whether to use JemallocNoDumpAllocator");
 
@@ -399,6 +403,9 @@ class CacheBench {
   ~CacheBench() = default;
 
   static std::shared_ptr<Cache> MakeCache() {
+    if (!FLAGS_cache_uri.empty()) {
+      return MakeCacheFromUri();
+    }
     std::shared_ptr<MemoryAllocator> allocator;
     if (FLAGS_use_jemalloc_no_dump_allocator) {
       JemallocAllocatorOptions opts;
@@ -444,6 +451,35 @@ class CacheBench {
       fprintf(stderr, "Cache type not supported.\n");
       exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
+  }
+
+  static std::shared_ptr<Cache> MakeCacheFromUri() {
+    if (!FLAGS_secondary_cache_uri.empty() ||
+        FLAGS_use_jemalloc_no_dump_allocator) {
+      fprintf(stderr,
+              "-cache_uri cannot be combined with -secondary_cache_uri or "
+              "-use_jemalloc_no_dump_allocator\n");
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
+    ConfigOptions config_options;
+    config_options.ignore_unsupported_options = false;
+    std::shared_ptr<Cache> cache;
+    Status s = Cache::CreateFromString(config_options, FLAGS_cache_uri, &cache);
+    if (!s.ok() || cache == nullptr) {
+      fprintf(stderr, "No cache registered matching string: %s status=%s\n",
+              FLAGS_cache_uri.c_str(), s.ToString().c_str());
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
+    // The key space, pinned share and capacity changes all derive from
+    // -cache_size, so the cache must have exactly that capacity.
+    if (cache->GetCapacity() != FLAGS_cache_size) {
+      fprintf(stderr,
+              "-cache_size (%" PRIu64
+              ") must equal the capacity of -cache_uri (%zu)\n",
+              FLAGS_cache_size, cache->GetCapacity());
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
+    return cache;
   }
 
   void PopulateCache() {
@@ -841,8 +877,12 @@ class CacheBench {
     printf("Ops per thread      : %" PRIu64 "\n", FLAGS_ops_per_thread);
     printf("Cache size          : %s\n",
            BytesToHumanString(FLAGS_cache_size).c_str());
-    printf("Num shard bits      : %d\n",
-           AsShardedCache(cache_.get())->GetNumShardBits());
+    if (FLAGS_cache_uri.empty()) {
+      printf("Num shard bits      : %d\n",
+             AsShardedCache(cache_.get())->GetNumShardBits());
+    } else {
+      printf("Cache URI           : %s\n", FLAGS_cache_uri.c_str());
+    }
     printf("Max key             : %" PRIu64 "\n", max_key_);
     printf("Resident ratio      : %g\n", FLAGS_resident_ratio);
     printf("Skew degree         : %u\n", FLAGS_skew);
