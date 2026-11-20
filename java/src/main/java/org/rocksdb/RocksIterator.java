@@ -8,6 +8,7 @@ package org.rocksdb;
 import static org.rocksdb.util.BufferUtil.CheckBounds;
 
 import java.nio.ByteBuffer;
+import java.util.function.Function;
 
 /**
  * <p>An iterator that yields a sequence of key/value pairs from a source.
@@ -25,6 +26,11 @@ import java.nio.ByteBuffer;
 public class RocksIterator extends AbstractRocksIterator<RocksDB> {
   protected RocksIterator(final RocksDB rocksDB, final long nativeHandle) {
     super(rocksDB, nativeHandle);
+  }
+
+  protected RocksIterator(final RocksDB rocksDB, final long nativeHandle,
+      final Function<AbstractRocksIterator<RocksDB>, Boolean> removeOnClosure) {
+    super(rocksDB, nativeHandle, removeOnClosure);
   }
 
   /**
