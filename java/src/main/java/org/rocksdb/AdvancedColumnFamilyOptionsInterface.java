@@ -247,7 +247,7 @@ public interface AdvancedColumnFamilyOptionsInterface<
    *
    * <p><strong>Caution</strong>: this option is experimental</p>
    *
-   * <p>Default: false</p>
+   * <p>Default: true</p>
    *
    * @param enableLevelCompactionDynamicLevelBytes boolean value indicating
    *     if {@code LevelCompactionDynamicLevelBytes} shall be enabled.
