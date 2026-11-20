@@ -1165,6 +1165,8 @@ struct AdvancedColumnFamilyOptions {
   // currently only supported with leveled compactions. Note that
   // enable_blob_garbage_collection has to be set in order for this option to
   // have any effect.
+  // With a threshold of 0, compaction is triggered only if the eligible blob
+  // files contain garbage.
   //
   // Default: 1.0
   //
