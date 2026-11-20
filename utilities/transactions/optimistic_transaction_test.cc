@@ -77,6 +77,29 @@ class OptimisticTransactionTest
   void Open() { OpenImpl(options, occ_opts, dbname, &txn_db); }
 };
 
+TEST(OptimisticTransactionDBTest, RejectsInvalidValidationPolicy) {
+  Options options;
+  options.create_if_missing = true;
+  OptimisticTransactionDBOptions occ_options;
+  occ_options.validate_policy = static_cast<OccValidationPolicy>(-1);
+  const std::string dbname =
+      test::PerThreadDBPath("invalid_optimistic_validation_policy");
+  ASSERT_OK(DestroyDB(dbname, options));
+
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(kDefaultColumnFamilyName,
+                               ColumnFamilyOptions(options));
+  std::vector<ColumnFamilyHandle*> handles;
+  OptimisticTransactionDB* txn_db = nullptr;
+  Status s = OptimisticTransactionDB::Open(options, occ_options, dbname,
+                                           column_families, &handles, &txn_db);
+  EXPECT_TRUE(s.IsInvalidArgument());
+  EXPECT_EQ(txn_db, nullptr);
+  EXPECT_TRUE(handles.empty());
+
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
 TEST_P(OptimisticTransactionTest, SuccessTest) {
   WriteOptions write_options;
   ReadOptions read_options;
