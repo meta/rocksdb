@@ -16,6 +16,7 @@
 #include "db/job_context.h"
 #include "db/range_del_aggregator.h"
 #include "db/range_tombstone_fragmenter.h"
+#include "options/options_helper.h"
 #include "rocksdb/env.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
@@ -231,7 +232,13 @@ ForwardIterator::ForwardIterator(DBImpl* db, const ReadOptions& read_options,
     : db_(db),
       read_options_(read_options),
       cfd_(cfd),
-      prefix_extractor_(current_sv->mutable_cf_options.prefix_extractor.get()),
+      // Total-order reads must advance prev_key_ across prefixes.
+      prefix_extractor_(
+          GetIteratorPrefixMode(
+              read_options, current_sv->mutable_cf_options.prefix_extractor !=
+                                nullptr) == IteratorPrefixMode::kPrefix
+              ? current_sv->mutable_cf_options.prefix_extractor.get()
+              : nullptr),
       user_comparator_(cfd->user_comparator()),
       allow_unprepared_value_(allow_unprepared_value),
       immutable_min_heap_(MinIterComparator(&cfd_->internal_comparator())),
