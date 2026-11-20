@@ -142,7 +142,8 @@ void BlockPrefetcher::PrefetchIfNeeded(
 
   // If prefetch is not supported, fall back to use internal prefetch buffer.
   IOOptions opts;
-  Status s = rep->file->PrepareIOOptions(read_options, opts);
+  IODebugContext dbg;
+  Status s = rep->file->PrepareIOOptions(read_options, opts, &dbg);
   if (!s.ok()) {
     return;
   }
@@ -150,7 +151,7 @@ void BlockPrefetcher::PrefetchIfNeeded(
   if (rep->fs_prefetch_support) {
     s = rep->file->Prefetch(
         opts, handle.offset(),
-        BlockBasedTable::BlockSizeWithTrailer(handle) + readahead_size_);
+        BlockBasedTable::BlockSizeWithTrailer(handle) + readahead_size_, &dbg);
     if (s.ok()) {
       readahead_limit_ = offset + len + readahead_size_;
       // Keep exponentially increasing readahead size until

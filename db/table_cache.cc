@@ -10,6 +10,7 @@
 #include "db/table_cache.h"
 
 #include <algorithm>
+#include <optional>
 #include <utility>
 
 #include "db/dbformat.h"
@@ -198,9 +199,15 @@ Status TableCache::GetTableReader(
     // Route same-file ("embedded") blob reads through the CFD's BlobSource for
     // caching + stats. nullptr in non-DB contexts (e.g. repair).
     table_reader_options.blob_source = blob_source_;
+    // Table initialization and preload IO do not contribute to user reads.
+    std::optional<ReadOptions> table_open_options;
+    if (ro.io_debug_context) {
+      table_open_options = ro;
+      table_open_options->io_debug_context = nullptr;
+    }
     s = mutable_cf_options.table_factory->NewTableReader(
-        ro, table_reader_options, std::move(file_reader),
-        file_meta.fd.GetFileSize(), table_reader,
+        table_open_options ? *table_open_options : ro, table_reader_options,
+        std::move(file_reader), file_meta.fd.GetFileSize(), table_reader,
         prefetch_index_and_filter_in_cache);
     TEST_SYNC_POINT("TableCache::GetTableReader:0");
   }
