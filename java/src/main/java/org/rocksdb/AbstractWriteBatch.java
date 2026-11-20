@@ -6,6 +6,7 @@
 package org.rocksdb;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 
 public abstract class AbstractWriteBatch extends RocksObject
     implements WriteBatchInterface {
@@ -60,6 +61,61 @@ public abstract class AbstractWriteBatch extends RocksObject
         value.remaining(), columnFamilyHandle.nativeHandle_);
     key.position(key.limit());
     value.position(value.limit());
+  }
+
+  @Override
+  public void putEntity(final ColumnFamilyHandle columnFamilyHandle, final byte[] key,
+      final List<WideColumn<byte[]>> columns) throws RocksDBException {
+    putEntity(columnFamilyHandle, key, 0, key.length, columns);
+  }
+  @Override
+  public void putEntity(final ColumnFamilyHandle columnFamilyHandle, final byte[] key,
+      final int keyOffset, final int keyLength, final List<WideColumn<byte[]>> columns)
+      throws RocksDBException {
+    if (columnFamilyHandle == null) {
+      throw new RocksDBException("ColumnFamilyHandle shall not be null.");
+    }
+
+    byte[][] name = new byte[columns.size()][];
+    byte[][] value = new byte[columns.size()][];
+
+    for (int i = 0; i < columns.size(); i++) {
+      name[i] = columns.get(i).getName();
+      value[i] = columns.get(i).getValue();
+    }
+
+    putEntity(nativeHandle_, key, keyOffset, keyLength, name, value,
+        columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_);
+  }
+  @Override
+  public void putEntity(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key,
+      final List<WideColumn<ByteBuffer>> columns) throws RocksDBException {
+    if (columnFamilyHandle == null) {
+      throw new RocksDBException("ColumnFamilyHandle shall not be null.");
+    }
+
+    ByteBuffer[] names = new ByteBuffer[columns.size()];
+    int[] namesOffset = new int[columns.size()];
+    int[] namesLength = new int[columns.size()];
+
+    ByteBuffer[] values = new ByteBuffer[columns.size()];
+    int[] valuesOffset = new int[columns.size()];
+    int[] valuesLength = new int[columns.size()];
+
+    for (int i = 0; i < names.length; i++) {
+      WideColumn<ByteBuffer> column = columns.get(i);
+      names[i] = column.getName();
+      namesOffset[i] = column.getName().position();
+      namesLength[i] = column.getName().remaining();
+
+      values[i] = column.getValue();
+      valuesOffset[i] = column.getValue().position();
+      valuesLength[i] = column.getValue().remaining();
+    }
+
+    putEntityDirect(nativeHandle_, key, key.position(), key.remaining(), names, namesOffset,
+        namesLength, values, valuesOffset, valuesLength,
+        columnFamilyHandle == null ? 0 : columnFamilyHandle.nativeHandle_);
   }
 
   @Override
@@ -154,9 +210,16 @@ public abstract class AbstractWriteBatch extends RocksObject
       final byte[] value, final int valueLen, final long cfHandle)
       throws RocksDBException;
 
+  abstract void putEntity(long nativeHandle, byte[] key, int keyOffset, int keyLength,
+      byte[][] names, byte[][] values, long cfHandle) throws RocksDBException;
+
   abstract void putDirect(final long handle, final ByteBuffer key, final int keyOffset,
       final int keyLength, final ByteBuffer value, final int valueOffset, final int valueLength,
       final long cfHandle) throws RocksDBException;
+
+  abstract void putEntityDirect(long nativeHandle, ByteBuffer key, int keyOffset, int keyLength,
+      ByteBuffer[] names, int[] namesOffset, int[] namesLength, ByteBuffer[] values,
+      int[] valuesOffset, int[] valuesLength, long cfHandle) throws RocksDBException;
 
   abstract void merge(final long handle, final byte[] key, final int keyLen,
       final byte[] value, final int valueLen) throws RocksDBException;

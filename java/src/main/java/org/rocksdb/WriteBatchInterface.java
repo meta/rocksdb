@@ -6,6 +6,7 @@
 package org.rocksdb;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 
 /**
  * <p>Defines the interface for a Write Batch which
@@ -68,6 +69,72 @@ public interface WriteBatchInterface {
      */
     void put(ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key, final ByteBuffer value)
         throws RocksDBException;
+
+    /**
+     * Sets the database entry for the specified key within the given column family to the
+     * wide-column entity defined by the provided columns. If the key already exists in the column
+     * family, it will be overwritten.
+     *
+     * @param columnFamilyHandle The {@link org.rocksdb.ColumnFamilyHandle} instance representing
+     *     the column family.
+     * @param key The key for which the database entry is to be set.
+     * @param columns A {@link java.util.List} of {@link WideColumn} objects representing the
+     *     wide-column entity to be set for the key.
+     *                Each {@link WideColumn} represents a column containing byte array values.
+     *                Upon execution, the wide-column entity defined by these columns will be
+     * associated with the key in the database.
+     * @throws RocksDBException Thrown if an error occurs while setting the database entry in the
+     *     underlying native library.
+     */
+    void putEntity(final ColumnFamilyHandle columnFamilyHandle, final byte[] key,
+        final List<WideColumn<byte[]>> columns) throws RocksDBException;
+
+    /**
+     * Sets the database entry for the specified key within the given column family to the
+     * wide-column entity defined by the provided columns. If the key already exists in the column
+     * family, it will be overwritten.
+     *
+     * @param columnFamilyHandle The {@link org.rocksdb.ColumnFamilyHandle} instance representing
+     *     the column family.
+     * @param key The key for which the database entry is to be set.
+     * @param keyOffset The offset within the {@code key} array indicating the start of the key to
+     *     be used. Must be non-negative and no larger than the length of the {@code key} array.
+     * @param keyLength The length of the key to be used, starting from the {@code keyOffset}.
+     *                  Must be non-negative and no larger than the remaining length of the {@code
+     * key} array after {@code keyOffset}.
+     * @param columns A {@link java.util.List} of {@link WideColumn} objects representing the
+     *     wide-column entity to be set for the key.
+     *                Each {@link WideColumn} represents a column containing byte array values.
+     *                Upon execution, the wide-column entity defined by these columns will be
+     * associated with the key in the database.
+     * @throws RocksDBException Thrown if an error occurs while setting the database entry in the
+     *     underlying native library.
+     */
+    void putEntity(final ColumnFamilyHandle columnFamilyHandle, final byte[] key,
+        final int keyOffset, final int keyLength, final List<WideColumn<byte[]>> columns)
+        throws RocksDBException;
+
+    /**
+     * Sets the database entry for the specified key within the given column family to the
+     * wide-column entity defined by the provided columns. If the key already exists in the column
+     * family, it will be overwritten.
+     *
+     * <p><strong>Note:</strong> All {@link java.nio.ByteBuffer} instances within the provided
+     * {@code columns} list must be direct.</p>
+     *
+     * @param columnFamilyHandle The {@link org.rocksdb.ColumnFamilyHandle} instance representing
+     *     the column family.
+     * @param key The key for which the database entry is to be set.
+     * @param columns A {@link java.util.List} of {@link WideColumn} objects representing the
+     *     wide-column entity to be set for the key.
+     *                Each {@link WideColumn} represents a column containing byte buffer values.
+     *                Upon execution, the wide-column entity defined by these columns will be
+     * associated with the key in the database.
+     * @throws RocksDBException Thrown if an error occurs while setting the database entry in the
+     *     underlying native library.
+     */
+    void putEntity(final ColumnFamilyHandle columnFamilyHandle, final ByteBuffer key,
+        final List<WideColumn<ByteBuffer>> columns) throws RocksDBException;
 
     /**
      * <p>Merge "value" with the existing value of "key" in the database.
