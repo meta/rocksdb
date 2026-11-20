@@ -19,6 +19,11 @@ public enum PerfLevel {
    */
   ENABLE_COUNT((byte) 2),
   /**
+   * Other than count stats, also enable time stats for user threads waiting
+   * on RocksDB to take actions (e.g. write stalls)
+   */
+  ENABLE_WAIT((byte) 7),
+  /**
    * Other than count stats, also enable time stats except for mutexes
    */
   ENABLE_TIME_EXCEPT_FOR_MUTEX((byte) 3),
