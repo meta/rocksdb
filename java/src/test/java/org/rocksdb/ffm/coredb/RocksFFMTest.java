@@ -16,6 +16,7 @@ import org.junit.rules.TemporaryFolder;
 import org.rocksdb.ffm.RocksFFM;
 import org.rocksdb.ffm.RocksFFMException;
 import org.rocksdb.ffm.RocksdbOptions;
+import org.rocksdb.ffm.RocksdbReadoptions;
 
 public class RocksFFMTest {
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();
@@ -42,15 +43,15 @@ public class RocksFFMTest {
       try (RocksdbOptions rocksdbOptions = new RocksdbOptions()) {
         rocksdbOptions.setCreateIfMissing((byte) 1);
         try (var db = RocksFFM.db(arena).open(rocksdbOptions, dbPath)) {
+          try (var readOptions = new RocksdbReadoptions()) {
+            var getter = db.get();
+            MemorySegment value2 = getter.get(readOptions, segmentOf(arena, "key2"));
+            assertThat(value2).isNull();
 
-          var get2 = db.get(segmentOf(arena, "key2"));
-          MemorySegment value2 = get2.invoke();
-          assertThat(value2).isNull();
-
-          // value doesn't exist
-          var get4 = db.get(segmentOf(arena, "key4"));
-          MemorySegment value4 = get4.invoke();
-          assertThat(value4).isNull();
+            // value doesn't exist
+            MemorySegment value4 = getter.get(readOptions, segmentOf(arena, "key4"));
+            assertThat(value4).isNull();
+          }
         }
       }
     }
@@ -62,19 +63,20 @@ public class RocksFFMTest {
       try (RocksdbOptions rocksdbOptions = new RocksdbOptions()) {
         rocksdbOptions.setCreateIfMissing((byte) 1);
         try (var db = RocksFFM.db(arena).open(rocksdbOptions, dbPath)) {
-          var key4 = segmentOf(arena, "key4");
+          try (var readOptions = new RocksdbReadoptions()) {
+            // value doesn't exist
+            var getter = db.get();
+            MemorySegment value2 = getter.get(readOptions, segmentOf(arena, "key2"));
+            assertThat(value2).isNull();
 
-          // value doesn't exist
-          var get4 = db.get(key4);
-          MemorySegment value4 = get4.invoke();
-          assertThat(value4).isNull();
+            var key4 = segmentOf(arena, "key4");
+            var put4 = db.put(key4, segmentOf(arena, "wroteValue4"));
+            put4.invoke();
 
-          var put4 = db.put(key4, segmentOf(arena, "wroteValue4"));
-          put4.invoke();
-
-          var get4_2 = db.get(key4);
-          MemorySegment value4_2 = get4_2.invoke();
-          assertThat(stringOf(value4_2)).isEqualTo("wroteValue4");
+            // value now exists exist
+            MemorySegment value4 = getter.get(readOptions, segmentOf(arena, "key4"));
+            assertThat(stringOf(value4)).isEqualTo("wroteValue4");
+          }
         }
       }
     }

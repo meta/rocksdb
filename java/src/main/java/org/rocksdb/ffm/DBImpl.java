@@ -10,12 +10,8 @@ final class DBImpl extends WithDB implements DB {
     super(allocator, db);
   }
 
-  public Getter get(MemorySegment key) {
-    return new GetterImpl(allocator, db, key);
-  }
-
-  public Getter get(String key) {
-    return new GetterImpl(allocator, db, FFMSegment.segmentOf(allocator, key));
+  public Getter get() {
+    return new GetterImpl(allocator, db);
   }
 
   public Putter put(MemorySegment key, MemorySegment value) {
