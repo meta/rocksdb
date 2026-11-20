@@ -58,7 +58,13 @@ class CheckpointImpl : public Checkpoint {
                             ExportImportFilesMetaData** metadata) override;
 
   // Checkpoint logic can be customized by providing callbacks for link, copy,
-  // or create.
+  // or create. A non-null table_and_blob_file_pin requires a non-null
+  // table_and_blob_files_pinned, file deletions disabled by the caller, and no
+  // cleanups on the pin. When table_and_blob_files_pinned is non-null, before
+  // any callback runs it says whether the listed table and blob files are
+  // held. On success, if it is true, they stay on disk until
+  // table_and_blob_file_pin is cleaned up. On failure nothing is held and it
+  // is false.
   Status CreateCustomCheckpoint(
       const std::function<Status(const std::string& src_dirname,
                                  const std::string& fname, FileType type,
@@ -77,7 +83,9 @@ class CheckpointImpl : public Checkpoint {
       const std::vector<uint32_t>& include_cf_ids = {},
       std::vector<uint32_t>* excluded_cf_ids = nullptr,
       std::string* manifest_relative_filename = nullptr,
-      uint64_t* manifest_size = nullptr);
+      uint64_t* manifest_size = nullptr,
+      Cleanable* table_and_blob_file_pin = nullptr,
+      bool* table_and_blob_files_pinned = nullptr);
 
  private:
   Status CreateCustomCheckpoint(
@@ -98,7 +106,8 @@ class CheckpointImpl : public Checkpoint {
       bool get_live_table_checksum, bool atomic_flush,
       const std::vector<uint32_t>& include_cf_ids,
       std::vector<uint32_t>* excluded_cf_ids,
-      std::string* manifest_relative_filename, uint64_t* manifest_size);
+      std::string* manifest_relative_filename, uint64_t* manifest_size,
+      Cleanable* table_and_blob_file_pin, bool* table_and_blob_files_pinned);
 
   Status CleanStagingDirectory(const std::string& path, Logger* info_log);
 

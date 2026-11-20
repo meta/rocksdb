@@ -55,6 +55,7 @@
 #include "util/stderr_logger.h"
 #include "util/string_util.h"
 #include "utilities/backup/backup_engine_impl.h"
+#include "utilities/blob_db/blob_db.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -1067,6 +1068,51 @@ class BackupEngineTest : public testing::Test {
       ++found_count;
     }
     ASSERT_GE(found_count, minimum_count);
+  }
+
+  std::vector<std::string> ListDBFiles(const std::string& suffix) {
+    std::vector<std::string> children;
+    EXPECT_OK(db_chroot_env_->GetChildren(dbname_, &children));
+    std::vector<std::string> files;
+    for (const auto& child : children) {
+      if (EndsWith(child, suffix)) {
+        files.push_back(child);
+      }
+    }
+    return files;
+  }
+
+  bool DBFileExists(const std::string& fname) {
+    return db_chroot_env_->FileExists(dbname_ + "/" + fname).ok();
+  }
+
+  // Also counts files still being copied under a temporary name.
+  int CountTableAndBlobFilesInBackupDir() {
+    std::vector<std::string> dirs;
+    std::vector<std::string> private_dirs;
+    if (backup_chroot_env_->GetChildren(backupdir_ + "/private", &private_dirs)
+            .ok()) {
+      for (const auto& dir : private_dirs) {
+        dirs.push_back("private/" + dir);
+      }
+    }
+    dirs.emplace_back("shared");
+    dirs.emplace_back("shared_checksum");
+    int count = 0;
+    for (const auto& dir : dirs) {
+      std::vector<std::string> children;
+      if (!backup_chroot_env_->GetChildren(backupdir_ + "/" + dir, &children)
+               .ok()) {
+        continue;
+      }
+      for (const auto& child : children) {
+        if (child.find(".sst") != std::string::npos ||
+            child.find(".blob") != std::string::npos) {
+          ++count;
+        }
+      }
+    }
+    return count;
   }
 
   // files
@@ -2265,6 +2311,296 @@ TEST_F(BackupEngineTest, NonEmptySharedDirChecksFileExistsAndReusesFiles) {
     AssertBackupConsistency(0, 0, keys_iteration * 2, keys_iteration * 3);
     DestroyDBWithoutCheck(dbname_, options_);
   }
+}
+
+TEST_F(BackupEngineTest, FileDeletionsResumeBeforeTableFilesAreCopied) {
+  const int keys_iteration = 5000;
+  engine_options_->schema_version = 2;
+
+  for (const auto& sopt : kAllShareOptions) {
+    for (const bool with_exclude_callback : {false, true}) {
+      SCOPED_TRACE("share option " + std::to_string(sopt) +
+                   ", exclude callback " +
+                   std::to_string(with_exclude_callback));
+      OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
+                            sopt);
+      FillDB(db_.get(), 0, keys_iteration);
+      const std::vector<std::string> wals_at_backup_start = ListDBFiles(".log");
+      const std::vector<std::string> ssts_at_backup_start = ListDBFiles(".sst");
+      ASSERT_FALSE(wals_at_backup_start.empty());
+      ASSERT_FALSE(ssts_at_backup_start.empty());
+
+      int callback_runs = 0;
+      SyncPoint::GetInstance()->SetCallBack(
+          "BackupEngineImpl::CreateNewBackupWithMetadata:"
+          "FileDeletionsEnabledBeforeTableFiles",
+          [&](void* /*arg*/) {
+            ++callback_runs;
+            EXPECT_EQ(CountTableAndBlobFilesInBackupDir(), 0);
+            FillDB(db_.get(), keys_iteration, 2 * keys_iteration);
+            CompactRangeOptions cro;
+            cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+            ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+            for (const auto& wal : wals_at_backup_start) {
+              EXPECT_FALSE(DBFileExists(wal)) << wal;
+            }
+            for (const auto& sst : ssts_at_backup_start) {
+              EXPECT_TRUE(DBFileExists(sst)) << sst;
+            }
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+
+      CreateBackupOptions cbo;
+      if (with_exclude_callback) {
+        cbo.exclude_files_callback = [](MaybeExcludeBackupFile* /*begin*/,
+                                        MaybeExcludeBackupFile* /*end*/) {};
+      }
+      ASSERT_OK(backup_engine_->CreateNewBackup(cbo, db_.get()));
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+
+      EXPECT_EQ(callback_runs, 1);
+      for (const auto& sst : ssts_at_backup_start) {
+        EXPECT_FALSE(DBFileExists(sst)) << sst;
+      }
+      CloseDBAndBackupEngine();
+      AssertBackupConsistency(0, 0, keys_iteration, 2 * keys_iteration);
+    }
+  }
+}
+
+TEST_F(BackupEngineTest, EarlyEnableKeepsCallerFileDeletionsDisabled) {
+  OpenDBAndBackupEngine(true /* destroy_old_data */);
+  FillDB(db_.get(), 0, 100);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_OK(db_->DisableFileDeletions());
+
+  int early_enables = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "BackupEngineImpl::CreateNewBackupWithMetadata:"
+      "FileDeletionsEnabledBeforeTableFiles",
+      [&](void* /*arg*/) { ++early_enables; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(backup_engine_->CreateNewBackup(db_.get()));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  EXPECT_EQ(early_enables, 1);
+  uint64_t file_deletions_enabled = 1;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kIsFileDeletionsEnabled,
+                                  &file_deletions_enabled));
+  EXPECT_EQ(file_deletions_enabled, 0U);
+  ASSERT_OK(db_->EnableFileDeletions());
+  CloseDBAndBackupEngine();
+}
+
+TEST_F(BackupEngineTest, FailedTableCopyAfterEarlyEnableReleasesPin) {
+  OpenDBAndBackupEngine(true /* destroy_old_data */);
+  FillDB(db_.get(), 0, 1000);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  const std::vector<std::string> ssts_at_backup_start = ListDBFiles(".sst");
+  ASSERT_FALSE(ssts_at_backup_start.empty());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "BackupEngineImpl::CreateNewBackupWithMetadata:"
+      "FileDeletionsEnabledBeforeTableFiles",
+      [&](void* /*arg*/) { test_backup_fs_->SetLimitWrittenFiles(0); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_NOK(backup_engine_->CreateNewBackup(db_.get()));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  test_backup_fs_->SetLimitWrittenFiles(1000000);
+
+  uint64_t file_deletions_enabled = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kIsFileDeletionsEnabled,
+                                  &file_deletions_enabled));
+  EXPECT_EQ(file_deletions_enabled, 1U);
+  FillDB(db_.get(), 1000, 2000);
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  for (const auto& sst : ssts_at_backup_start) {
+    EXPECT_FALSE(DBFileExists(sst)) << sst;
+  }
+  CloseDBAndBackupEngine();
+}
+
+TEST_F(BackupEngineTest, StackedBlobDBWithOwnBlobFilesFailsCleanly) {
+  // BlobDB's blob directory check does not work through the fixture's chroot
+  // Env, so this test uses the default Env.
+  const std::string db_dir = test::PerThreadDBPath("stacked_blob_db");
+  const std::string backup_dir = test::PerThreadDBPath("stacked_blob_backup");
+  Options options;
+  options.create_if_missing = true;
+  ASSERT_OK(DestroyDB(db_dir, options));
+  ASSERT_OK(DestroyDir(Env::Default(), backup_dir));
+  blob_db::BlobDBOptions bdb_options;
+  bdb_options.disable_background_tasks = true;
+  blob_db::BlobDB* blob_db = nullptr;
+  ASSERT_OK(blob_db::BlobDB::Open(options, bdb_options, db_dir, &blob_db));
+  std::unique_ptr<DB> db(blob_db);
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+  BackupEngine* backup_engine_ptr = nullptr;
+  ASSERT_OK(BackupEngine::Open(Env::Default(), BackupEngineOptions(backup_dir),
+                               &backup_engine_ptr));
+  std::unique_ptr<BackupEngine> backup_engine(backup_engine_ptr);
+
+  int early_enables = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "BackupEngineImpl::CreateNewBackupWithMetadata:"
+      "FileDeletionsEnabledBeforeTableFiles",
+      [&](void* /*arg*/) { ++early_enables; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // The stacked BlobDB's own blob files are in a subdirectory, which
+  // BackupEngine does not support.
+  ASSERT_TRUE(backup_engine->CreateNewBackup(db.get()).IsNotSupported());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  EXPECT_EQ(early_enables, 0);
+  EXPECT_TRUE(static_cast_with_check<DBImpl>(db->GetRootDB())
+                  ->IsFileDeletionsEnabled());
+  ASSERT_OK(db->Close());
+}
+
+TEST_F(BackupEngineTest,
+       CompactionDuringListingStillEnablesFileDeletionsEarly) {
+  const int keys_iteration = 1000;
+  options_.disable_auto_compactions = true;
+  OpenDBAndBackupEngine(true /* destroy_old_data */);
+  FillDB(db_.get(), 0, keys_iteration);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  FillDB(db_.get(), keys_iteration, keys_iteration * 2);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  const std::vector<std::string> ssts_at_backup_start = ListDBFiles(".sst");
+  ASSERT_GT(ssts_at_backup_start.size(), 1U);
+
+  int early_enables = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetLiveFilesStorageInfo:BeforeOptionsFileSize",
+      [&](void* /*arg*/) {
+        CompactRangeOptions cro;
+        cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+        ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "BackupEngineImpl::CreateNewBackupWithMetadata:"
+      "FileDeletionsEnabledBeforeTableFiles",
+      [&](void* /*arg*/) {
+        ++early_enables;
+        for (const auto& sst : ssts_at_backup_start) {
+          EXPECT_TRUE(DBFileExists(sst)) << sst;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(backup_engine_->CreateNewBackup(db_.get()));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  EXPECT_EQ(early_enables, 1);
+  CloseDBAndBackupEngine();
+  AssertBackupConsistency(0, 0, keys_iteration * 2);
+}
+
+TEST_F(BackupEngineTest, ColumnFamilyDroppedBeforeTableFilesAreCopied) {
+  for (const bool background_purge : {false, true}) {
+    SCOPED_TRACE("background purge " + std::to_string(background_purge));
+    options_.avoid_unnecessary_blocking_io = background_purge;
+    OpenDBAndBackupEngine(true /* destroy_old_data */);
+    ColumnFamilyHandle* dropped_cf = nullptr;
+    ASSERT_OK(db_->CreateColumnFamily(options_, "dropped", &dropped_cf));
+    ASSERT_OK(db_->Put(WriteOptions(), dropped_cf, "key", "value"));
+    ASSERT_OK(db_->Flush(FlushOptions(), dropped_cf));
+
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(dropped_cf, &cf_meta);
+    std::vector<std::string> dropped_cf_files;
+    for (const auto& level : cf_meta.levels) {
+      for (const auto& file : level.files) {
+        dropped_cf_files.push_back(file.relative_filename);
+      }
+    }
+    for (const auto& blob : cf_meta.blob_files) {
+      dropped_cf_files.push_back(BlobFileName(blob.blob_file_number));
+    }
+    ASSERT_EQ(dropped_cf_files.size(), 2);
+
+    SyncPoint::GetInstance()->SetCallBack(
+        "BackupEngineImpl::CreateNewBackupWithMetadata:"
+        "FileDeletionsEnabledBeforeTableFiles",
+        [&](void* /*arg*/) {
+          ASSERT_OK(db_->DropColumnFamily(dropped_cf));
+          ASSERT_OK(db_->DestroyColumnFamilyHandle(dropped_cf));
+          FillDB(db_.get(), 0, 100);
+          ASSERT_OK(db_->Flush(FlushOptions()));
+          for (const auto& file : dropped_cf_files) {
+            EXPECT_TRUE(DBFileExists(file)) << file;
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_OK(backup_engine_->CreateNewBackup(db_.get()));
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    if (background_purge) {
+      ASSERT_OK(static_cast_with_check<DBImpl>(db_->GetRootDB())
+                    ->TEST_WaitForPurge());
+    }
+    for (const auto& file : dropped_cf_files) {
+      EXPECT_FALSE(DBFileExists(file)) << file;
+    }
+    CloseDBAndBackupEngine();
+
+    OpenBackupEngine();
+    ASSERT_OK(backup_engine_->RestoreDBFromLatestBackup(dbname_, dbname_));
+    CloseBackupEngine();
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> restored;
+    ASSERT_OK(
+        DB::Open(options_, dbname_,
+                 {{kDefaultColumnFamilyName, options_}, {"dropped", options_}},
+                 &handles, &restored));
+    std::string value;
+    ASSERT_OK(restored->Get(ReadOptions(), handles[1], "key", &value));
+    EXPECT_EQ(value, "value");
+    for (auto* handle : handles) {
+      ASSERT_OK(restored->DestroyColumnFamilyHandle(handle));
+    }
+    restored.reset();
+    ASSERT_OK(DestroyDB(dbname_, options_));
+  }
+}
+
+TEST_F(BackupEngineTest, FailedBackupReenablesFileDeletionsAndReleasesPin) {
+  engine_options_->schema_version = 2;
+  OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
+                        kShareWithChecksum);
+  FillDB(db_.get(), 0, 1000);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  const std::vector<std::string> ssts_at_backup_start = ListDBFiles(".sst");
+  ASSERT_FALSE(ssts_at_backup_start.empty());
+
+  CreateBackupOptions cbo;
+  cbo.exclude_files_callback = [](MaybeExcludeBackupFile* /*begin*/,
+                                  MaybeExcludeBackupFile* /*end*/) {
+    throw std::runtime_error("exclude_files_callback failure");
+  };
+  const Status s = backup_engine_->CreateNewBackup(cbo, db_.get());
+  ASSERT_TRUE(s.IsAborted()) << s.ToString();
+
+  uint64_t file_deletions_enabled = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kIsFileDeletionsEnabled,
+                                  &file_deletions_enabled));
+  EXPECT_EQ(file_deletions_enabled, 1U);
+  FillDB(db_.get(), 1000, 2000);
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  for (const auto& sst : ssts_at_backup_start) {
+    EXPECT_FALSE(DBFileExists(sst)) << sst;
+  }
+  CloseDBAndBackupEngine();
 }
 
 inline std::string OptionsPath(std::string ret, int backupID) {

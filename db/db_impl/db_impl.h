@@ -22,6 +22,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -115,6 +116,48 @@ struct SubsetCheckpointOptionsSnapshot {
   DBOptions db_options;
   std::vector<std::string> cf_names;
   std::vector<ColumnFamilyOptions> cf_options;
+};
+
+// Asks the next DBImpl::GetLiveFilesStorageInfo() call on this thread,
+// including one reached through wrapper overrides, to keep the table and blob
+// files it lists on disk until `pin` is cleaned up. Only the first such call
+// takes the request. It is fulfilled only if that call succeeds, on a DB that
+// owns its table files and is not being closed. Close() returns Aborted while
+// a pin is held. Cleaning up the pin takes the DB mutex and can delete files.
+// Requires `pin` without cleanups; must be destroyed on the creating thread.
+//
+// Interim: a thread-local, so the request reaches DBImpl through wrapper
+// overrides of the public GetLiveFilesStorageInfo() virtual without changing
+// it. Unsafe for a coroutine that suspends in the request's scope. A follow-up
+// should replace it with public API support that also lets a wrapper hold its
+// own files.
+class LiveFilesPinRequest {
+ public:
+  explicit LiveFilesPinRequest(Cleanable* pin);
+  ~LiveFilesPinRequest();
+  LiveFilesPinRequest(const LiveFilesPinRequest&) = delete;
+  LiveFilesPinRequest& operator=(const LiveFilesPinRequest&) = delete;
+  LiveFilesPinRequest(LiveFilesPinRequest&&) = delete;
+  LiveFilesPinRequest& operator=(LiveFilesPinRequest&&) = delete;
+
+  // Whether `pin` holds the files in pinned_files().
+  bool pinned() const { return pinned_; }
+  // Directory, "/" and file name of each held table and blob file.
+  const std::unordered_set<std::string>& pinned_files() const {
+    return pinned_files_;
+  }
+
+ private:
+  friend class DBImpl;
+  static LiveFilesPinRequest* Take();
+  void Fulfill(Cleanable* pin, std::unordered_set<std::string> files);
+
+  static thread_local LiveFilesPinRequest* current_;
+  LiveFilesPinRequest* const previous_;
+  Cleanable* const pin_;
+  bool taken_ = false;
+  bool pinned_ = false;
+  std::unordered_set<std::string> pinned_files_;
 };
 
 // Class to maintain directories for all database paths other than main one.
@@ -697,12 +740,15 @@ class DBImpl : public DB
   // Shared body of GetLiveFilesStorageInfo and its subset-checkpoint variant.
   // include_cf_ids empty -> no filter; otherwise records skipped CF ids in
   // *excluded_cf_ids (which must be non-null in that case).
+  // A non-null pin_request is fulfilled only if the call succeeds; it requires
+  // empty include_cf_ids.
   Status GetLiveFilesStorageInfoImpl(
       const LiveFilesStorageInfoOptions& opts,
       const std::vector<uint32_t>& include_cf_ids,
       std::vector<LiveFileStorageInfo>* files,
       std::vector<uint32_t>* excluded_cf_ids,
-      SubsetCheckpointOptionsSnapshot* options_snapshot);
+      SubsetCheckpointOptionsSnapshot* options_snapshot,
+      LiveFilesPinRequest* pin_request);
 
   // Appends kColumnFamilyDrop records to the MANIFEST file at manifest_path for
   // the given column family ids. Used by Checkpoint to make a subset-CF
@@ -1171,6 +1217,12 @@ class DBImpl : public DB
 
   // Schedule a background job to actually delete obsolete files.
   void SchedulePurge();
+
+  // Call with mutex_ held, after dropping references that may have made files
+  // obsolete. Unlocks mutex_, then deletes those files and `sv_to_free` (if
+  // non-null), in a background purge job if `background_purge`.
+  void UnlockAndPurgeObsoleteFiles(SuperVersion* sv_to_free,
+                                   bool background_purge);
 
   // Thread-safe; does not require any DB lock.
   const ShardedSnapshotList& snapshots() const { return snapshots_; }
@@ -3404,6 +3456,14 @@ class DBImpl : public DB
 
   Status MaybeReleaseTimestampedSnapshotsAndCheck();
 
+  // Keeps the table and blob files of `versions` on disk until `pin` is
+  // cleaned up. Requires mutex_ held and `pin` without cleanups.
+  void PinVersionsWithLock(autovector<Version*> versions, Cleanable* pin);
+
+  // The cleanup PinVersionsWithLock() registers: drops the refs on
+  // `versions` (an autovector<Version*>) and deletes it.
+  static void ReleasePinnedVersions(void* db, void* versions);
+
   Status MaybeWriteWalMarkersToManifestOnClose();
 
   Status CloseHelper();
@@ -4158,6 +4218,12 @@ class DBImpl : public DB
 
   // number of background obsolete file purge jobs, submitted to the HIGH pool
   int bg_purge_scheduled_ = 0;
+
+  // number of LiveFilesPinRequest pins not yet cleaned up
+  int num_live_file_pins_ = 0;
+  // Set by Close() once it has seen no pins, so no new pin is taken while it
+  // closes the DB. Cleared if Close() returns without closing.
+  bool new_pins_blocked_ = false;
 
   // number of pressure callbacks currently in progress (for destructor safety)
   int bg_pressure_callback_in_progress_ = 0;

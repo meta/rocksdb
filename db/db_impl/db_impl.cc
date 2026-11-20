@@ -1462,6 +1462,7 @@ DBImpl::~DBImpl() {
       const Status s = MaybeReleaseTimestampedSnapshotsAndCheck();
       s.PermitUncheckedError();
     }
+    assert(num_live_file_pins_ == 0);
 
     closing_status_ = DBImpl::CloseImpl();
     closing_status_.PermitUncheckedError();
@@ -3386,28 +3387,39 @@ void DBImpl::CleanupIteratorSuperVersion(SuperVersion* super_version,
   background_purge =
       background_purge || immutable_db_options_.avoid_unnecessary_blocking_io;
   if (super_version->Unref()) {
-    // Job id == 0 means that this is not our background process, but rather
-    // user thread
-    JobContext job_context(0);
-
     mutex_.Lock();
     super_version->Cleanup();
-    FindObsoleteFiles(&job_context, false, true);
-    if (background_purge) {
-      ScheduleBgLogWriterClose(&job_context);
-      AddSuperVersionsToFreeQueue(super_version);
+    UnlockAndPurgeObsoleteFiles(super_version, background_purge);
+  }
+}
+
+void DBImpl::UnlockAndPurgeObsoleteFiles(SuperVersion* sv_to_free,
+                                         bool background_purge) {
+  mutex_.AssertHeld();
+  // Job id == 0 means that this is not our background process, but rather
+  // user thread
+  JobContext job_context(0);
+  FindObsoleteFiles(&job_context, false, true);
+  if (background_purge) {
+    const bool queues_work =
+        sv_to_free != nullptr || !job_context.wals_to_free.empty();
+    ScheduleBgLogWriterClose(&job_context);
+    if (sv_to_free != nullptr) {
+      AddSuperVersionsToFreeQueue(sv_to_free);
+    }
+    if (queues_work) {
       SchedulePurge();
     }
-    mutex_.Unlock();
-
-    if (!background_purge) {
-      delete super_version;
-    }
-    if (job_context.HaveSomethingToDelete()) {
-      PurgeObsoleteFiles(job_context, background_purge);
-    }
-    job_context.Clean();
   }
+  mutex_.Unlock();
+
+  if (!background_purge) {
+    delete sv_to_free;
+  }
+  if (job_context.HaveSomethingToDelete()) {
+    PurgeObsoleteFiles(job_context, background_purge);
+  }
+  job_context.Clean();
 }
 
 ColumnFamilyHandle* DBImpl::DefaultColumnFamily() const {
@@ -7425,8 +7437,18 @@ Status DBImpl::Close() {
   }
 
   {
+    InstrumentedMutexLock l(&mutex_);
+    if (num_live_file_pins_ > 0) {
+      return Status::Aborted(
+          "Cannot close DB with pinned live table and blob files.");
+    }
+    new_pins_blocked_ = true;
+  }
+  {
     const Status s = MaybeReleaseTimestampedSnapshotsAndCheck();
     if (!s.ok()) {
+      InstrumentedMutexLock l(&mutex_);
+      new_pins_blocked_ = false;
       return s;
     }
   }

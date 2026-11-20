@@ -94,7 +94,11 @@ BlobDBImpl::~BlobDBImpl() {
   tqueue_.shutdown();
   // CancelAllBackgroundWork(db_, true);
   Status s __attribute__((__unused__)) = BlobDBImpl::Close();
-  assert(s.ok());
+  if (s.IsAborted()) {
+    // The base DB's shutdown flush calls back into this object.
+    FreeBaseDB();
+  }
+  assert(s.ok() || s.IsAborted());
 }
 
 Status BlobDBImpl::Close() {
@@ -115,10 +119,11 @@ Status BlobDBImpl::CloseImpl() {
   // Close base DB before BlobDBImpl destructs to stop event listener and
   // compaction filter call.
   Status s = db_->Close();
-  // Reset ownership to free the underlying DB.
-  shared_db_ptr_.reset();
-  db_ = nullptr;
-  db_impl_ = nullptr;
+  if (s.IsAborted()) {
+    closed_ = false;
+    return s;
+  }
+  FreeBaseDB();
   if (!s.ok()) {
     return s;
   }
@@ -126,6 +131,12 @@ Status BlobDBImpl::CloseImpl() {
   // TODO: plumb Env::IOActivity, Env::IOPriority
   s = SyncBlobFiles(WriteOptions());
   return s;
+}
+
+void BlobDBImpl::FreeBaseDB() {
+  shared_db_ptr_.reset();
+  db_ = nullptr;
+  db_impl_ = nullptr;
 }
 
 Status BlobDBImpl::Open(std::vector<ColumnFamilyHandle*>* handles) {

@@ -933,6 +933,30 @@ TEST_F(DBSecondaryTest, InternalCompactionMissingFiles) {
   ASSERT_OK(result.status);
 }
 
+TEST_F(DBSecondaryTest, LiveFilesPinRequestNotFulfilled) {
+  Options options;
+  options.env = env_;
+  Reopen(options);
+  ASSERT_OK(Put("foo", "foo_value"));
+  ASSERT_OK(Flush());
+  Options secondary_options;
+  secondary_options.env = env_;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> files;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_secondary_->GetLiveFilesStorageInfo(opts, &files));
+    ASSERT_FALSE(pin_request.pinned());
+  }
+  ASSERT_FALSE(files.empty());
+  ASSERT_FALSE(pin.HasCleanups());
+}
+
 TEST_F(DBSecondaryTest, OpenAsSecondary) {
   Options options;
   options.env = env_;

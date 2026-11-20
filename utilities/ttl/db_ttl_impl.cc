@@ -350,8 +350,15 @@ DBWithTTLImpl::DBWithTTLImpl(std::unique_ptr<DB>&& db)
     : DBWithTTLImplBase(std::move(db)), closed_(false) {}
 
 DBWithTTLImpl::~DBWithTTLImpl() {
-  if (!closed_) {
-    DBWithTTLImpl::Close().PermitUncheckedError();
+  if (closed_) {
+    return;
+  }
+  const CompactionFilter* const filter = GetOptions().compaction_filter;
+  if (DBWithTTLImpl::Close().IsAborted()) {
+    // The base DB's background work can still call the filter.
+    shared_db_ptr_.reset();
+    db_ = nullptr;
+    delete filter;
   }
 }
 
@@ -359,9 +366,10 @@ Status DBWithTTLImpl::Close() {
   Status ret = Status::OK();
   if (!closed_) {
     Options default_options = GetOptions();
-    // Need to stop background compaction before getting rid of the filter
-    CancelAllBackgroundWork(db_, /* wait = */ true);
     ret = db_->Close();
+    if (ret.IsAborted()) {
+      return ret;
+    }
     delete default_options.compaction_filter;
     closed_ = true;
   }

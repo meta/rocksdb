@@ -30,6 +30,18 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+// Matching TableFileName() behavior
+const std::string& CfPathDir(const std::vector<DbPath>& cf_paths,
+                             size_t path_id) {
+  if (path_id >= cf_paths.size()) {
+    assert(false);
+    return cf_paths.back().path;
+  }
+  return cf_paths[path_id].path;
+}
+}  // namespace
+
 Status DBImpl::FlushForGetLiveFiles(bool force_atomic_flush) {
   FlushOptions flush_opts;
   flush_opts.force_atomic_flush = force_atomic_flush;
@@ -234,12 +246,77 @@ Status DBImpl::CreateOptionsFileForSubsetCheckpoint(
       options_snapshot.cf_options, options_path, fs_.get());
 }
 
+thread_local LiveFilesPinRequest* LiveFilesPinRequest::current_ = nullptr;
+
+LiveFilesPinRequest::LiveFilesPinRequest(Cleanable* pin)
+    : previous_(current_), pin_(pin) {
+  assert(pin_ != nullptr);
+  assert(!pin_->HasCleanups());
+  current_ = this;
+}
+
+LiveFilesPinRequest::~LiveFilesPinRequest() {
+  assert(current_ == this);
+  current_ = previous_;
+}
+
+LiveFilesPinRequest* LiveFilesPinRequest::Take() {
+  if (current_ == nullptr || current_->taken_) {
+    return nullptr;
+  }
+  current_->taken_ = true;
+  return current_;
+}
+
+void LiveFilesPinRequest::Fulfill(Cleanable* pin,
+                                  std::unordered_set<std::string> files) {
+  pin->DelegateCleanupsTo(pin_);
+  pinned_ = true;
+  pinned_files_ = std::move(files);
+}
+
 Status DBImpl::GetLiveFilesStorageInfo(
     const LiveFilesStorageInfoOptions& opts,
     std::vector<LiveFileStorageInfo>* files) {
-  return GetLiveFilesStorageInfoImpl(opts, /*include_cf_ids=*/{}, files,
-                                     /*excluded_cf_ids=*/nullptr,
-                                     /*options_snapshot=*/nullptr);
+  LiveFilesPinRequest* const pin_request = LiveFilesPinRequest::Take();
+  return GetLiveFilesStorageInfoImpl(
+      opts, /*include_cf_ids=*/{}, files,
+      /*excluded_cf_ids=*/nullptr,
+      /*options_snapshot=*/nullptr, OwnTablesAndLogs() ? pin_request : nullptr);
+}
+
+void DBImpl::PinVersionsWithLock(autovector<Version*> versions,
+                                 Cleanable* pin) {
+  mutex_.AssertHeld();
+  assert(!pin->HasCleanups());
+  // A Version ref, not a SuperVersion ref: a SuperVersion would also keep the
+  // memtables in memory for the whole backup.
+  for (Version* version : versions) {
+    // A dropped column family must outlive the Version, as it does for a
+    // SuperVersion.
+    version->cfd()->Ref();
+    version->Ref();
+  }
+  ++num_live_file_pins_;
+  pin->RegisterCleanup(&DBImpl::ReleasePinnedVersions, this,
+                       new autovector<Version*>(std::move(versions)));
+}
+
+void DBImpl::ReleasePinnedVersions(void* db, void* versions) {
+  auto* const db_impl = static_cast<DBImpl*>(db);
+  auto* const pinned = static_cast<autovector<Version*>*>(versions);
+  db_impl->mutex_.Lock();
+  for (Version* version : *pinned) {
+    ColumnFamilyData* const cfd = version->cfd();
+    version->Unref();
+    cfd->UnrefAndTryDelete();
+  }
+  assert(db_impl->num_live_file_pins_ > 0);
+  --db_impl->num_live_file_pins_;
+  db_impl->UnlockAndPurgeObsoleteFiles(
+      /*sv_to_free=*/nullptr,
+      db_impl->immutable_db_options_.avoid_unnecessary_blocking_io);
+  delete pinned;
 }
 
 Status DBImpl::GetLiveFilesStorageInfoForSubsetCheckpoint(
@@ -257,7 +334,8 @@ Status DBImpl::GetLiveFilesStorageInfoForSubsetCheckpoint(
   assert(excluded_cf_ids != nullptr);
   assert(options_snapshot != nullptr);
   return GetLiveFilesStorageInfoImpl(opts, include_cf_ids, files,
-                                     excluded_cf_ids, options_snapshot);
+                                     excluded_cf_ids, options_snapshot,
+                                     /*pin_request=*/nullptr);
 }
 
 Status DBImpl::GetLiveFilesStorageInfoImpl(
@@ -265,11 +343,18 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     const std::vector<uint32_t>& include_cf_ids,
     std::vector<LiveFileStorageInfo>* files,
     std::vector<uint32_t>* excluded_cf_ids,
-    SubsetCheckpointOptionsSnapshot* options_snapshot) {
+    SubsetCheckpointOptionsSnapshot* options_snapshot,
+    LiveFilesPinRequest* pin_request) {
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
   std::vector<LiveFileStorageInfo> results;
+  assert(include_cf_ids.empty() || pin_request == nullptr);
+  // Declared before any mutex_ hold, so a pin dropped on failure is released
+  // only after mutex_ is unlocked.
+  Cleanable pin_until_success;
+  autovector<Version*> pinned_versions;
+  std::unordered_set<std::string> pinned_files;
 
   const bool cf_subset = !include_cf_ids.empty();
   assert(!cf_subset || excluded_cf_ids != nullptr);
@@ -369,18 +454,14 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     if (cf_subset) {
       unseen_include_cf_ids.erase(cfd->GetID());
     }
+    if (pin_request != nullptr) {
+      pinned_versions.push_back(cfd->current());
+    }
+    const size_t first_result_of_cf = results.size();
     VersionStorageInfo& vsi = *cfd->current()->storage_info();
     auto& cf_paths = cfd->ioptions().cf_paths;
 
-    auto GetDir = [&](size_t path_id) {
-      // Matching TableFileName() behavior
-      if (path_id >= cf_paths.size()) {
-        assert(false);
-        return cf_paths.back().path;
-      } else {
-        return cf_paths[path_id].path;
-      }
-    };
+    auto GetDir = [&](size_t path_id) { return CfPathDir(cf_paths, path_id); };
 
     for (int level = 0; level < vsi.num_levels(); ++level) {
       const auto& level_files = vsi.LevelFiles(level);
@@ -428,6 +509,12 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
       }
       // TODO?: info.temperature
     }
+    if (pin_request != nullptr) {
+      for (size_t i = first_result_of_cf; i < results.size(); ++i) {
+        pinned_files.insert(results[i].directory + "/" +
+                            results[i].relative_filename);
+      }
+    }
   }
 
   // Release-build validation: every id the subset-checkpoint caller asked for
@@ -462,6 +549,11 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
         }
       }
     }
+  }
+
+  // Close() sets new_pins_blocked_ under mutex_ once it has seen no pins.
+  if (pin_request != nullptr && !new_pins_blocked_) {
+    PinVersionsWithLock(std::move(pinned_versions), &pin_until_success);
   }
 
   // Capture some final info before releasing mutex
@@ -664,6 +756,9 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   if (s.ok()) {
     // Only move results to output on success.
     *files = std::move(results);
+    if (pin_until_success.HasCleanups()) {
+      pin_request->Fulfill(&pin_until_success, std::move(pinned_files));
+    }
   }
   return s;
 }

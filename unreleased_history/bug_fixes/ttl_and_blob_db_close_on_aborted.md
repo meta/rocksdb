@@ -1,0 +1,1 @@
+Fixed `DBWithTTL` and the stacked `BlobDB` tearing themselves down when the underlying DB's `Close()` returned `Status::Aborted` (e.g. for unreleased timestamped snapshots). They now stay open, so `Close()` can be retried, and deleting them after an aborted `Close()` still frees them.

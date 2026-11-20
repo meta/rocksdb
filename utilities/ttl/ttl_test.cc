@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 
+#include "db/db_impl/db_impl.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/merge_operator.h"
@@ -416,6 +417,30 @@ class TtlTest : public testing::Test {
   const std::string kNewValue_ = "new_value";
   std::unique_ptr<CompactionFilter> test_comp_filter_;
 };  // class TtlTest
+
+TEST_F(TtlTest, CloseWhileBaseDBPinnedReturnsAbortedAndCanBeRetried) {
+  OpenTtl();
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db_ttl_->Flush(FlushOptions()));
+  ASSERT_OK(db_ttl_->DisableFileDeletions());
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> files;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_ttl_->GetLiveFilesStorageInfo(opts, &files));
+    ASSERT_TRUE(pin_request.pinned());
+  }
+
+  ASSERT_TRUE(db_ttl_->Close().IsAborted());
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key2", "value2"));
+  ASSERT_OK(db_ttl_->Flush(FlushOptions()));
+  pin.Reset();
+  ASSERT_OK(db_ttl_->EnableFileDeletions());
+  ASSERT_OK(db_ttl_->Close());
+  CloseTtlNoDBClose();
+}
 
 #if USE_COROUTINES
 TEST_F(TtlTest, GetCoroutine) {

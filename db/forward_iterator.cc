@@ -265,25 +265,9 @@ ForwardIterator::~ForwardIterator() { Cleanup(true); }
 void ForwardIterator::SVCleanup(DBImpl* db, SuperVersion* sv,
                                 bool background_purge_on_iterator_cleanup) {
   if (sv->Unref()) {
-    // Job id == 0 means that this is not our background process, but rather
-    // user thread
-    JobContext job_context(0);
     db->mutex_.Lock();
     sv->Cleanup();
-    db->FindObsoleteFiles(&job_context, false, true);
-    if (background_purge_on_iterator_cleanup) {
-      db->ScheduleBgLogWriterClose(&job_context);
-      db->AddSuperVersionsToFreeQueue(sv);
-      db->SchedulePurge();
-    }
-    db->mutex_.Unlock();
-    if (!background_purge_on_iterator_cleanup) {
-      delete sv;
-    }
-    if (job_context.HaveSomethingToDelete()) {
-      db->PurgeObsoleteFiles(job_context, background_purge_on_iterator_cleanup);
-    }
-    job_context.Clean();
+    db->UnlockAndPurgeObsoleteFiles(sv, background_purge_on_iterator_cleanup);
   }
 }
 
