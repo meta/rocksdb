@@ -1049,6 +1049,26 @@ TEST_F(SSTDumpToolTest, ReadSequentialCountsOnlyTheKeysItRead) {
   cleanup(opts, file_path);
 }
 
+TEST_F(SSTDumpToolTest, ReadNumLimitsScanOutput) {
+  Options opts;
+  opts.env = env();
+  const std::string file_path = MakeFilePath("rocksdb_sst_test.sst");
+  createSST(opts, file_path);
+
+  const std::string file_arg = "--file=" + file_path;
+  const char* args[] = {"sst_dump", "--command=scan", file_arg.c_str(),
+                        "--read_num=1"};
+  SSTDumpTool tool;
+  testing::internal::CaptureStdout();
+  const int result = tool.Run(4, args, opts);
+  const std::string output = testing::internal::GetCapturedStdout();
+
+  EXPECT_EQ(result, 0);
+  EXPECT_NE(output.find("'k_0000'"), std::string::npos);
+  EXPECT_EQ(output.find("'k_0001'"), std::string::npos);
+  cleanup(opts, file_path);
+}
+
 TEST_F(SSTDumpToolTest, DumpTableOutputFileCreationFails) {
   Options opts;
   opts.env = env();
