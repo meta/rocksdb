@@ -63,7 +63,19 @@ public class DirectSlice extends AbstractSlice<ByteBuffer> {
    * @param length The length of the data to use for the slice
    */
   public DirectSlice(final ByteBuffer data, final int length) {
-    super(createNewDirectSlice0(ensureDirect(data), length));
+    this(data, 0, length);
+  }
+
+  /**
+   * Constructs a slice where the data is
+   * read from the provided
+   * ByteBuffer up to a certain length
+   *
+   * @param data The buffer containing the data
+   * @param length The length of the data to use for the slice
+   */
+  public DirectSlice(final ByteBuffer data, final int offset, final int length) {
+    super(createNewDirectSlice0(ensureDirect(data), offset, length));
     this.internalBuffer = false;
   }
 
@@ -123,7 +135,7 @@ public class DirectSlice extends AbstractSlice<ByteBuffer> {
     disposeInternal(nativeHandle);
   }
 
-  private static native long createNewDirectSlice0(final ByteBuffer data, final int length);
+  private static native long createNewDirectSlice0(final ByteBuffer data, final int offset, final int length);
   private static native long createNewDirectSlice1(final ByteBuffer data);
   @Override protected final native ByteBuffer data0(long handle);
   private static native byte get0(long handle, int offset);
