@@ -113,9 +113,9 @@ TEST(DataBlockHashIndex, DataBlockHashTestSmall) {
 }
 
 TEST(DataBlockHashIndex, DataBlockHashTest) {
-  // bucket_num = 200, #keys = 100. 50% utilization
+  // bucket_num = 201, #keys = 100. 50% utilization
   DataBlockHashIndexBuilder builder;
-  builder.Initialize(0.75 /*util_ratio*/);
+  builder.Initialize(0.5 /*util_ratio*/);
 
   for (uint8_t i = 0; i < 100; i++) {
     std::string key("key" + std::to_string(i));
@@ -202,9 +202,10 @@ TEST(DataBlockHashIndex, InitializeRejectsUnsupportedSize) {
 }
 
 TEST(DataBlockHashIndex, DataBlockHashTestCollision) {
-  // bucket_num = 2. There will be intense hash collisions
+  // bucket_num = 11, #keys = 100. 1000% utilization. There will be intense hash
+  // collisions
   DataBlockHashIndexBuilder builder;
-  builder.Initialize(0.75 /*util_ratio*/);
+  builder.Initialize(10.0 /*util_ratio*/);
 
   for (uint8_t i = 0; i < 100; i++) {
     std::string key("key" + std::to_string(i));
@@ -231,12 +232,20 @@ TEST(DataBlockHashIndex, DataBlockHashTestCollision) {
 
   // the additional hash map should start at the end of the buffer
   ASSERT_EQ(original_size, map_offset);
+  size_t collision_count = 0;
   for (uint8_t i = 0; i < 100; i++) {
     std::string key("key" + std::to_string(i));
     uint8_t restart_point = i;
     ASSERT_TRUE(
         SearchForOffset(index, s.data(), map_offset, key, restart_point));
+    uint8_t entry = index.Lookup(s.data(), map_offset, key);
+    if (entry == kCollision) {
+      collision_count++;
+    }
   }
+  // bucket_num = 11, #keys = 100, so that there will be at least 90 hash
+  // collisions
+  ASSERT_GE(collision_count, 90);
 }
 
 TEST(DataBlockHashIndex, DataBlockHashTestLarge) {
