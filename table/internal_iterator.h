@@ -19,6 +19,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class PinnedIteratorsManager;
+class Version;
 
 template <class TValue>
 class InternalIteratorBase : public Cleanable {
@@ -215,6 +216,10 @@ class InternalIteratorBase : public Cleanable {
   // bounded scan ranges; implementations should then behave as a regular
   // iterator.
   virtual void Prepare(const MultiScanArgs* /*scan_opts*/) {}
+
+  // Returns the current Version associated with the iterator, if any.
+  // Overridden by ForwardIterator to provide the renewed Version to DBIter.
+  virtual const Version* current_version() const { return nullptr; }
 
  protected:
   void SeekForPrevImpl(const Slice& target, const CompareInterface* cmp) {

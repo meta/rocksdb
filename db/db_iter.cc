@@ -98,6 +98,7 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       has_trace_state_(db_impl != nullptr && cfd != nullptr),
       ingest_sst_lock_(cfd != nullptr ? &cfd->GetIngestSstLock() : nullptr),
       version_number_(version != nullptr ? version->GetVersionNumber() : 0),
+      current_version_(version),
       // Blob indexes exposed to legacy BlobDB are not integrated BlobDB
       // references.
       dropped_blob_files_(version != nullptr && !expose_blob_index
@@ -285,8 +286,20 @@ Status DBIter::BlobReader::RetrieveAndSetBlobValue(const Slice& user_key,
                                  &blob_value_, bytes_read);
 }
 
+void DBIter::UpdateVersionIfNecessary() {
+  if (iter_.iter() != nullptr) {
+    const Version* v = iter_.iter()->current_version();
+    if (v != nullptr && v != current_version_) {
+      current_version_ = v;
+      blob_state_.mut()->reader.SetVersion(v);
+      value_columns_state_.mut()->SetVersion(v);
+    }
+  }
+}
+
 bool DBIter::SetValueAndColumnsFromBlobImpl(const Slice& user_key,
                                             const Slice& blob_index) {
+  UpdateVersionIfNecessary();
   const Status s =
       blob_state_.mut()->reader.RetrieveAndSetBlobValue(user_key, blob_index);
   if (!s.ok()) {
@@ -351,6 +364,7 @@ void DBIter::RemoveDroppedBlobColumns(Slice* entity,
 }
 
 bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
+  UpdateVersionIfNecessary();
   // Auto-marks dirty via mut() up front since every successful path below
   // populates wide_columns_ (and possibly the lazy entity/blob column
   // vectors).
@@ -1717,6 +1731,7 @@ bool DBIter::MergeWithBlobBaseValue(const Slice& blob_index,
     return false;
   }
 
+  UpdateVersionIfNecessary();
   const Status s =
       blob_state_.mut()->reader.RetrieveAndSetBlobValue(user_key, blob_index);
   if (!s.ok()) {
@@ -1738,12 +1753,12 @@ bool DBIter::MergeWithBlobBaseValue(const Slice& blob_index,
 
 bool DBIter::MergeWithWideColumnBaseValue(const Slice& entity,
                                           const Slice& user_key) {
+  UpdateVersionIfNecessary();
   // The merge result is written to saved_value_, so the base cannot be kept
   // there.
   Slice base_entity = entity;
   std::string remaining_columns;
   RemoveDroppedBlobColumns(&base_entity, &remaining_columns);
-
   // Resolve V2 entity blob columns if present, since TimedFullMerge only
   // supports V1 format.
   std::string resolved_entity;
