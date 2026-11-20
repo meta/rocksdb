@@ -111,6 +111,8 @@ extern ROCKSDB_LIBRARY_API void rocksdb_pause_background_work(rocksdb_t* db,
 extern ROCKSDB_LIBRARY_API void rocksdb_continue_background_work(rocksdb_t* db,
                                                                  char** errptr);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_resume(rocksdb_t* db, char** errptr);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_disable_file_deletions(rocksdb_t* db,
                                                                char** errptr);
 
