@@ -3004,6 +3004,11 @@ int main(int argc, char** argv) {
 
     rocksdb_flush_wal(db, 1, &err);
     CheckNoError(err);
+
+    // Resume() on a healthy DB is a no-op that returns OK
+    rocksdb_resume(db, &err);
+    CheckNoError(err);
+
     {
       rocksdb_flushwaloptions_t* flush_wal_options =
           rocksdb_flushwaloptions_create();
