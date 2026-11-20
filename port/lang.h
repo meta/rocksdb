@@ -81,7 +81,7 @@ constexpr bool kMustFreeHeapAllocations = false;
 
 // MSVC doesn't support the same defines that gcc and clang provide
 // but does some like __AVX__. Here we can infer some features from others.
-#ifdef __AVX__
+#ifdef __AVX__ && (_MSC_VER)
 #define __SSE4_2__ 1
 #define __PCLMUL__ 1
 #endif  // __AVX__
