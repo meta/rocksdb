@@ -15,6 +15,7 @@
 #include "monitoring/iostats_context_imp.h"
 #include "test_util/sync_point.h"
 #include "util/aligned_buffer.h"
+#include "util/autovector.h"
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -34,6 +35,37 @@ inline bool IsPowerOfTwo(const size_t alignment) {
 inline bool IsAligned(size_t alignment, const void* ptr) {
   return ((uintptr_t(ptr)) & (alignment - 1)) == 0;
 }
+
+// Owns a per-thread auto-reset event used by preadAsyncIo() so synchronous
+// reads on FILE_FLAG_OVERLAPPED handles do not pay a CreateEvent/CloseHandle
+// kernel round-trip on every call. Safe because preadAsyncIo() blocks until
+// the IO completes before returning, so a thread can have at most one
+// outstanding IO using this event at any time.
+class ThreadLocalSyncReadEvent {
+ public:
+  ThreadLocalSyncReadEvent() : handle_(NULL) {}
+  ~ThreadLocalSyncReadEvent() {
+    if (handle_ != NULL) {
+      CloseHandle(handle_);
+    }
+  }
+
+  ThreadLocalSyncReadEvent(const ThreadLocalSyncReadEvent&) = delete;
+  ThreadLocalSyncReadEvent& operator=(const ThreadLocalSyncReadEvent&) = delete;
+
+  // Returns NULL on failure; caller should fall back to per-call CreateEvent.
+  HANDLE Get() {
+    if (handle_ == NULL) {
+      // Auto-reset event: WaitForSingleObject / GetOverlappedResult clears
+      // the signaled state automatically, so no ResetEvent() between reuses.
+      handle_ = RX_CreateEvent(NULL, FALSE, FALSE, NULL);
+    }
+    return handle_;
+  }
+
+ private:
+  HANDLE handle_;
+};
 }  // namespace
 
 std::string GetWindowsErrSz(DWORD err) {
@@ -128,6 +160,67 @@ IOStatus pread(const WinFileData* file_data, char* src, size_t num_bytes,
     if (lastError != ERROR_HANDLE_EOF) {
       s = IOErrorFromWindowsError("ReadFile failed: " + file_data->GetName(),
                                   lastError);
+    }
+  } else {
+    bytes_read = bytesRead;
+  }
+
+  return s;
+}
+
+IOStatus preadAsyncIo(const WinFileData* file_data, char* src, size_t num_bytes,
+                      uint64_t offset, size_t& bytes_read) {
+  IOStatus s;
+  bytes_read = 0;
+
+  if (num_bytes > std::numeric_limits<DWORD>::max()) {
+    return IOStatus::InvalidArgument(
+        "num_bytes is too large for a single ReadFile: " +
+        file_data->GetName());
+  }
+
+  OVERLAPPED overlapped = {0};
+  ULARGE_INTEGER offsetUnion;
+  offsetUnion.QuadPart = offset;
+
+  overlapped.Offset = offsetUnion.LowPart;
+  overlapped.OffsetHigh = offsetUnion.HighPart;
+  // Reuse a per-thread auto-reset event to avoid a CreateEvent/CloseHandle
+  // kernel round-trip on every synchronous read. This path always waits for
+  // the IO to complete before returning, so the event is never in use by
+  // more than one in-flight IO on the same thread.
+  static thread_local ThreadLocalSyncReadEvent tls_event;
+  overlapped.hEvent = tls_event.Get();
+
+  if (NULL == overlapped.hEvent) {
+    auto lastError = GetLastError();
+    return IOErrorFromWindowsError(
+        "CreateEvent for async read failed: " + file_data->GetName(),
+        lastError);
+  }
+
+  DWORD bytesRead = 0;
+
+  if (FALSE == ReadFile(file_data->GetFileHandle(), src,
+                        static_cast<DWORD>(num_bytes), &bytesRead,
+                        &overlapped)) {
+    DWORD lastError = GetLastError();
+    if (ERROR_IO_PENDING == lastError) {
+      if (FALSE != GetOverlappedResult(file_data->GetFileHandle(), &overlapped,
+                                       &bytesRead, TRUE)) {
+        bytes_read = bytesRead;
+      } else {
+        lastError = GetLastError();
+        if (lastError != ERROR_HANDLE_EOF) {
+          s = IOErrorFromWindowsError(
+              "GetOverlappedResult failed: " + file_data->GetName(), lastError);
+        }
+      }
+    } else {
+      if (lastError != ERROR_HANDLE_EOF) {
+        s = IOErrorFromWindowsError("ReadFile failed: " + file_data->GetName(),
+                                    lastError);
+      }
     }
   } else {
     bytes_read = bytesRead;
@@ -701,6 +794,7 @@ inline IOStatus WinRandomAccessImpl::ReadImpl(uint64_t offset, size_t n,
   // Check buffer alignment
   if (file_base_->use_direct_io()) {
     assert(file_base_->IsSectorAligned(static_cast<size_t>(offset)));
+    assert(file_base_->IsSectorAligned(n));
     assert(IsAligned(alignment_, scratch));
   }
 
@@ -723,8 +817,6 @@ WinRandomAccessFile::WinRandomAccessFile(const std::string& fname, HANDLE hFile,
                                          const FileOptions& options)
     : WinFileData(fname, hFile, options.use_direct_reads),
       WinRandomAccessImpl(this, alignment, options) {}
-
-WinRandomAccessFile::~WinRandomAccessFile() {}
 
 IOStatus WinRandomAccessFile::Read(uint64_t offset, size_t n,
                                    const IOOptions& /*options*/, Slice* result,
@@ -752,6 +844,302 @@ IOStatus WinRandomAccessFile::GetFileSize(uint64_t* size) {
     return IOStatus::OK();
   } else {
     return IOStatus::IOError("Failed to get file size", filename_);
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+/// WinRandomAccessFileAsyncIo
+template <typename T>
+using AutoVector =
+    autovector<T, WinRandomAccessFileAsyncIo::kMaxConcurrentRequests>;
+IOStatus WinRandomAccessFileAsyncIo::PositionedReadInternal(
+    char* src, size_t numBytes, uint64_t offset, size_t& bytes_read) const {
+  return preadAsyncIo(file_base_, src, numBytes, offset, bytes_read);
+}
+
+inline void UpdateOverlapped(uint64_t offset, OVERLAPPED& overlapped) {
+  overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
+  overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+};
+
+struct WrappedReadRequest {
+  FSReadRequest* req;
+  OVERLAPPED overlapped;
+  size_t finished_len;
+  DWORD error_code;
+
+  explicit WrappedReadRequest(FSReadRequest* r, uint64_t offset)
+      : req(r), finished_len(0), error_code(ERROR_SUCCESS) {
+    memset(&overlapped, 0, sizeof(overlapped));
+    UpdateOverlapped(offset, overlapped);
+  }
+
+  ~WrappedReadRequest() { CloseEvent(); }
+
+  IOStatus CreateEventIfNeeded() {
+    if (overlapped.hEvent == NULL) {
+      overlapped.hEvent = RX_CreateEvent(NULL, TRUE, FALSE, NULL);
+      if (overlapped.hEvent == NULL) {
+        return IOErrorFromWindowsError("CreateEvent failed", GetLastError());
+      }
+    }
+    return IOStatus::OK();
+  }
+
+  void CloseEvent() {
+    if (overlapped.hEvent != NULL) {
+      CloseHandle(overlapped.hEvent);
+      overlapped.hEvent = NULL;
+    }
+  }
+};
+
+inline IOStatus ProcessReadBatch(AutoVector<WrappedReadRequest>& req_wraps,
+                                 size_t start_idx, size_t batch_size,
+                                 WinFileData* file_data,
+                                 bool& stop_processing) {
+  IOStatus s = IOStatus::OK();
+  bool submitted_new_reqs = false;
+  DWORD bytes_read = 0;
+  stop_processing = false;
+
+  for (size_t i = 0; i < batch_size; i++) {
+    WrappedReadRequest* req_wrap = &req_wraps[start_idx + i];
+    FSReadRequest* req = req_wrap->req;
+
+    if (req->len > std::numeric_limits<DWORD>::max()) {
+      // To bypass regular error handling later
+      req_wrap->error_code = WinRandomAccessFileAsyncIo::kErrorCustomized;
+      req->result = Slice(req->scratch, 0);
+      req->status = IOStatus::InvalidArgument(
+          "FSReadRequest::len is too large for a single read: " +
+          file_data->GetName());
+      s = req->status;
+      continue;
+    }
+
+    // EOF presented as ERROR_HANDLE_EOF
+    if (req_wrap->finished_len == req->len ||
+        req_wrap->error_code != ERROR_SUCCESS) {
+      continue;
+    }
+
+    s = req_wrap->CreateEventIfNeeded();
+    if (!s.ok()) {
+      req_wrap->error_code = WinRandomAccessFileAsyncIo::kErrorCustomized;
+      req->result = Slice(req->scratch, 0);
+      req->status = s;
+      continue;
+    }
+
+    if (!submitted_new_reqs) {
+      submitted_new_reqs = true;
+    }
+
+    assert(req->len > req_wrap->finished_len);
+    UpdateOverlapped(req->offset + req_wrap->finished_len,
+                     req_wrap->overlapped);
+
+    if (FALSE == ReadFile(file_data->GetFileHandle(),
+                          req->scratch + req_wrap->finished_len,
+                          static_cast<DWORD>(req->len - req_wrap->finished_len),
+                          &bytes_read, &req_wrap->overlapped)) {
+      DWORD last_error = GetLastError();
+      req_wrap->error_code = last_error;
+      // Too many outstanding asynchronous I/O requests
+      if (last_error == ERROR_NOT_ENOUGH_MEMORY) {
+        CancelIoEx(file_data->GetFileHandle(), &req_wrap->overlapped);
+        stop_processing = true;
+        return IOErrorFromWindowsError(
+            "ReadFile failed: " + file_data->GetName(), last_error);
+      }
+    } else {
+      req_wrap->finished_len += bytes_read;
+      req_wrap->error_code = ERROR_SUCCESS;
+    }
+  }
+
+  if (!submitted_new_reqs) {
+    return s;
+  }
+
+  for (size_t i = 0; i < batch_size; i++) {
+    auto req_wrap = &req_wraps[start_idx + i];
+    auto req = req_wrap->req;
+    DWORD err = req_wrap->error_code;
+
+    if (ERROR_SUCCESS != err) {
+      if (ERROR_IO_PENDING == err) {
+        bytes_read = 0;
+        if (FALSE != GetOverlappedResult(file_data->GetFileHandle(),
+                                         &req_wrap->overlapped, &bytes_read,
+                                         TRUE)) {
+          TEST_SYNC_POINT_CALLBACK(
+              "UpdateResults::io_uring_result",
+              &bytes_read);  // For testing compatibility with io_uring only
+          req_wrap->finished_len += bytes_read;
+          req_wrap->error_code = ERROR_SUCCESS;
+          req->result = Slice(req->scratch, req_wrap->finished_len);
+          req->status = IOStatus::OK();
+        } else {
+          err = GetLastError();
+          req_wrap->error_code = err;
+          if (ERROR_HANDLE_EOF != err) {
+            req->result = Slice(req->scratch, 0);
+            req->status = IOErrorFromWindowsError(
+                "GetOverlappedResult failed: " + file_data->GetName(), err);
+          } else {  // EOF
+            req->result = Slice(req->scratch, 0);
+            req->status = IOStatus::OK();
+          }
+        }
+      } else if (ERROR_HANDLE_EOF == err) {  // EOF
+        req->result = Slice(req->scratch, 0);
+        req->status = IOStatus::OK();
+      } else if (WinRandomAccessFileAsyncIo::kErrorCustomized != err) {
+        req->result = Slice(req->scratch, 0);
+        req->status = IOErrorFromWindowsError(
+            "ReadFile failed: " + file_data->GetName(), err);
+      }
+    } else {
+      req->result = Slice(req->scratch, req_wrap->finished_len);
+      req->status = IOStatus::OK();
+    }
+
+    req_wrap->CloseEvent();
+  }
+
+  return s;
+}
+
+IOStatus WinRandomAccessFileAsyncIo::MultiRead(FSReadRequest* reqs,
+                                               size_t num_reqs,
+                                               const IOOptions& /*options*/,
+                                               IODebugContext* /*dbg*/) {
+  // Check buffer alignment
+  if (file_base_->use_direct_io()) {
+    for (size_t i = 0; i < num_reqs; i++) {
+      assert(file_base_->IsSectorAligned(static_cast<size_t>(reqs[i].offset)));
+      assert(file_base_->IsSectorAligned(reqs[i].len));
+      assert(IsAligned(GetAlignment(), reqs[i].scratch));
+    }
+  }
+
+  AutoVector<WrappedReadRequest> req_wraps;
+  IOStatus ios = IOStatus::OK();
+
+  for (size_t i = 0; i < num_reqs; i++) {
+    req_wraps.emplace_back(&reqs[i], reqs[i].offset);
+  }
+
+  // Process requests in batches
+  size_t current_idx = 0;
+  while (num_reqs > current_idx) {
+    size_t batch_size = num_reqs - current_idx;
+    batch_size = std::min(kMaxConcurrentRequests, batch_size);
+    size_t end_idx = batch_size + current_idx;
+
+    bool stop_processing = false;
+    ios = ProcessReadBatch(req_wraps, current_idx, batch_size, file_base_,
+                           stop_processing);
+    if (!ios.ok() && stop_processing) {
+      return ios;
+    }
+
+    current_idx = end_idx;
+  }
+
+  return ios;
+}
+
+IOStatus WinRandomAccessFileAsyncIo::ReadAsync(
+    FSReadRequest& req, const IOOptions& /*opts*/,
+    std::function<void(FSReadRequest&, void*)> cb, void* cb_arg,
+    void** io_handle, IOHandleDeleter* del_fn, IODebugContext* /*dbg*/) {
+  // Check buffer alignment
+  if (file_base_->use_direct_io()) {
+    assert(file_base_->IsSectorAligned(static_cast<size_t>(req.offset)));
+    assert(file_base_->IsSectorAligned(req.len));
+    assert(IsAligned(alignment_, req.scratch));
+  }
+
+  if (req.len > std::numeric_limits<DWORD>::max()) {
+    return IOStatus::InvalidArgument(
+        "FSReadRequest::len is too large for a single ReadFile: " +
+        file_base_->GetName());
+  }
+
+  HANDLE h_event = RX_CreateEvent(NULL, TRUE, FALSE, NULL);
+  if (h_event == NULL) {
+    return IOErrorFromWindowsError("CreateEvent failed", GetLastError());
+  }
+
+  IOHandleDeleter deletefn = [](void* args) -> void {
+    delete (static_cast<Win_IOHandle*>(args));
+    args = nullptr;
+  };
+
+  Win_IOHandle* win_handle = new Win_IOHandle(cb, cb_arg, req.offset, req.len,
+                                              req.scratch, file_base_);
+  win_handle->overlapped.hEvent = h_event;
+
+  *io_handle = static_cast<void*>(win_handle);
+  *del_fn = deletefn;
+
+  IOStatus ios = IOStatus::OK();
+  DWORD bytes_read = 0;
+  if (FALSE == ReadFile(file_base_->GetFileHandle(), req.scratch,
+                        static_cast<DWORD>(req.len), &bytes_read,
+                        &win_handle->overlapped)) {
+    DWORD last_error = GetLastError();
+    if (last_error == ERROR_HANDLE_EOF) {
+      win_handle->is_finished = true;
+      req.result = Slice(req.scratch, 0);
+      req.status = IOStatus::OK();
+      cb(req, cb_arg);
+    } else if (last_error != ERROR_IO_PENDING) {
+      ios = IOErrorFromWindowsError("ReadFile failed: " + file_base_->GetName(),
+                                    last_error);
+    }
+    // else last_error is ERROR_IO_PENDING
+  } else {
+    win_handle->is_finished = true;
+    req.result = Slice(req.scratch, bytes_read);
+    req.status = IOStatus::OK();
+    cb(req, cb_arg);
+  }
+
+  if (win_handle->is_finished && win_handle->overlapped.hEvent != NULL) {
+    CloseHandle(win_handle->overlapped.hEvent);
+    win_handle->overlapped.hEvent = NULL;
+  }
+
+  return ios;
+}
+
+WinRandomAccessFileAsyncIo::WinRandomAccessFileAsyncIo(
+    const std::string& fname, HANDLE hFile, size_t alignment,
+    const FileOptions& options)
+    : WinRandomAccessFile(fname, hFile, alignment, options) {}
+
+Win_IOHandle::Win_IOHandle(std::function<void(FSReadRequest&, void*)> _cb,
+                           void* _cb_arg, uint64_t _offset, size_t _len,
+                           char* _scratch, WinFileData* _file_data)
+    : cb(_cb),
+      cb_arg(_cb_arg),
+      offset(_offset),
+      len(_len),
+      scratch(_scratch),
+      is_finished(false),
+      file_data(_file_data) {
+  memset(&overlapped, 0, sizeof(overlapped));
+  UpdateOverlapped(_offset, overlapped);
+}
+
+Win_IOHandle::~Win_IOHandle() {
+  if (overlapped.hEvent != NULL) {
+    CloseHandle(overlapped.hEvent);
+    overlapped.hEvent = NULL;
   }
 }
 
