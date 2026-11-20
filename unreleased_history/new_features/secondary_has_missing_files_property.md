@@ -1,1 +1,0 @@
-Added DB property `rocksdb.secondary-has-missing-files`. It is 1 while a secondary or follower instance serves an older Version, because a table or blob file of its newest MANIFEST state is missing or fails verification.

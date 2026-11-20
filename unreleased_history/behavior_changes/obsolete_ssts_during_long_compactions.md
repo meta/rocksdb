@@ -1,1 +1,0 @@
-A long-running background job, such as a remote compaction waiting in `CompactionService::Wait()`, no longer delays deleting obsolete SST files created after the job started. The `rocksdb.min-obsolete-sst-number-to-keep` property no longer limits which of these files RocksDB keeps.

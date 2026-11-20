@@ -1,1 +1,0 @@
-Fixed a bug where a failed read of the MANIFEST made a secondary or follower instance stop catching up until it was reopened. Later `TryCatchUpWithPrimary()` calls returned the same error, or returned OK without reading further. The next call now opens the MANIFEST again and continues.
