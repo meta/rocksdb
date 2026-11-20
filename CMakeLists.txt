@@ -271,12 +271,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64")
 endif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|AARCH64")
-        CHECK_C_COMPILER_FLAG("-march=armv8-a+crc+crypto" HAS_ARMV8_CRC)
+  CHECK_C_COMPILER_FLAG("-march=armv8-a+crc+crypto" HAS_ARMV8_CRC)
   if(HAS_ARMV8_CRC)
     message(STATUS " HAS_ARMV8_CRC yes")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a+crc+crypto -Wno-unused-function")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+crc+crypto -Wno-unused-function")
   endif(HAS_ARMV8_CRC)
+
+  CHECK_C_COMPILER_FLAG("-march=armv8.2-a+sve" HAS_ARMV8_SVE)
+  if(HAS_ARMV8_SVE)
+    message(STATUS " HAS_ARMV8_SVE yes")
+    add_definitions(-DHAVE_ARMV8_SVE)
+    set_source_files_properties(util/xxhash.cc
+      PROPERTIES COMPILE_FLAGS "-march=armv8.2-a+sve")
+  endif(HAS_ARMV8_SVE)
+
 endif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|AARCH64")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
