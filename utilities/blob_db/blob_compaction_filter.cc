@@ -361,10 +361,9 @@ BlobIndexCompactionFilterFactory::CreateCompactionFilter(
 
   int64_t current_time = 0;
   Status s = clock()->GetCurrentTime(&current_time);
-  if (!s.ok()) {
+  if (!s.ok() || current_time < 0) {
     return nullptr;
   }
-  assert(current_time >= 0);
 
   assert(blob_db_impl());
 
@@ -386,10 +385,9 @@ BlobIndexCompactionFilterFactoryGC::CreateCompactionFilter(
 
   int64_t current_time = 0;
   Status s = clock()->GetCurrentTime(&current_time);
-  if (!s.ok()) {
+  if (!s.ok() || current_time < 0) {
     return nullptr;
   }
-  assert(current_time >= 0);
 
   assert(blob_db_impl());
 
