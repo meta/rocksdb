@@ -53,7 +53,7 @@ ASSERT_FEATURE_COMPAT_HEADER();
 #endif
 
 #if defined(HAVE_ARM64_CRC)
-bool pmull_runtime_flag = false;
+std::atomic<bool> pmull_runtime_flag = false;
 #endif
 
 namespace ROCKSDB_NAMESPACE::crc32c {
