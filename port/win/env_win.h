@@ -72,7 +72,7 @@ class WinEnvThreads {
   void IncBackgroundThreadsIfNeeded(int num, Env::Priority pri);
 
  private:
-  Env* hosted_env_;
+  [[maybe_unused]] Env* hosted_env_;
   mutable std::mutex mu_;
   std::vector<ThreadPoolImpl> thread_pools_;
   std::vector<Thread> threads_to_join_;
@@ -257,7 +257,7 @@ class WinEnvIO {
   virtual Status GetHostName(char* name, uint64_t len);
 
  private:
-  Env* hosted_env_;
+  [[maybe_unused]] Env* hosted_env_;
 };
 
 class WinEnv : public CompositeEnv {
