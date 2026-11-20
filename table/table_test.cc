@@ -602,9 +602,7 @@ std::string Reverse(const Slice& key) {
 
 class ReverseKeyComparator : public Comparator {
  public:
-  const char* Name() const override {
-    return "rocksdb.ReverseBytewiseComparator";
-  }
+  const char* Name() const override { return "rocksdb.ReverseKeyComparator"; }
 
   int Compare(const Slice& a, const Slice& b) const override {
     return BytewiseComparator()->Compare(Reverse(a), Reverse(b));
@@ -2618,7 +2616,7 @@ TEST_P(BlockBasedTableTest, BlockBasedTableProperties2) {
 
     auto& props = *c.GetTableReader()->GetTableProperties();
 
-    ASSERT_EQ("rocksdb.ReverseBytewiseComparator", props.comparator_name);
+    ASSERT_EQ("rocksdb.ReverseKeyComparator", props.comparator_name);
     ASSERT_EQ("UInt64AddOperator", props.merge_operator_name);
     ASSERT_EQ("rocksdb.Noop", props.prefix_extractor_name);
     ASSERT_EQ(
