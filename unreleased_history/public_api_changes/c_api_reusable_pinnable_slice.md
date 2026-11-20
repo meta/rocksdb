@@ -1,0 +1,1 @@
+Added `rocksdb_pinnableslice_create()`, `rocksdb_pinnableslice_reset()`, `rocksdb_get_pinned_into()`, and `rocksdb_get_pinned_cf_into()` to the C API, allowing callers to reuse pinnable slices across point lookups and reduce allocations.
