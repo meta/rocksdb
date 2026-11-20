@@ -83,7 +83,12 @@ class DeadlockInfoBufferTempl {
     else {
       auto prev_size = paths_buffer_.size();
       paths_buffer_.resize(target_size);
-      buffer_idx_ = (uint32_t)prev_size;
+      // prev_size <= target_size here. When they are equal the buffer is full,
+      // so the next write wraps to the front; taking the modulo keeps
+      // buffer_idx_ in range (prev_size == target_size would otherwise leave it
+      // one past the end, and AddNewPath indexes before applying its own
+      // modulo). target_size can be 0 when there are no recorded paths.
+      buffer_idx_ = target_size == 0 ? 0 : (uint32_t)(prev_size % target_size);
     }
   }
 
