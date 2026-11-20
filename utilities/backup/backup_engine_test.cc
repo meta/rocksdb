@@ -256,9 +256,6 @@ class TestFs : public FileSystemWrapper {
     limit_written_files_--;
     IOStatus s = FileSystemWrapper::NewWritableFile(f, file_opts, r, dbg);
     if (s.ok()) {
-      if ((*r)->use_direct_io()) {
-        ++num_direct_writers_;
-      }
       ++num_writers_;
     }
     return s;
@@ -367,7 +364,9 @@ class TestFs : public FileSystemWrapper {
         if (filename.find("MANIFEST") == 0) {
           size_bytes = 100;  // Match DummyDB::GetLiveFiles
         }
-        result->push_back({dir + "/" + filename, size_bytes});
+        std::string path = dir;
+        path.append("/").append(filename);
+        result->push_back({std::move(path), size_bytes});
       }
       return IOStatus::OK();
     }
@@ -421,7 +420,6 @@ class TestFs : public FileSystemWrapper {
     num_seq_readers_ = 0;
     num_direct_seq_readers_ = 0;
     num_writers_ = 0;
-    num_direct_writers_ = 0;
   }
 
   int num_rand_readers() { return num_rand_readers_; }
@@ -429,8 +427,6 @@ class TestFs : public FileSystemWrapper {
   int num_seq_readers() { return num_seq_readers_; }
   int num_direct_seq_readers() { return num_direct_seq_readers_; }
   int num_writers() { return num_writers_; }
-  // FIXME(?): unused
-  int num_direct_writers() { return num_direct_writers_; }
 
  private:
   port::Mutex mutex_;
@@ -454,7 +450,6 @@ class TestFs : public FileSystemWrapper {
   std::atomic<int> num_seq_readers_{};
   std::atomic<int> num_direct_seq_readers_{};
   std::atomic<int> num_writers_{};
-  std::atomic<int> num_direct_writers_{};
 };  // TestFs
 
 class FileManager : public EnvWrapper {
@@ -854,7 +849,7 @@ class BackupEngineTest : public testing::Test {
     ASSERT_OK(
         test_backup_env_->GetChildren(backupdir_ + "/private", &child_dirs));
     for (auto& dir : child_dirs) {
-      dir = "private/" + dir;
+      dir.insert(0, "private/");
     }
     child_dirs.emplace_back("shared");           // might not exist
     child_dirs.emplace_back("shared_checksum");  // might not exist
@@ -866,7 +861,8 @@ class BackupEngineTest : public testing::Test {
       for (auto& file : children) {
         uint64_t size;
         size = UINT64_MAX;  // appease clang-analyze
-        std::string rel_file = dir + "/" + file;
+        std::string rel_file = dir;
+        rel_file.append("/").append(file);
         // fprintf(stderr, "stat %s\n", (backupdir_ + "/" + rel_file).c_str());
         ASSERT_OK(
             test_backup_env_->GetFileSize(backupdir_ + "/" + rel_file, &size));
@@ -1057,7 +1053,7 @@ class BackupEngineTest : public testing::Test {
   std::unique_ptr<FileManager> db_file_manager_;
 
   // all the dbs!
-  DummyDB* dummy_db_;  // owned as db_ when present
+  DummyDB* dummy_db_ = nullptr;  // owned as db_ when present
   std::unique_ptr<DB> db_;
   DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_.get()); }
   std::unique_ptr<BackupEngine> backup_engine_;
@@ -1077,7 +1073,7 @@ class BackupEngineTest : public testing::Test {
 
 void AppendPath(const std::string& path, std::vector<std::string>& v) {
   for (auto& f : v) {
-    f = path + f;
+    f.insert(0, path);
   }
 }
 
@@ -1162,7 +1158,7 @@ TEST_F(BackupEngineTest, IncrementalRestore) {
       for (auto* f = files_begin; f != files_end; ++f) {
         std::string s = StringSplit(f->info.relative_file, '/').back();
         s = s.substr(0, s.find('_'));
-        auto filename = one_sst_file.substr(one_sst_file.find_last_of("/") + 1);
+        auto filename = one_sst_file.substr(one_sst_file.find_last_of('/') + 1);
         if (s + ".sst" == filename) {
           // Backup will include everything BUT that one very SST file.
           f->exclude_decision = true;
@@ -1519,7 +1515,7 @@ INSTANTIATE_TEST_CASE_P(BackupEngineTestWithParam, BackupEngineTestWithParam,
                         ::testing::Bool());
 
 // this will make sure that backup does not copy the same file twice
-TEST_F(BackupEngineTest, NoDoubleCopy_And_AutoGC) {
+TEST_F(BackupEngineTest, NoDoubleCopyAndAutoGC) {
   OpenDBAndBackupEngine(true, true);
 
   // should write 5 DB files + one meta file
@@ -3457,6 +3453,13 @@ TEST_F(BackupEngineTest, FileDetailsHaveCorrectFileType) {
       case kOptionsFile:
         found_options = true;
         break;
+      case kDBLockFile:
+      case kTempFile:
+      case kInfoLogFile:
+      case kMetaDatabase:
+      case kIdentityFile:
+      case kBlobFile:
+      case kCompactionProgressFile:
       default:
         break;
     }
@@ -3709,7 +3712,7 @@ TEST_F(BackupEngineTest, MetadataTooLarge) {
   DestroyDBWithoutCheck(dbname_, options_);
 }
 
-TEST_F(BackupEngineTest, MetaSchemaVersion2_SizeCorruption) {
+TEST_F(BackupEngineTest, MetaSchemaVersion2SizeCorruption) {
   engine_options_->schema_version = 1;
   OpenDBAndBackupEngine(/*destroy_old_data*/ true);
 
@@ -3777,7 +3780,7 @@ TEST_F(BackupEngineTest, MetaSchemaVersion2_SizeCorruption) {
   CloseBackupEngine();
 }
 
-TEST_F(BackupEngineTest, MetaSchemaVersion2_NotSupported) {
+TEST_F(BackupEngineTest, MetaSchemaVersion2NotSupported) {
   engine_options_->schema_version = 2;
   TEST_BackupMetaSchemaOptions test_opts;
   std::string app_metadata = "abc\ndef";
@@ -3830,7 +3833,7 @@ TEST_F(BackupEngineTest, MetaSchemaVersion2_NotSupported) {
   CloseBackupEngine();
 }
 
-TEST_F(BackupEngineTest, MetaSchemaVersion2_Restore) {
+TEST_F(BackupEngineTest, MetaSchemaVersion2Restore) {
   engine_options_->schema_version = 2;
   TEST_BackupMetaSchemaOptions test_opts;
   const int keys_iteration = 5000;

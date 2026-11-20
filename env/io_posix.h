@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "port/lang.h"
 #include "port/port.h"
@@ -170,7 +171,7 @@ struct Posix_IOHandle {
                  uint64_t _offset, size_t _len, char* _scratch,
                  bool _use_direct_io, size_t _alignment)
       : iu(_iu),
-        cb(_cb),
+        cb(std::move(_cb)),
         cb_arg(_cb_arg),
         offset(_offset),
         len(_len),
@@ -181,7 +182,7 @@ struct Posix_IOHandle {
         is_being_aborted(false),
         req_count(0) {}
 
-  struct iovec iov;
+  struct iovec iov{};
   struct io_uring* iu;
   std::function<void(FSReadRequest&, void*)> cb;
   void* cb_arg;
@@ -284,15 +285,15 @@ inline void FinalizeAsyncRead(struct io_uring* iu, struct io_uring_cqe* cqe,
 // synchronization.
 class LogicalBlockSizeCache {
  public:
-  LogicalBlockSizeCache(
+  explicit LogicalBlockSizeCache(
       std::function<size_t(int)> get_logical_block_size_of_fd =
           PosixHelper::GetLogicalBlockSizeOfFd,
       std::function<Status(const std::string&, size_t*)>
           get_logical_block_size_of_directory =
               PosixHelper::GetLogicalBlockSizeOfDirectory)
-      : get_logical_block_size_of_fd_(get_logical_block_size_of_fd),
+      : get_logical_block_size_of_fd_(std::move(get_logical_block_size_of_fd)),
         get_logical_block_size_of_directory_(
-            get_logical_block_size_of_directory) {}
+            std::move(get_logical_block_size_of_directory)) {}
 
   // Takes the following actions:
   // 1. Increases reference count of the directories;

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <memory>
 #include <string>
 
 #include "db/db_test_util.h"
@@ -265,6 +266,8 @@ void VerifyTableProperties(
 
   ASSERT_EQ(base_tp.raw_key_size, new_tp.raw_key_size);
   ASSERT_EQ(base_tp.raw_value_size, new_tp.raw_value_size);
+  ASSERT_EQ(base_tp.referenced_blob_bytes.value_or(0),
+            new_tp.referenced_blob_bytes.value_or(0));
   ASSERT_EQ(base_tp.num_entries, new_tp.num_entries);
   ASSERT_EQ(base_tp.num_deletions, new_tp.num_deletions);
   ASSERT_EQ(base_tp.num_range_deletions, new_tp.num_range_deletions);
@@ -372,7 +375,7 @@ TEST_F(DBPropertiesTest, AggregatedTableProperties) {
     options.level0_file_num_compaction_trigger = 8;
     options.compression = kNoCompression;
     options.create_if_missing = true;
-    options.merge_operator.reset(new TestPutOperator());
+    options.merge_operator = std::make_shared<TestPutOperator>();
 
     BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(
@@ -573,7 +576,7 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
   options.max_bytes_for_level_multiplier = 2;
   // The checks assume kTableCount number of files
   options.disable_auto_compactions = true;
-  options.merge_operator.reset(new TestPutOperator());
+  options.merge_operator = std::make_shared<TestPutOperator>();
 
   BlockBasedTableOptions table_options;
   table_options.filter_policy.reset(
@@ -624,6 +627,8 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
       sum_tp.filter_size += level_tps[level].filter_size;
       sum_tp.raw_key_size += level_tps[level].raw_key_size;
       sum_tp.raw_value_size += level_tps[level].raw_value_size;
+      *sum_tp.referenced_blob_bytes +=
+          level_tps[level].referenced_blob_bytes.value_or(0);
       sum_tp.num_data_blocks += level_tps[level].num_data_blocks;
       sum_tp.num_entries += level_tps[level].num_entries;
       sum_tp.num_deletions += level_tps[level].num_deletions;
@@ -640,6 +645,8 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
     ASSERT_EQ(sum_tp.filter_size, tp.filter_size);
     ASSERT_EQ(sum_tp.raw_key_size, tp.raw_key_size);
     ASSERT_EQ(sum_tp.raw_value_size, tp.raw_value_size);
+    ASSERT_EQ(sum_tp.referenced_blob_bytes.value_or(0),
+              tp.referenced_blob_bytes.value_or(0));
     ASSERT_EQ(sum_tp.num_data_blocks, tp.num_data_blocks);
     ASSERT_EQ(sum_tp.num_entries, tp.num_entries);
     ASSERT_EQ(sum_tp.num_deletions, tp.num_deletions);
@@ -1971,13 +1978,10 @@ TEST_F(DBPropertiesTest, MinObsoleteSstNumberToKeep) {
 
     void SetDB(DB* db) { db_ = db; }
 
-    int GetNumCompactions() { return num_compactions_; }
-
     // True if we've verified the property for at least one output file
     bool Validated() { return validated_; }
 
    private:
-    int num_compactions_ = 0;
     bool validated_ = false;
     DB* db_ = nullptr;
   };
@@ -2361,8 +2365,8 @@ TEST_F(DBPropertiesTest, GetMapPropertyWriteStallStats) {
   for (auto test_cause : {WriteStallCause::kWriteBufferManagerLimit,
                           WriteStallCause::kMemtableLimit}) {
     if (test_cause == WriteStallCause::kWriteBufferManagerLimit) {
-      options.write_buffer_manager.reset(
-          new WriteBufferManager(100000, nullptr, true));
+      options.write_buffer_manager =
+          std::make_shared<WriteBufferManager>(100000, nullptr, true);
     } else if (test_cause == WriteStallCause::kMemtableLimit) {
       options.max_write_buffer_number = 2;
       options.disable_auto_compactions = true;

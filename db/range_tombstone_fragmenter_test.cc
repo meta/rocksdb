@@ -70,7 +70,7 @@ void VerifyVisibleTombstones(
 struct SeekTestCase {
   Slice seek_target;
   RangeTombstone expected_position;
-  bool out_of_range;
+  bool out_of_range = false;
 };
 
 void VerifySeek(FragmentedRangeTombstoneIterator* iter,

@@ -1,0 +1,1 @@
+Added `CacheEntryRole::kReadaheadBuffer` for `BlockBasedTableOptions::cache_usage_options`. When charging is enabled for it, the memory of readahead buffers used to read block-based table files (e.g. iterator and compaction readahead) is charged to the block cache. It is disabled by default.

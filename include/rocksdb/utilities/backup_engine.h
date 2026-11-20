@@ -15,6 +15,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rocksdb/env.h"
@@ -564,7 +565,7 @@ class BackupEngineAppendOnlyBase {
       std::function<void()> progress_callback = []() {}) {
     CreateBackupOptions options;
     options.flush_before_backup = flush_before_backup;
-    options.progress_callback = progress_callback;
+    options.progress_callback = std::move(progress_callback);
     return CreateNewBackupWithMetadata(options, db, app_metadata);
   }
 
@@ -585,7 +586,7 @@ class BackupEngineAppendOnlyBase {
       std::function<void()> progress_callback = []() {}) {
     CreateBackupOptions options;
     options.flush_before_backup = flush_before_backup;
-    options.progress_callback = progress_callback;
+    options.progress_callback = std::move(progress_callback);
     return CreateNewBackup(options, db);
   }
 

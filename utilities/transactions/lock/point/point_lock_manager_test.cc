@@ -5,6 +5,8 @@
 
 #include "utilities/transactions/lock/point/point_lock_manager_test.h"
 
+#include <memory>
+
 #include "utilities/transactions/lock/point/any_lock_manager_test.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -40,11 +42,11 @@ class SpotLockManagerTest
   // can change the TransactionDBOptions (e.g. max_num_locks) before locking.
   void ResetLocker() {
     if (GetParam().use_per_key_point_lock_manager) {
-      locker_.reset(new PerKeyPointLockManager(
-          static_cast<PessimisticTransactionDB*>(db_), txndb_opt_));
+      locker_ = std::make_shared<PerKeyPointLockManager>(
+          static_cast<PessimisticTransactionDB*>(db_), txndb_opt_);
     } else {
-      locker_.reset(new PointLockManager(
-          static_cast<PessimisticTransactionDB*>(db_), txndb_opt_));
+      locker_ = std::make_shared<PointLockManager>(
+          static_cast<PessimisticTransactionDB*>(db_), txndb_opt_);
     }
   }
 };
@@ -366,7 +368,7 @@ TEST_P(SpotLockManagerTest,
   delete txn1;
 }
 
-TEST_P(SpotLockManagerTest, Deadlock_MultipleUpgrade) {
+TEST_P(SpotLockManagerTest, DeadlockMultipleUpgrade) {
   // Tests that deadlock can be detected for shared locks and exclusive locks
   // mixed Deadlock scenario:
 
@@ -423,7 +425,7 @@ TEST_P(SpotLockManagerTest, Deadlock_MultipleUpgrade) {
   delete txn1;
 }
 
-TEST_P(SpotLockManagerTest, Deadlock_MultipleUpgradeInterleaveExclusive) {
+TEST_P(SpotLockManagerTest, DeadlockMultipleUpgradeInterleaveExclusive) {
   // Tests that deadlock can be detected for shared locks and exclusive locks
   // mixed Deadlock scenario:
 
@@ -512,8 +514,8 @@ class PerKeyPointLockManagerTest : public PointLockManagerTest {
 
     // CAUTION: This test creates a separate lock manager object (right, NOT
     // the one that the TransactionDB is using!), and runs tests on it.
-    locker_.reset(new PerKeyPointLockManager(
-        static_cast<PessimisticTransactionDB*>(db_), txndb_opt_));
+    locker_ = std::make_shared<PerKeyPointLockManager>(
+        static_cast<PessimisticTransactionDB*>(db_), txndb_opt_);
     locker_->AddColumnFamily(cf_.get());
   }
 

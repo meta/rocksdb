@@ -78,19 +78,19 @@ class InjectedErrorLog {
   };
 
   struct Entry {
-    uint64_t timestamp_us;
-    uint64_t thread_id;
+    uint64_t timestamp_us = 0;
+    uint64_t thread_id = 0;
     EntryDetail detail;
-    uint8_t detail_kind;
-    uint8_t detail_payload_size;
-    uint8_t retryable;
-    uint8_t data_loss;
-    char op_name[kMaxOpNameLen];
-    char file_name[kMaxFileNameLen];
-    char status_message[kMaxStatusMessageLen];
+    uint8_t detail_kind = kDetailNone;
+    uint8_t detail_payload_size = 0;
+    uint8_t retryable = 0;
+    uint8_t data_loss = 0;
+    char op_name[kMaxOpNameLen] = {};
+    char file_name[kMaxFileNameLen] = {};
+    char status_message[kMaxStatusMessageLen] = {};
     // Explicit tail padding so the size does not depend on the alignment of
     // uint64_t (4 bytes on i386, 8 bytes on most other targets).
-    uint8_t padding[4];
+    uint8_t padding[4] = {};
   };
 
   static_assert(sizeof(Entry) == 256,
@@ -620,7 +620,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     return filesystem_writable_;
   }
   void SetFilesystemActiveNoLock(
-      bool active, IOStatus error = IOStatus::Corruption("Not active")) {
+      bool active, const IOStatus& error = IOStatus::Corruption("Not active")) {
     error.PermitUncheckedError();
     filesystem_active_ = active;
     if (!active) {
@@ -628,7 +628,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     }
   }
   void SetFilesystemActive(
-      bool active, IOStatus error = IOStatus::Corruption("Not active")) {
+      bool active, const IOStatus& error = IOStatus::Corruption("Not active")) {
     MutexLock l(&mutex_);
     error.PermitUncheckedError();
     SetFilesystemActiveNoLock(active, error);
@@ -687,7 +687,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     return fs_error_;
   }
 
-  void SetFileSystemIOError(IOStatus io_error) {
+  void SetFileSystemIOError(const IOStatus& io_error) {
     MutexLock l(&mutex_);
     io_error.PermitUncheckedError();
     fs_error_ = io_error;
@@ -922,13 +922,13 @@ class FaultInjectionTestFS : public FileSystemWrapper {
 
   struct ErrorContext {
     Random rand;
-    int one_in;
-    int count;
+    int one_in = 0;
+    int count = 0;
     bool enable_error_injection;
     void* callstack;
     std::string message;
     int frames;
-    ErrorType type;
+    ErrorType type = kErrorTypeStatus;
     bool retryable;
     bool has_data_loss;
 

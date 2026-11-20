@@ -453,9 +453,9 @@ class UniversalCompactionBuilder {
 
   const ImmutableOptions& ioptions_;
   const InternalKeyComparator* icmp_;
-  double score_;
+  double score_ = 0;
   std::vector<SortedRun> sorted_runs_;
-  uint64_t max_run_size_;
+  uint64_t max_run_size_ = 0;
   const std::string& cf_name_;
   const MutableCFOptions& mutable_cf_options_;
   const MutableDBOptions& mutable_db_options_;
@@ -467,7 +467,7 @@ class UniversalCompactionBuilder {
   // And this information is only passed to `Compaction` picked by deletion
   // triggered compaction for possible optimizations.
   std::optional<SequenceNumber> earliest_snapshot_;
-  const SnapshotChecker* snapshot_checker_;
+  const SnapshotChecker* snapshot_checker_ = nullptr;
   // Mapping from file id to its index in the sorted run for the files that are
   // marked for compaction. This is only populated when snapshot info is
   // populated.
@@ -795,7 +795,7 @@ Compaction* UniversalCompactionBuilder::PickCompaction() {
     return nullptr;
   }
 
-  VersionStorageInfo::LevelSummaryStorage tmp;
+  VersionStorageInfo::LevelSummaryStorage tmp{};
   ROCKS_LOG_BUFFER_MAX_SZ(
       log_buffer_, 3072,
       "[%s] Universal: sorted runs: %" ROCKSDB_PRIszt " files: %s\n",
@@ -945,14 +945,16 @@ Compaction* UniversalCompactionBuilder::PickCompactionToReduceSortedRuns(
       if (sr->being_compacted) {
         ROCKS_LOG_BUFFER(log_buffer_,
                          "[%s] Universal: %s"
-                         "[%d] being compacted, skipping for compaction to "
+                         "[%" ROCKSDB_PRIszt
+                         "] being compacted, skipping for compaction to "
                          "reduce sorted runs",
                          cf_name_.c_str(), file_num_buf, loop);
       } else if (sr->level_has_marked_standalone_rangedel) {
         ROCKS_LOG_BUFFER(
             log_buffer_,
             "[%s] Universal: %s"
-            "[%d] has standalone range tombstone files marked for "
+            "[%" ROCKSDB_PRIszt
+            "] has standalone range tombstone files marked for "
             "compaction, skipping for compaction to reduce sorted runs",
             cf_name_.c_str(), file_num_buf, loop);
       }
@@ -968,7 +970,7 @@ Compaction* UniversalCompactionBuilder::PickCompactionToReduceSortedRuns(
       sr->Dump(file_num_buf, sizeof(file_num_buf), true);
       ROCKS_LOG_BUFFER(log_buffer_,
                        "[%s] Universal: Possible candidate for compaction to "
-                       "reduce sorted runs %s[%d].",
+                       "reduce sorted runs %s[%" ROCKSDB_PRIszt "].",
                        cf_name_.c_str(), file_num_buf, loop);
     }
 

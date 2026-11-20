@@ -35,6 +35,7 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
 #include "monitoring/thread_status_util.h"
+#include "options/options_helper.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -493,11 +494,20 @@ Status FlushJob::MemPurge() {
       ctx.reason = TableFileCreationReason::kFlush;
       compaction_filter =
           ioptions.compaction_filter_factory->CreateCompactionFilter(ctx);
-      if (compaction_filter != nullptr &&
+      CompactionFilter::MergeOrder order;
+      s = GetCompactionFilterMergeOrder(
+          compaction_filter.get(), ioptions.compaction_filter_factory.get(),
+          TableFileCreationReason::kFlush, &order);
+      if (s.ok() && compaction_filter != nullptr &&
           !compaction_filter->IgnoreSnapshots()) {
         s = Status::NotSupported(
             "CompactionFilter::IgnoreSnapshots() = false is not supported "
             "anymore.");
+      }
+      if (!s.ok()) {
+        // Destroy the application filter before restoring the caller's lock.
+        compaction_filter.reset();
+        db_mutex_->Lock();
         return s;
       }
     }
@@ -515,6 +525,7 @@ Status FlushJob::MemPurge() {
     assert(env);
     MergeHelper merge(env, (cfd_->internal_comparator()).user_comparator(),
                       (ioptions.merge_operator).get(), compaction_filter.get(),
+                      CompactionFilter::MergeOrder::kFilterBeforeMerge,
                       ioptions.logger,
                       true /* internal key corruption is not ok */,
                       job_context_->GetLatestSnapshotSequence(),
@@ -1033,6 +1044,9 @@ Status FlushJob::WriteLevel0Table() {
           &oldest_ancestor_time);
       meta_.oldest_ancestor_time = oldest_ancestor_time;
       meta_.file_creation_time = current_time;
+      meta_.db_ownership_start_time = current_time;
+      meta_.data_file_provenance =
+          DataFileProvenanceForOrigin(DataFileProvenance::Origin::kFlush);
 
       uint64_t memtable_payload_bytes = 0;
       uint64_t memtable_garbage_bytes = 0;
@@ -1049,9 +1063,8 @@ Status FlushJob::WriteLevel0Table() {
           output_compression_, mutable_cf_options_.compression_opts,
           cfd_->GetID(), cfd_->GetName(), 0 /* level */,
           current_time /* newest_key_time */, false /* is_bottommost */,
-          TableFileCreationReason::kFlush, oldest_key_time, current_time,
-          db_id_, db_session_id_, 0 /* target_file_size */,
-          meta_.fd.GetNumber(),
+          TableFileCreationReason::kFlush, oldest_key_time, db_id_,
+          db_session_id_, 0 /* target_file_size */, meta_.fd.GetNumber(),
           preclude_last_level_min_seqno_ == kMaxSequenceNumber
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),

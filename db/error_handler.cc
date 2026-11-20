@@ -589,7 +589,7 @@ void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
 }
 
 void ErrorHandler::AddFilesToQuarantine(
-    autovector<const autovector<uint64_t>*> files_to_quarantine) {
+    const autovector<const autovector<uint64_t>*>& files_to_quarantine) {
   db_mutex_->AssertHeld();
   std::ostringstream quarantine_files_oss;
   bool is_first_one = true;

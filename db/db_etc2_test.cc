@@ -14,9 +14,12 @@
 #include <memory>
 
 #include "db/db_test_util.h"
+#include "db/log_format.h"
+#include "db/log_writer.h"
 #include "db/read_callback.h"
 #include "db/version_edit.h"
 #include "env/fs_readonly.h"
+#include "file/writable_file_writer.h"
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -28,6 +31,7 @@
 #include "rocksdb/utilities/replayer.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/testutil.h"
+#include "trace_replay/trace_replay.h"
 #include "util/defer.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
@@ -62,8 +66,9 @@ TEST_F(DBTest2, OpenForReadOnly) {
   // There should not be any subdirectories -- this is not checked here
   std::vector<std::string> files;
   ASSERT_OK(env_->GetChildren(dbname, &files));
+  const std::string dbname_prefix = dbname + "/";
   for (auto& f : files) {
-    ASSERT_OK(env_->DeleteFile(dbname + "/" + f));
+    ASSERT_OK(env_->DeleteFile(dbname_prefix + f));
   }
   // <dbname> should be empty now and we should be able to delete it
   ASSERT_OK(env_->DeleteDir(dbname));
@@ -93,8 +98,9 @@ TEST_F(DBTest2, OpenForReadOnlyWithColumnFamilies) {
   // There should not be any subdirectories -- this is not checked here
   std::vector<std::string> files;
   ASSERT_OK(env_->GetChildren(dbname, &files));
+  const std::string dbname_prefix = dbname + "/";
   for (auto& f : files) {
-    ASSERT_OK(env_->DeleteFile(dbname + "/" + f));
+    ASSERT_OK(env_->DeleteFile(dbname_prefix + f));
   }
   // <dbname> should be empty now and we should be able to delete it
   ASSERT_OK(env_->DeleteDir(dbname));
@@ -212,7 +218,7 @@ class PrefixFullBloomWithReverseComparator
   PrefixFullBloomWithReverseComparator()
       : DBTestBase("prefix_bloom_reverse", /*env_do_fsync=*/true) {}
   void SetUp() override { if_cache_filter_ = GetParam(); }
-  bool if_cache_filter_;
+  bool if_cache_filter_ = false;
 };
 
 TEST_P(PrefixFullBloomWithReverseComparator,
@@ -357,8 +363,8 @@ class DBTestSharedWriteBufferAcrossCFs
     use_old_interface_ = std::get<0>(GetParam());
     cost_cache_ = std::get<1>(GetParam());
   }
-  bool use_old_interface_;
-  bool cost_cache_;
+  bool use_old_interface_ = false;
+  bool cost_cache_ = false;
 };
 
 TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
@@ -394,9 +400,10 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   if (use_old_interface_) {
     options.db_write_buffer_size = 120000;  // this is the real limit
   } else if (!cost_cache_) {
-    options.write_buffer_manager.reset(new WriteBufferManager(114285));
+    options.write_buffer_manager = std::make_shared<WriteBufferManager>(114285);
   } else {
-    options.write_buffer_manager.reset(new WriteBufferManager(114285, cache));
+    options.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(114285, cache);
   }
   options.write_buffer_size = 500000;  // this is never hit
   CreateAndReopenWithCF({"pikachu", "dobrynia", "nikitich"}, options);
@@ -598,7 +605,7 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
   options.write_buffer_size = 500000;  // this is never hit
   // Use a write buffer total size so that the soft limit is about
   // 105000.
-  options.write_buffer_manager.reset(new WriteBufferManager(120000));
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(120000);
   CreateAndReopenWithCF({"cf1", "cf2"}, options);
 
   ASSERT_OK(DestroyDB(dbname2, options));
@@ -694,7 +701,7 @@ TEST_F(DBTest2, TestWriteBufferNoLimitWithCache) {
   options.write_buffer_size = 50000;  // this is never hit
   // Use a write buffer total size so that the soft limit is about
   // 105000.
-  options.write_buffer_manager.reset(new WriteBufferManager(0, cache));
+  options.write_buffer_manager = std::make_shared<WriteBufferManager>(0, cache);
   Reopen(options);
 
   ASSERT_OK(Put("foo", "bar"));
@@ -771,12 +778,12 @@ TEST_F(DBTest2, WalFilterTest) {
   // Create 3 batches with two keys each
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   // Test with all WAL processing options
   for (int option = 0;
@@ -872,6 +879,7 @@ TEST_F(DBTest2, WalFilterTest) {
         }
         break;
       }
+      case WalFilter::WalProcessingOption::kWalProcessingOptionMax:
       default:
         FAIL();  // unhandled case
     }
@@ -965,12 +973,12 @@ TEST_F(DBTest2, WalFilterTestWithChangeBatch) {
 
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1057,12 +1065,12 @@ TEST_F(DBTest2, WalFilterTestWithChangeBatchExtraKeys) {
 
   std::vector<std::vector<std::string>> batch_keys(3);
 
-  batch_keys[0].push_back("key1");
-  batch_keys[0].push_back("key2");
-  batch_keys[1].push_back("key3");
-  batch_keys[1].push_back("key4");
-  batch_keys[2].push_back("key5");
-  batch_keys[2].push_back("key6");
+  batch_keys[0].emplace_back("key1");
+  batch_keys[0].emplace_back("key2");
+  batch_keys[1].emplace_back("key3");
+  batch_keys[1].emplace_back("key4");
+  batch_keys[2].emplace_back("key5");
+  batch_keys[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1153,8 +1161,7 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
           // (i.e. isn't flushed to SST file(s) for column_family_id)
           // add it to the cf_wal_keys_ map for verification.
           if (log_number_ >= log_number_for_cf) {
-            cf_wal_keys_[column_family_id].push_back(
-                std::string(key.data(), key.size()));
+            cf_wal_keys_[column_family_id].emplace_back(key.data(), key.size());
           }
           return Status::OK();
         }
@@ -1184,12 +1191,12 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
 
   std::vector<std::vector<std::string>> batch_keys_pre_flush(3);
 
-  batch_keys_pre_flush[0].push_back("key1");
-  batch_keys_pre_flush[0].push_back("key2");
-  batch_keys_pre_flush[1].push_back("key3");
-  batch_keys_pre_flush[1].push_back("key4");
-  batch_keys_pre_flush[2].push_back("key5");
-  batch_keys_pre_flush[2].push_back("key6");
+  batch_keys_pre_flush[0].emplace_back("key1");
+  batch_keys_pre_flush[0].emplace_back("key2");
+  batch_keys_pre_flush[1].emplace_back("key3");
+  batch_keys_pre_flush[1].emplace_back("key4");
+  batch_keys_pre_flush[2].emplace_back("key5");
+  batch_keys_pre_flush[2].emplace_back("key6");
 
   Options options = OptionsForLogIterTest();
   DestroyAndReopen(options);
@@ -1213,12 +1220,12 @@ TEST_F(DBTest2, WalFilterTestWithColumnFamilies) {
   // Do some more writes
   std::vector<std::vector<std::string>> batch_keys_post_flush(3);
 
-  batch_keys_post_flush[0].push_back("key7");
-  batch_keys_post_flush[0].push_back("key8");
-  batch_keys_post_flush[1].push_back("key9");
-  batch_keys_post_flush[1].push_back("key10");
-  batch_keys_post_flush[2].push_back("key11");
-  batch_keys_post_flush[2].push_back("key12");
+  batch_keys_post_flush[0].emplace_back("key7");
+  batch_keys_post_flush[0].emplace_back("key8");
+  batch_keys_post_flush[1].emplace_back("key9");
+  batch_keys_post_flush[1].emplace_back("key10");
+  batch_keys_post_flush[2].emplace_back("key11");
+  batch_keys_post_flush[2].emplace_back("key12");
 
   // Write given keys in given batches
   for (size_t i = 0; i < batch_keys_post_flush.size(); i++) {
@@ -2055,8 +2062,8 @@ class PinL0IndexAndFilterBlocksTest
     table_options.block_cache->EraseUnRefEntries();
   }
 
-  bool infinite_max_files_;
-  bool disallow_preload_;
+  bool infinite_max_files_ = false;
+  bool disallow_preload_ = false;
 };
 
 TEST_P(PinL0IndexAndFilterBlocksTest,
@@ -2520,8 +2527,8 @@ TEST_F(DBTest2, PersistentCache) {
   for (auto bsize : bsizes) {
     for (auto type : types) {
       BlockBasedTableOptions table_options;
-      table_options.persistent_cache.reset(
-          new MockPersistentCache(type, 10 * 1024));
+      table_options.persistent_cache =
+          std::make_shared<MockPersistentCache>(type, 10 * 1024);
       table_options.no_block_cache = true;
       table_options.block_cache = bsize ? NewLRUCache(bsize) : nullptr;
       options.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -2838,7 +2845,7 @@ TEST_F(DBTest2, AutomaticCompactionOverlapManualCompaction) {
   cro.target_level = 2;
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
 
-  auto get_stat = [](std::string level_str, LevelStatType type,
+  auto get_stat = [](const std::string& level_str, LevelStatType type,
                      std::map<std::string, std::string> props) {
     auto prop_str =
         "compaction." + level_str + "." +
@@ -3382,8 +3389,8 @@ class CancelCompactionListener : public EventListener {
 
   std::atomic<size_t> num_compaction_started_;
   std::atomic<size_t> num_compaction_ended_;
-  Status::Code code_;
-  Status::SubCode subcode_;
+  Status::Code code_ = Status::kOk;
+  Status::SubCode subcode_ = Status::kNone;
 };
 
 TEST_F(DBTest2, CancelManualCompactionWithListener) {
@@ -4449,7 +4456,8 @@ TEST_F(DBTest2, TraceAndReplay) {
 
   TraceExecutionResultHandler res_handler;
   std::function<void(Status, std::unique_ptr<TraceRecordResult>&&)> res_cb =
-      [&res_handler](Status exec_s, std::unique_ptr<TraceRecordResult>&& res) {
+      [&res_handler](const Status& exec_s,
+                     std::unique_ptr<TraceRecordResult>&& res) {
         ASSERT_TRUE(exec_s.ok() || exec_s.IsNotSupported());
         if (res != nullptr) {
           ASSERT_OK(res->Accept(&res_handler));
@@ -5153,6 +5161,96 @@ TEST_F(DBTest2, TraceRecordsReadWriteOptions) {
   }
 }
 
+// A newer RocksDB may add query record fields under payload bits this one
+// does not know. They are encoded after the known fields, which still decode.
+TEST_F(DBTest2, TraceDecoderIgnoresUnknownRecordFields) {
+  const std::string trace_filename = dbname_ + "/rocksdb.trace";
+  std::unique_ptr<TraceWriter> trace_writer;
+  ASSERT_OK(
+      NewFileTraceWriter(env_, EnvOptions(), trace_filename, &trace_writer));
+  TraceOptions trace_options;
+  trace_options.include_read_write_options = true;
+  ASSERT_OK(db_->StartTrace(trace_options, std::move(trace_writer)));
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  ASSERT_OK(db_->Put(write_options, "a", "1"));
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  std::string value;
+  ASSERT_OK(db_->Get(read_options, "a", &value));
+  std::vector<std::string> values;
+  for (const Status& s : db_->MultiGet(read_options, {Slice("a")}, &values)) {
+    ASSERT_OK(s);
+  }
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    iter->Seek("a");
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_OK(db_->EndTrace());
+
+  std::unique_ptr<TraceReader> trace_reader;
+  ASSERT_OK(
+      NewFileTraceReader(env_, EnvOptions(), trace_filename, &trace_reader));
+  int decoded = 0;
+  std::string encoded;
+  while (trace_reader->Read(&encoded).ok()) {
+    Trace trace;
+    ASSERT_OK(TracerHelper::DecodeTrace(encoded, &trace));
+    if (trace.type != kTraceWrite && trace.type != kTraceGet &&
+        trace.type != kTraceMultiGet && trace.type != kTraceIteratorSeek) {
+      continue;
+    }
+    Trace extended = trace;
+    EncodeFixed64(&extended.payload[0],
+                  DecodeFixed64(trace.payload.data()) | (uint64_t{1} << 40));
+    extended.payload.append("a field from a newer version");
+    std::unique_ptr<TraceRecord> expected;
+    std::unique_ptr<TraceRecord> actual;
+    ASSERT_OK(TracerHelper::DecodeTraceRecord(&trace, kTraceFileMinorVersion,
+                                              &expected));
+    ASSERT_OK(TracerHelper::DecodeTraceRecord(&extended, kTraceFileMinorVersion,
+                                              &actual));
+    ASSERT_EQ(expected->GetTraceType(), actual->GetTraceType());
+    switch (trace.type) {
+      case kTraceWrite: {
+        auto* e = static_cast<WriteQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<WriteQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetWriteBatchRep(), a->GetWriteBatchRep());
+        ASSERT_NE(a->GetWriteOptions(), nullptr);
+        ASSERT_TRUE(a->GetWriteOptions()->disableWAL);
+        break;
+      }
+      case kTraceGet: {
+        auto* e = static_cast<GetQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<GetQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKey(), a->GetKey());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+      case kTraceMultiGet: {
+        auto* e = static_cast<MultiGetQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<MultiGetQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKeys(), a->GetKeys());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+      default: {
+        auto* e = static_cast<IteratorSeekQueryTraceRecord*>(expected.get());
+        auto* a = static_cast<IteratorSeekQueryTraceRecord*>(actual.get());
+        ASSERT_EQ(e->GetKey(), a->GetKey());
+        ASSERT_NE(a->GetReadOptions(), nullptr);
+        ASSERT_FALSE(a->GetReadOptions()->fill_cache);
+        break;
+      }
+    }
+    ++decoded;
+  }
+  ASSERT_EQ(decoded, 4);
+}
+
 // A call that the live DB served without I/O (here from the memtable) needs
 // I/O on the replay target, so with its recorded read_tier=kBlockCacheTier it
 // returns Incomplete; a write with sync and disableWAL fails live and on
@@ -5312,7 +5410,7 @@ TEST_F(DBTest2, TraceReplayPreparesValuesOfCapturedSeekResults) {
   int seeks = 0;
   ASSERT_OK(replayer->Replay(
       ReplayOptions(1, 1.0),
-      [&](Status exec_s, std::unique_ptr<TraceRecordResult>&& res) {
+      [&](const Status& exec_s, std::unique_ptr<TraceRecordResult>&& res) {
         ASSERT_OK(exec_s);
         auto* seek = dynamic_cast<IteratorTraceExecutionResult*>(res.get());
         ASSERT_NE(seek, nullptr);
@@ -6153,6 +6251,7 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
   std::vector<std::thread> open_threads;
   std::vector<std::unique_ptr<DB>> dbs(kNumDbs);
   options.create_if_missing = true;
+  open_threads.reserve(kNumDbs);
   for (int i = 0; i < kNumDbs; ++i) {
     open_threads.emplace_back(
         [&](int dbnum) {
@@ -7377,11 +7476,11 @@ TEST_F(DBTest2, VariousFileTemperatures) {
       }
     }
 
-    Temperature optimize_manifest_temperature;
-    Temperature optimize_wal_temperature;
-    Temperature expected_manifest_temperature;
-    Temperature expected_other_metadata_temperature;
-    Temperature expected_wal_temperature;
+    Temperature optimize_manifest_temperature = Temperature::kUnknown;
+    Temperature optimize_wal_temperature = Temperature::kUnknown;
+    Temperature expected_manifest_temperature = Temperature::kUnknown;
+    Temperature expected_other_metadata_temperature = Temperature::kUnknown;
+    Temperature expected_wal_temperature = Temperature::kUnknown;
     std::array<RelaxedAtomic<int>, kNumberFileTypes> counts;
   };
 
@@ -8950,7 +9049,7 @@ TEST_F(DBTest2, MultiGetBlockCacheTierSkipsColdSstData) {
   ASSERT_TRUE(statuses[1].IsIncomplete());
 }
 
-TEST_F(DBTest2, GetFileChecksumsFromCurrentManifest_CRC32) {
+TEST_F(DBTest2, GetFileChecksumsFromCurrentManifestCRC32) {
   Options opts = CurrentOptions();
   opts.create_if_missing = true;
   opts.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
@@ -9020,6 +9119,163 @@ TEST_F(DBTest2, GetFileChecksumsFromCurrentManifest_CRC32) {
     ASSERT_EQ(live_files[i].file_checksum, stored_checksum);
     ASSERT_EQ(live_files[i].file_checksum_func_name, stored_func_name);
   }
+}
+
+// The DB ID is read from the MANIFEST file of an open DB, from the new MANIFEST
+// file that a reopen writes, and from a MANIFEST file of a closed DB.
+TEST_F(DBTest2, GetDbIdentityFromManifest) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  std::string db_id;
+  ASSERT_OK(db_->GetDbIdentity(db_id));
+  ASSERT_FALSE(db_id.empty());
+  // The function does not write, so it works on a read-only file system.
+  std::shared_ptr<FileSystem> read_only_fs =
+      std::make_shared<ReadOnlyFileSystem>(env_->GetFileSystem());
+  const auto expect_db_id = [&](uint64_t manifest_number) {
+    std::string read_db_id;
+    ASSERT_OK(experimental::GetDbIdentityFromManifest(
+        read_only_fs.get(), DescriptorFileName(dbname_, manifest_number),
+        &read_db_id));
+    ASSERT_EQ(db_id, read_db_id);
+  };
+
+  const uint64_t first_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  expect_db_id(first_manifest);
+
+  Reopen(options);
+  const uint64_t second_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  ASSERT_NE(first_manifest, second_manifest);
+  expect_db_id(second_manifest);
+
+  Close();
+  expect_db_id(second_manifest);
+}
+
+// A MANIFEST file with no DB ID gives NotFound, a record that fails its
+// checksum gives Corruption, and a missing file gives the file system error.
+TEST_F(DBTest2, GetDbIdentityFromManifestErrors) {
+  Options options = CurrentOptions();
+  options.write_dbid_to_manifest = false;
+  DestroyAndReopen(options);
+  const std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  FileSystem* fs = env_->GetFileSystem().get();
+  std::string db_id;
+
+  Status s = experimental::GetDbIdentityFromManifest(fs, manifest_path, &db_id);
+  ASSERT_EQ(Status::Code::kNotFound, s.code());
+  ASSERT_TRUE(db_id.empty());
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(fs, manifest_path, &contents));
+  ASSERT_GT(contents.size(), size_t{log::kHeaderSize});
+  contents[log::kHeaderSize] ^= 1;
+  const std::string damaged_path = manifest_path + ".damaged";
+  ASSERT_OK(WriteStringToFile(fs, contents, damaged_path));
+  s = experimental::GetDbIdentityFromManifest(fs, damaged_path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
+
+  s = experimental::GetDbIdentityFromManifest(
+      fs, DescriptorFileName(dbname_, 999999), &db_id);
+  ASSERT_EQ(Status::Code::kIOError, s.code());
+  ASSERT_EQ(Status::SubCode::kPathNotFound, s.subcode());
+}
+
+namespace {
+// Returns the contents of a log file in the MANIFEST file format with the given
+// records.
+std::string LogFileWithRecords(const std::vector<std::string>& records) {
+  test::StringSink* sink = new test::StringSink();
+  std::unique_ptr<FSWritableFile> sink_holder(sink);
+  log::Writer writer(std::make_unique<WritableFileWriter>(
+                         std::move(sink_holder), "manifest", FileOptions()),
+                     0 /* log_number */, false /* recycle_log_files */);
+  for (const std::string& record : records) {
+    EXPECT_OK(writer.AddRecord(WriteOptions(), record));
+  }
+  EXPECT_OK(writer.WriteBuffer(WriteOptions()));
+  return sink->contents_;
+}
+
+std::string EncodeVersionEdit(const VersionEdit& edit) {
+  std::string record;
+  EXPECT_TRUE(edit.EncodeTo(&record));
+  return record;
+}
+}  // namespace
+
+// The DB ID can be in a later record than the first. When a record in an
+// earlier log block fails its checksum, the function returns Corruption, not
+// the DB ID of the later record: it does not skip damaged data.
+TEST_F(DBTest2, GetDbIdentityFromManifestInLaterRecord) {
+  const std::string kDbId = "db-id-in-a-later-record";
+  // log::Reader drops the rest of a log block after a checksum failure and
+  // continues with the next block. The record with the DB ID must start in a
+  // block after the damaged one, so that the reader would return it if the
+  // function ignored the error. The first record has a column family name of
+  // 2 * log::kBlockSize bytes, so it fills blocks 0 and 1 and ends in block 2,
+  // where the record with the DB ID follows. The test changes the first payload
+  // byte of block 0.
+  VersionEdit first;
+  first.AddColumnFamily(std::string(2 * log::kBlockSize, 'c'));
+  VersionEdit second;
+  second.SetDBId(kDbId);
+  std::string contents =
+      LogFileWithRecords({EncodeVersionEdit(first), EncodeVersionEdit(second)});
+  FileSystem* fs = env_->GetFileSystem().get();
+  ASSERT_OK(env_->CreateDirIfMissing(dbname_));
+  const std::string path = dbname_ + "/manifest_with_later_db_id";
+  std::string db_id;
+
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  ASSERT_OK(experimental::GetDbIdentityFromManifest(fs, path, &db_id));
+  ASSERT_EQ(kDbId, db_id);
+
+  // One changed byte in the payload of the first record.
+  contents[log::kHeaderSize] ^= 1;
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  db_id.clear();
+  Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
+  ASSERT_TRUE(db_id.empty());
+}
+
+// An empty file, and a file truncated inside the header or the body of the
+// record with the DB ID, give NotFound: a truncated record at the end of the
+// file counts as the end of the file. A record that passes its checksum but
+// cannot be decoded gives Corruption.
+TEST_F(DBTest2, GetDbIdentityFromManifestTruncatedOrUndecodable) {
+  const std::string kDbId = "db-id";
+  VersionEdit edit;
+  edit.SetDBId(kDbId);
+  const std::string contents = LogFileWithRecords({EncodeVersionEdit(edit)});
+  ASSERT_GT(contents.size(), size_t{log::kHeaderSize});
+  FileSystem* fs = env_->GetFileSystem().get();
+  ASSERT_OK(env_->CreateDirIfMissing(dbname_));
+  const std::string path = dbname_ + "/manifest_copy";
+  std::string db_id;
+
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  ASSERT_OK(experimental::GetDbIdentityFromManifest(fs, path, &db_id));
+  ASSERT_EQ(kDbId, db_id);
+
+  for (size_t size :
+       {size_t{0}, size_t{log::kHeaderSize - 1}, contents.size() - 1}) {
+    SCOPED_TRACE("size=" + std::to_string(size));
+    ASSERT_OK(WriteStringToFile(fs, contents.substr(0, size), path));
+    db_id.clear();
+    Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+    ASSERT_EQ(Status::Code::kNotFound, s.code());
+    ASSERT_TRUE(db_id.empty());
+  }
+
+  // Tag 0 is not a VersionEdit tag.
+  ASSERT_OK(
+      WriteStringToFile(fs, LogFileWithRecords({std::string(1, '\0')}), path));
+  Status s = experimental::GetDbIdentityFromManifest(fs, path, &db_id);
+  ASSERT_EQ(Status::Code::kCorruption, s.code());
 }
 
 // Parameterized by (allow_concurrent_memtable_write,

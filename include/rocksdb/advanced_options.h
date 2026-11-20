@@ -752,7 +752,7 @@ struct AdvancedColumnFamilyOptions {
   // Default: a factory that provides a skip-list-based implementation of
   // MemTableRep.
   std::shared_ptr<MemTableRepFactory> memtable_factory =
-      std::shared_ptr<SkipListFactory>(new SkipListFactory);
+      std::make_shared<SkipListFactory>();
 
   // Block-based table related options are moved to BlockBasedTableOptions.
   // Related options that were originally here but now moved include:
@@ -923,6 +923,12 @@ struct AdvancedColumnFamilyOptions {
   // oldest_ancestor_time table properties in order, if they have valid
   // non-zero values; if not, the age is based on the file's last modified time
   // (given by the underlying Env).
+  //
+  // For a file added by IngestExternalFile() or CreateColumnFamilyWithImport(),
+  // the age is based on the creation time recorded in the file or import
+  // metadata (when known and not in the future), not on when it was added, so
+  // such a file can be compacted soon after it is added. See also
+  // IngestExternalFileOptions::reject_too_old_file.
   //
   // This option only supports block based table format for any compaction
   // style.
@@ -1231,6 +1237,16 @@ struct AdvancedColumnFamilyOptions {
   //  - read-only and secondary opens can read flushed/manifest-visible blob
   //    files, but do not resolve still-active direct-write blob files.
   //
+  // An SstFileManager max allowed space is a soft limit for direct-write blob
+  // files. Their bytes are already on disk when a file is sealed, so the seal
+  // and the write or flush that triggered it still succeed, the file is kept,
+  // and writes then stop with a SpaceLimit background error. A direct-write
+  // blob file is counted only once it is sealed, and memtables waiting for a
+  // flush are not flushed after the error, so usage can exceed the limit by up
+  // to about blob_file_size * blob_direct_write_partitions for each memtable
+  // not flushed yet (up to max_write_buffer_number). Blob files written by
+  // flush or compaction instead fail that job and are deleted.
+  //
   // Default: false
   //
   // Not dynamically changeable through the SetOptions() API.
@@ -1352,7 +1368,10 @@ struct AdvancedColumnFamilyOptions {
   // "BottommostFiles". Usually such compaction can happen as soon as a
   // relevant snapshot is released. This option allows user to delay
   // such compactions. A file is qualified for "BottommostFiles" compaction
-  // if it is at least "bottommost_file_compaction_delay" seconds old.
+  // if this DB has held it for at least "bottommost_file_compaction_delay"
+  // seconds, i.e. since the DB started writing it or, for an ingested or
+  // imported file, since the file was added to the DB (see
+  // SstFileMetaData::db_ownership_start_time).
   //
   // Default: 0 (no delay)
   // Dynamically changeable through the SetOptions() API.

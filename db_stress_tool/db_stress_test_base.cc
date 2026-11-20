@@ -617,6 +617,22 @@ bool NeedsFaultInjection() {
          FLAGS_test_cf_lifecycle;
 }
 
+// Resolves --read_index. The auto value (-1) reads through the trie when it is
+// built as the secondary index, which kDefault reads would never use.
+ReadOptions::ReadIndex EffectiveReadIndex() {
+  if (FLAGS_read_index >= 0) {
+    return static_cast<ReadOptions::ReadIndex>(FLAGS_read_index);
+  }
+  const BlockBasedTableOptions::IndexMode index_mode =
+      static_cast<BlockBasedTableOptions::IndexMode>(FLAGS_index_mode);
+  const bool trie_is_secondary =
+      FLAGS_use_trie_index &&
+      (index_mode == BlockBasedTableOptions::IndexMode::kStandardDefault ||
+       index_mode == BlockBasedTableOptions::IndexMode::kStandardRequired);
+  return trie_is_secondary ? ReadOptions::ReadIndex::kPreferCustom
+                           : ReadOptions::ReadIndex::kDefault;
+}
+
 std::string GetFaultInjectionLogBaseDir() {
   if (!FLAGS_env_uri.empty() || !FLAGS_fs_uri.empty()) {
     return "/tmp";
@@ -1416,8 +1432,9 @@ void StressTest::InitializeListenersForOpen(
     SharedState* shared,
     const std::vector<ColumnFamilyDescriptor>& cf_descriptors) {
   options_.listeners.clear();
-  options_.listeners.emplace_back(new DbStressListener(
-      GetDbPath(), options_.db_paths, cf_descriptors, shared));
+  db_stress_listener_ = std::make_shared<DbStressListener>(
+      GetDbPath(), options_.db_paths, cf_descriptors, shared);
+  options_.listeners.emplace_back(db_stress_listener_);
   RegisterAdditionalListeners();
 
   if (!FLAGS_listener_uri.empty()) {
@@ -1463,7 +1480,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
       fprintf(stderr,
               "No secondary cache registered matching string: %s status=%s\n",
               FLAGS_secondary_cache_uri.c_str(), s.ToString().c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     if (FLAGS_secondary_cache_fault_one_in > 0) {
       secondary_cache = std::make_shared<FaultInjectionSecondaryCache>(
@@ -1475,7 +1492,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
       fprintf(stderr,
               "Cannot specify both compressed_secondary_cache_size and %s\n",
               FLAGS_cache_type.c_str());
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     CompressedSecondaryCacheOptions opts;
     opts.capacity = FLAGS_compressed_secondary_cache_size;
@@ -1486,7 +1503,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
     secondary_cache = NewCompressedSecondaryCache(opts);
     if (secondary_cache == nullptr) {
       fprintf(stderr, "Failed to allocate compressed secondary cache\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     compressed_secondary_cache = secondary_cache;
   }
@@ -1503,7 +1520,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
   }
   if (cache_type == "clock_cache") {
     fprintf(stderr, "Old clock cache implementation has been removed.\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   } else if (EndsWith(cache_type, "hyper_clock_cache")) {
     size_t estimated_entry_charge;
     if (cache_type == "fixed_hyper_clock_cache") {
@@ -1513,7 +1530,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
       estimated_entry_charge = 0;
     } else {
       fprintf(stderr, "Cache type not supported.");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
     HyperClockCacheOptions opts(cache_size, estimated_entry_charge,
                                 num_shard_bits);
@@ -1569,7 +1586,7 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
     }
   } else {
     fprintf(stderr, "Cache type not supported.");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   return block_cache;
 }
@@ -1595,7 +1612,10 @@ bool StressTest::BuildOptionsTable() {
     return true;
   }
 
-  bool keepRibbonFilterPolicyOnly = FLAGS_bloom_before_level != INT_MAX;
+  const bool is_block_based_table = options_.table_factory->IsInstanceOf(
+      TableFactory::kBlockBasedTableName());
+  const bool keepRibbonFilterPolicyOnly =
+      is_block_based_table && FLAGS_bloom_before_level != INT_MAX;
 
   std::unordered_map<std::string, std::vector<std::string>> options_tbl = {
       {"write_buffer_size",
@@ -1661,18 +1681,21 @@ bool StressTest::BuildOptionsTable() {
            "1",
            "2",
        }},
-      {"block_based_table_factory",
-       {
-           keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:2.35}"
-                                      : "{filter_policy=bloomfilter:2.34}",
-           "{filter_policy=ribbonfilter:5.67:-1}",
-           keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:8.9:3}"
-                                      : "{filter_policy=nullptr}",
-           "{block_size=" + std::to_string(FLAGS_block_size) + "}",
-           "{block_size=" +
-               std::to_string(FLAGS_block_size + (FLAGS_seed & 0xFFFU)) + "}",
-       }},
   };
+  if (is_block_based_table) {
+    options_tbl.emplace(
+        "block_based_table_factory",
+        std::vector<std::string>{
+            keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:2.35}"
+                                       : "{filter_policy=bloomfilter:2.34}",
+            "{filter_policy=ribbonfilter:5.67:-1}",
+            keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:8.9:3}"
+                                       : "{filter_policy=nullptr}",
+            "{block_size=" + std::to_string(FLAGS_block_size) + "}",
+            "{block_size=" +
+                std::to_string(FLAGS_block_size + (FLAGS_seed & 0xFFFU)) + "}",
+        });
+  }
   if (FLAGS_use_multiscan == 0) {
     // TODO: this can fail MultiScan when consecutive data blocks share the
     // same user at boundary. MultiScan uses user key to locate the block to
@@ -1703,7 +1726,7 @@ bool StressTest::BuildOptionsTable() {
             std::to_string(options_.level0_file_num_compaction_trigger + 4),
         });
   }
-  if (FLAGS_unordered_write) {
+  if (FLAGS_unordered_write || FLAGS_rep_factory == kSortedHash) {
     options_tbl.emplace("max_successive_merges", std::vector<std::string>{"0"});
   } else {
     options_tbl.emplace("max_successive_merges",
@@ -1909,7 +1932,7 @@ Status StressTest::AssertSame(DB* db, ColumnFamilyHandle* cf,
   return Status::OK();
 }
 
-void StressTest::ProcessStatus(SharedState* shared, std::string opname,
+void StressTest::ProcessStatus(SharedState* shared, const std::string& opname,
                                const Status& s,
                                bool ignore_injected_error) const {
   if (s.ok()) {
@@ -1923,13 +1946,14 @@ void StressTest::ProcessStatus(SharedState* shared, std::string opname,
   }
 }
 
-void StressTest::VerificationAbort(SharedState* shared, std::string msg) const {
+void StressTest::VerificationAbort(SharedState* shared,
+                                   const std::string& msg) const {
   fprintf(stderr, "Verification failed: %s\n", msg.c_str());
   shared->SetVerificationFailure();
 }
 
-void StressTest::VerificationAbort(SharedState* shared, std::string msg, int cf,
-                                   int64_t key) const {
+void StressTest::VerificationAbort(SharedState* shared, const std::string& msg,
+                                   int cf, int64_t key) const {
   auto key_str = Key(key);
   Slice key_slice = key_str;
   fprintf(stderr,
@@ -1938,8 +1962,8 @@ void StressTest::VerificationAbort(SharedState* shared, std::string msg, int cf,
   shared->SetVerificationFailure();
 }
 
-void StressTest::VerificationAbort(SharedState* shared, std::string msg, int cf,
-                                   int64_t key, Slice value_from_db,
+void StressTest::VerificationAbort(SharedState* shared, const std::string& msg,
+                                   int cf, int64_t key, Slice value_from_db,
                                    Slice value_from_expected) const {
   auto key_str = Key(key);
   fprintf(stderr,
@@ -2070,6 +2094,9 @@ std::string StressTest::DebugString(const Slice& value,
 }
 
 void StressTest::PrintStatistics() {
+  if (FLAGS_merge_before_compaction_filter) {
+    GetDbStressMergeFilterCounters().Print();
+  }
   // Print statistics from the DB instance instead of global dbstats
   if (db_) {
     auto stats = db_->GetOptions().statistics;
@@ -2386,6 +2413,29 @@ Status StressTest::CommitTxn(Transaction& txn, ThreadState* thread) {
                 txn.GetName().c_str(), s.ToString().c_str(),
                 rollback_s.ToString().c_str(), rollback_recovery_retries,
                 resume_busy_count, last_resume_status.c_str());
+        // The transaction stays prepared in the DB, and the caller resets the
+        // expected values of its keys to their old values. The test cannot
+        // keep those expected values correct:
+        // - When the transaction object is destroyed, its locks are released,
+        //   so other threads can write and commit the same keys.
+        // - When db_stress starts again, ProcessRecoveredPreparedTxns()
+        //   commits or rolls back the recovered transaction at random. A
+        //   commit makes the writes of the failed transaction visible, for
+        //   example a Delete of a key that the expected state marks as a
+        //   pending Put. In WriteCommitted these writes also win over later
+        //   writes to the same key.
+        // - A DB reopen in the same process does not resolve the transaction
+        //   either. It stays prepared until db_stress starts again, and then
+        //   the case above applies.
+        // Stop now, so that this message is the first and only error, instead
+        // of a later verification failure that looks like data loss.
+        if (thread != nullptr) {
+          thread->shared->SafeTerminate();
+        }
+        // Without a thread state (DB preload), no worker thread of this DB has
+        // started yet, so no other thread can print an error for this DB at
+        // the same time.
+        std::terminate();
       }
     }
     if (thread && FLAGS_create_timestamped_snapshot_one_in > 0 &&
@@ -2470,8 +2520,8 @@ void StressTest::OperateDb(ThreadState* thread) {
   read_opts.allow_unprepared_value = FLAGS_allow_unprepared_value;
   read_opts.auto_refresh_iterator_with_snapshot =
       FLAGS_auto_refresh_iterator_with_snapshot;
-  if (FLAGS_use_trie_index && !FLAGS_use_udi_as_primary_index && udi_factory_) {
-    read_opts.table_index_factory = udi_factory_.get();
+  if (udi_factory_) {
+    read_opts.read_index = EffectiveReadIndex();
   }
   std::unique_ptr<StressReadScopedBlockBufferProvider>
       read_scoped_block_buffer_provider;
@@ -2531,9 +2581,6 @@ void StressTest::OperateDb(ThreadState* thread) {
       }
       // Commenting this out as we don't want to reset stats on each open.
       // thread->stats.Start();
-      if (FLAGS_use_trie_index && udi_factory_) {
-        read_opts.table_index_factory = udi_factory_.get();
-      }
     }
 
 #ifndef NDEBUG
@@ -3709,21 +3756,21 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
     expect_total_order = true;
   } else if (thread->rand.OneIn(2)) {
     ro.prefix_same_as_start = true;
+    // prefix_same_as_start takes precedence over total_order_seek, which is
+    // also how every iterator looks under prefix_seek_opt_in_only.
+    ro.total_order_seek = thread->rand.OneIn(2);
   }
-  // Run SeekToFirst() after Seek() on the same table iterator under
-  // prefix_same_as_start, without bounds. DBIter converts SeekToFirst() with a
-  // lower bound to Seek(lower_bound). An upper bound inside the first prefix
-  // ends the scan before the verifier can tell a truncated scan from a complete
-  // one. prefix_hash returns nothing from a prefix SeekToFirst().
-  const bool cover_seek_to_first_after_seek =
-      ro.prefix_same_as_start && FLAGS_memtablerep != "prefix_hash" &&
-      thread->rand.OneIn(8);
+  // Under prefix_same_as_start, SeekToFirst() and SeekToLast() return
+  // NotSupported with prefix_seek_opt_in_only. Without it they are not well
+  // supported (they can skip live keys when range tombstones cross prefix
+  // boundaries), so they are not verified.
+  const bool expect_seek_to_first_last_not_supported =
+      ro.prefix_same_as_start && FLAGS_prefix_seek_opt_in_only;
 
   std::string upper_bound_str;
   Slice upper_bound;
   // Prefer no bound with no range query filtering; prefer bound with it
-  if (!cover_seek_to_first_after_seek &&
-      (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16))) {
+  if (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16)) {
     // Note: upper_bound can be smaller than the seek key.
     const int64_t rand_upper_key = GenerateOneKey(thread, FLAGS_ops_per_thread);
     upper_bound_str = Key(rand_upper_key);
@@ -3733,8 +3780,7 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
 
   std::string lower_bound_str;
   Slice lower_bound;
-  if (!cover_seek_to_first_after_seek &&
-      (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16))) {
+  if (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16)) {
     // Note: lower_bound can be greater than the seek key.
     const int64_t rand_lower_key = GenerateOneKey(thread, FLAGS_ops_per_thread);
     lower_bound_str = Key(rand_lower_key);
@@ -3823,13 +3869,8 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
 
     Slice key(key_str);
 
-    // DBIter converts SeekToFirst() with a lower bound to Seek(lower_bound),
-    // which VerifyIterator() does not handle. SeekToLast() is only verified
-    // under total order.
     const bool support_seek_to_first =
-        (expect_total_order && FLAGS_test_backward_scan) ||
-        (ro.prefix_same_as_start && ro.iterate_lower_bound == nullptr &&
-         FLAGS_memtablerep != "prefix_hash");
+        expect_total_order && FLAGS_test_backward_scan;
     const bool support_seek_to_last =
         expect_total_order && FLAGS_test_backward_scan;
     const bool support_seek_for_prev = FLAGS_test_backward_scan;
@@ -3846,31 +3887,30 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
       op_logs += "Refresh ";
     }
 
-    LastIterateOp last_op;
-    // Under prefix_same_as_start a SeekToFirst() scan covers the prefix of the
-    // first key.
-    std::string verify_key_str;
-    Slice verify_key = key;
-    if (support_seek_to_first &&
-        thread->rand.OneIn(cover_seek_to_first_after_seek ? 4 : 100)) {
-      if (cover_seek_to_first_after_seek) {
-        // If this Seek() read the first data block, the block would be cached
-        // and SeekToFirst() would not read the file.
-        const std::string pre_seek_key =
-            Key(GenerateOneKey(thread, FLAGS_ops_per_thread));
-        iter->Seek(pre_seek_key);
-        cmp_iter->Seek(pre_seek_key);
-        op_logs += "PreS " + Slice(pre_seek_key).ToString(true) + " ";
-        thread->stats.AddSeekToFirstAfterSeek(1);
+    if (expect_seek_to_first_last_not_supported && thread->rand.OneIn(100)) {
+      const bool to_first = thread->rand.OneIn(2);
+      if (to_first) {
+        iter->SeekToFirst();
+      } else {
+        iter->SeekToLast();
       }
+      if (iter->Valid() || !iter->status().IsNotSupported()) {
+        thread->shared->SetVerificationFailure();
+        fprintf(stderr,
+                "%s under prefix_same_as_start and prefix_seek_opt_in_only "
+                "returned %s, expected NotSupported\n",
+                to_first ? "SeekToFirst()" : "SeekToLast()",
+                iter->Valid() ? "a key" : iter->status().ToString().c_str());
+        return Status::OK();
+      }
+    }
+
+    LastIterateOp last_op;
+    if (support_seek_to_first && thread->rand.OneIn(100)) {
       iter->SeekToFirst();
       cmp_iter->SeekToFirst();
       last_op = kLastOpSeekToFirst;
       op_logs += "STF ";
-      if (ro.prefix_same_as_start && cmp_iter->Valid()) {
-        verify_key_str = cmp_iter->key().ToString();
-        verify_key = verify_key_str;
-      }
     } else if (support_seek_to_last && thread->rand.OneIn(100)) {
       iter->SeekToLast();
       cmp_iter->SeekToLast();
@@ -3905,14 +3945,11 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
     }
 
     VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
-                   verify_key, rand_column_families, op_logs, verify_func,
-                   &diverged);
+                   key, rand_column_families, op_logs, verify_func, &diverged);
 
-    // Prev() resets the table iterator's readahead lookup state.
     const bool no_reverse =
         (FLAGS_memtablerep == "prefix_hash" && !expect_total_order) ||
-        !FLAGS_test_backward_scan ||
-        (cover_seek_to_first_after_seek && last_op == kLastOpSeekToFirst);
+        !FLAGS_test_backward_scan;
     for (uint64_t i = 0; i < FLAGS_num_iterations && iter->Valid(); ++i) {
       if (no_reverse || thread->rand.OneIn(2)) {
         iter->Next();
@@ -3949,7 +3986,7 @@ Status StressTest::TestIterateImpl(ThreadState* thread,
       }
 
       VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
-                     verify_key, rand_column_families, op_logs, verify_func,
+                     key, rand_column_families, op_logs, verify_func,
                      &diverged);
     }
 
@@ -4001,11 +4038,12 @@ void StressTest::DumpIteratorDivergenceDiagnostics(
     const std::vector<int>& rand_column_families) const {
   fprintf(stderr,
           "Iterator divergence diagnostics: verify_key=%s, cmp_cf=%s, "
-          "prefix_extractor=%d, using_udi=%d, use_multi_cf_iterator=%d, "
-          "selected_cf_count=%zu\n",
+          "prefix_extractor=%d, use_trie_index=%d, index_mode=%d, "
+          "read_index=%d, use_multi_cf_iterator=%d, selected_cf_count=%zu\n",
           verify_key.ToString(/*hex=*/true).c_str(), cmp_cfh->GetName().c_str(),
           static_cast<int>(options_.prefix_extractor != nullptr),
-          static_cast<int>(ro.table_index_factory != nullptr),
+          static_cast<int>(FLAGS_use_trie_index), FLAGS_index_mode,
+          static_cast<int>(ro.read_index),
           static_cast<int>(FLAGS_use_multi_cf_iterator),
           rand_column_families.size());
 
@@ -4066,13 +4104,13 @@ void StressTest::DumpIteratorDivergenceDiagnostics(
   };
 
   ReadOptions standard_ro = ro;
-  standard_ro.table_index_factory = nullptr;
+  standard_ro.read_index = ReadOptions::ReadIndex::kBuiltin;
   dump_debug_iter("Debug standard direct", standard_ro,
                   /*use_multi_cf_iter=*/false);
 
   if (udi_factory_) {
     ReadOptions trie_ro = ro;
-    trie_ro.table_index_factory = udi_factory_.get();
+    trie_ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     dump_debug_iter("Debug trie direct", trie_ro,
                     /*use_multi_cf_iter=*/false);
   }
@@ -4082,7 +4120,7 @@ void StressTest::DumpIteratorDivergenceDiagnostics(
                     /*use_multi_cf_iter=*/true);
     if (udi_factory_) {
       ReadOptions trie_ro = ro;
-      trie_ro.table_index_factory = udi_factory_.get();
+      trie_ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
       dump_debug_iter("Debug trie coalescing", trie_ro,
                       /*use_multi_cf_iter=*/true);
     }
@@ -4150,8 +4188,11 @@ bool StressTest::VerifyIterator(
     return false;
   }
 
-  if (!ro.total_order_seek && options_.prefix_extractor != nullptr &&
-      ro.iterate_lower_bound != nullptr) {
+  // prefix_same_as_start takes precedence over total_order_seek.
+  const bool prefix_iteration =
+      GetIteratorPrefixMode(ro, options_.prefix_extractor != nullptr) ==
+      IteratorPrefixMode::kPrefix;
+  if (prefix_iteration && ro.iterate_lower_bound != nullptr) {
     const SliceTransform* prefix_extractor = options_.prefix_extractor.get();
     if (!prefix_extractor->InDomain(verify_key) ||
         !prefix_extractor->InDomain(*ro.iterate_lower_bound) ||
@@ -4165,9 +4206,8 @@ bool StressTest::VerifyIterator(
     }
   }
 
-  const SliceTransform* pe = (ro.total_order_seek || ro.auto_prefix_mode)
-                                 ? nullptr
-                                 : options_.prefix_extractor.get();
+  const SliceTransform* pe =
+      prefix_iteration ? options_.prefix_extractor.get() : nullptr;
   const Comparator* cmp = options_.comparator;
   std::ostringstream read_opt_oss;
   read_opt_oss << "pin_data: " << ro.pin_data
@@ -4525,6 +4565,7 @@ Status StressTest::TestBackupRestore(
     // `ListColumnFamilies` to get names because it won't necessarily give
     // the same order as `column_family_names_`.
     assert(FLAGS_clear_column_family_one_in == 0);
+    cf_descriptors.reserve(column_family_names_.size());
     for (const auto& name : column_family_names_) {
       cf_descriptors.emplace_back(name, ColumnFamilyOptions(db_opt));
     }
@@ -4751,6 +4792,7 @@ Status StressTest::TestApproximateSize(
     SizeApproximationOptions sao;
     sao.include_memtables = thread->rand.OneIn(2);
     sao.include_blob_files = thread->rand.OneIn(2);
+    sao.allow_expensive_query = thread->rand.OneIn(2);
     if (sao.include_memtables || sao.include_blob_files) {
       sao.include_files = thread->rand.OneIn(2);
     }
@@ -5447,6 +5489,7 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
 
   CompactRangeOptions cro;
   cro.exclusive_manual_compaction = static_cast<bool>(thread->rand.Next() % 2);
+  cro.skip_missing_blob_files = FLAGS_compact_range_skip_missing_blob_files;
   if (static_cast<ROCKSDB_NAMESPACE::CompactionStyle>(FLAGS_compaction_style) !=
       ROCKSDB_NAMESPACE::CompactionStyle::kCompactionStyleFIFO) {
     cro.change_level = static_cast<bool>(thread->rand.Next() % 2);
@@ -5476,7 +5519,17 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
 
   const Snapshot* pre_snapshot = nullptr;
   uint32_t pre_hash = 0;
-  if (thread->rand.OneIn(2)) {
+  // With ingest_external_file_atomic_replace_one_in, a concurrent atomic range
+  // replacement ingestion runs with snapshot_consistency=false. Like
+  // DeleteFilesInRange, it can drop files that an existing snapshot still
+  // reads. So the data that pre_snapshot sees in this key range can change
+  // while CompactRange runs, and the hash check would fail even when
+  // CompactRange is correct. Skip the check in this mode, for the same reason
+  // that db_stress rejects acquire_snapshot_one_in with it. The random number
+  // is drawn in both modes, so the random sequence of the test does not change.
+  const bool check_hash = thread->rand.OneIn(2) &&
+                          FLAGS_ingest_external_file_atomic_replace_one_in == 0;
+  if (check_hash) {
     // Temporarily disable error injection to for validation
     if (db_fault_injection_fs_) {
       db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
@@ -5495,6 +5548,8 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
   std::ostringstream compact_range_opt_oss;
   compact_range_opt_oss << "exclusive_manual_compaction: "
                         << cro.exclusive_manual_compaction
+                        << ", skip_missing_blob_files: "
+                        << cro.skip_missing_blob_files
                         << ", change_level: " << cro.change_level
                         << ", target_level: " << cro.target_level
                         << ", bottommost_level_compaction: "
@@ -5705,6 +5760,10 @@ void StressTest::PrintEnv() const {
           FLAGS_use_multiget ? "true" : "false");
   fprintf(stdout, "Use full external table   : %s\n",
           FLAGS_use_full_external_table ? "true" : "false");
+  fprintf(stdout, "Table factory URI         : %s\n",
+          FLAGS_table_factory_uri.c_str());
+  fprintf(stdout, "Structured key-value      : %s\n",
+          FLAGS_structured_key_value ? "true" : "false");
   fprintf(stdout, "Use async DB API          : %s\n",
           FLAGS_use_async_db_api ? "true" : "false");
   fprintf(stdout, "Use GetEntity             : %s\n",
@@ -5725,6 +5784,9 @@ void StressTest::PrintEnv() const {
       break;
     case kVectorRep:
       memtablerep = "vector";
+      break;
+    case kSortedHash:
+      memtablerep = "sorted_hash";
       break;
   }
 
@@ -5871,16 +5933,41 @@ void StressTest::Open(SharedState* shared, bool reopen) {
   } else {
     fprintf(stderr, "Unknown compression manager: %s\n",
             FLAGS_compression_manager.c_str());
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_use_full_external_table) {
     options_.table_factory = NewExternalTableFactory(
         std::make_shared<SimpleFullExternalTableFactory>());
   }
+  if (!FLAGS_table_factory_uri.empty()) {
+    ConfigOptions config_options;
+    config_options.ignore_unknown_options = false;
+    config_options.ignore_unsupported_options = false;
+    Status s = TableFactory::CreateFromString(
+        config_options, FLAGS_table_factory_uri, &options_.table_factory);
+    if (!s.ok()) {
+      fprintf(stderr, "Failed to create table factory from URI '%s': %s\n",
+              FLAGS_table_factory_uri.c_str(), s.ToString().c_str());
+      // Open() runs during single-threaded startup, before worker threads.
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
+      exit(1);
+    }
+    assert(options_.table_factory != nullptr);
+    if (!options_.table_factory->IsInstanceOf(
+            TableFactory::kBlockBasedTableName()) &&
+        (FLAGS_compaction_ttl != 0 || FLAGS_periodic_compaction_seconds != 0)) {
+      fprintf(stderr,
+              "A non-block-based table_factory_uri requires "
+              "--compaction_ttl=0 and --periodic_compaction_seconds=0\n");
+      // Open() runs during single-threaded startup, before worker threads.
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
+      exit(1);
+    }
+  }
   if (FLAGS_prefix_size == 0 && FLAGS_rep_factory == kHashSkipList) {
     fprintf(stderr,
             "prefeix_size cannot be zero if memtablerep == prefix_hash\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_prefix_size != 0 && FLAGS_rep_factory != kHashSkipList) {
     fprintf(stdout,
@@ -5896,6 +5983,8 @@ void StressTest::Open(SharedState* shared, bool reopen) {
         shared, FLAGS_remote_compaction_failure_fall_back_to_local);
 
     options_.compaction_service = compaction_service;
+    options_.use_separate_remote_compaction_pool =
+        FLAGS_use_separate_remote_compaction_pool;
   }
 
   if (FLAGS_allow_resumption_one_in > 0) {
@@ -5903,7 +5992,7 @@ void StressTest::Open(SharedState* shared, bool reopen) {
       fprintf(stderr,
               "allow_resumption or randomize_allow_resumption requires "
               "remote_compaction_worker_threads > 0\n");
-      exit(1);
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
 
@@ -5913,7 +6002,7 @@ void StressTest::Open(SharedState* shared, bool reopen) {
     fprintf(stderr,
             "Integrated BlobDB is currently incompatible with best-effort "
             "recovery\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
 
   fprintf(stdout,
@@ -6212,6 +6301,10 @@ void StressTest::Open(SharedState* shared, bool reopen) {
   if (!s.ok()) {
     fprintf(stderr, "open error: %s\n", s.ToString().c_str());
     port::ImmediateExit(1);
+  }
+
+  if (db_stress_listener_) {
+    db_stress_listener_->SetPrimaryDb(db_->GetRootDB());
   }
 
   if (db_->GetLatestSequenceNumber() < shared->GetPersistedSeqno()) {
@@ -6591,7 +6684,7 @@ void StressTest::VerifyManifestNotRewritten() {
               "Before: MANIFEST-%06" PRIu64 ", After: MANIFEST-%06" PRIu64 "\n",
               manifest_file_number_before_reopen_, current_manifest_number);
       fprintf(stderr, "This indicates a bug in the MANIFEST optimization.\n");
-      exit(1);
+      port::ImmediateExit(1);
     } else {
       fprintf(stdout,
               "WARNING: MANIFEST file was recreated despite "
@@ -6625,7 +6718,7 @@ void StressTest::VerifyManifestNotRewritten() {
                   "Expected complete avoidance (0 bytes growth). "
                   "This indicates a bug in the MANIFEST optimization.\n",
                   size_growth);
-          exit(1);
+          port::ImmediateExit(1);
         } else {
           fprintf(stdout,
                   "WARNING: MANIFEST file grew by %" PRIu64
@@ -6664,7 +6757,7 @@ void StressTest::VerifyManifestNotRewritten() {
               "FATAL: CURRENT file was updated despite ALL conditions for "
               "complete avoidance being met. MANIFEST was reused but CURRENT "
               "was modified. This indicates a bug.\n");
-          exit(1);
+          port::ImmediateExit(1);
         } else if (manifest_verify_mode_ == MANIFEST_VERIFY_NO_WRITE) {
           fprintf(stdout,
                   "WARNING: CURRENT file was updated despite both "
@@ -6845,21 +6938,21 @@ void CheckAndSetOptionsForUserTimestamp(Options& options) {
     fprintf(stderr,
             "Only -user_timestamp_size=%d is supported in stress test.\n",
             static_cast<int>(cmp->timestamp_size()));
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_use_txn) {
     fprintf(stderr, "TransactionDB does not support timestamp yet.\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_test_cf_consistency || FLAGS_test_batches_snapshots) {
     fprintf(stderr,
             "Due to per-key ts-seq ordering constraint, only the (default) "
             "non-batched test is supported with timestamp.\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   if (FLAGS_ingest_external_file_one_in > 0) {
     fprintf(stderr, "Bulk loading may not support timestamp yet.\n");
-    exit(1);
+    exit(1);  // NOLINT(concurrency-mt-unsafe)
   }
   options.comparator = cmp;
   options.persist_user_defined_timestamps =
@@ -6892,8 +6985,7 @@ bool InitializeOptionsFromFile(Options& options) {
 void InitializeOptionsFromFlags(
     const std::shared_ptr<Cache>& cache,
     const std::shared_ptr<const FilterPolicy>& filter_policy,
-    const std::shared_ptr<UserDefinedIndexFactory>& udi_factory,
-    Options& options) {
+    const std::shared_ptr<IndexFactory>& udi_factory, Options& options) {
   BlockBasedTableOptions block_based_options;
   block_based_options.decouple_partitioned_filters =
       FLAGS_decouple_partitioned_filters;
@@ -6931,6 +7023,11 @@ void InitializeOptionsFromFlags(
   block_based_options.cache_usage_options.options_overrides.insert(
       {CacheEntryRole::kBlobCache,
        {/*.charged = */ FLAGS_charge_blob_cache
+            ? CacheEntryRoleOptions::Decision::kEnabled
+            : CacheEntryRoleOptions::Decision::kDisabled}});
+  block_based_options.cache_usage_options.options_overrides.insert(
+      {CacheEntryRole::kReadaheadBuffer,
+       {/*.charged = */ FLAGS_charge_readahead_buffer
             ? CacheEntryRoleOptions::Decision::kEnabled
             : CacheEntryRoleOptions::Decision::kDisabled}});
   block_based_options.format_version =
@@ -6979,19 +7076,56 @@ void InitializeOptionsFromFlags(
       fLU64::FLAGS_super_block_alignment_size;
   block_based_options.super_block_alignment_space_overhead_ratio =
       fLU64::FLAGS_super_block_alignment_space_overhead_ratio;
+  if (FLAGS_index_mode < 0 || FLAGS_index_mode > 4) {
+    fprintf(stderr, "Invalid --index_mode=%d (must be 0..4)\n",
+            FLAGS_index_mode);
+    exit(1);
+  }
+  const BlockBasedTableOptions::IndexMode index_mode =
+      static_cast<BlockBasedTableOptions::IndexMode>(FLAGS_index_mode);
+  if (!udi_factory &&
+      index_mode != BlockBasedTableOptions::IndexMode::kStandardOnly &&
+      index_mode != BlockBasedTableOptions::IndexMode::kStandardDefault) {
+    fprintf(stderr,
+            "--index_mode=%d requires --use_trie_index=1; only "
+            "kStandardOnly/kStandardDefault are valid without a UDI factory\n",
+            FLAGS_index_mode);
+    exit(1);
+  }
+  if (FLAGS_read_index < -1 || FLAGS_read_index > 2) {
+    fprintf(stderr, "Invalid --read_index=%d (must be -1..2)\n",
+            FLAGS_read_index);
+    exit(1);
+  }
+  if (!udi_factory && FLAGS_read_index > 0) {
+    // No custom index reader is ever installed without a factory, so a
+    // non-default read_index would silently do nothing.
+    fprintf(stderr,
+            "--read_index=%d requires --use_trie_index=1; without a UDI "
+            "factory only auto (-1) or kDefault (0) has any effect\n",
+            FLAGS_read_index);
+    exit(1);
+  }
+  if (FLAGS_read_index == static_cast<int>(ReadOptions::ReadIndex::kBuiltin) &&
+      index_mode == BlockBasedTableOptions::IndexMode::kCustomOnly) {
+    // kCustomOnly SSTs carry only a standard-index stub, so kBuiltin reads
+    // fail loudly by design rather than returning an empty result.
+    fprintf(stderr,
+            "--read_index=1 (kBuiltin) is incompatible with --index_mode=3 "
+            "(kCustomOnly); those SSTs have only a standard-index stub\n");
+    exit(1);
+  }
+  block_based_options.index_mode = index_mode;
   if (udi_factory) {
     block_based_options.user_defined_index_factory = udi_factory;
-    if (FLAGS_use_udi_as_primary_index) {
-      block_based_options.index_mode =
-          BlockBasedTableOptions::IndexMode::kCustomDefault;
-    }
     // Write fault injection can corrupt the UDI meta block during SST
-    // creation. In primary mode all reads route through the UDI, so a
-    // corrupted UDI block causes the reader to fail, making compaction
-    // read zero keys from the affected SST and triggering a false
-    // positive in record count verification. In secondary mode this is
-    // not an issue because reads fall back to the standard index.
-    if (FLAGS_use_udi_as_primary_index &&
+    // creation. When reads default to the UDI (kCustomDefault, kCustomOnly), a
+    // corrupted UDI block causes the reader to fail, making compaction read
+    // zero keys from the affected SST and triggering a false positive in
+    // record count verification. Modes that read through the standard index
+    // by default are not affected.
+    if ((index_mode == BlockBasedTableOptions::IndexMode::kCustomDefault ||
+         index_mode == BlockBasedTableOptions::IndexMode::kCustomOnly) &&
         (FLAGS_write_fault_one_in > 0 ||
          FLAGS_metadata_write_fault_one_in > 0)) {
       options.compaction_verify_record_count = false;
@@ -7141,6 +7275,7 @@ void InitializeOptionsFromFlags(
       FLAGS_track_options_file_number_in_manifest;
   options.optimize_manifest_for_recovery = FLAGS_optimize_manifest_for_recovery;
   options.write_identity_file = FLAGS_write_identity_file;
+  options.prefix_seek_opt_in_only = FLAGS_prefix_seek_opt_in_only;
   options.reuse_manifest_on_open = FLAGS_reuse_manifest_on_open;
   options.avoid_flush_during_recovery = FLAGS_avoid_flush_during_recovery;
   options.enforce_write_buffer_manager_during_recovery =
@@ -7202,7 +7337,7 @@ void InitializeOptionsFromFlags(
         fprintf(stderr,
                 "Unable to create a standalone blob cache if blob_cache_size "
                 "<= 0.\n");
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
       }
     }
     switch (FLAGS_prepopulate_blob_cache) {
@@ -7214,7 +7349,7 @@ void InitializeOptionsFromFlags(
         break;
       default:
         fprintf(stderr, "Unknown prepopulate blob cache mode\n");
-        exit(1);
+        exit(1);  // NOLINT(concurrency-mt-unsafe)
     }
   }
 
@@ -7253,7 +7388,12 @@ void InitializeOptionsFromFlags(
       options.memtable_factory.reset(NewHashSkipListRepFactory(10000));
       break;
     case kVectorRep:
-      options.memtable_factory.reset(new VectorRepFactory());
+      options.memtable_factory = std::make_shared<VectorRepFactory>();
+      break;
+    case kSortedHash:
+      // About one bucket per KiB of write buffer.
+      options.memtable_factory.reset(NewSortedHashRepFactory(
+          std::max<size_t>(1, FLAGS_write_buffer_size / 1024)));
       break;
   }
 

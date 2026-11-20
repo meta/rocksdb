@@ -17,7 +17,7 @@
 // The factory will be passed an MemTableAllocator object when a new MemTableRep
 // is requested.
 //
-// Users can implement their own memtable representations. We include three
+// Users can implement their own memtable representations. We include these
 // types built in:
 //  - SkipListRep: This is the default; it is backed by a skip list.
 //  - HashSkipListRep: The memtable rep that is best used for keys that are
@@ -28,6 +28,10 @@
 // vector is sorted. It is intelligent about sorting; once the MarkReadOnly()
 // has been called, the vector will only be sorted once. It is optimized for
 // random-write-heavy workloads.
+//  - HashLinkListRep: A hash map where each bucket is a linked list that
+// switches to a skip list when it grows large. See NewHashLinkListRepFactory().
+//  - SortedHashRep: A whole-key hash map where each bucket is a sorted linked
+// list, for point-lookup-heavy workloads. See NewSortedHashRepFactory().
 //
 // The last four implementations are designed for situations in which
 // iteration over the entire collection is rare since doing so requires all the
@@ -385,6 +389,11 @@ class MemTableRepFactory : public Customizable {
 
   const char* Name() const override = 0;
 
+  // ValidateOptions() (from Configurable) is called for each column family
+  // using this factory by DB::Open(), CreateColumnFamily(), SetOptions(), and
+  // SetDBOptions(), possibly with the DB mutex held. Implementations must be
+  // fast and must not call back into the DB.
+
   // Return true if the current MemTableRep supports concurrent inserts
   // Default: false
   virtual bool IsInsertConcurrentlySupported() const { return false; }
@@ -394,6 +403,14 @@ class MemTableRepFactory : public Customizable {
   // false when if the <key,seq> already exists.
   // Default: false
   virtual bool CanHandleDuplicatedKey() const { return false; }
+
+  // Return true if iterators over the current MemTableRep observe entries
+  // inserted after the iterator was created, as tailing iterators
+  // (ReadOptions::tailing) require. If false, creating a tailing iterator on a
+  // column family using this factory fails with Status::NotSupported, and
+  // Iterator::Refresh() always rebuilds its memtable iterators.
+  // Default: true
+  virtual bool IsTailingIteratorSupported() const { return true; }
 };
 
 // This uses a skip list to store keys. It is the default.
@@ -493,5 +510,40 @@ MemTableRepFactory* NewHashLinkListRepFactory(
     int bucket_entries_logging_threshold = 4096,
     bool if_log_bucket_dist_when_flash = true,
     uint32_t threshold_use_skiplist = 256);
+
+// Creates a memtable for point-lookup-heavy workloads: a fixed array of
+// bucket_count buckets keyed by a hash of the whole user key, each holding a
+// linked list kept in internal-key order. Get and MultiGet hash to one bucket
+// and walk its list; inserts to different buckets proceed concurrently. The
+// WAL and SST formats are unchanged. Also available as "sorted_hash:<count>".
+//
+// Sizing: chains never resize, and point reads and inserts slow down as they
+// grow, so bucket_count must scale with write_buffer_size. Benchmarks with
+// ~130-byte entries favored about one bucket per KiB of write_buffer_size; for
+// example, 4096 buckets with a 64 MiB write buffer was several times slower
+// than the skip list. The bucket array takes 16 bytes per bucket from each
+// memtable's arena, and must be smaller than write_buffer_size.
+//
+// Iteration: creating an iterator after any write collects and sorts every
+// entry (O(n log n)), and the iterator sees a fixed view of the memtable as of
+// its creation; Iterator::Refresh() rebuilds it. Workloads that create many
+// iterators while writing should use the skip list.
+//
+// Memory: memtable usage includes one sorted view (a pointer per entry) whether
+// or not it has been built. Older views held by live iterators are not
+// counted, and no view memory is charged to the WriteBufferManager.
+//
+// Column families using this factory fail to open, or to apply SetOptions,
+// with:
+//  - user-defined timestamps, or a comparator under which keys with
+//    different bytes can compare equal;
+//  - paranoid_memory_checks or memtable_verify_per_key_checksum_on_seek;
+//  - inplace_update_support or max_successive_merges > 0;
+//  - bucket_count == 0, or a bucket array at least as large as
+//    write_buffer_size.
+// Tailing iterators (ReadOptions::tailing) fail with Status::NotSupported.
+// Read-only, secondary, and follower instances do not validate options, so
+// these constraints are not enforced there.
+MemTableRepFactory* NewSortedHashRepFactory(size_t bucket_count);
 
 }  // namespace ROCKSDB_NAMESPACE

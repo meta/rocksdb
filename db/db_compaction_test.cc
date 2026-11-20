@@ -7,13 +7,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "compaction/compaction_picker_universal.h"
 #include "db/blob/blob_index.h"
@@ -144,6 +149,19 @@ class DBCompactionTest : public DBTestBase {
   }
 
  protected:
+  std::vector<std::pair<std::string, std::string>> TableFileNamesByKey() {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    std::vector<std::pair<std::string, std::string>> files;
+    for (const auto& level : metadata.levels) {
+      for (const auto& file : level.files) {
+        files.emplace_back(file.smallestkey, file.name);
+      }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+  }
+
   /*
    * Verifies compaction stats of cfd are valid.
    *
@@ -505,7 +523,7 @@ class DBCompactionWaitForCompactTest
   bool abort_on_pause_;
   bool flush_;
   bool close_db_;
-  std::chrono::microseconds timeout_;
+  std::chrono::microseconds timeout_{};
   Options options_;
   WaitForCompactOptions wait_for_compact_options_;
 
@@ -588,13 +606,12 @@ class FlushedFileCollector : public EventListener {
   std::vector<std::string> GetFlushedFiles() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> result;
+    result.reserve(flushed_files_.size());
     for (const auto& fname : flushed_files_) {
       result.push_back(fname);
     }
     return result;
   }
-
-  void ClearFlushedFiles() { flushed_files_.clear(); }
 
  private:
   std::vector<std::string> flushed_files_;
@@ -3400,7 +3417,7 @@ TEST_P(DBCompactionTestWithParam, ConvertCompactionStyle) {
   ASSERT_EQ(keys_in_db, expected_keys);
 }
 
-TEST_F(DBCompactionTest, L0_CompactionBug_Issue44_a) {
+TEST_F(DBCompactionTest, L0CompactionBugIssue44A) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "b", "v"));
@@ -3419,7 +3436,7 @@ TEST_F(DBCompactionTest, L0_CompactionBug_Issue44_a) {
   } while (ChangeCompactOptions());
 }
 
-TEST_F(DBCompactionTest, L0_CompactionBug_Issue44_b) {
+TEST_F(DBCompactionTest, L0CompactionBugIssue44B) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "", ""));
@@ -4412,6 +4429,150 @@ static std::string ShortKey(int i) {
   char buf[100];
   snprintf(buf, sizeof(buf), "key%04d", i);
   return std::string(buf);
+}
+
+TEST_F(DBCompactionTest, MissingBlobRepairDisablesTrivialMovesPerCall) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "value-a"));
+  ASSERT_OK(Flush());
+  const auto before = TableFileNamesByKey();
+  ASSERT_EQ(before.size(), 1U);
+
+  std::atomic<int> trivial_moves{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:TrivialMove",
+      [&](void*) { ++trivial_moves; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CompactRangeOptions compact_options;
+  compact_options.skip_missing_blob_files = true;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kSkip;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  const auto repaired = TableFileNamesByKey();
+  ASSERT_EQ(repaired.size(), 1U);
+  ASSERT_NE(before[0].second, repaired[0].second);
+  ASSERT_EQ(trivial_moves.load(), 0);
+
+  ASSERT_OK(Put("z", "value-z"));
+  ASSERT_OK(Flush());
+  const auto before_default = TableFileNamesByKey();
+  ASSERT_EQ(before_default.size(), 2U);
+  const Slice key("z");
+  compact_options.skip_missing_blob_files = false;
+  ASSERT_OK(db_->CompactRange(compact_options, &key, &key));
+  ASSERT_EQ(TableFileNamesByKey(), before_default);
+  ASSERT_EQ(trivial_moves.load(), 1);
+  ASSERT_EQ(Get("a"), "value-a");
+  ASSERT_EQ(Get("z"), "value-z");
+  SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBCompactionTest, MissingBlobRepairRewritesSelectedBottommostFiles) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (const char* key : {"a", "m", "z"}) {
+    ASSERT_OK(Put(key, key));
+    ASSERT_OK(Flush());
+  }
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 2;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(NumTableFilesAtLevel(2), 3);
+  const auto before = TableFileNamesByKey();
+  ASSERT_EQ(before.size(), 3U);
+
+  compact_options = CompactRangeOptions();
+  compact_options.skip_missing_blob_files = true;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kSkip;
+  const Slice key("m");
+  ASSERT_OK(db_->CompactRange(compact_options, &key, &key));
+  const auto repaired = TableFileNamesByKey();
+  ASSERT_EQ(repaired.size(), 3U);
+  ASSERT_EQ(before[0], repaired[0]);
+  ASSERT_NE(before[1].second, repaired[1].second);
+  ASSERT_EQ(before[2], repaired[2]);
+
+  compact_options.skip_missing_blob_files = false;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(TableFileNamesByKey(), repaired);
+  for (const char* retained : {"a", "m", "z"}) {
+    ASSERT_EQ(Get(retained), retained);
+  }
+}
+
+TEST_F(DBCompactionTest, MissingBlobRepairKeepsBottommostProgress) {
+  class KeepFilter : public CompactionFilter {
+   public:
+    const char* Name() const override { return "KeepFilter"; }
+    bool Filter(int, const Slice&, const Slice&, std::string*,
+                bool*) const override {
+      return false;
+    }
+  } keep_filter;
+
+  for (bool repair : {false, true}) {
+    SCOPED_TRACE(repair);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.num_levels = 3;
+    options.level_compaction_dynamic_level_bytes = false;
+    options.compression = kNoCompression;
+    const auto collector = std::make_shared<CompactionStatsCollector>();
+    options.listeners.push_back(collector);
+    DestroyAndReopen(options);
+
+    for (const char* key : {"a", "z"}) {
+      ASSERT_OK(Put(key, key));
+      ASSERT_OK(Flush());
+    }
+    CompactRangeOptions compact_options;
+    compact_options.change_level = true;
+    compact_options.target_level = 2;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    ASSERT_EQ(NumTableFilesAtLevel(2), 2);
+    const auto before = TableFileNamesByKey();
+    ASSERT_EQ(before.size(), 2U);
+
+    options.compaction_filter = &keep_filter;
+    Reopen(options);
+    ASSERT_OK(Put("m", "m"));
+    ASSERT_OK(Flush());
+    const int compactions_before =
+        collector->NumberOfCompactions(CompactionReason::kManualCompaction);
+
+    compact_options = CompactRangeOptions();
+    compact_options.skip_missing_blob_files = repair;
+    compact_options.bottommost_level_compaction =
+        repair ? BottommostLevelCompaction::kSkip
+               : BottommostLevelCompaction::kForceOptimized;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    const auto after = TableFileNamesByKey();
+    ASSERT_EQ(after.size(), 3U);
+    ASSERT_NE(before[0].second, after[0].second);
+    ASSERT_NE(before[1].second, after[2].second);
+    ASSERT_EQ(
+        collector->NumberOfCompactions(CompactionReason::kManualCompaction) -
+            compactions_before,
+        4);
+    for (const char* retained : {"a", "m", "z"}) {
+      ASSERT_EQ(Get(retained), retained);
+    }
+    Close();
+  }
 }
 
 TEST_P(DBCompactionTestWithParam, ForceBottommostLevelCompaction) {
@@ -6289,6 +6450,7 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseCfSpread) {
                         uint64_t{12345678901234567ULL}, ~uint64_t{0}}) {
     ASSERT_EQ(Phaser::CfPhaseSeedHash(base, 0), base);
     std::vector<uint64_t> hs;
+    hs.reserve(64);
     for (uint32_t id = 0; id < 64; ++id) {
       hs.push_back(Phaser::CfPhaseSeedHash(base, id));
     }
@@ -6304,6 +6466,7 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseCfSpread) {
     for (uint32_t N : {uint32_t{3}, uint32_t{8}, uint32_t{16}, uint32_t{40}}) {
       const uint64_t n = 100000;
       std::vector<uint64_t> phases;
+      phases.reserve(N);
       for (uint32_t id = 0; id < N; ++id) {
         phases.push_back(FastRange64(Phaser::CfPhaseSeedHash(base, id), n));
       }
@@ -6701,8 +6864,8 @@ TEST_F(DBCompactionTest, LevelPeriodicCompactionWithCompactionFilters) {
       options.compaction_filter_factory.reset();
     } else if (comp_filter_type == kUseCompactionFilterFactory) {
       options.compaction_filter = nullptr;
-      options.compaction_filter_factory.reset(
-          new TestCompactionFilterFactory());
+      options.compaction_filter_factory =
+          std::make_shared<TestCompactionFilterFactory>();
     }
     DestroyAndReopen(options);
 
@@ -6926,6 +7089,119 @@ TEST_F(DBCompactionTest, CompactRangeShutdownWhileDelayed) {
     }
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   }
+}
+
+TEST_F(DBCompactionTest, CompactRangeAtomicFlushOtherColumnFamilyDropped) {
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  options.level0_stop_writes_trigger = 2;
+  options.level0_slowdown_writes_trigger = 2;
+  options.level0_file_num_compaction_trigger = -1;
+  for (bool drop_target : {false, true}) {
+    SCOPED_TRACE(drop_target);
+    DestroyAndReopen(options);
+    CreateAndReopenWithCF({"target", "obsolete"}, options);
+    test::SleepingBackgroundTask sleeping_task;
+    env_->SetBackgroundThreads(1, Env::LOW);
+    env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &sleeping_task,
+                   Env::LOW);
+    sleeping_task.WaitUntilSleeping();
+    ASSERT_OK(Put(2, "old", "value"));
+    ASSERT_OK(Flush(2));
+    ASSERT_OK(Put(2, "pending", "value"));
+    ASSERT_OK(Put(1, "key", "value"));
+
+    SyncPoint::GetInstance()->LoadDependency(
+        {{"DBImpl::WaitUntilFlushWouldNotStallWrites:StallWait",
+          "DBCompactionTest::AtomicFlushOtherColumnFamilyDropped:Drop"}});
+    SyncPoint::GetInstance()->EnableProcessing();
+    Status status;
+    port::Thread compact([&] {
+      status = db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr,
+                                 nullptr);
+    });
+    TEST_SYNC_POINT(
+        "DBCompactionTest::AtomicFlushOtherColumnFamilyDropped:Drop");
+    if (drop_target) {
+      ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+    }
+    ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+    sleeping_task.WakeUp();
+    compact.join();
+    if (drop_target) {
+      ASSERT_EQ(Status::kColumnFamilyDropped, status.code());
+    } else {
+      ASSERT_OK(status);
+      ASSERT_EQ("value", Get(1, "key"));
+      ASSERT_GT(TotalTableFiles(1), 0);
+      ASSERT_EQ(0, NumTableFilesAtLevel(0, 1));
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+  }
+}
+
+TEST_F(DBCompactionTest, CompactRangeAtomicFlushSelectedColumnFamilyDropped) {
+  // The target has nothing to flush, so the atomic flush selects only the
+  // other column family, which is dropped while the flush is pending.
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"target", "obsolete"}, options);
+  ASSERT_OK(Put(2, "key", "value"));
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::AtomicFlushMemTables:BeforeWaitForBgFlush",
+        "DBCompactionTest::AtomicFlushSelectedColumnFamilyDropped:Drop"},
+       {"DBCompactionTest::AtomicFlushSelectedColumnFamilyDropped:Dropped",
+        "DBImpl::BackgroundCallFlush:start"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  CompactRangeOptions cro;
+  cro.allow_write_stall = true;
+  Status status;
+  port::Thread compact(
+      [&] { status = db_->CompactRange(cro, handles_[1], nullptr, nullptr); });
+  TEST_SYNC_POINT(
+      "DBCompactionTest::AtomicFlushSelectedColumnFamilyDropped:Drop");
+  ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+  TEST_SYNC_POINT(
+      "DBCompactionTest::AtomicFlushSelectedColumnFamilyDropped:Dropped");
+  compact.join();
+  ASSERT_OK(status);
+  SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBCompactionTest, WaitForCompactAtomicFlushOtherColumnFamilyDropped) {
+  // The flush waits for a write stall on another column family that is
+  // dropped during the wait. The live column family must still be flushed.
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  options.level0_stop_writes_trigger = 2;
+  options.level0_slowdown_writes_trigger = 2;
+  options.level0_file_num_compaction_trigger = -1;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"live", "obsolete"}, options);
+  ASSERT_OK(Put(2, "old", "value"));
+  ASSERT_OK(Flush(2));
+  ASSERT_OK(Put(2, "pending", "value"));
+  ASSERT_OK(Put(1, "key", "value"));
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::WaitUntilFlushWouldNotStallWrites:StallWait",
+        "DBCompactionTest::WaitForCompactOtherColumnFamilyDropped:Drop"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  port::Thread wait([&] {
+    WaitForCompactOptions wait_for_compact_options;
+    wait_for_compact_options.flush = true;
+    status = db_->WaitForCompact(wait_for_compact_options);
+  });
+  TEST_SYNC_POINT(
+      "DBCompactionTest::WaitForCompactOtherColumnFamilyDropped:Drop");
+  ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+  wait.join();
+  ASSERT_OK(status);
+  ASSERT_EQ(1, NumTableFilesAtLevel(0, 1));
+  SyncPoint::GetInstance()->DisableProcessing();
 }
 
 TEST_F(DBCompactionTest, CompactRangeSkipFlushAfterDelay) {
@@ -8607,7 +8883,7 @@ TEST_F(DBCompactionTest, PartialManualCompaction) {
   opts.num_levels = 3;
   opts.level0_file_num_compaction_trigger = 10;
   opts.compression = kNoCompression;
-  opts.merge_operator.reset(new NoopMergeOperator());
+  opts.merge_operator = std::make_shared<NoopMergeOperator>();
   opts.target_file_size_base = 10240;
   DestroyAndReopen(opts);
 
@@ -8744,7 +9020,7 @@ TEST_F(DBCompactionTest, ManualCompactionBottomLevelOptimized) {
   opts.num_levels = 3;
   opts.level0_file_num_compaction_trigger = 5;
   opts.compression = kNoCompression;
-  opts.merge_operator.reset(new NoopMergeOperator());
+  opts.merge_operator = std::make_shared<NoopMergeOperator>();
   opts.target_file_size_base = 1024;
   opts.max_bytes_for_level_multiplier = 2;
   opts.disable_auto_compactions = true;
@@ -9008,7 +9284,7 @@ class DBCompactionTestWithOngoingFileIngestionParam
   }
 
   void PauseCompactionThread() {
-    sleeping_task_.reset(new test::SleepingBackgroundTask());
+    sleeping_task_ = std::make_shared<test::SleepingBackgroundTask>();
     env_->SetBackgroundThreads(1, Env::LOW);
     env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
                    sleeping_task_.get(), Env::Priority::LOW);
@@ -9386,7 +9662,7 @@ class DBCompactionTestL0FilesMisorderCorruption : public DBCompactionTest {
   }
 
   void PauseCompactionThread() {
-    sleeping_task_.reset(new test::SleepingBackgroundTask());
+    sleeping_task_ = std::make_shared<test::SleepingBackgroundTask>();
     env_->SetBackgroundThreads(1, Env::LOW);
     env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
                    sleeping_task_.get(), Env::Priority::LOW);
@@ -10805,7 +11081,7 @@ TEST_P(DBCompactionTestBlobGC, CompactionWithBlobGC) {
   }
 }
 
-TEST_F(DBCompactionTest, CompactionWithBlobGCError_CorruptIndex) {
+TEST_F(DBCompactionTest, CompactionWithBlobGCErrorCorruptIndex) {
   Options options;
   options.env = env_;
   options.disable_auto_compactions = true;
@@ -10855,7 +11131,7 @@ TEST_F(DBCompactionTest, CompactionWithBlobGCError_CorruptIndex) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_F(DBCompactionTest, CompactionWithBlobGCError_InlinedTTLIndex) {
+TEST_F(DBCompactionTest, CompactionWithBlobGCErrorInlinedTTLIndex) {
   constexpr uint64_t min_blob_size = 10;
 
   Options options;
@@ -10908,7 +11184,7 @@ TEST_F(DBCompactionTest, CompactionWithBlobGCError_InlinedTTLIndex) {
       db_->CompactRange(CompactRangeOptions(), begin, end).IsCorruption());
 }
 
-TEST_F(DBCompactionTest, CompactionWithBlobGCError_IndexWithInvalidFileNumber) {
+TEST_F(DBCompactionTest, CompactionWithBlobGCErrorIndexWithInvalidFileNumber) {
   Options options;
   options.env = env_;
   options.disable_auto_compactions = true;
@@ -11384,6 +11660,251 @@ TEST_F(DBCompactionTest, FIFOChangeTemperature) {
   }
 }
 
+namespace {
+Options FIFOTemperatureCopyOptions(Options options) {
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  // Needed for the newest key times that make files old enough
+  options.max_open_files = -1;
+  options.compaction_options_fifo.file_temperature_age_thresholds = {
+      {Temperature::kCold, 1000}};
+  options.compaction_options_fifo.max_table_files_size = 100000000;
+  options.compaction_options_fifo.allow_trivial_copy_when_change_temperature =
+      true;
+  return options;
+}
+
+// Bound on waits for expected events in the FIFO trivial copy tests, which
+// normally take milliseconds. Long enough to ride out CI stalls, so that only
+// a regression waits it out.
+constexpr std::chrono::minutes kTrivialCopyTestTimeout{5};
+
+// Pauses FIFO temperature-change trivial copies just before copying the file,
+// until Resume() or destruction
+class TrivialCopyPause {
+ public:
+  TrivialCopyPause() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::CopyTrivialCompactionFiles:BeforeCopyFile", [this](void*) {
+          std::unique_lock<std::mutex> lock(mu_);
+          paused_ = true;
+          cv_.notify_all();
+          // Bounded so that a failure elsewhere cannot hang the test
+          cv_.wait_for(lock, kTrivialCopyTestTimeout,
+                       [this]() { return resumed_; });
+          pause_ended_ = true;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  ~TrivialCopyPause() {
+    Resume();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  // Waits for a copy to pause, runs `fn` on another thread, and resumes the
+  // copy. Returns whether `fn` completed while the copy was paused, or false
+  // without running `fn` if no copy pauses.
+  bool CompletesWhilePaused(const std::function<void()>& fn) {
+    {
+      std::unique_lock<std::mutex> lock(mu_);
+      // Bounded so that a copy that is never picked fails the test
+      if (!cv_.wait_for(lock, kTrivialCopyTestTimeout,
+                        [this]() { return paused_; })) {
+        return false;
+      }
+    }
+    bool done = false;
+    // A pause that ended before `fn` finished does not count, such as when the
+    // test thread itself was blocked by the copy until the pause timed out
+    bool done_while_paused = false;
+    port::Thread thread([&]() {
+      fn();
+      std::lock_guard<std::mutex> lock(mu_);
+      done = true;
+      done_while_paused = !pause_ended_;
+      cv_.notify_all();
+    });
+    {
+      std::unique_lock<std::mutex> lock(mu_);
+      // Does not wait out the timeout unless `fn` is blocked by the copy
+      cv_.wait_for(lock, kTrivialCopyTestTimeout, [&]() { return done; });
+    }
+    Resume();
+    thread.join();
+    return done_while_paused;
+  }
+
+  void Resume() {
+    std::lock_guard<std::mutex> lock(mu_);
+    resumed_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool paused_ = false;
+  bool resumed_ = false;
+  bool pause_ended_ = false;
+};
+}  // namespace
+
+TEST_F(DBCompactionTest, FIFOChangeTemperatureCopyWithoutDBMutex) {
+  Options options = FIFOTemperatureCopyOptions(CurrentOptions());
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+
+  TrivialCopyPause pause;
+  ASSERT_OK(Put("a", "value"));
+  ASSERT_OK(Flush());
+  // The first file becomes old enough to be copied cold
+  env_->MockSleepForSeconds(1200);
+  ASSERT_OK(Put("b", "value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_TRUE(pause.CompletesWhilePaused([&]() {
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+  }));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.file_count, 2U);
+  ASSERT_EQ(metadata.levels[0].files[0].temperature, Temperature::kUnknown);
+  ASSERT_EQ(metadata.levels[0].files[1].temperature, Temperature::kCold);
+  ASSERT_EQ(Get("a"), "value");
+  ASSERT_EQ(Get("b"), "value");
+}
+
+TEST_F(DBCompactionTest, FIFOChangeTemperatureCopyDuringDropColumnFamily) {
+  Options options = FIFOTemperatureCopyOptions(CurrentOptions());
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  {
+    int copies_finished = 0;
+    TrivialCopyPause pause;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BackgroundCompaction:TriviaCopyAfterCompaction",
+        [&](void*) { ++copies_finished; });
+    ASSERT_OK(Put(1, "a", "value"));
+    ASSERT_OK(Flush(1));
+    // The first file becomes old enough to be copied cold
+    env_->MockSleepForSeconds(1200);
+    ASSERT_OK(Put(1, "b", "value"));
+    ASSERT_OK(Flush(1));
+
+    ASSERT_TRUE(pause.CompletesWhilePaused(
+        [&]() { ASSERT_OK(db_->DropColumnFamily(handles_[1])); }));
+    // The copy is not installed in the dropped column family, which is not an
+    // error
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    ASSERT_EQ(copies_finished, 1);
+  }
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handles_[1]));
+  handles_.pop_back();
+  ASSERT_OK(Put("c", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("c"), "value");
+
+  // Reopening leaves only the live table file
+  Reopen(options);
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  int table_files = 0;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kTableFile) {
+      ++table_files;
+    }
+  }
+  ASSERT_EQ(table_files, 1);
+  ASSERT_EQ(Get("c"), "value");
+}
+
+TEST_F(DBCompactionTest, FIFOChangeTemperatureCopyDuringIntraL0Compaction) {
+  class IntraL0Listener : public EventListener {
+   public:
+    void OnCompactionCompleted(DB* /*db*/,
+                               const CompactionJobInfo& info) override {
+      if (info.compaction_reason == CompactionReason::kFIFOReduceNumFiles) {
+        std::lock_guard<std::mutex> lock(mu);
+        ++completed;
+        num_input_files = info.input_files.size();
+        cv.notify_all();
+      }
+    }
+    std::mutex mu;
+    std::condition_variable cv;
+    int completed = 0;
+    size_t num_input_files = 0;
+  };
+  auto listener = std::make_shared<IntraL0Listener>();
+  Options options = FIFOTemperatureCopyOptions(CurrentOptions());
+  // Unlike the other FIFO compactions, intra-L0 compaction can be picked while
+  // another L0 compaction is running, on files newer than the ones it compacts
+  options.compaction_options_fifo.allow_compaction = true;
+  // Intra-L0 compaction needs a third file, so the copy is picked first
+  options.level0_file_num_compaction_trigger = 3;
+  // Allows two compactions at once
+  options.max_background_jobs = 4;
+  options.listeners.push_back(listener);
+  env_->SetMockSleep();
+  DestroyAndReopen(options);
+  // Without compaction pressure (such as from write stalls), only one
+  // compaction runs at a time regardless of max_background_jobs
+  std::unique_ptr<WriteControllerToken> pressure_token =
+      dbfull()->TEST_write_controler().GetCompactionPressureToken();
+
+  TrivialCopyPause pause;
+  ASSERT_OK(Put("a", "value"));
+  ASSERT_OK(Flush());
+  // The first file becomes old enough to be copied cold
+  env_->MockSleepForSeconds(1200);
+  ASSERT_OK(Put("b", "value"));
+  ASSERT_OK(Flush());
+
+  bool intra_l0_completed = false;
+  ASSERT_TRUE(pause.CompletesWhilePaused([&]() {
+    ASSERT_OK(Put("c", "value"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("d", "value"));
+    ASSERT_OK(Flush());
+    std::unique_lock<std::mutex> lock(listener->mu);
+    intra_l0_completed =
+        listener->cv.wait_for(lock, kTrivialCopyTestTimeout,
+                              [&]() { return listener->completed > 0; });
+  }));
+  ASSERT_TRUE(intra_l0_completed);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  {
+    std::lock_guard<std::mutex> lock(listener->mu);
+    ASSERT_EQ(listener->completed, 1);
+    // All files except the one being copied
+    ASSERT_EQ(listener->num_input_files, 3U);
+  }
+
+  // Both are installed, and the intra-L0 output is still ordered as newer
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.file_count, 2U);
+  ASSERT_EQ(metadata.levels[0].files[0].temperature, Temperature::kUnknown);
+  ASSERT_EQ(metadata.levels[0].files[0].smallestkey, "b");
+  ASSERT_EQ(metadata.levels[0].files[0].largestkey, "d");
+  ASSERT_EQ(metadata.levels[0].files[1].temperature, Temperature::kCold);
+  ASSERT_EQ(metadata.levels[0].files[1].smallestkey, "a");
+  for (const char* key : {"a", "b", "c", "d"}) {
+    ASSERT_EQ(Get(key), "value");
+  }
+}
+
 using TemperatureSet = SmallEnumSet<Temperature, Temperature::kLastTemperature>;
 static void VerifyTemperatureFileReadStats(const Statistics& st,
                                            TemperatureSet temps) {
@@ -11522,6 +12043,7 @@ TEST_F(DBCompactionTest, FIFOMultiTierTemperatureAging) {
           case Temperature::kUnknown:
             total_unknown++;
             break;
+          case Temperature::kLastTemperature:
           default:
             break;
         }
@@ -11837,6 +12359,199 @@ TEST_F(DBCompactionTest, DisableManualCompactionThreadQueueFull) {
   sleeping_task_low.WaitUntilDone();
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ASSERT_EQ("0,1", FilesPerLevel(0));
+}
+
+// A manual compaction that is unscheduled from the thread pool releases its
+// input files. The column family must then be rescored and requeued, or its
+// L0 files can stay uncompacted with no background work left to retry them.
+TEST_F(DBCompactionTest, UnscheduledManualCompactionRequeuesColumnFamily) {
+  const int kNumL0Files = 4;
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::RunManualCompaction:Scheduled",
+        "DBCompactionTest::UnscheduledManualCompactionRequeuesColumnFamily:"
+        "PreFlush"}});
+  std::atomic<int> num_unscheduled{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::UnscheduleCompactionCallback",
+      [&](void* /*arg*/) { num_unscheduled.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kNumL0Files;
+  Reopen(options);
+
+  // Block the compaction thread pool so the manual compaction stays queued.
+  test::SleepingBackgroundTask sleeping_task_low;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &sleeping_task_low,
+                 Env::Priority::LOW);
+
+  // Stay below the auto compaction trigger, so no automatic compaction is
+  // queued for this column family.
+  for (int i = 0; i < kNumL0Files - 1; i++) {
+    ASSERT_OK(Put(Key(1), "value1"));
+    ASSERT_OK(Put(Key(2), "value2"));
+    ASSERT_OK(Flush());
+  }
+
+  port::Thread compact_thread([&]() {
+    CompactRangeOptions cro;
+    cro.exclusive_manual_compaction = false;
+    Status s = db_->CompactRange(cro, nullptr, nullptr);
+    ASSERT_EQ(Status::Code::kIncomplete, s.code());
+    ASSERT_EQ(Status::SubCode::kManualCompactionPaused, s.subcode());
+  });
+
+  TEST_SYNC_POINT(
+      "DBCompactionTest::UnscheduledManualCompactionRequeuesColumnFamily:"
+      "PreFlush");
+
+  // The manual compaction now owns the first files. This flush reaches the
+  // trigger, but the new version's score only counts the file that is not
+  // being compacted, so the column family is not queued for compaction.
+  ASSERT_OK(Put(Key(1), "value1"));
+  ASSERT_OK(Put(Key(2), "value2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(std::to_string(kNumL0Files), FilesPerLevel(0));
+
+  // Unschedule the queued manual compaction. Nothing else installs a new
+  // version for this column family after this point.
+  db_->DisableManualCompaction();
+  compact_thread.join();
+  ASSERT_EQ(1, num_unscheduled.load());
+  db_->EnableManualCompaction();
+
+  sleeping_task_low.WakeUp();
+  sleeping_task_low.WaitUntilDone();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ("0,1", FilesPerLevel(0));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// A manual compaction that is canceled after a compaction thread took it from
+// the queue, but before it starts, releases its input files in
+// BackgroundCompaction(). The column family must then be rescored and
+// requeued. DisableManualCompaction() with the separate remote compaction pool,
+// which has no unschedule callback, also ends on this path.
+TEST_F(DBCompactionTest, CanceledManualCompactionBeforeStartRequeuesCF) {
+  const int kNumL0Files = 4;
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::RunManualCompaction:Scheduled",
+        "DBCompactionTest::CanceledManualCompactionBeforeStartRequeuesCF:"
+        "PreFlush"},
+       {"DBCompactionTest::CanceledManualCompactionBeforeStartRequeuesCF:"
+        "Canceled",
+        "BackgroundCallCompaction:0"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kNumL0Files;
+  Reopen(options);
+
+  // Stay below the auto compaction trigger, so no automatic compaction is
+  // queued for this column family.
+  for (int i = 0; i < kNumL0Files - 1; i++) {
+    ASSERT_OK(Put(Key(1), "value1"));
+    ASSERT_OK(Put(Key(2), "value2"));
+    ASSERT_OK(Flush());
+  }
+
+  std::atomic<bool> canceled{false};
+  port::Thread compact_thread([&]() {
+    CompactRangeOptions cro;
+    cro.exclusive_manual_compaction = false;
+    cro.canceled = &canceled;
+    Status s = db_->CompactRange(cro, nullptr, nullptr);
+    ASSERT_EQ(Status::Code::kIncomplete, s.code());
+    ASSERT_EQ(Status::SubCode::kManualCompactionPaused, s.subcode());
+  });
+
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CanceledManualCompactionBeforeStartRequeuesCF:"
+      "PreFlush");
+
+  // The manual compaction now owns the first files, and its compaction thread
+  // waits before it starts. This flush reaches the trigger, but the new
+  // version's score only counts the file that is not being compacted.
+  ASSERT_OK(Put(Key(1), "value1"));
+  ASSERT_OK(Put(Key(2), "value2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(std::to_string(kNumL0Files), FilesPerLevel(0));
+
+  canceled.store(true);
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CanceledManualCompactionBeforeStartRequeuesCF:"
+      "Canceled");
+  compact_thread.join();
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ("0,1", FilesPerLevel(0));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// A running manual compaction that is canceled releases its input files after
+// the compaction job returns. The column family must then be rescored and
+// requeued.
+TEST_F(DBCompactionTest, CanceledRunningManualCompactionRequeuesCF) {
+  const int kNumL0Files = 4;
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BackgroundCompaction:NonTrivial",
+        "DBCompactionTest::CanceledRunningManualCompactionRequeuesCF:"
+        "PreFlush"},
+       {"DBCompactionTest::CanceledRunningManualCompactionRequeuesCF:"
+        "Canceled",
+        "DBImpl::BackgroundCompaction:NonTrivial:BeforeRun"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kNumL0Files;
+  Reopen(options);
+
+  // Overlapping files, so the manual compaction is not a trivial move. Stay
+  // below the auto compaction trigger.
+  for (int i = 0; i < kNumL0Files - 1; i++) {
+    ASSERT_OK(Put(Key(1), "value1"));
+    ASSERT_OK(Put(Key(2), "value2"));
+    ASSERT_OK(Flush());
+  }
+
+  std::atomic<bool> canceled{false};
+  port::Thread compact_thread([&]() {
+    CompactRangeOptions cro;
+    cro.exclusive_manual_compaction = false;
+    cro.canceled = &canceled;
+    Status s = db_->CompactRange(cro, nullptr, nullptr);
+    ASSERT_EQ(Status::Code::kIncomplete, s.code());
+    ASSERT_EQ(Status::SubCode::kManualCompactionPaused, s.subcode());
+  });
+
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CanceledRunningManualCompactionRequeuesCF:PreFlush");
+
+  // The manual compaction job owns the first files and waits before it runs.
+  // This flush reaches the trigger, but the new version's score only counts
+  // the file that is not being compacted.
+  ASSERT_OK(Put(Key(1), "value1"));
+  ASSERT_OK(Put(Key(2), "value2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(std::to_string(kNumL0Files), FilesPerLevel(0));
+
+  canceled.store(true);
+  TEST_SYNC_POINT(
+      "DBCompactionTest::CanceledRunningManualCompactionRequeuesCF:Canceled");
+  compact_thread.join();
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ("0,1", FilesPerLevel(0));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_F(DBCompactionTest, DisableManualCompactionThreadQueueFullDBClose) {

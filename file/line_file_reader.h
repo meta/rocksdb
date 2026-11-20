@@ -15,7 +15,7 @@ namespace ROCKSDB_NAMESPACE {
 // trailing newline. Uses SequentialFileReader internally.
 class LineFileReader {
  private:
-  std::array<char, 8192> buf_;
+  std::array<char, 8192> buf_{};
   SequentialFileReader sfr_;
   IOStatus io_status_;
   const char* buf_begin_ = buf_.data();
@@ -58,6 +58,9 @@ class LineFileReader {
   // permanent and no retry or recovery is attempted with the same
   // LineFileReader.
   const IOStatus& GetStatus() const { return io_status_; }
+
+  // See SequentialFileReader::SetIOType()
+  void SetIOType(IOType io_type) { sfr_.SetIOType(io_type); }
 };
 
 }  // namespace ROCKSDB_NAMESPACE

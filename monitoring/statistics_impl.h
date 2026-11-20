@@ -41,7 +41,7 @@ enum HistogramsInternal : uint32_t {
 
 class StatisticsImpl : public Statistics {
  public:
-  StatisticsImpl(std::shared_ptr<Statistics> stats);
+  explicit StatisticsImpl(std::shared_ptr<Statistics> stats);
   ~StatisticsImpl() override;
   const char* Name() const override { return kClassName(); }
   static const char* kClassName() { return "BasicStatistics"; }

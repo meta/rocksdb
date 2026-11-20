@@ -24,6 +24,8 @@
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
+class SystemClock;
+
 // CacheReservationManager is an interface for reserving cache space for the
 // memory used
 class CacheReservationManager {
@@ -42,6 +44,12 @@ class CacheReservationManager {
   // `UpdateCacheReservation` function
   virtual Status UpdateCacheReservation(std::size_t memory_used_delta,
                                         bool increase) = 0;
+  // Increases the memory used by `memory_used_delta` and reserves cache space
+  // for it, as UpdateCacheReservation(memory_used_delta, /*increase=*/true)
+  // does. If the reservation fails, the call has no effect: the memory used is
+  // restored and the dummy entries inserted by this call are released, even
+  // with delayed decrease. Returns the status of the failed reservation.
+  virtual Status TryIncreaseCacheReservation(std::size_t memory_used_delta) = 0;
   virtual Status MakeCacheReservation(
       std::size_t incremental_memory_used,
       std::unique_ptr<CacheReservationManager::CacheReservationHandle>*
@@ -138,6 +146,8 @@ class CacheReservationManagerImpl
                                 bool /* increase */) override {
     return Status::NotSupported();
   }
+
+  Status TryIncreaseCacheReservation(std::size_t memory_used_delta) override;
 
   // One of the two ways of reserving cache space and releasing is done through
   // destruction of CacheReservationHandle.
@@ -289,6 +299,12 @@ class ConcurrentCacheReservationManager
     return s;
   }
 
+  inline Status TryIncreaseCacheReservation(
+      std::size_t memory_used_delta) override {
+    std::lock_guard<std::mutex> lock(cache_res_mgr_mu_);
+    return cache_res_mgr_->TryIncreaseCacheReservation(memory_used_delta);
+  }
+
   inline Status MakeCacheReservation(
       std::size_t incremental_memory_used,
       std::unique_ptr<CacheReservationManager::CacheReservationHandle>* handle)
@@ -318,6 +334,84 @@ class ConcurrentCacheReservationManager
 
  private:
   std::mutex cache_res_mgr_mu_;
+  std::shared_ptr<CacheReservationManager> cache_res_mgr_;
+};
+
+// AtomicCacheReservationManager reserves cache space for memory that many
+// threads change often, such as readahead buffers. It is thread-safe.
+//
+// ConcurrentCacheReservationManager takes a mutex on every update. When
+// hundreds of thousands of buffers per second are allocated and freed from
+// many threads, that mutex becomes the bottleneck. Here, most updates only
+// change an atomic counter. The mutex is taken, and the cache reservation is
+// changed, only when:
+// (1) the memory used goes above the reservation, or
+// (2) the memory used falls below 3/4 of the reservation, at least one dummy
+//     entry can be released, and the reservation has not grown for
+//     `release_delay_micros`.
+// The delay avoids inserting and erasing dummy entries again and again when
+// the memory used goes up and down quickly, for example from zero to one
+// buffer and back on every read.
+//
+// So the reservation is not exact:
+// - It can be up to the larger of about 4/3 of the memory used and the memory
+//   used plus one dummy entry.
+// - After the reservation grows, it is not reduced for the delay, and after
+//   that only by a later decrease. If no decrease comes (e.g. no more buffers
+//   are freed), it stays at up to its recent peak.
+// - The memory used can go above the reservation for a short time when an
+//   increase races with a release. The next increase that does not fit fixes
+//   it.
+class AtomicCacheReservationManager {
+ public:
+  // @param cache_res_mgr Not thread-safe; used only under this class's mutex.
+  // @param clock Used only when release_delay_micros > 0.
+  AtomicCacheReservationManager(
+      std::shared_ptr<CacheReservationManager> cache_res_mgr,
+      SystemClock* clock, uint64_t release_delay_micros);
+  ~AtomicCacheReservationManager() = default;
+  AtomicCacheReservationManager(const AtomicCacheReservationManager&) = delete;
+  AtomicCacheReservationManager& operator=(
+      const AtomicCacheReservationManager&) = delete;
+  AtomicCacheReservationManager(AtomicCacheReservationManager&&) = delete;
+  AtomicCacheReservationManager& operator=(AtomicCacheReservationManager&&) =
+      delete;
+
+  // All or nothing: if the reservation cannot cover the new memory used, the
+  // call has no effect and returns the status of the failed reservation.
+  Status TryIncreaseCacheReservation(std::size_t memory_used_delta);
+
+  // Releasing does not fail.
+  // REQUIRES: memory_used_delta is not more than the memory added by
+  // successful TryIncreaseCacheReservation() calls and not decreased yet.
+  void DecreaseCacheReservation(std::size_t memory_used_delta);
+
+  std::size_t GetTotalMemoryUsed() const {
+    return memory_used_.load(std::memory_order_relaxed);
+  }
+  // The block cache space reserved, a multiple of the dummy entry size.
+  std::size_t GetTotalReservedCacheSize() const {
+    return reserved_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<std::size_t> memory_used_{0};
+  // Written only under mu_.
+  std::atomic<std::size_t> reserved_{0};
+  // Whether less than 3/4 of the reservation is used and a release would free
+  // at least one dummy entry.
+  static bool CanRelease(std::size_t used, std::size_t reserved);
+  bool ReleaseDelayPassed() const;
+  // REQUIRES: mu_ is held.
+  void ReleaseIfUnusedLocked();
+
+  // Monotonic time (SystemClock::NowNanos()) of the last reservation growth.
+  // Written only under mu_.
+  std::atomic<uint64_t> last_increase_nanos_{0};
+  SystemClock* const clock_;
+  const uint64_t release_delay_nanos_;
+  std::mutex mu_;
+  // Its memory used is the memory used covered by the reservation.
   std::shared_ptr<CacheReservationManager> cache_res_mgr_;
 };
 }  // namespace ROCKSDB_NAMESPACE

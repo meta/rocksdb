@@ -6,11 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "cache/compressed_secondary_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
@@ -26,13 +29,16 @@
 #include "port/stack_trace.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/lazy_wide_columns.h"
 #include "rocksdb/trace_reader_writer.h"
 #include "rocksdb/trace_record.h"
+#include "rocksdb/utilities/options_util.h"
 #include "rocksdb/utilities/replayer.h"
 #include "test_util/sync_point.h"
 #include "util/compression.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
+#include "util/thread_guard.h"
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -41,6 +47,157 @@ class DBBlobBasicTest : public DBTestBase {
  protected:
   DBBlobBasicTest()
       : DBTestBase("db_blob_basic_test", /* env_do_fsync */ false) {}
+
+  static uint64_t PhysicalBlobSize(const ColumnFamilyMetaData& metadata) {
+    uint64_t size = 0;
+    for (const BlobMetaData& blob : metadata.blob_files) {
+      size += blob.blob_file_size;
+    }
+    return size;
+  }
+
+  static uint64_t SstSize(const ColumnFamilyMetaData& metadata) {
+    uint64_t size = 0;
+    for (const LevelMetaData& level : metadata.levels) {
+      for (const SstFileMetaData& file : level.files) {
+        size += file.size;
+      }
+    }
+    return size;
+  }
+
+  Options MissingBlobRepairOptions() {
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.min_blob_size = 0;
+    options.enable_blob_garbage_collection = false;
+    options.disable_auto_compactions = true;
+    options.num_levels = 3;
+    options.level_compaction_dynamic_level_bytes = false;
+    return options;
+  }
+
+  void AssertBlobReference(const Slice& key, uint64_t blob_file_number) {
+    PinnableSlice value;
+    bool is_blob_index = false;
+    DBImpl::GetImplOptions get_options;
+    get_options.column_family = db_->DefaultColumnFamily();
+    get_options.value = &value;
+    get_options.is_blob_index = &is_blob_index;
+    ASSERT_OK(dbfull()->GetImpl(ReadOptions(), key, get_options));
+    ASSERT_TRUE(is_blob_index);
+    BlobIndex blob_index;
+    ASSERT_OK(blob_index.DecodeFrom(value));
+    ASSERT_EQ(blob_index.file_number(), blob_file_number);
+  }
+
+  // Writes "a" and "c" (plus an older "b" if `preserve_older_value`) to one
+  // blob file and "b" and "d" to a newer one, compacts both into one SST file
+  // that references both blob files, then closes the DB and deletes the newer
+  // blob file, or the older one if `delete_oldest`. The SST file is linked
+  // only to the older blob file, its oldest referenced one.
+  void CreateSstWithMissingBlobFile(const Options& options,
+                                    bool preserve_older_value,
+                                    bool delete_oldest,
+                                    uint64_t* missing_blob_file) {
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "va"));
+    ASSERT_OK(Put("c", "vc"));
+    if (preserve_older_value) {
+      ASSERT_OK(Put("b", "old"));
+    }
+    ASSERT_OK(Flush());
+    const Snapshot* snapshot =
+        preserve_older_value ? db_->GetSnapshot() : nullptr;
+    {
+      Defer release_snapshot([this, snapshot]() {
+        if (snapshot) {
+          db_->ReleaseSnapshot(snapshot);
+        }
+      });
+      ASSERT_OK(Put("b", "vb"));
+      ASSERT_OK(Put("d", "vd"));
+      ASSERT_OK(Flush());
+      const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+      ASSERT_EQ(blob_files.size(), 2);
+      *missing_blob_file =
+          delete_oldest ? blob_files.front() : blob_files.back();
+      ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+      ASSERT_EQ(TotalTableFiles(), 1);
+    }
+
+    Close();
+    ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, *missing_blob_file)));
+  }
+
+  void RecoverMissingNonOldestBlob(const Options& options,
+                                   bool preserve_older_value,
+                                   uint64_t* missing_blob_file) {
+    ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+        options, preserve_older_value, /*delete_oldest=*/false,
+        missing_blob_file));
+    Options recovery_options = options;
+    recovery_options.best_efforts_recovery = true;
+    Reopen(recovery_options);
+    const std::vector<uint64_t> live_blob_files = GetBlobFileNumbers();
+    ASSERT_EQ(live_blob_files.size(), 1);
+    ASSERT_NE(live_blob_files.front(), *missing_blob_file);
+    ASSERT_EQ(TotalTableFiles(), 1);
+    ASSERT_NO_FATAL_FAILURE(AssertBlobReference("b", *missing_blob_file));
+    ASSERT_NO_FATAL_FAILURE(AssertBlobReference("d", *missing_blob_file));
+  }
+
+  std::vector<uint64_t> GetDroppedBlobFiles() {
+    return dbfull()
+        ->GetVersionSet()
+        ->GetColumnFamilySet()
+        ->GetDefault()
+        ->current()
+        ->storage_info()
+        ->GetDroppedBlobFiles();
+  }
+
+  static Options RepairOptions(Options options) {
+    options.best_efforts_blob_db_repair = true;
+    return options;
+  }
+
+  // Returns the keys and values a forward and a reverse scan read, which must
+  // agree.
+  std::string ScanAll(ReadOptions read_options = ReadOptions()) {
+    std::string forward;
+    std::string reverse;
+    {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        EXPECT_TRUE(iter->PrepareValue());
+        forward +=
+            iter->key().ToString() + "=" + iter->value().ToString() + ";";
+      }
+      EXPECT_OK(iter->status());
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        EXPECT_TRUE(iter->PrepareValue());
+        reverse.insert(
+            0, iter->key().ToString() + "=" + iter->value().ToString() + ";");
+      }
+      EXPECT_OK(iter->status());
+    }
+    EXPECT_EQ(forward, reverse);
+    return forward;
+  }
+
+  // Runs best-efforts BlobDB repair on a DB whose newer blob file is missing
+  // (see CreateSstWithMissingBlobFile()) and checks what it recorded.
+  void RepairMissingNonOldestBlob(const Options& options,
+                                  uint64_t* missing_blob_file) {
+    ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+        options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+        missing_blob_file));
+    Reopen(RepairOptions(options));
+    ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{*missing_blob_file});
+    ASSERT_EQ(TotalTableFiles(), 1);
+  }
 };
 
 class BlobFileChecksumCapturingFS : public FileSystemWrapper {
@@ -1203,7 +1360,7 @@ TEST_F(DBBlobBasicTest, MultiGetBlobsFromMultipleFiles) {
   }
 }
 
-TEST_F(DBBlobBasicTest, GetBlob_CorruptIndex) {
+TEST_F(DBBlobBasicTest, GetBlobCorruptIndex) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1233,7 +1390,7 @@ TEST_F(DBBlobBasicTest, GetBlob_CorruptIndex) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_F(DBBlobBasicTest, MultiGetBlob_CorruptIndex) {
+TEST_F(DBBlobBasicTest, MultiGetBlobCorruptIndex) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1292,7 +1449,7 @@ TEST_F(DBBlobBasicTest, MultiGetBlob_CorruptIndex) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_F(DBBlobBasicTest, MultiGetBlob_ExceedSoftLimit) {
+TEST_F(DBBlobBasicTest, MultiGetBlobExceedSoftLimit) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1323,7 +1480,7 @@ TEST_F(DBBlobBasicTest, MultiGetBlob_ExceedSoftLimit) {
   }
 }
 
-TEST_F(DBBlobBasicTest, GetBlob_InlinedTTLIndex) {
+TEST_F(DBBlobBasicTest, GetBlobInlinedTTLIndex) {
   constexpr uint64_t min_blob_size = 10;
 
   Options options = GetDefaultOptions();
@@ -1350,12 +1507,17 @@ TEST_F(DBBlobBasicTest, GetBlob_InlinedTTLIndex) {
 
   ASSERT_OK(Flush());
 
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes, 0U);
+
   PinnableSlice result;
   ASSERT_TRUE(db_->Get(ReadOptions(), db_->DefaultColumnFamily(), key, &result)
                   .IsCorruption());
 }
 
-TEST_F(DBBlobBasicTest, GetBlob_IndexWithInvalidFileNumber) {
+TEST_F(DBBlobBasicTest, GetBlobIndexWithInvalidFileNumber) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1417,7 +1579,7 @@ TEST_F(DBBlobBasicTest, GenerateIOTracing) {
         NewFileTraceReader(env_, EnvOptions(), trace_file, &trace_reader));
     IOTraceReader reader(std::move(trace_reader));
 
-    IOTraceHeader header;
+    IOTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));
@@ -1440,7 +1602,7 @@ TEST_F(DBBlobBasicTest, GenerateIOTracing) {
   }
 }
 
-TEST_F(DBBlobBasicTest, BestEffortsRecovery_MissingNewestBlobFile) {
+TEST_F(DBBlobBasicTest, BestEffortsRecoveryMissingNewestBlobFile) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
   options.min_blob_size = 0;
@@ -1481,6 +1643,1103 @@ TEST_F(DBBlobBasicTest, BestEffortsRecovery_MissingNewestBlobFile) {
   std::string value;
   ASSERT_OK(db_->Get(ReadOptions(), "a", &value));
   ASSERT_EQ("value" + std::to_string(kNumTableFiles - 2), value);
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairRecordsMissingBlobFile) {
+  Options options = MissingBlobRepairOptions();
+  options.statistics = CreateDBStatistics();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+
+  // Values in the dropped blob file read as deleted.
+  ASSERT_OK(options.statistics->Reset());
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(options.statistics->getTickerCount(BLOB_DB_DROPPED_BLOB_READ_COUNT),
+            0);
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+  ASSERT_EQ(options.statistics->getAndResetTickerCount(
+                BLOB_DB_DROPPED_BLOB_READ_COUNT),
+            2);
+
+  std::vector<std::string> values;
+  const std::vector<Status> statuses =
+      db_->MultiGet(ReadOptions(), {"a", "b", "c", "d"}, &values);
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0], "va");
+  ASSERT_EQ(statuses[1].code(), Status::kNotFound) << statuses[1].ToString();
+  ASSERT_OK(statuses[2]);
+  ASSERT_EQ(values[2], "vc");
+  ASSERT_EQ(statuses[3].code(), Status::kNotFound) << statuses[3].ToString();
+  ASSERT_EQ(options.statistics->getAndResetTickerCount(
+                BLOB_DB_DROPPED_BLOB_READ_COUNT),
+            2);
+
+  ASSERT_EQ(ScanAll(), "a=va;c=vc;");
+  ReadOptions unprepared_read_options;
+  unprepared_read_options.allow_unprepared_value = true;
+  ASSERT_EQ(ScanAll(unprepared_read_options), "a=va;c=vc;");
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    ASSERT_OK(options.statistics->Reset());
+    iter->Seek("b");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), "c");
+    ASSERT_EQ(options.statistics->getAndResetTickerCount(
+                  BLOB_DB_DROPPED_BLOB_READ_COUNT),
+              1);
+    iter->SeekForPrev("b");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), "a");
+    iter->Seek("d");
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+
+  // The record is persisted in the MANIFEST. It outlives regular reopens and
+  // is replayed by later best-efforts recovery or repair.
+  Options recovery_options = options;
+  recovery_options.best_efforts_recovery = true;
+  for (const Options& reopen_options :
+       {options, options, recovery_options, RepairOptions(options)}) {
+    Reopen(reopen_options);
+    ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+    ASSERT_EQ(Get("a"), "va");
+    ASSERT_EQ(Get("b"), "NOT_FOUND");
+  }
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairCountsOnlyDecidingEntries) {
+  // Reads count a lost value once, and only when it decides what they return,
+  // in either scan direction.
+  Options options = MissingBlobRepairOptions();
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  // "b" and "c" get two versions each in the newer blob file.
+  ASSERT_OK(Put("b", "b1"));
+  ASSERT_OK(Put("c", "c1"));
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(Put("b", "b2"));
+  ASSERT_OK(Put("c", "c2"));
+  ASSERT_OK(Flush());
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 2);
+  const uint64_t missing_blob_file = blob_files.back();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  db_->ReleaseSnapshot(snapshot);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, missing_blob_file)));
+
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  // A newer healthy version hides the lost versions of "c".
+  ASSERT_OK(Put("c", "c3"));
+  ASSERT_OK(Flush());
+
+  // With max_sequential_skip_in_iterations=1, reverse iteration seeks to the
+  // newest version of "b" and "c" after reading their oldest one.
+  for (const char* const max_skip : {"8", "1"}) {
+    SCOPED_TRACE(std::string("max_skip=") + max_skip);
+    ASSERT_OK(dbfull()->SetOptions(
+        {{"max_sequential_skip_in_iterations", max_skip}}));
+    ASSERT_OK(options.statistics->Reset());
+    // A forward and a reverse scan each count "b" once and "c" never.
+    ASSERT_EQ(ScanAll(), "a=va;c=c3;");
+    ASSERT_EQ(
+        options.statistics->getTickerCount(BLOB_DB_DROPPED_BLOB_READ_COUNT), 2);
+  }
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairKeepsOlderVersionsHidden) {
+  // A value in a dropped blob file hides the older versions of its key, as the
+  // deletion that compaction writes in its place does.
+  Options options = MissingBlobRepairOptions();
+  // Makes reverse iteration over "b" seek to its newest version.
+  options.max_sequential_skip_in_iterations = 1;
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+      options, /*preserve_older_value=*/true, /*delete_oldest=*/false,
+      &missing_blob_file));
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+
+  for (const bool compacted : {false, true}) {
+    SCOPED_TRACE(compacted ? "after compaction" : "before compaction");
+    ASSERT_EQ(Get("b"), "NOT_FOUND");
+    std::vector<std::string> values;
+    const std::vector<Status> statuses =
+        db_->MultiGet(ReadOptions(), {"b"}, &values);
+    ASSERT_EQ(statuses[0].code(), Status::kNotFound) << statuses[0].ToString();
+    ASSERT_EQ(ScanAll(), "a=va;c=vc;");
+    ReadOptions unprepared_read_options;
+    unprepared_read_options.allow_unprepared_value = true;
+    ASSERT_EQ(ScanAll(unprepared_read_options), "a=va;c=vc;");
+    ReadOptions cache_only_read_options;
+    cache_only_read_options.read_tier = kBlockCacheTier;
+    std::string value;
+    ASSERT_EQ(db_->Get(cache_only_read_options, "b", &value).code(),
+              Status::kNotFound);
+
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  }
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairMergesWithoutLostBase) {
+  // A merge on top of a value in a dropped blob file merges with no base
+  // value, as it does on top of the deletion that compaction writes.
+  Options options = MissingBlobRepairOptions();
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+
+  // A lost value that is the only version of its key has no merge operands.
+  {
+    std::vector<PinnableSlice> operands(1);
+    GetMergeOperandsOptions merge_operands_options;
+    merge_operands_options.expected_max_number_of_operands = 1;
+    int number_of_operands = 0;
+    ASSERT_EQ(
+        db_->GetMergeOperands(ReadOptions(), db_->DefaultColumnFamily(), "d",
+                              operands.data(), &merge_operands_options,
+                              &number_of_operands)
+            .code(),
+        Status::kNotFound);
+  }
+
+  ASSERT_OK(Merge("a", "ma"));
+  ASSERT_OK(Merge("b", "mb"));
+  for (const char* const stage : {"memtable", "flushed", "compacted"}) {
+    SCOPED_TRACE(stage);
+    if (std::string(stage) == "flushed") {
+      ASSERT_OK(Flush());
+    } else if (std::string(stage) == "compacted") {
+      ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    }
+    ASSERT_EQ(Get("a"), "va,ma");
+    ASSERT_EQ(Get("b"), "mb");
+    std::vector<std::string> values;
+    const std::vector<Status> statuses =
+        db_->MultiGet(ReadOptions(), {"a", "b"}, &values);
+    ASSERT_OK(statuses[0]);
+    ASSERT_EQ(values[0], "va,ma");
+    ASSERT_OK(statuses[1]);
+    ASSERT_EQ(values[1], "mb");
+    ASSERT_EQ(ScanAll(), "a=va,ma;b=mb;c=vc;");
+    // Makes reverse iteration over "a" and "b" seek to their newest versions.
+    ASSERT_OK(
+        dbfull()->SetOptions({{"max_sequential_skip_in_iterations", "1"}}));
+    ASSERT_EQ(ScanAll(), "a=va,ma;b=mb;c=vc;");
+    ASSERT_OK(
+        dbfull()->SetOptions({{"max_sequential_skip_in_iterations", "8"}}));
+
+    std::vector<PinnableSlice> operands(2);
+    GetMergeOperandsOptions merge_operands_options;
+    merge_operands_options.expected_max_number_of_operands = 2;
+    int number_of_operands = 0;
+    ASSERT_OK(db_->GetMergeOperands(
+        ReadOptions(), db_->DefaultColumnFamily(), "b", operands.data(),
+        &merge_operands_options, &number_of_operands));
+    ASSERT_EQ(number_of_operands, 1);
+    ASSERT_EQ(operands[0], "mb");
+  }
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairDropsLostWideColumns) {
+  // A wide-column entity loses its columns stored in a dropped blob file, as
+  // in compaction, and reads as deleted once it has no column left.
+  Options options = MissingBlobRepairOptions();
+  options.min_blob_size = 8;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  options.statistics = CreateDBStatistics();
+  // Required by GetEntityLazy.
+  options.max_open_files = -1;
+  DestroyAndReopen(options);
+  const std::string big(16, 'b');
+  ASSERT_OK(Put("a", big));
+  ASSERT_OK(Flush());
+  ColumnFamilyHandle* cf = db_->DefaultColumnFamily();
+  // "e1" keeps its small inline column. "e2", and "e3" without a default
+  // column, lose every column. "e4" and "e5" get merges on top.
+  for (const char* const key : {"e1", "e4"}) {
+    ASSERT_OK(db_->PutEntity(WriteOptions(), cf, key,
+                             {{kDefaultWideColumnName, big}, {"small", "s"}}));
+  }
+  for (const char* const key : {"e2", "e5"}) {
+    ASSERT_OK(db_->PutEntity(WriteOptions(), cf, key,
+                             {{kDefaultWideColumnName, big}, {"x", big}}));
+  }
+  ASSERT_OK(db_->PutEntity(WriteOptions(), cf, "e3", {{"x", big}, {"y", big}}));
+  ASSERT_OK(Flush());
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 2);
+  const uint64_t missing_blob_file = blob_files.back();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, missing_blob_file)));
+
+  Reopen(RepairOptions(options));
+  cf = db_->DefaultColumnFamily();
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_OK(Merge("e4", "m4"));
+  ASSERT_OK(Merge("e5", "m5"));
+  ASSERT_OK(Flush());
+
+  auto columns_to_string = [](const WideColumns& columns) {
+    std::string result;
+    for (const WideColumn& column : columns) {
+      result += (result.empty() ? "" : ";") + column.name().ToString() + ":" +
+                column.value().ToString();
+    }
+    return result;
+  };
+  const std::vector<std::string> keys{"a", "e1", "e2", "e3", "e4", "e5"};
+  // A merge treats a missing default column as an empty value.
+  const std::vector<std::string> expected_values{
+      big, "", "NOT_FOUND", "NOT_FOUND", ",m4", "m5"};
+  const std::vector<std::string> expected_entities{
+      ":" + big, "small:s", "NOT_FOUND", "NOT_FOUND", ":,m4;small:s", ":m5"};
+  const std::string expected_scan =
+      "a{:" + big + "}e1{small:s}e4{:,m4;small:s}e5{:m5}";
+
+  for (const bool compacted : {false, true}) {
+    SCOPED_TRACE(compacted ? "after compaction" : "before compaction");
+    ASSERT_OK(options.statistics->Reset());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      SCOPED_TRACE(keys[i]);
+      ASSERT_EQ(Get(keys[i]), expected_values[i]);
+      PinnableWideColumns entity;
+      const Status s = db_->GetEntity(ReadOptions(), cf, keys[i], &entity);
+      ASSERT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
+      ASSERT_EQ(s.ok() ? columns_to_string(entity.columns()) : "NOT_FOUND",
+                expected_entities[i]);
+
+      LazyWideColumns lazy_entity;
+      const Status lazy_s =
+          db_->GetEntityLazy(ReadOptions(), cf, keys[i], &lazy_entity);
+      ASSERT_TRUE(lazy_s.ok() || lazy_s.IsNotFound()) << lazy_s.ToString();
+      std::string lazy_columns = lazy_s.ok() ? "" : "NOT_FOUND";
+      for (size_t j = 0; lazy_s.ok() && j < lazy_entity.size(); ++j) {
+        PinnableSlice value;
+        ASSERT_OK(lazy_entity.ResolveColumn(lazy_entity[j], &value));
+        lazy_columns += (j == 0 ? "" : ";") + lazy_entity[j].name().ToString() +
+                        ":" + value.ToString();
+      }
+      ASSERT_EQ(lazy_columns, expected_entities[i]);
+    }
+    if (!compacted) {
+      // Get, GetEntity and GetEntityLazy each read the five entities with
+      // columns in the dropped blob file.
+      ASSERT_EQ(
+          options.statistics->getTickerCount(BLOB_DB_DROPPED_BLOB_READ_COUNT),
+          3 * 5);
+    }
+
+    std::vector<Slice> key_slices(keys.begin(), keys.end());
+    std::vector<PinnableWideColumns> entities(keys.size());
+    std::vector<Status> statuses(keys.size());
+    db_->MultiGetEntity(ReadOptions(), cf, keys.size(), key_slices.data(),
+                        entities.data(), statuses.data());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      SCOPED_TRACE(keys[i]);
+      ASSERT_TRUE(statuses[i].ok() || statuses[i].IsNotFound())
+          << statuses[i].ToString();
+      ASSERT_EQ(statuses[i].ok() ? columns_to_string(entities[i].columns())
+                                 : "NOT_FOUND",
+                expected_entities[i]);
+    }
+
+    // With max_sequential_skip_in_iterations=0, reverse iteration seeks to
+    // the newest version of every key.
+    for (const char* const max_skip : {"8", "0"}) {
+      ASSERT_OK(dbfull()->SetOptions(
+          {{"max_sequential_skip_in_iterations", max_skip}}));
+      for (const bool allow_unprepared_value : {false, true}) {
+        SCOPED_TRACE(std::string("max_skip=") + max_skip +
+                     (allow_unprepared_value ? " unprepared" : ""));
+        ReadOptions read_options;
+        read_options.allow_unprepared_value = allow_unprepared_value;
+        std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+        std::string forward;
+        for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+          ASSERT_TRUE(iter->PrepareValue());
+          forward += iter->key().ToString() + "{" +
+                     columns_to_string(iter->columns()) + "}";
+        }
+        ASSERT_OK(iter->status());
+        ASSERT_EQ(forward, expected_scan);
+        std::string reverse;
+        for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+          ASSERT_TRUE(iter->PrepareValue());
+          reverse.insert(0, iter->key().ToString() + "{" +
+                                columns_to_string(iter->columns()) + "}");
+        }
+        ASSERT_OK(iter->status());
+        ASSERT_EQ(reverse, expected_scan);
+      }
+    }
+    ASSERT_OK(
+        dbfull()->SetOptions({{"max_sequential_skip_in_iterations", "8"}}));
+    if (!compacted) {
+      // An iterator counts an entity that loses some columns, whether it
+      // reads it directly or as a merge base.
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+      for (const char* const key : {"e1", "e4"}) {
+        ASSERT_OK(options.statistics->Reset());
+        iter->Seek(key);
+        ASSERT_TRUE(iter->Valid());
+        ASSERT_EQ(iter->key(), key);
+        ASSERT_EQ(
+            options.statistics->getTickerCount(BLOB_DB_DROPPED_BLOB_READ_COUNT),
+            1);
+      }
+    }
+
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  }
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairTailingIterator) {
+  // A tailing iterator keeps skipping lost values after the Version it was
+  // created with is freed. It reads keys only, without fetching blobs.
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+
+  ReadOptions read_options;
+  read_options.tailing = true;
+  read_options.allow_unprepared_value = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("a");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key(), "a");
+
+  // Installs a new Version. Moving the iterator releases the old one.
+  ASSERT_OK(Put("e", "ve"));
+  ASSERT_OK(Flush());
+  std::string keys;
+  for (iter->Next(); iter->Valid(); iter->Next()) {
+    keys += iter->key().ToString();
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(keys, "ce");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairWithBlobDirectWrite) {
+  // With blob direct write, iterators can read blob files that the Version
+  // does not know yet, but a dropped blob file is never one of them.
+  Options options = MissingBlobRepairOptions();
+  options.enable_blob_direct_write = true;
+  options.allow_concurrent_memtable_write = false;
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  std::vector<std::string> values;
+  const std::vector<Status> statuses =
+      db_->MultiGet(ReadOptions(), {"a", "b"}, &values);
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0], "va");
+  ASSERT_EQ(statuses[1].code(), Status::kNotFound) << statuses[1].ToString();
+  ASSERT_EQ(ScanAll(), "a=va;c=vc;");
+
+  // Blob direct write resolves blob values after the SST lookup, and cannot
+  // do that without I/O, but a lost value needs no resolution.
+  ReadOptions cache_only_read_options;
+  cache_only_read_options.read_tier = kBlockCacheTier;
+  std::string value;
+  ASSERT_EQ(db_->Get(cache_only_read_options, "b", &value).code(),
+            Status::kNotFound);
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairCorruptBlobFile) {
+  // A blob file that is present but cannot be opened counts as missing.
+  Options options = MissingBlobRepairOptions();
+  uint64_t corrupt_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+      options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+      &corrupt_blob_file));
+  ASSERT_OK(WriteStringToFile(env_, "not a blob file",
+                              BlobFileName(dbname_, corrupt_blob_file),
+                              /*should_sync=*/true));
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{corrupt_blob_file});
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairRecordSurvivesManifestRollover) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+
+  // Tiny MANIFEST size limits make each flush start a new MANIFEST.
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  Reopen(options);
+  const uint64_t manifest_file_number =
+      dbfull()->TEST_Current_Manifest_FileNo();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("e" + std::to_string(i), "ve"));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_GT(dbfull()->TEST_Current_Manifest_FileNo(), manifest_file_number);
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+
+  Reopen(options);
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairFallsBackForMissingSst) {
+  // As in best-efforts recovery, a missing non-L0 SST file makes repair fall
+  // back to an older point in time, even when a blob file is missing too.
+  // Before the compaction that wrote the SST file, both flushed files existed,
+  // and they are gone now, so the column family recovers empty.
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+      options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+      &missing_blob_file));
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  std::vector<std::string> table_files;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type = kTempFile;
+    if (ParseFileName(child, &number, &type) && type == kTableFile) {
+      table_files.push_back(child);
+    }
+  }
+  ASSERT_EQ(table_files.size(), 1);
+  ASSERT_OK(env_->DeleteFile(dbname_ + "/" + table_files[0]));
+
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(TotalTableFiles(), 0);
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairOnHealthyDb) {
+  // Leaves a blob file that compaction made obsolete and deleted, while an
+  // older blob file stays live. The obsolete blob file is newer than the
+  // oldest referenced one, so repair must not record it as dropped.
+  Options options = MissingBlobRepairOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Flush());
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 2);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(Put("b", "vb2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(env_->FileExists(BlobFileName(dbname_, blob_files[1])).code(),
+            Status::kNotFound);
+  ASSERT_EQ(GetBlobFileNumbers().front(), blob_files[0]);
+  const std::vector<uint64_t> live_blob_files = GetBlobFileNumbers();
+
+  Reopen(RepairOptions(options));
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(GetBlobFileNumbers(), live_blob_files);
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "vb2");
+
+  Reopen(options);
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(Get("b"), "vb2");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairDropsBlobOfMissingL0File) {
+  // The newest L0 file is missing, but its blob file is present. Both modes
+  // leave the L0 file and its blob file out; only repair records the blob
+  // file as dropped.
+  Options options = MissingBlobRepairOptions();
+  for (const bool repair : {false, true}) {
+    SCOPED_TRACE(repair ? "repair" : "best-efforts recovery");
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "va"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("b", "vb"));
+    ASSERT_OK(Flush());
+    const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+    ASSERT_EQ(blob_files.size(), 2);
+    std::vector<LiveFileMetaData> table_files;
+    db_->GetLiveFilesMetaData(&table_files);
+    ASSERT_EQ(table_files.size(), 2);
+    const LiveFileMetaData& newest_table_file =
+        table_files[0].file_number > table_files[1].file_number
+            ? table_files[0]
+            : table_files[1];
+    const std::string newest_table_file_name =
+        newest_table_file.db_path + "/" + newest_table_file.relative_filename;
+    Close();
+    ASSERT_OK(env_->DeleteFile(newest_table_file_name));
+
+    Options reopen_options = repair ? RepairOptions(options) : options;
+    reopen_options.best_efforts_recovery = !repair;
+    Reopen(reopen_options);
+    ASSERT_EQ(TotalTableFiles(), 1);
+    ASSERT_EQ(Get("a"), "va");
+    ASSERT_EQ(Get("b"), "NOT_FOUND");
+    ASSERT_EQ(GetBlobFileNumbers(), std::vector<uint64_t>{blob_files[0]});
+    ASSERT_EQ(GetDroppedBlobFiles(), repair
+                                         ? std::vector<uint64_t>{blob_files[1]}
+                                         : std::vector<uint64_t>{});
+  }
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairReadOnly) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+      options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+      &missing_blob_file));
+
+  // A read-only DB applies the repair in memory only.
+  ASSERT_OK(ReadOnlyReopen(RepairOptions(options)));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+
+  // Nothing was recorded, so a regular open still has the blob file's
+  // metadata.
+  Reopen(options);
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(GetBlobFileNumbers().back(), missing_blob_file);
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsRecoveryDoesNotRecordDroppedBlobFiles) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RecoverMissingNonOldestBlob(options, false, &missing_blob_file));
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  std::string value;
+  const Status s = db_->Get(ReadOptions(), "b", &value);
+  ASSERT_EQ(s.code(), Status::kCorruption);
+  ASSERT_NE(s.ToString().find("Invalid blob file number"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairKeepsSstMissingOldestBlob) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+
+  // Best-efforts recovery can only recover a point in time before the SST
+  // file existed, which leaves the column family empty.
+  ASSERT_NO_FATAL_FAILURE(
+      CreateSstWithMissingBlobFile(options, /*preserve_older_value=*/false,
+                                   /*delete_oldest=*/true, &missing_blob_file));
+  Options recovery_options = options;
+  recovery_options.best_efforts_recovery = true;
+  Reopen(recovery_options);
+  ASSERT_EQ(TotalTableFiles(), 0);
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+
+  // Repair keeps the SST file and the newer blob file.
+  ASSERT_NO_FATAL_FAILURE(
+      CreateSstWithMissingBlobFile(options, /*preserve_older_value=*/false,
+                                   /*delete_oldest=*/true, &missing_blob_file));
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(TotalTableFiles(), 1);
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("b"), "vb");
+  ASSERT_EQ(Get("d"), "vd");
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+  ASSERT_EQ(Get("c"), "NOT_FOUND");
+
+  Reopen(options);
+  ASSERT_EQ(Get("b"), "vb");
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairWithAtomicFlush) {
+  // With two column families, atomic flush writes atomic groups, which keeps
+  // best-efforts recovery from accepting a Version that misses any file.
+  // Repair does not need that.
+  Options options = MissingBlobRepairOptions();
+  options.atomic_flush = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  const std::vector<std::string> cf_names{kDefaultColumnFamilyName, "pikachu"};
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Put(1, "x", "vx"));
+  ASSERT_OK(dbfull()->Flush(FlushOptions(), handles_));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put(1, "y", "vy"));
+  ASSERT_OK(dbfull()->Flush(FlushOptions(), handles_));
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 2);
+  const uint64_t missing_blob_file = blob_files.back();
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[0], nullptr, nullptr));
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, missing_blob_file)));
+
+  ReopenWithColumnFamilies(cf_names, RepairOptions(options));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  ASSERT_EQ(Get(1, "x"), "vx");
+  ASSERT_EQ(Get(1, "y"), "vy");
+}
+
+TEST_F(DBBlobBasicTest,
+       BestEffortsBlobDbRepairAutomaticCompactionDiscardsDroppedValues) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+
+  // Reopen without repair. Overwriting "b" makes an automatic compaction drop
+  // its old value, which is in the dropped blob file.
+  options.disable_auto_compactions = false;
+  options.level0_file_num_compaction_trigger = 1;
+  Reopen(options);
+  ASSERT_OK(Put("b", "vb2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  uint64_t background_errors = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBackgroundErrors,
+                                  &background_errors));
+  ASSERT_EQ(background_errors, 0);
+
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "vb2");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+
+  Reopen(options);
+  ASSERT_EQ(Get("b"), "vb2");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairWithBlobGarbageCollection) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+
+  // Garbage collection relocates every blob, so it would read the dropped
+  // blob file if the compaction did not discard its values first.
+  options.enable_blob_garbage_collection = true;
+  options.blob_garbage_collection_age_cutoff = 1.0;
+  Reopen(options);
+  CompactRangeOptions compact_range_options;
+  compact_range_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_range_options, nullptr, nullptr));
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+
+  // The surviving values were relocated to a new blob file, so no SST file
+  // can reference the dropped blob file anymore.
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  Reopen(options);
+  ASSERT_TRUE(GetDroppedBlobFiles().empty());
+  ASSERT_EQ(Get("a"), "va");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairMissingOldestBlobWithForcedGc) {
+  // After repair drops the oldest blob file an SST file references, the
+  // oldest blob file left in the Version has no linked SST file.
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      CreateSstWithMissingBlobFile(options, /*preserve_older_value=*/false,
+                                   /*delete_oldest=*/true, &missing_blob_file));
+  options.enable_blob_garbage_collection = true;
+  options.blob_garbage_collection_age_cutoff = 1.0;
+  options.blob_garbage_collection_force_threshold = 0.5;
+  Reopen(RepairOptions(options));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  ASSERT_EQ(Get("b"), "vb");
+
+  Reopen(options);
+  ASSERT_EQ(Get("b"), "vb");
+  ASSERT_EQ(Get("d"), "vd");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairRequiresBlobFiles) {
+  Options options = MissingBlobRepairOptions();
+  options.enable_blob_files = false;
+  options.best_efforts_blob_db_repair = true;
+  const Status s = TryReopen(options);
+  ASSERT_EQ(s.code(), Status::kInvalidArgument) << s.ToString();
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairNotSavedInOptionsFile) {
+  // A repair applies only to the open that sets it. Reopening with the options
+  // in the OPTIONS file replays the WAL and does not repair again.
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RepairMissingNonOldestBlob(options, &missing_blob_file));
+
+  ConfigOptions config_options;
+  config_options.env = env_;
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cf_descs;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                              &loaded_cf_descs));
+  ASSERT_FALSE(loaded_db_options.best_efforts_blob_db_repair);
+  ASSERT_EQ(loaded_cf_descs.size(), 1);
+  // Env pointers are not persisted in OPTIONS files.
+  loaded_db_options.env = env_;
+
+  // Only the WAL holds "e" when the DB closes.
+  ASSERT_OK(Put("e", "ve"));
+  ASSERT_OK(TryReopen(Options(loaded_db_options, loaded_cf_descs[0].options)));
+  ASSERT_EQ(Get("e"), "ve");
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+}
+
+TEST_F(DBBlobBasicTest, RepairMissingNonOldestBlobAfterBestEffortsRecovery) {
+  Options options = MissingBlobRepairOptions();
+  options.statistics = CreateDBStatistics();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RecoverMissingNonOldestBlob(options, false, &missing_blob_file));
+  const std::vector<uint64_t> healthy_blob_files = GetBlobFileNumbers();
+  ColumnFamilyMetaData before;
+  db_->GetColumnFamilyMetaData(db_->DefaultColumnFamily(), &before);
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  repair.bottommost_level_compaction = BottommostLevelCompaction::kSkip;
+  repair.max_subcompactions = 2;
+  repair.blob_garbage_collection_policy = BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(options.statistics->Reset());
+  ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+  ASSERT_GT(options.statistics->getTickerCount(COMPACT_READ_BYTES), 0);
+  ASSERT_EQ(options.statistics->getTickerCount(BLOB_DB_BLOB_FILE_BYTES_READ),
+            0);
+
+  ColumnFamilyMetaData after;
+  db_->GetColumnFamilyMetaData(db_->DefaultColumnFamily(), &after);
+  std::set<std::string> input_files;
+  for (const LevelMetaData& before_level : before.levels) {
+    for (const SstFileMetaData& input : before_level.files) {
+      input_files.insert(input.name);
+    }
+  }
+  for (const LevelMetaData& after_level : after.levels) {
+    for (const SstFileMetaData& output : after_level.files) {
+      ASSERT_EQ(input_files.count(output.name), 0);
+    }
+  }
+  ASSERT_EQ(GetBlobFileNumbers(), healthy_blob_files);
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  std::string value;
+  ASSERT_EQ(db_->Get(ReadOptions(), "b", &value).code(), Status::kNotFound);
+  ASSERT_EQ(db_->Get(ReadOptions(), "d", &value).code(), Status::kNotFound);
+
+  Reopen(options);
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  ASSERT_EQ(db_->Get(ReadOptions(), "b", &value).code(), Status::kNotFound);
+  ASSERT_EQ(db_->Get(ReadOptions(), "d", &value).code(), Status::kNotFound);
+}
+
+TEST_F(DBBlobBasicTest, MissingBlobRepairIsScopedToCompactRange) {
+  Options options = MissingBlobRepairOptions();
+  options.paranoid_checks = false;
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RecoverMissingNonOldestBlob(options, false, &missing_blob_file));
+  ASSERT_OK(Put("b", "replacement"));
+  ASSERT_OK(Flush());
+
+  const Status normal_compaction =
+      db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_EQ(normal_compaction.code(), Status::kCorruption);
+  ASSERT_NE(normal_compaction.ToString().find("unknown blob file"),
+            std::string::npos);
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+  ASSERT_EQ(Get("b"), "replacement");
+  ASSERT_EQ(Get("a"), "va");
+  std::string value;
+  ASSERT_EQ(db_->Get(ReadOptions(), "d", &value).code(), Status::kNotFound);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  Reopen(options);
+  ASSERT_EQ(Get("b"), "replacement");
+
+  const uint64_t later_missing_blob = GetBlobFileNumbers().back();
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, later_missing_blob)));
+  Reopen(options);
+  const Status later_corruption = db_->Get(ReadOptions(), "b", &value);
+  ASSERT_FALSE(later_corruption.ok());
+  ASSERT_TRUE(later_corruption.IsCorruption() || later_corruption.IsIOError() ||
+              later_corruption.IsNotFound())
+      << later_corruption.ToString();
+}
+
+TEST_F(DBBlobBasicTest, RepairMissingBlobsAcrossSubcompactions) {
+  Options options = MissingBlobRepairOptions();
+  options.statistics = CreateDBStatistics();
+  options.compression = kNoCompression;
+  options.target_file_size_base = 1024 * 1024;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 256;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+  constexpr int kNumKeys = 512;
+  for (int key = 0; key < kNumKeys; key += 2) {
+    ASSERT_OK(Put(Key(key), "healthy"));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t healthy_blob_file = GetBlobFileNumbers().back();
+  for (int key = 1; key < kNumKeys; key += 2) {
+    ASSERT_OK(Put(Key(key), "lost"));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t missing_blob_file = GetBlobFileNumbers().back();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(TotalTableFiles(), 1);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, missing_blob_file)));
+  Options recovery_options = options;
+  recovery_options.best_efforts_recovery = true;
+  Reopen(recovery_options);
+  ASSERT_EQ(GetBlobFileNumbers(), std::vector<uint64_t>{healthy_blob_file});
+  ASSERT_NO_FATAL_FAILURE(AssertBlobReference(Key(1), missing_blob_file));
+  ASSERT_OK(db_->SetOptions({{"target_file_size_base", "1024"}}));
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  repair.max_subcompactions = 4;
+  ASSERT_OK(options.statistics->Reset());
+  ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+  HistogramData subcompactions;
+  options.statistics->histogramData(NUM_SUBCOMPACTIONS_SCHEDULED,
+                                    &subcompactions);
+  ASSERT_GT(subcompactions.max, 1);
+  ASSERT_EQ(options.statistics->getTickerCount(BLOB_DB_BLOB_FILE_BYTES_READ),
+            0);
+  std::string value;
+  for (int key = 0; key < kNumKeys; ++key) {
+    if (key % 2 == 0) {
+      ASSERT_OK(db_->Get(ReadOptions(), Key(key), &value));
+      ASSERT_EQ(value, "healthy");
+    } else {
+      ASSERT_EQ(db_->Get(ReadOptions(), Key(key), &value).code(),
+                Status::kNotFound);
+    }
+  }
+}
+
+TEST_F(DBBlobBasicTest, RepairPropagatesKnownBlobFileIoFailureDuringGc) {
+  Options options = MissingBlobRepairOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 1);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, blob_files.front())));
+  Reopen(options);
+  ASSERT_EQ(GetBlobFileNumbers(), blob_files);
+  ASSERT_NO_FATAL_FAILURE(AssertBlobReference("key", blob_files.front()));
+
+  std::atomic<size_t> blob_file_opens{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobFileReader::OpenFile:NewRandomAccessFile",
+      [&blob_file_opens](void*) { ++blob_file_opens; });
+  Defer clear_sync_points([]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  repair.blob_garbage_collection_policy = BlobGarbageCollectionPolicy::kForce;
+  repair.blob_garbage_collection_age_cutoff = 1.0;
+  const Status status = db_->CompactRange(repair, nullptr, nullptr);
+  ASSERT_FALSE(status.ok());
+  ASSERT_TRUE(status.IsIOError() || status.IsCorruption() ||
+              status.IsNotFound())
+      << status.ToString();
+  ASSERT_GT(blob_file_opens.load(), 0);
+  ASSERT_EQ(GetBlobFileNumbers(), blob_files);
+  ASSERT_NO_FATAL_FAILURE(AssertBlobReference("key", blob_files.front()));
+}
+
+TEST_F(DBBlobBasicTest, RepairMissingBlobPreservesSnapshotDeletionSemantics) {
+  for (const bool use_merge : {false, true}) {
+    SCOPED_TRACE("use_merge=" + std::to_string(use_merge));
+    Options options = MissingBlobRepairOptions();
+    if (use_merge) {
+      options.merge_operator = MergeOperators::CreateStringAppendOperator();
+    }
+    uint64_t missing_blob_file = 0;
+    ASSERT_NO_FATAL_FAILURE(
+        RecoverMissingNonOldestBlob(options, true, &missing_blob_file));
+    {
+      const Snapshot* snapshot = db_->GetSnapshot();
+      Defer release_snapshot(
+          [this, snapshot]() { db_->ReleaseSnapshot(snapshot); });
+      if (use_merge) {
+        ASSERT_OK(Merge("b", "replacement"));
+      } else {
+        ASSERT_OK(Put("b", "replacement"));
+      }
+      ASSERT_OK(Flush());
+
+      CompactRangeOptions repair;
+      repair.skip_missing_blob_files = true;
+      ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+      ASSERT_EQ(Get("b"), "replacement");
+      ReadOptions read;
+      read.snapshot = snapshot;
+      std::string value;
+      ASSERT_EQ(db_->Get(read, "b", &value).code(), Status::kNotFound);
+      ASSERT_OK(db_->Get(read, "a", &value));
+      ASSERT_EQ(value, "va");
+    }
+    Reopen(options);
+    ASSERT_EQ(Get("b"), "replacement");
+  }
+}
+
+TEST_F(DBBlobBasicTest, RepairMissingBlobPairedWithSingleDelete) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RecoverMissingNonOldestBlob(options, false, &missing_blob_file));
+  {
+    const Snapshot* snapshot = db_->GetSnapshot();
+    Defer release_snapshot(
+        [this, snapshot]() { db_->ReleaseSnapshot(snapshot); });
+    ASSERT_OK(SingleDelete("b"));
+    ASSERT_OK(Flush());
+
+    CompactRangeOptions repair;
+    repair.skip_missing_blob_files = true;
+    ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+    std::string value;
+    ASSERT_EQ(db_->Get(ReadOptions(), "b", &value).code(), Status::kNotFound);
+    ReadOptions read;
+    read.snapshot = snapshot;
+    ASSERT_EQ(db_->Get(read, "b", &value).code(), Status::kNotFound);
+    ASSERT_OK(db_->Get(read, "a", &value));
+    ASSERT_EQ(value, "va");
+  }
+
+  CompactRangeOptions normal;
+  normal.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(normal, nullptr, nullptr));
+  Reopen(options);
+  std::string value;
+  ASSERT_EQ(db_->Get(ReadOptions(), "b", &value).code(), Status::kNotFound);
+  ASSERT_EQ(db_->Get(ReadOptions(), "d", &value).code(), Status::kNotFound);
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+}
+
+TEST_F(DBBlobBasicTest, RepairMissingBlobWithNoLiveBlobMetadata) {
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RecoverMissingNonOldestBlob(options, false, &missing_blob_file));
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Delete("c"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_TRUE(GetBlobFileNumbers().empty());
+  ASSERT_NO_FATAL_FAILURE(AssertBlobReference("b", missing_blob_file));
+  ASSERT_NO_FATAL_FAILURE(AssertBlobReference("d", missing_blob_file));
+  std::string value;
+  ASSERT_EQ(db_->Get(ReadOptions(), "b", &value).code(), Status::kCorruption);
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+  ASSERT_EQ(db_->Get(ReadOptions(), "b", &value).code(), Status::kNotFound);
+  ASSERT_EQ(db_->Get(ReadOptions(), "d", &value).code(), Status::kNotFound);
+  Reopen(options);
+  ASSERT_EQ(db_->Get(ReadOptions(), "b", &value).code(), Status::kNotFound);
+  ASSERT_EQ(db_->Get(ReadOptions(), "d", &value).code(), Status::kNotFound);
+}
+
+TEST_F(DBBlobBasicTest, RepairRetainsHealthyBlobsReferencedByUntouchedSsts) {
+  Options options = MissingBlobRepairOptions();
+  options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(1);
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a_anchor", "anchor"));
+  ASSERT_OK(Put("z_anchor", "anchor"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("a_lost", "lost"));
+  ASSERT_OK(Flush());
+  const uint64_t missing_blob_file = GetBlobFileNumbers().back();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(TotalTableFiles(), 2);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, missing_blob_file)));
+  Options recovery_options = options;
+  recovery_options.best_efforts_recovery = true;
+  Reopen(recovery_options);
+
+  ASSERT_OK(Put("a_live", "healthy"));
+  ASSERT_OK(Flush());
+  const uint64_t healthy_blob_file = GetBlobFileNumbers().back();
+  ASSERT_OK(Delete("a_anchor"));
+  ASSERT_OK(Flush());
+  const Slice a_begin("a");
+  const Slice a_end("b");
+  CompactRangeOptions rewrite;
+  rewrite.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(rewrite, &a_begin, &a_end));
+  ASSERT_EQ(Get("a_live"), "healthy");
+
+  ASSERT_OK(Delete("z_anchor"));
+  ASSERT_OK(Flush());
+  const Slice z_begin("z");
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  ASSERT_OK(db_->CompactRange(repair, &z_begin, nullptr));
+  ASSERT_NO_FATAL_FAILURE(AssertBlobReference("a_lost", missing_blob_file));
+  ASSERT_NO_FATAL_FAILURE(AssertBlobReference("a_live", healthy_blob_file));
+  ASSERT_EQ(Get("a_live"), "healthy");
+  const std::vector<uint64_t> retained_blob_files = GetBlobFileNumbers();
+  ASSERT_NE(std::find(retained_blob_files.begin(), retained_blob_files.end(),
+                      healthy_blob_file),
+            retained_blob_files.end());
+  std::string value;
+  ASSERT_EQ(db_->Get(ReadOptions(), "a_lost", &value).code(),
+            Status::kCorruption);
+
+  ASSERT_OK(db_->CompactRange(repair, &a_begin, &a_end));
+  ASSERT_EQ(db_->Get(ReadOptions(), "a_lost", &value).code(),
+            Status::kNotFound);
+  ASSERT_EQ(Get("a_live"), "healthy");
+  Reopen(options);
+  ASSERT_EQ(db_->Get(ReadOptions(), "a_lost", &value).code(),
+            Status::kNotFound);
+  ASSERT_EQ(Get("a_live"), "healthy");
 }
 
 TEST_F(DBBlobBasicTest, GetMergeBlobWithPut) {
@@ -1756,7 +3015,7 @@ INSTANTIATE_TEST_CASE_P(DBBlobBasicTest, DBBlobBasicIOErrorMultiGetTest,
                             "BlobFileReader::OpenFile:NewRandomAccessFile",
                             "BlobFileReader::MultiGetBlob:ReadFromFile"}));
 
-TEST_P(DBBlobBasicIOErrorTest, GetBlob_IOError) {
+TEST_P(DBBlobBasicIOErrorTest, GetBlobIOError) {
   Options options;
   options.env = fault_injection_env_.get();
   options.enable_blob_files = true;
@@ -1826,7 +3085,7 @@ TEST_P(DBBlobBasicIOErrorTest, GetEntityMergeWithBlobBaseIOError) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_P(DBBlobBasicIOErrorMultiGetTest, MultiGetBlobs_IOError) {
+TEST_P(DBBlobBasicIOErrorMultiGetTest, MultiGetBlobsIOError) {
   Options options = GetDefaultOptions();
   options.env = fault_injection_env_.get();
   options.enable_blob_files = true;
@@ -1915,7 +3174,7 @@ TEST_P(DBBlobBasicIOErrorMultiGetTest, MultipleBlobFiles) {
   ASSERT_TRUE(statuses[1].IsIOError());
 }
 
-TEST_F(DBBlobBasicTest, MultiGetFindTable_IOError) {
+TEST_F(DBBlobBasicTest, MultiGetFindTableIOError) {
   // Repro test for a specific bug where `MultiGet()` would fail to open a table
   // in `FindTable()` and then proceed to return raw blob handles for the other
   // keys.
@@ -1989,7 +3248,7 @@ class ReadBlobCompactionFilter : public CompactionFilter {
 
 }  // anonymous namespace
 
-TEST_P(DBBlobBasicIOErrorTest, CompactionFilterReadBlob_IOError) {
+TEST_P(DBBlobBasicIOErrorTest, CompactionFilterReadBlobIOError) {
   Options options = GetDefaultOptions();
   options.env = fault_injection_env_.get();
   options.enable_blob_files = true;
@@ -2019,7 +3278,7 @@ TEST_P(DBBlobBasicIOErrorTest, CompactionFilterReadBlob_IOError) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_P(DBBlobBasicIOErrorTest, IterateBlobsAllowUnpreparedValue_IOError) {
+TEST_P(DBBlobBasicIOErrorTest, IterateBlobsAllowUnpreparedValueIOError) {
   Options options;
   options.env = fault_injection_env_.get();
   options.enable_blob_files = true;
@@ -2314,6 +3573,267 @@ class DBBlobWithTimestampTest : public DBBasicTestWithTimestampBase {
   DBBlobWithTimestampTest()
       : DBBasicTestWithTimestampBase("db_blob_with_timestamp_test") {}
 };
+
+TEST_F(DBBlobWithTimestampTest, RepairPreservesTimestampHistoryAfterRecovery) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = false;
+  TestComparator test_cmp(Timestamp(0, 0).size());
+  options.comparator = &test_cmp;
+  DestroyAndReopen(options);
+  Defer close_db([this]() { Close(); });
+  const std::string old_timestamp = Timestamp(1, 0);
+  const std::string middle_timestamp = Timestamp(2, 0);
+  const std::string lost_timestamp = Timestamp(3, 0);
+  const std::string latest_timestamp = Timestamp(4, 0);
+  const Slice old_ts(old_timestamp);
+  const Slice middle_ts(middle_timestamp);
+  const Slice lost_ts(lost_timestamp);
+  const Slice latest_ts(latest_timestamp);
+  ReadOptions healthy_read;
+  healthy_read.verify_checksums = true;
+  healthy_read.timestamp = &latest_ts;
+  std::string healthy_value;
+  ASSERT_OK(db_->Put(WriteOptions(), "a", old_ts, "healthy"));
+  ASSERT_OK(db_->Put(WriteOptions(), "b", old_ts, "older"));
+  const SequenceNumber older_sequence = db_->GetLatestSequenceNumber();
+  ASSERT_OK(Flush());
+  const uint64_t healthy_blob_file = GetBlobFileNumbers().back();
+  ASSERT_OK(db_->Get(healthy_read, "a", &healthy_value));
+  ASSERT_EQ(healthy_value, "healthy");
+  ASSERT_OK(db_->Put(WriteOptions(), "b", lost_ts, "lost"));
+  const SequenceNumber lost_sequence = db_->GetLatestSequenceNumber();
+  ASSERT_OK(db_->Put(WriteOptions(), "d", lost_ts, "lost"));
+  const SequenceNumber other_lost_sequence = db_->GetLatestSequenceNumber();
+  ASSERT_OK(Flush());
+  const uint64_t missing_blob_file = GetBlobFileNumbers().back();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(TotalTableFiles(), 1);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, missing_blob_file)));
+  Options recovery_options = options;
+  recovery_options.best_efforts_recovery = true;
+  Reopen(recovery_options);
+  ASSERT_EQ(TotalTableFiles(), 1);
+  ASSERT_EQ(GetBlobFileNumbers(), std::vector<uint64_t>{healthy_blob_file});
+  ASSERT_OK(db_->Get(healthy_read, "a", &healthy_value));
+  ASSERT_EQ(healthy_value, "healthy");
+  {
+    ReadOptions read;
+    read.timestamp = &lost_ts;
+    PinnableSlice value;
+    bool is_blob_index = false;
+    DBImpl::GetImplOptions get_options;
+    get_options.column_family = db_->DefaultColumnFamily();
+    get_options.value = &value;
+    get_options.is_blob_index = &is_blob_index;
+    ASSERT_OK(dbfull()->GetImpl(read, "b", get_options));
+    ASSERT_TRUE(is_blob_index);
+    BlobIndex blob_index;
+    ASSERT_OK(blob_index.DecodeFrom(value));
+    ASSERT_EQ(blob_index.file_number(), missing_blob_file);
+  }
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  repair.full_history_ts_low = &old_ts;
+  ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+  for (int reopen = 0; reopen < 2; ++reopen) {
+    SCOPED_TRACE(reopen);
+    if (reopen != 0) {
+      Reopen(options);
+    }
+    std::string full_history_ts_low;
+    ASSERT_OK(db_->GetFullHistoryTsLow(db_->DefaultColumnFamily(),
+                                       &full_history_ts_low));
+    ASSERT_EQ(full_history_ts_low, old_timestamp);
+    ReadOptions read;
+    read.verify_checksums = true;
+    std::string value;
+    read.timestamp = &old_ts;
+    ASSERT_OK(db_->Get(read, "b", &value));
+    ASSERT_EQ(value, "older");
+    read.timestamp = &middle_ts;
+    ASSERT_OK(db_->Get(read, "b", &value));
+    ASSERT_EQ(value, "older");
+    read.timestamp = &lost_ts;
+    ASSERT_EQ(db_->Get(read, "b", &value).code(), Status::kNotFound);
+    ASSERT_EQ(db_->Get(read, "d", &value).code(), Status::kNotFound);
+    read.timestamp = &latest_ts;
+    ASSERT_EQ(db_->Get(read, "b", &value).code(), Status::kNotFound);
+    ASSERT_OK(db_->Get(read, "a", &value));
+    ASSERT_EQ(value, "healthy");
+
+    read.iter_start_ts = &old_ts;
+    std::unique_ptr<Iterator> history(db_->NewIterator(read));
+    history->Seek("b");
+    ASSERT_NO_FATAL_FAILURE(CheckIterEntry(history.get(), "b", lost_sequence,
+                                           kTypeDeletionWithTimestamp, Slice(),
+                                           lost_ts));
+    history->Next();
+    ASSERT_NO_FATAL_FAILURE(CheckIterEntry(history.get(), "b", older_sequence,
+                                           kTypeBlobIndex, "older", old_ts));
+    ASSERT_EQ(history->value(), "older");
+    history->Next();
+    ASSERT_NO_FATAL_FAILURE(
+        CheckIterEntry(history.get(), "d", other_lost_sequence,
+                       kTypeDeletionWithTimestamp, Slice(), lost_ts));
+    history->Next();
+    ASSERT_FALSE(history->Valid());
+    ASSERT_OK(history->status());
+  }
+
+  CompactRangeOptions normal;
+  normal.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  normal.full_history_ts_low = &latest_ts;
+  ASSERT_OK(db_->Get(healthy_read, "a", &healthy_value));
+  ASSERT_EQ(healthy_value, "healthy");
+  ASSERT_OK(db_->CompactRange(normal, nullptr, nullptr));
+  ASSERT_OK(db_->Get(healthy_read, "a", &healthy_value));
+  ASSERT_EQ(healthy_value, "healthy");
+  Reopen(options);
+  ReadOptions read;
+  read.verify_checksums = true;
+  read.timestamp = &latest_ts;
+  std::string value;
+  ASSERT_EQ(db_->Get(read, "b", &value).code(), Status::kNotFound);
+  ASSERT_EQ(db_->Get(read, "d", &value).code(), Status::kNotFound);
+  ASSERT_OK(db_->Get(read, "a", &value));
+  ASSERT_EQ(value, "healthy");
+  read.timestamp = &old_ts;
+  ASSERT_EQ(db_->Get(read, "b", &value).code(), Status::kInvalidArgument);
+}
+
+TEST_F(DBBlobWithTimestampTest, BestEffortsBlobDbRepairReadsTimestampHistory) {
+  // Reads see a version in a dropped blob file as the deletion with the same
+  // timestamp that compaction writes in its place, and older versions stay
+  // readable at older timestamps.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = false;
+  TestComparator test_cmp(Timestamp(0, 0).size());
+  options.comparator = &test_cmp;
+  DestroyAndReopen(options);
+  Defer close_db([this]() { Close(); });
+  const std::string old_timestamp = Timestamp(1, 0);
+  const std::string lost_timestamp = Timestamp(3, 0);
+  const std::string latest_timestamp = Timestamp(4, 0);
+  const Slice old_ts(old_timestamp);
+  const Slice lost_ts(lost_timestamp);
+  const Slice latest_ts(latest_timestamp);
+  ASSERT_OK(db_->Put(WriteOptions(), "a", old_ts, "healthy"));
+  ASSERT_OK(db_->Put(WriteOptions(), "b", old_ts, "older"));
+  const SequenceNumber older_sequence = db_->GetLatestSequenceNumber();
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->Put(WriteOptions(), "b", lost_ts, "lost"));
+  const SequenceNumber lost_sequence = db_->GetLatestSequenceNumber();
+  ASSERT_OK(Flush());
+  const uint64_t missing_blob_file = GetBlobFileNumbers().back();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(TotalTableFiles(), 1);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, missing_blob_file)));
+
+  Options repair_options = options;
+  repair_options.best_efforts_blob_db_repair = true;
+  Reopen(repair_options);
+  for (const bool compacted : {false, true}) {
+    SCOPED_TRACE(compacted ? "after compaction" : "before compaction");
+    ReadOptions read;
+    std::string value;
+    read.timestamp = &old_ts;
+    ASSERT_OK(db_->Get(read, "b", &value));
+    ASSERT_EQ(value, "older");
+    read.timestamp = &latest_ts;
+    ASSERT_EQ(db_->Get(read, "b", &value).code(), Status::kNotFound);
+    ASSERT_OK(db_->Get(read, "a", &value));
+    ASSERT_EQ(value, "healthy");
+    {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(read));
+      iter->SeekToFirst();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "a");
+      iter->Next();
+      ASSERT_FALSE(iter->Valid());
+      ASSERT_OK(iter->status());
+      iter->SeekToLast();
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), "a");
+    }
+
+    read.iter_start_ts = &old_ts;
+    std::unique_ptr<Iterator> history(db_->NewIterator(read));
+    history->Seek("b");
+    ASSERT_NO_FATAL_FAILURE(CheckIterEntry(history.get(), "b", lost_sequence,
+                                           kTypeDeletionWithTimestamp, Slice(),
+                                           lost_ts));
+    history->Next();
+    ASSERT_NO_FATAL_FAILURE(CheckIterEntry(history.get(), "b", older_sequence,
+                                           kTypeBlobIndex, "older", old_ts));
+    history->Next();
+    ASSERT_FALSE(history->Valid());
+    ASSERT_OK(history->status());
+    history->SeekForPrev("b");
+    ASSERT_NO_FATAL_FAILURE(CheckIterEntry(history.get(), "b", older_sequence,
+                                           kTypeBlobIndex, "older", old_ts));
+    history->Prev();
+    ASSERT_NO_FATAL_FAILURE(CheckIterEntry(history.get(), "b", lost_sequence,
+                                           kTypeDeletionWithTimestamp, Slice(),
+                                           lost_ts));
+
+    CompactRangeOptions compact_range_options;
+    compact_range_options.full_history_ts_low = &old_ts;
+    ASSERT_OK(db_->CompactRange(compact_range_options, nullptr, nullptr));
+  }
+}
+
+TEST_F(DBBlobWithTimestampTest, HistoryCompactionPreservesHealthyBlobKey) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = false;
+  TestComparator test_cmp(Timestamp(0, 0).size());
+  options.comparator = &test_cmp;
+  DestroyAndReopen(options);
+  Defer close_db([this]() { Close(); });
+  const std::string old_timestamp = Timestamp(1, 0);
+  const std::string history_floor = Timestamp(4, 0);
+  const Slice old_ts(old_timestamp);
+  const Slice history_floor_ts(history_floor);
+  ASSERT_OK(db_->Put(WriteOptions(), "a", old_ts, "healthy"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(GetBlobFileNumbers().size(), 1);
+
+  ReadOptions read;
+  read.verify_checksums = true;
+  read.timestamp = &history_floor_ts;
+  std::string value;
+  ASSERT_OK(db_->Get(read, "a", &value));
+  ASSERT_EQ(value, "healthy");
+  CompactRangeOptions normal;
+  normal.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  normal.full_history_ts_low = &history_floor_ts;
+  ASSERT_OK(db_->CompactRange(normal, nullptr, nullptr));
+  ASSERT_OK(db_->Get(read, "a", &value));
+  ASSERT_EQ(value, "healthy");
+  Reopen(options);
+  ASSERT_OK(db_->Get(read, "a", &value));
+  ASSERT_EQ(value, "healthy");
+}
 
 TEST_F(DBBlobWithTimestampTest, GetBlob) {
   Options options = GetDefaultOptions();
@@ -2827,8 +4347,8 @@ TEST_F(DBBlobBasicTest, GetApproximateSizesIncludingBlobFiles) {
 
     std::string mid = Key(kNumKeys / 2);
     std::string r1_start = Key(0);
-    std::string r1_end = mid;
-    std::string r2_start = mid;
+    const std::string& r1_end = mid;
+    const std::string& r2_start = mid;
     std::string r2_end = Key(kNumKeys);
     Range ranges[2] = {Range(r1_start, r1_end), Range(r2_start, r2_end)};
     uint64_t sizes[2] = {0, 0};
@@ -2844,6 +4364,892 @@ TEST_F(DBBlobBasicTest, GetApproximateSizesIncludingBlobFiles) {
     ASSERT_NEAR(static_cast<double>(sizes[0] + sizes[1]),
                 static_cast<double>(full_size), full_size * 0.1);
   }
+}
+
+TEST_F(DBBlobBasicTest,
+       ReferencedBlobBytesReadFromTablePropertiesAfterReopenAndCompaction) {
+  ASSERT_EQ(TablePropertiesNames::kReferencedBlobBytes,
+            "rocksdb.referenced.blob.bytes");
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 100;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  const std::string first_key = "blob_a";
+  const std::string first_value(1000, 'a');
+  ASSERT_OK(Put(first_key, first_value));
+  ASSERT_OK(Put("inline", "small"));
+  ASSERT_OK(Flush());
+
+  const uint64_t first_record_bytes =
+      first_value.size() +
+      BlobLogRecord::CalculateAdjustmentForRecordHeader(first_key.size());
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes,
+            first_record_bytes);
+
+  Reopen(options);
+  properties.clear();
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes,
+            first_record_bytes);
+
+  const std::string second_key = "blob_z";
+  const std::string second_value(1500, 'z');
+  ASSERT_OK(Put(second_key, second_value));
+  ASSERT_OK(Flush());
+  const uint64_t second_record_bytes =
+      second_value.size() +
+      BlobLogRecord::CalculateAdjustmentForRecordHeader(second_key.size());
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  properties.clear();
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  uint64_t compacted_referenced_bytes = 0;
+  for (const auto& property : properties) {
+    ASSERT_TRUE(property.second->referenced_blob_bytes.has_value());
+    compacted_referenced_bytes += *property.second->referenced_blob_bytes;
+  }
+  ASSERT_GT(properties.size(), 0U);
+  ASSERT_EQ(compacted_referenced_bytes,
+            first_record_bytes + second_record_bytes);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesAccountsForOrphanedBlobFiles) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.enable_blob_garbage_collection = false;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  constexpr int kKeysPerRange = 100;
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("a" + Key(i), std::string(1000, 'a')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("z" + Key(i), std::string(3000, 'z')));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ColumnFamilyMetaData before;
+  db_->GetColumnFamilyMetaData(&before);
+  ASSERT_EQ(before.blob_files.size(), 2U);
+  const uint64_t physical_size = PhysicalBlobSize(before);
+
+  const Slice b_start("z");
+  const Slice b_limit("{");
+  ASSERT_OK(DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &b_start,
+                               &b_limit));
+  ColumnFamilyMetaData after;
+  db_->GetColumnFamilyMetaData(&after);
+  ASSERT_EQ(after.blob_files.size(), 2U);
+  ASSERT_EQ(PhysicalBlobSize(after), physical_size);
+  ASSERT_EQ(Get("a" + Key(0)), std::string(1000, 'a'));
+  ASSERT_EQ(Get("z" + Key(0)), "NOT_FOUND");
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_TRUE(properties.begin()->second->referenced_blob_bytes.has_value());
+  const uint64_t referenced =
+      *properties.begin()->second->referenced_blob_bytes;
+  ASSERT_GT(referenced, 0U);
+  ASSERT_LT(referenced, physical_size / 2);
+
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  const Range ranges[] = {{"a", "b"}, {"z", "{"}, {"a", "{"}};
+  uint64_t sizes[3] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, sizes));
+  ASSERT_NEAR(static_cast<double>(sizes[0]), static_cast<double>(physical_size),
+              physical_size * 0.05);
+  ASSERT_EQ(sizes[1], 0U);
+  ASSERT_NEAR(static_cast<double>(sizes[2]), static_cast<double>(physical_size),
+              physical_size * 0.05);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesFallsBackWithNoReferenceWeights) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+  // Model a recorded zero count with a positive physical budget. The SST's
+  // real blob indexes retain that budget while its optional statistic is zero.
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:Start", [](void* arg) {
+        static_cast<TableProperties*>(arg)->referenced_blob_bytes = 0;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(1000, 'v')));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1U);
+  ASSERT_EQ(properties.begin()->second->referenced_blob_bytes, 0U);
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_size = PhysicalBlobSize(metadata);
+  ASSERT_GT(physical_size, 0U);
+  const std::string start = Key(0);
+  const std::string limit = Key(100);
+  const Range range(start, limit);
+  SizeApproximationOptions options_for_size;
+  options_for_size.include_files = false;
+  options_for_size.include_blob_files = true;
+  options_for_size.allow_expensive_query = true;
+  uint64_t size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(
+      options_for_size, db_->DefaultColumnFamily(), &range, 1, &size));
+  ASSERT_NEAR(static_cast<double>(size), static_cast<double>(physical_size),
+              physical_size * 0.05);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesDistinguishesBlobHeavyRange) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 256;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+
+  constexpr int kKeysPerRange = 200;
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("a" + Key(i), std::string(4096, 'a')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("z" + Key(i), std::string(48, 'z')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("m" + Key(i), std::string(4096, 'm')));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(/*level=*/1);
+
+  const std::string a_start = "a";
+  const std::string a_limit = "b";
+  const std::string z_start = "z";
+  const std::string z_limit = "{";
+  const Range ranges[] = {{a_start, a_limit}, {z_start, z_limit}};
+
+  SizeApproximationOptions file_options;
+  file_options.include_files = true;
+  file_options.include_blob_files = false;
+  uint64_t sst_sizes[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(file_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, sst_sizes));
+  ASSERT_GT(sst_sizes[0], 0U);
+  ASSERT_GT(sst_sizes[1], 0U);
+  ASSERT_LT(sst_sizes[0], 4 * sst_sizes[1]);
+  ASSERT_LT(sst_sizes[1], 4 * sst_sizes[0]);
+
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t blob_sizes[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, blob_sizes));
+  ASSERT_GT(blob_sizes[0], 0U);
+  ASSERT_EQ(blob_sizes[1], 0U);
+
+  const std::string half_limit = "a" + Key(kKeysPerRange / 2);
+  const Range half_range(a_start, half_limit);
+  uint64_t half_blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &half_range, 1, &half_blob_size));
+  ASSERT_GT(half_blob_size, blob_sizes[0] / 3);
+  ASSERT_LT(half_blob_size, blob_sizes[0] * 2 / 3);
+
+  SizeApproximationOptions margin_options = blob_options;
+  margin_options.files_size_error_margin = 100.0;
+  const std::string margin_start = "a" + Key(kKeysPerRange / 2);
+  const std::string margin_limit = "z" + Key(kKeysPerRange / 2);
+  const Range margin_range(margin_start, margin_limit);
+  std::vector<uint64_t> intersecting_referenced_blob_bytes;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ApproximateSize:IntersectingReferencedBlobBytes",
+      [&](void* arg) {
+        intersecting_referenced_blob_bytes.push_back(
+            *static_cast<uint64_t*>(arg));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  uint64_t margin_blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(margin_options, db_->DefaultColumnFamily(),
+                                     &margin_range, 1, &margin_blob_size));
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  ASSERT_GT(margin_blob_size, physical_blob_size / 2);
+  ASSERT_LT(margin_blob_size, physical_blob_size);
+
+  for (int i = 0; i < kKeysPerRange; ++i) {
+    ASSERT_OK(Put("~" + Key(i), std::string(8192, 'o')));
+  }
+  ASSERT_OK(Flush());
+  uint64_t margin_blob_size_with_disjoint_l0_file = 0;
+  ASSERT_OK(db_->GetApproximateSizes(margin_options, db_->DefaultColumnFamily(),
+                                     &margin_range, 1,
+                                     &margin_blob_size_with_disjoint_l0_file));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(intersecting_referenced_blob_bytes.size(), 2U);
+  ASSERT_EQ(intersecting_referenced_blob_bytes[0],
+            intersecting_referenced_blob_bytes[1]);
+
+  uint64_t sst_sizes_again[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(file_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, sst_sizes_again));
+  ASSERT_EQ(sst_sizes_again[0], sst_sizes[0]);
+  ASSERT_EQ(sst_sizes_again[1], sst_sizes[1]);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesMetadataReuseAcrossReopen) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.max_open_files = -1;
+  options.create_if_missing = true;
+  options.level0_slowdown_writes_trigger = 1000;
+  options.level0_stop_writes_trigger = 1000;
+  Reopen(options);
+
+  constexpr int kNumFiles = 64;
+  for (int i = 0; i < kNumFiles; ++i) {
+    const std::string key = (i % 2 == 0 ? "a" : "z") + Key(i);
+    ASSERT_OK(Put(key, std::string(i % 2 == 0 ? 2048 : 48, 'v')));
+    ASSERT_OK(Flush());
+  }
+  const Range ranges[] = {{"a", "b"}, {"z", "{"}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  blob_options.files_size_error_margin = 0;
+
+  struct Mode {
+    int max_open_files;
+    bool skip_stats;
+  };
+  const Mode modes[] = {{-1, false}, {20, false}, {20, true}};
+  constexpr int kIterations = 5;
+  for (const Mode& mode : modes) {
+    SCOPED_TRACE("max_open_files=" + std::to_string(mode.max_open_files) +
+                 ",skip_stats=" + std::to_string(mode.skip_stats));
+    options.max_open_files = mode.max_open_files;
+    options.skip_stats_update_on_db_open = mode.skip_stats;
+    Reopen(options);
+    int property_reads = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::GetApproximateSizes:TablePropertiesStatus",
+        [&](void*) { ++property_reads; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    SizeApproximationOptions sst_options;
+    uint64_t sst_sizes[2] = {};
+    ASSERT_OK(db_->GetApproximateSizes(sst_options, db_->DefaultColumnFamily(),
+                                       ranges, 2, sst_sizes));
+    SizeApproximationOptions fast_options;
+    fast_options.include_files = false;
+    fast_options.include_blob_files = true;
+    const double ratio = static_cast<double>(PhysicalBlobSize(metadata)) /
+                         static_cast<double>(SstSize(metadata));
+    for (int i = 0; i < kIterations; ++i) {
+      uint64_t fast_sizes[2] = {};
+      ASSERT_OK(db_->GetApproximateSizes(
+          fast_options, db_->DefaultColumnFamily(), ranges, 2, fast_sizes));
+      for (int range = 0; range < 2; ++range) {
+        ASSERT_EQ(fast_sizes[range],
+                  static_cast<uint64_t>(static_cast<double>(sst_sizes[range]) *
+                                        ratio));
+      }
+    }
+    ASSERT_EQ(property_reads, 0);
+    for (int i = 0; i < kIterations; ++i) {
+      uint64_t sizes[2] = {};
+      ASSERT_OK(db_->GetApproximateSizes(
+          blob_options, db_->DefaultColumnFamily(), ranges, 2, sizes));
+      ASSERT_GT(sizes[0], 0U);
+      ASSERT_EQ(sizes[1], 0U);
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    if (mode.max_open_files == -1) {
+      ASSERT_EQ(property_reads, 0);
+    } else if (mode.skip_stats) {
+      ASSERT_EQ(property_reads, kNumFiles * kIterations);
+    } else {
+      ASSERT_GT(property_reads, 0);
+      ASSERT_LT(property_reads, kNumFiles * kIterations);
+    }
+  }
+
+  options.max_open_files = -1;
+  options.skip_stats_update_on_db_open = false;
+  Reopen(options);
+  std::mutex start_mutex;
+  std::condition_variable start_cv;
+  bool start = false;
+  std::atomic<bool> read_failed{false};
+  {
+    std::vector<ThreadGuard> readers;
+    readers.reserve(3);
+    for (int reader = 0; reader < 3; ++reader) {
+      readers.emplace_back(port::Thread([&] {
+        {
+          std::unique_lock<std::mutex> lock(start_mutex);
+          start_cv.wait(lock, [&] { return start; });
+        }
+        for (int i = 0; i < 100; ++i) {
+          uint64_t sizes[2] = {};
+          const Status s = db_->GetApproximateSizes(
+              blob_options, db_->DefaultColumnFamily(), ranges, 2, sizes);
+          if (!s.ok() || sizes[0] == 0 || sizes[1] != 0) {
+            read_failed.store(true);
+          }
+        }
+      }));
+    }
+    {
+      std::lock_guard<std::mutex> lock(start_mutex);
+      start = true;
+    }
+    start_cv.notify_all();
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(Put("m" + Key(i), std::string(2048, 'm')));
+      ASSERT_OK(Flush());
+    }
+  }
+  ASSERT_FALSE(read_failed.load());
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesLegacyFallbackIsUnchanged) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:SkipReferencedBlobBytes",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(1000, 'v')));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  const std::string start = Key(0);
+  const std::string limit = Key(100);
+  const Range range(start, limit);
+  SizeApproximationOptions file_options;
+  file_options.include_files = true;
+  file_options.include_blob_files = false;
+  uint64_t sst_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(file_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &sst_size));
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  const uint64_t total_sst_size = SstSize(metadata);
+
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &blob_size));
+  const uint64_t expected = static_cast<uint64_t>(
+      static_cast<double>(sst_size) * (static_cast<double>(physical_blob_size) /
+                                       static_cast<double>(total_sst_size)));
+  ASSERT_EQ(blob_size, expected);
+}
+
+TEST_F(DBBlobBasicTest,
+       GetApproximateSizesFallsBackWhenTablePropertiesUnavailable) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.skip_stats_update_on_db_open = true;
+  Reopen(options);
+
+  constexpr int kNumKeys = 100;
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(1000, 'v')));
+  }
+  ASSERT_OK(Flush());
+  Reopen(options);
+
+  const std::string start = Key(0);
+  const std::string limit = Key(kNumKeys / 2);
+  const Range range(start, limit);
+  SizeApproximationOptions file_options;
+  file_options.include_files = true;
+  uint64_t sst_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(file_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &sst_size));
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  const uint64_t total_sst_size = SstSize(metadata);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:TablePropertiesStatus", [](void* arg) {
+        *static_cast<Status*>(arg) =
+            Status::IOError("injected table properties failure");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &blob_size));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  const uint64_t expected = static_cast<uint64_t>(
+      static_cast<double>(sst_size) * (static_cast<double>(physical_blob_size) /
+                                       static_cast<double>(total_sst_size)));
+  ASSERT_EQ(blob_size, expected);
+}
+
+TEST_F(DBBlobBasicTest,
+       GetApproximateSizesClassifiesEachTablePropertiesReadOnce) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  options.skip_stats_update_on_db_open = true;
+  Reopen(options);
+
+  constexpr int kNumKeys = 100;
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(1000, 'v')));
+  }
+  ASSERT_OK(Flush());
+  Reopen(options);
+
+  int table_properties_reads = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:TablePropertiesStatus", [&](void* arg) {
+        ++table_properties_reads;
+        if (table_properties_reads == 1) {
+          *static_cast<Status*>(arg) =
+              Status::IOError("injected table properties failure");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const std::string start = Key(0);
+  const std::string middle = Key(kNumKeys / 2);
+  const std::string limit = Key(kNumKeys);
+  const Range ranges[] = {{start, middle}, {middle, limit}, {start, limit}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t sst_sizes[3] = {};
+  SizeApproximationOptions sst_options;
+  ASSERT_OK(db_->GetApproximateSizes(sst_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, sst_sizes));
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const double ratio = static_cast<double>(PhysicalBlobSize(metadata)) /
+                       static_cast<double>(SstSize(metadata));
+  uint64_t blob_sizes[3] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, blob_sizes));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(table_properties_reads, 1);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(blob_sizes[i],
+              static_cast<uint64_t>(static_cast<double>(sst_sizes[i]) * ratio));
+  }
+  ASSERT_GT(blob_sizes[2], 0U);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesInflatesForGarbage) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  constexpr int kNumKeys = 200;
+  constexpr int kNumOverwrittenKeys = kNumKeys / 2;
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(2000, 'a')));
+  }
+  ASSERT_OK(Flush());
+  const std::string start = Key(0);
+  const std::string limit = Key(kNumKeys);
+  const Range range(start, limit);
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t clean_blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &clean_blob_size));
+  ColumnFamilyMetaData clean_metadata;
+  db_->GetColumnFamilyMetaData(&clean_metadata);
+  const uint64_t clean_physical_blob_size = PhysicalBlobSize(clean_metadata);
+  ASSERT_NEAR(static_cast<double>(clean_blob_size),
+              static_cast<double>(clean_physical_blob_size),
+              static_cast<double>(clean_physical_blob_size) * 0.05);
+
+  for (int i = 0; i < kNumOverwrittenKeys; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(2000, 'b')));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  uint64_t live_referenced_bytes = 0;
+  for (const auto& property : properties) {
+    ASSERT_TRUE(property.second->referenced_blob_bytes.has_value());
+    live_referenced_bytes += *property.second->referenced_blob_bytes;
+  }
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  uint64_t garbage_blob_bytes = 0;
+  for (const BlobMetaData& blob : metadata.blob_files) {
+    garbage_blob_bytes += blob.garbage_blob_bytes;
+  }
+  uint64_t expected_garbage_blob_bytes = 0;
+  for (int i = 0; i < kNumOverwrittenKeys; ++i) {
+    expected_garbage_blob_bytes +=
+        2000 + BlobLogRecord::CalculateAdjustmentForRecordHeader(Key(i).size());
+  }
+  ASSERT_EQ(garbage_blob_bytes, expected_garbage_blob_bytes);
+
+  uint64_t blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &blob_size));
+  ASSERT_GT(blob_size, live_referenced_bytes);
+  ASSERT_NEAR(static_cast<double>(blob_size),
+              static_cast<double>(physical_blob_size),
+              static_cast<double>(physical_blob_size) * 0.05);
+
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Delete(Key(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  uint64_t all_garbage_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &all_garbage_size));
+  ASSERT_EQ(all_garbage_size, 0U);
+}
+
+TEST_F(DBBlobBasicTest,
+       GetApproximateSizesCapsOvercountedReferencesAtPhysicalBudget) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  constexpr int kKeysPerRange = 50;
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(2000, 'a')));
+    }
+  }
+  ASSERT_OK(Flush());
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange - 5; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(2000, 'b')));
+    }
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:Start", [](void* arg) {
+        auto* properties = static_cast<TableProperties*>(arg);
+        ASSERT_TRUE(properties->referenced_blob_bytes.has_value());
+        *properties->referenced_blob_bytes *= 100;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(2000, 'c')));
+    }
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  uint64_t garbage_blob_bytes = 0;
+  for (const BlobMetaData& blob : metadata.blob_files) {
+    garbage_blob_bytes += blob.garbage_blob_bytes;
+  }
+  ASSERT_GT(physical_blob_size, 0U);
+  ASSERT_GT(garbage_blob_bytes, 0U);
+  ASSERT_EQ(FilesPerLevel(), "1,1");
+
+  const std::string a_start = "a";
+  const std::string a_limit = "b";
+  const std::string z_start = "z";
+  const std::string z_limit = "{";
+  const Range ranges[] = {{a_start, a_limit}, {z_start, z_limit}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t sizes[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, sizes));
+  EXPECT_LE(sizes[0], physical_blob_size);
+  EXPECT_LE(sizes[1], physical_blob_size);
+  EXPECT_LE(sizes[0] + sizes[1], physical_blob_size);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesDistributesZeroLiveBudgetBySstSize) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 256;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+
+  constexpr int kKeysPerRange = 50;
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(2000, 'b')));
+    }
+  }
+  ASSERT_OK(Flush());
+  for (const char prefix : {'a', 'z'}) {
+    for (int i = 0; i < kKeysPerRange; ++i) {
+      ASSERT_OK(Put(std::string(1, prefix) + Key(i), std::string(48, 'i')));
+    }
+  }
+  ASSERT_OK(Flush());
+
+  // A fully garbage blob file is normally retired with its last linked SST.
+  // Override the computed live budget to exercise the zero-live-byte fallback
+  // while retaining real live SSTs and a physical blob file.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:LiveBlobBytes",
+      [](void* arg) { *static_cast<uint64_t*>(arg) = 0; });
+  int table_properties_reads = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:TablePropertiesStatus",
+      [&](void*) { ++table_properties_reads; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  ASSERT_GT(physical_blob_size, 0U);
+  ASSERT_NE(FilesPerLevel(), "");
+
+  const std::string a_start = "a";
+  const std::string a_limit = "b";
+  const std::string z_start = "z";
+  const std::string z_limit = "{";
+  const Range ranges[] = {{a_start, a_limit}, {z_start, z_limit}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t sizes[2] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 2, sizes));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(table_properties_reads, 0);
+  ASSERT_GT(sizes[0], 0U);
+  ASSERT_GT(sizes[1], 0U);
+  ASSERT_NEAR(static_cast<double>(sizes[0] + sizes[1]),
+              static_cast<double>(physical_blob_size),
+              static_cast<double>(physical_blob_size) * 0.15);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesSaturatesInvalidBlobGarbageTotals) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  ASSERT_OK(Put("key", std::string(2000, 'b')));
+  ASSERT_OK(Flush());
+
+  uint64_t observed_total_blob_bytes = 0;
+  uint64_t observed_garbage_blob_bytes = 0;
+  uint64_t observed_live_blob_bytes = std::numeric_limits<uint64_t>::max();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:BlobByteTotals", [&](void* arg) {
+        auto* const totals = static_cast<std::pair<uint64_t*, uint64_t*>*>(arg);
+        ASSERT_NE(totals, nullptr);
+        observed_total_blob_bytes = *totals->first;
+        ASSERT_LT(observed_total_blob_bytes,
+                  std::numeric_limits<uint64_t>::max());
+        *totals->second = observed_total_blob_bytes + 1;
+        observed_garbage_blob_bytes = *totals->second;
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetApproximateSizes:LiveBlobBytes", [&](void* arg) {
+        observed_live_blob_bytes = *static_cast<uint64_t*>(arg);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const std::string start = "a";
+  const std::string limit = "z";
+  const Range range(start, limit);
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t blob_size = 0;
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     &range, 1, &blob_size));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_GT(observed_total_blob_bytes, 0U);
+  ASSERT_GT(observed_garbage_blob_bytes, observed_total_blob_bytes);
+  ASSERT_EQ(observed_live_blob_bytes, 0U);
+  ASSERT_GT(blob_size, 0U);
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesConservesMixedMetadataBudget) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 512;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  Reopen(options);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:SkipReferencedBlobBytes",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("a" + Key(i), std::string(2000, 'a')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("m" + Key(i), std::string(48, 'm')));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("z" + Key(i), std::string(1000, 'z')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Put("z" + Key(i), std::string(1200, 'y')));
+  }
+  ASSERT_OK(Flush());
+
+  const std::string a_start = "a";
+  const std::string a_limit = "b";
+  const std::string m_start = "m";
+  const std::string m_limit = "n";
+  const std::string z_start = "z";
+  const std::string z_limit = "{";
+  const Range ranges[] = {
+      {a_start, a_limit}, {m_start, m_limit}, {z_start, z_limit}};
+  SizeApproximationOptions blob_options;
+  blob_options.include_files = false;
+  blob_options.include_blob_files = true;
+  blob_options.allow_expensive_query = true;
+  uint64_t before[3] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, before));
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  const uint64_t physical_blob_size = PhysicalBlobSize(metadata);
+  const uint64_t before_total = before[0] + before[1] + before[2];
+  ASSERT_NEAR(static_cast<double>(before_total),
+              static_cast<double>(physical_blob_size),
+              static_cast<double>(physical_blob_size) * 0.15);
+  ASSERT_GT(before[1], 0U);
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  uint64_t after[3] = {};
+  ASSERT_OK(db_->GetApproximateSizes(blob_options, db_->DefaultColumnFamily(),
+                                     ranges, 3, after));
+  ColumnFamilyMetaData after_metadata;
+  db_->GetColumnFamilyMetaData(&after_metadata);
+  const uint64_t after_physical_blob_size = PhysicalBlobSize(after_metadata);
+  const uint64_t after_total = after[0] + after[1] + after[2];
+  ASSERT_NEAR(static_cast<double>(after_total),
+              static_cast<double>(after_physical_blob_size),
+              static_cast<double>(after_physical_blob_size) * 0.15);
+  const uint64_t distribution_change =
+      after[1] > before[1] ? after[1] - before[1] : before[1] - after[1];
+  ASSERT_GT(distribution_change, physical_blob_size / 100);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

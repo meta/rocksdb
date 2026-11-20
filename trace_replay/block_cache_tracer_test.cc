@@ -180,7 +180,7 @@ TEST_F(BlockCacheTracerTest, AtomicWriteBeforeStartTrace) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     BlockCacheTraceReader reader(std::move(trace_reader));
-    BlockCacheTraceHeader header;
+    BlockCacheTraceHeader header{};
     ASSERT_NOK(reader.ReadHeader(&header));
   }
 }
@@ -210,7 +210,7 @@ TEST_F(BlockCacheTracerTest, AtomicWrite) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     BlockCacheTraceReader reader(std::move(trace_reader));
-    BlockCacheTraceHeader header;
+    BlockCacheTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));
@@ -265,7 +265,7 @@ TEST_F(BlockCacheTracerTest, AtomicNoWriteAfterEndTrace) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     BlockCacheTraceReader reader(std::move(trace_reader));
-    BlockCacheTraceHeader header;
+    BlockCacheTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));
@@ -347,7 +347,7 @@ TEST_F(BlockCacheTracerTest, MixedBlocks) {
     ASSERT_OK(NewFileTraceReader(env_, env_options_, trace_file_path_,
                                  &trace_reader));
     BlockCacheTraceReader reader(std::move(trace_reader));
-    BlockCacheTraceHeader header;
+    BlockCacheTraceHeader header{};
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_EQ(kMajorVersion, static_cast<int>(header.rocksdb_major_version));
     ASSERT_EQ(kMinorVersion, static_cast<int>(header.rocksdb_minor_version));
@@ -384,7 +384,7 @@ TEST_F(BlockCacheTracerTest, HumanReadableTrace) {
   }
   {
     BlockCacheHumanReadableTraceReader reader(trace_file_path_);
-    BlockCacheTraceHeader header;
+    BlockCacheTraceHeader header{};
     BlockCacheTraceRecord read_record;
     ASSERT_OK(reader.ReadHeader(&header));
     ASSERT_OK(reader.ReadAccess(&read_record));

@@ -66,7 +66,7 @@ class LoudsTrie;
 
 // ============================================================================
 // BlockHandle: offset and size of a data block in the SST file.
-// Matches UserDefinedIndexBuilder::BlockHandle but defined locally to avoid
+// Matches IndexFactoryBuilder::BlockHandle but defined locally to avoid
 // header dependencies in the core trie implementation.
 // ============================================================================
 struct TrieBlockHandle {

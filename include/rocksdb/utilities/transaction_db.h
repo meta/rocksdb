@@ -61,13 +61,13 @@ class LockManagerHandle {
 // Same as class Endpoint, but use std::string to manage the buffer allocation
 struct EndpointWithString {
   std::string slice;
-  bool inf_suffix;
+  bool inf_suffix = false;
 };
 
 struct RangeDeadlockInfo {
-  TransactionID m_txn_id;
-  uint32_t m_cf_id;
-  bool m_exclusive;
+  TransactionID m_txn_id = 0;
+  uint32_t m_cf_id = 0;
+  bool m_exclusive = false;
 
   EndpointWithString m_start;
   EndpointWithString m_end;
@@ -80,7 +80,9 @@ struct RangeDeadlockPath {
 
   explicit RangeDeadlockPath(std::vector<RangeDeadlockInfo> path_entry,
                              const int64_t& dl_time)
-      : path(path_entry), limit_exceeded(false), deadlock_time(dl_time) {}
+      : path(std::move(path_entry)),
+        limit_exceeded(false),
+        deadlock_time(dl_time) {}
 
   // empty path, limit exceeded constructor and default constructor
   explicit RangeDeadlockPath(const int64_t& dl_time = 0, bool limit = false)
@@ -480,9 +482,9 @@ struct RangeLockInfo {
 };
 
 struct DeadlockInfo {
-  TransactionID m_txn_id;
-  uint32_t m_cf_id;
-  bool m_exclusive;
+  TransactionID m_txn_id = 0;
+  uint32_t m_cf_id = 0;
+  bool m_exclusive = false;
   std::string m_waiting_key;
 };
 
@@ -493,7 +495,9 @@ struct DeadlockPath {
 
   explicit DeadlockPath(std::vector<DeadlockInfo> path_entry,
                         const int64_t& dl_time)
-      : path(path_entry), limit_exceeded(false), deadlock_time(dl_time) {}
+      : path(std::move(path_entry)),
+        limit_exceeded(false),
+        deadlock_time(dl_time) {}
 
   // empty path, limit exceeded constructor and default constructor
   explicit DeadlockPath(const int64_t& dl_time = 0, bool limit = false)

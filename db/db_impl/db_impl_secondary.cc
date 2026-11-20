@@ -22,10 +22,12 @@
 #include "logging/auto_roll_logger.h"
 #include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
+#include "options/options_parser.h"
 #include "rocksdb/convenience.h"
-#include "rocksdb/utilities/options_util.h"
+#include "rocksdb/table.h"
 #include "util/atomic.h"
 #include "util/cast_util.h"
+#include "util/string_util.h"
 #include "util/write_batch_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -1090,7 +1092,7 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
                         cfd->GetName().c_str());
         continue;
       }
-      VersionStorageInfo::LevelSummaryStorage tmp;
+      VersionStorageInfo::LevelSummaryStorage tmp{};
       ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                       "[%s] Level summary: %s\n", cfd->GetName().c_str(),
                       cfd->current()->storage_info()->LevelSummary(&tmp));
@@ -1193,6 +1195,12 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
   }
   purge_files_job_context.Clean();
   return s;
+}
+
+bool DBImplSecondary::SecondaryHasMissingFiles() {
+  mutex_.AssertHeld();
+  return static_cast_with_check<ReactiveVersionSet>(versions_.get())
+      ->NewestStateHasMissingFiles();
 }
 
 Status DB::OpenAsSecondary(const Options& options, const std::string& dbname,
@@ -1984,7 +1992,8 @@ Status DBImplSecondary::CompactWithoutInstallation(
     const ReadOptions read_options(Env::IOActivity::kCompaction);
     for (const auto& level_files : input_files) {
       for (FileMetaData* file_meta : level_files.files) {
-        version->MaybeInitializeFileMetaData(read_options, file_meta);
+        version->MaybeInitializeFileMetaData(
+            read_options, file_meta, /*populate_referenced_blob_bytes=*/false);
       }
     }
   }
@@ -2091,6 +2100,54 @@ Status DBImplSecondary::CompactWithoutInstallation(
   return s;
 }
 
+namespace {
+// Creates the column family's table factory from its TableOptions section in
+// the OPTIONS file, failing on a component that cannot be created instead of
+// ignoring it. Unknown options are ignored as Parse() does, only in a file a
+// newer RocksDB wrote.
+Status CheckTableFactoryFromOptionsFile(const ConfigOptions& config_options,
+                                        const RocksDBOptionsParser& parser,
+                                        const std::string& cf_name) {
+  const RocksDBOptionsParser::TableOptionsSection* section =
+      parser.GetCFTableOptionsSection(cf_name);
+  if (section == nullptr) {
+    return Status::OK();
+  }
+  ConfigOptions strict_options = config_options;
+  strict_options.ignore_unknown_options =
+      config_options.ignore_unknown_options && parser.WrittenByNewerVersion();
+  strict_options.ignore_unsupported_options = false;
+  std::shared_ptr<TableFactory> table_factory;
+  Status s = TableFactory::CreateFromString(
+      strict_options, section->table_factory_id, &table_factory);
+  if (s.ok()) {
+    s = table_factory->ConfigureFromMap(strict_options, section->opt_map);
+  }
+  if (!s.ok()) {
+    return Status::NotSupported(
+        "Cannot create the table factory of column family " + cf_name +
+            " from the OPTIONS file",
+        s.ToString());
+  }
+  // A table factory may leave a component it cannot create null without an
+  // error (BlockBasedTableFactory does for a filter_policy that is not
+  // registered), so look for one the file sets but the created factory lacks.
+  for (const auto& [name, file_value] : section->opt_map) {
+    if (file_value.empty() || file_value == kNullptrString) {
+      continue;
+    }
+    std::string created_value;
+    if (table_factory->GetOption(strict_options, name, &created_value).ok() &&
+        created_value == kNullptrString) {
+      return Status::NotSupported("Cannot create " + name + "=" + file_value +
+                                  " in the table factory of column family " +
+                                  cf_name + " from the OPTIONS file");
+    }
+  }
+  return Status::OK();
+}
+}  // namespace
+
 Status DB::OpenAndCompact(
     const OpenAndCompactOptions& options, const std::string& name,
     const std::string& output_directory, const std::string& input,
@@ -2122,10 +2179,17 @@ Status DB::OpenAndCompact(
   std::string options_file_name =
       OptionsFileName(name, compaction_input.options_file_number);
 
-  s = LoadOptionsFromFile(config_options, options_file_name, &base_db_options,
-                          &all_column_families);
+  RocksDBOptionsParser options_parser;
+  s = options_parser.Parse(config_options, options_file_name,
+                           config_options.env->GetFileSystem().get());
   if (!s.ok()) {
     return s;
+  }
+  base_db_options = *options_parser.db_opt();
+  all_column_families.reserve(options_parser.cf_opts()->size());
+  for (size_t i = 0; i < options_parser.cf_opts()->size(); ++i) {
+    all_column_families.emplace_back(options_parser.cf_names()->at(i),
+                                     options_parser.cf_opts()->at(i));
   }
 
   // 3. Options to Override
@@ -2177,7 +2241,33 @@ Status DB::OpenAndCompact(
       cf.options.compaction_filter_factory =
           override_options.compaction_filter_factory;
       cf.options.prefix_extractor = override_options.prefix_extractor;
-      cf.options.table_factory = override_options.table_factory;
+      if (override_options.table_factory) {
+        cf.options.table_factory = override_options.table_factory;
+      } else {
+        // Parsing the OPTIONS file ignores components it cannot create, so
+        // check that the table factory lost none.
+        s = CheckTableFactoryFromOptionsFile(config_options, options_parser,
+                                             cf.name);
+        if (s.ok() && !cf.options.table_factory) {
+          s = Status::NotSupported(
+              "No table factory for column family " + cf.name +
+              " after applying CompactionServiceOptionsOverride::options_map");
+        }
+        if (!s.ok()) {
+          ROCKS_LOG_WARN(db_options.info_log,
+                         "Remote compaction cannot use the table factory in "
+                         "%s: %s",
+                         options_file_name.c_str(), s.ToString().c_str());
+          return s;
+        }
+        if (options_parser.WrittenByNewerVersion()) {
+          ROCKS_LOG_WARN(db_options.info_log,
+                         "%s was written by a newer RocksDB, so table options "
+                         "of column family %s that this RocksDB does not know "
+                         "are ignored",
+                         options_file_name.c_str(), cf.name.c_str());
+        }
+      }
       cf.options.sst_partitioner_factory =
           override_options.sst_partitioner_factory;
       cf.options.table_properties_collector_factories =
@@ -2301,7 +2391,16 @@ Status DB::OpenAndCompact(
       break;
     }
   }
-  assert(cfh);
+  if (cfh == nullptr) {
+    // The OPTIONS file named by the input does not list this column family, so
+    // step 4 did not open it.
+    for (auto& handle : handles) {
+      delete handle;
+    }
+    db.reset();
+    return Status::InvalidArgument("Column family not found",
+                                   compaction_input.cf_name);
+  }
 
   // 7. Run the compaction without installation.
   // Output will be stored under the DB-owned staging directory.
@@ -2446,20 +2545,6 @@ Status DBImplSecondary::FinalizeCompactionProgressWriter(
         temp_file_path, "" /* final_file_path */, compaction_progress_writer);
   }
 
-  if (!compaction_progress_.empty()) {
-    s = PersistInitialCompactionProgress(compaction_progress_writer->get(),
-                                         &compaction_progress_);
-    if (!s.ok()) {
-      ROCKS_LOG_WARN(immutable_db_options_.info_log,
-                     "Failed to persist the initial copmaction "
-                     "progress: %s. Will perform clean up "
-                     "to start compaction without progress persistence",
-                     s.ToString().c_str());
-      return HandleCompactionProgressWriterCreationFailure(
-          temp_file_path, "" /* final_file_path */, compaction_progress_writer);
-    }
-  }
-
   compaction_progress_writer->reset();
 
   std::string final_file_path;
@@ -2486,6 +2571,23 @@ Status DBImplSecondary::FinalizeCompactionProgressWriter(
                    s.ToString().c_str());
     return HandleCompactionProgressWriterCreationFailure(
         "" /* temp_file_path */, final_file_path, compaction_progress_writer);
+  }
+
+  // The resumed progress must be written through the final writer: reopening
+  // the final file with NewWritableFile() truncates it, and later checkpoints
+  // only persist output files added after this record.
+  if (!compaction_progress_.empty()) {
+    s = PersistInitialCompactionProgress(compaction_progress_writer->get(),
+                                         &compaction_progress_);
+    if (!s.ok()) {
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "Failed to persist the initial compaction "
+                     "progress: %s. Will perform clean up "
+                     "to start compaction without progress persistence",
+                     s.ToString().c_str());
+      return HandleCompactionProgressWriterCreationFailure(
+          "" /* temp_file_path */, final_file_path, compaction_progress_writer);
+    }
   }
 
   ROCKS_LOG_DEBUG(immutable_db_options_.info_log,

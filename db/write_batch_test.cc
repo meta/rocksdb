@@ -9,6 +9,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <utility>
 
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
@@ -38,7 +39,7 @@ static std::string PrintContents(WriteBatch* b,
   Options options;
   options.memtable_factory = factory;
   if (merge_operator_supported) {
-    options.merge_operator.reset(new TestPutOperator());
+    options.merge_operator = std::make_shared<TestPutOperator>();
   }
   ImmutableOptions ioptions(options);
   WriteBufferManager wb(options.db_write_buffer_size);
@@ -1301,7 +1302,7 @@ class TimestampChecker : public WriteBatch::Handler {
 Status CheckTimestampsInWriteBatch(
     WriteBatch& wb, Slice timestamp,
     std::unordered_map<uint32_t, const Comparator*> cf_to_ucmps) {
-  TimestampChecker ts_checker(cf_to_ucmps, timestamp);
+  TimestampChecker ts_checker(std::move(cf_to_ucmps), timestamp);
   return wb.Iterate(&ts_checker);
 }
 }  // anonymous namespace

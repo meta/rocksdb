@@ -20,7 +20,8 @@ namespace ROCKSDB_NAMESPACE {
 ExpectedState::ExpectedState(size_t max_key, size_t num_column_families)
     : max_key_(max_key),
       num_column_families_(num_column_families),
-      values_(nullptr) {}
+      values_(nullptr),
+      persisted_seqno_(nullptr) {}
 
 void ExpectedState::ClearColumnFamily(int cf) {
   const uint32_t del_mask = ExpectedValue::GetDelMask();
@@ -339,10 +340,9 @@ Status FileExpectedStateManager::Open() {
   }
 
   if (s.ok()) {
-    latest_.reset(
-        new FileExpectedState(std::move(expected_state_file_path),
-                              std::move(expected_persisted_seqno_file_path),
-                              max_key_, num_column_families_));
+    latest_.reset(new FileExpectedState(expected_state_file_path,
+                                        expected_persisted_seqno_file_path,
+                                        max_key_, num_column_families_));
     s = latest_->Open(false /* create */);
   }
   return s;
@@ -531,7 +531,7 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
 
     if (buffered_writes_ != nullptr) {
       return WriteBatchInternal::Put(buffered_writes_.get(), column_family_id,
-                                     key, value);
+                                     key_with_ts, value);
     }
 
     state_->SyncPut(column_family_id, expected_key_id, value_base);
@@ -553,7 +553,7 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
 
     if (buffered_writes_ != nullptr) {
       return WriteBatchInternal::TimedPut(buffered_writes_.get(),
-                                          column_family_id, key, value,
+                                          column_family_id, key_with_ts, value,
                                           write_unix_time);
     }
 
@@ -588,8 +588,8 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
     }
 
     if (buffered_writes_) {
-      return WriteBatchInternal::PutEntity(buffered_writes_.get(),
-                                           column_family_id, key, columns);
+      return WriteBatchInternal::PutEntity(
+          buffered_writes_.get(), column_family_id, key_with_ts, columns);
     }
 
     const uint32_t value_base =
@@ -612,7 +612,7 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
 
     if (buffered_writes_ != nullptr) {
       return WriteBatchInternal::Delete(buffered_writes_.get(),
-                                        column_family_id, key);
+                                        column_family_id, key_with_ts);
     }
 
     state_->SyncDelete(column_family_id, expected_key_id);
@@ -657,7 +657,8 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
 
     if (buffered_writes_ != nullptr) {
       return WriteBatchInternal::DeleteRange(
-          buffered_writes_.get(), column_family_id, begin_key, end_key);
+          buffered_writes_.get(), column_family_id, begin_key_with_ts,
+          end_key_with_ts);
     }
 
     state_->SyncDeleteRange(column_family_id,
@@ -669,16 +670,16 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
 
   Status MergeCF(uint32_t column_family_id, const Slice& key_with_ts,
                  const Slice& value) override {
-    Slice key =
-        StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
-
     bool should_buffer_write = !(buffered_writes_ == nullptr);
     if (should_buffer_write) {
       return WriteBatchInternal::Merge(buffered_writes_.get(), column_family_id,
-                                       key, value);
+                                       key_with_ts, value);
     }
 
-    return PutCF(column_family_id, key, value);
+    // The stress merge operators return the newest operand, so a merge has
+    // the same effect on the expected state as a put. `PutCF()` removes the
+    // timestamp itself, so pass the key with its timestamp.
+    return PutCF(column_family_id, key_with_ts, value);
   }
 
   Status PutBlobIndexCF(uint32_t column_family_id, const Slice& key_with_ts,
@@ -693,8 +694,8 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
     const int64_t expected_key_id = static_cast<int64_t>(key_id);
 
     if (buffered_writes_ != nullptr) {
-      return WriteBatchInternal::PutBlobIndex(buffered_writes_.get(),
-                                              column_family_id, key, value);
+      return WriteBatchInternal::PutBlobIndex(
+          buffered_writes_.get(), column_family_id, key_with_ts, value);
     }
 
     // Blob direct-write traces record the transformed BlobIndex write rather
@@ -708,6 +709,10 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
     return Status::OK();
   }
 
+  // A prepared transaction buffers its writes until `MarkCommit()`, which
+  // replays them through the handlers above. Those handlers remove the user
+  // timestamp from each key, so the buffered writes keep the key with its
+  // timestamp, as received from the trace.
   Status MarkBeginPrepare(bool = false) override {
     assert(!buffered_writes_);
     buffered_writes_.reset(new WriteBatch());

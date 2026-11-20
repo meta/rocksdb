@@ -108,8 +108,8 @@ class DeleteSchedulerTest : public testing::Test {
 
   Env* env_;
   std::vector<std::string> dummy_files_dirs_;
-  int64_t rate_bytes_per_sec_;
-  DeleteScheduler* delete_scheduler_;
+  int64_t rate_bytes_per_sec_ = 0;
+  DeleteScheduler* delete_scheduler_ = nullptr;
   std::unique_ptr<SstFileManagerImpl> sst_file_mgr_;
   std::shared_ptr<Statistics> stats_;
 };
@@ -288,6 +288,7 @@ TEST_F(DeleteSchedulerTest, RateLimitingMultiThreaded) {
       }
     };
 
+    threads.reserve(thread_cnt);
     for (int i = 0; i < thread_cnt; i++) {
       threads.emplace_back(delete_thread);
     }
@@ -965,6 +966,33 @@ TEST_F(DeleteSchedulerTest, ConcurrentDirectoryWaitStress) {
   ASSERT_EQ(0, sst_file_mgr_->GetTotalSize());
 }
 
+TEST_F(DeleteSchedulerTest, ConcurrentSetRateCreatesOneBackgroundThread) {
+  std::atomic<int> bg_threads_started{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DeleteScheduler::BackgroundEmptyTrash",
+      [&](void* /*arg*/) { bg_threads_started.fetch_add(1); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  constexpr int num_rounds = 1000;
+  constexpr int num_threads = 8;
+  rate_bytes_per_sec_ = 0;
+  for (int round = 0; round < num_rounds; ++round) {
+    NewDeleteScheduler();
+    std::vector<port::Thread> threads;
+    threads.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+      threads.emplace_back(
+          [&] { sst_file_mgr_->SetDeleteRateBytesPerSecond(1024 * 1024); });
+    }
+    for (auto& t : threads) {
+      t.join();
+    }
+    sst_file_mgr_.reset();
+  }
+
+  ASSERT_EQ(num_rounds, bg_threads_started.load());
+}
+
 TEST_F(DeleteSchedulerTest, ConcurrentlyDeleteUnaccountedFilesInBuckets) {
   int bg_delete_file = 0;
   int fg_delete_file = 0;
@@ -1006,6 +1034,7 @@ TEST_F(DeleteSchedulerTest, ConcurrentlyDeleteUnaccountedFilesInBuckets) {
     delete_scheduler_->WaitForEmptyTrashBucket(bucket.value());
   };
 
+  threads.reserve(thread_cnt);
   for (int i = 0; i < thread_cnt; i++) {
     threads.emplace_back(delete_thread);
   }

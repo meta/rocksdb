@@ -11,6 +11,7 @@
 
 #include <cinttypes>
 #include <limits>
+#include <memory>
 
 #include "logging/logging.h"
 #include "monitoring/statistics_impl.h"
@@ -644,7 +645,7 @@ ColumnFamilyOptions* ColumnFamilyOptions::OptimizeForSmallDb(
   // Two level iterator to avoid LRU cache imbalance
   table_options.index_type =
       BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
-  table_factory.reset(new BlockBasedTableFactory(table_options));
+  table_factory = std::make_shared<BlockBasedTableFactory>(table_options);
 
   return this;
 }
@@ -658,7 +659,7 @@ ColumnFamilyOptions* ColumnFamilyOptions::OptimizeForPointLookup(
   block_based_options.filter_policy.reset(NewBloomFilterPolicy(10));
   block_based_options.block_cache =
       NewLRUCache(static_cast<size_t>(block_cache_size_mb * 1024 * 1024));
-  table_factory.reset(new BlockBasedTableFactory(block_based_options));
+  table_factory = std::make_shared<BlockBasedTableFactory>(block_based_options);
   memtable_prefix_bloom_size_ratio = 0.02;
   memtable_whole_key_filtering = true;
   return this;

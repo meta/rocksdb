@@ -63,8 +63,7 @@ class AsyncFileReader {
     // A return value of true means suspend the awaiter (calling coroutine). The
     // awaiting_coro parameter is the handle of the awaiter. The handle can be
     // resumed later, so we cache it here.
-    bool await_suspend(
-        folly::coro::impl::coroutine_handle<> awaiting_coro) noexcept {
+    bool await_suspend(folly::coro::coroutine_handle<> awaiting_coro) noexcept {
       awaiting_coro_ = awaiting_coro;
       // MultiReadAsyncImpl always returns true, so caller will be suspended
       return reader_.MultiReadAsyncImpl(this);
@@ -86,7 +85,7 @@ class AsyncFileReader {
     IODebugContext* dbg_;
     autovector<void*, 32> io_handle_;
     autovector<IOHandleDeleter, 32> del_fn_;
-    folly::coro::impl::coroutine_handle<> awaiting_coro_;
+    folly::coro::coroutine_handle<> awaiting_coro_;
     // Use this to link to the next ReadAwaiter in the suspended coroutine
     // list. The head and tail of the list are tracked by AsyncFileReader.
     // We use this approach rather than an STL container in order to avoid

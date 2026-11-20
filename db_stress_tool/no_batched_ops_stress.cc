@@ -2719,14 +2719,17 @@ class NonBatchedOpsStressTest : public StressTest {
     }
 
     std::vector<ExternalSstFileInfo> file_infos(data_file_count);
-    // Embedded blobs are only supported by block-based table format_version >=
-    // 7 (the default db_stress table factory is block-based).
+    const auto* block_based_table_options =
+        options_.table_factory->GetOptions<BlockBasedTableOptions>();
+    // Embedded blobs are supported only by a block-based table whose active
+    // format version is at least 7.
     const bool use_embedded_blobs =
         FLAGS_ingest_external_file_with_embedded_blobs &&
-        FLAGS_format_version >= 7;
-    // Set the embedded-blob threshold so that only the largest values generated
-    // by GenerateValue() (size kRandomValueMaxFactor * value_size_mult) are
-    // written as same-file blob records; smaller values stay inline.
+        block_based_table_options != nullptr &&
+        block_based_table_options->format_version >= 7;
+    // This threshold is the largest value size of the default value format.
+    // Structured values have other sizes, so any of them at least this large
+    // is written as a same-file blob record.
     SstFileWriterEmbeddedBlobOptions embedded_blob_options;
     embedded_blob_options.min_blob_size =
         static_cast<uint64_t>(kRandomValueMaxFactor) * FLAGS_value_size_mult;
@@ -2993,13 +2996,14 @@ class NonBatchedOpsStressTest : public StressTest {
     fprintf(stderr,
             "Iterator config: allow_unprepared_value=%d, "
             "auto_refresh_iterator_with_snapshot=%d, has_snapshot=%d, "
-            "use_multi_cf_iterator=%d, using_udi=%d, use_trie_index=%d\n",
+            "use_multi_cf_iterator=%d, use_trie_index=%d, index_mode=%d, "
+            "read_index=%d\n",
             static_cast<int>(ro.allow_unprepared_value),
             static_cast<int>(ro.auto_refresh_iterator_with_snapshot),
             static_cast<int>(ro.snapshot != nullptr),
             static_cast<int>(FLAGS_use_multi_cf_iterator),
-            static_cast<int>(ro.table_index_factory != nullptr),
-            static_cast<int>(FLAGS_use_trie_index));
+            static_cast<int>(FLAGS_use_trie_index), FLAGS_index_mode,
+            static_cast<int>(ro.read_index));
     fprintf(stderr, "Iterator value: %s\n",
             iter->value().ToString(true).c_str());
 
@@ -3055,28 +3059,30 @@ class NonBatchedOpsStressTest : public StressTest {
     };
 
     ReadOptions standard_ro = ro;
-    standard_ro.table_index_factory = nullptr;
+    standard_ro.read_index = ReadOptions::ReadIndex::kBuiltin;
+    ReadOptions trie_ro = ro;
+    trie_ro.read_index = ReadOptions::ReadIndex::kPreferCustom;
     dump_debug_iter("Debug standard direct", standard_ro,
                     /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/false);
-    dump_debug_iter("Debug trie direct", ro, /*use_multi_cf_iter=*/false,
+    dump_debug_iter("Debug trie direct", trie_ro, /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/false);
     dump_debug_iter("Debug standard direct", standard_ro,
                     /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/true);
-    dump_debug_iter("Debug trie direct", ro, /*use_multi_cf_iter=*/false,
+    dump_debug_iter("Debug trie direct", trie_ro, /*use_multi_cf_iter=*/false,
                     /*replay_from_mid=*/true);
     if (FLAGS_use_multi_cf_iterator) {
       dump_debug_iter("Debug standard coalescing", standard_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/false);
-      dump_debug_iter("Debug trie coalescing", ro,
+      dump_debug_iter("Debug trie coalescing", trie_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/false);
       dump_debug_iter("Debug standard coalescing", standard_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/true);
-      dump_debug_iter("Debug trie coalescing", ro,
+      dump_debug_iter("Debug trie coalescing", trie_ro,
                       /*use_multi_cf_iter=*/true,
                       /*replay_from_mid=*/true);
     }
@@ -3157,6 +3163,7 @@ class NonBatchedOpsStressTest : public StressTest {
     std::vector<ExpectedValue> pre_read_expected_values;
     std::vector<ExpectedValue> post_read_expected_values;
 
+    pre_read_expected_values.reserve(expected_values_size);
     for (int64_t i = 0; i < static_cast<int64_t>(expected_values_size); ++i) {
       pre_read_expected_values.push_back(
           shared->Get(rand_column_family, i + lb));
@@ -3184,6 +3191,7 @@ class NonBatchedOpsStressTest : public StressTest {
       iter = std::unique_ptr<Iterator>(db_->NewIterator(ro, cfh));
     }
 
+    post_read_expected_values.reserve(expected_values_size);
     for (int64_t i = 0; i < static_cast<int64_t>(expected_values_size); ++i) {
       post_read_expected_values.push_back(
           shared->Get(rand_column_family, i + lb));
@@ -3628,7 +3636,7 @@ class NonBatchedOpsStressTest : public StressTest {
 
   bool VerifyOrSyncValue(int cf, int64_t key, const ReadOptions& opts,
                          SharedState* shared, const std::string& value_from_db,
-                         std::string msg_prefix, const Status& s) const {
+                         const std::string& msg_prefix, const Status& s) const {
     if (shared->HasVerificationFailedYet()) {
       return false;
     }
@@ -3894,6 +3902,7 @@ class NonBatchedOpsStressTest : public StressTest {
           s = txn->Delete(cfh, k);
           break;
         }
+        case Op::NumberOfOps:
         default:
           assert(false);
       }

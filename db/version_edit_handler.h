@@ -260,6 +260,10 @@ class VersionEditHandler : public VersionEditHandlerBase {
   // incomplete Version with only a suffix of L0 files missing is also
   // considered valid if the Version is never edited in an atomic group.
   const bool allow_incomplete_valid_version_;
+  // If true, every column family's VersionBuilder records missing blob files
+  // as dropped instead of treating them as missing (see
+  // VersionBuilder::RecordMissingBlobFilesAsDropped()).
+  bool record_missing_blob_files_as_dropped_ = false;
   EpochNumberRequirement epoch_number_requirement_;
   std::unordered_set<uint32_t> cfds_to_mark_no_udt_;
 
@@ -297,13 +301,15 @@ class VersionEditHandler : public VersionEditHandlerBase {
 // VersionEditHandlerPointInTime is shared by multiple threads.
 class VersionEditHandlerPointInTime : public VersionEditHandler {
  public:
+  // `record_missing_blob_files_as_dropped` requires
+  // `allow_incomplete_valid_version`.
   VersionEditHandlerPointInTime(
       bool read_only, std::vector<ColumnFamilyDescriptor> column_families,
       VersionSet* version_set, const std::shared_ptr<IOTracer>& io_tracer,
       const ReadOptions& read_options, bool allow_incomplete_valid_version,
-      bool trust_manifest_recovery, bool defer_sst_file_opening,
-      EpochNumberRequirement epoch_number_requirement =
-          EpochNumberRequirement::kMustPresent);
+      bool record_missing_blob_files_as_dropped, bool trust_manifest_recovery,
+      bool defer_sst_file_opening,
+      EpochNumberRequirement epoch_number_requirement);
   ~VersionEditHandlerPointInTime() override;
 
   bool HasMissingFiles() const;
@@ -342,6 +348,12 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
   Status LoadTables(ColumnFamilyData* cfd,
                     bool prefetch_index_and_filter_in_cache,
                     bool is_initial_load) override;
+
+  // Returns whether the builder of column family `cf_id` holds a state of the
+  // MANIFEST being read, so that a Version may be created from it.
+  virtual bool BuilderHoldsPointInTime(uint32_t /*cf_id*/) const {
+    return true;
+  }
 
   // A Version built from the MANIFEST records read up to some point in time,
   // together with the column family's log number that those records had put in
@@ -428,8 +440,10 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
       : VersionEditHandlerPointInTime(
             /*read_only=*/true, std::move(column_families), version_set,
             io_tracer, read_options,
-            /*allow_incomplete_valid_version=*/false, trust_manifest_recovery,
-            defer_sst_file_opening, epoch_number_requirement),
+            /*allow_incomplete_valid_version=*/false,
+            /*record_missing_blob_files_as_dropped=*/false,
+            trust_manifest_recovery, defer_sst_file_opening,
+            epoch_number_requirement),
         mode_(Mode::kRecovery) {}
 
   Status VerifyFile(ColumnFamilyData* cfd, const std::string& fpath, int level,
@@ -438,7 +452,31 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
   void PrepareToReadNewManifest() {
     initialized_ = false;
     ResetReadState();
+    cfs_awaiting_from_previous_manifest_ = cfs_awaiting_file_list_;
+    cfs_not_yet_in_manifest_.clear();
+    for (const auto& builder : builders_) {
+      cfs_not_yet_in_manifest_.insert(builder.first);
+    }
   }
+
+  // ReactiveVersionSet::ReadAndApply() calls this before it reads with a new
+  // reader that starts at GetLastValidRecordEnd(), after a failed MANIFEST read
+  // stopped the last Iterate(). Any other error stops all later reads, so
+  // status_ holds at most the read error, and clearing it is safe. The read
+  // buffer can hold the first records of an atomic group that the failed read
+  // cut. This clears them, and the new reader reads the group again.
+  void PrepareToResumeAfterReadError() {
+    status_ = Status::OK();
+    GetReadBuffer().Clear();
+  }
+
+  // Returns whether catch-up cannot build a Version of the newest state of a
+  // column family that this instance opened, because a file of that state was
+  // not found or failed verification. A column family that the current
+  // MANIFEST left out does not count: the primary dropped it before this
+  // instance read the drop record, and its builder keeps the state from the
+  // previous MANIFEST.
+  bool NewestStateHasMissingFiles();
 
   std::unordered_set<ColumnFamilyData*>& GetUpdatedColumnFamilies() {
     return cfds_changed_;
@@ -455,7 +493,13 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   Status OnColumnFamilyAdd(VersionEdit& edit, ColumnFamilyData** cfd) override;
 
+  bool BuilderHoldsPointInTime(uint32_t cf_id) const override {
+    return cfs_awaiting_file_list_.count(cf_id) == 0;
+  }
+
   void CheckIterationResult(const log::Reader& reader, Status* s) override;
+
+  void AwaitFileList(uint32_t cf_id);
 
   enum Mode : uint8_t {
     kRecovery = 0,
@@ -464,6 +508,19 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   Mode mode_;
   std::unordered_set<ColumnFamilyData*> cfds_changed_;
+  // Column families whose builder was reset to their empty initial Version to
+  // replay a new MANIFEST, and that have not yet applied the record in it that
+  // lists their files.
+  std::unordered_set<uint32_t> cfs_awaiting_file_list_;
+  // Column families that were awaiting their file list when the tailer
+  // switched to the current MANIFEST, and that it has not added again.
+  std::unordered_set<uint32_t> cfs_awaiting_from_previous_manifest_;
+  // Column families with a builder that the current MANIFEST has not added
+  // again since the tailer switched to it.
+  std::unordered_set<uint32_t> cfs_not_yet_in_manifest_;
+  // Column families that the snapshot opening a MANIFEST left out, because the
+  // primary dropped them. Their builders are never reset again.
+  std::unordered_set<uint32_t> cfs_left_out_of_manifest_;
 };
 
 class DumpManifestHandler : public VersionEditHandler {

@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <iostream>
+#include <memory>
 
 #include "db/db_impl/db_impl.h"
 #include "rocksdb/convenience.h"
@@ -125,8 +126,8 @@ class CassandraFunctionalTest : public testing::Test {
   std::unique_ptr<DB> OpenDb() {
     Options options;
     options.create_if_missing = true;
-    options.merge_operator.reset(
-        new CassandraValueMergeOperator(gc_grace_period_in_seconds_));
+    options.merge_operator = std::make_shared<CassandraValueMergeOperator>(
+        gc_grace_period_in_seconds_);
     auto* cf_factory = new TestCompactionFilterFactory(
         purge_ttl_on_expiration_, gc_grace_period_in_seconds_);
     options.compaction_filter_factory.reset(cf_factory);

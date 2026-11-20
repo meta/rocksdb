@@ -193,13 +193,13 @@ MultiGetQueryTraceRecord::MultiGetQueryTraceRecord(
     std::vector<uint32_t> column_family_ids, std::vector<PinnableSlice>&& keys,
     uint64_t timestamp)
     : QueryTraceRecord(timestamp),
-      cf_ids_(column_family_ids),
+      cf_ids_(std::move(column_family_ids)),
       keys_(std::move(keys)) {}
 
 MultiGetQueryTraceRecord::MultiGetQueryTraceRecord(
     std::vector<uint32_t> column_family_ids,
     const std::vector<std::string>& keys, uint64_t timestamp)
-    : QueryTraceRecord(timestamp), cf_ids_(column_family_ids) {
+    : QueryTraceRecord(timestamp), cf_ids_(std::move(column_family_ids)) {
   keys_.reserve(keys.size());
   for (const std::string& key : keys) {
     PinnableSlice ps;

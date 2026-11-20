@@ -1200,6 +1200,7 @@ bool WriteBufferManager::ExpireFlushHandoffLease(uint64_t now_micros) {
   active_flush_handoff_deadline_micros_ = 0;
   flush_handoff_state_.store(FlushHandoffState::kIdle,
                              std::memory_order_release);
+  TEST_SYNC_POINT("WriteBufferManager::ExpireFlushHandoffLease:Expired");
   return true;
 }
 

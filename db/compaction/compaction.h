@@ -151,6 +151,14 @@ class Compaction {
   // Returns input version of the compaction
   Version* input_version() const { return input_version_; }
 
+  bool skip_missing_blob_files() const { return skip_missing_blob_files_; }
+
+  // Set before registering or running this compaction.
+  void SetSkipMissingBlobFiles(bool skip_missing_blob_files) {
+    assert(is_manual_compaction_ || !skip_missing_blob_files);
+    skip_missing_blob_files_ = skip_missing_blob_files;
+  }
+
   // Returns the ColumnFamilyData associated with the compaction.
   ColumnFamilyData* column_family_data() const { return cfd_; }
 
@@ -271,6 +279,13 @@ class Compaction {
   // Does this compaction include all sst files?
   bool is_full_compaction() const { return is_full_compaction_; }
 
+  bool separate_remote_compaction_pool_selected() const {
+    return separate_remote_compaction_pool_selected_;
+  }
+  void SetSeparateRemoteCompactionPoolSelected(bool selected) {
+    separate_remote_compaction_pool_selected_ = selected;
+  }
+
   // Was this compaction triggered manually by the client?
   bool is_manual_compaction() const { return is_manual_compaction_; }
 
@@ -346,6 +361,16 @@ class Compaction {
   //
   // PRE: input version has been set.
   bool DoesInputReferenceBlobFiles() const;
+
+  // Returns true iff this compaction replaces references to blob files missing
+  // from its input Version (see MissingBlobRepairIterator): with
+  // skip_missing_blob_files(), references to any such blob file; otherwise
+  // references to blob files recorded as dropped in the input Version (see
+  // VersionStorageInfo::GetDroppedBlobFiles()), when an input file might
+  // reference one.
+  //
+  // PRE: input version has been set.
+  bool RepairsMissingBlobReferences() const;
 
   // test function to validate the functionality of IsBottommostLevel()
   // function -- determines if compaction with inputs and storage is bottommost
@@ -609,9 +634,11 @@ class Compaction {
   const bool bottommost_level_;
   // Does this compaction include all sst files?
   const bool is_full_compaction_;
+  bool separate_remote_compaction_pool_selected_ = false;
 
   // Is this compaction requested by the client?
   const bool is_manual_compaction_;
+  bool skip_missing_blob_files_ = false;
 
   // The data with timestamp > trim_ts_ will be removed
   const std::string trim_ts_;

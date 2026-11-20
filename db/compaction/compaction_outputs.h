@@ -179,6 +179,11 @@ class CompactionOutputs {
 
   bool HasBuilder() const { return builder_ != nullptr; }
 
+  // Returns true if the last output file is still open.
+  bool HasUnfinishedOutput() const {
+    return !outputs_.empty() && !outputs_.back().finished;
+  }
+
   FileMetaData* GetMetaData() { return &current_output().meta; }
 
   bool HasOutput() const { return !outputs_.empty(); }
@@ -216,6 +221,12 @@ class CompactionOutputs {
     stats_.num_output_records = num_output_records;
   }
 
+  // Counts the bytes of output files that an earlier run of this compaction
+  // wrote and this run restored.
+  void AddRestoredBytesWritten(uint64_t bytes) {
+    stats_.bytes_written += bytes;
+  }
+
  private:
   friend class SubcompactionState;
 
@@ -244,6 +255,15 @@ class CompactionOutputs {
   // Returns true iff we should stop building the current output
   // before processing the current key in compaction iterator.
   bool ShouldStopBefore(const CompactionIterator& c_iter);
+
+  // Returns true iff the SST partitioner requires a new output file to start
+  // at the current key. Only meaningful while an output file is open: the
+  // partitioner state describes the current file.
+  bool PartitionerRequiresCut(const CompactionIterator& c_iter) const;
+
+  // Returns true iff the current output file has a largest key and its user
+  // key equals `user_key`, ignoring timestamps.
+  bool LargestUserKeyEquals(const Slice& user_key);
 
   // Re-establishes per-file state that depends on the first key accepted by a
   // freshly opened builder. This keeps caller-requested file cuts equivalent to

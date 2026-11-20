@@ -894,6 +894,9 @@ std::vector<int64_t> GenerateNKeys(ThreadState* thread, int num_keys,
 }
 
 size_t GenerateValue(uint32_t rand, char* v, size_t max_sz) {
+  if (FLAGS_structured_key_value) {
+    return GenerateStructuredValue(rand, v, max_sz);
+  }
   size_t value_sz =
       ((rand % kRandomValueMaxFactor) + 1) * FLAGS_value_size_mult;
   assert(value_sz <= max_sz && value_sz >= sizeof(uint32_t));

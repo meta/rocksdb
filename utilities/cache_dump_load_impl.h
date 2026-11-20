@@ -62,21 +62,21 @@ struct DumpUnitMeta {
 struct DumpUnit {
   // The timestamp when the block is identified, copied, and dumped from block
   // cache
-  uint64_t timestamp;
+  uint64_t timestamp = 0;
   // The type of the block
-  CacheDumpUnitType type;
+  CacheDumpUnitType type = CacheDumpUnitType::kBlockTypeMax;
   // The key of this block when the block is referenced by this Cache
   Slice key;
   // The block size
-  size_t value_len;
+  size_t value_len = 0;
   // The Crc32c checksum of the block
-  uint32_t value_checksum;
+  uint32_t value_checksum = 0;
   // Pointer to the block. Note that, in the dump process, it points to a memory
   // buffer copied from cache block. The buffer is freed when we process the
   // next block. In the load process, we use an std::string to store the
   // serialized dump_unit read from the reader. So it points to the memory
   // address of the begin of the block in this string.
-  void* value;
+  void* value = nullptr;
 
   DumpUnit() { reset(); }
 
@@ -121,15 +121,15 @@ class CacheDumperImpl : public CacheDumper {
   CacheDumpOptions options_;
   std::shared_ptr<Cache> cache_;
   std::unique_ptr<CacheDumpWriter> writer_;
-  SystemClock* clock_;
-  uint32_t sequence_num_;
+  SystemClock* clock_ = nullptr;
+  uint32_t sequence_num_ = 0;
   // The cache key prefix filter. Currently, we use db_session_id as the prefix,
   // so using std::set to store the prefixes as filter is enough. Further
   // improvement can be applied like BloomFilter or others to speedup the
   // filtering.
   std::set<std::string> prefix_filter_;
   // Deadline for dumper in microseconds.
-  std::chrono::microseconds deadline_;
+  std::chrono::microseconds deadline_{};
   uint64_t dumped_size_bytes_;
   // dump all keys of cache if user doesn't call SetDumpFilter
   bool dump_all_keys_ = true;

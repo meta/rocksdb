@@ -61,10 +61,11 @@ class LogReaderContainer {
 
  private:
   struct LogReporter : public log::Reader::Reporter {
-    Env* env;
-    Logger* info_log;
+    Env* env = nullptr;
+    Logger* info_log = nullptr;
     std::string fname;
-    Status* status;  // nullptr if immutable_db_options_.paranoid_checks==false
+    // nullptr if immutable_db_options_.paranoid_checks==false
+    Status* status = nullptr;
     void Corruption(size_t bytes, const Status& s,
                     uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       ROCKS_LOG_WARN(info_log, "%s%s: dropping %d bytes; %s",
@@ -297,6 +298,9 @@ class DBImplSecondary : public DBImpl {
   // the amount of information in the log files to process is huge, this
   // method can take long time due to all the I/O and CPU costs.
   Status TryCatchUpWithPrimary() override;
+
+  // REQUIRES: mutex_ held
+  bool SecondaryHasMissingFiles() override;
 
   // Try to find log reader using log_number from log_readers_ map, initialize
   // if it doesn't exist

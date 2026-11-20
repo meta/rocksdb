@@ -12,13 +12,45 @@
 #include "rocksdb/file_system.h"
 
 #if USE_COROUTINES && FOLLY_HAS_LIBURING
+#include <pthread.h>
+#include <sched.h>
+
+#include <thread>
+#include <vector>
+
 #include "folly/executors/IOThreadPoolExecutor.h"
 #endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
 
 namespace ROCKSDB_NAMESPACE {
 
 #if USE_COROUTINES && FOLLY_HAS_LIBURING
-class PosixFileSystemTest : public testing::Test {};
+class PosixFileSystemTest : public testing::Test {
+ protected:
+  // Takes `reads` event bases from a thread lowered to SCHED_IDLE, as
+  // background reads do, and returns the scheduling policy of each one's
+  // thread.
+  static std::vector<int> PoliciesAfterIdleFirstReads(
+      folly::IOExecutor* read_executor, size_t reads) {
+    std::vector<folly::EventBase*> first_reads;
+    std::thread idle_reader([&] {
+      sched_param param{};
+      ASSERT_EQ(0, pthread_setschedparam(pthread_self(), SCHED_IDLE, &param));
+      for (size_t i = 0; i < reads; ++i) {
+        first_reads.push_back(read_executor->getEventBase());
+      }
+    });
+    idle_reader.join();
+
+    std::vector<int> policies;
+    for (auto* event_base : first_reads) {
+      int policy = -1;
+      event_base->runInEventBaseThreadAndWait(
+          [&] { policy = sched_getscheduler(0); });
+      policies.push_back(policy);
+    }
+    return policies;
+  }
+};
 
 TEST_F(PosixFileSystemTest, OnlyIncreasesReadIOExecutor) {
   auto fs = FileSystem::Default();
@@ -36,6 +68,65 @@ TEST_F(PosixFileSystemTest, OnlyIncreasesReadIOExecutor) {
 
   fs->SetReadIOExecutorThreads(static_cast<int>(original_threads));
   EXPECT_EQ(thread_pool->numThreads(), original_threads + 1);
+}
+
+TEST_F(PosixFileSystemTest, IdleFirstReadKeepsReadIOExecutorThreadsNormal) {
+  auto fs = FileSystem::Default();
+  fs->SetReadIOExecutorThreads(1);
+  auto* read_executor = fs->GetReadExecutor();
+  if (read_executor == nullptr) {
+    return;
+  }
+  auto* thread_pool = dynamic_cast<folly::IOThreadPoolExecutor*>(read_executor);
+  ASSERT_NE(thread_pool, nullptr);
+  const size_t threads = thread_pool->numThreads() + 1;
+  fs->SetReadIOExecutorThreads(static_cast<int>(threads));
+
+  EXPECT_EQ(PoliciesAfterIdleFirstReads(read_executor, threads),
+            std::vector<int>(threads, SCHED_OTHER));
+}
+
+// Run alone, this test's sizing is the one that creates the pool, as a
+// process's first DB::Open() is.
+TEST_F(PosixFileSystemTest, FirstSizingStartsReadIOExecutorThreads) {
+  auto fs = FileSystem::Default();
+  fs->SetReadIOExecutorThreads(1);
+  auto* read_executor = fs->GetReadExecutor();
+  if (read_executor == nullptr) {
+    return;
+  }
+
+  EXPECT_EQ(PoliciesAfterIdleFirstReads(read_executor, 1),
+            std::vector<int>{SCHED_OTHER});
+}
+
+TEST_F(PosixFileSystemTest, ThreadStartFailureFallsBackToLazyStart) {
+  auto fs = FileSystem::Default();
+  fs->SetReadIOExecutorThreads(1);
+  auto* read_executor = fs->GetReadExecutor();
+  if (read_executor == nullptr) {
+    return;
+  }
+  auto* thread_pool = dynamic_cast<folly::IOThreadPoolExecutor*>(read_executor);
+  ASSERT_NE(thread_pool, nullptr);
+  const size_t threads = thread_pool->numThreads() + 1;
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "ReadIOExecutorState::SetThreads:BeforeStart",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  fs->SetReadIOExecutorThreads(static_cast<int>(threads));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(thread_pool->numActiveThreads(), threads - 1);
+
+  for (size_t i = 0; i < threads; ++i) {
+    bool ran = false;
+    read_executor->getEventBase()->runInEventBaseThreadAndWait(
+        [&] { ran = true; });
+    EXPECT_TRUE(ran);
+  }
+  EXPECT_EQ(thread_pool->numActiveThreads(), threads);
 }
 
 #endif  // USE_COROUTINES && FOLLY_HAS_LIBURING

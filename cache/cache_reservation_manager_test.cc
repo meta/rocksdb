@@ -8,15 +8,21 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "cache/cache_reservation_manager.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <thread>
+#include <vector>
 
 #include "cache/cache_entry_roles.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/slice.h"
+#include "test_util/mock_time_env.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/coding.h"
+#include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
 class CacheReservationManagerTest : public ::testing::Test {
@@ -361,6 +367,285 @@ TEST(CacheReservationManagerWithDelayedDecreaseTest,
       << "Failed to decrease underlying dummy entries in cache when "
          "new_mem_used < GetTotalReservedCacheSize() * 3 / 4 on delayed "
          "decrease mode";
+}
+
+// Checks that a failed TryIncreaseCacheReservation() has no effect: the memory
+// used is restored and the dummy entries inserted by the call are released,
+// with and without delayed decrease, also through
+// ConcurrentCacheReservationManager.
+TEST(CacheReservationManagerTryIncreaseTest, FailedIncreaseHasNoEffect) {
+  constexpr std::size_t kSizeDummyEntry =
+      CacheReservationManagerImpl<CacheEntryRole::kMisc>::GetDummyEntrySize();
+  for (bool delayed_decrease : {false, true}) {
+    for (bool concurrent : {false, true}) {
+      SCOPED_TRACE("delayed_decrease=" + std::to_string(delayed_decrease) +
+                   " concurrent=" + std::to_string(concurrent));
+      LRUCacheOptions lo;
+      lo.capacity = 4 * kSizeDummyEntry;
+      lo.num_shard_bits = 0;
+      lo.strict_capacity_limit = true;
+      lo.metadata_charge_policy = kDontChargeCacheMetadata;
+      std::shared_ptr<Cache> cache = NewLRUCache(lo);
+      std::shared_ptr<CacheReservationManager> mgr =
+          std::make_shared<CacheReservationManagerImpl<CacheEntryRole::kMisc>>(
+              cache, delayed_decrease);
+      if (concurrent) {
+        mgr = std::make_shared<ConcurrentCacheReservationManager>(mgr);
+      }
+
+      ASSERT_OK(mgr->TryIncreaseCacheReservation(kSizeDummyEntry +
+                                                 kSizeDummyEntry / 2));
+      EXPECT_EQ(mgr->GetTotalMemoryUsed(),
+                kSizeDummyEntry + kSizeDummyEntry / 2);
+      EXPECT_EQ(mgr->GetTotalReservedCacheSize(), 2 * kSizeDummyEntry);
+
+      // Needs five dummy entries in total: two more fit, the third does not.
+      Status s = mgr->TryIncreaseCacheReservation(3 * kSizeDummyEntry);
+      ASSERT_TRUE(s.IsMemoryLimit()) << s.ToString();
+      EXPECT_EQ(mgr->GetTotalMemoryUsed(),
+                kSizeDummyEntry + kSizeDummyEntry / 2);
+      EXPECT_EQ(mgr->GetTotalReservedCacheSize(), 2 * kSizeDummyEntry);
+      EXPECT_EQ(cache->GetPinnedUsage(), 2 * kSizeDummyEntry);
+
+      // A later increase that fits still succeeds.
+      ASSERT_OK(mgr->TryIncreaseCacheReservation(kSizeDummyEntry));
+      EXPECT_EQ(mgr->GetTotalMemoryUsed(),
+                2 * kSizeDummyEntry + kSizeDummyEntry / 2);
+      EXPECT_EQ(mgr->GetTotalReservedCacheSize(), 3 * kSizeDummyEntry);
+      EXPECT_EQ(cache->GetPinnedUsage(), 3 * kSizeDummyEntry);
+    }
+  }
+}
+
+namespace {
+std::shared_ptr<Cache> NewAtomicTestCache(std::size_t capacity,
+                                          bool strict_capacity_limit) {
+  LRUCacheOptions lo;
+  lo.capacity = capacity;
+  lo.num_shard_bits = 0;
+  lo.strict_capacity_limit = strict_capacity_limit;
+  lo.metadata_charge_policy = kDontChargeCacheMetadata;
+  return NewLRUCache(lo);
+}
+
+std::shared_ptr<CacheReservationManager> NewAtomicTestImpl(
+    const std::shared_ptr<Cache>& cache) {
+  return std::make_shared<CacheReservationManagerImpl<CacheEntryRole::kMisc>>(
+      cache);
+}
+}  // namespace
+
+// Checks when AtomicCacheReservationManager changes the reservation: only when
+// the memory used goes above it, or falls below 3/4 of it and a dummy entry can
+// be released.
+TEST(AtomicCacheReservationManagerTest, ReserveAndRelease) {
+  constexpr std::size_t kSizeDummyEntry =
+      CacheReservationManagerImpl<CacheEntryRole::kMisc>::GetDummyEntrySize();
+  std::shared_ptr<Cache> cache =
+      NewAtomicTestCache(64 * kSizeDummyEntry, false);
+  AtomicCacheReservationManager mgr(NewAtomicTestImpl(cache), nullptr,
+                                    /*release_delay_micros=*/0);
+
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(1000));
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 1000);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), kSizeDummyEntry);
+  EXPECT_EQ(cache->GetPinnedUsage(), kSizeDummyEntry);
+
+  // Fits in the reservation.
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(kSizeDummyEntry - 1000));
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), kSizeDummyEntry);
+
+  // Goes above the reservation.
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(2 * kSizeDummyEntry + 1));
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 3 * kSizeDummyEntry + 1);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 4 * kSizeDummyEntry);
+  EXPECT_EQ(cache->GetPinnedUsage(), 4 * kSizeDummyEntry);
+
+  // Still at least 3/4 of the reservation.
+  mgr.DecreaseCacheReservation(1);
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 3 * kSizeDummyEntry);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 4 * kSizeDummyEntry);
+
+  // Below 3/4: released down to the memory used.
+  mgr.DecreaseCacheReservation(1);
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 3 * kSizeDummyEntry - 1);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 3 * kSizeDummyEntry);
+  EXPECT_EQ(cache->GetPinnedUsage(), 3 * kSizeDummyEntry);
+
+  // Below 3/4, but no dummy entry can be released yet.
+  mgr.DecreaseCacheReservation(kSizeDummyEntry - 2);
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 2 * kSizeDummyEntry + 1);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 3 * kSizeDummyEntry);
+
+  mgr.DecreaseCacheReservation(1);
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 2 * kSizeDummyEntry);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 2 * kSizeDummyEntry);
+  EXPECT_EQ(cache->GetPinnedUsage(), 2 * kSizeDummyEntry);
+
+  mgr.DecreaseCacheReservation(2 * kSizeDummyEntry);
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 0);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 0);
+  EXPECT_EQ(cache->GetPinnedUsage(), 0);
+}
+
+// Checks that a failed increase has no effect and a later increase that fits
+// still succeeds.
+TEST(AtomicCacheReservationManagerTest, FailedIncreaseHasNoEffect) {
+  constexpr std::size_t kSizeDummyEntry =
+      CacheReservationManagerImpl<CacheEntryRole::kMisc>::GetDummyEntrySize();
+  std::shared_ptr<Cache> cache = NewAtomicTestCache(4 * kSizeDummyEntry, true);
+  AtomicCacheReservationManager mgr(NewAtomicTestImpl(cache), nullptr,
+                                    /*release_delay_micros=*/0);
+
+  ASSERT_OK(
+      mgr.TryIncreaseCacheReservation(kSizeDummyEntry + kSizeDummyEntry / 2));
+  Status s = mgr.TryIncreaseCacheReservation(3 * kSizeDummyEntry);
+  ASSERT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), kSizeDummyEntry + kSizeDummyEntry / 2);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 2 * kSizeDummyEntry);
+  EXPECT_EQ(cache->GetPinnedUsage(), 2 * kSizeDummyEntry);
+
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(kSizeDummyEntry));
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(),
+            2 * kSizeDummyEntry + kSizeDummyEntry / 2);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 3 * kSizeDummyEntry);
+
+  mgr.DecreaseCacheReservation(2 * kSizeDummyEntry + kSizeDummyEntry / 2);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 0);
+  EXPECT_EQ(cache->GetPinnedUsage(), 0);
+}
+
+// Checks that when the last memory is freed while another increase is failing,
+// the rollback of the failed increase releases the reservation. The decrease
+// alone cannot, because it still sees the failing delta in the memory used.
+TEST(AtomicCacheReservationManagerTest, ReleaseAfterRollback) {
+  constexpr std::size_t kSizeDummyEntry =
+      CacheReservationManagerImpl<CacheEntryRole::kMisc>::GetDummyEntrySize();
+  std::shared_ptr<Cache> cache = NewAtomicTestCache(4 * kSizeDummyEntry, true);
+  AtomicCacheReservationManager mgr(NewAtomicTestImpl(cache), nullptr,
+                                    /*release_delay_micros=*/0);
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(kSizeDummyEntry));
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), kSizeDummyEntry);
+
+  // Runs on the failing thread while it holds the mutex. This decrease takes
+  // its fast path, so it does not need the mutex.
+  SyncPoint::GetInstance()->SetCallBack(
+      "AtomicCacheReservationManager::TryIncreaseCacheReservation:"
+      "BeforeRollback",
+      [&](void*) {
+        mgr.DecreaseCacheReservation(kSizeDummyEntry);
+        EXPECT_EQ(mgr.GetTotalReservedCacheSize(), kSizeDummyEntry);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status s = mgr.TryIncreaseCacheReservation(8 * kSizeDummyEntry);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(s.IsMemoryLimit()) << s.ToString();
+
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 0);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 0);
+  EXPECT_EQ(cache->GetPinnedUsage(), 0);
+}
+
+// Checks that the reservation is kept for the release delay after it grows,
+// and released by the first decrease after the delay.
+TEST(AtomicCacheReservationManagerTest, ReleaseDelay) {
+  constexpr std::size_t kSizeDummyEntry =
+      CacheReservationManagerImpl<CacheEntryRole::kMisc>::GetDummyEntrySize();
+  constexpr int kDelayMicros = 1000 * 1000;
+  std::shared_ptr<Cache> cache =
+      NewAtomicTestCache(64 * kSizeDummyEntry, false);
+  auto clock = std::make_shared<MockSystemClock>(SystemClock::Default());
+  clock->SetCurrentTime(100);
+  AtomicCacheReservationManager mgr(NewAtomicTestImpl(cache), clock.get(),
+                                    kDelayMicros);
+
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(2 * kSizeDummyEntry));
+  mgr.DecreaseCacheReservation(2 * kSizeDummyEntry);
+  EXPECT_EQ(mgr.GetTotalMemoryUsed(), 0);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 2 * kSizeDummyEntry);
+
+  // Within the delay, buffers come and go without changing the reservation.
+  clock->SleepForMicroseconds(kDelayMicros - 1);
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(1000));
+  mgr.DecreaseCacheReservation(1000);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 2 * kSizeDummyEntry);
+  EXPECT_EQ(cache->GetPinnedUsage(), 2 * kSizeDummyEntry);
+
+  // Growing again restarts the delay.
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(3 * kSizeDummyEntry));
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 3 * kSizeDummyEntry);
+  clock->SleepForMicroseconds(kDelayMicros - 1);
+  mgr.DecreaseCacheReservation(3 * kSizeDummyEntry);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 3 * kSizeDummyEntry);
+
+  // After the delay, the next decrease releases it.
+  clock->SleepForMicroseconds(1);
+  ASSERT_OK(mgr.TryIncreaseCacheReservation(1000));
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 3 * kSizeDummyEntry);
+  mgr.DecreaseCacheReservation(1000);
+  EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 0);
+  EXPECT_EQ(cache->GetPinnedUsage(), 0);
+}
+
+// Checks that concurrent updates keep the memory used exact and leave no
+// reservation behind once all memory is released, also with a strict cache
+// where some increases fail and are rolled back.
+TEST(AtomicCacheReservationManagerTest, ConcurrentUpdates) {
+  constexpr std::size_t kSizeDummyEntry =
+      CacheReservationManagerImpl<CacheEntryRole::kMisc>::GetDummyEntrySize();
+  constexpr int kNumThreads = 8;
+  constexpr int kOpsPerThread = 20000;
+  const uint32_t seed =
+      static_cast<uint32_t>(SystemClock::Default()->NowMicros());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  for (bool strict : {false, true}) {
+    SCOPED_TRACE("strict=" + std::to_string(strict));
+    // With the strict cache, the threads together want more than it holds.
+    std::shared_ptr<Cache> cache =
+        NewAtomicTestCache((strict ? 8 : 1024) * kSizeDummyEntry, strict);
+    AtomicCacheReservationManager mgr(NewAtomicTestImpl(cache), nullptr,
+                                      /*release_delay_micros=*/0);
+    std::atomic<int> num_failed{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(kNumThreads);
+    for (int t = 0; t < kNumThreads; ++t) {
+      threads.emplace_back([&, t]() {
+        Random rnd(seed + t);
+        std::size_t held = 0;
+        for (int i = 0; i < kOpsPerThread; ++i) {
+          if (held > 0 && rnd.OneIn(2)) {
+            const std::size_t delta = 1 + rnd.Uniform(static_cast<int>(held));
+            mgr.DecreaseCacheReservation(delta);
+            held -= delta;
+          } else {
+            const std::size_t delta = 1 + rnd.Uniform(2 * kSizeDummyEntry);
+            Status s = mgr.TryIncreaseCacheReservation(delta);
+            if (s.ok()) {
+              held += delta;
+            } else {
+              ASSERT_TRUE(strict);
+              ASSERT_TRUE(s.IsMemoryLimit()) << s.ToString();
+              num_failed.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        }
+        if (held > 0) {
+          mgr.DecreaseCacheReservation(held);
+        }
+      });
+    }
+    for (auto& thread : threads) {
+      thread.join();
+    }
+    if (strict) {
+      EXPECT_GT(num_failed.load(), 0);
+    }
+    EXPECT_EQ(mgr.GetTotalMemoryUsed(), 0);
+    EXPECT_EQ(mgr.GetTotalReservedCacheSize(), 0);
+    EXPECT_EQ(cache->GetPinnedUsage(), 0);
+  }
 }
 
 TEST(CacheReservationManagerDestructorTest,

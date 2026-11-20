@@ -12,7 +12,7 @@ namespace ROCKSDB_NAMESPACE {
 template <typename DBPtr>
 Status MemoryUtil::GetApproximateMemoryUsageByType(
     const std::vector<DBPtr>& dbs,
-    const std::unordered_set<const Cache*> cache_set,
+    const std::unordered_set<const Cache*>& cache_set,
     std::map<MemoryUtil::UsageType, uint64_t>* usage_by_type) {
   usage_by_type->clear();
 
@@ -50,13 +50,13 @@ Status MemoryUtil::GetApproximateMemoryUsageByType(
 
 template Status MemoryUtil::GetApproximateMemoryUsageByType<DB*>(
     const std::vector<DB*>& dbs,
-    const std::unordered_set<const Cache*> cache_set,
+    const std::unordered_set<const Cache*>& cache_set,
     std::map<MemoryUtil::UsageType, uint64_t>* usage_by_type);
 
 template Status
 MemoryUtil::GetApproximateMemoryUsageByType<std::unique_ptr<DB>>(
     const std::vector<std::unique_ptr<DB>>& dbs,
-    const std::unordered_set<const Cache*> cache_set,
+    const std::unordered_set<const Cache*>& cache_set,
     std::map<MemoryUtil::UsageType, uint64_t>* usage_by_type);
 
 }  // namespace ROCKSDB_NAMESPACE

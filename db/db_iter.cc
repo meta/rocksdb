@@ -98,6 +98,11 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       has_trace_state_(db_impl != nullptr && cfd != nullptr),
       ingest_sst_lock_(cfd != nullptr ? &cfd->GetIngestSstLock() : nullptr),
       version_number_(version != nullptr ? version->GetVersionNumber() : 0),
+      // Blob indexes exposed to legacy BlobDB are not integrated BlobDB
+      // references.
+      dropped_blob_files_(version != nullptr && !expose_blob_index
+                              ? version->storage_info()->GetDroppedBlobFiles()
+                              : std::vector<uint64_t>()),
       timestamp_ub_(read_options.timestamp),
       timestamp_lb_(read_options.iter_start_ts),
       timestamp_size_(timestamp_ub_ ? timestamp_ub_->size() : 0),
@@ -114,10 +119,13 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       is_key_seqnum_zero_(false),
       prefix_same_as_start_(
           prefix_extractor_ ? read_options.prefix_same_as_start : false),
+      strict_prefix_same_as_start_(prefix_same_as_start_ &&
+                                   ioptions.prefix_seek_opt_in_only),
+      unbounded_prefix_scan_(false),
       pin_thru_lifetime_(read_options.pin_data),
-      expect_total_order_inner_iter_(prefix_extractor_ == nullptr ||
-                                     read_options.total_order_seek ||
-                                     read_options.auto_prefix_mode),
+      expect_total_order_inner_iter_(
+          GetIteratorPrefixMode(read_options, prefix_extractor_ != nullptr) !=
+          IteratorPrefixMode::kPrefix),
       // Read-path range conversion assumes the scan can observe all interior
       // live keys. table_filter can hide whole SSTs, read tiers other than
       // kReadAllTier can skip SSTs or uncached blocks, and timestamp filtering
@@ -316,12 +324,40 @@ bool DBIter::SetValueAndColumnsFromBlob(const Slice& user_key,
   return SetValueAndColumnsFromBlobImpl(user_key, blob_index);
 }
 
+bool DBIter::CheckDeletedByDroppedBlobFiles(ValueType type) {
+  assert(!dropped_blob_files_.empty());
+  return VersionStorageInfo::CheckDroppedBlobReferences(
+             dropped_blob_files_, type, iter_.value(),
+             /*remaining_columns=*/nullptr) ==
+         VersionStorageInfo::DroppedBlobRead::kDeleted;
+}
+
+void DBIter::RemoveDroppedBlobColumns(Slice* entity,
+                                      std::string* remaining_columns) {
+  if (LIKELY(dropped_blob_files_.empty())) {
+    return;
+  }
+  std::string columns;
+  const VersionStorageInfo::DroppedBlobRead read =
+      VersionStorageInfo::CheckDroppedBlobReferences(
+          dropped_blob_files_, kTypeWideColumnEntity, *entity, &columns);
+  assert(read != VersionStorageInfo::DroppedBlobRead::kDeleted);
+  if (read == VersionStorageInfo::DroppedBlobRead::kRemainingColumns) {
+    // `entity` may point into *remaining_columns.
+    *remaining_columns = std::move(columns);
+    *entity = *remaining_columns;
+    RecordTick(statistics_, BLOB_DB_DROPPED_BLOB_READ_COUNT);
+  }
+}
+
 bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
   // Auto-marks dirty via mut() up front since every successful path below
   // populates wide_columns_ (and possibly the lazy entity/blob column
   // vectors).
   auto& state = *value_columns_state_.mut();
   state.AssertReadyForEntity();
+
+  RemoveDroppedBlobColumns(&slice, &state.saved_value());
 
   // Fast path: if no blob columns, use the simpler Deserialize
   bool has_blob_columns = false;
@@ -578,6 +614,21 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
                CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) > 0);
         num_skipped = 0;
         reseek_done = false;
+        if (UNLIKELY(!dropped_blob_files_.empty()) &&
+            (ikey_.type == kTypeBlobIndex ||
+             ikey_.type == kTypeWideColumnEntity)) {
+          if (!PrepareValueInternal()) {
+            return false;
+          }
+          // Preparing the value can move the key.
+          user_key_without_ts =
+              StripTimestampFromUserKey(ikey_.user_key, timestamp_size_);
+          if (IsDeletedByDroppedBlobFiles(ikey_.type)) {
+            RecordTick(statistics_, BLOB_DB_DROPPED_BLOB_READ_COUNT);
+            ikey_.type = timestamp_size_ == 0 ? kTypeDeletion
+                                              : kTypeDeletionWithTimestamp;
+          }
+        }
         switch (ikey_.type) {
           case kTypeDeletion:
           case kTypeDeletionWithTimestamp:
@@ -827,6 +878,11 @@ bool DBIter::MergeValuesNewToOld() {
     }
     if (!PrepareValueInternal()) {
       return false;
+    }
+    if (IsDeletedByDroppedBlobFiles(ikey.type)) {
+      RecordTick(statistics_, BLOB_DB_DROPPED_BLOB_READ_COUNT);
+      iter_.Next();
+      break;
     }
 
     if (kTypeValue == ikey.type || kTypeValuePreferredSeqno == ikey.type) {
@@ -1144,6 +1200,10 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
   // kTypeBlobIndex, kTypeWideColumnEntity or kTypeValuePreferredSeqno)
   ValueType last_not_merge_type = kTypeDeletion;
   ValueType last_key_entry_type = kTypeDeletion;
+  // Whether the last entry before merge reads as a deletion because of dropped
+  // blob files. Only that entry decides the result, so older entries that it
+  // hides are not counted in BLOB_DB_DROPPED_BLOB_READ_COUNT.
+  bool last_not_merge_dropped = false;
 
   // If false, it indicates that we have not seen any valid entry, even though
   // last_key_entry_type is initialized to kTypeDeletion.
@@ -1203,6 +1263,14 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
 
     if (!PrepareValueInternal()) {
       return false;
+    }
+    const bool dropped = IsDeletedByDroppedBlobFiles(ikey.type);
+    if (dropped) {
+      ikey.type =
+          timestamp_size_ == 0 ? kTypeDeletion : kTypeDeletionWithTimestamp;
+    }
+    if (ikey.type != kTypeMerge) {
+      last_not_merge_dropped = dropped;
     }
 
     if (timestamp_lb_ != nullptr) {
@@ -1301,6 +1369,9 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
 
   if (timestamp_lb_ != nullptr) {
     assert(last_key_entry_type == ikey_.type);
+  }
+  if (last_not_merge_dropped) {
+    RecordTick(statistics_, BLOB_DB_DROPPED_BLOB_READ_COUNT);
   }
 
   switch (last_key_entry_type) {
@@ -1441,6 +1512,20 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
   TEST_SYNC_POINT_CALLBACK(
       "DBIter::FindValueForCurrentKeyUsingSeek:ikey_updated", &ikey_);
 
+  if (UNLIKELY(!dropped_blob_files_.empty()) &&
+      (ikey.type == kTypeBlobIndex || ikey.type == kTypeWideColumnEntity)) {
+    if (!PrepareValueInternal()) {
+      return false;
+    }
+    // Preparing the value can move the key.
+    ikey = ikey_;
+    if (IsDeletedByDroppedBlobFiles(ikey.type)) {
+      RecordTick(statistics_, BLOB_DB_DROPPED_BLOB_READ_COUNT);
+      ikey.type = ikey_.type =
+          timestamp_size_ == 0 ? kTypeDeletion : kTypeDeletionWithTimestamp;
+    }
+  }
+
   if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion ||
       kTypeDeletionWithTimestamp == ikey.type) {
     if (timestamp_lb_ == nullptr) {
@@ -1532,6 +1617,10 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
     }
     if (!PrepareValueInternal()) {
       return false;
+    }
+    if (IsDeletedByDroppedBlobFiles(ikey.type)) {
+      RecordTick(statistics_, BLOB_DB_DROPPED_BLOB_READ_COUNT);
+      break;
     }
 
     if (ikey.type == kTypeValue || ikey.type == kTypeValuePreferredSeqno) {
@@ -1649,12 +1738,18 @@ bool DBIter::MergeWithBlobBaseValue(const Slice& blob_index,
 
 bool DBIter::MergeWithWideColumnBaseValue(const Slice& entity,
                                           const Slice& user_key) {
+  // The merge result is written to saved_value_, so the base cannot be kept
+  // there.
+  Slice base_entity = entity;
+  std::string remaining_columns;
+  RemoveDroppedBlobColumns(&base_entity, &remaining_columns);
+
   // Resolve V2 entity blob columns if present, since TimedFullMerge only
   // supports V1 format.
   std::string resolved_entity;
   Slice effective_entity;
   Status s_resolve = WideColumnSerialization::ResolveEntityForMerge(
-      entity, user_key, &blob_state_->reader.blob_fetcher(),
+      base_entity, user_key, &blob_state_->reader.blob_fetcher(),
       nullptr /* prefetch_buffers */, resolved_entity, effective_entity);
   if (!s_resolve.ok()) {
     status_ = std::move(s_resolve);
@@ -1779,7 +1874,8 @@ void DBIter::FlushPendingTombstoneRun(const Slice& end_key,
 }
 
 void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
-  if (contiguous_tombstone_count_ < min_tombstones_for_range_conversion_) {
+  if (contiguous_tombstone_count_ < min_tombstones_for_range_conversion_ ||
+      unbounded_prefix_scan_) {
     return;
   }
 
@@ -1988,6 +2084,9 @@ Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
 }
 
 Status DBIter::SetScanOptionsForPrepare(const MultiScanArgs& scan_opts) {
+  // Prepare() discards the current position, because child iterators may
+  // release the data blocks that key() and value() point into.
+  valid_ = false;
   status_ = ValidateScanOptions(scan_opts);
   if (!status_.ok()) {
     return status_;
@@ -2028,6 +2127,9 @@ void DBIter::Seek(const Slice& target) {
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   StopWatch sw(clock_, statistics_, DB_SEEK);
+  if (!CheckSeekTargetPrefix(target)) {
+    return;
+  }
 
   if (scan_opts_.has_value()) {
     if (scan_opts_->reverse) {
@@ -2144,6 +2246,9 @@ void DBIter::SeekForPrev(const Slice& target) {
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   StopWatch sw(clock_, statistics_, DB_SEEK);
+  if (!CheckSeekTargetPrefix(target)) {
+    return;
+  }
 
   if (scan_opts_.has_value()) {
     if (!scan_opts_->reverse) {
@@ -2264,11 +2369,35 @@ void DBIter::SeekForPrev(const Slice& target) {
   }
 }
 
+bool DBIter::CheckSeekTargetPrefix(const Slice& target) {
+  unbounded_prefix_scan_ = false;
+  if (expect_total_order_inner_iter_ || prefix_extractor_->InDomain(target)) {
+    return true;
+  }
+  if (strict_prefix_same_as_start_) {
+    valid_ = false;
+    status_ = Status::InvalidArgument(
+        "Seek target outside the prefix extractor's domain is not supported "
+        "with prefix_same_as_start under prefix_seek_opt_in_only");
+    return false;
+  }
+  unbounded_prefix_scan_ = true;
+  return true;
+}
+
 void DBIter::SeekToFirst() {
+  if (strict_prefix_same_as_start_) {
+    valid_ = false;
+    status_ = Status::NotSupported(
+        "SeekToFirst() is not supported with prefix_same_as_start under "
+        "prefix_seek_opt_in_only; Seek() to a key in the wanted prefix");
+    return;
+  }
   if (iterate_lower_bound_ != nullptr) {
     Seek(*iterate_lower_bound_);
     return;
   }
+  unbounded_prefix_scan_ = !expect_total_order_inner_iter_;
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   // Don't use iter_::Seek() if we set a prefix extractor
@@ -2319,6 +2448,14 @@ void DBIter::SeekToFirst() {
 }
 
 void DBIter::SeekToLast() {
+  if (strict_prefix_same_as_start_) {
+    valid_ = false;
+    status_ = Status::NotSupported(
+        "SeekToLast() is not supported with prefix_same_as_start under "
+        "prefix_seek_opt_in_only; SeekForPrev() to a key in the wanted "
+        "prefix");
+    return;
+  }
   if (iterate_upper_bound_ != nullptr) {
     // Seek to last key strictly less than ReadOptions.iterate_upper_bound.
     SeekForPrev(*iterate_upper_bound_);
@@ -2333,6 +2470,7 @@ void DBIter::SeekToLast() {
 #endif
     return;
   }
+  unbounded_prefix_scan_ = !expect_total_order_inner_iter_;
 
   PERF_COUNTER_ADD(iter_seek_count, 1);
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);

@@ -193,6 +193,12 @@ class SubcompactionState {
     return *current_outputs_;
   }
 
+  // Returns true if either output level still has an open output file.
+  bool HasUnfinishedOutputFile() const {
+    return compaction_outputs_.HasUnfinishedOutput() ||
+           proximal_level_outputs_.HasUnfinishedOutput();
+  }
+
   CompactionOutputs* Outputs(bool is_proximal_level) {
     assert(compaction);
     if (is_proximal_level) {

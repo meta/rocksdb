@@ -26,6 +26,18 @@ Status BlobFetcher::FetchBlob(const Slice& user_key,
   return status;
 }
 
+VersionBlobFetcherBase::VersionBlobFetcherBase(const Version* version,
+                                               BlobFileCache* blob_file_cache,
+                                               bool allow_write_path_fallback)
+    : version_(version),
+      blob_file_cache_(blob_file_cache),
+      allow_write_path_fallback_(allow_write_path_fallback) {
+  if (version_ != nullptr &&
+      UNLIKELY(!version_->storage_info()->GetDroppedBlobFiles().empty())) {
+    storage_with_dropped_blob_files_ = version_->storage_info();
+  }
+}
+
 Status VersionBlobFetcherBase::FetchBlob(const Slice& user_key,
                                          const BlobIndex& blob_index,
                                          FilePrefetchBuffer* prefetch_buffer,

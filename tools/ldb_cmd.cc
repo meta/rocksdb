@@ -194,13 +194,13 @@ std::string WALFileIterator::GetNextWAL() {
   return ret;
 }
 
-void DumpWalFiles(Options options, const std::string& dir_or_file,
+void DumpWalFiles(const Options& options, const std::string& dir_or_file,
                   bool print_header, bool print_values,
                   bool only_print_seqno_gaps, bool is_write_committed,
                   const std::map<uint32_t, const Comparator*>& ucmps,
                   LDBCommandExecuteResult* exec_state);
 
-void DumpWalFile(Options options, const std::string& wal_file,
+void DumpWalFile(const Options& options, const std::string& wal_file,
                  bool print_header, bool print_values,
                  bool only_print_seqno_gaps, bool is_write_committed,
                  const std::map<uint32_t, const Comparator*>& ucmps,
@@ -208,9 +208,10 @@ void DumpWalFile(Options options, const std::string& wal_file,
                  std::optional<SequenceNumber>* prev_batch_seqno,
                  std::optional<uint32_t>* prev_batch_count);
 
-void DumpSstFile(Options options, std::string filename, bool output_hex,
-                 bool show_properties, bool decode_blob_index,
-                 std::string from_key = "", std::string to_key = "");
+void DumpSstFile(const Options& options, const std::string& filename,
+                 bool output_hex, bool show_properties, bool decode_blob_index,
+                 const std::string& from_key = "",
+                 const std::string& to_key = "");
 
 void DumpBlobFile(const std::string& filename, bool is_key_hex,
                   bool is_value_hex, bool dump_uncompressed_blobs);
@@ -1867,7 +1868,7 @@ Status GetLiveFilesChecksumInfoFromVersionSet(Options options,
                                               FileChecksumList* checksum_list) {
   EnvOptions sopt;
   Status s;
-  std::string dbname(db_path);
+  const std::string& dbname(db_path);
   std::shared_ptr<Cache> tc(NewLRUCache(options.max_open_files - 10,
                                         options.table_cache_numshardbits));
   // Notice we are using the default options not through SanitizeOptions(),
@@ -1889,6 +1890,7 @@ Status GetLiveFilesChecksumInfoFromVersionSet(Options options,
                                   immutable_db_options.fs.get());
   if (s.ok()) {
     std::vector<ColumnFamilyDescriptor> cf_list;
+    cf_list.reserve(cf_name_list.size());
     for (const auto& name : cf_name_list) {
       cf_list.emplace_back(name, ColumnFamilyOptions(options));
     }
@@ -2504,6 +2506,14 @@ void DBDumperCommand::DoCommand() {
         DumpBlobFile(path_, is_key_hex_, is_value_hex_,
                      dump_uncompressed_blobs_);
         break;
+      case kDBLockFile:
+      case kCurrentFile:
+      case kTempFile:
+      case kInfoLogFile:
+      case kMetaDatabase:
+      case kIdentityFile:
+      case kOptionsFile:
+      case kCompactionProgressFile:
       default:
         exec_state_ = LDBCommandExecuteResult::Failed(
             "File type not supported: " + path_);
@@ -3130,7 +3140,7 @@ class InMemoryHandler : public WriteBatch::Handler {
   const std::map<uint32_t, const Comparator*> ucmps_;
 };
 
-void DumpWalFiles(Options options, const std::string& dir_or_file,
+void DumpWalFiles(const Options& options, const std::string& dir_or_file,
                   bool print_header, bool print_values,
                   bool only_print_seqno_gaps, bool is_write_committed,
                   const std::map<uint32_t, const Comparator*>& ucmps,
@@ -3187,7 +3197,7 @@ void DumpWalFiles(Options options, const std::string& dir_or_file,
   }
 }
 
-void DumpWalFile(Options options, const std::string& wal_file,
+void DumpWalFile(const Options& options, const std::string& wal_file,
                  bool print_header, bool print_values,
                  bool only_print_seqno_gaps, bool is_write_committed,
                  const std::map<uint32_t, const Comparator*>& ucmps,
@@ -3506,7 +3516,7 @@ MultiGetCommand::MultiGetCommand(
         "At least one <key> must be specified for multi_get.");
   } else {
     for (size_t i = 0; i < params.size(); ++i) {
-      std::string key = params.at(i);
+      const std::string& key = params.at(i);
       keys_.emplace_back(is_key_hex_ ? HexToString(key) : key);
     }
   }
@@ -3539,6 +3549,7 @@ void MultiGetCommand::DoCommand() {
   std::vector<Slice> key_slices;
   std::vector<PinnableSlice> values(num_keys);
   std::vector<Status> statuses(num_keys);
+  key_slices.reserve(keys_.size());
   for (const std::string& key : keys_) {
     key_slices.emplace_back(key);
   }
@@ -3641,7 +3652,7 @@ MultiGetEntityCommand::MultiGetEntityCommand(
         "command");
   } else {
     for (size_t i = 0; i < params.size(); i++) {
-      std::string key = params.at(i);
+      const std::string& key = params.at(i);
       keys_.emplace_back(is_key_hex_ ? HexToString(key) : key);
     }
   }
@@ -3675,6 +3686,7 @@ void MultiGetEntityCommand::DoCommand() {
   std::vector<Slice> key_slices;
   std::vector<PinnableWideColumns> results(num_keys);
   std::vector<Status> statuses(num_keys);
+  key_slices.reserve(keys_.size());
   for (const std::string& key : keys_) {
     key_slices.emplace_back(key);
   }
@@ -3778,8 +3790,8 @@ BatchPutCommand::BatchPutCommand(
         "Equal number of <key>s and <value>s must be specified for batchput.");
   } else {
     for (size_t i = 0; i < params.size(); i += 2) {
-      std::string key = params.at(i);
-      std::string value = params.at(i + 1);
+      const std::string& key = params.at(i);
+      const std::string& value = params.at(i + 1);
       key_values_.emplace_back(is_key_hex_ ? HexToString(key) : key,
                                is_value_hex_ ? HexToString(value) : value);
     }
@@ -4577,7 +4589,7 @@ void RepairCommand::Help(std::string& ret) {
 void RepairCommand::OverrideBaseOptions() {
   LDBCommand::OverrideBaseOptions();
   auto level = verbose_ ? InfoLogLevel::INFO_LEVEL : InfoLogLevel::WARN_LEVEL;
-  options_.info_log.reset(new StderrLogger(level));
+  options_.info_log = std::make_shared<StderrLogger>(level);
 }
 
 void RepairCommand::DoCommand() {
@@ -4763,9 +4775,9 @@ void RestoreCommand::DoCommand() {
 
 namespace {
 
-void DumpSstFile(Options options, std::string filename, bool output_hex,
-                 bool show_properties, bool decode_blob_index,
-                 std::string from_key, std::string to_key) {
+void DumpSstFile(const Options& options, const std::string& filename,
+                 bool output_hex, bool show_properties, bool decode_blob_index,
+                 const std::string& from_key, const std::string& to_key) {
   if (filename.length() <= 4 ||
       filename.rfind(".sst") != filename.length() - 4) {
     std::cout << "Invalid sst file name." << std::endl;

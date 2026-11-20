@@ -215,8 +215,8 @@ class TimerQueue {
 
   struct WorkItem {
     Clock::time_point end;
-    int64_t period;
-    uint64_t id;  // id==0 means it was cancelled
+    int64_t period = 0;
+    uint64_t id = 0;  // id==0 means it was cancelled
     std::function<std::pair<bool, int64_t>(bool)> handler;
     bool operator>(const WorkItem& other) const { return end > other.end; }
   };

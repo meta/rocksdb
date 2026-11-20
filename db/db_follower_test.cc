@@ -3,9 +3,14 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <atomic>
+#include <chrono>
+#include <future>
+
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
 #include "test_util/sync_point.h"
+#include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -407,6 +412,72 @@ TEST_F(DBFollowerTest, RetryCatchupManifestRollover) {
   SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_F(DBFollowerTest, CatchUpKeepsViewWhenNewManifestListsDeletedFiles) {
+  Options opts = CurrentOptions();
+  opts.disable_auto_compactions = true;
+  opts.max_manifest_file_size = 1;
+  opts.max_manifest_space_amp_pct = 0;
+  Reopen(opts);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->LoadDependency({
+      {"DBImplFollower::TryCatchupWithLeader:Begin1", "Leader::Start"},
+      {"Leader::Done", "DBImplFollower::TryCatchupWithLeader:Begin2"},
+      {"DBImplFollower::TryCatchupWithLeader:End",
+       "Follower::WaitForCatchup:1"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(OpenAsFollower());
+  ASSERT_EQ(FollowerGet("foo"), "v1");
+
+  std::atomic<bool> compacted{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit:Begin1",
+      [&](void*) {
+        if (compacted.exchange(true)) {
+          return;
+        }
+        std::vector<LiveFileMetaData> tables;
+        db_->GetLiveFilesMetaData(&tables);
+        CompactRangeOptions compact_options;
+        compact_options.bottommost_level_compaction =
+            BottommostLevelCompaction::kForce;
+        ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+        ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+        for (const auto& table : tables) {
+          const Status table_status =
+              env_->FileExists(MakeTableFileName(dbname_, table.file_number));
+          ASSERT_TRUE(table_status.IsNotFound()) << table_status.ToString();
+        }
+      });
+
+  TEST_SYNC_POINT("Leader::Start");
+  // The second flush rolls the MANIFEST again, so that the newest one lists
+  // the file of the first flush in its snapshot.
+  ASSERT_OK(Put("bar", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("baz", "v1"));
+  ASSERT_OK(Flush());
+  TEST_SYNC_POINT("Leader::Done");
+
+  TEST_SYNC_POINT("Follower::WaitForCatchup:1");
+  ASSERT_TRUE(compacted.load());
+  ASSERT_EQ(FollowerGet("foo"), "v1");
+
+  SyncPoint::GetInstance()->LoadDependency({
+      {"DBImplFollower::TryCatchupWithLeader:End",
+       "Follower::WaitForCatchup:2"},
+  });
+  TEST_SYNC_POINT("Follower::WaitForCatchup:2");
+  ASSERT_EQ(FollowerGet("foo"), "v1");
+  ASSERT_EQ(FollowerGet("bar"), "v1");
+  ASSERT_EQ(FollowerGet("baz"), "v1");
+
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->DisableProcessing();
+}
+
 // This test creates 4 L0 files and compacts them. The follower, during catchup,
 // successfully instantiates 4 Versions corresponding to the 4 files (but
 // doesn't install them yet), followed by deleting those 4 and adding a new
@@ -559,6 +630,56 @@ TEST_F(DBFollowerTest, PartialVersionRecoveryWithRollover) {
   ASSERT_EQ(FollowerGet("k2"), "v1");
   ASSERT_EQ(FollowerGet("k3"), "v2");
   SyncPoint::GetInstance()->DisableProcessing();
+}
+
+// The follower catches up in a background thread, which retries a failed
+// catch-up. After the leader DB is created again at the same path, the first
+// catch-up that reads the new MANIFEST finds another DB ID. Every later retry
+// must return the same error without reading the records of the new DB.
+TEST_F(DBFollowerTest, StopsCatchUpOnManifestOfAnotherDb) {
+  Options opts = CurrentOptions();
+  opts.disable_auto_compactions = true;
+  Reopen(opts);
+  ASSERT_OK(Put("k1", "v1"));
+  ASSERT_OK(Flush());
+  const uint64_t first_manifest_number =
+      dbfull()->TEST_Current_Manifest_FileNo();
+  ASSERT_OK(OpenAsFollower());
+  ASSERT_EQ(FollowerGet("k1"), "v1");
+  const SequenceNumber old_last_sequence =
+      follower()->GetLatestSequenceNumber();
+
+  // Catch-up reads a new MANIFEST only when CURRENT names another file, so
+  // reopen the new DB until its MANIFEST has another name than the old one.
+  DestroyAndReopen(opts);
+  while (dbfull()->TEST_Current_Manifest_FileNo() == first_manifest_number) {
+    Reopen(opts);
+  }
+  ASSERT_OK(Put("k1", "other_db"));
+  ASSERT_OK(Flush());
+
+  // Wait for three catch-ups that return Corruption: the one that finds the
+  // DB ID and two retries.
+  std::atomic<int> corruptions{0};
+  std::promise<void> three_corruptions;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImplFollower::TryCatchupWithLeader:End", [&](void* arg) {
+        if (static_cast<Status*>(arg)->IsCorruption() &&
+            corruptions.fetch_add(1) + 1 == 3) {
+          three_corruptions.set_value();
+        }
+      });
+  // The callback uses this scope, so remove it before the scope ends.
+  Defer remove_callback([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_EQ(std::future_status::ready,
+            three_corruptions.get_future().wait_for(std::chrono::seconds(30)));
+
+  ASSERT_EQ(FollowerGet("k1"), "v1");
+  ASSERT_EQ(old_last_sequence, follower()->GetLatestSequenceNumber());
 }
 #endif
 }  // namespace ROCKSDB_NAMESPACE

@@ -166,6 +166,11 @@ struct JobOptions {
   // that can guarantee sorted order may set this to let IODispatcher skip
   // defensive sorting before cache lookup and coalescing.
   bool block_handles_are_sorted = false;
+
+  // Use the table's Env::Priority::READ pool to materialize asynchronously
+  // read blocks in parallel. A READ pool with no workers preserves inline
+  // materialization.
+  bool use_parallel_async_io_block_decompression = false;
 };
 
 class IOJob {

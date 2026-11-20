@@ -12,6 +12,7 @@
 #include "db/event_helpers.h"
 #include "file/sst_file_manager_impl.h"
 #include "rocksdb/status.h"
+#include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -56,25 +57,70 @@ class BlobFileCompletionCallback {
             "BlobFileCompletionCallback::CallBack::MaxAllowedSpaceReached");
         if (set_bg_error_on_space_limit) {
           // This callback historically reports space limits as flush errors.
-          InstrumentedMutexLock l(mutex_);
-          error_handler_->SetBGError(s, BackgroundErrorReason::kFlush);
+          SetBGError(s);
         }
       }
     }
 
-    // Notify the listeners.
+    NotifyCreationFinished(
+        file_name, column_family_name, job_id, file_number, creation_reason,
+        (!report_status.ok() ? report_status : s), checksum_value,
+        checksum_method, blob_count, blob_bytes);
+    return s;
+  }
+
+  // For a complete blob file that is kept even when the space limit is
+  // reached. The file is registered with the SstFileManager at `file_size`,
+  // which cannot fail, and its creation is reported as successful. Returns
+  // whether the max allowed space is reached; the caller sets the background
+  // error, because this does not acquire the DB mutex.
+  bool OnKeptBlobFileCompleted(
+      const std::string& file_name, const std::string& column_family_name,
+      int job_id, uint64_t file_number, BlobFileCreationReason creation_reason,
+      const std::string& checksum_value, const std::string& checksum_method,
+      uint64_t blob_count, uint64_t blob_bytes, uint64_t file_size) {
+    bool space_limit_reached = false;
+
+    SstFileManagerImpl* sfm =
+        static_cast_with_check<SstFileManagerImpl>(sst_file_manager_);
+    if (sfm) {
+      sfm->OnAddFile(file_name, file_size).PermitUncheckedError();
+      space_limit_reached = sfm->IsMaxAllowedSpaceReached();
+      if (space_limit_reached) {
+        TEST_SYNC_POINT(
+            "BlobFileCompletionCallback::CallBack::MaxAllowedSpaceReached");
+      }
+    }
+
+    NotifyCreationFinished(file_name, column_family_name, job_id, file_number,
+                           creation_reason, Status::OK(), checksum_value,
+                           checksum_method, blob_count, blob_bytes);
+    return space_limit_reached;
+  }
+
+  void SetBGError(const Status& s) {
+    InstrumentedMutexLock l(mutex_);
+    error_handler_->SetBGError(s, BackgroundErrorReason::kFlush);
+  }
+
+ private:
+  void NotifyCreationFinished(const std::string& file_name,
+                              const std::string& column_family_name, int job_id,
+                              uint64_t file_number,
+                              BlobFileCreationReason creation_reason,
+                              const Status& status,
+                              const std::string& checksum_value,
+                              const std::string& checksum_method,
+                              uint64_t blob_count, uint64_t blob_bytes) {
     EventHelpers::LogAndNotifyBlobFileCreationFinished(
         event_logger_, listeners_, dbname_, column_family_name, file_name,
-        job_id, file_number, creation_reason,
-        (!report_status.ok() ? report_status : s),
+        job_id, file_number, creation_reason, status,
         (checksum_value.empty() ? kUnknownFileChecksum : checksum_value),
         (checksum_method.empty() ? kUnknownFileChecksumFuncName
                                  : checksum_method),
         blob_count, blob_bytes);
-    return s;
   }
 
- private:
   SstFileManager* sst_file_manager_;
   InstrumentedMutex* mutex_;
   ErrorHandler* error_handler_;

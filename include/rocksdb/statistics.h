@@ -684,6 +684,13 @@ enum Tickers : uint32_t {
   // metadata, files, or capabilities failed validation before installation.
   REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
 
+  // Number of entries that reads treated as deleted, or as wide-column
+  // entities missing some columns, because their values are stored in blob
+  // files that DBOptions::best_efforts_blob_db_repair recorded as dropped.
+  // Only entries that decide a read's result count, not older versions they
+  // hide. An iterator can count an entry again when it moves back to it.
+  BLOB_DB_DROPPED_BLOB_READ_COUNT,
+
   TICKER_ENUM_MAX
 };
 
@@ -878,11 +885,11 @@ enum Histograms : uint32_t {
 extern const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap;
 
 struct HistogramData {
-  double median;
-  double percentile95;
-  double percentile99;
-  double average;
-  double standard_deviation;
+  double median = 0.0;
+  double percentile95 = 0.0;
+  double percentile99 = 0.0;
+  double average = 0.0;
+  double standard_deviation = 0.0;
   // zero-initialize new members since old Statistics::histogramData()
   // implementations won't write them.
   double max = 0.0;

@@ -58,7 +58,8 @@ class WorkQueue {
    *
    * @param maxSize The maximum allowed size of the work queue.
    */
-  WorkQueue(std::size_t maxSize = 0) : done_(false), maxSize_(maxSize) {}
+  explicit WorkQueue(std::size_t maxSize = 0)
+      : done_(false), maxSize_(maxSize) {}
 
   /**
    * Push an item onto the work queue.  Notify a single thread that work is

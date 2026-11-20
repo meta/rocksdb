@@ -37,8 +37,39 @@ public class ImportColumnFamilyOptions extends RocksObject {
     return this;
   }
 
+  /**
+   * Returns true if the import rejects files that are already too old for
+   * the column family.
+   * <p>
+   * See {@link #setRejectTooOldFile(boolean)}.
+   *
+   * @return true if too-old files are rejected.
+   */
+  public boolean rejectTooOldFile() {
+    return rejectTooOldFile(nativeHandle_);
+  }
+
+  /**
+   * Like {@link IngestExternalFileOptions#setRejectTooOldFile(boolean)}, using
+   * the file creation time from the import metadata, or from the file itself
+   * if the metadata does not have one. If any file is rejected, the import
+   * fails.
+   * <p>
+   * Default: false
+   *
+   * @param rejectTooOldFile true to reject files that are too old
+   *
+   * @return the reference to the current ImportColumnFamilyOptions.
+   */
+  public ImportColumnFamilyOptions setRejectTooOldFile(final boolean rejectTooOldFile) {
+    setRejectTooOldFile(nativeHandle_, rejectTooOldFile);
+    return this;
+  }
+
   private static native long newImportColumnFamilyOptions();
   private native boolean moveFiles(final long handle);
   private native void setMoveFiles(final long handle, final boolean move_files);
+  private native boolean rejectTooOldFile(final long handle);
+  private native void setRejectTooOldFile(final long handle, final boolean rejectTooOldFile);
   @Override protected final native void disposeInternal(final long handle);
 }

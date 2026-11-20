@@ -161,7 +161,7 @@ EOF
 
 # To check for DB forward compatibility with loading options (old version
 # reading data from new), as well as backward compatibility
-declare -a db_forward_with_options_refs=("10.4.fb" "10.5.fb" "10.6.fb" "10.7.fb" "10.8.fb" "10.9.fb" "10.10.fb" "10.11.fb" "11.0.fb" "11.1.fb" "11.2.fb" "11.3.fb" "11.4.fb" "11.5.fb" "11.6.fb" "11.7.fb" "11.8.fb" "11.9.fb" "11.10.fb" "11.11.fb" "11.12.fb" "11.13.fb")
+declare -a db_forward_with_options_refs=("10.4.fb" "10.5.fb" "10.6.fb" "10.7.fb" "10.8.fb" "10.9.fb" "10.10.fb" "10.11.fb" "11.0.fb" "11.1.fb" "11.2.fb" "11.3.fb" "11.4.fb" "11.5.fb" "11.6.fb" "11.7.fb" "11.8.fb" "11.9.fb" "11.10.fb" "11.11.fb" "11.12.fb" "11.13.fb" "11.14.fb")
 # To check for DB forward compatibility without loading options (in addition
 # to the "with loading options" set), as well as backward compatibility
 declare -a db_forward_no_options_refs=() # N/A at the moment

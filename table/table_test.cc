@@ -19,11 +19,13 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "cache/cache_reservation_manager.h"
@@ -693,7 +695,7 @@ class Constructor {
   virtual bool AnywayDeleteIterator() const { return false; }
 
  protected:
-  const InternalKeyComparator* last_internal_comparator_;
+  const InternalKeyComparator* last_internal_comparator_ = nullptr;
 
  private:
   stl_wrappers::KVMap data_;
@@ -945,7 +947,7 @@ class TableConstructor : public Constructor {
   }
 
   const ReadOptions read_options_;
-  uint64_t file_num_;
+  uint64_t file_num_ = 0;
   std::unique_ptr<WritableFileWriter> file_writer_;
   std::unique_ptr<RandomAccessFileReader> file_reader_;
   std::unique_ptr<TableReader> table_reader_;
@@ -982,7 +984,7 @@ class MemTableConstructor : public Constructor {
                     const InternalKeyComparator& /*internal_comparator*/,
                     const stl_wrappers::KVMap& kv_map) override {
     delete memtable_->Unref();
-    ImmutableOptions mem_ioptions(ioptions);
+    const ImmutableOptions& mem_ioptions = ioptions;
     memtable_ = new MemTable(internal_comparator_, mem_ioptions,
                              MutableCFOptions(options_), write_buffer_manager_,
                              kMaxSequenceNumber, 0 /* column_family_id */,
@@ -1139,7 +1141,7 @@ static std::vector<TestArgs> GenerateArgList() {
           test_type == PLAIN_TABLE_FULL_STR_PREFIX ||
           test_type == PLAIN_TABLE_TOTAL_ORDER) {
         // Plain table doesn't use restart index or compression.
-        TestArgs one_arg;
+        TestArgs one_arg{};
         one_arg.type = test_type;
         one_arg.reverse_compare = reverse_compare;
         one_arg.restart_interval = restart_intervals[0];
@@ -1161,7 +1163,7 @@ static std::vector<TestArgs> GenerateArgList() {
             for (uint32_t fv :
                  {kMinSupportedBbtFormatVersionForRead, 7U,
                   BlockBasedTableOptions::kLatestSupportedFormatVersion}) {
-              TestArgs one_arg;
+              TestArgs one_arg{};
               one_arg.type = test_type;
               one_arg.reverse_compare = reverse_compare;
               one_arg.restart_interval = restart_interval;
@@ -1224,35 +1226,36 @@ class HarnessTest : public testing::Test {
       options_.comparator = &reverse_key_comparator;
     }
 
-    internal_comparator_.reset(
-        new test::PlainInternalKeyComparator(options_.comparator));
+    internal_comparator_ =
+        std::make_shared<test::PlainInternalKeyComparator>(options_.comparator);
 
     options_.allow_mmap_reads = args_.use_mmap;
     switch (args_.type) {
       case BLOCK_BASED_TABLE_TEST:
-        table_options_.flush_block_policy_factory.reset(
-            new FlushBlockBySizePolicyFactory());
+        table_options_.flush_block_policy_factory =
+            std::make_shared<FlushBlockBySizePolicyFactory>();
         table_options_.block_size = 256;
         table_options_.block_restart_interval = args_.restart_interval;
         table_options_.index_block_restart_interval = args_.restart_interval;
         table_options_.format_version = args_.format_version;
-        options_.table_factory.reset(
-            new BlockBasedTableFactory(table_options_));
+        options_.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options_);
         constructor_.reset(new TableConstructor(
             options_.comparator, true /* convert_to_internal_key_ */));
-        internal_comparator_.reset(
-            new InternalKeyComparator(options_.comparator));
+        internal_comparator_ =
+            std::make_shared<InternalKeyComparator>(options_.comparator);
         break;
 
       case PLAIN_TABLE_SEMI_FIXED_PREFIX:
         support_prev_ = false;
         only_support_prefix_seek_ = true;
-        options_.prefix_extractor.reset(new FixedOrLessPrefixTransform(2));
+        options_.prefix_extractor =
+            std::make_shared<FixedOrLessPrefixTransform>(2);
         options_.table_factory.reset(NewPlainTableFactory());
         constructor_.reset(new TableConstructor(
             options_.comparator, true /* convert_to_internal_key_ */));
-        internal_comparator_.reset(
-            new InternalKeyComparator(options_.comparator));
+        internal_comparator_ =
+            std::make_shared<InternalKeyComparator>(options_.comparator);
         break;
       case PLAIN_TABLE_FULL_STR_PREFIX:
         support_prev_ = false;
@@ -1261,8 +1264,8 @@ class HarnessTest : public testing::Test {
         options_.table_factory.reset(NewPlainTableFactory());
         constructor_.reset(new TableConstructor(
             options_.comparator, true /* convert_to_internal_key_ */));
-        internal_comparator_.reset(
-            new InternalKeyComparator(options_.comparator));
+        internal_comparator_ =
+            std::make_shared<InternalKeyComparator>(options_.comparator);
         break;
       case PLAIN_TABLE_TOTAL_ORDER:
         support_prev_ = false;
@@ -1280,26 +1283,26 @@ class HarnessTest : public testing::Test {
         }
         constructor_.reset(new TableConstructor(
             options_.comparator, true /* convert_to_internal_key_ */));
-        internal_comparator_.reset(
-            new InternalKeyComparator(options_.comparator));
+        internal_comparator_ =
+            std::make_shared<InternalKeyComparator>(options_.comparator);
         break;
       case BLOCK_TEST:
         table_options_.block_size = 256;
-        options_.table_factory.reset(
-            new BlockBasedTableFactory(table_options_));
+        options_.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options_);
         constructor_.reset(new BlockConstructor(options_.comparator));
         break;
       case MEMTABLE_TEST:
         table_options_.block_size = 256;
-        options_.table_factory.reset(
-            new BlockBasedTableFactory(table_options_));
+        options_.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options_);
         constructor_.reset(
             new MemTableConstructor(options_.comparator, &write_buffer_));
         break;
       case DB_TEST:
         table_options_.block_size = 256;
-        options_.table_factory.reset(
-            new BlockBasedTableFactory(table_options_));
+        options_.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options_);
         constructor_.reset(new DBConstructor(options_.comparator));
         break;
     }
@@ -1633,7 +1636,7 @@ class BlockBasedTableTest : public BlockBasedTableTestBase,
                                     &trace_reader);
       EXPECT_OK(s);
       BlockCacheTraceReader reader(std::move(trace_reader));
-      BlockCacheTraceHeader header;
+      BlockCacheTraceHeader header{};
       EXPECT_OK(reader.ReadHeader(&header));
       uint32_t index = 0;
       while (s.ok()) {
@@ -1708,7 +1711,7 @@ class BBTTailPrefetchTest : public TableTest {};
 // The helper class to test the file checksum
 class FileChecksumTestHelper {
  public:
-  FileChecksumTestHelper(bool convert_to_internal_key = false)
+  explicit FileChecksumTestHelper(bool convert_to_internal_key = false)
       : convert_to_internal_key_(convert_to_internal_key) {}
   ~FileChecksumTestHelper() = default;
 
@@ -1860,6 +1863,52 @@ TEST_F(TablePropertyTest, PrefixScanTest) {
   }
 }
 
+TEST_F(TablePropertyTest, ReferencedBlobBytesAggregationPreservesUnknown) {
+  TableProperties aggregate;
+  TableProperties unknown;
+  aggregate.Add(unknown);
+  aggregate.Add(unknown);
+  ASSERT_FALSE(aggregate.referenced_blob_bytes.has_value());
+  ASSERT_EQ(
+      aggregate.GetAggregatablePropertiesAsMap().at("referenced_blob_bytes"),
+      0U);
+
+  TableProperties zero;
+  zero.referenced_blob_bytes = 0;
+  aggregate.Add(zero);
+  ASSERT_EQ(aggregate.referenced_blob_bytes, 0U);
+  aggregate.Add(unknown);
+  ASSERT_EQ(aggregate.referenced_blob_bytes, 0U);
+
+  TableProperties first;
+  first.referenced_blob_bytes = 123;
+  TableProperties second;
+  second.referenced_blob_bytes = 456;
+  aggregate.Add(first);
+  aggregate.Add(unknown);
+  aggregate.Add(second);
+  ASSERT_EQ(aggregate.referenced_blob_bytes, 579U);
+  ASSERT_EQ(
+      aggregate.GetAggregatablePropertiesAsMap().at("referenced_blob_bytes"),
+      579U);
+}
+
+TEST_F(TablePropertyTest, RandomizationPreservesReferencedBlobBytes) {
+  const std::optional<uint64_t> cases[] = {std::nullopt, 0, 12345};
+  for (const std::optional<uint64_t>& expected : cases) {
+    TableProperties props;
+    props.referenced_blob_bytes = expected;
+    TEST_SetRandomTableProperties(&props);
+    ASSERT_EQ(props.referenced_blob_bytes, expected);
+
+    std::string serialized;
+    ASSERT_OK(props.Serialize(ConfigOptions(), &serialized));
+    TableProperties parsed;
+    ASSERT_OK(TableProperties::Parse(ConfigOptions(), serialized, &parsed));
+    ASSERT_EQ(parsed.referenced_blob_bytes, expected);
+  }
+}
+
 namespace {
 struct TestIds {
   UniqueId64x3 internal_id;
@@ -1893,7 +1942,7 @@ TestIds GetUniqueId(TableProperties* tp, std::unordered_set<uint64_t>* seen,
   tp->db_id = db_id;
   tp->db_session_id = db_session_id;
   tp->orig_file_number = file_number;
-  TestIds t;
+  TestIds t{};
   {
     std::string euid;
     EXPECT_OK(GetExtendedUniqueIdFromTableProperties(*tp, &euid));
@@ -2690,7 +2739,7 @@ void PrefetchRange(TableConstructor* c, Options* opt,
                    const char* key_end,
                    const std::vector<std::string>& keys_in_cache,
                    const std::vector<std::string>& keys_not_in_cache,
-                   const Status expected_status = Status::OK()) {
+                   const Status& expected_status = Status::OK()) {
   // reset the cache and reopen the table
   table_options->block_cache = NewLRUCache(16 * 1024 * 1024, 4);
   opt->table_factory.reset(NewBlockBasedTableFactory(*table_options));
@@ -2809,31 +2858,36 @@ TEST_P(BlockBasedTableTest, TotalOrderSeekOnHashIndex) {
       case 0:
         // Binary search index
         table_options.index_type = BlockBasedTableOptions::kBinarySearch;
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         break;
       case 1:
         // Hash search index
         table_options.index_type = BlockBasedTableOptions::kHashSearch;
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         options.prefix_extractor.reset(NewFixedPrefixTransform(4));
         break;
       case 2:
         // Hash search index with filter policy
         table_options.index_type = BlockBasedTableOptions::kHashSearch;
         table_options.filter_policy.reset(NewBloomFilterPolicy(10));
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         options.prefix_extractor.reset(NewFixedPrefixTransform(4));
         break;
       case 3:
         // Two-level index
         table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         break;
       case 4:
         // Binary search with first key
         table_options.index_type =
             BlockBasedTableOptions::kBinarySearchWithFirstKey;
-        options.table_factory.reset(new BlockBasedTableFactory(table_options));
+        options.table_factory =
+            std::make_shared<BlockBasedTableFactory>(table_options);
         break;
     }
 
@@ -2896,7 +2950,8 @@ TEST_P(BlockBasedTableTest, NoopTransformSeek) {
 
   Options options;
   options.comparator = BytewiseComparator();
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   options.prefix_extractor.reset(NewNoopTransform());
 
   TableConstructor c(options.comparator);
@@ -2937,7 +2992,8 @@ TEST_P(BlockBasedTableTest, SkipPrefixBloomFilter) {
 
   Options options;
   options.comparator = BytewiseComparator();
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   options.prefix_extractor.reset(NewFixedPrefixTransform(1));
 
   TableConstructor c(options.comparator);
@@ -2977,7 +3033,8 @@ TEST_P(BlockBasedTableTest, BadChecksumType) {
 
   Options options;
   options.comparator = BytewiseComparator();
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
 
   TableConstructor c(options.comparator);
   InternalKey key("abc", 1, kTypeValue);
@@ -3032,7 +3089,7 @@ TEST_P(BlockBasedTableTest, ReservedBitInDataBlockFooter) {
 
   // Try to construct a Block from the data with the reserved bit set. The
   // footer decode must reject it.
-  BlockContents contents(std::move(block_data));
+  BlockContents contents(block_data);
   Block block(std::move(contents), 0 /* read_amp_bytes_per_bit */);
 
   // Block should have size() == 0 indicating error
@@ -3064,7 +3121,7 @@ std::string ChecksumAsString(const std::string& data,
                      checksum_type, data.data(), data.size() - 1, data.back()));
   }
   // Little endian as in file
-  std::array<char, 4> raw_bytes;
+  std::array<char, 4> raw_bytes{};
   EncodeFixed32(raw_bytes.data(), v);
   return Slice(raw_bytes.data(), raw_bytes.size()).ToString(/*hex*/ true);
 }
@@ -3176,6 +3233,7 @@ TEST_P(BuiltinChecksumTest, ChecksumZeroInputs) {
     return;
   }
   // "Thorough" case is too slow for continouous testing
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
   bool thorough = getenv("ROCKSDB_THOROUGH_CHECKSUM_TEST") != nullptr;
   // Verified through 10M
   size_t kMaxZerosLen = thorough ? 10000000 : 20000;
@@ -3204,7 +3262,7 @@ TEST_P(BuiltinChecksumTest, ChecksumZeroInputs) {
 }
 
 void AddInternalKey(TableConstructor* c, const std::string& prefix,
-                    std::string value = "v", int /*suffix_len*/ = 800) {
+                    const std::string& value = "v", int /*suffix_len*/ = 800) {
   static Random rnd(1023);
   InternalKey k(prefix + rnd.RandomString(800), 0, kTypeValue);
   c->Add(k.Encode().ToString(), value);
@@ -3563,18 +3621,19 @@ TEST_F(GeneralTableTest, IndexBlockCommonPrefixEquivalence) {
   };
   const std::vector<Config> configs = {
       {"leaf_binary", BlockBasedTableOptions::kBinarySearch, false, false,
-       false},
-      {"leaf_binary_reverse", BlockBasedTableOptions::kBinarySearch, false,
-       true, false},
-      {"leaf_first_key", BlockBasedTableOptions::kBinarySearchWithFirstKey,
-       false, false, false},
-      {"leaf_hash", BlockBasedTableOptions::kHashSearch, false, false, true},
-      {"partitioned", BlockBasedTableOptions::kTwoLevelIndexSearch, false,
        false, false},
-      {"partitioned_reverse", BlockBasedTableOptions::kTwoLevelIndexSearch,
-       false, true, false},
-      {"partitioned_filters", BlockBasedTableOptions::kTwoLevelIndexSearch,
+      {"leaf_binary_reverse", BlockBasedTableOptions::kBinarySearch, false,
        true, false, false},
+      {"leaf_first_key", BlockBasedTableOptions::kBinarySearchWithFirstKey,
+       false, false, false, false},
+      {"leaf_hash", BlockBasedTableOptions::kHashSearch, false, false, true,
+       false},
+      {"partitioned", BlockBasedTableOptions::kTwoLevelIndexSearch, false,
+       false, false, false},
+      {"partitioned_reverse", BlockBasedTableOptions::kTwoLevelIndexSearch,
+       false, true, false, false},
+      {"partitioned_filters", BlockBasedTableOptions::kTwoLevelIndexSearch,
+       true, false, false, false},
       // Non-(reverse-)bytewise comparator with kEnabled: exercises the reader's
       // reconstruction path for stripped index blocks (leaf + partitioned).
       {"leaf_binary_custom_cmp", BlockBasedTableOptions::kBinarySearch, false,
@@ -3787,7 +3846,7 @@ class CustomFlushBlockPolicy : public FlushBlockPolicyFactory,
                                public FlushBlockPolicy {
  public:
   explicit CustomFlushBlockPolicy(std::vector<int> keys_per_block)
-      : keys_per_block_(keys_per_block) {}
+      : keys_per_block_(std::move(keys_per_block)) {}
 
   const char* Name() const override { return "CustomFlushBlockPolicy"; }
 
@@ -4083,6 +4142,7 @@ TEST_P(BlockBasedTableTest, IndexSizeStat) {
   Random rnd(test::RandomSeed());
   std::vector<std::string> keys;
 
+  keys.reserve(100);
   for (int i = 0; i < 100; ++i) {
     keys.push_back(rnd.RandomString(10000));
   }
@@ -4150,7 +4210,8 @@ TEST_P(BlockBasedTableTest, TracingGetTest) {
   table_options.block_cache = NewLRUCache(1024 * 1024, 0);
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -4262,7 +4323,8 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupSeqScans) {
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
   table_options.block_align = true;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   ASSERT_OK(options.table_factory->ValidateOptions(
       DBOptions(options), ColumnFamilyOptions(options)));
 
@@ -4407,7 +4469,8 @@ TEST_P(BlockBasedTableTest, BlockCacheLookupAsyncScansSeek) {
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
   table_options.block_align = true;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   ASSERT_OK(options.table_factory->ValidateOptions(
       DBOptions(options), ColumnFamilyOptions(options)));
 
@@ -4772,7 +4835,8 @@ TEST_P(BlockBasedTableTest, TracingMultiGetTest) {
   table_options.filter_policy.reset(NewBloomFilterPolicy(10));
   // Put auto_add_key1 and auto_add_key2 in the same data block
   table_options.block_size = kDummyValue.size() * 2 + 100;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -4876,7 +4940,8 @@ TEST_P(BlockBasedTableTest, TracingApproximateOffsetOfTest) {
   table_options.block_cache = NewLRUCache(1024 * 1024, 0);
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -4920,7 +4985,8 @@ TEST_P(BlockBasedTableTest, TracingIterator) {
   table_options.block_cache = NewLRUCache(1024 * 1024, 0);
   table_options.cache_index_and_filter_blocks = true;
   table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   SetupTracingTest(&c);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
@@ -5048,7 +5114,8 @@ TEST_P(BlockBasedTableTest, BlockCacheDisabledTest) {
   BlockBasedTableOptions table_options = GetBlockBasedTableOptions();
   table_options.block_cache = NewLRUCache(1024, 4);
   table_options.filter_policy.reset(NewBloomFilterPolicy(10));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
 
@@ -5100,7 +5167,8 @@ TEST_P(BlockBasedTableTest, FilterBlockInBlockCache) {
   co.metadata_charge_policy = kDontChargeCacheMetadata;
   table_options.block_cache = NewLRUCache(co);
   table_options.cache_index_and_filter_blocks = true;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   std::vector<std::string> keys;
   stl_wrappers::KVMap kvmap;
 
@@ -5185,7 +5253,8 @@ TEST_P(BlockBasedTableTest, FilterBlockInBlockCache) {
   // too small to fit even one entry.
   table_options.block_cache = NewLRUCache(1, 4);
   options.statistics = CreateDBStatistics();
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   const ImmutableOptions ioptions2(options);
   const MutableCFOptions moptions2(options);
   ASSERT_OK(c.Reopen(ioptions2, moptions2));
@@ -5242,7 +5311,8 @@ TEST_P(BlockBasedTableTest, FilterBlockInBlockCache) {
 
   // Open table with filter policy
   table_options.filter_policy.reset(NewBloomFilterPolicy(1));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   options.statistics = CreateDBStatistics();
   ImmutableOptions ioptions4(options);
   MutableCFOptions moptions4(options);
@@ -5324,7 +5394,8 @@ TEST_P(BlockBasedTableTest, BlockReadCountTest) {
       table_options.cache_index_and_filter_blocks = index_and_filter_in_cache;
       table_options.filter_policy.reset(
           NewBloomFilterPolicy(10, bloom_filter_type == 2));
-      options.table_factory.reset(new BlockBasedTableFactory(table_options));
+      options.table_factory =
+          std::make_shared<BlockBasedTableFactory>(table_options);
       std::vector<std::string> keys;
       stl_wrappers::KVMap kvmap;
 
@@ -5499,7 +5570,7 @@ TEST_P(BlockBasedTableTest, MemoryAllocator) {
     lruOptions.memory_allocator = custom_memory_allocator;
     lruOptions.capacity = 16 * 1024 * 1024;
     lruOptions.num_shard_bits = 4;
-    table_options.block_cache = NewLRUCache(std::move(lruOptions));
+    table_options.block_cache = NewLRUCache(lruOptions);
     opt.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
     TableConstructor c(BytewiseComparator(),
@@ -5814,7 +5885,8 @@ static void DoCompressionTest(CompressionType comp) {
   options.db_host_id = "";
   BlockBasedTableOptions table_options;
   table_options.block_size = 1024;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
   const ImmutableOptions ioptions(options);
   const MutableCFOptions moptions(options);
   c.Finish(options, ioptions, moptions, table_options, ikc, &keys, &kvmap);
@@ -6167,8 +6239,7 @@ TEST(TableTest, LegacyFormatRejectionTests) {
   // Test legacy block-based magic number from LevelDB should be rejected
   {
     // Construct a fake footer with legacy block-based magic number
-    std::array<char, Footer::kVersion0EncodedLength> fake_footer;
-    std::fill(fake_footer.begin(), fake_footer.end(), 0);
+    std::array<char, Footer::kVersion0EncodedLength> fake_footer{};
     // Put legacy magic number at the end
     EncodeFixed64(fake_footer.data() + fake_footer.size() - 8,
                   0xdb4775248b80fb57ull /*legacy magic number*/);
@@ -6186,8 +6257,7 @@ TEST(TableTest, LegacyFormatRejectionTests) {
 
   // Test format_version=1 with new magic number should be rejected
   {
-    std::array<char, Footer::kNewVersionsEncodedLength> fake_footer;
-    std::fill(fake_footer.begin(), fake_footer.end(), 0);
+    std::array<char, Footer::kNewVersionsEncodedLength> fake_footer{};
     // Part 1: checksum type
     fake_footer[0] = kCRC32c;
     // Part 3: format_version=1 and new magic number
@@ -6206,8 +6276,7 @@ TEST(TableTest, LegacyFormatRejectionTests) {
 
   // Test format_version=0 with new magic number should be rejected
   {
-    std::array<char, Footer::kNewVersionsEncodedLength> fake_footer;
-    std::fill(fake_footer.begin(), fake_footer.end(), 0);
+    std::array<char, Footer::kNewVersionsEncodedLength> fake_footer{};
     // Part 1: checksum type
     fake_footer[0] = kCRC32c;
     // Part 3: format_version=0 and new magic number
@@ -6312,7 +6381,8 @@ TEST_P(IndexBlockRestartIntervalTest, IndexBlockRestartInterval) {
   } else {
     table_options.format_version = 3;
   }
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
 
   TableConstructor c(BytewiseComparator());
   static Random rnd(301);
@@ -6368,7 +6438,6 @@ namespace {
 class TestPrefixExtractor : public ROCKSDB_NAMESPACE::SliceTransform {
  public:
   ~TestPrefixExtractor() override = default;
-  ;
   const char* Name() const override { return "TestPrefixExtractor"; }
 
   ROCKSDB_NAMESPACE::Slice Transform(
@@ -6463,7 +6532,7 @@ TEST_P(BlockBasedTableTest, LegacyGlobalSeqnoChecksumRecovery) {
 
   for (char c = 'a'; c <= 'z'; ++c) {
     std::string key(8, c);
-    std::string value = key;
+    const std::string& value = key;
     InternalKey ik(key, 0, kTypeValue);
 
     builder->Add(ik.Encode(), value);
@@ -7827,7 +7896,8 @@ TEST_P(BlockBasedTableTest, DataBlockHashIndex) {
   Options options;
   options.comparator = BytewiseComparator();
 
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  options.table_factory =
+      std::make_shared<BlockBasedTableFactory>(table_options);
 
   TableConstructor c(options.comparator);
 
@@ -8385,6 +8455,12 @@ class ExternalTableTest : public DBTestBase {
       : DBTestBase("external_table_test", /*env_do_fsync=*/false) {}
 
  protected:
+  // Reads the files of SimpleExternalTableFactory but cannot write any.
+  class ReadOnlyExternalTableFactory : public SimpleExternalTableFactory {
+   public:
+    bool IsTableBuilderSupported() const override { return false; }
+  };
+
   // A reader that pins values from its internal buffer, exercising the
   // zero-copy path in ExternalTableReaderAdapter::Get().
   class PinnedSimpleExternalTableReader
@@ -8551,6 +8627,104 @@ class ExternalTablePointReadTest : public ExternalTableTest,
   const bool use_coroutine_;
 };
 
+TEST(TableFactoryTest, FileIsValidTable) {
+  class DirectIOSource : public test::StringSource {
+   public:
+    using test::StringSource::StringSource;
+    bool use_direct_io() const override { return true; }
+    IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
+                  Slice* result, char* scratch,
+                  IODebugContext* dbg) const override {
+      if (fail_read) {
+        return IOStatus::IOError("Injected read failure");
+      }
+      const size_t alignment = GetRequiredBufferAlignment();
+      if (offset % alignment != 0 || n % alignment != 0 ||
+          !AlignedBuffer::isAligned(scratch, alignment)) {
+        return IOStatus::InvalidArgument("Unaligned direct read");
+      }
+      return test::StringSource::Read(offset, n, options, result, scratch, dbg);
+    }
+    bool fail_read = false;
+  };
+
+  std::unique_ptr<TableFactory> block(NewBlockBasedTableFactory());
+  std::unique_ptr<TableFactory> plain(NewPlainTableFactory());
+  std::unique_ptr<TableFactory> cuckoo(NewCuckooTableFactory());
+  std::unique_ptr<TableFactory> adaptive(NewAdaptiveTableFactory());
+  std::shared_ptr<ExternalTableFactory> inner =
+      std::make_shared<SimpleExternalTableFactory>();
+  std::unique_ptr<TableFactory> external = NewExternalTableFactory(inner);
+
+  // An empty SimpleExternal table consists of only its footer.
+  test::StringSink sink;
+  std::unique_ptr<ExternalTableBuilder> builder(inner->NewTableBuilder(
+      ExternalTableBuilderOptions(
+          ReadOptions(), WriteOptions(),
+          std::shared_ptr<const SliceTransform>(), BytewiseComparator(),
+          "default", TableFileCreationReason::kMisc, FileSystem::Default()),
+      "", &sink));
+  ASSERT_OK(builder->Finish());
+
+  auto magic = [](uint64_t magic_number) {
+    std::string signature;
+    PutFixed64(&signature, magic_number);
+    return signature;
+  };
+  // Each signature should be recognized by exactly the listed factories.
+  const std::pair<std::string, std::vector<TableFactory*>> signatures[] = {
+      {magic(kBlockBasedTableMagicNumber), {block.get(), adaptive.get()}},
+      {magic(kPlainTableMagicNumber), {plain.get(), adaptive.get()}},
+      {magic(kLegacyPlainTableMagicNumber), {plain.get(), adaptive.get()}},
+      {magic(kCuckooTableMagicNumber), {cuckoo.get(), adaptive.get()}},
+      {sink.contents(), {external.get()}}};
+  for (const auto& [signature, recognizers] : signatures) {
+    for (TableFactory* factory : {block.get(), plain.get(), cuckoo.get(),
+                                  adaptive.get(), external.get()}) {
+      SCOPED_TRACE(std::string(factory->Name()) + " probing " +
+                   Slice(signature).ToString(/*hex=*/true));
+      // Native magic numbers straddle a direct I/O alignment boundary.
+      DirectIOSource file(std::string(4093, 'x') + signature);
+      const bool expected = std::find(recognizers.begin(), recognizers.end(),
+                                      factory) != recognizers.end();
+      bool matches = !expected;
+      ASSERT_OK(
+          factory->FileIsValidTable(IOOptions(), file, file.Size(), &matches));
+      ASSERT_EQ(matches, expected);
+      ASSERT_EQ(file.total_reads(), 1);
+    }
+  }
+
+  // Probes the reader passed to NewTableReader() without taking ownership.
+  auto* source = new DirectIOSource(std::string(4093, 'x') +
+                                    magic(kBlockBasedTableMagicNumber));
+  RandomAccessFileReader reader(std::unique_ptr<FSRandomAccessFile>(source),
+                                "");
+  bool matches = false;
+  ASSERT_OK(block->FileIsValidTable(IOOptions(), *AsFSRandomAccessFile(&reader),
+                                    source->Size(), &matches));
+  ASSERT_TRUE(matches);
+  ASSERT_EQ(source->total_reads(), 1);
+
+  test::StringSource unknown(std::string(8, '\0'));
+  matches = true;
+  ASSERT_OK(
+      block->FileIsValidTable(IOOptions(), unknown, unknown.Size(), &matches));
+  ASSERT_FALSE(matches);
+  ASSERT_EQ(unknown.total_reads(), 1);
+  ASSERT_TRUE(
+      block
+          ->FileIsValidTable(IOOptions(), unknown, unknown.Size() + 1, &matches)
+          .IsCorruption());
+  DirectIOSource failed(std::string(8, '\0'));
+  failed.fail_read = true;
+  matches = true;
+  ASSERT_TRUE(
+      block->FileIsValidTable(IOOptions(), failed, failed.Size(), &matches)
+          .IsIOError());
+  ASSERT_FALSE(matches);
+}
+
 TEST_F(ExternalTableTest, BootstrapConfig) {
   RegisterConfigurableSimpleExternalTableFactory();
 
@@ -8575,6 +8749,186 @@ TEST_F(ExternalTableTest, BootstrapConfig) {
       ";external_table_config={mode=invalid}}";
   ASSERT_NOK(TableFactory::CreateFromString(config_options, invalid_config,
                                             &invalid_factory));
+}
+
+TEST_F(ExternalTableTest, WrappedFactoryValidatesColumnFamilyOptions) {
+  // Accepts only column families that cannot take memtable writes.
+  class IngestOnlyExternalTableFactory : public SimpleExternalTableFactory {
+   public:
+    Status ValidateOptions(const DBOptions& /*db_opts*/,
+                           const ColumnFamilyOptions& cf_opts) const override {
+      if (!cf_opts.disallow_memtable_writes) {
+        return Status::InvalidArgument("Requires disallow_memtable_writes");
+      }
+      return Status::OK();
+    }
+  };
+
+  Options options = CurrentOptions();
+  Options ingest_only = options;
+  ingest_only.table_factory = NewExternalTableFactory(
+      std::make_shared<IngestOnlyExternalTableFactory>());
+  ASSERT_TRUE(ingest_only.table_factory
+                  ->ValidateOptions(DBOptions(ingest_only),
+                                    ColumnFamilyOptions(ingest_only))
+                  .IsInvalidArgument());
+
+  ColumnFamilyHandle* handle = nullptr;
+  Status s = db_->CreateColumnFamily(ingest_only, "ingest_only", &handle);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(handle, nullptr);
+
+  ingest_only.disallow_memtable_writes = true;
+  ASSERT_OK(db_->CreateColumnFamily(ingest_only, "ingest_only", &handle));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
+
+  const std::vector<std::string> column_families{kDefaultColumnFamilyName,
+                                                 "ingest_only"};
+  ingest_only.disallow_memtable_writes = false;
+  s = TryReopenWithColumnFamilies(column_families,
+                                  std::vector<Options>{options, ingest_only});
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ingest_only.disallow_memtable_writes = true;
+  ASSERT_OK(TryReopenWithColumnFamilies(
+      column_families, std::vector<Options>{options, ingest_only}));
+}
+
+TEST_F(ExternalTableTest, FactoryWithoutTableBuilderIsNeverCompacted) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+  Options options = GetDefaultOptions();
+  // FIFO compaction, used below, requires it.
+  options.max_open_files = -1;
+  Reopen(options);
+  Options writable = options;
+  writable.table_factory =
+      NewExternalTableFactory(std::make_shared<SimpleExternalTableFactory>());
+  writable.disallow_memtable_writes = true;
+  // Any ingested file exceeds the FIFO size limit, so the picker always wants
+  // an automatic compaction.
+  writable.compaction_style = kCompactionStyleFIFO;
+  writable.compaction_options_fifo.max_table_files_size = 1;
+  Options read_only = writable;
+  read_only.table_factory =
+      NewExternalTableFactory(std::make_shared<ReadOnlyExternalTableFactory>());
+  ASSERT_TRUE(writable.table_factory->IsTableBuilderSupported());
+  ASSERT_FALSE(read_only.table_factory->IsTableBuilderSupported());
+
+  // Memtable writes would reach the missing builder at the next flush.
+  Options accepts_writes = read_only;
+  accepts_writes.disallow_memtable_writes = false;
+  ColumnFamilyHandle* handle = nullptr;
+  Status s = db_->CreateColumnFamily(accepts_writes, "accepts_writes", &handle);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_EQ(handle, nullptr);
+
+  // handles_[1] can build tables and handles_[2] cannot; both get the same
+  // ingested file.
+  CreateColumnFamilies({"writable", "read_only"}, writable);
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "writable", "read_only"},
+                           {options, writable, read_only});
+  const std::string file = dbname_ + "/external.immutable";
+  SstFileWriter writer(EnvOptions(writable), writable);
+  ASSERT_OK(writer.Open(file));
+  ASSERT_OK(writer.Put("a", "va"));
+  ASSERT_OK(writer.Put("b", "vb"));
+  ASSERT_OK(writer.Finish());
+  IngestExternalFileOptions ingest_options;
+  ingest_options.allow_global_seqno = true;
+  const auto live_files = [&](int cf) {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(handles_[cf], &metadata);
+    std::vector<std::string> names;
+    for (const auto& level : metadata.levels) {
+      for (const auto& file_metadata : level.files) {
+        names.push_back(file_metadata.name);
+      }
+    }
+    return names;
+  };
+  std::vector<std::string> ingested[3];
+  // Otherwise the FIFO compaction of handles_[1] can delete its file before
+  // the check below sees it.
+  ASSERT_OK(db_->PauseBackgroundWork());
+  for (int cf : {1, 2}) {
+    ASSERT_OK(db_->IngestExternalFile(handles_[cf], {file}, ingest_options));
+    ingested[cf] = live_files(cf);
+    ASSERT_EQ(ingested[cf].size(), 1);
+  }
+  ASSERT_OK(db_->ContinueBackgroundWork());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_TRUE(live_files(1).empty());
+  ASSERT_EQ(live_files(2), ingested[2]);
+  ASSERT_FALSE(static_cast_with_check<ColumnFamilyHandleImpl>(handles_[2])
+                   ->cfd()
+                   ->NeedsCompaction());
+
+  CompactRangeOptions forced;
+  forced.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  s = db_->CompactRange(CompactRangeOptions(), handles_[2], nullptr, nullptr);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  s = db_->CompactRange(forced, handles_[2], nullptr, nullptr);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  // FIFO compaction keeps every file on level 0.
+  s = db_->CompactFiles(CompactionOptions(), handles_[2], ingested[2],
+                        /*output_level=*/0);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_EQ(live_files(2), ingested[2]);
+
+  // The rejected compactions leave the DB writable and the file readable.
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get(2, "a"), "va");
+  ASSERT_EQ(Get(2, "b"), "vb");
+}
+
+TEST_F(ExternalTableTest, FactoryWithoutTableBuilderDoesNotStallWrites) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_SKIP("Test requires non-encrypted environment");
+    return;
+  }
+  Options options = GetDefaultOptions();
+  Reopen(options);
+  Options writable = options;
+  writable.table_factory =
+      NewExternalTableFactory(std::make_shared<SimpleExternalTableFactory>());
+  Options read_only = writable;
+  read_only.table_factory =
+      NewExternalTableFactory(std::make_shared<ReadOnlyExternalTableFactory>());
+  read_only.disallow_memtable_writes = true;
+  // A second overlapping file can only go to L0, which alone reaches every L0
+  // trigger.
+  read_only.num_levels = 2;
+  read_only.level0_file_num_compaction_trigger = 1;
+  read_only.level0_slowdown_writes_trigger = 1;
+  read_only.level0_stop_writes_trigger = 1;
+  CreateColumnFamilies({"read_only"}, read_only);
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "read_only"},
+                           std::vector<Options>{options, read_only});
+
+  IngestExternalFileOptions ingest_options;
+  ingest_options.allow_global_seqno = true;
+  for (const std::string value : {"v1", "v2"}) {
+    const std::string file = dbname_ + "/external_" + value + ".immutable";
+    SstFileWriter writer(EnvOptions(writable), writable);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("a", value));
+    ASSERT_OK(writer.Finish());
+    ASSERT_OK(db_->IngestExternalFile(handles_[1], {file}, ingest_options));
+  }
+  ASSERT_EQ(NumTableFilesAtLevel(0, 1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(1, 1), 1);
+  ASSERT_EQ(Get(1, "a"), "v2");
+
+  // No compaction can clear that L0 file, so it must not stall other column
+  // families.
+  ASSERT_FALSE(dbfull()->TEST_write_controler().IsStopped());
+  ASSERT_FALSE(dbfull()->TEST_write_controler().NeedsDelay());
+  WriteOptions no_slowdown;
+  no_slowdown.no_slowdown = true;
+  ASSERT_OK(db_->Put(no_slowdown, "key", "value"));
 }
 
 TEST_F(ExternalTableTest, GetWrappedExternalTableFactory) {
@@ -9964,7 +10318,8 @@ TEST_F(ExternalTableTest, IngestionTest) {
                                 {},
                                 {},
                                 Temperature::kUnknown,
-                                {{nullptr, nullptr}}}});
+                                {{nullptr, nullptr}},
+                                {}}});
   ASSERT_OK(s);
 
   iter.reset(db->NewIterator({}, cfh));
@@ -9992,7 +10347,7 @@ TEST_F(ExternalTableTest, IngestionTest) {
   writer.reset();
 
   s = db->IngestExternalFiles(
-      {{cfh, {ingest_file}, ifo, {}, {}, Temperature::kUnknown, {}}});
+      {{cfh, {ingest_file}, ifo, {}, {}, Temperature::kUnknown, {}, {}}});
   ASSERT_OK(s);
 
   std::string value;
@@ -10050,7 +10405,7 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
 
   class CustomFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
    public:
-    CustomFlushBlockPolicyFactory(int keys_per_block = 3)
+    explicit CustomFlushBlockPolicyFactory(int keys_per_block = 3)
         : keys_per_block_(keys_per_block) {}
     const char* Name() const override { return "CustomFlushBlockPolicy"; }
     FlushBlockPolicy* NewFlushBlockPolicy(const BlockBasedTableOptions&,
@@ -10088,7 +10443,7 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
         key_type_log_;
 
     struct CustomizedMapComparator {
-      CustomizedMapComparator(const Comparator* _comparator)
+      explicit CustomizedMapComparator(const Comparator* _comparator)
           : comparator(_comparator) {}
       const Comparator* comparator;
       bool operator()(const std::string& lhs, const std::string& rhs) const {
@@ -10653,7 +11008,7 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
     read_opts.iterate_upper_bound = &ub;
     std::unique_ptr<Iterator> iter(db->NewIterator(read_opts, cfh));
     iter->Prepare(scan_opts);
-    for (auto opt : opts) {
+    for (const auto& opt : opts) {
       ub = opt.range.limit.value();
       iter->Seek(opt.range.start.value());
       if (kVerbose) {
@@ -10676,8 +11031,8 @@ class UserDefinedIndexTestBase : public BlockBasedTableTestBase {
     EXPECT_OK(iter->status());
   }
   Options options_;
-  const Comparator* comparator_;
-  bool is_reverse_comparator_;
+  const Comparator* comparator_ = nullptr;
+  bool is_reverse_comparator_ = false;
   Random rnd{301};
 };
 
@@ -11578,6 +11933,7 @@ TEST(IndexFactoryCompatibilityTest, ConsumingReaderPreservesCachedContents) {
       // Each table reader must receive an independent Slice view, including
       // simultaneous opens using the same cached BlockContents.
       std::vector<std::thread> threads;
+      threads.reserve(4);
       for (int i = 0; i < 4; ++i) {
         threads.emplace_back(open_and_scan);
       }
@@ -11877,6 +12233,66 @@ TEST(IndexFactoryCompatibilityTest, AuxiliaryReaderMemoryIsFullyCharged) {
     table.Close();
     EXPECT_EQ(table.table_options.block_cache->GetUsage(), 0U);
   }
+}
+
+TEST_P(UserDefinedIndexTest, RawIndexMemoryIsChargedExactlyOnce) {
+  LRUCacheOptions cache_options;
+  cache_options.capacity = 1 << 20;
+  cache_options.metadata_charge_policy = kDontChargeCacheMetadata;
+  auto block_cache = cache_options.MakeSharedCache();
+  auto factory = std::make_shared<TestIndexFactory>();
+
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = block_cache;
+  table_options.cache_index_and_filter_blocks = false;
+  table_options.user_defined_index_factory = factory;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
+  table_options.flush_block_policy_factory =
+      std::make_shared<CustomFlushBlockPolicyFactory>();
+
+  Options options = options_;
+  options.compression = kNoCompression;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  std::unique_ptr<ImmutableOptions> immutable_options =
+      std::make_unique<ImmutableOptions>(options);
+  MutableCFOptions moptions(options);
+  InternalKeyComparator internal_comparator(options.comparator);
+
+  TableConstructor table(options.comparator,
+                         true /* convert_to_internal_key */);
+  for (const auto& [key, value] : generateKVs(/*key_count=*/30)) {
+    table.Add(key, value);
+  }
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  table.Finish(options, *immutable_options, moptions, table_options,
+               internal_comparator, &keys, &kvmap);
+  const size_t owned_memory = table.GetTableReader()->ApproximateMemoryUsage();
+  ASSERT_EQ(block_cache->GetUsage(), 0);
+
+  table.ResetTableReader();
+  table_options.cache_index_and_filter_blocks = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  immutable_options = std::make_unique<ImmutableOptions>(options);
+  MutableCFOptions cached_moptions(options);
+  const size_t cache_usage_before = block_cache->GetUsage();
+  ASSERT_OK(table.Reopen(*immutable_options, cached_moptions));
+  const size_t cached_memory = table.GetTableReader()->ApproximateMemoryUsage();
+  const size_t index_cache_charge =
+      block_cache->GetUsage() - cache_usage_before;
+
+  ASSERT_GT(index_cache_charge, 0);
+  // Block::ApproximateMemoryUsage() adds malloc_usable_size() of the Block
+  // object, so the owned and cached allocations can land in different
+  // allocator size classes and differ by a few bytes. Compare with a
+  // tolerance well under the block size: charging the block twice or not at
+  // all would shift the total by roughly index_cache_charge.
+  const size_t expected_total = cached_memory + index_cache_charge;
+  const size_t accounting_diff = owned_memory > expected_total
+                                     ? owned_memory - expected_total
+                                     : expected_total - owned_memory;
+  EXPECT_LT(accounting_diff, index_cache_charge / 4);
 }
 
 // Verifies that kStandardOnly truly ignores user_defined_index_factory:
@@ -14190,7 +14606,8 @@ struct UserDefinedIndexStressTestParam {
   using UserDefinedIndexStressTestTuple =
       std::tuple<const Comparator*, bool, bool, bool>;
 
-  UserDefinedIndexStressTestParam(const UserDefinedIndexStressTestTuple& tuple)
+  explicit UserDefinedIndexStressTestParam(
+      const UserDefinedIndexStressTestTuple& tuple)
       : comparator(std::get<0>(tuple)),
         enable_udi(std::get<1>(tuple)),
         enable_compaction_with_sst_partitioner(std::get<2>(tuple)),
@@ -14241,7 +14658,7 @@ class UserDefinedIndexStressTest
     std::cout << "Random seed: " << rand_seed_ << std::endl;
 
     rnd = Random(rand_seed_);
-    UserDefinedIndexStressTestParam param = GetParam();
+    UserDefinedIndexStressTestParam param(GetParam());
     comparator_ = param.comparator;
     enable_udi_ = param.enable_udi;
     enable_compaction_with_sst_partitioner_ =

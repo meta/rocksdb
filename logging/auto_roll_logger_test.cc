@@ -59,6 +59,7 @@ class AutoRollLoggerTest : public testing::Test {
         '\\');
     std::string deleteDbDirCmd =
         "if exist " + testDbDir + " rd /s /q " + testDbDir;
+    // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
     ASSERT_TRUE(system(deleteDbDirCmd.c_str()) == 0);
 
     std::string testDir(kTestDir);
@@ -69,6 +70,7 @@ class AutoRollLoggerTest : public testing::Test {
 #else
     std::string deleteCmd = "rm -rf " + kTestDir + " " + kTestDbDir;
 #endif
+    // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
     ASSERT_TRUE(system(deleteCmd.c_str()) == 0);
     ASSERT_OK(Env::Default()->CreateDir(kTestDir));
     ASSERT_OK(Env::Default()->CreateDir(kTestDbDir));
@@ -98,8 +100,9 @@ class AutoRollLoggerTest : public testing::Test {
 
   // Delete all log files under kTestDir
   void CleanupLogFiles() {
+    const std::string dir_prefix = kTestDir + "/";
     for (const std::string& f : GetLogFiles()) {
-      ASSERT_OK(default_env->DeleteFile(kTestDir + "/" + f));
+      ASSERT_OK(default_env->DeleteFile(dir_prefix + f));
     }
   }
 
@@ -251,7 +254,7 @@ TEST_F(AutoRollLoggerTest, SetInfoLogLevel) {
             auto_roll_logger->TEST_inner_logger()->GetInfoLogLevel());
 }
 
-TEST_F(AutoRollLoggerTest, OpenLogFilesMultipleTimesWithOptionLog_max_size) {
+TEST_F(AutoRollLoggerTest, OpenLogFilesMultipleTimesWithOptionLogMaxSize) {
   // If only 'log_max_size' options is specified, then every time
   // when rocksdb is restarted, a new empty log file will be created.
   InitTestDb();
@@ -582,9 +585,10 @@ static std::vector<std::string> GetOldFileNames(const std::string& path) {
 
   // We know that the old log files are named [path]<something>
   // Return all entities that match the pattern
+  const std::string dir_prefix = dirname + "/";
   for (auto& child : children) {
     if (fname != child && child.find(fname) == 0) {
-      ret.push_back(dirname + "/" + child);
+      ret.push_back(dir_prefix + child);
     }
   }
 
@@ -660,6 +664,7 @@ TEST_F(AutoRollLoggerTest, LogFileExistence) {
 #else
   std::string deleteCmd = "rm -rf " + kTestDir;
 #endif
+  // NOLINTNEXTLINE(concurrency-mt-unsafe,cert-env33-c)
   ASSERT_EQ(system(deleteCmd.c_str()), 0);
   options.max_log_file_size = 100 * 1024 * 1024;
   options.create_if_missing = true;

@@ -98,7 +98,8 @@ void WriteUnpreparedTxn::Initialize(const TransactionOptions& txn_options) {
   untracked_keys_.clear();
 }
 
-Status WriteUnpreparedTxn::HandleWrite(std::function<Status()> do_write) {
+Status WriteUnpreparedTxn::HandleWrite(
+    const std::function<Status()>& do_write) {
   Status s;
   if (active_iterators_.empty()) {
     s = MaybeFlushWriteBatchToDB();

@@ -82,7 +82,7 @@ class LRUCacheTest : public testing::Test {
 
   void Erase(const std::string& key) { cache_->Erase(key, 0 /*hash*/); }
 
-  void ValidateLRUList(std::vector<std::string> keys,
+  void ValidateLRUList(const std::vector<std::string>& keys,
                        size_t num_high_pri_pool_keys = 0,
                        size_t num_low_pri_pool_keys = 0,
                        size_t num_bottom_pri_pool_keys = 0) {
@@ -1227,7 +1227,7 @@ class DBSecondaryCacheTest : public DBTestBase, public WithCacheTypeParam {
  public:
   DBSecondaryCacheTest()
       : DBTestBase("db_secondary_cache_test", /*env_do_fsync=*/true) {
-    fault_fs_.reset(new FaultInjectionTestFS(env_->GetFileSystem()));
+    fault_fs_ = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
     fault_env_.reset(new CompositeEnvWrapper(env_, fault_fs_));
   }
 
@@ -2083,6 +2083,7 @@ TEST_P(DBSecondaryCacheTest, TestSecondaryCacheMultiGet) {
   std::vector<PinnableSlice> values(mget_keys.size());
   std::vector<Status> s(keys.size());
   std::vector<Slice> key_slices;
+  key_slices.reserve(mget_keys.size());
   for (const std::string& key : mget_keys) {
     key_slices.emplace_back(key);
   }

@@ -1100,7 +1100,8 @@ class ExternalTableFactoryAdapter : public TableFactory {
   explicit ExternalTableFactoryAdapter(
       std::shared_ptr<ExternalTableFactoryBase<Mode>> inner)
       : inner_(std::move(inner)),
-        supports_range_deletions_(inner_->IsDeleteRangeSupported()) {
+        supports_range_deletions_(inner_->IsDeleteRangeSupported()),
+        supports_table_builder_(inner_->IsTableBuilderSupported()) {
     RegisterOptions(&options_,
                     &GetExternalTableFactoryAdapterOptionsTypeInfo());
   }
@@ -1111,6 +1112,10 @@ class ExternalTableFactoryAdapter : public TableFactory {
     // This TableFactory capability gates live DB writes. Basic mode only
     // supports sequence-zero range deletions from external files.
     return Mode == ExternalTableMode::kFull && supports_range_deletions_;
+  }
+
+  bool IsTableBuilderSupported() const override {
+    return supports_table_builder_;
   }
 
   bool IsInstanceOf(const std::string& name) const override {
@@ -1124,6 +1129,7 @@ class ExternalTableFactoryAdapter : public TableFactory {
     }
     if (status.ok()) {
       supports_range_deletions_ = inner_->IsDeleteRangeSupported();
+      supports_table_builder_ = inner_->IsTableBuilderSupported();
     }
     return status;
   }
@@ -1210,7 +1216,22 @@ class ExternalTableFactoryAdapter : public TableFactory {
     return nullptr;
   }
 
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override {
+    return inner_->FileIsValidTable(io_options, file, file_size, matches);
+  }
+
   std::unique_ptr<TableFactory> Clone() const override { return nullptr; }
+
+  // Lets the wrapped factory reject column families it cannot serve.
+  Status ValidateOptions(const DBOptions& db_opts,
+                         const ColumnFamilyOptions& cf_opts) const override {
+    Status status = TableFactory::ValidateOptions(db_opts, cf_opts);
+    if (status.ok()) {
+      status = inner_->ValidateOptions(db_opts, cf_opts);
+    }
+    return status;
+  }
 
   const Customizable* Inner() const override { return inner_.get(); }
 
@@ -1219,9 +1240,10 @@ class ExternalTableFactoryAdapter : public TableFactory {
  private:
   std::shared_ptr<ExternalTableFactoryBase<Mode>> inner_;
   ExternalTableFactoryAdapterOptions options_;
-  // Avoid invoking external code when RocksDB queries this capability while
+  // Avoid invoking external code when RocksDB queries these capabilities while
   // holding the DB mutex.
   bool supports_range_deletions_;
+  bool supports_table_builder_;
 };
 
 template <ExternalTableMode Mode>

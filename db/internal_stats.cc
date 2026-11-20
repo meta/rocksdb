@@ -311,6 +311,8 @@ static const std::string aggregated_table_properties_at_level =
 static const std::string num_running_compactions = "num-running-compactions";
 static const std::string num_running_remote_compactions =
     "num-running-remote-compactions";
+static const std::string num_remote_compaction_pool_threads =
+    "num-remote-compaction-pool-threads";
 static const std::string num_running_bottom_compactions =
     "num-running-bottom-compactions";
 static const std::string num_running_compaction_sorted_runs =
@@ -322,6 +324,8 @@ static const std::string num_running_flushes = "num-running-flushes";
 static const std::string actual_delayed_write_rate =
     "actual-delayed-write-rate";
 static const std::string is_write_stopped = "is-write-stopped";
+static const std::string secondary_has_missing_files =
+    "secondary-has-missing-files";
 static const std::string estimate_oldest_key_time = "estimate-oldest-key-time";
 static const std::string block_cache_capacity = "block-cache-capacity";
 static const std::string block_cache_usage = "block-cache-usage";
@@ -370,6 +374,8 @@ const std::string DB::Properties::kNumRunningCompactions =
     rocksdb_prefix + num_running_compactions;
 const std::string DB::Properties::kNumRunningRemoteCompactions =
     rocksdb_prefix + num_running_remote_compactions;
+const std::string DB::Properties::kNumRemoteCompactionPoolThreads =
+    rocksdb_prefix + num_remote_compaction_pool_threads;
 const std::string DB::Properties::kNumRunningBottomCompactions =
     rocksdb_prefix + num_running_bottom_compactions;
 const std::string DB::Properties::kNumRunningCompactionSortedRuns =
@@ -435,6 +441,8 @@ const std::string DB::Properties::kActualDelayedWriteRate =
     rocksdb_prefix + actual_delayed_write_rate;
 const std::string DB::Properties::kIsWriteStopped =
     rocksdb_prefix + is_write_stopped;
+const std::string DB::Properties::kSecondaryHasMissingFiles =
+    rocksdb_prefix + secondary_has_missing_files;
 const std::string DB::Properties::kEstimateOldestKeyTime =
     rocksdb_prefix + estimate_oldest_key_time;
 const std::string DB::Properties::kBlockCacheCapacity =
@@ -610,6 +618,9 @@ const UnorderedMap<std::string, DBPropertyInfo>
         {DB::Properties::kNumRunningRemoteCompactions,
          {false, nullptr, &InternalStats::HandleNumRunningRemoteCompactions,
           nullptr, nullptr}},
+        {DB::Properties::kNumRemoteCompactionPoolThreads,
+         {false, nullptr, &InternalStats::HandleNumRemoteCompactionPoolThreads,
+          nullptr, nullptr}},
         {DB::Properties::kNumRunningBottomCompactions,
          {false, nullptr, &InternalStats::HandleNumRunningBottomCompactions,
           nullptr, nullptr}},
@@ -628,6 +639,9 @@ const UnorderedMap<std::string, DBPropertyInfo>
         {DB::Properties::kIsWriteStopped,
          {false, nullptr, &InternalStats::HandleIsWriteStopped, nullptr,
           nullptr}},
+        {DB::Properties::kSecondaryHasMissingFiles,
+         {false, nullptr, &InternalStats::HandleSecondaryHasMissingFiles,
+          nullptr, nullptr}},
         {DB::Properties::kEstimateOldestKeyTime,
          {false, nullptr, &InternalStats::HandleEstimateOldestKeyTime, nullptr,
           nullptr}},
@@ -1318,6 +1332,14 @@ bool InternalStats::HandleNumRunningRemoteCompactions(uint64_t* value,
   return true;
 }
 
+bool InternalStats::HandleNumRemoteCompactionPoolThreads(uint64_t* value,
+                                                         DBImpl* /*db*/,
+                                                         Version* /*version*/) {
+  auto pool = RemoteCompactionThreadPool::GetShared(false);
+  *value = pool ? static_cast<uint64_t>(pool->GetBackgroundThreads()) : 0;
+  return true;
+}
+
 bool InternalStats::HandleNumRunningBottomCompactions(uint64_t* value,
                                                       DBImpl* db,
                                                       Version* /*version*/) {
@@ -1550,6 +1572,12 @@ bool InternalStats::HandleIsWriteStopped(uint64_t* value, DBImpl* db,
   return true;
 }
 
+bool InternalStats::HandleSecondaryHasMissingFiles(uint64_t* value, DBImpl* db,
+                                                   Version* /*version*/) {
+  *value = db->SecondaryHasMissingFiles() ? 1 : 0;
+  return true;
+}
+
 bool InternalStats::HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* /*db*/,
                                                 Version* /*version*/) {
   // TODO(yiwu): The property is currently available for fifo compaction
@@ -1563,7 +1591,9 @@ bool InternalStats::HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* /*db*/,
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   TablePropertiesCollection collection;
-  auto s = cfd_->current()->GetPropertiesOfAllTables(read_options, &collection);
+  // The DB mutex is held.
+  auto s = cfd_->current()->GetPropertiesOfAllTables(
+      read_options, &collection, /*allow_table_open=*/false);
   if (!s.ok()) {
     return false;
   }

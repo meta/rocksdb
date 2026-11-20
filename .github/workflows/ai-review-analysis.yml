@@ -1,18 +1,8 @@
 # Shared analysis workflow for AI PR reviews.
 #
-# This workflow is invoked by provider-specific wrappers (Claude/Codex) so the
-# event triggers and workflow names stay user-friendly while the implementation
-# lives in one place.
-#
-# Security note for Codex:
-#   Codex runs in non-interactive CI, so the Codex CLI steps below pass
-#   `--dangerously-bypass-approvals-and-sandbox`. That disables Codex's
-#   approval prompts and sandbox protections, so treat those steps as
-#   arbitrary command execution on the runner. This file therefore keeps Codex
-#   in the read-only analysis workflow, restricts the pull_request_target path
-#   to same-repo PRs, and leaves write-scoped PR commenting in a separate
-#   workflow. Re-evaluate that trust boundary before expanding Codex auto
-#   review to broader trigger sources.
+# This workflow is invoked by provider-specific wrappers (such as
+# claude-review.yml) so the event triggers and workflow names stay
+# user-friendly while the implementation lives in one place.
 
 name: AI Review Analysis
 
@@ -20,7 +10,7 @@ on:
   workflow_call:
     inputs:
       provider:
-        description: Provider key, for example "claude" or "codex"
+        description: Provider key, for example "claude"
         required: true
         type: string
       display_name:
@@ -119,7 +109,7 @@ jobs:
             const FAIL_CONCLUSIONS = new Set([
               'failure', 'cancelled', 'timed_out', 'action_required'
             ]);
-            const AI_CHECK_TOKENS = ['claude', 'codex'];
+            const AI_CHECK_TOKENS = ['claude'];
             const MIN_CHECKS = 10;
             const THRESHOLD = 0.5;
             const POLL_INTERVAL_MS = 90 * 1000;
@@ -419,24 +409,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Setup Node.js
-        if: >-
-          steps.pr_info.outputs.skip != 'true' &&
-          steps.check_existing.outputs.skip != 'true' &&
-          inputs.provider == 'codex'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install Codex CLI
-        if: >-
-          steps.pr_info.outputs.skip != 'true' &&
-          steps.check_existing.outputs.skip != 'true' &&
-          inputs.provider == 'codex'
-        run: |
-          npm install -g @openai/codex
-          codex --version
-
       - name: Generate diff and prompt
         if: steps.pr_info.outputs.skip != 'true' && steps.check_existing.outputs.skip != 'true'
         env:
@@ -541,72 +513,6 @@ jobs:
             core.setOutput('label', label);
             core.setOutput('tokens', budget);
 
-      - name: Classify PR complexity (Codex)
-        if: >-
-          steps.pr_info.outputs.skip != 'true' &&
-          steps.check_existing.outputs.skip != 'true' &&
-          inputs.provider == 'codex'
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CODEX_HOME: /tmp/codex-home
-          CODEX_MODEL: ${{ inputs.default_model }}
-        run: |
-          if [ -z "${OPENAI_API_KEY}" ]; then
-            echo "OPENAI_API_KEY not configured, skipping Codex review"
-            printf 'complex\n' > codex-complexity-output.txt
-            exit 0
-          fi
-          mkdir -p "${CODEX_HOME}"
-          set +e
-          codex exec \
-            -m "${CODEX_MODEL}" \
-            -c model_reasoning_effort="medium" \
-            --dangerously-bypass-approvals-and-sandbox \
-            --output-last-message codex-complexity-output.txt \
-            - < /tmp/complexity_prompt.txt > codex-complexity.log 2>&1
-          exit_code=$?
-          set -e
-          if [ "${exit_code}" -ne 0 ]; then
-            echo "Codex complexity classification failed with exit code ${exit_code}"
-            echo "Defaulting to complex review budget"
-            if [ -s codex-complexity.log ]; then
-              echo "Last 100 lines of codex-complexity.log:"
-              tail -100 codex-complexity.log
-            fi
-            printf 'complex\n' > codex-complexity-output.txt
-          fi
-
-      - name: Pick thinking budget (Codex)
-        if: >-
-          steps.pr_info.outputs.skip != 'true' &&
-          steps.check_existing.outputs.skip != 'true' &&
-          inputs.provider == 'codex'
-        id: budget_codex
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let label = 'complex';
-            try {
-              const text = fs.readFileSync(
-                'codex-complexity-output.txt',
-                'utf8'
-              ).trim().toLowerCase();
-              if (/\bsimple\b/.test(text) && !/\bcomplex\b/.test(text)) {
-                label = 'simple';
-              }
-            } catch (error) {
-              core.warning(
-                `Could not parse classifier output: ${error.message}`);
-            }
-            const effort = label === 'simple' ? 'high' : 'xhigh';
-            core.info(
-              `Complexity classified as: ${label} ` +
-              `-> model_reasoning_effort=${effort}`
-            );
-            core.setOutput('label', label);
-            core.setOutput('effort', effort);
-
       - name: Run Claude
         if: >-
           steps.pr_info.outputs.skip != 'true' &&
@@ -703,99 +609,6 @@ jobs:
             });
             fs.writeFileSync(process.env.COMMENT_FILE, body);
 
-      - name: Run Codex
-        if: >-
-          steps.pr_info.outputs.skip != 'true' &&
-          steps.check_existing.outputs.skip != 'true' &&
-          inputs.provider == 'codex'
-        id: codex
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CODEX_HOME: /tmp/codex-home
-          CODEX_MODEL: ${{ inputs.default_model }}
-          CODEX_REASONING_EFFORT: ${{ steps.budget_codex.outputs.effort }}
-        run: |
-          if [ -z "${OPENAI_API_KEY}" ]; then
-            echo "OPENAI_API_KEY not configured, skipping Codex review"
-            exit 0
-          fi
-          mkdir -p "${CODEX_HOME}"
-          set +e
-          codex exec \
-            -m "${CODEX_MODEL}" \
-            -c model_reasoning_effort="${CODEX_REASONING_EFFORT}" \
-            --dangerously-bypass-approvals-and-sandbox \
-            --output-last-message codex-review-output.md \
-            - < /tmp/prompt.txt > codex-review-execution.log 2>&1
-          exit_code=$?
-          set -e
-          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
-          echo "${exit_code}" > codex-review-exit-code.txt
-
-      - name: Recover partial review (Codex)
-        if: >-
-          steps.pr_info.outputs.skip != 'true' &&
-          steps.check_existing.outputs.skip != 'true' &&
-          inputs.provider == 'codex' &&
-          steps.codex.outputs.exit_code != '0' &&
-          hashFiles('review-findings.md') != ''
-        id: recover_codex
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CODEX_HOME: /tmp/codex-home
-          CODEX_MODEL: ${{ inputs.default_model }}
-          CODEX_REASONING_EFFORT: ${{ steps.budget_codex.outputs.effort }}
-        run: |
-          set +e
-          codex exec \
-            -m "${CODEX_MODEL}" \
-            -c model_reasoning_effort="${CODEX_REASONING_EFFORT}" \
-            --dangerously-bypass-approvals-and-sandbox \
-            --output-last-message codex-review-recovery.md \
-            - < claude_md/ci_recovery_prompt.md > codex-review-recovery.log 2>&1
-          exit_code=$?
-          set -e
-          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
-
-      - name: Build review comment (Codex)
-        if: >-
-          steps.pr_info.outputs.skip != 'true' &&
-          steps.check_existing.outputs.skip != 'true' &&
-          inputs.provider == 'codex'
-        env:
-          RESPONSE_FILE: codex-review-output.md
-          RECOVERY_FILE: codex-review-recovery.md
-          FINDINGS_FILE: review-findings.md
-          LOG_FILE: codex-review-execution.log
-          EXIT_CODE: ${{ steps.codex.outputs.exit_code }}
-          HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
-          AUTO_MODE: ${{ steps.pr_info.outputs.auto_mode }}
-          USED_RECOVERY: ${{ steps.recover_codex.outputs.exit_code == '0' && 'true' || 'false' }}
-          COMMENT_FILE: ${{ inputs.comment_file }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const parse = require('./.github/scripts/parse-codex-review.js');
-            const body = parse({
-              responseFile: process.env.RESPONSE_FILE,
-              recoveryFile: process.env.RECOVERY_FILE,
-              findingsFile: process.env.FINDINGS_FILE,
-              logFile: process.env.LOG_FILE,
-              exitCode: process.env.EXIT_CODE,
-              meta: {
-                trigger: 'auto',
-                autoMode: process.env.AUTO_MODE,
-                headSha: process.env.HEAD_SHA,
-                reviewer: '',
-                isQuery: false,
-                isPartial: process.env.USED_RECOVERY === 'true' ||
-                  (!fs.existsSync(process.env.RESPONSE_FILE) &&
-                   fs.existsSync(process.env.FINDINGS_FILE)),
-              }
-            });
-            fs.writeFileSync(process.env.COMMENT_FILE, body);
-
       - name: Save PR number
         if: steps.pr_info.outputs.skip != 'true' && steps.check_existing.outputs.skip != 'true'
         run: |
@@ -843,27 +656,6 @@ jobs:
         with:
           name: claude-review-recovery-log
           path: ${{ steps.format_recovery_claude.outputs.execution_file }}
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Upload review logs (Codex)
-        if: >-
-          always() &&
-          steps.pr_info.outputs.skip != 'true' &&
-          steps.check_existing.outputs.skip != 'true' &&
-          inputs.provider == 'codex'
-        uses: actions/upload-artifact@v4
-        with:
-          name: codex-review-logs
-          path: |
-            codex-review-execution.log
-            codex-complexity.log
-            codex-complexity-output.txt
-            codex-review-recovery.log
-            codex-review-output.md
-            codex-review-recovery.md
-            review-findings.md
-            codex-review-exit-code.txt
           retention-days: 7
           if-no-files-found: ignore
 
@@ -989,18 +781,6 @@ jobs:
           ref: ${{ steps.pr_info.outputs.base_ref }}
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Setup Node.js
-        if: steps.request.outputs.skip != 'true' && inputs.provider == 'codex'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install Codex CLI
-        if: steps.request.outputs.skip != 'true' && inputs.provider == 'codex'
-        run: |
-          npm install -g @openai/codex
-          codex --version
 
       - name: Generate diff and prompt
         if: steps.request.outputs.skip != 'true'
@@ -1153,89 +933,6 @@ jobs:
             core.setOutput('label', label);
             core.setOutput('tokens', budget);
 
-      - name: Classify PR complexity (Codex)
-        if: >-
-          steps.request.outputs.skip != 'true' &&
-          steps.request.outputs.type == 'review' &&
-          inputs.provider == 'codex'
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CODEX_HOME: /tmp/codex-home
-          CODEX_MODEL: ${{ inputs.selected_model != '' && inputs.selected_model || inputs.default_model }}
-        run: |
-          if [ -z "${OPENAI_API_KEY}" ]; then
-            echo "OPENAI_API_KEY not configured, skipping Codex review"
-            printf 'complex\n' > codex-complexity-output.txt
-            exit 0
-          fi
-          mkdir -p "${CODEX_HOME}"
-          set +e
-          codex exec \
-            -m "${CODEX_MODEL}" \
-            -c model_reasoning_effort="medium" \
-            --dangerously-bypass-approvals-and-sandbox \
-            --output-last-message codex-complexity-output.txt \
-            - < /tmp/complexity_prompt.txt > codex-complexity.log 2>&1
-          exit_code=$?
-          set -e
-          if [ "${exit_code}" -ne 0 ]; then
-            echo "Codex complexity classification failed with exit code ${exit_code}"
-            echo "Defaulting to complex review budget"
-            if [ -s codex-complexity.log ]; then
-              echo "Last 100 lines of codex-complexity.log:"
-              tail -100 codex-complexity.log
-            fi
-            printf 'complex\n' > codex-complexity-output.txt
-          fi
-
-      - name: Pick thinking budget (Codex)
-        if: steps.request.outputs.skip != 'true' && inputs.provider == 'codex'
-        id: manual_budget_codex
-        env:
-          OVERRIDE: ${{ inputs.thinking_budget }}
-          COMMAND_TYPE: ${{ steps.request.outputs.type }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            if (process.env.COMMAND_TYPE !== 'review') {
-              core.setOutput('label', 'query');
-              core.setOutput('effort', 'medium');
-              return;
-            }
-            const override = (process.env.OVERRIDE || '').trim();
-            if (override && /^\d+$/.test(override)) {
-              const budget = parseInt(override, 10);
-              const effort = budget >= 32000 ? 'xhigh' : 'high';
-              core.info(
-                `Using thinking_budget override: ${override} ` +
-                `-> model_reasoning_effort=${effort}`
-              );
-              core.setOutput('label', 'override');
-              core.setOutput('effort', effort);
-              return;
-            }
-            let label = 'complex';
-            try {
-              const text = fs.readFileSync(
-                'codex-complexity-output.txt',
-                'utf8'
-              ).trim().toLowerCase();
-              if (/\bsimple\b/.test(text) && !/\bcomplex\b/.test(text)) {
-                label = 'simple';
-              }
-            } catch (error) {
-              core.warning(
-                `Could not parse classifier output: ${error.message}`);
-            }
-            const effort = label === 'simple' ? 'high' : 'xhigh';
-            core.info(
-              `Complexity classified as: ${label} ` +
-              `-> model_reasoning_effort=${effort}`
-            );
-            core.setOutput('label', label);
-            core.setOutput('effort', effort);
-
       - name: Run Claude
         if: steps.request.outputs.skip != 'true' && inputs.provider == 'claude'
         id: manual_claude
@@ -1328,99 +1025,6 @@ jobs:
             });
             fs.writeFileSync(process.env.COMMENT_FILE, body);
 
-      - name: Run Codex
-        if: steps.request.outputs.skip != 'true' && inputs.provider == 'codex'
-        id: manual_codex
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CODEX_HOME: /tmp/codex-home
-          CODEX_MODEL: ${{ inputs.selected_model != '' && inputs.selected_model || inputs.default_model }}
-          CODEX_REASONING_EFFORT: ${{ steps.manual_budget_codex.outputs.effort }}
-          COMMAND_TYPE: ${{ steps.request.outputs.type }}
-        run: |
-          mkdir -p "${CODEX_HOME}"
-          set +e
-          if [ "${COMMAND_TYPE}" = "query" ]; then
-            codex exec \
-              -m "${CODEX_MODEL}" \
-              -c model_reasoning_effort="${CODEX_REASONING_EFFORT}" \
-              --dangerously-bypass-approvals-and-sandbox \
-              --output-last-message codex-review-output.md \
-              - < /tmp/prompt.txt > codex-review-execution.log 2>&1
-          else
-            codex exec \
-              -m "${CODEX_MODEL}" \
-              -c model_reasoning_effort="${CODEX_REASONING_EFFORT}" \
-              --dangerously-bypass-approvals-and-sandbox \
-              --output-last-message codex-review-output.md \
-              - < /tmp/prompt.txt > codex-review-execution.log 2>&1
-          fi
-          exit_code=$?
-          set -e
-          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
-          echo "${exit_code}" > codex-review-exit-code.txt
-
-      - name: Recover partial review (Codex)
-        if: >-
-          steps.request.outputs.skip != 'true' &&
-          inputs.provider == 'codex' &&
-          steps.request.outputs.type == 'review' &&
-          steps.manual_codex.outputs.exit_code != '0' &&
-          hashFiles('review-findings.md') != ''
-        id: manual_recover_codex
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CODEX_HOME: /tmp/codex-home
-          CODEX_MODEL: ${{ inputs.selected_model != '' && inputs.selected_model || inputs.default_model }}
-          CODEX_REASONING_EFFORT: ${{ steps.manual_budget_codex.outputs.effort }}
-        run: |
-          set +e
-          codex exec \
-            -m "${CODEX_MODEL}" \
-            -c model_reasoning_effort="${CODEX_REASONING_EFFORT}" \
-            --dangerously-bypass-approvals-and-sandbox \
-            --output-last-message codex-review-recovery.md \
-            - < claude_md/ci_recovery_prompt.md > codex-review-recovery.log 2>&1
-          exit_code=$?
-          set -e
-          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
-
-      - name: Build review comment (Codex)
-        if: steps.request.outputs.skip != 'true' && inputs.provider == 'codex'
-        env:
-          RESPONSE_FILE: codex-review-output.md
-          RECOVERY_FILE: codex-review-recovery.md
-          FINDINGS_FILE: review-findings.md
-          LOG_FILE: codex-review-execution.log
-          EXIT_CODE: ${{ steps.manual_codex.outputs.exit_code }}
-          HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
-          REVIEWER: ${{ steps.request.outputs.reviewer }}
-          COMMAND_TYPE: ${{ steps.request.outputs.type }}
-          USED_RECOVERY: ${{ steps.manual_recover_codex.outputs.exit_code == '0' && 'true' || 'false' }}
-          COMMENT_FILE: ${{ inputs.comment_file }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const parse = require('./.github/scripts/parse-codex-review.js');
-            const body = parse({
-              responseFile: process.env.RESPONSE_FILE,
-              recoveryFile: process.env.RECOVERY_FILE,
-              findingsFile: process.env.FINDINGS_FILE,
-              logFile: process.env.LOG_FILE,
-              exitCode: process.env.EXIT_CODE,
-              meta: {
-                trigger: 'manual',
-                headSha: process.env.HEAD_SHA,
-                reviewer: process.env.REVIEWER,
-                isQuery: process.env.COMMAND_TYPE !== 'review',
-                isPartial: process.env.USED_RECOVERY === 'true' ||
-                  (!fs.existsSync(process.env.RESPONSE_FILE) &&
-                   fs.existsSync(process.env.FINDINGS_FILE)),
-              }
-            });
-            fs.writeFileSync(process.env.COMMENT_FILE, body);
-
       - name: Save PR number
         if: steps.request.outputs.skip != 'true'
         run: |
@@ -1472,22 +1076,5 @@ jobs:
         with:
           name: claude-review-recovery-log
           path: ${{ steps.manual_format_recovery_claude.outputs.execution_file }}
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Upload review logs (Codex)
-        if: always() && steps.request.outputs.skip != 'true' && inputs.provider == 'codex'
-        uses: actions/upload-artifact@v4
-        with:
-          name: codex-review-logs
-          path: |
-            codex-review-execution.log
-            codex-complexity.log
-            codex-complexity-output.txt
-            codex-review-recovery.log
-            codex-review-output.md
-            codex-review-recovery.md
-            review-findings.md
-            codex-review-exit-code.txt
           retention-days: 7
           if-no-files-found: ignore

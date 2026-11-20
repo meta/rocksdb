@@ -258,6 +258,13 @@ class FragmentBufferedReader : public Reader {
                   uint64_t* record_checksum = nullptr) override;
   void UnmarkEOF() override;
 
+  // Makes a new reader read on from `offset`, as if it had read the file up to
+  // `offset` and found EOF there. `offset` must be the end of a record in the
+  // file, and the caller must have skipped file() to `offset`. Call it before
+  // the first ReadRecord(). The first read completes the block that holds
+  // `offset`, as UnmarkEOF() does after an EOF in the middle of a block.
+  void StartAtRecordEnd(uint64_t offset);
+
  private:
   std::string fragments_;
   bool in_fragmented_record_;

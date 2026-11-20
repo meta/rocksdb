@@ -9,6 +9,7 @@
 #include <array>
 #include <map>
 #include <string>
+#include <utility>
 
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
@@ -28,13 +29,13 @@
 namespace ROCKSDB_NAMESPACE {
 namespace {
 std::string ValueWithWriteTime(std::string val, uint64_t write_time = 0) {
-  std::string result = val;
+  std::string result = std::move(val);
   PutFixed64(&result, write_time);
   return result;
 }
 std::string ValueWithPreferredSeqno(std::string val,
                                     SequenceNumber preferred_seqno = 0) {
-  std::string result = val;
+  std::string result = std::move(val);
   PutFixed64(&result, preferred_seqno);
   return result;
 }
@@ -60,7 +61,7 @@ class FlushJobTestBase : public testing::Test {
 
  public:
   ~FlushJobTestBase() override {
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "db is still in %s\n", dbname_.c_str());
     } else {
       // destroy versions_ to release all file handles
@@ -141,6 +142,7 @@ class FlushJobTestBase : public testing::Test {
 
     std::vector<ColumnFamilyDescriptor> column_families;
     cf_options_.table_factory = mock_table_factory_;
+    column_families.reserve(column_family_names_.size());
     for (const auto& cf_name : column_family_names_) {
       column_families.emplace_back(cf_name, cf_options_);
     }
@@ -185,6 +187,103 @@ class FlushJobTest : public FlushJobTestBase {
                          BytewiseComparator()) {}
 };
 
+class FlushJobMergeFilterGuardTest : public FlushJobTest {
+ public:
+  class Filter : public CompactionFilter {
+   public:
+    Filter(InstrumentedMutex* mutex, std::atomic<int>* destructions)
+        : mutex_(mutex), destructions_(destructions) {}
+    ~Filter() override {
+      const bool unlocked = mutex_->TryLock();
+      EXPECT_TRUE(unlocked);
+      if (unlocked) {
+        mutex_->Unlock();
+      }
+      destructions_->fetch_add(1);
+    }
+    const char* Name() const override { return "FlushJobMergeFilterGuard"; }
+    MergeOrder GetMergeOrder() const override {
+      const bool unlocked = mutex_->TryLock();
+      EXPECT_TRUE(unlocked);
+      if (unlocked) {
+        mutex_->Unlock();
+      }
+      return MergeOrder::kMergeBeforeFilter;
+    }
+
+   private:
+    InstrumentedMutex* const mutex_;
+    std::atomic<int>* const destructions_;
+  };
+
+  class Factory : public CompactionFilterFactory {
+   public:
+    Factory(InstrumentedMutex* mutex, std::atomic<int>* destructions)
+        : mutex_(mutex), destructions_(destructions) {}
+    const char* Name() const override {
+      return "FlushJobMergeFilterGuardFactory";
+    }
+    bool ShouldFilterTableFileCreation(
+        TableFileCreationReason reason) const override {
+      return reason == TableFileCreationReason::kFlush;
+    }
+    std::unique_ptr<CompactionFilter> CreateCompactionFilter(
+        const CompactionFilter::Context& /*context*/) override {
+      creations.fetch_add(1);
+      return std::make_unique<Filter>(mutex_, destructions_);
+    }
+    std::atomic<int> creations{0};
+
+   private:
+    InstrumentedMutex* const mutex_;
+    std::atomic<int>* const destructions_;
+  };
+
+  void SetUp() override {
+    factory_ = std::make_shared<Factory>(&mutex_, &destructions_);
+    cf_options_.compaction_filter_factory = factory_;
+    cf_options_.experimental_mempurge_threshold = 2.0;
+    FlushJobTest::SetUp();
+  }
+
+  std::shared_ptr<Factory> factory_;
+  std::atomic<int> destructions_{0};
+};
+
+TEST_F(FlushJobMergeFilterGuardTest, MergeBeforeFilterMemPurgeReacquiresMutex) {
+  JobContext context(0);
+  ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  MemTable* mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
+                                            kMaxSequenceNumber);
+  mem->Ref();
+  ASSERT_OK(mem->Add(1, kTypeValue, "a", "value", nullptr));
+  mem->ConstructFragmentedRangeTombstones();
+  autovector<ReadOnlyMemTable*> to_delete;
+  cfd->imm()->Add(mem, &to_delete);
+  for (ReadOnlyMemTable* old : to_delete) {
+    delete old;
+  }
+  EventLogger logger(db_options_.info_log.get());
+  context.InitSnapshotContext(nullptr, nullptr, kMaxSequenceNumber, {});
+  FlushJob job(dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
+               kMaxSequenceNumber, env_options_, versions_.get(), &mutex_,
+               &shutting_down_, &context, FlushReason::kWriteBufferFull,
+               nullptr, nullptr, nullptr, kNoCompression,
+               db_options_.statistics.get(), &logger, true, true, true,
+               Env::Priority::USER, nullptr, empty_seqno_to_time_mapping_);
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    job.PickMemTable();
+    ASSERT_TRUE(job.Run().IsInvalidArgument());
+    mutex_.AssertHeld();
+  }
+  // MemPurge rejects first, then the existing SST fallback also rejects.
+  ASSERT_EQ(2, factory_->creations.load());
+  ASSERT_EQ(2, destructions_.load());
+  ASSERT_EQ(0, cfd->current()->storage_info()->NumLevelFiles(0));
+  context.Clean();
+}
+
 TEST_F(FlushJobTest, Empty) {
   JobContext job_context(0);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
@@ -226,7 +325,7 @@ TEST_F(FlushJobTest, NonEmpty) {
                            nullptr /* kv_prot_info */));
     if ((i + 1000) % 10000 < 9995) {
       InternalKey internal_key(key, SequenceNumber(i), kTypeValue);
-      inserted_keys.push_back({internal_key.Encode().ToString(), value});
+      inserted_keys.emplace_back(internal_key.Encode().ToString(), value);
     }
   }
 
@@ -237,7 +336,7 @@ TEST_F(FlushJobTest, NonEmpty) {
                            true /* allow_concurrent */, &post_process_info));
     new_mem->BatchPostProcess(post_process_info);
     InternalKey internal_key("9995", SequenceNumber(10000), kTypeRangeDeletion);
-    inserted_keys.push_back({internal_key.Encode().ToString(), "9999a"});
+    inserted_keys.emplace_back(internal_key.Encode().ToString(), "9999a");
   }
 
   // Note: the first two blob references will not be considered when resolving
@@ -266,7 +365,7 @@ TEST_F(FlushJobTest, NonEmpty) {
                            nullptr /* kv_prot_info */));
 
     InternalKey internal_key(key, seq, kTypeBlobIndex);
-    inserted_keys.push_back({internal_key.Encode().ToString(), blob_index});
+    inserted_keys.emplace_back(internal_key.Encode().ToString(), blob_index);
   }
   mock::SortKVVector(&inserted_keys);
 
@@ -523,7 +622,7 @@ TEST_F(FlushJobTest, Snapshots) {
                      (snapshots_set.find(seqno) != snapshots_set.end());
       if (visible) {
         InternalKey internal_key(key, seqno, kTypeValue);
-        inserted_keys.push_back({internal_key.Encode().ToString(), value});
+        inserted_keys.emplace_back(internal_key.Encode().ToString(), value);
       }
     }
   }
@@ -651,11 +750,11 @@ TEST_F(FlushJobTest, ReplaceTimedPutWriteTimeWithPreferredSeqno) {
   auto inserted_entries = mock::MakeMockFile();
   InternalKey smallest_internal_key("bar", SequenceNumber(15),
                                     kTypeValuePreferredSeqno);
-  inserted_entries.push_back({smallest_internal_key.Encode().ToString(),
-                              ValueWithPreferredSeqno("bval", 10)});
+  inserted_entries.emplace_back(smallest_internal_key.Encode().ToString(),
+                                ValueWithPreferredSeqno("bval", 10));
   InternalKey largest_internal_key("foo", SequenceNumber(18), kTypeValue);
-  inserted_entries.push_back(
-      {largest_internal_key.Encode().ToString(), "fval"});
+  inserted_entries.emplace_back(largest_internal_key.Encode().ToString(),
+                                "fval");
   autovector<ReadOnlyMemTable*> to_delete;
   new_mem->ConstructFragmentedRangeTombstones();
   cfd->imm()->Add(new_mem, &to_delete);

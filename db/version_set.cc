@@ -43,6 +43,7 @@
 #include "db/version_builder.h"
 #include "db/version_edit.h"
 #include "db/version_edit_handler.h"
+#include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -57,6 +58,7 @@
 #include "options/options_helper.h"
 #include "options/options_parser.h"
 #include "rocksdb/env.h"
+#include "rocksdb/experimental.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/compaction_merging_iterator.h"
@@ -271,7 +273,8 @@ void AddTableIteratorForLevel(
       TableReaderCaller::kUserIterator, arena, skip_filters, level,
       max_file_size_for_l0_meta_pin,
       /*smallest_compaction_key=*/nullptr,
-      /*largest_compaction_key=*/nullptr, allow_unprepared_value, &read_seq,
+      /*largest_compaction_key=*/nullptr, allow_unprepared_value,
+      /*seek_target=*/nullptr, /*prefix_filtered_table=*/nullptr, &read_seq,
       &tombstone_iter,
       /*maybe_pin_table_handle=*/true);
 #ifndef NDEBUG
@@ -317,6 +320,16 @@ Status OverlapWithIterator(const Comparator* ucmp,
   }
 
   return iter->status();
+}
+
+// The status for a blob index whose blob file is not in `vstorage`.
+Status UnknownBlobFileStatus(const VersionStorageInfo& vstorage,
+                             uint64_t blob_file_number) {
+  if (vstorage.IsDroppedBlobFile(blob_file_number)) {
+    return Status::Corruption("Blob file dropped by best-efforts BlobDB repair",
+                              std::to_string(blob_file_number));
+  }
+  return Status::Corruption("Invalid blob file number");
 }
 
 }  // namespace
@@ -450,8 +463,8 @@ class FilePicker {
   bool search_ended_;
   bool is_hit_file_last_in_level_;
   LevelFilesBrief* curr_file_level_;
-  unsigned int curr_index_in_curr_level_;
-  unsigned int start_index_in_curr_level_;
+  unsigned int curr_index_in_curr_level_ = 0;
+  unsigned int start_index_in_curr_level_ = 0;
   Slice user_key_;
   Slice ikey_;
   FileIndexer* file_indexer_;
@@ -761,7 +774,7 @@ class FilePickerMultiGet {
   MultiGetRange::Iterator batch_iter_prev_;
   MultiGetRange::Iterator upper_key_;
   autovector<LevelFilesBrief>* level_files_brief_;
-  bool search_ended_;
+  bool search_ended_ = false;
   bool is_hit_file_last_in_level_;
   LevelFilesBrief* curr_file_level_;
   FileIndexer* file_indexer_;
@@ -1205,7 +1218,15 @@ class LevelIterator final : public InternalIterator {
         db_statistics_(db_statistics),
         clock_(clock),
         table_cache_open_options_(
-            GetCompactionTableCacheOpenOptions(open_ephemeral_table_reader)) {
+            GetCompactionTableCacheOpenOptions(open_ephemeral_table_reader)),
+        // Same condition under which a block-based table iterator checks the
+        // prefix filter on Seek(). TableCache hands out no reference to an
+        // ephemeral table reader, which a stand-in would need.
+        files_filterable_on_seek_(
+            !skip_filters_ && !table_cache_open_options_.skip_filters &&
+            !table_cache_open_options_.open_ephemeral_table_reader &&
+            GetIteratorPrefixMode(read_options, prefix_extractor_ != nullptr) !=
+                IteratorPrefixMode::kTotalOrder) {
     // Empty level is not supported.
     assert(flevel_ != nullptr && flevel_->num_files > 0);
     if (range_tombstone_iter_ptr_) {
@@ -1383,7 +1404,8 @@ class LevelIterator final : public InternalIterator {
 
         file_index_ = file_index;
         // Create iterator for this file
-        auto iter = NewFileIterator();
+        auto iter = NewFileIterator(/*seek_target=*/nullptr,
+                                    /*prefix_filtered_table=*/nullptr);
         if (iter != nullptr) {
           // If we have async enabled, lets prepare all our iterators.
           iter->Prepare(&file_to_arg.second);
@@ -1400,7 +1422,8 @@ class LevelIterator final : public InternalIterator {
   bool SkipEmptyFileForward();
   void SkipEmptyFileBackward();
   void SetFileIterator(InternalIterator* iter);
-  void InitFileIterator(size_t new_file_index);
+  void InitFileIterator(size_t new_file_index, const Slice* seek_target);
+  void RetryPrefixFilteredFile(const Slice* seek_target);
 
   const Slice& file_smallest_key(size_t file_index) {
     assert(file_index < flevel_->num_files);
@@ -1448,7 +1471,13 @@ class LevelIterator final : public InternalIterator {
   // Move file_iter_ to the file at file_index_.
   // range_tombstone_iter_ is updated with a range tombstone iterator
   // into the new file. Old range tombstone iterator is cleared.
-  InternalIterator* NewFileIterator() {
+  // If seek_target is non-null, the caller seeks the returned iterator to it
+  // next. When the file's prefix filter rules that seek out, the returned
+  // iterator is an empty stand-in and *prefix_filtered_table is set to the
+  // file's table reader, which the stand-in keeps alive. Otherwise
+  // *prefix_filtered_table is left unchanged.
+  InternalIterator* NewFileIterator(const Slice* seek_target,
+                                    TableReader** prefix_filtered_table) {
     assert(file_index_ < flevel_->num_files);
     auto file_meta = flevel_->files[file_index_];
 
@@ -1458,6 +1487,9 @@ class LevelIterator final : public InternalIterator {
       smallest_compaction_key = (*compaction_boundaries_)[file_index_].smallest;
       largest_compaction_key = (*compaction_boundaries_)[file_index_].largest;
     }
+    // TableCache hands out no reference to an ephemeral table reader.
+    assert(seek_target == nullptr ||
+           !table_cache_open_options_.open_ephemeral_table_reader);
     CheckMayBeOutOfLowerBound();
     ClearRangeTombstoneIter();
     return table_cache_->NewIterator(
@@ -1466,8 +1498,8 @@ class LevelIterator final : public InternalIterator {
         nullptr /* don't need reference to table */, file_read_hist_, caller_,
         /*arena=*/nullptr, skip_filters_, level_,
         /*max_file_size_for_l0_meta_pin=*/0, smallest_compaction_key,
-        largest_compaction_key, allow_unprepared_value_, &read_seq_,
-        range_tombstone_iter_,
+        largest_compaction_key, allow_unprepared_value_, seek_target,
+        prefix_filtered_table, &read_seq_, range_tombstone_iter_,
         /*maybe_pin_table_handle=*/
         !table_cache_open_options_.open_ephemeral_table_reader,
         /*file_open_metadata=*/nullptr, table_cache_open_options_);
@@ -1506,6 +1538,11 @@ class LevelIterator final : public InternalIterator {
   size_t file_index_;
   RangeDelAggregator* range_del_agg_;
   IteratorWrapper file_iter_;  // May be nullptr
+  // Non-null while file_iter_ is an empty stand-in for the file at
+  // file_index_, because that file's prefix filter ruled out the last Seek()
+  // target. Points to the file's table reader so that later seeks into the
+  // same file can check the filter again without the table cache.
+  TableReader* prefix_filtered_table_ = nullptr;
   PinnedIteratorsManager* pinned_iters_mgr_;
 
   // To be propagated to RangeDelAggregator in order to safely truncate range
@@ -1549,6 +1586,9 @@ class LevelIterator final : public InternalIterator {
   Statistics* db_statistics_ = nullptr;
   SystemClock* clock_ = nullptr;
   TableCacheOpenOptions table_cache_open_options_;
+  // Whether Seek() lets a file's prefix filter rule the seek out before the
+  // file's iterator is built.
+  const bool files_filterable_on_seek_;
 
   // Our stored scan_opts for each prefix
   std::unique_ptr<ScanOptionsMap> file_to_scan_opts_ = nullptr;
@@ -1575,6 +1615,11 @@ void LevelIterator::TrySetDeleteRangeSentinel(const Slice& boundary_key) {
 void LevelIterator::Seek(const Slice& target) {
   prefix_exhausted_ = false;
   ClearSentinel();
+  // A new file iterator is sought to target right away, so its file's prefix
+  // filter can rule the seek out before the iterator is built. MultiScan
+  // positions files through their prepared ranges instead.
+  const Slice* seek_target =
+      files_filterable_on_seek_ && scan_opts_ == nullptr ? &target : nullptr;
   // Check whether the seek key fall under the same file
   bool need_to_reseek = true;
   if (file_iter_.iter() != nullptr && file_index_ < flevel_->num_files) {
@@ -1591,7 +1636,9 @@ void LevelIterator::Seek(const Slice& target) {
   if (need_to_reseek) {
     TEST_SYNC_POINT("LevelIterator::Seek:BeforeFindFile");
     size_t new_file_index = FindFile(icomparator_, *flevel_, target);
-    InitFileIterator(new_file_index);
+    InitFileIterator(new_file_index, seek_target);
+  } else if (prefix_filtered_table_ != nullptr) {
+    InitFileIterator(file_index_, seek_target);
   }
 
   if (file_iter_.iter() != nullptr) {
@@ -1690,7 +1737,7 @@ void LevelIterator::SeekForPrev(const Slice& target) {
     new_file_index = flevel_->num_files - 1;
   }
 
-  InitFileIterator(new_file_index);
+  InitFileIterator(new_file_index, /*seek_target=*/nullptr);
   if (file_iter_.iter() != nullptr) {
     file_iter_.SeekForPrev(target);
     if (range_tombstone_iter_ &&
@@ -1713,7 +1760,7 @@ void LevelIterator::SeekForPrev(const Slice& target) {
 void LevelIterator::SeekToFirst() {
   prefix_exhausted_ = false;
   ClearSentinel();
-  InitFileIterator(0);
+  InitFileIterator(0, /*seek_target=*/nullptr);
   if (file_iter_.iter() != nullptr) {
     file_iter_.SeekToFirst();
     if (range_tombstone_iter_) {
@@ -1730,7 +1777,7 @@ void LevelIterator::SeekToFirst() {
 void LevelIterator::SeekToLast() {
   prefix_exhausted_ = false;
   ClearSentinel();
-  InitFileIterator(flevel_->num_files - 1);
+  InitFileIterator(flevel_->num_files - 1, /*seek_target=*/nullptr);
   if (file_iter_.iter() != nullptr) {
     file_iter_.SeekToLast();
     if (range_tombstone_iter_) {
@@ -1824,7 +1871,7 @@ bool LevelIterator::SkipEmptyFileForward() {
       break;
     }
     // may init a new *range_tombstone_iter
-    InitFileIterator(file_index_ + 1);
+    InitFileIterator(file_index_ + 1, /*seek_target=*/nullptr);
     // We moved to a new SST file
     // Seek range_tombstone_iter_ to reset its !Valid() default state.
     // We do not need to call range_tombstone_iter_.Seek* in
@@ -1878,7 +1925,7 @@ void LevelIterator::SkipEmptyFileBackward() {
       ClearRangeTombstoneIter();
       return;
     }
-    InitFileIterator(file_index_ - 1);
+    InitFileIterator(file_index_ - 1, /*seek_target=*/nullptr);
     // We moved to a new SST file
     // Seek range_tombstone_iter_ to reset its !Valid() default state.
     if (file_iter_.iter() != nullptr) {
@@ -1904,6 +1951,7 @@ bool LevelIterator::OverlapRange(const ScanOptions& opts, size_t file_index) {
 #endif
 
 void LevelIterator::SetFileIterator(InternalIterator* iter) {
+  prefix_filtered_table_ = nullptr;
   if (pinned_iters_mgr_ && iter) {
     iter->SetPinnedItersMgr(pinned_iters_mgr_);
   }
@@ -1926,7 +1974,8 @@ void LevelIterator::SetFileIterator(InternalIterator* iter) {
   }
 }
 
-void LevelIterator::InitFileIterator(size_t new_file_index) {
+void LevelIterator::InitFileIterator(size_t new_file_index,
+                                     const Slice* seek_target) {
   if (new_file_index >= flevel_->num_files) {
     file_index_ = new_file_index;
     SetFileIterator(nullptr);
@@ -1937,10 +1986,14 @@ void LevelIterator::InitFileIterator(size_t new_file_index) {
     // to the same file, as this time we may go to a different data block
     // which is cached in block cache.
     //
-    if (file_iter_.iter() != nullptr && !file_iter_.status().IsIncomplete() &&
-        new_file_index == file_index_) {
+    const bool same_file = file_iter_.iter() != nullptr &&
+                           !file_iter_.status().IsIncomplete() &&
+                           new_file_index == file_index_;
+    if (same_file && prefix_filtered_table_ == nullptr) {
       // file_iter_ is already constructed with this iterator, so
       // no need to change anything
+    } else if (same_file && scan_opts_ == nullptr) {
+      RetryPrefixFilteredFile(seek_target);
     } else {
       file_index_ = new_file_index;
       if (!prepared_iters_.empty()) {
@@ -1953,7 +2006,9 @@ void LevelIterator::InitFileIterator(size_t new_file_index) {
         }
       }
 
-      InternalIterator* iter = NewFileIterator();
+      TableReader* prefix_filtered_table = nullptr;
+      InternalIterator* iter =
+          NewFileIterator(seek_target, &prefix_filtered_table);
       if (FileHasMultiScanArg(file_index_)) {
         auto& args = GetMultiScanArgForFile(file_index_);
         assert(OverlapRange(*args.GetScanRanges().begin(), file_index_) &&
@@ -1962,28 +2017,70 @@ void LevelIterator::InitFileIterator(size_t new_file_index) {
       }
 
       SetFileIterator(iter);
+      prefix_filtered_table_ = prefix_filtered_table;
     }
   }
+}
+
+// file_iter_ stands in for the file at file_index_ because the file's prefix
+// filter ruled out an earlier seek target. Replaces it with a real iterator
+// for the file, unless the filter rules out seek_target too. Only the point
+// iterator is replaced: TableCache::NewIterator() already set up the file's
+// range tombstones, if any, along with the stand-in.
+void LevelIterator::RetryPrefixFilteredFile(const Slice* seek_target) {
+  TEST_SYNC_POINT("LevelIterator::RetryPrefixFilteredFile");
+  PERF_TIMER_GUARD(new_table_iterator_nanos);
+  const bool skip_filters =
+      skip_filters_ || table_cache_open_options_.skip_filters;
+  InternalIterator* iter =
+      seek_target != nullptr
+          ? prefix_filtered_table_->NewIteratorForSeek(
+                read_options_, prefix_extractor_, /*arena=*/nullptr,
+                skip_filters, caller_, file_options_.compaction_readahead_size,
+                allow_unprepared_value_, *seek_target)
+          : prefix_filtered_table_->NewIterator(
+                read_options_, prefix_extractor_, /*arena=*/nullptr,
+                skip_filters, caller_, file_options_.compaction_readahead_size,
+                allow_unprepared_value_);
+  if (iter == nullptr) {
+    return;
+  }
+  // The stand-in holds the table cache handle that keeps the reader alive.
+  file_iter_.iter()->DelegateCleanupsTo(iter);
+  SetFileIterator(iter);
 }
 
 }  // anonymous namespace
 
 Status Version::GetTableProperties(const ReadOptions& read_options,
                                    std::shared_ptr<const TableProperties>* tp,
-                                   const FileMetaData* file_meta,
+                                   const FileMetaData* file_meta, int level,
+                                   bool allow_table_open,
                                    const std::string* fname) const {
   auto* table_cache = cfd_->table_cache();
   const auto& ioptions = cfd_->ioptions();
+  // With an unbounded table cache, files are normally opened anyway, so open
+  // this one now (coalesced with any concurrent open) rather than reading its
+  // metadata an extra time.
+  const bool open_table =
+      allow_table_open &&
+      vset_->GetColumnFamilySet()->get_table_cache()->GetCapacity() ==
+          TableCache::kInfiniteCapacity;
+  assert(level >= 0 || !allow_table_open);
   Status s = table_cache->GetTableProperties(
       file_options_, read_options, cfd_->internal_comparator(), *file_meta, tp,
-      mutable_cf_options_, true /* no io */);
+      mutable_cf_options_, /*no_io=*/!open_table, level,
+      open_table ? cfd_->internal_stats()->GetFileReadHist(level) : nullptr,
+      /*prefetch_index_and_filter_in_cache=*/false);
   if (s.ok()) {
     return s;
   }
 
   // We only ignore error type `Incomplete` since it's by design that we
-  // disallow table when it's not in table cache.
-  if (!s.IsIncomplete()) {
+  // disallow table when it's not in table cache. A failed open also falls
+  // through, because the properties block might still be readable, as when
+  // the same open failed during DB::Open with paranoid_checks = false.
+  if (!open_table && !s.IsIncomplete()) {
     return s;
   }
 
@@ -2027,11 +2124,12 @@ Status Version::GetTableProperties(const ReadOptions& read_options,
   return s;
 }
 
-Status Version::GetPropertiesOfAllTables(
-    const ReadOptions& read_options, TablePropertiesCollection* props) const {
+Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
+                                         TablePropertiesCollection* props,
+                                         bool allow_table_open) const {
   Status s;
   for (int level = 0; level < storage_info_.num_levels_; level++) {
-    s = GetPropertiesOfAllTables(read_options, props, level);
+    s = GetPropertiesOfAllTables(read_options, props, level, allow_table_open);
     if (!s.ok()) {
       return s;
     }
@@ -2099,7 +2197,8 @@ Status Version::TablesRangeTombstoneSummary(int max_entries_to_print,
 
 Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
                                          TablePropertiesCollection* props,
-                                         int level) const {
+                                         int level,
+                                         bool allow_table_open) const {
   for (const auto& file_meta : storage_info_.files_[level]) {
     auto fname =
         TableFileName(cfd_->ioptions().cf_paths, file_meta->fd.GetNumber(),
@@ -2107,8 +2206,8 @@ Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
     // 1. If the table is already present in table cache, load table
     // properties from there.
     std::shared_ptr<const TableProperties> table_properties;
-    Status s =
-        GetTableProperties(read_options, &table_properties, file_meta, &fname);
+    Status s = GetTableProperties(read_options, &table_properties, file_meta,
+                                  level, allow_table_open, &fname);
     if (s.ok()) {
       props->insert({fname, table_properties});
     } else {
@@ -2121,7 +2220,7 @@ Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
 
 Status Version::GetPropertiesOfTablesInRange(
     const ReadOptions& read_options, const autovector<UserKeyRange>& ranges,
-    TablePropertiesCollection* props) const {
+    TablePropertiesCollection* props, bool allow_table_open) const {
   for (int level = 0; level < storage_info_.num_non_empty_levels(); level++) {
     for (const auto& range : ranges) {
       // Convert user_key into a corresponding internal key.
@@ -2138,8 +2237,9 @@ Status Version::GetPropertiesOfTablesInRange(
           // 1. If the table is already present in table cache, load table
           // properties from there.
           std::shared_ptr<const TableProperties> table_properties;
-          Status s = GetTableProperties(read_options, &table_properties,
-                                        file_meta, &fname);
+          Status s =
+              GetTableProperties(read_options, &table_properties, file_meta,
+                                 level, allow_table_open, &fname);
           if (s.ok()) {
             props->insert({fname, table_properties});
           } else {
@@ -2155,15 +2255,15 @@ Status Version::GetPropertiesOfTablesInRange(
 
 Status Version::GetPropertiesOfTablesByLevel(
     const ReadOptions& read_options,
-    std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level)
-    const {
+    std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level,
+    bool allow_table_open) const {
   Status s;
 
   props_by_level->reserve(storage_info_.num_levels_);
   for (int level = 0; level < storage_info_.num_levels_; level++) {
     props_by_level->push_back(std::make_unique<TablePropertiesCollection>());
     s = GetPropertiesOfAllTables(read_options, props_by_level->back().get(),
-                                 level);
+                                 level, allow_table_open);
     if (!s.ok()) {
       return s;
     }
@@ -2176,10 +2276,12 @@ Status Version::GetAggregatedTableProperties(
     int level) {
   TablePropertiesCollection props;
   Status s;
+  // The DB mutex is held.
+  constexpr bool kAllowTableOpen = false;
   if (level < 0) {
-    s = GetPropertiesOfAllTables(read_options, &props);
+    s = GetPropertiesOfAllTables(read_options, &props, kAllowTableOpen);
   } else {
-    s = GetPropertiesOfAllTables(read_options, &props, level);
+    s = GetPropertiesOfAllTables(read_options, &props, level, kAllowTableOpen);
   }
   if (!s.ok()) {
     return s;
@@ -2247,6 +2349,8 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
           file->file_checksum, file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
+      files.back().db_ownership_start_time = file->db_ownership_start_time;
+      files.back().data_file_provenance = file->data_file_provenance;
       files.back().smallest = file->smallest.Encode().ToString();
       files.back().largest = file->largest.Encode().ToString();
       level_size += file->fd.GetFileSize();
@@ -2330,6 +2434,8 @@ void Version::GetColumnFamilyMetaData(
           file->file_checksum, file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
+      files.back().db_ownership_start_time = file->db_ownership_start_time;
+      files.back().data_file_provenance = file->data_file_provenance;
       files.back().smallest = file->smallest.Encode().ToString();
       files.back().largest = file->largest.Encode().ToString();
       level_size += file->fd.GetFileSize();
@@ -2670,7 +2776,8 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
           /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
           /*smallest_compaction_key=*/nullptr,
           /*largest_compaction_key=*/nullptr,
-          /*allow_unprepared_value=*/false));
+          /*allow_unprepared_value=*/false, /*seek_target=*/nullptr,
+          /*prefix_filtered_table=*/nullptr));
       status = OverlapWithIterator(ucmp, smallest_user_key, largest_user_key,
                                    iter.get(), overlap);
       if (!status.ok() || *overlap) {
@@ -2822,7 +2929,7 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
     // index, or a same-file reference that should have been resolved by
     // EmbeddedBlobResolvingIterator before reaching the integrated-BlobDB read
     // path. See FileMetaData::UpdateBoundaries for the write-side tripwire.
-    return Status::Corruption("Invalid blob file number");
+    return UnknownBlobFileStatus(storage_info_, blob_file_number);
   }
 
   assert(blob_source_);
@@ -2861,7 +2968,7 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
     // INTEGRITY CHECK -- see Version::GetBlob. No metadata (including
     // file_number 0, the same-file "embedded" sentinel) means a corrupt index
     // or a same-file reference that the lazy caller must not route here.
-    return Status::Corruption("Invalid blob file number");
+    return UnknownBlobFileStatus(storage_info_, blob_file_number);
   }
 
   assert(blob_source_);
@@ -2911,7 +3018,7 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     if (!blob_file_meta) {
       // INTEGRITY CHECK -- see Version::GetBlob. A same-file/embedded reference
       // (file_number 0) must be resolved via SameFileBlobReader, not here.
-      *req.status = Status::Corruption("Invalid blob file number");
+      *req.status = UnknownBlobFileStatus(storage_info_, file_number);
       continue;
     }
     const uint64_t file_size = blob_file_meta->GetBlobFileSize();
@@ -3010,7 +3117,7 @@ void Version::MultiGetBlob(
         // INTEGRITY CHECK -- do not weaken; see Version::GetBlob and
         // FileMetaData::UpdateBoundaries. A same-file/embedded reference must
         // be resolved before reaching the integrated-BlobDB read path.
-        *key_context->s = Status::Corruption("Invalid blob file number");
+        *key_context->s = UnknownBlobFileStatus(storage_info_, file_number);
         continue;
       }
 
@@ -3350,12 +3457,18 @@ void Version::PrepareAppend(const ReadOptions& read_options,
 }
 
 bool Version::MaybeInitializeFileMetaData(const ReadOptions& read_options,
-                                          FileMetaData* file_meta) {
+                                          FileMetaData* file_meta,
+                                          bool populate_referenced_blob_bytes) {
   if (file_meta->init_stats_from_file || file_meta->compensated_file_size > 0) {
     return false;
   }
   std::shared_ptr<const TableProperties> tp;
-  Status s = GetTableProperties(read_options, &tp, file_meta);
+  // PrepareAppend() can run with the DB mutex held. With an unbounded table
+  // cache, files reaching here are normally already open: files recovered at
+  // DB open have compensated_file_size set, and files added later are opened
+  // when added.
+  Status s = GetTableProperties(read_options, &tp, file_meta, /*level=*/-1,
+                                /*allow_table_open=*/false);
   file_meta->init_stats_from_file = true;
   if (!s.ok()) {
     ROCKS_LOG_ERROR(vset_->db_options_->info_log,
@@ -3371,6 +3484,9 @@ bool Version::MaybeInitializeFileMetaData(const ReadOptions& read_options,
   file_meta->num_deletions = tp->num_deletions;
   file_meta->raw_value_size = tp->raw_value_size;
   file_meta->raw_key_size = tp->raw_key_size;
+  if (populate_referenced_blob_bytes) {
+    file_meta->referenced_blob_bytes = tp->referenced_blob_bytes;
+  }
   file_meta->num_range_deletions = tp->num_range_deletions;
   // Ensure new invariants on old files
   file_meta->num_deletions =
@@ -3425,7 +3541,9 @@ void Version::UpdateAccumulatedStats(const ReadOptions& read_options) {
        level < storage_info_.num_levels_ && init_count < kMaxInitCount;
        ++level) {
     for (auto* file_meta : storage_info_.files_[level]) {
-      if (MaybeInitializeFileMetaData(read_options, file_meta)) {
+      if (MaybeInitializeFileMetaData(
+              read_options, file_meta,
+              /*populate_referenced_blob_bytes=*/true)) {
         // each FileMeta will be initialized only once.
         storage_info_.UpdateAccumulatedStats(file_meta);
         // when option "max_open_files" is -1, all the file metadata has
@@ -3450,8 +3568,9 @@ void Version::UpdateAccumulatedStats(const ReadOptions& read_options) {
        storage_info_.accumulated_raw_value_size_ == 0 && level >= 0; --level) {
     for (int i = static_cast<int>(storage_info_.files_[level].size()) - 1;
          storage_info_.accumulated_raw_value_size_ == 0 && i >= 0; --i) {
-      if (MaybeInitializeFileMetaData(read_options,
-                                      storage_info_.files_[level][i])) {
+      if (MaybeInitializeFileMetaData(
+              read_options, storage_info_.files_[level][i],
+              /*populate_referenced_blob_bytes=*/true)) {
         storage_info_.UpdateAccumulatedStats(storage_info_.files_[level][i]);
       }
     }
@@ -3890,6 +4009,29 @@ void VersionStorageInfo::ComputeCompactionScore(
   EstimateCompactionBytesNeeded(mutable_cf_options);
 }
 
+void VersionStorageInfo::RemoveFilesBeingCompactedFromCompactionCandidates() {
+  for (auto* candidates :
+       {&files_marked_for_compaction_, &bottommost_files_marked_for_compaction_,
+        &expired_ttl_files_, &files_marked_for_periodic_compaction_,
+        &files_marked_for_forced_blob_gc_, &read_triggered_compaction_files_}) {
+    const size_t remaining =
+        std::remove_if(candidates->begin(), candidates->end(),
+                       [](const auto& level_file) {
+                         return level_file.second->being_compacted;
+                       }) -
+        candidates->begin();
+    candidates->resize(remaining);
+  }
+  standalone_range_tombstone_files_mark_threshold_ = kMaxSequenceNumber;
+  for (const auto& level_file : files_marked_for_compaction_) {
+    if (level_file.second->FileIsStandAloneRangeTombstone()) {
+      standalone_range_tombstone_files_mark_threshold_ =
+          std::min(standalone_range_tombstone_files_mark_threshold_,
+                   level_file.second->fd.smallest_seqno);
+    }
+  }
+}
+
 void VersionStorageInfo::ComputeFilesMarkedForCompaction(int last_level) {
   files_marked_for_compaction_.clear();
   int last_qualify_level = 0;
@@ -4023,6 +4165,43 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
   }
 }
 
+VersionStorageInfo::DroppedBlobRead
+VersionStorageInfo::CheckDroppedBlobReferences(
+    const std::vector<uint64_t>& dropped_blob_files, ValueType type,
+    const Slice& value, std::string* remaining_columns) {
+  if (type == kTypeBlobIndex) {
+    BlobIndex blob_index;
+    return blob_index.DecodeFrom(value).ok() &&
+                   IsDroppedBlobIndex(dropped_blob_files, blob_index)
+               ? DroppedBlobRead::kDeleted
+               : DroppedBlobRead::kUnaffected;
+  }
+  if (type != kTypeWideColumnEntity) {
+    return DroppedBlobRead::kUnaffected;
+  }
+
+  WideColumnSerialization::BlobColumnRemoval removal;
+  const Status s = WideColumnSerialization::RemoveBlobColumns(
+      value,
+      [&dropped_blob_files](const BlobIndex& blob_index) {
+        return IsDroppedBlobIndex(dropped_blob_files, blob_index);
+      },
+      remaining_columns, removal);
+  if (!s.ok()) {
+    return DroppedBlobRead::kUnaffected;
+  }
+  switch (removal) {
+    case WideColumnSerialization::BlobColumnRemoval::kNone:
+      return DroppedBlobRead::kUnaffected;
+    case WideColumnSerialization::BlobColumnRemoval::kSome:
+      return DroppedBlobRead::kRemainingColumns;
+    case WideColumnSerialization::BlobColumnRemoval::kAll:
+      return DroppedBlobRead::kDeleted;
+  }
+  assert(false);
+  return DroppedBlobRead::kUnaffected;
+}
+
 void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
     double blob_garbage_collection_age_cutoff,
     double blob_garbage_collection_force_threshold,
@@ -4077,7 +4256,12 @@ void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
   assert(oldest_meta);
 
   const auto& linked_ssts = oldest_meta->GetLinkedSsts();
-  assert(!linked_ssts.empty());
+  if (linked_ssts.empty()) {
+    // SST files that reference the oldest blob file are linked to an older,
+    // dropped blob file instead, so the SST files to compact are unknown.
+    assert(!dropped_blob_files_.empty());
+    return;
+  }
 
   size_t count = 1;
   uint64_t sum_total_blob_bytes = oldest_meta->GetTotalBlobBytes();
@@ -4555,9 +4739,11 @@ void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction(
   if (allow_ingest_behind) {
     return;
   }
-  // If a file's creation time is larger than creation_time_ub,
-  // it is too new to be marked for compaction.
-  int64_t creation_time_ub = 0;
+  // If this DB began holding a file later than ownership_start_time_ub, it is
+  // too new to be marked for compaction. (Measuring from when the DB took the
+  // file rather than from file creation means a file ingested with old
+  // contents still gets the delay.)
+  int64_t ownership_start_time_ub = 0;
   bool needs_delay = bottommost_file_compaction_delay_ > 0;
   if (needs_delay) {
     int64_t current_time = 0;
@@ -4566,7 +4752,7 @@ void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction(
     // We will treat it as is and treat all files as too new.
     // The subtraction will not underflow since
     // bottommost_file_compaction_delay_ is of type uint32_t.
-    creation_time_ub =
+    ownership_start_time_ub =
         current_time - static_cast<int64_t>(bottommost_file_compaction_delay_);
   }
 
@@ -4623,11 +4809,11 @@ void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction(
 
         if (!needs_delay) {
           bottommost_files_marked_for_compaction_.push_back(level_and_file);
-        } else if (creation_time_ub > 0) {
-          int64_t creation_time = static_cast<int64_t>(
-              level_and_file.second->TryGetFileCreationTime());
-          if (creation_time == kUnknownFileCreationTime ||
-              creation_time <= creation_time_ub) {
+        } else if (ownership_start_time_ub > 0) {
+          int64_t ownership_start_time = static_cast<int64_t>(
+              level_and_file.second->TryGetDbOwnershipStartTime());
+          if (ownership_start_time == kUnknownDbOwnershipStartTime ||
+              ownership_start_time <= ownership_start_time_ub) {
             bottommost_files_marked_for_compaction_.push_back(level_and_file);
           } else {
             // Just ignore this file for both
@@ -4639,8 +4825,8 @@ void VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction(
             // bottommost_files_mark_threshold_ is released.
           }
         } else {
-          // creation_time_ub <= 0, all files are too new to be marked for
-          // compaction.
+          // ownership_start_time_ub <= 0, all files are too new to be marked
+          // for compaction.
         }
       } else {
         bottommost_files_mark_threshold_ =
@@ -5325,6 +5511,8 @@ Env::WriteLifeTimeHint VersionStorageInfo::CalculateSSTWriteHint(
         return Env::WLTH_MEDIUM;
       }
       return Env::WLTH_LONG;
+    case kCompactionStyleFIFO:
+    case kCompactionStyleNone:
     default:
       return Env::WLTH_NOT_SET;
   }
@@ -5581,7 +5769,10 @@ Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
   descriptor_log_.reset();
   TEST_SYNC_POINT("VersionSet::Close:AfterClose");
   if (io_s.ok()) {
-    io_s = fs_->GetFileSize(manifest_file_name, IOOptions(), &size, nullptr);
+    IOOptions manifest_io_opts;
+    manifest_io_opts.type = IOType::kManifest;
+    io_s =
+        fs_->GetFileSize(manifest_file_name, manifest_io_opts, &size, nullptr);
   }
   if (!io_s.ok() || size != manifest_file_size_) {
     if (io_s.ok()) {
@@ -5624,7 +5815,7 @@ Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
           DescriptorFileName(dbname_, manifest_file_number_);
       std::unique_ptr<FSSequentialFile> manifest_file;
       IOStatus content_io_s = fs_->NewSequentialFile(
-          content_manifest_name, fs_->OptimizeForManifestRead(file_options_),
+          content_manifest_name, GetFileOptionsForManifestRead(),
           &manifest_file, nullptr);
       if (!content_io_s.ok()) {
         // Surface I/O errors to the caller -- users who call DB::Close() and
@@ -5642,6 +5833,7 @@ Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
                                    content_manifest_name,
                                    db_options_->log_readahead_size, io_tracer_,
                                    db_options_->listeners));
+      manifest_file_reader->SetIOType(IOType::kManifest);
       LogReporter reporter;
       Status log_read_status;
       reporter.status = &log_read_status;
@@ -6063,8 +6255,8 @@ Status VersionSet::ProcessManifestWrites(
                                  : MutableCFOptions(*new_cf_options),
                 io_tracer_, current_version_number_++);
             versions.push_back(version);
-            builder_guards.emplace_back(
-                new BaseReferencedVersionBuilder(last_writer->cfd));
+            builder_guards.emplace_back(new BaseReferencedVersionBuilder(
+                last_writer->cfd, last_writer->cfd->current()));
             builder = builder_guards.back()->version_builder();
           }
           assert(last_writer->IsAllVersionIndependentEdits() || builder);
@@ -6794,6 +6986,13 @@ FileOptions VersionSet::GetFileOptionsForManifestWrite() const {
   if (file_options_.temperature != Temperature::kUnknown) {
     opt_file_opts.temperature = file_options_.temperature;
   }
+  opt_file_opts.io_options.type = IOType::kManifest;
+  return opt_file_opts;
+}
+
+FileOptions VersionSet::GetFileOptionsForManifestRead() const {
+  FileOptions opt_file_opts = fs_->OptimizeForManifestRead(file_options_);
+  opt_file_opts.io_options.type = IOType::kManifest;
   return opt_file_opts;
 }
 
@@ -6839,7 +7038,7 @@ Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
   // MANIFEST + CURRENT from scratch via the side-effect of
   // LogAndApplyForRecovery emitting an edit. Reusing the (possibly
   // stale) prior MANIFEST contradicts the salvage contract.
-  if (db_options_->best_efforts_recovery) {
+  if (db_options_->UsesBestEffortsRecoveryPath()) {
     return Status::OK();
   }
 
@@ -6853,8 +7052,8 @@ Status VersionSet::ReopenManifestForAppend(const std::string& manifest_path) {
   // consumed -- likely a torn tail from a prior crash; mid-block append
   // would mis-frame the record stream.
   uint64_t physical_size = 0;
-  IOStatus stat_s = fs_->GetFileSize(manifest_path, IOOptions(), &physical_size,
-                                     /*dbg=*/nullptr);
+  IOStatus stat_s = fs_->GetFileSize(manifest_path, opt_file_opts.io_options,
+                                     &physical_size, /*dbg=*/nullptr);
   if (!stat_s.ok() ||
       physical_size != manifest_recovery_last_valid_record_end_) {
     ROCKS_LOG_WARN(db_options_->info_log,
@@ -6934,23 +7133,25 @@ Status VersionSet::AppendColumnFamilyDropsToManifest(
   // memory (which can reach ~1GB depending on configuration).
   const std::string tmp_path = manifest_path + ".tmp";
 
+  FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
+  // Buffered writes only: direct writes would need alignment / tail-pad
+  // reasoning that isn't worth the complexity for a checkpoint MANIFEST.
+  opt_file_opts.use_direct_writes = false;
+
   // Best-effort cleanup of any stale .tmp left by a prior aborted run.
-  fs_->DeleteFile(tmp_path, IOOptions(), /*dbg=*/nullptr)
+  fs_->DeleteFile(tmp_path, opt_file_opts.io_options, /*dbg=*/nullptr)
       .PermitUncheckedError();
 
   std::unique_ptr<FSSequentialFile> src_file;
   {
-    IOStatus io_s = fs_->NewSequentialFile(manifest_path, FileOptions(),
+    FileOptions src_file_opts;
+    src_file_opts.io_options.type = IOType::kManifest;
+    IOStatus io_s = fs_->NewSequentialFile(manifest_path, src_file_opts,
                                            &src_file, /*dbg=*/nullptr);
     if (!io_s.ok()) {
       return io_s;
     }
   }
-
-  FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
-  // Buffered writes only: direct writes would need alignment / tail-pad
-  // reasoning that isn't worth the complexity for a checkpoint MANIFEST.
-  opt_file_opts.use_direct_writes = false;
 
   std::unique_ptr<FSWritableFile> dst_file;
   {
@@ -7069,7 +7270,8 @@ Status VersionSet::AppendColumnFamilyDropsToManifest(
 
   // Replace the original with the rewritten .tmp.
   IOStatus rename_s =
-      fs_->RenameFile(tmp_path, manifest_path, IOOptions(), /*dbg=*/nullptr);
+      fs_->RenameFile(tmp_path, manifest_path, opt_file_opts.io_options,
+                      /*dbg=*/nullptr);
   if (!rename_s.ok()) {
     return rename_s;
   }
@@ -7077,12 +7279,13 @@ Status VersionSet::AppendColumnFamilyDropsToManifest(
   const std::string manifest_dir =
       slash == std::string::npos ? "." : manifest_path.substr(0, slash);
   std::unique_ptr<FSDirectory> dir;
-  IOStatus dir_s = fs_->NewDirectory(manifest_dir, IOOptions(), &dir, nullptr);
+  IOStatus dir_s =
+      fs_->NewDirectory(manifest_dir, opt_file_opts.io_options, &dir, nullptr);
   if (!dir_s.ok()) {
     return dir_s;
   }
   assert(dir != nullptr);
-  dir_s = dir->FsyncWithDirOptions(IOOptions(), nullptr,
+  dir_s = dir->FsyncWithDirOptions(opt_file_opts.io_options, nullptr,
                                    DirFsyncOptions(manifest_path));
   if (!dir_s.ok()) {
     return dir_s;
@@ -7110,8 +7313,7 @@ Status VersionSet::Recover(
   std::unique_ptr<SequentialFileReader> manifest_file_reader;
   {
     std::unique_ptr<FSSequentialFile> manifest_file;
-    s = fs_->NewSequentialFile(manifest_path,
-                               fs_->OptimizeForManifestRead(file_options_),
+    s = fs_->NewSequentialFile(manifest_path, GetFileOptionsForManifestRead(),
                                &manifest_file, nullptr);
     if (!s.ok()) {
       return s;
@@ -7120,6 +7322,7 @@ Status VersionSet::Recover(
         std::move(manifest_file), manifest_path,
         db_options_->log_readahead_size, io_tracer_, db_options_->listeners,
         /*rate_limiter=*/nullptr, is_retry));
+    manifest_file_reader->SetIOType(IOType::kManifest);
   }
   TEST_SYNC_POINT("VersionSet::Recover:StartManifestRead");
 
@@ -7300,8 +7503,7 @@ Status VersionSet::TryRecoverFromOneManifest(
   Status s;
   {
     std::unique_ptr<FSSequentialFile> manifest_file;
-    s = fs_->NewSequentialFile(manifest_path,
-                               fs_->OptimizeForManifestRead(file_options_),
+    s = fs_->NewSequentialFile(manifest_path, GetFileOptionsForManifestRead(),
                                &manifest_file, nullptr);
     if (!s.ok()) {
       return s;
@@ -7309,6 +7511,7 @@ Status VersionSet::TryRecoverFromOneManifest(
     manifest_file_reader.reset(new SequentialFileReader(
         std::move(manifest_file), manifest_path,
         db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
+    manifest_file_reader->SetIOType(IOType::kManifest);
   }
 
   assert(s.ok());
@@ -7319,6 +7522,8 @@ Status VersionSet::TryRecoverFromOneManifest(
   VersionEditHandlerPointInTime handler_pit(
       read_only, column_families, const_cast<VersionSet*>(this), io_tracer_,
       read_options, /*allow_incomplete_valid_version=*/true,
+      /*record_missing_blob_files_as_dropped=*/
+      db_options_->best_efforts_blob_db_repair,
       /*trust_manifest_recovery=*/false,
       /*defer_sst_file_opening=*/false, EpochNumberRequirement::kMightMissing);
 
@@ -7332,8 +7537,35 @@ Status VersionSet::TryRecoverFromOneManifest(
   s = handler_pit.status();
   if (s.ok()) {
     RecoverEpochNumbers();
+    if (db_options_->best_efforts_blob_db_repair) {
+      LogDroppedBlobFiles();
+    }
   }
   return s;
+}
+
+void VersionSet::LogDroppedBlobFiles() const {
+  for (ColumnFamilyData* cfd : *column_family_set_) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    const std::vector<uint64_t>& dropped_blob_files =
+        cfd->current()->storage_info()->GetDroppedBlobFiles();
+    if (dropped_blob_files.empty()) {
+      continue;
+    }
+    std::string numbers;
+    for (const uint64_t blob_file_number : dropped_blob_files) {
+      numbers.append(" #");
+      AppendNumberTo(&numbers, blob_file_number);
+    }
+    ROCKS_LOG_WARN(db_options_->info_log,
+                   "[%s] %" ROCKSDB_PRIszt
+                   " dropped blob files are in effect after best-efforts "
+                   "BlobDB repair:%s",
+                   cfd->GetName().c_str(), dropped_blob_files.size(),
+                   numbers.c_str());
+  }
 }
 
 void VersionSet::RecoverEpochNumbers() {
@@ -7372,12 +7604,15 @@ Status VersionSet::ListColumnFamiliesFromManifest(
     std::unique_ptr<FSSequentialFile> file;
     // these are just for performance reasons, not correctness,
     // so we're fine using the defaults
-    s = fs->NewSequentialFile(manifest_path, FileOptions(), &file, nullptr);
+    FileOptions file_opts;
+    file_opts.io_options.type = IOType::kManifest;
+    s = fs->NewSequentialFile(manifest_path, file_opts, &file, nullptr);
     if (!s.ok()) {
       return s;
     }
     file_reader = std::make_unique<SequentialFileReader>(
         std::move(file), manifest_path, /*io_tracer=*/nullptr);
+    file_reader->SetIOType(IOType::kManifest);
   }
 
   VersionSet::LogReporter reporter;
@@ -7438,7 +7673,9 @@ Status VersionSet::GetOptionsFileManifestState(
     }
 
     std::unique_ptr<FSSequentialFile> file;
-    s = fs->NewSequentialFile(manifest_path, FileOptions(), &file, nullptr);
+    FileOptions file_opts;
+    file_opts.io_options.type = IOType::kManifest;
+    s = fs->NewSequentialFile(manifest_path, file_opts, &file, nullptr);
     if (s.IsNotFound() || s.IsPathNotFound()) {
       if (attempt + 1 == kMaxAttempts) {
         return s;
@@ -7450,6 +7687,7 @@ Status VersionSet::GetOptionsFileManifestState(
     }
     auto file_reader = std::make_unique<SequentialFileReader>(
         std::move(file), manifest_path, /*io_tracer=*/nullptr);
+    file_reader->SetIOType(IOType::kManifest);
     LogReporter reporter;
     reporter.status = &s;
     log::Reader reader(nullptr, std::move(file_reader), &reporter,
@@ -7551,13 +7789,16 @@ Status VersionSet::ResolveOptionsFileNumber(
     TEST_SYNC_POINT(
         "VersionSet::ResolveOptionsFileNumber:InspectTrackingMarker");
     std::unique_ptr<FSSequentialFile> file;
-    Status s = fs->NewSequentialFile(path, FileOptions(), &file, nullptr);
+    FileOptions file_opts;
+    file_opts.io_options.type = IOType::kMetadata;
+    Status s = fs->NewSequentialFile(path, file_opts, &file, nullptr);
     if (!s.ok()) {
       return s;
     }
     LineFileReader reader(std::move(file), path, /*io_tracer=*/nullptr,
                           std::vector<std::shared_ptr<EventListener>>{},
                           /*rate_limiter=*/nullptr);
+    reader.SetIOType(IOType::kMetadata);
     bool in_db_options = false;
     std::string line;
     while (reader.ReadLine(&line, Env::IO_TOTAL)) {
@@ -7836,13 +8077,15 @@ Status VersionSet::DumpManifest(
   {
     std::unique_ptr<FSSequentialFile> file;
     const std::shared_ptr<FileSystem>& fs = options.env->GetFileSystem();
-    s = fs->NewSequentialFile(
-        dscname, fs->OptimizeForManifestRead(file_options_), &file, nullptr);
+    FileOptions file_opts = fs->OptimizeForManifestRead(file_options_);
+    file_opts.io_options.type = IOType::kManifest;
+    s = fs->NewSequentialFile(dscname, file_opts, &file, nullptr);
     if (!s.ok()) {
       return s;
     }
     file_reader = std::make_unique<SequentialFileReader>(
         std::move(file), dscname, db_options_->log_readahead_size, io_tracer_);
+    file_reader->SetIOType(IOType::kManifest);
   }
 
   std::map<std::string, const ColumnFamilyDescriptor*> cf_name_to_desc;
@@ -7995,21 +8238,10 @@ Status VersionSet::WriteCurrentStateToManifest(
 
         for (const auto& f : level_files) {
           assert(f);
-          // Preserve file_open_metadata so live SSTs still benefit from
-          // fast_sst_open after a MANIFEST rotation. Without this, the
-          // rotated MANIFEST snapshot drops kFileOpenMetadata for unchanged
-          // files and their fast-open advantage is lost until they are
-          // rewritten.
-          edit.AddFile(level, f->fd.GetNumber(), f->fd.GetPathId(),
-                       f->fd.GetFileSize(), f->smallest, f->largest,
-                       f->fd.smallest_seqno, f->fd.largest_seqno,
-                       f->marked_for_compaction, f->temperature,
-                       f->oldest_blob_file_number, f->oldest_ancestor_time,
-                       f->file_creation_time, f->epoch_number, f->file_checksum,
-                       f->file_checksum_func_name, f->unique_id,
-                       f->compensated_range_deletion_size, f->tail_size,
-                       f->user_defined_timestamps_persisted, f->min_timestamp,
-                       f->max_timestamp, f->file_open_metadata);
+          // Preserves all persisted metadata, including file_open_metadata
+          // so live SSTs still benefit from fast_sst_open after a MANIFEST
+          // rotation.
+          edit.AddExistingFile(level, *f, /*provenance_flags_to_set=*/0);
         }
       }
 
@@ -8028,6 +8260,10 @@ Status VersionSet::WriteCurrentStateToManifest(
           edit.AddBlobFileGarbage(blob_file_number, meta->GetGarbageBlobCount(),
                                   meta->GetGarbageBlobBytes());
         }
+      }
+
+      for (const uint64_t blob_file_number : vstorage->GetDroppedBlobFiles()) {
+        edit.AddDroppedBlobFile(blob_file_number);
       }
 
       const auto iter = curr_state.find(cfd->GetID());
@@ -8113,12 +8349,62 @@ Status VersionSet::WriteCurrentStateToManifest(
 // (a,b) then (b,c) then (c,d). Knowing this, an optimization is possible
 // where we avoid doing binary search for the keys b and c twice and instead
 // somehow maintain state of where they first appear in the files.
+std::optional<uint64_t> VersionSet::BlobSizeAccounting::GetReferencedBlobBytes(
+    const FileMetaData& file) const {
+  if (file.referenced_blob_bytes.has_value()) {
+    return file.referenced_blob_bytes;
+  }
+  const auto captured = references.find(file.fd.GetNumber());
+  assert(captured != references.end());
+  return captured == references.end() ? std::nullopt : captured->second;
+}
+
 uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
                                      const ReadOptions& read_options,
                                      Version* v, const Slice& start,
                                      const Slice& end, int start_level,
-                                     int end_level, TableReaderCaller caller) {
+                                     int end_level, TableReaderCaller caller,
+                                     BlobSizeAccounting* blob_accounting) {
   const auto& icmp = v->cfd_->internal_comparator();
+
+  if (blob_accounting != nullptr) {
+    blob_accounting->referenced_blob_bytes = 0;
+    blob_accounting->unknown_sst_bytes = 0;
+  }
+
+  const auto get_referenced_blob_bytes =
+      [&](const FdWithKeyRange& file) -> std::optional<uint64_t> {
+    assert(blob_accounting != nullptr);
+    assert(file.file_metadata != nullptr);
+    return blob_accounting->GetReferencedBlobBytes(*file.file_metadata);
+  };
+
+  auto account_file = [&](const FdWithKeyRange& file, uint64_t sst_bytes) {
+    if (blob_accounting == nullptr) {
+      return;
+    }
+    if (icmp.Compare(file.largest_key, start) <= 0 ||
+        icmp.Compare(file.smallest_key, end) > 0) {
+      return;
+    }
+    const std::optional<uint64_t> file_referenced_blob_bytes =
+        get_referenced_blob_bytes(file);
+    if (!file_referenced_blob_bytes.has_value()) {
+      blob_accounting->unknown_sst_bytes += sst_bytes;
+      return;
+    }
+    if (sst_bytes == 0) {
+      return;
+    }
+    const uint64_t file_size = file.fd.GetFileSize();
+    if (sst_bytes == file_size) {
+      blob_accounting->referenced_blob_bytes += *file_referenced_blob_bytes;
+    } else if (file_size > 0) {
+      blob_accounting->referenced_blob_bytes += static_cast<uint64_t>(
+          static_cast<double>(*file_referenced_blob_bytes) *
+          static_cast<double>(sst_bytes) / static_cast<double>(file_size));
+    }
+  };
 
   // pre-condition
   assert(icmp.Compare(start, end) <= 0);
@@ -8198,6 +8484,7 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
       assert(file_size == ApproximateSize(read_options, v, files_brief.files[i],
                                           start, end, caller));
       total_full_size += file_size;
+      account_file(files_brief.files[i], file_size);
     }
 
     // save the first and the last files (which may be the same file), so we
@@ -8211,12 +8498,35 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
 
   // The sum of all file sizes that intersect the [start, end] keys range.
   uint64_t total_intersecting_size = 0;
+  uint64_t intersecting_referenced_blob_bytes = 0;
+  uint64_t intersecting_unknown_sst_bytes = 0;
+  auto account_intersecting_file = [&](const FdWithKeyRange& file) {
+    const uint64_t file_size = file.fd.GetFileSize();
+    total_intersecting_size += file_size;
+    if (blob_accounting == nullptr) {
+      return;
+    }
+    if (icmp.Compare(file.largest_key, start) <= 0 ||
+        icmp.Compare(file.smallest_key, end) > 0) {
+      return;
+    }
+    const std::optional<uint64_t> file_referenced_blob_bytes =
+        get_referenced_blob_bytes(file);
+    if (file_referenced_blob_bytes.has_value()) {
+      intersecting_referenced_blob_bytes += *file_referenced_blob_bytes;
+    } else {
+      intersecting_unknown_sst_bytes += file_size;
+    }
+  };
   for (const auto* file_ptr : first_files) {
-    total_intersecting_size += file_ptr->fd.GetFileSize();
+    account_intersecting_file(*file_ptr);
   }
   for (const auto* file_ptr : last_files) {
-    total_intersecting_size += file_ptr->fd.GetFileSize();
+    account_intersecting_file(*file_ptr);
   }
+  TEST_SYNC_POINT_CALLBACK(
+      "VersionSet::ApproximateSize:IntersectingReferencedBlobBytes",
+      &intersecting_referenced_blob_bytes);
 
   // Now scan all the first & last files at each level, and estimate their
   // size. If the total_intersecting_size is less than X% of the
@@ -8228,20 +8538,29 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
   if (margin > 0 && total_intersecting_size <
                         static_cast<uint64_t>(total_full_size * margin)) {
     total_full_size += total_intersecting_size / 2;
+    if (blob_accounting != nullptr) {
+      blob_accounting->referenced_blob_bytes +=
+          intersecting_referenced_blob_bytes / 2;
+      blob_accounting->unknown_sst_bytes += intersecting_unknown_sst_bytes / 2;
+    }
   } else {
     // Estimate for all the first files (might also be last files), at each
     // level
     for (const auto file_ptr : first_files) {
-      total_full_size +=
+      const uint64_t file_size =
           ApproximateSize(read_options, v, *file_ptr, start, end, caller);
+      total_full_size += file_size;
+      account_file(*file_ptr, file_size);
     }
 
     // Estimate for all the last files, at each level
     for (const auto file_ptr : last_files) {
       // We could use ApproximateSize here, but calling ApproximateOffsetOf
       // directly is just more efficient.
-      total_full_size +=
+      const uint64_t file_size =
           ApproximateOffsetOf(read_options, v, *file_ptr, end, caller);
+      total_full_size += file_size;
+      account_file(*file_ptr, file_size);
     }
   }
 
@@ -8475,7 +8794,8 @@ InternalIterator* VersionSet::MakeInputIterator(
               MaxFileSizeForL0MetaPin(c->mutable_cf_options()),
               /*smallest_compaction_key=*/nullptr,
               /*largest_compaction_key=*/nullptr,
-              /*allow_unprepared_value=*/false,
+              /*allow_unprepared_value=*/false, /*seek_target=*/nullptr,
+              /*prefix_filtered_table=*/nullptr,
               /*range_del_read_seqno=*/nullptr,
               /*range_del_iter=*/&range_tombstone_iter,
               /*maybe_pin_table_handle=*/false,
@@ -8588,6 +8908,8 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.temperature = file->temperature;
         filemetadata.oldest_ancestor_time = file->TryGetOldestAncestorTime();
         filemetadata.file_creation_time = file->TryGetFileCreationTime();
+        filemetadata.db_ownership_start_time = file->db_ownership_start_time;
+        filemetadata.data_file_provenance = file->data_file_provenance;
         filemetadata.epoch_number = file->epoch_number;
         metadata->push_back(filemetadata);
       }
@@ -8598,7 +8920,8 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
 void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
                                   std::vector<ObsoleteBlobFileInfo>* blob_files,
                                   std::vector<std::string>* manifest_filenames,
-                                  uint64_t min_pending_output) {
+                                  uint64_t min_pending_output,
+                                  uint64_t min_listener_pending_output) {
   assert(files);
   assert(blob_files);
   assert(manifest_filenames);
@@ -8606,9 +8929,14 @@ void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
   assert(blob_files->empty());
   assert(manifest_filenames->empty());
 
+  // Every SST in obsolete_files_ was part of an installed Version (see
+  // ~Version()), so none is an unfinished output of a running job and none
+  // needs min_pending_output protection. Those at or above
+  // min_listener_pending_output might still be reported to event listeners,
+  // so they stay for a later call (see DBImpl::listener_pending_outputs_).
   std::vector<ObsoleteFileInfo> pending_files;
   for (auto& f : obsolete_files_) {
-    if (f.metadata->fd.GetNumber() < min_pending_output) {
+    if (f.metadata->fd.GetNumber() < min_listener_pending_output) {
       files->emplace_back(std::move(f));
     } else {
       pending_files.emplace_back(std::move(f));
@@ -8616,6 +8944,9 @@ void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
   }
   obsolete_files_.swap(pending_files);
 
+  // min_pending_output still holds back blob files: VersionBuilder can report
+  // one obsolete without it having been part of an installed Version, so the
+  // reasoning above does not apply to them.
   std::vector<ObsoleteBlobFileInfo> pending_blob_files;
   for (auto& blob_file : obsolete_blob_files_) {
     if (blob_file.GetBlobFileNumber() < min_pending_output) {
@@ -8757,13 +9088,11 @@ Status VersionSet::VerifyFileMetadata(const ReadOptions& read_options,
 
     TableCache::TypedHandle* handle = nullptr;
     TableReader* table_reader = nullptr;
-    FileMetaData meta_copy = meta;
     status = table_cache->FindTable(
-        read_options, file_opts, *icmp, meta_copy, &handle, cf_opts,
-        &table_reader, /*no_io=*/false, internal_stats->GetFileReadHist(level),
-        false, level,
+        read_options, file_opts, *icmp, meta, &handle, cf_opts, &table_reader,
+        /*no_io=*/false, internal_stats->GetFileReadHist(level), false, level,
         /*prefetch_index_and_filter_in_cache*/ false, max_sz_for_l0_meta_pin,
-        meta_copy.temperature);
+        meta.temperature);
     if (handle) {
       table_cache->get_cache().Release(handle);
     }
@@ -8831,6 +9160,13 @@ Status ReactiveVersionSet::ReadAndApply(
   assert(cfds_changed != nullptr);
   mu->AssertHeld();
 
+  // An error from applying a MANIFEST record is final. The tailer can have
+  // applied that record in part, and the records after it can belong to
+  // another DB, so return the error without reading more records. A failed
+  // read is not final: the next call resumes after it.
+  if (!resume_after_manifest_read_error_ && !manifest_tailer_->status().ok()) {
+    return manifest_tailer_->status();
+  }
   Status s;
   log::Reader* reader = manifest_reader->get();
   assert(reader);
@@ -8838,8 +9174,37 @@ Status ReactiveVersionSet::ReadAndApply(
   if (!s.ok()) {
     return s;
   }
+  // See resume_after_manifest_read_error_ for the steps of a resume. Every
+  // MANIFEST reader reports into *manifest_read_status, which can still hold
+  // the error of the failed read. If MaybeSwitchManifest() opened another
+  // MANIFEST, its new reader starts at the beginning of that MANIFEST, so only
+  // that old error needs to be cleared.
+  if (resume_after_manifest_read_error_) {
+    if (manifest_reader->get() == reader) {
+      s = ReopenManifestAfterReadError(manifest_reader, manifest_read_status);
+      if (!s.ok()) {
+        return s;
+      }
+    } else {
+      *manifest_read_status = Status::OK();
+    }
+    manifest_tailer_->PrepareToResumeAfterReadError();
+    resume_after_manifest_read_error_ = false;
+  }
+  assert(manifest_tailer_->status().ok());
   manifest_tailer_->Iterate(*(manifest_reader->get()), manifest_read_status);
   s = manifest_tailer_->status();
+  if (manifest_reader->get()->hasReadError()) {
+    resume_after_manifest_read_error_ = true;
+    if (s.ok()) {
+      // The reader can set its read error flag without a report. This happens
+      // in Reader::UnmarkEOFInternal(): the last call stopped at EOF in the
+      // middle of a log block, and this call reads the rest of that block. If
+      // that read fails and returns no data, nothing is reported.
+      s = Status::IOError("Failed to read MANIFEST",
+                          manifest_reader->get()->file()->file_name());
+    }
+  }
   if (s.ok()) {
     *cfds_changed = std::move(manifest_tailer_->GetUpdatedColumnFamilies());
   }
@@ -8850,10 +9215,97 @@ Status ReactiveVersionSet::ReadAndApply(
   return s;
 }
 
+Status ReactiveVersionSet::NewManifestReader(
+    const std::string& manifest_path, log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
+  std::unique_ptr<FSSequentialFile> manifest_file;
+  Status s = fs_->NewSequentialFile(
+      manifest_path, GetFileOptionsForManifestRead(), &manifest_file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<SequentialFileReader> manifest_file_reader(
+      new SequentialFileReader(std::move(manifest_file), manifest_path,
+                               db_options_->log_readahead_size, io_tracer_,
+                               db_options_->listeners));
+  manifest_file_reader->SetIOType(IOType::kManifest);
+  manifest_reader->reset(new log::FragmentBufferedReader(
+      nullptr, std::move(manifest_file_reader), reporter, true /* checksum */,
+      0 /* log_number */));
+  return Status::OK();
+}
+
+Status ReactiveVersionSet::ReopenManifestAfterReadError(
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    Status* manifest_read_status) {
+  assert(manifest_reader != nullptr && manifest_reader->get() != nullptr);
+  log::FragmentBufferedReader* const old_reader = manifest_reader->get();
+  const std::string manifest_path = old_reader->file()->file_name();
+  const uint64_t resume_offset = manifest_tailer_->GetLastValidRecordEnd();
+
+  // The name of the MANIFEST can now name a file of another DB, for example
+  // after the DB was destroyed and created again at the same path. RocksDB
+  // writes the DB ID in the first record of each MANIFEST while
+  // write_dbid_to_manifest is true, so a check reads one record. There is no
+  // check when either MANIFEST has no DB ID.
+  const VersionEditParams& params = manifest_tailer_->GetVersionEditParams();
+  if (params.HasDbId()) {
+    std::string db_id;
+    Status id_status = experimental::GetDbIdentityFromManifest(
+        fs_.get(), manifest_path, &db_id);
+    if (id_status.ok() && db_id != params.GetDbId()) {
+      return Status::Corruption("MANIFEST " + manifest_path + " has DB ID " +
+                                db_id + ", but this instance opened DB ID " +
+                                params.GetDbId());
+    }
+    if (!id_status.ok() && !id_status.IsNotFound()) {
+      return id_status;
+    }
+  }
+
+  // The old reader read the file up to `resume_offset`. A shorter file can be
+  // a short-lived view of a remote file system, so return a retryable error.
+  uint64_t file_size = 0;
+  Status s = fs_->GetFileSize(manifest_path, IOOptions(), &file_size, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  if (file_size < resume_offset) {
+    return Status::IOError("MANIFEST " + manifest_path + " has " +
+                           std::to_string(file_size) +
+                           " bytes, but this instance applied records up to "
+                           "offset " +
+                           std::to_string(resume_offset));
+  }
+
+  std::unique_ptr<log::FragmentBufferedReader> new_reader;
+  s = NewManifestReader(manifest_path, old_reader->GetReporter(), &new_reader);
+  if (!s.ok()) {
+    return s;
+  }
+  s = new_reader->file()->Skip(resume_offset);
+  if (!s.ok()) {
+    return s;
+  }
+  new_reader->StartAtRecordEnd(resume_offset);
+  *manifest_read_status = Status::OK();
+  *manifest_reader = std::move(new_reader);
+  ROCKS_LOG_INFO(db_options_->info_log,
+                 "Reopened MANIFEST %s at offset %" PRIu64
+                 " after a failed read\n",
+                 manifest_path.c_str(), resume_offset);
+  return Status::OK();
+}
+
 uint64_t ReactiveVersionSet::GetInstalledVersionLogNumber(
     uint32_t cf_id) const {
   assert(manifest_tailer_ != nullptr);
   return manifest_tailer_->GetInstalledVersionLogNumber(cf_id);
+}
+
+bool ReactiveVersionSet::NewestStateHasMissingFiles() {
+  assert(manifest_tailer_ != nullptr);
+  return manifest_tailer_->NewestStateHasMissingFiles();
 }
 
 Status ReactiveVersionSet::MaybeSwitchManifest(
@@ -8867,7 +9319,6 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
   if (!s.ok()) {
     return s;
   }
-  std::unique_ptr<FSSequentialFile> manifest_file;
   if (manifest_reader->get() != nullptr &&
       manifest_reader->get()->file()->file_name() == manifest_path) {
     // CURRENT points to the same MANIFEST as before, no need to switch
@@ -8876,7 +9327,9 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
   }
   assert(nullptr == manifest_reader->get() ||
          manifest_reader->get()->file()->file_name() != manifest_path);
-  s = fs_->FileExists(manifest_path, IOOptions(), nullptr);
+  IOOptions manifest_io_opts;
+  manifest_io_opts.type = IOType::kManifest;
+  s = fs_->FileExists(manifest_path, manifest_io_opts, nullptr);
   if (s.IsNotFound()) {
     return Status::TryAgain(
         "The primary may have switched to a new MANIFEST and deleted the old "
@@ -8893,17 +9346,8 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
   // The primary can also delete the MANIFEST while the secondary is reading
   // it. This is OK on POSIX. For other file systems, maybe create a hard link
   // to MANIFEST. The hard link should be cleaned up later by the secondary.
-  s = fs_->NewSequentialFile(manifest_path,
-                             fs_->OptimizeForManifestRead(file_options_),
-                             &manifest_file, nullptr);
-  std::unique_ptr<SequentialFileReader> manifest_file_reader;
+  s = NewManifestReader(manifest_path, reporter, manifest_reader);
   if (s.ok()) {
-    manifest_file_reader.reset(new SequentialFileReader(
-        std::move(manifest_file), manifest_path,
-        db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
-    manifest_reader->reset(new log::FragmentBufferedReader(
-        nullptr, std::move(manifest_file_reader), reporter, true /* checksum */,
-        0 /* log_number */));
     ROCKS_LOG_INFO(db_options_->info_log, "Switched to new manifest: %s\n",
                    manifest_path.c_str());
     if (manifest_tailer_) {

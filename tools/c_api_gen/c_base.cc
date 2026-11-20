@@ -639,13 +639,13 @@ struct rocksdb_pinnable_multi_get_t {
     errors.reserve(error_count);
   }
 
-  void StoreResults(std::vector<PinnableSlice>* multi_get_values,
+  void StoreResults(PinnableSlice* multi_get_values,
                     const std::vector<Status>& statuses) {
     ReservePayloads(statuses);
     for (size_t i = 0; i < statuses.size(); ++i) {
       if (statuses[i].ok()) {
         result_indexes[i] = values.size();
-        values.emplace_back(std::move((*multi_get_values)[i]));
+        values.emplace_back(std::move(multi_get_values[i]));
       } else if (!statuses[i].IsNotFound()) {
         result_indexes[i] = kNotFound - errors.size() - 1;
         errors.emplace_back(statuses[i].ToString());
@@ -898,20 +898,20 @@ struct rocksdb_compactionfilterfactory_t : public CompactionFilterFactory {
 };
 
 struct rocksdb_comparator_t : public Comparator {
-  void* state_;
-  void (*destructor_)(void*);
+  void* state_ = nullptr;
+  void (*destructor_)(void*) = nullptr;
   int (*compare_)(void*, const char* a, size_t alen, const char* b,
-                  size_t blen);
-  const char* (*name_)(void*);
+                  size_t blen) = nullptr;
+  const char* (*name_)(void*) = nullptr;
   int (*compare_ts_)(void*, const char* a_ts, size_t a_tslen, const char* b_ts,
-                     size_t b_tslen);
+                     size_t b_tslen) = nullptr;
   int (*compare_without_ts_)(void*, const char* a, size_t alen,
                              unsigned char a_has_ts, const char* b, size_t blen,
-                             unsigned char b_has_ts);
+                             unsigned char b_has_ts) = nullptr;
 
   rocksdb_comparator_t() : Comparator() {}
 
-  rocksdb_comparator_t(size_t ts_size) : Comparator(ts_size) {}
+  explicit rocksdb_comparator_t(size_t ts_size) : Comparator(ts_size) {}
 
   // No copying allowed
   rocksdb_comparator_t(const rocksdb_comparator_t&) = delete;
@@ -2186,6 +2186,7 @@ rocksdb_t* rocksdb_open_column_families(
     const rocksdb_options_t* const* column_family_options,
     rocksdb_column_family_handle_t** column_family_handles, char** errptr) {
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(num_column_families);
   for (int i = 0; i < num_column_families; i++) {
     column_families.emplace_back(
         std::string(column_family_names[i]),
@@ -2254,6 +2255,7 @@ rocksdb_t* rocksdb_open_for_read_only_column_families(
     rocksdb_column_family_handle_t** column_family_handles,
     unsigned char error_if_wal_file_exists, char** errptr) {
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(num_column_families);
   for (int i = 0; i < num_column_families; i++) {
     column_families.emplace_back(
         std::string(column_family_names[i]),
@@ -2970,11 +2972,11 @@ rocksdb_pinnable_multi_get_t* rocksdb_batched_multi_get_pinned_cf(
     return results.release();
   }
   const Slice* key_slices = reinterpret_cast<const Slice*>(keys);
-  std::vector<PinnableSlice> values(num_keys);
+  std::unique_ptr<PinnableSlice[]> values(new PinnableSlice[num_keys]);
   std::vector<Status> statuses(num_keys);
   db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
-                    values.data(), statuses.data(), sorted_input != 0);
-  results->StoreResults(&values, statuses);
+                    values.get(), statuses.data(), sorted_input != 0);
+  results->StoreResults(values.get(), statuses);
   return results.release();
 }
 
@@ -3192,6 +3194,7 @@ void rocksdb_create_iterators(rocksdb_t* db, rocksdb_readoptions_t* opts,
                               rocksdb_iterator_t** iterators, size_t size,
                               char** errptr) {
   std::vector<ColumnFamilyHandle*> column_families_vec;
+  column_families_vec.reserve(size);
   for (size_t i = 0; i < size; i++) {
     column_families_vec.push_back(column_families[i]->rep);
   }
@@ -3821,10 +3824,11 @@ void rocksdb_writebatch_delete_rangev_cf(
 
 class H : public WriteBatch::Handler {
  public:
-  void* state_;
-  void (*put_)(void*, const char* k, size_t klen, const char* v, size_t vlen);
-  void (*deleted_)(void*, const char* k, size_t klen);
-  void (*log_data_)(void*, const char* blob, size_t blob_len);
+  void* state_ = nullptr;
+  void (*put_)(void*, const char* k, size_t klen, const char* v,
+               size_t vlen) = nullptr;
+  void (*deleted_)(void*, const char* k, size_t klen) = nullptr;
+  void (*log_data_)(void*, const char* blob, size_t blob_len) = nullptr;
 
   void Put(const Slice& key, const Slice& value) override {
     (*put_)(state_, key.data(), key.size(), value.data(), value.size());
@@ -3842,13 +3846,14 @@ class H : public WriteBatch::Handler {
 
 class HCF : public WriteBatch::Handler {
  public:
-  void* state_;
+  void* state_ = nullptr;
   void (*put_cf_)(void*, uint32_t cfid, const char* k, size_t klen,
-                  const char* v, size_t vlen);
-  void (*deleted_cf_)(void*, uint32_t cfid, const char* k, size_t klen);
+                  const char* v, size_t vlen) = nullptr;
+  void (*deleted_cf_)(void*, uint32_t cfid, const char* k,
+                      size_t klen) = nullptr;
   void (*merge_cf_)(void*, uint32_t cfid, const char* k, size_t klen,
-                    const char* v, size_t vlen);
-  void (*log_data_)(void*, const char* blob, size_t blob_len);
+                    const char* v, size_t vlen) = nullptr;
+  void (*log_data_)(void*, const char* blob, size_t blob_len) = nullptr;
 
   Status PutCF(uint32_t column_family_id, const Slice& key,
                const Slice& value) override {
@@ -4393,12 +4398,11 @@ void rocksdb_load_latest_options(
         cf_descs.size() * sizeof(rocksdb_options_t*));
     for (size_t i = 0; i < cf_descs.size(); ++i) {
       cf_names[i] = strdup(cf_descs[i].name.c_str());
-      cf_options[i] = new rocksdb_options_t{
-          Options(DBOptions(), std::move(cf_descs[i].options))};
+      cf_options[i] =
+          new rocksdb_options_t{Options(DBOptions(), cf_descs[i].options)};
     }
     *num_column_families = cf_descs.size();
-    *db_options = new rocksdb_options_t{
-        Options(std::move(db_opt), ColumnFamilyOptions())};
+    *db_options = new rocksdb_options_t{Options(db_opt, ColumnFamilyOptions())};
     *list_column_family_names = cf_names;
     *list_column_family_options = cf_options;
   } else {
@@ -4555,6 +4559,16 @@ void rocksdb_options_set_block_based_table_factory(
 #include "c_api_gen/c_generated_jobinfo_metadata_subset.cc.inc"
 #include "c_api_gen/c_generated_metadata_structs_auto.cc.inc"
 
+unsigned char rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_compactionjobinfo_t* info) {
+  return info->rep.separate_remote_compaction_pool_selected;
+}
+
+unsigned char rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_subcompactionjobinfo_t* info) {
+  return info->rep.separate_remote_compaction_pool_selected;
+}
+
 rocksdb_compactionjobinfo_t* rocksdb_compactionjobinfo_create() {
   return new rocksdb_compactionjobinfo_t;
 }
@@ -4576,6 +4590,16 @@ unsigned char rocksdb_table_properties_has_key_largest_seqno(
 unsigned char rocksdb_table_properties_has_key_smallest_seqno(
     const rocksdb_table_properties_t* props) {
   return props->rep.HasKeySmallestSeqno();
+}
+
+unsigned char rocksdb_table_properties_has_referenced_blob_bytes(
+    const rocksdb_table_properties_t* props) {
+  return props->rep.referenced_blob_bytes.has_value();
+}
+
+uint64_t rocksdb_table_properties_referenced_blob_bytes(
+    const rocksdb_table_properties_t* props) {
+  return props->rep.referenced_blob_bytes.value_or(0);
 }
 
 size_t rocksdb_table_properties_user_collected_properties_count(
@@ -7991,6 +8015,7 @@ rocksdb_transactiondb_t* rocksdb_transactiondb_open_column_families(
     const rocksdb_options_t* const* column_family_options,
     rocksdb_column_family_handle_t** column_family_handles, char** errptr) {
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(num_column_families);
   for (int i = 0; i < num_column_families; i++) {
     column_families.emplace_back(
         std::string(column_family_names[i]),
@@ -8585,6 +8610,74 @@ void rocksdb_transactiondb_multi_get_cf(
   }
 }
 
+void rocksdb_transactiondb_batched_multi_get_cf(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input) {
+  Slice* key_slices = new Slice[num_keys];
+  PinnableSlice* value_slices = new PinnableSlice[num_keys];
+  Status* statuses = new Status[num_keys];
+  for (size_t i = 0; i < num_keys; ++i) {
+    key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
+  }
+
+  txn_db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
+                        value_slices, statuses, sorted_input);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new (rocksdb_pinnableslice_t);
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      if (!statuses[i].IsNotFound()) {
+        errs[i] = strdup(statuses[i].ToString().c_str());
+      } else {
+        errs[i] = nullptr;
+      }
+    }
+  }
+
+  delete[] key_slices;
+  delete[] value_slices;
+  delete[] statuses;
+}
+
+void rocksdb_transactiondb_batched_multi_get_cf_slice(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input) {
+  PinnableSlice* value_slices = new PinnableSlice[num_keys];
+  Status* statuses = new Status[num_keys];
+
+  // Cast rocksdb_slice_t* to Slice* - they have identical memory layout
+  const Slice* key_slices = reinterpret_cast<const Slice*>(keys_list);
+
+  txn_db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
+                        value_slices, statuses, sorted_input);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new (rocksdb_pinnableslice_t);
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      if (!statuses[i].IsNotFound()) {
+        errs[i] = strdup(statuses[i].ToString().c_str());
+      } else {
+        errs[i] = nullptr;
+      }
+    }
+  }
+
+  delete[] value_slices;
+  delete[] statuses;
+}
+
 void rocksdb_transaction_set_commit_timestamp(rocksdb_transaction_t* txn,
                                               uint64_t commit_timestamp) {
   txn->rep->SetCommitTimestamp(commit_timestamp);
@@ -8640,6 +8733,7 @@ void rocksdb_transactiondb_flush_cfs(
     rocksdb_column_family_handle_t** column_families, int num_column_families,
     char** errptr) {
   std::vector<ColumnFamilyHandle*> column_family_handles;
+  column_family_handles.reserve(num_column_families);
   for (int i = 0; i < num_column_families; i++) {
     column_family_handles.push_back(column_families[i]->rep);
   }
@@ -8709,6 +8803,7 @@ rocksdb_optimistictransactiondb_open_column_families(
     const rocksdb_options_t* const* column_family_options,
     rocksdb_column_family_handle_t** column_family_handles, char** errptr) {
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(num_column_families);
   for (int i = 0; i < num_column_families; i++) {
     column_families.emplace_back(
         std::string(column_family_names[i]),
@@ -8918,6 +9013,7 @@ struct rocksdb_memory_usage_t {
 rocksdb_memory_usage_t* rocksdb_approximate_memory_usage_create(
     rocksdb_memory_consumers_t* consumers, char** errptr) {
   vector<DB*> dbs;
+  dbs.reserve(consumers->dbs.size());
   for (auto db : consumers->dbs) {
     dbs.push_back(db->rep);
   }

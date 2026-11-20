@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 
 #include "env/emulated_clock.h"
 #include "file/filename.h"
@@ -540,8 +541,7 @@ class TestMemLogger : public Logger {
       port::TimeVal now_tv;
       port::GetTimeOfDay(&now_tv, nullptr);
       const time_t seconds = now_tv.tv_sec;
-      struct tm t;
-      memset(&t, 0, sizeof(t));
+      struct tm t{};
       struct tm* ret __attribute__((__unused__));
       ret = port::LocalTimeR(&seconds, &t);
       assert(ret);
@@ -936,8 +936,10 @@ bool MockFileSystem::RenameFileInternal(const std::string& src,
   } else {
     std::vector<std::string> children;
     if (GetChildrenInternal(src, &children)) {
+      const std::string src_prefix = src + "/";
+      const std::string dest_prefix = dest + "/";
       for (const auto& child : children) {
-        RenameFileInternal(src + "/" + child, dest + "/" + child);
+        RenameFileInternal(src_prefix + child, dest_prefix + child);
       }
     }
     DeleteFileInternal(dest);
@@ -1002,7 +1004,7 @@ IOStatus MockFileSystem::NewLogger(const std::string& fname,
     file = iter->second;
   }
   std::unique_ptr<FSWritableFile> f(new MockWritableFile(file, FileOptions()));
-  result->reset(new TestMemLogger(std::move(f), clock_, io_opts, dbg));
+  *result = std::make_shared<TestMemLogger>(std::move(f), clock_, io_opts, dbg);
   return IOStatus::OK();
 }
 

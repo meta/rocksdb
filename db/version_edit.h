@@ -23,10 +23,12 @@
 #include "port/malloc.h"
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/metadata.h"
 #include "table/table_reader.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/autovector.h"
+#include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -76,6 +78,7 @@ enum Tag : uint32_t {
   kSubcompactionProgress,
   kLastCompactedManifestFileSize,
   kCommittedOptionsFileNumber,
+  kDroppedBlobFile,
 };
 
 enum SubcompactionProgressPerLevelCustomTag : uint32_t {
@@ -116,6 +119,8 @@ enum NewFileCustomTag : uint32_t {
   kTailSize = 15,
   kUserDefinedTimestampsPersisted = 16,
   kFileOpenMetadata = 17,
+  kDbOwnershipStartTime = 18,
+  kDataFileProvenance = 19,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -131,10 +136,32 @@ constexpr uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
 constexpr uint64_t kUnknownOldestAncestorTime = 0;
 constexpr uint64_t kUnknownNewestKeyTime = 0;
 constexpr uint64_t kUnknownFileCreationTime = 0;
+constexpr uint64_t kUnknownDbOwnershipStartTime = 0;
 constexpr uint64_t kUnknownEpochNumber = 0;
 // If `Options::cf_allow_ingest_behind` is true, this epoch number
 // will be dedicated to files ingested behind.
 constexpr uint64_t kReservedEpochNumberForFileIngestedBehind = 1;
+
+// Bit layout of FileMetaData::data_file_provenance (decoded form:
+// DataFileProvenance), LSB first:
+//  * bits 0-7: DataFileProvenance::Origin (values above kImport reserved)
+//  * bits 8-11: the flags below
+//  * bits 12-31: reserved
+// Readers ignore bits they don't recognize, and code carrying a file's record
+// over (moves, MANIFEST rewrites, copies) preserves them, by updating the
+// packed value rather than re-encoding a decoded one.
+constexpr uint32_t kProvenanceOriginMask = 0xff;
+constexpr uint32_t kProvenanceMovedBetweenLevels = uint32_t{1} << 8;
+constexpr uint32_t kProvenanceTemperatureChangedByCopy = uint32_t{1} << 9;
+constexpr uint32_t kProvenanceTemperatureUpdatedFromFileSystem = uint32_t{1}
+                                                                 << 10;
+constexpr uint32_t kProvenanceRecordedByRepair = uint32_t{1} << 11;
+
+// Packed data_file_provenance for a file this DB got via `origin`, with no
+// flags.
+inline uint32_t DataFileProvenanceForOrigin(DataFileProvenance::Origin origin) {
+  return lossless_cast<uint32_t>(origin);
+}
 
 uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id);
 
@@ -264,6 +291,9 @@ struct FileMetaData {
   uint64_t num_deletions = 0;
   uint64_t raw_key_size = 0;    // total uncompressed key size.
   uint64_t raw_value_size = 0;  // total uncompressed value size.
+  // Immutable after a pre-publication table-property statistics read.
+  // Unknown if that read was skipped, failed, or the SST lacks the property.
+  std::optional<uint64_t> referenced_blob_bytes;
   uint64_t num_range_deletions = 0;
   // This is computed during Flush/Compaction, and is added to
   // `compensated_file_size`. Currently, this estimates the size of keys in the
@@ -279,6 +309,12 @@ struct FileMetaData {
   bool marked_for_compaction = false;  // True if client asked us nicely to
                                        // compact this file.
   Temperature temperature = Temperature::kUnknown;
+
+  // How this DB got the file's contents and what has happened to the file
+  // since, packed as described by DataFileProvenance
+  // (include/rocksdb/metadata.h). 0 means unknown. Persisted in the MANIFEST
+  // only.
+  uint32_t data_file_provenance = 0;
 
   // Used only in BlobDB. The file number of the oldest blob file this SST file
   // refers to. 0 is an invalid value; BlobDB numbers the files starting from 1.
@@ -296,8 +332,15 @@ struct FileMetaData {
   // 0 means the information is not available.
   uint64_t oldest_ancestor_time = kUnknownOldestAncestorTime;
 
-  // Unix time when the SST file is created.
+  // Unix time when the SST file's contents were built (by flush or
+  // compaction, in this DB or another, or by SstFileWriter). Preserved when
+  // the file is moved between levels or copied to another temperature.
   uint64_t file_creation_time = kUnknownFileCreationTime;
+
+  // Unix time when this DB began holding this physical file (this file
+  // number); see SstFileMetaData::db_ownership_start_time. Persisted in the
+  // MANIFEST only. kUnknownDbOwnershipStartTime if unknown.
+  uint64_t db_ownership_start_time = kUnknownDbOwnershipStartTime;
 
   // The order of a file being flushed or ingested/imported.
   // Compaction output file will be assigned with the minimum `epoch_number`
@@ -422,6 +465,18 @@ struct FileMetaData {
     return kUnknownFileCreationTime;
   }
 
+  // When this DB began holding this file, if recorded. Otherwise falls back on
+  // TryGetFileCreationTime(): for files recorded by older RocksDB versions,
+  // that was the time of ingestion, import or temperature-change copy for
+  // files that arrived that way, and is the creation time for files built by
+  // this DB.
+  uint64_t TryGetDbOwnershipStartTime() {
+    if (db_ownership_start_time != kUnknownDbOwnershipStartTime) {
+      return db_ownership_start_time;
+    }
+    return TryGetFileCreationTime();
+  }
+
   // Tries to get the newest key time from the current file
   // Falls back on oldest ancestor time of previous (newer) file
   uint64_t TryGetNewestKeyTime(FileMetaData* prev_file = nullptr) {
@@ -509,8 +564,8 @@ struct FdWithKeyRange {
   FdWithKeyRange()
       : fd(), file_metadata(nullptr), smallest_key(), largest_key() {}
 
-  FdWithKeyRange(FileDescriptor _fd, Slice _smallest_key, Slice _largest_key,
-                 FileMetaData* _file_metadata)
+  FdWithKeyRange(const FileDescriptor& _fd, Slice _smallest_key,
+                 Slice _largest_key, FileMetaData* _file_metadata)
       : fd(_fd),
         file_metadata(_file_metadata),
         smallest_key(_smallest_key),
@@ -868,6 +923,15 @@ class VersionEdit {
     }
   }
 
+  // Add a file that is already in the LSM under the same file number, such as
+  // a file being moved to another level (paired with DeleteFile()) or recorded
+  // in a new MANIFEST, preserving all of its persisted metadata. In-memory-only
+  // state (refs, being_compacted, sampled stats, pinned table reader) starts
+  // fresh. `provenance_flags_to_set` are DataFileProvenance flag bits to set
+  // on the added file, recording what is happening to it (0 for none).
+  void AddExistingFile(int level, const FileMetaData& f,
+                       uint32_t provenance_flags_to_set);
+
   const NewFiles& GetNewFiles() const { return new_files_; }
 
   NewFiles& GetMutableNewFiles() { return new_files_; }
@@ -876,7 +940,7 @@ class VersionEdit {
   using CompactCursors = std::vector<std::pair<int, InternalKey>>;
   const CompactCursors& GetCompactCursors() const { return compact_cursors_; }
   void AddCompactCursor(int level, const InternalKey& cursor) {
-    compact_cursors_.push_back(std::make_pair(level, cursor));
+    compact_cursors_.emplace_back(level, cursor);
   }
   void SetCompactCursors(
       const std::vector<InternalKey>& compact_cursors_by_level) {
@@ -884,8 +948,7 @@ class VersionEdit {
     compact_cursors_.reserve(compact_cursors_by_level.size());
     for (int i = 0; i < (int)compact_cursors_by_level.size(); i++) {
       if (compact_cursors_by_level[i].Valid()) {
-        compact_cursors_.push_back(
-            std::make_pair(i, compact_cursors_by_level[i]));
+        compact_cursors_.emplace_back(i, compact_cursors_by_level[i]);
       }
     }
   }
@@ -945,6 +1008,17 @@ class VersionEdit {
     assert(blob_file_garbages_.empty());
     blob_file_garbages_ = std::move(blob_file_garbages);
   }
+
+  // Record a blob file that best-efforts BlobDB repair left out of the column
+  // family because it was missing, while SST files may still reference it (see
+  // VersionStorageInfo::GetDroppedBlobFiles()).
+  void AddDroppedBlobFile(uint64_t blob_file_number) {
+    dropped_blob_files_.push_back(blob_file_number);
+  }
+  const std::vector<uint64_t>& GetDroppedBlobFiles() const {
+    return dropped_blob_files_;
+  }
+  bool HasDroppedBlobFiles() const { return !dropped_blob_files_.empty(); }
 
   // Add a WAL (either just created or closed).
   // AddWal and DeleteWalsBefore cannot be called on the same VersionEdit.
@@ -1154,6 +1228,7 @@ class VersionEdit {
   NewFiles new_files_;
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;
+  std::vector<uint64_t> dropped_blob_files_;
   WalAdditions wal_additions_;
 
   std::string db_id_;

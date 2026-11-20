@@ -1,1 +1,0 @@
-Added `TraceOptions::include_read_write_options`: query traces can record the main `ReadOptions` and `WriteOptions` of each traced call (e.g. `fill_cache`, `disableWAL`), which replay then uses instead of default options.

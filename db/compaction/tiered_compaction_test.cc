@@ -843,19 +843,20 @@ TEST_F(TieredCompactionTest, LevelOutofBoundaryRangeDelete) {
   ASSERT_OK(Flush());
 
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
-  ASSERT_EQ("0,2,10",
-            FilesPerLevel());  // one file is at the proximal level
-                               // which only contains a range delete
+  ASSERT_EQ("0,3,10",
+            FilesPerLevel());  // the partitioner cuts before and after the
+                               // range delete, so it has a file of its own
+                               // at the proximal level
   std::vector<LiveFileMetaData> live_file_meta;
   db_->GetLiveFilesMetaData(&live_file_meta);
   bool found_sst_with_del = false;
   uint64_t sst_with_del_num = 0;
   for (const auto& meta : live_file_meta) {
     if (meta.num_deletions > 0) {
-      // found SST with del, which has 2 entries, one for data one for range del
+      // found SST with del, which only contains the range del
       ASSERT_EQ(meta.level,
                 kNumLevels - 2);  // output to proximal level
-      ASSERT_EQ(meta.num_entries, 2);
+      ASSERT_EQ(meta.num_entries, 1);
       ASSERT_EQ(meta.num_deletions, 1);
       found_sst_with_del = true;
       sst_with_del_num = meta.file_number;
@@ -974,7 +975,9 @@ TEST_F(TieredCompactionTest, UniversalRangeDelete) {
   ASSERT_OK(Flush());
 
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
-  ASSERT_EQ("0,0,0,0,0,2,8", FilesPerLevel());
+  // the partitioner cuts before and after the range del, so it has a file of
+  // its own at the proximal level
+  ASSERT_EQ("0,0,0,0,0,3,8", FilesPerLevel());
   // find the SST with range del
   std::vector<LiveFileMetaData> live_file_meta;
   db_->GetLiveFilesMetaData(&live_file_meta);
@@ -982,10 +985,10 @@ TEST_F(TieredCompactionTest, UniversalRangeDelete) {
   uint64_t sst_with_del_num = 0;
   for (const auto& meta : live_file_meta) {
     if (meta.num_deletions > 0) {
-      // found SST with del, which has 2 entries, one for data one for range del
+      // found SST with del, which only contains the range del
       ASSERT_EQ(meta.level,
                 kNumLevels - 2);  // output_to_proximal_level level
-      ASSERT_EQ(meta.num_entries, 2);
+      ASSERT_EQ(meta.num_entries, 1);
       ASSERT_EQ(meta.num_deletions, 1);
       found_sst_with_del = true;
       sst_with_del_num = meta.file_number;
@@ -1500,7 +1503,8 @@ TEST_F(TieredCompactionTest, DISABLED_RangeBasedTieredStorageLevel) {
 
 class PrecludeLastLevelTestBase : public DBTestBase {
  public:
-  PrecludeLastLevelTestBase(std::string test_name = "preclude_last_level_test")
+  explicit PrecludeLastLevelTestBase(
+      const std::string& test_name = "preclude_last_level_test")
       : DBTestBase(test_name, /*env_do_fsync=*/false) {
     mock_clock_ = std::make_shared<MockSystemClock>(env_->GetSystemClock());
     mock_clock_->SetCurrentTime(kMockStartTime);
@@ -3143,6 +3147,152 @@ TEST_F(PrecludeLastLevelTestBase,
     l6_range_deletions += f->num_range_deletions;
   }
   ASSERT_GT(l6_range_deletions, 0);
+}
+
+// With a bottom-priority pool and `reduce_file_locking`, a leveled compaction
+// into the last level is replaced by an intended compaction that locks only
+// its last input level while it waits for a bottom-priority thread. That
+// intended compaction must keep the actual LSM level of its inputs. Otherwise
+// its proximal level and proximal output range are derived from a wrong start
+// level, so registering it conflicts with a running compaction into the
+// proximal level that does not overlap the original compaction.
+TEST_F(PrecludeLastLevelTestBase, IntendedBottomPriCompactionKeepsInputLevel) {
+  constexpr int kNumLevels = 7;
+  constexpr int kLastLevel = kNumLevels - 1;
+  constexpr int kProximalLevel = kNumLevels - 2;
+  constexpr uint64_t kPeriodicCompactionSeconds = 1000;
+
+  env_->SetBackgroundThreads(1, Env::Priority::BOTTOM);
+  Defer reset_bottom_pool(
+      [&] { env_->SetBackgroundThreads(0, Env::Priority::BOTTOM); });
+  Defer close_db([&] { Close(); });
+
+  // Original compaction forwarded to the bottom-priority pool:
+  // false: size-triggered L5->L6, true: periodic L6->L6.
+  for (bool last_level_only : {false, true}) {
+    SCOPED_TRACE("last_level_only=" + std::to_string(last_level_only));
+    Options options = CurrentOptions();
+    options.env = mock_env_.get();
+    options.compaction_style = kCompactionStyleLevel;
+    options.num_levels = kNumLevels;
+    options.disable_auto_compactions = true;
+    options.max_background_jobs = 8;
+    options.level_compaction_dynamic_level_bytes = false;
+    // Any file in L1-L5 that is not being compacted triggers a compaction.
+    options.max_bytes_for_level_base = 1;
+    options.max_bytes_for_level_multiplier = 1;
+    options.periodic_compaction_seconds =
+        last_level_only ? kPeriodicCompactionSeconds : 0;
+    options.compaction_options_universal.reduce_file_locking = true;
+    DestroyAndReopen(options);
+
+    auto add_file = [&](int smallest, int largest, int level) {
+      ASSERT_OK(Put(Key(smallest), "v"));
+      ASSERT_OK(Put(Key(largest), "v"));
+      ASSERT_OK(Flush());
+      MoveFilesToLevel(level);
+    };
+    add_file(0, 100, kLastLevel);
+    add_file(10, 20, kProximalLevel);
+    if (!last_level_only) {
+      add_file(30, 40, kProximalLevel);
+    }
+    add_file(12, 15, kProximalLevel - 1);
+    ASSERT_EQ(last_level_only ? "0,0,0,0,1,1,1" : "0,0,0,0,1,2,1",
+              FilesPerLevel());
+
+    const uint64_t last_level_file =
+        GetLevelFileMetadatas(kLastLevel)[0]->fd.GetNumber();
+    const std::vector<std::string> manual_compaction_files = {
+        MakeTableFileName(
+            GetLevelFileMetadatas(kProximalLevel - 1)[0]->fd.GetNumber()),
+        MakeTableFileName(
+            GetLevelFileMetadatas(kProximalLevel)[0]->fd.GetNumber())};
+
+    ASSERT_OK(db_->SetOptions({{"preclude_last_level_data_seconds", "10000"}}));
+    mock_clock_->MockSleepForSeconds(2 * kPeriodicCompactionSeconds);
+
+    bool forwarding = false;
+    std::vector<std::pair<int, uint64_t>> intended_compaction_inputs;
+    // Both callbacks run under the DB mutex.
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BackgroundCompaction:ForwardToBottomPriPool",
+        [&](void*) { forwarding = true; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionPicker::RegisterCompaction:Registered", [&](void* arg) {
+          if (!forwarding) {
+            return;
+          }
+          forwarding = false;
+          if (!intended_compaction_inputs.empty()) {
+            return;
+          }
+          auto* c = static_cast<Compaction*>(arg);
+          for (size_t which = 0; which < c->num_input_levels(); ++which) {
+            for (const FileMetaData* f : *c->inputs(which)) {
+              intended_compaction_inputs.emplace_back(c->level(which),
+                                                      f->fd.GetNumber());
+            }
+          }
+        });
+    // Let all data reach the last level so the auto compactions converge.
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionJob::PrepareTimes():preclude_last_level_min_seqno",
+        [](void* arg) {
+          *static_cast<SequenceNumber*>(arg) = kMaxSequenceNumber;
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionJob::ProcessKeyValueCompaction()::Processing",
+        [&](void* arg) {
+          if (static_cast<Compaction*>(arg)->output_level() == kProximalLevel) {
+            TEST_SYNC_POINT(
+                "PrecludeLastLevelTestBase::IntendedBottomPriCompaction:"
+                "ProximalLevelCompactionRunning");
+            TEST_SYNC_POINT(
+                "PrecludeLastLevelTestBase::IntendedBottomPriCompaction:"
+                "ProximalLevelCompactionResume");
+          }
+        });
+    SyncPoint::GetInstance()->LoadDependency({
+        {"PrecludeLastLevelTestBase::IntendedBottomPriCompaction:"
+         "ProximalLevelCompactionRunning",
+         "PrecludeLastLevelTestBase::IntendedBottomPriCompaction:"
+         "EnableAutoCompaction"},
+        {"DBImpl::BGWorkBottomCompaction",
+         "PrecludeLastLevelTestBase::IntendedBottomPriCompaction:"
+         "ProximalLevelCompactionResume"},
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    // Hold a compaction into the proximal level over the first L5 file only.
+    port::Thread manual_compaction_thread([&]() {
+      ASSERT_OK(db_->CompactFiles(CompactionOptions(), manual_compaction_files,
+                                  kProximalLevel));
+    });
+    TEST_SYNC_POINT(
+        "PrecludeLastLevelTestBase::IntendedBottomPriCompaction:"
+        "EnableAutoCompaction");
+    // The held compaction occupies a background compaction slot, so allow
+    // another one to run in parallel.
+    auto pressure_token =
+        dbfull()->TEST_write_controler().GetCompactionPressureToken();
+    // The auto compaction includes the last level file, whose key range
+    // covers the held compaction's, and is forwarded to the bottom-priority
+    // pool.
+    ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+    manual_compaction_thread.join();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    pressure_token.reset();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    const std::vector<std::pair<int, uint64_t>> expected_inputs = {
+        {kLastLevel, last_level_file}};
+    ASSERT_EQ(expected_inputs, intended_compaction_inputs);
+    for (int k : {0, 10, 12, 15, 20, 100}) {
+      ASSERT_EQ("v", Get(Key(k)));
+    }
+  }
 }
 
 // Tests DBIter::GetProperty("rocksdb.iterator.write-time") return a data's

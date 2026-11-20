@@ -879,7 +879,7 @@ class BuiltinLZ4CompressorV2WithDict : public CompressorWithSimpleDictBase {
 class BuiltinLZ4CompressorV2NoDict final
     : public BuiltinLZ4CompressorV2WithDict {
  public:
-  BuiltinLZ4CompressorV2NoDict(const CompressionOptions& opts)
+  explicit BuiltinLZ4CompressorV2NoDict(const CompressionOptions& opts)
       : BuiltinLZ4CompressorV2WithDict(opts, /*dict_data=*/{}) {}
 
   std::unique_ptr<Compressor> Clone() const override {

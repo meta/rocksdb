@@ -192,6 +192,37 @@ class FileIngestionHandle {
   // returns a Status.
   virtual Status Abort() = 0;
 
+  // Metadata of the ingested files this handle will make visible on commit.
+  // The files exist from prepare until commit or abort and keep their path,
+  // number, size and checksum when committed, so a caller can read them
+  // before they go live. Empty once the handle is spent.
+  //
+  // Set fields:
+  //   directory
+  //   relative_filename
+  //   name
+  //   db_path
+  //   file_number
+  //   size
+  //   temperature
+  //   file_checksum
+  //   file_checksum_func_name
+  //   smallestkey
+  //   largestkey
+  //   num_entries
+  //   num_deletions
+  //   smallest_seqno, largest_seqno: only with allow_db_generated_files;
+  //     otherwise commit assigns them
+  //
+  // Left at defaults (commit decides them):
+  //   epoch_number
+  //   file_creation_time
+  //   oldest_ancestor_time
+  //
+  // Does not include the range-tombstone file that an atomic_replace_range
+  // ingestion may add at commit.
+  virtual std::vector<SstFileMetaData> GetPreparedFiles() const = 0;
+
   FileIngestionHandle(const FileIngestionHandle&) = delete;
   FileIngestionHandle& operator=(const FileIngestionHandle&) = delete;
   FileIngestionHandle(FileIngestionHandle&&) = delete;
@@ -411,6 +442,10 @@ class DB {
   // tries to keep up with the leader by periodically tailing the leader's
   // MANIFEST, and (in the future) memtable updates, rather than relying on
   // the user to manually call TryCatchupWithPrimary().
+  // If the leader's MANIFEST belongs to another DB (another DB ID), for example
+  // after the leader DB is destroyed and created again at the same path, the
+  // follower stops catching up and keeps serving its current data. Reopen the
+  // follower to read the new DB.
 
   // Open as a follower with the default column family
   static Status OpenAsFollower(const Options& options, const std::string& name,
@@ -1442,9 +1477,11 @@ class DB {
   // a native coroutine capability or read executor, the default implementation
   // delegates to the synchronous Get/MultiGet path and invokes the callback
   // inline before returning. The callback is invoked after the requested
-  // statuses and output buffers have been populated. Applications can set
-  // `DBOptions::read_io_executor_threads` before opening the DB to configure
-  // executor parallelism for their workload.
+  // statuses and output buffers have been populated. The default FileSystem
+  // creates its read executor only for a positive
+  // `DBOptions::read_io_executor_threads` (default 0), so set it before
+  // opening the DB to use async file IO and to size the executor for the
+  // workload.
   //
   // Only selected data-block file reads can be issued asynchronously. Other
   // work in the read path, including waiting for DB or cache locks, opening
@@ -1702,6 +1739,13 @@ class DB {
     //      to this count. Always 0 when no `compaction_service` is configured.
     static const std::string kNumRunningRemoteCompactions;
 
+    //  "rocksdb.num-remote-compaction-pool-threads" - returns the thread count
+    //      of the process-wide remote compaction pool, including idle workers
+    //      and coordinators waiting for local fallback. This value is shared
+    //      by all DBs and must not be summed across DBs. Returns 0 before first
+    //      use and after releasing all idle workers.
+    static const std::string kNumRemoteCompactionPoolThreads;
+
     //  "rocksdb.num-running-bottom-compactions" - returns the number of
     //      currently running bottom-priority compactions.
     static const std::string kNumRunningBottomCompactions;
@@ -1802,9 +1846,13 @@ class DB {
     //      log files that should be kept.
     static const std::string kMinLogNumberToKeep;
 
-    //  "rocksdb.min-obsolete-sst-number-to-keep" - return the minimum file
-    //      number for an obsolete SST to be kept. The max value of `uint64_t`
-    //      will be returned if all obsolete files can be deleted.
+    //  "rocksdb.min-obsolete-sst-number-to-keep" - return a lower bound on
+    //      the file numbers of SST files that in-progress operations might
+    //      still be writing. RocksDB does not delete unrecognized SST files in
+    //      the DB directories at or above this number. This number does not
+    //      delay deleting SST files that became obsolete after being part of
+    //      the DB. The max value of `uint64_t` will be returned if no such
+    //      operation is in progress.
     static const std::string kMinObsoleteSstNumberToKeep;
 
     //  "rocksdb.total-sst-files-size" - returns total size (bytes) of all SST
@@ -1856,6 +1904,22 @@ class DB {
 
     //  "rocksdb.is-write-stopped" - Return 1 if write has been stopped.
     static const std::string kIsWriteStopped;
+
+    //  "rocksdb.secondary-has-missing-files" - for a secondary or follower
+    //      instance, returns 1 while catch-up cannot build a Version of the
+    //      newest MANIFEST state of a column family that the instance opened,
+    //      because a table or blob file of that state is missing or failed
+    //      verification. TryCatchUpWithPrimary() returns OK in that case, and
+    //      the column family keeps serving an older Version. Otherwise, and
+    //      for other instances, returns 0.
+    //      A value of 0 does not prove that the instance is caught up. These
+    //      files do not count: files of column families that the instance did
+    //      not open, files listed at open with `open_files_async`, and, with
+    //      `verify_sst_unique_id_in_manifest` = false, a table file of the
+    //      right size that fails to open.
+    //      After a missing blob file is deleted, the value can stay 1 while a
+    //      table file still references a blob file with a lower number.
+    static const std::string kSecondaryHasMissingFiles;
 
     //  "rocksdb.estimate-oldest-key-time" - returns an estimation of
     //      oldest key timestamp in the DB. Currently only available for
@@ -1964,6 +2028,7 @@ class DB {
   //  "rocksdb.estimate-pending-compaction-bytes"
   //  "rocksdb.num-running-compactions"
   //  "rocksdb.num-running-remote-compactions"
+  //  "rocksdb.num-remote-compaction-pool-threads"
   //  "rocksdb.num-running-bottom-compactions"
   //  "rocksdb.num-running-flushes"
   //  "rocksdb.num-unscheduled-compactions"
@@ -2094,7 +2159,13 @@ class DB {
   //
   // RELIABILITY & PERFORMANCE NOTE: SetOptions is not fully stress-tested for
   // reliability, and this is a slow call because a new OPTIONS file is
-  // serialized and persisted for each call. Use only infrequently.
+  // serialized and persisted for each call. Use only infrequently. As with
+  // SetDBOptions, a valid call that changes no option value returns OK without
+  // doing anything. This does not apply to a call that sets an object option
+  // such as table_factory or one of its fields. It also does not apply after
+  // an options or column family update fails part way or fails to write the
+  // OPTIONS file. Then SetOptions applies in full, and SetDBOptions writes the
+  // OPTIONS file even if no option value changes.
   //
   // EXAMPLES:
   //  s = db->SetOptions(cfh, {{"ttl", "36000"}});
@@ -2733,6 +2804,10 @@ class DB {
   // On error return, column family handle returned will be nullptr.
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
+  // Import never brings blob files, so it returns NotSupported if any file in
+  // `metadata` references blob files (oldest_blob_file_number != 0). Importing
+  // files without blob references into a column family with
+  // `enable_blob_files` is allowed.
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,
       const ImportColumnFamilyOptions& import_options,
@@ -2905,6 +2980,20 @@ class DB {
   // is reclaimed only once those files become readable or this instance is
   // reopened; `rocksdb.num-immutable-mem-table` reports how many memtables are
   // being held.
+  // When a table or blob file of the newest MANIFEST state is missing or fails
+  // verification, this call returns OK, and the column family keeps serving an
+  // older Version. `rocksdb.secondary-has-missing-files` reports this state.
+  // If a read of the MANIFEST fails, this call returns the error. The next
+  // call opens the MANIFEST again and continues after the last record that
+  // this instance applied. If that fails, the call returns the error, and the
+  // call after it tries again.
+  // If CURRENT names a MANIFEST of another DB (another DB ID), for example
+  // after the primary DB is destroyed and created again at the same path, this
+  // call returns Corruption. Reopen the instance to read the new DB.
+  // Any other error persists: every later call returns it and reads no more of
+  // the MANIFEST, until this instance is reopened. Examples are a corrupted
+  // MANIFEST record and an I/O error while applying a record, such as from
+  // opening a table file.
   virtual Status TryCatchUpWithPrimary() {
     return Status::NotSupported("Supported only by secondary instance");
   }

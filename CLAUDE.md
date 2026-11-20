@@ -16,7 +16,7 @@ This document provides guidance for generating and reviewing code in the RocksDB
 
 **Refactoring traps:** At least in production code, avoid constructs that could allow existing code to unexpectedly, quietly change meaning.
 Specifically:
-* Avoid new defaulted parameters. This is the #1 trap on refactoring!
+* Avoid new defaulted parameters. This is the #1 trap on refactoring! (Permitted exception: optional outputs that are generally safe to ignore.)
 * Avoid static_cast, reinterpret_cast, and C-style casts; static_cast_with_check, up_cast, and lossless_cast from cast_util.h are preferred.
 * Avoid declared type `auto` (`auto&`, `auto*` OK).
 
@@ -24,7 +24,8 @@ Specifically:
 
 **Comprehensive Coverage:** Every change should include appropriate test coverage. This includes unit tests for isolated functionality, integration tests for component interactions, and stress tests for concurrency and performance validation. Reviewers will ask for additional tests if coverage is insufficient.
 
-**Edge Cases and Failure Modes:** Tests should explicitly cover edge cases, boundary conditions, and potential failure scenarios. This is especially important for changes affecting core database operations, compaction, or recovery logic.
+**Edge Cases and Failure Modes:** Tests should explicitly cover edge cases, boundary conditions, and potential failure scenarios. This is especially important for changes affecting core database operations, compaction, or recovery logic. For non-OK Statuses, prefer comparing code() rather than using ASSERT_TRUE
+which is bad for debugging.
 
 **Platform-Specific Testing:** RocksDB supports multiple platforms (Linux, Windows, macOS) and compilers (GCC, Clang, MSVC). Changes should be tested across relevant platforms, particularly when touching platform-specific code or using compiler-specific features.
 
@@ -53,13 +54,79 @@ Specifically:
 - **Cold path** (executed rarely, e.g., DB open, configuration parsing, error handling): Maintainability and clarity are more important. Prefer readable code over micro-optimizations. Complex optimizations here add maintenance burden with negligible performance benefit.
 - **Warm path** (moderate frequency): Balance both concerns. Use profiling data to guide optimization decisions.
 
-**Avoid Premature Optimization:** Performance is known critical in places like inner loops of compaction, read path and write path. Elsewhere, try to find a "holy trinity" solution of *correct, simple, and reasonably efficient*. More complex solutions are only appropriate when profiling/benchmarking data shows a measurable payoff.
+**Avoid Premature Optimization:** Performance is known critical in places like inner loops of compaction, read path and write path (the data path in "Design Priorities" below). Elsewhere (control path), try to find a "holy trinity" solution of *correct, simple, and reasonably efficient*. In every case, more complex solutions are only appropriate when profiling/benchmarking data shows a measurable payoff.
+
+### Design Priorities
+
+**Priority order:** Data integrity first. Then efficiency (memory, CPU, I/O).
+Then code simplicity. RocksDB is a storage engine: after integrity, efficiency
+matters as much as correctness. Judge every data structure and algorithm by
+this order.
+
+**Classify the path before choosing a design:**
+- **Data path** (per key, per block or per file: reads, writes, flush,
+  compaction input/output): ask whether the design is the most efficient one
+  possible (fewest bytes per entry, fewest allocations, fewest I/Os, least
+  work under locks). Efficiency beats simplicity here.
+- **Control path** (DB open, option changes, MANIFEST bookkeeping, repair
+  tools; runs rarely): simplicity may win over efficiency, as long as the cost
+  stays bounded at scale (for example 100K SST files, many column families).
+- **Background work** (garbage collection, cleanup, census or statistics
+  rebuilds): latency does not matter (it may start later or run slower), but
+  CPU, memory, I/O and write amplification must stay as low as possible.
+  Prefer slower-but-cheaper over fast-but-costly.
+
+**Measure before choosing, and let numbers decide:** Compare candidate designs
+with db_bench (warm and cold, direct I/O for cold reads, cost per found key) or
+with exact counts (bytes per entry, allocations, I/Os). Drop a design the
+numbers reject, even if it is already written; revert an optimization that
+shows no measurable gain. Label estimates as estimates; never state them as
+measured.
+
+**Bounded, accounted memory:** Every new in-memory structure needs a stated
+size per entry and a bound at realistic scale. Large or data-dependent buffers
+should be charged to the block cache (or another existing memory budget), not
+left uncharged.
+
+**Feature-off cost is zero:** Users who do not enable a feature must not pay
+for it: no extra work under the DB mutex, no extra per-file or per-key
+metadata, no new failure modes. Gate new bookkeeping on the feature (or on its
+persisted format marker), and list anything that remains under "Changes
+visible to existing users" in the diff summary.
+
+**Fail loudly, never skip silently:** A rare path may be slow if it is correct
+and reports errors. Never silently ignore a record, a reference or an
+unexpected state. A retry loop must separate retryable conditions (stale
+input, transient I/O) from permanent ones (unresolvable metadata, missing
+file): permanent conditions return an error (for background jobs, a background
+error) instead of retrying forever.
+
+**Data-loss contracts are explicit:** Recovery modes have contracts users rely
+on (for example, best-efforts recovery yields a consistent point-in-time
+state). Do not add silent data loss to an existing mode. Accepting data loss
+(for example, dropping references to a lost blob file) must be an explicit
+user action through a dedicated API or option, and must never be triggered
+automatically by an error that could be transient.
+
+**Prefer supporting over rejecting:** When two features interact, prefer making
+the combination work if the change is moderate; reject the combination only
+when support is very large or unsafe, and document why.
 
 ### API Design and Compatibility
 
 **Backwards Compatibility:** RocksDB maintains strong backwards compatibility guarantees. Breaking changes are rare and require extensive justification. When deprecating features, follow the project's deprecation policy (typically spanning multiple releases).
 
 **Behavioral Compatibility:** Behavior changes are human judgment calls that must be intentional, well-documented (including release notes), and well researched for potential downstream production impact. Agents and reviewers must call out potential gaps, ambiguity, or adverse impacts in intentionality, documentation, and production impact. For an existing accepted input—including an undocumented, discouraged, or historically ignored value—the analysis should compare old and new observable behavior, including performance and resource impact, identify known direct callers and stored configurations, and add or update regression coverage as appropriate.
+
+**File Format Changes:** For formats with a version number, show a new
+feature with a version bump, not with an extra field or flag bit. Examples:
+`BlockBasedTableOptions::format_version` (`include/rocksdb/table.h`) adds
+features at each version (2..8) with no capability flags; blob files use the
+`BlobLogHeader` version. Readers reject unknown versions. MANIFEST records and
+table properties have no version: add a new tag or property key. If old
+readers must not silently ignore it, use a MANIFEST tag without
+`kTagSafeIgnoreMask` (or with `kCustomTagNonSafeIgnoreMask` for NewFile custom
+fields), so old readers fail to open the DB.
 
 **API Consistency:** New APIs should be consistent with existing patterns. Use similar naming conventions, parameter ordering, and return types. Reviewers will suggest changes to improve consistency with the broader codebase.
 
@@ -249,6 +316,28 @@ from an implementation detail instead of an explicit option.
   corresponding internal Phabricator diff summary, read and follow
   `claude_md/pull_request_summary_guideline.md`.
 
+### Multi-diff stacks and change hygiene
+* Each diff must build, pass its tests and be correct on its own.
+* Keep closely related changes in the same diff, so a reviewer can judge each
+  diff without reading later ones. An earlier diff may add code that later
+  diffs build on, but it should use or test that code itself and explain its
+  purpose. Avoid adding code whose only reason to exist is a later diff.
+* Avoid churn inside a stack: do not add a data model, format or interface in
+  one diff that a later diff in the same stack replaces. Put the final design
+  in the first diff that needs it.
+* Fix problems in the diff that introduces them rather than in a follow-up
+  diff. Do not add new diffs to a stack unless the change is very large.
+* Bugs found in existing RocksDB code go into separate diffs on master, not
+  into a feature stack.
+* Remove things that are unused or never verified. If every writer always
+  sets an optional field, make it mandatory.
+* Ask the maintainers before: on-disk or MANIFEST format changes, public API
+  (`include/`) changes, compaction logic changes, deprecating options, or
+  breaking compatibility.
+* Every summary claim must match the code. Include a "Changes visible to
+  existing users" section whenever behavior, cost or failure modes change for
+  users who do not enable the feature.
+
 ### Build system
 * There are 3 build system. Make for git clones, BUCK (meta internal) for hg
   clones, and CMake for some special cases.
@@ -342,6 +431,14 @@ architectures.
     unit tests. This should be done every time unit test is updated.
 * Don't use sleep to wait for certain events to happen. This will cause test to
     be flaky. Instead, use sync point to synchronize thread progress.
+* When a test waits for an expected event (a condition variable, sync point or
+    background job) with a timeout, so that it fails instead of hanging, make
+    the timeout several minutes, even if the event normally takes
+    milliseconds. CI machines can stall, and RocksDB CI does not retry failed
+    tests, so tests must be stable. A passing test returns as soon as the event
+    happens, so only a regression waits out the timeout. It is much better to
+    penalize a regressor with a slow result than to disrupt the workflow of the
+    innocent.
 * Cap unit test execution with 60 seconds timeout.
 * To build and run unit tests locally, prefer these helper scripts:
     * `build_tools/rocksptest.sh <test_binary> [more_binaries...] [args...]`
@@ -402,6 +499,18 @@ architectures.
 
 ### Stress test
 * When adding a new feature, make sure stress test covers the new option.
+* The crash test finds bugs through breadth: many randomized configurations
+    and operations, run continuously. A check for one feature or possible
+    regression should be cheap and leave the general workload largely
+    unchanged. Catching a specific regression only occasionally per run is
+    fine, because the crash test runs constantly. Do not add machinery that
+    frequently forces one scenario (for example, calling DB APIs from listener
+    callbacks, or extra compactions or long sleeps to provoke one race). It
+    takes time and operations away from finding other failures. Cover a
+    specific scenario deterministically in unit tests instead.
+* When adding such a check, confirm that it can fire against a deliberately
+    broken build, even if only occasionally, and that it does not fire against
+    correct code.
 
 ### Component docs
 * For component-level design notes and implementation walkthroughs, start with
@@ -436,7 +545,8 @@ architectures.
     objects are properly checked. This catches missing error handling that can
     lead to silent data corruption. Merely building with ASSERT_STATUS_CHECKED=1
     accomplishes nothing; it enables a runtime check. New unit tests missing
-    Status checks is a common failure point, even from agents.
+    Status checks is a common failure point, even from agents. Avoid new uses
+    of PermitUncheckedError(). That's the lazy solution.
 
 ### Monitoring make check progress
 * Use `make check-progress` to get machine-parseable JSON progress while

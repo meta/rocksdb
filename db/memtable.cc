@@ -31,6 +31,7 @@
 #include "memory/memory_usage.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
+#include "options/options_helper.h"
 #include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/comparator.h"
@@ -523,9 +524,9 @@ class MemTableIterator : public InternalIterator {
                // NOTE: checking extractor equivalence when not pointer
                // equivalent is arguably too expensive for memtable
                prefix_extractor_ == cf_prefix_extractor &&
-               (read_options.prefix_same_as_start ||
-                (!read_options.total_order_seek &&
-                 !read_options.auto_prefix_mode))) {
+               GetIteratorPrefixMode(read_options,
+                                     /*has_prefix_extractor=*/true) ==
+                   IteratorPrefixMode::kPrefix) {
       // Auto prefix mode is not implemented in memtable yet.
       assert(kind == kPointEntries);
       bloom_ = mem.bloom_filter_.get();

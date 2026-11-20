@@ -70,7 +70,7 @@ Step 1: When compression is enabled and blocks are physically adjacent (`prev_en
 
 Step 2: When temporary scratch storage is required, the synchronous path uses a stack buffer if the total read size fits in `kMultiGetReadStackBufSize` (8192 bytes), and otherwise uses a heap buffer. The coroutine path has no embedded stack buffer and allocates heap scratch only after request planning identifies blocks requiring I/O, so cache-hit-only requests allocate no scratch buffer
 
-Step 3: I/O dispatch -- the synchronous expansion uses `file->MultiRead()`. In the coroutine expansion, `use_coro_read()` selects `file->MultiReadCoroutine()`; otherwise direct I/O uses `file->MultiRead()` and buffered I/O awaits `AsyncFileReader::MultiReadAsync()`
+Step 3: I/O dispatch -- the synchronous expansion uses `file->MultiRead()`. In the coroutine expansion, `use_coro_read()` selects `file->MultiReadCoroutine()`; otherwise both buffered and direct I/O await `AsyncFileReader::MultiReadAsync()`
 
 Step 4: After reads complete, each block is verified (checksum), decompressed if needed, and inserted into block cache
 
@@ -86,7 +86,7 @@ MultiGet has two coroutine integration modes:
 
 **Async cache probes:** For each unique block handle, `block_cache.StartAsyncLookupFull()` initiates an async cache lookup. All lookups are started, then `WaitAll()` collects results. Cache hits populate results directly; misses accumulate into the I/O phase.
 
-**Async disk I/O:** When `use_coro_read()` is enabled, the coroutine expansion awaits `RandomAccessFileReader::MultiReadCoroutine()`. Otherwise, buffered reads use `AsyncFileReader::MultiReadAsync()`. `AsyncFileReader` implements the C++20 Awaitable concept; `MultiReadAsyncImpl` calls `RandomAccessFileReader::ReadAsync`, which on Linux uses `io_uring` via `PosixFileSystem::Poll()`. The `ReadAwaiter` stores pending I/O handles and the suspended coroutine handle.
+**Async disk I/O:** When `use_coro_read()` is enabled, the coroutine expansion awaits `RandomAccessFileReader::MultiReadCoroutine()`. Otherwise, reads use `AsyncFileReader::MultiReadAsync()`. `AsyncFileReader` implements the C++20 Awaitable concept; `MultiReadAsyncImpl` calls `RandomAccessFileReader::ReadAsync`, which on Linux uses `io_uring` via `PosixFileSystem::Poll()`. For direct I/O, `ReadAsync` aligns each request and returns its aligned buffer in the request's `fs_scratch`, which `RetrieveMultipleBlocks()` keeps until the blocks are parsed. Direct I/O requests are not merged, so adjacent blocks can read an overlapping aligned page twice. The `ReadAwaiter` stores pending I/O handles and the suspended coroutine handle.
 
 ## Version::MultiGet SST File Routing
 

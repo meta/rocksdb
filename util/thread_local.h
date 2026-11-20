@@ -76,7 +76,7 @@ class ThreadLocalPtr {
   // prevents unref handler from running during this call, but clients must
   // still provide external synchronization since the owning thread can
   // access the values without internal locking, e.g., via Get() and Reset().
-  void Fold(FoldFunc func, void* res);
+  void Fold(const FoldFunc& func, void* res);
 
   // Add here for testing
   // Return the next available Id without claiming it

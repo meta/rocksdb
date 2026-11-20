@@ -147,7 +147,7 @@ void RangeLockList::ReplaceLocks(const toku::locktree *lt,
   it->second->create();
 
   toku::range_buffer::iterator iter(&buffer);
-  toku::range_buffer::iterator::record rec;
+  toku::range_buffer::iterator::record rec{};
   while (iter.current(&rec)) {
     it->second->append(rec.get_left_key(), rec.get_right_key());
     iter.next();

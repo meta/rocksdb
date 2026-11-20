@@ -336,6 +336,32 @@ int db_stress_tool(int argc, char** argv) {
     }
   }
 
+  if (!FLAGS_table_factory_uri.empty() && FLAGS_use_full_external_table) {
+    return ReturnValidationError(
+        "table_factory_uri and use_full_external_table both select the table "
+        "factory");
+  }
+
+  if (!FLAGS_structured_key_value &&
+      FLAGS_prefix_size > static_cast<int32_t>(sizeof(uint64_t))) {
+    return ReturnValidationError(
+        "prefix_size must be <= 8, the size of the shortest keys, unless "
+        "structured_key_value is set");
+  }
+  if (FLAGS_structured_key_value) {
+    if (FLAGS_test_batches_snapshots || FLAGS_test_multi_ops_txns) {
+      return ReturnValidationError(
+          "structured_key_value does not support test_batches_snapshots or "
+          "test_multi_ops_txns, which generate their own keys");
+    }
+    if (FLAGS_prefix_size >
+        static_cast<int32_t>(kStructuredSingleFieldKeySize)) {
+      return ReturnValidationError(
+          "structured_key_value requires prefix_size <= ",
+          kStructuredSingleFieldKeySize, ", the size of its shortest keys");
+    }
+  }
+
   if (!FLAGS_verify_cpu_corruption_dir.empty()) {
     // The full-keyspace read-back is only well-defined with a single writer,
     // and injected I/O faults would taint it -- so require --threads=1 and all
@@ -690,7 +716,25 @@ int db_stress_tool(int argc, char** argv) {
           "true.");
     }
   }
-  if ((FLAGS_enable_compaction_filter || FLAGS_inplace_update_support) &&
+  if (FLAGS_merge_before_compaction_filter &&
+      (!FLAGS_enable_compaction_filter || FLAGS_use_txn ||
+       FLAGS_user_timestamp_size != 0)) {
+    return ReturnValidationError(
+        "merge_before_compaction_filter requires enable_compaction_filter, "
+        "no transactions, and no user-defined timestamps");
+  }
+  if ((FLAGS_merge_before_filter_change_one_in > 0 ||
+       FLAGS_merge_before_filter_remove_deleted) &&
+      !FLAGS_merge_before_compaction_filter) {
+    return ReturnValidationError(
+        "merge_before_filter_change_one_in and "
+        "merge_before_filter_remove_deleted require "
+        "merge_before_compaction_filter");
+  }
+  if (((FLAGS_enable_compaction_filter &&
+        (!FLAGS_merge_before_compaction_filter ||
+         FLAGS_merge_before_filter_remove_deleted)) ||
+       FLAGS_inplace_update_support) &&
       (FLAGS_acquire_snapshot_one_in > 0 || FLAGS_compact_range_one_in > 0 ||
        FLAGS_iterpercent > 0 || FLAGS_prefixpercent > 0 ||
        FLAGS_test_batches_snapshots || FLAGS_test_cf_consistency ||
@@ -776,6 +820,16 @@ int db_stress_tool(int argc, char** argv) {
     }
     key_gen_ctx.weights.emplace_back(key_gen_ctx.window -
                                      keys_per_level * (levels - 1));
+  }
+  if (FLAGS_structured_key_value) {
+    s = InitStructuredKeyValueContext(
+        FLAGS_structured_keys_per_key_space, FLAGS_structured_key_fanout,
+        FLAGS_structured_key_space_type_weights,
+        FLAGS_structured_value_version_weights,
+        static_cast<size_t>(FLAGS_value_size_mult), FLAGS_max_key);
+    if (!s.ok()) {
+      return ReturnValidationError(s.ToString());
+    }
   }
   // Initialize shared resources (hot-key generator, block cache, WBM,
   // rate limiter) once so that all DB instances share them.

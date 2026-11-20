@@ -37,7 +37,7 @@ class MemoryAllocatorTest
   std::string id_;
 
  private:
-  bool supported_;
+  bool supported_ = false;
 };
 
 TEST_P(MemoryAllocatorTest, Allocate) {

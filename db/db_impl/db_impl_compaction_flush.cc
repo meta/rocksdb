@@ -11,6 +11,7 @@
 #include <deque>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/builder.h"
@@ -60,6 +61,11 @@ void RecordAtomicFlushRequestReason(Statistics* stats,
       RecordTick(stats, ATOMIC_FLUSH_REQUEST_REASON_OTHER);
       break;
   }
+}
+
+Status TableBuilderNotSupported(const ColumnFamilyData& cfd) {
+  return Status::NotSupported(
+      "Column family's table factory cannot build tables", cfd.GetName());
 }
 
 std::vector<uint64_t> MemTableIds(const autovector<ReadOnlyMemTable*>& mems) {
@@ -158,7 +164,7 @@ bool DBImpl::ShouldRescheduleFlushRequestToRetainUDT(
           cfd->GetUnflushedMemTableCountForWriteStallCheck(),
           /*num_l0_files=*/0,
           /*num_compaction_needed_bytes=*/0, mutable_cf_options,
-          cfd->ioptions())
+          cfd->ioptions(), cfd->is_table_builder_supported())
           .first;
   if (write_stall != WriteStallCondition::kNormal) {
     return false;
@@ -403,6 +409,8 @@ Status DBImpl::FlushMemTableToOutputFile(
   }
 
   if (!s.ok() && need_cancel) {
+    cfd->imm()->RollbackMemtableFlush(flush_job.GetMemTables(),
+                                      /*rollback_succeeding_memtables=*/false);
     flush_job.Cancel();
   }
 
@@ -426,7 +434,7 @@ Status DBImpl::FlushMemTableToOutputFile(
     const VersionStorageInfo* const storage_info = current->storage_info();
     assert(storage_info);
 
-    VersionStorageInfo::LevelSummaryStorage tmp;
+    VersionStorageInfo::LevelSummaryStorage tmp{};
     ROCKS_LOG_BUFFER(log_buffer, "[%s] Level summary: %s\n",
                      column_family_name.c_str(),
                      storage_info->LevelSummary(&tmp));
@@ -467,8 +475,7 @@ Status DBImpl::FlushMemTableToOutputFile(
       }
     } else {
       assert(s == log_io_s);
-      Status new_bg_error = s;
-      error_handler_.SetBGError(new_bg_error, BackgroundErrorReason::kFlush);
+      error_handler_.SetBGError(s, BackgroundErrorReason::kFlush);
     }
   }
   // If flush ran smoothly and no mempurge happened
@@ -786,9 +793,11 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     // Need to undo atomic flush if something went wrong, i.e. s is not OK and
     // it is not because of CF drop.
     // Have to cancel the flush jobs that have NOT executed because we need to
-    // unref the versions.
+    // unref the versions and make their picked memtables flushable again.
     for (int i = 0; i != num_cfs; ++i) {
       if (pick_status[i] && !exec_status[i].first) {
+        cfds[i]->imm()->RollbackMemtableFlush(
+            jobs[i]->GetMemTables(), /*rollback_succeeding_memtables=*/false);
         jobs[i]->Cancel();
       }
     }
@@ -1017,7 +1026,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
       const VersionStorageInfo* const storage_info = current->storage_info();
       assert(storage_info);
 
-      VersionStorageInfo::LevelSummaryStorage tmp;
+      VersionStorageInfo::LevelSummaryStorage tmp{};
       ROCKS_LOG_BUFFER(log_buffer, "[%s] Level summary: %s\n",
                        column_family_name.c_str(),
                        storage_info->LevelSummary(&tmp));
@@ -1093,8 +1102,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
       }
     } else {
       assert(s == log_io_s);
-      Status new_bg_error = s;
-      error_handler_.SetBGError(new_bg_error, BackgroundErrorReason::kFlush);
+      error_handler_.SetBGError(s, BackgroundErrorReason::kFlush);
     }
   }
 
@@ -1189,6 +1197,10 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
   assert(cfd);
 
+  if (!cfd->is_table_builder_supported()) {
+    return TableBuilderNotSupported(*cfd);
+  }
+
   if (manual_compaction_paused_.load(std::memory_order_acquire) > 0) {
     return Status::Incomplete(Status::SubCode::kManualCompactionPaused);
   }
@@ -1243,7 +1255,7 @@ Status DBImpl::IncreaseFullHistoryTsLow(ColumnFamilyHandle* column_family,
 }
 
 Status DBImpl::IncreaseFullHistoryTsLowImpl(ColumnFamilyData* cfd,
-                                            std::string ts_low) {
+                                            const std::string& ts_low) {
   VersionEdit edit;
   edit.SetColumnFamily(cfd->GetID());
   edit.SetFullHistoryTsLow(ts_low);
@@ -1302,6 +1314,11 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
     return Status::NotSupported(
         "FIFO compaction does not support change_level.");
   }
+  if (options.skip_missing_blob_files &&
+      cfd->ioptions().compaction_style == kCompactionStyleFIFO) {
+    return Status::NotSupported(
+        "FIFO compaction does not support missing blob file repair.");
+  }
 
   bool flush_needed = true;
 
@@ -1338,6 +1355,9 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
     fo.allow_write_stall = options.allow_write_stall;
     if (immutable_db_options_.atomic_flush) {
       s = AtomicFlushMemTables(fo, FlushReason::kManualCompaction);
+      if (s.ok() && cfd->IsDropped()) {
+        s = Status::ColumnFamilyDropped();
+      }
     } else {
       s = FlushMemTable(cfd, fo, FlushReason::kManualCompaction);
     }
@@ -1529,7 +1549,8 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
         if (s.ok()) {
           assert(final_output_level > 0);
           // bottommost level intra-level compaction
-          if ((options.bottommost_level_compaction ==
+          if (options.skip_missing_blob_files ||
+              (options.bottommost_level_compaction ==
                    BottommostLevelCompaction::kIfHaveCompactionFilter &&
                (cfd->ioptions().compaction_filter != nullptr ||
                 cfd->ioptions().compaction_filter_factory != nullptr)) ||
@@ -1538,7 +1559,7 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
               options.bottommost_level_compaction ==
                   BottommostLevelCompaction::kForce) {
             // Use `next_file_number` as `max_file_num_to_ignore` to avoid
-            // rewriting newly compacted files when it is kForceOptimized
+            // rewriting newly compacted files during repair, kForceOptimized,
             // or kIfHaveCompactionFilter with compaction filter set.
             s = RunManualCompaction(
                 cfd, final_output_level, final_output_level, options, begin,
@@ -1605,6 +1626,10 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
   auto cfd =
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
   assert(cfd);
+
+  if (!cfd->is_table_builder_supported()) {
+    return TableBuilderNotSupported(*cfd);
+  }
 
   {
     InstrumentedMutexLock l(&mutex_);
@@ -1699,16 +1724,8 @@ void DBImpl::PrepareTrivialMoveEdit(Compaction& c, LogBuffer* log_buffer,
     for (size_t i = 0; i < c.num_input_files(l); i++) {
       FileMetaData* f = c.input(l, i);
       c.edit()->DeleteFile(c.level(l), f->fd.GetNumber());
-      c.edit()->AddFile(
-          c.output_level(), f->fd.GetNumber(), f->fd.GetPathId(),
-          f->fd.GetFileSize(), f->smallest, f->largest, f->fd.smallest_seqno,
-          f->fd.largest_seqno, f->marked_for_compaction, f->temperature,
-          f->oldest_blob_file_number, f->oldest_ancestor_time,
-          f->file_creation_time, f->epoch_number, f->file_checksum,
-          f->file_checksum_func_name, f->unique_id,
-          f->compensated_range_deletion_size, f->tail_size,
-          f->user_defined_timestamps_persisted, f->min_timestamp,
-          f->max_timestamp, f->file_open_metadata);
+      c.edit()->AddExistingFile(c.output_level(), *f,
+                                kProvenanceMovedBetweenLevels);
       moved_bytes += static_cast<size_t>(c.input(l, i)->fd.GetFileSize());
       ROCKS_LOG_BUFFER(
           log_buffer, "[%s] Moved #%" PRIu64 " to level-%d %" PRIu64 " bytes\n",
@@ -1812,7 +1829,11 @@ Status DBImpl::CompactFilesImpl(
   }
 
   // At this point, CompactFiles will be run.
-  bg_compaction_scheduled_++;
+  const bool separate_remote_pool = UseSeparateRemoteCompactionPool();
+  int& scheduled_compactions = separate_remote_pool
+                                   ? remote_coordinators_scheduled_
+                                   : bg_compaction_scheduled_;
+  ++scheduled_compactions;
 
   std::unique_ptr<Compaction> c;
   assert(cfd->compaction_picker());
@@ -1869,6 +1890,7 @@ Status DBImpl::CompactFilesImpl(
       if (!compaction_released) {
         c->ReleaseCompactionFiles(status);
       }
+      RescoreAndEnqueuePendingCompaction(c->column_family_data());
       ROCKS_LOG_BUFFER(log_buffer, "[%s] Trivial move failed: %s\n",
                        c->column_family_data()->GetName().c_str(),
                        status.ToString().c_str());
@@ -1876,8 +1898,9 @@ Status DBImpl::CompactFilesImpl(
     }
 
     c.reset();
-    bg_compaction_scheduled_--;
-    if (bg_compaction_scheduled_ == 0 || per_cf_compaction_abort_waiters_ > 0) {
+    --scheduled_compactions;
+    if (separate_remote_pool || bg_compaction_scheduled_ == 0 ||
+        per_cf_compaction_abort_waiters_ > 0) {
       bg_cv_.SignalAll();
     }
     MaybeScheduleFlushOrCompaction();
@@ -1908,6 +1931,10 @@ Status DBImpl::CompactFilesImpl(
       db_session_id_, c->column_family_data()->GetFullHistoryTsLow(),
       c->trim_ts(), &blob_callback_, &bg_compaction_scheduled_,
       &bg_bottom_compaction_scheduled_, &num_running_remote_compactions_);
+  ConfigureCompactionExecutors(&compaction_job, c->column_family_data(),
+                               kManualCompactionCanceledFalse_, false,
+                               separate_remote_pool);
+  c->SetSeparateRemoteCompactionPoolSelected(separate_remote_pool);
 
   // Creating a compaction influences the compaction score because the score
   // takes running compactions into account (by skipping files that are already
@@ -1947,6 +1974,8 @@ Status DBImpl::CompactFilesImpl(
     InstallSuperVersionAndScheduleWork(
         c->column_family_data(), job_context->superversion_contexts.data(),
         /*defer_snapshot_refresh=*/false);
+  } else {
+    RescoreAndEnqueuePendingCompaction(c->column_family_data());
   }
   // status above captures any error during compaction_job.Install, so its ok
   // not check compaction_job.io_status() explicitly if we're not calling
@@ -2012,8 +2041,9 @@ Status DBImpl::CompactFilesImpl(
 
   c.reset();
 
-  bg_compaction_scheduled_--;
-  if (bg_compaction_scheduled_ == 0 || per_cf_compaction_abort_waiters_ > 0) {
+  --scheduled_compactions;
+  if (separate_remote_pool || bg_compaction_scheduled_ == 0 ||
+      per_cf_compaction_abort_waiters_ > 0) {
     bg_cv_.SignalAll();
   }
   MaybeScheduleFlushOrCompaction();
@@ -2025,8 +2055,9 @@ Status DBImpl::CompactFilesImpl(
 Status DBImpl::PauseBackgroundWork() {
   InstrumentedMutexLock guard_lock(&mutex_);
   bg_compaction_paused_++;
-  while (bg_bottom_compaction_scheduled_ > 0 || bg_compaction_scheduled_ > 0 ||
+  while (CompactionsScheduled() > 0 || remote_compaction_pool_jobs_ > 0 ||
          bg_flush_scheduled_ > 0 || bg_wbm_flush_scheduled_ > 0) {
+    TEST_SYNC_POINT("DBImpl::PauseBackgroundWork:Wait");
     bg_cv_.Wait();
   }
   bg_work_paused_++;
@@ -2278,15 +2309,7 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
 
     for (const auto& f : vstorage->LevelFiles(level)) {
       edit.DeleteFile(level, f->fd.GetNumber());
-      edit.AddFile(
-          to_level, f->fd.GetNumber(), f->fd.GetPathId(), f->fd.GetFileSize(),
-          f->smallest, f->largest, f->fd.smallest_seqno, f->fd.largest_seqno,
-          f->marked_for_compaction, f->temperature, f->oldest_blob_file_number,
-          f->oldest_ancestor_time, f->file_creation_time, f->epoch_number,
-          f->file_checksum, f->file_checksum_func_name, f->unique_id,
-          f->compensated_range_deletion_size, f->tail_size,
-          f->user_defined_timestamps_persisted, f->min_timestamp,
-          f->max_timestamp, f->file_open_metadata);
+      edit.AddExistingFile(to_level, *f, kProvenanceMovedBetweenLevels);
     }
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                     "[%s] Apply version edit:\n%s", cfd->GetName().c_str(),
@@ -2342,9 +2365,6 @@ Status DBImpl::FlushAllColumnFamilies(const FlushOptions& flush_options,
     TEST_SYNC_POINT(
         "DBImpl::FlushAllColumnFamilies:BeforeAtomicFlushMemTables");
     status = AtomicFlushMemTables(flush_options, flush_reason);
-    if (status.IsColumnFamilyDropped()) {
-      status = Status::OK();
-    }
     mutex_.Lock();
   } else {
     for (auto cfd : versions_->GetRefedColumnFamilySet()) {
@@ -2450,7 +2470,9 @@ Status DBImpl::RunManualCompaction(
 
   ManualCompactionState manual(
       cfd, input_level, output_level, compact_range_options.target_path_id,
-      exclusive, disallow_trivial_move, compact_range_options.canceled);
+      exclusive,
+      disallow_trivial_move || compact_range_options.skip_missing_blob_files,
+      compact_range_options.canceled);
   // For universal compaction, we enforce every manual compaction to compact
   // all files.
   if (begin == nullptr ||
@@ -2516,8 +2538,7 @@ Status DBImpl::RunManualCompaction(
     // Limitation: there's no way to wake up the below loop when user sets
     // `*manual.canceled`. So `CompactRangeOptions::exclusive_manual_compaction`
     // and `CompactRangeOptions::canceled` might not work well together.
-    while (bg_bottom_compaction_scheduled_ > 0 ||
-           bg_compaction_scheduled_ > 0) {
+    while (CompactionsScheduled() > 0 || remote_compaction_pool_jobs_ > 0) {
       if (IsCompactionAborted(cfd)) {
         // Pretend the error came from compaction so the below cleanup/error
         // handling code can process it.
@@ -2624,20 +2645,19 @@ Status DBImpl::RunManualCompaction(
       manual.incomplete = false;
       if (compaction->bottommost_level() &&
           env_->GetBackgroundThreads(Env::Priority::BOTTOM) > 0) {
-        bg_bottom_compaction_scheduled_++;
         ca->compaction_pri_ = Env::Priority::BOTTOM;
-        env_->Schedule(&DBImpl::BGWorkBottomCompaction, ca,
-                       Env::Priority::BOTTOM,
-                       GetTaskTag(TaskType::kManualCompaction),
-                       &DBImpl::UnscheduleCompactionCallback);
         thread_pool_priority = Env::Priority::BOTTOM;
       } else {
-        bg_compaction_scheduled_++;
         ca->compaction_pri_ = Env::Priority::LOW;
-        env_->Schedule(&DBImpl::BGWorkCompaction, ca, Env::Priority::LOW,
-                       GetTaskTag(TaskType::kManualCompaction),
-                       &DBImpl::UnscheduleCompactionCallback);
         thread_pool_priority = Env::Priority::LOW;
+      }
+      Status schedule_status =
+          ScheduleCompaction(ca, GetTaskTag(TaskType::kManualCompaction));
+      if (!schedule_status.ok()) {
+        manual.status = std::move(schedule_status);
+        manual.done = true;
+        bg_cv_.SignalAll();
+        continue;
       }
       scheduled = true;
       TEST_SYNC_POINT("DBImpl::RunManualCompaction:Scheduled");
@@ -2667,11 +2687,11 @@ Status DBImpl::RunManualCompaction(
   assert(!manual.in_progress);
   assert(HasPendingManualCompaction());
   RemoveManualCompaction(&manual);
-  // if the manual job is unscheduled, try schedule other jobs in case there's
-  // any unscheduled compaction job which was blocked by exclusive manual
-  // compaction.
-  if (manual.status.IsIncomplete() &&
-      manual.status.subcode() == Status::SubCode::kManualCompactionPaused) {
+  // If the manual job did not succeed, try to schedule other jobs in case
+  // there is any unscheduled compaction job which was blocked by exclusive
+  // manual compaction, including the column family that the failed manual
+  // compaction requeued when it released its input files.
+  if (!manual.status.ok()) {
     MaybeScheduleFlushOrCompaction();
   }
   bg_cv_.SignalAll();
@@ -2694,8 +2714,8 @@ void DBImpl::GenerateFlushRequest(const autovector<ColumnFamilyData*>& cfds,
   }
 }
 
-void DBImpl::NotifyOnManualFlushScheduled(autovector<ColumnFamilyData*> cfds,
-                                          FlushReason flush_reason) {
+void DBImpl::NotifyOnManualFlushScheduled(
+    const autovector<ColumnFamilyData*>& cfds, FlushReason flush_reason) {
   if (immutable_db_options_.listeners.size() == 0U) {
     return;
   }
@@ -3032,7 +3052,10 @@ Status DBImpl::AtomicFlushMemTablesImpl(
     for (auto cfd : candidate_cfds) {
       bool flush_needed = true;
       s = WaitUntilFlushWouldNotStallWrites(cfd, &flush_needed);
-      if (!s.ok()) {
+      if (s.IsColumnFamilyDropped() && provided_candidate_cfds.empty()) {
+        // A generated candidate dropped while waiting has nothing to flush.
+        s = Status::OK();
+      } else if (!s.ok()) {
         unref_generated_candidates();
         return s;
       } else if (flush_needed) {
@@ -3169,6 +3192,11 @@ Status DBImpl::AtomicFlushMemTablesImpl(
         cfds, flush_memtable_ids,
         flush_reason == FlushReason::kErrorRecovery /* resuming_from_bg_err */,
         flush_reason, flush_options.listener_wait);
+    if (s.IsColumnFamilyDropped() && provided_candidate_cfds.empty()) {
+      // Every selected CF was dropped. Generated candidates that were not
+      // selected had nothing to flush.
+      s = Status::OK();
+    }
     InstrumentedMutexLock lock_guard(&mutex_);
     for (auto* cfd : cfds) {
       cfd->UnrefAndTryDelete();
@@ -3333,7 +3361,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
               cfd->GetUnflushedMemTableCountForWriteStallCheck(),
               vstorage->l0_delay_trigger_count() + 1,
               vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
-              cfd->ioptions())
+              cfd->ioptions(), cfd->is_table_builder_supported())
               .first;
     } while (write_stall_condition != WriteStallCondition::kNormal);
   }
@@ -3539,8 +3567,9 @@ void DBImpl::AbortAllCompactions() {
   // or abort before returning.
   // Note: bg_cv_.Wait() releases the mutex while waiting, so other threads
   // can make progress and signal when compactions complete.
-  while (bg_bottom_compaction_scheduled_ > 0 || bg_compaction_scheduled_ > 0 ||
+  while (CompactionsScheduled() > 0 || remote_compaction_pool_jobs_ > 0 ||
          HasPendingManualCompaction()) {
+    TEST_SYNC_POINT("DBImpl::AbortAllCompactions:Wait");
     bg_cv_.Wait();
   }
 }
@@ -3608,12 +3637,8 @@ void DBImpl::ResumeCompactions(ColumnFamilyHandle* column_family) {
                  "[%s] ResumeCompactions: counter %d -> %d",
                  cfd->GetName().c_str(), before, current);
   if (current == 0) {
-    // TODO: Aborting an automatic compaction after PickCompaction()
-    // releases its inputs without recomputing the compaction score, so this
-    // EnqueuePendingCompaction() can observe a stale sub-trigger score and
-    // queue nothing, leaving the CF idle until the next flush. Pre-existing
-    // (ResumeAllCompactions() has the same gap); fix separately for both APIs
-    // by recomputing the score on the abort path.
+    // A compaction aborted after it was picked rescores the column family
+    // when it releases its inputs, but does not queue it.
     if (!RestoreParkedCompaction(cfd) && !cfd->IsDropped()) {
       EnqueuePendingCompaction(cfd);
     }
@@ -3647,7 +3672,21 @@ void DBImpl::ResumeAllCompactions() {
   // If this is the last resume call (abort counter back to 0), schedule
   // compactions that may have been waiting
   if (current == 0) {
-    // The stale-score TODO in ResumeCompactions() also applies here.
+    // A compaction aborted after it was picked rescores its column family
+    // when it releases its inputs, but does not queue it. Queue every column
+    // family that needs compaction, except those with their own abort still
+    // active: ResumeCompactions() queues them.
+    // Read-only and secondary DBs never schedule compactions, so queuing
+    // here would make WaitForCompact() wait forever.
+    if (opened_successfully_ && !read_only_ &&
+        !shutting_down_.load(std::memory_order_acquire)) {
+      for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+        if (!cfd->IsDropped() && cfd->initialized() &&
+            cfd->compaction_aborted() == 0) {
+          EnqueuePendingCompaction(cfd);
+        }
+      }
+    }
     MaybeScheduleFlushOrCompaction();
   }
 }
@@ -3729,18 +3768,512 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
     return;
   }
 
-  while (bg_compaction_scheduled_ + bg_bottom_compaction_scheduled_ <
-             bg_job_limits.max_compactions &&
+  while ((UseSeparateRemoteCompactionPool() ||
+          LocalCompactionsScheduled() < bg_job_limits.max_compactions) &&
          unscheduled_compactions_ > 0) {
     CompactionArg* ca = new CompactionArg;
     ca->db = this;
     ca->compaction_pri_ = Env::Priority::LOW;
     ca->prepicked_compaction = nullptr;
-    bg_compaction_scheduled_++;
+    Status schedule_status = ScheduleCompaction(ca, this);
+    if (!schedule_status.ok()) {
+      error_handler_.SetBGError(schedule_status,
+                                BackgroundErrorReason::kCompaction);
+      bg_cv_.SignalAll();
+      break;
+    }
     unscheduled_compactions_--;
-    env_->Schedule(&DBImpl::BGWorkCompaction, ca, Env::Priority::LOW, this,
-                   &DBImpl::UnscheduleCompactionCallback);
   }
+}
+
+class DBImpl::RemoteCompactionCompletionGuard {
+ public:
+  explicit RemoteCompactionCompletionGuard(DBImpl& db) : db_(db) {}
+
+  ~RemoteCompactionCompletionGuard() {
+    db_.remote_compaction_pool_->CompleteJob();
+    InstrumentedMutexLock completed(&db_.mutex_);
+    --db_.remote_compaction_pool_jobs_;
+    db_.bg_cv_.SignalAll();
+  }
+
+  RemoteCompactionCompletionGuard(const RemoteCompactionCompletionGuard&) =
+      delete;
+  RemoteCompactionCompletionGuard& operator=(
+      const RemoteCompactionCompletionGuard&) = delete;
+  RemoteCompactionCompletionGuard(RemoteCompactionCompletionGuard&&) = delete;
+  RemoteCompactionCompletionGuard& operator=(
+      RemoteCompactionCompletionGuard&&) = delete;
+
+ private:
+  DBImpl& db_;
+};
+
+void DBImpl::ScheduleRemoteCompaction(std::function<void()> work) {
+  InstrumentedMutexLock lock(&mutex_);
+  ScheduleRemoteCompactionLocked(std::move(work));
+}
+
+void DBImpl::ScheduleRemoteCompactionLocked(std::function<void()> work) {
+  mutex_.AssertHeld();
+  if (!remote_compaction_pool_) {
+    remote_compaction_pool_ = RemoteCompactionThreadPool::GetShared();
+  }
+#ifndef NDEBUG
+  std::function<void()> before_submit;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::ScheduleRemoteCompaction:BeforeSubmit",
+                           &before_submit);
+  if (before_submit) {
+    before_submit();
+  }
+#endif
+  remote_compaction_pool_->SubmitJob(
+      [this, work = std::move(work)] {
+        RemoteCompactionCompletionGuard completed(*this);
+        work();
+      },
+      this, RemoteCompactionPoolBaseline());
+  ++remote_compaction_pool_jobs_;
+}
+
+int DBImpl::RemoteCompactionPoolBaseline() const {
+  mutex_.AssertHeld();
+  return std::max(1, env_->GetBackgroundThreads(Env::Priority::LOW) +
+                         env_->GetBackgroundThreads(Env::Priority::BOTTOM));
+}
+
+void DBImpl::ShrinkRemoteCompactionPool() {
+  InstrumentedMutexLock lock(&mutex_);
+  if (remote_compaction_pool_) {
+    remote_compaction_pool_->Shrink(this, UseSeparateRemoteCompactionPool()
+                                              ? RemoteCompactionPoolBaseline()
+                                              : 0);
+  }
+}
+
+void DBImpl::ReleaseRemoteCompactionPool() {
+  if (remote_compaction_pool_) {
+    remote_compaction_pool_->RemoveClient(this);
+    remote_compaction_pool_.reset();
+  }
+}
+
+Status DBImpl::ScheduleCompaction(CompactionArg* arg, void* tag) {
+  mutex_.AssertHeld();
+  const Env::Priority priority = arg->compaction_pri_;
+  const bool separate_remote_pool = UseSeparateRemoteCompactionPool();
+  void (*worker)(void*) = priority == Env::Priority::BOTTOM
+                              ? &DBImpl::BGWorkBottomCompaction
+                              : &DBImpl::BGWorkCompaction;
+  arg->separate_remote_pool = separate_remote_pool;
+  try {
+    if (separate_remote_pool) {
+      ScheduleRemoteCompactionLocked([worker, arg] { worker(arg); });
+    } else {
+      env_->Schedule(worker, arg, priority, tag,
+                     &DBImpl::UnscheduleCompactionCallback);
+    }
+  } catch (...) {
+    Status status = Status::Aborted();
+    std::unique_ptr<CompactionArg> rejected(arg);
+    std::unique_ptr<PrepickedCompaction> prepicked(arg->prepicked_compaction);
+    if (prepicked && prepicked->compaction) {
+      std::unique_ptr<Compaction> compaction(prepicked->compaction);
+      compaction->ReleaseCompactionFiles(status);
+    }
+    return status;
+  }
+  if (separate_remote_pool) {
+    ++remote_coordinators_scheduled_;
+  } else if (priority == Env::Priority::BOTTOM) {
+    ++bg_bottom_compaction_scheduled_;
+  } else {
+    ++bg_compaction_scheduled_;
+  }
+  return Status::OK();
+}
+
+void DBImpl::ConfigureCompactionExecutors(CompactionJob* job,
+                                          ColumnFamilyData* cfd,
+                                          const std::atomic<bool>& canceled,
+                                          bool is_manual,
+                                          bool separate_remote_pool) {
+  if (!separate_remote_pool) {
+    return;
+  }
+  job->SetCompactionExecutors(
+      [this](std::function<void()> work) {
+        ScheduleRemoteCompaction(std::move(work));
+      },
+      [this, cfd, &canceled, is_manual](std::function<void()> work,
+                                        Env::Priority priority) {
+        return RunLocalCompaction(std::move(work), priority, cfd, canceled,
+                                  is_manual);
+      });
+}
+
+Status DBImpl::LocalCompactionStatus(ColumnFamilyData* cfd,
+                                     const std::atomic<bool>& canceled) {
+  mutex_.AssertHeld();
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    return Status::ShutdownInProgress();
+  }
+  if (IsCompactionAborted(cfd)) {
+    return Status::Incomplete(Status::SubCode::kCompactionAborted);
+  }
+  if (canceled.load(std::memory_order_acquire)) {
+    return Status::Incomplete(Status::SubCode::kManualCompactionPaused);
+  }
+  if (cfd->IsDropped()) {
+    return Status::ColumnFamilyDropped();
+  }
+  if (error_handler_.IsBGWorkStopped()) {
+    try {
+#ifndef NDEBUG
+      std::function<void()> before_copy;
+      TEST_SYNC_POINT_CALLBACK("DBImpl::LocalCompactionStatus:BeforeGetBGError",
+                               &before_copy);
+      if (before_copy) {
+        before_copy();
+      }
+#endif
+      return error_handler_.GetBGError();
+    } catch (...) {
+      return Status::Aborted();
+    }
+  }
+  return Status::OK();
+}
+
+Status DBImpl::RunLocalCompaction(std::function<void()> work,
+                                  Env::Priority priority, ColumnFamilyData* cfd,
+                                  const std::atomic<bool>& canceled,
+                                  bool is_manual) {
+  if (priority == Env::Priority::USER) {
+    work();
+    return Status::OK();
+  }
+  InstrumentedMutexLock lock(&mutex_);
+  constexpr uint64_t kCancellationPollMicros = 100000;
+  Status status;
+  while ((status = LocalCompactionStatus(cfd, canceled)).ok() &&
+         LocalCompactionsScheduled() >= GetBGJobLimits().max_compactions) {
+    TEST_SYNC_POINT("DBImpl::RunLocalCompaction:WaitForCredit");
+    if (is_manual) {
+      bg_cv_.TimedWait(immutable_db_options_.clock->NowMicros() +
+                       kCancellationPollMicros);
+    } else {
+      bg_cv_.Wait();
+    }
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  assert(priority == Env::Priority::LOW || priority == Env::Priority::BOTTOM);
+  LocalCompactionTask task{this,     cfd,         &canceled, std::move(work),
+                           priority, Status::OK()};
+  bool task_submitted = false;
+  Defer drain_accepted_task([this, &task, &task_submitted] {
+    while (task_submitted && !task.done) {
+      bg_cv_.Wait();
+    }
+  });
+  if (priority == Env::Priority::BOTTOM) {
+    ++bg_bottom_compaction_scheduled_;
+  } else {
+    ++bg_compaction_scheduled_;
+  }
+  try {
+    env_->Schedule(&DBImpl::BGWorkLocalCompaction, &task, priority, &task,
+                   &DBImpl::UnscheduleLocalCompaction);
+  } catch (...) {
+    if (priority == Env::Priority::BOTTOM) {
+      --bg_bottom_compaction_scheduled_;
+    } else {
+      --bg_compaction_scheduled_;
+    }
+    bg_cv_.SignalAll();
+    return Status::Aborted();
+  }
+  task_submitted = true;
+  TEST_SYNC_POINT("DBImpl::RunLocalCompaction:Scheduled");
+  bool cancellation_requested = false;
+  while (!task.done) {
+    if (!cancellation_requested && !LocalCompactionStatus(cfd, canceled).ok()) {
+      try {
+        env_->UnSchedule(&task, priority);
+        cancellation_requested = true;
+      } catch (...) {
+        if (!task.done) {
+          bg_cv_.TimedWait(immutable_db_options_.clock->NowMicros() +
+                           kCancellationPollMicros);
+        }
+        continue;
+      }
+      if (task.done) {
+        break;
+      }
+    }
+    if (is_manual) {
+      bg_cv_.TimedWait(immutable_db_options_.clock->NowMicros() +
+                       kCancellationPollMicros);
+    } else {
+      bg_cv_.Wait();
+    }
+  }
+  return task.status;
+}
+
+IOStatus DBImpl::CopyTrivialCompactionFiles(
+    Compaction* c, LogBuffer* log_buffer, std::vector<FileMetaData>* out_files,
+    int job_id) {
+  IOStatus io_s;
+  ColumnFamilyData* const cfd = c->column_family_data();
+  // Output whose creation was announced to listeners but has not finished.
+  std::string unfinished_out_fname;
+  for (const auto& in_file : *c->inputs(0)) {
+    const uint64_t out_file_number = versions_->NewFileNumber();
+    const std::string in_fname =
+        TableFileName(c->immutable_options().cf_paths, in_file->fd.GetNumber(),
+                      in_file->fd.GetPathId());
+    const std::string out_fname = TableFileName(
+        c->immutable_options().cf_paths, out_file_number, c->output_path_id());
+
+    // The output is a byte-for-byte copy of the input, so its table
+    // properties are exactly the input's, including the SST unique ID.
+    std::shared_ptr<const TableProperties> out_table_properties;
+    const TablePropertiesCollection& input_table_properties =
+        c->GetOrInitInputTableProperties();
+    auto input_table_properties_it = input_table_properties.find(in_fname);
+    if (input_table_properties_it != input_table_properties.end()) {
+      out_table_properties = input_table_properties_it->second;
+    }
+    EventHelpers::NotifyTableFileCreationStarted(
+        cfd->ioptions().listeners, dbname_, cfd->GetName(), out_fname, job_id,
+        TableFileCreationReason::kCompaction);
+    unfinished_out_fname = out_fname;
+
+    int64_t tmp_current_time = 0;
+    auto get_time_status =
+        immutable_db_options_.clock->GetCurrentTime(&tmp_current_time);
+    if (!get_time_status.ok()) {
+      ROCKS_LOG_BUFFER(log_buffer,
+                       "[%s] WARNING: Failed to get current time %s "
+                       "status=%s",
+                       c->column_family_data()->GetName().c_str(),
+                       get_time_status.ToString().c_str());
+    }
+    // The copy is a new file for this DB to hold, but has the same contents
+    // (and file_creation_time) as the input
+    uint64_t copy_time = static_cast<uint64_t>(tmp_current_time);
+
+    FileOptions copied_file_options = file_options_;
+    copied_file_options.temperature = c->GetOutputTemperature();
+    std::unique_ptr<WritableFileWriter> dest_writer;
+    {
+      std::unique_ptr<FSWritableFile> dest_file;
+      IOStatus writable_file_io_status =
+          immutable_db_options_.fs.get()->NewWritableFile(
+              out_fname, copied_file_options, &dest_file, nullptr /* dbg */);
+      TEST_SYNC_POINT_CALLBACK(
+          "NewWritableFile::FileOptions.temperature",
+          const_cast<Temperature*>(&copied_file_options.temperature));
+      if (!writable_file_io_status.ok()) {
+        io_s = writable_file_io_status;
+        ROCKS_LOG_BUFFER(
+            log_buffer,
+            "[%s] Error: Abort trivial copy compaction, failed to open "
+            "NewWritableFile %s\n"
+            " out_fname=%s, temperature=%s, io_status=%s",
+            c->column_family_data()->GetName().c_str(), out_fname.c_str(),
+            out_fname.c_str(),
+            temperature_to_string[c->GetOutputTemperature()].c_str(),
+            io_s.ToString().c_str());
+        break;
+      }
+
+      FileTypeSet tmp_set = immutable_db_options_.checksum_handoff_file_types;
+      dest_writer.reset(new WritableFileWriter(
+          std::move(dest_file), out_fname, copied_file_options,
+          immutable_db_options_.clock, io_tracer_, immutable_db_options_.stats,
+          Histograms::SST_WRITE_MICROS, c->immutable_options().listeners,
+          immutable_db_options_.file_checksum_gen_factory.get(),
+          tmp_set.Contains(FileType::kTableFile),
+          tmp_set.Contains(FileType::kTableFile)));
+    }
+
+    ROCKS_LOG_BUFFER(
+        log_buffer,
+        "[%s] Started copying from: %s\n"
+        " temperature=%s, to: %s, temperature=%s, buffer_size=%" PRIu64,
+        c->column_family_data()->GetName().c_str(), in_fname.c_str(),
+        temperature_to_string[in_file->temperature].c_str(), out_fname.c_str(),
+        temperature_to_string[c->GetOutputTemperature()].c_str(),
+        c->mutable_cf_options()
+            .compaction_options_fifo.trivial_copy_buffer_size);
+    // Add IO_LOW HINT for compaction
+    IOOptions copy_files_compaction_io_options;
+    copy_files_compaction_io_options.rate_limiter_priority =
+        Env::IOPriority::IO_LOW;
+    copy_files_compaction_io_options.type = IOType::kData;
+    copy_files_compaction_io_options.io_activity = Env::IOActivity::kCompaction;
+
+    TEST_SYNC_POINT("DBImpl::CopyTrivialCompactionFiles:BeforeCopyFile");
+    IOStatus copy_file_io_status = CopyFile(
+        immutable_db_options_.fs.get() /* fileSystem */, in_fname /* source */,
+        in_file->temperature /* src_temp_hint */, dest_writer /* dest_writer */,
+        0 /* size */, true /* use_fsync */, io_tracer_ /* io_tracer*/,
+        c->mutable_cf_options()
+            .compaction_options_fifo
+            .trivial_copy_buffer_size /* max_read_buffer_size
+                                       */
+        ,
+        copy_files_compaction_io_options /* readIOOptions */,
+        copy_files_compaction_io_options /* writeIOOptions */);
+    if (dest_writer) {
+      IOOptions close_files_compaction_io_options;
+      close_files_compaction_io_options.rate_limiter_priority =
+          Env::IOPriority::IO_LOW;
+      close_files_compaction_io_options.type = IOType::kData;
+      close_files_compaction_io_options.io_activity =
+          Env::IOActivity::kCompaction;
+      // Close the dest_write
+      io_s = dest_writer->Close(close_files_compaction_io_options);
+      if (!io_s.ok()) {
+        ROCKS_LOG_BUFFER(
+            log_buffer,
+            "[%s] Failed to close the writer. Failed to copy from: %s\n"
+            " temperature=%s, to=%s, temperature=%s, io_status=%s",
+            c->column_family_data()->GetName().c_str(), in_fname.c_str(),
+            temperature_to_string[in_file->temperature].c_str(),
+            out_fname.c_str(),
+            temperature_to_string[c->GetOutputTemperature()].c_str(),
+            io_s.ToString().c_str());
+        break;
+      }
+    }
+
+    io_s = copy_file_io_status;
+
+    if (!io_s.ok()) {
+      ROCKS_LOG_BUFFER(log_buffer,
+                       "[%s] Failed to copy from: %s\n"
+                       " temperature=%s, to=%s, temperature=%s, io_status=%s",
+                       c->column_family_data()->GetName().c_str(),
+                       in_fname.c_str(),
+                       temperature_to_string[in_file->temperature].c_str(),
+                       out_fname.c_str(),
+                       temperature_to_string[c->GetOutputTemperature()].c_str(),
+                       io_s.ToString().c_str());
+      break;
+    }
+    ROCKS_LOG_BUFFER(
+        log_buffer,
+        "[%s] Successfully copying from: %s\n"
+        " temperature=%s, to=%s, temperature=%s, io_status=%s",
+        c->column_family_data()->GetName().c_str(), in_fname.c_str(),
+        temperature_to_string[in_file->temperature].c_str(), out_fname.c_str(),
+        temperature_to_string[c->GetOutputTemperature()].c_str(),
+        io_s.ToString().c_str());
+
+    FileMetaData out_file_metadata{out_file_number,
+                                   c->output_path_id(),
+                                   in_file->fd.GetFileSize(),
+                                   in_file->smallest,
+                                   in_file->largest,
+                                   in_file->fd.smallest_seqno,
+                                   in_file->fd.largest_seqno,
+                                   false /* marked_for_compact */,
+                                   c->GetOutputTemperature() /* temperature */,
+                                   in_file->oldest_blob_file_number,
+                                   in_file->oldest_ancestor_time,
+                                   in_file->file_creation_time,
+                                   c->MinInputFileEpochNumber(),
+                                   dest_writer->GetFileChecksum(),
+                                   dest_writer->GetFileChecksumFuncName(),
+                                   in_file->unique_id,
+                                   in_file->compensated_range_deletion_size,
+                                   in_file->tail_size,
+                                   in_file->user_defined_timestamps_persisted,
+                                   in_file->min_timestamp,
+                                   in_file->max_timestamp};
+    out_file_metadata.db_ownership_start_time = copy_time;
+    out_file_metadata.data_file_provenance =
+        in_file->data_file_provenance | kProvenanceTemperatureChangedByCopy;
+
+    if (out_table_properties) {
+      c->SetOutputTableProperties(out_fname, out_table_properties);
+    }
+    EventHelpers::LogAndNotifyTableFileCreationFinished(
+        &event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
+        out_fname, job_id, out_file_metadata.fd,
+        out_file_metadata.oldest_blob_file_number,
+        out_table_properties ? *out_table_properties : TableProperties(),
+        TableFileCreationReason::kCompaction, io_s,
+        out_file_metadata.file_checksum,
+        out_file_metadata.file_checksum_func_name);
+    unfinished_out_fname.clear();
+
+    out_files->push_back(std::move(out_file_metadata));
+  }
+
+  if (!unfinished_out_fname.empty()) {
+    assert(!io_s.ok());
+    EventHelpers::LogAndNotifyTableFileCreationFinished(
+        &event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
+        unfinished_out_fname, job_id, FileDescriptor(), kInvalidBlobFileNumber,
+        TableProperties(), TableFileCreationReason::kCompaction, io_s,
+        kUnknownFileChecksum, kUnknownFileChecksumFuncName);
+  }
+  return io_s;
+}
+
+void DBImpl::BGWorkLocalCompaction(void* arg) {
+  auto* task = static_cast<LocalCompactionTask*>(arg);
+  DBImpl* db = task->db;
+  const int priority_index = task->priority == Env::Priority::BOTTOM ? 0 : 1;
+  IOSTATS_SET_THREAD_POOL_ID(task->priority);
+  db->mutex_.Lock();
+  ++db->local_compactions_running_by_priority_[priority_index];
+  TEST_SYNC_POINT("DBImpl::BGWorkLocalCompaction:BeforeStatus");
+  task->status = db->LocalCompactionStatus(task->cfd, *task->canceled);
+  db->mutex_.Unlock();
+  if (task->status.ok()) {
+    TEST_SYNC_POINT("DBImpl::BGWorkLocalCompaction:Start");
+    try {
+      task->work();
+    } catch (...) {
+      task->status = Status::Aborted();
+    }
+    TEST_SYNC_POINT("DBImpl::BGWorkLocalCompaction:Finished");
+  }
+  InstrumentedMutexLock lock(&db->mutex_);
+  if (task->priority == Env::Priority::BOTTOM) {
+    --db->bg_bottom_compaction_scheduled_;
+  } else {
+    --db->bg_compaction_scheduled_;
+  }
+  --db->local_compactions_running_by_priority_[priority_index];
+  task->done = true;
+  db->MaybeScheduleFlushOrCompaction();
+  db->bg_cv_.SignalAll();
+}
+
+void DBImpl::UnscheduleLocalCompaction(void* arg) {
+  auto* task = static_cast<LocalCompactionTask*>(arg);
+  task->db->mutex_.AssertHeld();
+  task->status = task->db->LocalCompactionStatus(task->cfd, *task->canceled);
+  if (task->status.ok()) {
+    task->status = Status::ShutdownInProgress();
+  }
+  if (task->priority == Env::Priority::BOTTOM) {
+    --task->db->bg_bottom_compaction_scheduled_;
+  } else {
+    --task->db->bg_compaction_scheduled_;
+  }
+  task->done = true;
+  task->db->MaybeScheduleFlushOrCompaction();
+  task->db->bg_cv_.SignalAll();
 }
 
 DBImpl::BGJobLimits DBImpl::GetBGJobLimits() const {
@@ -3755,7 +4288,7 @@ DBImpl::BGJobLimits DBImpl::GetBGJobLimits(int max_background_flushes,
                                            int max_background_compactions,
                                            int max_background_jobs,
                                            bool parallelize_compactions) {
-  BGJobLimits res;
+  BGJobLimits res{};
   if (max_background_flushes == -1 && max_background_compactions == -1) {
     // for our first stab implementing max_background_jobs, simply allocate a
     // quarter of the threads to flushes.
@@ -3779,18 +4312,16 @@ BackgroundJobPressure DBImpl::CaptureBackgroundJobPressure() const {
 
   BackgroundJobPressure snapshot;
 
-  // Compaction: LOW + BOTTOM combined (matches RocksDB's scheduling check)
-  snapshot.compaction_scheduled =
-      bg_compaction_scheduled_ + bg_bottom_compaction_scheduled_;
+  snapshot.compaction_scheduled = CompactionsScheduled();
   snapshot.compaction_running = num_running_compactions_;
 
   // Per-priority breakdown for pool-specific expansion
   assert(num_running_compactions_ >= num_running_bottom_compactions_);
   snapshot.compaction_low_scheduled = bg_compaction_scheduled_;
-  snapshot.compaction_low_running =
-      std::max(0, num_running_compactions_ - num_running_bottom_compactions_);
+  snapshot.compaction_low_running = local_compactions_running_by_priority_[1];
   snapshot.compaction_bottom_scheduled = bg_bottom_compaction_scheduled_;
-  snapshot.compaction_bottom_running = num_running_bottom_compactions_;
+  snapshot.compaction_bottom_running =
+      local_compactions_running_by_priority_[0];
 
   // Flush
   snapshot.flush_scheduled = bg_flush_scheduled_;
@@ -4047,13 +4578,31 @@ void DBImpl::EnqueuePendingCompaction(ColumnFamilyData* cfd) {
   }
 }
 
+void DBImpl::RescoreAndEnqueuePendingCompaction(ColumnFamilyData* cfd) {
+  mutex_.AssertHeld();
+  // Without this, a column family that stopped writes because of too many L0
+  // files can keep a stale low score: with writes stopped there are no
+  // flushes, so no new version is installed to fix the score, and writes stay
+  // stopped.
+  cfd->current()->storage_info()->ComputeCompactionScore(
+      cfd->ioptions(), cfd->GetLatestMutableCFOptions(),
+      cfd->GetFullHistoryTsLow());
+  // While compactions are aborted, ResumeCompactions() or
+  // ResumeAllCompactions() queues the column family instead. Queuing it here
+  // would make WaitForCompact() wait until compactions are resumed.
+  if (!IsCompactionAborted(cfd)) {
+    EnqueuePendingCompaction(cfd);
+  }
+}
+
 void DBImpl::SchedulePendingPurge(std::string fname, std::string dir_to_sync,
                                   FileType type, uint64_t number, int job_id) {
   mutex_.AssertHeld();
   if (reject_new_background_jobs_) {
     return;
   }
-  PurgeFileInfo file_info(fname, dir_to_sync, type, number, job_id);
+  PurgeFileInfo file_info(std::move(fname), std::move(dir_to_sync), type,
+                          number, job_id);
   purge_files_.insert({{number, std::move(file_info)}});
 }
 
@@ -4075,7 +4624,7 @@ void DBImpl::BGWorkCompaction(void* arg) {
   auto prepicked_compaction =
       static_cast<PrepickedCompaction*>(ca.prepicked_compaction);
   static_cast_with_check<DBImpl>(ca.db)->BackgroundCallCompaction(
-      prepicked_compaction, Env::Priority::LOW);
+      prepicked_compaction, Env::Priority::LOW, ca.separate_remote_pool);
   delete prepicked_compaction;
 }
 
@@ -4086,7 +4635,8 @@ void DBImpl::BGWorkBottomCompaction(void* arg) {
   TEST_SYNC_POINT("DBImpl::BGWorkBottomCompaction");
   auto* prepicked_compaction = ca.prepicked_compaction;
   assert(prepicked_compaction && prepicked_compaction->compaction);
-  ca.db->BackgroundCallCompaction(prepicked_compaction, Env::Priority::BOTTOM);
+  ca.db->BackgroundCallCompaction(prepicked_compaction, Env::Priority::BOTTOM,
+                                  ca.separate_remote_pool);
   delete prepicked_compaction;
 }
 
@@ -4117,9 +4667,14 @@ void DBImpl::UnscheduleCompactionCallback(void* arg) {
           Status::Incomplete(Status::SubCode::kManualCompactionPaused);
     }
     if (ca.prepicked_compaction->compaction != nullptr) {
-      ca.prepicked_compaction->compaction->ReleaseCompactionFiles(
+      Compaction* c = ca.prepicked_compaction->compaction;
+      // The compaction still holds a reference to its column family.
+      ColumnFamilyData* cfd = c->column_family_data();
+      c->ReleaseCompactionFiles(
           Status::Incomplete(Status::SubCode::kManualCompactionPaused));
-      delete ca.prepicked_compaction->compaction;
+      // The caller holds the DB mutex.
+      ca.db->RescoreAndEnqueuePendingCompaction(cfd);
+      delete c;
     }
     delete ca.prepicked_compaction;
   }
@@ -4269,7 +4824,7 @@ void DBImpl::BackgroundCallWBMFlush() {
       }
     }
   }
-  TEST_SYNC_POINT("DBImpl::BackgroundCallWBMFlush:AfterPick");
+  TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCallWBMFlush:AfterPick", this);
 
   FlushOptions flush_options;
   flush_options.wait = false;
@@ -4475,6 +5030,10 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
     std::unique_ptr<std::list<uint64_t>::iterator>
         pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
             CaptureCurrentFileNumberInPendingOutputs()));
+    // Flushes are short, so this registers for OnFlushCompleted() from the
+    // start of the job (see listener_pending_outputs_).
+    std::optional<std::multiset<uint64_t>::iterator> listener_pending_output =
+        CaptureListenerPendingOutput(**pending_outputs_inserted_elem);
     FlushReason reason;
     bool flush_rescheduled_to_retain_udt = false;
     Status s =
@@ -4510,6 +5069,7 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
 
     TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:FlushFinish:0");
     ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
+    ReleaseListenerPendingOutput(listener_pending_output);
     // There is no need to find obsolete files if the flush job is rescheduled
     // to retain user-defined timestamps because the job doesn't get to the
     // stage of actually flushing the MemTables.
@@ -4559,8 +5119,10 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
 }
 
 void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
-                                      Env::Priority bg_thread_pri) {
+                                      Env::Priority bg_thread_pri,
+                                      bool separate_remote_pool) {
   bool made_progress = false;
+  int deferred_compactions = 0;
   JobContext job_context(next_job_id_.fetch_add(1), true);
   TEST_SYNC_POINT("BackgroundCallCompaction:0");
   if (bg_thread_pri == Env::Priority::BOTTOM) {
@@ -4573,6 +5135,10 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
     InstrumentedMutexLock l(&mutex_);
 
     num_running_compactions_++;
+    const int priority_index = bg_thread_pri == Env::Priority::BOTTOM ? 0 : 1;
+    if (!separate_remote_pool) {
+      ++local_compactions_running_by_priority_[priority_index];
+    }
     if (bg_thread_pri == Env::Priority::BOTTOM) {
       num_running_bottom_compactions_++;
     }
@@ -4581,15 +5147,22 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
         pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
             CaptureCurrentFileNumberInPendingOutputs()));
 
-    assert((bg_thread_pri == Env::Priority::BOTTOM &&
-            bg_bottom_compaction_scheduled_) ||
-           (bg_thread_pri == Env::Priority::LOW && bg_compaction_scheduled_));
+    assert(bg_thread_pri == Env::Priority::BOTTOM ||
+           bg_thread_pri == Env::Priority::LOW);
+    assert(separate_remote_pool ? remote_coordinators_scheduled_ > 0
+                                : (bg_thread_pri == Env::Priority::BOTTOM
+                                       ? bg_bottom_compaction_scheduled_ > 0
+                                       : bg_compaction_scheduled_ > 0));
     Status s = BackgroundCompaction(&made_progress, &job_context, &log_buffer,
-                                    prepicked_compaction, bg_thread_pri);
+                                    prepicked_compaction, bg_thread_pri,
+                                    separate_remote_pool, &deferred_compactions,
+                                    **pending_outputs_inserted_elem);
     TEST_SYNC_POINT("BackgroundCallCompaction:1");
     if (s.IsBusy()) {
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
       mutex_.Unlock();
+      TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCallCompaction:BeforeBackoff",
+                               &s);
       immutable_db_options_.clock->SleepForMicroseconds(
           10000);  // prevent hot loop
       mutex_.Lock();
@@ -4604,6 +5177,8 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
           default_cf_internal_stats_->BumpAndGetBackgroundErrorCount();
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
       mutex_.Unlock();
+      TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCallCompaction:BeforeBackoff",
+                               &s);
       log_buffer.FlushBufferToLog();
       ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                       "Waiting after background compaction error: %s, "
@@ -4613,11 +5188,26 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
       immutable_db_options_.clock->SleepForMicroseconds(1000000);
       mutex_.Lock();
     } else if (s.IsManualCompactionPaused()) {
-      assert(prepicked_compaction);
-      ManualCompactionState* m = prepicked_compaction->manual_compaction_state;
-      assert(m);
-      ROCKS_LOG_BUFFER(&log_buffer, "[%s] [JOB %d] Manual compaction paused",
-                       m->cfd->GetName().c_str(), job_context.job_id);
+      // A manual compaction ends with this status when the user pauses or
+      // cancels it. An automatic compaction can also end with it: a remote
+      // compaction returns it when the CompactionService cancels the job, for
+      // example through OpenAndCompactOptions::canceled after the DB calls
+      // CompactionService::CancelAwaitingJobs() during close. An automatic
+      // compaction has no ManualCompactionState: its prepicked_compaction is
+      // null, or has a null manual_compaction_state when the compaction was
+      // forwarded to the bottom-priority pool.
+      const ManualCompactionState* m =
+          prepicked_compaction != nullptr
+              ? prepicked_compaction->manual_compaction_state
+              : nullptr;
+      if (m != nullptr) {
+        ROCKS_LOG_BUFFER(&log_buffer, "[%s] [JOB %d] Manual compaction paused",
+                         m->cfd->GetName().c_str(), job_context.job_id);
+      } else {
+        ROCKS_LOG_BUFFER(&log_buffer,
+                         "[JOB %d] Automatic compaction canceled: %s",
+                         job_context.job_id, s.ToString().c_str());
+      }
     }
 
     ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
@@ -4652,16 +5242,23 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
 
     assert(num_running_compactions_ > 0);
     num_running_compactions_--;
-
-    if (bg_thread_pri == Env::Priority::LOW) {
-      bg_compaction_scheduled_--;
+    if (separate_remote_pool) {
+      --remote_coordinators_scheduled_;
     } else {
-      assert(bg_thread_pri == Env::Priority::BOTTOM);
-      bg_bottom_compaction_scheduled_--;
+      --local_compactions_running_by_priority_[priority_index];
+      if (bg_thread_pri == Env::Priority::BOTTOM) {
+        --bg_bottom_compaction_scheduled_;
+      } else {
+        --bg_compaction_scheduled_;
+      }
+    }
+
+    if (bg_thread_pri == Env::Priority::BOTTOM) {
       assert(num_running_bottom_compactions_ > 0);
       num_running_bottom_compactions_--;
     }
 
+    unscheduled_compactions_ += deferred_compactions;
     // See if there's more work to be done
     MaybeScheduleFlushOrCompaction();
 
@@ -4675,9 +5272,8 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
       prepicked_compaction->task_token.reset();
     }
 
-    if (made_progress || per_cf_compaction_abort_waiters_ > 0 ||
-        (bg_compaction_scheduled_ == 0 &&
-         bg_bottom_compaction_scheduled_ == 0) ||
+    if (separate_remote_pool || made_progress ||
+        per_cf_compaction_abort_waiters_ > 0 || CompactionsScheduled() == 0 ||
         HasPendingManualCompaction() || unscheduled_compactions_ == 0) {
       // signal if
       // * made_progress -- need to wakeup DelayWrite
@@ -4695,17 +5291,36 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
 }
 
 // Precondition: mutex_ must be held when calling this function.
-Status DBImpl::BackgroundCompaction(bool* made_progress,
-                                    JobContext* job_context,
-                                    LogBuffer* log_buffer,
-                                    PrepickedCompaction* prepicked_compaction,
-                                    Env::Priority thread_pri) {
+Status DBImpl::BackgroundCompaction(
+    bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
+    PrepickedCompaction* prepicked_compaction, Env::Priority thread_pri,
+    bool separate_remote_pool, int* deferred_compactions,
+    uint64_t min_output_file_number) {
   ManualCompactionState* manual_compaction =
       prepicked_compaction == nullptr
           ? nullptr
           : prepicked_compaction->manual_compaction_state;
   *made_progress = false;
   mutex_.AssertHeld();
+  const auto restore_compaction_credit = [&] {
+    if (separate_remote_pool) {
+      ++*deferred_compactions;
+    } else {
+      ++unscheduled_compactions_;
+    }
+  };
+  // Use after a compaction released its input files without installing a new
+  // version. With the separate remote pool, a new credit is deferred until
+  // this coordinator finishes, like the failed automatic compaction retry
+  // below.
+  const auto rescore_and_requeue = [&](ColumnFamilyData* cfd) {
+    const int unscheduled_before = unscheduled_compactions_;
+    RescoreAndEnqueuePendingCompaction(cfd);
+    if (separate_remote_pool && unscheduled_compactions_ > unscheduled_before) {
+      --unscheduled_compactions_;
+      restore_compaction_credit();
+    }
+  };
   TEST_SYNC_POINT("DBImpl::BackgroundCompaction:Start");
 
   const ReadOptions read_options(Env::IOActivity::kCompaction);
@@ -4733,6 +5348,11 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     in_flight_cfd = c->column_family_data();
     BeginInFlightCompaction(in_flight_cfd);
   }
+  // Set just before new output files are installed, and released on return,
+  // after NotifyOnCompactionCompleted() (see listener_pending_outputs_).
+  std::optional<std::multiset<uint64_t>::iterator> listener_pending_output;
+  Defer release_listener_pending_output(
+      [&]() { ReleaseListenerPendingOutput(listener_pending_output); });
   bool is_prepicked = is_manual || c;
   ColumnFamilyData* prepicked_cfd = nullptr;
   if (c) {
@@ -4765,7 +5385,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         // abort happened before PickCompactionFromQueue() could remove the
         // queued CF. Restore the unscheduled count so ResumeAllCompactions()
         // can schedule the still-queued work.
-        unscheduled_compactions_++;
+        restore_compaction_credit();
       }
     } else if (prepicked_cfd != nullptr &&
                prepicked_cfd->compaction_aborted() > 0) {
@@ -4783,7 +5403,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     // restore the credit here. Prepicked work was scheduled directly and did
     // not consume unscheduled_compactions_.
     if (!is_prepicked) {
-      unscheduled_compactions_++;
+      restore_compaction_credit();
     }
   }
 
@@ -4796,6 +5416,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     }
     if (c) {
       c->ReleaseCompactionFiles(status);
+      rescore_and_requeue(c->column_family_data());
       c.reset();
     }
     return status;
@@ -4832,6 +5453,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
       if (!enough_room) {
         // Then don't do the compaction
         c->ReleaseCompactionFiles(status);
+        rescore_and_requeue(c->column_family_data());
         c.reset();
         // m's vars will get set properly at the end of this function,
         // as long as status == CompactionTooLarge
@@ -4865,7 +5487,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         // don't need to
         // dequeue and enqueue the CFD again in the compaction queue and thus
         // keep the CFD's position in the queue
-        unscheduled_compactions_++;
+        restore_compaction_credit();
 
         return Status::OK();
       }
@@ -4878,7 +5500,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
       if (std::holds_alternative<CompactionQueueThrottled>(pick_result)) {
         // Can't find any executable task from the compaction queue.
         // All tasks have been throttled by compaction thread limiter.
-        ++unscheduled_compactions_;
+        restore_compaction_credit();
         return Status::Busy();
       }
       if (std::holds_alternative<CompactionQueueParked>(pick_result)) {
@@ -4994,6 +5616,9 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
 
   IOStatus io_s;
   bool compaction_released = false;
+  if (c) {
+    c->SetSeparateRemoteCompactionPoolSelected(separate_remote_pool);
+  }
   if (!c) {
     // Nothing to do
     ROCKS_LOG_BUFFER(log_buffer, "Compaction nothing to do");
@@ -5051,213 +5676,30 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             compaction_job_stats, job_context->job_id);
 
-    ColumnFamilyData* const cfd = c->column_family_data();
     std::vector<FileMetaData> out_files;
-    // Output whose creation was announced to listeners but has not finished.
-    std::string unfinished_out_fname;
-    for (const auto& in_file : *c->inputs(0)) {
-      const uint64_t out_file_number = versions_->NewFileNumber();
-      const std::string in_fname =
-          TableFileName(c->immutable_options().cf_paths,
-                        in_file->fd.GetNumber(), in_file->fd.GetPathId());
-      const std::string out_fname =
-          TableFileName(c->immutable_options().cf_paths, out_file_number,
-                        c->output_path_id());
-
-      // The output is a byte-for-byte copy of the input, so its table
-      // properties are exactly the input's, including the SST unique ID.
-      // Loading them can read the input file, and listeners are called without
-      // the DB mutex.
-      std::shared_ptr<const TableProperties> out_table_properties;
-      mutex_.Unlock();
-      const TablePropertiesCollection& input_table_properties =
-          c->GetOrInitInputTableProperties();
-      auto input_table_properties_it = input_table_properties.find(in_fname);
-      if (input_table_properties_it != input_table_properties.end()) {
-        out_table_properties = input_table_properties_it->second;
+    // As for other compactions, the copy runs without the DB mutex. The inputs
+    // are protected by being compacted and referenced by the input version, and
+    // the new file numbers by pending_outputs_.
+    mutex_.Unlock();
+    if (separate_remote_pool) {
+      try {
+        status = RunLocalCompaction(
+            [&] {
+              io_s = CopyTrivialCompactionFiles(c.get(), log_buffer, &out_files,
+                                                job_context->job_id);
+            },
+            thread_pri, c->column_family_data(),
+            is_manual ? manual_compaction->canceled
+                      : kManualCompactionCanceledFalse_,
+            is_manual);
+      } catch (...) {
+        status = Status::Aborted();
       }
-      EventHelpers::NotifyTableFileCreationStarted(
-          cfd->ioptions().listeners, dbname_, cfd->GetName(), out_fname,
-          job_context->job_id, TableFileCreationReason::kCompaction);
-      mutex_.Lock();
-      unfinished_out_fname = out_fname;
-
-      int64_t tmp_current_time = 0;
-      auto get_time_status =
-          immutable_db_options_.clock->GetCurrentTime(&tmp_current_time);
-      if (!get_time_status.ok()) {
-        ROCKS_LOG_BUFFER(log_buffer,
-                         "[%s] WARNING: Failed to get current time %s "
-                         "status=%s",
-                         c->column_family_data()->GetName().c_str(),
-                         get_time_status.ToString().c_str());
-      }
-      uint64_t out_file_creation_time = static_cast<uint64_t>(tmp_current_time);
-
-      FileOptions copied_file_options = file_options_;
-      copied_file_options.temperature = c->GetOutputTemperature();
-      std::unique_ptr<WritableFileWriter> dest_writer;
-      {
-        std::unique_ptr<FSWritableFile> dest_file;
-        IOStatus writable_file_io_status =
-            immutable_db_options_.fs.get()->NewWritableFile(
-                out_fname, copied_file_options, &dest_file, nullptr /* dbg */);
-        TEST_SYNC_POINT_CALLBACK(
-            "NewWritableFile::FileOptions.temperature",
-            const_cast<Temperature*>(&copied_file_options.temperature));
-        if (!writable_file_io_status.ok()) {
-          io_s = writable_file_io_status;
-          ROCKS_LOG_BUFFER(
-              log_buffer,
-              "[%s] Error: Abort trivial copy compaction, failed to open "
-              "NewWritableFile %s\n"
-              " out_fname=%s, temperature=%s, io_status=%s",
-              c->column_family_data()->GetName().c_str(), out_fname.c_str(),
-              temperature_to_string[c->GetOutputTemperature()].c_str(),
-              io_s.ToString().c_str());
-          break;
-        }
-
-        FileTypeSet tmp_set = immutable_db_options_.checksum_handoff_file_types;
-        dest_writer.reset(new WritableFileWriter(
-            std::move(dest_file), out_fname, copied_file_options,
-            immutable_db_options_.clock, io_tracer_,
-            immutable_db_options_.stats, Histograms::SST_WRITE_MICROS,
-            c->immutable_options().listeners,
-            immutable_db_options_.file_checksum_gen_factory.get(),
-            tmp_set.Contains(FileType::kTableFile),
-            tmp_set.Contains(FileType::kTableFile)));
-      }
-
-      ROCKS_LOG_BUFFER(
-          log_buffer,
-          "[%s] Started copying from: %s\n"
-          " temperature=%s, to: %s, temperature=%s, buffer_size=%" PRIu64,
-          c->column_family_data()->GetName().c_str(), in_fname.c_str(),
-          temperature_to_string[in_file->temperature].c_str(),
-          out_fname.c_str(),
-          temperature_to_string[c->GetOutputTemperature()].c_str(),
-          c->mutable_cf_options()
-              .compaction_options_fifo.trivial_copy_buffer_size);
-      // Add IO_LOW HINT for compaction
-      IOOptions copy_files_compaction_io_options;
-      copy_files_compaction_io_options.rate_limiter_priority =
-          Env::IOPriority::IO_LOW;
-      copy_files_compaction_io_options.type = IOType::kData;
-      copy_files_compaction_io_options.io_activity =
-          Env::IOActivity::kCompaction;
-
-      IOStatus copy_file_io_status = CopyFile(
-          immutable_db_options_.fs.get() /* fileSystem */,
-          in_fname /* source */, in_file->temperature /* src_temp_hint */,
-          dest_writer /* dest_writer */, 0 /* size */, true /* use_fsync */,
-          io_tracer_ /* io_tracer*/,
-          c->mutable_cf_options()
-              .compaction_options_fifo
-              .trivial_copy_buffer_size /* max_read_buffer_size
-                                         */
-          ,
-          copy_files_compaction_io_options /* readIOOptions */,
-          copy_files_compaction_io_options /* writeIOOptions */);
-      if (dest_writer) {
-        IOOptions close_files_compaction_io_options;
-        close_files_compaction_io_options.rate_limiter_priority =
-            Env::IOPriority::IO_LOW;
-        close_files_compaction_io_options.type = IOType::kData;
-        close_files_compaction_io_options.io_activity =
-            Env::IOActivity::kCompaction;
-        // Close the dest_write
-        io_s = dest_writer->Close(close_files_compaction_io_options);
-        if (!io_s.ok()) {
-          ROCKS_LOG_BUFFER(
-              log_buffer,
-              "[%s] Failed to close the writer. Failed to copy from: %s\n"
-              " temperature=%s, to=%s, temperature=%s, io_status=%s",
-              c->column_family_data()->GetName().c_str(), in_fname.c_str(),
-              temperature_to_string[in_file->temperature].c_str(),
-              out_fname.c_str(),
-              temperature_to_string[c->GetOutputTemperature()].c_str(),
-              io_s.ToString().c_str());
-          break;
-        }
-      }
-
-      io_s = copy_file_io_status;
-
-      if (!io_s.ok()) {
-        ROCKS_LOG_BUFFER(
-            log_buffer,
-            "[%s] Failed to copy from: %s\n"
-            " temperature=%s, to=%s, temperature=%s, io_status=%s",
-            c->column_family_data()->GetName().c_str(), in_fname.c_str(),
-            temperature_to_string[in_file->temperature].c_str(),
-            out_fname.c_str(),
-            temperature_to_string[c->GetOutputTemperature()].c_str(),
-            io_s.ToString().c_str());
-        break;
-      }
-      ROCKS_LOG_BUFFER(log_buffer,
-                       "[%s] Successfully copying from: %s\n"
-                       " temperature=%s, to=%s, temperature=%s, io_status=%s",
-                       c->column_family_data()->GetName().c_str(),
-                       in_fname.c_str(),
-                       temperature_to_string[in_file->temperature].c_str(),
-                       out_fname.c_str(),
-                       temperature_to_string[c->GetOutputTemperature()].c_str(),
-                       io_s.ToString().c_str());
-
-      FileMetaData out_file_metadata{
-          out_file_number,
-          c->output_path_id(),
-          in_file->fd.GetFileSize(),
-          in_file->smallest,
-          in_file->largest,
-          in_file->fd.smallest_seqno,
-          in_file->fd.largest_seqno,
-          false /* marked_for_compact */,
-          c->GetOutputTemperature() /* temperature */,
-          in_file->oldest_blob_file_number,
-          in_file->oldest_ancestor_time,
-          out_file_creation_time,
-          c->MinInputFileEpochNumber(),
-          dest_writer->GetFileChecksum(),
-          dest_writer->GetFileChecksumFuncName(),
-          in_file->unique_id,
-          in_file->compensated_range_deletion_size,
-          in_file->tail_size,
-          in_file->user_defined_timestamps_persisted,
-          in_file->min_timestamp,
-          in_file->max_timestamp};
-
-      if (out_table_properties) {
-        c->SetOutputTableProperties(out_fname, out_table_properties);
-      }
-      mutex_.Unlock();
-      EventHelpers::LogAndNotifyTableFileCreationFinished(
-          &event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
-          out_fname, job_context->job_id, out_file_metadata.fd,
-          out_file_metadata.oldest_blob_file_number,
-          out_table_properties ? *out_table_properties : TableProperties(),
-          TableFileCreationReason::kCompaction, io_s,
-          out_file_metadata.file_checksum,
-          out_file_metadata.file_checksum_func_name);
-      mutex_.Lock();
-      unfinished_out_fname.clear();
-
-      out_files.push_back(std::move(out_file_metadata));
+    } else {
+      io_s = CopyTrivialCompactionFiles(c.get(), log_buffer, &out_files,
+                                        job_context->job_id);
     }
-
-    if (!unfinished_out_fname.empty()) {
-      assert(!io_s.ok());
-      mutex_.Unlock();
-      EventHelpers::LogAndNotifyTableFileCreationFinished(
-          &event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
-          unfinished_out_fname, job_context->job_id, FileDescriptor(),
-          kInvalidBlobFileNumber, TableProperties(),
-          TableFileCreationReason::kCompaction, io_s, kUnknownFileChecksum,
-          kUnknownFileChecksumFuncName);
-      mutex_.Lock();
-    }
+    mutex_.Lock();
 
     // Update version set
     if (status.ok() && io_s.ok()) {
@@ -5279,6 +5721,8 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
 
       NotifyOnCompactionPreCommit(c->column_family_data(), c.get(), status,
                                   compaction_job_stats, job_context->job_id);
+      listener_pending_output =
+          CaptureListenerPendingOutput(min_output_file_number);
       status = versions_->LogAndApply(
           c->column_family_data(), read_options, write_options, c->edit(),
           &mutex_, directories_.GetDbDir(),
@@ -5360,7 +5804,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         c->column_family_data(), job_context->superversion_contexts.data(),
         /*defer_snapshot_refresh=*/false);
 
-    VersionStorageInfo::LevelSummaryStorage tmp;
+    VersionStorageInfo::LevelSummaryStorage tmp{};
     c->column_family_data()->internal_stats()->IncBytesMoved(c->output_level(),
                                                              moved_bytes);
     {
@@ -5419,10 +5863,8 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     ca->prepicked_compaction->manual_compaction_state = nullptr;
     // Transfer requested token, so it doesn't need to do it again.
     ca->prepicked_compaction->task_token = std::move(task_token);
-    ++bg_bottom_compaction_scheduled_;
     assert(c == nullptr);
-    env_->Schedule(&DBImpl::BGWorkBottomCompaction, ca, Env::Priority::BOTTOM,
-                   this, &DBImpl::UnscheduleCompactionCallback);
+    status = ScheduleCompaction(ca, this);
   } else {
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:BeforeCompaction",
                              c->column_family_data());
@@ -5449,6 +5891,10 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         c->column_family_data()->GetFullHistoryTsLow(), c->trim_ts(),
         &blob_callback_, &bg_compaction_scheduled_,
         &bg_bottom_compaction_scheduled_, &num_running_remote_compactions_);
+    ConfigureCompactionExecutors(&compaction_job, c->column_family_data(),
+                                 is_manual ? manual_compaction->canceled
+                                           : kManualCompactionCanceledFalse_,
+                                 is_manual, separate_remote_pool);
     compaction_job.Prepare(std::nullopt /*subcompact to be computed*/);
 
     std::unique_ptr<std::list<uint64_t>::iterator> min_options_file_number_elem;
@@ -5482,6 +5928,8 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     // ReleaseCompactionFiles in its manifest write callback.
     NotifyOnCompactionPreCommit(c->column_family_data(), c.get(), status,
                                 compaction_job_stats, job_context->job_id);
+    listener_pending_output =
+        CaptureListenerPendingOutput(min_output_file_number);
     status = compaction_job.Install(&compaction_released);
     io_s = compaction_job.io_status();
     if (status.ok()) {
@@ -5576,8 +6024,20 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
           ->ComputeCompactionScore(c->immutable_options(),
                                    c->mutable_cf_options(),
                                    cfd->GetFullHistoryTsLow());
+      const int unscheduled_before_retry = unscheduled_compactions_;
       EnqueuePendingCompaction(cfd);
+      if (separate_remote_pool &&
+          unscheduled_compactions_ > unscheduled_before_retry) {
+        --unscheduled_compactions_;
+        restore_compaction_credit();
+      }
     }
+  }
+  if (c != nullptr && !status.ok() &&
+      (is_manual || status.IsCompactionAborted())) {
+    // The compaction released its input files without installing a new
+    // version. A failed automatic compaction is requeued above.
+    rescore_and_requeue(c->column_family_data());
   }
   // this will unref its input_version and column_family_data
   c.reset();
@@ -5646,10 +6106,10 @@ Compaction* DBImpl::CreateIntendedCompactionForwardedToBottomPriorityPool(
   int max_intput_level = 0;
 
   for (size_t i = c->num_input_levels(); i >= 1; --i) {
-    size_t level = i - 1;
-    if (c->num_input_files(level) > 0) {
-      max_intput_level = static_cast<int>(level);
-      max_intput_level_files = c->inputs(level);
+    size_t which = i - 1;
+    if (c->num_input_files(which) > 0) {
+      max_intput_level = c->level(which);
+      max_intput_level_files = c->inputs(which);
       break;
     }
   }
@@ -5688,10 +6148,12 @@ Compaction* DBImpl::CreateIntendedCompactionForwardedToBottomPriorityPool(
 }
 
 bool DBImpl::HasPendingManualCompaction() {
+  mutex_.AssertHeld();
   return (!manual_compaction_dequeue_.empty());
 }
 
 bool DBImpl::HasPendingManualCompaction(ColumnFamilyData* cfd) {
+  mutex_.AssertHeld();
   return std::any_of(manual_compaction_dequeue_.begin(),
                      manual_compaction_dequeue_.end(),
                      [cfd](const ManualCompactionState* manual) {
@@ -5720,8 +6182,7 @@ void DBImpl::RemoveManualCompaction(DBImpl::ManualCompactionState* m) {
 
 bool DBImpl::ShouldntRunManualCompaction(ManualCompactionState* m) {
   if (m->exclusive) {
-    return (bg_bottom_compaction_scheduled_ > 0 ||
-            bg_compaction_scheduled_ > 0);
+    return CompactionsScheduled() > 0 || remote_compaction_pool_jobs_ > 0;
   }
   std::deque<ManualCompactionState*>::iterator it =
       manual_compaction_dequeue_.begin();
@@ -5817,6 +6278,8 @@ void DBImpl::BuildCompactionJobInfo(
   compaction_job_info->aborted = st.IsCompactionAborted();
   compaction_job_info->thread_id = env_->GetThreadID();
   compaction_job_info->job_id = job_id;
+  compaction_job_info->separate_remote_compaction_pool_selected =
+      c->separate_remote_compaction_pool_selected();
   compaction_job_info->base_input_level = c->start_level();
   compaction_job_info->output_level = c->output_level();
   compaction_job_info->stats = compaction_job_stats;
@@ -6102,7 +6565,7 @@ Status DBImpl::WaitForCompact(
     UpdateOldestSnapshotAndScheduleWork(oldest_snapshot, snapshot_release_count,
                                         /*installed_cfd=*/nullptr);
     // A WBM job can enqueue a regular flush, so wait for both to quiesce.
-    if ((bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
+    if ((CompactionsScheduled() || remote_compaction_pool_jobs_ ||
          bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
          unscheduled_compactions_ || !parked_compaction_cfds_.empty() ||
          (wait_for_compact_options.wait_for_purge && bg_purge_scheduled_) ||

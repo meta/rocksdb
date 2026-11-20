@@ -1,0 +1,1 @@
+`DB::OpenAndCompact()` now uses the table factory from the primary's OPTIONS file when `CompactionServiceOptionsOverride::table_factory` is null, so remote compactions pick up table options changed with `DB::SetOptions()`. A null override was previously not supported.

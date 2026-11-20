@@ -495,6 +495,7 @@ TEST_F(DBWideBasicTest, MultiCFMultiGetEntityAsPinnableAttributeGroups) {
     ReadOptions read_options;
     read_options.io_activity = Env::IOActivity::kGetEntity;
     std::vector<PinnableAttributeGroups> results;
+    results.reserve(num_keys);
     for (size_t i = 0; i < num_keys; ++i) {
       results.emplace_back(create_result(all_cfs));
     }

@@ -898,7 +898,7 @@ class OnFileDeletionListener : public EventListener {
   const char* Name() const override { return kClassName(); }
   static const char* kClassName() { return "OnFileDeletionListener"; }
 
-  void SetExpectedFileName(const std::string file_name) {
+  void SetExpectedFileName(const std::string& file_name) {
     expected_file_name_ = file_name;
   }
 
@@ -1062,6 +1062,7 @@ class DBTestBase : public testing::Test {
     kUniversalSubcompactions,
     kUnorderedWrite,
     kBlockBasedTableWithBinarySearchWithFirstKeyIndex,
+    kSortedHash,
     // This must be the last line
     kEnd,
   };
@@ -1094,6 +1095,7 @@ class DBTestBase : public testing::Test {
     kSkipFIFOCompaction = 128,
     kSkipMmapReads = 256,
     kSkipRowCache = 512,
+    kSkipSortedHash = 1024,
   };
 
   const int kRangeDelSkipConfigs =
@@ -1108,7 +1110,7 @@ class DBTestBase : public testing::Test {
   // `env_do_fsync` decides whether the special Env would do real
   // fsync for files and directories. Skipping fsync can speed up
   // tests, but won't cover the exact fsync logic.
-  DBTestBase(const std::string path, bool env_do_fsync);
+  DBTestBase(const std::string& path, bool env_do_fsync);
 
   ~DBTestBase() override;
 
@@ -1351,10 +1353,10 @@ class DBTestBase : public testing::Test {
 
   std::string DumpSSTableList();
 
-  static void GetSstFiles(Env* env, std::string path,
+  static void GetSstFiles(Env* env, const std::string& path,
                           std::vector<std::string>* files);
 
-  int GetSstFileCount(std::string path);
+  int GetSstFileCount(const std::string& path);
 
   // this will generate non-overlapping files since it keeps increasing key_idx
   void GenerateNewFile(Random* rnd, int* key_idx, bool nowait = false);
@@ -1372,7 +1374,7 @@ class DBTestBase : public testing::Test {
 
   std::string DummyString(size_t len, char c = 'a');
 
-  void VerifyIterLast(std::string expected_key, int cf = 0);
+  void VerifyIterLast(const std::string& expected_key, int cf = 0);
 
   // Used to test InplaceUpdate
 
@@ -1415,10 +1417,10 @@ class DBTestBase : public testing::Test {
       std::unordered_set<std::string>* not_found = nullptr) const;
 
   void VerifyDBInternal(
-      std::vector<std::pair<std::string, std::string>> true_data);
+      const std::vector<std::pair<std::string, std::string>>& true_data);
 
-  uint64_t GetNumberOfSstFilesForColumnFamily(DB* db,
-                                              std::string column_family_name);
+  uint64_t GetNumberOfSstFilesForColumnFamily(
+      DB* db, const std::string& column_family_name);
 
   uint64_t GetSstSizeHelper(Temperature temperature);
 
@@ -1445,6 +1447,7 @@ class DBTestBase : public testing::Test {
     tp->filter_size = 0;
     tp->raw_key_size = 0;
     tp->raw_value_size = 0;
+    tp->referenced_blob_bytes = 0;
     tp->num_data_blocks = 0;
     tp->num_data_blocks_compression_rejected = 0;
     tp->num_data_blocks_compression_bypassed = 0;
@@ -1457,6 +1460,7 @@ class DBTestBase : public testing::Test {
 
   void ParseTablePropertiesString(std::string tp_string, TableProperties* tp) {
     double dummy_double;
+    uint64_t referenced_blob_bytes;
     std::replace(tp_string.begin(), tp_string.end(), ';', ' ');
     std::replace(tp_string.begin(), tp_string.end(), '=', ' ');
     ResetTableProperties(tp);
@@ -1468,7 +1472,7 @@ class DBTestBase : public testing::Test {
         " # deletions %" SCNu64 " # merge operands %" SCNu64
         " # range deletions %" SCNu64 " raw key size %" SCNu64
         " raw average key size %lf "
-        " raw value size %" SCNu64
+        " raw value size %" SCNu64 " referenced blob bytes %" SCNu64
         " raw average value size %lf "
         " data block size %" SCNu64 " data uncompressed size %" SCNu64
         " index block size (user-key? %" SCNu64 ", delta-value? %" SCNu64
@@ -1477,10 +1481,11 @@ class DBTestBase : public testing::Test {
         &tp->num_data_blocks_compression_bypassed, &tp->num_uniform_blocks,
         &tp->num_entries, &tp->num_deletions, &tp->num_merge_operands,
         &tp->num_range_deletions, &tp->raw_key_size, &dummy_double,
-        &tp->raw_value_size, &dummy_double, &tp->data_size,
-        &tp->uncompressed_data_size, &tp->index_key_is_user_key,
+        &tp->raw_value_size, &referenced_blob_bytes, &dummy_double,
+        &tp->data_size, &tp->uncompressed_data_size, &tp->index_key_is_user_key,
         &tp->index_value_is_delta_encoded, &tp->index_size, &tp->filter_size);
-    ASSERT_EQ(count, 18);
+    ASSERT_EQ(count, 19);
+    tp->referenced_blob_bytes = referenced_blob_bytes;
 
     const char* standard_index_is_stub =
         std::strstr(tp_string.c_str(), "standard index is stub ");

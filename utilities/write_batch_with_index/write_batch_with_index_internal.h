@@ -459,7 +459,7 @@ class WriteBatchWithIndexInternal {
                                         ResultTs... results) {
     const ImmutableOptions* ioptions = nullptr;
 
-    const Status s = CheckAndGetImmutableOptions(column_family, &ioptions);
+    Status s = CheckAndGetImmutableOptions(column_family, &ioptions);
     if (!s.ok()) {
       return s;
     }
@@ -483,7 +483,7 @@ class WriteBatchWithIndexInternal {
                                       ResultTs... results) {
     const ImmutableOptions* ioptions = nullptr;
 
-    const Status s = CheckAndGetImmutableOptions(column_family, &ioptions);
+    Status s = CheckAndGetImmutableOptions(column_family, &ioptions);
     if (!s.ok()) {
       return s;
     }

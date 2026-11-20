@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstring>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -59,24 +60,9 @@ DEFINE_bool(enable_print, false, "Print options generated to console.");
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
-class StringLogger : public Logger {
- public:
-  using Logger::Logv;
-  void Logv(const char* format, va_list ap) override {
-    char buffer[1000];
-    vsnprintf(buffer, sizeof(buffer), format, ap);
-    string_.append(buffer);
-  }
-  const std::string& str() const { return string_; }
-  void clear() { string_.clear(); }
-
- private:
-  std::string string_;
-};
-
 class TestCustomizable : public Customizable {
  public:
-  TestCustomizable(const std::string& name) : name_(name) {}
+  explicit TestCustomizable(const std::string& name) : name_(name) {}
   // Method to allow CheckedCast to work for this class
   static const char* kClassName() { return "TestCustomizable"; }
 
@@ -216,11 +202,6 @@ class SimpleConfigurable : public Configurable {
 
  public:
   SimpleConfigurable() { RegisterOptions(&simple_, &simple_option_info); }
-
-  explicit SimpleConfigurable(
-      const std::unordered_map<std::string, OptionTypeInfo>* map) {
-    RegisterOptions(&simple_, map);
-  }
 };
 
 static void GetMapFromProperties(
@@ -520,7 +501,7 @@ TEST_F(CustomizableTest, IsInstanceOfTest) {
   ASSERT_EQ(tc->CheckedCast<TestCustomizable>(), tc.get());
   ASSERT_EQ(tc->CheckedCast<BCustomizable>(), nullptr);
 
-  tc.reset(new BCustomizable("B"));
+  tc = std::make_shared<BCustomizable>("B");
   ASSERT_TRUE(tc->IsInstanceOf("B"));
   ASSERT_TRUE(tc->IsInstanceOf("TestCustomizable"));
   ASSERT_FALSE(tc->IsInstanceOf("A"));
@@ -845,24 +826,24 @@ TEST_F(CustomizableTest, NewEmptySharedTest) {
   SimpleOptions* simple = base->GetOptions<SimpleOptions>();
   ASSERT_NE(simple, nullptr);
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared={id=}"));
   ASSERT_NE(simple, nullptr);
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared={id=nullptr}"));
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared.id="));
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared.id=nullptr"));
   ASSERT_EQ(simple->cs, nullptr);
-  simple->cs.reset(new BCustomizable("B"));
+  simple->cs = std::make_shared<BCustomizable>("B");
 
   ASSERT_OK(base->ConfigureFromString(config_options_, "shared=nullptr"));
   ASSERT_EQ(simple->cs, nullptr);

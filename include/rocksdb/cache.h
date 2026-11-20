@@ -82,6 +82,8 @@ enum class CacheEntryRole {
   // Blob cache's charge to account for its memory usage (when using a
   // separate block cache and blob cache)
   kBlobCache,
+  // Readahead (prefetch) buffers' charge to account for their memory usage
+  kReadaheadBuffer,
   // Default bucket, for miscellaneous cache entries. Do not use for
   // entries that could potentially add up to large usage.
   kMisc,

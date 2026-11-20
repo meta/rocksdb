@@ -6,10 +6,21 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <future>
+#include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <new>
+#include <set>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -23,12 +34,15 @@
 #include "file/sst_file_manager_impl.h"
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_compression.h"
+#include "rocksdb/concurrent_task_limiter.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_util.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/unique_id_impl.h"
+#include "test_util/merge_filter_test_util.h"
 #include "test_util/mock_time_env.h"
+#include "util/cast_util.h"
 #include "util/defer.h"
 #include "utilities/merge_operators/string_append/stringappend.h"
 
@@ -290,6 +304,26 @@ class RetryCloseTableFactory : public TableFactory {
   BlockBasedTableFactory base_factory_;
 };
 
+class UnregisteredFilterPolicy : public FilterPolicy {
+ public:
+  UnregisteredFilterPolicy() : base_policy_(NewBloomFilterPolicy(10)) {}
+
+  const char* Name() const override { return "UnregisteredFilterPolicy"; }
+  const char* CompatibilityName() const override {
+    return base_policy_->CompatibilityName();
+  }
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext& context) const override {
+    return base_policy_->GetBuilderWithContext(context);
+  }
+  FilterBitsReader* GetFilterBitsReader(const Slice& contents) const override {
+    return base_policy_->GetFilterBitsReader(contents);
+  }
+
+ private:
+  std::unique_ptr<const FilterPolicy> base_policy_;
+};
+
 }  // namespace
 
 class MyTestCompactionService : public CompactionService {
@@ -314,6 +348,21 @@ class MyTestCompactionService : public CompactionService {
   static const char* kClassName() { return "MyTestCompactionService"; }
 
   const char* Name() const override { return kClassName(); }
+
+  bool SupportsMergeBeforeFilter() const override {
+    return supports_merge_before_filter_;
+  }
+
+  void SetSupportsMergeBeforeFilter(bool value) {
+    supports_merge_before_filter_ = value;
+  }
+
+  void SetWorkerCompactionFilter(
+      const CompactionFilter* filter,
+      std::shared_ptr<CompactionFilterFactory> factory) {
+    options_.compaction_filter = filter;
+    options_.compaction_filter_factory = std::move(factory);
+  }
 
   CompactionServiceScheduleResponse Schedule(
       const CompactionServiceJobInfo& info,
@@ -409,7 +458,9 @@ class MyTestCompactionService : public CompactionService {
     options_override.compaction_filter_factory =
         options_.compaction_filter_factory;
     options_override.prefix_extractor = options_.prefix_extractor;
-    options_override.table_factory = options_.table_factory;
+    if (!table_factory_from_options_file_) {
+      options_override.table_factory = options_.table_factory;
+    }
     options_override.sst_partitioner_factory = options_.sst_partitioner_factory;
     options_override.statistics = statistics_;
     options_override.info_log = options_.info_log;
@@ -480,6 +531,10 @@ class MyTestCompactionService : public CompactionService {
 
   void ReturnIncompleteAsFailure(bool value) {
     return_incomplete_as_failure_ = value;
+  }
+
+  void SetTableFactoryFromOptionsFile(bool value) {
+    table_factory_from_options_file_ = value;
   }
 
   void SetWorkerOptionOverride(const std::string& name,
@@ -553,6 +608,7 @@ class MyTestCompactionService : public CompactionService {
  private:
   std::atomic_int compaction_num_{0};
   Options options_;
+  bool supports_merge_before_filter_ = false;
   CompactionServiceJobInfo start_info_;
   CompactionServiceJobInfo wait_info_;
   bool is_override_start_status_ = false;
@@ -565,6 +621,7 @@ class MyTestCompactionService : public CompactionService {
   std::string override_wait_result_;
   std::function<void(std::string*)> wait_result_mutator_;
   bool return_incomplete_as_failure_ = false;
+  bool table_factory_from_options_file_ = false;
   std::unordered_map<std::string, std::string> worker_options_override_;
   std::vector<std::shared_ptr<EventListener>> listeners_;
   std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
@@ -610,6 +667,33 @@ class CompactionServiceTest : public DBTestBase {
   MyTestCompactionService* GetCompactionService() {
     CompactionService* cs = compaction_service_.get();
     return static_cast_with_check<MyTestCompactionService>(cs);
+  }
+
+  // Writes two overlapping files to column family cf, compacts them remotely,
+  // and returns the average data block size of the column family's files.
+  uint64_t CompactAndGetAverageDataBlockSize(int cf) {
+    Random rnd(301);
+    for (int file = 0; file < 2; file++) {
+      for (int i = 0; i < 1000; i++) {
+        EXPECT_OK(Put(cf, Key(i), rnd.RandomString(100)));
+      }
+      EXPECT_OK(Flush(cf));
+    }
+    const int compactions_before = GetCompactionService()->GetCompactionNum();
+    EXPECT_OK(db_->CompactRange(CompactRangeOptions(), handles_[cf], nullptr,
+                                nullptr));
+    EXPECT_GT(GetCompactionService()->GetCompactionNum(), compactions_before);
+
+    TablePropertiesCollection props;
+    EXPECT_OK(db_->GetPropertiesOfAllTables(handles_[cf], &props));
+    uint64_t data_size = 0;
+    uint64_t num_data_blocks = 0;
+    for (const auto& file_and_props : props) {
+      data_size += file_and_props.second->data_size;
+      num_data_blocks += file_and_props.second->num_data_blocks;
+    }
+    EXPECT_GT(num_data_blocks, 0);
+    return num_data_blocks == 0 ? 0 : data_size / num_data_blocks;
   }
 
   void GenerateTestData(bool move_files_manually = false) {
@@ -704,6 +788,655 @@ class CompactionServiceTest : public DBTestBase {
   std::shared_ptr<CompactionService> compaction_service_;
 };
 
+TEST_F(CompactionServiceTest, RemotePoolPropertyDoesNotCreatePool) {
+  Options options = CurrentOptions();
+  options.compaction_service.reset();
+  DestroyAndReopen(options);
+  ASSERT_EQ(RemoteCompactionThreadPool::GetShared(false), nullptr);
+
+  int pools_created = 0;
+  SyncPoint::GetInstance()->SetCallBack("RemoteCompactionThreadPool::Created",
+                                        [&](void*) { ++pools_created; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  uint64_t threads = 0;
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_TRUE(db_->GetIntProperty(
+        DB::Properties::kNumRemoteCompactionPoolThreads, &threads));
+    EXPECT_EQ(threads, 0U);
+  }
+  EXPECT_EQ(pools_created, 0);
+  {
+    auto pool = RemoteCompactionThreadPool::GetShared();
+    auto* pool_ptr = pool.get();
+    pool->SubmitJob([pool_ptr] { pool_ptr->CompleteJob(); }, this, 3);
+    EXPECT_TRUE(db_->GetIntProperty(
+        DB::Properties::kNumRemoteCompactionPoolThreads, &threads));
+    EXPECT_EQ(threads, 3U);
+  }
+  EXPECT_TRUE(db_->GetIntProperty(
+      DB::Properties::kNumRemoteCompactionPoolThreads, &threads));
+  EXPECT_EQ(threads, 0U);
+  EXPECT_EQ(pools_created, 1);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteFullResults) {
+  for (bool use_factory : {false, true}) {
+    for (bool blobs : {false, true}) {
+      for (CompactionFilter::Decision decision :
+           {CompactionFilter::Decision::kKeep,
+            CompactionFilter::Decision::kChangeValue,
+            CompactionFilter::Decision::kRemove,
+            CompactionFilter::Decision::kPurge}) {
+        if (use_factory &&
+            decision == CompactionFilter::Decision::kChangeValue) {
+          continue;
+        }
+        SCOPED_TRACE(blobs);
+        SCOPED_TRACE(use_factory);
+        SCOPED_TRACE(static_cast<int>(decision));
+        test::MergeFilterTrace trace;
+        test::RecordingMergeFilter filter(
+            CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+        filter.replacement = "replacement";
+        auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+            CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+        Options options = CurrentOptions();
+        options.disable_auto_compactions = true;
+        options.enable_blob_files = blobs;
+        options.min_blob_size = 1;
+        options.merge_operator =
+            std::make_shared<test::RecordingMergeOperator>(&trace);
+        if (use_factory) {
+          options.compaction_filter_factory = factory;
+        } else {
+          options.compaction_filter = &filter;
+        }
+        ReopenWithCompactionService(&options);
+        GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+        ASSERT_OK(Put("a", "older"));
+        ASSERT_OK(Flush());
+        const Snapshot* snapshot = db_->GetSnapshot();
+        MoveFilesToLevel(2);
+        const int previous_jobs = GetCompactionService()->GetCompactionNum();
+        filter.value_decision = decision;
+        factory->value_decision = decision;
+        ASSERT_OK(Put("a", "base"));
+        ASSERT_OK(Flush());
+        ASSERT_OK(Merge("a", "M"));
+        ASSERT_OK(Flush());
+        trace.Clear();
+        std::vector<LiveFileMetaData> files;
+        db_->GetLiveFilesMetaData(&files);
+        std::vector<std::string> inputs;
+        for (const auto& file : files) {
+          if (file.level == 0) {
+            inputs.push_back(file.relative_filename);
+          }
+        }
+        CompactionOptions compact;
+        ASSERT_OK(db_->CompactFiles(compact, inputs, 1));
+        ASSERT_EQ(previous_jobs + 1,
+                  GetCompactionService()->GetCompactionNum());
+        ASSERT_TRUE(GetCompactionService()
+                        ->GetCompactionInfoForStart()
+                        .merge_before_filter);
+        ASSERT_EQ((std::vector<std::string>{"full:a:baseM", "value:a:baseM"}),
+                  trace.Events());
+        CompactionServiceResult result;
+        GetCompactionService()->GetResult(&result);
+        ASSERT_OK(result.status);
+        ASSERT_EQ(kCompactionServiceMergeBeforeFilterVersion,
+                  result.merge_before_filter_version);
+        ASSERT_FALSE(result.merge_order_mismatch);
+        const std::string expected =
+            decision == CompactionFilter::Decision::kKeep ? "baseM"
+            : decision == CompactionFilter::Decision::kChangeValue
+                ? "replacement"
+                : "NOT_FOUND";
+        ASSERT_EQ(expected, Get("a"));
+        ReadOptions read;
+        read.snapshot = snapshot;
+        std::string old_value;
+        ASSERT_OK(db_->Get(read, "a", &old_value));
+        ASSERT_EQ("older", old_value);
+        db_->ReleaseSnapshot(snapshot);
+      }
+    }
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteAcknowledgmentFallback) {
+  for (uint64_t acknowledgment : {uint64_t{0}, uint64_t{2}}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    filter.value_decision = CompactionFilter::Decision::kPurge;
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    options.compaction_filter = &filter;
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+    GetCompactionService()->SetWaitResultMutator(
+        [acknowledgment](std::string* serialized) {
+          CompactionServiceResult result;
+          ASSERT_OK(CompactionServiceResult::Read(*serialized, &result));
+          ASSERT_OK(result.status);
+          result.merge_before_filter_version = acknowledgment;
+          serialized->clear();
+          ASSERT_OK(result.Write(serialized));
+        });
+    ASSERT_OK(Put("a", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "M"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_EQ("NOT_FOUND", Get("a"));
+    ASSERT_EQ(1, GetCompactionService()->GetCompactionNum());
+    ASSERT_EQ(1, GetCompactionService()->GetUseLocalInstallationCount());
+    ASSERT_EQ((std::vector<std::string>{"full:a:baseM", "value:a:baseM",
+                                        "full:a:baseM", "value:a:baseM"}),
+              trace.Events());
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemotePartialAndDeclined) {
+  for (bool partial_success : {false, true}) {
+    for (CompactionFilter::Decision decision :
+         {CompactionFilter::Decision::kKeep,
+          CompactionFilter::Decision::kChangeValue,
+          CompactionFilter::Decision::kRemove}) {
+      SCOPED_TRACE(partial_success);
+      SCOPED_TRACE(static_cast<int>(decision));
+      test::MergeFilterTrace trace;
+      auto merge = std::make_shared<test::RecordingMergeOperator>(&trace);
+      merge->partial_success = partial_success;
+      test::RecordingMergeFilter filter(
+          CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+      filter.operand_decision = decision;
+      filter.replacement = "X";
+      Options options = CurrentOptions();
+      options.disable_auto_compactions = true;
+      options.compaction_filter = &filter;
+      options.merge_operator = merge;
+      ReopenWithCompactionService(&options);
+      GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+      ASSERT_OK(Put("a", "base"));
+      ASSERT_OK(Flush());
+      MoveFilesToLevel(2);
+      ASSERT_OK(Merge("a", "A"));
+      ASSERT_OK(Flush());
+      ASSERT_OK(Merge("a", "B"));
+      ASSERT_OK(Flush());
+      trace.Clear();
+      std::vector<LiveFileMetaData> files;
+      db_->GetLiveFilesMetaData(&files);
+      std::vector<std::string> inputs;
+      for (const auto& file : files) {
+        if (file.level == 0) {
+          inputs.push_back(file.relative_filename);
+        }
+      }
+      CompactionOptions compact;
+      ASSERT_OK(db_->CompactFiles(compact, inputs, 1));
+      ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+      ASSERT_EQ(partial_success
+                    ? (std::vector<std::string>{"partial:a:AB", "operand:a:AB"})
+                    : (std::vector<std::string>{"partial:a:AB", "operand:a:B",
+                                                "operand:a:A"}),
+                trace.Events());
+      const std::string expected =
+          decision == CompactionFilter::Decision::kKeep ? "baseAB"
+          : decision == CompactionFilter::Decision::kChangeValue
+              ? (partial_success ? "baseX" : "baseXX")
+              : "base";
+      ASSERT_EQ(expected, Get("a"));
+    }
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteErrorsDoNotFallback) {
+  for (bool factory_mismatch : {false, true}) {
+    test::MergeFilterTrace trace;
+    auto merge = std::make_shared<test::RecordingMergeOperator>(&trace);
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.merge_operator = merge;
+    options.compaction_filter = &filter;
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+    if (factory_mismatch) {
+      factory->instance_order =
+          CompactionFilter::MergeOrder::kFilterBeforeMerge;
+      GetCompactionService()->SetWorkerCompactionFilter(nullptr, factory);
+    } else {
+      merge->fail_full = true;
+      merge->failure_scope = MergeOperator::OpFailureScope::kTryMerge;
+    }
+    ASSERT_OK(Put("a", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "M"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+    ASSERT_FALSE(status.ok());
+    ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+    CompactionServiceResult result;
+    GetCompactionService()->GetResult(&result);
+    ASSERT_FALSE(result.status.ok());
+    ASSERT_FALSE(result.merge_order_mismatch);
+    ASSERT_TRUE(result.output_files.empty());
+    if (factory_mismatch) {
+      ASSERT_TRUE(status.IsInvalidArgument());
+      ASSERT_TRUE(trace.Events().empty());
+    }
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteInvalidDecline) {
+  test::MergeFilterTrace trace;
+  test::RecordingMergeFilter filter(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.compaction_filter = &filter;
+  options.merge_operator =
+      std::make_shared<test::RecordingMergeOperator>(&trace);
+  ReopenWithCompactionService(&options);
+  GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+  GetCompactionService()->SetWaitResultMutator([](std::string* serialized) {
+    CompactionServiceResult result;
+    ASSERT_OK(CompactionServiceResult::Read(*serialized, &result));
+    ASSERT_OK(result.status);
+    result.status = Status::IOError("Injected worker error");
+    result.merge_order_mismatch = true;
+    result.merge_before_filter_version = 0;
+    result.stats.num_input_records = 0;
+    result.output_files.clear();
+    serialized->clear();
+    ASSERT_OK(result.Write(serialized));
+  });
+  ASSERT_OK(Put("a", "base"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Merge("a", "M"));
+  ASSERT_OK(Flush());
+  Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(status.IsCorruption());
+  ASSERT_EQ("baseM", Get("a"));
+  ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteWorkerOrderMismatch) {
+  for (bool new_order_primary : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter legacy(
+        CompactionFilter::MergeOrder::kFilterBeforeMerge, &trace);
+    test::RecordingMergeFilter newer(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    options.compaction_filter = new_order_primary ? &newer : &legacy;
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+    GetCompactionService()->SetWorkerCompactionFilter(
+        new_order_primary ? &legacy : &newer, nullptr);
+    ASSERT_OK(Put("a", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "M"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_EQ("baseM", Get("a"));
+    ASSERT_EQ(1, GetCompactionService()->GetUseLocalInstallationCount());
+    CompactionServiceResult result;
+    GetCompactionService()->GetResult(&result);
+    ASSERT_TRUE(result.status.IsNotSupported());
+    ASSERT_TRUE(result.merge_order_mismatch);
+    ASSERT_TRUE(result.output_files.empty());
+    ASSERT_EQ(0, result.stats.num_input_records);
+    ASSERT_EQ(0, GetCompactorStatistics()->getTickerCount(COMPACT_WRITE_BYTES));
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterNullWorkerFilterRunsRemotely) {
+  test::MergeFilterTrace trace;
+  auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+      CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+  factory->return_null = true;
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.merge_operator =
+      std::make_shared<test::RecordingMergeOperator>(&trace);
+  options.compaction_filter_factory = factory;
+  ReopenWithCompactionService(&options);
+  GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+  GetCompactionService()->SetWorkerCompactionFilter(nullptr, factory);
+  ASSERT_OK(Put("a", "base"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Merge("a", "M"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ("baseM", Get("a"));
+  // Without a filter both orders give the same output, so the worker accepts.
+  ASSERT_EQ(1, GetCompactionService()->GetCompactionNum());
+  ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_FALSE(result.merge_order_mismatch);
+  ASSERT_EQ(kCompactionServiceMergeBeforeFilterVersion,
+            result.merge_before_filter_version);
+  for (const std::string& event : trace.Events()) {
+    ASSERT_EQ(0, event.rfind("full:", 0)) << event;
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteEntityAndStoredPurge) {
+  for (bool blobs : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter filter(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.enable_blob_files = blobs;
+    options.min_blob_size = 0;
+    options.compaction_filter = &filter;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->SetSupportsMergeBeforeFilter(true);
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "a",
+                             {{"", "A"}, {"extra", "payload"}}));
+    ASSERT_OK(Put("b", "base"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Merge("a", "B"));
+    ASSERT_OK(Merge("b", "operand"));
+    ASSERT_OK(Flush());
+    trace.Clear();
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::vector<std::string> inputs;
+    inputs.reserve(files.size());
+    for (const auto& file : files) {
+      inputs.push_back(file.relative_filename);
+    }
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 1));
+    ASSERT_EQ(
+        (std::vector<std::string>{"full:a:AB", "entity:a:AB",
+                                  "full:b:baseoperand", "value:b:baseoperand"}),
+        trace.Events());
+    PinnableWideColumns columns;
+    ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "a",
+                             &columns));
+    ASSERT_EQ((WideColumns{{"", "AB"}, {"extra", "payload"}}),
+              columns.columns());
+    filter.value_decision = CompactionFilter::Decision::kPurge;
+    filter.blob_decision = CompactionFilter::Decision::kPurge;
+    trace.Clear();
+    files.clear();
+    inputs.clear();
+    db_->GetLiveFilesMetaData(&files);
+    inputs.reserve(files.size());
+    for (const auto& file : files) {
+      inputs.push_back(file.relative_filename);
+    }
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 2));
+    ASSERT_EQ("NOT_FOUND", Get("a"));
+    ASSERT_EQ("NOT_FOUND", Get("b"));
+    ASSERT_EQ(2, GetCompactionService()->GetCompactionNum());
+    ASSERT_EQ(0, GetCompactionService()->GetUseLocalInstallationCount());
+    if (blobs) {
+      ASSERT_GT(filter.blob_key_calls.load(), 0);
+    }
+    CompactRangeOptions compact;
+    compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+    ASSERT_EQ("NOT_FOUND", Get("a"));
+    ASSERT_EQ("NOT_FOUND", Get("b"));
+  }
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteWireVersions) {
+  for (bool new_order : {false, true}) {
+    CompactionServiceInput input;
+    input.merge_before_filter = new_order;
+    std::string serialized;
+    ASSERT_OK(input.Write(&serialized));
+    // Both orders use the existing format; old workers ignore the new field.
+    ASSERT_EQ(1, DecodeFixed32(serialized.data()));
+    CompactionServiceInput decoded;
+    ASSERT_OK(CompactionServiceInput::Read(serialized, &decoded));
+    ASSERT_EQ(new_order, decoded.merge_before_filter);
+  }
+  {
+    // A request from an old primary has no field and decodes as legacy order.
+    CompactionServiceInput decoded;
+    decoded.merge_before_filter = true;
+    std::string legacy(sizeof(uint32_t), '\0');
+    EncodeFixed32(&legacy[0], 1);
+    legacy += "output_level=0;";
+    ASSERT_OK(CompactionServiceInput::Read(legacy, &decoded));
+    ASSERT_FALSE(decoded.merge_before_filter);
+  }
+  CompactionServiceResult decoded;
+  decoded.merge_before_filter_version = 1;
+  decoded.merge_order_mismatch = true;
+  std::string legacy(sizeof(uint32_t), '\0');
+  EncodeFixed32(&legacy[0], 1);
+  legacy += "output_level=0;";
+  ASSERT_OK(CompactionServiceResult::Read(legacy, &decoded));
+  ASSERT_OK(decoded.status);
+  ASSERT_EQ(0, decoded.merge_before_filter_version);
+  ASSERT_FALSE(decoded.merge_order_mismatch);
+}
+
+TEST_F(CompactionServiceTest, MergeBeforeFilterLocalSubcompactions) {
+  class CompletionCounter : public EventListener {
+   public:
+    void OnSubcompactionCompleted(const SubcompactionJobInfo& info) override {
+      EXPECT_FALSE(info.stats.is_remote_compaction);
+      completions.fetch_add(1);
+    }
+    std::atomic<uint64_t> completions{0};
+  };
+  for (bool use_factory : {false, true}) {
+    test::MergeFilterTrace trace;
+    test::RecordingMergeFilter direct(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    auto factory = std::make_shared<test::RecordingMergeFilterFactory>(
+        CompactionFilter::MergeOrder::kMergeBeforeFilter, &trace);
+    factory->value_decision = CompactionFilter::Decision::kPurge;
+    auto listener = std::make_shared<CompletionCounter>();
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.max_subcompactions = 4;
+    options.target_file_size_base = 32 << 10;
+    options.compression = kNoCompression;
+    options.merge_operator =
+        std::make_shared<test::RecordingMergeOperator>(&trace);
+    options.listeners.push_back(listener);
+    if (use_factory) {
+      options.compaction_filter_factory = factory;
+    } else {
+      options.compaction_filter = &direct;
+    }
+    ReopenWithCompactionService(&options);
+    constexpr int kKeys = 4096;
+    const std::string base(1024, 'A');
+    for (int i = 0; i < kKeys; ++i) {
+      ASSERT_OK(Put(Key(i), base));
+    }
+    ASSERT_OK(Flush());
+    for (int i = 0; i < kKeys; ++i) {
+      ASSERT_OK(Merge(Key(i), "B"));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_EQ(0, factory->creations.load());
+    trace.Clear();
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::vector<std::string> inputs;
+    for (const auto& file : files) {
+      inputs.push_back(file.relative_filename);
+    }
+    std::atomic<uint64_t> local_routes{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionJob::ShouldUseLocalCompaction:MergeBeforeFilterLocal",
+        [&](void*) { local_routes.fetch_add(1); });
+    SyncPoint::GetInstance()->EnableProcessing();
+    CompactionOptions compact;
+    compact.max_subcompactions = 4;
+    ASSERT_OK(db_->CompactFiles(compact, inputs, 1));
+    const uint64_t subcompactions = listener->completions.load();
+    ASSERT_GT(subcompactions, 1);
+    ASSERT_EQ(use_factory ? subcompactions : 0, factory->creations.load());
+    ASSERT_EQ(0, GetCompactionService()->GetCompactionNum());
+    ASSERT_EQ(0, GetCompactorStatistics()->getTickerCount(COMPACT_WRITE_BYTES));
+    if (use_factory) {
+      ASSERT_EQ(0, GetPrimaryStatistics()->getTickerCount(COMPACT_WRITE_BYTES));
+    } else {
+      ASSERT_GT(GetPrimaryStatistics()->getTickerCount(COMPACT_WRITE_BYTES), 0);
+    }
+    std::map<std::string, size_t> full_positions;
+    size_t values = 0;
+    const std::vector<std::string> events = trace.Events();
+    for (size_t i = 0; i < events.size(); ++i) {
+      const size_t colon = events[i].find(':');
+      const size_t last_colon = events[i].find(':', colon + 1);
+      const std::string key =
+          events[i].substr(colon + 1, last_colon - colon - 1);
+      if (events[i].compare(0, colon, "full") == 0) {
+        ASSERT_TRUE(full_positions.emplace(key, i).second);
+      } else {
+        ASSERT_EQ("value", events[i].substr(0, colon));
+        ASSERT_EQ(1, full_positions.count(key));
+        ASSERT_LT(full_positions.at(key), i);
+        ++values;
+      }
+    }
+    ASSERT_EQ(kKeys, full_positions.size());
+    ASSERT_EQ(kKeys, values);
+    for (int i = 0; i < kKeys; ++i) {
+      ASSERT_EQ(use_factory ? "NOT_FOUND" : base + "B", Get(Key(i)));
+    }
+    ASSERT_EQ(subcompactions, local_routes.load());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    Close();
+  }
+}
+
+TEST_F(CompactionServiceTest, PendingRemoteCompactionDoesNotPinObsoleteSsts) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.max_background_jobs = 8;
+  ReopenWithCompactionService(&options);
+
+  // Hold the first remote compaction inside Wait(), as a stuck remote worker
+  // would. Its pending_outputs_ entry stays registered until it is released.
+  std::promise<void> stuck_started;
+  std::promise<void> release_stuck;
+  std::shared_future<void> release = release_stuck.get_future().share();
+  std::atomic<bool> first_wait{true};
+  std::promise<void> purged;
+  std::atomic<bool> purged_once{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "MyTestCompactionService::Wait:BeforeOpenAndCompact", [&](void*) {
+        if (first_wait.exchange(false)) {
+          stuck_started.set_value();
+          release.wait();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCallCompaction:PurgedObsoleteFiles", [&](void*) {
+        if (!purged_once.exchange(true)) {
+          purged.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto write_two_overlapping_files = [&](int cf) {
+    for (int file = 0; file < 2; file++) {
+      for (int i = 0; i < 100; i++) {
+        ASSERT_OK(Put(cf, Key(i), "v" + std::to_string(file)));
+      }
+      ASSERT_OK(Flush(cf));
+    }
+  };
+
+  CompactRangeOptions cro;
+  cro.exclusive_manual_compaction = false;
+
+  write_two_overlapping_files(1);
+  port::Thread stuck_thread([&]() {
+    ASSERT_OK(db_->CompactRange(cro, handles_[1], nullptr, nullptr));
+  });
+  // Unblock and join on every exit path, so that a failed assertion below
+  // reports a failure instead of hanging or terminating the test.
+  bool stuck_released = false;
+  auto release_and_join = [&]() {
+    if (!stuck_released) {
+      stuck_released = true;
+      release_stuck.set_value();
+      stuck_thread.join();
+    }
+  };
+  Defer release_on_exit(release_and_join);
+  stuck_started.get_future().wait();
+
+  // These files are created after the stuck job registered its
+  // pending_outputs_ entry, so their numbers are above it.
+  write_two_overlapping_files(2);
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  std::vector<std::string> cf2_inputs;
+  uint64_t min_cf2_input_number = std::numeric_limits<uint64_t>::max();
+  for (const auto& file : live_files) {
+    if (file.column_family_name == "cf_2") {
+      cf2_inputs.push_back(file.directory + "/" + file.relative_filename);
+      min_cf2_input_number = std::min(min_cf2_input_number, file.file_number);
+    }
+  }
+  ASSERT_EQ(cf2_inputs.size(), 2U);
+  uint64_t min_to_keep = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kMinObsoleteSstNumberToKeep,
+                                  &min_to_keep));
+  ASSERT_LT(min_to_keep, min_cf2_input_number);
+
+  // Compacting cf_2 makes its two input files obsolete while the cf_1 job is
+  // still waiting.
+  ASSERT_OK(db_->CompactRange(cro, handles_[2], nullptr, nullptr));
+  uint64_t obsolete_sst_size = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kObsoleteSstFilesSize,
+                                  &obsolete_sst_size));
+  ASSERT_EQ(obsolete_sst_size, 0U);
+  purged.get_future().wait();
+  for (const auto& path : cf2_inputs) {
+    ASSERT_TRUE(env_->FileExists(path).IsNotFound()) << path;
+  }
+
+  release_and_join();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  for (int cf : {1, 2}) {
+    for (int i = 0; i < 100; i++) {
+      ASSERT_EQ("v1", Get(cf, Key(i)));
+    }
+  }
+}
+
 TEST_F(CompactionServiceTest, BasicCompactions) {
   Options options = CurrentOptions();
   options.max_open_files = -1;
@@ -724,6 +1457,25 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   SyncPoint::GetInstance()->DisableProcessing();
   VerifyTestData();
+
+  // Remote compaction outputs record DB ownership as local ones would
+  {
+    std::vector<LiveFileMetaData> live_files;
+    db_->GetLiveFilesMetaData(&live_files);
+    int num_compaction_outputs = 0;
+    for (const auto& f : live_files) {
+      const DataFileProvenance info =
+          DataFileProvenance::DecodeFrom(f.data_file_provenance);
+      if (info.origin == DataFileProvenance::Origin::kCompaction) {
+        ++num_compaction_outputs;
+      } else {
+        EXPECT_EQ(info.origin, DataFileProvenance::Origin::kFlush);
+      }
+      EXPECT_GT(f.db_ownership_start_time, 0U);
+      EXPECT_EQ(f.db_ownership_start_time, f.file_creation_time);
+    }
+    EXPECT_GT(num_compaction_outputs, 0);
+  }
 
   auto my_cs = GetCompactionService();
   ASSERT_GE(my_cs->GetCompactionNum(), 1);
@@ -793,6 +1545,7 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   // a new DB session, and DB::Open() deletes staging directories belonging to
   // any other session.
   uint64_t total_size = 0;
+  uint64_t total_entries = 0;
   Env* const env = options.env;
   ASSERT_TRUE(options.env != nullptr);
   for (const auto& output_file : result.output_files) {
@@ -802,6 +1555,7 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
     ASSERT_OK(env->GetFileSize(file_name, &file_size));
     ASSERT_GT(file_size, 0);
     total_size += file_size;
+    total_entries += output_file.table_properties.num_entries;
   }
   ASSERT_EQ(total_size, result.internal_stats.TotalBytesWritten());
 
@@ -822,7 +1576,9 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   ASSERT_GE(result.internal_stats.output_level_stats.micros, 1);
   ASSERT_GE(result.internal_stats.output_level_stats.cpu_micros, 1);
 
-  ASSERT_EQ(20, result.internal_stats.output_level_stats.num_output_records);
+  ASSERT_GT(total_entries, 0);
+  ASSERT_EQ(total_entries,
+            result.internal_stats.output_level_stats.num_output_records);
   ASSERT_EQ(result.output_files.size(),
             result.internal_stats.output_level_stats.num_output_files);
 
@@ -1003,6 +1759,233 @@ TEST_F(CompactionServiceTest, SkipWALRecoveryInOpenAndCompact) {
 
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(CompactionServiceTest, MissingBlobRepairRunsLocallyPerCall) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("key", "value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+
+  MyTestCompactionService* service = GetCompactionService();
+  const int remote_compactions = service->GetCompactionNum();
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  std::atomic<bool> canceled{true};
+  repair.canceled = &canceled;
+  ASSERT_EQ(db_->CompactRange(repair, nullptr, nullptr).code(),
+            Status::kIncomplete);
+  ASSERT_EQ(service->GetCompactionNum(), remote_compactions);
+
+  canceled.store(false);
+  ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+  ASSERT_EQ(service->GetCompactionNum(), remote_compactions);
+  ASSERT_EQ(Get("key"), "value2");
+
+  ASSERT_OK(Put("key", "value3"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions regular;
+  regular.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(regular, nullptr, nullptr));
+  ASSERT_GT(service->GetCompactionNum(), remote_compactions);
+  ASSERT_EQ(Get("key"), "value3");
+}
+
+TEST_F(CompactionServiceTest, MissingBlobRepairRejectsFIFOWithoutFlushing) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  options.max_open_files = -1;
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  ASSERT_OK(Put("sst", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("memtable", "value"));
+  ASSERT_EQ(TotalTableFiles(), 1);
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  ASSERT_EQ(db_->CompactRange(repair, nullptr, nullptr).code(),
+            Status::kNotSupported);
+  ASSERT_EQ(TotalTableFiles(), 1);
+  ASSERT_EQ(Get("sst"), "value");
+  ASSERT_EQ(Get("memtable"), "value");
+  ASSERT_EQ(GetCompactionService()->GetCompactionNum(), 0);
+}
+
+TEST_F(CompactionServiceTest, NullTableFactoryOverrideUsesOptionsFile) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 4096;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  ReopenWithCompactionService(&options);
+  MyTestCompactionService* cs = GetCompactionService();
+  cs->ReturnIncompleteAsFailure(true);
+
+  ASSERT_OK(
+      db_->SetOptions({{"block_based_table_factory", "{block_size=32768;}"}}));
+
+  // The worker's table factory override still has the block size from open.
+  EXPECT_LT(CompactAndGetAverageDataBlockSize(0), 8192);
+
+  // Without an override, the worker uses the table options in the OPTIONS
+  // file, which SetOptions() rewrote.
+  cs->SetTableFactoryFromOptionsFile(true);
+  EXPECT_GT(CompactAndGetAverageDataBlockSize(0), 16384);
+
+  // Each column family gets its own table options, and
+  // CompactionServiceOptionsOverride::options_map applies on top of them.
+  EXPECT_LT(CompactAndGetAverageDataBlockSize(1), 8192);
+  cs->SetWorkerOptionOverride("block_based_table_factory",
+                              "{block_size=65536;}");
+  EXPECT_GT(CompactAndGetAverageDataBlockSize(1), 32768);
+}
+
+TEST_F(CompactionServiceTest, NullTableFactoryOverrideUnregisteredFactory) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  // Not registered with the object registry, so the worker cannot create it
+  // from the OPTIONS file.
+  options.table_factory = std::make_shared<RetryCloseTableFactory>(
+      "", std::make_shared<RetryCloseTableFactoryState>());
+  ReopenWithCompactionService(&options);
+  MyTestCompactionService* cs = GetCompactionService();
+  cs->SetTableFactoryFromOptionsFile(true);
+
+  for (int i = 0; i < 2; i++) {
+    ASSERT_OK(Put("key", "value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+  }
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  const Status s = db_->CompactRange(cro, nullptr, nullptr);
+  ASSERT_EQ(s.code(), Status::kIncomplete) << s.ToString();
+  ASSERT_EQ(cs->GetCompactionNum(), 1);
+  // The worker writes no result, so the primary handles this like any failed
+  // remote compaction.
+  ASSERT_EQ(dbfull()->TEST_GetBGError().severity(),
+            Status::Severity::kFatalError);
+  ASSERT_EQ(Get("key"), "value1");
+}
+
+TEST_F(CompactionServiceTest, NullTableFactoryOverrideFilterPolicy) {
+  // The worker creates the filter policy named in the OPTIONS file if it is
+  // registered, and fails the compaction if it is not.
+  for (bool registered : {true, false}) {
+    SCOPED_TRACE(registered ? "registered" : "unregistered");
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    BlockBasedTableOptions table_options;
+    if (registered) {
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+    } else {
+      table_options.filter_policy =
+          std::make_shared<UnregisteredFilterPolicy>();
+    }
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    ReopenWithCompactionService(&options);
+    MyTestCompactionService* cs = GetCompactionService();
+    cs->ReturnIncompleteAsFailure(true);
+    cs->SetTableFactoryFromOptionsFile(true);
+
+    for (int file = 0; file < 2; file++) {
+      for (int i = 0; i < 100; i++) {
+        ASSERT_OK(Put(Key(i), "value" + std::to_string(file)));
+      }
+      ASSERT_OK(Flush());
+    }
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    const Status s = db_->CompactRange(cro, nullptr, nullptr);
+    ASSERT_GT(cs->GetCompactionNum(), 0);
+    if (!registered) {
+      ASSERT_EQ(s.code(), Status::kIncomplete) << s.ToString();
+      ASSERT_EQ(dbfull()->TEST_GetBGError().severity(),
+                Status::Severity::kFatalError);
+      ASSERT_EQ(Get(Key(0)), "value1");
+      continue;
+    }
+    ASSERT_OK(s);
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(props.size(), 1);
+    const TableProperties& table_properties = *props.begin()->second;
+    EXPECT_GT(table_properties.filter_size, 0);
+    EXPECT_FALSE(table_properties.filter_policy_name.empty());
+  }
+}
+
+TEST_F(CompactionServiceTest, NullTableFactoryOverrideUnknownTableOption) {
+  // As for any option in the OPTIONS file, the worker ignores a table option it
+  // does not know only if a newer RocksDB wrote the file.
+  for (bool newer : {true, false}) {
+    SCOPED_TRACE(newer ? "newer" : "same version");
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    ReopenWithCompactionService(&options);
+    MyTestCompactionService* cs = GetCompactionService();
+    cs->ReturnIncompleteAsFailure(true);
+    cs->SetTableFactoryFromOptionsFile(true);
+
+    // Point the worker at a copy of the OPTIONS file with an unknown table
+    // option.
+    std::string copy_name;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImplSecondary::OpenAndCompact::BeforeLoadingOptions:0",
+        [&](void* arg) {
+          uint64_t* options_file_number = static_cast<uint64_t*>(arg);
+          std::string contents;
+          ASSERT_OK(ReadFileToString(
+              env_, OptionsFileName(dbname_, *options_file_number), &contents));
+          const std::string table_section =
+              "[TableOptions/BlockBasedTable \"default\"]\n";
+          const size_t pos = contents.find(table_section);
+          ASSERT_NE(pos, std::string::npos);
+          contents.insert(pos + table_section.size(),
+                          "  unknown_table_option=1\n");
+          if (newer) {
+            const std::string version_key = "rocksdb_version=";
+            const size_t version_pos = contents.find(version_key);
+            ASSERT_NE(version_pos, std::string::npos);
+            const size_t version_end = contents.find('\n', version_pos);
+            contents.replace(
+                version_pos, version_end - version_pos,
+                version_key + std::to_string(ROCKSDB_MAJOR + 1) + ".0.0");
+          }
+          *options_file_number += 1000;
+          copy_name = OptionsFileName(dbname_, *options_file_number);
+          ASSERT_OK(WriteStringToFile(env_, contents, copy_name));
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    for (int file = 0; file < 2; file++) {
+      for (int i = 0; i < 100; i++) {
+        ASSERT_OK(Put(Key(i), "value" + std::to_string(file)));
+      }
+      ASSERT_OK(Flush());
+    }
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    const Status s = db_->CompactRange(cro, nullptr, nullptr);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    ASSERT_GT(cs->GetCompactionNum(), 0);
+    ASSERT_FALSE(copy_name.empty());
+    ASSERT_OK(env_->DeleteFile(copy_name));
+    if (newer) {
+      ASSERT_OK(s);
+      ASSERT_OK(dbfull()->TEST_GetBGError());
+    } else {
+      ASSERT_EQ(s.code(), Status::kIncomplete) << s.ToString();
+    }
+    ASSERT_EQ(Get(Key(0)), "value1");
+  }
 }
 
 TEST_F(CompactionServiceTest, ManualCompaction) {
@@ -3366,9 +4349,9 @@ TEST_F(CompactionServiceTest, EmptyResult) {
           ColumnFamilyMetaData cf_meta;
           db_->GetColumnFamilyMetaData(&cf_meta);
           for (const auto& level : cf_meta.levels) {
-            for (const auto& file : level.files) {
+            if (!level.files.empty()) {
               // Use one of the existing file name
-              *n = test::GetFileNumber(file.name);
+              *n = test::GetFileNumber(level.files.front().name);
               need_to_override_file_number = false;
               return;
             }
@@ -3825,6 +4808,64 @@ TEST_F(CompactionServiceTest, CancelCompactionOnPrimarySide) {
   ASSERT_GE(my_cs->GetCompactionNum(), comp_num);
 }
 
+// An automatic remote compaction can end with
+// Status::Incomplete(kManualCompactionPaused): when the DB closes, it calls
+// CompactionService::CancelAwaitingJobs(), and this test service passes its
+// canceled flag to DB::OpenAndCompact() as OpenAndCompactOptions::canceled. The
+// worker then stops and returns the paused status, and the primary takes it as
+// the compaction result. The primary must accept this status for a compaction
+// that it picked by itself, not only for a manual compaction.
+TEST_F(CompactionServiceTest, CancelAutoCompactionOnPrimarySide) {
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = 2;
+  ReopenWithCompactionService(&options);
+  auto my_cs = GetCompactionService();
+
+  // Close calls CancelAllBackgroundWork() first. Call it while the worker runs
+  // the automatic compaction, so the worker sees the canceled flag. The test
+  // calls Close() only after this callback, so the compaction has started
+  // before the close.
+  std::atomic_bool cancel_issued{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Inprogress", [&](void* /*arg*/) {
+        if (!cancel_issued.exchange(true)) {
+          CancelAllBackgroundWork(db_.get(), false /*wait*/);
+        }
+      });
+  // The remote compaction starts only after both Flush() calls return, so the
+  // cancel cannot make a Flush() call fail with ShutdownInProgress.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"CompactionServiceTest::CancelAutoCompactionOnPrimarySide:"
+        "FlushesDone",
+        "MyTestCompactionService::Wait:BeforeOpenAndCompact"},
+       {"CompactionJob::Run():Inprogress",
+        "CompactionServiceTest::CancelAutoCompactionOnPrimarySide:"
+        "BeforeClose"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Two L0 files reach level0_file_num_compaction_trigger, so the DB schedules
+  // an automatic compaction, which runs remotely. Both files hold the same
+  // keys, so the compaction cannot be a trivial move.
+  for (int file = 0; file < 2; file++) {
+    for (int i = 0; i < 10; i++) {
+      ASSERT_OK(Put(Key(i), "value" + std::to_string(file)));
+    }
+    ASSERT_OK(Flush());
+  }
+  TEST_SYNC_POINT(
+      "CompactionServiceTest::CancelAutoCompactionOnPrimarySide:FlushesDone");
+
+  // Close waits for the canceled compaction to finish.
+  TEST_SYNC_POINT(
+      "CompactionServiceTest::CancelAutoCompactionOnPrimarySide:BeforeClose");
+  Close();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_TRUE(cancel_issued);
+  ASSERT_TRUE(my_cs->GetCanceled());
+}
+
 TEST_F(CompactionServiceTest, FailedToStart) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
@@ -3841,6 +4882,32 @@ TEST_F(CompactionServiceTest, FailedToStart) {
   Slice end(end_str);
   Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
   ASSERT_TRUE(s.IsIncomplete()) << s.ToString();
+}
+
+TEST_F(CompactionServiceTest, WorkerRejectsUnknownColumnFamily) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+
+  GenerateTestData();
+
+  // Capture a real compaction input without running the remote worker.
+  auto my_cs = GetCompactionService();
+  my_cs->OverrideStartStatus(CompactionServiceJobStatus::kFailure);
+  ASSERT_TRUE(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr)
+                  .IsIncomplete());
+
+  CompactionServiceInput input;
+  my_cs->GetInput(&input);
+  input.cf_name = "missing_cf";
+  std::string serialized_input;
+  ASSERT_OK(input.Write(&serialized_input));
+
+  std::string serialized_result;
+  Status s = DB::OpenAndCompact(
+      OpenAndCompactOptions(), dbname_, "missing_cf_job", serialized_input,
+      &serialized_result, my_cs->GetOptionsOverride());
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
 }
 
 TEST_F(CompactionServiceTest, InvalidResultIsDeclinedRecoverably) {
@@ -4099,6 +5166,2266 @@ TEST_F(CompactionServiceTest, RejectsExcessiveCrossSubcompactionBlobGarbage) {
   ASSERT_OK(Put("post-fallback", "writable"));
 }
 
+// Bounds each wait for background progress in the remote compaction pool
+// tests, so that a hang fails the test instead of blocking it. It is only meant
+// to catch hangs, not to bound how long a slow host may take.
+constexpr std::chrono::minutes kProgressTimeout{10};
+
+enum class LocalRouting { kRemote, kSchedule, kWait, kInvalidResult };
+
+class PoolTestCompactionService : public MyTestCompactionService {
+ public:
+  using MyTestCompactionService::MyTestCompactionService;
+
+  void SetRouting(LocalRouting routing) { routing_ = routing; }
+  void SetScheduleObserver(
+      std::function<void(const CompactionServiceJobInfo&)> observer) {
+    schedule_observer_ = std::move(observer);
+  }
+  void SetLocalCF(const std::string& cf) { local_cf_ = cf; }
+  void SetLocalSubcompactions(int count) { local_subcompactions_ = count; }
+  void SetSubcompactionException(uint32_t sub_job_id, bool unknown) {
+    throwing_subcompaction_ = sub_job_id;
+    throw_unknown_ = unknown;
+  }
+
+  CompactionServiceScheduleResponse Schedule(
+      const CompactionServiceJobInfo& info, const std::string& input) override {
+    if (schedule_observer_) {
+      schedule_observer_(info);
+    }
+    if ((info.job_id & UINT32_MAX) == throwing_subcompaction_) {
+      if (throw_unknown_) {
+        throw 42;
+      }
+      throw std::runtime_error("Injected subcompaction exception");
+    }
+    if (routing_ == LocalRouting::kSchedule ||
+        (info.cf_name == local_cf_ &&
+         local_decisions_.fetch_add(1) < local_subcompactions_)) {
+      return CompactionServiceScheduleResponse(
+          CompactionServiceJobStatus::kUseLocal);
+    }
+    return MyTestCompactionService::Schedule(info, input);
+  }
+
+  CompactionServiceJobStatus Wait(const std::string& id,
+                                  std::string* result) override {
+    {
+      std::unique_lock<std::mutex> lock(wait_mutex_);
+      ++waiting_;
+      wait_cv_.notify_all();
+      wait_cv_.wait(lock, [&] { return released_; });
+    }
+    if (routing_ == LocalRouting::kWait) {
+      return CompactionServiceJobStatus::kUseLocal;
+    }
+    if (routing_ == LocalRouting::kInvalidResult) {
+      *result = "invalid result";
+      return CompactionServiceJobStatus::kSuccess;
+    }
+    return MyTestCompactionService::Wait(id, result);
+  }
+
+  bool WaitForRemote(int count) {
+    std::unique_lock<std::mutex> lock(wait_mutex_);
+    bool ready = wait_cv_.wait_for(lock, kProgressTimeout,
+                                   [&] { return waiting_ >= count; });
+    EXPECT_GE(waiting_, count);
+    return ready;
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(wait_mutex_);
+    released_ = true;
+    wait_cv_.notify_all();
+  }
+
+  void ResetWait() {
+    std::lock_guard<std::mutex> lock(wait_mutex_);
+    waiting_ = 0;
+    released_ = false;
+  }
+
+ private:
+  std::function<void(const CompactionServiceJobInfo&)> schedule_observer_;
+  LocalRouting routing_ = LocalRouting::kRemote;
+  uint64_t throwing_subcompaction_ = UINT64_MAX;
+  bool throw_unknown_ = false;
+  std::string local_cf_;
+  int local_subcompactions_ = 100;
+  std::atomic<int> local_decisions_{0};
+  std::mutex wait_mutex_;
+  std::condition_variable wait_cv_;
+  int waiting_ = 0;
+  bool released_ = false;
+};
+
+class PoolPressureListener : public EventListener {
+ public:
+  void OnBackgroundJobPressureChanged(
+      DB*, const BackgroundJobPressure& pressure) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pressure_ = pressure;
+    cv_.notify_all();
+  }
+
+  BackgroundJobPressure WaitForCompactionPressure() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    EXPECT_TRUE(cv_.wait_for(lock, kProgressTimeout, [&] {
+      return pressure_.compaction_scheduled > 0;
+    }));
+    return pressure_;
+  }
+
+  void Reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pressure_ = BackgroundJobPressure();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  BackgroundJobPressure pressure_;
+};
+
+class ShortcutCompactionListener : public EventListener {
+ public:
+  explicit ShortcutCompactionListener(bool gate) : gate_(gate) {}
+
+  void OnCompactionBegin(DB*, const CompactionJobInfo& info) override {
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
+    moved_files = info.stats.num_input_files_trivially_moved;
+    ++begun;
+  }
+
+  void OnCompactionPreCommit(DB*, const CompactionJobInfo& info) override {
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
+    ++precommitted;
+  }
+
+  void OnCompactionCompleted(DB*, const CompactionJobInfo& info) override {
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
+    ++completed;
+  }
+
+  void Verify(int count) {
+    EXPECT_EQ(begun.load(), count);
+    EXPECT_EQ(precommitted.load(), count);
+    EXPECT_EQ(completed.load(), count);
+  }
+
+  std::atomic<int> begun{0};
+  std::atomic<int> precommitted{0};
+  std::atomic<int> completed{0};
+  std::atomic<uint64_t> moved_files{0};
+
+ private:
+  const bool gate_;
+};
+
+class CompactionContextListener : public EventListener {
+ public:
+  void OnCompactionBegin(DB*, const CompactionJobInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    EXPECT_TRUE(
+        jobs_
+            .emplace(std::make_pair(info.cf_id, info.job_id),
+                     Counts{info.separate_remote_compaction_pool_selected})
+            .second);
+    ++begun_;
+    gated_jobs_ += info.separate_remote_compaction_pool_selected ? 1 : 0;
+  }
+
+  void OnSchedule(const CompactionServiceJobInfo& info) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = jobs_.find({info.cf_id, static_cast<int>(info.job_id >> 32)});
+    ASSERT_NE(it, jobs_.end());
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
+              it->second.separate_pool);
+    ++scheduled_;
+  }
+
+  void OnSubcompactionBegin(const SubcompactionJobInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = jobs_.find({info.cf_id, info.job_id});
+    ASSERT_NE(it, jobs_.end());
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
+              it->second.separate_pool);
+    ++it->second.begun;
+  }
+
+  void OnSubcompactionCompleted(const SubcompactionJobInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = jobs_.find({info.cf_id, info.job_id});
+    ASSERT_NE(it, jobs_.end());
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
+              it->second.separate_pool);
+    ++it->second.completed;
+  }
+
+  void OnCompactionPreCommit(DB*, const CompactionJobInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = jobs_.find({info.cf_id, info.job_id});
+    ASSERT_NE(it, jobs_.end());
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
+              it->second.separate_pool);
+    EXPECT_EQ(it->second.begun, 3);
+    EXPECT_EQ(it->second.completed, 3);
+    it->second.precommitted = true;
+  }
+
+  void OnCompactionCompleted(DB*, const CompactionJobInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = jobs_.find({info.cf_id, info.job_id});
+    ASSERT_NE(it, jobs_.end());
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected,
+              it->second.separate_pool);
+    EXPECT_TRUE(it->second.precommitted);
+    jobs_.erase(it);
+    ++completed_;
+  }
+
+  void Verify() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    EXPECT_TRUE(jobs_.empty());
+    EXPECT_EQ(begun_, 2);
+    EXPECT_EQ(gated_jobs_, 1);
+    EXPECT_EQ(completed_, 2);
+    EXPECT_EQ(scheduled_, 6);
+  }
+
+ private:
+  struct Counts {
+    bool separate_pool;
+    int begun = 0;
+    int completed = 0;
+    bool precommitted = false;
+  };
+  std::mutex mutex_;
+  std::map<std::pair<uint32_t, int>, Counts> jobs_;
+  int gated_jobs_ = 0;
+  int begun_ = 0;
+  int completed_ = 0;
+  int scheduled_ = 0;
+};
+
+class CompactFilesPoolGateListener : public EventListener {
+ public:
+  explicit CompactFilesPoolGateListener(bool gate) : gate_(gate) {}
+  void OnCompactionBegin(DB*, const CompactionJobInfo&) override { ++parents; }
+  void OnSchedule(const CompactionServiceJobInfo& info) {
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
+    ++scheduled;
+  }
+  void OnSubcompactionBegin(const SubcompactionJobInfo& info) override {
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
+    ++begun;
+  }
+  void OnSubcompactionCompleted(const SubcompactionJobInfo& info) override {
+    EXPECT_EQ(info.separate_remote_compaction_pool_selected, gate_);
+    ++completed;
+  }
+  std::atomic<int> parents{0};
+  std::atomic<int> scheduled{0};
+  std::atomic<int> begun{0};
+  std::atomic<int> completed{0};
+
+ private:
+  const bool gate_;
+};
+
+class DedicatedCompactionPoolTest : public CompactionServiceTest {
+ protected:
+  DedicatedCompactionPoolTest() {
+    // Durability is not under test, and each fsync can take seconds on a busy
+    // shared disk.
+    env_->skip_fsync_ = true;
+  }
+
+  Options SetUpCompactions(
+      LocalRouting routing, int subcompactions = 1, int local_threads = 1,
+      int local_limit = 1, int num_levels = 7, bool separate_pool = true,
+      bool thread_tracking = false,
+      const CompactionFilter* compaction_filter = nullptr) {
+    Options options = CurrentOptions();
+    options.env = env_;
+    options.disable_auto_compactions = true;
+    options.enable_thread_tracking = thread_tracking;
+    options.compaction_filter = compaction_filter;
+    if (extra_listener_) {
+      options.listeners.push_back(extra_listener_);
+    }
+    if (pressure_listener_) {
+      options.listeners.push_back(pressure_listener_);
+    }
+    options.level0_file_num_compaction_trigger = 4;
+    options.max_background_compactions = local_limit;
+    if (local_limit > 1) {
+      options.level0_slowdown_writes_trigger = 4;
+    }
+    options.max_background_flushes = 1;
+    options.max_subcompactions = subcompactions;
+    options.target_file_size_base = 4096;
+    options.compression = kNoCompression;
+    options.num_levels = num_levels;
+    env_->SetBackgroundThreads(local_threads, Env::Priority::LOW);
+    env_->SetBackgroundThreads(1, Env::Priority::BOTTOM);
+    std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+    service_ = std::make_shared<PoolTestCompactionService>(
+        dbname_, options, statistics,
+        std::vector<std::shared_ptr<EventListener>>{},
+        std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+    service_->SetRouting(routing);
+    options.compaction_service = service_;
+    options.use_separate_remote_compaction_pool = separate_pool;
+    DestroyAndReopen(options);
+    CreateAndReopenWithCF({"cf_1", "cf_2", "cf_3"}, options);
+    service_->SetCanceled(false);
+    env_->SetBackgroundThreads(local_threads, Env::Priority::LOW);
+    for (int cf = 0; cf < 4; ++cf) {
+      WriteCompactionInputs(cf);
+    }
+    return options;
+  }
+
+  void WriteCompactionInputs(int cf) {
+    for (int file = 0; file < 4; ++file) {
+      for (int key = 0; key < 200; ++key) {
+        ASSERT_OK(Put(cf, Key(key + file * 17),
+                      std::string(1024, static_cast<char>('a' + file))));
+      }
+      ASSERT_OK(Flush(cf));
+    }
+  }
+
+  Options SetUpShortcutCompaction(int kind, bool gate,
+                                  std::shared_ptr<EventListener> listener) {
+    Options options = CurrentOptions();
+    options.env = env_;
+    options.disable_auto_compactions = true;
+    options.compaction_style = kCompactionStyleLevel;
+    options.level0_file_num_compaction_trigger = 1;
+    options.max_background_compactions = 1;
+    options.max_background_flushes = 1;
+    options.max_open_files = -1;
+    options.use_separate_remote_compaction_pool = gate;
+    options.listeners.push_back(std::move(listener));
+    if (kind != 0) {
+      options.compaction_style = kCompactionStyleFIFO;
+      options.num_levels = 1;
+      options.compaction_options_fifo.max_table_files_size =
+          kind == 1 ? 1 : 1024 * 1024 * 1024;
+      if (kind == 2) {
+        options.compaction_options_fifo.file_temperature_age_thresholds = {
+            {Temperature::kCold, 30}};
+        options.compaction_options_fifo
+            .allow_trivial_copy_when_change_temperature = true;
+        options.default_write_temperature = Temperature::kWarm;
+        env_->SetMockSleep();
+      }
+    }
+    env_->SetBackgroundThreads(1, Env::Priority::LOW);
+    env_->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+    ReopenWithCompactionService(&options);
+    return options;
+  }
+
+  void BlockLocalWork() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BGWorkLocalCompaction:Start", [this](void*) {
+          std::unique_lock<std::mutex> lock(local_mutex_);
+          ++local_started_;
+          ++local_active_;
+          peak_local_active_ = std::max(peak_local_active_, local_active_);
+          local_cv_.notify_all();
+          local_cv_.wait(lock, [&] { return release_local_; });
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BGWorkLocalCompaction:Finished", [this](void*) {
+          std::lock_guard<std::mutex> lock(local_mutex_);
+          --local_active_;
+          ++local_finished_;
+          local_cv_.notify_all();
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::RunLocalCompaction:WaitForCredit", [this](void*) {
+          std::lock_guard<std::mutex> lock(local_mutex_);
+          ++credit_waits_;
+          local_cv_.notify_all();
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  bool WaitForLocal(int started, int credit_waits, int finished = 0) {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    bool ready = local_cv_.wait_for(lock, kProgressTimeout, [&] {
+      return local_started_ >= started && credit_waits_ >= credit_waits &&
+             local_finished_ >= finished;
+    });
+    EXPECT_GE(local_started_, started);
+    EXPECT_GE(credit_waits_, credit_waits);
+    EXPECT_GE(local_finished_, finished);
+    return ready;
+  }
+
+  void ReleaseLocal() {
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    release_local_ = true;
+    local_cv_.notify_all();
+  }
+
+  int RemotePoolThreads() {
+    uint64_t threads = 0;
+    if (db_) {
+      EXPECT_TRUE(db_->GetIntProperty(
+          DB::Properties::kNumRemoteCompactionPoolThreads, &threads));
+      EXPECT_EQ(
+          threads,
+          static_cast<uint64_t>(
+              RemoteCompactionThreadPool::GetShared()->GetBackgroundThreads()));
+    } else {
+      threads = RemoteCompactionThreadPool::GetShared()->GetBackgroundThreads();
+    }
+    return static_cast<int>(threads);
+  }
+
+  bool SharesRemotePool(DBImpl* other) {
+    return dbfull()->remote_compaction_pool_ == other->remote_compaction_pool_;
+  }
+
+  int LocalScheduled() {
+    InstrumentedMutexLock lock(&dbfull()->mutex_);
+    return dbfull()->LocalCompactionsScheduled();
+  }
+
+  int ManualCompactionPauseCount() {
+    return dbfull()->manual_compaction_paused_.load();
+  }
+
+  void WaitForRemotePoolIdle() {
+    InstrumentedMutexLock lock(&dbfull()->mutex_);
+    while (dbfull()->remote_compaction_pool_jobs_ != 0) {
+      dbfull()->bg_cv_.Wait();
+    }
+    EXPECT_EQ(dbfull()->remote_coordinators_scheduled_, 0);
+  }
+
+  void CompleteLocalTaskAfterStatusCopyFailure(Env::Priority priority,
+                                               bool queued) {
+    SetUpCompactions(LocalRouting::kRemote);
+    if (queued) {
+      BlockPool(priority);
+    }
+    std::atomic<bool> fail_copy{false};
+    std::atomic<int> failures{0};
+    std::atomic<int> work_runs{0};
+    const auto set_error = [&] {
+      dbfull()->mutex_.AssertHeld();
+      dbfull()->error_handler_.SetBGErrorNoAutoRecovery(
+          Status::IOError("Injected background error"),
+          BackgroundErrorReason::kCompaction);
+      EXPECT_TRUE(dbfull()->error_handler_.IsBGWorkStopped());
+    };
+    if (queued) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::RunLocalCompaction:Scheduled", [&](void*) { set_error(); });
+      SyncPoint::GetInstance()->SetCallBack(
+          "ThreadPoolImpl::UnSchedule:BeforeRemove",
+          [&](void*) { fail_copy = true; });
+    } else {
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::BGWorkLocalCompaction:BeforeStatus", [&](void*) {
+            set_error();
+            fail_copy = true;
+          });
+    }
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::LocalCompactionStatus:BeforeGetBGError", [&](void* arg) {
+          if (fail_copy.exchange(false)) {
+            *static_cast<std::function<void()>*>(arg) = [&] {
+              ++failures;
+              throw std::bad_alloc();
+            };
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    std::atomic<bool> canceled{false};
+    Status result;
+    bool completed = false;
+    std::thread coordinator([&] {
+      result = dbfull()->RunLocalCompaction(
+          [&] { ++work_runs; }, priority,
+          static_cast<ColumnFamilyHandleImpl*>(handles_[0])->cfd(), canceled,
+          false);
+      std::lock_guard<std::mutex> lock(local_mutex_);
+      completed = true;
+      local_cv_.notify_all();
+    });
+    {
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout,
+                                     [&] { return completed; }));
+    }
+    coordinator.join();
+    EXPECT_TRUE(result.IsAborted());
+    EXPECT_EQ(failures.load(), 1);
+    EXPECT_EQ(work_runs.load(), 0);
+    EXPECT_EQ(LocalScheduled(), 0);
+    {
+      InstrumentedMutexLock lock(&dbfull()->mutex_);
+      EXPECT_EQ(dbfull()->local_compactions_running_by_priority_[0], 0);
+      EXPECT_EQ(dbfull()->local_compactions_running_by_priority_[1], 0);
+    }
+    EXPECT_EQ(env_->GetThreadPoolQueueLen(priority), 0U);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ReleasePools();
+    Close();
+  }
+
+  void RunPoolMaintenance(uint64_t idle_seconds, DBImpl* db = nullptr) {
+    SyncPoint::GetInstance()->SetCallBack(
+        "RemoteCompactionThreadPool::Shrink:IdleNanos",
+        [idle_seconds](void* arg) {
+          *static_cast<uint64_t*>(arg) = idle_seconds * 1000 * 1000 * 1000;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    (db ? db : dbfull())
+        ->periodic_task_functions_.at(PeriodicTaskType::kFlushInfoLog)();
+    SyncPoint::GetInstance()->ClearCallBack(
+        "RemoteCompactionThreadPool::Shrink:IdleNanos");
+  }
+
+  void AbortQueuedFallback(Env::Priority priority, int subcompactions,
+                           bool from_worker, bool reject_first_cancel = false) {
+    SetUpCompactions(LocalRouting::kSchedule, subcompactions, 1, 4,
+                     priority == Env::Priority::BOTTOM ? 2 : 7);
+    if (priority == Env::Priority::LOW) {
+      env_->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+    }
+    BlockLocalWork();
+    std::atomic<int> cancellation_attempts{0};
+    if (reject_first_cancel) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "ThreadPoolImpl::UnSchedule:BeforeRemove", [&](void* arg) {
+            if (cancellation_attempts.fetch_add(1) == 0) {
+              *static_cast<std::function<void()>*>(arg) = [] {
+                throw std::bad_alloc();
+              };
+            }
+          });
+    }
+    bool occupied = false;
+    bool abort_requested = false;
+    bool aborted = false;
+    bool release_worker = false;
+    bool worker_done = false;
+    int queued = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::RunLocalCompaction:Scheduled", [&](void*) {
+          std::lock_guard<std::mutex> lock(local_mutex_);
+          ++queued;
+          local_cv_.notify_all();
+        });
+    std::function<void()> occupy = [&] {
+      {
+        std::unique_lock<std::mutex> lock(local_mutex_);
+        occupied = true;
+        local_cv_.notify_all();
+        local_cv_.wait(lock, [&] { return abort_requested; });
+      }
+      if (from_worker) {
+        db_->AbortCompactions(handles_[0]);
+        std::lock_guard<std::mutex> lock(local_mutex_);
+        aborted = true;
+        local_cv_.notify_all();
+      }
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      local_cv_.wait(lock, [&] { return release_worker; });
+      worker_done = true;
+      local_cv_.notify_all();
+    };
+    env_->Schedule(
+        [](void* arg) { (*static_cast<std::function<void()>*>(arg))(); },
+        &occupy, priority);
+    {
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      EXPECT_TRUE(
+          local_cv_.wait_for(lock, kProgressTimeout, [&] { return occupied; }));
+    }
+    EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0], handles_[1]}));
+    {
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout, [&] {
+        return queued >= std::min(4, 2 * subcompactions);
+      }));
+      abort_requested = true;
+      local_cv_.notify_all();
+    }
+    std::thread abort_thread;
+    if (!from_worker) {
+      abort_thread = std::thread([&] {
+        db_->AbortCompactions(handles_[0]);
+        std::lock_guard<std::mutex> lock(local_mutex_);
+        aborted = true;
+        local_cv_.notify_all();
+      });
+    }
+    bool abort_finished;
+    {
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      abort_finished =
+          local_cv_.wait_for(lock, kProgressTimeout, [&] { return aborted; });
+      EXPECT_TRUE(abort_finished);
+      if (abort_finished) {
+        EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout, [&] {
+          return env_->GetThreadPoolQueueLen(priority) ==
+                 static_cast<unsigned int>(subcompactions);
+        }));
+        EXPECT_EQ(local_started_, 0);
+      }
+    }
+    if (abort_finished) {
+      EXPECT_EQ(LocalScheduled(), subcompactions);
+      EXPECT_EQ(NumTableFilesAtLevel(0), 4);
+      EXPECT_EQ(Get(Key(199)), std::string(1024, 'd'));
+    }
+    ReleaseLocal();
+    if (!abort_finished) {
+      env_->SetBackgroundThreads(2, priority);
+    }
+    {
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      release_worker = true;
+      local_cv_.notify_all();
+      local_cv_.wait(lock, [&] { return worker_done; });
+    }
+    if (abort_thread.joinable()) {
+      abort_thread.join();
+    }
+    db_->ResumeCompactions(handles_[0]);
+    EXPECT_OK(dbfull()->TEST_WaitForCompact());
+    EXPECT_EQ(LocalScheduled(), 0);
+    EXPECT_EQ(NumTableFilesAtLevel(0, 1), 0);
+    EXPECT_EQ(Get(1, Key(199)), std::string(1024, 'd'));
+    if (reject_first_cancel) {
+      EXPECT_GE(cancellation_attempts.load(), 2);
+    }
+    Close();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  void VerifyCompacted() {
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    for (int cf = 0; cf < 4; ++cf) {
+      ASSERT_EQ(NumTableFilesAtLevel(0, cf), 0);
+      ASSERT_EQ(Get(cf, Key(0)), std::string(1024, 'a'));
+      ASSERT_EQ(Get(cf, Key(199)), std::string(1024, 'd'));
+    }
+  }
+
+  void BlockPool(Env::Priority priority) {
+    auto task = std::make_unique<test::SleepingBackgroundTask>();
+    env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, task.get(),
+                   priority);
+    task->WaitUntilSleeping();
+    blockers_.push_back(std::move(task));
+  }
+
+  void ReleasePools() {
+    for (auto& blocker : blockers_) {
+      blocker->WakeUp();
+      blocker->WaitUntilDone();
+    }
+    blockers_.clear();
+  }
+
+  void CancelQueuedManualCompaction(LocalRouting routing,
+                                    Env::Priority priority, bool close,
+                                    bool caller_cancellation = false) {
+    SetUpCompactions(routing, 3, 1, 1,
+                     priority == Env::Priority::BOTTOM ? 2 : 7);
+    if (priority == Env::Priority::LOW) {
+      env_->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+    }
+    BlockPool(priority);
+    BlockLocalWork();
+    service_->Release();
+    int queued = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::RunLocalCompaction:Scheduled", [&](void*) {
+          std::lock_guard<std::mutex> lock(local_mutex_);
+          ++queued;
+          local_cv_.notify_all();
+        });
+    Status manual_status;
+    std::atomic<bool> caller_canceled{false};
+    bool manual_done = false;
+    if (close) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::CloseHelper:CFHandleCleanupUnlocked", [&](void*) {
+            std::unique_lock<std::mutex> lock(local_mutex_);
+            local_cv_.wait(lock, [&] { return manual_done; });
+          });
+    }
+    std::thread manual([&] {
+      CompactRangeOptions options;
+      options.canceled = &caller_canceled;
+      manual_status = db_->CompactRange(options, nullptr, nullptr);
+      std::lock_guard<std::mutex> lock(local_mutex_);
+      manual_done = true;
+      local_cv_.notify_all();
+    });
+    {
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout, [&] {
+        return queued == 1 && credit_waits_ >= 2;
+      }));
+    }
+    bool canceled = false;
+    std::thread cancel([&] {
+      if (caller_cancellation) {
+        caller_canceled.store(true, std::memory_order_release);
+        std::unique_lock<std::mutex> lock(local_mutex_);
+        local_cv_.wait(lock, [&] { return manual_done; });
+      } else if (close) {
+        Close();
+      } else {
+        db_->DisableManualCompaction();
+      }
+      std::lock_guard<std::mutex> lock(local_mutex_);
+      canceled = true;
+      local_cv_.notify_all();
+    });
+    {
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      EXPECT_TRUE(
+          local_cv_.wait_for(lock, kProgressTimeout, [&] { return canceled; }));
+    }
+    ReleaseLocal();
+    ReleasePools();
+    cancel.join();
+    manual.join();
+    EXPECT_TRUE(manual_status.IsManualCompactionPaused() ||
+                (close && manual_status.IsShutdownInProgress()));
+    EXPECT_EQ(local_started_, 0);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  void CancelManualWaitingForCredit(LocalRouting routing, int subcompactions) {
+    SetUpCompactions(routing, subcompactions, 2);
+    env_->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+    BlockLocalWork();
+    service_->Release();
+    ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+    ASSERT_TRUE(WaitForLocal(1, subcompactions - 1));
+
+    std::atomic<bool> canceled{false};
+    Status status;
+    bool done = false;
+    std::thread manual([&] {
+      CompactRangeOptions options;
+      options.exclusive_manual_compaction = false;
+      options.canceled = &canceled;
+      status = db_->CompactRange(options, handles_[1], nullptr, nullptr);
+      std::lock_guard<std::mutex> lock(local_mutex_);
+      done = true;
+      local_cv_.notify_all();
+    });
+    EXPECT_TRUE(WaitForLocal(1, 2 * subcompactions - 1));
+    canceled.store(true, std::memory_order_release);
+    {
+      std::unique_lock<std::mutex> lock(local_mutex_);
+      EXPECT_TRUE(
+          local_cv_.wait_for(lock, kProgressTimeout, [&] { return done; }));
+      EXPECT_EQ(local_started_, 1);
+      EXPECT_EQ(local_finished_, 0);
+    }
+    ReleaseLocal();
+    manual.join();
+    ASSERT_TRUE(status.IsManualCompactionPaused());
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    EXPECT_EQ(NumTableFilesAtLevel(0, 1), 4);
+  }
+
+  void TearDown() override {
+    ReleaseLocal();
+    ReleasePools();
+    if (service_) {
+      service_->Release();
+    }
+    // Drain callbacks before destroying the state they capture.
+    Close();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    CompactionServiceTest::TearDown();
+  }
+
+  std::shared_ptr<EventListener> extra_listener_;
+  std::shared_ptr<PoolTestCompactionService> service_;
+  std::shared_ptr<PoolPressureListener> pressure_listener_;
+  std::vector<std::unique_ptr<test::SleepingBackgroundTask>> blockers_;
+  std::mutex local_mutex_;
+  std::condition_variable local_cv_;
+  bool release_local_ = false;
+  int local_started_ = 0;
+  int local_finished_ = 0;
+  int local_active_ = 0;
+  int peak_local_active_ = 0;
+  int credit_waits_ = 0;
+};
+
+class RemoteCompactionPoolGateTest : public DedicatedCompactionPoolTest,
+                                     public testing::WithParamInterface<bool> {
+};
+
+TEST_P(RemoteCompactionPoolGateTest, RemoteSchedulingRespectsPoolGate) {
+  ASSERT_FALSE(Options().use_separate_remote_compaction_pool);
+  SetUpCompactions(LocalRouting::kRemote, 3, 1, 1, 7, GetParam());
+  ASSERT_EQ(db_->GetDBOptions().use_separate_remote_compaction_pool,
+            GetParam());
+  BlockPool(Env::Priority::LOW);
+  BlockPool(Env::Priority::BOTTOM);
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  if (GetParam()) {
+    ASSERT_TRUE(service_->WaitForRemote(3));
+    EXPECT_EQ(env_->GetThreadPoolQueueLen(Env::Priority::LOW), 0U);
+  } else {
+    EXPECT_EQ(env_->GetThreadPoolQueueLen(Env::Priority::LOW), 1U);
+    uint64_t running = 0;
+    ASSERT_TRUE(db_->GetIntProperty(
+        DB::Properties::kNumRunningRemoteCompactions, &running));
+    EXPECT_EQ(running, 0U);
+  }
+  ReleasePools();
+  service_->Release();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+  EXPECT_EQ(Get(Key(199)), std::string(1024, 'd'));
+}
+
+TEST_P(RemoteCompactionPoolGateTest, RuntimeSwitchPreservesScheduledJobs) {
+  auto listener = std::make_shared<CompactionContextListener>();
+  extra_listener_ = listener;
+  SetUpCompactions(LocalRouting::kWait, 3, 1, 1, 7, GetParam());
+  service_->SetScheduleObserver(
+      [listener](const CompactionServiceJobInfo& info) {
+        listener->OnSchedule(info);
+      });
+  BlockPool(Env::Priority::LOW);
+  BlockPool(Env::Priority::BOTTOM);
+  BlockLocalWork();
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  if (GetParam()) {
+    ASSERT_TRUE(service_->WaitForRemote(3));
+  } else {
+    ASSERT_EQ(env_->GetThreadPoolQueueLen(Env::Priority::LOW), 1U);
+  }
+  ASSERT_OK(db_->SetDBOptions({{"use_separate_remote_compaction_pool",
+                                GetParam() ? "false" : "true"}}));
+  ASSERT_EQ(db_->GetDBOptions().use_separate_remote_compaction_pool,
+            !GetParam());
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[1]}));
+  ASSERT_TRUE(service_->WaitForRemote(3));
+  EXPECT_EQ(env_->GetThreadPoolQueueLen(Env::Priority::LOW), 1U);
+  service_->Release();
+  ASSERT_TRUE(WaitForLocal(0, 3));
+  {
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    EXPECT_EQ(local_started_, 0);
+  }
+  ReleasePools();
+  ASSERT_TRUE(WaitForLocal(1, 3));
+  ReleaseLocal();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  for (int cf : {0, 1}) {
+    EXPECT_EQ(NumTableFilesAtLevel(0, cf), 0);
+    EXPECT_EQ(Get(cf, Key(199)), std::string(1024, 'd'));
+  }
+  listener->Verify();
+  EXPECT_EQ(local_finished_, 3);
+  EXPECT_EQ(peak_local_active_, 1);
+}
+
+TEST_P(RemoteCompactionPoolGateTest, CompactFilesCarriesSubcompactionGate) {
+  auto listener = std::make_shared<CompactFilesPoolGateListener>(GetParam());
+  extra_listener_ = listener;
+  SetUpCompactions(LocalRouting::kSchedule, 3, 1, 1, 7, GetParam());
+  service_->SetScheduleObserver(
+      [listener](const CompactionServiceJobInfo& info) {
+        listener->OnSchedule(info);
+      });
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const auto& file : metadata.levels[0].files) {
+    inputs.push_back(file.db_path + "/" + file.name);
+  }
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 1));
+  EXPECT_EQ(listener->parents.load(), 0);
+  EXPECT_EQ(listener->scheduled.load(), 3);
+  EXPECT_EQ(listener->begun.load(), 3);
+  EXPECT_EQ(listener->completed.load(), 3);
+  EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+}
+
+INSTANTIATE_TEST_CASE_P(PoolGate, RemoteCompactionPoolGateTest,
+                        testing::Bool());
+
+enum class RemoteLifecycle { kPause, kAbort, kExclusiveManual, kWait };
+
+class RemoteCompactionLifecycleTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<std::tuple<RemoteLifecycle, int>> {};
+
+TEST_P(RemoteCompactionLifecycleTest, WaitsForRemoteCoordinators) {
+  const auto operation = std::get<0>(GetParam());
+  const int subcompactions = std::get<1>(GetParam());
+  SetUpCompactions(LocalRouting::kRemote, subcompactions);
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  ASSERT_TRUE(service_->WaitForRemote(subcompactions));
+  const char* wait_point = nullptr;
+  switch (operation) {
+    case RemoteLifecycle::kPause:
+      wait_point = "DBImpl::PauseBackgroundWork:Wait";
+      break;
+    case RemoteLifecycle::kAbort:
+      wait_point = "DBImpl::AbortAllCompactions:Wait";
+      break;
+    case RemoteLifecycle::kExclusiveManual:
+      wait_point = "DBImpl::RunManualCompaction:WaitScheduled";
+      break;
+    case RemoteLifecycle::kWait:
+      wait_point = "DBImpl::WaitForCompact:InsideLoop";
+      break;
+  }
+  bool waiting = false;
+  bool done = false;
+  SyncPoint::GetInstance()->SetCallBack(wait_point, [&](void*) {
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    waiting = true;
+    local_cv_.notify_all();
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  std::thread waiter([&] {
+    switch (operation) {
+      case RemoteLifecycle::kPause:
+        status = db_->PauseBackgroundWork();
+        break;
+      case RemoteLifecycle::kAbort:
+        db_->AbortAllCompactions();
+        break;
+      case RemoteLifecycle::kExclusiveManual: {
+        CompactRangeOptions options;
+        options.exclusive_manual_compaction = true;
+        status = db_->CompactRange(options, handles_[1], nullptr, nullptr);
+        break;
+      }
+      case RemoteLifecycle::kWait:
+        status = db_->WaitForCompact(WaitForCompactOptions());
+        break;
+    }
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    done = true;
+    local_cv_.notify_all();
+  });
+  {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout,
+                                   [&] { return waiting || done; }));
+    EXPECT_TRUE(waiting);
+    EXPECT_FALSE(done);
+  }
+  service_->Release();
+  waiter.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(status);
+  if (operation == RemoteLifecycle::kPause) {
+    ASSERT_OK(db_->ContinueBackgroundWork());
+  } else if (operation == RemoteLifecycle::kAbort) {
+    db_->ResumeAllCompactions();
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(Get(Key(199)), std::string(1024, 'd'));
+}
+
+INSTANTIATE_TEST_CASE_P(
+    RemoteWork, RemoteCompactionLifecycleTest,
+    testing::Combine(testing::Values(RemoteLifecycle::kPause,
+                                     RemoteLifecycle::kAbort,
+                                     RemoteLifecycle::kExclusiveManual,
+                                     RemoteLifecycle::kWait),
+                     testing::Values(1, 3)));
+
+class RemoteCompactFilesLifecycleTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<int> {};
+
+TEST_P(RemoteCompactFilesLifecycleTest, WaitsForCallerThreadCompactFiles) {
+  SetUpCompactions(LocalRouting::kRemote, GetParam());
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const auto& file : metadata.levels[0].files) {
+    inputs.push_back(file.db_path + "/" + file.name);
+  }
+  Status status;
+  std::thread compact(
+      [&] { status = db_->CompactFiles(CompactionOptions(), inputs, 1); });
+  EXPECT_TRUE(service_->WaitForRemote(GetParam()));
+  WaitForCompactOptions wait_options;
+  wait_options.timeout = std::chrono::milliseconds(10);
+  EXPECT_TRUE(db_->WaitForCompact(wait_options).IsTimedOut());
+  service_->Release();
+  compact.join();
+  ASSERT_OK(status);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+}
+
+INSTANTIATE_TEST_CASE_P(RemoteWork, RemoteCompactFilesLifecycleTest,
+                        testing::Values(1, 3));
+
+class RemoteCompactionAccountingTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<Env::Priority> {};
+
+TEST_P(RemoteCompactionAccountingTest, CountsOnlyAdmittedLocalWorkInPools) {
+  const bool bottom = GetParam() == Env::Priority::BOTTOM;
+  pressure_listener_ = std::make_shared<PoolPressureListener>();
+  SetUpCompactions(LocalRouting::kWait, 3, 1, 1, bottom ? 2 : 7);
+  BlockLocalWork();
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  ASSERT_TRUE(service_->WaitForRemote(3));
+  ASSERT_OK(Put(1, "remote-pressure", "value"));
+  ASSERT_OK(Flush(1));
+  auto pressure = pressure_listener_->WaitForCompactionPressure();
+  EXPECT_EQ(pressure.compaction_scheduled, 1);
+  EXPECT_EQ(pressure.compaction_low_scheduled, 0);
+  EXPECT_EQ(pressure.compaction_bottom_scheduled, 0);
+  EXPECT_EQ(pressure.compaction_low_running, 0);
+  EXPECT_EQ(pressure.compaction_bottom_running, 0);
+
+  service_->Release();
+  ASSERT_TRUE(WaitForLocal(1, 2));
+  pressure_listener_->Reset();
+  ASSERT_OK(Put(1, "local-pressure", "value"));
+  ASSERT_OK(Flush(1));
+  pressure = pressure_listener_->WaitForCompactionPressure();
+  EXPECT_EQ(pressure.compaction_scheduled, 2);
+  EXPECT_EQ(pressure.compaction_low_scheduled, bottom ? 0 : 1);
+  EXPECT_EQ(pressure.compaction_bottom_scheduled, bottom ? 1 : 0);
+  EXPECT_EQ(pressure.compaction_low_running, bottom ? 0 : 1);
+  EXPECT_EQ(pressure.compaction_bottom_running, bottom ? 1 : 0);
+  ReleaseLocal();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(local_finished_, 3);
+  EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+}
+
+INSTANTIATE_TEST_CASE_P(LocalPools, RemoteCompactionAccountingTest,
+                        testing::Values(Env::Priority::LOW,
+                                        Env::Priority::BOTTOM));
+
+#ifndef NROCKSDB_THREAD_STATUS
+class DedicatedCompactionThreadTrackingTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<
+          std::tuple<LocalRouting, Env::Priority, int, bool>> {
+ protected:
+  void CheckThreadTracking(LocalRouting routing, Env::Priority priority,
+                           int subcompactions, bool separate_pool,
+                           bool throw_error) {
+    std::mutex ids_mutex;
+    std::vector<uint64_t> worker_ids;
+    std::set<uint64_t> armed_workers;
+    class ThrowingFilter : public CompactionFilter {
+     public:
+      explicit ThrowingFilter(std::function<bool()> should_throw)
+          : should_throw_(std::move(should_throw)) {}
+      const char* Name() const override {
+        return "ThreadTrackingThrowingFilter";
+      }
+      bool Filter(int, const Slice&, const Slice&, std::string*,
+                  bool*) const override {
+        if (should_throw_()) {
+          throw std::runtime_error("Injected thread tracking exception");
+        }
+        return false;
+      }
+
+     private:
+      const std::function<bool()> should_throw_;
+    } filter([&] {
+      std::lock_guard<std::mutex> lock(ids_mutex);
+      return armed_workers.erase(env_->GetThreadID()) != 0;
+    });
+    SetUpCompactions(routing, subcompactions, 1, 1,
+                     priority == Env::Priority::BOTTOM ? 2 : 7, separate_pool,
+                     true, throw_error ? &filter : nullptr);
+    if (priority == Env::Priority::LOW) {
+      env_->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+    }
+    service_->Release();
+    auto* primary_cfd =
+        static_cast_with_check<ColumnFamilyHandleImpl>(handles_[0])->cfd();
+    std::atomic<int> started{0};
+    std::atomic<int> finished{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionJob::ProcessKeyValueCompaction()::Processing",
+        [&](void* arg) {
+          auto* compaction = static_cast<Compaction*>(arg);
+          if (compaction->column_family_data() != primary_cfd) {
+            return;
+          }
+          const uint64_t thread_id = env_->GetThreadID();
+          {
+            std::lock_guard<std::mutex> lock(ids_mutex);
+            worker_ids.push_back(thread_id);
+            if (throw_error) {
+              armed_workers.insert(thread_id);
+            }
+          }
+          std::vector<ThreadStatus> threads;
+          EXPECT_OK(env_->GetThreadList(&threads));
+          bool found = false;
+          for (const ThreadStatus& thread : threads) {
+            if (thread.thread_id != thread_id) {
+              continue;
+            }
+            found = true;
+            EXPECT_EQ(thread.db_name, dbname_);
+            EXPECT_EQ(thread.cf_name, "default");
+            EXPECT_EQ(thread.operation_type, ThreadStatus::OP_COMPACTION);
+            EXPECT_EQ(thread.operation_stage,
+                      ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
+            EXPECT_EQ(thread.thread_type, priority == Env::Priority::BOTTOM
+                                              ? ThreadStatus::BOTTOM_PRIORITY
+                                              : ThreadStatus::LOW_PRIORITY);
+            EXPECT_GT(thread.op_properties[ThreadStatus::COMPACTION_JOB_ID],
+                      0U);
+            EXPECT_EQ(
+                thread
+                    .op_properties[ThreadStatus::COMPACTION_INPUT_OUTPUT_LEVEL],
+                (static_cast<uint64_t>(compaction->start_level()) << 32) +
+                    compaction->output_level());
+            EXPECT_GT(
+                thread
+                    .op_properties[ThreadStatus::COMPACTION_TOTAL_INPUT_BYTES],
+                0U);
+          }
+          EXPECT_TRUE(found);
+          ++started;
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BGWorkLocalCompaction:Finished", [&](void*) {
+          std::vector<ThreadStatus> threads;
+          EXPECT_OK(env_->GetThreadList(&threads));
+          bool found = false;
+          for (const ThreadStatus& thread : threads) {
+            if (thread.thread_id != env_->GetThreadID()) {
+              continue;
+            }
+            found = true;
+            EXPECT_TRUE(thread.db_name.empty());
+            EXPECT_TRUE(thread.cf_name.empty());
+            EXPECT_EQ(thread.operation_type, ThreadStatus::OP_UNKNOWN);
+            EXPECT_EQ(thread.operation_stage, ThreadStatus::STAGE_UNKNOWN);
+            for (uint64_t property : thread.op_properties) {
+              EXPECT_EQ(property, 0U);
+            }
+          }
+          EXPECT_TRUE(found);
+          ++finished;
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+    Status status = dbfull()->TEST_WaitForCompact();
+    if (throw_error) {
+      EXPECT_TRUE(status.IsAborted());
+    } else {
+      EXPECT_OK(status);
+      EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+      EXPECT_EQ(Get(Key(199)), std::string(1024, 'd'));
+    }
+    EXPECT_EQ(started.load(), subcompactions);
+    EXPECT_EQ(finished.load(), separate_pool ? subcompactions : 0);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    std::vector<ThreadStatus> threads;
+    ASSERT_OK(env_->GetThreadList(&threads));
+    for (const ThreadStatus& thread : threads) {
+      for (uint64_t worker_id : worker_ids) {
+        if (thread.thread_id == worker_id) {
+          EXPECT_EQ(thread.operation_type, ThreadStatus::OP_UNKNOWN);
+          EXPECT_TRUE(thread.cf_name.empty());
+        }
+      }
+    }
+    Close();
+  }
+};
+
+TEST_P(DedicatedCompactionThreadTrackingTest, LocalWorkersTrackCompaction) {
+  CheckThreadTracking(std::get<0>(GetParam()), std::get<1>(GetParam()),
+                      std::get<2>(GetParam()), true, std::get<3>(GetParam()));
+}
+
+TEST_F(DedicatedCompactionThreadTrackingTest, LegacyWorkerTracksCompaction) {
+  CheckThreadTracking(LocalRouting::kSchedule, Env::Priority::LOW, 1, false,
+                      false);
+}
+
+INSTANTIATE_TEST_CASE_P(
+    LocalExecution, DedicatedCompactionThreadTrackingTest,
+    testing::Combine(testing::Values(LocalRouting::kSchedule,
+                                     LocalRouting::kWait,
+                                     LocalRouting::kInvalidResult),
+                     testing::Values(Env::Priority::LOW, Env::Priority::BOTTOM),
+                     testing::Values(1, 3), testing::Bool()));
+#endif  // NROCKSDB_THREAD_STATUS
+
+class RemoteCompactionRetryTest : public DedicatedCompactionPoolTest,
+                                  public testing::WithParamInterface<bool> {
+ protected:
+  void CheckBackoff(bool error) {
+    auto limiter = std::shared_ptr<ConcurrentTaskLimiter>(
+        NewConcurrentTaskLimiter("retry-limiter", error ? -1 : 0));
+    Options options = SetUpCompactions(error ? LocalRouting::kSchedule
+                                             : LocalRouting::kRemote);
+    options.compaction_thread_limiter = limiter;
+    options.use_separate_remote_compaction_pool = GetParam();
+    options.paranoid_checks = !error;
+    ReopenWithColumnFamilies({"default", "cf_1", "cf_2", "cf_3"}, options);
+    service_->SetCanceled(false);
+    env_->non_writeable_rate_ = error ? 100 : 0;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    int backoffs = 0;
+    bool released = false;
+    const std::vector<ColumnFamilyHandle*> families = {handles_[0], handles_[1],
+                                                       handles_[2]};
+    const int expected_coordinators =
+        GetParam() ? static_cast<int>(families.size()) : 1;
+    {
+      Defer drain([&] {
+        limiter->ResetMaxOutstandingTask();
+        env_->non_writeable_rate_ = 0;
+        service_->Release();
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          released = true;
+          cv.notify_all();
+        }
+        EXPECT_OK(dbfull()->TEST_WaitForCompact());
+        SyncPoint::GetInstance()->DisableProcessing();
+        SyncPoint::GetInstance()->ClearAllCallBacks();
+      });
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::BackgroundCallCompaction:BeforeBackoff", [&](void* arg) {
+            auto* status = static_cast<Status*>(arg);
+            EXPECT_TRUE(error ? status->IsIOError() : status->IsBusy());
+            std::unique_lock<std::mutex> lock(mutex);
+            ++backoffs;
+            cv.notify_all();
+            cv.wait(lock, [&] { return released; });
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+      const auto schedule = [&] {
+        const Status status = dbfull()->EnableAutoCompaction(families);
+        if (error) {
+          EXPECT_TRUE(status.IsIOError());
+        } else {
+          EXPECT_OK(status);
+        }
+      };
+      schedule();
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, kProgressTimeout, [&] {
+          return backoffs >= expected_coordinators;
+        }));
+      }
+      uint64_t unscheduled = 0;
+      ASSERT_TRUE(db_->GetIntProperty(
+          DB::Properties::kNumUnscheduledCompactions, &unscheduled));
+      EXPECT_EQ(unscheduled, GetParam() ? 0U : families.size());
+      for (int i = 0; i < 3; ++i) {
+        schedule();
+        EXPECT_EQ(RemotePoolThreads(), GetParam() ? expected_coordinators : 0);
+      }
+      EXPECT_EQ(LocalScheduled(), GetParam() ? 0 : 1);
+    }
+    for (int cf = 0; cf < 3; ++cf) {
+      EXPECT_EQ(NumTableFilesAtLevel(0, cf), 0);
+      EXPECT_EQ(Get(cf, Key(199)), std::string(1024, 'd'));
+    }
+    EXPECT_EQ(LocalScheduled(), 0);
+    WaitForRemotePoolIdle();
+    Close();
+  }
+};
+
+TEST_P(RemoteCompactionRetryTest, ThrottledPickRetainsCreditDuringBackoff) {
+  CheckBackoff(false);
+}
+
+TEST_P(RemoteCompactionRetryTest, RetryableErrorRetainsCreditDuringBackoff) {
+  CheckBackoff(true);
+}
+
+INSTANTIATE_TEST_CASE_P(PoolGate, RemoteCompactionRetryTest, testing::Bool());
+
+TEST_F(DedicatedCompactionPoolTest, DisableManualCompactionPausesFutureWork) {
+  SetUpCompactions(LocalRouting::kRemote);
+  service_->Release();
+  EXPECT_EQ(ManualCompactionPauseCount(), 0);
+  db_->DisableManualCompaction();
+  EXPECT_EQ(ManualCompactionPauseCount(), 1);
+  EXPECT_TRUE(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr)
+                  .IsManualCompactionPaused());
+  db_->EnableManualCompaction();
+  EXPECT_EQ(ManualCompactionPauseCount(), 0);
+  EXPECT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+}
+
+TEST_F(DedicatedCompactionPoolTest, CloseWithoutManualWorkPreservesPauseCount) {
+  for (bool paused : {false, true}) {
+    SetUpCompactions(LocalRouting::kRemote);
+    if (paused) {
+      db_->DisableManualCompaction();
+    }
+    const int pause_count = ManualCompactionPauseCount();
+    for (auto handle : handles_) {
+      EXPECT_OK(db_->DestroyColumnFamilyHandle(handle));
+    }
+    handles_.clear();
+    ASSERT_OK(db_->Close());
+    EXPECT_EQ(ManualCompactionPauseCount(), pause_count);
+    ASSERT_OK(db_->Close());
+    EXPECT_EQ(ManualCompactionPauseCount(), pause_count);
+  }
+}
+
+TEST_F(DedicatedCompactionPoolTest, RemoteProgressWithBothLocalPoolsOccupied) {
+  SetUpCompactions(LocalRouting::kRemote);
+  BlockPool(Env::Priority::LOW);
+  BlockPool(Env::Priority::BOTTOM);
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(service_->WaitForRemote(4));
+  ReleasePools();
+  service_->Release();
+  VerifyCompacted();
+}
+
+TEST_F(DedicatedCompactionPoolTest, RemotePoolStartsAtCombinedLocalPoolSize) {
+  SetUpCompactions(LocalRouting::kRemote, 1, 2);
+  env_->SetBackgroundThreads(3, Env::Priority::BOTTOM);
+  EXPECT_EQ(RemotePoolThreads(), 0);
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  ASSERT_TRUE(service_->WaitForRemote(1));
+  EXPECT_EQ(RemotePoolThreads(), 5);
+  service_->Release();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+}
+
+TEST_F(DedicatedCompactionPoolTest, MultipleDBsShareRemotePoolAndLifetime) {
+  SetUpCompactions(LocalRouting::kRemote, 3, 2);
+  env_->SetBackgroundThreads(3, Env::Priority::BOTTOM);
+  EnvWrapper other_env(env_);
+  Options options = CurrentOptions();
+  options.env = &other_env;
+  options.disable_auto_compactions = true;
+  options.level0_file_num_compaction_trigger = 4;
+  options.max_subcompactions = 3;
+  options.target_file_size_base = 4096;
+  options.compression = kNoCompression;
+  options.use_separate_remote_compaction_pool = true;
+  const std::string other_name = dbname_ + "_other";
+  auto statistics = CreateDBStatistics();
+  auto other_service = std::make_shared<PoolTestCompactionService>(
+      other_name, options, statistics,
+      std::vector<std::shared_ptr<EventListener>>{},
+      std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+  options.compaction_service = other_service;
+  std::unique_ptr<DB> other_db;
+  ASSERT_OK(DB::Open(options, other_name, &other_db));
+  auto* other_impl = static_cast<DBImpl*>(other_db->GetRootDB());
+  for (int file = 0; file < 4; ++file) {
+    for (int key = 0; key < 200; ++key) {
+      ASSERT_OK(
+          other_db->Put(WriteOptions(), Key(key + file * 17),
+                        std::string(1024, static_cast<char>('a' + file))));
+    }
+    ASSERT_OK(other_db->Flush(FlushOptions()));
+  }
+#if defined(_GNU_SOURCE) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 12)
+  std::atomic<int> named_threads{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [&](void*) {
+        char name[16];
+        EXPECT_EQ(pthread_getname_np(pthread_self(), name, sizeof(name)), 0);
+        EXPECT_STREQ(name, "rocksdb:remote");
+        ++named_threads;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+#endif
+#endif
+  EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  EXPECT_TRUE(service_->WaitForRemote(3));
+  EXPECT_EQ(RemotePoolThreads(), 5);
+  EXPECT_OK(
+      other_impl->EnableAutoCompaction({other_db->DefaultColumnFamily()}));
+  EXPECT_TRUE(other_service->WaitForRemote(3));
+  const int peak = RemotePoolThreads();
+  EXPECT_GE(peak, 6);
+  EXPECT_TRUE(SharesRemotePool(other_impl));
+  EXPECT_OK(
+      db_->SetDBOptions({{"use_separate_remote_compaction_pool", "false"}}));
+  RunPoolMaintenance(60);
+  EXPECT_EQ(RemotePoolThreads(), peak);
+  service_->Release();
+  EXPECT_OK(dbfull()->TEST_WaitForCompact());
+  RunPoolMaintenance(60);
+  EXPECT_EQ(RemotePoolThreads(), peak);
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool closed = false;
+  std::thread close([&] {
+    Close();
+    std::lock_guard<std::mutex> lock(mutex);
+    closed = true;
+    cv.notify_all();
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(cv.wait_for(lock, kProgressTimeout, [&] { return closed; }));
+  }
+  other_service->Release();
+  close.join();
+  EXPECT_OK(other_impl->TEST_WaitForCompact());
+  RunPoolMaintenance(30, other_impl);
+  EXPECT_EQ(RemotePoolThreads(), 5);
+  EXPECT_OK(other_db->SetDBOptions(
+      {{"use_separate_remote_compaction_pool", "false"}}));
+  RunPoolMaintenance(30, other_impl);
+  EXPECT_EQ(RemotePoolThreads(), 0);
+  EXPECT_OK(other_db->SetDBOptions(
+      {{"use_separate_remote_compaction_pool", "true"}}));
+  EXPECT_OK(other_db->SetOptions({{"disable_auto_compactions", "true"}}));
+  for (int file = 0; file < 4; ++file) {
+    EXPECT_OK(other_db->Put(WriteOptions(), Key(file), std::string(1024, 'x')));
+    EXPECT_OK(other_db->Flush(FlushOptions()));
+  }
+  EXPECT_OK(
+      other_impl->EnableAutoCompaction({other_db->DefaultColumnFamily()}));
+  EXPECT_OK(other_impl->TEST_WaitForCompact());
+  EXPECT_EQ(RemotePoolThreads(), 5);
+  other_db.reset();
+  EXPECT_EQ(RemotePoolThreads(), 0);
+  EXPECT_OK(DestroyDB(other_name, options));
+#if defined(_GNU_SOURCE) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 12)
+  EXPECT_GE(named_threads.load(), 6);
+#endif
+#endif
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DedicatedCompactionPoolTest, RemotePoolShrinksAfterQuietPeriod) {
+  SetUpCompactions(LocalRouting::kRemote, 3);
+  BlockPool(Env::Priority::LOW);
+  BlockPool(Env::Priority::BOTTOM);
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(service_->WaitForRemote(12));
+  const int peak = RemotePoolThreads();
+  EXPECT_GE(peak, 12);
+  RunPoolMaintenance(60);
+  EXPECT_EQ(RemotePoolThreads(), peak);
+  ReleasePools();
+  service_->Release();
+  VerifyCompacted();
+  RunPoolMaintenance(29);
+  EXPECT_EQ(RemotePoolThreads(), peak);
+  RunPoolMaintenance(30);
+  EXPECT_EQ(RemotePoolThreads(), 2);
+  ASSERT_OK(
+      db_->SetDBOptions({{"use_separate_remote_compaction_pool", "false"}}));
+  RunPoolMaintenance(30);
+  EXPECT_EQ(RemotePoolThreads(), 0);
+  ASSERT_OK(
+      db_->SetDBOptions({{"use_separate_remote_compaction_pool", "true"}}));
+  ASSERT_OK(
+      db_->SetOptions(handles_[1], {{"disable_auto_compactions", "true"}}));
+  WriteCompactionInputs(1);
+  service_->ResetWait();
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[1]}));
+  ASSERT_TRUE(service_->WaitForRemote(3));
+  EXPECT_GE(RemotePoolThreads(), 3);
+  RunPoolMaintenance(60);
+  EXPECT_GE(RemotePoolThreads(), 3);
+  service_->Release();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  RunPoolMaintenance(30);
+  EXPECT_EQ(RemotePoolThreads(), 2);
+}
+
+TEST_F(DedicatedCompactionPoolTest, RemotePoolBaselineTracksLocalPoolSizes) {
+  SetUpCompactions(LocalRouting::kRemote, 3);
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(service_->WaitForRemote(12));
+  service_->Release();
+  VerifyCompacted();
+  env_->SetBackgroundThreads(2, Env::Priority::LOW);
+  env_->SetBackgroundThreads(3, Env::Priority::BOTTOM);
+  RunPoolMaintenance(30);
+  EXPECT_EQ(RemotePoolThreads(), 5);
+  env_->SetBackgroundThreads(0, Env::Priority::LOW);
+  env_->SetBackgroundThreads(0, Env::Priority::BOTTOM);
+  RunPoolMaintenance(30);
+  EXPECT_EQ(RemotePoolThreads(), 1);
+}
+
+class DedicatedQueuedCompactionAbortTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<std::tuple<Env::Priority, int, bool>> {
+};
+
+TEST_P(DedicatedQueuedCompactionAbortTest,
+       TargetedAbortCancelsOnlyItsFallbacks) {
+  AbortQueuedFallback(std::get<0>(GetParam()), std::get<1>(GetParam()),
+                      std::get<2>(GetParam()));
+}
+
+INSTANTIATE_TEST_CASE_P(
+    QueuedWork, DedicatedQueuedCompactionAbortTest,
+    testing::Combine(testing::Values(Env::Priority::LOW, Env::Priority::BOTTOM),
+                     testing::Values(1, 3), testing::Bool()));
+
+TEST_F(DedicatedCompactionPoolTest,
+       RemoteSubcompactionsDoNotReserveLocalSlots) {
+  SetUpCompactions(LocalRouting::kRemote, 3);
+  BlockPool(Env::Priority::LOW);
+  BlockPool(Env::Priority::BOTTOM);
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(service_->WaitForRemote(12));
+  uint64_t running = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningRemoteCompactions,
+                                  &running));
+  ASSERT_EQ(running, 12U);
+  ReleasePools();
+  service_->Release();
+  VerifyCompacted();
+}
+
+TEST_F(DedicatedCompactionPoolTest, LocalCompletionDoesNotBlockRemoteSiblings) {
+  SetUpCompactions(LocalRouting::kRemote, 3);
+  service_->SetLocalCF("cf_1");
+  service_->SetLocalSubcompactions(1);
+  BlockLocalWork();
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(WaitForLocal(1, 0));
+  ASSERT_TRUE(service_->WaitForRemote(11));
+  ReleaseLocal();
+  ASSERT_TRUE(WaitForLocal(1, 0, 1));
+  // Local subcompactions have finished while other jobs remain in Wait().
+  uint64_t running = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumRunningRemoteCompactions,
+                                  &running));
+  ASSERT_EQ(running, 11U);
+  service_->Release();
+  VerifyCompacted();
+  ASSERT_EQ(peak_local_active_, 1);
+}
+
+class DedicatedCompactionExceptionTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<std::tuple<uint32_t, bool>> {};
+
+TEST_P(DedicatedCompactionExceptionTest, ServiceExceptionFailsCompaction) {
+  SetUpCompactions(LocalRouting::kSchedule, 3);
+  service_->SetSubcompactionException(std::get<0>(GetParam()),
+                                      std::get<1>(GetParam()));
+  Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  EXPECT_TRUE(status.IsAborted());
+  EXPECT_EQ(NumTableFilesAtLevel(0), 4);
+  EXPECT_EQ(Get(Key(0)), std::string(1024, 'a'));
+  EXPECT_EQ(Get(Key(199)), std::string(1024, 'd'));
+  Close();
+}
+
+INSTANTIATE_TEST_CASE_P(Subcompaction, DedicatedCompactionExceptionTest,
+                        testing::Combine(testing::Values(0U, 1U),
+                                         testing::Bool()));
+
+class LocalCompactionCancellationFailureTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<std::tuple<Env::Priority, int>> {};
+
+TEST_P(LocalCompactionCancellationFailureTest, RetriesWithoutUnwindingTask) {
+  AbortQueuedFallback(std::get<0>(GetParam()), std::get<1>(GetParam()), true,
+                      true);
+}
+
+INSTANTIATE_TEST_CASE_P(LocalPools, LocalCompactionCancellationFailureTest,
+                        testing::Combine(testing::Values(Env::Priority::LOW,
+                                                         Env::Priority::BOTTOM),
+                                         testing::Values(1, 3)));
+
+class LocalCompactionStatusCopyFailureTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<std::tuple<Env::Priority, bool>> {};
+
+TEST_P(LocalCompactionStatusCopyFailureTest, CompletesAcceptedTask) {
+  CompleteLocalTaskAfterStatusCopyFailure(std::get<0>(GetParam()),
+                                          std::get<1>(GetParam()));
+}
+
+INSTANTIATE_TEST_CASE_P(LocalPools, LocalCompactionStatusCopyFailureTest,
+                        testing::Combine(testing::Values(Env::Priority::LOW,
+                                                         Env::Priority::BOTTOM),
+                                         testing::Bool()));
+
+TEST_F(DedicatedCompactionPoolTest,
+       IncreasedCompactionLimitWakesAutomaticWaiters) {
+  SetUpCompactions(LocalRouting::kWait, 3, 1, 1);
+  ASSERT_OK(db_->SetOptions({{"level0_slowdown_writes_trigger", "4"}}));
+  BlockLocalWork();
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  ASSERT_TRUE(service_->WaitForRemote(3));
+  service_->Release();
+  ASSERT_TRUE(WaitForLocal(1, 2));
+  ASSERT_OK(db_->SetDBOptions({{"max_background_compactions", "3"}}));
+  EXPECT_TRUE(WaitForLocal(3, 2));
+  EXPECT_EQ(local_finished_, 0);
+  ReleaseLocal();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  WaitForRemotePoolIdle();
+  EXPECT_EQ(LocalScheduled(), 0);
+  EXPECT_EQ(local_finished_, 3);
+}
+
+class CoordinatorSubmissionFailureTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<std::tuple<bool, int>> {};
+
+TEST_P(CoordinatorSubmissionFailureTest,
+       BackgroundSubmissionPreservesPendingWork) {
+  const bool separate_pool = std::get<0>(GetParam());
+  const int failed_submission = std::get<1>(GetParam());
+  SetUpCompactions(LocalRouting::kRemote, 1, 1, 1, 7, separate_pool);
+  int submissions = 0;
+  SyncPoint::GetInstance()->EnableProcessing();
+  bool finished = false;
+  std::function<void()> schedule = [&] {
+    SyncPoint::GetInstance()->SetCallBack(
+        separate_pool ? "ThreadPoolImpl::StartBGThreads:BeforeCreate"
+                      : "ThreadPoolImpl::Submit:BeforeEnqueue",
+        [&](void* arg) {
+          if (++submissions == failed_submission) {
+            *static_cast<std::function<void()>*>(arg) = [separate_pool] {
+              if (separate_pool) {
+                throw std::system_error(std::make_error_code(
+                    std::errc::resource_unavailable_try_again));
+              }
+              throw std::bad_alloc();
+            };
+          }
+        });
+    EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    finished = true;
+    local_cv_.notify_all();
+  };
+  env_->Schedule(
+      [](void* arg) { (*static_cast<std::function<void()>*>(arg))(); },
+      &schedule, Env::Priority::HIGH);
+  {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return finished; }));
+  }
+  WaitForCompactOptions wait;
+  wait.timeout = kProgressTimeout;
+  EXPECT_TRUE(db_->WaitForCompact(wait).IsAborted());
+  WaitForRemotePoolIdle();
+  EXPECT_EQ(LocalScheduled(), 0);
+  EXPECT_EQ(submissions, failed_submission);
+  if (separate_pool) {
+    EXPECT_EQ(RemotePoolThreads(), failed_submission - 1);
+  }
+  uint64_t pending = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumUnscheduledCompactions,
+                                  &pending));
+  EXPECT_EQ(pending, 1U);
+  EXPECT_EQ(NumTableFilesAtLevel(0), 4);
+  EXPECT_EQ(Get(Key(199)), std::string(1024, 'd'));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  Close();
+}
+
+INSTANTIATE_TEST_CASE_P(Submission, CoordinatorSubmissionFailureTest,
+                        testing::Values(std::make_tuple(true, 1),
+                                        std::make_tuple(true, 2),
+                                        std::make_tuple(false, 1)));
+
+class CoordinatorSubmissionModeTest : public DedicatedCompactionPoolTest,
+                                      public testing::WithParamInterface<bool> {
+};
+
+TEST_P(CoordinatorSubmissionModeTest, RejectedManualCoordinatorReleasesInputs) {
+  SetUpCompactions(LocalRouting::kRemote, 1, 1, 1, 7, GetParam());
+  SyncPoint::GetInstance()->SetCallBack(
+      GetParam() ? "DBImpl::ScheduleRemoteCompaction:BeforeSubmit"
+                 : "ThreadPoolImpl::Submit:BeforeEnqueue",
+      [](void* arg) {
+        *static_cast<std::function<void()>*>(arg) = [] {
+          throw std::bad_alloc();
+        };
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  EXPECT_TRUE(
+      db_->CompactRange(CompactRangeOptions(), nullptr, nullptr).IsAborted());
+  WaitForRemotePoolIdle();
+  EXPECT_EQ(LocalScheduled(), 0);
+  EXPECT_EQ(NumTableFilesAtLevel(0), 4);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  service_->Release();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+  EXPECT_EQ(Get(Key(199)), std::string(1024, 'd'));
+}
+
+TEST_P(CoordinatorSubmissionModeTest,
+       RejectedBottomCoordinatorDrainsPickingTask) {
+  SetUpCompactions(LocalRouting::kRemote, 1, 1, 1, 2, GetParam());
+  int submissions = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      GetParam() ? "DBImpl::ScheduleRemoteCompaction:BeforeSubmit"
+                 : "ThreadPoolImpl::Submit:BeforeEnqueue",
+      [&](void* arg) {
+        if (++submissions == 2) {
+          *static_cast<std::function<void()>*>(arg) = [] {
+            throw std::runtime_error("Rejected BOTTOM coordinator");
+          };
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  WaitForCompactOptions wait;
+  wait.timeout = kProgressTimeout;
+  EXPECT_TRUE(db_->WaitForCompact(wait).IsAborted());
+  ASSERT_OK(db_->PauseBackgroundWork());
+  WaitForRemotePoolIdle();
+  ASSERT_OK(db_->ContinueBackgroundWork());
+  EXPECT_EQ(submissions, 2);
+  EXPECT_EQ(LocalScheduled(), 0);
+  EXPECT_EQ(NumTableFilesAtLevel(0), 4);
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  for (const auto& file : metadata.levels[0].files) {
+    EXPECT_FALSE(file.being_compacted);
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(PoolMode, CoordinatorSubmissionModeTest,
+                        testing::Bool());
+
+class ShortcutCompactionGateTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<std::tuple<int, bool>> {};
+
+TEST_P(ShortcutCompactionGateTest, CallbacksPreserveSubmittedMode) {
+  const int kind = std::get<0>(GetParam());
+  const bool gate = std::get<1>(GetParam());
+  auto listener = std::make_shared<ShortcutCompactionListener>(gate);
+  SetUpShortcutCompaction(kind, gate, listener);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  if (kind == 2) {
+    env_->MockSleepForSeconds(60);
+  }
+  bool started = false;
+  bool released = false;
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::BGWorkCompaction", [&](void*) {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    started = true;
+    local_cv_.notify_all();
+    local_cv_.wait(lock, [&] { return released; });
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return started; }));
+  }
+  EXPECT_OK(db_->SetDBOptions(
+      {{"use_separate_remote_compaction_pool", gate ? "false" : "true"}}));
+  {
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    released = true;
+    local_cv_.notify_all();
+  }
+  EXPECT_OK(dbfull()->TEST_WaitForCompact());
+  listener->Verify(1);
+  if (kind == 0) {
+    EXPECT_EQ(listener->moved_files.load(), 1U);
+  } else if (kind == 1) {
+    EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+  } else {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+    EXPECT_EQ(metadata.levels[0].files[0].temperature, Temperature::kCold);
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(Shortcut, ShortcutCompactionGateTest,
+                        testing::Combine(testing::Values(0, 1, 2),
+                                         testing::Bool()));
+
+TEST_F(DedicatedCompactionPoolTest, FifoCopiesShareLocalWorkersAcrossDBs) {
+  auto listener = std::make_shared<ShortcutCompactionListener>(true);
+  Options options = SetUpShortcutCompaction(2, true, listener);
+  const std::string second_path = dbname_ + "_fifo_copy";
+  std::unique_ptr<DB> second;
+  ASSERT_OK(DB::Open(options, second_path, &second));
+  ASSERT_OK(Put("key", "first"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(second->Put(WriteOptions(), "key", "second"));
+  ASSERT_OK(second->Flush(FlushOptions()));
+  env_->MockSleepForSeconds(60);
+  int scheduled = 0;
+  int copies_started = 0;
+  bool released = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunLocalCompaction:Scheduled", [&](void*) {
+        std::lock_guard<std::mutex> lock(local_mutex_);
+        ++scheduled;
+        local_cv_.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "NewWritableFile::FileOptions.temperature", [&](void* arg) {
+        if (*static_cast<Temperature*>(arg) != Temperature::kCold) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(local_mutex_);
+        ++copies_started;
+        local_cv_.notify_all();
+        local_cv_.wait(lock, [&] { return released; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  EXPECT_OK(second->EnableAutoCompaction({second->DefaultColumnFamily()}));
+  {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout, [&] {
+      return scheduled == 2 && copies_started == 1;
+    }));
+    EXPECT_EQ(copies_started, 1);
+  }
+  EXPECT_OK(
+      db_->SetDBOptions({{"use_separate_remote_compaction_pool", "false"}}));
+  {
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    released = true;
+    local_cv_.notify_all();
+  }
+  EXPECT_OK(dbfull()->TEST_WaitForCompact());
+  WaitForCompactOptions wait;
+  wait.timeout = kProgressTimeout;
+  EXPECT_OK(second->WaitForCompact(wait));
+  EXPECT_EQ(copies_started, 2);
+  listener->Verify(2);
+  EXPECT_EQ(Get("key"), "first");
+  std::string value;
+  EXPECT_OK(second->Get(ReadOptions(), "key", &value));
+  EXPECT_EQ(value, "second");
+  EXPECT_OK(second->Close());
+  second.reset();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_OK(DestroyDB(second_path, options));
+}
+
+TEST_F(DedicatedCompactionPoolTest, AbortQueuedFifoCopyReleasesLocalCredit) {
+  auto listener = std::make_shared<ShortcutCompactionListener>(true);
+  SetUpShortcutCompaction(2, true, listener);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  env_->MockSleepForSeconds(60);
+  BlockPool(Env::Priority::LOW);
+  bool scheduled = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunLocalCompaction:Scheduled", [&](void*) {
+        std::lock_guard<std::mutex> lock(local_mutex_);
+        scheduled = true;
+        local_cv_.notify_all();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  EXPECT_OK(dbfull()->EnableAutoCompaction({handles_[0]}));
+  {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return scheduled; }));
+  }
+  db_->AbortCompactions(handles_[0]);
+  WaitForRemotePoolIdle();
+  EXPECT_EQ(LocalScheduled(), 0);
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+  EXPECT_EQ(metadata.levels[0].files[0].temperature, Temperature::kWarm);
+  EXPECT_EQ(Get("key"), "value");
+  listener->Verify(1);
+  ReleasePools();
+  db_->ResumeCompactions(handles_[0]);
+  EXPECT_OK(dbfull()->TEST_WaitForCompact());
+}
+
+class DedicatedCompactionSubmissionExceptionTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<std::tuple<int, int>> {};
+
+TEST_P(DedicatedCompactionSubmissionExceptionTest,
+       DrainsAcceptedSubcompactionsBeforeReturning) {
+  SetUpCompactions(LocalRouting::kRemote, 3);
+  const int failed_sibling = std::get<0>(GetParam());
+  const int exception_kind = std::get<1>(GetParam());
+  int submissions = 0;
+  bool draining = false;
+  bool manual_done = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ScheduleRemoteCompaction:BeforeSubmit", [&](void* arg) {
+        if (++submissions == failed_sibling + 1) {
+          *static_cast<std::function<void()>*>(arg) = [exception_kind] {
+            if (exception_kind == 0) {
+              throw std::runtime_error("Injected submission exception");
+            }
+            if (exception_kind == 1) {
+              throw std::bad_alloc();
+            }
+            throw 42;
+          };
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::RunSubcompactions:Wait", [&](void*) {
+        std::lock_guard<std::mutex> lock(local_mutex_);
+        draining = true;
+        local_cv_.notify_all();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  std::thread manual([&] {
+    status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    manual_done = true;
+    local_cv_.notify_all();
+  });
+  {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return draining; }));
+    if (failed_sibling > 1) {
+      EXPECT_FALSE(manual_done);
+    }
+  }
+  if (failed_sibling > 1) {
+    EXPECT_TRUE(service_->WaitForRemote(failed_sibling - 1));
+  }
+  service_->Release();
+  {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    EXPECT_TRUE(local_cv_.wait_for(lock, kProgressTimeout,
+                                   [&] { return manual_done; }));
+  }
+  manual.join();
+  EXPECT_TRUE(status.IsAborted());
+  EXPECT_EQ(submissions, failed_sibling + 1);
+  WaitForRemotePoolIdle();
+  EXPECT_EQ(LocalScheduled(), 0);
+  EXPECT_EQ(NumTableFilesAtLevel(0), 4);
+  EXPECT_EQ(NumTableFilesAtLevel(1), 0);
+  EXPECT_EQ(Get(Key(0)), std::string(1024, 'a'));
+  EXPECT_EQ(Get(Key(199)), std::string(1024, 'd'));
+  Close();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+INSTANTIATE_TEST_CASE_P(Submission, DedicatedCompactionSubmissionExceptionTest,
+                        testing::Combine(testing::Values(1, 2),
+                                         testing::Values(0, 1, 2)));
+
+TEST_F(CompactionServiceTest, LocalFilterExceptionFailsCompaction) {
+  class ThrowingFilterFactory : public CompactionFilterFactory {
+   public:
+    ThrowingFilterFactory(std::string key, bool unknown)
+        : key_(std::move(key)), unknown_(unknown) {}
+
+    const char* Name() const override { return "ThrowingFilterFactory"; }
+
+    std::unique_ptr<CompactionFilter> CreateCompactionFilter(
+        const CompactionFilter::Context&) override {
+      class ThrowingFilter : public CompactionFilter {
+       public:
+        ThrowingFilter(std::string key, bool unknown)
+            : key_(std::move(key)), unknown_(unknown) {}
+        const char* Name() const override { return "ThrowingFilter"; }
+        bool Filter(int, const Slice& key, const Slice&, std::string*,
+                    bool*) const override {
+          if (key == Slice(key_)) {
+            if (unknown_) {
+              throw 42;
+            }
+            throw std::runtime_error("Injected local filter exception");
+          }
+          return false;
+        }
+
+       private:
+        const std::string key_;
+        const bool unknown_;
+      };
+      return std::make_unique<ThrowingFilter>(key_, unknown_);
+    }
+
+   private:
+    const std::string key_;
+    const bool unknown_;
+  };
+  class CompletionListener : public EventListener {
+   public:
+    void OnSubcompactionBegin(const SubcompactionJobInfo&) override {
+      ++started;
+    }
+    void OnSubcompactionCompleted(const SubcompactionJobInfo& info) override {
+      ++completed;
+      if (!info.status.ok()) {
+        ++failed;
+      }
+    }
+    std::atomic<int> started{0};
+    std::atomic<int> completed{0};
+    std::atomic<int> failed{0};
+  };
+
+  for (bool unknown : {false, true}) {
+    SCOPED_TRACE(unknown);
+    Options options = CurrentOptions();
+    options.use_separate_remote_compaction_pool = true;
+    options.disable_auto_compactions = true;
+    options.max_subcompactions = 3;
+    options.max_background_compactions = 1;
+    options.target_file_size_base = 4096;
+    options.compression = kNoCompression;
+    options.compaction_filter_factory =
+        std::make_shared<ThrowingFilterFactory>(Key(100), unknown);
+    auto listener = std::make_shared<CompletionListener>();
+    options.listeners.push_back(listener);
+    ReopenWithCompactionService(&options);
+    GetCompactionService()->OverrideStartStatus(
+        CompactionServiceJobStatus::kUseLocal);
+    GenerateTestData();
+
+    Status status = db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+    EXPECT_TRUE(status.IsAborted());
+    EXPECT_NE(
+        status.ToString().find(unknown ? "Unknown local subcompaction exception"
+                                       : "Injected local filter exception"),
+        std::string::npos);
+    EXPECT_GT(listener->started.load(), 1);
+    EXPECT_EQ(listener->started.load(), listener->completed.load());
+    EXPECT_EQ(listener->failed.load(), 1);
+    VerifyTestData();
+    Close();
+  }
+}
+
+class DedicatedCompactionFallbackTest
+    : public DedicatedCompactionPoolTest,
+      public testing::WithParamInterface<LocalRouting> {};
+
+TEST_P(DedicatedCompactionFallbackTest, CompactFilesFromLowWorker) {
+  SetUpCompactions(GetParam(), 3);
+  service_->Release();
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const SstFileMetaData& file : metadata.levels[0].files) {
+    inputs.push_back(file.db_path + "/" + file.name);
+  }
+  ASSERT_EQ(inputs.size(), 4);
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool done = false;
+  Status status;
+  std::function<void()> compact = [&] {
+    status = db_->CompactFiles(CompactionOptions(), inputs, 1);
+    std::lock_guard<std::mutex> lock(mutex);
+    done = true;
+    cv.notify_one();
+  };
+  env_->Schedule(
+      [](void* arg) { (*static_cast<std::function<void()>*>(arg))(); },
+      &compact, Env::Priority::LOW);
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(cv.wait_for(lock, kProgressTimeout, [&] { return done; }));
+  }
+  // Allow cleanup to complete if a regression queues work behind the caller.
+  env_->SetBackgroundThreads(2, Env::Priority::LOW);
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return done; });
+  }
+  ASSERT_OK(status);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(Get(Key(0)), std::string(1024, 'a'));
+  ASSERT_EQ(Get(Key(199)), std::string(1024, 'd'));
+}
+
+TEST_P(DedicatedCompactionFallbackTest, DisableQueuedManualLowSubcompactions) {
+  CancelQueuedManualCompaction(GetParam(), Env::Priority::LOW, false);
+}
+
+TEST_P(DedicatedCompactionFallbackTest, CallerCancellationWhileQueued) {
+  CancelQueuedManualCompaction(GetParam(), Env::Priority::LOW, false, true);
+}
+
+TEST_P(DedicatedCompactionFallbackTest,
+       DisableQueuedManualBottomSubcompactions) {
+  CancelQueuedManualCompaction(GetParam(), Env::Priority::BOTTOM, false);
+}
+
+TEST_P(DedicatedCompactionFallbackTest, CloseQueuedManualLowSubcompactions) {
+  CancelQueuedManualCompaction(GetParam(), Env::Priority::LOW, true);
+}
+
+TEST_P(DedicatedCompactionFallbackTest, CloseQueuedManualBottomSubcompactions) {
+  CancelQueuedManualCompaction(GetParam(), Env::Priority::BOTTOM, true);
+}
+
+TEST_P(DedicatedCompactionFallbackTest,
+       CallerCancellationWhileWaitingForCredit) {
+  CancelManualWaitingForCredit(GetParam(), 1);
+}
+
+TEST_P(DedicatedCompactionFallbackTest,
+       CallerCancellationWhileSubcompactionsWaitForCredit) {
+  CancelManualWaitingForCredit(GetParam(), 3);
+}
+
+TEST_P(DedicatedCompactionFallbackTest, LocalSubcompactionsRespectDBCredits) {
+  SetUpCompactions(GetParam(), 3, 4);
+  BlockLocalWork();
+  service_->Release();
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(WaitForLocal(1, 11));
+  {
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    ASSERT_EQ(local_started_, 1);
+  }
+  ReleaseLocal();
+  VerifyCompacted();
+  ASSERT_EQ(peak_local_active_, 1);
+  ASSERT_EQ(local_finished_, 12);
+}
+
+TEST_P(DedicatedCompactionFallbackTest,
+       LowFlushProgressWhileBottomSubcompactionsRun) {
+  SetUpCompactions(GetParam(), 3, 1, 1, 2);
+  BlockLocalWork();
+  service_->Release();
+  ASSERT_OK(Put(1, "flush-key", "flush-value"));
+  const int high_threads = env_->GetBackgroundThreads(Env::Priority::HIGH);
+  env_->SetBackgroundThreads(0, Env::Priority::HIGH);
+
+  Status compaction_status;
+  std::thread compaction([&] {
+    compaction_status =
+        db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  });
+  EXPECT_TRUE(WaitForLocal(1, 2));
+  Status flush_status;
+  bool flushed = false;
+  std::thread flush([&] {
+    flush_status = Flush(1);
+    std::lock_guard<std::mutex> lock(local_mutex_);
+    flushed = true;
+    local_cv_.notify_all();
+  });
+  {
+    std::unique_lock<std::mutex> lock(local_mutex_);
+    EXPECT_TRUE(
+        local_cv_.wait_for(lock, kProgressTimeout, [&] { return flushed; }));
+    EXPECT_EQ(local_finished_, 0);
+  }
+  env_->SetBackgroundThreads(high_threads, Env::Priority::HIGH);
+  ReleaseLocal();
+  compaction.join();
+  flush.join();
+  ASSERT_OK(compaction_status);
+  ASSERT_OK(flush_status);
+  EXPECT_EQ(Get(1, "flush-key"), "flush-value");
+  EXPECT_EQ(NumTableFilesAtLevel(0, 1), 5);
+}
+
+TEST_P(DedicatedCompactionFallbackTest, BottomSubcompactionsUseBottomPool) {
+  SetUpCompactions(GetParam(), 3, 1, 1, 2);
+  BlockPool(Env::Priority::LOW);
+  BlockLocalWork();
+  service_->Release();
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(WaitForLocal(1, 11));
+  ReleaseLocal();
+  VerifyCompacted();
+  ASSERT_EQ(peak_local_active_, 1);
+  ASSERT_EQ(local_finished_, 12);
+}
+
+TEST_F(DedicatedCompactionPoolTest, LocalWorkRespectsPoolCapacity) {
+  SetUpCompactions(LocalRouting::kSchedule, 3, 1, 4);
+  BlockLocalWork();
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(WaitForLocal(1, 8));
+  ReleaseLocal();
+  VerifyCompacted();
+  ASSERT_EQ(peak_local_active_, 1);
+  ASSERT_EQ(local_finished_, 12);
+}
+
+TEST_F(DedicatedCompactionPoolTest, ShutdownCancelsQueuedLocalSubcompactions) {
+  SetUpCompactions(LocalRouting::kSchedule, 3);
+  BlockPool(Env::Priority::LOW);
+  BlockLocalWork();
+  ASSERT_OK(dbfull()->EnableAutoCompaction(handles_));
+  ASSERT_TRUE(WaitForLocal(0, 11));
+  // The LOW worker stays occupied throughout close. Shutdown must unschedule
+  // its queued local task and wake the remaining credit waiters.
+  Close();
+  ASSERT_EQ(local_started_, 0);
+  ReleasePools();
+}
+
+INSTANTIATE_TEST_CASE_P(LocalRouting, DedicatedCompactionFallbackTest,
+                        testing::Values(LocalRouting::kSchedule,
+                                        LocalRouting::kWait,
+                                        LocalRouting::kInvalidResult));
+
 class PropertySamplingCompactionService : public MyTestCompactionService {
  public:
   using MyTestCompactionService::MyTestCompactionService;
@@ -4245,7 +7572,7 @@ TEST_F(CompactionServiceTest, CompactionFilter) {
 
 TEST_F(CompactionServiceTest, MergeOperator) {
   Options options = CurrentOptions();
-  options.merge_operator.reset(new StringAppendOperator(','));
+  options.merge_operator = std::make_shared<StringAppendOperator>(',');
   ReopenWithCompactionService(&options);
   GenerateTestData();
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
@@ -5426,6 +8753,123 @@ TEST_F(CompactionServiceTest, RemoteEventListener) {
   }
 }
 
+namespace {
+// Runs each remote compaction in two attempts. The first attempt stops after
+// it saves progress. The second attempt resumes after the saved output files
+// are deleted, so the resume fails and the primary compacts locally.
+class FailedResumeCompactionService : public MyTestCompactionService {
+ public:
+  using MyTestCompactionService::MyTestCompactionService;
+
+  CompactionServiceJobStatus Wait(const std::string& scheduled_job_id,
+                                  std::string* result) override {
+    std::string compaction_input;
+    {
+      InstrumentedMutexLock l(&mutex_);
+      auto it = jobs_.find(scheduled_job_id);
+      if (it == jobs_.end()) {
+        return CompactionServiceJobStatus::kFailure;
+      }
+      compaction_input = it->second;
+      jobs_.erase(it);
+    }
+
+    CompactionServiceOptionsOverride options_override = GetOptionsOverride();
+    std::atomic<bool> canceled{false};
+    OpenAndCompactOptions open_options;
+    open_options.allow_resumption = true;
+    open_options.canceled = &canceled;
+
+    // Put each key in its own output file, and stop at the first saved
+    // progress.
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionOutputs::ShouldStopBefore::manual_decision", [](void* p) {
+          *static_cast<std::pair<bool*, const Slice>*>(p)->first = true;
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionJob::PersistSubcompactionProgress:Complete",
+        [&](void*) { canceled.store(true); });
+    SyncPoint::GetInstance()->EnableProcessing();
+    std::string first_result;
+    Status s =
+        DB::OpenAndCompact(open_options, db_path_, scheduled_job_id,
+                           compaction_input, &first_result, options_override);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_TRUE(s.IsManualCompactionPaused()) << s.ToString();
+
+    Env* env = options_override.env;
+    const std::string output_dir = GetOutputPath(scheduled_job_id);
+    std::vector<std::string> children;
+    EXPECT_OK(env->GetChildren(output_dir, &children));
+    for (const auto& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(child, &number, &type) && type == kTableFile) {
+        EXPECT_OK(env->DeleteFile(MakeTableFileName(output_dir, number)));
+      }
+    }
+
+    canceled.store(false);
+    s = DB::OpenAndCompact(open_options, db_path_, scheduled_job_id,
+                           compaction_input, result, options_override);
+    EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+};
+}  // namespace
+
+TEST_F(CompactionServiceTest, FailedResumeReportsSubcompactionCompleted) {
+  class SubcompactionEventCounter : public EventListener {
+   public:
+    const char* Name() const override { return "SubcompactionEventCounter"; }
+
+    void OnSubcompactionBegin(const SubcompactionJobInfo& /*info*/) override {
+      ++begin_count;
+    }
+    void OnSubcompactionCompleted(const SubcompactionJobInfo& info) override {
+      ++completed_count;
+      if (info.status.IsCorruption()) {
+        ++corruption_count;
+      }
+    }
+
+    std::atomic<int> begin_count{0};
+    std::atomic<int> completed_count{0};
+    std::atomic<int> corruption_count{0};
+  };
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.env = env_;
+  auto listener = std::make_shared<SubcompactionEventCounter>();
+  std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+  auto cs = std::make_shared<FailedResumeCompactionService>(
+      dbname_, options, statistics,
+      std::vector<std::shared_ptr<EventListener>>{listener},
+      std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>{});
+  options.compaction_service = cs;
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 2; ++i) {
+    for (int key = 0; key < 4; ++key) {
+      ASSERT_OK(Put(Key(key), "value" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Each attempt that began a subcompaction also reported its completion, and
+  // the failed resume reported its status.
+  ASSERT_GT(listener->begin_count, 0);
+  ASSERT_EQ(listener->completed_count, listener->begin_count);
+  ASSERT_GT(listener->corruption_count, 0);
+  for (int key = 0; key < 4; ++key) {
+    ASSERT_EQ(Get(Key(key)), "value1");
+  }
+}
+
 TEST_F(CompactionServiceTest, TablePropertiesCollector) {
   const static std::string kUserPropertyName = "TestCount";
 
@@ -5568,6 +9012,12 @@ class ResumableCompactionService : public MyTestCompactionService {
     cancel_at_seqno_ = seqno;
   }
 
+  // Run an extra resumed-then-canceled phase between the first canceled phase
+  // and the final phase, canceling at `key`.
+  void SetSecondCancelAtKey(const std::string& key) {
+    second_cancel_at_key_ = key;
+  }
+
   void CaptureVerifiedInputRecords(std::atomic<uint64_t>* records) {
     verified_input_records_ = records;
   }
@@ -5639,6 +9089,16 @@ class ResumableCompactionService : public MyTestCompactionService {
     std::string output_path = GetOutputPath(scheduled_job_id);
     TEST_SYNC_POINT_CALLBACK(
         "ResumableCompactionService::AfterCancelledCompaction", &output_path);
+
+    if (!second_cancel_at_key_.empty()) {
+      open_and_compaction_options.allow_resumption = true;
+      cancel_at_key_ = second_cancel_at_key_;
+      already_canceled_ = false;
+      canceled_ = false;
+      output_key_count_ = 0;
+      RunCancelledCompaction(open_and_compaction_options, scheduled_job_id,
+                             compaction_input, override_options);
+    }
 
     HistogramData phase2_stats;
 
@@ -5832,6 +9292,7 @@ class ResumableCompactionService : public MyTestCompactionService {
   const bool merge_resumed_output_;
   size_t output_key_count_ = 0;
   std::string cancel_at_key_;
+  std::string second_cancel_at_key_;
   SequenceNumber cancel_at_seqno_ = kMaxSequenceNumber;
   std::atomic<bool> already_canceled_{false};
   std::atomic<uint64_t>* verified_input_records_ = nullptr;
@@ -6044,6 +9505,16 @@ class ResumableCompactionServiceTest : public CompactionServiceTest {
     ASSERT_TRUE(result.stats.is_manual_compaction);
     ASSERT_TRUE(result.stats.is_remote_compaction);
     ASSERT_GT(result.output_files.size(), 0);
+
+    // The output stats cover every output file, including the files that a
+    // resumed run restored instead of writing again.
+    uint64_t output_file_bytes = 0;
+    for (const auto& file : result.output_files) {
+      output_file_bytes += file.file_size;
+    }
+    ASSERT_EQ(result.internal_stats.output_level_stats.bytes_written,
+              output_file_bytes);
+    ASSERT_EQ(result.stats.total_output_bytes, output_file_bytes);
 
     uint64_t resumed_bytes =
         statistics->getTickerCount(REMOTE_COMPACT_RESUMED_BYTES);
@@ -6404,6 +9875,105 @@ TEST_F(ResumableCompactionServiceTest,
 }
 
 TEST_F(ResumableCompactionServiceTest,
+       RepeatedCancelKeepsOutputRecordCountConsistent) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.compaction_verify_record_count = true;
+  std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+
+  auto resume_cs = std::make_shared<ResumableCompactionService>(
+      dbname_, options, statistics,
+      ResumableCompactionService::TestScenario::kCancelThenResume,
+      /*output_file_key_interval=*/3);
+  resume_cs->SetCancelAtKey(Key(20), kMaxSequenceNumber);
+  resume_cs->SetSecondCancelAtKey(Key(40));
+  resume_cs->SetWorkerOptionOverride("compaction_verify_record_count", "true");
+  options.compaction_service = resume_cs;
+
+  DestroyAndReopen(options);
+  constexpr int kTestNumKeys = 60;
+  for (int i = 0; i < kTestNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), "old"));
+  }
+  ASSERT_OK(Flush());
+  const Snapshot* snapshot = db_->GetSnapshot();
+  for (int i = 0; i < kTestNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), "new"));
+  }
+  ASSERT_OK(Flush());
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  const Status s = db_->CompactRange(compact_options, nullptr, nullptr);
+  db_->ReleaseSnapshot(snapshot);
+  ASSERT_OK(s);
+
+  CompactionServiceResult result;
+  resume_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  uint64_t entries_in_output_files = 0;
+  for (const auto& file : result.output_files) {
+    entries_in_output_files += file.table_properties.num_entries -
+                               file.table_properties.num_range_deletions;
+  }
+  // The snapshot keeps both versions of every key.
+  EXPECT_EQ(entries_in_output_files, 2 * kTestNumKeys);
+  EXPECT_EQ(result.stats.num_output_records, entries_in_output_files);
+  EXPECT_GT(statistics->getTickerCount(REMOTE_COMPACT_RESUMED_BYTES), 0);
+  for (int i = 0; i < kTestNumKeys; ++i) {
+    EXPECT_EQ(Get(Key(i)), "new");
+  }
+}
+
+TEST_F(ResumableCompactionServiceTest,
+       PerKeyPlacementResumeWithBothOutputLevels) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  // Compact L0 straight into the last level, which per-key placement needs.
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = true;
+  std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+
+  auto resume_cs = std::make_shared<ResumableCompactionService>(
+      dbname_, options, statistics,
+      ResumableCompactionService::TestScenario::kCancelThenResume,
+      /*output_file_key_interval=*/1);
+  resume_cs->SetCancelAtKey("c", kMaxSequenceNumber);
+  options.compaction_service = resume_cs;
+
+  DestroyAndReopen(options);
+  // "a", "c", and "e" get sequence numbers 1 to 3 and go to the last level.
+  // "b", "d", and "f" get 4 to 6 and go to the proximal level. When the file
+  // with "a" closes at "c", the proximal level still has an open file with
+  // "b".
+  for (const char* const key : {"a", "c", "e", "b", "d", "f"}) {
+    ASSERT_OK(Put(key, std::string(100, key[0])));
+  }
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "Compaction::SupportsPerKeyPlacement:Enabled",
+      [&](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::PrepareTimes():preclude_last_level_min_seqno",
+      [&](void* arg) { *static_cast<SequenceNumber*>(arg) = 3; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  CompactionServiceResult result;
+  resume_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_GT(NumTableFilesAtLevel(1), 0);
+  ASSERT_GT(NumTableFilesAtLevel(2), 0);
+  for (const char* const key : {"a", "b", "c", "d", "e", "f"}) {
+    EXPECT_EQ(Get(key), std::string(100, key[0]));
+  }
+  ASSERT_OK(Put("g", "g"));
+}
+
+TEST_F(ResumableCompactionServiceTest,
        BlobPerKeyPlacementDoesNotPersistProgress) {
   const auto run_compaction = [&](bool supports_per_key_placement,
                                   size_t* persisted_progress_count) {
@@ -6462,6 +10032,51 @@ TEST_F(ResumableCompactionServiceTest,
   run_compaction(/*supports_per_key_placement=*/true,
                  &per_key_placement_persisted_progress);
   EXPECT_EQ(per_key_placement_persisted_progress, 0);
+}
+
+TEST_F(ResumableCompactionServiceTest,
+       PerKeyPlacementResumesWithoutProximalLevelOutput) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  // Compact L0 straight into the last level, which per-key placement needs.
+  options.num_levels = 3;
+  options.level_compaction_dynamic_level_bytes = true;
+  std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+
+  auto resume_cs = std::make_shared<ResumableCompactionService>(
+      dbname_, options, statistics,
+      ResumableCompactionService::TestScenario::kCancelThenResume,
+      /*output_file_key_interval=*/1);
+  resume_cs->SetCancelAtKey("c", kMaxSequenceNumber);
+  options.compaction_service = resume_cs;
+
+  DestroyAndReopen(options);
+  for (const char* const key : {"a", "b", "c", "d"}) {
+    ASSERT_OK(Put(key, std::string(100, key[0])));
+  }
+  ASSERT_OK(Flush());
+
+  // Per-key placement without a preclude threshold sends every key to the last
+  // level, so the saved progress has no proximal level output files.
+  SyncPoint::GetInstance()->SetCallBack(
+      "Compaction::SupportsPerKeyPlacement:Enabled",
+      [&](void* arg) { *static_cast<bool*>(arg) = true; });
+  std::atomic<size_t> persisted_progress{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::PersistSubcompactionProgress:Complete",
+      [&](void*) { ++persisted_progress; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  EXPECT_GT(persisted_progress.load(), 0);
+  EXPECT_GT(statistics->getTickerCount(REMOTE_COMPACT_RESUMED_BYTES), 0);
+  for (const char* const key : {"a", "b", "c", "d"}) {
+    EXPECT_EQ(Get(key), std::string(100, key[0]));
+  }
 }
 
 TEST_F(ResumableCompactionServiceTest,

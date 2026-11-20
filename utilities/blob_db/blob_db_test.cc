@@ -6,6 +6,7 @@
 #include "utilities/blob_db/blob_db.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/blob/blob_index.h"
@@ -102,7 +104,7 @@ class BlobDBTest : public testing::Test {
 
   void Open(BlobDBOptions bdb_options = BlobDBOptions(),
             Options options = Options()) {
-    ASSERT_OK(TryOpen(bdb_options, options));
+    ASSERT_OK(TryOpen(bdb_options, std::move(options)));
   }
 
   void Reopen(BlobDBOptions bdb_options = BlobDBOptions(),
@@ -110,7 +112,7 @@ class BlobDBTest : public testing::Test {
     assert(blob_db_ != nullptr);
     delete blob_db_;
     blob_db_ = nullptr;
-    Open(bdb_options, options);
+    Open(bdb_options, std::move(options));
   }
 
   void Close() {
@@ -539,6 +541,7 @@ TEST_F(BlobDBTest, MultipleWriters) {
 
   std::vector<port::Thread> workers;
   std::vector<std::map<std::string, std::string>> data_set(10);
+  workers.reserve(10);
   for (uint32_t i = 0; i < 10; i++) {
     workers.emplace_back(
         [&](uint32_t id) {
@@ -958,6 +961,156 @@ TEST_F(BlobDBTest, OutOfSpace) {
   ASSERT_TRUE(s.IsNoSpace());
 }
 
+namespace {
+class BlobDBMergeOrderFilter : public CompactionFilter {
+ public:
+  explicit BlobDBMergeOrderFilter(MergeOrder order) : order_(order) {}
+  MergeOrder GetMergeOrder() const override { return order_; }
+  const char* Name() const override { return "BlobDBMergeOrderFilter"; }
+  Decision FilterV2(int /*level*/, const Slice& key, ValueType /*type*/,
+                    const Slice& /*value*/, std::string* /*new_value*/,
+                    std::string* /*skip_until*/) const override {
+    calls.fetch_add(1);
+    return key == "drop" ? Decision::kPurge : Decision::kKeep;
+  }
+  mutable std::atomic<uint64_t> calls{0};
+
+ private:
+  const MergeOrder order_;
+};
+
+class BlobDBMergeOrderFactory : public CompactionFilterFactory {
+ public:
+  explicit BlobDBMergeOrderFactory(CompactionFilter::MergeOrder order)
+      : instance_order(order), order_(order) {}
+  CompactionFilter::MergeOrder GetMergeOrder() const override { return order_; }
+  const char* Name() const override { return "BlobDBMergeOrderFactory"; }
+  std::unique_ptr<CompactionFilter> CreateCompactionFilter(
+      const CompactionFilter::Context& /*context*/) override {
+    creations.fetch_add(1);
+    return std::make_unique<BlobDBMergeOrderFilter>(instance_order);
+  }
+  CompactionFilter::MergeOrder instance_order;
+  std::atomic<uint64_t> creations{0};
+
+ private:
+  const CompactionFilter::MergeOrder order_;
+};
+}  // namespace
+
+TEST_F(BlobDBTest, MergeBeforeFilterRealStackedOpen) {
+  using Order = CompactionFilter::MergeOrder;
+  const Order legacy = Order::kFilterBeforeMerge;
+  const Order post = Order::kMergeBeforeFilter;
+  struct Case {
+    Order direct_order;
+    Order factory_order;
+    bool direct;
+    bool factory;
+    bool not_supported;
+  };
+  const Case cases[] = {
+      {legacy, legacy, false, false, false},
+      {legacy, legacy, true, false, false},
+      {legacy, legacy, false, true, false},
+      {post, legacy, true, false, true},
+      {legacy, post, false, true, true},
+      {post, legacy, true, true, true},
+      {legacy, post, true, true, false},
+  };
+  for (bool gc : {false, true}) {
+    for (const Case& c : cases) {
+      SCOPED_TRACE(gc);
+      SCOPED_TRACE(testing::PrintToString(c.direct_order));
+      SCOPED_TRACE(testing::PrintToString(c.factory_order));
+      BlobDBMergeOrderFilter direct(c.direct_order);
+      auto factory = std::make_shared<BlobDBMergeOrderFactory>(c.factory_order);
+      BlobDBOptions bdb_options;
+      bdb_options.disable_background_tasks = true;
+      bdb_options.enable_garbage_collection = gc;
+      Options options;
+      options.disable_auto_compactions = true;
+      options.compaction_filter = c.direct ? &direct : nullptr;
+      options.compaction_filter_factory = c.factory ? factory : nullptr;
+      Status s = TryOpen(bdb_options, options);
+      if (c.not_supported) {
+        ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+        ASSERT_EQ(nullptr, blob_db_);
+        ASSERT_TRUE(Env::Default()->FileExists(dbname_).IsNotFound());
+        ASSERT_EQ(0, direct.calls.load());
+        ASSERT_EQ(0, factory->creations.load());
+        continue;
+      }
+      ASSERT_OK(s);
+      ASSERT_OK(Put("a", "older"));
+      ASSERT_OK(Put("keep", "older"));
+      ASSERT_OK(blob_db_->Flush(FlushOptions()));
+      CompactRangeOptions move;
+      move.change_level = true;
+      move.target_level = 2;
+      ASSERT_OK(blob_db_->CompactRange(move, nullptr, nullptr));
+      ASSERT_OK(Put("drop", "value"));
+      ASSERT_OK(Put("keep", "value"));
+      ASSERT_OK(blob_db_->Flush(FlushOptions()));
+      std::vector<LiveFileMetaData> files;
+      blob_db_->GetRootDB()->GetLiveFilesMetaData(&files);
+      std::vector<std::string> inputs;
+      for (const auto& file : files) {
+        if (file.level == 0) {
+          inputs.push_back(file.relative_filename);
+        }
+      }
+      ASSERT_FALSE(inputs.empty());
+      ASSERT_OK(
+          blob_db_->GetRootDB()->CompactFiles(CompactionOptions(), inputs, 1));
+      if (c.direct || c.factory) {
+        VerifyDB({{"a", "older"}, {"keep", "value"}});
+        std::vector<KeyVersion> versions;
+        ASSERT_OK(GetAllKeyVersions(blob_db_->GetRootDB(), "drop", "droq", 10,
+                                    &versions));
+        ASSERT_EQ(1, versions.size());
+        ASSERT_EQ(kTypeSingleDeletion, versions.front().type);
+      } else {
+        VerifyDB({{"a", "older"}, {"drop", "value"}, {"keep", "value"}});
+      }
+      if (c.direct) {
+        ASSERT_GT(direct.calls.load(), 0);
+      }
+      Destroy();
+    }
+  }
+}
+
+TEST_F(BlobDBTest, MergeBeforeFilterRealStackedRuntimeMismatch) {
+  for (bool gc : {false, true}) {
+    SCOPED_TRACE(gc);
+    auto factory = std::make_shared<BlobDBMergeOrderFactory>(
+        CompactionFilter::MergeOrder::kFilterBeforeMerge);
+    factory->instance_order = CompactionFilter::MergeOrder::kMergeBeforeFilter;
+    BlobDBOptions bdb_options;
+    bdb_options.disable_background_tasks = true;
+    bdb_options.enable_garbage_collection = gc;
+    Options options;
+    options.disable_auto_compactions = true;
+    options.compaction_filter_factory = factory;
+    Open(bdb_options, options);
+    ASSERT_OK(Put("drop", "value"));
+    ASSERT_OK(blob_db_->Flush(FlushOptions()));
+    std::vector<LiveFileMetaData> before;
+    blob_db_->GetRootDB()->GetLiveFilesMetaData(&before);
+    ASSERT_TRUE(blob_db_->CompactRange(CompactRangeOptions(), nullptr, nullptr)
+                    .IsInvalidArgument());
+    std::vector<LiveFileMetaData> after;
+    blob_db_->GetRootDB()->GetLiveFilesMetaData(&after);
+    ASSERT_EQ(before.size(), after.size());
+    for (size_t i = 0; i < before.size(); ++i) {
+      ASSERT_EQ(before[i].file_number, after[i].file_number);
+    }
+    VerifyDB({{"drop", "value"}});
+    Destroy();
+  }
+}
+
 TEST_F(BlobDBTest, UserCompactionFilter) {
   class CustomerFilter : public CompactionFilter {
    public:
@@ -1007,7 +1160,8 @@ TEST_F(BlobDBTest, UserCompactionFilter) {
     if (case_num == 0) {
       options.compaction_filter = new CustomerFilter();
     } else {
-      options.compaction_filter_factory.reset(new CustomerFilterFactory());
+      options.compaction_filter_factory =
+          std::make_shared<CustomerFilterFactory>();
     }
     options.disable_auto_compactions = true;
     options.env = mock_env_.get();
@@ -1059,7 +1213,7 @@ TEST_F(BlobDBTest, UserCompactionFilter) {
 }
 
 // Test user comapction filter when there is IO error on blob data.
-TEST_F(BlobDBTest, UserCompactionFilter_BlobIOError) {
+TEST_F(BlobDBTest, UserCompactionFilterBlobIOError) {
   class CustomerFilter : public CompactionFilter {
    public:
     bool Filter(int /*level*/, const Slice& /*key*/, const Slice& value,
@@ -1468,7 +1622,7 @@ TEST_F(BlobDBTest, EvictExpiredFile) {
   ASSERT_OK(PutWithTTL("foo", "bar", 100, &data));
   auto blob_files = blob_db_impl()->TEST_GetBlobFiles();
   ASSERT_EQ(1, blob_files.size());
-  auto blob_file = blob_files[0];
+  const auto& blob_file = blob_files[0];
   ASSERT_FALSE(blob_file->Immutable());
   ASSERT_FALSE(blob_file->Obsolete());
   VerifyDB(data);
@@ -1829,7 +1983,7 @@ TEST_F(BlobDBTest, ShutdownWait) {
   ASSERT_OK(PutWithTTL("foo", "bar", 100, &data));
   auto blob_files = blob_db_impl()->TEST_GetBlobFiles();
   ASSERT_EQ(1, blob_files.size());
-  auto blob_file = blob_files[0];
+  const auto& blob_file = blob_files[0];
   ASSERT_FALSE(blob_file->Immutable());
   ASSERT_FALSE(blob_file->Obsolete());
   VerifyDB(data);

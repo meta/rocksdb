@@ -517,8 +517,8 @@ class InternalStats {
     size_t table_size = 0;
     size_t occupancy = 0;
     std::string cache_id;
-    std::array<uint64_t, kNumCacheEntryRoles> total_charges;
-    std::array<size_t, kNumCacheEntryRoles> entry_counts;
+    std::array<uint64_t, kNumCacheEntryRoles> total_charges{};
+    std::array<size_t, kNumCacheEntryRoles> entry_counts{};
     uint32_t collection_count = 0;
     uint32_t copies_of_last_collection = 0;
     uint64_t last_start_time_micros_ = 0;
@@ -856,6 +856,8 @@ class InternalStats {
                                    Version* version);
   bool HandleNumRunningRemoteCompactions(uint64_t* value, DBImpl* db,
                                          Version* version);
+  bool HandleNumRemoteCompactionPoolThreads(uint64_t* value, DBImpl* db,
+                                            Version* version);
   bool HandleNumRunningBottomCompactions(uint64_t* value, DBImpl* db,
                                          Version* version);
   bool HandleNumRunningCompactionSortedRuns(uint64_t* value, DBImpl* db,
@@ -904,6 +906,8 @@ class InternalStats {
   bool HandleActualDelayedWriteRate(uint64_t* value, DBImpl* db,
                                     Version* version);
   bool HandleIsWriteStopped(uint64_t* value, DBImpl* db, Version* version);
+  bool HandleSecondaryHasMissingFiles(uint64_t* value, DBImpl* db,
+                                      Version* version);
   bool HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* db,
                                    Version* version);
   bool HandleBlockCacheCapacity(uint64_t* value, DBImpl* db, Version* version);

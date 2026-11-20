@@ -1554,6 +1554,10 @@ rocksdb_compactionjobinfo_thread_id(const rocksdb_compactionjobinfo_t* info);
 extern ROCKSDB_LIBRARY_API int rocksdb_compactionjobinfo_job_id(
     const rocksdb_compactionjobinfo_t* info);
 
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_compactionjobinfo_separate_remote_compaction_pool_selected(
+    const rocksdb_compactionjobinfo_t* info);
+
 extern ROCKSDB_LIBRARY_API int rocksdb_compactionjobinfo_num_l0_files(
     const rocksdb_compactionjobinfo_t* info);
 
@@ -1591,6 +1595,10 @@ extern ROCKSDB_LIBRARY_API uint64_t rocksdb_subcompactionjobinfo_thread_id(
     const rocksdb_subcompactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API int rocksdb_subcompactionjobinfo_job_id(
+    const rocksdb_subcompactionjobinfo_t* info);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_subcompactionjobinfo_separate_remote_compaction_pool_selected(
     const rocksdb_subcompactionjobinfo_t* info);
 
 extern ROCKSDB_LIBRARY_API int
@@ -2098,6 +2106,13 @@ extern ROCKSDB_LIBRARY_API uint64_t
 rocksdb_blob_file_garbage_info_garbage_blob_bytes(
     const rocksdb_blob_file_garbage_info_t* info);
 // END generated: c_generated_metadata_structs_auto.h.inc
+/* Compatibility aliases for the captured compaction pool selection. */
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_compactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_compactionjobinfo_t* info);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_subcompactionjobinfo_use_separate_remote_compaction_pool(
+    const rocksdb_subcompactionjobinfo_t* info);
 extern ROCKSDB_LIBRARY_API rocksdb_compactionjobinfo_t*
 rocksdb_compactionjobinfo_create(void);
 extern ROCKSDB_LIBRARY_API void rocksdb_compactionjobinfo_destroy(
@@ -2111,6 +2126,14 @@ rocksdb_table_properties_has_key_largest_seqno(
     const rocksdb_table_properties_t* props);
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_table_properties_has_key_smallest_seqno(
+    const rocksdb_table_properties_t* props);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_table_properties_has_referenced_blob_bytes(
+    const rocksdb_table_properties_t* props);
+/* Returns zero when the property is unknown; use the has accessor to
+ * distinguish unknown from a known zero value. */
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_table_properties_referenced_blob_bytes(
     const rocksdb_table_properties_t* props);
 extern ROCKSDB_LIBRARY_API size_t
 rocksdb_table_properties_user_collected_properties_count(
@@ -4498,6 +4521,20 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_multi_get_cf(
     size_t num_keys, const char* const* keys_list,
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_batched_multi_get_cf(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_transactiondb_batched_multi_get_cf_slice(
+    rocksdb_transactiondb_t* txn_db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input);
+
 // BEGIN generated: c_generated_transactiondb_subset.h.inc
 // @generated
 // -----------------------------------------------------------------------------
@@ -5309,6 +5346,12 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_best_efforts_recovery(
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_options_get_best_efforts_recovery(rocksdb_options_t* opt);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_best_efforts_blob_db_repair(
+    rocksdb_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_best_efforts_blob_db_repair(rocksdb_options_t* opt);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_max_bgerror_resume_count(
     rocksdb_options_t* opt, int v);
 
@@ -5333,6 +5376,13 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_db_host_id(
 
 extern ROCKSDB_LIBRARY_API const char* rocksdb_options_get_db_host_id(
     rocksdb_options_t* opt, size_t* size);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_use_separate_remote_compaction_pool(rocksdb_options_t* opt,
+                                                        unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_use_separate_remote_compaction_pool(rocksdb_options_t* opt);
 
 extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_remote_compaction_manifest_floor(rocksdb_options_t* opt,
@@ -5858,6 +5908,14 @@ rocksdb_compaction_options_get_allow_trivial_move(
 /* CompactRangeOptions */
 
 extern ROCKSDB_LIBRARY_API void
+rocksdb_compactoptions_set_skip_missing_blob_files(
+    rocksdb_compactoptions_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_compactoptions_get_skip_missing_blob_files(
+    rocksdb_compactoptions_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
 rocksdb_compactoptions_set_blob_garbage_collection_policy(
     rocksdb_compactoptions_t* opt, int v);
 
@@ -5971,6 +6029,14 @@ extern ROCKSDB_LIBRARY_API int
 rocksdb_ingestexternalfileoptions_get_file_opening_threads(
     rocksdb_ingestexternalfileoptions_t* opt);
 
+extern ROCKSDB_LIBRARY_API void
+rocksdb_ingestexternalfileoptions_set_reject_too_old_file(
+    rocksdb_ingestexternalfileoptions_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_ingestexternalfileoptions_get_reject_too_old_file(
+    rocksdb_ingestexternalfileoptions_t* opt);
+
 /* OpenAndCompactOptions */
 
 extern ROCKSDB_LIBRARY_API void
@@ -5989,6 +6055,14 @@ rocksdb_open_and_compact_options_get_allow_resumption(
 
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_import_column_family_options_get_move_files(
+    rocksdb_import_column_family_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_import_column_family_options_set_reject_too_old_file(
+    rocksdb_import_column_family_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_import_column_family_options_get_reject_too_old_file(
     rocksdb_import_column_family_options_t* opt);
 
 /* SizeApproximationOptions */
@@ -6023,6 +6097,14 @@ rocksdb_size_approximation_options_set_files_size_error_margin(
 
 extern ROCKSDB_LIBRARY_API double
 rocksdb_size_approximation_options_get_files_size_error_margin(
+    rocksdb_size_approximation_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_size_approximation_options_set_allow_expensive_query(
+    rocksdb_size_approximation_options_t* opt, unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_size_approximation_options_get_allow_expensive_query(
     rocksdb_size_approximation_options_t* opt);
 
 /* LiveFilesStorageInfoOptions */

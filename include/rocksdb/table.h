@@ -37,6 +37,8 @@ class FilterPolicy;
 class FlushBlockPolicyFactory;
 class PersistentCache;
 class RandomAccessFile;
+class FSRandomAccessFile;
+struct IOOptions;
 struct TableReaderOptions;
 struct TableBuilderOptions;
 class TableBuilder;
@@ -68,8 +70,10 @@ class IndexFactory;
 // preserve provider-backed block ownership.
 //
 // Requirements:
-// - If the same provider instance is shared by multiple concurrently active
-//   readers, `Allocate()` must be safe to call concurrently.
+// - `Allocate()` must be safe to call concurrently if the same provider is
+//   shared by multiple active readers or if parallel block decompression is
+//   enabled. Parallel decompression may call `Allocate()` concurrently from
+//   multiple block-materialization workers for one reader.
 // - `Lease::data` must point to at least `size` bytes of writable contiguous
 //   memory that remains valid until every copy of `Lease::cleanup` is reset.
 // - `Lease::data` must be aligned to `alignment` bytes, where `alignment` is a
@@ -500,7 +504,32 @@ struct BlockBasedTableOptions {
   // (iii) Compatible existing behavior:
   // Same as kDisabled.
   //
-  // (e) Other CacheEntryRole
+  // (e) CacheEntryRole::kReadaheadBuffer
+  // (i) If kEnabled:
+  // Charge memory usage of the readahead (prefetch) buffers that RocksDB
+  // allocates when reading block-based table files, e.g. for iterator and
+  // compaction readahead. Readahead done by the file system instead (e.g.
+  // compaction readahead with buffered reads on a file system that supports
+  // prefetch) allocates no such buffer and is not charged.
+  // Charging is best effort: if such memory exceeds the available space left in
+  // the block cache at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), that memory is not
+  // charged and the read continues.
+  // To keep charging cheap when many threads allocate and free buffers, the
+  // charge is not exact: it can be up to about 4/3 of the buffer memory, or
+  // the buffer memory plus 256KB, and after it grows it is not reduced for
+  // about 1 second, and after that only when a buffer is freed. So if
+  // readahead stops (e.g. a burst of scans followed by only point lookups),
+  // the charge can stay at its recent peak.
+  // Like other charged memory, charged space is not available for other cache
+  // entries, so with `strict_capacity_limit` = true it can make other block
+  // cache insertions fail with Status::MemoryLimit().
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kDisabled.
+  //
+  // (f) Other CacheEntryRole
   // Not supported.
   // `Status::kNotSupported` will be returned if
   // `CacheEntryRoleOptions::charged` is set to {`kEnabled`, `kDisabled`}.
@@ -1221,6 +1250,9 @@ TableFactory* NewCuckooTableFactory(
 
 class RandomAccessFileReader;
 
+// Returns a non-owning public view of the file passed to NewTableReader().
+FSRandomAccessFile* AsFSRandomAccessFile(RandomAccessFileReader* reader);
+
 // A base class for table factories.
 class TableFactory : public Customizable {
  public:
@@ -1235,6 +1267,15 @@ class TableFactory : public Customizable {
                                  std::shared_ptr<TableFactory>* factory);
 
   static const char* Type() { return "TableFactory"; }
+
+  // Recognizes this factory's table format without taking ownership of file.
+  // On OK, matches reports recognition. I/O failures are returned as Status.
+  virtual Status FileIsValidTable(const IOOptions& /*io_options*/,
+                                  FSRandomAccessFile& /*file*/,
+                                  uint64_t /*file_size*/,
+                                  bool* /*matches*/) const {
+    return Status::NotSupported("Table format probing is unsupported");
+  }
 
   // Returns a Table object table that can fetch data from file specified
   // in parameter file. It's the caller's responsibility to make sure
@@ -1300,6 +1341,12 @@ class TableFactory : public Customizable {
 
   // Return is delete range supported
   virtual bool IsDeleteRangeSupported() const { return false; }
+
+  // Returns whether NewTableBuilder() can write tables. A column family whose
+  // table factory returns false holds only ingested or imported files: it must
+  // set disallow_memtable_writes, automatic compactions are not scheduled for
+  // it, and CompactRange() and CompactFiles() on it return NotSupported.
+  virtual bool IsTableBuilderSupported() const { return true; }
 };
 
 // Create a special table factory that can open either of the supported

@@ -53,6 +53,7 @@ class Arena;
 class CompactionState;
 class ErrorHandler;
 class MemTable;
+class MissingBlobRepairIterator;
 class SnapshotChecker;
 class SystemClock;
 class TableCache;
@@ -173,6 +174,20 @@ class CompactionJob {
 
   virtual ~CompactionJob();
 
+  using RemoteCompactionExecutor = std::function<void(std::function<void()>)>;
+  using LocalCompactionExecutor =
+      std::function<Status(std::function<void()>, Env::Priority)>;
+
+  // Set before Prepare(). Remote submissions are asynchronous: returning
+  // accepts the task exactly once, and throwing must leave it unsubmitted.
+  // Local execution blocks until the task finishes or is canceled. Both
+  // executors must outlive Run(). Service workers leave these unset.
+  void SetCompactionExecutors(RemoteCompactionExecutor remote_executor,
+                              LocalCompactionExecutor local_executor) {
+    remote_compaction_executor_ = std::move(remote_executor);
+    local_compaction_executor_ = std::move(local_executor);
+  }
+
   // no copy/move
   CompactionJob(CompactionJob&& job) = delete;
   CompactionJob(const CompactionJob& job) = delete;
@@ -225,6 +240,7 @@ class CompactionJob {
 
   // Iterate through input and compact the kv-pairs.
   void ProcessKeyValueCompaction(SubcompactionState* sub_compact);
+  void ProcessLocalKeyValueCompaction(SubcompactionState* sub_compact);
 
   CompactionState* compact_;
   InternalStats::CompactionStatsFull internal_stats_;
@@ -333,7 +349,8 @@ class CompactionJob {
                              uint64_t num_input_range_del);
 
   CompactionServiceJobStatus ProcessKeyValueCompactionWithCompactionService(
-      SubcompactionState* sub_compact);
+      SubcompactionState* sub_compact,
+      CompactionFilter::MergeOrder merge_order);
 
   struct CompactionIOStatsSnapshot {
     PerfLevel prev_perf_level = PerfLevel::kEnableTime;
@@ -379,6 +396,7 @@ class CompactionJob {
     std::unique_ptr<InternalIterator> clip;
     std::unique_ptr<BlobCountingIterator> blob_counter;
     std::unique_ptr<InternalIterator> trim_history_iter;
+    std::unique_ptr<MissingBlobRepairIterator> missing_blob_repair;
   };
 
   bool ShouldUseLocalCompaction(SubcompactionState* sub_compact);
@@ -387,7 +405,8 @@ class CompactionJob {
       SubcompactionState* sub_compact,
       const CompactionFilter* configured_compaction_filter,
       const CompactionFilter*& compaction_filter,
-      std::unique_ptr<CompactionFilter>& compaction_filter_from_factory);
+      std::unique_ptr<CompactionFilter>& compaction_filter_from_factory,
+      CompactionFilter::MergeOrder& merge_order);
   void InitializeReadOptionsAndBoundaries(
       size_t ts_sz, ReadOptions& read_options,
       SubcompactionKeyBoundaries& boundaries);
@@ -426,7 +445,8 @@ class CompactionJob {
                                        InternalIterator* input_iter,
                                        CompactionIterator* c_iter,
                                        Status status);
-  Status CleanupCompactionFiles(SubcompactionState* sub_compact, Status status,
+  Status CleanupCompactionFiles(SubcompactionState* sub_compact,
+                                const Status& status,
                                 const CompactionFileOpenFunc& open_file_func,
                                 const CompactionFileCloseFunc& close_file_func);
   Status FinalizeBlobFiles(SubcompactionState* sub_compact,
@@ -441,8 +461,8 @@ class CompactionJob {
                              uint64_t prev_cpu_micros,
                              const CompactionIOStatsSnapshot& io_stats);
 
-  // update the thread status for starting a compaction.
   void ReportStartedCompaction(Compaction* compaction);
+  void InitializeThreadStatus();
 
   Status FinishCompactionOutputFile(
       const Status& input_status,
@@ -521,6 +541,8 @@ class CompactionJob {
   // has no owning DBImpl to report to (compaction service workers, unit tests).
   // Updated without the DB mutex held.
   std::atomic<int>* num_running_remote_compactions_;
+  RemoteCompactionExecutor remote_compaction_executor_;
+  LocalCompactionExecutor local_compaction_executor_;
 
   // Stores the sequence number to time mapping gathered from all input files
   // it also collects the smallest_seqno -> oldest_ancestor_time from the SST.
@@ -577,6 +599,14 @@ class CompactionJob {
   // True if this job builds output files as a remote (offloaded)
   // CompactionService worker. Overridden by CompactionServiceCompactionJob.
   virtual bool IsRemoteCompaction() const { return false; }
+  // Checks the actual filter order against what the job requires before any
+  // input is processed. A remote worker compares it with the primary's
+  // request and records the acknowledgment or decline in its result.
+  virtual Status ValidateCompactionFilterMergeOrder(
+      const CompactionFilter* /*compaction_filter*/,
+      CompactionFilter::MergeOrder /*merge_order*/) {
+    return Status::OK();
+  }
   // The rate limiter priority (io_priority) is determined dynamically here.
   // The Compaction Read and Write priorities are the same for different
   // scenarios, such as write stalled.
@@ -590,7 +620,7 @@ class CompactionJob {
       const ReadOptions& read_options,
       std::vector<std::shared_ptr<const TableProperties>>&
           output_files_table_properties,
-      bool is_proximal_level = false);
+      bool is_proximal_level);
 
   Status ReadTablePropertiesDirectly(
       const ImmutableOptions& ioptions, const MutableCFOptions& moptions,
@@ -634,6 +664,7 @@ class CompactionJob {
 // Zero means the worker did not advertise support.
 constexpr uint64_t kCompactionServiceBlobVersion = 1;
 constexpr uint64_t kCompactionServiceBlobGCCutoffVersion = 1;
+constexpr uint64_t kCompactionServiceMergeBeforeFilterVersion = 1;
 
 // CompactionServiceInput is used the pass compaction information between two
 // db instances. It contains the information needed to do a compaction. It
@@ -641,6 +672,11 @@ constexpr uint64_t kCompactionServiceBlobGCCutoffVersion = 1;
 // file.
 struct CompactionServiceInput {
   std::string cf_name;
+
+  // Requests merge-before-filter. Old workers ignore this field and return no
+  // applied-order acknowledgment, so the primary falls back to local compaction
+  // before importing their output.
+  bool merge_before_filter = false;
 
   // Snapshot sequence numbers in strictly increasing order.
   std::vector<SequenceNumber> snapshots;
@@ -719,7 +755,9 @@ struct CompactionServiceInput {
 #endif  // NDEBUG
 };
 
-// CompactionServiceOutputFile is the metadata for the output SST file
+// CompactionServiceOutputFile is the metadata for the output SST file. Parsing
+// a serialized result sets only the fields present in it, so every member
+// needs a default value.
 struct CompactionServiceOutputFile {
   std::string file_name;
   uint64_t file_size{};
@@ -734,10 +772,10 @@ struct CompactionServiceOutputFile {
   std::string file_checksum = kUnknownFileChecksum;
   std::string file_checksum_func_name = kUnknownFileChecksumFuncName;
   uint64_t paranoid_hash{};
-  bool marked_for_compaction;
+  bool marked_for_compaction = false;
   UniqueId64x2 unique_id{};
   TableProperties table_properties;
-  bool is_proximal_level_output;
+  bool is_proximal_level_output = false;
   Temperature file_temperature = Temperature::kUnknown;
 
   CompactionServiceOutputFile() = default;
@@ -776,6 +814,10 @@ struct CompactionServiceOutputFile {
 // permission is able to install the result to the DB.
 struct CompactionServiceResult {
   Status status;
+  // Nonzero only after validating the actual worker filter/factory order.
+  uint64_t merge_before_filter_version = 0;
+  // The worker declined an order mismatch before processing input records.
+  bool merge_order_mismatch = false;
   std::vector<CompactionServiceOutputFile> output_files;
 
   // Blob metadata generated by the remote compaction. Blob file additions
@@ -865,6 +907,9 @@ class CompactionServiceCompactionJob : private CompactionJob {
   std::optional<uint64_t> GetBlobGarbageCollectionCutoffFileNumber()
       const override;
   bool IsRemoteCompaction() const override { return true; }
+  Status ValidateCompactionFilterMergeOrder(
+      const CompactionFilter* compaction_filter,
+      CompactionFilter::MergeOrder merge_order) override;
   // Specific the compaction output path, otherwise it uses default DB path
   const std::string output_path_;
 

@@ -173,7 +173,7 @@ void ObjectLibrary::GetFactoryNames(const std::string& type,
   auto iter = factories_.find(type);
   if (iter != factories_.end()) {
     for (const auto& f : iter->second) {
-      names->push_back(f->Name());
+      names->emplace_back(f->Name());
     }
   }
 }

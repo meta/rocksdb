@@ -178,7 +178,7 @@ static void DBOpen(benchmark::State& state) {
 
   auto rnd = Random(123);
 
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     {
       Status s = DB::Open(options, db_name, &db);
       if (!s.ok()) {
@@ -225,7 +225,7 @@ static void DBClose(benchmark::State& state) {
 
   auto rnd = Random(12345);
 
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     state.PauseTiming();
     {
       Status s = DB::Open(options, db_name, &db);
@@ -285,7 +285,7 @@ static void DBPut(benchmark::State& state) {
   auto wo = WriteOptions();
   wo.disableWAL = !enable_wal;
 
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     state.PauseTiming();
     Slice key = kg.Next();
     std::string val = rnd.RandomString(static_cast<int>(per_key_size));
@@ -396,7 +396,7 @@ static void ManualCompaction(benchmark::State& state) {
   get_perf_context()->EnablePerLevelPerfContext();
   get_perf_context()->Reset();
   CompactionOptions co;
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     s = db->CompactFiles(co, files_before_compact, 1);
     if (!s.ok()) {
       state.SkipWithError(s.ToString().c_str());
@@ -489,7 +489,7 @@ static void ManualFlush(benchmark::State& state) {
   }
 
   auto wo = WriteOptions();
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     state.PauseTiming();
     for (uint64_t i = 0; i < key_num; i++) {
       Status s = db->Put(wo, kg.Next(),
@@ -630,7 +630,7 @@ static void DBGet(benchmark::State& state) {
   }
   size_t not_found = 0;
   if (negative_query) {
-    for (auto _ : state) {
+    for ([[maybe_unused]] auto _ : state) {
       std::string val;
       Status s = db->Get(ro, kg_rnd.NextNonExist(), &val);
       if (s.IsNotFound()) {
@@ -638,7 +638,7 @@ static void DBGet(benchmark::State& state) {
       }
     }
   } else {
-    for (auto _ : state) {
+    for ([[maybe_unused]] auto _ : state) {
       std::string val;
       Status s = db->Get(ro, kg_rnd.Next(), &val);
       if (s.IsNotFound()) {
@@ -765,7 +765,7 @@ static void SimpleGetWithPerfContext(benchmark::State& state) {
   uint64_t get_from_table_nanos = 0;
   SetPerfLevel(kEnableTime);
   get_perf_context()->EnablePerLevelPerfContext();
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     std::string val;
     get_perf_context()->Reset();
     Status s = db->Get(ro, kg.NextNonExist(), &val);
@@ -868,7 +868,7 @@ static void DBGetMergeOperandsInMemtable(benchmark::State& state) {
   GetMergeOperandsOptions get_merge_ops_opts;
   get_merge_ops_opts.expected_max_number_of_operands =
       static_cast<int>(kNumEntriesPerKey);
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     int num_value_operands = 0;
     Status s = db->GetMergeOperands(
         ReadOptions(), db->DefaultColumnFamily(), random_key_gen.Next(),
@@ -966,7 +966,7 @@ static void DBGetMergeOperandsInSstFile(benchmark::State& state) {
   GetMergeOperandsOptions get_merge_ops_opts;
   get_merge_ops_opts.expected_max_number_of_operands =
       static_cast<int>(kNumEntriesPerKey);
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     int num_value_operands = 0;
     ReadOptions read_opts;
     read_opts.verify_checksums = false;
@@ -1083,7 +1083,7 @@ static void DataBlockSeek(benchmark::State& state) {
 
   SetPerfLevel(kEnableTime);
   uint64_t total = 0;
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     DataBlockIter* iter = reader.NewDataIterator(options.comparator,
                                                  kDisableGlobalSequenceNumber);
     uint32_t index = rnd.Uniform(static_cast<int>(num_records));
@@ -1157,7 +1157,7 @@ static void IteratorSeek(benchmark::State& state) {
     }
   }
 
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     std::unique_ptr<Iterator> iter{nullptr};
     state.PauseTiming();
     if (!iter) {
@@ -1248,7 +1248,7 @@ static void IteratorNext(benchmark::State& state) {
     }
   }
 
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     std::unique_ptr<Iterator> iter{nullptr};
     state.PauseTiming();
     if (!iter) {
@@ -1325,7 +1325,7 @@ static void IteratorNextWithPerfContext(benchmark::State& state) {
   SetPerfLevel(kEnableTime);
   get_perf_context()->EnablePerLevelPerfContext();
 
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     std::unique_ptr<Iterator> iter{nullptr};
     state.PauseTiming();
     if (!iter) {
@@ -1410,7 +1410,7 @@ static void IteratorPrev(benchmark::State& state) {
     }
   }
 
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     std::unique_ptr<Iterator> iter{nullptr};
     state.PauseTiming();
     if (!iter) {
@@ -1502,7 +1502,7 @@ static void PrefixSeek(benchmark::State& state) {
     }
   }
 
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     std::unique_ptr<Iterator> iter{nullptr};
     state.PauseTiming();
     if (!iter) {
@@ -1591,7 +1591,7 @@ static void RandomAccessFileReaderRead(benchmark::State& state) {
   std::unique_ptr<char[]> scratch(new char[2048]);
   Slice result;
   uint64_t idx = 0;
-  for (auto _ : state) {
+  for ([[maybe_unused]] auto _ : state) {
     s = readers[idx++ % kFileNum]->Read(0, kDefaultPageSize / 3, io_options,
                                         &result, scratch.get(), nullptr);
     if (!s.ok()) {

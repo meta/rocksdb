@@ -16,6 +16,7 @@
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_compression.h"
+#include "rocksdb/c.h"
 #include "rocksdb/db.h"
 #include "rocksdb/sst_file_reader.h"
 #include "rocksdb/sst_file_writer.h"
@@ -29,6 +30,14 @@
 #include "test_util/testutil.h"
 #include "util/atomic.h"
 #include "util/random.h"
+
+using ROCKSDB_NAMESPACE::TableProperties;
+
+extern "C" {
+struct rocksdb_table_properties_t {
+  TableProperties rep;
+};
+}
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -100,6 +109,18 @@ class DBTablePropertiesTest : public DBTestBase,
   DBTablePropertiesTest()
       : DBTestBase("db_table_properties_test", /*env_do_fsync=*/false) {}
 };
+
+TEST(TablePropertiesCApiTest, ReferencedBlobBytesPreservesUnknownAndKnownZero) {
+  rocksdb_table_properties_t properties;
+
+  ASSERT_FALSE(properties.rep.referenced_blob_bytes.has_value());
+  ASSERT_EQ(rocksdb_table_properties_has_referenced_blob_bytes(&properties), 0);
+  ASSERT_EQ(rocksdb_table_properties_referenced_blob_bytes(&properties), 0U);
+
+  properties.rep.referenced_blob_bytes = 0;
+  ASSERT_EQ(rocksdb_table_properties_has_referenced_blob_bytes(&properties), 1);
+  ASSERT_EQ(rocksdb_table_properties_referenced_blob_bytes(&properties), 0U);
+}
 
 TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
   Options options = CurrentOptions();
@@ -199,6 +220,30 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfAllTablesTest) {
   }
 
   SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBTablePropertiesTest,
+       ReferencedBlobBytesPresenceIsBlockBasedBuilderOwned) {
+  auto verify = [&](std::shared_ptr<TableFactory> table_factory,
+                    bool expected_presence) {
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.table_factory = std::move(table_factory);
+    options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+    DestroyAndReopen(options);
+
+    ASSERT_OK(Put("key", "value"));
+    ASSERT_OK(Flush());
+
+    TablePropertiesCollection properties;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+    ASSERT_EQ(properties.size(), 1U);
+    EXPECT_EQ(properties.begin()->second->referenced_blob_bytes.has_value(),
+              expected_presence);
+  };
+
+  verify(std::shared_ptr<TableFactory>(NewBlockBasedTableFactory()), true);
+  verify(std::shared_ptr<TableFactory>(NewPlainTableFactory()), false);
 }
 
 TEST_F(DBTablePropertiesTest, InvalidReportedAsCorruption) {
@@ -487,6 +532,7 @@ TEST_P(DBTablePropertiesInRangeTest, GetPropertiesOfTablesInRange) {
     // the below loop requires that random_keys.size() to be even.
     auto n = 2 * (rnd.Uniform(50) + 1);
 
+    random_keys.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
       random_keys.push_back(test::RandomKey(&rnd, 5));
     }
@@ -994,6 +1040,70 @@ TEST_F(DBTablePropertiesTest, LsmInfoNotApplicableForSstFileWriter) {
   EXPECT_FALSE(info.is_bottommost);
   // uncompressed_data_size is persisted for SstFileWriter files too.
   EXPECT_GT(table_props->uncompressed_data_size, 0U);
+}
+
+TEST_F(DBTablePropertiesTest, FileCreationTimeAlwaysSet) {
+  // file_creation_time is recorded in both table properties and the MANIFEST
+  // for SstFileWriter files, WAL recovery flushes, and after DB repair.
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  int64_t start_time = 0;
+  ASSERT_OK(env_->GetCurrentTime(&start_time));
+
+  std::string file = dbname_ + "/for_ingestion.sst";
+  {
+    // With a column family, so that repair keeps the file
+    SstFileWriter writer(EnvOptions(), options, db_->DefaultColumnFamily());
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("a", "1"));
+    ASSERT_OK(writer.Finish());
+  }
+  IngestExternalFileOptions ifo;
+  ifo.move_files = true;
+  ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+
+  // Left in the WAL to be flushed during recovery
+  ASSERT_OK(Put("b", "2"));
+  Reopen(options);
+
+  auto verify = [&]() {
+    int64_t end_time = 0;
+    ASSERT_OK(env_->GetCurrentTime(&end_time));
+    const uint64_t lo = static_cast<uint64_t>(start_time);
+    const uint64_t hi = static_cast<uint64_t>(end_time);
+
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(props.size(), 2U);
+    for (const auto& p : props) {
+      EXPECT_GE(p.second->file_creation_time, lo) << p.first;
+      EXPECT_LE(p.second->file_creation_time, hi) << p.first;
+    }
+
+    std::vector<std::vector<FileMetaData>> metadata;
+    dbfull()->TEST_GetFilesMetaData(db_->DefaultColumnFamily(), &metadata);
+    size_t num_files = 0;
+    for (const auto& level : metadata) {
+      for (const auto& f : level) {
+        ++num_files;
+        EXPECT_GE(f.file_creation_time, lo) << f.fd.GetNumber();
+        EXPECT_LE(f.file_creation_time, hi) << f.fd.GetNumber();
+      }
+    }
+    ASSERT_EQ(num_files, 2U);
+  };
+  {
+    SCOPED_TRACE("before repair");
+    verify();
+  }
+
+  Close();
+  ASSERT_OK(RepairDB(dbname_, options));
+  Reopen(options);
+  {
+    SCOPED_TRACE("after repair");
+    verify();
+  }
 }
 
 TEST_F(DBTablePropertiesTest, CompressionManagerFullDetailsPersisted) {

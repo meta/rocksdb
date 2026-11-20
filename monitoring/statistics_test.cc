@@ -38,7 +38,7 @@ TEST_F(StatisticsTest, SanityTickers) {
             TickersNameMap.size());
 
   for (uint32_t t = 0; t < Tickers::TICKER_ENUM_MAX; t++) {
-    auto pair = TickersNameMap[static_cast<size_t>(t)];
+    const auto& pair = TickersNameMap[static_cast<size_t>(t)];
     ASSERT_EQ(pair.first, t) << "Miss match at " << pair.second;
   }
 }
@@ -50,7 +50,7 @@ TEST_F(StatisticsTest, SanityHistograms) {
             HistogramsNameMap.size());
 
   for (uint32_t h = 0; h < Histograms::HISTOGRAM_ENUM_MAX; h++) {
-    auto pair = HistogramsNameMap[static_cast<size_t>(h)];
+    const auto& pair = HistogramsNameMap[static_cast<size_t>(h)];
     ASSERT_EQ(pair.first, h) << "Miss match at " << pair.second;
   }
 }
@@ -65,7 +65,8 @@ TEST_F(StatisticsTest, NoNameStats) {
 
   class DefaultNameStatistics : public Statistics {
    public:
-    DefaultNameStatistics(const std::shared_ptr<Statistics>& stats = nullptr)
+    explicit DefaultNameStatistics(
+        const std::shared_ptr<Statistics>& stats = nullptr)
         : inner(stats) {
       RegisterOptions("", &inner, &no_name_opt_info);
     }
@@ -406,11 +407,15 @@ TEST_F(SlowMutexTest, PreservesConstructorStatisticsAccounting) {
   InstrumentedMutex mutex(stats.get(), SystemClock::Default().get(),
                           DB_MUTEX_WAIT_MICROS);
   Configure(&mutex, "constructor_mutex");
-#ifndef NPERF_CONTEXT
+#if !defined(NDEBUG) && !defined(NPERF_CONTEXT)
   const uint64_t before = stats->getTickerCount(DB_MUTEX_WAIT_MICROS);
+  // The ticker is in microseconds, and an uncontended lock can take less
+  // than 1 microsecond. Inject a lock wait so the ticker must grow.
+  ThreadStatusUtil::TEST_SetStateDelay(ThreadStatus::STATE_MUTEX_WAIT, 10);
 #endif
   Hold(&mutex, 200000);
-#ifndef NPERF_CONTEXT
+#if !defined(NDEBUG) && !defined(NPERF_CONTEXT)
+  ThreadStatusUtil::TEST_SetStateDelay(ThreadStatus::STATE_MUTEX_WAIT, 0);
   EXPECT_GT(stats->getTickerCount(DB_MUTEX_WAIT_MICROS), before);
 #endif
   ASSERT_EQ(logger->entries.size(), 1);

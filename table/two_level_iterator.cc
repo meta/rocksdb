@@ -75,11 +75,6 @@ class TwoLevelIndexIterator : public InternalIteratorBase<IndexValue> {
   bool IsValuePinned() const override { return false; }
 
  private:
-  void SaveError(const Status& s) {
-    if (status_.ok() && !s.ok()) {
-      status_ = s;
-    }
-  }
   void SkipEmptyDataBlocksForward();
   void SkipEmptyDataBlocksBackward();
   void SetSecondLevelIterator(InternalIteratorBase<IndexValue>* iter);

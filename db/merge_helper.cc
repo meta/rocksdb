@@ -31,6 +31,7 @@ namespace ROCKSDB_NAMESPACE {
 MergeHelper::MergeHelper(Env* env, const Comparator* user_comparator,
                          const MergeOperator* user_merge_operator,
                          const CompactionFilter* compaction_filter,
+                         CompactionFilter::MergeOrder merge_order,
                          Logger* logger, bool assert_valid_internal_key,
                          SequenceNumber latest_snapshot,
                          const SnapshotChecker* snapshot_checker, int level,
@@ -41,6 +42,7 @@ MergeHelper::MergeHelper(Env* env, const Comparator* user_comparator,
       user_comparator_(user_comparator),
       user_merge_operator_(user_merge_operator),
       compaction_filter_(compaction_filter),
+      merge_order_(merge_order),
       shutting_down_(shutting_down),
       logger_(logger),
       assert_valid_internal_key_(assert_valid_internal_key),
@@ -227,8 +229,7 @@ Status MergeHelper::TimedFullMergeImpl(
         WideColumnsHelper::SortColumns(sorted_columns);
 
         std::string result;
-        const Status s =
-            WideColumnSerialization::Serialize(sorted_columns, result);
+        Status s = WideColumnSerialization::Serialize(sorted_columns, result);
         if (!s.ok()) {
           result_entity->Reset();
           return s;
@@ -292,6 +293,8 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
   keys_.clear();
   merge_context_.Clear();
   has_compaction_filter_skip_until_ = false;
+  outcome_ = Outcome::kUncombined;
+  aggregate_eligible_ = true;
   assert(user_merge_operator_);
   assert(user_comparator_);
   const size_t ts_sz = user_comparator_->timestamp_size();
@@ -405,6 +408,15 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       if (range_del_agg &&
           range_del_agg->ShouldDelete(
               ikey, RangeDelPositioningMode::kForwardTraversal)) {
+        if (ts_sz > 0 && cmp_with_full_history_ts_low >= 0) {
+          // With user-defined timestamps, a base value not eligible for GC can
+          // be neither dropped nor merged in. The tombstone may hide it from
+          // every read (same timestamp, newer sequence number) or only from
+          // reads at newer timestamps, and ShouldDelete() cannot tell which.
+          // Output only the operands and leave iter at the base value, as for
+          // kMustMerge below, so that CompactionIterator writes it separately.
+          return Status::MergeInProgress();
+        }
         s = TimedFullMerge(user_merge_operator_, ikey.user_key, kNoBaseValue,
                            merge_context_.GetOperands(), logger_, stats_,
                            clock_, /* update_num_ops_stats */ false,
@@ -488,6 +500,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       // We store the result in keys_.back() and operands_.back()
       // if nothing went wrong (i.e.: no operand corruption on disk)
       if (s.ok()) {
+        outcome_ = Outcome::kFull;
         // The original key encountered
         original_key = std::move(keys_.back());
 
@@ -528,18 +541,27 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       // it out, no matter what compaction filter says
       // 2) it's not filtered by a compaction filter
       CompactionFilter::Decision filter =
-          ikey.sequence <= latest_snapshot_
+          merge_order_ == CompactionFilter::MergeOrder::kMergeBeforeFilter ||
+                  ikey.sequence <= latest_snapshot_
               ? CompactionFilter::Decision::kKeep
               : FilterMerge(orig_ikey.user_key, value_slice);
       // FIXME: should also check for kRemove here
+      // With user-defined timestamps, drop an operand covered by a range
+      // tombstone only if it is below full_history_ts_low (eligible for GC), as
+      // CompactionIterator does for point keys: a read at a timestamp after the
+      // operand's and before the tombstone's must still see the operand. If
+      // full_history_ts_low is unset, cmp_with_full_history_ts_low stays 0, so
+      // no operand is dropped here.
       if (filter != CompactionFilter::Decision::kRemoveAndSkipUntil &&
           range_del_agg != nullptr &&
+          (ts_sz == 0 || cmp_with_full_history_ts_low < 0) &&
           range_del_agg->ShouldDelete(
               iter->key(), RangeDelPositioningMode::kForwardTraversal)) {
         filter = CompactionFilter::Decision::kRemove;
       }
       if (filter == CompactionFilter::Decision::kKeep ||
           filter == CompactionFilter::Decision::kChangeValue) {
+        aggregate_eligible_ &= OperandEligible(ikey.sequence);
         if (original_key_is_iter) {
           // this is just an optimization that saves us one memcpy
           keys_.emplace_front(original_key);
@@ -630,6 +652,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
                        &merge_result,
                        /* result_operand */ nullptr, &merge_result_type);
     if (s.ok()) {
+      outcome_ = Outcome::kFull;
       // The original key encountered
       // We are certain that keys_ is not empty here (see assertions couple of
       // lines before).
@@ -677,6 +700,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
           s = Status::Corruption("PartialMerge result exceeds 4GB limit");
           return s;
         }
+        outcome_ = Outcome::kPartial;
         merge_context_.Clear();
         merge_context_.PushOperand(merge_result);
         keys_.erase(keys_.begin(), keys_.end() - 1);

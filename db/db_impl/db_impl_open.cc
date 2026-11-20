@@ -6,7 +6,9 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <algorithm>
 #include <cinttypes>
+#include <memory>
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/builder.h"
@@ -74,8 +76,8 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
   }
 
   if (!result.write_buffer_manager) {
-    result.write_buffer_manager.reset(
-        new WriteBufferManager(result.db_write_buffer_size));
+    result.write_buffer_manager =
+        std::make_shared<WriteBufferManager>(result.db_write_buffer_size);
   }
   auto bg_job_limits = DBImpl::GetBGJobLimits(
       result.max_background_flushes, result.max_background_compactions,
@@ -175,7 +177,7 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
     std::vector<std::string> filenames;
     IOOptions io_opts;
     io_opts.do_not_recurse = true;
-    auto wal_dir = immutable_db_options.GetWalDir();
+    const auto& wal_dir = immutable_db_options.GetWalDir();
     Status s = immutable_db_options.fs->GetChildren(
         wal_dir, io_opts, &filenames, /*IODebugContext*=*/nullptr);
     s.PermitUncheckedError();  //**TODO: What to do on error?
@@ -183,7 +185,8 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
       if (filename.find(".log.trash", filename.length() -
                                           std::string(".log.trash").length()) !=
           std::string::npos) {
-        std::string trash_file = wal_dir + "/" + filename;
+        std::string trash_file = wal_dir;
+        trash_file.append("/").append(filename);
         result.env->DeleteFile(trash_file).PermitUncheckedError();
       }
     }
@@ -238,14 +241,23 @@ Status DBImpl::ValidateOptions(
       }
     }
   }
+  if (db_options.best_efforts_blob_db_repair &&
+      std::none_of(column_families.begin(), column_families.end(),
+                   [](const ColumnFamilyDescriptor& cf) {
+                     return cf.options.enable_blob_files;
+                   })) {
+    return Status::InvalidArgument(
+        "best_efforts_blob_db_repair requires enable_blob_files on at least "
+        "one column family");
+  }
   s = ValidateOptions(db_options);
   return s;
 }
 
 Status DBImpl::ValidateOptions(const DBOptions& db_options) {
-  if (db_options.read_io_executor_threads <= 0) {
+  if (db_options.read_io_executor_threads < 0) {
     return Status::InvalidArgument(
-        "read_io_executor_threads must be greater than zero");
+        "read_io_executor_threads must not be negative");
   }
 
   if (db_options.db_paths.size() > 4) {
@@ -300,6 +312,11 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "atomic_flush is incompatible with enable_pipelined_write");
   }
 
+  if (db_options.two_write_queues && db_options.enable_pipelined_write) {
+    return Status::InvalidArgument(
+        "two_write_queues is incompatible with enable_pipelined_write");
+  }
+
   if (db_options.use_direct_io_for_flush_and_compaction &&
       0 == db_options.writable_file_max_buffer_size) {
     return Status::InvalidArgument(
@@ -341,9 +358,12 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
 
   ROCKS_LOG_INFO(immutable_db_options_.info_log, "Creating manifest 1 \n");
   const std::string manifest = DescriptorFileName(dbname_, 1);
+  IOOptions manifest_io_opts;
+  manifest_io_opts.type = IOType::kManifest;
   {
-    if (fs_->FileExists(manifest, IOOptions(), nullptr).ok()) {
-      fs_->DeleteFile(manifest, IOOptions(), nullptr).PermitUncheckedError();
+    if (fs_->FileExists(manifest, manifest_io_opts, nullptr).ok()) {
+      fs_->DeleteFile(manifest, manifest_io_opts, nullptr)
+          .PermitUncheckedError();
     }
     std::unique_ptr<FSWritableFile> file;
     FileOptions file_options = fs_->OptimizeForManifestWrite(file_options_);
@@ -353,6 +373,7 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
       file_options.temperature =
           immutable_db_options_.metadata_write_temperature;
     }
+    file_options.io_options.type = IOType::kManifest;
     s = NewWritableFile(fs_.get(), manifest, &file, file_options);
     if (!s.ok()) {
       return s;
@@ -385,7 +406,7 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
           manifest.substr(manifest.find_last_of("/\\") + 1));
     }
   } else {
-    fs_->DeleteFile(manifest, IOOptions(), nullptr).PermitUncheckedError();
+    fs_->DeleteFile(manifest, manifest_io_opts, nullptr).PermitUncheckedError();
   }
   return s;
 }
@@ -470,7 +491,7 @@ Status DBImpl::Recover(
     // MANIFEST indicates the recovery to recover existing db. If no MANIFEST
     // can be found, a new db will be created.
     std::string manifest_path;
-    if (!immutable_db_options_.best_efforts_recovery) {
+    if (!immutable_db_options_.UsesBestEffortsRecoveryPath()) {
       s = env_->FileExists(current_fname);
     } else {
       s = Status::NotFound();
@@ -527,6 +548,10 @@ Status DBImpl::Recover(
           immutable_db_options_.use_direct_io_for_compaction_reads;
       const std::string& fname =
           manifest_path.empty() ? current_fname : manifest_path;
+      // This probe opens CURRENT, or under best-efforts recovery the MANIFEST
+      // in manifest_path; tag the open with the type of the file it opens.
+      customized_fs.io_options.type =
+          manifest_path.empty() ? IOType::kMetadata : IOType::kManifest;
       s = fs_->NewRandomAccessFile(fname, customized_fs, &idfile, nullptr);
       if (!s.ok()) {
         std::string error_str = s.ToString();
@@ -542,7 +567,7 @@ Status DBImpl::Recover(
         }
       }
     }
-  } else if (immutable_db_options_.best_efforts_recovery) {
+  } else if (immutable_db_options_.UsesBestEffortsRecoveryPath()) {
     assert(files_in_dbname.empty());
     IOOptions io_opts;
     io_opts.do_not_recurse = true;
@@ -559,7 +584,7 @@ Status DBImpl::Recover(
   assert(is_new_db || db_id_.empty());
   Status s;
   bool missing_table_file = false;
-  if (!immutable_db_options_.best_efforts_recovery) {
+  if (!immutable_db_options_.UsesBestEffortsRecoveryPath()) {
     // Status of reading the descriptor file
     Status desc_status;
     s = versions_->Recover(column_families, read_only, &db_id_,
@@ -679,19 +704,9 @@ Status DBImpl::Recover(
             edit.SetColumnFamily(cfd->GetID());
             for (const FileMetaData* f : level_files) {
               edit.DeleteFile(from_level, f->fd.GetNumber());
-              edit.AddFile(to_level, f->fd.GetNumber(), f->fd.GetPathId(),
-                           f->fd.GetFileSize(), f->smallest, f->largest,
-                           f->fd.smallest_seqno, f->fd.largest_seqno,
-                           f->marked_for_compaction,
-                           f->temperature,  // this can be different from
-                           // `last_level_temperature`
-                           f->oldest_blob_file_number, f->oldest_ancestor_time,
-                           f->file_creation_time, f->epoch_number,
-                           f->file_checksum, f->file_checksum_func_name,
-                           f->unique_id, f->compensated_range_deletion_size,
-                           f->tail_size, f->user_defined_timestamps_persisted,
-                           f->min_timestamp, f->max_timestamp,
-                           f->file_open_metadata);
+              // Keeps f->temperature, which can be different from
+              // `last_level_temperature`
+              edit.AddExistingFile(to_level, *f, kProvenanceMovedBetweenLevels);
               ROCKS_LOG_WARN(immutable_db_options_.info_log,
                              "[%s] Moving #%" PRIu64
                              " from from_level-%d to from_level-%d %" PRIu64
@@ -716,7 +731,7 @@ Status DBImpl::Recover(
     // disabled there (see optimize_manifest_for_recovery doc).
     const bool optimize_manifest_for_recovery =
         mutable_db_options_.optimize_manifest_for_recovery &&
-        !immutable_db_options_.best_efforts_recovery;
+        !immutable_db_options_.UsesBestEffortsRecoveryPath();
     if (!optimize_manifest_for_recovery || edit.HasDbId()) {
       recovery_ctx->UpdateVersionEdits(
           versions_->GetColumnFamilySet()->GetDefault(), edit);
@@ -797,7 +812,7 @@ Status DBImpl::Recover(
     // attention to it in case we are recovering a database
     // produced by an older version of rocksdb.
     auto wal_dir = immutable_db_options_.GetWalDir();
-    if (!immutable_db_options_.best_efforts_recovery) {
+    if (!immutable_db_options_.UsesBestEffortsRecoveryPath()) {
       IOOptions io_opts;
       io_opts.do_not_recurse = true;
       s = immutable_db_options_.fs->GetChildren(
@@ -826,12 +841,13 @@ Status DBImpl::Recover(
     }
 
     if (immutable_db_options_.track_and_verify_wals && !is_new_db &&
-        !immutable_db_options_.best_efforts_recovery && wal_files.empty()) {
+        !immutable_db_options_.UsesBestEffortsRecoveryPath() &&
+        wal_files.empty()) {
       return Status::Corruption("Opening an existing DB with no WAL files");
     }
 
     if (immutable_db_options_.track_and_verify_wals_in_manifest) {
-      if (!immutable_db_options_.best_efforts_recovery) {
+      if (!immutable_db_options_.UsesBestEffortsRecoveryPath()) {
         // Verify WALs in MANIFEST.
         s = versions_->GetWalSet().CheckWals(env_, wal_files);
       }  // else since best effort recovery does not recover from WALs, no need
@@ -919,7 +935,7 @@ Status DBImpl::Recover(
       const std::string normalized_dbname = NormalizePath(dbname_);
       const std::string normalized_wal_dir =
           NormalizePath(immutable_db_options_.GetWalDir());
-      if (immutable_db_options_.best_efforts_recovery) {
+      if (immutable_db_options_.UsesBestEffortsRecoveryPath()) {
         filenames = std::move(files_in_dbname);
       } else if (normalized_dbname == normalized_wal_dir) {
         filenames = std::move(files_in_wal_dir);
@@ -1165,6 +1181,7 @@ bool DBImpl::InvokeWalFilterIfNeededOnWalRecord(uint64_t wal_number,
       }
       break;
     }
+    case WalFilter::WalProcessingOption::kWalProcessingOptionMax:
     default: {
       // logical error which should not happen. If RocksDB throws, we would
       // just do `throw std::logic_error`.
@@ -1980,7 +1997,7 @@ Status DBImpl::MaybeFlushFinalMemtableOrRestoreActiveLogFiles(
 
       const bool optimize_manifest_for_recovery =
           mutable_db_options_.optimize_manifest_for_recovery &&
-          !immutable_db_options_.best_efforts_recovery;
+          !immutable_db_options_.UsesBestEffortsRecoveryPath();
       for (auto* cfd : *versions_->GetColumnFamilySet()) {
         auto iter = version_edits->find(cfd->GetID());
         assert(iter != version_edits->end());
@@ -2186,6 +2203,10 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
         .PermitUncheckedError();  // ignore error
     const uint64_t current_time = static_cast<uint64_t>(_current_time);
     meta.oldest_ancestor_time = current_time;
+    meta.file_creation_time = current_time;
+    meta.db_ownership_start_time = current_time;
+    meta.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kFlush);
     meta.epoch_number = cfd->NewEpochNumber();
     {
       auto write_hint = cfd->current()->storage_info()->CalculateSSTWriteHint(
@@ -2229,9 +2250,9 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           mutable_cf_options_copy.compression_opts, cfd->GetID(),
           cfd->GetName(), 0 /* level */, current_time /* newest_key_time */,
           false /* is_bottommost */, TableFileCreationReason::kRecovery,
-          0 /* oldest_key_time */, 0 /* file_creation_time */, db_id_,
-          db_session_id_, 0 /* target_file_size */, meta.fd.GetNumber(),
-          kMaxSequenceNumber, dbname_ /* db_name */);
+          0 /* oldest_key_time */, db_id_, db_session_id_,
+          0 /* target_file_size */, meta.fd.GetNumber(), kMaxSequenceNumber,
+          dbname_ /* db_name */);
       Version* version = cfd->current();
       version->Ref();
       TableProperties temp_table_proerties;
@@ -2316,15 +2337,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
   }
 
   if (s.ok() && has_output) {
-    edit->AddFile(level, meta.fd.GetNumber(), meta.fd.GetPathId(),
-                  meta.fd.GetFileSize(), meta.smallest, meta.largest,
-                  meta.fd.smallest_seqno, meta.fd.largest_seqno,
-                  meta.marked_for_compaction, meta.temperature,
-                  meta.oldest_blob_file_number, meta.oldest_ancestor_time,
-                  meta.file_creation_time, meta.epoch_number,
-                  meta.file_checksum, meta.file_checksum_func_name,
-                  meta.unique_id, meta.compensated_range_deletion_size,
-                  meta.tail_size, meta.user_defined_timestamps_persisted);
+    edit->AddFile(level, meta);
 
     for (const auto& blob : blob_file_additions) {
       edit->AddBlobFile(blob);
@@ -2334,7 +2347,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     // a flush happens.
     if (logical_strip_timestamp) {
       Slice mem_newest_udt = mem->GetNewestUDT();
-      std::string full_history_ts_low = cfd->GetFullHistoryTsLow();
+      const std::string& full_history_ts_low = cfd->GetFullHistoryTsLow();
       if (full_history_ts_low.empty() ||
           ucmp->CompareTimestamp(mem_newest_udt, full_history_ts_low) >= 0) {
         std::string new_full_history_ts_low;
@@ -2697,7 +2710,17 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   const WriteOptions write_options(Env::IOActivity::kDBOpen);
   const ReadOptions read_options(Env::IOActivity::kDBOpen);
 
-  Status s = ValidateOptionsByTable(db_options, column_families);
+  Status s;
+  for (const ColumnFamilyDescriptor& cf : column_families) {
+    s = ValidateCompactionFilterOptions(cf.options);
+    if (!s.ok()) {
+      return s;
+    }
+    if (seq_per_batch && DeclaresMergeBeforeFilter(cf.options)) {
+      return MergeBeforeFilterTransactionError();
+    }
+  }
+  s = ValidateOptionsByTable(db_options, column_families);
   if (!s.ok()) {
     return s;
   }
@@ -2705,6 +2728,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   s = ValidateOptions(db_options, column_families);
   if (!s.ok()) {
     return s;
+  }
+  if (seq_per_batch && db_options.enable_pipelined_write) {
+    return Status::NotSupported(
+        "enable_pipelined_write is incompatible with seq_per_batch "
+        "(WritePrepared and WriteUnprepared transactions)");
   }
 
   *dbptr = nullptr;
@@ -2828,7 +2856,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         assert(log_writer->get_log_number() == wal_file_number_size.number);
         impl->mutex_.AssertHeld();
         s = impl->WriteToWAL(empty_batch, write_options, log_writer, &wal_used,
-                             &log_size, wal_file_number_size, recovered_seq);
+                             &log_size, wal_file_number_size, recovered_seq,
+                             /*seq_inc=*/0);
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
           s = impl->FlushWAL(write_options, false);

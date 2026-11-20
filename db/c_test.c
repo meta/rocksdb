@@ -240,6 +240,138 @@ static void CheckPinnableMultiGetError(
   CheckCondition(strstr(error, expected) != NULL);
 }
 
+static void CheckTxnDBBatchedMultiGet(rocksdb_transactiondb_t* db,
+                                      const rocksdb_readoptions_t* options,
+                                      rocksdb_column_family_handle_t* cf,
+                                      const char* expected_a) {
+  for (int sorted = 0; sorted <= 1; ++sorted) {
+    const char* keys[4] = {"b", "a", "b", "missing"};
+    const size_t sizes[4] = {1, 1, 1, 7};
+    const char* expected[4] = {"", expected_a, "", NULL};
+    if (sorted) {
+      keys[0] = "a";
+      keys[1] = "b";
+      expected[0] = expected_a;
+      expected[1] = "";
+    }
+    for (int slices = 0; slices <= 1; ++slices) {
+      rocksdb_pinnableslice_t* values[4];
+      char* errs[4];
+      if (slices) {
+        rocksdb_slice_t key_slices[4];
+        for (size_t i = 0; i < 4; ++i) {
+          key_slices[i].data = keys[i];
+          key_slices[i].size = sizes[i];
+        }
+        rocksdb_transactiondb_batched_multi_get_cf_slice(
+            db, options, cf, 4, key_slices, values, errs, sorted);
+      } else {
+        rocksdb_transactiondb_batched_multi_get_cf(db, options, cf, 4, keys,
+                                                   sizes, values, errs, sorted);
+      }
+      for (size_t i = 0; i < 4; ++i) {
+        CheckNoError(errs[i]);
+        if (expected[i] == NULL) {
+          CheckCondition(values[i] == NULL);
+        } else {
+          size_t size;
+          CheckCondition(values[i] != NULL);
+          const char* value = rocksdb_pinnableslice_value(values[i], &size);
+          CheckEqual(expected[i], value, size);
+        }
+        rocksdb_pinnableslice_destroy(values[i]);
+      }
+    }
+  }
+  rocksdb_transactiondb_batched_multi_get_cf(db, options, cf, 0, NULL, NULL,
+                                             NULL, NULL, false);
+  rocksdb_transactiondb_batched_multi_get_cf_slice(db, options, cf, 0, NULL,
+                                                   NULL, NULL, true);
+}
+
+static void TestTxnDBBatchedMultiGet(void) {
+  rocksdb_options_t* options = rocksdb_options_create();
+  rocksdb_readoptions_t* ro = rocksdb_readoptions_create();
+  rocksdb_writeoptions_t* wo = rocksdb_writeoptions_create();
+  rocksdb_transaction_options_t* to = rocksdb_transaction_options_create();
+  rocksdb_transactiondb_options_t* dbo = rocksdb_transactiondb_options_create();
+  char path[200];
+  char* err = NULL;
+  snprintf(path, sizeof(path), "%s/rocksdb_c_test-batched-txn-%" PRIu64,
+           GetTempDir(), GetTestId());
+  rocksdb_options_set_create_if_missing(options, 1);
+  rocksdb_transaction_options_set_skip_prepare(to, 0);
+  for (int policy = rocksdb_txndb_write_policy_write_committed;
+       policy <= rocksdb_txndb_write_policy_write_prepared; ++policy) {
+    rocksdb_destroy_db(options, path, &err);
+    CheckNoError(err);
+    rocksdb_transactiondb_options_set_write_policy(dbo, policy);
+    rocksdb_transactiondb_t* db =
+        rocksdb_transactiondb_open(options, dbo, path, &err);
+    CheckNoError(err);
+    rocksdb_column_family_handle_t* cf =
+        rocksdb_transactiondb_create_column_family(db, options, "batched",
+                                                   &err);
+    CheckNoError(err);
+    rocksdb_transactiondb_put_cf(db, wo, cf, "a", 1, "old", 3, &err);
+    CheckNoError(err);
+    rocksdb_transactiondb_put_cf(db, wo, cf, "b", 1, "", 0, &err);
+    CheckNoError(err);
+    CheckTxnDBBatchedMultiGet(db, ro, cf, "old");
+
+    rocksdb_transaction_t* txn = rocksdb_transaction_begin(db, wo, to, NULL);
+    rocksdb_transaction_set_name(txn, "batched", 7, &err);
+    CheckNoError(err);
+    rocksdb_transaction_put_cf(txn, cf, "a", 1, "new", 3, &err);
+    CheckNoError(err);
+    rocksdb_transaction_prepare(txn, &err);
+    CheckNoError(err);
+    // WRITE_PREPARED puts the new value in the base DB before commit. Reads
+    // must go through TransactionDB to keep that value invisible.
+    CheckTxnDBBatchedMultiGet(db, ro, cf, "old");
+    const rocksdb_snapshot_t* snapshot =
+        rocksdb_transactiondb_create_snapshot(db);
+    rocksdb_transaction_commit(txn, &err);
+    CheckNoError(err);
+    CheckTxnDBBatchedMultiGet(db, ro, cf, "new");
+    rocksdb_readoptions_set_snapshot(ro, snapshot);
+    CheckTxnDBBatchedMultiGet(db, ro, cf, "old");
+    rocksdb_readoptions_set_snapshot(ro, NULL);
+    rocksdb_transactiondb_release_snapshot(db, snapshot);
+    // A timestamp on a non-timestamped column family must return an error,
+    // rather than being reported as a missing key.
+    rocksdb_readoptions_set_timestamp(ro, "timestamp", 9);
+    for (int slices = 0; slices <= 1; ++slices) {
+      const char* keys[1] = {"a"};
+      const size_t sizes[1] = {1};
+      const rocksdb_slice_t key_slices[1] = {{"a", 1}};
+      rocksdb_pinnableslice_t* values[1];
+      char* errs[1];
+      if (slices) {
+        rocksdb_transactiondb_batched_multi_get_cf_slice(
+            db, ro, cf, 1, key_slices, values, errs, true);
+      } else {
+        rocksdb_transactiondb_batched_multi_get_cf(db, ro, cf, 1, keys, sizes,
+                                                   values, errs, true);
+      }
+      CheckCondition(values[0] == NULL);
+      CheckCondition(errs[0] != NULL);
+      rocksdb_free(errs[0]);
+    }
+    rocksdb_readoptions_set_timestamp(ro, NULL, 0);
+    rocksdb_transaction_destroy(txn);
+    rocksdb_column_family_handle_destroy(cf);
+    rocksdb_transactiondb_close(db);
+    rocksdb_destroy_db(options, path, &err);
+    CheckNoError(err);
+  }
+  rocksdb_transactiondb_options_destroy(dbo);
+  rocksdb_transaction_options_destroy(to);
+  rocksdb_writeoptions_destroy(wo);
+  rocksdb_readoptions_destroy(ro);
+  rocksdb_options_destroy(options);
+}
+
 static void CheckIter(rocksdb_iterator_t* iter, const char* key,
                       const char* val) {
   size_t len;
@@ -5637,6 +5769,9 @@ int main(int argc, char** argv) {
     rocksdb_destroy_db(options, wp_dbname, &err);
     CheckNoError(err);
   }
+
+  StartPhase("transactiondb_batched_multi_get");
+  TestTxnDBBatchedMultiGet();
 
   StartPhase("transactions");
   {

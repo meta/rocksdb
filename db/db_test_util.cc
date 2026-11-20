@@ -9,6 +9,8 @@
 
 #include "db/db_test_util.h"
 
+#include <memory>
+
 #include "cache/cache_reservation_manager.h"
 #include "db/forward_iterator.h"
 #include "env/fs_readonly.h"
@@ -69,16 +71,16 @@ SpecialEnv::SpecialEnv(Env* base, bool time_elapse_only_sleep)
   non_writable_count_ = 0;
   table_write_callback_ = nullptr;
 }
-DBTestBase::DBTestBase(const std::string path, bool env_do_fsync)
+DBTestBase::DBTestBase(const std::string& path, bool env_do_fsync)
     : mem_env_(nullptr), encrypted_env_(nullptr), option_config_(kDefault) {
   Env* base_env = Env::Default();
   ConfigOptions config_options;
   EXPECT_OK(test::CreateEnvFromSystem(config_options, &base_env, &env_guard_));
   EXPECT_NE(nullptr, base_env);
-  if (getenv("MEM_ENV")) {
+  if (getenv("MEM_ENV")) {  // NOLINT(concurrency-mt-unsafe)
     mem_env_ = MockEnv::Create(base_env, base_env->GetSystemClock());
   }
-  if (auto ee = getenv("ENCRYPTED_ENV")) {
+  if (auto ee = getenv("ENCRYPTED_ENV")) {  // NOLINT(concurrency-mt-unsafe)
     std::shared_ptr<EncryptionProvider> provider;
     std::string provider_id = ee;
     if (provider_id.find('=') == std::string::npos &&
@@ -123,7 +125,7 @@ DBTestBase::~DBTestBase() {
   options.db_paths.emplace_back(dbname_ + "_4", 0);
   options.env = env_;
 
-  if (getenv("KEEP_DB")) {
+  if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
     printf("DB is still at %s\n", dbname_.c_str());
   } else {
     EXPECT_OK(DestroyDir(env_, alternative_wal_dir_));
@@ -170,6 +172,9 @@ bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
     return true;
   }
   if ((skip_mask & kSkipRowCache) && option_config == kRowCache) {
+    return true;
+  }
+  if ((skip_mask & kSkipSortedHash) && option_config == kSortedHash) {
     return true;
   }
   return false;
@@ -348,6 +353,9 @@ Options DBTestBase::GetDefaultOptions() const {
   // Unit tests for this option sets level_compaction_dynamic_level_bytes=true
   // explicitly.
   options.level_compaction_dynamic_level_bytes = false;
+  // Lets tests that request coroutine reads take the native path rather than
+  // the synchronous fallback.
+  options.read_io_executor_threads = 1;
   options.env = env_;
   if (!env_->skip_fsync_) {
     options.track_and_verify_wals_in_manifest = true;
@@ -416,8 +424,11 @@ Options DBTestBase::GetOptions(
       options.max_sequential_skip_in_iterations = 999999;
       set_block_based_table_factory = false;
       break;
+    case kSortedHash:
+      options.memtable_factory.reset(NewSortedHashRepFactory(16));
+      break;
     case kVectorRep:
-      options.memtable_factory.reset(new VectorRepFactory(100));
+      options.memtable_factory = std::make_shared<VectorRepFactory>(100);
       options.allow_concurrent_memtable_write = false;
       options.unordered_write = false;
       break;
@@ -673,6 +684,7 @@ Status DBTestBase::TryReopenWithColumnFamilies(
   Close();
   EXPECT_EQ(cfs.size(), options.size());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cfs.size());
   for (size_t i = 0; i < cfs.size(); ++i) {
     column_families.emplace_back(cfs[i], options[i]);
   }
@@ -695,6 +707,7 @@ Status DBTestBase::TryReopenReadOnlyWithColumnFamilies(
   Close();
   EXPECT_EQ(cfs.size(), options.size());
   std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cfs.size());
   for (size_t i = 0; i < cfs.size(); ++i) {
     column_families.emplace_back(cfs[i], options[i]);
   }
@@ -1027,6 +1040,7 @@ void DBTestBase::MultiGet(const std::vector<std::string>& k,
   statuses.resize(k.size());
   values.resize(k.size());
 
+  keys.reserve(k.size());
   for (size_t i = 0; i < k.size(); ++i) {
     keys.emplace_back(k[i]);
   }
@@ -1500,12 +1514,12 @@ std::string DBTestBase::DumpSSTableList() {
   return property;
 }
 
-void DBTestBase::GetSstFiles(Env* env, std::string path,
+void DBTestBase::GetSstFiles(Env* env, const std::string& path,
                              std::vector<std::string>* files) {
   EXPECT_OK(env->GetChildren(path, files));
 
   files->erase(std::remove_if(files->begin(), files->end(),
-                              [](std::string name) {
+                              [](const std::string& name) {
                                 uint64_t number;
                                 FileType type;
                                 return !(ParseFileName(name, &number, &type) &&
@@ -1514,7 +1528,7 @@ void DBTestBase::GetSstFiles(Env* env, std::string path,
                files->end());
 }
 
-int DBTestBase::GetSstFileCount(std::string path) {
+int DBTestBase::GetSstFileCount(const std::string& path) {
   std::vector<std::string> files;
   DBTestBase::GetSstFiles(env_, path, &files);
   return static_cast<int>(files.size());
@@ -1580,7 +1594,7 @@ std::string DBTestBase::DummyString(size_t len, char c) {
   return std::string(len, c);
 }
 
-void DBTestBase::VerifyIterLast(std::string expected_key, int cf) {
+void DBTestBase::VerifyIterLast(const std::string& expected_key, int cf) {
   Iterator* iter;
   ReadOptions ro;
   if (cf == 0) {
@@ -1773,6 +1787,7 @@ void DBTestBase::VerifyDBFromMap(
 
   // MultiGet
   std::vector<Slice> key_slice;
+  key_slice.reserve(true_data.size());
   for (const auto& [k, _] : true_data) {
     key_slice.emplace_back(k);
   }
@@ -1889,7 +1904,7 @@ void DBTestBase::VerifyDBFromMap(
 }
 
 void DBTestBase::VerifyDBInternal(
-    std::vector<std::pair<std::string, std::string>> true_data) {
+    const std::vector<std::pair<std::string, std::string>>& true_data) {
   Arena arena;
   InternalKeyComparator icmp(last_options_.comparator);
   ReadOptions read_options;
@@ -1909,7 +1924,7 @@ void DBTestBase::VerifyDBInternal(
 }
 
 uint64_t DBTestBase::GetNumberOfSstFilesForColumnFamily(
-    DB* db, std::string column_family_name) {
+    DB* db, const std::string& column_family_name) {
   std::vector<LiveFileMetaData> metadata;
   db->GetLiveFilesMetaData(&metadata);
   uint64_t result = 0;
@@ -1996,6 +2011,7 @@ template class TargetCacheChargeTrackingCache<
 template class TargetCacheChargeTrackingCache<
     CacheEntryRole::kBlockBasedTableReader>;
 template class TargetCacheChargeTrackingCache<CacheEntryRole::kFileMetadata>;
+template class TargetCacheChargeTrackingCache<CacheEntryRole::kReadaheadBuffer>;
 
 const std::vector<Temperature> kKnownTemperatures = {
     Temperature::kHot, Temperature::kWarm, Temperature::kCool,

@@ -80,8 +80,9 @@ class FaultInjectionSecondaryCache : public SecondaryCache {
 
     size_t Size() override;
 
-    static void WaitAll(FaultInjectionSecondaryCache* cache,
-                        std::vector<SecondaryCacheResultHandle*> handles);
+    static void WaitAll(
+        FaultInjectionSecondaryCache* cache,
+        const std::vector<SecondaryCacheResultHandle*>& handles);
 
    private:
     static void UpdateHandleValue(ResultHandle* handle);

@@ -53,6 +53,7 @@ class BaseCacheInterface {
  public:
   CACHE_TYPE_DEFS();
 
+  // NOLINTNEXTLINE(google-explicit-constructor)
   /*implicit*/ BaseCacheInterface(CachePtr cache) : cache_(std::move(cache)) {}
 
   inline void Release(Handle* handle) { cache_->Release(handle); }

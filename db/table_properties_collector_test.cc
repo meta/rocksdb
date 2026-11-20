@@ -33,7 +33,7 @@ class TablePropertiesTest : public testing::Test,
  public:
   void SetUp() override { backward_mode_ = GetParam(); }
 
-  bool backward_mode_;
+  bool backward_mode_ = false;
 };
 
 // Utilities test functions

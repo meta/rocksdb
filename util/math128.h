@@ -31,7 +31,7 @@ struct Unsigned128 {
     hi = 0;
   }
 
-  inline Unsigned128(uint64_t lower) {
+  inline Unsigned128(uint64_t lower) {  // NOLINT(google-explicit-constructor)
     lo = lower;
     hi = 0;
   }

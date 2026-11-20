@@ -9,17 +9,23 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include "db/blob/blob_index.h"
 #include "db/db_impl/db_impl_secondary.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "db/log_reader.h"
+#include "db/manifest_ops.h"
+#include "db/version_edit.h"
 #include "db/wide/wide_column_test_util.h"
 #include "db/write_batch_internal.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
+#include "file/sequence_file_reader.h"
 #include "port/stack_trace.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
@@ -42,7 +48,7 @@ class DBSecondaryTestBase : public DBBasicTestWithTimestampBase {
 
   ~DBSecondaryTestBase() override {
     CloseSecondary();
-    if (getenv("KEEP_DB") != nullptr) {
+    if (getenv("KEEP_DB") != nullptr) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "Secondary DB is still at %s\n", secondary_path_.c_str());
     } else {
       Options options;
@@ -206,6 +212,45 @@ class DBSecondaryTestBase : public DBBasicTestWithTimestampBase {
     }
     EXPECT_FALSE(path.empty());
     return path;
+  }
+
+  struct ManifestRecord {
+    // The offset in the file where the record ends.
+    uint64_t end_offset;
+    VersionEdit edit;
+  };
+
+  // Returns the records of the primary's current MANIFEST.
+  std::vector<ManifestRecord> ReadPrimaryManifestRecords() {
+    std::string manifest_path;
+    uint64_t manifest_number = 0;
+    EXPECT_OK(GetCurrentManifestPath(dbname_, env_->GetFileSystem().get(),
+                                     /*is_retry=*/false, &manifest_path,
+                                     &manifest_number));
+    std::unique_ptr<SequentialFileReader> file_reader;
+    EXPECT_OK(SequentialFileReader::Create(
+        env_->GetFileSystem(), manifest_path, FileOptions(), &file_reader,
+        /*dbg=*/nullptr, /*rate_limiter=*/nullptr));
+    log::Reader reader(/*info_log=*/nullptr, std::move(file_reader),
+                       /*reporter=*/nullptr, /*checksum=*/true,
+                       /*log_num=*/0);
+    std::vector<ManifestRecord> records;
+    Slice record;
+    std::string scratch;
+    while (reader.ReadRecord(&record, &scratch)) {
+      VersionEdit edit;
+      EXPECT_OK(edit.DecodeFrom(record));
+      records.push_back({reader.LastRecordEnd(), std::move(edit)});
+    }
+    return records;
+  }
+
+  // Returns the value of `rocksdb.secondary-has-missing-files` for `db`.
+  static uint64_t GetSecondaryHasMissingFiles(DB* db) {
+    uint64_t value = 0;
+    EXPECT_TRUE(
+        db->GetIntProperty(DB::Properties::kSecondaryHasMissingFiles, &value));
+    return value;
   }
 
   // Moves `path` aside so that opening it fails, and returns where it went.
@@ -1754,7 +1799,7 @@ TEST_F(DBSecondaryTest, CatchUpTailsCurrentWalWhenFutureWalExists) {
   ASSERT_EQ("value2", value);
 }
 
-TEST_F(DBSecondaryTest, SecondaryTailingBug_ISSUE_8467) {
+TEST_F(DBSecondaryTest, SecondaryTailingBugISSUE8467) {
   Options options;
   options.env = env_;
   Reopen(options);
@@ -1926,6 +1971,128 @@ TEST_F(DBSecondaryTest, KeepsMemtableWhenFlushedFileIsMissing) {
   // reopen. What must not happen is the key disappearing.
   VerifySecondaryValue("foo", "v1");
 }
+
+// TryCatchUpWithPrimary() returns OK while a file that the newest MANIFEST
+// state lists is missing, so the property is how a caller can tell that the
+// secondary still serves an older Version.
+TEST_F(DBSecondaryTest, SecondaryHasMissingFilesProperty) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(0U, GetSecondaryHasMissingFiles(db_.get()));
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_EQ(0U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+
+  // The file of the next flush goes away before the secondary reads the
+  // MANIFEST record that adds it.
+  ASSERT_OK(Put("foo", "v2"));
+  ASSERT_OK(Flush());
+  const std::string table_file =
+      GetNewestTableFilePath(kDefaultColumnFamilyName);
+  Close();
+  const std::string aside_file = MoveFileAside(table_file);
+  bool restored = false;
+  Defer restore_file([&] {
+    if (!restored) {
+      EXPECT_OK(env_->RenameFile(aside_file, table_file));
+    }
+  });
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_EQ(1U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+  VerifySecondaryValue("foo", "v1");
+
+  // The primary compacts the file into a new one, so the newest state no
+  // longer lists it.
+  ASSERT_OK(env_->RenameFile(aside_file, table_file));
+  restored = true;
+  Reopen(options);
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_EQ(0U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+  VerifySecondaryValue("foo", "v2");
+}
+
+// The parameter is whether the primary drops the column family whose file is
+// missing. Either way, the primary then starts a new MANIFEST before the
+// secondary catches up again. The new MANIFEST leaves out a dropped column
+// family, so the property returns to 0. A column family that the new MANIFEST
+// lists again is checked again, and its missing file keeps the value at 1.
+class DBSecondaryMissingFileAcrossManifestSwitchTest
+    : public DBSecondaryTestBase,
+      public testing::WithParamInterface<bool> {
+ public:
+  DBSecondaryMissingFileAcrossManifestSwitchTest()
+      : DBSecondaryTestBase(
+            "db_secondary_missing_file_across_manifest_switch_test") {}
+};
+
+TEST_P(DBSecondaryMissingFileAcrossManifestSwitchTest,
+       PropertyFollowsNewManifest) {
+  const bool drop_column_family = GetParam();
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ASSERT_OK(Put(1, "foo", "v1"));
+  ASSERT_OK(Flush(1));
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({"pikachu"}, secondary_options);
+  ASSERT_EQ(0U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+
+  // The file of the next flush of "pikachu" is away while the secondary reads
+  // the MANIFEST record that adds it.
+  ASSERT_OK(Put(1, "foo", "v2"));
+  ASSERT_OK(Flush(1));
+  const std::string table_file = GetNewestTableFilePath("pikachu");
+  Close();
+  std::string aside_file = MoveFileAside(table_file);
+  bool file_is_aside = true;
+  Defer restore_file([&] {
+    if (file_is_aside) {
+      EXPECT_OK(env_->RenameFile(aside_file, table_file));
+    }
+  });
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_EQ(1U, GetSecondaryHasMissingFiles(db_secondary_.get()));
+
+  // The primary needs the file to open. Each open starts a new MANIFEST, so the
+  // MANIFEST of the second open leaves out a column family that was dropped
+  // after the first open.
+  ASSERT_OK(env_->RenameFile(aside_file, table_file));
+  file_is_aside = false;
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu"}, options);
+  if (drop_column_family) {
+    ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+    Reopen(options);
+  } else {
+    ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu"}, options);
+  }
+  ASSERT_OK(Put("bar", "b1"));
+  ASSERT_OK(Flush());
+  Close();
+  if (!drop_column_family) {
+    aside_file = MoveFileAside(table_file);
+    file_is_aside = true;
+  }
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryValue("bar", "b1");
+  ASSERT_EQ(drop_column_family ? 0U : 1U,
+            GetSecondaryHasMissingFiles(db_secondary_.get()));
+}
+
+INSTANTIATE_TEST_CASE_P(DBSecondaryMissingFileAcrossManifestSwitchTest,
+                        DBSecondaryMissingFileAcrossManifestSwitchTest,
+                        ::testing::Bool());
 
 // Same hazard reached without any missing file of the column family's own: an
 // atomic flush whose group is incomplete parks the new Version of every column
@@ -2651,6 +2818,702 @@ TEST_F(DBSecondaryTest, SwitchToNewManifestDuringOpen) {
   ro_db_thread.join();
 }
 
+TEST_F(DBSecondaryTest, CatchUpAfterInitialRecoveryFindsOnlyMissingFiles) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  Reopen(options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  // Start recovery from a manifest snapshot containing the old SST.
+  Reopen(options);
+  const std::string old_table =
+      GetNewestTableFilePath(kDefaultColumnFamilyName);
+
+  bool rewritten = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit:Begin1",
+      [&](void*) {
+        if (rewritten) {
+          return;
+        }
+        rewritten = true;
+        // Replace the snapshot's SST before the secondary applies it.
+        ASSERT_OK(Put("foo", "v2"));
+        ASSERT_OK(Flush());
+        CompactRangeOptions compact_options;
+        compact_options.bottommost_level_compaction =
+            BottommostLevelCompaction::kForce;
+        ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+        // CompactRange() can return before the compaction thread purges
+        // the obsolete files, and TEST_WaitForPurge() only waits for the
+        // separate purge thread. Wait for both.
+        WaitForCompactOptions wait_options;
+        wait_options.wait_for_purge = true;
+        ASSERT_OK(dbfull()->WaitForCompact(wait_options));
+        const Status old_table_status = env_->FileExists(old_table);
+        ASSERT_TRUE(old_table_status.IsNotFound())
+            << old_table_status.ToString();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup_sync_points([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  ASSERT_TRUE(rewritten);
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryValue("foo", "v2");
+}
+
+TEST_F(DBSecondaryTest, CatchUpKeepsViewWhenNewManifestListsDeletedFiles) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  const std::string cf_name = "pikachu";
+  CreateAndReopenWithCF({cf_name}, options);
+  for (int cf : {0, 1}) {
+    ASSERT_OK(Put(cf, "foo", "v1"));
+    ASSERT_OK(Flush(cf));
+  }
+
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondaryWithColumnFamilies({cf_name}, secondary_options);
+  ASSERT_EQ(2, handles_secondary_.size());
+
+  // Roll the MANIFEST past the one the secondary opened.
+  std::vector<std::string> newest_tables;
+  for (int cf : {0, 1}) {
+    ASSERT_OK(Put(cf, "bar", "v1"));
+    ASSERT_OK(Flush(cf));
+  }
+  for (const std::string& name : {kDefaultColumnFamilyName, cf_name}) {
+    newest_tables.push_back(GetNewestTableFilePath(name));
+  }
+
+  bool compacted = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit:Begin1",
+      [&](void*) {
+        if (compacted) {
+          return;
+        }
+        compacted = true;
+        // Delete every file the new MANIFEST lists before the secondary
+        // applies its snapshot, recording the deletions in a newer MANIFEST.
+        CompactRangeOptions compact_options;
+        compact_options.bottommost_level_compaction =
+            BottommostLevelCompaction::kForce;
+        for (auto* handle : handles_) {
+          ASSERT_OK(
+              db_->CompactRange(compact_options, handle, nullptr, nullptr));
+        }
+        // CompactRange() can return before the compaction thread purges
+        // the obsolete files, and TEST_WaitForPurge() only waits for the
+        // separate purge thread. Wait for both.
+        WaitForCompactOptions wait_options;
+        wait_options.wait_for_purge = true;
+        ASSERT_OK(dbfull()->WaitForCompact(wait_options));
+        for (const std::string& table : newest_tables) {
+          const Status table_status = env_->FileExists(table);
+          ASSERT_TRUE(table_status.IsNotFound()) << table_status.ToString();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup_sync_points([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_TRUE(compacted);
+  for (auto* handle : handles_secondary_) {
+    VerifySecondaryValue(handle, "foo", "v1");
+  }
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  for (auto* handle : handles_secondary_) {
+    VerifySecondaryValue(handle, "foo", "v1");
+    VerifySecondaryValue(handle, "bar", "v1");
+  }
+}
+
+// Makes the MANIFEST files opened while a cap is set appear to end after `cap`
+// bytes until the cap is lifted, as a file system can show a new MANIFEST
+// before all of it is visible.
+class CappedManifestFS : public FileSystemWrapper {
+ public:
+  explicit CappedManifestFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+
+  static const char* kClassName() { return "CappedManifestFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  // A cap of 0 lifts it.
+  void SetCap(uint64_t cap) { cap_.store(cap); }
+
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override {
+    IOStatus s = target()->NewSequentialFile(fname, file_opts, result, dbg);
+    uint64_t number = 0;
+    FileType type = kWalFile;
+    if (s.ok() && cap_.load() > 0 &&
+        ParseFileName(fname.substr(fname.find_last_of('/') + 1), &number,
+                      &type) &&
+        type == kDescriptorFile) {
+      *result = std::make_unique<CappedFile>(std::move(*result), &cap_);
+    }
+    return s;
+  }
+
+ private:
+  class CappedFile : public FSSequentialFileOwnerWrapper {
+   public:
+    CappedFile(std::unique_ptr<FSSequentialFile>&& target,
+               const std::atomic<uint64_t>* cap)
+        : FSSequentialFileOwnerWrapper(std::move(target)), cap_(cap) {}
+
+    IOStatus Read(size_t n, const IOOptions& options, Slice* result,
+                  char* scratch, IODebugContext* dbg) override {
+      const uint64_t cap = cap_->load();
+      if (cap > 0) {
+        n = static_cast<size_t>(
+            std::min<uint64_t>(n, cap - std::min(cap, offset_)));
+      }
+      IOStatus s =
+          FSSequentialFileOwnerWrapper::Read(n, options, result, scratch, dbg);
+      if (s.ok()) {
+        offset_ += result->size();
+      }
+      return s;
+    }
+
+   private:
+    const std::atomic<uint64_t>* const cap_;
+    uint64_t offset_ = 0;
+  };
+
+  std::atomic<uint64_t> cap_{0};
+};
+
+// The destructor closes the secondary before the capped Env it was opened on is
+// destroyed.
+class DBSecondaryPartialManifestTest : public DBSecondaryTestBase {
+ public:
+  DBSecondaryPartialManifestTest()
+      : DBSecondaryTestBase("db_secondary_partial_manifest_test"),
+        capped_fs_(std::make_shared<CappedManifestFS>(env_->GetFileSystem())),
+        capped_env_(new CompositeEnvWrapper(env_, capped_fs_)) {}
+
+  ~DBSecondaryPartialManifestTest() override { CloseSecondary(); }
+
+ protected:
+  static Options PrimaryOptions(Env* env) {
+    Options options;
+    options.env = env;
+    options.disable_auto_compactions = true;
+    options.max_manifest_file_size = 1;
+    options.max_manifest_space_amp_pct = 0;
+    return options;
+  }
+
+  Options SecondaryOptions(const Options& primary_options) const {
+    Options options = primary_options;
+    options.env = capped_env_.get();
+    options.max_open_files = -1;
+    return options;
+  }
+
+  // Returns the offset where the first record adding a column family ends in
+  // the primary's current MANIFEST.
+  uint64_t EndOfFirstColumnFamilyAddRecord() {
+    for (const ManifestRecord& record : ReadPrimaryManifestRecords()) {
+      if (record.edit.IsColumnFamilyAdd()) {
+        return record.end_offset;
+      }
+    }
+    ADD_FAILURE() << "No column family add record in the primary's MANIFEST";
+    return 0;
+  }
+
+  std::shared_ptr<CappedManifestFS> capped_fs_;
+  std::unique_ptr<Env> capped_env_;
+};
+
+// With the parameter false, catch-up sees no record of the new MANIFEST, so the
+// default column family has not been listed. With it true, catch-up sees the
+// records up to the one adding "pikachu", which has not been listed.
+class DBSecondaryManifestCutTest : public DBSecondaryPartialManifestTest,
+                                   public testing::WithParamInterface<bool> {};
+
+TEST_P(DBSecondaryManifestCutTest, CatchUpKeepsViewOfColumnFamilyNotListed) {
+  const Options options = PrimaryOptions(env_);
+  const std::string cf_name = "pikachu";
+  CreateAndReopenWithCF({cf_name}, options);
+  for (int cf : {0, 1}) {
+    ASSERT_OK(Put(cf, "foo", "v1"));
+    ASSERT_OK(Flush(cf));
+  }
+  OpenSecondaryWithColumnFamilies({cf_name}, SecondaryOptions(options));
+  ASSERT_EQ(2, handles_secondary_.size());
+
+  for (int cf : {0, 1}) {
+    ASSERT_OK(Put(cf, "bar", "v1"));
+    ASSERT_OK(Flush(cf));
+  }
+  capped_fs_->SetCap(GetParam() ? EndOfFirstColumnFamilyAddRecord() : 1);
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  for (auto* handle : handles_secondary_) {
+    VerifySecondaryValue(handle, "foo", "v1");
+  }
+
+  capped_fs_->SetCap(0);
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  for (auto* handle : handles_secondary_) {
+    VerifySecondaryValue(handle, "foo", "v1");
+    VerifySecondaryValue(handle, "bar", "v1");
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(DBSecondaryManifestCutTest, DBSecondaryManifestCutTest,
+                        ::testing::Bool());
+
+// Catch-up sees the new MANIFEST only up to the record adding "pikachu". The
+// primary then drops "pikachu", so no later MANIFEST lists it, and atomically
+// flushes the other column families.
+TEST_F(DBSecondaryPartialManifestTest,
+       CatchUpReleasesColumnFamilyDroppedBeforeItWasListed) {
+  Options options = PrimaryOptions(env_);
+  options.atomic_flush = true;
+  CreateAndReopenWithCF({"pikachu", "eevee"}, options);
+  for (int cf : {0, 1, 2}) {
+    ASSERT_OK(Put(cf, "foo", "v1"));
+  }
+  ASSERT_OK(Flush({0, 1, 2}));
+  OpenSecondaryWithColumnFamilies({"pikachu", "eevee"},
+                                  SecondaryOptions(options));
+  ASSERT_EQ(3, handles_secondary_.size());
+
+  for (int cf : {0, 1, 2}) {
+    ASSERT_OK(Put(cf, "bar", "v1"));
+  }
+  ASSERT_OK(Flush({0, 1, 2}));
+  capped_fs_->SetCap(EndOfFirstColumnFamilyAddRecord());
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  capped_fs_->SetCap(0);
+
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  for (int cf : {0, 2}) {
+    ASSERT_OK(Put(cf, "baz", "v1", no_wal));
+  }
+  ASSERT_OK(Flush({0, 2}));
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  for (auto* handle : {handles_secondary_[0], handles_secondary_[2]}) {
+    VerifySecondaryValue(handle, "baz", "v1");
+  }
+}
+
+// Makes MANIFEST reads fail while armed, as a remote file system can fail
+// reads for a short time.
+class FailingManifestReadFS : public FileSystemWrapper {
+ public:
+  explicit FailingManifestReadFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+
+  static const char* kClassName() { return "FailingManifestReadFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  // Lets `reads_that_succeed` more MANIFEST reads succeed, then fails every
+  // later MANIFEST read until Disarm().
+  void FailReadsAfter(int reads_that_succeed) {
+    fail_offset_.store(kAnyOffset);
+    reads_that_succeed_.store(reads_that_succeed);
+    armed_.store(true);
+  }
+
+  // Fails every MANIFEST read that starts at `offset` in the file, until
+  // Disarm().
+  void FailReadsAt(uint64_t offset) {
+    reads_that_succeed_.store(0);
+    fail_offset_.store(offset);
+    armed_.store(true);
+  }
+
+  void Disarm() { armed_.store(false); }
+  int failed_reads() const { return failed_reads_.load(); }
+
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override {
+    IOStatus s = target()->NewSequentialFile(fname, file_opts, result, dbg);
+    if (s.ok() && test::GetFileType(fname) == kDescriptorFile) {
+      *result = std::make_unique<FailingFile>(std::move(*result), this);
+    }
+    return s;
+  }
+
+ private:
+  static constexpr uint64_t kAnyOffset = std::numeric_limits<uint64_t>::max();
+
+  class FailingFile : public FSSequentialFileOwnerWrapper {
+   public:
+    FailingFile(std::unique_ptr<FSSequentialFile>&& target,
+                FailingManifestReadFS* fs)
+        : FSSequentialFileOwnerWrapper(std::move(target)), fs_(fs) {}
+
+    IOStatus Read(size_t n, const IOOptions& options, Slice* result,
+                  char* scratch, IODebugContext* dbg) override {
+      if (fs_->ShouldFailRead(offset_)) {
+        *result = Slice();
+        return IOStatus::IOError("Injected MANIFEST read error");
+      }
+      IOStatus s =
+          FSSequentialFileOwnerWrapper::Read(n, options, result, scratch, dbg);
+      if (s.ok()) {
+        offset_ += result->size();
+      }
+      return s;
+    }
+
+    IOStatus Skip(uint64_t n) override {
+      IOStatus s = FSSequentialFileOwnerWrapper::Skip(n);
+      if (s.ok()) {
+        offset_ += n;
+      }
+      return s;
+    }
+
+   private:
+    FailingManifestReadFS* const fs_;
+    // The offset in the file where the next read starts.
+    uint64_t offset_ = 0;
+  };
+
+  bool ShouldFailRead(uint64_t offset) {
+    if (!armed_.load()) {
+      return false;
+    }
+    const uint64_t fail_offset = fail_offset_.load();
+    if (fail_offset != kAnyOffset) {
+      if (offset != fail_offset) {
+        return false;
+      }
+    } else if (reads_that_succeed_.load() > 0) {
+      reads_that_succeed_.fetch_sub(1);
+      return false;
+    }
+    failed_reads_.fetch_add(1);
+    return true;
+  }
+
+  std::atomic<bool> armed_{false};
+  std::atomic<uint64_t> fail_offset_{kAnyOffset};
+  std::atomic<int> reads_that_succeed_{0};
+  std::atomic<int> failed_reads_{0};
+};
+
+// The destructor closes the secondary before the Env it was opened on is
+// destroyed.
+class DBSecondaryManifestReadErrorTest : public DBSecondaryTestBase {
+ public:
+  DBSecondaryManifestReadErrorTest()
+      : DBSecondaryTestBase("db_secondary_manifest_read_error_test"),
+        failing_fs_(
+            std::make_shared<FailingManifestReadFS>(env_->GetFileSystem())),
+        failing_env_(new CompositeEnvWrapper(env_, failing_fs_)) {}
+
+  ~DBSecondaryManifestReadErrorTest() override { CloseSecondary(); }
+
+ protected:
+  // Opens the secondary on the failing file system, with the default column
+  // family and `cf_names`.
+  void OpenSecondaryOnFailingFs(const Options& options,
+                                const std::vector<std::string>& cf_names) {
+    Options secondary_options = options;
+    secondary_options.env = failing_env_.get();
+    secondary_options.max_open_files = -1;
+    OpenSecondaryWithColumnFamilies(cf_names, secondary_options);
+  }
+
+  // Flushes the column families `cfs` together `num_flushes` times. Flush `i`
+  // writes the key LongKey(key_size, i) and "foo"="v<i + 2>" to each of them.
+  // The long key is the largest key of each new table file, so each MANIFEST
+  // record that a flush adds is longer than `key_size` bytes.
+  void FlushWithLongKeys(const std::vector<int>& cfs, int num_flushes,
+                         size_t key_size) {
+    for (int i = 0; i < num_flushes; ++i) {
+      for (int cf : cfs) {
+        ASSERT_OK(Put(cf, LongKey(key_size, i), "v"));
+        ASSERT_OK(Put(cf, "foo", "v" + std::to_string(i + 2)));
+      }
+      ASSERT_OK(Flush(cfs));
+    }
+  }
+
+  // Checks that the secondary reads every key that
+  // FlushWithLongKeys(cfs, num_flushes, key_size) wrote, so that a record that
+  // catch-up skipped makes the check fail.
+  void VerifySecondaryHasFlushes(const std::vector<int>& cfs, int num_flushes,
+                                 size_t key_size) {
+    for (int cf : cfs) {
+      for (int i = 0; i < num_flushes; ++i) {
+        VerifySecondaryValue(handles_secondary_[cf], LongKey(key_size, i), "v");
+      }
+      VerifySecondaryValue(handles_secondary_[cf], "foo",
+                           "v" + std::to_string(num_flushes + 1));
+    }
+  }
+
+  static std::string LongKey(size_t key_size, int i) {
+    std::string key = "k" + std::to_string(i);
+    key.resize(key_size, 'k');
+    return key;
+  }
+
+  std::shared_ptr<FailingManifestReadFS> failing_fs_;
+  std::unique_ptr<Env> failing_env_;
+};
+
+enum class ManifestReadFailure {
+  // The failed read continues the log block that the secondary read in part at
+  // its last EOF. The MANIFEST reader does not report it.
+  kUnreported,
+  // The first read succeeds, and the failed read starts the next block. The
+  // MANIFEST reader reports it.
+  kReported,
+  // As kUnreported, and the two calls after the failed one fail too.
+  kFailedRetries,
+  // As kReported, and the primary starts a new MANIFEST before the next call.
+  // The new reader shares the status that holds the reported error.
+  kManifestSwitch,
+};
+
+class DBSecondaryManifestReadFailureTest
+    : public DBSecondaryManifestReadErrorTest,
+      public testing::WithParamInterface<ManifestReadFailure> {};
+
+TEST_P(DBSecondaryManifestReadFailureTest,
+       CatchUpResumesAfterManifestReadError) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName}, options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  OpenSecondaryOnFailingFs(options, /*cf_names=*/{});
+  VerifySecondaryValue("foo", "v1");
+
+  // Each of the 40 MANIFEST records is longer than 1000 bytes, so together they
+  // fill more than the rest of the log block (log::kBlockSize, 32 KiB) that
+  // the secondary read in part, and catch-up reads at least one more block.
+  constexpr int kNumFlushes = 40;
+  constexpr size_t kKeySize = 1000;
+  FlushWithLongKeys({0}, kNumFlushes, kKeySize);
+
+  const ManifestReadFailure failure = GetParam();
+  const bool reported = failure == ManifestReadFailure::kReported ||
+                        failure == ManifestReadFailure::kManifestSwitch;
+  failing_fs_->FailReadsAfter(reported ? 1 : 0);
+  Status s = db_secondary_->TryCatchUpWithPrimary();
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+  ASSERT_GT(failing_fs_->failed_reads(), 0);
+  if (failure == ManifestReadFailure::kFailedRetries) {
+    for (int retry = 0; retry < 2; ++retry) {
+      s = db_secondary_->TryCatchUpWithPrimary();
+      ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+    }
+  }
+  failing_fs_->Disarm();
+  if (failure == ManifestReadFailure::kManifestSwitch) {
+    // The new MANIFEST lists every table file in its first records.
+    Reopen(options);
+  }
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryHasFlushes({0}, kNumFlushes, kKeySize);
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DBSecondaryManifestReadFailureTest, DBSecondaryManifestReadFailureTest,
+    ::testing::Values(ManifestReadFailure::kUnreported,
+                      ManifestReadFailure::kReported,
+                      ManifestReadFailure::kFailedRetries,
+                      ManifestReadFailure::kManifestSwitch));
+
+// The failed read cuts an atomic group: it starts a log block after the first
+// record of the group ends and before its last record ends. The tailer has
+// read the first records of the group but applied none of them, and the next
+// call must read the whole group again.
+TEST_F(DBSecondaryManifestReadErrorTest, CatchUpResumesInsideAtomicGroup) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  options.atomic_flush = true;
+  const std::vector<std::string> cf_names = {"cf1", "cf2", "cf3"};
+  const std::vector<int> cfs = {0, 1, 2, 3};
+  CreateAndReopenWithCF(cf_names, options);
+  for (int cf : cfs) {
+    ASSERT_OK(Put(cf, "foo", "v1"));
+  }
+  ASSERT_OK(Flush(cfs));
+  OpenSecondaryOnFailingFs(options, cf_names);
+  const size_t records_read_at_open = ReadPrimaryManifestRecords().size();
+
+  // Each flush adds an atomic group of 4 records, one for each column family.
+  // Each record is longer than 10000 bytes, so each group is longer than a log
+  // block (log::kBlockSize, 32 KiB), and the block boundaries cut groups.
+  constexpr int kNumFlushes = 4;
+  constexpr size_t kKeySize = 10000;
+  FlushWithLongKeys(cfs, kNumFlushes, kKeySize);
+
+  // Catch-up reads the rest of the block that the secondary read in part at
+  // open, and then one whole block at a time. Find the first block boundary
+  // after the first record of a group and before the end of that group.
+  const std::vector<ManifestRecord> records = ReadPrimaryManifestRecords();
+  uint64_t cut = 0;
+  for (size_t i = records_read_at_open; cut == 0 && i < records.size(); ++i) {
+    const VersionEdit& first = records[i].edit;
+    if (!first.IsInAtomicGroup()) {
+      continue;
+    }
+    const size_t last = i + first.GetRemainingEntries();
+    ASSERT_LT(last, records.size());
+    const uint64_t boundary = (records[i].end_offset + log::kBlockSize - 1) /
+                              log::kBlockSize * log::kBlockSize;
+    if (boundary < records[last].end_offset) {
+      cut = boundary;
+    }
+    i = last;
+  }
+  ASSERT_GT(cut, 0);
+
+  failing_fs_->FailReadsAt(cut);
+  const Status s = db_secondary_->TryCatchUpWithPrimary();
+  failing_fs_->Disarm();
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+  ASSERT_EQ(1, failing_fs_->failed_reads());
+  // The tailer holds the first records of the cut group.
+  ASSERT_GT(static_cast_with_check<ReactiveVersionSet>(
+                db_secondary_full()->GetVersionSet())
+                ->TEST_read_edits_in_atomic_group(),
+            0);
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryHasFlushes(cfs, kNumFlushes, kKeySize);
+}
+
+// The next two tests replace the MANIFEST while the secondary has it open,
+// which not every platform allows.
+#ifndef OS_WIN
+// Between the failed read and the next call, the name of the MANIFEST comes to
+// name the MANIFEST of another DB. The next call must not continue in that
+// file.
+TEST_F(DBSecondaryManifestReadErrorTest,
+       CatchUpRejectsReopenedManifestOfAnotherDb) {
+  Options options;
+  options.env = env_;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName}, options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  OpenSecondaryOnFailingFs(options, /*cf_names=*/{});
+  constexpr int kNumFlushes = 40;
+  constexpr size_t kKeySize = 1000;
+  FlushWithLongKeys({0}, kNumFlushes, kKeySize);
+
+  failing_fs_->FailReadsAfter(0);
+  Status s = db_secondary_->TryCatchUpWithPrimary();
+  failing_fs_->Disarm();
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+
+  // Replace the primary's MANIFEST with the MANIFEST of a new DB, under the
+  // same name.
+  std::string manifest_path;
+  uint64_t manifest_number = 0;
+  ASSERT_OK(GetCurrentManifestPath(dbname_, env_->GetFileSystem().get(),
+                                   /*is_retry=*/false, &manifest_path,
+                                   &manifest_number));
+  Close();
+  const std::string other_db = dbname_ + "_other";
+  ASSERT_OK(DestroyDB(other_db, options));
+  std::string other_manifest_path;
+  {
+    std::unique_ptr<DB> other;
+    ASSERT_OK(DB::Open(options, other_db, &other));
+    ASSERT_OK(GetCurrentManifestPath(other_db, env_->GetFileSystem().get(),
+                                     /*is_retry=*/false, &other_manifest_path,
+                                     &manifest_number));
+  }
+  ASSERT_OK(env_->RenameFile(other_manifest_path, manifest_path));
+  ASSERT_OK(DestroyDB(other_db, options));
+
+  for (int call = 0; call < 2; ++call) {
+    s = db_secondary_->TryCatchUpWithPrimary();
+    ASSERT_EQ(Status::Code::kCorruption, s.code()) << s.ToString();
+    VerifySecondaryValue("foo", "v1");
+  }
+}
+
+// Between the failed read and the next call, the MANIFEST looks shorter than
+// what the secondary applied, as a remote file system can show an old view of
+// a file for a short time. The next call returns a retryable error, and the
+// call after the file looks whole again resumes.
+TEST_F(DBSecondaryManifestReadErrorTest,
+       CatchUpRetriesReopenOfShorterManifest) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName}, options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  OpenSecondaryOnFailingFs(options, /*cf_names=*/{});
+  constexpr int kNumFlushes = 40;
+  constexpr size_t kKeySize = 1000;
+  FlushWithLongKeys({0}, kNumFlushes, kKeySize);
+
+  // The first read succeeds, so the secondary applies the records in the rest
+  // of the block that it read in part at open.
+  failing_fs_->FailReadsAfter(1);
+  Status s = db_secondary_->TryCatchUpWithPrimary();
+  failing_fs_->Disarm();
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+
+  std::string manifest_path;
+  uint64_t manifest_number = 0;
+  ASSERT_OK(GetCurrentManifestPath(dbname_, env_->GetFileSystem().get(),
+                                   /*is_retry=*/false, &manifest_path,
+                                   &manifest_number));
+  Close();
+  std::string manifest;
+  ASSERT_OK(ReadFileToString(env_, manifest_path, &manifest));
+  ASSERT_GT(manifest.size(), size_t{log::kBlockSize});
+  // Half of the first block still holds the record with the DB ID.
+  ASSERT_OK(WriteStringToFile(env_, manifest.substr(0, log::kBlockSize / 2),
+                              manifest_path));
+  s = db_secondary_->TryCatchUpWithPrimary();
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+
+  ASSERT_OK(WriteStringToFile(env_, manifest, manifest_path));
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  VerifySecondaryHasFlushes({0}, kNumFlushes, kKeySize);
+}
+#endif  // !OS_WIN
+
 TEST_F(DBSecondaryTest, MissingTableFileDuringOpen) {
   Options options;
   options.env = env_;
@@ -2793,6 +3656,7 @@ TEST_F(DBSecondaryTest, PrimaryDropColumnFamily) {
   Status new_iterators_status = db_secondary_->NewIterators(
       ropts, {handles_secondary_[1]}, &raw_iterators);
   std::vector<std::unique_ptr<Iterator>> iterators;
+  iterators.reserve(raw_iterators.size());
   for (Iterator* iterator : raw_iterators) {
     iterators.emplace_back(iterator);
   }
@@ -2924,6 +3788,7 @@ TEST_F(DBSecondaryTest, ReclaimsRetiredReadViewAfterLastReader) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 
   std::vector<std::unique_ptr<Iterator>> owned_iterators;
+  owned_iterators.reserve(iterators.size());
   for (Iterator* iterator : iterators) {
     owned_iterators.emplace_back(iterator);
   }
@@ -3249,6 +4114,66 @@ TEST_F(DBSecondaryTest, SwitchManifestTwice) {
 
   ASSERT_OK(db_secondary_->Get(ropts, "0", &value));
   ASSERT_EQ("value1", value);
+}
+
+// A new DB created at the primary's path writes a MANIFEST with another DB ID.
+// Catch-up must not replay that MANIFEST on top of the Versions of the old DB,
+// in the call that finds the DB ID or in a later one.
+TEST_F(DBSecondaryTest, CatchUpRejectsManifestOfAnotherDb) {
+  Options options;
+  options.env = env_;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Flush());
+  std::string first_db_id;
+  ASSERT_OK(db_->GetDbIdentity(first_db_id));
+  const uint64_t first_manifest_number =
+      dbfull()->TEST_Current_Manifest_FileNo();
+
+  // With max_open_files = -1, the secondary keeps the table file of the old DB
+  // open, so it can still read it after the primary DB is destroyed.
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+  VerifySecondaryValue("foo", "v1");
+  const auto live_file_numbers = [this]() {
+    std::vector<LiveFileMetaData> live_files;
+    db_secondary_->GetLiveFilesMetaData(&live_files);
+    std::set<uint64_t> numbers;
+    for (const auto& file : live_files) {
+      numbers.insert(file.file_number);
+    }
+    return numbers;
+  };
+  const std::set<uint64_t> old_live_file_numbers = live_file_numbers();
+  const SequenceNumber old_last_sequence =
+      db_secondary_->GetLatestSequenceNumber();
+
+  // A new DB numbers its files from the start, so its MANIFEST can get the
+  // number of the MANIFEST of the old DB. Each open writes a MANIFEST with a
+  // higher number. Reopen until the name differs, because catch-up reads a new
+  // MANIFEST only when CURRENT names another file.
+  DestroyAndReopen(options);
+  while (dbfull()->TEST_Current_Manifest_FileNo() == first_manifest_number) {
+    Reopen(options);
+  }
+  ASSERT_OK(Put("foo", "other_db"));
+  ASSERT_OK(Flush());
+  std::string second_db_id;
+  ASSERT_OK(db_->GetDbIdentity(second_db_id));
+  ASSERT_NE(first_db_id, second_db_id);
+
+  // Only the first record of the new MANIFEST has a DB ID. The second call
+  // must not read the records after it.
+  for (int call = 0; call < 2; ++call) {
+    const Status s = db_secondary_->TryCatchUpWithPrimary();
+    ASSERT_EQ(Status::Code::kCorruption, s.code()) << s.ToString();
+    VerifySecondaryValue("foo", "v1");
+    ASSERT_EQ(old_live_file_numbers, live_file_numbers());
+    ASSERT_EQ(old_last_sequence, db_secondary_->GetLatestSequenceNumber());
+  }
 }
 
 TEST_F(DBSecondaryTest, DISABLED_SwitchWAL) {
@@ -3742,7 +4667,8 @@ TEST_F(DBSecondaryTestWithTimestamp, IteratorAndGet) {
   ASSERT_OK(ReopenAsSecondary(options));
 
   auto get_value_and_check = [](DB* db, ReadOptions read_opts, Slice key,
-                                Slice expected_value, std::string expected_ts) {
+                                Slice expected_value,
+                                const std::string& expected_ts) {
     std::string value_from_get;
     std::string timestamp;
     ASSERT_OK(db->Get(read_opts, key.ToString(), &value_from_get, &timestamp));

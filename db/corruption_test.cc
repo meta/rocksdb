@@ -12,6 +12,7 @@
 #include <sys/types.h>
 
 #include <cinttypes>
+#include <memory>
 
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
@@ -84,7 +85,7 @@ class CorruptionTest : public testing::Test {
     EXPECT_OK(
         test::CreateEnvFromSystem(ConfigOptions(), &base_env_, &env_guard_));
     EXPECT_NE(base_env_, nullptr);
-    fs_.reset(new ErrorFS(base_env_->GetFileSystem()));
+    fs_ = std::make_shared<ErrorFS>(base_env_->GetFileSystem());
     env_ = NewCompositeEnv(fs_);
     options_.wal_recovery_mode = WALRecoveryMode::kTolerateCorruptedTailRecords;
     options_.env = env_.get();
@@ -106,7 +107,7 @@ class CorruptionTest : public testing::Test {
     SyncPoint::GetInstance()->LoadDependency({});
     SyncPoint::GetInstance()->ClearAllCallBacks();
     db_.reset();
-    if (getenv("KEEP_DB")) {
+    if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
       fprintf(stdout, "db is still at %s\n", dbname_.c_str());
     } else {
       Options opts;
@@ -295,8 +296,17 @@ class CorruptionTest : public testing::Test {
       case FileType::kWalFile:
         path = LogFileName(dbname_, number);
         break;
-      // TODO: Add other file types as this method is being used for those file
-      // types.
+      case FileType::kDBLockFile:
+      case FileType::kTableFile:
+      case FileType::kDescriptorFile:
+      case FileType::kCurrentFile:
+      case FileType::kTempFile:
+      case FileType::kInfoLogFile:
+      case FileType::kMetaDatabase:
+      case FileType::kIdentityFile:
+      case FileType::kOptionsFile:
+      case FileType::kBlobFile:
+      case FileType::kCompactionProgressFile:
       default:
         return;
     }

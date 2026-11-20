@@ -416,6 +416,7 @@ TEST_F(BlockTest, BlockReadAmpBitmap) {
 
     // Generate some random entries
     std::vector<size_t> random_entry_offsets;
+    random_entry_offsets.reserve(1000);
     for (int i = 0; i < 1000; i++) {
       random_entry_offsets.push_back(rnd.Next() % block_size);
     }

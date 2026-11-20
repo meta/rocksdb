@@ -40,12 +40,25 @@ Status GetInternalKeyForSeekForPrev(const Slice& user_key,
 Status ParseEntry(const Slice& internal_key, const Comparator* comparator,
                   ParsedEntryInfo* parsed_entry);
 
+// Returns the buffer size required to encode entry.
+inline size_t GetEncodedEntrySize(const ParsedEntryInfo& entry) {
+  return entry.user_key.size() + entry.timestamp.size() +
+         kInternalKeyFooterSize;
+}
+
 // Encodes entry into internal_key, replacing its contents on success.
 // entry.timestamp is appended verbatim to the user key and must match the
 // column family's timestamp size. Input slices must not refer to internal_key.
 // Returns InvalidArgument for unsupported entry types or a sequence above the
 // 56-bit limit; internal_key is unchanged on error.
 Status EncodeEntry(const ParsedEntryInfo& entry, std::string* internal_key);
+
+// Encodes entry into a caller-owned buffer without allocating on success.
+// internal_key must have at least GetEncodedEntrySize(entry) writable bytes.
+// Writes exactly that many bytes, leaving remaining space unchanged.
+// Input slices must not overlap the written region.
+// Timestamp handling and errors are as above.
+Status EncodeEntry(const ParsedEntryInfo& entry, char* internal_key);
 
 // Packs seq and the internal value type corresponding to type into *packed.
 // The sequence occupies the upper 56 bits and the value type the lower 8 bits.

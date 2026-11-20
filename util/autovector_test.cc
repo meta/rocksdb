@@ -210,7 +210,7 @@ std::vector<std::string> GetTestKeys(size_t size) {
 
 template <class TVector>
 void BenchmarkVectorCreationAndInsertion(
-    std::string name, size_t ops, size_t item_size,
+    const std::string& name, size_t ops, size_t item_size,
     const std::vector<typename TVector::value_type>& items) {
   auto env = Env::Default();
 
@@ -230,7 +230,8 @@ void BenchmarkVectorCreationAndInsertion(
 }
 
 template <class TVector>
-size_t BenchmarkSequenceAccess(std::string name, size_t ops, size_t elem_size) {
+size_t BenchmarkSequenceAccess(const std::string& name, size_t ops,
+                               size_t elem_size) {
   TVector v;
   for (const auto& item : GetTestKeys(elem_size)) {
     v.push_back(item);

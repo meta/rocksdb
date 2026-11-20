@@ -52,7 +52,7 @@ static void TestKey(const std::string& key, uint64_t seq, ValueType vt) {
 
 class FormatTest : public testing::Test {};
 
-TEST_F(FormatTest, InternalKey_EncodeDecode) {
+TEST_F(FormatTest, InternalKeyEncodeDecode) {
   const char* keys[] = {"", "k", "hello", "longggggggggggggggggggggg"};
   const uint64_t seq[] = {1,
                           2,

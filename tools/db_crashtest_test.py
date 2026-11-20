@@ -130,6 +130,109 @@ class DBCrashTestTest(unittest.TestCase):
         args.update(overrides)
         return SimpleNamespace(**args)
 
+    def test_merge_before_filter_profile_selection_and_snapshots(self):
+        db_crashtest = self.load_db_crashtest()
+        compatible = {
+            "enable_compaction_filter": 1,
+            "merge_before_compaction_filter": 1,
+            "merge_before_filter_remove_deleted": 0,
+            "test_batches_snapshots": 0,
+            "sync_fault_injection": 0,
+            "disable_wal": 0,
+            "manual_wal_flush_one_in": 0,
+            "inplace_update_support": 0,
+            "enable_blob_direct_write": 0,
+            "remote_compaction_worker_threads": 0,
+            "ingest_external_file_atomic_replace_one_in": 0,
+            "use_txn": 0,
+            "use_optimistic_txn": 0,
+            "test_multi_ops_txns": 0,
+            "user_timestamp_size": 0,
+            "persist_user_defined_timestamps": 1,
+            "use_blob_db": 0,
+            "acquire_snapshot_one_in": 100,
+            "compact_range_one_in": 100,
+            "prefix_size": -1,
+            "prefixpercent": 0,
+            "iterpercent": 10,
+        }
+        for overrides in ({}, {"merge_before_compaction_filter": 0}):
+            params = self.build_params(db_crashtest.default_params, compatible)
+            params.update(overrides)
+            finalized = db_crashtest.finalize_and_sanitize(params)
+            post = finalized["merge_before_compaction_filter"]
+            self.assertEqual(
+                compatible["acquire_snapshot_one_in"] if post else 0,
+                finalized["acquire_snapshot_one_in"],
+            )
+            self.assertEqual(10 if post else 0, finalized["iterpercent"])
+            command, _ = db_crashtest.gen_cmd(finalized, [])
+            self.assertIn(f"--merge_before_compaction_filter={post}", command)
+            if not post:
+                self.assertEqual(0, finalized["merge_before_filter_remove_deleted"])
+                self.assertEqual(0, finalized["merge_before_filter_change_one_in"])
+        # Removing records can change what a snapshot reads, so the remove/skip
+        # mode uses the same no-snapshot settings as the default-order filter.
+        params = self.build_params(db_crashtest.default_params, compatible)
+        params["merge_before_filter_remove_deleted"] = 1
+        finalized = db_crashtest.finalize_and_sanitize(params)
+        self.assertEqual(1, finalized["merge_before_compaction_filter"])
+        self.assertEqual(1, finalized["merge_before_filter_remove_deleted"])
+        self.assertEqual(0, finalized["acquire_snapshot_one_in"])
+        self.assertEqual(0, finalized["compact_range_one_in"])
+        self.assertEqual(0, finalized["iterpercent"])
+        for name in (
+            "enable_compaction_filter",
+            "use_txn",
+            "use_optimistic_txn",
+            "test_multi_ops_txns",
+            "user_timestamp_size",
+            "use_blob_db",
+            "test_batches_snapshots",
+            "sync_fault_injection",
+            "disable_wal",
+        ):
+            with self.subTest(name=name):
+                params = self.build_params(db_crashtest.default_params, compatible)
+                params[name] = 0 if name == "enable_compaction_filter" else 1
+                finalized = db_crashtest.finalize_and_sanitize(params)
+                self.assertEqual(0, finalized["merge_before_compaction_filter"])
+        # cf_lifecycle_params pins use_merge=0, so merge-before-filter must not
+        # turn merges back on.
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args("blackbox", cf_lifecycle=True)
+        )
+        params.update(
+            {"enable_compaction_filter": 1, "merge_before_compaction_filter": 1}
+        )
+        for _ in range(20):
+            finalized = db_crashtest.finalize_and_sanitize(self.build_params(params))
+            self.assertEqual(0, finalized["use_merge"])
+
+    def test_user_timestamp_disables_merge(self):
+        db_crashtest = self.load_db_crashtest()
+        base = dict(db_crashtest.default_params)
+        base.update(db_crashtest.ts_params)
+        # gen_cmd_params() adds this from the command line arguments.
+        base["test_best_efforts_recovery"] = 0
+        # Merge-before-filter selection turns merges on in about half of these
+        # runs when nothing turns them off later.
+        overrides = {
+            "enable_compaction_filter": 1,
+            "merge_before_compaction_filter": 1,
+            "use_merge": 0,
+        }
+        for seed in range(32):
+            with self.subTest(seed=seed):
+                db_crashtest.random.seed(seed)
+                params = self.build_params(base, overrides)
+                finalized = db_crashtest.finalize_and_sanitize(params)
+                self.assertEqual(0, finalized["use_merge"])
+        # An explicit use_merge=1 is turned off as well.
+        params = self.build_params(base, {"use_merge": 1})
+        finalized = db_crashtest.finalize_and_sanitize(params)
+        self.assertEqual(0, finalized["use_merge"])
+
     def test_stress_cmd_env_defaults_tsan_suppressions(self):
         os.environ.pop(_TSAN_OPTIONS_ENV_VAR, None)
         db_crashtest = self.load_db_crashtest()
@@ -651,6 +754,8 @@ class DBCrashTestTest(unittest.TestCase):
         args = self.build_mode_args(
             test_type="blackbox", test_full_external_table=True
         )
+        # In-place updates would disable the snapshots asserted below.
+        db_crashtest.default_params["inplace_update_support"] = 0
 
         # Choose the blob overlay whenever it is consulted. The full external
         # table profile must bypass that random overlay.
@@ -875,6 +980,24 @@ class DBCrashTestTest(unittest.TestCase):
         self.assertEqual(self.expected_dir, expected_dir)
         self.assertTrue(os.path.exists(marker))
 
+    def test_finalize_keeps_parallel_compression_with_trie_index(self):
+        db_crashtest = self.load_db_crashtest()
+        for index_mode in range(5):
+            with self.subTest(index_mode=index_mode):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "use_trie_index": 1,
+                        "index_mode": index_mode,
+                        "compression_parallel_threads": 4,
+                    },
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual(1, finalized["use_trie_index"])
+                self.assertEqual(4, finalized["compression_parallel_threads"])
+
     def test_finalize_disables_test_batches_snapshots_when_disable_wal(self):
         db_crashtest = self.load_db_crashtest()
         params = self.build_params(
@@ -917,6 +1040,7 @@ class DBCrashTestTest(unittest.TestCase):
             db_crashtest.default_params,
             {
                 "file_scope_wal_write_faults": 1,
+                "inplace_update_support": 0,
                 "write_fault_one_in": 0,
                 "max_write_buffer_number": 3,
                 "disable_wal": 1,
@@ -992,6 +1116,7 @@ class DBCrashTestTest(unittest.TestCase):
             db_crashtest.default_params,
             {
                 "file_scope_wal_write_faults": 1,
+                "inplace_update_support": 0,
                 "disable_wal": 1,
                 "ingest_wbwi_one_in": 100,
                 "enable_pipelined_write": 0,
@@ -1108,6 +1233,192 @@ class DBCrashTestTest(unittest.TestCase):
 
         self.assertEqual(1, params["file_scope_wal_write_faults"])
 
+    def choose_without_blob_or_file_scope_profile(self, values):
+        return values[0]
+
+    def gen_inplace_update_cmd_params(self, db_crashtest, args, unknown_params=None):
+        with mock.patch.object(
+            db_crashtest.random,
+            "choice",
+            side_effect=self.choose_without_blob_or_file_scope_profile,
+        ):
+            params = db_crashtest.gen_cmd_params(args, unknown_params)
+        params["db"] = self.test_tmpdir
+        return params
+
+    def assert_inplace_update_incompatible_features_off(self, finalized):
+        self.assertEqual(1, finalized["inplace_update_support"])
+        for flag in [
+            "delrangepercent",
+            "min_tombstones_for_range_conversion",
+            "test_ingest_standalone_range_deletion_one_in",
+            "prefixpercent",
+            "iterpercent",
+            "acquire_snapshot_one_in",
+            "compact_range_one_in",
+            "check_multiget_consistency",
+            "check_multiget_entity_consistency",
+            "memtable_verify_per_key_checksum_on_seek",
+            "test_batches_snapshots",
+            "allow_concurrent_memtable_write",
+            "remote_compaction_worker_threads",
+            "lazy_entity_read_one_in",
+            "sync_fault_injection",
+            "disable_wal",
+            "manual_wal_flush_one_in",
+        ]:
+            self.assertEqual(0, finalized[flag], flag)
+
+    def test_inplace_update_support_stays_on_across_runs(self):
+        for test_type, simple in (
+            ("blackbox", False),
+            ("blackbox", True),
+            ("whitebox", False),
+        ):
+            with self.subTest(test_type=test_type, simple=simple):
+                db_crashtest = self.load_db_crashtest()
+                db_crashtest.default_params["inplace_update_support"] = 1
+                args = self.build_mode_args(test_type=test_type, simple=simple)
+                params = self.gen_inplace_update_cmd_params(db_crashtest, args)
+                self.assertEqual(1, params["inplace_update_support"])
+                # Features drawn per run must be turned off in every run, even
+                # when a run draws them on.
+                params.update(
+                    {
+                        "delrangepercent": 1,
+                        "min_tombstones_for_range_conversion": 2,
+                        "remote_compaction_worker_threads": 8,
+                        "allow_concurrent_memtable_write": 1,
+                        "test_batches_snapshots": 1,
+                        "disable_wal": 1,
+                        "sync_fault_injection": 1,
+                        "memtable_verify_per_key_checksum_on_seek": 1,
+                        "test_ingest_standalone_range_deletion_one_in": 5,
+                        "lazy_entity_read_one_in": 10,
+                    }
+                )
+                for _ in range(20):
+                    _, finalized = db_crashtest.gen_cmd(dict(params), [])
+                    self.assert_inplace_update_incompatible_features_off(finalized)
+
+    def test_explicit_incompatible_flag_disables_inplace_update_support(self):
+        cases = [
+            {"delrangepercent": 1},
+            {"min_tombstones_for_range_conversion": 2},
+            {"test_ingest_standalone_range_deletion_one_in": 5},
+            {"allow_concurrent_memtable_write": 1},
+            {"test_batches_snapshots": 1},
+            {"disable_wal": 1},
+            {"remote_compaction_worker_threads": 8},
+            {"lazy_entity_read_one_in": 10},
+            {"memtablerep": "vector"},
+            {"memtablerep": "sorted_hash"},
+            {"inplace_update_support": 1, "memtablerep": "sorted_hash"},
+            {"use_txn": 1},
+            {"file_scope_wal_write_faults": 1},
+            {"inplace_update_support": 1, "delrangepercent": 1},
+            {"inplace_update_support": 1, "txn": True},
+            {"test_best_efforts_recovery": True},
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                db_crashtest = self.load_db_crashtest()
+                db_crashtest.default_params["inplace_update_support"] = 1
+                args = self.build_mode_args(test_type="blackbox", **overrides)
+                params = self.gen_inplace_update_cmd_params(db_crashtest, args)
+                self.assertEqual(0, params["inplace_update_support"])
+                _, finalized = db_crashtest.gen_cmd(dict(params), [])
+                self.assertEqual(0, finalized["inplace_update_support"])
+
+    def test_explicit_compatible_flag_keeps_inplace_update_support(self):
+        db_crashtest = self.load_db_crashtest()
+        db_crashtest.default_params["inplace_update_support"] = 1
+        args = self.build_mode_args(
+            test_type="blackbox", delrangepercent=0, disable_wal=0
+        )
+        params = self.gen_inplace_update_cmd_params(db_crashtest, args)
+        self.assertEqual(1, params["inplace_update_support"])
+
+    def test_unparsed_args_disable_only_random_inplace_update_support(self):
+        db_crashtest = self.load_db_crashtest()
+        db_crashtest.default_params["inplace_update_support"] = 1
+        args = self.build_mode_args(test_type="blackbox")
+        params = self.gen_inplace_update_cmd_params(
+            db_crashtest, args, ["--options_file=/tmp/OPTIONS"]
+        )
+        self.assertEqual(0, params["inplace_update_support"])
+
+        args = self.build_mode_args(test_type="blackbox", inplace_update_support=1)
+        params = self.gen_inplace_update_cmd_params(
+            db_crashtest, args, ["--options_file=/tmp/OPTIONS"]
+        )
+        self.assertEqual(1, params["inplace_update_support"])
+
+    def test_profiles_skip_incompatible_blob_direct_write(self):
+        def choose_last_blob_profile(values):
+            if values == [0] * 9 + [1]:
+                return 1
+            return values[-1] if isinstance(values[0], dict) else values[0]
+
+        cases = (
+            ({}, "enable_blob_direct_write", 1),
+            ({"inplace_update_support": 1}, "inplace_update_support", 1),
+            ({"txn": True}, "use_txn", 1),
+            ({"optimistic_txn": True}, "use_optimistic_txn", 1),
+            ({"test_multiops_txn": True}, "test_multi_ops_txns", 1),
+            ({"enable_ts": True}, "user_timestamp_size", 8),
+        )
+        for overrides, preserved_flag, expected_value in cases:
+            with self.subTest(overrides=overrides):
+                db_crashtest = self.load_db_crashtest()
+                args = self.build_mode_args(test_type="blackbox", **overrides)
+                with mock.patch.object(
+                    db_crashtest.random, "choice", side_effect=choose_last_blob_profile
+                ):
+                    params = db_crashtest.gen_cmd_params(args)
+                expected_direct_write = int(not overrides)
+                self.assertEqual(
+                    expected_direct_write, params.get("enable_blob_direct_write", 0)
+                )
+                self.assertEqual(expected_value, params[preserved_flag])
+                if overrides:
+                    self.assertEqual(
+                        db_crashtest.blob_params["enable_blob_files"],
+                        params["enable_blob_files"],
+                    )
+                _, finalized = db_crashtest.gen_cmd(self.build_params(params), [])
+                self.assertEqual(expected_value, finalized[preserved_flag])
+
+    def test_finalize_rejects_inplace_update_support_with_profile_conflict(self):
+        db_crashtest = self.load_db_crashtest()
+        for conflict in (
+            {"use_txn": 1},
+            {"memtablerep": "vector"},
+            {"memtablerep": "sorted_hash"},
+        ):
+            with self.subTest(conflict=conflict):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    dict(conflict, inplace_update_support=1),
+                )
+                with self.assertRaises(ValueError):
+                    db_crashtest.finalize_and_sanitize(params)
+
+    def test_sorted_hash_keeps_timestamps_off(self):
+        db_crashtest = self.load_db_crashtest()
+        params = self.build_params(
+            db_crashtest.default_params,
+            {
+                "inplace_update_support": 0,
+                "memtablerep": "sorted_hash",
+                "user_timestamp_size": 8,
+            },
+        )
+        _, finalized = db_crashtest.gen_cmd(params, [])
+        self.assertEqual(0, finalized["inplace_update_support"])
+        self.assertEqual(0, finalized["user_timestamp_size"])
+        self.assertEqual("sorted_hash", finalized["memtablerep"])
+
     def test_finalize_disables_sqfc_range_queries_with_range_conversion(self):
         db_crashtest = self.load_db_crashtest()
         params = self.build_params(
@@ -1117,6 +1428,7 @@ class DBCrashTestTest(unittest.TestCase):
                 "use_multiscan": 0,
                 "use_sqfc_for_range_queries": 1,
                 "min_tombstones_for_range_conversion": 2,
+                "inplace_update_support": 0,
             },
         )
 
@@ -1186,6 +1498,118 @@ class DBCrashTestTest(unittest.TestCase):
                 self.assertEqual(
                     0, finalized["ingest_external_file_atomic_replace_one_in"]
                 )
+
+    def test_finalize_trie_index_mode_rules(self):
+        db_crashtest = self.load_db_crashtest()
+        for index_mode in range(5):
+            with self.subTest(index_mode=index_mode):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "use_trie_index": 1,
+                        "index_mode": index_mode,
+                        "mmap_read": 1,
+                        "index_type": 2,
+                        "partition_filters": 1,
+                        "backup_one_in": 1000,
+                        "test_secondary": 1,
+                        "remote_compaction_worker_threads": 0,
+                        "format_version": 2,
+                    },
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual(index_mode, finalized["index_mode"])
+                self.assertEqual(0, finalized["mmap_read"])
+                if index_mode in (2, 3):
+                    self.assertIn(finalized["index_type"], [0, 3])
+                    self.assertEqual(0, finalized["partition_filters"])
+                    self.assertEqual(0, finalized["backup_one_in"])
+                    self.assertEqual(0, finalized["test_secondary"])
+                else:
+                    self.assertEqual(2, finalized["index_type"])
+                    self.assertEqual(1, finalized["partition_filters"])
+                    self.assertEqual(1000, finalized["backup_one_in"])
+                    self.assertEqual(1, finalized["test_secondary"])
+                if index_mode == 3:
+                    self.assertGreaterEqual(finalized["format_version"], 6)
+
+    def test_finalize_keeps_remote_compaction_in_trie_index_modes(self):
+        db_crashtest = self.load_db_crashtest()
+        for index_mode in range(5):
+            with self.subTest(index_mode=index_mode):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "use_trie_index": 1,
+                        "index_mode": index_mode,
+                        "backup_one_in": 0,
+                        "test_secondary": 0,
+                        "remote_compaction_worker_threads": 8,
+                        "enable_blob_direct_write": 0,
+                        "use_txn": 0,
+                        "inplace_update_support": 0,
+                    },
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual(8, finalized["remote_compaction_worker_threads"])
+
+    def test_finalize_read_index_rules(self):
+        db_crashtest = self.load_db_crashtest()
+        # (use_trie_index, index_mode, read_index, expected read_index)
+        cases = [
+            (1, 2, 1, 1),  # kBuiltin is valid with kCustomDefault
+            (1, 3, 1, -1),  # kCustomOnly has only a stub standard index
+            (1, 3, 2, 2),
+            (0, 1, 1, -1),  # selectors need the trie factory
+            (0, 1, 2, -1),
+            (0, 1, 0, 0),
+        ]
+        for use_trie_index, index_mode, read_index, expected in cases:
+            with self.subTest(
+                use_trie_index=use_trie_index,
+                index_mode=index_mode,
+                read_index=read_index,
+            ):
+                params = self.build_params(
+                    db_crashtest.default_params,
+                    {
+                        "use_trie_index": use_trie_index,
+                        "index_mode": index_mode,
+                        "read_index": read_index,
+                    },
+                )
+
+                finalized = db_crashtest.finalize_and_sanitize(params)
+
+                self.assertEqual(expected, finalized["read_index"])
+
+    def test_finalize_resets_custom_index_mode_without_trie(self):
+        db_crashtest = self.load_db_crashtest()
+        for index_mode in (2, 3, 4):
+            for overrides in (
+                {"use_trie_index": 0},
+                # Timestamps disable the trie after the trie rules run.
+                {
+                    "use_trie_index": 1,
+                    "user_timestamp_size": 8,
+                    "persist_user_defined_timestamps": 1,
+                },
+            ):
+                with self.subTest(index_mode=index_mode, **overrides):
+                    params = self.build_params(
+                        db_crashtest.default_params,
+                        dict(overrides, index_mode=index_mode, read_index=2),
+                    )
+
+                    finalized = db_crashtest.finalize_and_sanitize(params)
+
+                    self.assertEqual(0, finalized["use_trie_index"])
+                    self.assertEqual(1, finalized["index_mode"])
+                    self.assertEqual(-1, finalized["read_index"])
 
     def test_sanitize_known_stderr_suppresses_only_known_sigterm_lines(self):
         db_crashtest = self.load_db_crashtest()
@@ -1429,6 +1853,7 @@ class DBCrashTestTest(unittest.TestCase):
                 "num_dbs": 3,
                 "clear_column_family_one_in": 10,
                 "test_multi_ops_txns": 1,
+                "inplace_update_support": 0,
             },
         )
 
@@ -1512,6 +1937,7 @@ class DBCrashTestTest(unittest.TestCase):
             db_crashtest.default_params,
             {
                 "enable_blob_direct_write": 1,
+                "inplace_update_support": 0,
                 "tolerate_non_injected_io_errors_for_remote_dbs": 1,
             },
         )

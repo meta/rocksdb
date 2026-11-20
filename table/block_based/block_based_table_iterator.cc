@@ -50,24 +50,6 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
     return;
   }
 
-  if (target == nullptr) {
-    // `SeekToFirst()` has no seek key, so no prefix to trim readahead against.
-    // An earlier `Seek()` on this iterator can have left one behind, and
-    // `ResetBlockCacheLookupVar()` below does not clear it. Without this clear,
-    // `IsNextBlockOutOfReadaheadBound()` would trim against a key range that
-    // this positioning does not scan.
-    //
-    // TODO(hx235): set `seek_key_prefix_for_readahead_trimming_`
-    // even when `target == nullptr` that is when `SeekToFirst()` is called
-    seek_key_prefix_for_readahead_trimming_.clear();
-  } else if (prefix_extractor_ && read_options_.prefix_same_as_start) {
-    const Slice& seek_user_key = ExtractUserKey(*target);
-    seek_key_prefix_for_readahead_trimming_ =
-        prefix_extractor_->InDomain(seek_user_key)
-            ? prefix_extractor_->Transform(seek_user_key).ToString()
-            : "";
-  }
-
   bool is_first_pass = !async_read_in_progress_;
 
   if (!is_first_pass) {
@@ -90,20 +72,52 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
   is_out_of_bound_ = false;
   is_at_first_key_from_index_ = false;
   seek_stat_state_ = kNone;
+  assert(target != nullptr ||
+         first_seek_prefix_check_ == FirstSeekPrefixCheck::kNotRun);
   bool filter_checked = false;
-  if (target &&
-      !CheckPrefixMayMatch(*target, IterDirection::kForward, &filter_checked)) {
-    ResetDataIter();
-    RecordTick(table_->GetStatistics(), is_last_level_
-                                            ? LAST_LEVEL_SEEK_FILTERED
-                                            : NON_LAST_LEVEL_SEEK_FILTERED);
-    return;
+  if (target) {
+    if (first_seek_prefix_check_ != FirstSeekPrefixCheck::kNotRun) {
+      // BlockBasedTable::NewIteratorForSeek() ran this seek's prefix check.
+      filter_checked =
+          first_seek_prefix_check_ == FirstSeekPrefixCheck::kPassedFilter;
+      first_seek_prefix_check_ = FirstSeekPrefixCheck::kNotRun;
+    } else if (!CheckPrefixMayMatch(*target, IterDirection::kForward,
+                                    &filter_checked)) {
+      ResetDataIter();
+      RecordTick(table_->GetStatistics(), is_last_level_
+                                              ? LAST_LEVEL_SEEK_FILTERED
+                                              : NON_LAST_LEVEL_SEEK_FILTERED);
+      return;
+    }
   }
   if (filter_checked) {
     seek_stat_state_ = kFilterUsed;
     RecordTick(table_->GetStatistics(), is_last_level_
                                             ? LAST_LEVEL_SEEK_FILTER_MATCH
                                             : NON_LAST_LEVEL_SEEK_FILTER_MATCH);
+  }
+
+  // Set only after the prefix filter has passed the seek: a filtered seek
+  // reads no data blocks, and the next positioning call replaces or ignores
+  // this prefix. The second pass of an async seek reuses the first pass's.
+  if (target == nullptr) {
+    // `SeekToFirst()` has no seek key, so no prefix to trim readahead against.
+    // An earlier `Seek()` on this iterator can have left one behind, and
+    // `ResetBlockCacheLookupVar()` above does not clear it. Without this clear,
+    // `IsNextBlockOutOfReadaheadBound()` would trim against a key range that
+    // this positioning does not scan.
+    //
+    // TODO(hx235): set `seek_key_prefix_for_readahead_trimming_`
+    // even when `target == nullptr` that is when `SeekToFirst()` is called
+    seek_key_prefix_for_readahead_trimming_.clear();
+  } else if (prefix_extractor_ && read_options_.prefix_same_as_start) {
+    const Slice& seek_user_key = ExtractUserKey(*target);
+    const Slice prefix = prefix_extractor_->InDomain(seek_user_key)
+                             ? prefix_extractor_->Transform(seek_user_key)
+                             : Slice();
+    // assign() reuses the buffer kept from earlier seeks.
+    seek_key_prefix_for_readahead_trimming_.assign(prefix.data(),
+                                                   prefix.size());
   }
 
   bool need_seek_index = true;
@@ -892,6 +906,9 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
   if (!readahead_cache_lookup_) {
     return;
   }
+  TEST_SYNC_POINT_CALLBACK(
+      "BlockBasedTableIterator::BlockCacheLookupForReadAheadSize:TrimPrefix",
+      &seek_key_prefix_for_readahead_trimming_);
 
   // Readahead lookup may advance index_iter_ to the end of the file while the
   // current block is still being consumed. In that case there is no next block
@@ -1016,8 +1033,10 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
 }
 
 // Note:
-// - Iterator should not be reused for multiple multiscans or mixing
-// multiscan with regular iterator usage.
+// - multiscan_opts == nullptr (no bounded scan ranges) is a no-op.
+// - Prepare() may follow regular positioning (e.g. Seek()); the current
+// position is discarded.
+// - Iterator should not be reused for multiple multiscans.
 // - scan ranges should be non-overlapping, and have increasing start keys.
 // If a scan range's limit is not set, then there should only be one scan range.
 // - After Prepare(), a forward scan expects Seek to be called on the start key
@@ -1039,6 +1058,9 @@ void BlockBasedTableIterator::BlockCacheLookupForReadAheadSize(
 // moving forward.
 void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   assert(!multi_scan_read_set_);
+  if (multiscan_opts == nullptr) {
+    return;
+  }
   RecordTick(table_->GetStatistics(), MULTISCAN_PREPARE_CALLS);
   PERF_COUNTER_ADD(multiscan_prepare_count, 1);
   StopWatch sw(table_->get_rep()->ioptions.clock, table_->GetStatistics(),
@@ -1065,6 +1087,12 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
     RecordTick(table_->GetStatistics(), MULTISCAN_PREPARE_ERRORS);
     return;
   }
+
+  // CollectBlockHandles() repositions index_iter_ and success replaces it, so
+  // discard the current position and its data block, whatever the outcome.
+  ResetDataIter();
+  is_index_at_curr_block_ = false;
+  is_at_first_key_from_index_ = false;
 
   index_iter_->Prepare(multiscan_opts);
 
@@ -1130,6 +1158,8 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   }
   job->job_options.read_options = read_options_;
   job->job_options.read_options.async_io = multiscan_opts->use_async_io;
+  job->job_options.use_parallel_async_io_block_decompression =
+      multiscan_opts->use_parallel_async_io_block_decompression;
   // CollectBlockHandles walks sorted scan ranges through the table index, whose
   // key order matches data block offset order.
   job->job_options.block_handles_are_sorted = true;
@@ -1168,9 +1198,6 @@ void BlockBasedTableIterator::Prepare(const MultiScanArgs* multiscan_opts) {
   prefetch_max_idx_ = prefetch_max_idx;
   original_index_iter_ = std::move(index_iter_);
   index_iter_ = std::move(multi_scan_idx_iter);
-
-  is_index_at_curr_block_ = false;
-  block_iter_points_to_real_block_ = false;
 }
 
 constexpr auto kVerbose = false;

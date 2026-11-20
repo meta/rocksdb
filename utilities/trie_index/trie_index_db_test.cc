@@ -14,6 +14,7 @@
 // DB path including CompactionIterator, memtable flush, and the UDI builder
 // wrapper's ValueType mapping and kTypeValuePreferredSeqno handling.
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +32,7 @@
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/wide_columns.h"
 #include "rocksdb/write_batch.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/coding.h"
@@ -146,6 +148,27 @@ MakeStressLikeSqfcFactory() {
   return factory;
 }
 
+// Counts table builds that start the parallel compression pipeline. Tests that
+// configure parallel_threads > 1 check it so they fail, rather than passing
+// serially, if a builder declines the parallel protocol.
+class ParallelCompressionStartCounter {
+ public:
+  ParallelCompressionStartCounter() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "BlockBasedTableBuilder::MaybeStartParallelCompression:Started",
+        [this](void* /*arg*/) { started_.fetch_add(1); });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+  ~ParallelCompressionStartCounter() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+  int started() const { return started_.load(); }
+
+ private:
+  std::atomic<int> started_{0};
+};
+
 // Parameterized on IndexMode: kStandardDefault, kCustomDefault, and
 // kCustomOnly. All tests run in all three modes to ensure full coverage.
 class TrieIndexDBTest
@@ -174,6 +197,23 @@ class TrieIndexDBTest
   // Opens a DB using the parameterized UDI mode.
   Status OpenDB(int block_size = 0) {
     return OpenDBImpl(block_size, GetIndexMode());
+  }
+
+  void VerifySharedPrefixCompaction();
+
+  // Puts keys "key_000000" through "key_<num_keys - 1>", each with `value`,
+  // and returns them in key order.
+  std::vector<std::string> PutNumberedKeys(int num_keys,
+                                           const std::string& value) {
+    std::vector<std::string> keys;
+    keys.reserve(static_cast<size_t>(num_keys));
+    for (int i = 0; i < num_keys; i++) {
+      char key[16];
+      snprintf(key, sizeof(key), "key_%06d", i);
+      keys.emplace_back(key);
+      EXPECT_OK(db_->Put(WriteOptions(), keys.back(), value));
+    }
+    return keys;
   }
 
   // Explicitly opens as primary -- used by the backward compatibility test.
@@ -670,9 +710,8 @@ TEST_P(TrieIndexDBTest, CompactionTailSizeIsUpperBound) {
   EXPECT_EQ(value, "new");
 }
 
-TEST_P(TrieIndexDBTest, SharedPrefixDoesNotCutCompactionFilesEarly) {
+void TrieIndexDBTest::VerifySharedPrefixCompaction() {
   options_.disable_auto_compactions = true;
-  options_.compression = kNoCompression;
   options_.target_file_size_is_upper_bound = true;
   options_.target_file_size_base = 256 << 10;
   ASSERT_OK(OpenDB(512));
@@ -706,6 +745,26 @@ TEST_P(TrieIndexDBTest, SharedPrefixDoesNotCutCompactionFilesEarly) {
     ASSERT_NO_FATAL_FAILURE(
         VerifyGetBothIndexes(prefix + MakeKeyBody(i), std::string(64, 'b')));
   }
+}
+
+TEST_P(TrieIndexDBTest, SharedPrefixDoesNotCutCompactionFilesEarly) {
+  options_.compression = kNoCompression;
+  ASSERT_NO_FATAL_FAILURE(VerifySharedPrefixCompaction());
+}
+
+TEST_P(TrieIndexDBTest, SharedPrefixWithParallelCompression) {
+  if (!Zlib_Supported()) {
+    ROCKSDB_GTEST_SKIP("Zlib not linked into this build");
+    return;
+  }
+  options_.compression = kZlibCompression;
+  options_.compression_opts.parallel_threads = 4;
+  // Exercise the compression pipeline but retain uncompressed blocks so
+  // the file-size assertions match the serial case regardless of codec ratio.
+  options_.compression_opts.max_compressed_bytes_per_kb = 1;
+  ParallelCompressionStartCounter parallel_starts;
+  ASSERT_NO_FATAL_FAILURE(VerifySharedPrefixCompaction());
+  EXPECT_GT(parallel_starts.started(), 0);
 }
 
 TEST_P(TrieIndexDBTest, FlushWithAllOperationTypes) {
@@ -5095,6 +5154,98 @@ TEST_P(TrieIndexDBTest, PrefetchWithCustomIndexWrapper) {
   ASSERT_EQ(value, std::string(200, 'v'));
   ASSERT_OK(db_->Get(ro, "prefetch_key_000499", &value));
   ASSERT_EQ(value, std::string(200, 'v'));
+}
+
+// End-to-end parallel compression: a DB with the trie UDI factory and
+// compression_opts.parallel_threads > 1 must start the parallel pipeline (the
+// trie builder opts into PrepareAddEntry / FinishAddEntry) and produce SSTs
+// that read back correctly in all three modes. Any divergence between the
+// parallel and serial trie construction surfaces as missing or extra keys.
+TEST_P(TrieIndexDBTest, ParallelCompressionWithTrieIndex) {
+  // Compression must be on for the parallel pipeline to actually run;
+  // with no compressor the table builder silently falls back to serial.
+  // Use Zlib because it's reliably linked across test build configs
+  // where Snappy / LZ4 / ZSTD may not be.
+  if (!Zlib_Supported()) {
+    ROCKSDB_GTEST_SKIP("Zlib not linked into this build");
+    return;
+  }
+  options_.compression = kZlibCompression;
+  options_.compression_opts.parallel_threads = 4;
+  options_.write_buffer_size = 1 << 20;  // small buffer -> multiple flushes
+
+  ASSERT_OK(OpenDB());
+
+  ParallelCompressionStartCounter parallel_starts;
+  // Enough keys to produce many data blocks -> many index entries flowing
+  // through the parallel pipeline.
+  const std::string value(200, 'v');
+  const std::vector<std::string> keys = PutNumberedKeys(500, value);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  EXPECT_GT(parallel_starts.started(), 0);
+
+  ASSERT_NO_FATAL_FAILURE(VerifyScanBothIndexes(keys));
+  for (size_t i : {0, 7, 123, 250, 499}) {
+    ASSERT_NO_FATAL_FAILURE(VerifyGetBothIndexes(keys[i], value));
+  }
+}
+
+// Trie + parallel compression on top of the kHashSearch built-in index.
+//
+// kCustomDefault / kCustomOnly restrict index_type to kBinarySearch /
+// kBinarySearchWithFirstKey (the UDI wrapper layout is incompatible with
+// hash / partitioned indexes). kStandardDefault has no such restriction,
+// so the trie can coexist with any built-in index_type. The
+// parameterized ParallelCompressionWithTrieIndex above covers the
+// kBinarySearch case; this test covers kHashSearch. kTwoLevelIndexSearch
+// is excluded because partition_filters constraints force
+// parallel_threads = 1.
+TEST_F(TrieIndexDBTest, ParallelCompressionWithHashStandardIndexAndTrieUdi) {
+  if (!Zlib_Supported()) {
+    ROCKSDB_GTEST_SKIP("Zlib not linked into this build");
+    return;
+  }
+
+  options_.create_if_missing = true;
+  options_.compression = kZlibCompression;
+  options_.compression_opts.parallel_threads = 4;
+  options_.write_buffer_size = 1 << 20;
+  options_.prefix_extractor.reset(NewFixedPrefixTransform(4));
+
+  BlockBasedTableOptions table_options;
+  table_options.user_defined_index_factory = trie_factory_;
+  table_options.index_mode =
+      BlockBasedTableOptions::IndexMode::kStandardDefault;
+  table_options.index_type = BlockBasedTableOptions::kHashSearch;
+  options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  last_options_ = options_;
+
+  ASSERT_OK(DB::Open(options_, dbname_, &db_));
+
+  ParallelCompressionStartCounter parallel_starts;
+  // Enough keys to fill multiple blocks -> multiple iterations through
+  // the parallel ring buffer for both the hash builder and the trie
+  // builder.
+  const std::string value(200, 'v');
+  const std::vector<std::string> keys = PutNumberedKeys(500, value);
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  EXPECT_GT(parallel_starts.started(), 0);
+
+  // This test is not parameterized, so the mode-aware read helpers do not
+  // apply. Default reads use the hash index; kPreferCustom uses the trie.
+  std::vector<ReadOptions> read_options(2);
+  read_options[1].read_index = ReadOptions::ReadIndex::kPreferCustom;
+  for (const ReadOptions& ro : read_options) {
+    SCOPED_TRACE(ro.read_index == ReadOptions::ReadIndex::kPreferCustom
+                     ? "trie index"
+                     : "hash index");
+    ASSERT_EQ(ScanAllKeys(ro), keys);
+    for (size_t i : {0, 7, 123, 250, 499}) {
+      std::string v;
+      ASSERT_OK(db_->Get(ro, keys[i], &v));
+      ASSERT_EQ(v, value);
+    }
+  }
 }
 
 // Run all parameterized tests in all three custom UDI modes:

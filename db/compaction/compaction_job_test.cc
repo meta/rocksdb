@@ -9,8 +9,10 @@
 #include <array>
 #include <cinttypes>
 #include <map>
+#include <memory>
 #include <string>
 #include <tuple>
+#include <utility>
 
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
@@ -195,6 +197,42 @@ class MockTestFileSystem : public FileSystemWrapper {
 };
 
 enum TableTypeForTest : uint8_t { kMockTable = 0, kBlockBasedTable = 1 };
+
+// Replaces the first scalar `name=value;` entry after `scope` in a serialized
+// CompactionServiceResult with `replacement`. An empty `replacement` removes
+// the entry. Returns false if there is no such entry.
+bool ReplaceResultEntry(std::string* serialized, const std::string& scope,
+                        const std::string& name,
+                        const std::string& replacement) {
+  const size_t scope_pos = serialized->find(scope);
+  if (scope_pos == std::string::npos) {
+    return false;
+  }
+  // Match the whole name, so that "code" does not match "subcode".
+  size_t pos = std::string::npos;
+  for (const char delimiter : {'{', ';'}) {
+    pos = std::min(pos, serialized->find(delimiter + name + "=", scope_pos));
+  }
+  if (pos == std::string::npos) {
+    return false;
+  }
+  const size_t end = serialized->find(';', pos + 1);
+  if (end == std::string::npos) {
+    return false;
+  }
+  serialized->replace(pos + 1, end - pos, replacement);
+  return true;
+}
+
+// Formats every field of `s`. A failed gtest comparison prints the `Status`
+// enums as raw characters, so tests compare these strings instead.
+std::string StatusFields(const Status& s) {
+  const char* state = s.getState();
+  return "code=" + std::to_string(s.code()) +
+         " subcode=" + std::to_string(s.subcode()) +
+         " severity=" + std::to_string(s.severity()) +
+         " message=" + (state != nullptr ? state : "");
+}
 
 }  // namespace
 
@@ -517,7 +555,7 @@ class CompactionJobTestBase : public testing::Test {
           test::CorruptKeyType(&internal_key);
           test::CorruptKeyType(&bottommost_internal_key);
         }
-        contents.push_back({internal_key.Encode().ToString(), value});
+        contents.emplace_back(internal_key.Encode().ToString(), value);
         if (i == 1 || k < kMatchingKeys || corrupt_id(k - kMatchingKeys)) {
           expected_results.insert(
               {bottommost_internal_key.Encode().ToString(), value});
@@ -532,7 +570,7 @@ class CompactionJobTestBase : public testing::Test {
 
     mock::KVVector expected_results_kvvector;
     for (auto& kv : expected_results) {
-      expected_results_kvvector.push_back({kv.first, kv.second});
+      expected_results_kvvector.emplace_back(kv.first, kv.second);
     }
 
     return expected_results_kvvector;
@@ -595,7 +633,7 @@ class CompactionJobTestBase : public testing::Test {
   // input_files[i] on input_levels[i]
   void RunLastLevelCompaction(
       const std::vector<std::vector<FileMetaData*>>& input_files,
-      const std::vector<int> input_levels,
+      const std::vector<int>& input_levels,
       std::function<void(Compaction& comp)>&& verify_func,
       std::vector<SequenceNumber>&& snapshots = {}) {
     const int kLastLevel = cf_options_.num_levels - 1;
@@ -620,8 +658,8 @@ class CompactionJobTestBase : public testing::Test {
       int max_subcompactions = 0) {
     // For compaction, set fs as MockTestFileSystem to check the io_priority.
     if (test_io_priority_) {
-      db_options_.fs.reset(
-          new MockTestFileSystem(fs_, read_io_priority, write_io_priority));
+      db_options_.fs = std::make_shared<MockTestFileSystem>(
+          fs_, read_io_priority, write_io_priority);
     }
 
     auto cfd = versions_->GetColumnFamilySet()->GetDefault();
@@ -699,7 +737,7 @@ class CompactionJobTestBase : public testing::Test {
       ASSERT_EQ(compaction_job_stats_.num_input_files, num_input_files);
 
       VerifyTables(output_level, expected_results,
-                   expected_oldest_blob_file_numbers);
+                   std::move(expected_oldest_blob_file_numbers));
     }
 
     if (check_get_priority) {
@@ -755,7 +793,7 @@ class CompactionJobTestBase : public testing::Test {
   std::atomic<bool> shutting_down_;
   std::shared_ptr<mock::MockTableFactory> mock_table_factory_;
   CompactionJobStats compaction_job_stats_;
-  ColumnFamilyData* cfd_;
+  ColumnFamilyData* cfd_ = nullptr;
   std::unique_ptr<CompactionFilter> compaction_filter_;
   std::shared_ptr<MergeOperator> merge_op_;
   ErrorHandler error_handler_;
@@ -1682,6 +1720,17 @@ TEST_F(CompactionJobTest, InputSerialization) {
   ASSERT_TRUE(CompactionServiceInput::Read(invalid_range, &parsed_invalid_range)
                   .IsInvalidArgument());
 
+  // Test malformed hex in an encoded string field
+  const std::string cf_name_field = "cf_name=";
+  std::string malformed_hex;
+  ASSERT_OK(input.Write(&malformed_hex));
+  const size_t cf_name_pos = malformed_hex.find(cf_name_field);
+  ASSERT_NE(cf_name_pos, std::string::npos);
+  malformed_hex.insert(cf_name_pos + cf_name_field.size(), "Z");
+  CompactionServiceInput parsed_malformed_hex;
+  ASSERT_TRUE(CompactionServiceInput::Read(malformed_hex, &parsed_malformed_hex)
+                  .IsInvalidArgument());
+
   // Test missing field
   CompactionServiceInput deserialized3;
   deserialized3.output_level = 0;
@@ -1926,6 +1975,102 @@ TEST_F(CompactionJobTest, ResultSerialization) {
   for (const auto& item : status_list) {
     item.PermitUncheckedError();
   }
+}
+
+TEST_F(CompactionJobTest, ResultSerializationMissingOrInvalidFields) {
+  // Each status field differs between the written status, the destination's
+  // earlier status, and `Status::OK()`, so every check below can tell which of
+  // the three a parsed field came from.
+  CompactionServiceResult result;
+  result.status = Status(Status::kIOError, Status::kNoSpace, Status::kHardError,
+                         "disk full");
+  CompactionServiceOutputFile file;
+  file.file_name = "000123.sst";
+  file.marked_for_compaction = true;
+  file.is_proximal_level_output = true;
+  result.output_files.push_back(file);
+  std::string serialized;
+  ASSERT_OK(result.Write(&serialized));
+  const Status earlier(Status::kTimedOut, Status::kMutexTimeout,
+                       Status::kSoftError, "earlier");
+
+  CompactionServiceResult parsed;
+  ASSERT_OK(CompactionServiceResult::Read(serialized, &parsed));
+  ASSERT_EQ(StatusFields(parsed.status), StatusFields(result.status));
+  ASSERT_EQ(parsed.output_files.size(), 1U);
+  ASSERT_TRUE(parsed.output_files[0].marked_for_compaction);
+  ASSERT_TRUE(parsed.output_files[0].is_proximal_level_output);
+
+  // A missing status field takes its value in `Status::OK()`, and the other
+  // fields keep their written values.
+  struct MissingFieldCase {
+    const char* field;
+    Status::Code code;
+    Status::SubCode subcode;
+    Status::Severity severity;
+    const char* message;
+  };
+  const MissingFieldCase missing_field_cases[] = {
+      {"code", Status::kOk, Status::kNoSpace, Status::kHardError, "disk full"},
+      {"subcode", Status::kIOError, Status::kNone, Status::kHardError,
+       "disk full"},
+      {"severity", Status::kIOError, Status::kNoSpace, Status::kNoError,
+       "disk full"},
+      {"message", Status::kIOError, Status::kNoSpace, Status::kHardError, ""},
+  };
+  for (const MissingFieldCase& c : missing_field_cases) {
+    SCOPED_TRACE(c.field);
+    std::string missing_field = serialized;
+    ASSERT_TRUE(ReplaceResultEntry(&missing_field, "status={", c.field, ""));
+    CompactionServiceResult parsed_missing_field;
+    parsed_missing_field.status = earlier;
+    ASSERT_OK(
+        CompactionServiceResult::Read(missing_field, &parsed_missing_field));
+    const Status expected(c.code, c.subcode, c.severity, c.message);
+    ASSERT_EQ(StatusFields(parsed_missing_field.status),
+              StatusFields(expected));
+  }
+
+  // A malformed or out-of-range status field fails the parse, and the
+  // destination keeps its earlier status.
+  struct InvalidFieldCase {
+    const char* field;
+    std::string entry;
+  };
+  const InvalidFieldCase invalid_field_cases[] = {
+      {"message", "message=Z;"},
+      {"code", "code=" + std::to_string(Status::kMaxCode) + ";"},
+      {"subcode", "subcode=" + std::to_string(Status::kMaxSubCode) + ";"},
+      {"severity", "severity=" + std::to_string(Status::kMaxSeverity) + ";"},
+  };
+  for (const InvalidFieldCase& c : invalid_field_cases) {
+    SCOPED_TRACE(c.entry);
+    std::string invalid_field = serialized;
+    ASSERT_TRUE(
+        ReplaceResultEntry(&invalid_field, "status={", c.field, c.entry));
+    CompactionServiceResult parsed_invalid_field;
+    parsed_invalid_field.status = earlier;
+    const Status s =
+        CompactionServiceResult::Read(invalid_field, &parsed_invalid_field);
+    ASSERT_EQ(s.code(), Status::kInvalidArgument) << s.ToString();
+    ASSERT_EQ(StatusFields(parsed_invalid_field.status), StatusFields(earlier));
+  }
+
+  // A missing output-file flag reads as false.
+  std::string missing_flags = serialized;
+  ASSERT_TRUE(ReplaceResultEntry(&missing_flags,
+                                 "output_files=", "marked_for_compaction", ""));
+  ASSERT_TRUE(ReplaceResultEntry(
+      &missing_flags, "output_files=", "is_proximal_level_output", ""));
+  CompactionServiceResult parsed_missing_flags;
+  ASSERT_OK(
+      CompactionServiceResult::Read(missing_flags, &parsed_missing_flags));
+  ASSERT_EQ(StatusFields(parsed_missing_flags.status),
+            StatusFields(result.status));
+  ASSERT_EQ(parsed_missing_flags.output_files.size(), 1U);
+  ASSERT_EQ(parsed_missing_flags.output_files[0].file_name, "000123.sst");
+  ASSERT_FALSE(parsed_missing_flags.output_files[0].marked_for_compaction);
+  ASSERT_FALSE(parsed_missing_flags.output_files[0].is_proximal_level_output);
 }
 
 TEST_F(CompactionJobTest, CutForMaxCompactionBytes) {

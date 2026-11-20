@@ -226,14 +226,14 @@ class Repairer {
     if (status.ok()) {
       // Need to scan existing SST files first so the column families are
       // created before we process WAL files
-      ExtractMetaData();
+      ExtractMetaData(/*tables_built_from_wals=*/false);
 
       // ExtractMetaData() uses table_fds_ to know which SST files' metadata to
       // extract -- we need to clear it here since metadata for existing SST
       // files has been extracted already
       table_fds_.clear();
       ConvertLogFilesToTables();
-      ExtractMetaData();
+      ExtractMetaData(/*tables_built_from_wals=*/true);
       status = AddTables();
     }
     if (status.ok()) {
@@ -255,7 +255,7 @@ class Repairer {
  private:
   struct TableInfo {
     FileMetaData meta;
-    uint32_t column_family_id;
+    uint32_t column_family_id = 0;
     std::string column_family_name;
   };
 
@@ -294,6 +294,7 @@ class Repairer {
     bool found_file = false;
     std::vector<std::string> to_search_paths;
 
+    to_search_paths.reserve(db_options_.db_paths.size() + 1);
     for (size_t path_id = 0; path_id < db_options_.db_paths.size(); path_id++) {
       to_search_paths.push_back(db_options_.db_paths[path_id].path);
     }
@@ -361,9 +362,9 @@ class Repairer {
 
   Status ConvertLogToTable(const std::string& wal_dir, uint64_t log) {
     struct LogReporter : public log::Reader::Reporter {
-      Env* env;
+      Env* env = nullptr;
       std::shared_ptr<Logger> info_log;
-      uint64_t lognum;
+      uint64_t lognum = 0;
       void Corruption(size_t bytes, const Status& s,
                       uint64_t log_number = kMaxSequenceNumber) override {
         // We print error messages for corruption, but continue repairing.
@@ -487,8 +488,8 @@ class Repairer {
           default_compression, cfd->GetID(), cfd->GetName(), -1 /* level */,
           current_time /* newest_key_time */, false /* is_bottommost */,
           TableFileCreationReason::kRecovery, 0 /* oldest_key_time */,
-          0 /* file_creation_time */, "DB Repairer" /* db_id */, db_session_id_,
-          0 /*target_file_size*/, meta.fd.GetNumber(),
+          "DB Repairer" /* db_id */, db_session_id_, 0 /*target_file_size*/,
+          meta.fd.GetNumber(),
           kMaxSequenceNumber /*last_level_inclusive_max_seqno_threshold*/,
           dbname_ /*db_name*/);
 
@@ -503,6 +504,10 @@ class Repairer {
           BlobFileCreationReason::kRecovery,
           nullptr /* seqno_to_time_mapping */, nullptr /* event_logger */,
           0 /* job_id */, nullptr /* table_properties */, write_hint);
+      // BuildTable() folds I/O failures into its Status, but it can return
+      // early (for example, on an invalid compaction filter declaration)
+      // before reading `io_s`.
+      io_s.PermitUncheckedError();
       ROCKS_LOG_INFO(db_options_.info_log,
                      "Log #%" PRIu64 ": %d ops saved to Table #%" PRIu64 " %s",
                      log, counter, meta.fd.GetNumber(),
@@ -519,7 +524,9 @@ class Repairer {
     return status;
   }
 
-  void ExtractMetaData() {
+  // `tables_built_from_wals`: whether table_fds_ are tables this repair built
+  // from WAL files, rather than tables that existed before the repair.
+  void ExtractMetaData(bool tables_built_from_wals) {
     for (size_t i = 0; i < table_fds_.size(); i++) {
       TableInfo t;
       t.meta.fd = table_fds_[i];
@@ -534,6 +541,14 @@ class Repairer {
                        file_num_buf, status.ToString().c_str());
         ArchiveFile(fname);
       } else {
+        // The MANIFEST being rebuilt held the ownership start time and origin
+        // of tables that existed before the repair, so those are unknown.
+        t.meta.data_file_provenance = kProvenanceRecordedByRepair;
+        if (tables_built_from_wals) {
+          t.meta.data_file_provenance |=
+              DataFileProvenanceForOrigin(DataFileProvenance::Origin::kFlush);
+          t.meta.db_ownership_start_time = t.meta.file_creation_time;
+        }
         tables_.push_back(t);
       }
     }
@@ -552,7 +567,9 @@ class Repairer {
       // TODO: plumb Env::IOActivity, Env::IOPriority
       const ReadOptions read_options;
       status = table_cache_->GetTableProperties(
-          file_options_, read_options, icmp_, t->meta, &props, default_mopts_);
+          file_options_, read_options, icmp_, t->meta, &props, default_mopts_,
+          /*no_io=*/false, /*level=*/-1, /*file_read_hist=*/nullptr,
+          /*prefetch_index_and_filter_in_cache=*/true);
     }
     if (status.ok()) {
       auto s =
@@ -582,6 +599,7 @@ class Repairer {
             AddColumnFamily(props->column_family_name, t->column_family_id);
       }
       t->meta.oldest_ancestor_time = props->oldest_ancestor_time;
+      t->meta.file_creation_time = props->file_creation_time;
       t->meta.user_defined_timestamps_persisted =
           static_cast<bool>(props->user_defined_timestamps_persisted);
     }
@@ -615,7 +633,8 @@ class Repairer {
           /*level=*/-1, /*max_file_size_for_l0_meta_pin=*/0,
           /*smallest_compaction_key=*/nullptr,
           /*largest_compaction_key=*/nullptr,
-          /*allow_unprepared_value=*/false);
+          /*allow_unprepared_value=*/false, /*seek_target=*/nullptr,
+          /*prefix_filtered_table=*/nullptr);
       ParsedInternalKey parsed;
       for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
         Slice key = iter->key();
@@ -713,17 +732,7 @@ class Repairer {
       VersionEdit dummy_edit;
       for (const auto* table : cf_id_and_tables.second) {
         // TODO(opt): separate out into multiple levels
-        const auto& meta = table->meta;
-        dummy_edit.AddFile(
-            0, meta.fd.GetNumber(), meta.fd.GetPathId(), meta.fd.GetFileSize(),
-            meta.smallest, meta.largest, meta.fd.smallest_seqno,
-            meta.fd.largest_seqno, meta.marked_for_compaction, meta.temperature,
-            meta.oldest_blob_file_number, meta.oldest_ancestor_time,
-            meta.file_creation_time, meta.epoch_number, meta.file_checksum,
-            meta.file_checksum_func_name, meta.unique_id,
-            meta.compensated_range_deletion_size, meta.tail_size,
-            meta.user_defined_timestamps_persisted, meta.min_timestamp,
-            meta.max_timestamp);
+        dummy_edit.AddFile(0, table->meta);
       }
       s = dummy_version_builder.Apply(&dummy_edit);
       if (s.ok()) {
@@ -854,9 +863,8 @@ Status RepairDB(const std::string& dbname, const DBOptions& db_options,
 }
 
 Status RepairDB(const std::string& dbname, const Options& options) {
-  Options opts(options);
-  DBOptions db_options(opts);
-  ColumnFamilyOptions cf_options(opts);
+  DBOptions db_options(options);
+  ColumnFamilyOptions cf_options(options);
 
   Repairer repairer(dbname, db_options, {}, cf_options /* default_cf_opts */,
                     cf_options /* unknown_cf_opts */,

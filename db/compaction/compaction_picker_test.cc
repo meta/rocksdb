@@ -28,7 +28,7 @@ class CountingLogger : public Logger {
  public:
   using Logger::Logv;
   void Logv(const char* /*format*/, va_list /*ap*/) override { log_count++; }
-  size_t log_count;
+  size_t log_count = 0;
 };
 
 class CompactionPickerTestBase : public testing::Test {
@@ -51,7 +51,7 @@ class CompactionPickerTestBase : public testing::Test {
   std::unordered_map<uint32_t, std::pair<FileMetaData*, int>> file_map_;
   // input files to compaction process.
   std::vector<CompactionInputFiles> input_files_;
-  int compaction_level_start_;
+  int compaction_level_start_ = 0;
 
   explicit CompactionPickerTestBase(const Comparator* _ucmp)
       : ucmp_(_ucmp),
@@ -2492,6 +2492,18 @@ TEST_F(CompactionPickerTest, FileTtlBoosterLargeNumLevels) {
   FileMetaData meta;
   meta.oldest_ancestor_time = kCurrentTime - 1023;
   ASSERT_EQ(1, booster.GetBoostScore(&meta));
+}
+
+TEST_F(CompactionPickerTest, FileTtlBoosterSmallTtl) {
+  // With a TTL below 32 seconds, boosting still starts after half the TTL.
+  const uint64_t kCurrentTime = 1000000;
+  FileTtlBooster booster(kCurrentTime, /*ttl=*/10,
+                         /*num_non_empty_levels=*/4, /*level=*/1);
+  FileMetaData meta;
+  meta.oldest_ancestor_time = kCurrentTime - 5;
+  ASSERT_EQ(1, booster.GetBoostScore(&meta));
+  meta.oldest_ancestor_time = kCurrentTime - 9;
+  ASSERT_EQ(5, booster.GetBoostScore(&meta));
 }
 
 TEST_F(CompactionPickerTest, FileTtlBooster) {
@@ -5527,17 +5539,18 @@ TEST_F(CompactionPickerTest, FIFORatioBasedCompactionFallbackToOldPath) {
 // ============================================================================
 
 TEST_F(CompactionPickerTest, FIFOOptionValidation) {
-  auto validate = [](std::function<void(ColumnFamilyOptions&)> configure) {
-    ColumnFamilyOptions cf_opts;
-    cf_opts.compaction_style = kCompactionStyleFIFO;
-    cf_opts.compaction_options_fifo.allow_compaction = true;
-    cf_opts.compaction_options_fifo.use_kv_ratio_compaction = true;
-    cf_opts.compaction_options_fifo.max_data_files_size =
-        1ULL * 1024 * 1024 * 1024;
-    cf_opts.num_levels = 1;
-    configure(cf_opts);
-    return ColumnFamilyData::ValidateOptions(DBOptions(), cf_opts);
-  };
+  auto validate =
+      [](const std::function<void(ColumnFamilyOptions&)>& configure) {
+        ColumnFamilyOptions cf_opts;
+        cf_opts.compaction_style = kCompactionStyleFIFO;
+        cf_opts.compaction_options_fifo.allow_compaction = true;
+        cf_opts.compaction_options_fifo.use_kv_ratio_compaction = true;
+        cf_opts.compaction_options_fifo.max_data_files_size =
+            1ULL * 1024 * 1024 * 1024;
+        cf_opts.num_levels = 1;
+        configure(cf_opts);
+        return ColumnFamilyData::ValidateOptions(DBOptions(), cf_opts);
+      };
 
   // These used to be InvalidArgument, now accepted (handled at runtime
   // in the picker with fallback to cost-based intra-L0 compaction):

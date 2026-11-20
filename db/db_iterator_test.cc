@@ -29,6 +29,7 @@
 #include "rocksdb/persistent_cache.h"
 #include "table/block_based/flush_block_policy_impl.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/merge_operators/string_append/stringappend2.h"
 
@@ -86,6 +87,147 @@ class DBIteratorBaseTest : public DBTestBase {
 };
 
 #ifdef OS_LINUX
+TEST_F(DBIteratorBaseTest, PrefixSameAsStartDirectionChange) {
+  // prefix_same_as_start uses prefix seek even with total_order_seek=true (as
+  // forced by prefix_seek_opt_in_only) or auto_prefix_mode. On Next() after
+  // Prev(), the inner iterator stands on a key with another prefix (bbbb1).
+  // DBIter must reseek it to the current key; moving it without a reseek
+  // seeks the other children to bbbb1, where a prefix filter drops the child
+  // holding kkkk1 and kkkk3.
+  struct ReadCase {
+    const char* name;
+    bool opt_in;
+    bool total_order_seek;
+    bool auto_prefix_mode;
+  };
+  const std::vector<ReadCase> read_cases = {
+      {"prefix_same_as_start", false, false, false},
+      {"+total_order_seek", false, true, false},
+      {"+auto_prefix_mode", false, false, true},
+      {"+prefix_seek_opt_in_only", true, false, false},
+  };
+  for (bool memtable_bloom : {false, true}) {
+    for (const ReadCase& rc : read_cases) {
+      SCOPED_TRACE(std::string(rc.name) +
+                   (memtable_bloom ? " memtable_bloom" : " sst_filter"));
+      Options options = CurrentOptions();
+      options.disable_auto_compactions = true;
+      options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+      options.prefix_seek_opt_in_only = rc.opt_in;
+      BlockBasedTableOptions table_options;
+      if (memtable_bloom) {
+        options.memtable_prefix_bloom_size_ratio = 0.1;
+      } else {
+        table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+        table_options.whole_key_filtering = false;
+      }
+      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      DestroyAndReopen(options);
+      // The child that gets filtered has prefix kkkk only: the SST for the
+      // SST filter case, the memtable for the memtable bloom case.
+      const std::vector<std::string> kkkk_only = {"kkkk1", "kkkk3"};
+      const std::vector<std::string> mixed = {"bbbb1", "kkkk2"};
+      for (const std::string& key : memtable_bloom ? mixed : kkkk_only) {
+        ASSERT_OK(Put(key, "v"));
+      }
+      ASSERT_OK(Flush());
+      for (const std::string& key : memtable_bloom ? kkkk_only : mixed) {
+        ASSERT_OK(Put(key, "v"));
+      }
+
+      ReadOptions ro;
+      ro.prefix_same_as_start = true;
+      ro.total_order_seek = rc.total_order_seek;
+      ro.auto_prefix_mode = rc.auto_prefix_mode;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      iter->Seek("kkkk1");
+      std::vector<std::string> keys;
+      // Seek, Next, Prev, then Next until the end of the prefix.
+      for (int step = 0; iter->Valid(); ++step) {
+        keys.push_back(iter->key().ToString());
+        if (step == 1) {
+          iter->Prev();
+        } else {
+          iter->Next();
+        }
+      }
+      ASSERT_OK(iter->status());
+      const std::vector<std::string> expected = {"kkkk1", "kkkk2", "kkkk1",
+                                                 "kkkk2", "kkkk3"};
+      EXPECT_EQ(expected, keys);
+    }
+  }
+}
+
+TEST_F(DBIteratorBaseTest, PrefixSameAsStartWithExplicitBounds) {
+  // prefix_same_as_start implies a bound at the end of the seek prefix. With
+  // or without auto_prefix_mode, the iterator returns only keys within both
+  // that implied bound and the explicit iterate_lower_bound /
+  // iterate_upper_bound, whichever is narrower.
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+  for (const char* key : {"kkkj9", "kkkk1", "kkkk5"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+  ASSERT_OK(Flush());
+  for (const char* key : {"kkkk3", "kkkl1"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+
+  struct BoundCase {
+    const char* name;
+    const char* bound;
+    std::vector<std::string> expected;
+  };
+  const std::vector<BoundCase> forward_cases = {
+      {"upper bound inside prefix", "kkkk4", {"kkkk1", "kkkk3"}},
+      {"upper bound past prefix", "kkkm", {"kkkk1", "kkkk3", "kkkk5"}},
+  };
+  const std::vector<BoundCase> backward_cases = {
+      {"lower bound inside prefix", "kkkk2", {"kkkk5", "kkkk3"}},
+      {"lower bound before prefix", "kkkj", {"kkkk5", "kkkk3", "kkkk1"}},
+  };
+  for (bool auto_prefix_mode : {false, true}) {
+    ReadOptions ro;
+    ro.prefix_same_as_start = true;
+    ro.auto_prefix_mode = auto_prefix_mode;
+    for (const BoundCase& bc : forward_cases) {
+      SCOPED_TRACE(std::string(bc.name) +
+                   (auto_prefix_mode ? " auto_prefix_mode" : ""));
+      Slice upper_bound(bc.bound);
+      ro.iterate_upper_bound = &upper_bound;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      std::vector<std::string> keys;
+      for (iter->Seek("kkkk1"); iter->Valid(); iter->Next()) {
+        keys.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+      EXPECT_EQ(bc.expected, keys);
+    }
+    ro.iterate_upper_bound = nullptr;
+    for (const BoundCase& bc : backward_cases) {
+      SCOPED_TRACE(std::string(bc.name) +
+                   (auto_prefix_mode ? " auto_prefix_mode" : ""));
+      Slice lower_bound(bc.bound);
+      ro.iterate_lower_bound = &lower_bound;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      std::vector<std::string> keys;
+      for (iter->SeekForPrev("kkkk5"); iter->Valid(); iter->Prev()) {
+        keys.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+      EXPECT_EQ(bc.expected, keys);
+    }
+    ro.iterate_lower_bound = nullptr;
+  }
+}
+
 TEST_F(DBIteratorBaseTest, PrevChecksQueryAbort) {
   ASSERT_OK(Put("a", "va"));
   ASSERT_OK(Put("b", "vb"));
@@ -362,6 +504,9 @@ TEST_F(DBIteratorBaseTest, PrepareWithMultiScanAllowsSingleUnboundedRange) {
   ASSERT_OK(Put("c", "vc"));
   ASSERT_OK(Flush());
   MoveFilesToLevel(1);
+  // L0 table iterators receive the unbounded Prepare() directly.
+  ASSERT_OK(Put("d", "vd"));
+  ASSERT_OK(Flush());
 
   MultiScanArgs scan_opts(BytewiseComparator());
   scan_opts.insert(Slice("b"));
@@ -374,7 +519,7 @@ TEST_F(DBIteratorBaseTest, PrepareWithMultiScanAllowsSingleUnboundedRange) {
   for (iter->Seek("b"); iter->Valid(); iter->Next()) {
     keys.push_back(iter->key().ToString());
   }
-  ASSERT_EQ(keys, std::vector<std::string>({"b", "c"}));
+  ASSERT_EQ(keys, std::vector<std::string>({"b", "c", "d"}));
   ASSERT_FALSE(iter->Valid());
   ASSERT_OK(iter->status());
 }
@@ -608,6 +753,133 @@ TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesNonIntersectingMemTables) {
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_OK(db_->ContinueBackgroundWork());
+}
+
+// Prepare() on an iterator that is already positioned must discard that
+// position and yield the same results as on a fresh iterator. The test needs
+// an L0 file, because L0 table iterators receive Prepare() directly from the
+// merging iterator rather than through LevelIterator, so they are positioned
+// on a data block.
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanAfterPositioning) {
+  // Other tests can leave counting disabled on this thread.
+  const PerfLevel prev_perf_level = GetPerfLevel();
+  SetPerfLevel(kEnableCount);
+  Defer restore_perf_level(
+      [prev_perf_level]() { SetPerfLevel(prev_perf_level); });
+
+  constexpr int kNumKeys = 200;
+  std::vector<std::string> keys;
+  for (int i = 0; i <= kNumKeys; ++i) {
+    keys.push_back(Key(i));
+  }
+  const std::string l1_value(50, '1');
+  const std::string l0_value(50, '0');
+  const std::vector<std::pair<int, int>> ranges = {{10, 20}, {120, 140}};
+
+  struct Case {
+    const char* name;
+    std::function<void(Iterator*)> position;
+    bool reverse;
+  };
+  const std::vector<Case> cases = {
+      {"Seek inside a range", [&](Iterator* it) { it->Seek(keys[15]); }, false},
+      {"Seek outside the ranges", [&](Iterator* it) { it->Seek(keys[190]); },
+       false},
+      {"Seek then Next",
+       [&](Iterator* it) {
+         it->Seek(keys[5]);
+         for (int i = 0; i < 10; ++i) {
+           it->Next();
+         }
+       },
+       false},
+      {"SeekToFirst", [](Iterator* it) { it->SeekToFirst(); }, false},
+      {"SeekToLast", [](Iterator* it) { it->SeekToLast(); }, false},
+      {"SeekForPrev", [&](Iterator* it) { it->SeekForPrev(keys[130]); }, false},
+      {"Seek then reverse MultiScan", [&](Iterator* it) { it->Seek(keys[15]); },
+       true},
+  };
+
+  for (bool first_key_index : {false, true}) {
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.compression = kNoCompression;
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 256;
+    if (first_key_index) {
+      table_options.index_type =
+          BlockBasedTableOptions::IndexType::kBinarySearchWithFirstKey;
+    }
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_OK(Put(keys[i], l1_value));
+    }
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(1);
+    for (int i = 0; i < kNumKeys; i += 7) {
+      ASSERT_OK(Put(keys[i], l0_value));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_EQ(1, NumTableFilesAtLevel(0));
+    ASSERT_EQ(1, NumTableFilesAtLevel(1));
+
+    for (bool pin_data : {false, true}) {
+      for (const Case& c : cases) {
+        SCOPED_TRACE(std::string(c.name) +
+                     " first_key_index=" + std::to_string(first_key_index) +
+                     " pin_data=" + std::to_string(pin_data));
+        Slice lower_bound = keys[0];
+        Slice upper_bound = keys[kNumKeys];
+        ReadOptions read_options;
+        read_options.pin_data = pin_data;
+        read_options.iterate_lower_bound = &lower_bound;
+        read_options.iterate_upper_bound = &upper_bound;
+        std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+        c.position(iter.get());
+        ASSERT_TRUE(iter->Valid());
+        ASSERT_OK(iter->status());
+
+        MultiScanArgs scan_opts(BytewiseComparator());
+        scan_opts.reverse = c.reverse;
+        for (const auto& range : ranges) {
+          scan_opts.insert(keys[range.first], keys[range.second]);
+        }
+        get_perf_context()->Reset();
+        iter->Prepare(scan_opts);
+        ASSERT_OK(iter->status());
+        ASSERT_FALSE(iter->Valid());
+        // The L0 table iterator took the MultiScan path.
+        ASSERT_GT(get_perf_context()->multiscan_prepare_count, 0);
+
+        std::vector<std::pair<std::string, std::string>> expected;
+        std::vector<std::pair<std::string, std::string>> actual;
+        for (const auto& range : ranges) {
+          lower_bound = keys[range.first];
+          upper_bound = keys[range.second];
+          if (c.reverse) {
+            for (int i = range.second - 1; i >= range.first; --i) {
+              expected.emplace_back(keys[i], i % 7 == 0 ? l0_value : l1_value);
+            }
+            for (iter->SeekForPrev(upper_bound); iter->Valid(); iter->Prev()) {
+              actual.emplace_back(iter->key().ToString(),
+                                  iter->value().ToString());
+            }
+          } else {
+            for (int i = range.first; i < range.second; ++i) {
+              expected.emplace_back(keys[i], i % 7 == 0 ? l0_value : l1_value);
+            }
+            for (iter->Seek(lower_bound); iter->Valid(); iter->Next()) {
+              actual.emplace_back(iter->key().ToString(),
+                                  iter->value().ToString());
+            }
+          }
+          ASSERT_OK(iter->status());
+        }
+        ASSERT_EQ(expected, actual);
+      }
+    }
+  }
 }
 
 // Test param:
@@ -1227,8 +1499,8 @@ TEST_F(DBIteratorTest, ReseekUponDirectionChange) {
   options.create_if_missing = true;
   options.prefix_extractor.reset(NewFixedPrefixTransform(1));
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(
-      new StringAppendTESTOperator(/*delim_char=*/' '));
+  options.merge_operator = std::make_shared<StringAppendTESTOperator>(
+      /*delim_char=*/' ');
   DestroyAndReopen(options);
   ASSERT_OK(Put("foo", "value"));
   ASSERT_OK(Put("bar", "value"));
@@ -3453,6 +3725,7 @@ TEST_P(DBIteratorTest, IteratorWithLocalStatistics) {
     total_bytes += bytes;
   };
 
+  threads.reserve(10 + 15);
   for (int i = 0; i < 10; i++) {
     threads.emplace_back(reader_func_next);
   }
@@ -6085,8 +6358,7 @@ TEST_P(DBMultiScanIteratorTest, FragmentedRangeTombstones) {
           if (kiter != kvs.end()) {
             kvs.erase(kiter);
           }
-          auto res =
-              kvs.emplace(std::make_pair(Key(i), rnd->RandomString(2 << 10)));
+          auto res = kvs.emplace(Key(i), rnd->RandomString(2 << 10));
           ASSERT_OK(writer->Put(res.first->first, res.first->second));
         }
         ASSERT_OK(writer->Finish());
@@ -7970,10 +8242,10 @@ TEST_P(ReadPathRangeTombstoneTest,
 
 TEST_P(ReadPathRangeTombstoneTest, PrefixFilterOutOfDomainSeek) {
   // With an out-of-domain seek target, prefix_same_as_start cannot establish
-  // a seek-prefix bound. The iterator therefore behaves like an unrestricted
-  // scan while still avoiding Transform() on the short seek target, so the
-  // valid run [bbbb, bbdd) should be converted even though it spans multiple
-  // distinct prefixes.
+  // a seek-prefix bound. The iterator scans past the seek prefix while the
+  // child iterators still use prefix seek, which can skip live keys, so the
+  // run [bbbb, bbdd) must not be converted. The scan must still avoid
+  // Transform() on the short seek target.
   Options options = CurrentOptions();
   options.min_tombstones_for_range_conversion = 2;
   options.statistics = CreateDBStatistics();
@@ -8013,8 +8285,7 @@ TEST_P(ReadPathRangeTombstoneTest, PrefixFilterOutOfDomainSeek) {
     }
   }
   ASSERT_OK(it->status());
-  ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
-  AssertRange(0, "bbbb", "bbdd");
+  ASSERT_TRUE(attempted_insert_ranges_.empty());
 }
 
 TEST_P(ReadPathRangeTombstoneTest, TableFilterNotAllowed) {

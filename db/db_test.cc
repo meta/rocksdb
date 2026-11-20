@@ -13,6 +13,7 @@
 #include <fcntl.h>
 
 #include <algorithm>
+#include <memory>
 #include <set>
 #include <thread>
 #include <unordered_set>
@@ -1199,6 +1200,7 @@ TEST_F(DBTest, FlushSchedule) {
     }
   };
 
+  threads.reserve(10);
   for (int i = 0; i < 10; ++i) {
     threads.emplace_back(fill_memtable_func);
   }
@@ -2289,7 +2291,7 @@ TEST_F(DBTest, ApproximateSizes) {
                          kSkipPlainTable | kSkipHashIndex));
 }
 
-TEST_F(DBTest, ApproximateSizes_MixOfSmallAndLarge) {
+TEST_F(DBTest, ApproximateSizesMixOfSmallAndLarge) {
   do {
     Options options = CurrentOptions();
     options.compression = kNoCompression;
@@ -2723,7 +2725,7 @@ TEST_F(DBTest, CustomComparator) {
   } while (ChangeCompactOptions());
 }
 
-TEST_F(DBTest, DBOpen_Options) {
+TEST_F(DBTest, DBOpenOptions) {
   Options options = CurrentOptions();
   std::string dbname = test::PerThreadDBPath("db_options_test");
   ASSERT_OK(DestroyDB(dbname, options));
@@ -2768,7 +2770,7 @@ TEST_F(DBTest, DBOpen_Options) {
   db.reset();
 }
 
-TEST_F(DBTest, DBOpen_Change_NumLevels) {
+TEST_F(DBTest, DBOpenChangeNumLevels) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
   DestroyAndReopen(options);
@@ -3115,7 +3117,7 @@ static const int kTestSeconds = 10;
 static const int kNumKeys = 1000;
 
 struct MTState {
-  DBTest* test;
+  DBTest* test = nullptr;
   std::atomic<int> counter[kNumThreads];
 };
 
@@ -3258,7 +3260,7 @@ class MultiThreadedDBTest
     return optionConfigs;
   }
 
-  bool multiget_batched_;
+  bool multiget_batched_ = false;
 };
 
 TEST_P(MultiThreadedDBTest, MultiThreaded) {
@@ -3309,8 +3311,8 @@ static const int kGCNumThreads = 4;
 static const int kGCNumKeys = 1000;
 
 struct GCThread {
-  DB* db;
-  int id;
+  DB* db = nullptr;
+  int id = 0;
   std::atomic<bool> done;
 };
 
@@ -3356,6 +3358,7 @@ TEST_F(DBTest, GroupCommitTest) {
     ASSERT_GT(TestGetTickerCount(options, WRITE_DONE_BY_OTHER), 0);
 
     std::vector<std::string> expected_db;
+    expected_db.reserve(kGCNumThreads * kGCNumKeys);
     for (int i = 0; i < kGCNumThreads * kGCNumKeys; ++i) {
       expected_db.push_back(std::to_string(i));
     }
@@ -3636,7 +3639,7 @@ class ModelDB : public DB {
   Status Write(const WriteOptions& /*options*/, WriteBatch* batch) override {
     class Handler : public WriteBatch::Handler {
      public:
-      KVMap* map_;
+      KVMap* map_ = nullptr;
       void Put(const Slice& key, const Slice& value) override {
         (*map_)[key.ToString()] = value.ToString();
       }
@@ -4873,7 +4876,8 @@ class MockedRateLimiterWithNoOptionalAPIImpl : public RateLimiter {
 // operations (e.g, Put, Get, Flush)
 TEST_F(DBTest, CustomedRateLimiterWithNoOptionalAPIImplTest) {
   Options options = CurrentOptions();
-  options.rate_limiter.reset(new MockedRateLimiterWithNoOptionalAPIImpl());
+  options.rate_limiter =
+      std::make_shared<MockedRateLimiterWithNoOptionalAPIImpl>();
   DestroyAndReopen(options);
   ASSERT_OK(Put("abc", "def"));
   ASSERT_EQ(Get("abc"), "def");
@@ -4915,7 +4919,7 @@ TEST_F(DBTest, ConcurrentMemtableNotSupported) {
   options.memtable_factory.reset(NewHashLinkListRepFactory(4, 0, 3, true, 4));
   ASSERT_NOK(TryReopen(options));
 
-  options.memtable_factory.reset(new SkipListFactory);
+  options.memtable_factory = std::make_shared<SkipListFactory>();
   ASSERT_OK(TryReopen(options));
 
   ColumnFamilyOptions cf_options(options);
@@ -6064,6 +6068,7 @@ TEST_F(DBTest, FileCreationRandomFailure) {
   constexpr int kRandomFailureTest = kTotalIteration / 2;
 
   std::vector<std::string> values;
+  values.reserve(kTestSize);
   for (int i = 0; i < kTestSize; ++i) {
     values.emplace_back("NOT_FOUND");
   }
@@ -6327,7 +6332,7 @@ TEST_F(DBTest, MergeTestTime) {
   SetPerfLevel(kEnableTime);
   Options options = CurrentOptions();
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(new DelayedMergeOperator(this));
+  options.merge_operator = std::make_shared<DelayedMergeOperator>(this);
   SetTimeElapseOnlySleepOnReopen(&options);
   DestroyAndReopen(options);
 
@@ -6370,7 +6375,7 @@ TEST_P(DBTestWithParam, MergeCompactionTimeTest) {
   Options options = CurrentOptions();
   options.compaction_filter_factory = std::make_shared<KeepFilterFactory>();
   options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-  options.merge_operator.reset(new DelayedMergeOperator(this));
+  options.merge_operator = std::make_shared<DelayedMergeOperator>(this);
   options.disable_auto_compactions = true;
   options.max_subcompactions = max_subcompactions_;
   SetTimeElapseOnlySleepOnReopen(&options);
@@ -6536,8 +6541,8 @@ TEST_F(DBTest, SuggestCompactRangeTest) {
   options.memtable_factory.reset(test::NewSpecialSkipListFactory(
       DBTestBase::kNumKeysByGenerateNewRandomFile));
   options.compaction_style = kCompactionStyleLevel;
-  options.compaction_filter_factory.reset(
-      new CompactionFilterFactoryGetContext());
+  options.compaction_filter_factory =
+      std::make_shared<CompactionFilterFactoryGetContext>();
   options.write_buffer_size = 200 << 10;
   options.arena_block_size = 4 << 10;
   options.level0_file_num_compaction_trigger = 4;
@@ -7958,6 +7963,7 @@ class OpenFilesAsyncTest
         return "TableCache::MultiGet::BeforeFindTable";
       case ReadType::kIterator:
         return "TableCache::NewIterator::BeforeFindTable";
+      case ReadType::kNumReadTypes:
       default:
         assert(false);
         return "";
@@ -8043,6 +8049,7 @@ class OpenFilesAsyncTest
         ASSERT_OK(iter->status());
         break;
       }
+      case ReadType::kNumReadTypes:
       default:
         assert(false);
     }
@@ -8088,6 +8095,7 @@ class OpenFilesAsyncTest
         ASSERT_TRUE(iter->status().IsCorruption()) << iter->status().ToString();
         break;
       }
+      case ReadType::kNumReadTypes:
       default:
         assert(false);
     }
@@ -8268,6 +8276,173 @@ TEST_P(OpenFilesAsyncTest, BeforeRead) {
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
     Close();
   }
+}
+
+TEST_P(OpenFilesAsyncTest, TableProperties) {
+  Options options = CurrentOptions();
+  ASSERT_NO_FATAL_FAILURE(SetupData(options));
+
+  for (bool before_async_open : {true, false}) {
+    SCOPED_TRACE("before_async_open=" + std::to_string(before_async_open));
+    if (before_async_open) {
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+          {"OpenFilesAsyncTest::TableProperties::AfterGet",
+           "DBImpl::BGWorkAsyncFileOpen::Start"},
+          {"DBImpl::BGWorkAsyncFileOpen:Done",
+           "OpenFilesAsyncTest::TableProperties::BeforeCheck"},
+      });
+    } else {
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+          {"DBImpl::BGWorkAsyncFileOpen:Done",
+           "OpenFilesAsyncTest::TableProperties::BeforeCheck"},
+      });
+    }
+
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+    OpenTestDB(options);
+
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(props.size(), num_flushes_);
+
+    if (before_async_open) {
+      if (max_open_files_ == -1) {
+        // Opened through the table cache, as the async opener would
+        EXPECT_EQ(
+            TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES),
+            0);
+        EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), num_flushes_);
+      } else {
+        // Read directly from the files, without using up table cache capacity
+        EXPECT_EQ(
+            TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES),
+            num_flushes_);
+        EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), 0);
+      }
+    }
+
+    TEST_SYNC_POINT("OpenFilesAsyncTest::TableProperties::AfterGet");
+    TEST_SYNC_POINT("OpenFilesAsyncTest::TableProperties::BeforeCheck");
+
+    // Each file is opened only once in total
+    EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), num_flushes_);
+    if (max_open_files_ == -1) {
+      EXPECT_EQ(
+          TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES), 0);
+    }
+
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+    Close();
+  }
+}
+
+// Callers that hold the DB mutex read only the properties block of a file that
+// is not open yet, even with max_open_files = -1, because a table open does
+// more I/O.
+TEST_P(OpenFilesAsyncTest, TablePropertiesUnderDBMutex) {
+  Options options = CurrentOptions();
+  // Makes CompactionJob::Prepare() read each input's table properties
+  options.preserve_internal_time_seconds = 1000;
+  ASSERT_NO_FATAL_FAILURE(SetupData(options));
+
+  // Hold the async opener at its start until the checks are done
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+      {"OpenFilesAsyncTest::TablePropertiesUnderDBMutex::Checked",
+       "DBImpl::BGWorkAsyncFileOpen::Start"},
+      {"DBImpl::BGWorkAsyncFileOpen:Done",
+       "OpenFilesAsyncTest::TablePropertiesUnderDBMutex::AsyncOpenDone"},
+  });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  OpenTestDB(options);
+
+  std::string value;
+  ASSERT_TRUE(
+      db_->GetProperty(DB::Properties::kAggregatedTableProperties, &value));
+  EXPECT_EQ(TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES),
+            num_flushes_);
+  EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), 0);
+
+  if (max_open_files_ == -1 && !read_only_) {
+    // CompactFiles() runs a CompactionJob (never a trivial move) on these
+    // still-unopened files.
+    std::vector<std::string> input_files;
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    for (const auto& file : cf_meta.levels[0].files) {
+      input_files.push_back(file.name);
+    }
+    ASSERT_EQ(input_files.size(), num_flushes_);
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), input_files,
+                                /*output_level=*/1));
+    // Prepare() read each input's properties block directly. The inputs were
+    // then opened through the table cache, without the DB mutex.
+    EXPECT_EQ(TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES),
+              2 * num_flushes_);
+    EXPECT_GE(TestGetTickerCount(options, NO_FILE_OPENS), num_flushes_);
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  }
+
+  TEST_SYNC_POINT("OpenFilesAsyncTest::TablePropertiesUnderDBMutex::Checked");
+  TEST_SYNC_POINT(
+      "OpenFilesAsyncTest::TablePropertiesUnderDBMutex::AsyncOpenDone");
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  Close();
+}
+
+// With max_open_files = -1, a file whose table open failed during DB::Open
+// (tolerated with paranoid_checks = false) is not in the table cache. If
+// opening it for its table properties fails again, they are read directly.
+TEST_F(DBTest, TablePropertiesAfterFailedTableOpen) {
+  Options options = CurrentOptions();
+  options.max_open_files = -1;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  constexpr size_t kNumFiles = 2;
+  for (size_t i = 0; i < kNumFiles; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), "value"));
+    ASSERT_OK(Flush());
+  }
+
+  std::atomic<bool> fail_table_open{true};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::GetTableReader:BeforeOpenFile", [&](void* arg) {
+        if (fail_table_open.load()) {
+          *static_cast<Status*>(arg) = Status::IOError("injected");
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  options.paranoid_checks = false;
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+  const uint64_t direct_loads_after_open =
+      TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES);
+  ASSERT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), 0);
+
+  TablePropertiesCollection props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+  EXPECT_EQ(props.size(), kNumFiles);
+  EXPECT_EQ(TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES),
+            direct_loads_after_open + kNumFiles);
+  EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), 0);
+
+  // Once the files can be opened, they are opened through the table cache
+  fail_table_open.store(false);
+  props.clear();
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+  EXPECT_EQ(props.size(), kNumFiles);
+  EXPECT_EQ(TestGetTickerCount(options, NUMBER_DIRECT_LOAD_TABLE_PROPERTIES),
+            direct_loads_after_open + kNumFiles);
+  EXPECT_EQ(TestGetTickerCount(options, NO_FILE_OPENS), kNumFiles);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  Close();
 }
 
 // For modern DBs (manifest carries file_creation_time),

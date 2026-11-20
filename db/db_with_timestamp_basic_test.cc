@@ -250,8 +250,8 @@ TEST_F(DBBasicTestWithTimestamp, MultiGetMultipleCfs) {
   std::vector<Slice> keys;
   std::vector<std::string> expected_values;
   for (int i = 0; i < num_keys; i++) {
-    keys.push_back("a");
-    expected_values.push_back("value");
+    keys.emplace_back("a");
+    expected_values.emplace_back("value");
   }
   std::vector<ColumnFamilyHandle*> handles;
   handles.push_back(db_->DefaultColumnFamily());
@@ -674,6 +674,87 @@ TEST_F(DBBasicTestWithTimestamp, SimpleIterate) {
   Close();
 }
 
+TEST_F(DBBasicTestWithTimestamp,
+       CompactionKeepsMergeOperandCoveredByNewerRangeTombstone) {
+  // One key per case, all written at ts 1, with the value a read at ts 2 must
+  // return:
+  // - Key1(1): merge operand only ("a").
+  // - Key1(2): base value, then merge operand ("v,m").
+  // - Key1(3): base value, range tombstone, then merge operand ("m").
+  // A range tombstone at ts 3 then covers Key1(1) and Key1(2).
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.merge_operator = std::make_shared<StringAppendTESTOperator>(',');
+  const size_t kTimestampSize = Timestamp(0, 0).size();
+  TestComparator test_cmp(kTimestampSize);
+  options.comparator = &test_cmp;
+  DestroyAndReopen(options);
+
+  WriteOptions wo;
+  // Key1(2) and Key1(3) have a base value at the same ts as their merge
+  // operand. Flush them separately so that compaction, not flush, merges them.
+  ASSERT_OK(db_->Put(wo, Key1(2), Timestamp(1, 0), "v"));
+  ASSERT_OK(db_->Put(wo, Key1(3), Timestamp(1, 0), "v"));
+  // This ts 1 tombstone hides Key1(3)'s base value from every read, but not its
+  // later merge operand.
+  ASSERT_OK(db_->DeleteRange(wo, db_->DefaultColumnFamily(), Key1(3), Key1(4),
+                             Timestamp(1, 0)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->Merge(wo, db_->DefaultColumnFamily(), Key1(1), Timestamp(1, 0),
+                       "a"));
+  ASSERT_OK(db_->Merge(wo, db_->DefaultColumnFamily(), Key1(2), Timestamp(1, 0),
+                       "m"));
+  ASSERT_OK(db_->Merge(wo, db_->DefaultColumnFamily(), Key1(3), Timestamp(1, 0),
+                       "m"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->DeleteRange(wo, db_->DefaultColumnFamily(), Key1(0), Key1(3),
+                             Timestamp(3, 0)));
+  ASSERT_OK(Flush());
+
+  const std::vector<std::pair<std::string, std::string>> expected_at_ts2 = {
+      {Key1(1), "a"}, {Key1(2), "v,m"}, {Key1(3), "m"}};
+  auto verify = [&]() {
+    const std::string read_ts = Timestamp(2, 0);
+    Slice read_ts_slice = read_ts;
+    ReadOptions ro;
+    ro.timestamp = &read_ts_slice;
+    std::string value;
+    std::string ts;
+    for (const auto& [key, expected] : expected_at_ts2) {
+      ASSERT_OK(db_->Get(ro, key, &value, &ts));
+      ASSERT_EQ(expected, value);
+    }
+    std::unique_ptr<Iterator> it(db_->NewIterator(ro));
+    it->Seek(Key1(0));
+    for (const auto& [key, expected] : expected_at_ts2) {
+      ASSERT_TRUE(it->Valid());
+      ASSERT_EQ(key, it->key());
+      ASSERT_EQ(expected, it->value());
+      it->Next();
+    }
+    ASSERT_FALSE(it->Valid());
+    ASSERT_OK(it->status());
+
+    // A read at or after ts 3 still sees Key1(1) and Key1(2) deleted.
+    const std::string newer_ts = Timestamp(4, 0);
+    Slice newer_ts_slice = newer_ts;
+    ro.timestamp = &newer_ts_slice;
+    ASSERT_EQ(Status::Code::kNotFound,
+              db_->Get(ro, Key1(1), &value, &ts).code());
+    ASSERT_EQ(Status::Code::kNotFound,
+              db_->Get(ro, Key1(2), &value, &ts).code());
+  };
+
+  verify();
+  // Without full_history_ts_low, compaction must not change what a read at
+  // ts 2 sees, even though the ts 3 tombstone covers Key1(1) and Key1(2).
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  verify();
+  Close();
+}
+
 TEST_F(DBBasicTestWithTimestamp, TrimHistoryTest) {
   Options options = CurrentOptions();
   options.env = env_;
@@ -682,23 +763,23 @@ TEST_F(DBBasicTestWithTimestamp, TrimHistoryTest) {
   TestComparator test_cmp(kTimestampSize);
   options.comparator = &test_cmp;
   DestroyAndReopen(options);
-  auto check_value_by_ts = [](DB* db, Slice key, std::string readTs,
-                              Status status, std::string checkValue,
-                              std::string expected_ts) {
-    ReadOptions ropts;
-    Slice ts = readTs;
-    ropts.timestamp = &ts;
-    std::string value;
-    std::string key_ts;
-    Status s = db->Get(ropts, key, &value, &key_ts);
-    ASSERT_TRUE(s == status);
-    if (s.ok()) {
-      ASSERT_EQ(checkValue, value);
-    }
-    if (s.ok() || s.IsNotFound()) {
-      ASSERT_EQ(expected_ts, key_ts);
-    }
-  };
+  auto check_value_by_ts =
+      [](DB* db, Slice key, const std::string& readTs, const Status& status,
+         const std::string& checkValue, const std::string& expected_ts) {
+        ReadOptions ropts;
+        Slice ts = readTs;
+        ropts.timestamp = &ts;
+        std::string value;
+        std::string key_ts;
+        Status s = db->Get(ropts, key, &value, &key_ts);
+        ASSERT_TRUE(s == status);
+        if (s.ok()) {
+          ASSERT_EQ(checkValue, value);
+        }
+        if (s.ok() || s.IsNotFound()) {
+          ASSERT_EQ(expected_ts, key_ts);
+        }
+      };
   // Construct data of different versions with different ts
   ASSERT_OK(db_->Put(WriteOptions(), "k1", Timestamp(2, 0), "v1"));
   ASSERT_OK(db_->Put(WriteOptions(), "k1", Timestamp(4, 0), "v2"));
@@ -856,9 +937,11 @@ TEST_P(DBBasicTestWithTimestampTableOptions, GetAndMultiGet) {
     for (uint64_t k = 0; k < kNumKeys; k += 2) {
       std::vector<std::string> key_strs;
       std::vector<Slice> keys;
+      key_strs.reserve(step);
       for (size_t i = 0; i < step; ++i) {
         key_strs.push_back(Key1(k + i));
       }
+      keys.reserve(step);
       for (size_t i = 0; i < step; ++i) {
         keys.emplace_back(key_strs[i]);
       }
@@ -1359,7 +1442,7 @@ TEST_F(DBBasicTestWithTimestamp, SimpleBackwardIterateLowerTsBound) {
   Close();
 }
 
-TEST_F(DBBasicTestWithTimestamp, BackwardIterateLowerTsBound_Reseek) {
+TEST_F(DBBasicTestWithTimestamp, BackwardIterateLowerTsBoundReseek) {
   Options options = CurrentOptions();
   options.env = env_;
   options.create_if_missing = true;
@@ -2338,9 +2421,9 @@ class DataVisibilityTest : public DBBasicTestWithTimestampBase {
   struct TestData {
     std::string key;
     std::string value;
-    int ts;
+    int ts = 0;
     std::string timestamp;
-    SequenceNumber seq_num;
+    SequenceNumber seq_num = 0;
   };
 
   constexpr static int kTestDataSize = 3;
@@ -4074,6 +4157,7 @@ TEST_F(DBBasicTestWithTimestamp, FullHistoryTsLowSanityCheckFail) {
     std::vector<std::string> key_vals = {"foo", "foo"};
     std::vector<Slice> keys;
     std::vector<std::string> values;
+    keys.reserve(2);
     for (size_t j = 0; j < 2; ++j) {
       keys.emplace_back(key_vals[j]);
     }
@@ -4091,6 +4175,7 @@ TEST_F(DBBasicTestWithTimestamp, FullHistoryTsLowSanityCheckFail) {
     std::vector<std::string> key_vals = {"foo"};
     std::vector<Slice> keys;
     std::vector<std::string> values;
+    keys.reserve(1);
     for (size_t j = 0; j < 1; ++j) {
       keys.emplace_back(key_vals[j]);
     }
@@ -4829,7 +4914,7 @@ TEST_F(DBBasicTestWithTimestamp, MergeBasic) {
       ASSERT_OK(it->status());
       ASSERT_EQ(std::numeric_limits<size_t>::max(), key_int_val);
 
-      value_suffix = value_suffix + "." + std::to_string(i + 1);
+      value_suffix += "." + std::to_string(i + 1);
     }
   };
 

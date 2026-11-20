@@ -251,6 +251,16 @@ early_argument_parsing_before_main()
 # base liveness profile cannot accidentally turn fault injection back on.
 
 
+# use_trie_index and index_mode must be the same across invocations so that all
+# SSTs in a DB are opened with matching table options, so they are drawn once
+# here. The custom index modes require the trie factory.
+_USE_TRIE_INDEX = random.choice([0] * 15 + [1])
+# 0=kStandardOnly, 1=kStandardDefault, 2=kCustomDefault, 3=kCustomOnly,
+# 4=kStandardRequired. Without a factory, the default kStandardDefault builds
+# only the standard index.
+_INDEX_MODE = random.choice([0, 1, 2, 2, 3, 3, 4]) if _USE_TRIE_INDEX == 1 else 1
+
+
 default_params = {
     "acquire_snapshot_one_in": lambda: random.choice([100, 10000]),
     "backup_max_size": 100 * 1024 * 1024,
@@ -269,6 +279,7 @@ default_params = {
     "charge_filter_construction": lambda: random.choice([0, 1]),
     "charge_table_reader": lambda: random.choice([0, 1]),
     "charge_file_metadata": lambda: random.choice([0, 1]),
+    "charge_readahead_buffer": lambda: random.choice([0, 1]),
     "checkpoint_one_in": lambda: random.choice([0, 0, 10000, 1000000]),
     "checkpoint_engine_max_background_operations": lambda: random.choice([4, 8]),
     "checkpoint_engine_use_link_file_when_available": lambda: random.randint(0, 1),
@@ -314,19 +325,17 @@ default_params = {
     "num_dbs": 1,
     "enable_pipelined_write": lambda: random.randint(0, 1),
     "enable_compaction_filter": lambda: random.choice([0, 0, 0, 1]),
+    "merge_before_compaction_filter": lambda: random.randint(0, 1),
+    "merge_before_filter_change_one_in": lambda: random.choice([0, 1, 10, 100]),
+    "merge_before_filter_remove_deleted": lambda: random.randint(0, 1),
     "enable_compaction_on_deletion_trigger": lambda: random.choice([0, 0, 0, 1]),
-    # `inplace_update_support` is incompatible with a wide range of features.
-    # The current sanitization process is not sufficient to reliably handle
-    # this. While inplace_update_support is intended to stay on across runs
-    # in default_params, in certain runs it can be toggled off by
-    # sanitization due to some incompatible features being enabled. When
-    # inplace_update_support is off, other incompatible features such as
-    # delete range may be enabled and leave state in the DB. A later run
-    # reads default_params again with inplace_update_support on, but now
-    # operates on a DB containing delete range data from the previous run,
-    # causing stress test failures. Temporarily disabled until the
-    # sanitization can account for cross-run incompatibility.
-    "inplace_update_support": 0,
+    # inplace_update_support has to be the same across invocations, hence no
+    # lambda: a run without it can leave state in the DB, such as range
+    # tombstones in a WAL that a later run recovers into its memtable, that
+    # in-place updates of a later run would read incorrectly. See
+    # resolve_inplace_update_support() and finalize_and_sanitize() for how
+    # incompatible features are kept off for the whole series.
+    "inplace_update_support": random.choice([0] * 9 + [1]),
     "flush_one_in": lambda: random.choice([1000, 1000000]),
     "manual_wal_flush_one_in": lambda: random.choice([0, 1000]),
     "sync_wal_one_in": 0,
@@ -385,7 +394,8 @@ default_params = {
     "prefixpercent": 5,
     "progress_reports": 0,
     "readpercent": 45,
-    # See disabled DBWALTest.RecycleMultipleWalsCrash
+    # Disabled for recovery data loss reproduced by
+    # DBWALTest.RecycleMultipleWalsCrash. TODO: enable at random again.
     "recycle_log_file_num": 0,
     "snapshot_hold_ops": 100000,
     "sqfc_name": lambda: random.choice(["foo", "bar"]),
@@ -420,13 +430,13 @@ default_params = {
     "uncache_aggressiveness": lambda: int(math.pow(10, 4.0 * random.random()) - 1.0),
     "use_full_merge_v1": lambda: random.randint(0, 1),
     "use_merge": lambda: random.randint(0, 1),
-    # use_trie_index must be the same across invocations so that all SSTs
-    # in a DB are opened with matching table options.
-    "use_trie_index": random.choice([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
-    # use_udi_as_primary_index must be the same across invocations (like
-    # use_trie_index) so that SSTs written in primary mode can be read on
-    # reopen.
-    "use_udi_as_primary_index": random.choice([0, 0, 0, 1]),
+    # Drawn above, together with index_mode.
+    "use_trie_index": _USE_TRIE_INDEX,
+    "index_mode": _INDEX_MODE,
+    # ReadOptions::read_index: -1=auto (db_stress selects kPreferCustom when the
+    # trie is the secondary index), 0=kDefault, 1=kBuiltin, 2=kPreferCustom.
+    # finalize_and_sanitize() drops selectors the index mode cannot serve.
+    "read_index": lambda: random.choice([-1, -1, 0, 1, 2]),
     # use_put_entity_one_in has to be the same across invocations for verification to work, hence no lambda
     "use_put_entity_one_in": random.choice([0] * 7 + [1, 5, 10]),
     "use_attribute_group": lambda: random.randint(0, 1),
@@ -499,6 +509,7 @@ default_params = {
     "write_dbid_to_manifest": random.randint(0, 1),
     "track_options_file_number_in_manifest": lambda: random.randint(0, 1),
     "write_identity_file": random.randint(0, 1),
+    "prefix_seek_opt_in_only": lambda: random.randint(0, 1),
     "optimize_manifest_for_recovery": lambda: 1 if random.randint(1, 5) == 1 else 0,
     "reuse_manifest_on_open": lambda: 1 if random.randint(1, 5) == 1 else 0,
     "avoid_flush_during_recovery": lambda: random.choice(
@@ -631,9 +642,7 @@ default_params = {
     "default_temperature": lambda: random.choice(
         ["kUnknown", "kHot", "kWarm", "kCool", "kCold", "kIce"]
     ),
-    # TODO(hx235): enable `enable_memtable_insert_with_hint_prefix_extractor`
-    # after fixing the surfaced issue with delete range
-    "enable_memtable_insert_with_hint_prefix_extractor": 0,
+    "enable_memtable_insert_with_hint_prefix_extractor": lambda: random.choice([0, 1]),
     "check_multiget_consistency": lambda: random.choice([0, 0, 0, 1]),
     "check_multiget_entity_consistency": lambda: random.choice([0, 0, 0, 1]),
     "use_timed_put_one_in": lambda: random.choice([0] * 7 + [1, 5, 10]),
@@ -652,6 +661,7 @@ default_params = {
     "remote_compaction_worker_threads": lambda: random.choice([0, 8]),
     "allow_resumption_one_in": lambda: random.choice([0, 1, 2, 20]),
     "remote_compaction_failure_fall_back_to_local": lambda: random.choice([0, 1]),
+    "use_separate_remote_compaction_pool": lambda: random.choice([0, 1]),
     "auto_refresh_iterator_with_snapshot": lambda: random.choice([0, 1]),
     "memtable_op_scan_flush_trigger": lambda: random.choice([0, 10, 100, 1000]),
     "memtable_avg_op_scan_flush_trigger": lambda: random.choice([0, 2, 20, 200]),
@@ -976,6 +986,27 @@ def apply_liveness_remote_defaults(params, args):
             DEFAULT_LIVENESS_NO_PROGRESS_TIMEOUT_SEC
             * REMOTE_DB_LIVENESS_TIMEOUT_MULTIPLIER
         )
+    # Run fewer CompactRange calls, so that queued manual compactions do not
+    # starve automatic compaction for longer than the no-progress timeout.
+    #
+    # Background: while an exclusive manual compaction waits in the queue,
+    # RocksDB schedules no automatic compaction for any column family. About
+    # half of the db_stress CompactRange calls are exclusive. On a remote DB,
+    # manual compactions are slow. In one observed run, each one took about 40
+    # to 100 seconds. By default, default_params picks compact_range_one_in
+    # from 1000 and 1000000. At 1000, CompactRange calls arrive about 10 times
+    # faster than the exclusive ones can run one at a time (an estimate from
+    # the same run). The queue then never empties, the number of L0 files
+    # reaches level0_stop_writes_trigger, and writes stay blocked until the
+    # liveness watchdog aborts the test.
+    #
+    # 20000 makes CompactRange 20 times less frequent than 1000. By the same
+    # estimate, exclusive manual compactions then keep their one-at-a-time
+    # queue busy about half of the time, so the queue drains and CompactRange
+    # still gets coverage. The other value, 1000000, is the same as in
+    # default_params.
+    if getattr(args, "compact_range_one_in", None) is None:
+        params["compact_range_one_in"] = lambda: random.choice([20000, 1000000])
 
 
 simple_default_params = {
@@ -1068,7 +1099,7 @@ cf_consistency_params = {
     "ingest_external_file_one_in": 0,
     # `CfConsistencyStressTest::TestIterateAgainstExpected()` is not implemented.
     "verify_iterator_with_expected_state_one_in": 0,
-    "memtablerep": random.choice(["skip_list"] * 9 + ["vector"]),
+    "memtablerep": random.choice(["skip_list"] * 8 + ["vector", "sorted_hash"]),
 }
 
 cf_lifecycle_params = {
@@ -1407,10 +1438,136 @@ multiops_txn_params = {
     "commit_bypass_memtable_one_in": random.choice([0] * 4 + [100]),
 }
 
+# Settings that select a test profile, fixed for a whole crash test series by a
+# preset or the command line, that cannot be combined with
+# inplace_update_support.
+_INPLACE_UPDATE_INCOMPATIBLE_PROFILE_PARAMS = (
+    "best_efforts_recovery",
+    "enable_blob_direct_write",
+    "file_scope_wal_write_faults",
+    "test_cf_consistency",
+    "test_multi_ops_txns",
+    "use_optimistic_txn",
+    "use_txn",
+)
+# Features that finalize_and_sanitize() turns off in every run of a series with
+# inplace_update_support. Explicitly enabling one of them on the command line
+# keeps inplace_update_support off for the series instead.
+_INPLACE_UPDATE_INCOMPATIBLE_RUN_PARAMS = (
+    "acquire_snapshot_one_in",
+    "allow_concurrent_memtable_write",
+    "check_multiget_consistency",
+    "check_multiget_entity_consistency",
+    "compact_range_one_in",
+    "delrangepercent",
+    "disable_wal",
+    "iterpercent",
+    "lazy_entity_read_one_in",
+    "manual_wal_flush_one_in",
+    "memtable_verify_per_key_checksum_on_seek",
+    "min_tombstones_for_range_conversion",
+    "prefixpercent",
+    "remote_compaction_worker_threads",
+    "sync_fault_injection",
+    "test_batches_snapshots",
+    "test_ingest_standalone_range_deletion_one_in",
+    "unordered_write",
+)
+
+
+def inplace_update_support_profile_conflicts(params):
+    conflicts = [
+        name
+        for name in _INPLACE_UPDATE_INCOMPATIBLE_PROFILE_PARAMS
+        if callable(params.get(name)) or params.get(name) not in (None, 0)
+    ]
+    memtablerep = params.get("memtablerep")
+    if callable(memtablerep) or memtablerep in ("vector", "sorted_hash"):
+        conflicts.append("memtablerep")
+    return conflicts
+
+
+def resolve_inplace_update_support(params, args, unknown_params):
+    # Called once per crash test series, after presets and command line
+    # arguments are merged into `params`, so that every run uses the same
+    # inplace_update_support.
+    if params.get("inplace_update_support", 0) != 1:
+        return
+    conflicts = inplace_update_support_profile_conflicts(params)
+    conflicts += [
+        name
+        for name in _INPLACE_UPDATE_INCOMPATIBLE_RUN_PARAMS
+        if getattr(args, name, None) not in (None, 0)
+    ]
+    # Unknown arguments are forwarded to db_stress without being checked here,
+    # so only use inplace_update_support with them when explicitly requested.
+    if unknown_params and getattr(args, "inplace_update_support", None) is None:
+        conflicts.append("unparsed db_stress arguments")
+    if conflicts:
+        print(
+            "inplace_update_support is off for all runs as it is incompatible "
+            "with: " + ", ".join(conflicts) + "\n"
+        )
+        params["inplace_update_support"] = 0
+
 
 def finalize_and_sanitize(src_params):
     dest_params = {k: v() if callable(v) else v for (k, v) in src_params.items()}
     apply_cache_and_write_buffer_size_multiplier(dest_params)
+    # inplace_update_support is fixed for the whole series, so turn off the
+    # features incompatible with it in every run rather than turning it off in
+    # some runs. Profiles that cannot be turned off here must have been ruled
+    # out by resolve_inplace_update_support().
+    if dest_params.get("inplace_update_support", 0) == 1:
+        profile_conflicts = inplace_update_support_profile_conflicts(dest_params)
+        if profile_conflicts:
+            raise ValueError(
+                "inplace_update_support=1 is incompatible with "
+                + ", ".join(profile_conflicts)
+            )
+        # A range tombstone in the memtable hides a value later updated in
+        # place under an older sequence number. Besides DeleteRange,
+        # iterators insert such tombstones when converting point tombstones.
+        dest_params["delpercent"] += dest_params["delrangepercent"]
+        dest_params["delrangepercent"] = 0
+        dest_params["min_tombstones_for_range_conversion"] = 0
+        # Iterators and seek-time key checksum verification can see an entry
+        # while it is being updated in place.
+        dest_params["readpercent"] += dest_params["prefixpercent"]
+        dest_params["prefixpercent"] = 0
+        dest_params["memtable_verify_per_key_checksum_on_seek"] = 0
+        # Rejected together with inplace_update_support by db_stress or
+        # RocksDB, or otherwise unsupported with it.
+        dest_params["test_batches_snapshots"] = 0
+        dest_params["allow_concurrent_memtable_write"] = 0
+        dest_params["unordered_write"] = 0
+        dest_params["remote_compaction_worker_threads"] = 0
+        # Lazy entity reads are checked against eager reads under a snapshot,
+        # but DB::GetSnapshot() returns nullptr with inplace_update_support.
+        dest_params["lazy_entity_read_one_in"] = 0
+        # inplace_update_support does not update sequence number. Our stress test recovery
+        # logic for unsynced data loss relies on max sequence number stored
+        # in MANIFEST, so they don't work together.
+        dest_params["sync_fault_injection"] = 0
+        dest_params["disable_wal"] = 0
+        dest_params["manual_wal_flush_one_in"] = 0
+    # Merge-before-filter is only interesting with merges, so use them in about
+    # 3/4 of those runs. Do this only when the profile leaves use_merge random:
+    # some profiles, such as cf_lifecycle_params, set use_merge=0 on purpose.
+    # Later rules can still turn merges off.
+    if (
+        callable(src_params.get("use_merge"))
+        and dest_params.get("enable_compaction_filter", 0) == 1
+        and dest_params.get("merge_before_compaction_filter", 0) == 1
+        and dest_params.get("use_merge", 0) == 0
+    ):
+        dest_params["use_merge"] = random.randint(0, 1)
+    # Merges with user-defined timestamps can hit the assertion in
+    # MergeHelper::MergeUntil() that merge operands with different timestamps
+    # are never combined, so keep merges off for them. This must come after
+    # every rule that can turn merges on.
+    if dest_params.get("user_timestamp_size", 0) > 0:
+        dest_params["use_merge"] = 0
     if is_release_mode():
         dest_params["read_fault_one_in"] = 0
     if dest_params.get("compression_max_dict_bytes") == 0:
@@ -1430,8 +1587,6 @@ def finalize_and_sanitize(src_params):
         # range tombstone conversion is enabled, because conversion must see
         # the full relevant SST set before synthesizing a memtable tombstone.
         dest_params["use_sqfc_for_range_queries"] = 0
-        # Delete range not compatible with inplace_update_support
-        dest_params["inplace_update_support"] = 0
     if (
         dest_params["use_direct_io_for_flush_and_compaction"] == 1
         or dest_params["use_direct_reads"] == 1
@@ -1489,10 +1644,6 @@ def finalize_and_sanitize(src_params):
         dest_params["enable_pipelined_write"] = 0
         dest_params["two_write_queues"] = 0
         dest_params["unordered_write"] = 0
-        # Keep inplace updates off. The later inplace_update_support
-        # sanitization intentionally forces disable_wal=0 for its own recovery
-        # assumptions, which would silently undo the BDW crash-test profile.
-        dest_params["inplace_update_support"] = 0
         # Direct write is implemented only for integrated BlobDB, without
         # dynamic blob option changes or background blob GC.
         dest_params["use_blob_db"] = 0
@@ -1558,8 +1709,8 @@ def finalize_and_sanitize(src_params):
         dest_params["ingest_external_file_one_in"] = 0
         dest_params["ingest_wbwi_one_in"] = 0
 
-    if dest_params.get("memtablerep") == "vector":
-        dest_params["inplace_update_support"] = 0
+    if dest_params.get("memtablerep") == "sorted_hash":
+        dest_params["user_timestamp_size"] = 0
 
     # only skip list memtable representation supports paranoid memory checks
     if dest_params.get("memtablerep") != "skip_list":
@@ -1568,7 +1719,6 @@ def finalize_and_sanitize(src_params):
 
     if dest_params["test_batches_snapshots"] == 1:
         dest_params["enable_compaction_filter"] = 0
-        dest_params["inplace_update_support"] = 0
         # TODO(hx235): enable test_batches_snapshots with fault injection after stabilizing the CI
         dest_params["write_fault_one_in"] = 0
         dest_params["metadata_write_fault_one_in"] = 0
@@ -1583,7 +1733,6 @@ def finalize_and_sanitize(src_params):
     # incompatible, so force blob-related toggles off even if they came from
     # command-line overrides or another preset.
     if dest_params.get("best_efforts_recovery") == 1:
-        dest_params["inplace_update_support"] = 0
         dest_params["enable_blob_files"] = 0
         dest_params["enable_blob_garbage_collection"] = 0
         dest_params["allow_setting_blob_options_dynamically"] = 0
@@ -1592,7 +1741,6 @@ def finalize_and_sanitize(src_params):
     # Remote Compaction Incompatible Tests and Features
     if dest_params.get("remote_compaction_worker_threads", 0) > 0:
         # Disable Incompatible Ones
-        dest_params["inplace_update_support"] = 0
         dest_params["checkpoint_one_in"] = 0
         dest_params["use_timed_put_one_in"] = 0
         dest_params["test_secondary"] = 0
@@ -1621,33 +1769,33 @@ def finalize_and_sanitize(src_params):
         dest_params["open_read_fault_one_in"] = 0
         dest_params["sync_fault_injection"] = 0
 
-    # UDI now supports all operation types and all iteration directions.
-    # Only parallel compression and mmap_read remain incompatible.
+    # UDI is compatible with all operation types and iteration directions
+    # except mmap_read.
     if dest_params.get("use_trie_index") == 1:
         # Trie UDI uses zero-copy pointers into block data, which is
         # incompatible with mmap_read.
         dest_params["mmap_read"] = 0
-        # Parallel compression is incompatible with UDI
-        dest_params["compression_parallel_threads"] = 1
-        if dest_params.get("use_udi_as_primary_index") == 1:
-            # Primary UDI mode: the standard index is still fully populated,
-            # but partitioned index (kTwoLevelIndexSearch) and partitioned
-            # filters are not compatible with the UDI wrapper layout.
+        index_mode = dest_params.get("index_mode")
+        if index_mode in (2, 3):
+            # kCustomDefault/kCustomOnly reject partitioned index
+            # (kTwoLevelIndexSearch) and partitioned filters.
             dest_params["index_type"] = random.choice([0, 0, 3])
             dest_params["partition_filters"] = 0
-            # Backup/restore serializes Options to strings, losing the
-            # user_defined_index_factory (shared_ptr). The restored DB
-            # opens without UDI support and cannot route reads through
-            # the trie in primary mode.
+            # db_stress rebuilds the restored DB's options from strings that
+            # do not carry the user_defined_index_factory, so the restored DB
+            # cannot read through the trie, and cannot open kCustomOnly SSTs.
             dest_params["backup_one_in"] = 0
-            # Secondary DB opens SSTs with default Options (not a copy of
-            # the primary's), losing the UDI factory. Without the factory,
-            # reads cannot be routed through the trie.
+            # The secondary instance gets the trie through the column family
+            # options, but it has not been crash tested with the trie as the
+            # default read index.
             dest_params["test_secondary"] = 0
-    else:
-        # use_udi_as_primary_index requires use_trie_index
-        dest_params["use_udi_as_primary_index"] = 0
-
+        if index_mode == 3:
+            # kCustomOnly requires format_version >= 6.
+            dest_params["format_version"] = max(6, dest_params["format_version"])
+            # kCustomOnly SSTs have only a stub standard index, so db_stress
+            # rejects kBuiltin reads.
+            if dest_params.get("read_index") == 1:
+                dest_params["read_index"] = -1
     # Multi-key operations are not currently compatible with transactions or
     # timestamp.
     if (
@@ -1662,22 +1810,6 @@ def finalize_and_sanitize(src_params):
     ):
         dest_params["delpercent"] += dest_params["delrangepercent"]
         dest_params["delrangepercent"] = 0
-    # Since the value of inplace_update_support needs to be fixed across runs,
-    # we disable other incompatible options here instead of disabling
-    # inplace_update_support based on other option values, which may change
-    # across runs.
-    if dest_params["inplace_update_support"] == 1:
-        dest_params["delpercent"] += dest_params["delrangepercent"]
-        dest_params["delrangepercent"] = 0
-        dest_params["readpercent"] += dest_params["prefixpercent"]
-        dest_params["prefixpercent"] = 0
-        dest_params["allow_concurrent_memtable_write"] = 0
-        # inplace_update_support does not update sequence number. Our stress test recovery
-        # logic for unsynced data loss relies on max sequence number stored
-        # in MANIFEST, so they don't work together.
-        dest_params["sync_fault_injection"] = 0
-        dest_params["disable_wal"] = 0
-        dest_params["manual_wal_flush_one_in"] = 0
     if (
         dest_params.get("sync_fault_injection") == 1
         or dest_params.get("disable_wal") == 1
@@ -1719,9 +1851,6 @@ def finalize_and_sanitize(src_params):
         dest_params["write_fault_one_in"] = 0
         dest_params["reopen"] = 0
         dest_params["manual_wal_flush_one_in"] = 0
-        # disableWAL and recycle_log_file_num options are not mutually
-        # compatible at the moment
-        dest_params["recycle_log_file_num"] = 0
     if dest_params.get("open_files", 1) != -1:
         # Compaction TTL and periodic compactions are only compatible
         # with open_files = -1
@@ -1797,6 +1926,9 @@ def finalize_and_sanitize(src_params):
         dest_params["commit_bypass_memtable_one_in"] = 0
         # not compatible with Remote Compaction yet
         dest_params["remote_compaction_worker_threads"] = 0
+        # Pipelined write does not support seq_per_batch, which WritePrepared
+        # and WriteUnprepared use.
+        dest_params["enable_pipelined_write"] = 0
     # TODO(hx235): enable test_multi_ops_txns with fault injection after stabilizing the CI
     if dest_params.get("test_multi_ops_txns") == 1:
         dest_params["write_fault_one_in"] = 0
@@ -1809,8 +1941,6 @@ def finalize_and_sanitize(src_params):
             # try small wp_commit_cache_bits, e.g. 0 once we explore storing full
             # commit sequence numbers in commit cache
             dest_params["wp_commit_cache_bits"] = 10
-            # pipeline write is not currnetly compatible with WritePrepared txns
-            dest_params["enable_pipelined_write"] = 0
             # OpenReadOnly after checkpoint is not currently compatible with WritePrepared txns
             dest_params["checkpoint_one_in"] = 0
             # Required to be 1 in order to use commit-time-batch
@@ -1885,10 +2015,30 @@ def finalize_and_sanitize(src_params):
         dest_params["index_block_search_type"] = 0
         # TrieIndexFactory requires BytewiseComparator.
         dest_params["use_trie_index"] = 0
+    # Select the new-order stress filter only with a compatible active filter;
+    # other profiles keep their existing filter policy and
+    # unsupported-configuration coverage.
+    if (
+        dest_params.get("enable_compaction_filter", 0) != 1
+        or dest_params.get("use_txn", 0) == 1
+        or dest_params.get("use_optimistic_txn", 0) == 1
+        or dest_params.get("test_multi_ops_txns", 0) == 1
+        or dest_params.get("user_timestamp_size", 0) > 0
+        or dest_params.get("use_blob_db", 0) == 1
+    ):
+        dest_params["merge_before_compaction_filter"] = 0
+    if dest_params.get("merge_before_compaction_filter", 0) == 0:
+        dest_params["merge_before_filter_change_one_in"] = 0
+        dest_params["merge_before_filter_remove_deleted"] = 0
+    # Removing records (either order) can change what a snapshot reads. The
+    # new-order filter without removal never changes what a reader sees.
     if (
         dest_params.get("enable_compaction_filter", 0) == 1
-        or dest_params.get("inplace_update_support", 0) == 1
-    ):
+        and (
+            dest_params.get("merge_before_compaction_filter", 0) == 0
+            or dest_params.get("merge_before_filter_remove_deleted", 0) == 1
+        )
+    ) or dest_params.get("inplace_update_support", 0) == 1:
         # Compaction filter, inplace update support are incompatible with snapshots. Need to avoid taking
         # snapshots, as well as avoid operations that use snapshots for
         # verification.
@@ -2069,11 +2219,6 @@ def finalize_and_sanitize(src_params):
     if dest_params.get("skip_stats_update_on_db_open", 0) == 0:
         dest_params["open_files_async"] = 0
 
-    # inplace update and key checksum verification during seek would cause race condition
-    # Therefore, when inplace_update_support is enabled, disable memtable_verify_per_key_checksum_on_seek
-    if dest_params["inplace_update_support"] == 1:
-        dest_params["memtable_verify_per_key_checksum_on_seek"] = 0
-
     # allow_resumption requires remote compaction
     if dest_params.get("remote_compaction_worker_threads", 0) == 0:
         dest_params["allow_resumption_one_in"] = 0
@@ -2163,6 +2308,15 @@ def finalize_and_sanitize(src_params):
         dest_params["cache_size"] = 65536
         dest_params["use_write_buffer_manager"] = 0
 
+    # Some sanitizers, such as user timestamps, can disable trie after the
+    # UDI-specific rules above have run. Keep the final mode and per-read
+    # selection valid without a custom factory.
+    if dest_params.get("use_trie_index") != 1:
+        if dest_params.get("index_mode", 1) in (2, 3, 4):
+            dest_params["index_mode"] = 1
+        if dest_params.get("read_index", -1) > 0:
+            dest_params["read_index"] = -1
+
     # `db_stress` rejects either verification knob when `skip_verifydb` is set.
     # Must stay last: sanitization above can turn a verification knob back on
     # after `skip_verifydb` was decided.
@@ -2219,22 +2373,25 @@ def gen_cmd_params(args, unknown_params=None):
         and params.get("test_secondary", 0) == 0
         and random.choice([0] * 9 + [1]) == 1
     ):
-        params.update(
-            random.choice(
-                [
-                    blob_params,
-                    blob_direct_write_params,
-                    blob_direct_write_get_entity_params,
-                    blob_direct_write_multi_get_entity_params,
-                ]
-            )
-        )
+        blob_profiles = [blob_params]
+        # Blob direct write turns off transactions and user-defined timestamps,
+        # so it would silently drop the feature these flavors exist to test.
+        if not (
+            args.txn or args.optimistic_txn or args.test_multiops_txn or args.enable_ts
+        ) and getattr(args, "inplace_update_support", None) != 1:
+            blob_profiles += [
+                blob_direct_write_params,
+                blob_direct_write_get_entity_params,
+                blob_direct_write_multi_get_entity_params,
+            ]
+        params.update(random.choice(blob_profiles))
 
     if "compaction_style" not in params:
-        # Default to leveled compaction
-        # TODO: Fix "Unsafe to store Seq later" with tiered+leveled and
-        # enable that combination rather than falling back to universal.
-        params["compaction_style"] = 0 if not args.test_tiered_storage else 1
+        # Default to leveled compaction. Tiered storage picks leveled or
+        # universal at random, fixed for all runs of the series.
+        params["compaction_style"] = (
+            0 if not args.test_tiered_storage else random.choice([0, 1])
+        )
 
     for k, v in vars(args).items():
         if v is not None:
@@ -2272,6 +2429,7 @@ def gen_cmd_params(args, unknown_params=None):
         "open_metadata_write_fault_one_in",
         "open_read_fault_one_in",
         "open_write_fault_one_in",
+        "inplace_update_support",
     ]
     has_explicit_file_scope_conflict = any(
         getattr(args, flag, None) not in (None, 0)
@@ -2308,6 +2466,7 @@ def gen_cmd_params(args, unknown_params=None):
     if args.test_type == "liveness":
         apply_liveness_remote_defaults(params, args)
         params.update(no_fault_injection_params)
+    resolve_inplace_update_support(params, args, unknown_params)
 
     # DB paths must not change between the crash and recovery processes.
     wbm_flush_policy = params["wbm_flush_policy"]

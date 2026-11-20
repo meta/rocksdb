@@ -210,6 +210,10 @@ class InternalIteratorBase : public Cleanable {
   // used by MergingIterator and LevelIterator for now.
   virtual bool IsDeleteRangeSentinelKey() const { return false; }
 
+  // Prepares the iterator for the scan ranges in scan_opts (see
+  // Iterator::Prepare()). scan_opts may be nullptr, meaning there are no
+  // bounded scan ranges; implementations should then behave as a regular
+  // iterator.
   virtual void Prepare(const MultiScanArgs* /*scan_opts*/) {}
 
  protected:

@@ -196,7 +196,7 @@ class SecondaryIndexMixin : public Txn {
   Status PerformWithSavePoint(Operation&& operation) {
     Txn::SetSavePoint();
 
-    const Status s = operation();
+    Status s = std::forward<Operation>(operation)();
 
     if (!s.ok()) {
       [[maybe_unused]] const Status st = Txn::RollbackToSavePoint();
@@ -472,7 +472,7 @@ class SecondaryIndexMixin : public Txn {
     {
       PinnableWideColumns existing_primary_columns;
 
-      const Status s = GetPrimaryEntryForUpdate(
+      Status s = GetPrimaryEntryForUpdate(
           column_family, primary_key, &existing_primary_columns, do_validate);
       if (!s.ok()) {
         if (!s.IsNotFound()) {
@@ -542,7 +542,7 @@ class SecondaryIndexMixin : public Txn {
     {
       PinnableWideColumns existing_primary_columns;
 
-      const Status s = GetPrimaryEntryForUpdate(
+      Status s = GetPrimaryEntryForUpdate(
           column_family, key, &existing_primary_columns, do_validate);
       if (!s.ok()) {
         if (!s.IsNotFound()) {
@@ -560,7 +560,7 @@ class SecondaryIndexMixin : public Txn {
     }
 
     {
-      const Status s = operation(column_family, key);
+      const Status s = std::forward<Operation>(operation)(column_family, key);
       if (!s.ok()) {
         return s;
       }

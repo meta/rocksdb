@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db/merge_context.h"
@@ -24,7 +25,7 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 std::string ValueWithWriteTime(std::string value, uint64_t write_time) {
   std::string result;
-  result = value;
+  result = std::move(value);
   PutFixed64(&result, write_time);
   return result;
 }

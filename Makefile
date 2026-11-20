@@ -660,6 +660,7 @@ TESTS_PLATFORM_DEPENDENT := \
 	dynamic_bloom_test \
 	c_test \
 	checkpoint_test \
+	live_tuner_test \
 	sorted_run_builder_test \
 	crc32c_test \
 	coding_test \
@@ -1892,6 +1893,9 @@ backup_engine_test: $(OBJ_DIR)/utilities/backup/backup_engine_test.o $(TEST_LIBR
 checkpoint_test: $(OBJ_DIR)/utilities/checkpoint/checkpoint_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+live_tuner_test: $(OBJ_DIR)/utilities/live_tune/live_tuner_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_split_merge_test: $(OBJ_DIR)/utilities/db_split_merge_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -2202,6 +2206,9 @@ repair_test: $(OBJ_DIR)/db/repair_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 ldb_cmd_test: $(OBJ_DIR)/tools/ldb_cmd_test.o $(TOOLS_LIBRARY) $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+db_stress_structured_key_value_test: $(OBJ_DIR)/db_stress_tool/db_stress_structured_key_value_test.o $(OBJ_DIR)/db_stress_tool/db_stress_structured_key_value.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 ldb: $(OBJ_DIR)/tools/ldb.o $(TOOLS_LIBRARY) $(LIBRARY)

@@ -129,6 +129,34 @@ public class CompactRangeOptions extends RocksObject {
   }
 
   /**
+   * Returns whether this compaction repairs references to missing integrated external blob files.
+   *
+   * @return true if repair is enabled; false by default
+   */
+  public boolean skipMissingBlobFiles() {
+    return skipMissingBlobFiles(nativeHandle_);
+  }
+
+  /**
+   * Enables offline repair of references to integrated external blob files absent from the
+   * compaction's input Version. Lost scalar values become deletions; wide entities retain available
+   * columns and become deletions when no columns remain. This deliberately discards unavailable
+   * data. Legacy BlobDB is unsupported.
+   *
+   * <p>Selected SST files are rewritten, including bottommost files even with {@code kSkip}, and
+   * repair runs locally. FIFO compaction is unsupported. The metadata-only check cannot detect disk
+   * loss when blob metadata remains present. Filters, merges, and blob garbage collection can still
+   * read payloads and propagate errors. This setting applies only to calls using this object.
+   *
+   * @param skipMissingBlobFiles true to enable repair
+   * @return this CompactRangeOptions
+   */
+  public CompactRangeOptions setSkipMissingBlobFiles(final boolean skipMissingBlobFiles) {
+    setSkipMissingBlobFiles(nativeHandle_, skipMissingBlobFiles);
+    return this;
+  }
+
+  /**
    * Returns whether compacted files will be moved to the minimum level capable of holding the data or given level
    * (specified non-negative target_level).
    * @return true, if compacted files will be moved to the minimum level
@@ -278,6 +306,9 @@ public class CompactRangeOptions extends RocksObject {
   private static native boolean exclusiveManualCompaction(final long handle);
   private static native void setExclusiveManualCompaction(
       final long handle, final boolean exclusive_manual_compaction);
+  private static native boolean skipMissingBlobFiles(final long handle);
+  private static native void setSkipMissingBlobFiles(
+      final long handle, final boolean skipMissingBlobFiles);
   private static native boolean changeLevel(final long handle);
   private static native void setChangeLevel(final long handle, final boolean changeLevel);
   private static native int targetLevel(final long handle);

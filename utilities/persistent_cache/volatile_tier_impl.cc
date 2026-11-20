@@ -81,7 +81,7 @@ Status VolatileCacheTier::Insert(const Slice& page_key, const char* data,
 Status VolatileCacheTier::Lookup(const Slice& page_key,
                                  std::unique_ptr<char[]>* result,
                                  size_t* size) {
-  CacheData key(std::move(page_key.ToString()));
+  CacheData key(page_key.ToString());
   CacheData* kv;
   bool ok = index_.Find(&key, &kv);
   if (ok) {

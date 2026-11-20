@@ -59,7 +59,6 @@ CompactionServiceJobStatus DbStressCompactionService::Wait(
       Env::Default()->SleepForMicroseconds(kWaitIntervalInMicros);
     }
   }
-  return CompactionServiceJobStatus::kFailure;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

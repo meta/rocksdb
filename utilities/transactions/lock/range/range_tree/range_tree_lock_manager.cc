@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <memory>
 #include <mutex>
 
 #include "monitoring/perf_context_imp.h"
@@ -31,7 +32,7 @@ RangeLockManagerHandle* NewRangeLockManager(
   if (mutex_factory) {
     use_factory = mutex_factory;
   } else {
-    use_factory.reset(new TransactionDBMutexFactoryImpl());
+    use_factory = std::make_shared<TransactionDBMutexFactoryImpl>();
   }
   return new RangeTreeLockManager(use_factory);
 }
@@ -360,7 +361,7 @@ RangeTreeLockManager::~RangeTreeLockManager() {
 RangeLockManagerHandle::Counters RangeTreeLockManager::GetStatus() {
   LTM_STATUS_S ltm_status_test;
   ltm_.get_status(&ltm_status_test);
-  Counters res;
+  Counters res{};
 
   // Searching status variable by its string name is how Toku's unit tests
   // do it (why didn't they make LTM_ESCALATION_COUNT constant visible?)
@@ -395,7 +396,7 @@ void RangeTreeLockManager::AddColumnFamily(const ColumnFamilyHandle* cfh) {
   InstrumentedMutexLock l(&ltree_map_mutex_);
   if (ltree_map_.find(column_family_id) == ltree_map_.end()) {
     DICTIONARY_ID dict_id = {.dictid = column_family_id};
-    toku::comparator cmp;
+    toku::comparator cmp{};
     cmp.create(CompareDbtEndpoints, (void*)cfh->GetComparator());
     toku::locktree* ltree =
         ltm_.get_lt(dict_id, cmp,

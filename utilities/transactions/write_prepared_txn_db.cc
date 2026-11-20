@@ -109,6 +109,11 @@ Status WritePreparedTxnDB::VerifyCFOptions(
         "memtable_factory->CanHandleDuplicatedKey() cannot be false with "
         "WritePrepared transactions");
   }
+  if (cf_options.inplace_update_support) {
+    return Status::NotSupported(
+        "inplace_update_support is not supported with WritePrepared or "
+        "WriteUnprepared transactions");
+  }
   return Status::OK();
 }
 

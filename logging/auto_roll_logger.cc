@@ -130,8 +130,9 @@ void AutoRollLogger::GetExistingFiles() {
   // delete file from the front, it is the oldest file.
   std::sort(info_log_files.begin(), info_log_files.end());
 
+  const std::string dir_prefix = parent_dir + "/";
   for (const std::string& f : info_log_files) {
-    old_log_files_.push(parent_dir + "/" + f);
+    old_log_files_.push(dir_prefix + f);
   }
 }
 

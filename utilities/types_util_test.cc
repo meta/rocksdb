@@ -134,6 +134,13 @@ TEST(EncodeEntryTest, RoundTrip) {
   }
 }
 
+TEST(EncodeEntryTest, Buffer) {
+  const ParsedEntryInfo entry{"foo", Slice(), 42, kEntryPut};
+  std::string buffer(GetEncodedEntrySize(entry), '\0');
+  ASSERT_OK(EncodeEntry(entry, buffer.data()));
+  ASSERT_EQ(buffer, IKey("foo", 42, kTypeValue, std::nullopt));
+}
+
 TEST(EncodeEntryTest, InvalidEntry) {
   ParsedEntryInfo entry{"foo", Slice(), 3, kEntryOther};
   std::string encoded = "unchanged";

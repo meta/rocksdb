@@ -50,7 +50,7 @@ class MergerTest : public testing::Test {
     Seek(ik.Encode().ToString(false));
   }
 
-  void Seek(std::string target) {
+  void Seek(const std::string& target) {
     merging_iterator_->Seek(target);
     single_iterator_->Seek(target);
   }

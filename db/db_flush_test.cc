@@ -803,7 +803,7 @@ class TestFlushListener : public EventListener {
   std::vector<DB*> flushed_dbs_;
   int slowdown_count;
   int stop_count;
-  bool db_closing;
+  bool db_closing = false;
   std::atomic_bool db_closed;
   TableFileCreationInfo prev_fc_info_;
 
@@ -1715,6 +1715,7 @@ TEST_F(DBFlushTest, DISABLED_MemPurgeWALSupport) {
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
     std::vector<std::string> keys;
+    keys.reserve(KVSIZE);
     for (size_t k = 0; k < KVSIZE; k++) {
       keys.push_back("IamKey" + std::to_string(k));
     }
@@ -3190,7 +3191,7 @@ TEST_P(DBAtomicFlushTest, AtomicFlushRollbackSomeJobs) {
   Destroy(options);
 }
 
-TEST_P(DBAtomicFlushTest, FlushMultipleCFs_DropSomeBeforeRequestFlush) {
+TEST_P(DBAtomicFlushTest, FlushMultipleCFsDropSomeBeforeRequestFlush) {
   bool atomic_flush = GetParam();
   if (!atomic_flush) {
     return;
@@ -3219,7 +3220,7 @@ TEST_P(DBAtomicFlushTest, FlushMultipleCFs_DropSomeBeforeRequestFlush) {
 }
 
 TEST_P(DBAtomicFlushTest,
-       FlushMultipleCFs_DropSomeAfterScheduleFlushBeforeFlushJobRun) {
+       FlushMultipleCFsDropSomeAfterScheduleFlushBeforeFlushJobRun) {
   bool atomic_flush = GetParam();
   if (!atomic_flush) {
     return;

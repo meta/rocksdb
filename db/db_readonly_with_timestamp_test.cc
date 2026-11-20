@@ -218,7 +218,8 @@ TEST_F(DBReadOnlyTestWithTimestamp, IteratorAndGet) {
   ASSERT_OK(ReadOnlyReopen(options));
 
   auto get_value_and_check = [](DB* db, ReadOptions read_opts, Slice key,
-                                Slice expected_value, std::string expected_ts) {
+                                Slice expected_value,
+                                const std::string& expected_ts) {
     std::string value_from_get;
     std::string timestamp;
     ASSERT_OK(db->Get(read_opts, key.ToString(), &value_from_get, &timestamp));
@@ -762,6 +763,7 @@ TEST_F(DBReadOnlyTestWithTimestamp,
   for (uint64_t key = 0; key <= kMaxKey; ++key) {
     key_strs.push_back(Key1(key));
   }
+  keys.reserve(key_strs.size());
   for (const auto& key_str : key_strs) {
     keys.emplace_back(key_str);
   }
@@ -809,6 +811,7 @@ TEST_F(DBReadOnlyTestWithTimestamp,
   for (uint64_t key = 0; key <= kMaxKey; ++key) {
     key_strs.push_back(Key1(key));
   }
+  keys.reserve(key_strs.size());
   for (const auto& key_str : key_strs) {
     keys.emplace_back(key_str);
   }
@@ -858,6 +861,7 @@ TEST_F(DBReadOnlyTestWithTimestamp,
   for (uint64_t key = 0; key <= kMaxKey; ++key) {
     key_strs.push_back(Key1(key));
   }
+  keys.reserve(key_strs.size());
   for (const auto& key_str : key_strs) {
     keys.emplace_back(key_str);
   }
@@ -913,6 +917,7 @@ TEST_F(DBReadOnlyTestWithTimestamp, CompactedDBMultiGetWithOnlyOneL0File) {
     for (uint64_t key = start_keys[i]; key <= kMaxKey; ++key) {
       key_strs.push_back(Key1(key));
     }
+    keys.reserve(key_strs.size());
     for (const auto& key_str : key_strs) {
       keys.emplace_back(key_str);
     }
@@ -979,6 +984,7 @@ TEST_F(DBReadOnlyTestWithTimestamp,
     for (uint64_t key = start_keys[i]; key <= kMaxKey; ++key) {
       key_strs.push_back(Key1(key));
     }
+    keys.reserve(key_strs.size());
     for (const auto& key_str : key_strs) {
       keys.emplace_back(key_str);
     }

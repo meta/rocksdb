@@ -6,7 +6,7 @@ on:
   workflow_call:
     inputs:
       provider:
-        description: Provider key, for example "claude" or "codex"
+        description: Provider key, for example "claude"
         required: true
         type: string
       result_artifact_name:
@@ -71,7 +71,8 @@ jobs:
 
             const post = require('./.github/scripts/post-pr-comment.js');
             const provider = process.env.PROVIDER;
-            const providerTitle = provider === 'codex' ? 'Codex' : 'Claude';
+            const providerTitle =
+              provider.charAt(0).toUpperCase() + provider.slice(1);
             const body = fs.readFileSync(commentFile, 'utf8');
             const prNumber = parseInt(
               fs.readFileSync(prNumberFile, 'utf8').trim(),

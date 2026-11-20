@@ -203,11 +203,12 @@ void WalManager::PurgeObsoleteWALFiles() {
 
   size_t log_files_num = 0;
   uint64_t log_file_size = 0;
+  const std::string archival_dir_prefix = archival_dir + "/";
   for (auto& f : files) {
     uint64_t number;
     FileType type;
     if (ParseFileName(f, &number, &type) && type == kWalFile) {
-      std::string const file_path = archival_dir + "/" + f;
+      std::string const file_path = archival_dir_prefix + f;
       if (ttl_enabled) {
         uint64_t file_m_time;
         s = env_->GetFileModificationTime(file_path, &file_m_time);
@@ -331,7 +332,7 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
                                        VectorWalPtr& log_files,
                                        WalFileType log_type, bool need_seqnos) {
   std::vector<std::string> all_files;
-  const Status status = env_->GetChildren(path, &all_files);
+  Status status = env_->GetChildren(path, &all_files);
   if (!status.ok()) {
     return status;
   }
@@ -496,12 +497,12 @@ Status WalManager::ReadFirstLine(const std::string& fname,
                                  const uint64_t number,
                                  SequenceNumber* sequence) {
   struct LogReporter : public log::Reader::Reporter {
-    Env* env;
-    Logger* info_log;
-    const char* fname;
+    Env* env = nullptr;
+    Logger* info_log = nullptr;
+    const char* fname = nullptr;
 
-    Status* status;
-    bool ignore_error;  // true if db_options_.paranoid_checks==false
+    Status* status = nullptr;
+    bool ignore_error = false;  // true if db_options_.paranoid_checks==false
     void Corruption(size_t bytes, const Status& s,
                     uint64_t /*log_number*/ = kMaxSequenceNumber) override {
       ROCKS_LOG_WARN(info_log, "[WalManager] %s%s: dropping %d bytes; %s",

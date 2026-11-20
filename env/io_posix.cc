@@ -199,7 +199,7 @@ bool IsSyncFileRangeSupported(int fd) {
   // (`ROCKSDB_RANGESYNC_PRESENT`). If we are unsure, or if any of the checks
   // fail in unexpected ways, we allow `sync_file_range` to be used. This way
   // should minimize risk of impacting existing use cases.
-  struct statfs buf;
+  struct statfs buf{};
   int ret = fstatfs(fd, &buf);
   assert(ret == 0);
   if (ret == 0 && buf.f_type == ZFS_SUPER_MAGIC) {
@@ -360,7 +360,7 @@ size_t PosixHelper::GetUniqueIdFromFile(int fd, char* id, size_t max_size) {
     return 0;
   }
 
-  struct stat buf;
+  struct stat buf{};
   int result = fstat(fd, &buf);
   if (result == -1) {
     return 0;
@@ -527,7 +527,7 @@ size_t PosixHelper::GetMaxSectorsKBOfFd(int fd) {
 size_t PosixHelper::GetQueueSysfsFileValueOfFd(
     int fd, const std::string& file_name, const size_t default_return_value) {
 #ifdef OS_LINUX
-  struct stat buf;
+  struct stat buf{};
   int result = fstat(fd, &buf);
   if (result == -1) {
     return default_return_value;
@@ -922,7 +922,7 @@ IOStatus PosixRandomAccessFile::MultiRead(FSReadRequest* reqs, size_t num_reqs,
 
   struct WrappedReadRequest {
     FSReadRequest* req;
-    struct iovec iov;
+    struct iovec iov{};
     size_t finished_len;
     explicit WrappedReadRequest(FSReadRequest* r) : req(r), finished_len(0) {}
   };
@@ -1792,7 +1792,7 @@ IOStatus PosixWritableFile::Close(const IOOptions& /*opts*/,
     //   tmpfs (since Linux 3.5)
     // We ignore error since failure of this operation does not affect
     // correctness.
-    struct stat file_stats;
+    struct stat file_stats{};
     int result = fstat(fd_, &file_stats);
     // After ftruncate, we check whether ftruncate has the correct behavior.
     // If not, we should hack it with FALLOC_FL_PUNCH_HOLE
@@ -2073,7 +2073,7 @@ PosixDirectory::PosixDirectory(int fd, const std::string& directory_name)
     : fd_(fd), directory_name_(directory_name) {
   is_btrfs_ = false;
 #ifdef OS_LINUX
-  struct statfs buf;
+  struct statfs buf{};
   int ret = fstatfs(fd, &buf);
   is_btrfs_ = (ret == 0 && buf.f_type == static_cast<decltype(buf.f_type)>(
                                              BTRFS_SUPER_MAGIC));

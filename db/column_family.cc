@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -635,6 +636,8 @@ ColumnFamilyData::ColumnFamilyData(
       mutable_cf_options_(initial_cf_options_),
       is_delete_range_supported_(
           cf_options.table_factory->IsDeleteRangeSupported()),
+      is_table_builder_supported_(
+          cf_options.table_factory->IsTableBuilderSupported()),
       write_buffer_manager_(write_buffer_manager),
       mem_(nullptr),
       imm_(ioptions_.min_write_buffer_number_to_merge,
@@ -740,10 +743,11 @@ ColumnFamilyData::ColumnFamilyData(
       // TODO(hx235): Add a `ConcurrentCacheReservationManager` at DB scope
       // responsible for reservation of `ObsoleteFileInfo` so that we can keep
       // this `file_metadata_cache_res_mgr_` nonconcurrent
-      file_metadata_cache_res_mgr_.reset(new ConcurrentCacheReservationManager(
-          std::make_shared<
-              CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>>(
-              bbto->block_cache)));
+      file_metadata_cache_res_mgr_ =
+          std::make_shared<ConcurrentCacheReservationManager>(
+              std::make_shared<
+                  CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>>(
+                  bbto->block_cache));
     }
   }
 }
@@ -1025,13 +1029,16 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
     int num_unflushed_memtables, int num_l0_files,
     uint64_t num_compaction_needed_bytes,
     const MutableCFOptions& mutable_cf_options,
-    const ImmutableCFOptions& immutable_cf_options) {
+    const ImmutableCFOptions& immutable_cf_options,
+    bool table_builder_supported) {
+  const bool auto_compactions =
+      table_builder_supported && !mutable_cf_options.disable_auto_compactions;
   if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
     return {WriteStallCondition::kStopped, WriteStallCause::kMemtableLimit};
-  } else if (!mutable_cf_options.disable_auto_compactions &&
+  } else if (auto_compactions &&
              num_l0_files >= mutable_cf_options.level0_stop_writes_trigger) {
     return {WriteStallCondition::kStopped, WriteStallCause::kL0FileCountLimit};
-  } else if (!mutable_cf_options.disable_auto_compactions &&
+  } else if (auto_compactions &&
              mutable_cf_options.hard_pending_compaction_bytes_limit > 0 &&
              num_compaction_needed_bytes >=
                  mutable_cf_options.hard_pending_compaction_bytes_limit) {
@@ -1043,12 +1050,12 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
              num_unflushed_memtables - 1 >=
                  immutable_cf_options.min_write_buffer_number_to_merge) {
     return {WriteStallCondition::kDelayed, WriteStallCause::kMemtableLimit};
-  } else if (!mutable_cf_options.disable_auto_compactions &&
+  } else if (auto_compactions &&
              mutable_cf_options.level0_slowdown_writes_trigger >= 0 &&
              num_l0_files >=
                  mutable_cf_options.level0_slowdown_writes_trigger) {
     return {WriteStallCondition::kDelayed, WriteStallCause::kL0FileCountLimit};
-  } else if (!mutable_cf_options.disable_auto_compactions &&
+  } else if (auto_compactions &&
              mutable_cf_options.soft_pending_compaction_bytes_limit > 0 &&
              num_compaction_needed_bytes >=
                  mutable_cf_options.soft_pending_compaction_bytes_limit) {
@@ -1070,7 +1077,7 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
     auto write_stall_condition_and_cause = GetWriteStallConditionAndCause(
         imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
         vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
-        ioptions());
+        ioptions(), is_table_builder_supported_);
     write_stall_condition = write_stall_condition_and_cause.first;
     auto write_stall_cause = write_stall_condition_and_cause.second;
 
@@ -1276,7 +1283,8 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
-  return !mutable_cf_options_.disable_auto_compactions &&
+  return is_table_builder_supported_ &&
+         !mutable_cf_options_.disable_auto_compactions &&
          compaction_picker_->NeedsCompaction(current_->storage_info());
 }
 
@@ -1537,8 +1545,18 @@ Status ColumnFamilyData::ValidateOptions(
   if (s.ok()) {
     s = CheckCFPathsSupported(db_options, cf_options);
   }
+  if (s.ok() && cf_options.memtable_factory != nullptr) {
+    s = cf_options.memtable_factory->ValidateOptions(db_options, cf_options);
+  }
   if (!s.ok()) {
     return s;
+  }
+
+  if (!cf_options.table_factory->IsTableBuilderSupported() &&
+      !cf_options.disallow_memtable_writes) {
+    return Status::InvalidArgument(
+        "A table factory that cannot build tables requires "
+        "disallow_memtable_writes");
   }
 
   if (cf_options.ttl > 0 && cf_options.ttl != kDefaultTtl) {
@@ -1741,8 +1759,19 @@ Status ColumnFamilyData::SetOptions(
   if (s.ok()) {
     mutable_cf_options_ = MutableCFOptions(cf_opts);
     mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+    options_install_pending_ = true;
   }
   return s;
+}
+
+bool ColumnFamilyData::SetOptionsIsNoOp(
+    const DBOptions& db_opts,
+    const std::unordered_map<std::string, std::string>& options_map) const {
+  // SetOptions() validates the resulting options, so a request that changes
+  // nothing must pass the same check to return the same status.
+  return !IsDropped() && !options_install_pending_ &&
+         MutableCFOptionsUnchangedByMap(mutable_cf_options_, options_map) &&
+         ValidateOptions(db_opts, GetLatestCFOptions()).ok();
 }
 
 Status ColumnFamilyData::AddDirectories(

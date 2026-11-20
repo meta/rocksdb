@@ -29,10 +29,12 @@ struct UniqueIdPtr {
   uint64_t* ptr = nullptr;
   bool extended = false;
 
+  // NOLINTNEXTLINE(google-explicit-constructor)
   /*implicit*/ UniqueIdPtr(UniqueId64x2* id) {
     ptr = (*id).data();
     extended = false;
   }
+  // NOLINTNEXTLINE(google-explicit-constructor)
   /*implicit*/ UniqueIdPtr(UniqueId64x3* id) {
     ptr = (*id).data();
     extended = true;

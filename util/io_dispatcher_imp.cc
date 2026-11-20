@@ -36,6 +36,7 @@
 #include "test_util/sync_point.h"
 #include "util/aligned_buffer.h"
 #include "util/io_prefetch_scheduler.h"
+#include "util/parallel_async_io_materializer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -255,6 +256,39 @@ struct AsyncIOState {
   uint64_t submit_time_us = 0;
   std::atomic<bool> completed{false};
 };
+
+// Materializes the blocks of one completed async read across the READ pool.
+// Each range writes only its own pinned_blocks entries.
+static void MaterializeAsyncIOBlocksInParallel(
+    const std::shared_ptr<IOJob>& job, const AsyncIOState& async_state,
+    const Slice& buffer_data, const SharedCleanablePtr& read_buffer_cleanup,
+    std::vector<CachableEntry<Block>>& pinned_blocks,
+    std::vector<size_t>* failed_block_indices) {
+  const size_t num_blocks = async_state.block_indices.size();
+  std::vector<uint8_t> failed(num_blocks, 0);
+  ParallelAsyncIOMaterializer::Materialize(
+      job->table->get_rep()->ioptions.env, num_blocks,
+      [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+          TEST_SYNC_POINT_CALLBACK(
+              "ParallelAsyncIOMaterializer::MaterializeBlock", &i);
+          const size_t idx = async_state.block_indices[i];
+          Status s = CreateAndPinBlockFromBuffer(
+              job, async_state.blocks[i], async_state.offset, buffer_data,
+              read_buffer_cleanup, async_state.read_buffer_requires_cleanup,
+              pinned_blocks[idx]);
+          if (!s.ok()) {
+            pinned_blocks[idx].Reset();
+            failed[i] = 1;
+          }
+        }
+      });
+  for (size_t i = 0; i < num_blocks; ++i) {
+    if (failed[i]) {
+      failed_block_indices->push_back(async_state.block_indices[i]);
+    }
+  }
+}
 
 static uint64_t GetIODispatcherNowMicros(SystemClock* clock) {
   return clock != nullptr ? clock->NowMicros() : 0;
@@ -572,17 +606,25 @@ Status ReadSet::PollAndProcessAsyncIO(std::shared_ptr<AsyncIOState> async_state,
   // local to that block: siblings can still be served, while the failed block
   // is retried through ReadIndex's ordinary read path.
   std::vector<size_t> failed_block_indices;
-  for (size_t i = 0; i < async_state->block_indices.size(); ++i) {
-    const size_t idx = async_state->block_indices[i];
-    const auto& block_handle = async_state->blocks[i];
+  if (job_->job_options.use_parallel_async_io_block_decompression &&
+      async_state->block_indices.size() > 1 &&
+      ParallelAsyncIOMaterializer::CanParallelize(rep->ioptions.env)) {
+    MaterializeAsyncIOBlocksInParallel(job_, *async_state, buffer_data,
+                                       read_buffer_cleanup, pinned_blocks_,
+                                       &failed_block_indices);
+  } else {
+    for (size_t i = 0; i < async_state->block_indices.size(); ++i) {
+      const size_t idx = async_state->block_indices[i];
+      const auto& block_handle = async_state->blocks[i];
 
-    Status s = CreateAndPinBlockFromBuffer(
-        job_, block_handle, async_state->offset, buffer_data,
-        read_buffer_cleanup, async_state->read_buffer_requires_cleanup,
-        pinned_blocks_[idx]);
-    if (!s.ok()) {
-      pinned_blocks_[idx].Reset();
-      failed_block_indices.push_back(idx);
+      Status s = CreateAndPinBlockFromBuffer(
+          job_, block_handle, async_state->offset, buffer_data,
+          read_buffer_cleanup, async_state->read_buffer_requires_cleanup,
+          pinned_blocks_[idx]);
+      if (!s.ok()) {
+        pinned_blocks_[idx].Reset();
+        failed_block_indices.push_back(idx);
+      }
     }
   }
 

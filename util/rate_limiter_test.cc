@@ -409,13 +409,15 @@ TEST_F(RateLimiterTest, Rate) {
 #if defined(ROCKSDB_VALGRIND_RUN)
       true;
 #elif defined(OS_MACOSX)
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       getenv("CIRCLECI") || getenv("GITHUB_ACTIONS");
 #elif defined(__aarch64__) || defined(__arm__)
       // Unlike x86_64, the small/loaded ARM CI runners can't reliably sustain
       // the target rate, so also exempt GitHub Actions here.
+      // NOLINTNEXTLINE(concurrency-mt-unsafe)
       getenv("SANDCASTLE") || getenv("GITHUB_ACTIONS");
 #else
-      getenv("SANDCASTLE");
+      getenv("SANDCASTLE");  // NOLINT(concurrency-mt-unsafe)
 #endif
   if (skip_minimum_rate_check) {
     fprintf(stderr, "Skipped minimum rate check (%d / %d passed)\n",

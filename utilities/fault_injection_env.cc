@@ -20,7 +20,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 // Assume a filename, and not a directory name like "/foo/bar/"
-std::string GetDirName(const std::string filename) {
+std::string GetDirName(const std::string& filename) {
   size_t found = filename.find_last_of("/\\");
   if (found == std::string::npos) {
     return "";
@@ -400,7 +400,7 @@ Status FaultInjectionTestEnv::NewRandomAccessFile(
   }
 
   assert(target());
-  const Status s = target()->NewRandomAccessFile(fname, result, soptions);
+  Status s = target()->NewRandomAccessFile(fname, result, soptions);
   if (!s.ok()) {
     return s;
   }
@@ -507,7 +507,7 @@ void FaultInjectionTestEnv::WritableFileAppended(const FileState& state) {
 // For every file that is not fully synced, make a call to `func` with
 // FileState of the file as the parameter.
 Status FaultInjectionTestEnv::DropFileData(
-    std::function<Status(Env*, FileState)> func) {
+    const std::function<Status(Env*, FileState)>& func) {
   Status s;
   MutexLock l(&mutex_);
   for (std::map<std::string, FileState>::const_iterator it =

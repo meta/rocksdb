@@ -48,6 +48,30 @@ jboolean Java_org_rocksdb_ImportColumnFamilyOptions_moveFiles(JNIEnv*, jobject,
 
 /*
  * Class:     org_rocksdb_ImportColumnFamilyOptions
+ * Method:    setRejectTooOldFile
+ * Signature: (JZ)V
+ */
+void Java_org_rocksdb_ImportColumnFamilyOptions_setRejectTooOldFile(
+    JNIEnv*, jobject, jlong jhandle, jboolean jreject_too_old_file) {
+  auto* options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ImportColumnFamilyOptions*>(jhandle);
+  options->reject_too_old_file = static_cast<bool>(jreject_too_old_file);
+}
+
+/*
+ * Class:     org_rocksdb_ImportColumnFamilyOptions
+ * Method:    rejectTooOldFile
+ * Signature: (J)Z
+ */
+jboolean Java_org_rocksdb_ImportColumnFamilyOptions_rejectTooOldFile(
+    JNIEnv*, jobject, jlong jhandle) {
+  auto* options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ImportColumnFamilyOptions*>(jhandle);
+  return static_cast<jboolean>(options->reject_too_old_file);
+}
+
+/*
+ * Class:     org_rocksdb_ImportColumnFamilyOptions
  * Method:    disposeInternal
  * Signature: (J)V
  */

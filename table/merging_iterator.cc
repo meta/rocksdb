@@ -78,7 +78,7 @@ class MergingIterator : public InternalIterator {
   MergingIterator(MergingIterator&&) = delete;
   MergingIterator& operator=(MergingIterator&&) = delete;
 
-  void considerStatus(Status s) {
+  void considerStatus(const Status& s) {
     if (!s.ok() && status_.ok()) {
       status_ = s;
     }

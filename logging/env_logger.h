@@ -104,7 +104,7 @@ class EnvLogger : public Logger {
 
   Status CloseHelper() {
     FileOpGuard guard(*this);
-    const auto close_status = file_.Close(IOOptions());
+    auto close_status = file_.Close(IOOptions());
 
     if (close_status.ok()) {
       return close_status;
@@ -140,7 +140,7 @@ class EnvLogger : public Logger {
       port::TimeVal now_tv;
       port::GetTimeOfDay(&now_tv, nullptr);
       const time_t seconds = now_tv.tv_sec;
-      struct tm t;
+      struct tm t{};
       port::LocalTimeR(&seconds, &t);
       p += snprintf(p, limit - p, "%04d/%02d/%02d-%02d:%02d:%02d.%06d %llu ",
                     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,

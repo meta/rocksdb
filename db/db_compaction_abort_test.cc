@@ -188,8 +188,11 @@ class SyncPointAbortHelper {
 
   // Clean up sync points and wait for abort completion in one call
   void CleanupAndWait() {
-    CleanupSyncPoints();
+    // We hold no DB mutex, and the wait releases abort_mutex_. Keeping sync
+    // points enabled lets the worker observe the abort and exit, so the abort
+    // thread can finish before cleanup.
     WaitForAbortCompletion();
+    CleanupSyncPoints();
   }
 
  private:
@@ -358,6 +361,7 @@ class DBCompactionAbortStyleTest
         options.compaction_options_fifo.allow_compaction = true;
         options.max_open_files = -1;  // Required for FIFO compaction
         break;
+      case kCompactionStyleNone:
       default:
         break;
     }
@@ -691,6 +695,71 @@ TEST_F(DBCompactionAbortTest, ResumeRestoresParkedAutomaticCompaction) {
   CleanupSyncPoints();
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   ASSERT_LT(NumTableFilesAtLevel(0, 1), l0_files_before_resume);
+}
+
+// An automatic compaction aborted after it was picked releases its input
+// files. ResumeAllCompactions() must schedule the column family again without
+// a new flush, and WaitForCompact() must not wait for it while aborted.
+TEST_F(DBCompactionAbortTest, ResumeAllCompactionsRequeuesAbortedCompaction) {
+  constexpr int kCompactionTrigger = 4;
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kCompactionTrigger;
+  options.disable_auto_compactions = false;
+  Reopen(options);
+
+  SyncPointAbortHelper helper("CompactionJob::ProcessKeyValueCompaction:Start");
+  helper.Setup(dbfull());
+
+  PopulateData(/*num_files=*/kCompactionTrigger, /*keys_per_file=*/100,
+               /*value_size=*/1000);
+  helper.CleanupAndWait();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(kCompactionTrigger, NumTableFilesAtLevel(0));
+
+  dbfull()->ResumeAllCompactions();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+  VerifyDataIntegrity(/*num_keys=*/100);
+}
+
+// Same as above with AbortCompactions() and ResumeCompactions() on one column
+// family.
+TEST_F(DBCompactionAbortTest, ResumeCompactionsRequeuesAbortedCompaction) {
+  constexpr int kCompactionTrigger = 4;
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = kCompactionTrigger;
+  options.disable_auto_compactions = false;
+  CreateAndReopenWithCF({"target"}, options);
+
+  AbortSynchronizer abort_sync;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+      {"DBImpl::AbortCompactions:FlagSet",
+       "DBCompactionAbortTest::ResumeCompactionsRequeues:WaitForAbort"},
+  });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction:Start", [&](void* /*arg*/) {
+        abort_sync.TriggerAbort(dbfull(), handles_[1]);
+        TEST_SYNC_POINT_CALLBACK(
+            "DBCompactionAbortTest::ResumeCompactionsRequeues:WaitForAbort",
+            nullptr);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Random rnd(301);
+  for (int file = 0; file < kCompactionTrigger; ++file) {
+    for (int key = 0; key < 100; ++key) {
+      ASSERT_OK(Put(1, Key(key), rnd.RandomString(1000)));
+    }
+    ASSERT_OK(Flush(1));
+  }
+  abort_sync.WaitForAbortCompletion();
+  CleanupSyncPoints();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(kCompactionTrigger, NumTableFilesAtLevel(0, 1));
+
+  dbfull()->ResumeCompactions(handles_[1]);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(0, NumTableFilesAtLevel(0, 1));
 }
 
 TEST_F(DBCompactionAbortTest, DropColumnFamilyReleasesParkedCompaction) {
@@ -1247,6 +1316,7 @@ TEST_F(DBCompactionAbortTest, AbortWithInProgressFileCleanup) {
     std::vector<uint64_t> blob_file_numbers;
     ColumnFamilyMetaData cf_meta;
     dbfull()->GetColumnFamilyMetaData(db_->DefaultColumnFamily(), &cf_meta);
+    blob_file_numbers.reserve(cf_meta.blob_files.size());
     for (const auto& blob_meta : cf_meta.blob_files) {
       blob_file_numbers.push_back(blob_meta.blob_file_number);
     }

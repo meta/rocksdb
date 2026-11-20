@@ -168,6 +168,7 @@ Status TraceExecutionHandler::Handle(
       single_iter->SeekForPrev(record.GetKey());
       break;
     }
+    case IteratorSeekQueryTraceRecord::kSeek:
     default: {
       single_iter->Seek(record.GetKey());
       break;

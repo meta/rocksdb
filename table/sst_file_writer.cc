@@ -25,6 +25,7 @@
 #include "table/format.h"
 #include "table/prepared_file_info.h"
 #include "table/sst_file_writer_collectors.h"
+#include "table/table_properties_internal.h"
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
@@ -76,8 +77,9 @@ OptionTypeInfo TablePropertiesOptionTypeInfo(int offset) {
                            const std::string&, const void* addr,
                            std::string* value) {
     std::string serialized;
-    Status s = static_cast<const TableProperties*>(addr)->Serialize(
-        config_options, &serialized);
+    Status s = SerializeTablePropertiesForPreparedFileInfo(
+        config_options, *static_cast<const TableProperties*>(addr),
+        &serialized);
     if (s.ok()) {
       *value = Slice(serialized).ToString(true);
     }
@@ -158,6 +160,7 @@ Status DeserializePreparedFileInfo(
 
   ConfigOptions config_options;
   config_options.invoke_prepare_options = false;
+  config_options.ignore_unknown_options = true;
   auto result = std::make_shared<PreparedFileInfo>();
   s = OptionTypeInfo::ParseType(config_options, fields,
                                 PreparedFileInfoTypeInfo(), result.get());
@@ -192,7 +195,7 @@ struct SstFileWriter::Rep {
         internal_comparator(_user_comparator),
         cfh(_cfh),
         invalidate_page_cache(_invalidate_page_cache),
-        db_session_id(_db_session_id),
+        db_session_id(std::move(_db_session_id)),
         ts_sz(_user_comparator->timestamp_size()),
         strip_timestamp(ts_sz > 0 &&
                         !ioptions.persist_user_defined_timestamps) {
@@ -326,7 +329,7 @@ struct SstFileWriter::Rep {
     WideColumnsHelper::SortColumns(sorted_columns);
 
     std::string entity;
-    const Status s = WideColumnSerialization::Serialize(sorted_columns, entity);
+    Status s = WideColumnSerialization::Serialize(sorted_columns, entity);
     if (!s.ok()) {
       return s;
     }
@@ -573,10 +576,9 @@ Status SstFileWriter::Open(const std::string& file_path, Temperature temp) {
       compression_type, compression_opts, cf_id, r->column_family_name,
       unknown_level, kUnknownNewestKeyTime, false /* is_bottommost */,
       TableFileCreationReason::kSstFileWriter, 0 /* oldest_key_time */,
-      0 /* file_creation_time */, "SST Writer" /* db_id */, r->db_session_id,
-      0 /* target_file_size */, r->next_file_number, kMaxSequenceNumber,
-      Slice() /* db_name */, false /* is_remote_compaction */,
-      r->embedded_blob_options.get());
+      "SST Writer" /* db_id */, r->db_session_id, 0 /* target_file_size */,
+      r->next_file_number, kMaxSequenceNumber, Slice() /* db_name */,
+      false /* is_remote_compaction */, r->embedded_blob_options.get());
   // External SST files used to each get a unique session id. Now for
   // slightly better uniqueness probability in constructing cache keys, we
   // assign fake file numbers to each file (into table properties) and keep

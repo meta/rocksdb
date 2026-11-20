@@ -30,6 +30,9 @@ class AdaptiveTableFactory : public TableFactory {
 
   const char* Name() const override { return "AdaptiveTableFactory"; }
 
+  Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
+                          uint64_t file_size, bool* matches) const override;
+
   using TableFactory::NewTableReader;
   Status NewTableReader(
       const ReadOptions& ro, const TableReaderOptions& table_reader_options,

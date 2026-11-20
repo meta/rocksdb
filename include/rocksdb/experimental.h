@@ -42,6 +42,29 @@ Status GetFileChecksumsFromCurrentManifest(FileSystem* fs,
                                            const std::string& dbname,
                                            FileChecksumList* checksum_list);
 
+// Reads the DB ID (see DB::GetDbIdentity()) that a MANIFEST file records,
+// without opening the DB. manifest_path is the path of one MANIFEST file, not a
+// DB directory, so no CURRENT file is needed. While
+// DBOptions::write_dbid_to_manifest is true, RocksDB writes the DB ID as the
+// first record of each new MANIFEST file. The DB ID stays the same when the DB
+// reopens or starts a new MANIFEST file, and a physical copy of the DB keeps
+// it. RepairDB() gives the DB a new DB ID.
+//
+// The file is read until the first record that has a DB ID. Returns NotFound
+// when no record has one, for example in a MANIFEST file written with
+// write_dbid_to_manifest=false. A record that is truncated at the end of the
+// file counts as the end of the file, so an empty or truncated file also
+// returns NotFound. Returns the first error when the file cannot be read, a
+// record fails its checksum, or a record cannot be decoded. Damaged records are
+// never skipped.
+//
+// This function does not write. It can read the MANIFEST file of an open DB:
+// the DB ID is in the first record of a new MANIFEST file, so records that the
+// DB appends later do not change the result.
+Status GetDbIdentityFromManifest(FileSystem* fs,
+                                 const std::string& manifest_path,
+                                 std::string* db_id);
+
 struct UpdateManifestForFilesStateOptions {
   // When true, read current file temperatures from FileSystem and update in
   // DB manifest when a temperature other than Unknown is reported and

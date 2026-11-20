@@ -32,6 +32,7 @@
 #include "db/blob/blob_constants.h"
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_log_format.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/logging.h"
@@ -1614,6 +1615,7 @@ struct BlockBasedTableBuilder::Rep {
                 ? std::make_unique<EmbeddedBlobSstBuilderOptions>(
                       *tbo.embedded_blob_options)
                 : nullptr) {
+    props.referenced_blob_bytes = 0;
     FilterBuildingContext filter_context(table_options);
 
     filter_context.info_log = ioptions.logger;
@@ -2020,7 +2022,6 @@ struct BlockBasedTableBuilder::Rep {
     props.column_family_name = tbo.column_family_name;
     props.oldest_key_time = tbo.oldest_key_time;
     props.newest_key_time = tbo.newest_key_time;
-    props.file_creation_time = tbo.file_creation_time;
     props.orig_file_number = tbo.cur_file_num;
     props.db_id = tbo.db_id;
     props.db_session_id = tbo.db_session_id;
@@ -2256,6 +2257,36 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
       return;
     }
 #endif  // !NDEBUG
+
+    const auto account_blob_index = [&](const BlobIndex& blob_index) {
+      if (r->props.referenced_blob_bytes.has_value() &&
+          !blob_index.IsInlined() && !blob_index.HasTTL() &&
+          !blob_index.IsSameFile()) {
+        const uint64_t blob_record_overhead =
+            BlobLogRecord::CalculateAdjustmentForRecordHeader(
+                ExtractUserKey(entry_ikey).size());
+        *r->props.referenced_blob_bytes +=
+            blob_index.size() + blob_record_overhead;
+      }
+    };
+    if (value_type == kTypeBlobIndex) {
+      BlobIndex blob_index;
+      Status s = blob_index.DecodeFrom(entry_value);
+      if (!s.ok()) {
+        r->props.referenced_blob_bytes.reset();
+      } else {
+        account_blob_index(blob_index);
+      }
+    } else if (value_type == kTypeWideColumnEntity) {
+      Status s = WideColumnSerialization::ForEachBlobFileNumber(
+          entry_value, [&](const BlobIndex& blob_index) {
+            account_blob_index(blob_index);
+            return Status::OK();
+          });
+      if (!s.ok()) {
+        r->props.referenced_blob_bytes.reset();
+      }
+    }
 
     auto should_flush = r->flush_block_policy->Update(entry_ikey, entry_value);
     if (should_flush) {
@@ -2685,7 +2716,7 @@ void BlockBasedTableBuilder::BGWorker(WorkingAreaPair& working_area) {
           &block_rep->contents_checksum));
     };
     auto write_fn = [this, block_rep, &ios]() {
-      Slice compressed = block_rep->compressed;
+      Slice compressed = block_rep->compressed.AsSlice();
       Slice uncompressed = block_rep->uncompressed;
       bool skip_delta_encoding = false;
       const bool has_precomputed_block_contents_crc32c =
@@ -4049,6 +4080,14 @@ Status BlockBasedTableBuilder::Finish() {
   r->AutoSkipWriteBack();
 
   r->props.tail_start_offset = r->offset.LoadRelaxed();
+
+  // Read the clock when finishing rather than when starting, so that this
+  // time is no earlier than when any entry was added, even for a builder whose
+  // input arrives over a long time (e.g. SstFileWriter).
+  int64_t now = 0;
+  if (r->ioptions.clock->GetCurrentTime(&now).ok()) {
+    r->props.file_creation_time = lossless_cast<uint64_t>(now);
+  }
 
   uint64_t last_estimated_tail_size = EstimatedTailSize();
 

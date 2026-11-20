@@ -61,6 +61,23 @@ class TableReader {
       size_t compaction_readahead_size = 0,
       bool allow_unprepared_value = false) = 0;
 
+  // Same as NewIterator(), for an iterator whose first operation will be
+  // Seek(seek_target). Returns nullptr instead when the table can tell, from
+  // the prefix filter alone, that the seek would find nothing in this table.
+  // That filtered seek is recorded in statistics as if it ran on an iterator.
+  // A returned iterator may skip the prefix check on its first Seek() because
+  // it already ran here, so that Seek() must be the first operation and use
+  // the same target and read_options.
+  virtual InternalIterator* NewIteratorForSeek(
+      const ReadOptions& read_options, const SliceTransform* prefix_extractor,
+      Arena* arena, bool skip_filters, TableReaderCaller caller,
+      size_t compaction_readahead_size, bool allow_unprepared_value,
+      const Slice& /*seek_target*/) {
+    return NewIterator(read_options, prefix_extractor, arena, skip_filters,
+                       caller, compaction_readahead_size,
+                       allow_unprepared_value);
+  }
+
   // read_options.snapshot needs to outlive this call.
   virtual FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& /*read_options*/) {

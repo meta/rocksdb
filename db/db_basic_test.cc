@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <cstring>
+#include <memory>
 
 #include "db/db_test_util.h"
 #include "db/log_writer.h"
@@ -1369,7 +1370,7 @@ TEST_F(DBBasicTest, ReadOnlyDB) {
             Status::Code::kNotSupported);
 
   std::vector<ColumnFamilyDescriptor> cfds;
-  cfds.push_back({"blah", options});
+  cfds.emplace_back("blah", options);
   ASSERT_EQ(db_->CreateColumnFamilies(cfds, &cfhs).code(),
             Status::Code::kNotSupported);
 }
@@ -2651,7 +2652,7 @@ INSTANTIATE_TEST_CASE_P(
     DBBasicMultiConfigs, DBBasicMultiConfigs,
     ::testing::ValuesIn(DBBasicMultiConfigs::GenerateOptionConfigs()));
 
-TEST_F(DBBasicTest, DBOpen_Options) {
+TEST_F(DBBasicTest, DBOpenOptions) {
   Options options = CurrentOptions();
   Close();
   Destroy(options);
@@ -3030,7 +3031,7 @@ TEST_P(DBBlockChecksumTest, BlockChecksumTest) {
   Options options = CurrentOptions();
   const int kNumPerFile = 2;
 
-  const auto algs = GetSupportedChecksums();
+  const auto& algs = GetSupportedChecksums();
   const int algs_size = static_cast<int>(algs.size());
 
   // generate one table with each type of checksum
@@ -3125,7 +3126,7 @@ class TestEnv : public EnvWrapper {
 
   Status NewLogger(const std::string& /*fname*/,
                    std::shared_ptr<Logger>* result) override {
-    result->reset(new TestLogger(this));
+    *result = std::make_shared<TestLogger>(this);
     return Status::OK();
   }
 
@@ -3177,7 +3178,7 @@ TEST_F(DBBasicTest, DBClose) {
   ASSERT_EQ(env->GetCloseCount(), 3);
 
   // Provide our own logger and ensure DB::Close() does not close it
-  options.info_log.reset(new TestEnv::TestLogger(env));
+  options.info_log = std::make_shared<TestEnv::TestLogger>(env);
   s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
   ASSERT_TRUE(db != nullptr);
@@ -3837,9 +3838,10 @@ TEST_P(DBMultiGetTestWithParam, MultiGetDuplicatesEmptyLevel) {
       BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
   table_opts.cache_index_and_filter_blocks = true;
   table_opts.block_cache = cache_opts.MakeSharedCache();
-  table_opts.flush_block_policy_factory.reset(new MyFlushBlockPolicyFactory(1));
+  table_opts.flush_block_policy_factory =
+      std::make_shared<MyFlushBlockPolicyFactory>(1);
 
-  options.table_factory.reset(new BlockBasedTableFactory(table_opts));
+  options.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
   Reopen(options);
   int key;
 
@@ -3936,9 +3938,10 @@ TEST_P(DBMultiGetTestWithParam, MultiGetDuplicatesNonEmptyLevel) {
       BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
   table_opts.cache_index_and_filter_blocks = true;
   table_opts.block_cache = cache_opts.MakeSharedCache();
-  table_opts.flush_block_policy_factory.reset(new MyFlushBlockPolicyFactory(1));
+  table_opts.flush_block_policy_factory =
+      std::make_shared<MyFlushBlockPolicyFactory>(1);
 
-  options.table_factory.reset(new BlockBasedTableFactory(table_opts));
+  options.table_factory = std::make_shared<BlockBasedTableFactory>(table_opts);
   Reopen(options);
   int key;
 
@@ -4676,12 +4679,13 @@ INSTANTIATE_TEST_CASE_P(DBMultiGetTestWithParam, DBMultiGetTestWithParam,
 #if USE_COROUTINES
 class DBMultiGetAsyncIOTest
     : public DBBasicTest,
-      public ::testing::WithParamInterface<std::tuple<bool, bool>> {
+      public ::testing::WithParamInterface<std::tuple<bool, bool, bool>> {
  public:
   DBMultiGetAsyncIOTest()
       : DBBasicTest(),
         optimize_multiget_for_io_(std::get<0>(GetParam())),
         use_coroutine_(std::get<1>(GetParam())),
+        use_direct_io_(std::get<2>(GetParam())),
         statistics_(ROCKSDB_NAMESPACE::CreateDBStatistics()) {
     BlockBasedTableOptions bbto;
     bbto.filter_policy.reset(NewBloomFilterPolicy(10));
@@ -4690,6 +4694,7 @@ class DBMultiGetAsyncIOTest
     options_.statistics = statistics_;
     options_.table_factory.reset(NewBlockBasedTableFactory(bbto));
     options_.env = Env::Default();
+    options_.use_direct_reads = use_direct_io_ && IsDirectIOSupported();
     Reopen(options_);
     int num_keys = 0;
 
@@ -4753,6 +4758,12 @@ class DBMultiGetAsyncIOTest
     EXPECT_EQ(0, num_keys);
   }
 
+  void SetUp() override {
+    if (use_direct_io_ && !options_.use_direct_reads) {
+      ROCKSDB_GTEST_SKIP("Direct IO is not supported");
+    }
+  }
+
   const std::shared_ptr<Statistics>& statistics() { return statistics_; }
 
  protected:
@@ -4787,6 +4798,7 @@ class DBMultiGetAsyncIOTest
 
   const bool optimize_multiget_for_io_;
   const bool use_coroutine_;
+  const bool use_direct_io_;
 
  private:
   std::shared_ptr<Statistics> statistics_;
@@ -5236,7 +5248,8 @@ TEST_P(DBMultiGetAsyncIOTest, MixedReadAsyncFallbackPropagatesPollError) {
 #endif  // ROCKSDB_IOURING_PRESENT
 
 INSTANTIATE_TEST_CASE_P(DBMultiGetAsyncIOTest, DBMultiGetAsyncIOTest,
-                        testing::Combine(testing::Bool(), testing::Bool()));
+                        testing::Combine(testing::Bool(), testing::Bool(),
+                                         testing::Bool()));
 #endif  // USE_COROUTINES
 
 TEST_F(DBBasicTest, MultiGetStats) {
@@ -6262,6 +6275,7 @@ TEST_F(DBBasicTest, ConcurrentlyCloseDB) {
   Options options = CurrentOptions();
   DestroyAndReopen(options);
   std::vector<std::thread> workers;
+  workers.reserve(10);
   for (int i = 0; i < 10; i++) {
     workers.emplace_back([&]() {
       auto s = db_->Close();
@@ -6283,7 +6297,7 @@ class DBBasicTestTrackWal : public DBTestBase,
     VectorLogPtr log_files;
     EXPECT_OK(dbfull()->GetSortedWalFiles(log_files));
     return static_cast<int>(log_files.size());
-  };
+  }
 };
 
 TEST_P(DBBasicTestTrackWal, DoNotTrackObsoleteWal) {
@@ -6331,7 +6345,7 @@ INSTANTIATE_TEST_CASE_P(DBBasicTestTrackWal, DBBasicTestTrackWal,
 
 class DBBasicTestMultiGet : public DBTestBase {
  public:
-  DBBasicTestMultiGet(std::string test_dir, int num_cfs,
+  DBBasicTestMultiGet(const std::string& test_dir, int num_cfs,
                       bool uncompressed_cache, bool _compression_enabled,
                       bool _fill_cache, uint32_t compression_parallel_threads)
       : DBTestBase(test_dir, /*env_do_fsync=*/false) {
@@ -6374,8 +6388,8 @@ class DBBasicTestMultiGet : public DBTestBase {
     } else {
       table_options.pin_l0_filter_and_index_blocks_in_cache = true;
     }
-    table_options.flush_block_policy_factory.reset(
-        new MyFlushBlockPolicyFactory(10));
+    table_options.flush_block_policy_factory =
+        std::make_shared<MyFlushBlockPolicyFactory>(10);
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
     if (!compression_enabled_) {
       options.compression = kNoCompression;
@@ -6653,11 +6667,10 @@ TEST_P(DBBasicTestWithParallelIO, MultiGet) {
 
 TEST_P(DBBasicTestWithParallelIO, MultiGetDirectIO) {
   class FakeDirectIOEnv : public EnvWrapper {
-    class FakeDirectIOSequentialFile;
     class FakeDirectIORandomAccessFile;
 
    public:
-    FakeDirectIOEnv(Env* env) : EnvWrapper(env) {}
+    explicit FakeDirectIOEnv(Env* env) : EnvWrapper(env) {}
     static const char* kClassName() { return "FakeDirectIOEnv"; }
     const char* Name() const override { return kClassName(); }
 
@@ -6677,22 +6690,10 @@ TEST_P(DBBasicTestWithParallelIO, MultiGetDirectIO) {
     }
 
    private:
-    class FakeDirectIOSequentialFile : public SequentialFileWrapper {
-     public:
-      FakeDirectIOSequentialFile(std::unique_ptr<SequentialFile>&& file)
-          : SequentialFileWrapper(file.get()), file_(std::move(file)) {}
-      ~FakeDirectIOSequentialFile() override {}
-
-      bool use_direct_io() const override { return true; }
-      size_t GetRequiredBufferAlignment() const override { return 1; }
-
-     private:
-      std::unique_ptr<SequentialFile> file_;
-    };
-
     class FakeDirectIORandomAccessFile : public RandomAccessFileWrapper {
      public:
-      FakeDirectIORandomAccessFile(std::unique_ptr<RandomAccessFile>&& file)
+      explicit FakeDirectIORandomAccessFile(
+          std::unique_ptr<RandomAccessFile>&& file)
           : RandomAccessFileWrapper(file.get()), file_(std::move(file)) {}
       ~FakeDirectIORandomAccessFile() override {}
 
@@ -6987,9 +6988,9 @@ class DeadlineFS : public FileSystemWrapper {
 
  private:
   // The number of IOs to trigger the delay after
-  int delay_trigger_;
+  int delay_trigger_ = 0;
   // Current IO count
-  int io_count_;
+  int io_count_ = 0;
   // ReadOptions deadline for the Get/MultiGet/Iterator
   std::chrono::microseconds deadline_;
   // ReadOptions io_timeout for the Get/MultiGet/Iterator
@@ -7304,7 +7305,8 @@ TEST_F(DBBasicTest, VerifyFileChecksums) {
   // error.
   class MisnamedFileChecksumGenerator : public FileChecksumGenCrc32c {
    public:
-    MisnamedFileChecksumGenerator(const FileChecksumGenContext& context)
+    explicit MisnamedFileChecksumGenerator(
+        const FileChecksumGenContext& context)
         : FileChecksumGenCrc32c(context) {}
 
     const char* Name() const override { return "sha1"; }
@@ -7319,7 +7321,8 @@ TEST_F(DBBasicTest, VerifyFileChecksums) {
     }
   };
 
-  options.file_checksum_gen_factory.reset(new MisnamedFileChecksumGenFactory());
+  options.file_checksum_gen_factory =
+      std::make_shared<MisnamedFileChecksumGenFactory>();
   Reopen(options);
   ASSERT_TRUE(db_->VerifyFileChecksums(ReadOptions()).IsInvalidArgument());
 }

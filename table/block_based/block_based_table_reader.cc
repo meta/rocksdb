@@ -35,6 +35,7 @@
 #include "logging/logging.h"
 #include "memory/memory_allocator_impl.h"
 #include "monitoring/perf_context_imp.h"
+#include "options/options_helper.h"
 #include "parsed_full_filter_block.h"
 #include "port/lang.h"
 #include "rocksdb/cache.h"
@@ -374,6 +375,13 @@ void BlockBasedTable::UpdateCacheHitMetrics(BlockType block_type,
       }
       break;
 
+    case BlockType::kData:
+    case BlockType::kProperties:
+    case BlockType::kRangeDeletion:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       // TODO: introduce dedicated tickers/statistics/counters
       // for range tombstones
@@ -428,6 +436,13 @@ void BlockBasedTable::UpdateCacheMissMetrics(BlockType block_type,
       }
       break;
 
+    case BlockType::kData:
+    case BlockType::kProperties:
+    case BlockType::kRangeDeletion:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       // TODO: introduce dedicated tickers/statistics/counters
       // for range tombstones
@@ -512,6 +527,13 @@ void BlockBasedTable::UpdateCacheInsertionMetrics(
       }
       break;
 
+    case BlockType::kData:
+    case BlockType::kProperties:
+    case BlockType::kRangeDeletion:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       // TODO: introduce dedicated tickers/statistics/counters
       // for range tombstones
@@ -722,6 +744,7 @@ Status BlockBasedTable::Open(
     uint8_t block_protection_bytes_per_key,
     std::unique_ptr<TableReader>* table_reader, uint64_t tail_size,
     std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr,
+    std::shared_ptr<AtomicCacheReservationManager> readahead_cache_res_mgr,
     const std::shared_ptr<const SliceTransform>& prefix_extractor,
     UnownedPtr<CompressionManager> compression_manager,
     const bool prefetch_index_and_filter_in_cache, const bool skip_filters,
@@ -764,7 +787,7 @@ Status BlockBasedTable::Open(
     s = PrefetchTail(ro, ioptions, file.get(), file_size, force_direct_prefetch,
                      tail_prefetch_stats, prefetch_all, preload_all,
                      &prefetch_buffer, ioptions.stats, tail_size,
-                     ioptions.logger);
+                     ioptions.logger, readahead_cache_res_mgr);
     // Return error in prefetch path to users.
     if (!s.ok()) {
       return s;
@@ -812,6 +835,7 @@ Status BlockBasedTable::Open(
   rep->file = std::move(file);
   rep->footer = footer;
   rep->blob_source_ = blob_source;
+  rep->readahead_cache_res_mgr = std::move(readahead_cache_res_mgr);
 
   // For fully portable/stable cache keys, we need to read the properties
   // block before setting up cache keys. TODO: consider setting up a bootstrap
@@ -880,6 +904,14 @@ Status BlockBasedTable::Open(
       rep->index_has_first_key,
       FormatVersionUsesValueDeltaEscape(rep->footer.format_version()),
       rep->data_block_restart_interval, rep->index_block_restart_interval);
+  // Blocks written by RocksDB 11.10 through 11.13 with
+  // ReverseBytewiseComparator can need full-key seeks (see
+  // BlockCreateContext::check_common_prefix).
+  if (rep->internal_comparator.user_comparator() ==
+      ReverseBytewiseComparator()) {
+    rep->create_context.check_common_prefix = true;
+    rep->create_context.index_key_includes_seq = rep->index_key_includes_seq;
+  }
 
   // Check expected unique id if provided
   if (expected_unique_id != kNullUniqueId64x2) {
@@ -1011,7 +1043,9 @@ Status BlockBasedTable::PrefetchTail(
     bool force_direct_prefetch, TailPrefetchStats* tail_prefetch_stats,
     const bool prefetch_all, const bool preload_all,
     std::unique_ptr<FilePrefetchBuffer>* prefetch_buffer, Statistics* stats,
-    uint64_t tail_size, Logger* const logger) {
+    uint64_t tail_size, Logger* const logger,
+    const std::shared_ptr<AtomicCacheReservationManager>&
+        readahead_cache_res_mgr) {
   assert(tail_size <= file_size);
 
   size_t tail_prefetch_size = 0;
@@ -1083,6 +1117,9 @@ Status BlockBasedTable::PrefetchTail(
       ioptions.fs.get() /* fs */, nullptr /* clock */, stats,
       /* readahead_cb */ nullptr,
       FilePrefetchBufferUsage::kTableOpenPrefetchTail));
+  if (readahead_cache_res_mgr) {
+    (*prefetch_buffer)->SetCacheReservationManager(readahead_cache_res_mgr);
+  }
 
   if (s.ok()) {
     s = (*prefetch_buffer)->Prefetch(opts, file, prefetch_off, prefetch_len);
@@ -2263,6 +2300,7 @@ std::unique_ptr<FilterBlockReader> BlockBasedTable::CreateFilterBlockReader(
       return FullFilterBlockReader::Create(this, ro, prefetch_buffer, use_cache,
                                            prefetch, pin, lookup_context);
 
+    case Rep::FilterType::kNoFilter:
     default:
       // filter_type is either kNoFilter (exited the function at the first if),
       // or it must be covered in this switch block
@@ -2478,6 +2516,11 @@ BlockBasedTable::SaveLookupContextOrTraceRecord(
     case BlockType::kUserDefinedIndex:
       trace_block_type = TraceType::kBlockTraceIndexBlock;
       break;
+    case BlockType::kProperties:
+    case BlockType::kHashIndexPrefixes:
+    case BlockType::kHashIndexMetadata:
+    case BlockType::kMetaIndex:
+    case BlockType::kInvalid:
     default:
       // This cannot happen.
       assert(false);
@@ -2748,19 +2791,59 @@ InternalIterator* BlockBasedTable::NewIterator(
     const ReadOptions& read_options, const SliceTransform* prefix_extractor,
     Arena* arena, bool skip_filters, TableReaderCaller caller,
     size_t compaction_readahead_size, bool allow_unprepared_value) {
+  return NewIteratorImpl(read_options, prefix_extractor, arena, skip_filters,
+                         caller, compaction_readahead_size,
+                         allow_unprepared_value, /*seek_target=*/nullptr);
+}
+
+InternalIterator* BlockBasedTable::NewIteratorForSeek(
+    const ReadOptions& read_options, const SliceTransform* prefix_extractor,
+    Arena* arena, bool skip_filters, TableReaderCaller caller,
+    size_t compaction_readahead_size, bool allow_unprepared_value,
+    const Slice& seek_target) {
+  return NewIteratorImpl(read_options, prefix_extractor, arena, skip_filters,
+                         caller, compaction_readahead_size,
+                         allow_unprepared_value, &seek_target);
+}
+
+InternalIterator* BlockBasedTable::NewIteratorImpl(
+    const ReadOptions& read_options, const SliceTransform* prefix_extractor,
+    Arena* arena, bool skip_filters, TableReaderCaller caller,
+    size_t compaction_readahead_size, bool allow_unprepared_value,
+    const Slice* seek_target) {
   BlockCacheLookupContext lookup_context{caller};
   bool need_upper_bound_check =
       read_options.auto_prefix_mode || PrefixExtractorChanged(prefix_extractor);
+  bool check_filter =
+      !skip_filters &&
+      GetIteratorPrefixMode(read_options, prefix_extractor != nullptr) !=
+          IteratorPrefixMode::kTotalOrder;
+  // Runs the check that the iterator's first Seek() would run, with the same
+  // arguments.
+  auto first_seek_prefix_check =
+      BlockBasedTableIterator::FirstSeekPrefixCheck::kNotRun;
+  if (seek_target != nullptr && check_filter &&
+      rep_->fragmented_range_dels == nullptr) {
+    bool filter_checked = false;
+    if (!PrefixRangeMayMatch(*seek_target, read_options, prefix_extractor,
+                             need_upper_bound_check, &lookup_context,
+                             &filter_checked)) {
+      RecordTick(rep_->ioptions.stats, IsLastLevel()
+                                           ? LAST_LEVEL_SEEK_FILTERED
+                                           : NON_LAST_LEVEL_SEEK_FILTERED);
+      return nullptr;
+    }
+    first_seek_prefix_check =
+        filter_checked
+            ? BlockBasedTableIterator::FirstSeekPrefixCheck::kPassedFilter
+            : BlockBasedTableIterator::FirstSeekPrefixCheck::
+                  kPassedWithoutFilter;
+  }
   std::unique_ptr<InternalIteratorBase<IndexValue>> index_iter(NewIndexIterator(
       read_options,
       /*disable_prefix_seek=*/need_upper_bound_check &&
           rep_->index_type == BlockBasedTableOptions::kHashSearch,
       /*input_iter=*/nullptr, /*get_context=*/nullptr, &lookup_context));
-  bool check_filter =
-      !skip_filters &&
-      (!read_options.total_order_seek || read_options.auto_prefix_mode ||
-       read_options.prefix_same_as_start) &&
-      prefix_extractor != nullptr;
   // Same-file ("embedded") blob references are resolved by a wrapper iterator
   // so the block-based iterator never exposes an unresolved BlobIndex. The SST
   // dump tool must keep seeing raw BlobIndex values, so it is excluded.
@@ -2776,7 +2859,8 @@ InternalIterator* BlockBasedTable::NewIterator(
     auto* iter = new BlockBasedTableIterator(
         this, read_options, rep_->internal_comparator, std::move(index_iter),
         check_filter, need_upper_bound_check, prefix_extractor, caller,
-        compaction_readahead_size, inner_allow_unprepared_value);
+        first_seek_prefix_check, compaction_readahead_size,
+        inner_allow_unprepared_value);
     if (!resolve_embedded_values) {
       return iter;
     }
@@ -2791,7 +2875,8 @@ InternalIterator* BlockBasedTable::NewIterator(
     auto* iter = new (mem) BlockBasedTableIterator(
         this, read_options, rep_->internal_comparator, std::move(index_iter),
         check_filter, need_upper_bound_check, prefix_extractor, caller,
-        compaction_readahead_size, inner_allow_unprepared_value);
+        first_seek_prefix_check, compaction_readahead_size,
+        inner_allow_unprepared_value);
     if (!resolve_embedded_values) {
       return iter;
     }
@@ -3141,6 +3226,9 @@ Status BlockBasedTable::VerifyChecksumInBlocks(
   readahead_params.max_readahead_size = readahead_size;
   FilePrefetchBuffer prefetch_buffer(
       readahead_params, !rep_->ioptions.allow_mmap_reads /* enable */);
+  if (rep_->readahead_cache_res_mgr) {
+    prefetch_buffer.SetCacheReservationManager(rep_->readahead_cache_res_mgr);
+  }
 
   for (index_iter->SeekToFirst(); index_iter->Valid(); index_iter->Next()) {
     s = index_iter->status();
@@ -3550,8 +3638,7 @@ Status BlockBasedTable::GetKVPairsFromDataBlocks(
       std::string key_copy = std::string(key.data(), key.size());
       std::string value_copy = std::string(value.data(), value.size());
 
-      kv_pair_block.push_back(
-          std::make_pair(std::move(key_copy), std::move(value_copy)));
+      kv_pair_block.emplace_back(std::move(key_copy), std::move(value_copy));
     }
     kv_pair_blocks->push_back(std::move(kv_pair_block));
   }

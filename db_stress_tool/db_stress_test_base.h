@@ -30,6 +30,7 @@ class Transaction;
 class TransactionDB;
 class OptimisticTransactionDB;
 class DbStressFSWrapper;
+class DbStressListener;
 class Iterator;
 struct TransactionDBOptions;
 using experimental::SstQueryFilterConfigsManager;
@@ -573,15 +574,15 @@ class StressTest {
     return Status::NotSupported("TestCustomOperations() must be overridden");
   }
 
-  void ProcessStatus(SharedState* shared, std::string msg, const Status& s,
-                     bool ignore_injected_error = true) const;
+  void ProcessStatus(SharedState* shared, const std::string& msg,
+                     const Status& s, bool ignore_injected_error = true) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg) const;
+  void VerificationAbort(SharedState* shared, const std::string& msg) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg, int cf,
+  void VerificationAbort(SharedState* shared, const std::string& msg, int cf,
                          int64_t key) const;
 
-  void VerificationAbort(SharedState* shared, std::string msg, int cf,
+  void VerificationAbort(SharedState* shared, const std::string& msg, int cf,
                          int64_t key, Slice value_from_db,
                          Slice value_from_expected) const;
 
@@ -658,6 +659,10 @@ class StressTest {
   // Currently only used in MultiOpsTxnsStressTest
   std::atomic<DB*> db_aptr_;
 
+  // The DbStressListener in options_.listeners for the current open; null
+  // when the open path does not install one.
+  std::shared_ptr<DbStressListener> db_stress_listener_;
+
   Options options_;
   SystemClock* clock_;
   std::vector<ColumnFamilyHandle*> column_families_;
@@ -668,7 +673,7 @@ class StressTest {
   std::vector<std::string> options_index_;
   std::atomic<bool> db_preload_finished_;
   std::shared_ptr<SstQueryFilterConfigsManager::Factory> sqfc_factory_;
-  std::shared_ptr<UserDefinedIndexFactory> udi_factory_;
+  std::shared_ptr<IndexFactory> udi_factory_;
 
   std::unique_ptr<DB> secondary_db_;
   std::vector<ColumnFamilyHandle*> secondary_cfhs_;
@@ -698,8 +703,7 @@ bool InitializeOptionsFromFile(Options& options);
 void InitializeOptionsFromFlags(
     const std::shared_ptr<Cache>& cache,
     const std::shared_ptr<const FilterPolicy>& filter_policy,
-    const std::shared_ptr<UserDefinedIndexFactory>& udi_factory,
-    Options& options);
+    const std::shared_ptr<IndexFactory>& udi_factory, Options& options);
 
 // Initialize `options` on which `InitializeOptionsFromFile()` and
 // `InitializeOptionsFromFlags()` have both been called already.

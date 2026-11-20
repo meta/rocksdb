@@ -361,7 +361,7 @@ void SstFileManagerImpl::ClearError() {
 }
 
 void SstFileManagerImpl::StartErrorRecovery(ErrorHandler* handler,
-                                            Status bg_error) {
+                                            const Status& bg_error) {
   MutexLock l(&mu_);
   if (bg_error.severity() == Status::Severity::kSoftError) {
     if (bg_err_.ok()) {
@@ -494,7 +494,7 @@ void SstFileManagerImpl::OnDeleteFileImpl(const std::string& file_path) {
 }
 
 SstFileManager* NewSstFileManager(Env* env, std::shared_ptr<Logger> info_log,
-                                  std::string trash_dir,
+                                  const std::string& trash_dir,
                                   int64_t rate_bytes_per_sec,
                                   bool delete_existing_trash, Status* status,
                                   double max_trash_db_ratio,
@@ -524,8 +524,9 @@ SstFileManager* NewSstFileManager(Env* env, std::shared_ptr<FileSystem> fs,
     std::vector<std::string> files_in_trash;
     s = fs->GetChildren(trash_dir, IOOptions(), &files_in_trash, nullptr);
     if (s.ok()) {
+      const std::string trash_dir_prefix = trash_dir + "/";
       for (const std::string& trash_file : files_in_trash) {
-        std::string path_in_trash = trash_dir + "/" + trash_file;
+        std::string path_in_trash = trash_dir_prefix + trash_file;
         res->OnAddFile(path_in_trash);
         Status file_delete =
             res->ScheduleFileDeletion(path_in_trash, trash_dir);

@@ -65,6 +65,7 @@ std::unique_ptr<DB> OpenDb(bool read_only = false) {
   Options options;
   options.create_if_missing = true;
   options.max_open_files = -1;
+  options.read_io_executor_threads = 1;
   options.write_buffer_size = FLAGS_write_buffer_size;
   options.max_write_buffer_number = FLAGS_max_write_buffer_number;
   options.min_write_buffer_number_to_merge =
@@ -183,6 +184,60 @@ TEST_F(PerfContextTest, CoroutineStatsContextScopeCollectsStats) {
         };
         verify_stats();
       }()));
+}
+
+TEST_F(PerfContextTest, CapturedCoroutineStatsContextOutlivesEnv) {
+  std::unique_ptr<Env> env = NewCompositeEnv(FileSystem::Default());
+  std::shared_ptr<folly::RequestContext> captured;
+  {
+    CoroutineStatsContextScope scope(CaptureCoroutineStatsConfig(), env.get());
+    captured = folly::RequestContext::saveContext();
+  }
+  env.reset();
+
+  folly::RequestContextScopeGuard restore(std::move(captured));
+}
+
+TEST_F(PerfContextTest, CapturedCoroutineStatsContextLeavesThreadStatsAlone) {
+  std::shared_ptr<folly::RequestContext> captured;
+  {
+    CoroutineStatsContextScope scope(CaptureCoroutineStatsConfig(),
+                                     Env::Default());
+    captured = folly::RequestContext::saveContext();
+  }
+  SetPerfLevel(PerfLevel::kEnableCount);
+  get_perf_context()->block_read_count = 42;
+
+  {
+    folly::RequestContextScopeGuard restore(std::move(captured));
+    EXPECT_EQ(42, get_perf_context()->block_read_count);
+  }
+  EXPECT_EQ(42, get_perf_context()->block_read_count);
+  EXPECT_EQ(PerfLevel::kEnableCount, GetPerfLevel());
+}
+
+TEST_F(PerfContextTest, ForeignRestoreOfCoroutineStatsContextNeverCallsEnv) {
+  class CountingEnv : public EnvWrapper {
+   public:
+    using EnvWrapper::EnvWrapper;
+    const char* Name() const override { return "CountingEnv"; }
+    uint64_t GetThreadID() const override {
+      calls.fetch_add(1);
+      return EnvWrapper::GetThreadID();
+    }
+    mutable std::atomic<int> calls{0};
+  };
+  CountingEnv env(Env::Default());
+  CoroutineStatsContextScope scope(CaptureCoroutineStatsConfig(), &env);
+  env.calls = 0;
+  std::shared_ptr<folly::RequestContext> captured =
+      folly::RequestContext::saveContext();
+
+  std::thread foreign(
+      [captured] { folly::RequestContextScopeGuard restore(captured); });
+  foreign.join();
+
+  EXPECT_EQ(0, env.calls.load());
 }
 
 TEST_F(PerfContextTest, CoroutineStatsContextsRemainIsolatedWhenInterleaved) {
@@ -1003,6 +1058,7 @@ TEST_F(PerfContextTest, SeekKeyComparison) {
   }
 
   std::vector<int> keys;
+  keys.reserve(FLAGS_total_keys);
   for (int i = 0; i < FLAGS_total_keys; ++i) {
     keys.push_back(i);
   }

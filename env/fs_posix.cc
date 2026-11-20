@@ -127,6 +127,11 @@ struct ReadIOExecutorState {
     return event_base_manager_.Load();
   }
 
+  // A new thread inherits its creator's scheduling policy, and an
+  // unprivileged thread can't leave SCHED_IDLE. Start every thread this
+  // creates or adds here, on the thread sizing the pool, rather than lazily on
+  // a reader's first getEventBase(), so an idle background reader can't put
+  // all later reads on an idle thread.
   void SetThreads(int num) {
     assert(num > 0);
     MutexLock lock(&mutex_);
@@ -136,6 +141,15 @@ struct ReadIOExecutorState {
       if (requested_threads > executor->numThreads()) {
         try {
           executor->setNumThreads(requested_threads);
+#ifndef NDEBUG
+          bool fail_for_test = false;
+          TEST_SYNC_POINT_CALLBACK(
+              "ReadIOExecutorState::SetThreads:BeforeStart", &fail_for_test);
+          if (fail_for_test) {
+            throw std::runtime_error("injected failure");
+          }
+#endif  // NDEBUG
+          executor->getAllEventBases();
         } catch (const std::exception&) {
         }
       }
@@ -157,7 +171,7 @@ struct ReadIOExecutorState {
       auto event_base_manager =
           std::make_unique<folly::EventBaseManager>(event_base_options);
       auto new_executor = std::make_unique<folly::IOThreadPoolExecutor>(
-          requested_threads, 0,
+          requested_threads, requested_threads,
           std::make_shared<folly::NamedThreadFactory>("RocksDBAsyncRead"),
           event_base_manager.get());
       event_base_manager_.Store(event_base_manager.release());
@@ -184,8 +198,7 @@ static port::Mutex mutex_locked_files;
 
 static int LockOrUnlock(int fd, bool lock) {
   errno = 0;
-  struct flock f;
-  memset(&f, 0, sizeof(f));
+  struct flock f{};
   f.l_type = (lock ? F_WRLCK : F_UNLCK);
   f.l_whence = SEEK_SET;
   f.l_start = 0;
@@ -705,7 +718,7 @@ class PosixFileSystem : public FileSystem {
 #endif
           );
       if (!ignore) {
-        result->push_back(entry->d_name);
+        result->emplace_back(entry->d_name);
       }
       errno = 0;  // reset errno if readdir() success
     }
@@ -784,7 +797,7 @@ class PosixFileSystem : public FileSystem {
                                    const IOOptions& /*opts*/,
                                    uint64_t* file_mtime,
                                    IODebugContext* /*dbg*/) override {
-    struct stat s;
+    struct stat s{};
     if (stat(fname.c_str(), &s) != 0) {
       return IOError("while stat a file for modification time", fname, errno);
     }
@@ -817,7 +830,7 @@ class PosixFileSystem : public FileSystem {
 
   IOStatus NumFileLinks(const std::string& fname, const IOOptions& /*opts*/,
                         uint64_t* count, IODebugContext* /*dbg*/) override {
-    struct stat s;
+    struct stat s{};
     if (stat(fname.c_str(), &s) != 0) {
       return IOError("while stat a file for num file links", fname, errno);
     }
@@ -850,7 +863,7 @@ class PosixFileSystem : public FileSystem {
                     FileLock** lock, IODebugContext* /*dbg*/) override {
     *lock = nullptr;
 
-    LockHoldingInfo lhi;
+    LockHoldingInfo lhi{};
     int64_t current_time = 0;
     // Ignore status code as the time is only used for error message.
     SystemClock::Default()
@@ -972,7 +985,7 @@ class PosixFileSystem : public FileSystem {
   IOStatus GetFreeSpace(const std::string& fname, const IOOptions& /*opts*/,
                         uint64_t* free_space,
                         IODebugContext* /*dbg*/) override {
-    struct statvfs sbuf;
+    struct statvfs sbuf{};
 
     if (statvfs(fname.c_str(), &sbuf) < 0) {
       return IOError("While doing statvfs", fname, errno);
@@ -1005,7 +1018,7 @@ class PosixFileSystem : public FileSystem {
       return IOError("While open for IsDirectory()", path, errno);
     }
     IOStatus io_s;
-    struct stat sbuf;
+    struct stat sbuf{};
     if (fstat(fd, &sbuf) < 0) {
       io_s = IOError("While doing stat for IsDirectory()", path, errno);
     }
@@ -1120,7 +1133,7 @@ class PosixFileSystem : public FileSystem {
 #endif
   // Returns true iff the named directory exists and is a directory.
   virtual bool DirExists(const std::string& dname) {
-    struct stat statbuf;
+    struct stat statbuf{};
     if (stat(dname.c_str(), &statbuf) == 0) {
       return S_ISDIR(statbuf.st_mode);
     }
@@ -1129,7 +1142,7 @@ class PosixFileSystem : public FileSystem {
 
   bool SupportsFastAllocate(int fd) {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
-    struct statfs s;
+    struct statfs s{};
     if (fstatfs(fd, &s)) {
       return false;
     }

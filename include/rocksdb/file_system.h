@@ -115,7 +115,14 @@ struct IOOptions {
   // rate_limiter_priority
   Env::IOPriority rate_limiter_priority;
 
-  // Type of data being read/written
+  // Type of data being read/written. This is a hint that a FileSystem may
+  // use, e.g. to give small metadata IO priority over bulk data IO. RocksDB
+  // sets IOType::kManifest for IO on MANIFEST files and IOType::kMetadata for
+  // IO on CURRENT, IDENTITY and OPTIONS files and their temporary files, both
+  // in FileOptions::io_options when opening such a file and in the IOOptions
+  // of later IO on it. Other IO, such as WAL, SST and blob file IO, and calls
+  // made through Env APIs (which take no IOOptions) may carry
+  // IOType::kUnknown.
   IOType type;
 
   // EXPERIMENTAL
@@ -365,7 +372,7 @@ struct IODebugContext {
   std::string ToString() {
     std::ostringstream ss;
     ss << file_path << ", ";
-    for (auto counter : counters) {
+    for (const auto& counter : counters) {
       ss << counter.first << " = " << counter.second << ",";
     }
     ss << msg;
@@ -952,11 +959,11 @@ using FSAllocationPtr = std::unique_ptr<void, std::function<void(void*)>>;
 // A read IO request structure for use in MultiRead and asynchronous Read APIs.
 struct FSReadRequest {
   // Input parameter that represents the file offset in bytes.
-  uint64_t offset;
+  uint64_t offset = 0;
 
   // Input parameter that represents the length to read in bytes. `result` only
   // returns fewer bytes if end of file is hit (or `status` is not OK).
-  size_t len;
+  size_t len = 0;
 
   // A buffer that MultiRead() can optionally place data in. It can
   // ignore this and allocate its own buffer.
@@ -965,7 +972,7 @@ struct FSReadRequest {
   // In case of asynchronous reads, its an output parameter and it will be
   // maintained until callback has been called. Scratch is allocated by RocksDB
   // and will be passed to underlying FileSystem.
-  char* scratch;
+  char* scratch = nullptr;
 
   // Output parameter set by MultiRead() to point to the start of the data
   // buffer.
@@ -2202,7 +2209,8 @@ IOStatus WriteStringToFile(FileSystem* fs, const Slice& data,
 IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
                           std::string* data);
 
-// A utility routine: read contents of named file into *data
+// A utility routine: read contents of named file into *data. `opts.type` is
+// also used for opening the file.
 IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
                           const IOOptions& opts, std::string* data);
 

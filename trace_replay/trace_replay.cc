@@ -287,7 +287,10 @@ Status TracerHelper::DecodeTraceRecord(Trace* trace, int trace_file_version,
               break;
             }
             default: {
-              assert(false);
+              // A field from a newer version. Fields are encoded in bit order,
+              // so this one and any after it are left undecoded.
+              payload_map = 0;
+              break;
             }
           }
           // unset the rightmost bit.
@@ -340,7 +343,10 @@ Status TracerHelper::DecodeTraceRecord(Trace* trace, int trace_file_version,
               break;
             }
             default: {
-              assert(false);
+              // A field from a newer version. Fields are encoded in bit order,
+              // so this one and any after it are left undecoded.
+              payload_map = 0;
+              break;
             }
           }
           // unset the rightmost bit.
@@ -405,7 +411,10 @@ Status TracerHelper::DecodeTraceRecord(Trace* trace, int trace_file_version,
               break;
             }
             default: {
-              assert(false);
+              // A field from a newer version. Fields are encoded in bit order,
+              // so this one and any after it are left undecoded.
+              payload_map = 0;
+              break;
             }
           }
           // unset the rightmost bit.
@@ -474,7 +483,10 @@ Status TracerHelper::DecodeTraceRecord(Trace* trace, int trace_file_version,
             break;
           }
           default: {
-            assert(false);
+            // A field from a newer version. Fields are encoded in bit order, so
+            // this one and any after it are left undecoded.
+            payload_map = 0;
+            break;
           }
         }
         // unset the rightmost bit.
@@ -510,6 +522,16 @@ Status TracerHelper::DecodeTraceRecord(Trace* trace, int trace_file_version,
 
       return Status::OK();
     }
+    case kTraceNone:
+    case kTraceBegin:
+    case kTraceEnd:
+    case kBlockTraceIndexBlock:
+    case kBlockTraceFilterBlock:
+    case kBlockTraceDataBlock:
+    case kBlockTraceUncompressionDictBlock:
+    case kBlockTraceRangeDeletionBlock:
+    case kIOTracer:
+    case kTraceMax:
     default:
       return Status::NotSupported("Unsupported trace type.");
   }

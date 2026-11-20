@@ -789,9 +789,9 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
     // If current block is adjacent to the previous one, at the same time,
     // compression is enabled and there is no compressed cache, we combine
     // the two block read as one.
-    // We don't combine block reads here in direct IO mode, because when doing
-    // direct IO read, the block requests will be realigned and merged when
-    // necessary.
+    // We don't combine block reads here in direct IO mode. MultiRead()
+    // realigns and merges direct IO requests when necessary, but the async_io
+    // path below reads each request on its own.
     if ((use_shared_buffer || use_fs_scratch) && !file->use_direct_io() &&
         prev_end == handle.offset()) {
       req_offset_for_block.emplace_back(prev_len);
@@ -848,14 +848,14 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
     IOStatus s = file->PrepareIOOptions(options, opts, &dbg);
     if (s.ok()) {
 #if defined(WITH_COROUTINES)
-      // RandomAccessFileReader handles direct IO alignment and delegates to the
-      // file coroutine read path.
+      // RandomAccessFileReader handles direct IO alignment on both paths. On
+      // the async_io path each direct-IO request is aligned and read on its
+      // own, so adjacent blocks can read (and charge the rate limiter for) a
+      // shared aligned page twice. Each request keeps its aligned buffer in
+      // fs_scratch until the blocks below are parsed.
       if (batch->context()->use_coro_read()) {
         s = co_await file->MultiReadCoroutine(
             opts, &read_reqs[0], read_reqs.size(), &direct_io_context, &dbg);
-      } else if (file->use_direct_io()) {
-        s = file->MultiRead(opts, &read_reqs[0], read_reqs.size(),
-                            &direct_io_context, &dbg);
       } else {
         co_await batch->context()->reader().MultiReadAsync(
             file, opts, &read_reqs[0], read_reqs.size(), &dbg);

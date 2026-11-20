@@ -44,7 +44,7 @@ class ColumnFamilyHandleImplDummy : public ColumnFamilyHandleImpl {
 struct Entry {
   std::string key;
   std::string value;
-  WriteType type;
+  WriteType type = kPutRecord;
 };
 
 struct TestHandler : public WriteBatch::Handler {
@@ -390,7 +390,7 @@ class WBWIBaseTest : public testing::Test {
         if (result.empty()) {
           result = value;
         } else {
-          result = result + "," + value;
+          result.append(",").append(value);
         }
       }
     }
@@ -686,7 +686,7 @@ void TestValueAsSecondaryIndexHelper(std::vector<Entry> entries,
     ASSERT_EQ(entries.size(), handler.seen[data.GetID()].size());
     size_t i = 0;
     for (const auto& e : handler.seen[data.GetID()]) {
-      auto write_entry = entries[i++];
+      const auto& write_entry = entries[i++];
       ASSERT_EQ(e.type, write_entry.type);
       ASSERT_EQ(e.key, write_entry.key);
       if (e.type != kDeleteRecord) {
@@ -700,7 +700,7 @@ void TestValueAsSecondaryIndexHelper(std::vector<Entry> entries,
     ASSERT_EQ(entries.size(), handler.seen[index.GetID()].size());
     size_t i = 0;
     for (const auto& e : handler.seen[index.GetID()]) {
-      auto write_entry = entries[i++];
+      const auto& write_entry = entries[i++];
       ASSERT_EQ(e.key, write_entry.value);
       if (write_entry.type != kDeleteRecord) {
         ASSERT_EQ(e.value, write_entry.key);
@@ -1156,7 +1156,7 @@ TEST_P(WriteBatchWithIndexTest, TestRandomIteraratorWithBase) {
         case 2: {
           // Seek to random key
           auto key_idx = rnd.Uniform(static_cast<int>(source_strings.size()));
-          auto key = source_strings[key_idx];
+          const auto& key = source_strings[key_idx];
           iter->Seek(key);
           result_iter->Seek(key);
           break;
@@ -1164,7 +1164,7 @@ TEST_P(WriteBatchWithIndexTest, TestRandomIteraratorWithBase) {
         case 3: {
           // SeekForPrev to random key
           auto key_idx = rnd.Uniform(static_cast<int>(source_strings.size()));
-          auto key = source_strings[key_idx];
+          const auto& key = source_strings[key_idx];
           iter->SeekForPrev(key);
           result_iter->SeekForPrev(key);
           break;
@@ -1518,7 +1518,7 @@ TEST_P(WriteBatchWithIndexTest, TestGetFromBatchMerge) {
 
   for (int i = 0; i < 5; i++) {
     ASSERT_OK(batch_->Merge("x", std::to_string(i)));
-    expected = expected + "," + std::to_string(i);
+    expected.append(",").append(std::to_string(i));
 
     if (i % 2 == 0) {
       ASSERT_OK(batch_->Put("y", std::to_string(i / 2)));
@@ -1784,12 +1784,12 @@ TEST_P(WriteBatchWithIndexTest, TestPinnedGetFromBatchAndDB) {
   }
 }
 
-void AssertKey(std::string key, WBWIIterator* iter) {
+void AssertKey(const std::string& key, WBWIIterator* iter) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(key, iter->Entry().key.ToString());
 }
 
-void AssertValue(std::string value, WBWIIterator* iter) {
+void AssertValue(const std::string& value, WBWIIterator* iter) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(value, iter->Entry().value.ToString());
 }
@@ -1831,12 +1831,12 @@ TEST_F(WBWIOverwriteTest, MutateWhileIteratingCorrectnessTest) {
   AssertKey("w", iter.get());
 }
 
-void AssertIterKey(std::string key, Iterator* iter) {
+void AssertIterKey(const std::string& key, Iterator* iter) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(key, iter->key().ToString());
 }
 
-void AssertIterValue(std::string value, Iterator* iter) {
+void AssertIterValue(const std::string& value, Iterator* iter) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(value, iter->value().ToString());
 }
@@ -2556,6 +2556,7 @@ TEST_P(WriteBatchWithIndexTest, SingleDeleteDeltaIterTest) {
 TEST_P(WriteBatchWithIndexTest, MultiGetTest) {
   // MultiGet a lot of keys in order to force std::vector reallocations
   std::vector<std::string> keys;
+  keys.reserve(100);
   for (int i = 0; i < 100; ++i) {
     keys.emplace_back(std::to_string(i));
   }
@@ -2591,6 +2592,7 @@ TEST_P(WriteBatchWithIndexTest, MultiGetTest) {
   }
 
   std::vector<Slice> key_slices;
+  key_slices.reserve(keys.size());
   for (size_t i = 0; i < keys.size(); ++i) {
     key_slices.emplace_back(keys[i]);
   }
@@ -2634,6 +2636,7 @@ TEST_P(WriteBatchWithIndexTest, MultiGetTest2) {
   const int num_keys = 700;
   const int keys_per_pass = 100;
   std::vector<std::string> keys;
+  keys.reserve(num_keys);
   for (size_t i = 0; i < num_keys; ++i) {
     keys.emplace_back(std::to_string(i));
   }
@@ -2939,7 +2942,7 @@ TEST_P(WriteBatchWithIndexTest, TestBadMergeOperator) {
 
     const char* Name() const override { return "Failing"; }
   };
-  options_.merge_operator.reset(new FailingMergeOperator());
+  options_.merge_operator = std::make_shared<FailingMergeOperator>();
   ASSERT_OK(OpenDB());
 
   ColumnFamilyHandle* column_family = db_->DefaultColumnFamily();

@@ -48,6 +48,11 @@ extern const uint64_t kPlainTableMagicNumber;
 
 extern const uint64_t kCuckooTableMagicNumber;
 
+// Reads the trailing SST format signature without decoding the footer.
+Status ReadTableMagicNumber(const IOOptions& io_options,
+                            FSRandomAccessFile& file, uint64_t file_size,
+                            uint64_t* magic_number);
+
 // BlockHandle is a pointer to the extent of a file that stores a data
 // block or a meta block.
 class BlockHandle {
@@ -453,7 +458,7 @@ class FooterBuilder {
 
  private:
   Slice slice_;
-  std::array<char, Footer::kMaxEncodedLength> data_;
+  std::array<char, Footer::kMaxEncodedLength> data_{};
 };
 
 // Set to true to allow unit testing of writing unsupported block-based table
@@ -526,7 +531,7 @@ struct BlockContents {
   BlockContents() {}
 
   // Does not take ownership of the underlying data bytes.
-  BlockContents(const Slice& _data) : data(_data) {}
+  explicit BlockContents(const Slice& _data) : data(_data) {}
 
   // Takes ownership of the underlying data bytes.
   BlockContents(CacheAllocationPtr&& _data, size_t _size)

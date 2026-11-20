@@ -102,9 +102,9 @@ class WriteController {
   // Next time that we can add more credit of bytes
   uint64_t next_refill_time_;
   // Write rate set when initialization or by `DBImpl::SetDBOptions`
-  uint64_t max_delayed_write_rate_;
+  uint64_t max_delayed_write_rate_ = 0;
   // Current write rate (bytes / second)
-  uint64_t delayed_write_rate_;
+  uint64_t delayed_write_rate_ = 0;
 
   std::unique_ptr<RateLimiter> low_pri_rate_limiter_;
 };

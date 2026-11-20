@@ -171,6 +171,14 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kOriginalFileNumber, props.orig_file_number);
   Add(TablePropertiesNames::kRawKeySize, props.raw_key_size);
   Add(TablePropertiesNames::kRawValueSize, props.raw_value_size);
+  bool skip_referenced_blob_bytes = false;
+  TEST_SYNC_POINT_CALLBACK(
+      "PropertyBlockBuilder::AddTableProperty:SkipReferencedBlobBytes",
+      &skip_referenced_blob_bytes);
+  if (props.referenced_blob_bytes.has_value() && !skip_referenced_blob_bytes) {
+    Add(TablePropertiesNames::kReferencedBlobBytes,
+        *props.referenced_blob_bytes);
+  }
   Add(TablePropertiesNames::kDataSize, props.data_size);
   Add(TablePropertiesNames::kUncompressedDataSize,
       props.uncompressed_data_size);
@@ -491,7 +499,17 @@ Status ParsePropertiesBlock(
       *global_seqno_value_offset = iter->ValueOffset();
     }
 
-    if (pos != predefined_uint64_properties.end()) {
+    if (key == TablePropertiesNames::kReferencedBlobBytes) {
+      uint64_t val;
+      if (GetVarint64(&raw_val, &val)) {
+        new_table_properties->referenced_blob_bytes = val;
+      } else {
+        ROCKS_LOG_ERROR(ioptions.logger,
+                        "Detect malformed value in properties "
+                        "meta-block:\tkey: %s\tval: %s",
+                        key.c_str(), raw_val.ToString().c_str());
+      }
+    } else if (pos != predefined_uint64_properties.end()) {
       if (key == TablePropertiesNames::kDeletedKeys ||
           key == TablePropertiesNames::kMergeOperands) {
         // Insert in user-collected properties for API backwards compatibility

@@ -472,7 +472,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
  public:
   IMPORT_RIBBON_TYPES_AND_SETTINGS(TypesAndSettings);
 
-  StandardBanding(Index num_slots = 0, Index backtrack_size = 0) {
+  explicit StandardBanding(Index num_slots = 0, Index backtrack_size = 0) {
     Reset(num_slots, backtrack_size);
   }
 

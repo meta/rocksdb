@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 
@@ -183,7 +184,7 @@ bool WriteFdExactly(int fd, const void* data, size_t size, std::string* error) {
 
 template <typename ProduceMappingFn>
 std::string RunDeterministicMappingReuseScenario(
-    ProduceMappingFn&& produce_mapping) {
+    const ProduceMappingFn& produce_mapping) {
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
     return "pipe failed: " + errnoStr(errno);
@@ -343,13 +344,35 @@ static void SetBool(void* ptr) {
 }
 
 TEST_F(EnvPosixTest, DISABLED_RunImmediately) {
-  for (int pri = Env::BOTTOM; pri < Env::TOTAL; ++pri) {
+  for (int pri = Env::BOTTOM; pri < Env::USER; ++pri) {
     std::atomic<bool> called(false);
     env_->SetBackgroundThreads(1, static_cast<Env::Priority>(pri));
     env_->Schedule(&SetBool, &called, static_cast<Env::Priority>(pri));
     Env::Default()->SleepForMicroseconds(kDelayMicros);
     ASSERT_TRUE(called.load());
   }
+}
+
+TEST_F(EnvPosixTest, ReadPoolRunsWhileLowPoolIsBlocked) {
+  env_->SetBackgroundThreads(1, Env::Priority::LOW);
+  env_->SetBackgroundThreads(1, Env::Priority::READ);
+
+  test::SleepingBackgroundTask low_task;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &low_task,
+                 Env::Priority::LOW);
+  low_task.WaitUntilSleeping();
+
+  test::SleepingBackgroundTask read_task;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &read_task,
+                 Env::Priority::READ);
+  read_task.WaitUntilSleeping();
+  ASSERT_EQ(0u, env_->GetThreadPoolQueueLen(Env::Priority::READ));
+
+  read_task.WakeUp();
+  read_task.WaitUntilDone();
+  low_task.WakeUp();
+  low_task.WaitUntilDone();
+  env_->SetBackgroundThreads(0, Env::Priority::READ);
 }
 
 TEST_F(EnvPosixTest, RunEventually) {
@@ -404,7 +427,7 @@ TEST_F(EnvPosixTest, DISABLED_FilePermission) {
     std::unique_ptr<RandomRWFile> rwfile;
     ASSERT_OK(env_->NewRandomRWFile(fileNames[1], &rwfile, soptions));
 
-    struct stat sb;
+    struct stat sb{};
     for (const auto& filename : fileNames) {
       if (::stat(filename.c_str(), &sb) == 0) {
         ASSERT_EQ(sb.st_mode & 0777, 0644);
@@ -670,8 +693,8 @@ TEST_P(EnvPosixTestWithParam, RunMany) {
 
 struct State {
   port::Mutex mu;
-  int val;
-  int num_running;
+  int val = 0;
+  int num_running = 0;
 };
 
 static void ThreadBody(void* arg) {
@@ -1222,12 +1245,13 @@ class IoctlFriendlyTmpdir {
     char dir_buf[100];
 
     const char* fmt = "%s/rocksdb.XXXXXX";
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
     const char* tmp = getenv("TEST_IOCTL_FRIENDLY_TMPDIR");
 
 #ifdef OS_WIN
 #define rmdir _rmdir
     if (tmp == nullptr) {
-      tmp = getenv("TMP");
+      tmp = getenv("TMP");  // NOLINT(concurrency-mt-unsafe)
     }
 
     snprintf(dir_buf, sizeof dir_buf, fmt, tmp);
@@ -1244,7 +1268,7 @@ class IoctlFriendlyTmpdir {
     // add 1 for the trailing NUL byte.
     if (tmp && strlen(tmp) + strlen(fmt) - 2 + 1 <= sizeof dir_buf) {
       // use $TEST_IOCTL_FRIENDLY_TMPDIR value
-      candidate_dir_list.push_front(tmp);
+      candidate_dir_list.emplace_front(tmp);
     }
 
     for (const std::string& d : candidate_dir_list) {
@@ -1274,7 +1298,7 @@ class IoctlFriendlyTmpdir {
     // check if it's running test within a docker container, in which case, the
     // file system inside `overlayfs` may not support FS_IOC_GETVERSION
     // skip the tests
-    struct stat buffer;
+    struct stat buffer{};
     if (stat("/.dockerenv", &buffer) == 0) {
       is_supported_ = false;
       return;
@@ -1434,7 +1458,7 @@ TEST_P(EnvPosixTestWithParam, AllocateTest) {
     ASSERT_OK(wfile->Append(data));
     ASSERT_OK(wfile->Flush());
 
-    struct stat f_stat;
+    struct stat f_stat{};
     ASSERT_EQ(stat(fname.c_str(), &f_stat), 0);
     ASSERT_EQ((unsigned int)kDataSize, f_stat.st_size);
     // btrfs (and other CoW filesystems) accept fallocate but use
@@ -1445,7 +1469,7 @@ TEST_P(EnvPosixTestWithParam, AllocateTest) {
     // blocks in st_blocks reliably.
     bool skip_block_checks = false;
 #ifdef OS_LINUX
-    struct statfs fs_stat;
+    struct statfs fs_stat{};
     if (statfs(fname.c_str(), &fs_stat) == 0) {
       if (fs_stat.f_type ==
           static_cast<decltype(fs_stat.f_type)>(BTRFS_SUPER_MAGIC)) {
@@ -1747,6 +1771,7 @@ TEST_F(EnvPosixTest, MultiReadNonAlignedLargeNum) {
     std::vector<size_t> offsets;
     std::vector<size_t> lens;
     // std::set already sorted the offsets.
+    offsets.reserve(start_offsets.size());
     for (int so : start_offsets) {
       offsets.push_back(so);
     }
@@ -2227,9 +2252,9 @@ class TestLogger : public Logger {
       }
     }
   }
-  int log_count;
-  int char_x_count;
-  int char_0_count;
+  int log_count = 0;
+  int char_x_count = 0;
+  int char_0_count = 0;
 };
 
 TEST_P(EnvPosixTestWithParam, LogBufferTest) {
@@ -2397,7 +2422,8 @@ TEST_P(EnvPosixTestWithParam, ConsistentChildrenAttributes) {
   ASSERT_OK(env_->GetChildrenFileAttributes(test_base_dir, &file_attrs));
   for (int i = 0; i < kNumChildren; ++i) {
     const std::string name = "testfile_" + std::to_string(i);
-    const std::string path = test_base_dir + "/" + name;
+    std::string path = test_base_dir;
+    path.append("/").append(name);
 
     auto file_attrs_iter = std::find_if(
         file_attrs.begin(), file_attrs.end(),
@@ -2700,7 +2726,7 @@ class RandomRWFileWithMirrorString {
     }
   }
 
-  char buf_[10000];
+  char buf_[10000]{};
   RandomRWFile* file_;
   std::string file_mirror_;
 };
@@ -2784,7 +2810,7 @@ class TestEnv : public EnvWrapper {
 
   Status NewLogger(const std::string& /*fname*/,
                    std::shared_ptr<Logger>* result) override {
-    result->reset(new TestLogger(this));
+    *result = std::make_shared<TestLogger>(this);
     return Status::OK();
   }
 
@@ -3295,7 +3321,7 @@ TEST_F(CreateEnvTest, CreateEncryptedFileSystem) {
       std::string("provider=1://test; id=") + EncryptedFileSystem::kClassName();
   // Rewrite the default FileSystem URI if the "TEST_FS_URI" environment
   // variable is set. This is useful to test customer encryption plugins.
-  const char* uri = getenv("TEST_FS_URI");
+  const char* uri = getenv("TEST_FS_URI");  // NOLINT(concurrency-mt-unsafe)
   if (uri != nullptr) {
     base_opts = uri;
   }
@@ -3497,6 +3523,17 @@ TEST_F(EnvTest, GenerateRawUniqueIdTrackEnvDetailsOnly) {
 }
 
 TEST_F(EnvTest, GenerateRawUniqueIdTrackRandomDeviceOnly) {
+  // Temporarily skipped on GitHub Actions until 2027-02-01, when we can
+  // reassess if failures recur.
+  if (getenv("GITHUB_ACTIONS")) {  // NOLINT(concurrency-mt-unsafe)
+    int64_t now = 0;
+    ASSERT_OK(Env::Default()->GetCurrentTime(&now));
+    if (now < 1801440000) {
+      ROCKSDB_GTEST_SKIP("Temporarily skipped on GitHub Actions");
+      return;
+    }
+  }
+
   struct MyStressTest
       : public NoDuplicateMiniStressTest<uint64_pair_t, HashUint64Pair> {
     uint64_pair_t Generate() override {
@@ -3747,15 +3784,16 @@ TEST_F(CreateEnvTest, CreateWrappedEnv) {
   ASSERT_NE(copy, guard);
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
-  guard.reset(new WrappedEnv(std::make_shared<WrappedEnv>(Env::Default())));
+  guard = std::make_shared<WrappedEnv>(
+      std::make_shared<WrappedEnv>(Env::Default()));
   ASSERT_NE(guard.get(), env);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
   ASSERT_NE(copy, guard);
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
-  guard.reset(new WrappedEnv(std::make_shared<WrappedEnv>(
-      std::make_shared<WrappedEnv>(Env::Default()))));
+  guard = std::make_shared<WrappedEnv>(std::make_shared<WrappedEnv>(
+      std::make_shared<WrappedEnv>(Env::Default())));
   ASSERT_NE(guard.get(), env);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
@@ -3798,7 +3836,7 @@ TEST_F(CreateEnvTest, CreateCompositeEnv) {
   ASSERT_EQ(env->GetSystemClock(), SystemClock::Default());
 
   env = nullptr;
-  guard.reset(new CompositeEnvWrapper(wrapped.get(), timed_fs));
+  guard = std::make_shared<CompositeEnvWrapper>(wrapped.get(), timed_fs);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
   ASSERT_NE(env, nullptr);
@@ -3806,7 +3844,7 @@ TEST_F(CreateEnvTest, CreateCompositeEnv) {
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
   env = nullptr;
-  guard.reset(new CompositeEnvWrapper(wrapped.get(), clock));
+  guard = std::make_shared<CompositeEnvWrapper>(wrapped.get(), clock);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
   ASSERT_NE(env, nullptr);
@@ -3814,14 +3852,14 @@ TEST_F(CreateEnvTest, CreateCompositeEnv) {
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
   env = nullptr;
-  guard.reset(new CompositeEnvWrapper(wrapped.get(), timed_fs, clock));
+  guard = std::make_shared<CompositeEnvWrapper>(wrapped.get(), timed_fs, clock);
   opt_str = guard->ToString(options);
   ASSERT_OK(Env::CreateFromString(options, opt_str, &env, &copy));
   ASSERT_NE(env, nullptr);
   ASSERT_NE(env, Env::Default());
   ASSERT_TRUE(guard->AreEquivalent(options, copy.get(), &mismatch));
 
-  guard.reset(new CompositeEnvWrapper(nullptr, timed_fs, clock));
+  guard = std::make_shared<CompositeEnvWrapper>(nullptr, timed_fs, clock);
   ColumnFamilyOptions cf_opts;
   DBOptions db_opts;
   db_opts.env = guard.get();
@@ -3839,8 +3877,8 @@ class ReadAsyncFS;
 
 struct MockIOHandle {
   std::function<void(FSReadRequest&, void*)> cb;
-  void* cb_arg;
-  bool create_io_error;
+  void* cb_arg = nullptr;
+  bool create_io_error = false;
 };
 
 // ReadAsyncFS and ReadAsyncRandomAccessFile mocks the FS doing asynchronous

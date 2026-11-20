@@ -57,6 +57,11 @@ TEST(BlobIndexTest, SameFileBlobIndex) {
   EXPECT_NE(blob_index.DebugString(false).find("file:same"), std::string::npos);
 }
 
+TEST(BlobIndexTest, EmptyBlobIndexIsCorruption) {
+  BlobIndex blob_index;
+  ASSERT_EQ(blob_index.DecodeFrom(Slice()).code(), Status::Code::kCorruption);
+}
+
 // kTypeBlobIndex is a value type used by BlobDB only. The base rocksdb
 // should accept the value type on write, and report not supported value
 // for reads, unless caller request for it explicitly. The base rocksdb
@@ -206,6 +211,20 @@ class DBBlobIndexTest : public DBTestBase {
     }
   }
 };
+
+TEST_F(DBBlobIndexTest, EmptyBlobIndexFailsFlushWithCorruption) {
+  Options options = GetTestOptions();
+  options.paranoid_checks = true;
+  DestroyAndReopen(options);
+
+  WriteBatch batch;
+  ASSERT_OK(PutBlobIndex(&batch, "key", Slice()));
+  ASSERT_OK(Write(&batch));
+
+  const Status status = Flush();
+  ASSERT_TRUE(status.IsCorruption());
+  ASSERT_NE(status.ToString().find("Empty blob index"), std::string::npos);
+}
 
 // Note: the following test case pertains to the StackableDB-based BlobDB
 // implementation. We should be able to write kTypeBlobIndex to memtables and
@@ -1406,8 +1425,9 @@ TEST_F(DBBlobIndexTest, Iterate) {
 
   auto verify = [&](int index, Status::Code expected_status,
                     const Slice& forward_value, const Slice& backward_value,
-                    std::function<Iterator*()> create_iterator,
-                    std::function<void(Iterator*)> extra_check = nullptr) {
+                    const std::function<Iterator*()>& create_iterator,
+                    const std::function<void(Iterator*)>& extra_check =
+                        nullptr) {
     // Seek
     auto* iterator = create_iterator();
     ASSERT_OK(iterator->status());
@@ -2715,7 +2735,7 @@ TEST_F(DBBlobIndexTest, IntegratedBlobIterate) {
     return get_key(index) + "_value" + std::to_string(version);
   };
 
-  auto check_iterator = [&](Iterator* iterator, Status expected_status,
+  auto check_iterator = [&](Iterator* iterator, const Status& expected_status,
                             const Slice& expected_value) {
     ASSERT_EQ(expected_status, iterator->status());
     if (expected_status.ok()) {
@@ -2726,7 +2746,7 @@ TEST_F(DBBlobIndexTest, IntegratedBlobIterate) {
     }
   };
 
-  auto verify = [&](size_t index, Status expected_status,
+  auto verify = [&](size_t index, const Status& expected_status,
                     const Slice& expected_value) {
     // Seek
     {

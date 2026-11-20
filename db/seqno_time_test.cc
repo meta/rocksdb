@@ -62,6 +62,11 @@ class SeqnoTimeTest : public DBTestBase {
         ASSERT_GT(iostats->file_io_stats_by_temperature.cold_file_bytes_read,
                   0);
         break;
+      case Temperature::kHot:
+      case Temperature::kWarm:
+      case Temperature::kCool:
+      case Temperature::kIce:
+      case Temperature::kLastTemperature:
       default:
         // the test only support kCold now for the bottommost temperature
         FAIL();

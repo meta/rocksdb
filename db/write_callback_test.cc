@@ -118,13 +118,13 @@ class WriteCallbackPTest
   }
 
  protected:
-  bool unordered_write_;
-  bool seq_per_batch_;
-  bool two_queues_;
-  bool allow_parallel_;
-  bool allow_batching_;
-  bool enable_WAL_;
-  bool enable_pipelined_write_;
+  bool unordered_write_ = false;
+  bool seq_per_batch_ = false;
+  bool two_queues_ = false;
+  bool allow_parallel_ = false;
+  bool allow_batching_ = false;
+  bool enable_WAL_ = false;
+  bool enable_pipelined_write_ = false;
 };
 
 TEST_P(WriteCallbackPTest, WriteWithCallbackTest) {
@@ -338,7 +338,8 @@ TEST_P(WriteCallbackPTest, WriteWithCallbackTest) {
       if (seq_per_batch_) {
         class PublishSeqCallback : public PreReleaseCallback {
          public:
-          PublishSeqCallback(DBImpl* db_impl_in) : db_impl_(db_impl_in) {}
+          explicit PublishSeqCallback(DBImpl* db_impl_in)
+              : db_impl_(db_impl_in) {}
           Status Callback(SequenceNumber last_seq, bool /*not used*/, uint64_t,
                           size_t /*index*/, size_t /*total*/) override {
             db_impl_->SetLastPublishedSequence(last_seq);
@@ -377,6 +378,7 @@ TEST_P(WriteCallbackPTest, WriteWithCallbackTest) {
 
     // do all the writes
     std::vector<port::Thread> threads;
+    threads.reserve(write_group.size());
     for (uint32_t i = 0; i < write_group.size(); i++) {
       threads.emplace_back(write_with_callback_func);
     }

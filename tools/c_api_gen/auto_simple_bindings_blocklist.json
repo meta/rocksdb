@@ -613,6 +613,11 @@
           "field": "readable_properties",
           "policy": "manual",
           "reason": "Returns map-like metadata that needs dedicated marshalling rather than a simple scalar getter."
+        },
+        {
+          "field": "referenced_blob_bytes",
+          "policy": "manual",
+          "reason": "std::optional uses separate value and presence accessors; nullopt maps to has=false and value=0."
         }
       ]
     }
