@@ -35,6 +35,7 @@
 #include "rocksdb/wal_iterator.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
+#include "util/defer.h"
 #include "util/file_checksum_helper.h"
 #include "utilities/copy_engine/copy_engine.h"
 
@@ -265,6 +266,14 @@ class ParallelFileMover : public CheckpointFileMover {
   std::vector<std::future<WorkItemResult>> copy_futures_;
   std::vector<PendingLink> link_pendings_;
 };
+
+bool AllTableAndBlobFilesIn(const std::vector<LiveFileStorageInfo>& files,
+                            const std::unordered_set<std::string>& paths) {
+  return std::all_of(files.begin(), files.end(), [&](const auto& file) {
+    return (file.file_type != kTableFile && file.file_type != kBlobFile) ||
+           paths.count(file.directory + "/" + file.relative_filename) > 0;
+  });
+}
 }  // namespace
 
 Status CheckpointEngine::Open(
@@ -495,7 +504,8 @@ Status CheckpointImpl::CreateCheckpointImpl(
           &sequence_number, log_size_for_flush, &options_snapshot,
           /*get_live_table_checksum=*/false, /*atomic_flush=*/false,
           include_cf_ids, &excluded_cf_ids, &manifest_relative_filename,
-          &manifest_size);
+          &manifest_size, /*table_and_blob_file_pin=*/nullptr,
+          /*table_and_blob_files_pinned=*/nullptr);
 
       // Await any deferred work and fold in the first error before committing.
       Status finish_s = mover->Finish();
@@ -598,13 +608,13 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     bool get_live_table_checksum, bool atomic_flush,
     const std::vector<uint32_t>& include_cf_ids,
     std::vector<uint32_t>* excluded_cf_ids,
-    std::string* manifest_relative_filename, uint64_t* manifest_size) {
-  return CreateCustomCheckpoint(link_file_cb, copy_file_cb, create_file_cb,
-                                sequence_number, log_size_for_flush,
-                                /*options_snapshot=*/nullptr,
-                                get_live_table_checksum, atomic_flush,
-                                include_cf_ids, excluded_cf_ids,
-                                manifest_relative_filename, manifest_size);
+    std::string* manifest_relative_filename, uint64_t* manifest_size,
+    Cleanable* table_and_blob_file_pin, bool* table_and_blob_files_pinned) {
+  return CreateCustomCheckpoint(
+      link_file_cb, copy_file_cb, create_file_cb, sequence_number,
+      log_size_for_flush, /*options_snapshot=*/nullptr, get_live_table_checksum,
+      atomic_flush, include_cf_ids, excluded_cf_ids, manifest_relative_filename,
+      manifest_size, table_and_blob_file_pin, table_and_blob_files_pinned);
 }
 
 Status CheckpointImpl::CreateCustomCheckpoint(
@@ -624,7 +634,19 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     bool get_live_table_checksum, bool atomic_flush,
     const std::vector<uint32_t>& include_cf_ids,
     std::vector<uint32_t>* excluded_cf_ids,
-    std::string* manifest_relative_filename, uint64_t* manifest_size) {
+    std::string* manifest_relative_filename, uint64_t* manifest_size,
+    Cleanable* table_and_blob_file_pin, bool* table_and_blob_files_pinned) {
+  assert(table_and_blob_file_pin == nullptr ||
+         table_and_blob_files_pinned != nullptr);
+  bool succeeded = false;
+  const Defer clear_pinned_on_failure([&]() {
+    if (!succeeded && table_and_blob_files_pinned != nullptr) {
+      *table_and_blob_files_pinned = false;
+    }
+  });
+  if (table_and_blob_files_pinned != nullptr) {
+    *table_and_blob_files_pinned = false;
+  }
   *sequence_number = db_->GetLatestSequenceNumber();
 
   LiveFilesStorageInfoOptions opts;
@@ -633,9 +655,26 @@ Status CheckpointImpl::CreateCustomCheckpoint(
   opts.atomic_flush = atomic_flush;
 
   std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin_until_success;
   {
     Status s;
-    if (include_cf_ids.empty()) {
+    if (include_cf_ids.empty() && table_and_blob_file_pin != nullptr) {
+      LiveFilesPinRequest pin_request(&pin_until_success);
+      s = db_->GetLiveFilesStorageInfo(opts, &infos);
+      if (s.ok()) {
+        *table_and_blob_files_pinned =
+            pin_request.pinned() &&
+            AllTableAndBlobFilesIn(infos, pin_request.pinned_files());
+        if (!*table_and_blob_files_pinned) {
+          ROCKS_LOG_INFO(db_->GetDBOptions().info_log,
+                         "Table and blob files not held for the checkpoint: %s",
+                         pin_request.pinned()
+                             ? "a wrapper listed files the DB did not pin"
+                             : "the DB did not pin");
+          pin_until_success.Reset();
+        }
+      }
+    } else if (include_cf_ids.empty()) {
       s = db_->GetLiveFilesStorageInfo(opts, &infos);
     } else {
       assert(excluded_cf_ids != nullptr);
@@ -661,6 +700,8 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     return Status::NotSupported(
         "db_paths / cf_paths not supported for Checkpoint nor BackupEngine");
   }
+
+  TEST_SYNC_POINT("CheckpointImpl::CreateCustomCheckpoint:AfterListingFiles");
 
   bool same_fs = true;
 
@@ -719,6 +760,10 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     }
   }
 
+  if (table_and_blob_file_pin != nullptr) {
+    pin_until_success.DelegateCleanupsTo(table_and_blob_file_pin);
+  }
+  succeeded = true;
   return Status::OK();
 }
 

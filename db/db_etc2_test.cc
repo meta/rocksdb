@@ -12,6 +12,9 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <set>
+#include <thread>
+#include <utility>
 
 #include "db/db_test_util.h"
 #include "db/log_format.h"
@@ -4176,6 +4179,266 @@ TEST_F(DBTest2, LiveFilesStorageInfoReadOnlyKeepsDeletionsEnabled) {
   std::vector<LiveFileStorageInfo> infos;
   ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
   ASSERT_TRUE(dbfull()->IsFileDeletionsEnabled());
+}
+
+namespace {
+std::set<std::string> TableAndBlobPaths(
+    const std::vector<LiveFileStorageInfo>& infos) {
+  std::set<std::string> paths;
+  for (const auto& info : infos) {
+    if (info.file_type == kTableFile || info.file_type == kBlobFile) {
+      paths.insert(info.directory + "/" + info.relative_filename);
+    }
+  }
+  return paths;
+}
+}  // namespace
+
+TEST_F(DBTest2, LiveFilesPinRequestKeepsFilesUntilCleanup) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->DisableFileDeletions());
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin;
+  std::set<std::string> pinned_paths;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
+    ASSERT_TRUE(pin_request.pinned());
+    pinned_paths = std::set<std::string>(pin_request.pinned_files().begin(),
+                                         pin_request.pinned_files().end());
+  }
+  ASSERT_EQ(pinned_paths, TableAndBlobPaths(infos));
+  ASSERT_EQ(pinned_paths.size(), 2);
+  ASSERT_OK(db_->EnableFileDeletions());
+
+  ASSERT_OK(Put("key", "new_value"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  for (const auto& path : pinned_paths) {
+    ASSERT_OK(env_->FileExists(path)) << path;
+  }
+  ASSERT_TRUE(dbfull()->Close().IsAborted());
+
+  pin.Reset();
+  for (const auto& path : pinned_paths) {
+    ASSERT_TRUE(env_->FileExists(path).IsNotFound()) << path;
+  }
+  ASSERT_OK(dbfull()->Close());
+}
+
+TEST_F(DBTest2, LiveFilesPinRequestHoldsFilesCompactedDuringListing) {
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", "new_value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->DisableFileDeletions());
+  // Runs after the listing has read the current Versions and released the DB
+  // mutex, while it is still reading file sizes and WAL files.
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetLiveFilesStorageInfo:BeforeOptionsFileSize",
+      [&](void* /*arg*/) {
+        CompactRangeOptions cro;
+        cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+        ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
+    ASSERT_TRUE(pin_request.pinned());
+  }
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  const std::set<std::string> listed = TableAndBlobPaths(infos);
+  ASSERT_EQ(listed.size(), 2);
+
+  ASSERT_OK(db_->EnableFileDeletions());
+  for (const auto& path : listed) {
+    ASSERT_OK(env_->FileExists(path)) << path;
+  }
+  pin.Reset();
+  for (const auto& path : listed) {
+    ASSERT_TRUE(env_->FileExists(path).IsNotFound()) << path;
+  }
+}
+
+TEST_F(DBTest2, LiveFilesPinRequestNotFulfilledOnFailedListing) {
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->DisableFileDeletions());
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetLiveFilesStorageInfo:BeforeOptionsFileSize",
+      [&](void* /*arg*/) {
+        ASSERT_OK(env_->DeleteFile(OptionsFileName(
+            dbname_, dbfull()->GetVersionSet()->options_file_number())));
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_NOK(db_->GetLiveFilesStorageInfo(opts, &infos));
+    ASSERT_FALSE(pin_request.pinned());
+  }
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_FALSE(pin.HasCleanups());
+  ASSERT_OK(db_->EnableFileDeletions());
+  ASSERT_OK(dbfull()->Close());
+}
+
+TEST_F(DBTest2, LiveFilesPinRequestFromFlushListenerDoesNotDeadlock) {
+  class NestedPinListener : public EventListener {
+   public:
+    void OnManualFlushScheduled(
+        DB* db, const std::vector<ManualFlushInfo>& /*info*/) override {
+      if (std::exchange(nested_, true)) {
+        return;
+      }
+      LiveFilesStorageInfoOptions opts;
+      opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+      std::vector<LiveFileStorageInfo> infos;
+      Cleanable pin;
+      LiveFilesPinRequest pin_request(&pin);
+      nested_status_ = db->GetLiveFilesStorageInfo(opts, &infos);
+      nested_pinned_ = pin_request.pinned();
+    }
+    bool nested_ = false;
+    Status nested_status_;
+    bool nested_pinned_ = false;
+  };
+  auto listener = std::make_shared<NestedPinListener>();
+  Options options = CurrentOptions();
+  options.listeners.push_back(listener);
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+
+  ASSERT_OK(db_->DisableFileDeletions());
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = 0;
+  std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
+    ASSERT_TRUE(pin_request.pinned());
+  }
+  ASSERT_TRUE(listener->nested_);
+  ASSERT_OK(listener->nested_status_);
+  ASSERT_TRUE(listener->nested_pinned_);
+  pin.Reset();
+  ASSERT_OK(db_->EnableFileDeletions());
+  ASSERT_OK(dbfull()->Close());
+}
+
+TEST_F(DBTest2, LiveFilesPinRequestDuringCloseFromWaitForCompact) {
+  // Close() aborts on this snapshot, after WaitForCompact() has stopped new
+  // background jobs and while the listing is about to flush.
+  const Snapshot* const snapshot = db_->GetSnapshot();
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(db_->DisableFileDeletions());
+
+  std::thread closer;
+  Status closer_status;
+  bool closer_started = false;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::FlushAllColumnFamilies:BeforeFlushMemTable", [&](void*) {
+        if (std::exchange(closer_started, true)) {
+          return;
+        }
+        closer = std::thread([&]() {
+          WaitForCompactOptions wco;
+          wco.close_db = true;
+          closer_status = db_->WaitForCompact(wco);
+        });
+        closer.join();
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = 0;
+  std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
+    ASSERT_TRUE(pin_request.pinned());
+  }
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(closer_started);
+  ASSERT_TRUE(closer_status.IsAborted()) << closer_status.ToString();
+
+  pin.Reset();
+  db_->ReleaseSnapshot(snapshot);
+  ASSERT_OK(db_->EnableFileDeletions());
+  ASSERT_OK(dbfull()->Close());
+}
+
+TEST_F(DBTest2, LiveFilesPinRequestAfterCloseAbortedBySnapshots) {
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  auto snapshot =
+      dbfull()->CreateTimestampedSnapshot(kMaxSequenceNumber, /*ts=*/1);
+  ASSERT_OK(snapshot.first);
+  ASSERT_TRUE(dbfull()->Close().IsAborted());
+
+  ASSERT_OK(db_->DisableFileDeletions());
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
+    ASSERT_TRUE(pin_request.pinned());
+  }
+  pin.Reset();
+  ASSERT_OK(db_->EnableFileDeletions());
+  snapshot.second.reset();
+  ASSERT_OK(dbfull()->Close());
+}
+
+TEST_F(DBTest2, CloseWithPinnedFilesKeepsTimestampedSnapshots) {
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(
+      dbfull()->CreateTimestampedSnapshot(kMaxSequenceNumber, /*ts=*/1).first);
+
+  ASSERT_OK(db_->DisableFileDeletions());
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
+    ASSERT_TRUE(pin_request.pinned());
+  }
+  ASSERT_OK(db_->EnableFileDeletions());
+
+  ASSERT_TRUE(dbfull()->Close().IsAborted());
+  ASSERT_NE(dbfull()->GetTimestampedSnapshot(/*ts=*/1), nullptr);
+
+  pin.Reset();
+  ASSERT_OK(dbfull()->Close());
 }
 
 TEST_F(DBTest2, TestNumPread) {

@@ -685,10 +685,13 @@ class BackupEngineImpl {
   //    copied.
   // @param fname Name of destination file and, in case of copy, source file.
   // @param contents If non-empty, the file will be created with these contents.
+  // @param deferred_items If non-null, a copy that is not excludable is queued
+  //    here instead of starting right away.
   IOStatus AddBackupFileWorkItem(
       std::unordered_set<std::string>& live_dst_paths,
       std::deque<BackupAfterCopyOrCreateWorkItem>& backup_items_to_finish,
-      std::deque<BackupWorkItemPair>* excludable_items, BackupID backup_id,
+      std::deque<BackupWorkItemPair>* excludable_items,
+      std::deque<BackupWorkItemPair>* deferred_items, BackupID backup_id,
       bool shared, const std::string& src_dir,
       const std::string& fname,  // starts with "/"
       const EnvOptions& src_env_options, RateLimiter* rate_limiter,
@@ -1225,9 +1228,15 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
   std::unordered_set<std::string> live_dst_paths;
 
   std::deque<BackupWorkItemPair> excludable_items;
+  std::deque<BackupWorkItemPair> deferred_table_and_blob_items;
   std::deque<BackupAfterCopyOrCreateWorkItem> backup_items_to_finish;
   // Add a WorkItem to the channel for each live file
   Status disabled = db->DisableFileDeletions();
+  bool deletions_disabled = disabled.ok();
+  // Pinned table and blob files need deletions disabled only until the other
+  // files are copied, so a long copy does not hold obsolete WAL files.
+  Cleanable table_and_blob_file_pin;
+  bool table_and_blob_files_pinned = false;
   DBOptions db_options = db->GetDBOptions();
   Statistics* stats = db_options.statistics.get();
   if (io_s.ok()) {
@@ -1244,93 +1253,103 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
             : false;
     EnvOptions src_raw_env_options(db_options);
     RateLimiter* rate_limiter = options_.backup_rate_limiter.get();
-    io_s = status_to_io_status(checkpoint.CreateCustomCheckpoint(
-        [&](const std::string& /*src_dirname*/, const std::string& /*fname*/,
-            FileType, const Temperature /*temperature*/) {
-          // custom checkpoint will switch to calling copy_file_cb after it sees
-          // NotSupported returned from link_file_cb.
-          return IOStatus::NotSupported();
-        } /* link_file_cb */,
-        [&](const std::string& src_dirname, const std::string& fname,
-            uint64_t size_limit_bytes, FileType type,
-            const std::string& checksum_func_name,
-            const std::string& checksum_val,
-            const Temperature src_temperature) {
-          if (type == kWalFile && !options_.backup_log_files) {
-            return IOStatus::OK();
-          }
-          Log(options_.info_log, "add file for backup %s", fname.c_str());
-          uint64_t size_bytes = 0;
-          IOStatus io_st;
-          if (type == kTableFile || type == kBlobFile) {
-            io_st = db_fs_->GetFileSize(src_dirname + "/" + fname, io_options_,
-                                        &size_bytes, nullptr);
-            if (!io_st.ok()) {
-              Log(options_.info_log, "GetFileSize is failed: %s",
-                  io_st.ToString().c_str());
-              return io_st;
-            }
-          }
-          EnvOptions src_env_options;
-          switch (type) {
-            case kWalFile:
-              src_env_options =
-                  db_env_->OptimizeForLogRead(src_raw_env_options);
-              break;
-            case kTableFile:
-              src_env_options = db_env_->OptimizeForCompactionTableRead(
-                  src_raw_env_options, ImmutableDBOptions(db_options));
-              break;
-            case kDescriptorFile:
-              src_env_options =
-                  db_env_->OptimizeForManifestRead(src_raw_env_options);
-              break;
-            case kBlobFile:
-              src_env_options = db_env_->OptimizeForBlobFileRead(
-                  src_raw_env_options, ImmutableDBOptions(db_options));
-              break;
-            case kDBLockFile:
-            case kCurrentFile:
-            case kTempFile:
-            case kInfoLogFile:
-            case kMetaDatabase:
-            case kIdentityFile:
-            case kOptionsFile:
-            case kCompactionProgressFile:
-            default:
-              // Other backed up files (like options file) are not read by live
-              // DB, so don't need to worry about avoiding mixing buffered and
-              // direct I/O. Just use plain defaults.
-              src_env_options = src_raw_env_options;
-              break;
-          }
-          io_st = AddBackupFileWorkItem(
-              live_dst_paths, backup_items_to_finish,
-              maybe_exclude_items ? &excludable_items : nullptr, new_backup_id,
-              options_.share_table_files &&
-                  (type == kTableFile || type == kBlobFile),
-              src_dirname, fname, src_env_options, rate_limiter, type,
-              size_bytes, db_options.statistics.get(), size_limit_bytes,
-              options_.share_files_with_checksum &&
-                  (type == kTableFile || type == kBlobFile),
-              options.progress_callback, "" /* contents */, checksum_func_name,
-              checksum_val, src_temperature);
+    const auto link_file_cb = [&](const std::string& /*src_dirname*/,
+                                  const std::string& /*fname*/, FileType,
+                                  const Temperature /*temperature*/) {
+      // custom checkpoint will switch to calling copy_file_cb after it sees
+      // NotSupported returned from link_file_cb.
+      return IOStatus::NotSupported();
+    };
+    const auto copy_file_cb = [&](const std::string& src_dirname,
+                                  const std::string& fname,
+                                  uint64_t size_limit_bytes, FileType type,
+                                  const std::string& checksum_func_name,
+                                  const std::string& checksum_val,
+                                  const Temperature src_temperature) {
+      if (type == kWalFile && !options_.backup_log_files) {
+        return IOStatus::OK();
+      }
+      Log(options_.info_log, "add file for backup %s", fname.c_str());
+      uint64_t size_bytes = 0;
+      IOStatus io_st;
+      if (type == kTableFile || type == kBlobFile) {
+        io_st = db_fs_->GetFileSize(src_dirname + "/" + fname, io_options_,
+                                    &size_bytes, nullptr);
+        if (!io_st.ok()) {
+          Log(options_.info_log, "GetFileSize is failed: %s",
+              io_st.ToString().c_str());
           return io_st;
-        } /* copy_file_cb */,
-        [&](const std::string& fname, const std::string& contents,
-            FileType type) {
-          Log(options_.info_log, "add file for backup %s", fname.c_str());
-          return AddBackupFileWorkItem(
-              live_dst_paths, backup_items_to_finish,
-              maybe_exclude_items ? &excludable_items : nullptr, new_backup_id,
-              false /* shared */, "" /* src_dir */, fname,
-              EnvOptions() /* src_env_options */, rate_limiter, type,
-              contents.size(), db_options.statistics.get(), 0 /* size_limit */,
-              false /* shared_checksum */, options.progress_callback, contents);
-        } /* create_file_cb */,
-        &sequence_number,
+        }
+      }
+      EnvOptions src_env_options;
+      switch (type) {
+        case kWalFile:
+          src_env_options = db_env_->OptimizeForLogRead(src_raw_env_options);
+          break;
+        case kTableFile:
+          src_env_options = db_env_->OptimizeForCompactionTableRead(
+              src_raw_env_options, ImmutableDBOptions(db_options));
+          break;
+        case kDescriptorFile:
+          src_env_options =
+              db_env_->OptimizeForManifestRead(src_raw_env_options);
+          break;
+        case kBlobFile:
+          src_env_options = db_env_->OptimizeForBlobFileRead(
+              src_raw_env_options, ImmutableDBOptions(db_options));
+          break;
+        case kDBLockFile:
+        case kCurrentFile:
+        case kTempFile:
+        case kInfoLogFile:
+        case kMetaDatabase:
+        case kIdentityFile:
+        case kOptionsFile:
+        case kCompactionProgressFile:
+        default:
+          // Other backed up files (like options file) are not read by live
+          // DB, so don't need to worry about avoiding mixing buffered and
+          // direct I/O. Just use plain defaults.
+          src_env_options = src_raw_env_options;
+          break;
+      }
+      const bool is_table_or_blob = type == kTableFile || type == kBlobFile;
+      std::deque<BackupWorkItemPair>* const deferred_items =
+          table_and_blob_files_pinned && is_table_or_blob
+              ? &deferred_table_and_blob_items
+              : nullptr;
+      io_st = AddBackupFileWorkItem(
+          live_dst_paths, backup_items_to_finish,
+          maybe_exclude_items ? &excludable_items : nullptr, deferred_items,
+          new_backup_id, options_.share_table_files && is_table_or_blob,
+          src_dirname, fname, src_env_options, rate_limiter, type, size_bytes,
+          db_options.statistics.get(), size_limit_bytes,
+          options_.share_files_with_checksum && is_table_or_blob,
+          options.progress_callback, "" /* contents */, checksum_func_name,
+          checksum_val, src_temperature);
+      return io_st;
+    };
+    const auto create_file_cb = [&](const std::string& fname,
+                                    const std::string& contents,
+                                    FileType type) {
+      Log(options_.info_log, "add file for backup %s", fname.c_str());
+      return AddBackupFileWorkItem(
+          live_dst_paths, backup_items_to_finish,
+          maybe_exclude_items ? &excludable_items : nullptr,
+          nullptr /* deferred_items */, new_backup_id, false /* shared */,
+          "" /* src_dir */, fname, EnvOptions() /* src_env_options */,
+          rate_limiter, type, contents.size(), db_options.statistics.get(),
+          0 /* size_limit */, false /* shared_checksum */,
+          options.progress_callback, contents);
+    };
+    io_s = status_to_io_status(checkpoint.CreateCustomCheckpoint(
+        link_file_cb, copy_file_cb, create_file_cb, &sequence_number,
         options.flush_before_backup ? 0 : std::numeric_limits<uint64_t>::max(),
-        compare_checksum, options.atomic_flush));
+        compare_checksum, options.atomic_flush, /*include_cf_ids=*/{},
+        /*excluded_cf_ids=*/nullptr, /*manifest_relative_filename=*/nullptr,
+        /*manifest_size=*/nullptr,
+        deletions_disabled ? &table_and_blob_file_pin : nullptr,
+        &table_and_blob_files_pinned));
     if (io_s.ok()) {
       new_backup->SetSequenceNumber(sequence_number);
     }
@@ -1362,6 +1381,8 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
         auto& e = excludable_items[i];
         if (maybe_exclude_files[i].exclude_decision) {
           new_backup.get()->AddExcludedFile(e.second.dst_relative);
+        } else if (table_and_blob_files_pinned) {
+          deferred_table_and_blob_items.push_back(std::move(e));
         } else {
           copy_engine_->Submit(std::move(e.first));
           backup_items_to_finish.push_back(std::move(e.second));
@@ -1375,29 +1396,50 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
   }
   ROCKS_LOG_INFO(options_.info_log,
                  "dispatch files for backup done, wait for finish.");
-  for (auto& item : backup_items_to_finish) {
-    item.result.wait();
-    auto result = item.result.get();
-    IOStatus item_io_status = result.io_status;
-    Temperature temp = result.expected_src_temperature;
-    if (result.current_src_temperature != Temperature::kUnknown &&
-        (temp == Temperature::kUnknown ||
-         options_.current_temperatures_override_manifest)) {
-      temp = result.current_src_temperature;
+  auto finish_items = [&]() {
+    for (auto& item : backup_items_to_finish) {
+      item.result.wait();
+      auto result = item.result.get();
+      IOStatus item_io_status = result.io_status;
+      Temperature temp = result.expected_src_temperature;
+      if (result.current_src_temperature != Temperature::kUnknown &&
+          (temp == Temperature::kUnknown ||
+           options_.current_temperatures_override_manifest)) {
+        temp = result.current_src_temperature;
+      }
+      if (item_io_status.ok()) {
+        item_io_status = new_backup.get()->AddFile(std::make_shared<FileInfo>(
+            item.dst_relative, result.size, result.checksum_hex, result.db_id,
+            result.db_session_id, temp));
+      }
+      if (!item_io_status.ok()) {
+        io_s = std::move(item_io_status);
+        io_s.MustCheck();
+      }
     }
-    if (item_io_status.ok()) {
-      item_io_status = new_backup.get()->AddFile(std::make_shared<FileInfo>(
-          item.dst_relative, result.size, result.checksum_hex, result.db_id,
-          result.db_session_id, temp));
+    backup_items_to_finish.clear();
+  };
+  finish_items();
+
+  if (table_and_blob_files_pinned) {
+    if (io_s.ok()) {
+      db->EnableFileDeletions().PermitUncheckedError();
+      deletions_disabled = false;
+      TEST_SYNC_POINT(
+          "BackupEngineImpl::CreateNewBackupWithMetadata:"
+          "FileDeletionsEnabledBeforeTableFiles");
+      for (auto& item : deferred_table_and_blob_items) {
+        copy_engine_->Submit(std::move(item.first));
+        backup_items_to_finish.push_back(std::move(item.second));
+      }
     }
-    if (!item_io_status.ok()) {
-      io_s = std::move(item_io_status);
-      io_s.MustCheck();
-    }
+    deferred_table_and_blob_items.clear();
+    finish_items();
+    table_and_blob_file_pin.Reset();
   }
 
   // we copied all the files, enable file deletions
-  if (disabled.ok()) {  // If we successfully disabled file deletions
+  if (deletions_disabled) {
     db->EnableFileDeletions().PermitUncheckedError();
   }
   auto backup_time = backup_env_->NowMicros() - start_backup;
@@ -2085,7 +2127,8 @@ IOStatus BackupEngineImpl::VerifyBackup(BackupID backup_id,
 IOStatus BackupEngineImpl::AddBackupFileWorkItem(
     std::unordered_set<std::string>& live_dst_paths,
     std::deque<BackupAfterCopyOrCreateWorkItem>& backup_items_to_finish,
-    std::deque<BackupWorkItemPair>* excludable_items, BackupID backup_id,
+    std::deque<BackupWorkItemPair>* excludable_items,
+    std::deque<BackupWorkItemPair>* deferred_items, BackupID backup_id,
     bool shared, const std::string& src_dir, const std::string& fname,
     const EnvOptions& src_env_options, RateLimiter* rate_limiter,
     FileType file_type, uint64_t size_bytes, Statistics* stats,
@@ -2309,6 +2352,11 @@ IOStatus BackupEngineImpl::AddBackupFileWorkItem(
                      fname.c_str(), copy_dest_path->c_str());
       excludable_items->emplace_back(std::move(copy_or_create_work_item),
                                      std::move(after_copy_or_create_work_item));
+    } else if (deferred_items != nullptr) {
+      ROCKS_LOG_INFO(options_.info_log, "Copying %s to %s (deferred)",
+                     fname.c_str(), copy_dest_path->c_str());
+      deferred_items->emplace_back(std::move(copy_or_create_work_item),
+                                   std::move(after_copy_or_create_work_item));
     } else {
       // For files known not excluded, can start copying even before finishing
       // the checkpoint

@@ -41,11 +41,13 @@
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/backup_engine.h"
 #include "rocksdb/utilities/options_util.h"
+#include "rocksdb/utilities/stackable_db.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/defer.h"
+#include "utilities/checkpoint/checkpoint_impl.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
 
@@ -539,6 +541,100 @@ TEST_F(CheckpointTest, ExportColumnFamilyWithBlobFiles) {
   // File deletions were enabled again on the error path.
   ASSERT_TRUE(dbfull()->IsFileDeletionsEnabled());
   delete checkpoint;
+}
+
+TEST_F(CheckpointTest, FailedCustomCheckpointHoldsNoTableAndBlobFiles) {
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->DisableFileDeletions());
+
+  CheckpointImpl checkpoint(db_.get());
+  uint64_t sequence_number = 0;
+  Cleanable table_and_blob_file_pin;
+  bool table_and_blob_files_pinned = false;
+  bool pinned_when_copying = false;
+  const Status s = checkpoint.CreateCustomCheckpoint(
+      [](const std::string&, const std::string&, FileType, const Temperature) {
+        return Status::NotSupported();
+      },
+      [&](const std::string&, const std::string&, uint64_t, FileType,
+          const std::string&, const std::string&, const Temperature) {
+        pinned_when_copying = table_and_blob_files_pinned;
+        return Status::IOError("copy failed");
+      },
+      [](const std::string&, const std::string&, FileType) {
+        return Status::OK();
+      },
+      &sequence_number, std::numeric_limits<uint64_t>::max(),
+      /*get_live_table_checksum=*/false, /*atomic_flush=*/false,
+      /*include_cf_ids=*/{}, /*excluded_cf_ids=*/nullptr,
+      /*manifest_relative_filename=*/nullptr, /*manifest_size=*/nullptr,
+      &table_and_blob_file_pin, &table_and_blob_files_pinned);
+
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  EXPECT_TRUE(pinned_when_copying);
+  EXPECT_FALSE(table_and_blob_files_pinned);
+  EXPECT_FALSE(table_and_blob_file_pin.HasCleanups());
+  ASSERT_OK(db_->EnableFileDeletions());
+  ASSERT_OK(db_->Close());
+}
+
+namespace {
+// A wrapper that lists one blob file of its own, as stacked BlobDB does.
+class ExtraBlobFileDB : public StackableDB {
+ public:
+  using StackableDB::StackableDB;
+  Status GetLiveFilesStorageInfo(
+      const LiveFilesStorageInfoOptions& opts,
+      std::vector<LiveFileStorageInfo>* files) override {
+    Status s = StackableDB::GetLiveFilesStorageInfo(opts, files);
+    if (s.ok()) {
+      LiveFileStorageInfo blob;
+      blob.relative_filename = BlobFileName(999);
+      blob.directory = GetName();
+      blob.file_number = 999;
+      blob.file_type = kBlobFile;
+      files->push_back(blob);
+    }
+    return s;
+  }
+};
+}  // namespace
+
+TEST_F(CheckpointTest, CustomCheckpointHoldsNoFilesWhenWrapperListsOwnFiles) {
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->DisableFileDeletions());
+
+  ExtraBlobFileDB wrapper(std::shared_ptr<DB>(db_.get(), [](DB*) {}));
+  CheckpointImpl checkpoint(&wrapper);
+  uint64_t sequence_number = 0;
+  Cleanable table_and_blob_file_pin;
+  bool table_and_blob_files_pinned = true;
+  bool pinned_when_copying = true;
+  ASSERT_OK(checkpoint.CreateCustomCheckpoint(
+      [](const std::string&, const std::string&, FileType, const Temperature) {
+        return Status::NotSupported();
+      },
+      [&](const std::string&, const std::string&, uint64_t, FileType,
+          const std::string&, const std::string&, const Temperature) {
+        pinned_when_copying = table_and_blob_files_pinned;
+        return Status::OK();
+      },
+      [](const std::string&, const std::string&, FileType) {
+        return Status::OK();
+      },
+      &sequence_number, std::numeric_limits<uint64_t>::max(),
+      /*get_live_table_checksum=*/false, /*atomic_flush=*/false,
+      /*include_cf_ids=*/{}, /*excluded_cf_ids=*/nullptr,
+      /*manifest_relative_filename=*/nullptr, /*manifest_size=*/nullptr,
+      &table_and_blob_file_pin, &table_and_blob_files_pinned));
+
+  EXPECT_FALSE(pinned_when_copying);
+  EXPECT_FALSE(table_and_blob_files_pinned);
+  EXPECT_FALSE(table_and_blob_file_pin.HasCleanups());
+  ASSERT_OK(db_->EnableFileDeletions());
+  ASSERT_OK(db_->Close());
 }
 
 TEST_F(CheckpointTest, CheckpointCF) {

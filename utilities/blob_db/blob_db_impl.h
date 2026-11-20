@@ -402,6 +402,7 @@ class BlobDBImpl : public BlobDB {
   uint64_t EpochNow() { return clock_->NowMicros() / 1000000; }
 
   Status CloseImpl();
+  void FreeBaseDB();
 
   // name of the database directory
   std::string dbname_;

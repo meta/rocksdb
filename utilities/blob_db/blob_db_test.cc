@@ -819,6 +819,49 @@ TEST_F(BlobDBTest, ColumnFamilyNotSupported) {
   delete handle;
 }
 
+TEST_F(BlobDBTest, CloseWhileBaseDBPinnedReturnsAbortedAndCanBeRetried) {
+  BlobDBOptions bdb_options;
+  bdb_options.disable_background_tasks = true;
+  Open(bdb_options);
+  ASSERT_OK(blob_db_->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(blob_db_->Flush(FlushOptions()));
+  ASSERT_OK(blob_db_->DisableFileDeletions());
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> files;
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(blob_db_->GetLiveFilesStorageInfo(opts, &files));
+    ASSERT_TRUE(pin_request.pinned());
+  }
+
+  ASSERT_TRUE(blob_db_->Close().IsAborted());
+  std::string value;
+  ASSERT_OK(blob_db_->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ(value, "value");
+  pin.Reset();
+  ASSERT_OK(blob_db_->EnableFileDeletions());
+  ASSERT_OK(blob_db_->Close());
+  delete blob_db_;
+  blob_db_ = nullptr;
+}
+
+TEST_F(BlobDBTest, DeleteAfterCloseAbortedBySnapshot) {
+  BlobDBOptions bdb_options;
+  bdb_options.disable_background_tasks = true;
+  Open(bdb_options);
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  ASSERT_OK(blob_db_->Put(write_options, "key", "value"));
+  const Snapshot* const snapshot = blob_db_->GetSnapshot();
+  ASSERT_TRUE(blob_db_->Close().IsAborted());
+  delete blob_db_;
+  blob_db_ = nullptr;
+  // Freeing a DB doesn't free its unreleased snapshots.
+  delete static_cast<const SnapshotImpl*>(snapshot);
+}
+
 TEST_F(BlobDBTest, GetLiveFilesMetaData) {
   Random rnd(301);
 
@@ -866,8 +909,22 @@ TEST_F(BlobDBTest, GetLiveFilesMetaData) {
 
   std::vector<LiveFileStorageInfo> all_files;
   std::vector<LiveFileStorageInfo> blob_files;
-  ASSERT_OK(blob_db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(),
-                                              &all_files));
+  Cleanable pin;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(blob_db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(),
+                                                &all_files));
+    // The base DB holds its own files, but not the stacked BlobDB's.
+    ASSERT_TRUE(pin_request.pinned());
+    for (const auto& file : all_files) {
+      if (file.file_type == kBlobFile) {
+        ASSERT_EQ(pin_request.pinned_files().count(file.directory + "/" +
+                                                   file.relative_filename),
+                  0U);
+      }
+    }
+  }
+  pin.Reset();
   for (size_t i = 0; i < all_files.size(); i++) {
     if (all_files[i].file_type == kBlobFile) {
       blob_files.push_back(all_files[i]);
