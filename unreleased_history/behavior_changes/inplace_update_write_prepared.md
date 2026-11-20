@@ -1,1 +1,0 @@
-WritePrepared and WriteUnprepared `TransactionDB`s now return `NotSupported` at open and when creating a column family with `inplace_update_support = true`. In-place memtable updates were never compatible with these write policies (debug builds asserted on the first write).

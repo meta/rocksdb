@@ -1,1 +1,0 @@
-A secondary instance now fails `TryCatchUpWithPrimary()` with `Corruption` when the primary's MANIFEST has a different DB ID from the DB that the instance opened, for example after the primary DB is destroyed and created again at the same path, or repaired with `RepairDB()`. A follower instance stops catching up. Reopen the instance to read the new DB.
