@@ -7,13 +7,13 @@
 
 #include <atomic>
 #include <functional>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "db/internal_stats.h"
 #include "db/table_cache.h"
-#include "port/port.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -28,6 +28,10 @@ Status LoadTableHandlersHelper(
     size_t max_file_size_for_l0_meta_pin, const ReadOptions& read_options,
     std::atomic<bool>* stop) {
   assert(table_cache != nullptr);
+
+  if (files_meta.empty()) {
+    return Status::OK();
+  }
 
   std::atomic<size_t> next_file_meta_idx(0);
   std::atomic<bool> has_error(false);
@@ -85,14 +89,15 @@ Status LoadTableHandlersHelper(
     }
   });
 
-  std::vector<port::Thread> threads;
+  std::vector<std::jthread> threads;
   for (int i = 1; i < max_threads; i++) {
-    threads.emplace_back(load_handlers_func);
+    try {
+      threads.emplace_back(load_handlers_func);
+    } catch (const std::system_error&) {
+      break;
+    }
   }
   load_handlers_func();
-  for (auto& t : threads) {
-    t.join();
-  }
   return ret;
 }
 
