@@ -1,0 +1,1 @@
+Fixed experimental SST query filters (`SstQueryFilterConfigs`) with `SelectKeySegmentRange` reading back every key segment range except segments 0 to 6 as segments 0 to 6. Range queries using `GetTableFilterForRangeQuery()` could then skip SST files that contain keys in the range, so the query silently returned too few keys.
