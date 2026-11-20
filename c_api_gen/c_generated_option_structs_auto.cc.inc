@@ -703,6 +703,15 @@ int rocksdb_options_get_wal_compression(rocksdb_options_t* opt) {
   return static_cast<int>(opt->rep.wal_compression);
 }
 
+void rocksdb_options_set_partition_wal_usage(rocksdb_options_t* opt, int v) {
+  opt->rep.partition_wal_usage =
+      static_cast<decltype(opt->rep.partition_wal_usage)>(v);
+}
+
+int rocksdb_options_get_partition_wal_usage(rocksdb_options_t* opt) {
+  return static_cast<int>(opt->rep.partition_wal_usage);
+}
+
 void rocksdb_options_set_background_close_inactive_wals(rocksdb_options_t* opt,
                                                         unsigned char v) {
   opt->rep.background_close_inactive_wals = v;
