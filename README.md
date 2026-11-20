@@ -9,8 +9,8 @@ key-value server, especially suited for storing data on flash drives.
 It has a Log-Structured-Merge-Database (LSM) design with flexible tradeoffs
 between Write-Amplification-Factor (WAF), Read-Amplification-Factor (RAF)
 and Space-Amplification-Factor (SAF). It has multi-threaded compactions,
-making it especially suitable for storing multiple terabytes of data in a
-single database.
+making it especially suitable for high write throughput applications while
+efficiently handling many terabytes of storage in a single instance.
 
 Start with example usage here: https://github.com/meta/rocksdb/tree/main/examples
 
@@ -24,4 +24,5 @@ Questions and discussions are welcome on the [RocksDB Developers Public](https:/
 
 ## License
 
-RocksDB is dual-licensed under both the GPLv2 (found in the COPYING file in the root directory) and Apache 2.0 License (found in the LICENSE.Apache file in the root directory).  You may select, at your option, one of the above-listed licenses.
+RocksDB is dual-licensed under both the GPLv2 (found in the COPYING file in the root directory) and
+Apache 2.0 License (found in the LICENSE.Apache file in the root directory). You may select, at your option, one of the above-listed licenses.
