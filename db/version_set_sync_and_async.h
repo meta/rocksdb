@@ -61,11 +61,17 @@ DEFINE_SYNC_AND_ASYNC(void, Version::Get)
                 &storage_info_.file_indexer_, user_comparator(),
                 internal_comparator());
   FdWithKeyRange* f = fp.GetNextFile();
+  // Whether f is the next file in the level (above L0) of the file searched
+  // before it.
+  bool continues_level = false;
 
   while (f != nullptr) {
-    if (*max_covering_tombstone_seq > 0) {
-      // The remaining files we look at will only contain covered keys, so we
-      // stop here.
+    // A covering range tombstone hides every version of the key in the levels
+    // below, which are older than it, so we stop there. The next file in the
+    // same level is different: the versions of one user key can be split
+    // across two adjacent files of a level, and the versions in the second
+    // file can be newer than the tombstone.
+    if (*max_covering_tombstone_seq > 0 && !continues_level) {
       break;
     }
     if (get_context.sample()) {
@@ -183,7 +189,10 @@ DEFINE_SYNC_AND_ASYNC(void, Version::Get)
         *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
         CO_RETURN;
     }
+    const unsigned int searched_level = fp.GetHitFileLevel();
     f = fp.GetNextFile();
+    continues_level = f != nullptr && searched_level > 0 &&
+                      fp.GetHitFileLevel() == searched_level;
   }
   if (db_statistics_ != nullptr) {
     get_context.ReportCounters();

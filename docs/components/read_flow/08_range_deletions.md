@@ -61,7 +61,7 @@ Step 3: In `GetContext::SaveValue()`, if `max_covering_tombstone_seq > parsed_ke
 
 This avoids building a full `RangeDelAggregator` for point lookups, using a single sequence number comparison instead.
 
-**Early termination:** In `Version::Get()`, before each file search, if `max_covering_tombstone_seq > 0`, the search stops immediately -- any entry found at lower levels would have a lower sequence number and be covered by the tombstone. This check is at the top of the file search loop, before `TableCache::Get()` is called for the next file.
+**Early termination:** In `Version::Get()`, before each file search, if `max_covering_tombstone_seq > 0` and the next file is in a lower level or is another L0 file, the search stops immediately -- any entry found there would have a lower sequence number and be covered by the tombstone. The next file of the same level above L0 is still searched: the file picker returns it only when the key is the current file's last user key, and the versions of one key split across two adjacent files can be newer than the tombstone. This check is at the top of the file search loop, before `TableCache::Get()` is called for the next file.
 
 ## Iterator Integration
 

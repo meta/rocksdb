@@ -1,0 +1,1 @@
+Fixed a bug where `Get()` could return a merged value missing some operands or the base value when a range tombstone covered the key and the key's versions were split across two adjacent SST files of one level. `MultiGet()` and iterators were not affected.

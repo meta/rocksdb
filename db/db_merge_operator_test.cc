@@ -2,6 +2,7 @@
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1069,6 +1070,75 @@ TEST_F(DBMergeOperatorTest, MaxSuccessiveMergesBaseValues) {
     ASSERT_EQ(key_versions[1].type, kTypeMerge);
     ASSERT_EQ(key_versions[2].type, kTypeWideColumnEntity);
   }
+}
+
+TEST_F(DBMergeOperatorTest, GetMergesOperandsSplitAcrossFilesOfALevel) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator(',');
+  DestroyAndReopen(options);
+
+  // A snapshot before the range tombstone keeps the bottommost compaction from
+  // dropping it, and a snapshot between the two operands keeps the compaction
+  // from merging them into one value.
+  ASSERT_OK(Put("a", "va"));
+  const Snapshot* before_tombstone = db_->GetSnapshot();
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "a", "z"));
+  ASSERT_OK(Merge("k", "v1"));
+  const Snapshot* between_operands = db_->GetSnapshot();
+  ASSERT_OK(Merge("k", "v2"));
+  ASSERT_OK(Flush());
+
+  // Cut the compaction output between the two versions of "k", so the newer
+  // operand ends one file and the older version starts the next.
+  const SequenceNumber older_seq = between_operands->GetSequenceNumber();
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionOutputs::ShouldStopBefore::manual_decision", [&](void* arg) {
+        auto* p = static_cast<std::pair<bool*, const Slice>*>(arg);
+        ParsedInternalKey ikey;
+        ASSERT_OK(ParseInternalKey(p->second, &ikey, true /* log_err_key */));
+        if (ikey.user_key == "k" && ikey.sequence == older_seq) {
+          *p->first = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Both output files are in one level and share the user key "k"; both
+  // carry the range tombstone, which is older than both versions of "k".
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(files.size(), 2);
+  std::sort(files.begin(), files.end(),
+            [](const LiveFileMetaData& x, const LiveFileMetaData& y) {
+              return x.smallestkey < y.smallestkey;
+            });
+  ASSERT_EQ(files[0].level, files[1].level);
+  ASSERT_EQ(files[0].largestkey, "k");
+  ASSERT_EQ(files[1].smallestkey, "k");
+
+  ASSERT_EQ(Get("k"), "v1,v2");
+  ASSERT_EQ(MultiGet({"k"}), std::vector<std::string>({"v1,v2"}));
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->Seek("k");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key(), "k");
+  ASSERT_EQ(iter->value(), "v1,v2");
+  ASSERT_OK(iter->status());
+  iter.reset();
+
+  ASSERT_EQ(Get("k", between_operands), "v1");
+  ASSERT_EQ(Get("a", before_tombstone), "va");
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+
+  db_->ReleaseSnapshot(between_operands);
+  db_->ReleaseSnapshot(before_tombstone);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
