@@ -109,7 +109,7 @@ runs:
       $env:Path = "$env:JAVA_HOME\bin;" + $env:Path
       mkdir build
       cd build
-      & cmake -G "$Env:CMAKE_GENERATOR" -DCMAKE_BUILD_TYPE=Debug -DWIN_CI=1 -DPORTABLE="$Env:CMAKE_PORTABLE" -DSNAPPY=1 -DXPRESS=1 -DJNI=1 ..
+      & cmake -G "$Env:CMAKE_GENERATOR" -DCMAKE_BUILD_TYPE=Debug -DWIN_CI=1 -DPORTABLE="$Env:CMAKE_PORTABLE" -DSNAPPY=1 -DXPRESS=1 -DJNI=1 -DWITH_JNI_EXPORT_ROCKSDB=1 ..
       if(!$?) { Exit $LASTEXITCODE }
       cd ..
       echo "Building with VS version: $Env:CMAKE_GENERATOR"
