@@ -36,7 +36,6 @@ class DynamicBloom {
   // allocator: pass allocator to bloom filter, hence trace the usage of memory
   // total_bits: fixed total bits for the bloom
   // num_probes: number of hash probes for a single key
-  // hash_func:  customized hash function
   // huge_page_tlb_size:  if >0, try to allocate bloom bytes from huge page TLB
   //                      within this page size. Need to reserve huge pages for
   //                      it to be allocated, like:
