@@ -72,12 +72,16 @@ enum WorkItemType : uint64_t {
   Link = 3U,
 };
 
-// Exactly one of src_path and contents must be non-empty. If src_path is
-// non-empty, the file is copied from this pathname. Otherwise, if contents is
-// non-empty, the file will be created at dst_path with these contents.
+// For CopyOrCreate, exactly one of src_path and contents must be non-empty.
+// dst_path is the initial destination for the copy or the supplied contents.
 struct WorkItem {
   std::string src_path;
   std::string dst_path;
+  // CopyOrCreate only. If non-empty, rename dst_path to final_dst_path after
+  // successful copy or creation, close, and any checksum verification. The
+  // rename completes before result is fulfilled, and any rename error is
+  // reported in result. An OK result means the file is at final_dst_path.
+  std::string final_dst_path;
   Temperature src_temperature = Temperature::kUnknown;
   Temperature dst_temperature = Temperature::kUnknown;
   std::string contents;
@@ -107,6 +111,7 @@ struct WorkItem {
   WorkItem& operator=(WorkItem&& o) noexcept {
     src_path = std::move(o.src_path);
     dst_path = std::move(o.dst_path);
+    final_dst_path = std::move(o.final_dst_path);
     src_temperature = o.src_temperature;
     dst_temperature = o.dst_temperature;
     contents = std::move(o.contents);

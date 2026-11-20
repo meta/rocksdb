@@ -592,11 +592,6 @@ class BackupEngineImpl {
 
   struct BackupAfterCopyOrCreateWorkItem {
     std::future<WorkItemResult> result;
-    bool shared = false;
-    bool needed_to_copy = false;
-    Env* backup_env = nullptr;
-    std::string dst_path_tmp;
-    std::string dst_path;
     std::string dst_relative;
 
     BackupAfterCopyOrCreateWorkItem(
@@ -607,11 +602,6 @@ class BackupEngineImpl {
     BackupAfterCopyOrCreateWorkItem& operator=(
         BackupAfterCopyOrCreateWorkItem&& o) noexcept {
       result = std::move(o.result);
-      shared = o.shared;
-      needed_to_copy = o.needed_to_copy;
-      backup_env = o.backup_env;
-      dst_path_tmp = std::move(o.dst_path_tmp);
-      dst_path = std::move(o.dst_path);
       dst_relative = std::move(o.dst_relative);
       return *this;
     }
@@ -619,16 +609,8 @@ class BackupEngineImpl {
     ~BackupAfterCopyOrCreateWorkItem() = default;
 
     BackupAfterCopyOrCreateWorkItem(std::future<WorkItemResult>&& _result,
-                                    bool _shared, bool _needed_to_copy,
-                                    Env* _backup_env, std::string _dst_path_tmp,
-                                    std::string _dst_path,
                                     std::string _dst_relative)
         : result(std::move(_result)),
-          shared(_shared),
-          needed_to_copy(_needed_to_copy),
-          backup_env(_backup_env),
-          dst_path_tmp(std::move(_dst_path_tmp)),
-          dst_path(std::move(_dst_path)),
           dst_relative(std::move(_dst_relative)) {}
   };
 
@@ -1402,10 +1384,6 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
         (temp == Temperature::kUnknown ||
          options_.current_temperatures_override_manifest)) {
       temp = result.current_src_temperature;
-    }
-    if (item_io_status.ok() && item.shared && item.needed_to_copy) {
-      item_io_status = item.backup_env->GetFileSystem()->RenameFile(
-          item.dst_path_tmp, item.dst_path, io_options_, nullptr);
     }
     if (item_io_status.ok()) {
       item_io_status = new_backup.get()->AddFile(std::make_shared<FileInfo>(
@@ -2320,9 +2298,11 @@ IOStatus BackupEngineImpl::AddBackupFileWorkItem(
         src_env_options, options_.sync, false /* use_fsync */, rate_limiter,
         size_limit, stats, std::move(progress_callback), src_checksum_func_name,
         checksum_hex, db_id, db_session_id);
+    if (shared && need_to_copy) {
+      copy_or_create_work_item.final_dst_path = std::move(final_dest_path);
+    }
     BackupAfterCopyOrCreateWorkItem after_copy_or_create_work_item(
-        copy_or_create_work_item.result.get_future(), shared, need_to_copy,
-        backup_env_, temp_dest_path, final_dest_path, dst_relative);
+        copy_or_create_work_item.result.get_future(), dst_relative);
     if (excludable_items != nullptr && shared && shared_checksum &&
         need_to_copy) {
       ROCKS_LOG_INFO(options_.info_log, "Copying (if not excluded) %s to %s",
@@ -2341,8 +2321,7 @@ IOStatus BackupEngineImpl::AddBackupFileWorkItem(
   } else {
     std::promise<WorkItemResult> promise_result;
     BackupAfterCopyOrCreateWorkItem after_copy_or_create_work_item(
-        promise_result.get_future(), shared, need_to_copy, backup_env_,
-        temp_dest_path, final_dest_path, dst_relative);
+        promise_result.get_future(), dst_relative);
     backup_items_to_finish.push_back(std::move(after_copy_or_create_work_item));
     WorkItemResult result;
     result.io_status = IOStatus::OK();
