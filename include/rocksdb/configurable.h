@@ -70,7 +70,7 @@ class Configurable {
   //
   // Note that changing the underlying options while the object
   // is currently used by any open DB is undefined behavior.
-  // Developers should use DB::SetOption() instead to dynamically change
+  // Developers should use DB::SetOptions() instead to dynamically change
   // options while the DB is open.
   template <typename T>
   const T* GetOptions() const {
