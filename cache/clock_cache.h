@@ -37,7 +37,10 @@ class ClockCacheTest;
 // Benefits
 // --------
 // * Lock/wait free (no waits or spins) for efficiency under high concurrency
-//   * Fixed version (estimated_entry_charge > 0) is fully lock/wait free
+//   * Fixed version (estimated_entry_charge > 0) is fully lock free and has no
+//     waits. A few operations, such as Erase() and Release() with
+//     erase_if_last_ref, retry a compare-exchange when another thread updates
+//     the same entry meanwhile.
 //   * Automatic version (estimated_entry_charge = 0) has rare waits among
 //     certain insertion or erase operations that involve the same very small
 //     set of entries.
@@ -132,7 +135,11 @@ class ClockCacheTest;
 // refcount never reaches to many millions, we only have to correct for
 // overflow in both counters in Release, not in Lookup. The overflow check
 // should be only 1-2 CPU cycles per Release because it is a predictable
-// branch on a simple condition on data already in registers.
+// branch on a simple condition on data already in registers. For an entry
+// that is invisible (erased while referenced), Ref does the check instead of
+// Release, as the entry can be a standalone handle, which the release of its
+// last reference deletes, so a Release must not touch it after dropping its
+// reference.
 //
 // Slot states
 // -----------
@@ -275,11 +282,18 @@ class ClockCacheTest;
 //
 // However Release tries to immediately delete entries reaching zero refs
 // if (a) erase_if_last_ref is set by the caller, or (b) the entry is already
-// marked invisible. Both of these are checks on values already in CPU
-// registers so do not increase cross-CPU contention when not applicable.
-// When applicable, they use a compare-exchange loop to take exclusive
-// ownership of the slot for freeing the entry. These are rare cases
-// that should not usually affect performance.
+// marked invisible. For (a), Release loads the meta word instead of the
+// atomic add and, in a compare-exchange loop, either takes exclusive
+// ownership of the slot, if its reference is the only one, or drops the
+// reference. Deciding before dropping the reference keeps it from taking a
+// different entry that another thread puts in the slot after the reference
+// is dropped. The loop retries when another thread changes the counters in
+// between, so it can retry repeatedly on an entry in heavy concurrent use.
+// For (b), the check is on a value already in a CPU register after the atomic
+// add, so does not increase cross-CPU contention when not applicable; when
+// applicable, a compare-exchange loop takes exclusive ownership of the slot
+// for freeing the entry. Both are rare cases that should not usually affect
+// performance.
 //
 // Erase
 // -----
@@ -720,6 +734,10 @@ class FixedHyperClockTable : public BaseClockTable {
   // before releasing it so that it can be provided to this function.
   inline void ReclaimEntryUsage(size_t total_charge);
 
+  // Frees an entry this thread has taken ownership of (moved to under
+  // construction), whether in the table or standalone, and its usage.
+  void FreeOwnedEntry(HandleImpl* h);
+
   MemoryAllocator* GetAllocator() const { return allocator_; }
 
   // Returns the number of bits used to hash an element in the hash
@@ -760,9 +778,10 @@ class FixedHyperClockTable : public BaseClockTable {
 // FixedHCC there is essentially an entry-level read-write lock implemented
 // with atomics, but our relaxed atomicity/consistency guarantees (e.g.
 // duplicate inserts are possible) mean we do not need to wait for entry
-// locking. Lookups, non-erasing Releases, and non-evicting non-growing Inserts
-// are all fully wait-free. Of course, these waits are not dependent on any
-// external factors such as I/O.
+// locking. Lookups, Releases without erase_if_last_ref that don't free an
+// erased entry, and non-evicting non-growing Inserts are all fully wait-free.
+// Of course, these waits are not dependent on any external factors such as
+// I/O.
 //
 // For operations that remove entries from a chain or grow the table by
 // splitting a chain, there is a chain-level locking mechanism that we call a
@@ -1001,11 +1020,15 @@ class AutoHyperClockTable : public BaseClockTable {
   // "under (de)construction" and removed it from its chain.
   void Remove(HandleImpl* h);
 
-  // Try to take ownership of an entry and erase+remove it from the table.
-  // Returns true if successful. Could fail if
-  // * There are other references to the entry
-  // * Some other thread has exclusive ownership or has freed it.
-  bool TryEraseHandle(HandleImpl* h, bool holding_ref, bool mark_invisible);
+  // With the caller holding a reference to an entry, try to take ownership of
+  // it and erase+remove it from the table, or mark it invisible if there are
+  // other references. Returns true if it took ownership.
+  bool TryEraseHandle(HandleImpl* h);
+
+  // Frees an entry this thread has taken ownership of (moved to under
+  // construction), whether in the table or standalone, removing it from its
+  // chain, and its usage.
+  void FreeOwnedEntry(HandleImpl* h);
 
   // Calculates the appropriate maximum table size, for creating the memory
   // mapping.
@@ -1181,6 +1204,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
   // Acquire/release N references
   void TEST_RefN(HandleImpl* handle, uint32_t n);
   void TEST_ReleaseN(HandleImpl* handle, uint32_t n);
+  // Release N-1 references with plain counter updates, for the caller to
+  // release the last one
+  void TEST_ReleaseNMinus1(HandleImpl* handle, uint32_t n);
 #endif
 
  private:  // data

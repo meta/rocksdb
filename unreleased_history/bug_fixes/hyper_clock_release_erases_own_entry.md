@@ -1,0 +1,1 @@
+Fixed rare races in HyperClockCache where `Release()` with `erase_if_last_ref=true`, or of the last reference to an entry erased while referenced, could erase a different entry that another thread had put in the same slot, and where a `Release()` of a standalone handle with more than one reference could read or write it after another thread's release deleted it.
