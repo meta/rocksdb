@@ -773,6 +773,95 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCSingleBatch) {
   }
 }
 
+TEST_F(VersionStorageInfoTest, ForcedBlobGCZeroThresholdNoGarbage) {
+  // With a force threshold of 0.0, a batch without garbage must not be marked:
+  // rewriting it produces another clean batch, which would be marked again,
+  // forever. We have one L0 SST file #1 and one blob file #10 with no garbage.
+
+  constexpr int level = 0;
+
+  constexpr uint64_t sst = 1;
+  constexpr uint64_t blob = 10;
+
+  {
+    constexpr char smallest[] = "bar1";
+    constexpr char largest[] = "foo1";
+    constexpr uint64_t file_size = 1000;
+
+    Add(level, sst, smallest, largest, file_size, blob);
+  }
+
+  {
+    constexpr uint64_t total_blob_count = 10;
+    constexpr uint64_t total_blob_bytes = 100000;
+    constexpr uint64_t garbage_blob_count = 0;
+    constexpr uint64_t garbage_blob_bytes = 0;
+
+    AddBlob(blob, total_blob_count, total_blob_bytes,
+            BlobFileMetaData::LinkedSsts{sst}, garbage_blob_count,
+            garbage_blob_bytes);
+  }
+
+  UpdateVersionStorageInfo();
+
+  constexpr double age_cutoff = 1.0;
+  constexpr double force_threshold = 0.0;
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true);
+
+  ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+}
+
+TEST_F(VersionStorageInfoTest, ForcedBlobGCZeroThresholdWithGarbage) {
+  // With a force threshold of 0.0, a batch with any garbage is marked.
+  // We have one L0 SST file #1 and one blob file #10 with a little garbage.
+
+  constexpr int level = 0;
+
+  constexpr uint64_t sst = 1;
+  constexpr uint64_t blob = 10;
+
+  {
+    constexpr char smallest[] = "bar1";
+    constexpr char largest[] = "foo1";
+    constexpr uint64_t file_size = 1000;
+
+    Add(level, sst, smallest, largest, file_size, blob);
+  }
+
+  {
+    constexpr uint64_t total_blob_count = 10;
+    constexpr uint64_t total_blob_bytes = 100000;
+    constexpr uint64_t garbage_blob_count = 1;
+    constexpr uint64_t garbage_blob_bytes = 100;
+
+    AddBlob(blob, total_blob_count, total_blob_bytes,
+            BlobFileMetaData::LinkedSsts{sst}, garbage_blob_count,
+            garbage_blob_bytes);
+  }
+
+  UpdateVersionStorageInfo();
+
+  assert(vstorage_.num_levels() > 0);
+  const auto& level_files = vstorage_.LevelFiles(level);
+
+  assert(level_files.size() == 1);
+  assert(level_files[0] && level_files[0]->fd.GetNumber() == sst);
+
+  constexpr double age_cutoff = 1.0;
+  constexpr double force_threshold = 0.0;
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true);
+
+  auto ssts_to_be_compacted = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(ssts_to_be_compacted.size(), 1);
+
+  const autovector<std::pair<int, FileMetaData*>> expected_ssts_to_be_compacted{
+      {level, level_files[0]}};
+
+  ASSERT_EQ(ssts_to_be_compacted[0], expected_ssts_to_be_compacted[0]);
+}
+
 TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
   // Add three L0 SSTs (1, 2, and 3) and four blob files (10, 11, 12, and 13).
   // The first two SSTs have the same oldest blob file, namely, the very oldest
