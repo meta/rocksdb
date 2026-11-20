@@ -228,17 +228,14 @@ void DBImpl::SetRecoverableStatePreReleaseCallback(
 }
 
 Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
-  Status s;
   if (write_options.protection_bytes_per_key > 0) {
-    s = WriteBatchInternal::UpdateProtectionInfo(
+    Status s = WriteBatchInternal::UpdateProtectionInfo(
         my_batch, write_options.protection_bytes_per_key);
+    if (!s.ok()) return s;
   }
-  if (s.ok()) {
-    s = WriteImpl(write_options, my_batch, /*callback=*/nullptr,
+  return WriteImpl(write_options, my_batch, /*callback=*/nullptr,
                   /*user_write_cb=*/nullptr,
                   /*wal_used=*/nullptr);
-  }
-  return s;
 }
 
 Status DBImpl::WriteWithCallback(const WriteOptions& write_options,
