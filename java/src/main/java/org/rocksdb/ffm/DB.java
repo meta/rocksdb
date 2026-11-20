@@ -1,7 +1,20 @@
 package org.rocksdb.ffm;
 
-public interface DB {
-  OpenDB open(String path) throws RocksFFMException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SegmentAllocator;
 
-  OpenDB open(RocksdbOptions options, String path) throws RocksFFMException;
+public interface DB extends AutoCloseable {
+  Getter get(MemorySegment key);
+
+  Putter put(MemorySegment key, MemorySegment value);
+
+  MultiGetter multiGet();
+
+  MultiGetter multiGet(SegmentAllocator allocator);
+
+  ColumnFamily columnFamily();
+
+  ColumnFamily columnFamily(SegmentAllocator allocator);
+
+  void close();
 }

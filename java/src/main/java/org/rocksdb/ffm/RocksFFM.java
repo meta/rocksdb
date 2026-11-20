@@ -2,7 +2,6 @@ package org.rocksdb.ffm;
 
 import org.rocksdb.RocksDB;
 
-import java.lang.foreign.Arena;
 import java.lang.foreign.SegmentAllocator;
 
 /**
@@ -17,8 +16,8 @@ public final class RocksFFM {
     RocksDB.loadLibrary();
   }
 
-  public static DB db(SegmentAllocator allocator) {
-    return new DBImpl(allocator);
+  public static DBSpec db(SegmentAllocator allocator) {
+    return new DBSpecImpl(allocator);
   }
 
 }

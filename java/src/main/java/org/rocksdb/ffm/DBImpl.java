@@ -1,34 +1,59 @@
 package org.rocksdb.ffm;
 
+import org.rocksdb.ffm.util.FFMSegment;
+
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SegmentAllocator;
-import java.lang.foreign.ValueLayout;
 
-import static java.lang.foreign.MemorySegment.NULL;
-import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.rocksdb.ffm.RocksFFMException.throwOnError;
+final class DBImpl extends WithDB implements DB {
+  DBImpl(SegmentAllocator allocator, MemorySegment db) {
+    super(allocator, db);
+  }
 
-final class DBImpl extends WithAllocator implements DB {
+  public Getter get(MemorySegment key) {
+    return new GetterImpl(allocator, db, key);
+  }
 
-  DBImpl(SegmentAllocator allocator) {
-    super(allocator);
+  public Getter get(String key) {
+    return new GetterImpl(allocator, db, FFMSegment.segmentOf(allocator, key));
+  }
+
+  public Putter put(MemorySegment key, MemorySegment value) {
+    return new PutterImpl(allocator, db, key, value);
   }
 
   @Override
-  public OpenDB open(String path) throws RocksFFMException {
-    try (RocksdbOptions dbOptions = new RocksdbOptions()) {
-      return open(dbOptions, path);
-    }
+  public MultiGetter multiGet() {
+    return new MultiGetter(allocator, db);
+  }
+
+  /**
+   * A multi-getter, but override the DB's allocator for allocations when performing the {@code }multiGet()}
+   *
+   * @param allocator to be used by the multi-getter, in place of the DB's allocator
+   * @return
+   */
+  @Override
+  public MultiGetter multiGet(SegmentAllocator allocator) {
+    return new MultiGetter(allocator, db);
   }
 
   @Override
-  public OpenDB open(RocksdbOptions dbOptions, String path) throws RocksFFMException {
-    // See RocksDB rules on options structs
-    MemorySegment pathName = allocator.allocateFrom(path, UTF_8);
-    MemorySegment errptr = allocator.allocateFrom(ValueLayout.ADDRESS, NULL);
-    MemorySegment db = rocksdb_c_api_2.rocksdb_open(dbOptions.nativeSegment(), pathName, errptr);
-    throwOnError(errptr, message -> String.format("rocksdb_get() %s", message));
+  public ColumnFamily columnFamily() {
+    return new ColumnFamilyImpl(allocator, db);
+  }
 
-    return new OpenDBImpl(allocator, db);
+  @Override
+  public ColumnFamily columnFamily(SegmentAllocator allocator) {
+    return new ColumnFamilyImpl(allocator, db);
+  }
+
+  public Putter put(String key, MemorySegment value) {
+    return new PutterImpl(allocator, db, FFMSegment.segmentOf(allocator, key), value);
+  }
+
+  @Override
+  public void close() {
+    rocksdb_c_api_2.rocksdb_close(db);
   }
 }
