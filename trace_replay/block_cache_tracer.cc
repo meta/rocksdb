@@ -42,17 +42,17 @@ const uint64_t BlockCacheTraceRecord::kReservedGetId = 0;
 const uint64_t BlockCacheTraceHelper::kReservedGetId = 0;
 
 bool BlockCacheTraceHelper::IsGetOrMultiGetOnDataBlock(
-    TraceType block_type, TableReaderCaller caller) {
+    const TraceType& block_type, const TableReaderCaller& caller) {
   return (block_type == TraceType::kBlockTraceDataBlock) &&
          IsGetOrMultiGet(caller);
 }
 
-bool BlockCacheTraceHelper::IsGetOrMultiGet(TableReaderCaller caller) {
+bool BlockCacheTraceHelper::IsGetOrMultiGet(const TableReaderCaller& caller) {
   return caller == TableReaderCaller::kUserGet ||
          caller == TableReaderCaller::kUserMultiGet;
 }
 
-bool BlockCacheTraceHelper::IsUserAccess(TableReaderCaller caller) {
+bool BlockCacheTraceHelper::IsUserAccess(const TableReaderCaller& caller) {
   return caller == TableReaderCaller::kUserGet ||
          caller == TableReaderCaller::kUserMultiGet ||
          caller == TableReaderCaller::kUserIterator ||
