@@ -7292,6 +7292,131 @@ int main(int argc, char** argv) {
     free(cf_err);
   }
 
+  StartPhase("delete_range_cf_with_ts");
+  {
+    // This test creates a separate DB with a column family that has
+    // user-defined timestamps enabled, writes some keys, performs a
+    // timestamped range delete, and verifies the keys are deleted.
+    rocksdb_close(db);
+    rocksdb_destroy_db(options, dbname, &err);
+    CheckNoError(err);
+
+    const size_t kTsSize = sizeof(uint64_t);
+
+    // Comparator callbacks for a bytewise comparator with 8-byte timestamps.
+    // Keys are: [user_key][8-byte timestamp]. Compare strips the ts suffix for
+    // user-key ordering and breaks ties by timestamp (descending for recency).
+    rocksdb_comparator_t* ts_cmp = rocksdb_comparator_with_ts_create(
+        NULL, CmpDestroy,
+        // compare (full key including ts)
+        CmpCompare,
+        // compare_ts: compare two 8-byte big-endian timestamps
+        CmpCompare,
+        // compare_without_ts
+        CmpCompare, CmpName, kTsSize);
+
+    rocksdb_options_t* ts_opts = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(ts_opts, 1);
+    rocksdb_options_set_comparator(ts_opts, ts_cmp);
+
+    // Open the DB
+    db = rocksdb_open(ts_opts, dbname, &err);
+    CheckNoError(err);
+
+    // Create a CF with the same ts-aware comparator
+    rocksdb_options_t* cf_ts_opts = rocksdb_options_create();
+    rocksdb_options_set_comparator(cf_ts_opts, ts_cmp);
+
+    rocksdb_column_family_handle_t* cf_ts =
+        rocksdb_create_column_family(db, cf_ts_opts, "ts_cf", &err);
+    CheckNoError(err);
+
+    // Encode timestamps as 8-byte little-endian values
+    uint64_t ts1_val = 1;
+    uint64_t ts2_val = 2;
+    uint64_t ts3_val = 3;
+    char ts1[sizeof(uint64_t)];
+    char ts2[sizeof(uint64_t)];
+    char ts3[sizeof(uint64_t)];
+    memcpy(ts1, &ts1_val, sizeof(uint64_t));
+    memcpy(ts2, &ts2_val, sizeof(uint64_t));
+    memcpy(ts3, &ts3_val, sizeof(uint64_t));
+
+    // Put three keys at ts1
+    rocksdb_put_cf_with_ts(db, woptions, cf_ts, "aaa", 3, ts1, kTsSize, "v1",
+                           2, &err);
+    CheckNoError(err);
+    rocksdb_put_cf_with_ts(db, woptions, cf_ts, "bbb", 3, ts1, kTsSize, "v2",
+                           2, &err);
+    CheckNoError(err);
+    rocksdb_put_cf_with_ts(db, woptions, cf_ts, "ccc", 3, ts1, kTsSize, "v3",
+                           2, &err);
+    CheckNoError(err);
+
+    // Verify all keys are readable at ts2
+    rocksdb_readoptions_t* ts_ropts = rocksdb_readoptions_create();
+    rocksdb_readoptions_set_timestamp(ts_ropts, ts2, kTsSize);
+
+    size_t val_len = 0;
+    char* returned_ts = NULL;
+    size_t returned_ts_len = 0;
+    char* val = NULL;
+
+    val = rocksdb_get_cf_with_ts(db, ts_ropts, cf_ts, "aaa", 3, &val_len,
+                                 &returned_ts, &returned_ts_len, &err);
+    CheckNoError(err);
+    CheckEqual("v1", val, val_len);
+    Free(&val);
+    Free(&returned_ts);
+
+    val = rocksdb_get_cf_with_ts(db, ts_ropts, cf_ts, "bbb", 3, &val_len,
+                                 &returned_ts, &returned_ts_len, &err);
+    CheckNoError(err);
+    CheckEqual("v2", val, val_len);
+    Free(&val);
+    Free(&returned_ts);
+
+    // Delete range [aaa, ccc) at ts2 -- should delete "aaa" and "bbb"
+    rocksdb_delete_range_cf_with_ts(db, woptions, cf_ts, "aaa", 3, "ccc", 3,
+                                    ts2, kTsSize, &err);
+    CheckNoError(err);
+
+    // Read at ts3 (after the range delete): "aaa" and "bbb" should be gone,
+    // "ccc" should remain
+    rocksdb_readoptions_set_timestamp(ts_ropts, ts3, kTsSize);
+
+    val = rocksdb_get_cf_with_ts(db, ts_ropts, cf_ts, "aaa", 3, &val_len,
+                                 &returned_ts, &returned_ts_len, &err);
+    CheckNoError(err);
+    CheckCondition(val == NULL);
+
+    val = rocksdb_get_cf_with_ts(db, ts_ropts, cf_ts, "bbb", 3, &val_len,
+                                 &returned_ts, &returned_ts_len, &err);
+    CheckNoError(err);
+    CheckCondition(val == NULL);
+
+    val = rocksdb_get_cf_with_ts(db, ts_ropts, cf_ts, "ccc", 3, &val_len,
+                                 &returned_ts, &returned_ts_len, &err);
+    CheckNoError(err);
+    CheckEqual("v3", val, val_len);
+    Free(&val);
+    Free(&returned_ts);
+
+    // Cleanup
+    rocksdb_readoptions_destroy(ts_ropts);
+    rocksdb_column_family_handle_destroy(cf_ts);
+    rocksdb_close(db);
+    rocksdb_destroy_db(ts_opts, dbname, &err);
+    CheckNoError(err);
+    rocksdb_options_destroy(cf_ts_opts);
+    rocksdb_options_destroy(ts_opts);
+    rocksdb_comparator_destroy(ts_cmp);
+
+    // Re-open the original DB for subsequent phases
+    db = rocksdb_open(options, dbname, &err);
+    CheckNoError(err);
+  }
+
   StartPhase("cancel_all_background_work");
   rocksdb_cancel_all_background_work(db, 1);
 
