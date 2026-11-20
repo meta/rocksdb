@@ -283,6 +283,7 @@ struct rocksdb_writebatch_t {
 };
 struct rocksdb_writebatch_wi_t {
   WriteBatchWithIndex* rep;
+  bool owns_rep;
 };
 struct rocksdb_table_properties_t {
   TableProperties rep;
@@ -4201,6 +4202,7 @@ rocksdb_writebatch_wi_t* rocksdb_writebatch_wi_create(
   rocksdb_writebatch_wi_t* b = new rocksdb_writebatch_wi_t;
   b->rep = new WriteBatchWithIndex(BytewiseComparator(), reserved_bytes,
                                    overwrite_key);
+  b->owns_rep = true;
   return b;
 }
 
@@ -4212,6 +4214,7 @@ rocksdb_writebatch_wi_t* rocksdb_writebatch_wi_create_with_params(
   b->rep = new WriteBatchWithIndex(backup_index_comparator, reserved_bytes,
                                    overwrite_key, max_bytes,
                                    protection_bytes_per_key);
+  b->owns_rep = true;
   return b;
 }
 
@@ -4234,10 +4237,12 @@ void rocksdb_writebatch_wi_update_timestamps(
 }
 
 void rocksdb_writebatch_wi_destroy(rocksdb_writebatch_wi_t* b) {
-  if (b->rep) {
+  if (b->owns_rep) {
     delete b->rep;
+    delete b;
+  } else {
+    free(b);
   }
-  delete b;
 }
 
 void rocksdb_writebatch_wi_clear(rocksdb_writebatch_wi_t* b) {
@@ -13032,6 +13037,7 @@ rocksdb_writebatch_wi_t* rocksdb_transaction_get_writebatch_wi(
   rocksdb_writebatch_wi_t* wi =
       (rocksdb_writebatch_wi_t*)malloc(sizeof(rocksdb_writebatch_wi_t));
   wi->rep = txn->rep->GetWriteBatch();
+  wi->owns_rep = false;
 
   return wi;
 }
