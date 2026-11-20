@@ -16,6 +16,8 @@ import static org.rocksdb.util.CapturingWriteBatchHandler.Action.LOG;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.MERGE;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.PUT;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.SINGLE_DELETE;
+import static org.rocksdb.util.DirectByteBufferAddress.address;
+import static org.rocksdb.util.DirectByteBufferAddress.directBuffer;
 
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
@@ -113,6 +115,49 @@ public class WriteBatchTest {
           .isEqualTo("Put(baz, boo)@102"
               + "Delete(box)@101"
               + "Put(foo, bar)@100");
+    }
+  }
+
+  @Test
+  public void multipleBatchOperationsWithAddress() throws RocksDBException {
+    try (final WriteBatch batch = new WriteBatch()) {
+      final WriteBatchAddr addrBatch = new WriteBatchAddr(batch) {};
+      final ByteBuffer key = directBuffer("foo");
+      final ByteBuffer value = directBuffer("bar");
+      final ByteBuffer deletedKey = directBuffer("box");
+      addrBatch.put(address(key), key.remaining(), address(value), value.remaining());
+      addrBatch.delete(address(deletedKey), deletedKey.remaining());
+      batch.put("baz".getBytes(UTF_8), "boo".getBytes(UTF_8));
+
+      WriteBatchTestInternalHelper.setSequence(batch, 100);
+      assertThat(batch.count()).isEqualTo(3);
+      assertThat(new String(getContents(batch), UTF_8))
+          .isEqualTo("Put(baz, boo)@102"
+              + "Delete(box)@101"
+              + "Put(foo, bar)@100");
+    }
+  }
+
+  @Test
+  public void batchOperationsWithAddressInColumnFamily() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final ColumnFamilyHandle cf =
+            db.createColumnFamily(new ColumnFamilyDescriptor("cf".getBytes(UTF_8)));
+        final WriteBatch batch = new WriteBatch();
+        final WriteOptions writeOpts = new WriteOptions()) {
+      db.put(cf, "k2".getBytes(UTF_8), "v2".getBytes(UTF_8));
+
+      final WriteBatchAddr addrBatch = new WriteBatchAddr(batch) {};
+      final ByteBuffer key1 = directBuffer("k1");
+      final ByteBuffer value1 = directBuffer("v1");
+      final ByteBuffer key2 = directBuffer("k2");
+      addrBatch.put(cf, address(key1), key1.remaining(), address(value1), value1.remaining());
+      addrBatch.delete(cf, address(key2), key2.remaining());
+      db.write(writeOpts, batch);
+
+      assertThat(db.get(cf, "k1".getBytes(UTF_8))).isEqualTo("v1".getBytes(UTF_8));
+      assertThat(db.get(cf, "k2".getBytes(UTF_8))).isNull();
+      assertThat(db.get("k1".getBytes(UTF_8))).isNull();
     }
   }
 

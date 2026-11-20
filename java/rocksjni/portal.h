@@ -2453,6 +2453,32 @@ class JniUtil {
   }
 
   /*
+   * Create the key and value slices for an operation that takes raw native
+   * memory addresses from Java, for example WriteBatch->Put. The slices refer
+   * directly to that memory; no copy is made.
+   *
+   * @return false if an address is null or a length is negative, in which
+   *     case a Java exception has been thrown and the slices are not modified
+   */
+  static bool kv_create_slices_from_direct_addr(
+      JNIEnv* env, jlong jkey_addr, jint jkey_len, jlong jval_addr,
+      jint jval_len, ROCKSDB_NAMESPACE::Slice* key_slice,
+      ROCKSDB_NAMESPACE::Slice* value_slice) {
+    if (!k_create_slice_from_direct_addr(env, jkey_addr, jkey_len, key_slice)) {
+      return false;
+    }
+    if (jval_addr == 0 || jval_len < 0) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(
+          env, "Invalid value argument");
+      return false;
+    }
+    *value_slice =
+        ROCKSDB_NAMESPACE::Slice(reinterpret_cast<const char*>(jval_addr),
+                                 static_cast<size_t>(jval_len));
+    return true;
+  }
+
+  /*
    * Helper for operations on a key and value
    * for example WriteBatch->Delete
    *
@@ -2475,6 +2501,28 @@ class JniUtil {
     ROCKSDB_NAMESPACE::Slice key_slice(key, jkey_len);
 
     return op(key_slice);
+  }
+
+  /*
+   * Create the key slice for an operation that takes a raw native memory
+   * address from Java, for example WriteBatch->Delete. The slice refers
+   * directly to that memory; no copy is made.
+   *
+   * @return false if the address is null or the length is negative, in which
+   *     case a Java exception has been thrown and the slice is not modified
+   */
+  static bool k_create_slice_from_direct_addr(
+      JNIEnv* env, jlong jkey_addr, jint jkey_len,
+      ROCKSDB_NAMESPACE::Slice* key_slice) {
+    if (jkey_addr == 0 || jkey_len < 0) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env,
+                                                       "Invalid key argument");
+      return false;
+    }
+    *key_slice =
+        ROCKSDB_NAMESPACE::Slice(reinterpret_cast<const char*>(jkey_addr),
+                                 static_cast<size_t>(jkey_len));
+    return true;
   }
 
   template <class T>
