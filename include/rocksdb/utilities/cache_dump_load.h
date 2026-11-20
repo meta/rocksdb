@@ -51,7 +51,7 @@ class CacheDumpWriter {
 
 // NOTE that: this class is EXPERIMENTAL! May be changed in the future!
 // This is an abstract class to read or receive the data that is stored
-// or transfered by CacheDumpWriter. Note that, ReadMetadata must be called
+// or transferred by CacheDumpWriter. Note that, ReadMetadata must be called
 // once before we call a ReadPacket.
 class CacheDumpReader {
  public:

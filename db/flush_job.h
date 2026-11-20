@@ -138,7 +138,7 @@ class FlushJob {
   // Memtable Garbage Collection algorithm: a MemPurge takes the list
   // of immutable memtables and filters out (or "purge") the outdated bytes
   // out of it. The output (the filtered bytes, or "useful payload") is
-  // then transfered into a new memtable. If this memtable is filled, then
+  // then transferred into a new memtable. If this memtable is filled, then
   // the mempurge is aborted and rerouted to a regular flush process. Else,
   // depending on the heuristics, placed onto the immutable memtable list.
   // The addition to the imm list will not trigger a flush operation. The
