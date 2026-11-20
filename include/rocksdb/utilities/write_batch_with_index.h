@@ -226,6 +226,10 @@ class WriteBatchWithIndex : public WriteBatchBase {
   // The returned iterator should be deleted by the caller.
   // The base_iterator is now 'owned' by the returned iterator. Deleting the
   // returned iterator will also delete the base_iterator.
+  // The returned iterator does not infer the ReadOptions or prefix extractor
+  // used to create base_iterator. In particular, prefix_same_as_start on
+  // base_iterator is not applied to keys from this write batch; callers that
+  // need prefix-bounded iteration must enforce the prefix boundary themselves.
   //
   // Updating write batch with the current key of the iterator is not safe.
   // We strongly recommend users not to do it. It will invalidate the current
