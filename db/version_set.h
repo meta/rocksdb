@@ -1641,6 +1641,11 @@ class Version {
 
   void GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta);
 
+  // Appends immutable relocation-file metadata. Callers can pin this Version
+  // and invoke this after releasing the DB mutex, unlike the SST portion above
+  // whose being_compacted field is mutex-protected.
+  void AppendBlobRelocationFileMetaData(ColumnFamilyMetaData* cf_meta) const;
+
   // Get column family metadata with optional filtering by key range and level.
   void GetColumnFamilyMetaData(const GetColumnFamilyMetaDataOptions& options,
                                ColumnFamilyMetaData* cf_meta);
@@ -1843,8 +1848,8 @@ class AtomicGroupReadBuffer {
 //      SetOptions() edits are dummy edits, and a batch of dummy edits ends at
 //      the caller's last writer. On the test-only MANIFEST path (a test clears
 //      the dummy flag through the sync point DBImpl::SetOptions:dummy_edit),
-//      the grouping rule for prepared options in
-//      VersionSet::ProcessManifestWrites() keeps the call alone in its batch.
+//      rule 5 of VersionSet::ManifestBatchEndsBefore() (the grouping rule for
+//      prepared options) keeps the call alone in its batch.
 //   3. When the call reaches the head of the MANIFEST writer queue, pre_cb
 //      applies the input maps to the entries under the DB mutex
 //      (ColumnFamilyData::PrepareMutableCFOptions()).
@@ -2003,6 +2008,9 @@ class VersionSet {
   // The edits of the other column families of the call are applied under the DB
   // mutex. Dummy edits (SetOptions()) write no MANIFEST record and are applied
   // under the DB mutex, so their pre_cb runs once.
+  // LogAndApplyWithJoinablePrecondition() below differs in all of this: its
+  // call may join a batch, its edits are applied with the DB mutex held, and
+  // its pre_cb is not run again after the apply.
   virtual Status LogAndApply(
       const autovector<ColumnFamilyData*>& cfds,
       const ReadOptions& read_options, const WriteOptions& write_options,
@@ -2014,6 +2022,30 @@ class VersionSet {
       const std::function<Status()>& pre_cb = {},
       int max_file_opening_threads = 1,
       const MutableCFOptionsPublication* options_publication = nullptr);
+
+  // Like the batch LogAndApply() above, but pre_cb may also be run by an
+  // earlier queue leader, with the DB mutex held, to let this caller join that
+  // leader's MANIFEST batch. pre_cb must then be cheap and must not release the
+  // DB mutex. A failed join never fails the batch; this caller then reaches the
+  // queue head and runs pre_cb as usual. Only file ingestion uses this.
+  // Joining saves MANIFEST syncs; it is not needed for correctness.
+  //
+  // Candidate Version: a new Version that a batch builds from its edits before
+  // it writes them to the MANIFEST. It is installed only if the batch
+  // succeeds; otherwise it is discarded. A joinable precondition is checked
+  // against the current Versions, not the candidate Versions. So a batch does
+  // not take in a joining caller after an edit that can change what the
+  // precondition read: an edit that sets a blob indirection fence, or one that
+  // publishes new CF options. Also, after a caller joins (or when an ingestion
+  // leads the batch), the batch takes no later caller that activates a fence or
+  // publishes options.
+  Status LogAndApplyWithJoinablePrecondition(
+      const autovector<ColumnFamilyData*>& cfds,
+      const ReadOptions& read_options, const WriteOptions& write_options,
+      const autovector<autovector<VersionEdit*>>& edit_lists,
+      InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
+      const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
+      const std::function<Status()>& pre_cb, int max_file_opening_threads);
 
   void WakeUpWaitingManifestWriters();
 
@@ -2909,10 +2941,14 @@ class VersionSet {
 
   // Step 1 (see BlobReferenceCensusInstallBatch). REQUIRES: DB mutex held.
   // `pending_format_version` is the DB-global blob indirection format version
-  // after this batch commits: the current one, or the one this batch
-  // activates. It is 0 only when the DB has no format fence, and then no
-  // column family needs a census.
-  void ReserveBlobReferenceCensusInstalls(
+  // after this batch commits: the current one, or the one this batch activates.
+  // It is 0 only when the DB has no format fence, and then no column family
+  // needs a census. The function also reserves an install for each column
+  // family whose format fence an edit of `batch_edits` sets. Returns true if
+  // the batch sets the format fence of a column family that does not have it
+  // yet. The caller uses this only for a test sync point.
+  bool ReserveBlobReferenceCensusInstalls(
+      const autovector<VersionEdit*>& batch_edits,
       const autovector<Version*>& versions, uint32_t pending_format_version,
       BlobReferenceCensusInstallBatch* batch) const;
 
@@ -2931,6 +2967,26 @@ class VersionSet {
       const autovector<VersionEdit*>& batch_edits, Version* version,
       std::shared_ptr<BlobReferenceCensusDelta>* delta) const;
 
+  // What the writers that ProcessManifestWrites() took into its batch hold.
+  // The struct is defined in version_set.cc.
+  struct ManifestBatchState;
+
+  // The batch-end rules of ProcessManifestWrites(). The group commit leader
+  // `first_writer` has taken the writers up to `last_writer` into its batch.
+  // `writers` are the writers of the leader's caller. Returns true if the batch
+  // must end before `next_writer`, the next writer in the queue. If
+  // `last_writer` is the first writer of its caller, the function first adds
+  // that caller's caller_* flags to `*batch`. The rules are numbered in the
+  // function and checked in order. Rule 6 can run the precondition of
+  // `next_writer` and record in `*batch` that it joined.
+  // REQUIRES: DB mutex held.
+  bool ManifestBatchEndsBefore(const ManifestWriter& first_writer,
+                               const ManifestWriter& last_writer,
+                               const std::deque<ManifestWriter>& writers,
+                               const ManifestWriter& next_writer,
+                               bool skip_manifest_write,
+                               ManifestBatchState* batch) const;
+
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
   Status ProcessManifestWrites(
       std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
@@ -2947,7 +3003,8 @@ class VersionSet {
       bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
       bool new_cf_options_are_sanitized,
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-      const std::function<Status()>& pre_cb, int max_file_opening_threads,
+      const std::function<Status()>& pre_cb, bool precondition_may_join_batch,
+      int max_file_opening_threads,
       const MutableCFOptionsPublication* options_publication);
 
   void LogAndApplyCFHelper(VersionEdit* edit,

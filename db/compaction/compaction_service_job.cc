@@ -170,9 +170,10 @@ Status ValidateBlobGCCompactionServiceResult(
     //      the fenced MANIFEST. The legacy install path does not check feature
     //      metadata (the fingerprint, the origins and the allowed generation
     //      numbers), so the primary declines the result instead of installing
-    //      it unchecked. The local rerun also fails to install: a fenced
-    //      Version rejects a new SST without exact blob reference metadata
-    //      (Corruption).
+    //      it unchecked. The local rerun writes predating outputs, and the
+    //      MANIFEST writer marks them as legacy SSTs (see
+    //      FileMetaData::blob_reference_output_predates_indirection), so they
+    //      install.
     for (const CompactionServiceOutputFile& file : result.output_files) {
       const auto& properties = file.table_properties.user_collected_properties;
       if (properties.count(kBlobReferenceDescriptorPropertyName) != 0 ||
@@ -882,6 +883,10 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
                    "[%s] [JOB %d] Remote Blob GC contract validation failed "
                    "(%s), falling back to local compaction",
                    cfd->GetName().c_str(), job_id_, s.ToString().c_str());
+    TEST_SYNC_POINT_CALLBACK(
+        "CompactionJob::ProcessKeyValueCompactionWithCompactionService:"
+        "BlobGCResultDeclined",
+        &s);
     compaction_result.status.PermitUncheckedError();
     db_options_.compaction_service->OnInstallation(
         response.scheduled_job_id, CompactionServiceJobStatus::kUseLocal);

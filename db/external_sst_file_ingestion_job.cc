@@ -11,9 +11,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/blob/blob_index.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/version_edit.h"
+#include "db/wide/wide_column_serialization.h"
 #include "file/file_util.h"
 #include "file/random_access_file_reader.h"
 #include "logging/logging.h"
@@ -1012,6 +1014,17 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
             : cfd_->NewEpochNumber(),  // orders files ingested to L0
         file->file_checksum, file->file_checksum_func_name, file->unique_id, 0,
         tail_size, file->user_defined_timestamps_persisted, "", "");
+    // An ingested SST never carries exact reference metadata. If the CF has the
+    // format fence when the MANIFEST write runs, the queue head marks the file
+    // as legacy (see
+    // VersionEdit::MarkBlobReferenceOutputsPredatingIndirectionLegacy()).
+    // Prepare() makes sure that such a file holds no separate-file reference:
+    // it trusts an SstFileWriter file, because the SstFileWriter API cannot
+    // write such a reference, and it scans a DB-generated file when the CF has
+    // the fence, the option or a pending activation at that time. The
+    // publication check (ValidateBlobIndirectionPublication()) returns TryAgain
+    // when the CF needs the check and Prepare() did not do it.
+    f_metadata.blob_reference_output_predates_indirection = true;
     f_metadata.temperature = file->file_temperature;
     f_metadata.marked_for_compaction = marked_for_compaction;
     f_metadata.db_ownership_start_time = file->db_ownership_start_time;
@@ -1719,6 +1732,74 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
     return status;
   }
 
+  if (!ingestion_options_.allow_db_generated_files) {
+    // An SstFileWriter file. Without allow_db_generated_files, base accepts
+    // only SstFileWriter files (the external SST version property and sequence
+    // numbers of 0 are checked above), and the SstFileWriter API cannot write a
+    // separate-file blob reference, so the file holds none. It needs no entry
+    // scan in any CF. This trusts the file as base trusts its properties and
+    // sequence numbers. The property check still rejects a file whose
+    // properties carry blob indirection metadata.
+    status = RejectBlobIndirectionTableProperties(
+        file_to_ingest->table_properties, "External SST ingestion");
+    if (!status.ok()) {
+      return status;
+    }
+    file_to_ingest->blob_indirection_ingestion_validated = true;
+  } else if (sv->current->storage_info()->HasBlobIndirectionFormat() ||
+             sv->mutable_cf_options.enable_blob_indirection ||
+             blob_indirection_pending_at_prepare_) {
+    if (table_reader == nullptr) {
+      status =
+          ResetTableReader(external_file, new_file_number,
+                           file_to_ingest->user_defined_timestamps_persisted,
+                           sv, file_to_ingest, &table_reader);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    // A DB-generated file can hold legacy blob references, so scan it. Check
+    // before Prepare() copies or links any input. This uses internal entries,
+    // so hidden versions and blob-backed wide columns are covered.
+    // TODO: avoid the full scan for DB-generated files too: write a table
+    // property with the count of separate-file blob references in every SST,
+    // and read it here; scan only files from older writers that lack it.
+    // A legacy CF (no fence, option off) skips this scan and uses the
+    // property check below. If activation happens after this point, the
+    // publication check (ValidateBlobIndirectionPublication()) asks for a
+    // retry, also when a flush or compaction picked with the option on is
+    // still pending.
+    const auto validate_blob = [](const BlobIndex& index) {
+      return index.IsSameFile()
+                 ? Status::OK()
+                 : Status::NotSupported(
+                       "External SST ingestion supports only same-file blob "
+                       "references");
+    };
+    TEST_SYNC_POINT("ExternalSstFileIngestionJob::Prepare:ScanBlobIndexes");
+    status = ValidateExternalTableBlobIndexes(
+        table_reader.get(), sv->mutable_cf_options.prefix_extractor.get(),
+        ingestion_options_.fill_cache, validate_blob);
+    if (!status.ok()) {
+      return status;
+    }
+    file_to_ingest->blob_indirection_ingestion_validated = true;
+  } else {
+    // A legacy CF (no fence, option off) does not scan the entries. An SST
+    // that can hold indirect references must still not enter it, because
+    // those references can need the routes of the DB that wrote it. Every such
+    // SST carries an exact reference descriptor or a coarse frontier other than
+    // 0 (the coarse frontier is the oldest indirect-origin file number a coarse
+    // SST may reference), so the table properties are enough to reject it. An
+    // SST whose classification has frontier 0 holds only legacy references and
+    // is accepted.
+    status = RejectBlobIndirectionTableProperties(
+        file_to_ingest->table_properties, "External SST ingestion");
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
   assert(file_to_ingest->file_size > 0);
   assert(!file_to_ingest->unset());
   assert(file_to_ingest->table_properties.num_entries > 0 ||
@@ -1791,6 +1872,24 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
   }
 
   return status;
+}
+
+Status ExternalSstFileIngestionJob::ValidateBlobIndirectionPublication() const {
+  if (!cfd_->current()->storage_info()->HasBlobIndirectionFormat() &&
+      !cfd_->GetLatestMutableCFOptions().enable_blob_indirection &&
+      !cfd_->HasPendingBlobIndirectionOutput()) {
+    return Status::OK();
+  }
+  for (const IngestedFileInfo& file : files_to_ingest_) {
+    if (!file.blob_indirection_ingestion_validated &&
+        !file.generated_for_ingestion) {
+      return Status::TryAgain(
+          "Blob indirection is active or pending after external SST "
+          "preparation; "
+          "retry ingestion to check its blob references");
+    }
+  }
+  return Status::OK();
 }
 
 Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(
