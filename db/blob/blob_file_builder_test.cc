@@ -25,6 +25,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -70,6 +71,7 @@ class BlobFileBuilderTest : public testing::Test {
     BlobLogHeader header;
     ASSERT_OK(blob_log_reader.ReadHeader(&header));
     ASSERT_EQ(header.version, kVersion1);
+    ASSERT_EQ(header.file_number, kInvalidBlobFileNumber);
     ASSERT_EQ(header.column_family_id, column_family_id);
     ASSERT_EQ(header.compression, blob_compression_type);
     ASSERT_FALSE(header.has_ttl);
@@ -198,6 +200,145 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
   // Verify the contents of the new blob file as well as the blob references
   VerifyBlobFile(blob_file_number, blob_file_path, column_family_id,
                  kNoCompression, expected_key_value_pairs, blob_indexes);
+}
+
+TEST_F(BlobFileBuilderTest, StableIdentityIndex) {
+  Options options;
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileBuilderTest_StableIdentityIndex"),
+      0);
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.env = mock_env_.get();
+
+  ImmutableOptions immutable_options(options);
+  MutableCFOptions mutable_cf_options(options);
+  std::vector<std::string> blob_file_paths;
+  std::vector<BlobFileAddition> blob_file_additions;
+  BlobFileBuilder builder(
+      TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      /*job_id=*/1, /*column_family_id=*/123, "foobar", Env::WLTH_MEDIUM,
+      nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
+      BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+      &blob_file_paths, &blob_file_additions);
+
+  const std::string value = "logical uncompressed value";
+  std::string encoded;
+  ASSERT_OK(builder.Add("key", value, &encoded));
+  ASSERT_OK(builder.Finish());
+
+  BlobIndex blob_index;
+  ASSERT_OK(blob_index.DecodeFrom(encoded));
+  ASSERT_TRUE(blob_index.IsIndirect());
+  EXPECT_EQ(blob_index.generation_file_number(), 2);
+  EXPECT_EQ(blob_index.origin_file_number(), 2);
+  EXPECT_EQ(blob_index.stable_checksum(),
+            crc32c::Value(value.data(), value.size()));
+  EXPECT_EQ(blob_index.stored_checksum(),
+            BlobIndex::ComputeStoredChecksum(value, kNoCompression));
+
+  // Blob indirection writes a version 2 header. The header names the file's
+  // own number (2, the first number that TestFileNumberGenerator returns). The
+  // file has no TTL, and the footer is the same as in version 1.
+  ASSERT_EQ(blob_file_paths.size(), 1U);
+  std::unique_ptr<FSRandomAccessFile> file;
+  ASSERT_OK(fs_->NewRandomAccessFile(blob_file_paths.front(), file_options_,
+                                     &file, /*dbg=*/nullptr));
+  BlobLogSequentialReader reader(
+      std::make_unique<RandomAccessFileReader>(std::move(file),
+                                               blob_file_paths.front(), clock_),
+      clock_, /*statistics=*/nullptr);
+  BlobLogHeader header;
+  ASSERT_OK(reader.ReadHeader(&header));
+  EXPECT_EQ(header.version, kVersion2);
+  EXPECT_EQ(header.file_number, 2U);
+  EXPECT_FALSE(header.has_ttl);
+  EXPECT_EQ(header.expiration_range, ExpirationRange());
+  BlobLogRecord record;
+  uint64_t blob_offset = 0;
+  ASSERT_OK(reader.ReadRecord(
+      &record, BlobLogSequentialReader::kReadHeaderKeyBlob, &blob_offset));
+  BlobLogFooter footer;
+  ASSERT_OK(reader.ReadFooter(&footer));
+  EXPECT_EQ(footer.blob_count, 1U);
+  EXPECT_EQ(footer.expiration_range, ExpirationRange());
+}
+
+TEST_F(BlobFileBuilderTest, StableChecksumsComputedOnceMatchDirectValues) {
+  // BlobFileBuilder computes the CRC of the stored bytes once. It derives the
+  // blob log record CRC and the BlobIndex stored CRC from it, and for an
+  // uncompressed value also the logical CRC. Each CRC must equal the CRC
+  // computed directly from the bytes, with and without compression.
+  std::vector<CompressionType> compressions{kNoCompression};
+  if (Snappy_Supported()) {
+    compressions.push_back(kSnappyCompression);
+  }
+  for (const CompressionType compression : compressions) {
+    SCOPED_TRACE(CompressionTypeToString(compression));
+    Options options;
+    options.cf_paths.emplace_back(
+        test::PerThreadDBPath(mock_env_.get(),
+                              "BlobFileBuilderTest_StableChecksums" +
+                                  CompressionTypeToString(compression)),
+        0);
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.blob_compression_type = compression;
+    options.env = mock_env_.get();
+    ImmutableOptions immutable_options(options);
+    MutableCFOptions mutable_cf_options(options);
+    std::vector<std::string> blob_file_paths;
+    std::vector<BlobFileAddition> blob_file_additions;
+    BlobFileBuilder builder(
+        TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
+        &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+        /*job_id=*/1, /*column_family_id=*/123, "foobar", Env::WLTH_MEDIUM,
+        nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
+        BlobFileCreationReason::kFlush, immutable_options.cf_paths.front().path,
+        &blob_file_paths, &blob_file_additions);
+    const std::vector<std::pair<std::string, std::string>> key_values{
+        {"k1", std::string(100, 'x')},
+        {"key2", "a short value"},
+        {"k3", std::string(3000, 'y') + "tail"}};
+    std::vector<std::string> blob_indexes(key_values.size());
+    for (size_t i = 0; i < key_values.size(); ++i) {
+      ASSERT_OK(builder.Add(key_values[i].first, key_values[i].second,
+                            &blob_indexes[i]));
+    }
+    ASSERT_OK(builder.Finish());
+    ASSERT_EQ(blob_file_paths.size(), 1);
+
+    std::unique_ptr<FSRandomAccessFile> file;
+    ASSERT_OK(fs_->NewRandomAccessFile(blob_file_paths[0], file_options_, &file,
+                                       /*dbg=*/nullptr));
+    BlobLogSequentialReader reader(
+        std::make_unique<RandomAccessFileReader>(std::move(file),
+                                                 blob_file_paths[0], clock_),
+        clock_, /*statistics=*/nullptr);
+    BlobLogHeader header;
+    ASSERT_OK(reader.ReadHeader(&header));
+    for (size_t i = 0; i < key_values.size(); ++i) {
+      BlobLogRecord record;
+      uint64_t blob_offset = 0;
+      ASSERT_OK(reader.ReadRecord(
+          &record, BlobLogSequentialReader::kReadHeaderKeyBlob, &blob_offset));
+      const Slice stored = record.value;
+      uint32_t record_crc = crc32c::Value(record.key.data(), record.key.size());
+      record_crc = crc32c::Extend(record_crc, stored.data(), stored.size());
+      EXPECT_EQ(record.blob_crc, crc32c::Mask(record_crc));
+
+      BlobIndex blob_index;
+      ASSERT_OK(blob_index.DecodeFrom(blob_indexes[i]));
+      ASSERT_TRUE(blob_index.IsIndirect());
+      EXPECT_EQ(blob_index.stable_checksum(),
+                crc32c::Value(key_values[i].second.data(),
+                              key_values[i].second.size()));
+      EXPECT_EQ(blob_index.stored_checksum(),
+                BlobIndex::ComputeStoredChecksum(stored, compression));
+    }
+  }
 }
 
 TEST_F(BlobFileBuilderTest, BuildAndCheckMultipleFiles) {

@@ -11,18 +11,21 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-void BlobLogHeader::EncodeTo(std::string* dst) {
+void BlobLogHeader::EncodeTo(std::string* dst) const {
   assert(dst != nullptr);
   dst->clear();
   dst->reserve(BlobLogHeader::kSize);
   PutFixed32(dst, kMagicNumber);
   PutFixed32(dst, version);
   PutFixed32(dst, column_family_id);
+  assert(version == kVersion1 || version == kVersion2);
+  assert(version != kVersion2 || !has_ttl);
+  assert(version != kVersion2 || file_number != kInvalidBlobFileNumber);
   unsigned char flags = (has_ttl ? 1 : 0);
   dst->push_back(flags);
   dst->push_back(compression);
-  PutFixed64(dst, expiration_range.first);
-  PutFixed64(dst, expiration_range.second);
+  PutFixed64(dst, version == kVersion2 ? file_number : expiration_range.first);
+  PutFixed64(dst, version == kVersion2 ? 0 : expiration_range.second);
 }
 
 Status BlobLogHeader::DecodeFrom(Slice src) {
@@ -42,7 +45,7 @@ Status BlobLogHeader::DecodeFrom(Slice src) {
   if (magic_number != kMagicNumber) {
     return Status::Corruption(kErrorMessage, "Magic number mismatch");
   }
-  if (version != kVersion1) {
+  if (version != kVersion1 && version != kVersion2) {
     return Status::Corruption(kErrorMessage, "Unknown header version");
   }
   flags = src.data()[0];
@@ -52,6 +55,17 @@ Status BlobLogHeader::DecodeFrom(Slice src) {
   if (!GetFixed64(&src, &expiration_range.first) ||
       !GetFixed64(&src, &expiration_range.second)) {
     return Status::Corruption(kErrorMessage, "Error decoding expiration range");
+  }
+  file_number = kInvalidBlobFileNumber;
+  if (version == kVersion2) {
+    if (flags != 0) {
+      return Status::Corruption(kErrorMessage, "Invalid blob file flags");
+    }
+    file_number = expiration_range.first;
+    if (file_number == kInvalidBlobFileNumber || expiration_range.second != 0) {
+      return Status::Corruption(kErrorMessage, "Invalid blob file number");
+    }
+    expiration_range = ExpirationRange{};
   }
   return Status::OK();
 }
@@ -94,6 +108,11 @@ Status BlobLogFooter::DecodeFrom(Slice src) {
 }
 
 void BlobLogRecord::EncodeHeaderTo(std::string* dst) {
+  EncodeHeaderTo(dst, /*value_crc32c=*/nullptr);
+}
+
+void BlobLogRecord::EncodeHeaderTo(std::string* dst,
+                                   const uint32_t* value_crc32c) {
   assert(dst != nullptr);
   dst->clear();
   dst->reserve(BlobLogRecord::kHeaderSize + key.size() + value.size());
@@ -103,8 +122,13 @@ void BlobLogRecord::EncodeHeaderTo(std::string* dst) {
   header_crc = crc32c::Value(dst->c_str(), dst->size());
   header_crc = crc32c::Mask(header_crc);
   PutFixed32(dst, header_crc);
-  blob_crc = crc32c::Value(key.data(), key.size());
-  blob_crc = crc32c::Extend(blob_crc, value.data(), value.size());
+  if (value_crc32c != nullptr) {
+    blob_crc = crc32c::Crc32cCombine(crc32c::Value(key.data(), key.size()),
+                                     *value_crc32c, value.size());
+  } else {
+    blob_crc = crc32c::Value(key.data(), key.size());
+    blob_crc = crc32c::Extend(blob_crc, value.data(), value.size());
+  }
   blob_crc = crc32c::Mask(blob_crc);
   PutFixed32(dst, blob_crc);
 }
