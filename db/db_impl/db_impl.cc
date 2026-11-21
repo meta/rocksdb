@@ -2195,7 +2195,6 @@ Status DBImpl::SetOptions(
         }
         cfd->MarkOptionsInstalled();
       }
-
       persist_options_status =
           WriteOptionsFile(write_options, true /*db_mutex_already_held*/);
       bg_cv_.SignalAll();
