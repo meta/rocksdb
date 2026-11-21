@@ -1545,6 +1545,10 @@ class DBImpl : public DB
   Status TEST_WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options);
 
+  Status TEST_RunIndirectBlobGCBatch(
+      ColumnFamilyData* cfd,
+      const std::vector<uint64_t>& candidate_physical_file_numbers);
+
   // Wait for any background purge
   Status TEST_WaitForPurge();
   void TEST_WaitForBlobReferenceCensus();
@@ -3416,6 +3420,59 @@ class DBImpl : public DB
                                const std::vector<CompactionInputFiles>& inputs,
                                bool* sfm_bookkeeping, LogBuffer* log_buffer);
 
+  // Runs one indirect blob GC job. The job collects 1 to 8 input files (normal
+  // blob files or relocation files) of `cfd`, whose file numbers are
+  // `candidate_physical_file_numbers`, into new relocation files, and installs
+  // the result with one MANIFEST edit. BackgroundCompaction() calls it. The
+  // overview at the top of db/blob/blob_relocation_gc.h lists the job steps and
+  // says why GC suppresses inputs. IndirectBlobGCJob in
+  // db_impl_compaction_flush.cc holds the code and lists every suppression
+  // reason.
+  //
+  // DB mutex: held on entry and held on return. The job releases it while it
+  // reads and writes files, and takes it again for short steps.
+  //
+  // Out parameters (each must be non-null; otherwise the call returns
+  // InvalidArgument):
+  // - `*made_progress` is set to true when the MANIFEST edit is installed.
+  // - `*sfm_reserved_bytes` must be 0 on entry. It is set to the bytes that
+  //   the job reserved in the SstFileManager for its outputs. The caller
+  //   releases that reservation.
+  // - `*retryable_stale_input` is set to false when the job starts, and to true
+  //   when the job returns TryAgain because an input or the census changed
+  //   while the job ran (a stale job). A later job can then retry the same
+  //   inputs. It is not changed when the call returns InvalidArgument.
+  //
+  // Other parameters:
+  // - `log_buffer` receives the job's progress lines: the live bytes of each
+  //   input that DecideInputs() checks, the skipped inputs when the job
+  //   installs nothing, and the install summary. Errors go to the info log. It
+  //   can be null.
+  // - `job_id` names the job in the logs and in the blob file listener calls.
+  //
+  // Return codes:
+  // - OK: the edit is installed, or no input was collected because every
+  //   input was suppressed or deferred, or another GC job or an earlier
+  //   metadata commit with an unknown outcome blocks the job (Busy from
+  //   BlobReferenceCensus::BeginGcJob()).
+  // - TryAgain: the job installs nothing. `*retryable_stale_input` is set for a
+  //   stale job, when the census is not ready, and when a metadata-only commit
+  //   is in progress.
+  // - CompactionTooLarge: the SstFileManager has not enough disk space for
+  //   the outputs, even with only one input left.
+  // - InvalidArgument: a null argument or a wrong number of inputs.
+  // - Others: ShutdownInProgress, ColumnFamilyDropped, Incomplete (the
+  //   compaction was aborted), and I/O or Corruption errors.
+  Status RunIndirectBlobGCBatch(
+      ColumnFamilyData* cfd,
+      const std::vector<uint64_t>& candidate_physical_file_numbers,
+      bool* made_progress, uint64_t* sfm_reserved_bytes,
+      bool* retryable_stale_input, LogBuffer* log_buffer, int job_id);
+
+  // The job of RunIndirectBlobGCBatch(), with one method per phase. It is
+  // defined in db_impl_compaction_flush.cc.
+  class IndirectBlobGCJob;
+
   // Request compaction tasks token from compaction thread limiter.
   // It always succeeds if force = true or limiter is disable.
   bool RequestCompactionToken(ColumnFamilyData* cfd, bool force,
@@ -4276,6 +4333,11 @@ class DBImpl : public DB
   // Number of compaction service jobs currently waiting in
   // CompactionService::Wait(), counted per executed subcompaction.
   std::atomic<int> num_running_remote_compactions_ = 0;
+
+  // An indirect blob GC job removes whole relocation files and re-points the
+  // routes into them, so only one GC job runs per column family. Protected by
+  // mutex_.
+  std::set<uint32_t> indirect_blob_gc_cfs_in_progress_;
 
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_ = 0;

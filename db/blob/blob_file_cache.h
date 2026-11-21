@@ -94,11 +94,21 @@ class BlobFileCache {
       const MutableCFOptions& mutable_cf_options,
       CacheHandleGuard<BlobFileReader>* blob_file_reader);
 
-  // Opens a blob file reader without inserting it into the cache.
+  // The base signature. It passes prefer_direct_reads = false (the file is
+  // opened as configured).
   Status OpenBlobFileReaderUncached(
       const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
       std::unique_ptr<BlobFileReader>* blob_file_reader,
       bool allow_footer_skip_retry = false);
+
+  // Opens a blob file reader without inserting it into the cache. With
+  // `prefer_direct_reads`, the file is opened for direct reads when mmap reads
+  // are off. If that open fails (for example, the file system does not support
+  // direct reads), the file is opened as configured.
+  Status OpenBlobFileReaderUncached(
+      const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+      std::unique_ptr<BlobFileReader>* blob_file_reader,
+      bool allow_footer_skip_retry, bool prefer_direct_reads);
 
   // Makes finalized checksum metadata available to direct-write fallback reads
   // whose pinned Version predates the blob-file addition. Any cached

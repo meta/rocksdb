@@ -63,6 +63,7 @@
 
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
@@ -83,6 +84,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/write_buffer_manager.h"
+#include "table/meta_blocks.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/string_util.h"
@@ -320,7 +322,7 @@ class Repairer {
     //   - in any SST: an exact reference metadata descriptor that decodes, or
     //     a coarse classification that decodes.
     //   - in any blob file: a version 2 header, which only blob indirection
-    //     writes (see db/blob/blob_log_format.h).
+    //     writes (see db/blob/blob_log_format.h), or a blob relocation file.
     // The search is best effort: it skips a file or record that it cannot read.
     // So when it finds nothing, that does not prove that the DB never used the
     // feature. But once it finds evidence, RepairDB never runs the legacy
@@ -451,6 +453,40 @@ class Repairer {
             header.version == kVersion2) {
           return UnsupportedBlobIndirectionRepair();
         }
+      }
+      char scratch[kBlobRelocationFilePrefixSize];
+      Slice prefix;
+      status = reader->Read(0, sizeof(scratch), IOOptions(), &prefix, scratch,
+                            nullptr);
+      if (!status.ok() || prefix != Slice(kBlobRelocationFilePrefix,
+                                          kBlobRelocationFilePrefixSize)) {
+        continue;
+      }
+      // The file starts with kBlobRelocationFilePrefix. The <number>.blob name
+      // and the prefix alone do not prove that it is a relocation file. Treat
+      // it as one only if its checksummed table properties hold a relocation
+      // directory that decodes and is valid for the file size.
+      std::unique_ptr<TableProperties> properties;
+      ReadOptions read_options;
+      read_options.fill_cache = false;
+      status = ReadTableProperties(reader.get(), size,
+                                   kBlockBasedTableMagicNumber, default_iopts_,
+                                   read_options, &properties, nullptr, nullptr);
+      if (!status.ok()) {
+        continue;
+      }
+      const auto directory = properties->user_collected_properties.find(
+          kBlobRelocationDirectoryPropertyName);
+      if (directory == properties->user_collected_properties.end()) {
+        continue;
+      }
+      BlobRelocationDirectory decoded;
+      status = BlobRelocationDirectory::DecodeFrom(directory->second, &decoded);
+      if (status.ok()) {
+        status = decoded.ValidateForFileSize(size);
+      }
+      if (status.ok()) {
+        return UnsupportedBlobIndirectionRepair();
       }
     }
     return Status::OK();

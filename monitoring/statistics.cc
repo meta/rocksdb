@@ -360,6 +360,24 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {BLOB_DB_INDIRECT_READ_ROUTED, "rocksdb.blobdb.indirect.read.routed"},
     {COMPACTION_COARSE_L0_TRIVIAL_MOVE_BLOCKED,
      "rocksdb.compaction.coarse.l0.trivial.move.blocked"},
+    {INDIRECT_BLOB_GC_JOBS_STARTED, "rocksdb.indirect.blob.gc.jobs.started"},
+    {INDIRECT_BLOB_GC_JOBS_INSTALLED,
+     "rocksdb.indirect.blob.gc.jobs.installed"},
+    {INDIRECT_BLOB_GC_JOBS_STALE, "rocksdb.indirect.blob.gc.jobs.stale"},
+    {INDIRECT_BLOB_GC_JOBS_NOTHING_INSTALLED,
+     "rocksdb.indirect.blob.gc.jobs.nothing.installed"},
+    {INDIRECT_BLOB_GC_JOBS_FAILED, "rocksdb.indirect.blob.gc.jobs.failed"},
+    {INDIRECT_BLOB_GC_CORRUPT_INPUTS,
+     "rocksdb.indirect.blob.gc.corrupt.inputs"},
+    {INDIRECT_BLOB_GC_CENSUS_MISMATCHES,
+     "rocksdb.indirect.blob.gc.census.mismatches"},
+    {INDIRECT_BLOB_GC_KEYS_RELOCATED,
+     "rocksdb.indirect.blob.gc.keys.relocated"},
+    {INDIRECT_BLOB_GC_BYTES_RELOCATED,
+     "rocksdb.indirect.blob.gc.bytes.relocated"},
+    {INDIRECT_BLOB_GC_BYTES_READ, "rocksdb.indirect.blob.gc.bytes.read"},
+    {INDIRECT_BLOB_GC_BYTES_RECLAIMED,
+     "rocksdb.indirect.blob.gc.bytes.reclaimed"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
@@ -459,6 +477,7 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
      "rocksdb.open.and.compact.db.open.micros"},
     {COMPACTION_OUTPUT_BLOB_REFERENCES,
      "rocksdb.compaction.output.blob.references"},
+    {INDIRECT_BLOB_GC_JOB_MICROS, "rocksdb.indirect.blob.gc.job.micros"},
 };
 
 std::shared_ptr<Statistics> CreateDBStatistics() {
