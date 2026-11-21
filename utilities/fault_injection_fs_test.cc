@@ -10,8 +10,11 @@
 #include <thread>
 #include <vector>
 
+#include "file/file_util.h"
+#include "file/filename.h"
 #include "port/port.h"
 #include "test_util/testharness.h"
+#include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -402,6 +405,246 @@ TEST_F(FaultInjectionTestFSTest,
   // forward another raw Close().
   file.reset();
   ASSERT_EQ(0, inner_close_calls);
+}
+
+// Tests of the atomic-replace mode (FaultInjectionTestFS::
+// SetAtomicReplaceOnClose()). Each test writes into its own empty DB
+// directory on the default file system and reads the result through the
+// target file system, which shows what a new process would see after a kill.
+class FaultInjectionTestFSAtomicReplaceTest : public testing::Test {
+ protected:
+  FaultInjectionTestFSAtomicReplaceTest()
+      : env_(Env::Default()),
+        dbname_(test::PerThreadDBPath("fault_injection_fs_atomic_replace")),
+        fault_fs_(
+            std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem())) {
+    EXPECT_OK(DestroyDir(env_, dbname_));
+    EXPECT_OK(env_->CreateDirIfMissing(dbname_));
+    fault_fs_->SetAtomicReplaceOnClose(true);
+  }
+
+  ~FaultInjectionTestFSAtomicReplaceTest() override {
+    EXPECT_OK(DestroyDir(env_, dbname_));
+  }
+
+  // Returns the content of `fname` on the target file system, or "<none>" if
+  // the file does not exist.
+  std::string TargetContent(const std::string& fname) {
+    if (env_->FileExists(fname).IsNotFound()) {
+      return "<none>";
+    }
+    std::string data;
+    EXPECT_OK(ReadFileToString(env_, fname, &data));
+    return data;
+  }
+
+  // Opens `fname` through fault_fs_ and appends `data`.
+  std::unique_ptr<FSWritableFile> OpenAndAppend(const std::string& fname,
+                                                const std::string& data) {
+    std::unique_ptr<FSWritableFile> file;
+    EXPECT_OK(fault_fs_->NewWritableFile(fname, FileOptions(), &file,
+                                         nullptr /* dbg */));
+    if (file != nullptr) {
+      EXPECT_OK(file->Append(data, IOOptions(), nullptr /* dbg */));
+    }
+    return file;
+  }
+
+  // Writes `data` to `fname` through fault_fs_ and closes the file.
+  void WriteAndClose(const std::string& fname, const std::string& data) {
+    std::unique_ptr<FSWritableFile> file = OpenAndAppend(fname, data);
+    ASSERT_NE(nullptr, file);
+    ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+    ASSERT_OK(file->Close(IOOptions(), nullptr /* dbg */));
+  }
+
+  // Returns the names in dbname_ that start with the hidden temp prefix.
+  std::vector<std::string> HiddenTempFiles() {
+    std::vector<std::string> children;
+    EXPECT_OK(env_->GetChildren(dbname_, &children));
+    std::vector<std::string> hidden;
+    for (const std::string& child : children) {
+      if (Slice(child).starts_with(
+              FaultInjectionTestFS::kAtomicTempFilePrefix)) {
+        hidden.push_back(child);
+      }
+    }
+    return hidden;
+  }
+
+  Env* const env_;
+  const std::string dbname_;
+  std::shared_ptr<FaultInjectionTestFS> fault_fs_;
+};
+
+// The mode sets the bit. CURRENT, IDENTITY and OPTIONS files are not visible
+// on the target until Close(), also after Sync(), and Close() replaces the old
+// file. Without the mode, the bit is cleared.
+TEST_F(FaultInjectionTestFSAtomicReplaceTest, HiddenUntilClose) {
+  const int64_t bit = int64_t{1} << FSSupportedOps::kAtomicReplaceOnClose;
+  int64_t ops = 0;
+  fault_fs_->SupportedOps(ops);
+  ASSERT_EQ(bit, ops & bit);
+
+  const std::string current = CurrentFileName(dbname_);
+  ASSERT_OK(WriteStringToFile(env_, "MANIFEST-000004\n", current,
+                              true /* should_sync */));
+  for (const std::string& fname :
+       {current, IdentityFileName(dbname_), OptionsFileName(dbname_, 5)}) {
+    SCOPED_TRACE(fname);
+    const std::string old_content = TargetContent(fname);
+    std::unique_ptr<FSWritableFile> file = OpenAndAppend(fname, "new");
+    ASSERT_NE(nullptr, file);
+    ASSERT_OK(file->Sync(IOOptions(), nullptr /* dbg */));
+    ASSERT_OK(file->Fsync(IOOptions(), nullptr /* dbg */));
+    ASSERT_EQ(old_content, TargetContent(fname));
+    ASSERT_EQ(uint64_t{3}, file->GetFileSize(IOOptions(), nullptr /* dbg */));
+    ASSERT_OK(file->Close(IOOptions(), nullptr /* dbg */));
+    ASSERT_EQ("new", TargetContent(fname));
+    ASSERT_TRUE(HiddenTempFiles().empty());
+  }
+
+  fault_fs_->SetAtomicReplaceOnClose(false);
+  ops = bit;
+  fault_fs_->SupportedOps(ops);
+  ASSERT_EQ(0, ops & bit);
+}
+
+// Destroying the file without Close() and a Close() while the file system is
+// inactive publish nothing and delete the hidden temp file.
+TEST_F(FaultInjectionTestFSAtomicReplaceTest, NothingPublishedWithoutClose) {
+  const std::string current = CurrentFileName(dbname_);
+  ASSERT_OK(WriteStringToFile(env_, "old", current, true /* should_sync */));
+  for (const char* how : {"destroy", "inactive"}) {
+    SCOPED_TRACE(how);
+    std::unique_ptr<FSWritableFile> file = OpenAndAppend(current, "new");
+    ASSERT_NE(nullptr, file);
+    ASSERT_EQ(size_t{1}, HiddenTempFiles().size());
+    const std::string mode = how;
+    if (mode == "inactive") {
+      fault_fs_->SetFilesystemActive(false);
+      ASSERT_NOK(file->Close(IOOptions(), nullptr /* dbg */));
+      fault_fs_->SetFilesystemActive(true);
+    }
+    file.reset();
+    ASSERT_EQ("old", TargetContent(current));
+    ASSERT_TRUE(HiddenTempFiles().empty());
+  }
+}
+
+// An injected Close() error fails the Close(). About half of the time it
+// comes before the publish, and the old file stays. Otherwise it comes after
+// the publish, and the new file is in place. Either way no hidden temp file
+// stays. The test repeats the write until it sees both cases; with a chance
+// of one half each time, 64 tries miss a case with a chance of about 2^-63.
+TEST_F(FaultInjectionTestFSAtomicReplaceTest, InjectedCloseError) {
+  const std::string current = CurrentFileName(dbname_);
+  fault_fs_->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kMetadataWrite, /*seed=*/0, /*one_in=*/1,
+      /*retryable=*/false, /*has_data_loss=*/false);
+  int published = 0;
+  int not_published = 0;
+  for (int i = 0; i < 64 && (published == 0 || not_published == 0); ++i) {
+    SCOPED_TRACE("try " + std::to_string(i));
+    ASSERT_OK(WriteStringToFile(env_, "old", current, true /* should_sync */));
+    std::unique_ptr<FSWritableFile> file = OpenAndAppend(current, "new");
+    ASSERT_NE(nullptr, file);
+    fault_fs_->EnableThreadLocalErrorInjection(
+        FaultInjectionIOType::kMetadataWrite);
+    IOStatus s = file->Close(IOOptions(), nullptr /* dbg */);
+    fault_fs_->DisableThreadLocalErrorInjection(
+        FaultInjectionIOType::kMetadataWrite);
+    ASSERT_TRUE(s.IsIOError()) << s.ToString();
+    file.reset();
+    const std::string content = TargetContent(current);
+    if (content == "new") {
+      ++published;
+    } else {
+      ASSERT_EQ("old", content);
+      ++not_published;
+    }
+    ASSERT_TRUE(HiddenTempFiles().empty());
+  }
+  ASSERT_GT(published, 0);
+  ASSERT_GT(not_published, 0);
+}
+
+// A write that is not published keeps the crash state of an older file with
+// the same name. Here the older CURRENT was written without the mode after the
+// last directory sync, so the simulated crash still deletes it.
+TEST_F(FaultInjectionTestFSAtomicReplaceTest, UnpublishedWriteKeepsOldState) {
+  const std::string current = CurrentFileName(dbname_);
+  fault_fs_->SetAtomicReplaceOnClose(false);
+  ASSERT_NO_FATAL_FAILURE(WriteAndClose(current, "old"));
+  fault_fs_->SetAtomicReplaceOnClose(true);
+
+  std::unique_ptr<FSWritableFile> file = OpenAndAppend(current, "new");
+  ASSERT_NE(nullptr, file);
+  file.reset();
+  ASSERT_EQ("old", TargetContent(current));
+  ASSERT_OK(fault_fs_->DeleteFilesCreatedAfterLastDirSync(IOOptions(),
+                                                          nullptr /* dbg */));
+  ASSERT_EQ("<none>", TargetContent(current));
+}
+
+// A published file is durable: the three functions that simulate a crash do
+// not delete, revert or truncate it. A MANIFEST keeps the normal behavior: it
+// was created after the last directory sync, so the simulated crash deletes
+// it.
+TEST_F(FaultInjectionTestFSAtomicReplaceTest, PublishedFileSurvivesCrash) {
+  fault_fs_->SetInjectUnsyncedDataLoss(true);
+  const std::string current = CurrentFileName(dbname_);
+  const std::string identity = IdentityFileName(dbname_);
+  const std::string options_file = OptionsFileName(dbname_, 5);
+  const std::string manifest = DescriptorFileName(dbname_, 4);
+  // An old CURRENT that FaultInjectionTestFS tracks as created after the last
+  // directory sync, written without the mode.
+  fault_fs_->SetAtomicReplaceOnClose(false);
+  ASSERT_NO_FATAL_FAILURE(WriteAndClose(current, "old"));
+  fault_fs_->SetAtomicReplaceOnClose(true);
+
+  ASSERT_NO_FATAL_FAILURE(WriteAndClose(manifest, "manifest"));
+  ASSERT_NO_FATAL_FAILURE(WriteAndClose(current, "MANIFEST-000004\n"));
+  ASSERT_NO_FATAL_FAILURE(WriteAndClose(identity, "id"));
+  ASSERT_NO_FATAL_FAILURE(WriteAndClose(options_file, "options"));
+
+  Random rnd(301);
+  ASSERT_OK(fault_fs_->DropRandomUnsyncedFileData(&rnd));
+  ASSERT_OK(fault_fs_->DropUnsyncedFileData());
+  ASSERT_OK(fault_fs_->DeleteFilesCreatedAfterLastDirSync(IOOptions(),
+                                                          nullptr /* dbg */));
+  ASSERT_EQ("MANIFEST-000004\n", TargetContent(current));
+  ASSERT_EQ("id", TargetContent(identity));
+  ASSERT_EQ("options", TargetContent(options_file));
+  ASSERT_EQ("<none>", TargetContent(manifest));
+}
+
+// After a kill during Close(), the hidden temp file can stay. RocksDB cannot
+// parse its name, so it ignores it. A next write of the same name truncates
+// it, publishes the new content and leaves no hidden temp file. RocksDB does
+// not reuse OPTIONS file numbers, so the test writes the OPTIONS name again
+// only to check the file system.
+TEST_F(FaultInjectionTestFSAtomicReplaceTest, LeftoverTempFileAfterRestart) {
+  for (const std::string& fname :
+       {CurrentFileName(dbname_), OptionsFileName(dbname_, 5)}) {
+    SCOPED_TRACE(fname);
+    const std::string base = fname.substr(dbname_.size() + 1);
+    const std::string hidden =
+        FaultInjectionTestFS::kAtomicTempFilePrefix + base;
+    uint64_t number = 0;
+    FileType type;
+    ASSERT_FALSE(ParseFileName(hidden, &number, &type));
+    ASSERT_OK(WriteStringToFile(env_, "partial content of a killed write",
+                                dbname_ + "/" + hidden,
+                                true /* should_sync */));
+
+    // A new process gets a new file system.
+    fault_fs_ = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+    fault_fs_->SetAtomicReplaceOnClose(true);
+    ASSERT_NO_FATAL_FAILURE(WriteAndClose(fname, "new"));
+    ASSERT_EQ("new", TargetContent(fname));
+    ASSERT_TRUE(HiddenTempFiles().empty());
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

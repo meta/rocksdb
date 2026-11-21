@@ -253,7 +253,8 @@ class TestFSWritableFile : public FSWritableFile {
                               const FileOptions& file_opts,
                               std::unique_ptr<FSWritableFile>&& f,
                               FaultInjectionTestFS* fs,
-                              bool reopened_for_write = false);
+                              bool reopened_for_write = false,
+                              const std::string& atomic_temp_name = {});
   ~TestFSWritableFile() override;
   IOStatus Append(const Slice& data, const IOOptions&,
                   IODebugContext*) override;
@@ -282,12 +283,21 @@ class TestFSWritableFile : public FSWritableFile {
 
   uint64_t GetFileSize(const IOOptions& options, IODebugContext* dbg) override {
     MutexLock l(&mutex_);
+    if (atomic_replace_) {
+      return state_.pos_at_last_append_;
+    }
     return target_->GetFileSize(options, dbg);
   }
 
  private:
   IOStatus CloseImpl(const IOOptions& options, IODebugContext* dbg);
   IOStatus ValidateWrite(const char* op_name);
+  // Atomic-replace files only. Writes the buffered content to the hidden temp
+  // file, syncs and closes it, and renames it over the final name.
+  IOStatus PublishAtomicFile(const IOOptions& options, IODebugContext* dbg);
+  // Atomic-replace files only. Closes target_ if it is still open and deletes
+  // the hidden temp file, so that nothing is published.
+  void DiscardAtomicFile();
 
   FSFileState state_;  // Need protection by mutex_
   FileOptions file_opts_;
@@ -301,6 +311,15 @@ class TestFSWritableFile : public FSWritableFile {
   port::Mutex mutex_;
   const bool unsync_data_loss_;
   const bool reopened_for_write_;
+  // The hidden temp file that target_ writes, for an atomic-replace file (see
+  // FaultInjectionTestFS::SetAtomicReplaceOnClose()). Empty for other files.
+  const std::string atomic_temp_name_;
+  // True when atomic_temp_name_ is not empty. Then all appended data stays in
+  // state_.buffer_ until Close(), and this file is not tracked for simulated
+  // crashes.
+  const bool atomic_replace_;
+  // Atomic-replace files only. Whether target_ is still open.
+  bool target_open_ = true;
 };
 
 // A per-file fault-injection wrapper around FSRandomRWFile that reports
@@ -439,15 +458,75 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   FaultInjectionTestFS& operator=(FaultInjectionTestFS&&) = delete;
   ~FaultInjectionTestFS() override { fs_error_.PermitUncheckedError(); }
 
-  // Clears FSSupportedOps::kAtomicReplaceOnClose. For every file, including
-  // CURRENT, IDENTITY and OPTIONS files, written content is visible before
-  // Close(), a writable file closes itself when it is destroyed, and a
-  // simulated crash drops unsynced data. So this file system does not keep
-  // the contract of the bit, even if its target does.
+  // Sets FSSupportedOps::kAtomicReplaceOnClose only in the atomic-replace
+  // mode (see SetAtomicReplaceOnClose()), and clears it otherwise. Outside
+  // that mode, written content of every file is visible before Close(), a
+  // writable file closes itself when it is destroyed, and a simulated crash
+  // drops unsynced data. So this file system does not keep the contract of
+  // the bit, even if its target does.
   void SupportedOps(int64_t& supported_ops) override {
     target()->SupportedOps(supported_ops);
-    supported_ops &= ~(int64_t{1} << FSSupportedOps::kAtomicReplaceOnClose);
+    const int64_t bit = int64_t{1} << FSSupportedOps::kAtomicReplaceOnClose;
+    if (AtomicReplaceOnClose()) {
+      supported_ops |= bit;
+    } else {
+      supported_ops &= ~bit;
+    }
   }
+
+  // Atomic-replace mode. Crash tests use it to run RocksDB on a file system
+  // that sets FSSupportedOps::kAtomicReplaceOnClose and keeps the contract of
+  // the bit (include/rocksdb/file_system.h) for the files that the contract
+  // names: CURRENT, IDENTITY and OPTIONS-<number>, under any directory. Call
+  // it before the DB is opened, and keep the mode for the life of the file
+  // system. In this mode, a file that NewWritableFile() opens under one of
+  // these names behaves like this:
+  // 1. All appended data stays in memory. Sync() and Fsync() write nothing.
+  //    The target file system has only an empty hidden temp file,
+  //    `<dir>/.fault_injection_atomic_tmp.<name>`. RocksDB cannot parse this
+  //    name, so it ignores the file.
+  // 2. A successful Close() publishes the file: it writes the data to the
+  //    hidden temp file, syncs and closes it, and renames it over the final
+  //    name on the target. A POSIX rename is atomic, so a process kill shows
+  //    the old or the new file, never a part. A kill during Close() can leave
+  //    the hidden temp file, which the next write of CURRENT or IDENTITY
+  //    truncates. A leftover OPTIONS temp file stays until the DB directory
+  //    is removed, because OPTIONS file numbers are not reused. RocksDB
+  //    ignores it.
+  // 3. The destructor without a successful Close() and a failed Close()
+  //    publish nothing and delete the hidden temp file. An injected Close()
+  //    error happens before the publish about half of the time, and then
+  //    publishes nothing. Otherwise it happens after the publish, like a
+  //    Close() whose result is lost (contract property 4).
+  // 4. These files are not tracked for simulated crashes. A published file is
+  //    durable: DropUnsyncedFileData(), DropRandomUnsyncedFileData() and
+  //    DeleteFilesCreatedAfterLastDirSync() do not change it. An unpublished
+  //    file never reached the target, so there is nothing to drop, and the
+  //    crash state of an older file with the same name stays.
+  // The mode applies also when SetFilesystemDirectWritable(true) is set,
+  // because RocksDB writes these files in place once the bit is set. All
+  // other files, including MANIFEST, WAL and SST files and the temp files of
+  // other writers, keep the normal behavior of this file system.
+  void SetAtomicReplaceOnClose(bool atomic_replace_on_close) {
+    MutexLock l(&mutex_);
+    atomic_replace_on_close_ = atomic_replace_on_close;
+  }
+
+  bool AtomicReplaceOnClose() {
+    MutexLock l(&mutex_);
+    return atomic_replace_on_close_;
+  }
+
+  // Atomic-replace mode only. After an injected Close() error, returns true
+  // about half of the time, to inject the error after the file is published.
+  // It uses the random generator of the thread's metadata write error
+  // context, so the choice follows the seed of that context.
+  bool InjectCloseErrorAfterPublish();
+
+  // Prefix of the hidden temp file of an atomic-replace file. See
+  // SetAtomicReplaceOnClose().
+  inline static const std::string kAtomicTempFilePrefix =
+      ".fault_injection_atomic_tmp.";
 
   static const char* kClassName() { return "FaultInjectionTestFS"; }
   const char* Name() const override { return kClassName(); }
@@ -891,6 +970,16 @@ class FaultInjectionTestFS : public FileSystemWrapper {
                                     const char* op_name,
                                     bool allow_missing_file);
 
+  // Whether the atomic-replace mode is on and `fname` names CURRENT, IDENTITY
+  // or an OPTIONS file. See SetAtomicReplaceOnClose().
+  bool IsAtomicReplaceFile(const std::string& fname);
+
+  // Opens an atomic-replace file. See SetAtomicReplaceOnClose().
+  IOStatus NewAtomicReplaceFile(const std::string& fname,
+                                const FileOptions& file_opts,
+                                std::unique_ptr<FSWritableFile>* result,
+                                IODebugContext* dbg);
+
   inline static const std::string kInjectedReadError = "injected read error";
   inline static const std::string kInjectedEmptyResult =
       "injected empty result";
@@ -921,6 +1010,7 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   bool inject_unsynced_data_loss_;  // See InjectUnsyncedDataLoss()
   bool read_unsynced_data_;         // See SetReadUnsyncedData()
   bool allow_link_open_file_;       // See SetAllowLinkOpenFile()
+  bool atomic_replace_on_close_ = false;  // See SetAtomicReplaceOnClose()
   IOStatus fs_error_;
 
   enum ErrorType : int {
