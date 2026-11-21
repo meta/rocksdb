@@ -66,6 +66,10 @@ class SubcompactionState {
   // sub-compaction begin.
   bool notify_on_subcompaction_completion = false;
 
+  // True when local output contains a BlobIndex whose generation number was
+  // flattened to its route target in the compaction's pinned input Version.
+  bool has_flattened_blob_index = false;
+
   // compaction job stats for this sub-compaction
   CompactionJobStats compaction_job_stats;
 
@@ -159,6 +163,7 @@ class SubcompactionState {
         io_status(std::move(state.io_status)),
         notify_on_subcompaction_completion(
             state.notify_on_subcompaction_completion),
+        has_flattened_blob_index(state.has_flattened_blob_index),
         compaction_job_stats(std::move(state.compaction_job_stats)),
         sub_job_id(state.sub_job_id),
         compaction_outputs_(std::move(state.compaction_outputs_)),

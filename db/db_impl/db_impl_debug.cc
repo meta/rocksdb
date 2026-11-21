@@ -17,6 +17,7 @@
 #include "db/error_handler.h"
 #include "db/periodic_task_scheduler.h"
 #include "file/sst_file_manager_impl.h"
+#include "logging/log_buffer.h"
 #include "monitoring/thread_status_updater.h"
 #include "util/cast_util.h"
 #include "util/hash_containers.h"
