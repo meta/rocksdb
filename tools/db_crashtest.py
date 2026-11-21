@@ -1224,6 +1224,11 @@ txn_params = {
     # frequency low to reduce stalls
     "commit_bypass_memtable_one_in": random.choice([0] * 2 + [500, 1000]),
     "two_write_queues": lambda: random.choice([0, 1]),
+    # txn_write_batch_flush_threshold stays at 0; see its db_stress help text.
+
+    # Sets TransactionDBOptions::rollback_merge_operands. Both values are
+    # tested: true makes rollbacks undo merge operands, false is the default.
+    "txn_rollback_merge_operands": lambda: random.choice([0, 1]),
 }
 
 # For optimistic transaction db
@@ -1929,12 +1934,27 @@ def finalize_and_sanitize(src_params):
         # Pipelined write does not support seq_per_batch, which WritePrepared
         # and WriteUnprepared use.
         dest_params["enable_pipelined_write"] = 0
+    # txn_write_batch_flush_threshold applies only to pessimistic transactions
+    # with the WRITE_UNPREPARED write policy, and txn_rollback_merge_operands
+    # only to pessimistic transactions.
+    is_pessimistic_txn = (
+        dest_params.get("use_txn", 0) == 1
+        and dest_params.get("use_optimistic_txn", 0) != 1
+    )
+    if not is_pessimistic_txn or dest_params.get("txn_write_policy", 0) != 2:
+        dest_params["txn_write_batch_flush_threshold"] = 0
+    if not is_pessimistic_txn:
+        dest_params["txn_rollback_merge_operands"] = 0
     # TODO(hx235): enable test_multi_ops_txns with fault injection after stabilizing the CI
     if dest_params.get("test_multi_ops_txns") == 1:
         dest_params["write_fault_one_in"] = 0
         dest_params["metadata_write_fault_one_in"] = 0
         dest_params["read_fault_one_in"] = 0
         dest_params["metadata_read_fault_one_in"] = 0
+        dest_params["open_write_fault_one_in"] = 0
+        dest_params["open_metadata_write_fault_one_in"] = 0
+        dest_params["open_read_fault_one_in"] = 0
+        dest_params["open_metadata_read_fault_one_in"] = 0
         if dest_params.get("txn_write_policy", 0) != 0:
             # TODO: should any of this change for WUP (txn_write_policy==2)?
             dest_params["wp_snapshot_cache_bits"] = 1

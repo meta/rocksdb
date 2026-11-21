@@ -1828,10 +1828,10 @@ void StressTest::FinishInitDb(SharedState* shared) {
     }
   }
   if (FLAGS_use_txn && !FLAGS_use_optimistic_txn) {
-    // It's OK here without sync because unsynced data cannot be lost at this
-    // point
-    // - even with sync_fault_injection=1 as the
-    // file is still directly writable until after FinishInitDb()
+    // The commits and rollbacks below cannot be lost as unsynced data. Every
+    // write policy creates the recovered transactions with WriteOptions::sync
+    // set, so these writes are synced even when MaybeEnableOpenFaultInjection()
+    // has turned off direct writes to the file system.
     ProcessRecoveredPreparedTxns(shared);
   }
 
@@ -5690,6 +5690,13 @@ void StressTest::PrintEnv() const {
         fprintf(stdout, "Commit cache bits         : %d\n",
                 static_cast<int>(FLAGS_wp_commit_cache_bits));
       }
+      if (static_cast<uint64_t>(TxnDBWritePolicy::WRITE_UNPREPARED) ==
+          FLAGS_txn_write_policy) {
+        fprintf(stdout, "Write batch flush thresh. : %" PRId64 "\n",
+                FLAGS_txn_write_batch_flush_threshold);
+      }
+      fprintf(stdout, "Rollback merge operands   : %s\n",
+              FLAGS_txn_rollback_merge_operands ? "true" : "false");
       fprintf(stdout, "last cwb for recovery    : %s\n",
               FLAGS_use_only_the_last_commit_time_batch_for_recovery ? "true"
                                                                      : "false");
@@ -5877,6 +5884,51 @@ void StressTest::PrintEnv() const {
           static_cast<int>(FLAGS_fast_sst_open));
 
   fprintf(stdout, "------------------------------------------------\n");
+}
+
+Status StressTest::OpenTransactionDB(
+    SharedState* shared,
+    const std::vector<ColumnFamilyDescriptor>& cf_descriptors) {
+  TransactionDBOptions txn_db_options;
+  // Match the 10-minute lock_timeout used for explicit transactions
+  // in NewTxn(), rather than the 1-second default which is too short
+  // for stress tests under heavy contention (see T228932399).
+  txn_db_options.default_lock_timeout = 600000;
+  assert(FLAGS_txn_write_policy <= TxnDBWritePolicy::WRITE_UNPREPARED);
+  txn_db_options.write_policy =
+      static_cast<TxnDBWritePolicy>(FLAGS_txn_write_policy);
+  if (FLAGS_unordered_write) {
+    assert(txn_db_options.write_policy == TxnDBWritePolicy::WRITE_PREPARED);
+    options_.unordered_write = true;
+    options_.two_write_queues = true;
+    txn_db_options.skip_concurrency_control = true;
+  } else {
+    options_.two_write_queues = FLAGS_two_write_queues;
+  }
+  txn_db_options.wp_snapshot_cache_bits =
+      static_cast<size_t>(FLAGS_wp_snapshot_cache_bits);
+  txn_db_options.wp_commit_cache_bits =
+      static_cast<size_t>(FLAGS_wp_commit_cache_bits);
+  txn_db_options.use_per_key_point_lock_mgr = FLAGS_use_per_key_point_lock_mgr;
+  txn_db_options.default_write_batch_flush_threshold =
+      FLAGS_txn_write_batch_flush_threshold;
+  txn_db_options.rollback_merge_operands = FLAGS_txn_rollback_merge_operands;
+  PrepareTxnDbOptions(shared, txn_db_options);
+  Status s = TransactionDB::Open(options_, txn_db_options, GetDbPath(),
+                                 cf_descriptors, &column_families_, &txn_db_);
+  if (!s.ok()) {
+    // TransactionDB::Open() deletes the column family handles on failure.
+    // When the failure comes after DBImpl::Open(), it leaves the deleted
+    // handles in column_families_, so clear them here without deleting.
+    column_families_.clear();
+    txn_db_ = nullptr;
+    return s;
+  }
+  // Do not swap the order of the following.
+  db_owner_.reset(txn_db_);
+  db_ = txn_db_;
+  db_aptr_.store(txn_db_, std::memory_order_release);
+  return s;
 }
 
 void StressTest::Open(SharedState* shared, bool reopen) {
@@ -6104,8 +6156,11 @@ void StressTest::Open(SharedState* shared, bool reopen) {
       cf_descriptors.emplace_back(name, ColumnFamilyOptions(options_));
       column_family_names_.push_back(name);
     }
-    // TODO; test transaction DB Open with fault injection
-    if (!FLAGS_use_txn) {
+    // The OptimisticTransactionDB stays out of the open fault loop below.
+    // OptimisticTransactionDB::Open() adds no recovery work on top of
+    // DB::Open(), so open fault injection would test the same code as for a
+    // plain DB.
+    if (!FLAGS_use_txn || !FLAGS_use_optimistic_txn) {
       OpenFaultInjectionConfig open_fault_injection;
       open_fault_injection.sync_fault = FLAGS_sync_fault_injection;
       open_fault_injection.metadata_read_one_in =
@@ -6119,8 +6174,10 @@ void StressTest::Open(SharedState* shared, bool reopen) {
 
         const bool open_fault_injection_enabled = MaybeEnableOpenFaultInjection(
             db_fault_injection_fs_, GetDbPath(), open_fault_injection);
-        // StackableDB-based BlobDB
-        if (FLAGS_use_blob_db) {
+        if (FLAGS_use_txn) {
+          s = OpenTransactionDB(shared, cf_descriptors);
+        } else if (FLAGS_use_blob_db) {
+          // StackableDB-based BlobDB
           blob_db::BlobDBOptions blob_db_options;
           blob_db_options.blob_file_size = FLAGS_blob_db_file_size;
           blob_db_options.enable_garbage_collection = FLAGS_blob_db_enable_gc;
@@ -6157,8 +6214,10 @@ void StressTest::Open(SharedState* shared, bool reopen) {
             s = db_->GetRootDB()->WaitForCompact(WaitForCompactOptions());
             if (!s.ok()) {
               CleanUpColumnFamilies();
+              db_aptr_.store(nullptr, std::memory_order_release);
               db_owner_.reset();
               db_ = nullptr;
+              txn_db_ = nullptr;
               secondary_db_.reset();
             }
           }
@@ -6191,64 +6250,27 @@ void StressTest::Open(SharedState* shared, bool reopen) {
     } else {
       InitializeListenersForOpen(shared, cf_descriptors);
 
-      if (FLAGS_use_optimistic_txn) {
-        OptimisticTransactionDBOptions optimistic_txn_db_options;
-        optimistic_txn_db_options.validate_policy =
-            static_cast<OccValidationPolicy>(FLAGS_occ_validation_policy);
+      OptimisticTransactionDBOptions optimistic_txn_db_options;
+      optimistic_txn_db_options.validate_policy =
+          static_cast<OccValidationPolicy>(FLAGS_occ_validation_policy);
 
-        if (FLAGS_share_occ_lock_buckets) {
-          optimistic_txn_db_options.shared_lock_buckets =
-              MakeSharedOccLockBuckets(FLAGS_occ_lock_bucket_count);
-        } else {
-          optimistic_txn_db_options.occ_lock_buckets =
-              FLAGS_occ_lock_bucket_count;
-          optimistic_txn_db_options.shared_lock_buckets = nullptr;
-        }
-        s = OptimisticTransactionDB::Open(
-            options_, optimistic_txn_db_options, GetDbPath(), cf_descriptors,
-            &column_families_, &optimistic_txn_db_);
-        DB_STRESS_ASSERT_OK_MSG(s,
-                                "Error in opening the OptimisticTransactionDB");
-        {
-          db_owner_.reset(optimistic_txn_db_);
-          db_ = optimistic_txn_db_;
-          db_aptr_.store(optimistic_txn_db_, std::memory_order_release);
-        }
+      if (FLAGS_share_occ_lock_buckets) {
+        optimistic_txn_db_options.shared_lock_buckets =
+            MakeSharedOccLockBuckets(FLAGS_occ_lock_bucket_count);
       } else {
-        TransactionDBOptions txn_db_options;
-        // Match the 10-minute lock_timeout used for explicit transactions
-        // in NewTxn(), rather than the 1-second default which is too short
-        // for stress tests under heavy contention (see T228932399).
-        txn_db_options.default_lock_timeout = 600000;
-        assert(FLAGS_txn_write_policy <= TxnDBWritePolicy::WRITE_UNPREPARED);
-        txn_db_options.write_policy =
-            static_cast<TxnDBWritePolicy>(FLAGS_txn_write_policy);
-        if (FLAGS_unordered_write) {
-          assert(txn_db_options.write_policy ==
-                 TxnDBWritePolicy::WRITE_PREPARED);
-          options_.unordered_write = true;
-          options_.two_write_queues = true;
-          txn_db_options.skip_concurrency_control = true;
-        } else {
-          options_.two_write_queues = FLAGS_two_write_queues;
-        }
-        txn_db_options.wp_snapshot_cache_bits =
-            static_cast<size_t>(FLAGS_wp_snapshot_cache_bits);
-        txn_db_options.wp_commit_cache_bits =
-            static_cast<size_t>(FLAGS_wp_commit_cache_bits);
-        txn_db_options.use_per_key_point_lock_mgr =
-            FLAGS_use_per_key_point_lock_mgr;
-        PrepareTxnDbOptions(shared, txn_db_options);
-        s = TransactionDB::Open(options_, txn_db_options, GetDbPath(),
-                                cf_descriptors, &column_families_, &txn_db_);
-        DB_STRESS_ASSERT_OK_MSG(s, "Error in opening the TransactionDB");
-
-        // Do not swap the order of the following.
-        {
-          db_owner_.reset(txn_db_);
-          db_ = txn_db_;
-          db_aptr_.store(txn_db_, std::memory_order_release);
-        }
+        optimistic_txn_db_options.occ_lock_buckets =
+            FLAGS_occ_lock_bucket_count;
+        optimistic_txn_db_options.shared_lock_buckets = nullptr;
+      }
+      s = OptimisticTransactionDB::Open(options_, optimistic_txn_db_options,
+                                        GetDbPath(), cf_descriptors,
+                                        &column_families_, &optimistic_txn_db_);
+      DB_STRESS_ASSERT_OK_MSG(s,
+                              "Error in opening the OptimisticTransactionDB");
+      {
+        db_owner_.reset(optimistic_txn_db_);
+        db_ = optimistic_txn_db_;
+        db_aptr_.store(optimistic_txn_db_, std::memory_order_release);
       }
     }
     DB_STRESS_ASSERT_OK_MSG(s, "Error in opening the DB");
