@@ -15,6 +15,7 @@
 #include "db/compaction/compaction_iterator.h"
 #include "db/internal_stats.h"
 #include "db/output_validator.h"
+#include "port/likely.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -41,6 +42,11 @@ class CompactionOutputs {
     OutputValidator validator;
     bool finished;
     bool is_proximal_level;
+    // True when the output was closed because it already held
+    // blob_indirection_max_references_per_sst blob references when the next
+    // user key arrived (see CompactionOutputs::AddToOutput()). Used by the
+    // event log.
+    bool closed_by_blob_reference_limit = false;
     std::shared_ptr<const TableProperties> table_properties;
   };
 
@@ -128,10 +134,10 @@ class CompactionOutputs {
 
   // Update output table properties from already populated TableProperties.
   // Used for remote compaction
-  void UpdateTableProperties(const TableProperties& table_properties);
+  Status UpdateTableProperties(const TableProperties& table_properties);
 
   // Update output table properties from table builder
-  void UpdateTableProperties();
+  Status UpdateTableProperties();
 
   IOStatus WriterSyncClose(const Status& intput_status, SystemClock* clock,
                            Statistics* statistics, bool use_fsync);
@@ -180,6 +186,10 @@ class CompactionOutputs {
   }
 
   FileMetaData* GetMetaData() { return &current_output().meta; }
+
+  bool CurrentOutputClosedByBlobReferenceLimit() const {
+    return outputs_.back().closed_by_blob_reference_limit;
+  }
 
   bool HasOutput() const { return !outputs_.empty(); }
 
@@ -291,6 +301,10 @@ class CompactionOutputs {
   uint64_t GetCurrentKeyGrandparentOverlappedBytes(
       const Slice& internal_key) const;
 
+  // Counts and logs a cut of the current output by the blob reference limit
+  // before `next_key`, and marks the output for the event log.
+  ROCKSDB_COLD void NoteBlobReferenceLimitCut(const Slice& next_key);
+
   // Add current key from compaction_iterator to the output file. If needed
   // close and open new compaction output with the functions provided.
   Status AddToOutput(CompactionIterator& c_iter,
@@ -342,6 +356,10 @@ class CompactionOutputs {
 
   // current output builder and writer
   std::unique_ptr<TableBuilder> builder_;
+  // True when builder_ collects exact blob reference metadata, so it can
+  // reach the per-SST reference limit. Set by NewBuilder(). Other keys skip
+  // the limit check.
+  bool builder_collects_blob_references_ = false;
   std::unique_ptr<WritableFileWriter> file_writer_;
   uint64_t current_output_file_size_ = 0;
   SequenceNumber smallest_preferred_seqno_ = kMaxSequenceNumber;
