@@ -1716,6 +1716,64 @@ TEST_F(VersionEditTest, TryGetDbOwnershipStartTime) {
   EXPECT_EQ(f.TryGetDbOwnershipStartTime(), 2500u);
 }
 
+TEST_F(VersionEditTest, BlobReferenceDescriptorEncodeDecode) {
+  VersionEdit edit;
+  edit.AddFile(3, 300, 0, 100, InternalKey("foo", 10, kTypeValue),
+               InternalKey("zoo", 20, kTypeValue), 10, 20, false,
+               Temperature::kUnknown, kInvalidBlobFileNumber,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+               300 /* epoch_number */, kUnknownFileChecksum,
+               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
+  BlobReferenceMetadataDescriptor descriptor;
+  descriptor.index_handle = BlockHandle(10, 20);
+  descriptor.column_family_id = 0;
+  descriptor.sst_file_number = 300;
+  descriptor.EncodeTo(
+      &edit.GetMutableNewFiles()[0].second.blob_reference_descriptor);
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded, 0 /* ts_sz */));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_EQ(decoded.GetNewFiles().size(), 1);
+  ASSERT_EQ(decoded.GetNewFiles()[0].second.blob_reference_descriptor,
+            edit.GetNewFiles()[0].second.blob_reference_descriptor);
+  ASSERT_NE(NewFileCustomTag::kBlobReferenceDescriptor &
+                NewFileCustomTag::kCustomTagNonSafeIgnoreMask,
+            0U);
+
+  std::string corrupt = encoded;
+  const std::string& descriptor_bytes =
+      edit.GetNewFiles()[0].second.blob_reference_descriptor;
+  const size_t descriptor_offset = corrupt.find(descriptor_bytes);
+  ASSERT_NE(descriptor_offset, std::string::npos);
+  corrupt[descriptor_offset] ^= 1;
+  ASSERT_TRUE(decoded.DecodeFrom(corrupt).IsCorruption());
+}
+
+TEST_F(VersionEditTest, BlobReferenceLegacyMetadataEncodeDecode) {
+  VersionEdit edit;
+  edit.AddFile(3, 300, 0, 100, InternalKey("foo", 10, kTypeValue),
+               InternalKey("zoo", 20, kTypeValue), 10, 20, false,
+               Temperature::kUnknown, kInvalidBlobFileNumber,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+               300 /* epoch_number */, kUnknownFileChecksum,
+               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
+  edit.GetMutableNewFiles()[0].second.blob_reference_legacy_metadata = true;
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded, 0 /* ts_sz */));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_EQ(decoded.GetNewFiles().size(), 1);
+  ASSERT_TRUE(decoded.GetNewFiles()[0].second.blob_reference_legacy_metadata);
+  ASSERT_TRUE(
+      decoded.GetNewFiles()[0].second.blob_reference_descriptor.empty());
+  ASSERT_NE(NewFileCustomTag::kBlobReferenceLegacyMetadata &
+                NewFileCustomTag::kCustomTagNonSafeIgnoreMask,
+            0U);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

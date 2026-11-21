@@ -1058,12 +1058,13 @@ Status InstallMemtableAtomicFlushResults(
   // of the batch, after the install of the new Versions (see the callback
   // contract in VersionSet::LogAndApply()). The batch can release the DB mutex
   // for a short time between the install and the callbacks, to free relocation
-  // state (see publish_batch_callbacks in VersionSet::ProcessManifestWrites()).
-  // The callbacks of the other writers are empty, so each memtable list changes
-  // exactly once. If LogAndApply() returns before the batch starts, no callback
-  // runs, and the code right after the call runs publish_atomic_flush itself.
-  // For an atomic flush this happens only when every column family was dropped
-  // while its writers waited: the flush always has edits and passes no pre_cb.
+  // state or census state (see publish_batch_callbacks in
+  // VersionSet::ProcessManifestWrites()). The callbacks of the other writers
+  // are empty, so each memtable list changes exactly once. If LogAndApply()
+  // returns before the batch starts, no callback runs, and the code right after
+  // the call runs publish_atomic_flush itself. For an atomic flush this happens
+  // only when every column family was dropped while its writers waited: the
+  // flush always has edits and passes no pre_cb.
   bool published = false;
   const auto publish_atomic_flush = [&](const Status& status) {
     published = true;

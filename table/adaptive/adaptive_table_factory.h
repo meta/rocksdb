@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
 #include "rocksdb/options.h"
@@ -17,6 +18,7 @@ struct EnvOptions;
 class Status;
 class RandomAccessFile;
 class WritableFile;
+class CacheReservationManager;
 class Table;
 class TableBuilder;
 
@@ -28,6 +30,15 @@ class TableBuilder;
 // with nullptr, relocation file reads return NotSupported.
 const BlockBasedTableOptions* GetBlockBasedTableWriterOptions(
     const TableFactory* table_factory);
+// Returns the cache reservation manager that charges blob reference metadata to
+// the block cache (CacheEntryRole::kBlobReferenceMetadataBuildingBuffer). It
+// belongs to the block-based writer: the factory itself, or the write factory
+// of an AdaptiveTableFactory. The table builders of that writer use it.
+// TableCache also uses it to read the reference summary of an SST when the
+// caller passes no reservation manager. Returns nullptr when there is no
+// block-based writer, no block cache, or charging is disabled.
+std::shared_ptr<CacheReservationManager>
+GetBlobReferenceCacheReservationManager(const TableFactory* table_factory);
 
 class AdaptiveTableFactory : public TableFactory {
  public:
@@ -61,6 +72,10 @@ class AdaptiveTableFactory : public TableFactory {
   // Returns the block-based options used for newly written tables, or nullptr
   // when the configured write factory uses another table format.
   const BlockBasedTableOptions* GetBlockBasedTableWriterOptions() const;
+  // The blob reference metadata cache reservation manager of the write
+  // factory, or nullptr (see the free function of the same name).
+  std::shared_ptr<CacheReservationManager>
+  GetBlobReferenceCacheReservationManager() const;
 
   std::unique_ptr<TableFactory> Clone() const override {
     return std::make_unique<AdaptiveTableFactory>(*this);
