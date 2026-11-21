@@ -25,6 +25,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
@@ -450,6 +451,12 @@ DBOptions GetCheckpointDBOptions(DB* source) {
   db_options.compaction_service.reset();
   // Recovery would apply it again to WAL records that source already holds.
   db_options.wal_filter = nullptr;
+  // A checkpoint of a DB in store mode is a DB in file mode (see
+  // LiveFileStorageInfo::replacement_contents). The store object belongs to
+  // source, and an open with it would claim and change the rows of source.
+  db_options.manifest_store.reset();
+  db_options.manifest_store_migrate = false;
+  db_options.manifest_store_copy_mode = ManifestCopyMode::kOff;
   return db_options;
 }
 

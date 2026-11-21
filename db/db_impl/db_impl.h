@@ -39,6 +39,7 @@
 #include "db/internal_stats.h"
 #include "db/log_writer.h"
 #include "db/logs_with_prep_tracker.h"
+#include "db/manifest_store_state.h"
 #include "db/memtable_list.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/post_memtable_callback.h"
@@ -728,12 +729,25 @@ class DBImpl : public DB
       const LiveFilesStorageInfoOptions& opts,
       std::vector<LiveFileStorageInfo>* files) override;
 
+  // True when the metadata of this DB is in a ManifestStore and the MANIFEST
+  // file is only a stub (see db/manifest_store_state.h). A primary is in store
+  // mode when its VersionSet commits to the store. A read-only, secondary or
+  // follower instance (read_only_ is true) has no ManifestStoreState. It reads
+  // the rows when its options hold a store. Paths that copy the files of the DB
+  // use this to give the MANIFEST from memory instead of the stub.
+  bool MetadataInStore() const {
+    return versions_->IsStoreMode() ||
+           (read_only_ && StoreModeOptions(immutable_db_options_));
+  }
+
   // Variant of GetLiveFilesStorageInfo used by subset-CF Checkpoint. Only
   // table/blob files of the given column families are captured; the rest are
   // reported in excluded_cf_ids so the caller can reconcile the copied
   // MANIFEST (typically via AppendColumnFamilyDropsToManifest below). Caller
   // must supply a non-empty include_cf_ids containing the default CF id and a
-  // non-null excluded_cf_ids; both are internal-contract preconditions.
+  // non-null excluded_cf_ids; both are internal-contract preconditions. In
+  // store mode the MANIFEST is built from memory without the excluded column
+  // families, so no append is needed.
   Status GetLiveFilesStorageInfoForSubsetCheckpoint(
       const LiveFilesStorageInfoOptions& opts,
       const std::vector<uint32_t>& include_cf_ids,
@@ -3769,12 +3783,9 @@ class DBImpl : public DB
   // matters for a store. With a store, the results are:
   // - InvalidArgument when the feature version is not from 1 to
   //   kManifestRowFeatureVersionLatest;
-  // - NotSupported when `store_mode_supported` is false (see "Not supported in
-  //   store mode yet" in include/rocksdb/manifest_store.h);
   // - InvalidArgument with best_efforts_recovery or
-  //   best_efforts_blob_db_repair, and NotSupported with compaction_service.
-  static Status CheckManifestStoreOptions(const DBOptions& db_options,
-                                          bool store_mode_supported);
+  //   best_efforts_blob_db_repair.
+  static Status CheckManifestStoreOptions(const DBOptions& db_options);
 
   // Validate self-consistency of DB options and its consistency with cf options
   static Status ValidateOptions(

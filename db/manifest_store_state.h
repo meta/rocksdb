@@ -92,7 +92,10 @@ struct ImmutableDBOptions;
 //
 // Read-only: DB::OpenForReadOnly() needs a done stub. It scans without a
 // claim, with a consistent scan, and never commits. DB::ListColumnFamilies()
-// with a store scans the same way.
+// with a store scans the same way. DB::OpenAsSecondary(), DB::OpenAsFollower()
+// and the remote compaction worker open the same way. A secondary and a
+// follower scan again to catch up (see "Store mode in a secondary or
+// follower" at ReactiveVersionSet::ReadStoreForCatchUp()).
 //
 // Close: when the DB starts to close, a commit with an unknown outcome gives
 // up at the first failed retry, so a close does not wait for a store that
@@ -103,8 +106,26 @@ struct ImmutableDBOptions;
 // (DBImpl::ClaimForEnter()). When the enter fails before its switch, that row
 // stays. It belongs to no DB, so a later create or enter may take it over.
 //
-// Unsupported paths: see "Not supported in store mode yet" in
+// Unsupported paths: see "Not supported in store mode" in
 // include/rocksdb/manifest_store.h. They return NotSupported.
+//
+// Copies of the DB: DB::GetLiveFilesStorageInfo() builds a MANIFEST from the
+// in-memory state (ManifestRowsToRecords()), so checkpoints and backups are
+// DBs in file mode.
+//
+// Remote compaction: the primary sends its applied commit sequence
+// (ManifestStoreState::applied_commit_sequence()) as
+// CompactionServiceInput::min_store_commit_sequence when
+// DBOptions::remote_compaction_manifest_floor is true (otherwise it sends 0,
+// which means no floor). The worker refuses a scan with a smaller commit
+// sequence and returns Incomplete, so the compaction service can run the job
+// locally.
+//
+// DestroyDB(): with the store in the options, it checks that the DB row has
+// the db id of the stub, calls ManifestStore::Destroy(), and then deletes the
+// files. After a rollback, it also removes the rows that the rollback left
+// when they have the db id of the DB (see DestroyDB() in
+// db/db_impl/db_impl.cc).
 //
 // Write path (VersionSet::ProcessManifestWrites()): RocksDB turns each batch
 // of VersionEdits into row changes and sends them to the store as one
@@ -134,6 +155,25 @@ struct ImmutableDBOptions;
 // store, DBImpl::EnterManifestStore() moves a file-mode DB into the store,
 // and RollBackManifestStore() moves a DB back to file mode. The MANIFEST file
 // copy (below) makes a rollback without the store possible.
+
+// Returns true when `options` (DBOptions or ImmutableDBOptions) give a store,
+// so that a reader (a read-only, secondary or follower instance, or a remote
+// compaction worker) reads the metadata from the store instead of the
+// MANIFEST file. Three checks answer "is the metadata in the store?" for
+// different callers:
+//
+//   Check                        Used by
+//   ---------------------------  --------------------------------------------
+//   VersionSet::IsStoreMode()    a primary, whose VersionSet commits to the
+//                                store
+//   StoreModeOptions(options)    the readers above, which have no
+//                                ManifestStoreState
+//   DBImpl::MetadataInStore()    the copy paths (checkpoints, backups), which
+//                                run on a primary or a reader
+template <typename DbOptions>
+bool StoreModeOptions(const DbOptions& options) {
+  return options.manifest_store != nullptr;
+}
 
 // Makes the commit ids of one DB instance. A commit id is the DB session id
 // (new for each DB::Open()), a dash and a counter, so the ids of two instances
@@ -257,6 +297,21 @@ Status CheckOwnerAndClaim(ManifestStore* store,
                           ManifestDbRowResult* claimed,
                           ManifestDbRowExtraFields* extra = nullptr);
 
+// What a secondary or follower reads from the store for its open or one
+// catch-up (see "Store mode in a secondary or follower" at
+// ReactiveVersionSet::ReadStoreForCatchUp()).
+struct ManifestStoreRead {
+  // The number of the stub MANIFEST that CURRENT names.
+  uint64_t stub_number = 0;
+  // A consistent scan of all rows.
+  ManifestStoreScan scan;
+  // The ids of the live column families of the instance (in increasing
+  // order) that `bytes` was built for.
+  std::vector<uint32_t> live_cf_ids;
+  // The rows as the records of a MANIFEST file.
+  std::string bytes;
+};
+
 // MANIFEST file copy
 //
 // Background: in store mode RocksDB can also write the metadata as a MANIFEST
@@ -327,7 +382,8 @@ IOStatus DeleteManifestCopies(FileSystem* fs, const std::string& dbname,
 Status RecordsToManifestBytes(const std::vector<std::string>& records,
                               std::string* bytes);
 
-// Returns a sequential file that reads `data`.
+// Returns a sequential file that reads `data`. It frees `data` when a read
+// reaches the end.
 std::unique_ptr<FSSequentialFile> NewStringSequentialFile(std::string data);
 
 // The store mode state of one DB instance that opened a DB for writing.
@@ -368,6 +424,17 @@ class ManifestStoreState {
   // The DB row and the column family rows of the last commit. File rows are
   // not kept.
   const ManifestRows& committed_rows() const { return committed_rows_; }
+
+  // The commit sequence of the last commit that applied: the claim of
+  // DB::Open() or a later CommitBatch(). Every Version installed so far was
+  // committed at or below it, so a consistent scan with at least this commit
+  // sequence holds them. A remote compaction worker uses it as its floor
+  // (CompactionServiceInput::min_store_commit_sequence). Any thread can read
+  // it without a data race. The guarantee above holds only for a caller that
+  // holds the DB mutex.
+  uint64_t applied_commit_sequence() const {
+    return expected_commit_sequence_.load(std::memory_order_relaxed);
+  }
 
   // Stops the DB with `error`, for an error after a commit applied, such as a
   // failed copy append in sync mode. Returns the stop error.
@@ -498,8 +565,16 @@ class ManifestStoreState {
   const std::shared_ptr<ManifestStore> store_;
   ManifestCommitIdGenerator commit_ids_;
   const uint32_t feature_version_;
-  // The commit sequence that the next commit expects.
-  uint64_t expected_commit_sequence_ = 0;
+  // The commit sequence that the next commit expects, which is also the
+  // commit sequence of the last commit that applied: ManifestStore::Commit()
+  // takes the commit sequence that the DB row has now, and the store adds 1 on
+  // success. So after a commit applies, the DB row has the value that the next
+  // commit expects. Only the commit thread changes it. It is atomic because
+  // other threads read it with applied_commit_sequence(). Relaxed order is
+  // enough there: a reader that needs the guarantee of
+  // applied_commit_sequence() holds the DB mutex, and the Versions it uses were
+  // installed under the DB mutex after their commit applied.
+  std::atomic<uint64_t> expected_commit_sequence_{0};
   ManifestRows committed_rows_;
   ManifestDbRowExtraFields extra_fields_;
   IOStatus stop_error_;

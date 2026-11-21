@@ -1959,7 +1959,10 @@ struct DBOptions {
   // older MANIFEST view than that -- e.g. an eventually-consistent filesystem
   // returning a stale CURRENT, or a truncated MANIFEST -- and falls back to a
   // local compaction rather than risk an incorrect result computed against the
-  // wrong (older) LSM shape.
+  // wrong (older) LSM shape. In store mode (DBOptions::manifest_store) the
+  // MANIFEST file is a stub, so the primary also sends the commit sequence of
+  // the store, and the worker checks that value instead of the MANIFEST
+  // position.
   //
   // The presence of this position on the request also enables the worker's
   // "trust the MANIFEST" recovery, which avoids failing a job over a
@@ -2183,11 +2186,10 @@ struct DBOptions {
   // names is a small stub. DB::Open() with create_if_missing creates a new DB
   // in the store. A DB whose CURRENT names a normal MANIFEST file needs
   // manifest_store_migrate. include/rocksdb/manifest_store.h lists the paths
-  // that store mode does not support yet (for example checkpoints, backups
-  // and secondary instances). DB::Open() returns InvalidArgument when
-  // best_efforts_recovery or best_efforts_blob_db_repair is also set, and
-  // NotSupported when compaction_service is set. The object is not written
-  // to the OPTIONS file, because it belongs to one DB instance.
+  // that store mode does not support (for example DB::GetLiveFiles() and
+  // RepairDB()). DB::Open() returns InvalidArgument when best_efforts_recovery
+  // or best_efforts_blob_db_repair is also set. The object is not written to
+  // the OPTIONS file, because it belongs to one DB instance.
   std::shared_ptr<ManifestStore> manifest_store = nullptr;
 
   // EXPERIMENTAL
@@ -3723,6 +3725,16 @@ struct CompactionServiceOptionsOverride {
 
   // Info Log. If not overriden, default one will be used.
   std::shared_ptr<Logger> info_log = nullptr;
+
+  // The store of a primary in store mode (DBOptions::manifest_store, see
+  // include/rocksdb/manifest_store.h for the terms). The OPTIONS file never
+  // holds the store, so the worker gets it only here. Use a store object
+  // without an epoch: the worker only reads the store (a consistent scan), and
+  // it never claims the DB, so it never fences the primary. Each
+  // DB::OpenAndCompact() call is its own DB instance, so give each concurrent
+  // call its own object, or a thread-safe one, and never the object that the
+  // primary uses. Null for a primary in file mode.
+  std::shared_ptr<ManifestStore> manifest_store = nullptr;
 
   // Only compaction generated SST files use this user defined table properties
   // collector.

@@ -51,6 +51,7 @@
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/malloc_stats.h"
+#include "db/manifest_rows.h"
 #include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/memtable_list.h"
@@ -95,6 +96,7 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/experimental.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/stats_history.h"
@@ -7501,6 +7503,101 @@ Status DB::ListColumnFamilies(const DBOptions& db_options,
 
 Snapshot::~Snapshot() = default;
 
+namespace {
+// Removes the rows of a DB in store mode (see db/manifest_store_state.h) for
+// DestroyDB(), after a check that the rows belong to this DB
+// (CheckManifestDbRowOwner()): a store object for another DB, given by mistake,
+// must not remove the rows of that DB. A missing DB row passes the check, and
+// Destroy() runs. A DB row without a db id is the row of an enter (a move from
+// file mode into the store) that failed before its switch (see
+// db/manifest_store_state.h). It belongs to no DB, so it passes the check too.
+// Such a row holds no metadata, so removing it loses no DB's metadata.
+IOStatus DestroyManifestStoreRows(ManifestStore* store,
+                                  const std::string& stub_db_id) {
+  ManifestDbRowResult db_row;
+  IOStatus io_s = store->ReadDbRow(&db_row);
+  if (io_s.ok()) {
+    Status s = CheckManifestDbRowOwner(db_row.db_row, stub_db_id);
+    if (!s.ok()) {
+      return status_to_io_status(std::move(s));
+    }
+  } else if (!io_s.IsNotFound()) {
+    return io_s;
+  }
+  return store->Destroy();
+}
+
+// Reads the db id of a DB in file mode for DestroyDB(): from the MANIFEST file
+// `manifest_number` (experimental::GetDbIdentityFromManifest()), or else from
+// the IDENTITY file. A MANIFEST without a db id, or one that cannot be read up
+// to the first record with a db id, falls back to the IDENTITY file. Sets
+// `*db_id` to empty when neither has one.
+Status ReadFileModeDbId(FileSystem* fs, const std::string& dbname,
+                        uint64_t manifest_number, std::string* db_id) {
+  db_id->clear();
+  Status s = experimental::GetDbIdentityFromManifest(
+      fs, DescriptorFileName(dbname, manifest_number), db_id);
+  if (s.ok()) {
+    return s;
+  }
+  db_id->clear();
+  std::string identity;
+  s = ReadFileToString(fs, IdentityFileName(dbname), &identity);
+  if (s.IsNotFound() || s.IsPathNotFound()) {
+    return Status::OK();
+  }
+  if (s.ok()) {
+    while (!identity.empty() && identity.back() == '\n') {
+      identity.pop_back();
+    }
+    *db_id = std::move(identity);
+  }
+  return s;
+}
+
+// After RollBackManifestStore(), the rows of a DB stay in the store with
+// authority kFile, and they stop a new DB from being created on top of them
+// (see ManifestStore::Destroy()). DestroyDB() of that DB in file mode, with
+// the store in the options, removes them when they have the db id of the DB.
+// It leaves other rows alone, because they belong to another DB or to a DB in
+// store mode.
+IOStatus DestroyRolledBackRows(ManifestStore* store, const std::string& db_id) {
+  if (db_id.empty()) {
+    return IOStatus::OK();
+  }
+  ManifestDbRowResult db_row;
+  IOStatus io_s = store->ReadDbRow(&db_row);
+  if (io_s.IsNotFound()) {
+    return IOStatus::OK();
+  }
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  ManifestRows rows;
+  ManifestDbRowExtraFields extra_fields;
+  Status s =
+      CheckManifestDbRowOwner(db_row.db_row, db_id, &rows, &extra_fields);
+  if (s.IsInvalidArgument()) {
+    // CheckManifestDbRowOwner() returns InvalidArgument only when the row has
+    // another db id (the rows of another DB). A row that cannot be decoded
+    // gives another error, which is returned below.
+    return IOStatus::OK();
+  }
+  if (!s.ok()) {
+    return status_to_io_status(std::move(s));
+  }
+  // A DB row without a db id (an enter that failed before its switch) passes
+  // the owner check. After a rollback, CURRENT names a MANIFEST file, not a
+  // stub, so nothing ties such a row to this folder, and it may belong to
+  // another folder. It is kept.
+  if (rows.db.db_id != db_id ||
+      extra_fields.authority != ManifestAuthority::kFile) {
+    return IOStatus::OK();
+  }
+  return store->Destroy();
+}
+}  // namespace
+
 Status DestroyDB(const std::string& dbname, const Options& options,
                  const std::vector<ColumnFamilyDescriptor>& column_families) {
   ImmutableDBOptions soptions(SanitizeOptions(dbname, options));
@@ -7527,19 +7624,47 @@ Status DestroyDB(const std::string& dbname, const Options& options,
   Status result = env->LockFile(lockname, &lock);
   if (result.ok()) {
     // A DB in store mode keeps its metadata in a ManifestStore (see
-    // db/manifest_store_state.h). Deleting the files would leave the rows,
-    // and a later DB::Open() with create_if_missing would not create a new
-    // DB on top of them.
+    // db/manifest_store_state.h). Deleting only the files would leave the
+    // rows, and a later DB::Open() with create_if_missing would not create a
+    // new DB on top of them. So the rows are removed first, with the store in
+    // the options, and then the files. A crash between the two steps leaves
+    // a folder whose stub names a DB that the store no longer has: DB::Open()
+    // refuses it, and DestroyDB() can run again (ManifestStore::Destroy()
+    // returns OK when there is no DB row).
     CurrentManifestInfo current;
     Status current_s =
         ReadCurrentManifestInfo(soptions.fs.get(), dbname, &current);
-    // A stub that this binary cannot decode (current_s not OK) is still a
-    // stub.
+    // A stub that this binary cannot decode (current_s not OK, for example a
+    // stub of a newer binary) is still a stub. Its error is returned, because
+    // there is no db id to check the rows against.
     if (current.is_stub) {
-      current_s.PermitUncheckedError();
-      env->UnlockFile(lock).PermitUncheckedError();
-      return Status::NotSupported(
-          "DestroyDB() does not support a DB in store mode yet");
+      Status destroy_s;
+      if (!current_s.ok()) {
+        destroy_s = current_s;
+      } else if (options.manifest_store == nullptr) {
+        destroy_s = Status::NotSupported(
+            "DestroyDB() on a DB in store mode needs the store in "
+            "DBOptions::manifest_store");
+      } else {
+        destroy_s = DestroyManifestStoreRows(options.manifest_store.get(),
+                                             current.stub.db_id);
+      }
+      if (!destroy_s.ok()) {
+        env->UnlockFile(lock).PermitUncheckedError();
+        return destroy_s;
+      }
+    } else if (current_s.ok() && current.exists &&
+               options.manifest_store != nullptr) {
+      std::string db_id;
+      Status destroy_s =
+          ReadFileModeDbId(soptions.fs.get(), dbname, current.number, &db_id);
+      if (destroy_s.ok()) {
+        destroy_s = DestroyRolledBackRows(options.manifest_store.get(), db_id);
+      }
+      if (!destroy_s.ok()) {
+        env->UnlockFile(lock).PermitUncheckedError();
+        return destroy_s;
+      }
     }
     if (sfm) {
       sfm->WaitForEmptyTrashInDirectory(dbname);

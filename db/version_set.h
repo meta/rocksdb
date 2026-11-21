@@ -26,6 +26,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -87,6 +88,7 @@ class ManifestTailer;
 struct ManifestRows;
 struct ManifestRowChanges;
 class ManifestStoreState;
+struct ManifestStoreRead;
 class FilePickerMultiGet;
 class MultiScanArgs;
 
@@ -1586,6 +1588,12 @@ class VersionSet {
   // never writes the MANIFEST.
   bool IsStoreMode() const { return manifest_store_state_ != nullptr; }
 
+  // In store mode, it returns ManifestStoreState::applied_commit_sequence(). In
+  // file mode, it returns 0. Any thread can read it without a data race. Its
+  // guarantee (every installed Version was committed at or below it) holds only
+  // for a caller that holds the DB mutex. Defined in db/manifest_rows.cc.
+  uint64_t StoreAppliedCommitSequence() const;
+
   // Prepares the MANIFEST file copy (see db/manifest_store_state.h) at
   // DB::Open() in store mode, before the first commit, as the copy mode of the
   // DB row says. First it marks the file numbers of all files and copies in
@@ -1689,6 +1697,13 @@ class VersionSet {
   Status DumpManifest(Options& options, std::string& manifestFileName,
                       bool verbose, bool hex = false, bool json = false,
                       const std::vector<ColumnFamilyDescriptor>& cf_descs = {});
+
+  // Prints the metadata of a DB in store mode (see db/manifest_store_state.h)
+  // like DumpManifest(): a consistent scan of `store`, turned into the records
+  // of a MANIFEST (ManifestRowsToRecords()). The store object needs no epoch.
+  Status DumpManifestFromStore(
+      Options& options, ManifestStore* store, bool verbose, bool hex, bool json,
+      const std::vector<ColumnFamilyDescriptor>& cf_descs);
 
   const std::string& DbSessionId() const { return db_session_id_; }
 
@@ -2058,6 +2073,50 @@ class VersionSet {
   // VersionSet.
   // REQUIRES: DB mutex held.
   void GetManifestRows(ManifestRows* rows) const;
+
+  // DB::GetLiveFilesStorageInfo() in store mode builds a MANIFEST from the
+  // rows of the current state (see LiveFileStorageInfo::replacement_contents).
+  // It copies the rows in steps, so that most of the work that grows with the
+  // number of live files runs without the DB mutex:
+  // 1. GetManifestRowsWithoutFiles(), with the DB mutex held, sets the DB row,
+  //    the WAL rows and the column family rows. It refs the current Version
+  //    of each column family and the ColumnFamilyData of that Version, so that
+  //    a column family dropped in the meantime stays alive. It also records
+  //    the files that are marked for compaction, because
+  //    FileMetaData::marked_for_compaction changes under the DB mutex
+  //    (DB::SuggestCompactRange()).
+  // 2. AddManifestFileRows(), without the DB mutex, adds the file and blob
+  //    file rows from those Versions. The other fields of a file that its row
+  //    holds do not change after the file is added to a Version, and the blob
+  //    file metadata of a Version does not change.
+  // 3. ReleaseCheckpointRowsRefs(), with the DB mutex held, unrefs them.
+  // When `include_cf_ids` is not null, only the column families in it are
+  // included (a subset checkpoint). Rows of dropped column families are not
+  // included. Defined in db/manifest_rows.cc.
+  // Memory: the rows and the built MANIFEST are in memory at the same time.
+  // An estimate is a few hundred bytes for each live file in each of them.
+  struct CheckpointRowsRefs {
+    // Referenced Versions; their ColumnFamilyData objects are referenced too.
+    std::vector<Version*> versions;
+    // The numbers of the files that are marked for compaction.
+    UnorderedSet<uint64_t> marked_files;
+  };
+
+  // Takes references that the caller must release with
+  // ReleaseCheckpointRowsRefs(). This function does step 1 of the steps
+  // above, and fills `refs`.
+  // REQUIRES: DB mutex held.
+  void GetManifestRowsWithoutFiles(ManifestRows* rows,
+                                   const UnorderedSet<uint32_t>* include_cf_ids,
+                                   CheckpointRowsRefs* refs) const;
+
+  // This function does step 2 of the steps above.
+  static void AddManifestFileRows(const CheckpointRowsRefs& refs,
+                                  ManifestRows* rows);
+
+  // This function does step 3 of the steps above.
+  // REQUIRES: DB mutex held.
+  static void ReleaseCheckpointRowsRefs(CheckpointRowsRefs* refs);
 
   void TEST_CreateAndAppendVersion(ColumnFamilyData* cfd) {
     assert(cfd);
@@ -2507,6 +2566,14 @@ class VersionSet {
   // REQUIRES: DB mutex held.
   VersionEdit ManifestCopyDbFields() const;
 
+  // The shared part of DumpManifest() and DumpManifestFromStore(): prints the
+  // records that `file_reader` reads, for the column families named in
+  // `column_families`.
+  Status DumpManifestRecords(
+      Options& options, const std::vector<std::string>& column_families,
+      std::unique_ptr<SequentialFileReader> file_reader, bool verbose, bool hex,
+      bool json, const std::vector<ColumnFamilyDescriptor>& cf_descs);
+
   // Replays the MANIFEST records that `reader` reads, for Recover() and
   // RecoverFromStore(). On OK, sets `*db_id` (if not null), `*log_number` and
   // `*read_size` (the bytes read).
@@ -2583,12 +2650,76 @@ class ReactiveVersionSet : public VersionSet {
   // They do not publish an OPTIONS file selected from primary MANIFEST state.
   void ApplyCommittedOptionsFileNumber(uint64_t /*number*/) override {}
 
+  // In store mode, `store_read` is the result of ReadStoreForCatchUp(), and
+  // null means that nothing changed. In file mode it must be null.
+  // When nothing changed, the reader of the last replay is at its end and its
+  // bytes are freed (NewStringSequentialFile()), so the tailer reads nothing.
   Status ReadAndApply(
       InstrumentedMutex* mu,
       std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
       Status* manifest_read_status,
       std::unordered_set<ColumnFamilyData*>* cfds_changed,
-      std::vector<std::string>* files_to_delete);
+      std::vector<std::string>* files_to_delete, ManifestStoreRead* store_read);
+
+  // Store mode in a secondary or follower
+  //
+  // In store mode (DBOptions::manifest_store, see db/manifest_store_state.h)
+  // the MANIFEST file is only a stub, and the primary keeps the metadata in
+  // the rows of the store. A secondary or follower replays the rows as if the
+  // primary had switched to a new MANIFEST file that holds the whole state.
+  // ManifestTailer handles that: the files that the new state does not list
+  // leave the Version.
+  //
+  // Open (Recover()):
+  // 1. ReadStore() reads CURRENT and does a consistent scan of the store.
+  // 2. BuildStoreManifestBytes() turns the rows into full-state records.
+  // 3. ApplyStoreRead() gives the records to the tailer from memory.
+  //
+  // One catch-up (TryCatchUpWithPrimary() or TryCatchUpWithLeader()):
+  // 1. ReadStoreForCatchUp(), without the DB mutex, calls
+  //    ManifestStore::ReadDbRow(). The DB row must have the db id that the
+  //    open read; otherwise the DB at this path was created again, and it
+  //    returns Corruption, as file mode does. If the commit sequence equals
+  //    replayed_store_commit_sequence(), nothing changed: it sets `*store_read`
+  //    to null and returns OK.
+  // 2. Otherwise it calls ReadStore(), takes the DB mutex for a short time to
+  //    list the live column families, and then builds the records without the
+  //    DB mutex. The records leave out the rows of column families that this
+  //    instance does not have (created after the open, or not asked for by the
+  //    open), because the tailer refuses their files. They add a drop record
+  //    for each live column family that the rows list as dropped or do not
+  //    list.
+  // 3. ReadAndApply(), with the DB mutex held, calls ApplyStoreCatchUp().
+  //    It skips a result whose commit sequence is not higher than the last
+  //    replay (a concurrent catch-up applied a newer one). If the live column
+  //    families changed since step 2, it builds the records again. Then the
+  //    tailer replays them. The reader frees the bytes when the tailer
+  //    reaches their end, so a later catch-up with nothing new reads nothing.
+  // 4. The tailer checks only the files that the current Version does not
+  //    hold yet (ManifestTailer::VerifyFile()). It still builds a new Version
+  //    from all live files with the DB mutex held, so the time of a catch-up
+  //    after a change grows with the number of live files.
+  // Memory: a catch-up after a change holds the scanned rows and their
+  // records at the same time. An estimate is a few hundred bytes for each
+  // live file in each of them.
+  //
+  // Errors: an error while the store is read or the records are built (steps
+  // 1 and 2, or the rebuild in step 3) changes nothing, and the next catch-up
+  // tries again. The db id check of step 1 is the exception: it fails again
+  // on every catch-up until the instance is opened again. An error during the
+  // replay stays in the tailer, as in file mode, and every later catch-up
+  // returns it until the instance is opened again. A catch-up never calls
+  // ManifestStore::Open(), so it never claims the DB.
+  // Concurrent catch-ups wait for each other during the store calls
+  // (store_read_mutex_), because RocksDB makes at most one call at a time on
+  // the store object.
+  //
+  // In file mode, it returns OK and sets `*store_read` to null, so the callers
+  // need no mode check.
+  //
+  // `mu` is the DB mutex, which must not be held. Any thread can call it.
+  Status ReadStoreForCatchUp(InstrumentedMutex* mu,
+                             std::unique_ptr<ManifestStoreRead>* store_read);
 
   Status Recover(const std::vector<ColumnFamilyDescriptor>& column_families,
                  std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
@@ -2622,6 +2753,13 @@ class ReactiveVersionSet : public VersionSet {
   // REQUIRES: db mutex
   bool NewestStateHasMissingFiles();
 
+  // In store mode, it returns the commit sequence of the store scan that this
+  // VersionSet replayed last (see "Store mode in a secondary or follower"
+  // above). In file mode, it returns 0. Any thread can call it.
+  uint64_t replayed_store_commit_sequence() const {
+    return replayed_store_commit_sequence_.load(std::memory_order_relaxed);
+  }
+
 #ifndef NDEBUG
   uint64_t TEST_read_edits_in_atomic_group() const;
 #endif  //! NDEBUG
@@ -2634,7 +2772,26 @@ class ReactiveVersionSet : public VersionSet {
       VersionEdit& edit, std::unordered_set<ColumnFamilyData*>* cfds_changed,
       VersionEdit* version_edit);
 
+  // Step 3 of a catch-up in store mode (see "Store mode in a secondary or
+  // follower" above): applies `store_read`, the result of
+  // ReadStoreForCatchUp(), unless it is null or not newer than the last
+  // replay. REQUIRES: DB mutex held.
+  Status ApplyStoreCatchUp(
+      log::Reader::Reporter* reporter,
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+      ManifestStoreRead* store_read);
+
+  // In store mode, `store_read` is as in ReadAndApply(), and the call goes to
+  // ApplyStoreCatchUp(). Recover() calls OpenStoreRead() instead in store
+  // mode.
   Status MaybeSwitchManifest(
+      log::Reader::Reporter* reporter,
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+      ManifestStoreRead* store_read);
+
+  // Reads the store and installs the reader of the rows for Recover() in store
+  // mode (see "Store mode in a secondary or follower" above).
+  Status OpenStoreRead(
       log::Reader::Reporter* reporter,
       std::unique_ptr<log::FragmentBufferedReader>* manifest_reader);
 
@@ -2653,8 +2810,43 @@ class ReactiveVersionSet : public VersionSet {
       std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
       Status* manifest_read_status);
 
+  // Step 1 of the open, and part of step 2 of a catch-up, in store mode (see
+  // "Store mode in a secondary or follower" above). It reads CURRENT, which
+  // must name a stub in state ManifestStubState::kDone (no mode change in
+  // progress), and does a consistent scan (ManifestScanOptions::consistent).
+  // The DB row must still have authority kStore and the db id of the stub. It
+  // does not need the DB mutex.
+  Status ReadStore(ManifestStoreRead* store_read) const;
+
+  // Installs a reader of `store_read->bytes` in `*manifest_reader`, and sets
+  // the MANIFEST file number to the stub number and
+  // replayed_store_commit_sequence() to the commit sequence of the scan.
+  // REQUIRES: DB mutex held, or no other thread uses this VersionSet.
+  void ApplyStoreRead(
+      log::Reader::Reporter* reporter,
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+      ManifestStoreRead* store_read);
+
+  // The ids of the column families that this instance has and has not
+  // dropped, in increasing order.
+  // REQUIRES: DB mutex held.
+  std::vector<uint32_t> LiveColumnFamilyIds() const;
+
  private:
   std::unique_ptr<ManifestTailer> manifest_tailer_;
+  // See replayed_store_commit_sequence(). ApplyStoreRead() sets it with the DB
+  // mutex held, or during the open, when no other thread uses this VersionSet.
+  // It is atomic because ReadStoreForCatchUp() reads it without the DB mutex;
+  // relaxed order is enough, because a stale value only causes one more scan,
+  // and ApplyStoreCatchUp() skips a scan that is not newer.
+  std::atomic<uint64_t> replayed_store_commit_sequence_{0};
+  // The db id of the rows that OpenStoreRead() read. It is set during the
+  // open, before any other thread uses this VersionSet, and only read after.
+  std::string opened_db_id_;
+  // Held during the store calls of ReadStoreForCatchUp(), so that two
+  // concurrent catch-ups do not call the store at the same time. It is never
+  // held with the DB mutex.
+  mutable std::mutex store_read_mutex_;
   // When true, MANIFEST recovery trusts the manifest and does not stat/open SST
   // or blob files (see
   // VersionEditHandlerPointInTime::trust_manifest_recovery_). Set only for the

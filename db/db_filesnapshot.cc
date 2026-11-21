@@ -13,6 +13,8 @@
 
 #include "db/db_impl/db_impl.h"
 #include "db/job_context.h"
+#include "db/manifest_rows.h"
+#include "db/manifest_store_state.h"
 #include "db/version_set.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -25,7 +27,9 @@
 #include "rocksdb/types.h"
 #include "rocksdb/wal_iterator.h"
 #include "test_util/sync_point.h"
+#include "util/defer.h"
 #include "util/file_checksum_helper.h"
+#include "util/hash_containers.h"
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -49,20 +53,24 @@ Status DBImpl::FlushForGetLiveFiles(bool force_atomic_flush) {
 }
 
 namespace {
-// The live file APIs return the MANIFEST file, which is only a stub in store
-// mode (see db/manifest_store_state.h). So checkpoints and backups, which use
-// these APIs, would copy a DB that cannot be opened.
+// Returns the error of GetLiveFiles() and AppendColumnFamilyDropsToManifest()
+// in store mode (see db/manifest_store_state.h). GetLiveFiles() names the
+// MANIFEST file for the caller to copy, and AppendColumnFamilyDropsToManifest()
+// appends to such a copy. In store mode the MANIFEST file is only a stub, so no
+// MANIFEST file that CURRENT can name holds the metadata. The MANIFEST file
+// copies (MANIFEST_COPY-<number>) are not offered in place of the stub either.
+// GetLiveFilesStorageInfo() gives the MANIFEST content in memory instead.
 Status StoreModeLiveFilesNotSupported() {
   return Status::NotSupported(
-      "The live file APIs do not support a DB in store mode (manifest_store) "
-      "yet");
+      "In store mode (manifest_store) no MANIFEST file can be copied; use "
+      "GetLiveFilesStorageInfo()");
 }
 }  // namespace
 
 Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
                             uint64_t* manifest_file_size, bool flush_memtable) {
   *manifest_file_size = 0;
-  if (immutable_db_options_.manifest_store != nullptr) {
+  if (MetadataInStore()) {
     return StoreModeLiveFilesNotSupported();
   }
 
@@ -227,7 +235,7 @@ Status DBImpl::AppendColumnFamilyDropsToManifest(
     const std::string& manifest_path, uint64_t manifest_size,
     const std::vector<uint32_t>& cf_ids,
     uint64_t committed_options_file_number) {
-  if (immutable_db_options_.manifest_store != nullptr) {
+  if (MetadataInStore()) {
     return StoreModeLiveFilesNotSupported();
   }
   const WriteOptions write_options;
@@ -362,9 +370,6 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     std::vector<uint32_t>* excluded_cf_ids,
     SubsetCheckpointOptionsSnapshot* options_snapshot,
     LiveFilesPinRequest* pin_request) {
-  if (immutable_db_options_.manifest_store != nullptr) {
-    return StoreModeLiveFilesNotSupported();
-  }
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
@@ -379,13 +384,13 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   const bool cf_subset = !include_cf_ids.empty();
   assert(!cf_subset || excluded_cf_ids != nullptr);
   assert(!cf_subset || options_snapshot != nullptr);
-  const std::unordered_set<uint32_t> include_cf_id_set(include_cf_ids.begin(),
-                                                       include_cf_ids.end());
+  const UnorderedSet<uint32_t> include_cf_id_set(include_cf_ids.begin(),
+                                                 include_cf_ids.end());
   // Tracks which requested ids remain to be observed as live under the DB
   // mutex; any id still present after the enumeration was either dropped
   // before or during the checkpoint (race) and must not silently disappear
   // from the checkpoint.
-  std::unordered_set<uint32_t> unseen_include_cf_ids = include_cf_id_set;
+  UnorderedSet<uint32_t> unseen_include_cf_ids = include_cf_id_set;
 
   // NOTE: This implementation was largely migrated from Checkpoint.
 
@@ -576,10 +581,42 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     PinVersionsWithLock(std::move(pinned_versions), &pin_until_success);
   }
 
+  // Store mode (see db/manifest_store_state.h): the MANIFEST file is a stub,
+  // so the result gives a MANIFEST that RocksDB builds from the in-memory state
+  // instead (see LiveFileStorageInfo::replacement_contents). A DB opened from
+  // it is a normal DB in file mode. The rows are copied in three steps (see
+  // VersionSet::CheckpointRowsRefs); step 1 runs here with the DB mutex held.
+  //
+  // A subset checkpoint leaves out the excluded column families, and records
+  // its own OPTIONS file when the DB tracks the OPTIONS file number in the
+  // MANIFEST, so the checkpoint needs no MANIFEST append (see
+  // CheckpointImpl::CreateCheckpointImpl()).
+  std::unique_ptr<ManifestRows> store_rows;
+  VersionSet::CheckpointRowsRefs store_refs;
+  // Every return after this point runs without the DB mutex, so the Defer
+  // below can take the DB mutex to release the referenced Versions.
+  Defer release_store_refs([this, &store_refs]() {
+    if (!store_refs.versions.empty()) {
+      InstrumentedMutexLock l(&mutex_);
+      VersionSet::ReleaseCheckpointRowsRefs(&store_refs);
+    }
+  });
+  if (MetadataInStore()) {
+    store_rows = std::make_unique<ManifestRows>();
+    versions_->GetManifestRowsWithoutFiles(
+        store_rows.get(), cf_subset ? &include_cf_id_set : nullptr,
+        &store_refs);
+    if (cf_subset && options_snapshot->options_file_number != 0 &&
+        options_snapshot->commit_options_file_number) {
+      store_rows->db.committed_options_file_number =
+          options_snapshot->options_file_number;
+    }
+  }
+
   // Capture some final info before releasing mutex
   const uint64_t manifest_number = versions_->manifest_file_number();
   uint64_t manifest_size = versions_->manifest_file_size();
-  if (cf_subset && !excluded_cf_ids->empty()) {
+  if (store_rows == nullptr && cf_subset && !excluded_cf_ids->empty()) {
     Status manifest_s = versions_->GetManifestAppendBoundary(&manifest_size);
     if (!manifest_s.ok()) {
       mutex_.Unlock();
@@ -618,6 +655,25 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     }
   }
 
+  // In store mode, the MANIFEST content is built here and held in memory in
+  // the result until the caller copies it. Its size is about the size of a
+  // MANIFEST file right after a rollover. This is an estimate of a few hundred
+  // bytes for each live file.
+  std::string manifest_contents;
+  if (store_rows != nullptr) {
+    VersionSet::AddManifestFileRows(store_refs, store_rows.get());
+    std::vector<std::string> records;
+    Status export_s = ManifestRowsToRecords(*store_rows, &records);
+    store_rows.reset();
+    if (export_s.ok()) {
+      export_s = RecordsToManifestBytes(records, &manifest_contents);
+    }
+    if (!export_s.ok()) {
+      return export_s;
+    }
+    manifest_size = manifest_contents.size();
+  }
+
   std::string manifest_fname = DescriptorFileName(manifest_number);
   {  // MANIFEST
     results.emplace_back();
@@ -628,7 +684,11 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     info.file_number = manifest_number;
     info.file_type = kDescriptorFile;
     info.size = manifest_size;
-    info.trim_to_size = true;
+    if (manifest_contents.empty()) {
+      info.trim_to_size = true;
+    } else {
+      info.replacement_contents = std::move(manifest_contents);
+    }
     if (opts.include_checksum_info) {
       info.file_checksum_func_name = kUnknownFileChecksumFuncName;
       info.file_checksum = kUnknownFileChecksum;
