@@ -4,7 +4,6 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.ffm.*;
 
 import java.io.IOException;
@@ -69,7 +68,7 @@ public class RocksFFMMultiGetTest {
   // TODO (AP) - write to the new CF
 
   @Test
-  public void readEmptyNewColumnFamily() throws RocksFFMException {
+  public void readWriteNewColumnFamily() throws RocksFFMException {
     try (Arena arena = Arena.ofConfined()) {
       try (RocksdbOptions rocksdbOptions = new RocksdbOptions()) {
         rocksdbOptions.setCreateIfMissing((byte) 1);
@@ -83,16 +82,43 @@ public class RocksFFMMultiGetTest {
 
           try (RocksdbOptions columnFamilyOptions = new RocksdbOptions()) {
             try (ColumnFamilyHandle cf2 = db.columnFamily().createColumnFamily("CF2", columnFamilyOptions)) {
-              List<String> keys = List.of("key1", "key2", "key3", "key4", "key5");
 
+              try (RocksdbWriteoptions writeoptions = new RocksdbWriteoptions()) {
+                var putter = db.put();
+                putter.put(writeoptions, cf2, segmentOf(arena, "key3"), segmentOf(arena, "value3"));
+                putter.put(writeoptions, cf2, segmentOf(arena, "key5"), segmentOf(arena, "value5"));
+              }
+
+              List<String> keys = List.of("key1", "key2", "key3", "key4", "key5");
               try (RocksdbReadoptions readoptions = new RocksdbReadoptions()) {
                 var result = db.multiGet().get(readoptions, cf2, keys, false);
                 assertThat(result.getCount()).isEqualTo(5);
                 for (int i = 0; i < keys.size(); i++) {
                   assertThat(result.isError(i)).isFalse();
-                  assertThat(result.getValue(i)).isEqualTo(MemorySegment.NULL);
                 }
+                assertThat(result.getValue(0)).isEqualTo(MemorySegment.NULL);
+                assertThat(result.getValue(1)).isEqualTo(MemorySegment.NULL);
+                assertThat(stringOf(result.getValue(2))).isEqualTo("value3");
+                assertThat(result.getValue(3)).isEqualTo(MemorySegment.NULL);
+                assertThat(stringOf(result.getValue(4))).isEqualTo("value5");
               }
+
+              ColumnFamilyHandle defaultColumnFamilyHandle = db.columnFamily().defaultFamilyHandle();
+
+              try (RocksdbReadoptions readoptions = new RocksdbReadoptions()) {
+                var result = db.multiGet().get(readoptions, defaultColumnFamilyHandle, keys, false);
+                assertThat(result.getCount()).isEqualTo(5);
+                for (int i = 0; i < keys.size(); i++) {
+                  assertThat(result.isError(i)).isFalse();
+                }
+                assertThat(result.getValue(0)).isEqualTo(MemorySegment.NULL);
+                assertThat(stringOf(result.getValue(1))).isEqualTo("value2");
+                assertThat(result.getValue(2)).isEqualTo(MemorySegment.NULL);
+                assertThat(stringOf(result.getValue(3))).isEqualTo("value4");
+                assertThat(result.getValue(4)).isEqualTo(MemorySegment.NULL);
+              }
+
+              // TODO (AP) errors returned from the multiGet()
             }
           }
         }
