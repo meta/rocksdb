@@ -457,6 +457,44 @@ int db_stress_tool(int argc, char** argv) {
     return ReturnValidationError(
         "nooverwritepercent must not be 100 when using merge operands");
   }
+  if (FLAGS_enable_blob_indirection ||
+      FLAGS_allow_setting_blob_indirection_dynamically) {
+    // These checks follow the blob indirection rules of
+    // ColumnFamilyData::ValidateOptions: blob files on, no blob direct write,
+    // no FIFO, and no full external table. A table factory that is not
+    // block-based can still come from --table_factory_uri; DB open or
+    // SetOptions() then rejects it. db_stress also rejects stacked BlobDB
+    // (use_blob_db), which this test does not support with blob indirection.
+    // db_crashtest.py has the same list. FIFO is rejected even while the option
+    // is off: a column family that has used blob indirection keeps its per-CF
+    // format fence (see db/blob/blob_relocation_manifest.h), and RocksDB
+    // rejects FIFO for such a column family after the option is turned off.
+    if (!FLAGS_enable_blob_files) {
+      return ReturnValidationError(
+          "blob indirection requires enable_blob_files");
+    }
+    if (FLAGS_enable_blob_direct_write) {
+      return ReturnValidationError(
+          "blob indirection is incompatible with enable_blob_direct_write");
+    }
+    if (FLAGS_use_blob_db) {
+      return ReturnValidationError(
+          "blob indirection is only supported with integrated BlobDB");
+    }
+    if (FLAGS_compaction_style ==
+        static_cast<int>(ROCKSDB_NAMESPACE::kCompactionStyleFIFO)) {
+      return ReturnValidationError(
+          "blob indirection is incompatible with FIFO compaction");
+    }
+    if (FLAGS_use_full_external_table) {
+      return ReturnValidationError(
+          "blob indirection requires the block-based table format");
+    }
+  }
+  if (FLAGS_blob_indirection_require_gc && !FLAGS_statistics) {
+    return ReturnValidationError(
+        "blob_indirection_require_gc requires statistics");
+  }
   if (FLAGS_enable_blob_direct_write) {
     // Blob direct write is intentionally validated as a reduced-scope stress
     // feature. We allow the WAL-disabled crash-test profile, including
@@ -790,6 +828,30 @@ int db_stress_tool(int argc, char** argv) {
   KillPoint* kp = KillPoint::GetInstance();
   kp->rocksdb_kill_odds = FLAGS_kill_random_test;
   kp->rocksdb_kill_exclude_prefixes = SplitString(FLAGS_kill_exclude_prefixes);
+  if (FLAGS_blob_indirection_retire_routes_at_once) {
+    // Route retirement normally waits until it has a full batch of removable
+    // routes (kBlobRouteRetirementBatchSize, 64) or until routes have waited
+    // kBlobRouteRetirementMaxPendingMicros (10 minutes); see
+    // db_impl_compaction_flush.cc. These callbacks set the batch size to 1 and
+    // the wait to 0. So each time route retirement runs, it removes at once
+    // every picked route that still passes its final checks (see
+    // BlobReferenceCensus::SelectWorkerRetirementSources() for which routes it
+    // picks).
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "DBImpl::RetireBlobRelocationRoutes:BatchSize",
+        [](void* arg) { *static_cast<uint64_t*>(arg) = 1; });
+    sync_point->SetCallBack(
+        "DBImpl::RetireBlobRelocationRoutes:MaxPending",
+        [](void* arg) { *static_cast<uint64_t*>(arg) = 0; });
+    sync_point->EnableProcessing();
+  }
+#else
+  if (FLAGS_blob_indirection_retire_routes_at_once) {
+    fprintf(stderr,
+            "blob_indirection_retire_routes_at_once is ignored in release "
+            "builds\n");
+  }
 #endif
 
   unsigned int levels = FLAGS_max_key_len;

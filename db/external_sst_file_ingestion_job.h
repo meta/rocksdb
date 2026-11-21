@@ -8,22 +8,66 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/blob/blob_index.h"
 #include "db/column_family.h"
 #include "db/internal_stats.h"
 #include "db/snapshot_impl.h"
 #include "db/version_edit.h"
+#include "db/wide/wide_column_serialization.h"
 #include "env/file_system_tracer.h"
 #include "logging/event_logger.h"
 #include "options/db_options.h"
 #include "rocksdb/db.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/sst_file_writer.h"
+#include "table/table_reader.h"
 #include "util/autovector.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 class Directories;
 class SystemClock;
+
+// Reads every internal entry of an external SST, including hidden versions and
+// blob-backed wide columns, and calls validate_blob on each BlobIndex.
+// Ingestion uses it for DB-generated files (allow_db_generated_files) when the
+// CF has the format fence or enable_blob_indirection on, or when an activation
+// was pending before Prepare() (see
+// ExternalSstFileIngestionJob::SetBlobIndirectionPendingAtPrepare()). For such
+// a file, only a full scan proves that it holds no separate-file reference.
+template <typename Validator>
+Status ValidateExternalTableBlobIndexes(TableReader* table,
+                                        const SliceTransform* prefix_extractor,
+                                        bool fill_cache,
+                                        const Validator& validate_blob) {
+  ReadOptions read_options;
+  read_options.total_order_seek = true;
+  read_options.fill_cache = fill_cache;
+  std::unique_ptr<InternalIterator> iter(
+      table->NewIterator(read_options, prefix_extractor, nullptr, false,
+                         TableReaderCaller::kExternalSSTIngestion));
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    ParsedInternalKey key;
+    Status status = ParseInternalKey(iter->key(), &key, false);
+    if (!status.ok()) {
+      return status;
+    }
+    if (key.type == kTypeBlobIndex) {
+      BlobIndex index;
+      status = index.DecodeFrom(iter->value());
+      if (status.ok()) {
+        status = validate_blob(index);
+      }
+    } else if (key.type == kTypeWideColumnEntity) {
+      status = WideColumnSerialization::ForEachBlobIndex(iter->value(),
+                                                         validate_blob);
+    }
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return iter->status();
+}
 
 struct KeyRangeInfo {
   // Smallest internal key in an external file or for a batch of external files.
@@ -189,6 +233,16 @@ struct IngestedFileInfo : public KeyRangeInfo {
   // input when move_files is enabled.
   bool generated_for_ingestion = false;
 
+  // True when Prepare() knows that the file holds only same-file blob
+  // references (BlobIndex::IsSameFile(): the blob record is stored in the SST
+  // itself): either it scanned a DB-generated file, or the file is an
+  // SstFileWriter file (allow_db_generated_files false), which cannot hold
+  // another kind. Every other blob reference is rejected: a separate-file
+  // reference (legacy or indirect, flattened or not) needs the blob files and
+  // relocation state of the DB that wrote it, and an inlined TTL reference is
+  // not supported. Set outside the DB mutex, before the file is queued.
+  bool blob_indirection_ingestion_validated = false;
+
   SequenceNumber largest_seqno = kMaxSequenceNumber;
   SequenceNumber smallest_seqno = kMaxSequenceNumber;
 };
@@ -301,6 +355,41 @@ class ExternalSstFileIngestionJob {
     return ingestion_options_;
   }
 
+  // Blob indirection checks of an ingestion, in order:
+  // 1. Before Prepare(), the caller reads under the DB mutex whether an
+  //    activation is pending
+  //    (ColumnFamilyData::HasPendingBlobIndirectionOutput()) and passes it to
+  //    SetBlobIndirectionPendingAtPrepare().
+  // 2. Prepare() checks the table properties of an SstFileWriter file
+  //    (allow_db_generated_files false) and marks it checked without a scan:
+  //    the SstFileWriter API cannot write a separate-file blob reference, and
+  //    base trusts such a file's properties and sequence numbers too. For a
+  //    DB-generated file, it scans the entries for blob references if the CF
+  //    has the format fence, enable_blob_indirection is on, or an activation
+  //    was pending (ValidateExternalTableBlobIndexes()). Otherwise it checks
+  //    only the table properties (RejectBlobIndirectionTableProperties()).
+  // 3. At the MANIFEST install, ValidateBlobIndirectionPublication() returns
+  //    TryAgain if the CF now needs the scan but a DB-generated file was not
+  //    scanned.
+  //    Files that the ingestion generated itself (generated_for_ingestion) do
+  //    not need the scan: the job writes them with SstFileWriter and they hold
+  //    only range tombstones, so they cannot hold a blob reference. Prepare()
+  //    runs without the DB mutex, so after it the CF can get the fence, the
+  //    option can be turned on, or an activation can become pending.
+  // 4. The TryAgain status goes back to the user. When the user calls the
+  //    ingestion again, step 1 reads the state again. If the CF still needs
+  //    the scan, Prepare() now scans, so the check in step 3 passes.
+
+  // Records whether an activation was pending (see "Pending activation" in
+  // db/column_family.h) when the caller read the state under the DB mutex
+  // (step 1 above). When it was pending, Prepare() scans DB-generated files
+  // even if the CF has no fence and the option is off, so that a new call after
+  // a TryAgain from ValidateBlobIndirectionPublication() can pass (step 4).
+  // Call before Prepare().
+  void SetBlobIndirectionPendingAtPrepare(bool pending) {
+    blob_indirection_pending_at_prepare_ = pending;
+  }
+
   // Prepare the job by copying external files into the DB.
   Status Prepare(const std::vector<std::string>& external_files_paths,
                  const std::vector<std::string>& files_checksums,
@@ -325,6 +414,18 @@ class ExternalSstFileIngestionJob {
   // Will execute the ingestion job and prepare edit() to be applied.
   // REQUIRES: Mutex held
   Status Run();
+
+  // Checks, before the ingestion is published, that every caller-supplied
+  // ingested file was validated (files that RocksDB generated for the
+  // ingestion are exempt) if the CF now has the format fence,
+  // enable_blob_indirection on, or a pending activation. Activation can happen
+  // after Prepare(), which runs without the DB mutex. The MANIFEST queue head
+  // runs this check, and an earlier queue leader may also run it to join this
+  // ingestion to its batch.
+  // Returns TryAgain if a file needs validation.
+  // REQUIRES: DB mutex held. Does no file I/O. It allocates only for the
+  // TryAgain status message.
+  Status ValidateBlobIndirectionPublication() const;
 
   // Register key range involved in this ingestion job
   // to prevent key range conflict with other ongoing compaction/file ingestion.
@@ -522,6 +623,7 @@ class ExternalSstFileIngestionJob {
   const EnvOptions& env_options_;
   const ShardedSnapshotList* db_snapshots_;
   autovector<IngestedFileInfo> files_to_ingest_;
+  bool blob_indirection_pending_at_prepare_ = false;
   std::vector<FileBatchInfo> file_batches_to_ingest_;
   const IngestExternalFileOptions ingestion_options_;
   std::optional<KeyRangeInfo> atomic_replace_range_;

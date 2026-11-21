@@ -1733,16 +1733,57 @@ bool StressTest::BuildOptionsTable() {
                         std::vector<std::string>{"0", "2", "4"});
   }
 
+  // True when blob indirection is on or SetOptions may turn it on. The
+  // SetOptions choices below then keep blob files on (blob indirection needs
+  // them) and pick values that make indirect blob GC run.
+  const bool blob_indirection_possible =
+      FLAGS_enable_blob_indirection ||
+      FLAGS_allow_setting_blob_indirection_dynamically;
+  if (FLAGS_allow_setting_blob_indirection_dynamically) {
+    // Mostly on, so that indirect blob GC makes relocation files and routes
+    // before the option is turned off again.
+    options_tbl.emplace(
+        "enable_blob_indirection",
+        std::vector<std::string>{"false", "true", "true", "true"});
+  }
+  if (FLAGS_allow_setting_blob_options_dynamically &&
+      blob_indirection_possible) {
+    // With a small cap (4096 references), compaction often starts a new output
+    // SST at the cap, which tests that path. The cap is a blob option, so it
+    // changes only when allow_setting_blob_options_dynamically is set.
+    options_tbl.emplace("blob_indirection_max_references_per_sst",
+                        std::vector<std::string>{"4096", "65536", "1048576"});
+    // A change applies to relocation file readers opened after it.
+    options_tbl.emplace("pin_blob_relocation_location_blocks",
+                        std::vector<std::string>{"false", "true"});
+    // A change applies from the next census run. A low value makes GC copy
+    // files with more live values, and a high value makes GC skip more files.
+    options_tbl.emplace("indirect_blob_gc_garbage_ratio",
+                        std::vector<std::string>{"0.25", "0.5", "0.75"});
+  }
   if (FLAGS_allow_setting_blob_options_dynamically) {
     options_tbl.emplace("enable_blob_files",
-                        std::vector<std::string>{"false", "true"});
+                        blob_indirection_possible
+                            ? std::vector<std::string>{"true"}
+                            : std::vector<std::string>{"false", "true"});
     options_tbl.emplace("min_blob_size",
                         std::vector<std::string>{"0", "8", "16"});
-    options_tbl.emplace("blob_file_size",
-                        std::vector<std::string>{"1M", "16M", "256M", "1G"});
+    // Blob indirection: small blob files reach the indirect blob GC garbage
+    // threshold quickly.
+    options_tbl.emplace(
+        "blob_file_size",
+        blob_indirection_possible
+            ? std::vector<std::string>{"256K", "1M", "4M"}
+            : std::vector<std::string>{"1M", "16M", "256M", "1G"});
     options_tbl.emplace("blob_compression_type", GetBlobCompressionTags());
-    options_tbl.emplace("enable_blob_garbage_collection",
-                        std::vector<std::string>{"false", "true"});
+    // Indirect blob GC needs enable_blob_garbage_collection on. With blob
+    // indirection, keep it on most of the time, but still turn it off sometimes
+    // while the DB holds relocation files and routes.
+    options_tbl.emplace(
+        "enable_blob_garbage_collection",
+        blob_indirection_possible
+            ? std::vector<std::string>{"false", "true", "true", "true"}
+            : std::vector<std::string>{"false", "true"});
     options_tbl.emplace(
         "blob_garbage_collection_age_cutoff",
         std::vector<std::string>{"0.0", "0.25", "0.5", "0.75", "1.0"});
@@ -2091,6 +2132,63 @@ std::string StressTest::DebugString(const Slice& value,
       << ", columns: " << WideColumnsToHex(columns);
 
   return oss.str();
+}
+
+void StressTest::ReportBlobIndirectionGc(SharedState* shared) const {
+  if (!FLAGS_enable_blob_indirection &&
+      !FLAGS_allow_setting_blob_indirection_dynamically) {
+    return;
+  }
+  std::shared_ptr<Statistics> stats =
+      db_ ? db_->GetOptions().statistics : nullptr;
+  if (!stats) {
+    if (FLAGS_blob_indirection_require_gc) {
+      VerificationAbort(shared,
+                        "blob_indirection_require_gc requires --statistics");
+    }
+    return;
+  }
+  // Only indirect blob GC records the file counts; compaction-time blob GC
+  // relocates values during compaction and records keys and bytes only.
+  const uint64_t files_retired = stats->getTickerCount(BLOB_DB_GC_NUM_FILES);
+  const uint64_t files_written =
+      stats->getTickerCount(BLOB_DB_GC_NUM_NEW_FILES);
+  const uint64_t routes_retired =
+      stats->getTickerCount(BLOB_RELOCATION_ROUTES_RETIRED);
+  fprintf(stdout,
+          "Blob indirection GC: %" PRIu64 " input files retired, %" PRIu64
+          " relocation files written, %" PRIu64 " routes retired\n",
+          files_retired, files_written, routes_retired);
+  if (FLAGS_blob_indirection_require_gc && files_retired == 0) {
+    VerificationAbort(shared,
+                      "blob indirection is enabled but no indirect blob GC "
+                      "retired a file in this run");
+  }
+}
+
+void StressTest::ReportBlobIndirectionState() const {
+  if ((!FLAGS_enable_blob_indirection &&
+       !FLAGS_allow_setting_blob_indirection_dynamically) ||
+      db_ == nullptr) {
+    return;
+  }
+  auto* const db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+  uint64_t relocation_files = 0;
+  uint64_t routes = 0;
+  for (ColumnFamilyHandle* handle : column_families_) {
+    ColumnFamilyData* const cfd =
+        static_cast_with_check<ColumnFamilyHandleImpl>(handle)->cfd();
+    SuperVersion* const sv = cfd->GetReferencedSuperVersion(db_impl);
+    const VersionStorageInfo* const storage = sv->current->storage_info();
+    relocation_files += storage->GetBlobRelocationFiles().size();
+    storage->ForEachBlobRelocationRoute(
+        [&routes](const BlobRelocationRoute&) { ++routes; });
+    db_impl->CleanupSuperVersion(sv);
+  }
+  fprintf(stdout,
+          "Blob indirection state: %" PRIu64 " relocation files, %" PRIu64
+          " routes\n",
+          relocation_files, routes);
 }
 
 void StressTest::PrintStatistics() {
@@ -7305,6 +7403,12 @@ void InitializeOptionsFromFlags(
 
   // Integrated BlobDB
   options.enable_blob_files = FLAGS_enable_blob_files;
+  options.enable_blob_indirection = FLAGS_enable_blob_indirection;
+  options.blob_indirection_max_references_per_sst =
+      FLAGS_blob_indirection_max_references_per_sst;
+  options.pin_blob_relocation_location_blocks =
+      FLAGS_pin_blob_relocation_location_blocks;
+  options.indirect_blob_gc_garbage_ratio = FLAGS_indirect_blob_gc_garbage_ratio;
   options.enable_blob_direct_write = FLAGS_enable_blob_direct_write;
   options.blob_direct_write_partitions =
       static_cast<uint32_t>(FLAGS_blob_direct_write_partitions);

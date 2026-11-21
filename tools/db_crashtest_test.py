@@ -125,6 +125,8 @@ class DBCrashTestTest(unittest.TestCase):
             "test_multiops_txn": False,
             "test_tiered_storage": False,
             "test_full_external_table": False,
+            "test_blob_indirection": False,
+            "test_blob_indirection_toggle": False,
             "print_stderr_separately": False,
         }
         args.update(overrides)
@@ -1355,10 +1357,24 @@ class DBCrashTestTest(unittest.TestCase):
         self.assertEqual(1, params["inplace_update_support"])
 
     def test_profiles_skip_incompatible_blob_direct_write(self):
-        def choose_last_blob_profile(values):
+        # Replaces random.choice() in db_crashtest. For a 1-in-10 choice
+        # ([0] * 9 + [1]) it returns 1, so the blob profile override always
+        # happens. For a list of profiles (dicts) it picks a blob direct write
+        # profile when the list has one, and the first profile (the plain blob
+        # profile) otherwise. The pick goes by content, not by position,
+        # because the list also has other blob profiles (for example blob
+        # indirection). For any other list it returns the first value.
+        def choose_blob_direct_write_profile(values):
             if values == [0] * 9 + [1]:
                 return 1
-            return values[-1] if isinstance(values[0], dict) else values[0]
+            if not isinstance(values[0], dict):
+                return values[0]
+            direct_write = [
+                profile
+                for profile in values
+                if profile.get("enable_blob_direct_write", 0) == 1
+            ]
+            return direct_write[-1] if direct_write else values[0]
 
         cases = (
             ({}, "enable_blob_direct_write", 1),
@@ -1373,7 +1389,7 @@ class DBCrashTestTest(unittest.TestCase):
                 db_crashtest = self.load_db_crashtest()
                 args = self.build_mode_args(test_type="blackbox", **overrides)
                 with mock.patch.object(
-                    db_crashtest.random, "choice", side_effect=choose_last_blob_profile
+                    db_crashtest.random, "choice", side_effect=choose_blob_direct_write_profile
                 ):
                     params = db_crashtest.gen_cmd_params(args)
                 expected_direct_write = int(not overrides)

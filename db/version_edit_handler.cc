@@ -9,6 +9,7 @@
 
 #include "db/version_edit_handler.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <sstream>
 
@@ -33,7 +34,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
   while (reader.LastRecordEnd() < max_manifest_read_size_ && s.ok() &&
          reader.ReadRecord(&record, &scratch) && log_read_status->ok()) {
     VersionEdit edit;
-    s = edit.DecodeFrom(record);
+    s = DecodeVersionEdit(record, &edit);
     if (s.ok()) {
       s = read_buffer_.AddEdit(&edit);
     }
@@ -45,6 +46,12 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
           s = OnAtomicGroupReplayBegin();
           for (size_t i = 0; s.ok() && i < read_buffer_.replay_buffer().size();
                i++) {
+            TEST_SYNC_POINT_CALLBACK(
+                "VersionEditHandlerBase::Iterate:BeforeApplyAtomicGroupEdit",
+                &s);
+            if (!s.ok()) {
+              break;
+            }
             auto& e = read_buffer_.replay_buffer()[i];
             s = ApplyVersionEdit(e, &cfd);
             if (s.ok()) {
@@ -97,6 +104,14 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
   }
   TEST_SYNC_POINT_CALLBACK("VersionEditHandlerBase::Iterate:Finish",
                            &recovered_edits);
+}
+
+Status VersionEditHandlerBase::DecodeVersionEdit(const Slice& record,
+                                                 VersionEdit* edit) {
+  if (edit == nullptr) {
+    return Status::InvalidArgument("null VersionEdit output");
+  }
+  return edit->DecodeFrom(record);
 }
 
 Status ListColumnFamiliesHandler::ApplyVersionEdit(
@@ -169,6 +184,24 @@ Status FileChecksumRetriever::ApplyVersionEdit(VersionEdit& edit,
         new_blob_file.GetBlobFileNumber(),
         std::make_pair(checksum_value, checksum_method));
   }
+  for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
+    const auto cf = cf_file_checksums_.find(column_family_id);
+    if (cf != cf_file_checksums_.end()) {
+      cf->second.erase(file_number);
+    }
+  }
+  for (const BlobRelocationFileAddition& addition :
+       edit.GetBlobRelocationFileAdditions()) {
+    std::string checksum_value = addition.GetChecksumValue();
+    std::string checksum_method = addition.GetChecksumMethod();
+    if (checksum_method.empty()) {
+      checksum_value = kUnknownFileChecksum;
+      checksum_method = kUnknownFileChecksumFuncName;
+    }
+    cf_file_checksums_[column_family_id].emplace(
+        addition.GetFileNumber(),
+        std::make_pair(std::move(checksum_value), std::move(checksum_method)));
+  }
   return Status::OK();
 }
 
@@ -236,6 +269,17 @@ Status VersionEditHandler::ApplyVersionEdit(VersionEdit& edit,
   if (s.ok()) {
     assert(cfd != nullptr);
     s = ExtractInfoFromVersionEdit(*cfd, edit);
+  }
+  if (s.ok()) {
+    replay_removed_blob_physical_files_.insert(
+        edit.GetBlobRelocationFileDeletions().begin(),
+        edit.GetBlobRelocationFileDeletions().end());
+    replay_removed_blob_physical_files_.insert(
+        edit.GetBlobFileRetirements().begin(),
+        edit.GetBlobFileRetirements().end());
+    replay_deleted_blob_relocation_routes_.insert(
+        edit.GetBlobRelocationRouteDeletions().begin(),
+        edit.GetBlobRelocationRouteDeletions().end());
   }
   return s;
 }
@@ -518,9 +562,7 @@ ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
 ColumnFamilyData* VersionEditHandler::DestroyCfAndCleanup(
     const VersionEdit& edit) {
   uint32_t cf_id = edit.GetColumnFamily();
-  auto builder_iter = builders_.find(cf_id);
-  assert(builder_iter != builders_.end());
-  builders_.erase(builder_iter);
+  DestroyVersionBuilder(cf_id);
   ColumnFamilyData* ret =
       version_set_->GetColumnFamilySet()->GetColumnFamily(cf_id);
   assert(ret != nullptr);
@@ -528,6 +570,12 @@ ColumnFamilyData* VersionEditHandler::DestroyCfAndCleanup(
   ret->UnrefAndTryDelete();
   ret = nullptr;
   return ret;
+}
+
+void VersionEditHandler::DestroyVersionBuilder(uint32_t column_family_id) {
+  const auto builder = builders_.find(column_family_id);
+  assert(builder != builders_.end());
+  builders_.erase(builder);
 }
 
 Status VersionEditHandler::MaybeCreateVersionBeforeApplyEdit(
@@ -591,7 +639,28 @@ Status VersionEditHandler::LoadTables(ColumnFamilyData* cfd,
 
 Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
                                                       const VersionEdit& edit) {
+  if (version_set_ == nullptr) {
+    return Status::Corruption("null VersionSet while replaying MANIFEST");
+  }
   Status s;
+  if (edit.HasBlobIndirectionFormatVersion() &&
+      edit.HasDbBlobIndirectionFormatVersion()) {
+    return Status::Corruption(
+        "Conflicting per-CF and DB-global blob indirection format fences");
+  }
+  if (edit.HasBlobIndirectionFormatVersion() ||
+      edit.HasDbBlobIndirectionFormatVersion()) {
+    const uint32_t format_version =
+        edit.HasBlobIndirectionFormatVersion()
+            ? edit.GetBlobIndirectionFormatVersion()
+            : edit.GetDbBlobIndirectionFormatVersion();
+    if (version_set_->blob_indirection_format_version_ != 0 &&
+        version_set_->blob_indirection_format_version_ != format_version) {
+      return Status::Corruption(
+          "Conflicting DB-global blob indirection format fence");
+    }
+    version_set_->blob_indirection_format_version_ = format_version;
+  }
   if (edit.HasDbId()) {
     version_set_->db_id_ = edit.GetDbId();
     version_edit_params_.SetDBId(edit.GetDbId());
@@ -751,13 +820,21 @@ VersionEditHandlerPointInTime::VersionEditHandlerPointInTime(
 }
 
 VersionEditHandlerPointInTime::~VersionEditHandlerPointInTime() {
-  for (const auto& cfid_and_version : atomic_update_versions_) {
-    delete cfid_and_version.second.version;
-  }
-  for (const auto& elem : versions_) {
+  VersionEditHandlerPointInTime::DiscardVersions(&atomic_update_versions_);
+  VersionEditHandlerPointInTime::DiscardVersions(&versions_);
+}
+
+void VersionEditHandlerPointInTime::DeleteVersion(Version* version) {
+  delete version;
+}
+
+void VersionEditHandlerPointInTime::DiscardVersions(
+    PointInTimeVersions* versions) {
+  assert(versions != nullptr);
+  for (const auto& elem : *versions) {
     delete elem.second.version;
   }
-  versions_.clear();
+  versions->clear();
 }
 
 Status VersionEditHandlerPointInTime::OnAtomicGroupReplayBegin() {
@@ -784,9 +861,7 @@ Status VersionEditHandlerPointInTime::OnAtomicGroupReplayBegin() {
   // An old AtomicGroup is incomplete. Throw away the versions that failed to
   // complete it. They must not be used for completing the upcoming
   // AtomicGroup since they are too old.
-  for (auto& cfid_and_version : atomic_update_versions_) {
-    delete cfid_and_version.second.version;
-  }
+  ResetAtomicUpdateState();
 
   in_atomic_group_ = true;
   // We lazily assume the column families that exist at this point are all
@@ -826,10 +901,41 @@ Status VersionEditHandlerPointInTime::OnAtomicGroupReplayEnd() {
   return Status::OK();
 }
 
+void VersionEditHandlerPointInTime::ResetAtomicUpdateState() {
+  DiscardVersions(&atomic_update_versions_);
+  atomic_update_versions_missing_ = 0;
+  in_atomic_group_ = false;
+}
+
 void VersionEditHandlerPointInTime::CheckIterationResult(
     const log::Reader& reader, Status* s) {
+  if (s->ok() && read_only_ && allow_incomplete_valid_version_) {
+    // Plain best_efforts_recovery (without best_efforts_blob_db_repair) never
+    // marks a relocation file lost. When the current state needs a missing
+    // relocation file, a read-write open falls back to an older complete
+    // Version. It then writes a new MANIFEST, so the DB stays at that point and
+    // every later open sees the same state. A read-only open cannot write the
+    // MANIFEST. Its fallback would show old values of keys that later edits
+    // overwrote or deleted, while the MANIFEST still holds the later state. So
+    // the read-only open fails instead. This check covers only the MANIFEST
+    // file being read. If an older MANIFEST file exists, a read-only open can
+    // still fall back to it (VersionSet::TryRecover()), as in base RocksDB.
+    // Secondary and follower catch-up keep their usual rule of complete
+    // Versions only. Only the final builder state counts: a file that an old
+    // edit added and a later edit deleted is ignored.
+    for (const auto& entry : builders_) {
+      if (entry.second->version_builder()->HasMissingBlobRelocationFiles()) {
+        *s = Status::NotFound(
+            "Current MANIFEST requires a missing relocation file");
+        break;
+      }
+    }
+  }
   VersionEditHandler::CheckIterationResult(reader, s);
   assert(s != nullptr);
+  if (s->ok()) {
+    *s = CheckRepairFallbackAgainstGc();
+  }
   if (s->ok()) {
     for (auto* cfd : *(version_set_->column_family_set_)) {
       if (cfd->IsDropped()) {
@@ -853,17 +959,101 @@ void VersionEditHandlerPointInTime::CheckIterationResult(
       }
     }
   } else {
-    for (const auto& elem : versions_) {
-      delete elem.second.version;
-    }
-    versions_.clear();
+    DiscardVersions(&versions_);
   }
+}
+
+Status VersionEditHandlerPointInTime::CheckRepairFallbackAgainstGc() {
+  // Problem: with best_efforts_blob_db_repair, a missing non-L0 SST can still
+  // make the open fall back to an older point in the MANIFEST. In a column
+  // family with blob indirection, that point can be older than an indirect blob
+  // GC edit: GC moved the values of some origin files into a relocation file
+  // and then removed the origins. The old point still names those origins, and
+  // they are gone from disk. The base best_efforts_blob_db_repair rule drops a
+  // blob file only when its data is gone from disk. A fallback past a GC edit
+  // would drop old origin files whose values are still on disk in a relocation
+  // file, and the purge at open would then delete that relocation file.
+  //
+  // Rule: the open fails instead, so it never loses a value whose data is
+  // still on disk.
+  //
+  // Two states: versions_ holds the chosen fallback point, which the open
+  // would install. builders_ hold the state after the last edit of this
+  // MANIFEST file, so they know every GC removal in this file that comes after
+  // the fallback point. A file that is dropped (or marked lost) in the
+  // fallback Version, but that a later edit retired or deleted, was removed by
+  // indirect blob GC on purpose. In this example, edit 40 is the fallback
+  // point, origin file 12 is dropped there, and a later GC edit retired file
+  // 12 and added relocation file 20:
+  //
+  //   MANIFEST: edit 1 ... edit 40 .......... GC edit ............ last edit
+  //                        (fallback point)   (retire 12, add 20)
+  //                        ^ versions_                             ^ builders_
+  //
+  //   File 12 is dropped in versions_, and builders_ say that GC retired it,
+  //   so the open fails.
+  //
+  // Scope: the check uses only this MANIFEST file. When this check fails, it
+  // sets VersionSet::repair_fallback_crossed_gc_, and VersionSet::TryRecover()
+  // does not try an older MANIFEST file (see the comments there). Only the
+  // builders of a repair open record dropped files. For a secondary or
+  // follower (ManifestTailer), this check therefore skips every column family.
+  for (const auto& entry : versions_) {
+    const VersionStorageInfo* const storage =
+        entry.second.version->storage_info();
+    if (!storage->HasBlobIndirectionFormat()) {
+      continue;
+    }
+    const auto builder = builders_.find(entry.first);
+    if (builder == builders_.end()) {
+      continue;
+    }
+    const VersionBuilder* const version_builder =
+        builder->second->version_builder();
+    if (!version_builder->RecordsMissingBlobFilesAsDropped()) {
+      continue;
+    }
+    std::vector<uint64_t> removed_by_gc;
+    for (uint64_t file_number : storage->GetDroppedBlobFiles()) {
+      if (version_builder->IsBlobFileRemovedByGc(file_number)) {
+        removed_by_gc.push_back(file_number);
+      }
+    }
+    for (const std::shared_ptr<BlobRelocationFileMetaData>& file :
+         storage->GetBlobRelocationFiles()) {
+      if (file->IsMarkedLost() &&
+          version_builder->IsBlobFileRemovedByGc(file->GetFileNumber())) {
+        removed_by_gc.push_back(file->GetFileNumber());
+      }
+    }
+    if (!removed_by_gc.empty()) {
+      std::string numbers;
+      for (uint64_t file_number : removed_by_gc) {
+        numbers.append(" #");
+        AppendNumberTo(&numbers, file_number);
+      }
+      // An older MANIFEST file never saw these indirect blob GC edits, so
+      // TryRecover() must not try it next.
+      version_set_->repair_fallback_crossed_gc_ = true;
+      return Status::Corruption(
+          "best_efforts_blob_db_repair would fall back to a MANIFEST point "
+          "older than a blob GC edit in column family " +
+          std::to_string(entry.first) +
+          "; restore the missing SST files. Blob files that GC removed "
+          "after that point:" +
+          numbers);
+    }
+  }
+  return Status::OK();
 }
 
 ColumnFamilyData* VersionEditHandlerPointInTime::DestroyCfAndCleanup(
     const VersionEdit& edit) {
-  ColumnFamilyData* cfd = VersionEditHandler::DestroyCfAndCleanup(edit);
   uint32_t cfid = edit.GetColumnFamily();
+  // Delete the candidate Versions of this column family first, while its
+  // builder still holds every added FileMetaData and the current Version still
+  // holds every base file. Then a candidate Version is never the last holder of
+  // a file, so deleting it (or the ManifestTailer) never marks a file obsolete.
   if (AtomicUpdateVersionsContains(cfid)) {
     AtomicUpdateVersionsDropCf(cfid);
     if (AtomicUpdateVersionsCompleted()) {
@@ -872,9 +1062,10 @@ ColumnFamilyData* VersionEditHandlerPointInTime::DestroyCfAndCleanup(
   }
   auto v_iter = versions_.find(cfid);
   if (v_iter != versions_.end()) {
-    delete v_iter->second.version;
+    DeleteVersion(v_iter->second.version);
     versions_.erase(v_iter);
   }
+  ColumnFamilyData* cfd = VersionEditHandler::DestroyCfAndCleanup(edit);
   installed_version_log_numbers_.erase(cfid);
   return cfd;
 }
@@ -943,7 +1134,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
           version_set_->db_options_->max_file_opening_threads, false, true,
           mopts, MaxFileSizeForL0MetaPin(mopts), read_options_);
       if (!s.ok()) {
-        delete version;
+        DeleteVersion(version);
         if (negative_edge) {
           builder->RedoLastApply();
         }
@@ -961,7 +1152,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
         return s;
       }
     }
-    s = builder->SaveTo(version->storage_info());
+    s = SaveVersionTo(builder, version->storage_info());
     if (negative_edge) {
       builder->RedoLastApply();
     }
@@ -977,7 +1168,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
             !version_set_->db_options_->skip_stats_update_on_db_open);
         auto v_iter = versions_.find(cfd->GetID());
         if (v_iter != versions_.end()) {
-          delete v_iter->second.version;
+          DeleteVersion(v_iter->second.version);
           v_iter->second = PointInTimeVersion{version, log_number};
         } else {
           versions_.emplace(cfd->GetID(),
@@ -985,7 +1176,7 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
         }
       }
     } else {
-      delete version;
+      DeleteVersion(version);
     }
   }
 
@@ -1029,10 +1220,38 @@ Status VersionEditHandlerPointInTime::VerifyBlobFile(
   return s;
 }
 
+Status VersionEditHandlerPointInTime::VerifyBlobRelocationFile(
+    ColumnFamilyData* cfd, const BlobRelocationFileAddition& addition) {
+  if (trust_manifest_recovery_) {
+    return Status::OK();
+  }
+  assert(cfd != nullptr);
+  Status status = addition.Validate();
+  if (!status.ok()) {
+    return status;
+  }
+  CacheHandleGuard<BlobFileReader> reader;
+  const MutableCFOptions& mutable_options = cfd->GetLatestMutableCFOptions();
+  BlobFileCache* const blob_file_cache = cfd->blob_file_cache();
+  if (blob_file_cache == nullptr) {
+    return Status::Corruption("Missing blob relocation recovery dependency");
+  }
+  return blob_file_cache->GetRelocationFileReader(
+      read_options_, addition.ToPhysicalFile(), mutable_options, &reader);
+}
+
 Status VersionEditHandlerPointInTime::LoadTables(
     ColumnFamilyData* /*cfd*/, bool /*prefetch_index_and_filter_in_cache*/,
     bool /*is_initial_load*/) {
   return Status::OK();
+}
+
+Status VersionEditHandlerPointInTime::SaveVersionTo(
+    VersionBuilder* builder, VersionStorageInfo* storage) {
+  if (builder == nullptr || storage == nullptr) {
+    return Status::InvalidArgument("null point-in-time Version output");
+  }
+  return builder->SaveTo(storage);
 }
 
 bool VersionEditHandlerPointInTime::HasMissingFiles() const {
@@ -1069,7 +1288,7 @@ void VersionEditHandlerPointInTime::AtomicUpdateVersionsDropCf(uint32_t cfid) {
   if (atomic_update_versions_iter->second.version == nullptr) {
     atomic_update_versions_missing_--;
   } else {
-    delete atomic_update_versions_iter->second.version;
+    DeleteVersion(atomic_update_versions_iter->second.version);
   }
   atomic_update_versions_.erase(atomic_update_versions_iter);
 }
@@ -1084,7 +1303,7 @@ void VersionEditHandlerPointInTime::AtomicUpdateVersionsPut(
   if (atomic_update_versions_iter->second.version == nullptr) {
     atomic_update_versions_missing_--;
   } else {
-    delete atomic_update_versions_iter->second.version;
+    DeleteVersion(atomic_update_versions_iter->second.version);
   }
   atomic_update_versions_iter->second = pit_version;
 }
@@ -1100,13 +1319,31 @@ void VersionEditHandlerPointInTime::AtomicUpdateVersionsApply() {
         !version_set_->db_options_->skip_stats_update_on_db_open);
     auto versions_iter = versions_.find(cfid);
     if (versions_iter != versions_.end()) {
-      delete versions_iter->second.version;
+      DeleteVersion(versions_iter->second.version);
       versions_iter->second = pit_version;
     } else {
       versions_.emplace(cfid, pit_version);
     }
   }
   atomic_update_versions_.clear();
+}
+
+void ManifestTailer::PrepareToReadNewManifest(InstrumentedMutex* db_mutex) {
+  assert(db_mutex_ == nullptr);
+  db_mutex_ = db_mutex;
+  ResetAtomicUpdateState();
+  RunWithoutDbMutex("ManifestTailer::PrepareToReadNewManifest:Unlocked", [&] {
+    ResetReadState();
+    ResetReplayBlobRelocationHistory();
+  });
+  db_mutex_ = nullptr;
+  initialized_ = false;
+  status_ = Status::OK();
+  cfs_awaiting_from_previous_manifest_ = cfs_awaiting_file_list_;
+  cfs_not_yet_in_manifest_.clear();
+  for (const auto& builder : builders_) {
+    cfs_not_yet_in_manifest_.insert(builder.first);
+  }
 }
 
 Status ManifestTailer::Initialize() {
@@ -1120,8 +1357,7 @@ Status ManifestTailer::Initialize() {
     assert(cfd_set);
     ColumnFamilyData* default_cfd = cfd_set->GetDefault();
     assert(default_cfd);
-    auto builder_iter = builders_.find(default_cfd->GetID());
-    assert(builder_iter != builders_.end());
+    assert(builders_.find(default_cfd->GetID()) != builders_.end());
 
     Version* dummy_version = default_cfd->dummy_versions();
     assert(dummy_version);
@@ -1130,7 +1366,7 @@ Status ManifestTailer::Initialize() {
     VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
         default_cfd, base_version, this, track_found_and_missing_files_,
         allow_incomplete_valid_version_));
-    builder_iter->second = std::move(new_builder);
+    ReplaceBuilder(default_cfd->GetID(), std::move(new_builder));
     AwaitFileList(default_cfd->GetID());
 
     initialized_ = true;
@@ -1184,6 +1420,125 @@ Status ManifestTailer::ApplyVersionEdit(VersionEdit& edit,
   return s;
 }
 
+Status ManifestTailer::DecodeVersionEdit(const Slice& record,
+                                         VersionEdit* edit) {
+  return RunWithoutDbMutex("ManifestTailer::DecodeVersionEdit:Unlocked", [&] {
+    return VersionEditHandlerBase::DecodeVersionEdit(record, edit);
+  });
+}
+
+Status ManifestTailer::VerifyBlobRelocationFile(
+    ColumnFamilyData* cfd, const BlobRelocationFileAddition& addition) {
+  // Called while the builder applies an edit under the DB mutex. The file check
+  // does I/O, so it runs without the mutex. This is safe because catch-up calls
+  // run one at a time and only this tailer uses the builder.
+  return RunWithoutDbMutex(
+      "ManifestTailer::VerifyBlobRelocationFile:Unlocked", [&] {
+        return VersionEditHandlerPointInTime::VerifyBlobRelocationFile(
+            cfd, addition);
+      });
+}
+
+Status ManifestTailer::SaveVersionTo(VersionBuilder* builder,
+                                     VersionStorageInfo* storage) {
+  if (builder == nullptr || storage == nullptr) {
+    return Status::InvalidArgument("null point-in-time Version output");
+  }
+  // As in LogAndApply: save the SST files (and change their reference counts)
+  // under the DB mutex, and finalize the blob and relocation metadata without
+  // it.
+  Status status = builder->SaveTableFilesTo(storage);
+  if (status.ok()) {
+    status = RunWithoutDbMutex("ManifestTailer::SaveVersionTo:Unlocked", [&] {
+      return builder->SaveBlobFilesAndCheckTo(storage);
+    });
+  }
+  return status;
+}
+
+void ManifestTailer::DeleteVersion(Version* version) {
+  assert(version != nullptr);
+  if (db_mutex_ == nullptr) {
+    VersionEditHandlerPointInTime::DeleteVersion(version);
+    return;
+  }
+  // The Version is deleted under the DB mutex. Only its relocation state, which
+  // can be large, is freed without the mutex.
+  std::vector<std::shared_ptr<void>> holders;
+  holders.push_back(version->storage_info()->ReleaseBlobRelocationState());
+  VersionEditHandlerPointInTime::DeleteVersion(version);
+  VersionSet::FreeBlobRelocationState(&holders, db_mutex_,
+                                      "ManifestTailer::DeleteVersion:Unlocked");
+}
+
+void ManifestTailer::DiscardVersions(PointInTimeVersions* versions) {
+  assert(versions != nullptr);
+  if (db_mutex_ == nullptr) {
+    VersionEditHandlerPointInTime::DiscardVersions(versions);
+    return;
+  }
+  std::vector<std::shared_ptr<void>> holders;
+  for (const auto& entry : *versions) {
+    if (entry.second.version != nullptr) {
+      holders.push_back(
+          entry.second.version->storage_info()->ReleaseBlobRelocationState());
+    }
+  }
+  VersionEditHandlerPointInTime::DiscardVersions(versions);
+  VersionSet::FreeBlobRelocationState(
+      &holders, db_mutex_, "ManifestTailer::DiscardVersions:Unlocked");
+}
+
+ColumnFamilyData* ManifestTailer::DestroyCfAndCleanup(const VersionEdit& edit) {
+  assert(version_set_ != nullptr);
+  ColumnFamilySet* cfd_set = version_set_->GetColumnFamilySet();
+  assert(cfd_set != nullptr);
+  ColumnFamilyData* cfd = cfd_set->GetColumnFamily(edit.GetColumnFamily());
+  assert(cfd != nullptr);
+  cfds_changed_.erase(cfd);
+
+  ColumnFamilyData* result =
+      VersionEditHandlerPointInTime::DestroyCfAndCleanup(edit);
+  assert(result == nullptr);
+  return result;
+}
+
+void ManifestTailer::DestroyVersionBuilder(uint32_t column_family_id) {
+  const auto existing = builders_.find(column_family_id);
+  assert(existing != builders_.end());
+  assert(existing->second != nullptr);
+  VersionBuilderUPtr guard = std::move(existing->second);
+  builders_.erase(existing);
+  ReleaseBuilderUnderMutex(std::move(guard),
+                           "ManifestTailer::DestroyVersionBuilder:Unlocked");
+}
+
+void ManifestTailer::ReleaseBuilderUnderMutex(VersionBuilderUPtr guard,
+                                              const char* unlocked_sync_point) {
+  if (db_mutex_ == nullptr) {
+    return;
+  }
+  // The builder and its reference to the base Version are deleted under the DB
+  // mutex. Only its staged relocation changes, which can be large, are freed
+  // without the mutex.
+  std::vector<std::shared_ptr<void>> holders;
+  holders.push_back(guard->version_builder()->ReleaseBlobRelocationChanges());
+  guard.reset();
+  VersionSet::FreeBlobRelocationState(&holders, db_mutex_, unlocked_sync_point);
+}
+
+void ManifestTailer::ReplaceBuilder(uint32_t column_family_id,
+                                    VersionBuilderUPtr replacement) {
+  assert(replacement != nullptr);
+  const auto existing = builders_.find(column_family_id);
+  assert(existing != builders_.end());
+  assert(existing->second != nullptr);
+  VersionBuilderUPtr old = std::move(existing->second);
+  existing->second = std::move(replacement);
+  ReleaseBuilderUnderMutex(std::move(old),
+                           "ManifestTailer::ReplaceBuilder:Unlocked");
+}
+
 Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
                                          ColumnFamilyData** cfd) {
   if (Mode::kRecovery == mode_) {
@@ -1199,8 +1554,7 @@ Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
     // For now, ignore new column families created after Recover() succeeds.
     return Status::OK();
   }
-  auto builder_iter = builders_.find(edit.GetColumnFamily());
-  assert(builder_iter != builders_.end());
+  assert(builders_.find(edit.GetColumnFamily()) != builders_.end());
 
   Version* dummy_version = tmp_cfd->dummy_versions();
   assert(dummy_version);
@@ -1208,7 +1562,7 @@ Status ManifestTailer::OnColumnFamilyAdd(VersionEdit& edit,
   assert(base_version);
   VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
       tmp_cfd, base_version, this, track_found_and_missing_files_));
-  builder_iter->second = std::move(new_builder);
+  ReplaceBuilder(edit.GetColumnFamily(), std::move(new_builder));
   AwaitFileList(tmp_cfd->GetID());
 
 #ifndef NDEBUG
@@ -1275,6 +1629,63 @@ Status ManifestTailer::VerifyFile(ColumnFamilyData* cfd,
   return s;
 }
 
+namespace {
+// Prints the blob indirection state of a column family for "ldb
+// manifest_dump": the per-CF format fence, the relocation files, the routes
+// and the lost relocation files (see "MANIFEST records" in
+// db/blob/blob_relocation_manifest.h), then the kind of reference metadata of
+// its SSTs. A column family without the fence, relocation files or routes
+// prints nothing, so the dump of a DB that does not use blob indirection does
+// not change.
+void PrintBlobIndirectionSummary(const VersionStorageInfo& vstorage) {
+  const VersionStorageInfo::BlobRelocationFiles& files =
+      vstorage.GetBlobRelocationFiles();
+  const size_t route_count = vstorage.GetBlobRelocationRouteCount();
+  if (!vstorage.HasBlobIndirectionFormat() && files.empty() &&
+      route_count == 0) {
+    return;
+  }
+  uint64_t file_bytes = 0;
+  uint64_t values = 0;
+  for (const std::shared_ptr<BlobRelocationFileMetaData>& file : files) {
+    file_bytes += file->GetFileSize();
+    values += file->GetTotalEntries();
+  }
+  fprintf(stdout,
+          "--- blob indirection --- format version: %" PRIu32
+          ", relocation files: %zu (%" PRIu64 " bytes, %" PRIu64
+          " values), routes: %zu, lost relocation files: %zu\n",
+          vstorage.GetBlobIndirectionFormatVersion(), files.size(), file_bytes,
+          values, route_count, vstorage.GetLostBlobRelocationFileCount());
+  // The kind of blob reference metadata of each SST (see
+  // db/blob/blob_reference_metadata.h). Indirect blob GC does not collect a
+  // blob file numbered at or above the lowest frontier of the coarse SSTs. The
+  // coarse frontier of an SST is the oldest indirect-origin file number a
+  // coarse SST may reference (see "Coarse SST" in
+  // db/blob/blob_reference_metadata.h).
+  size_t exact_ssts = 0;
+  size_t coarse_ssts = 0;
+  size_t legacy_ssts = 0;
+  for (int level = 0; level < vstorage.num_levels(); ++level) {
+    for (const FileMetaData* f : vstorage.LevelFiles(level)) {
+      if (!f->blob_reference_descriptor.empty()) {
+        ++exact_ssts;
+      } else if (f->oldest_coarse_indirect_origin_file_number !=
+                 kInvalidBlobFileNumber) {
+        ++coarse_ssts;
+      } else if (f->blob_reference_legacy_metadata) {
+        ++legacy_ssts;
+      }
+    }
+  }
+  fprintf(stdout,
+          "--- blob reference metadata --- exact SSTs: %zu, coarse SSTs: %zu "
+          "(lowest frontier %" PRIu64 "), legacy SSTs: %zu\n",
+          exact_ssts, coarse_ssts,
+          vstorage.OldestCoarseIndirectOriginFileNumber(), legacy_ssts);
+}
+}  // namespace
+
 void DumpManifestHandler::CheckIterationResult(const log::Reader& reader,
                                                Status* s) {
   VersionEditHandler::CheckIterationResult(reader, s);
@@ -1302,6 +1713,7 @@ void DumpManifestHandler::CheckIterationResult(const log::Reader& reader,
     // Print out DebugStrings. Can include non-terminating null characters.
     fwrite(cfd->current()->DebugString(hex_).data(), sizeof(char),
            cfd->current()->DebugString(hex_).size(), stdout);
+    PrintBlobIndirectionSummary(*cfd->current()->storage_info());
 
     fprintf(stdout,
             "By default, manifest file dump prints LSM trees as if %d levels "
@@ -1320,6 +1732,10 @@ void DumpManifestHandler::CheckIterationResult(const log::Reader& reader,
           version_set_->LastSequence(), version_set_->prev_log_number(),
           version_set_->column_family_set_->GetMaxColumnFamily(),
           version_set_->min_log_number_to_keep());
+  if (version_set_->blob_indirection_format_version_ != 0) {
+    fprintf(stdout, "db blob indirection format version %" PRIu32 "\n",
+            version_set_->blob_indirection_format_version_);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
