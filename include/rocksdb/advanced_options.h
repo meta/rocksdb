@@ -1087,6 +1087,33 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   bool enable_blob_files = false;
 
+  // Experimental, and not complete yet. Option validation returns NotSupported
+  // for this option until the rest of the feature is in place.
+  //
+  // Purpose: let indirect blob GC move the live values out of a blob file that
+  // has a lot of garbage without rewriting the SSTs that point to them. When
+  // this option is on, each new blob value gets a kIndirectBlob BlobIndex,
+  // which keeps the value's identity (origin file and offset) when GC moves it,
+  // and each SST built by flush or compaction saves the exact list of blob
+  // references it keeps. See db/blob/blob_reference_metadata.h for how it
+  // works.
+  //
+  // Requirements and limits (option validation checks these after the
+  // NotSupported check above):
+  //   - enable_blob_files must be true (else InvalidArgument).
+  //   - The table format must be block-based (else NotSupported).
+  //   - enable_blob_direct_write must be false (else NotSupported).
+  //   - The FIFO compaction style is not supported (NotSupported). FIFO
+  //     column families that do not set this option keep their existing
+  //     BlobDB behavior.
+  // Turning the option off stops new values from using kIndirectBlob. The
+  // SSTs and blob files that were already written keep their format.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through the SetOptions() API
+  bool enable_blob_indirection = false;
+
   // The size of the smallest value to be stored separately in a blob file.
   // Values which have an uncompressed size smaller than this threshold are
   // stored alongside the keys in SST files in the usual fashion. A value of
