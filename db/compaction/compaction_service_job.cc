@@ -625,10 +625,11 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
 
   if (feature_aware_compaction && !compaction->CollectExactBlobReferences()) {
     // The output is coarse (output level 0, the compaction is not
-    // bottommost, and no input has exact metadata; for example an intra-L0
-    // compaction above older overlapping data). The primary accepts only
-    // feature-aware output with exact reference metadata, so run the job
-    // locally from the start instead of declining the worker's result.
+    // bottommost, no input has exact metadata, and the column family has no
+    // lost relocation file; for example an intra-L0 compaction above older
+    // overlapping data). The primary accepts only feature-aware output with
+    // exact reference metadata, so run the job locally from the start instead
+    // of declining the worker's result.
     RecordTick(stats_, REMOTE_COMPACT_COARSE_FALLBACK_COUNT);
     ROCKS_LOG_INFO(db_options_.info_log,
                    "[%s] [JOB %d] Coarse blob indirection output; running the "

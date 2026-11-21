@@ -1974,6 +1974,12 @@ class DB {
     //      entries being pinned in blob cache.
     static const std::string kBlobCachePinnedUsage;
 
+    // "rocksdb.blob-relocation-lost-files" - returns the number of relocation
+    // files of the column family that are marked lost (their values read as
+    // deleted). The lost-relocation-files key of rocksdb.indirect-blob-gc-stats
+    // has the same value.
+    static const std::string kBlobRelocationLostFiles;
+
     // "rocksdb.indirect-blob-gc-idle-micros-with-candidates" - returns how long
     // the column family has had indirect blob GC candidates while no GC job
     // began, in microseconds (a duration). A large value means that GC is
@@ -1991,19 +1997,19 @@ class DB {
     // role, including short-lived copies), route-count, relocation-file-count,
     // relocation-file-bytes, relocation-garbage-bytes, tracked-files (the files
     // in the census candidate heap, which GC may pick, including files below
-    // the garbage threshold; suppressed files and files pinned by the coarse
-    // frontier are not counted), garbage-bytes-collectable,
-    // garbage-bytes-suppressed, coarse-pinned-files, coarse-pinned-bytes,
-    // coarse-pinned-garbage-bytes, coarse-sst-count, lowest-coarse-frontier,
-    // idle-micros-with-candidates, retirement-pending-micros,
-    // corrupt-input-files (the number of files that GC skips now because it
-    // found corruption in them) and corrupt-input-file-list (at most 8 file
-    // numbers, lowest first, comma separated; the list is partial when the
-    // count is above 8). A corrupt file stays in the list until it changes, the
-    // census is rebuilt, or the coarse frontier rises (relocation files only).
-    // The list also holds a file whose corrupt data made GC set a background
-    // error (with paranoid_checks). Every *-micros key is a duration, never a
-    // timestamp.
+    // the garbage threshold; suppressed files, files pinned by the coarse
+    // frontier, and lost relocation files that still have references are not
+    // counted), garbage-bytes-collectable, garbage-bytes-suppressed,
+    // coarse-pinned-files, coarse-pinned-bytes, coarse-pinned-garbage-bytes,
+    // coarse-sst-count, lowest-coarse-frontier, idle-micros-with-candidates,
+    // retirement-pending-micros, lost-relocation-files, corrupt-input-files
+    // (the number of files that GC skips now because it found corruption in
+    // them) and corrupt-input-file-list (at most 8 file numbers, lowest first,
+    // comma separated; the list is partial when the count is above 8). A
+    // corrupt file stays in the list until it changes, the census is rebuilt,
+    // or the coarse frontier rises (relocation files only). The list also holds
+    // a file whose corrupt data made GC set a background error (with
+    // paranoid_checks). Every *-micros key is a duration, never a timestamp.
     static const std::string kIndirectBlobGcStats;
 
     // "rocksdb.blob-reference-census-unready-micros" - returns how long the
@@ -3173,6 +3179,11 @@ Status DestroyDB(const std::string& name, const Options& options,
 // specified in column_families.
 //
 // @param column_families Descriptors for known column families
+//
+// Blob indirection (enable_blob_indirection): RepairDB does not support a DB
+// that has blob indirection data. When it finds such data, for example the
+// blob indirection format in the MANIFEST or a blob relocation file, it
+// returns NotSupported and does not change the DB.
 Status RepairDB(const std::string& dbname, const DBOptions& db_options,
                 const std::vector<ColumnFamilyDescriptor>& column_families);
 

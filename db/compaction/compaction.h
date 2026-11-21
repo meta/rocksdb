@@ -376,6 +376,15 @@ class Compaction {
   // PRE: input version has been set.
   bool RepairsMissingBlobReferences() const;
 
+  // Returns true iff the input Version marks relocation files lost (see "Lost
+  // relocation files" in db/blob/blob_relocation_manifest.h). This loss gate is
+  // separate from the missing-file gate above. With this gate on, the
+  // compaction replaces references to lost files with deletions or partial
+  // entities, writes exact reference metadata (also at L0), and runs locally.
+  //
+  // PRE: input version has been set.
+  bool RepairsLostBlobReferences() const;
+
   // test function to validate the functionality of IsBottommostLevel()
   // function -- determines if compaction with inputs and storage is bottommost
   static bool TEST_IsBottommostLevel(
@@ -461,9 +470,10 @@ class Compaction {
   // Returns true when the output must have exact reference metadata: the DB
   // uses blob indirection (the option is on, or the Version has the format),
   // and one of these holds: the output level is L1 or deeper, the compaction
-  // is bottommost (at any level, including L0), or an L0 input already has
-  // exact metadata. Otherwise the output gets at most the coarse
-  // classification. Called during unlocked job preparation.
+  // is bottommost (at any level, including L0), an L0 input already has exact
+  // metadata, or the compaction repairs lost blob references. Otherwise the
+  // output gets at most the coarse classification. Called during unlocked job
+  // preparation.
   //
   // Why: a flush and an L0 compaction that is not bottommost stay coarse to
   // save collector memory. Their data gets exact metadata when a later

@@ -1945,6 +1945,10 @@ class DBImpl : public DB
     std::vector<std::string> existing_db_files_;
     // All existing data files (SST files and Blob files) found during DB::Open.
     std::vector<std::string> existing_data_files_;
+    // Blob file numbers in each normalized DB path, from the same listing.
+    // The relocation file existence check uses it instead of FileExists.
+    UnorderedMap<std::string, UnorderedSet<uint64_t>>
+        blob_file_numbers_by_path_;
     bool is_new_db_ = false;
   };
 
@@ -2278,6 +2282,14 @@ class DBImpl : public DB
   // recovery_ctx stores the context about version edits. All those edits are
   // persisted to new Manifest after successfully syncing the new WAL.
   Status MaybeUpdateNextFileNumber(RecoveryContext* recovery_ctx);
+
+  // Fails with NotFound when a relocation file that the MANIFEST does not mark
+  // lost is absent from its directory. `blob_file_numbers_by_path` maps a
+  // normalized path to its blob file numbers; a path it does not have is
+  // listed once here and added. Does I/O only for such paths.
+  Status CheckRelocationFilesExist(
+      UnorderedMap<std::string, UnorderedSet<uint64_t>>*
+          blob_file_numbers_by_path);
 
   // Track existing data files, including both referenced and unreferenced SST
   // and Blob files in SstFileManager. This is only called during DB::Open and

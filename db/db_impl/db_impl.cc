@@ -9606,6 +9606,13 @@ Status DBImpl::VerifyChecksumInternal(const ReadOptions& read_options,
           break;
         }
         assert(meta != nullptr);
+        // A repair open marks a relocation file lost when the file is missing
+        // or corrupt. Its values read as deleted, and indirect blob GC removes
+        // the file later, so there is nothing to check. GetLiveFiles*() skip
+        // it too.
+        if (meta->IsMarkedLost()) {
+          continue;
+        }
         s = verify_blob_file(meta->GetFileNumber(), meta->GetChecksumValue(),
                              meta->GetChecksumMethod());
       }

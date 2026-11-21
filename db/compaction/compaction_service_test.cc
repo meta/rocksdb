@@ -37,6 +37,7 @@
 #include "rocksdb/advanced_compression.h"
 #include "rocksdb/concurrent_task_limiter.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/utilities/debug.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_util.h"
 #include "table/block_based/block_based_table_factory.h"
@@ -3429,6 +3430,101 @@ TEST_F(CompactionServiceTest, MissingBlobRepairRunsLocallyPerCall) {
   ASSERT_OK(db_->CompactRange(regular, nullptr, nullptr));
   ASSERT_GT(service->GetCompactionNum(), remote_compactions);
   ASSERT_EQ(Get("key"), "value3");
+}
+
+TEST_F(CompactionServiceTest, LostRelocationFileRepairRunsLocally) {
+  // A loss record marks a relocation file lost when the DB cannot read it. A
+  // compaction whose input Version has such a file turns the references to it
+  // into deletions (loss repair). The primary does not check a worker's loss
+  // repair, so the compaction runs locally (a conservative choice), also with
+  // a compaction service configured.
+  //
+  // The test runs the same steps twice. Indirect blob GC moves the live value
+  // of "live" into a relocation file. Then the DB reopens, and in the second
+  // run (lose == true) the relocation file is deleted and marked lost during
+  // the open. The first run (lose == false) is the control: the same
+  // compaction goes to the compaction service.
+  for (const bool lose : {false, true}) {
+    SCOPED_TRACE("lose=" + std::to_string(lose));
+    uint64_t origin = kInvalidBlobFileNumber;
+    ASSERT_NO_FATAL_FAILURE(
+        OpenAndWriteBlobFileToL1(/*info_log=*/nullptr, &origin));
+    uint64_t relocation = kInvalidBlobFileNumber;
+    ASSERT_NO_FATAL_FAILURE(RouteBlobFileByGc(origin, &relocation));
+    // "other" is in a new L0 SST and a new blob file. So the compaction below
+    // has L0 and L1 inputs, and only the L1 SST references the relocation
+    // file.
+    const std::string other_value(4096, 'o');
+    ASSERT_OK(Put("other", other_value));
+    ASSERT_OK(Flush());
+
+    // The reopen uses the options of the last open (set by
+    // OpenAndWriteBlobFileToL1()), which include the compaction service.
+    Options options = last_options_;
+    Close();
+    // Close() cancels the waiting jobs of the service; allow new jobs.
+    GetCompactionService()->SetCanceled(false);
+    if (lose) {
+      ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+      // This hook marks the relocation file lost while the DB opens, and the
+      // open writes the loss record into its new MANIFEST.
+      SyncPoint::GetInstance()->SetCallBack(
+          "VersionBuilder::MarkBlobFileLostForTest", [&](void* arg) {
+            auto* const file = static_cast<std::pair<uint64_t, bool*>*>(arg);
+            if (file->first == relocation) {
+              *file->second = true;
+            }
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+    ASSERT_OK(TryReopenWithColumnFamilies(
+        {kDefaultColumnFamilyName, "cf_1", "cf_2", "cf_3"}, options));
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    const VersionStorageInfo* storage = dbfull()
+                                            ->GetVersionSet()
+                                            ->GetColumnFamilySet()
+                                            ->GetDefault()
+                                            ->current()
+                                            ->storage_info();
+    ASSERT_EQ(storage->HasLostBlobRelocationFiles(), lose);
+    ASSERT_NE(storage->PeekBlobRelocationFileMetaData(relocation), nullptr);
+    ASSERT_EQ(
+        storage->PeekBlobRelocationFileMetaData(relocation)->IsMarkedLost(),
+        lose);
+
+    const int compactions_before = GetCompactionService()->GetCompactionNum();
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+    ASSERT_EQ(Get("other"), other_value);
+    std::vector<KeyVersion> versions;
+    ASSERT_OK(GetAllKeyVersions(db_.get(), Slice("live"), Slice("live"),
+                                /*max_num_ikeys=*/10, &versions));
+    if (lose) {
+      // CompactRange() runs one job per level here (L0 to L1, then the
+      // forced rewrite of L1). Every job ran locally, so the service saw no
+      // job.
+      ASSERT_EQ(GetCompactionService()->GetCompactionNum(), compactions_before);
+      // Loss repair turned the lost reference into a deletion. The output is
+      // at the bottommost level, so the compaction then dropped the deletion,
+      // and no version of "live" is left.
+      ASSERT_TRUE(versions.empty());
+      std::string value;
+      ASSERT_EQ(db_->Get(ReadOptions(), "live", &value).code(),
+                Status::kNotFound);
+    } else {
+      ASSERT_GT(GetCompactionService()->GetCompactionNum(), compactions_before);
+      ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+                CompactionServiceJobStatus::kSuccess);
+      ASSERT_EQ(versions.size(), 1U);
+      ASSERT_EQ(Get("live"), RoutedLiveValue());
+    }
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+  }
 }
 
 TEST_F(CompactionServiceTest, MissingBlobRepairRejectsFIFOWithoutFlushing) {

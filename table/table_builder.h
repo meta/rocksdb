@@ -210,8 +210,9 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
   //   ignored.
   // - collect_blob_reference_metadata false, this field true: a coarse SST. The
   //   builder stores only the small classification property (flush, WAL
-  //   recovery flush, and a compaction to L0 that has no exact input and is
-  //   not bottommost; see Compaction::CollectExactBlobReferences()).
+  //   recovery flush, and a compaction to L0 that has no exact input, is not
+  //   bottommost, and runs while the column family has no lost relocation
+  //   file; see Compaction::CollectExactBlobReferences()).
   // - Both false: no blob reference metadata (the DB never used the option,
   //   and SstFileWriter).
   bool track_blob_reference_classification = false;
