@@ -755,6 +755,10 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_enable_blob_direct_write(obj) == 1);
   rocksdb_options_set_enable_blob_direct_write(obj, 0);
   CheckCondition(rocksdb_options_get_enable_blob_direct_write(obj) == 0);
+  rocksdb_options_set_enable_blob_indirection(obj, 1);
+  CheckCondition(rocksdb_options_get_enable_blob_indirection(obj) == 1);
+  rocksdb_options_set_enable_blob_indirection(obj, 0);
+  CheckCondition(rocksdb_options_get_enable_blob_indirection(obj) == 0);
   rocksdb_options_set_enable_thread_tracking(obj, 1);
   CheckCondition(rocksdb_options_get_enable_thread_tracking(obj) == 1);
   rocksdb_options_set_enable_thread_tracking(obj, 0);
@@ -875,6 +879,12 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   CheckCondition(rocksdb_options_get_persist_user_defined_timestamps(obj) == 1);
   rocksdb_options_set_persist_user_defined_timestamps(obj, 0);
   CheckCondition(rocksdb_options_get_persist_user_defined_timestamps(obj) == 0);
+  rocksdb_options_set_pin_blob_relocation_location_blocks(obj, 1);
+  CheckCondition(rocksdb_options_get_pin_blob_relocation_location_blocks(obj) ==
+                 1);
+  rocksdb_options_set_pin_blob_relocation_location_blocks(obj, 0);
+  CheckCondition(rocksdb_options_get_pin_blob_relocation_location_blocks(obj) ==
+                 0);
   rocksdb_options_set_preclude_last_level_data_seconds(obj, 1);
   CheckCondition(rocksdb_options_get_preclude_last_level_data_seconds(obj) ==
                  1);
