@@ -1074,6 +1074,12 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         break;
       }
 
+      case kManifestStoreStub:
+        // The rows in the store hold the metadata, not this file.
+        return Status::NotSupported(
+            "The DB is in store mode: its metadata is in the ManifestStore "
+            "and the MANIFEST file is a stub");
+
       default:
         if (tag & kTagSafeIgnoreMask) {
           // Tag from future which can be safely ignored.

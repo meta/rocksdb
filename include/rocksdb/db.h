@@ -548,6 +548,11 @@ class DB {
   // and return the list of all column families in that DB
   // through column_families argument. The ordering of
   // column families in column_families is unspecified.
+  //
+  // For a DB in store mode (see DBOptions::manifest_store), pass the store in
+  // db_options.manifest_store. The function then reads the column families
+  // from the store with a consistent scan, without a claim. Without the
+  // store, a DB in store mode returns NotSupported.
   static Status ListColumnFamilies(const DBOptions& db_options,
                                    const std::string& name,
                                    std::vector<std::string>* column_families);
@@ -2706,6 +2711,10 @@ class DB {
   // - Otherwise, the temperature is set to the CF's default_write_temperature.
   // (Landing in the last level does not currently guarantee using
   // last_level_temperature - TODO)
+  //
+  // In store mode (DBOptions::manifest_store), an error return can behave as
+  // described at IngestExternalFiles() and
+  // IngestExternalFileOptions::link_files.
   virtual Status IngestExternalFile(
       ColumnFamilyHandle* column_family,
       const std::vector<std::string>& external_files,
@@ -2722,6 +2731,9 @@ class DB {
   // If this function returns OK, all column families' ingestion must succeed.
   // If this function returns NOK, or the process crashes, then non-of the
   // files will be ingested into the database after recovery.
+  // In store mode (DBOptions::manifest_store), an IOError return can mean that
+  // the store applied the commit and the DB stopped. The next DB::Open() then
+  // shows the ingested files.
   // Note that it is possible for application to observe a mixed state during
   // the execution of this function. If the user performs range scan over the
   // column families with iterators, iterator on one column family may return
@@ -2775,7 +2787,12 @@ class DB {
   // passed to a single IngestExternalFiles() call, in the order the handles
   // appear in `handles` (so for overlapping keys a later handle's data wins).
   // Handles that target the same column family must have been prepared with the
-  // same IngestExternalFileOptions. On failure all handles are rolled back.
+  // same IngestExternalFileOptions. On failure all handles are rolled back. In
+  // store mode (DBOptions::manifest_store), the rollback can keep the ingested
+  // files, which can be hard links to the input files (see
+  // IngestExternalFileOptions::link_files). An IOError return in store mode can
+  // mean that the store applied the commit and the DB stopped. The next
+  // DB::Open() then shows the ingested files.
   virtual Status CommitFileIngestionHandles(
       std::vector<std::unique_ptr<FileIngestionHandle>> handles) = 0;
 
@@ -2800,10 +2817,16 @@ class DB {
   // move, the call makes a best effort to delete the specified files at
   // external_file_path on successful return, logging any failure to delete
   // rather than returning in Status. Files are not modified on any error
-  // return, and a best effort is made to remove any newly-created files.
+  // return, and a best effort is made to remove any newly-created files. In
+  // store mode (DBOptions::manifest_store), an error return can keep the
+  // newly-created files, which can be hard links to the input files (see
+  // ImportColumnFamilyOptions::move_files).
   // On error return, column family handle returned will be nullptr.
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
+  // In store mode, an IOError return can mean that the store applied the
+  // commit and the DB stopped. The next DB::Open() then shows the column family
+  // with the imported files.
   // Import never brings blob files, so it returns NotSupported if any file in
   // `metadata` references blob files (oldest_blob_file_number != 0). Importing
   // files without blob references into a column family with
@@ -3105,6 +3128,11 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
 
 // Destroy the contents of the specified database.
 // Be very careful using this method.
+// It returns NotSupported for a DB in store mode (see
+// DBOptions::manifest_store), because its metadata is in the store. When it
+// cannot read CURRENT or the MANIFEST that CURRENT names (other than a missing
+// file) and the folder can be listed, it returns that I/O error and deletes
+// nothing.
 Status DestroyDB(const std::string& name, const Options& options,
                  const std::vector<ColumnFamilyDescriptor>& column_families =
                      std::vector<ColumnFamilyDescriptor>());
