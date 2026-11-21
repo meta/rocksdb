@@ -1309,11 +1309,20 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
+  Version* const current = current_;
+  // Removing blob files and relocation files that hold no live value from the
+  // Version is not an LSM compaction and copies no value. So it runs even when
+  // disable_auto_compactions is set or blob GC or blob indirection is off.
+  const BlobReferenceCensus* const census = blob_reference_census();
+  if (current != nullptr && census != nullptr &&
+      census->IsReady(current->GetVersionNumber()) &&
+      current->storage_info()->HasEmptyBlobGcCandidate()) {
+    return true;
+  }
   if (!is_table_builder_supported_ ||
       mutable_cf_options_.disable_auto_compactions) {
     return false;
   }
-  Version* const current = current_;
   if (current == nullptr) {
     return false;
   }
@@ -1325,8 +1334,7 @@ bool ColumnFamilyData::NeedsCompaction() const {
          mutable_cf_options_.enable_blob_indirection &&
          current->storage_info()->BlobPhysicalFileForIndirectBlobGC() !=
              kInvalidBlobFileNumber &&
-         blob_reference_census() != nullptr &&
-         blob_reference_census()->IsReady(current->GetVersionNumber());
+         census != nullptr && census->IsReady(current->GetVersionNumber());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -1897,14 +1905,18 @@ Status ColumnFamilyData::PrepareMutableCFOptions(
     // ValidateOptions().
     s = ValidateOptions(db_opts, cf_opts);
   }
-  // A CF with the format fence needs a supported compaction style and a
-  // Block-Based Table writer: its later flush and compaction outputs must store
-  // blob reference metadata, which only the Block-Based Table writes, and
-  // relocation files must stay readable. Turning enable_blob_indirection off
-  // does not remove the fence.
+  // A CF with the format fence, or with a flush or compaction that was picked
+  // with the option on, needs a supported compaction style and a Block-Based
+  // Table writer: its later flush and compaction outputs must store blob
+  // reference metadata (exact metadata or the coarse classification), which
+  // only the Block-Based Table writes, and relocation files must stay readable.
+  // Turning enable_blob_indirection off does not cancel such a job, which may
+  // still set the first fence, and does not remove the fence. The pending check
+  // is O(1).
   const bool has_blob_indirection_state =
-      current_ != nullptr &&
-      current_->storage_info()->HasBlobIndirectionFormat();
+      (current_ != nullptr &&
+       current_->storage_info()->HasBlobIndirectionFormat()) ||
+      HasPendingBlobIndirectionOutput();
   if (s.ok() && has_blob_indirection_state) {
     s = CheckBlobIndirectionCompactionStyle(cf_opts.compaction_style, true);
   }

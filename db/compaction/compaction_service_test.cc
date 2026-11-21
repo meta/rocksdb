@@ -2992,6 +2992,104 @@ TEST_F(CompactionServiceTest, BlobIndirectionFirstActivationStaysLocal) {
   ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
 }
 
+TEST_F(CompactionServiceTest, BlobIndirectionFenceDuringLegacyRemoteJob) {
+  // A remote compaction is built while the column family has no format fence
+  // and the option is off. Before the worker opens the DB, the option is
+  // turned on and a flush writes the fence. The worker sees the fence and
+  // writes feature metadata, so the primary declines the legacy job's result
+  // (case 2 in ValidateBlobGCCompactionServiceResult()) and runs the job
+  // locally. The local outputs were made for a job built before the fence, so
+  // they are installed as legacy-marked SSTs
+  // (FileMetaData::blob_reference_legacy_metadata), and no background error is
+  // set.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), value));
+    ASSERT_OK(Flush());
+  }
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  bool job_waiting = false;
+  bool release_job = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MyTestCompactionService::Wait:BeforeOpenAndCompact", [&](void*) {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        job_waiting = true;
+        state_changed.notify_all();
+        state_changed.wait(lock, [&] { return release_job; });
+      });
+  int declined = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompactionWithCompactionService:"
+      "BlobGCResultDeclined",
+      [&](void* arg) {
+        EXPECT_TRUE(static_cast<Status*>(arg)->IsIncomplete());
+        ++declined;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto my_cs = GetCompactionService();
+  const int compaction_num_before = my_cs->GetCompactionNum();
+  Status compact_status;
+  port::Thread compactor([&] {
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    compact_status = db_->CompactRange(compact_options, nullptr, nullptr);
+  });
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    state_changed.wait(lock, [&] { return job_waiting; });
+  }
+  // The remote job is built. Turn the option on, and let a flush write the
+  // fence.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("key2", value));
+  ASSERT_OK(Flush());
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    release_job = true;
+    state_changed.notify_all();
+  }
+  compactor.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(compact_status);
+  EXPECT_EQ(declined, 1);
+  EXPECT_GT(my_cs->GetCompactionNum(), compaction_num_before);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), value);
+  }
+  // The compaction outputs (every SST below L0; the flush that wrote the fence
+  // stays in L0) are legacy-marked.
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  size_t compaction_outputs = 0;
+  for (int level = 1; level < storage->num_levels(); ++level) {
+    for (const FileMetaData* file : storage->LevelFiles(level)) {
+      ++compaction_outputs;
+      EXPECT_TRUE(file->blob_reference_legacy_metadata);
+      EXPECT_TRUE(file->blob_reference_descriptor.empty());
+    }
+  }
+  EXPECT_GT(compaction_outputs, 0U);
+}
+
 TEST_F(CompactionServiceTest, BlobIndirectionWorkerDeclinesNewBlobOutput) {
   Options options = CurrentOptions();
   options.enable_blob_files = true;

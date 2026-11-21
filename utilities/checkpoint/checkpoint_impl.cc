@@ -778,6 +778,24 @@ Status CheckpointImpl::ExportColumnFamily(
 
   assert(metadata != nullptr);
   assert(*metadata == nullptr);
+  DBImpl* const db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+  // An exported CF cannot carry the relocation files and routes that blob
+  // indirection needs. Fail early, before the export directory is created and
+  // the CF is flushed. SetOptions() can turn the option on after this check,
+  // and then the flush below can activate the CF. So
+  // GetColumnFamilyMetaDataForExport() checks again under the same lock that
+  // reads the SST list.
+  {
+    InstrumentedMutexLock lock(db_impl->mutex());
+    ColumnFamilyData* const cfd = cfh->cfd();
+    if (cfd->GetLatestMutableCFOptions().enable_blob_indirection ||
+        cfd->HasPendingBlobIndirectionOutput() ||
+        cfd->current()->storage_info()->HasBlobIndirectionFormat()) {
+      return Status::NotSupported(
+          "Column-family export does not carry blob indirection "
+          "relocation files and routes");
+    }
+  }
   auto s = db_->GetEnv()->FileExists(export_dir);
   if (s.ok()) {
     return Status::InvalidArgument("Specified export_dir exists");
@@ -809,7 +827,7 @@ Status CheckpointImpl::ExportColumnFamily(
     // Export live sst files with file deletions disabled.
     s = db_->DisableFileDeletions();
     if (s.ok()) {
-      db_->GetColumnFamilyMetaData(handle, &db_metadata);
+      s = db_impl->GetColumnFamilyMetaDataForExport(handle, &db_metadata);
 
       // Export only copies SST files, never blob files, so an SST that
       // references blob files could never be imported. Reject before any
