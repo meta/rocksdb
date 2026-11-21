@@ -168,6 +168,10 @@ Status BlobRelocationLiveSet::Finalize() {
   // the header for why the smallest one is correct). The sort puts the smallest
   // record_overhead first, and the loop below keeps it. In a normal input every
   // copy is unflattened, with the same record_overhead.
+  //
+  // The choice of record_overhead does not change the indirect blob GC
+  // decision: for a relocation input, the GC job computes the live record bytes
+  // again as stored bytes plus one trailer per value.
   std::sort(values_.begin(), values_.end(),
             [&](const BlobRelocationLiveValue& lhs,
                 const BlobRelocationLiveValue& rhs) {

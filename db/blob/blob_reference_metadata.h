@@ -340,7 +340,12 @@
 // keeps it out of the GC candidate heap. IsCoarseIndirectOriginBlobPinned()
 // compares only the file number with the frontier, so it also returns true
 // for a relocation file at or above the frontier. The census heap applies the
-// pin only to indirect-origin blob files.
+// pin only to indirect-origin blob files. Indirect blob GC skips a normal
+// input whose file number is pinned, and a relocation input with a pinned
+// routed generation number. In normal operation a coarse SST never references
+// a relocation file or a routed number (a flush references only its own new
+// blob files, and a coarse L0 compaction has only coarse inputs and does not
+// flatten), so the relocation check is a safety margin.
 //
 // Coarse classification property
 //

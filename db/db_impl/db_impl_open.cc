@@ -3438,6 +3438,15 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete,
     }
   }
   BlobReferenceCensus& census = *cfd->blob_reference_census();
+  if (census.TakeMismatchReport()) {
+    // Indirect blob GC reported a census mismatch. Fail this build.
+    // ReportMismatch() also set RebuildRequested(), so a new build starts at
+    // once from the current Version. This status fails only the build slice. It
+    // is not a background error. Any non-OK status would do: the slice caller
+    // (BGWorkBlobReferenceCensus) normally sees RebuildRequested() and restarts
+    // at once. Corruption names the cause: the census does not match the SSTs.
+    return Status::Corruption("Blob GC found a census mismatch");
+  }
   std::shared_ptr<BlobReferenceCensusBuildContext> context =
       census.GetBuildContext();
   Status status;
@@ -3718,14 +3727,17 @@ Status DBImpl::PublishBlobReferenceCensusWorker(
   // stored below, after the DB mutex is taken.
   const uint64_t candidate_retry_micros = census.RetryWorkerCandidates(
       context->token, immutable_db_options_.clock->NowMicros());
-  const BlobGcCandidateHeap::Selection candidates =
-      census.SelectWorkerCandidates(context->token);
+  BlobGcCandidateHeap::SelectionBytes candidate_bytes{};
+  BlobGcCandidateHeap::Selection candidates =
+      census.SelectWorkerCandidates(context->token, &candidate_bytes);
   const BlobGcCandidateHeap::Selection empty_candidates =
       census.SelectWorkerEmptyCandidates(context->token);
   const uint64_t relocation_garbage =
       census.WorkerRelocationGarbageBytes(context->token);
   const BlobGcCandidateHeap::Totals candidate_totals =
       census.WorkerCandidateTotals(context->token);
+  const BlobGcCandidateHeap::CorruptFileReport corrupt_files =
+      census.WorkerCorruptFileReport(context->token);
   InstrumentedMutexLock lock(&mutex_);
   context->candidate_retry_micros = candidate_retry_micros;
   if (shutting_down_.load(std::memory_order_acquire) || cfd->IsDropped()) {
@@ -3734,8 +3746,24 @@ Status DBImpl::PublishBlobReferenceCensusWorker(
   const BlobReferenceCensus::PublishResult result = census.TryPublishWorker(
       context->token, applied_version, cfd->current()->GetVersionNumber());
   if (result == BlobReferenceCensus::PublishResult::kPublished) {
+    // The census matches cfd->current(), so these are the options that a GC
+    // job at this Version reads for its own garbage ratio check.
+    BlobGcCandidateHeap::CutSelection(
+        cfd->current()->GetMutableCFOptions().indirect_blob_gc_garbage_ratio,
+        candidate_bytes, &candidates);
     census.NoteReady();
     census.SetPublishedTotals(candidate_totals, relocation_garbage);
+    census.SetPublishedCorruptFiles(corrupt_files);
+    if (candidates[0] != kInvalidBlobFileNumber) {
+      // A running GC job keeps the idle time at 0. The job's end starts it
+      // again if candidates remain.
+      if (!census.HasGcJob()) {
+        cfd->NoteIndirectBlobGcCandidates(
+            immutable_db_options_.clock->NowMicros());
+      }
+    } else {
+      cfd->ClearIndirectBlobGcCandidates();
+    }
     const uint64_t build_start_micros = census.TakeBuildStartMicros();
     if (build_start_micros != 0) {
       const uint64_t now_micros = immutable_db_options_.clock->NowMicros();
