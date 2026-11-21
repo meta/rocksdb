@@ -1326,6 +1326,14 @@ asan_crash_test_with_best_efforts_recovery: clean
 	COMPILE_WITH_ASAN=1 $(MAKE) crash_test_with_best_efforts_recovery
 	$(MAKE) clean
 
+asan_crash_test_with_manifest_store_sync: clean
+	COMPILE_WITH_ASAN=1 $(MAKE) crash_test_with_manifest_store_sync
+	$(MAKE) clean
+
+asan_crash_test_with_manifest_store_off: clean
+	COMPILE_WITH_ASAN=1 $(MAKE) crash_test_with_manifest_store_off
+	$(MAKE) clean
+
 ubsan_check: clean
 	COMPILE_WITH_UBSAN=1 $(MAKE) check -j32
 	$(MAKE) clean
@@ -1352,6 +1360,22 @@ ubsan_crash_test_with_txn: clean
 
 ubsan_crash_test_with_best_efforts_recovery: clean
 	COMPILE_WITH_UBSAN=1 $(MAKE) crash_test_with_best_efforts_recovery
+	$(MAKE) clean
+
+ubsan_crash_test_with_manifest_store_sync: clean
+	COMPILE_WITH_UBSAN=1 $(MAKE) crash_test_with_manifest_store_sync
+	$(MAKE) clean
+
+ubsan_crash_test_with_manifest_store_off: clean
+	COMPILE_WITH_UBSAN=1 $(MAKE) crash_test_with_manifest_store_off
+	$(MAKE) clean
+
+asan_crash_test_with_manifest_store_shadow: clean
+	COMPILE_WITH_ASAN=1 $(MAKE) crash_test_with_manifest_store_shadow
+	$(MAKE) clean
+
+ubsan_crash_test_with_manifest_store_shadow: clean
+	COMPILE_WITH_UBSAN=1 $(MAKE) crash_test_with_manifest_store_shadow
 	$(MAKE) clean
 
 full_valgrind_test:
@@ -2208,6 +2232,9 @@ repair_test: $(OBJ_DIR)/db/repair_test.o $(TEST_LIBRARY) $(LIBRARY)
 ldb_cmd_test: $(OBJ_DIR)/tools/ldb_cmd_test.o $(TOOLS_LIBRARY) $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_stress_manifest_store_test: $(OBJ_DIR)/db_stress_tool/db_stress_manifest_store_test.o $(OBJ_DIR)/db_stress_tool/db_stress_manifest_store.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_stress_structured_key_value_test: $(OBJ_DIR)/db_stress_tool/db_stress_structured_key_value_test.o $(OBJ_DIR)/db_stress_tool/db_stress_structured_key_value.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
@@ -2263,6 +2290,9 @@ db_secondary_test: $(OBJ_DIR)/db/db_secondary_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 db_follower_test: $(OBJ_DIR)/db/db_follower_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+db_manifest_store_test: $(OBJ_DIR)/db/db_manifest_store_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 block_cache_tracer_test: $(OBJ_DIR)/trace_replay/block_cache_tracer_test.o $(TEST_LIBRARY) $(LIBRARY)
@@ -2553,9 +2583,15 @@ BUILD_SIG_NONBUILD_GOALS += \
 	release coverage build_size analyze analyze_incremental \
 	asan_check asan_crash_test asan_crash_test_with_atomic_flush \
 	asan_crash_test_with_txn asan_crash_test_with_best_efforts_recovery \
+	asan_crash_test_with_manifest_store_sync \
+	asan_crash_test_with_manifest_store_off \
 	whitebox_asan_crash_test blackbox_asan_crash_test \
 	ubsan_check ubsan_crash_test ubsan_crash_test_with_atomic_flush \
 	ubsan_crash_test_with_txn ubsan_crash_test_with_best_efforts_recovery \
+	ubsan_crash_test_with_manifest_store_sync \
+	ubsan_crash_test_with_manifest_store_off \
+	asan_crash_test_with_manifest_store_shadow \
+	ubsan_crash_test_with_manifest_store_shadow \
 	whitebox_ubsan_crash_test blackbox_ubsan_crash_test
 
 # Goals that explicitly clean; never trip the check when one is requested.

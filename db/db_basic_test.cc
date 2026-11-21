@@ -7,12 +7,19 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <set>
+#include <tuple>
 
 #include "db/db_test_util.h"
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
+#include "db/manifest_rows.h"
+#include "db/manifest_store_shadow.h"
 #include "db/version_edit.h"
 #ifdef ROCKSDB_IOURING_PRESENT
 #include "env/io_posix.h"
@@ -20,8 +27,10 @@
 #include "file/writable_file_writer.h"
 #include "options/options_helper.h"
 #include "port/stack_trace.h"
+#include "rocksdb/experimental.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/flush_block_policy.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/table.h"
@@ -31,7 +40,10 @@
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_builder.h"
 #include "table/format.h"
+#include "test_util/mock_manifest_store.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
+#include "util/coding.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
 #include "util/random.h"
@@ -133,6 +145,1277 @@ TEST_F(DBBasicTest, OpenWhenOpen) {
   ASSERT_EQ(Status::Code::kIOError, s.code());
   ASSERT_EQ(Status::SubCode::kNone, s.subcode());
   ASSERT_TRUE(strstr(s.getState(), "lock ") != nullptr);
+}
+
+// Tests the option checks that every DB open function runs with a store,
+// before it changes anything on disk:
+// - a feature version out of range gives InvalidArgument;
+// - best_efforts_recovery and best_efforts_blob_db_repair give
+//   InvalidArgument.
+// DB::OpenAndCompact() takes its options from the OPTIONS file and from
+// CompactionServiceOptionsOverride. Both paths reach the secondary open
+// function of DB::OpenAsSecondary(), which runs the same check.
+// db/db_manifest_store_test.cc tests store mode itself.
+TEST_F(DBBasicTest, ManifestStoreOptionsAreCheckedAtOpen) {
+  Close();
+  // A path where no DB exists, so that the test can check that a failed open
+  // with create_if_missing does not create it.
+  const std::string new_path = dbname_ + "_manifest_store";
+  ASSERT_OK(DestroyDB(new_path, CurrentOptions()));
+  const std::string secondary_path = dbname_ + "_secondary";
+  struct OpenCase {
+    const char* name;
+    std::function<Status(const Options&)> open;
+    // The result with a store, from an options check before any disk change.
+    Status::Code store_code;
+    // Sets options that the store check rejects with `store_code`.
+    std::function<void(Options*)> store_options;
+  };
+  const std::vector<OpenCase> open_cases = {
+      {"Open",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::Open(create, new_path, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
+      {"Open with best_efforts_blob_db_repair",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::Open(create, new_path, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) {
+         o->best_efforts_blob_db_repair = true;
+         o->enable_blob_files = true;
+       }},
+      {"OpenForReadOnly",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         return DB::OpenForReadOnly(options, dbname_, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
+      {"OpenForReadOnly with column families",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         std::vector<ColumnFamilyHandle*> handles;
+         return DB::OpenForReadOnly(options, dbname_,
+                                    {{kDefaultColumnFamilyName, options}},
+                                    &handles, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
+      {"OpenAsSecondary",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         return DB::OpenAsSecondary(options, dbname_, secondary_path, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
+      {"OpenAsFollower",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::OpenAsFollower(create, new_path, dbname_, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
+  };
+  for (const OpenCase& c : open_cases) {
+    SCOPED_TRACE(c.name);
+    Options options = CurrentOptions();
+    options.manifest_store = std::make_shared<MockManifestStore>(
+        std::make_shared<MockManifestStoreData>(), /*epoch=*/1);
+    c.store_options(&options);
+    ASSERT_EQ(c.store_code, c.open(options).code());
+    for (uint32_t feature_version :
+         {0u, kManifestRowFeatureVersionLatest + 1}) {
+      options.manifest_row_feature_version = feature_version;
+      ASSERT_EQ(Status::Code::kInvalidArgument, c.open(options).code());
+    }
+    ASSERT_EQ(Status::kNotFound, env_->FileExists(new_path).code());
+  }
+
+  // Without a store, the feature version is not checked. So a DB opens with the
+  // value of a later release, for example one read from its OPTIONS file.
+  Options options = CurrentOptions();
+  options.manifest_row_feature_version = kManifestRowFeatureVersionLatest + 1;
+  Reopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_EQ("v", Get("k"));
+  // A DB whose CURRENT names a MANIFEST file needs manifest_store_migrate.
+  options = CurrentOptions();
+  options.manifest_store = std::make_shared<MockManifestStore>(
+      std::make_shared<MockManifestStoreData>(), /*epoch=*/1);
+  ASSERT_EQ(Status::Code::kInvalidArgument, TryReopen(options).code());
+}
+
+namespace {
+
+// A store for the shadow mode tests. It is a MockManifestStore that records
+// the calls. It also keeps the keys that the store holds after each
+// successful call, so a test can check that no commit deletes a row that the
+// store never had.
+class RecordingManifestStore : public MockManifestStore {
+ public:
+  using MockManifestStore::MockManifestStore;
+
+  IOStatus Open(const ManifestStoreOpenOptions& opts,
+                ManifestDbRowResult* db_row) override {
+    ++opens;
+    if (before_open) {
+      before_open();
+    }
+    return MockManifestStore::Open(opts, db_row);
+  }
+
+  IOStatus Commit(const ManifestCommit& commit) override {
+    ++commits;
+    {
+      MutexLock lock(&mutex_);
+      if (!rows_unknown_) {
+        for (const ManifestRowKey& key : commit.deletes) {
+          if (stored_.count(key) == 0) {
+            ++deletes_of_unstored_rows_;
+          }
+        }
+      }
+    }
+    const IOStatus s = MockManifestStore::Commit(commit);
+    MutexLock lock(&mutex_);
+    if (s.ok()) {
+      for (const ManifestRow& row : commit.upserts) {
+        stored_.insert(row.key);
+      }
+      for (const ManifestRowKey& key : commit.deletes) {
+        stored_.erase(key);
+      }
+      last_commit_upserts_ = commit.upserts.size();
+    } else if (!s.IsBusy() && !s.IsTryAgain() && !s.IsIOFenced()) {
+      rows_unknown_ = true;
+    }
+    return s;
+  }
+
+  IOStatus ReadDbRow(ManifestDbRowResult* db_row) override {
+    ++reads;
+    return MockManifestStore::ReadDbRow(db_row);
+  }
+
+  IOStatus Scan(const ManifestScanOptions& opts,
+                ManifestRowVisitor* visitor) override {
+    ++scans;
+    return MockManifestStore::Scan(opts, visitor);
+  }
+
+  IOStatus WriteGeneration(const ManifestGeneration& request,
+                           uint64_t* generation) override {
+    ++generations;
+    const IOStatus s = MockManifestStore::WriteGeneration(request, generation);
+    MutexLock lock(&mutex_);
+    if (s.ok()) {
+      stored_.clear();
+      for (const ManifestRow& row : request.rows) {
+        stored_.insert(row.key);
+      }
+      rows_unknown_ = false;
+    } else if (!s.IsBusy() && !s.IsTryAgain() && !s.IsIOFenced()) {
+      rows_unknown_ = true;
+    }
+    return s;
+  }
+
+  int TotalCalls() const {
+    return opens + commits + reads + scans + generations;
+  }
+  int DeletesOfUnstoredRows() {
+    MutexLock lock(&mutex_);
+    return deletes_of_unstored_rows_;
+  }
+  size_t LastCommitUpserts() {
+    MutexLock lock(&mutex_);
+    return last_commit_upserts_;
+  }
+
+  std::atomic<int> opens{0};
+  std::atomic<int> commits{0};
+  std::atomic<int> reads{0};
+  std::atomic<int> scans{0};
+  std::atomic<int> generations{0};
+  // Runs at the start of each Open() call.
+  std::function<void()> before_open;
+
+ private:
+  port::Mutex mutex_;
+  std::set<ManifestRowKey, ManifestRowKeyLess> stored_;
+  // True after a call with an unknown outcome, until the next generation.
+  bool rows_unknown_ = false;
+  int deletes_of_unstored_rows_ = 0;
+  size_t last_commit_upserts_ = 0;
+};
+
+// A store whose rounds wait until the test lets them go on. A round of shadow
+// mode starts with ReadDbRow() (a resync) or with a Commit() that changes rows
+// (a commit round). Each of these calls counts as one started round and waits
+// until the test has released that many rounds. A Commit() that changes no
+// rows, such as the one that creates the DB row, does not wait.
+class BlockingRoundsStore : public MockManifestStore {
+ public:
+  using MockManifestStore::MockManifestStore;
+
+  IOStatus ReadDbRow(ManifestDbRowResult* db_row) override {
+    WaitForTurn();
+    return MockManifestStore::ReadDbRow(db_row);
+  }
+
+  IOStatus Commit(const ManifestCommit& commit) override {
+    if (!commit.upserts.empty() || !commit.deletes.empty()) {
+      WaitForTurn();
+    }
+    return MockManifestStore::Commit(commit);
+  }
+
+  // Waits up to 5 minutes until `count` rounds have started. The limit is far
+  // above the normal wait, so that slow sanitizer builds do not time out.
+  // Returns false on timeout, so that a broken test fails instead of hanging.
+  bool WaitForRounds(int count) {
+    constexpr uint64_t kWaitMicros = 5 * 60 * 1000000ull;
+    const uint64_t deadline = SystemClock::Default()->NowMicros() + kWaitMicros;
+    MutexLock lock(&mutex_);
+    while (started_ < count) {
+      if (cv_.TimedWait(deadline)) {
+        return started_ >= count;
+      }
+    }
+    return true;
+  }
+
+  // Lets the first `count` rounds go on.
+  void ReleaseRounds(int count) {
+    MutexLock lock(&mutex_);
+    released_ = count;
+    cv_.SignalAll();
+  }
+
+  void ReleaseAll() { ReleaseRounds(std::numeric_limits<int>::max()); }
+
+ private:
+  void WaitForTurn() {
+    MutexLock lock(&mutex_);
+    const int round = ++started_;
+    cv_.SignalAll();
+    while (released_ < round) {
+      cv_.Wait();
+    }
+  }
+
+  port::Mutex mutex_;
+  port::CondVar cv_{&mutex_};
+  int started_ = 0;
+  int released_ = 0;
+};
+
+// Returns `fields` with the value of field `id` set to `value`.
+std::string ReplaceManifestField(const std::string& fields, uint32_t id,
+                                 const std::string& value) {
+  std::vector<ManifestRowField> parsed;
+  EXPECT_OK(ParseManifestRowFields(fields, &parsed));
+  for (ManifestRowField& field : parsed) {
+    if (field.id == id) {
+      field.value = value;
+    }
+  }
+  return EncodeManifestRowFields(parsed);
+}
+
+std::string Varint(uint64_t value) {
+  std::string result;
+  PutVarint64(&result, value);
+  return result;
+}
+
+// A DB row with row format version 1, the given authority value and copy mode
+// kOff. The default is a DB in store mode.
+std::string StoreModeDbRow(uint8_t authority_value = lossless_cast<uint8_t>(
+                               ManifestAuthority::kStore)) {
+  const std::string version = Varint(1);
+  const std::string authority(1, static_cast<char>(authority_value));
+  const std::string copy_mode(1, lossless_cast<char>(ManifestCopyMode::kOff));
+  return EncodeManifestRowFields(
+      {{lossless_cast<uint32_t>(ManifestDbField::kRowFormatVersion), version},
+       {lossless_cast<uint32_t>(ManifestDbField::kAuthority), authority},
+       {lossless_cast<uint32_t>(ManifestDbField::kCopyMode), copy_mode}});
+}
+
+}  // namespace
+
+// Shadow mode (DBOptions::manifest_store_shadow): each MANIFEST write is also
+// committed to the store in the background, and
+// CompareManifestStoreWithManifest() checks the store after close.
+class DBManifestStoreShadowTest : public DBTestBase {
+ public:
+  DBManifestStoreShadowTest()
+      : DBTestBase("db_manifest_store_shadow_test", /*env_do_fsync=*/false) {}
+
+ protected:
+  Options ShadowOptions() {
+    Options options = CurrentOptions();
+    options.manifest_store = store_;
+    options.manifest_store_shadow = true;
+    // Retry a failed store call at the next MANIFEST write, without a wait.
+    options.bgerror_resume_retry_interval = 0;
+    options.disable_auto_compactions = true;
+    return options;
+  }
+
+  static ManifestStoreShadow* ShadowOf(DB* db) {
+    return static_cast_with_check<DBImpl>(db)->TEST_GetManifestStoreShadow();
+  }
+  ManifestStoreShadow* shadow() { return ShadowOf(db_.get()); }
+
+  void WaitForShadow() { shadow()->TEST_WaitForIdle(); }
+
+  // Writes one key and flushes, which makes one MANIFEST write.
+  void PutAndFlush(const std::string& key, int cf = 0) {
+    if (handles_.empty()) {
+      ASSERT_EQ(0, cf);
+      ASSERT_OK(Put(key, "v"));
+    } else {
+      ASSERT_OK(Put(cf, key, "v"));
+    }
+    ASSERT_OK(Flush(cf));
+  }
+
+  // Compares the store with the MANIFEST of the closed DB.
+  void Compare(const Options& options, const std::vector<std::string>& cfs,
+               std::vector<std::string>* differences,
+               std::vector<std::string>* warnings) {
+    std::vector<ColumnFamilyDescriptor> descriptors;
+    descriptors.reserve(cfs.size());
+    for (const std::string& name : cfs) {
+      descriptors.emplace_back(name, options);
+    }
+    MockManifestStore reader(data_, /*epoch=*/std::nullopt);
+    ASSERT_OK(CompareManifestStoreWithManifest(dbname_, options, descriptors,
+                                               &reader, differences, warnings));
+  }
+
+  // Makes a checkpoint of the open DB at `path`, a copy with the same db id.
+  void CreateCheckpointCopy(const std::string& path) {
+    ASSERT_OK(DestroyDir(env_, path));
+    Checkpoint* checkpoint = nullptr;
+    ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+    std::unique_ptr<Checkpoint> owner(checkpoint);
+    ASSERT_OK(checkpoint->CreateCheckpoint(path));
+  }
+
+  // Closes the DB and checks that the store matches the MANIFEST.
+  void CloseAndExpectStoreMatches(const Options& options,
+                                  const std::vector<std::string>& cfs = {
+                                      kDefaultColumnFamilyName}) {
+    Close();
+    std::vector<std::string> differences;
+    std::vector<std::string> warnings;
+    ASSERT_NO_FATAL_FAILURE(Compare(options, cfs, &differences, &warnings));
+    ASSERT_EQ(std::vector<std::string>{}, differences);
+    ASSERT_EQ(std::vector<std::string>{}, warnings);
+  }
+
+  // Opens another shadow DB at `path`, with `*options` and a new store of its
+  // own, which is returned in `*store`. `*options` gets that store.
+  void OpenOtherShadowDb(const std::string& path, Options* options,
+                         std::shared_ptr<RecordingManifestStore>* store,
+                         std::unique_ptr<DB>* db) {
+    *store = std::make_shared<RecordingManifestStore>(
+        std::make_shared<MockManifestStoreData>(), /*epoch=*/1);
+    options->manifest_store = *store;
+    options->create_if_missing = true;
+    ASSERT_OK(DestroyDB(path, *options));
+    ASSERT_OK(DB::Open(*options, path, db));
+  }
+
+  // Waits for the jobs of the other shadow DB, checks that its store is in
+  // sync, then closes and destroys it.
+  void CloseOtherShadowDb(const std::string& path, const Options& options,
+                          std::unique_ptr<DB>* db) {
+    ManifestStoreShadow* const other = ShadowOf(db->get());
+    other->TEST_WaitForIdle();
+    ASSERT_TRUE(other->TEST_InSync());
+    db->reset();
+    ASSERT_OK(DestroyDB(path, options));
+  }
+
+  std::shared_ptr<MockManifestStoreData> data_ =
+      std::make_shared<MockManifestStoreData>();
+  std::shared_ptr<RecordingManifestStore> store_ =
+      std::make_shared<RecordingManifestStore>(data_, /*epoch=*/1);
+};
+
+TEST_F(DBManifestStoreShadowTest, OpenRules) {
+  Options options = CurrentOptions();
+  options.manifest_store_shadow = true;
+  ASSERT_EQ(Status::Code::kInvalidArgument, TryReopen(options).code());
+  options = ShadowOptions();
+  options.best_efforts_recovery = true;
+  ASSERT_EQ(Status::Code::kInvalidArgument, TryReopen(options).code());
+  std::unique_ptr<DB> db;
+  ASSERT_EQ(Status::Code::kInvalidArgument,
+            DB::OpenForReadOnly(options, dbname_, &db).code());
+  // Shadow mode checks the feature version as store mode does.
+  for (uint32_t feature_version : {0u, kManifestRowFeatureVersionLatest + 1}) {
+    options = ShadowOptions();
+    options.manifest_row_feature_version = feature_version;
+    ASSERT_EQ(Status::Code::kInvalidArgument, TryReopen(options).code());
+  }
+  // A failed DB::Open() never calls the store.
+  options = ShadowOptions();
+  options.error_if_exists = true;
+  ASSERT_EQ(Status::Code::kInvalidArgument, TryReopen(options).code());
+
+  // Read-only, secondary and follower instances open from the MANIFEST and
+  // never call the store.
+  Reopen(CurrentOptions());
+  PutAndFlush("k");
+  Close();
+  options = ShadowOptions();
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &db));
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "k", &value));
+  ASSERT_EQ("v", value);
+  // The MANIFEST file holds the metadata, so it can be copied.
+  std::vector<std::string> live_files;
+  uint64_t manifest_size = 0;
+  ASSERT_OK(db->GetLiveFiles(live_files, &manifest_size,
+                             /*flush_memtable=*/false));
+  ASSERT_GT(manifest_size, 0);
+  db.reset();
+  ASSERT_OK(DB::OpenAsSecondary(options, dbname_, dbname_ + "_secondary", &db));
+  ASSERT_OK(db->Get(ReadOptions(), "k", &value));
+  db.reset();
+  Options follower = options;
+  follower.create_if_missing = true;
+  ASSERT_OK(DB::OpenAsFollower(follower, dbname_ + "_follower", dbname_, &db));
+  db.reset();
+  ASSERT_EQ(0, store_->TotalCalls());
+
+  // A shadow DB stays in file mode: it cannot change the mode of the DB, and
+  // it cannot open a DB in store mode, read-write or read-only.
+  options = ShadowOptions();
+  options.manifest_store_migrate = true;
+  ASSERT_EQ(Status::Code::kInvalidArgument, TryReopen(options).code());
+  ASSERT_EQ(0, store_->TotalCalls());
+  const std::string store_db = dbname_ + "_store_mode";
+  Options store_mode = ShadowOptions();
+  store_mode.manifest_store_shadow = false;
+  store_mode.create_if_missing = true;
+  ASSERT_OK(DB::Open(store_mode, store_db, &db));
+  db.reset();
+  options = ShadowOptions();
+  ASSERT_EQ(Status::Code::kInvalidArgument,
+            DB::Open(options, store_db, &db).code());
+  ASSERT_EQ(Status::Code::kInvalidArgument,
+            DB::OpenForReadOnly(options, store_db, &db).code());
+  ASSERT_OK(DestroyDB(store_db, store_mode));
+}
+
+// Every kind of MANIFEST write reaches the store: flushes, compactions with
+// blob garbage, a trivial move, column family add and drop, ingestion and WAL
+// tracking.
+TEST_F(DBManifestStoreShadowTest, WritesReachStore) {
+  Options options = ShadowOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.enable_blob_garbage_collection = true;
+  options.blob_garbage_collection_age_cutoff = 1.0;
+  options.track_and_verify_wals_in_manifest = true;
+  CreateAndReopenWithCF({"one"}, options);
+  for (int i = 0; i < 3; ++i) {
+    PutAndFlush("a", 0);
+    PutAndFlush("b" + std::to_string(i), 1);
+  }
+  // The overwritten values of "a" become blob garbage.
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[0], nullptr, nullptr));
+  MoveFilesToLevel(2, 1);
+
+  ColumnFamilyHandle* dropped = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(options, "dropped", &dropped));
+  ASSERT_OK(db_->Put(WriteOptions(), dropped, "d", "v"));
+  ASSERT_OK(db_->Flush(FlushOptions(), dropped));
+  ASSERT_OK(db_->DropColumnFamily(dropped));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(dropped));
+
+  const std::string sst = dbname_ + "_ingest.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(sst));
+  ASSERT_OK(writer.Put("z", "v"));
+  ASSERT_OK(writer.Finish());
+  ASSERT_OK(
+      db_->IngestExternalFile(handles_[0], {sst}, IngestExternalFileOptions()));
+
+  WaitForShadow();
+  ASSERT_TRUE(shadow()->TEST_InSync());
+  ASSERT_GT(store_->commits.load(), 0);
+  CloseAndExpectStoreMatches(options, {kDefaultColumnFamilyName, "one"});
+}
+
+// Reopen writes all rows again: one claim and one generation per open, also
+// with reuse_manifest_on_open.
+TEST_F(DBManifestStoreShadowTest, Reopen) {
+  for (const bool reuse_manifest : {false, true}) {
+    SCOPED_TRACE(reuse_manifest);
+    Options options = ShadowOptions();
+    options.reuse_manifest_on_open = reuse_manifest;
+    const int opens = store_->opens;
+    const int generations = store_->generations;
+    // The first open finds no DB row and creates it instead of a claim.
+    const int expected_opens = opens + (data_->StoredEpoch() == 0 ? 0 : 1);
+    Reopen(options);
+    PutAndFlush("k" + std::to_string(reuse_manifest));
+    WaitForShadow();
+    ASSERT_TRUE(shadow()->TEST_InSync());
+    ASSERT_EQ(expected_opens, store_->opens);
+    ASSERT_EQ(generations + 1, store_->generations);
+    CloseAndExpectStoreMatches(options);
+  }
+}
+
+// A store error never fails a write. The next MANIFEST write starts a full
+// copy, and the store matches again.
+TEST_F(DBManifestStoreShadowTest, StoreFaults) {
+  using Fault = MockManifestStoreData::Fault;
+  Options options = ShadowOptions();
+  Reopen(options);
+  PutAndFlush("start");
+  WaitForShadow();
+  ASSERT_TRUE(shadow()->TEST_InSync());
+  int key = 0;
+  for (const Fault fault :
+       {Fault::kTryAgain, Fault::kTimedOutNotApplied, Fault::kTimedOutApplied,
+        Fault::kTimedOutLateApply}) {
+    SCOPED_TRACE(lossless_cast<int>(fault));
+    data_->SetNextFault(fault);
+    PutAndFlush("k" + std::to_string(key++));
+    WaitForShadow();
+    ASSERT_FALSE(shadow()->TEST_InSync());
+    const int generations = store_->generations;
+    PutAndFlush("k" + std::to_string(key++));
+    WaitForShadow();
+    ASSERT_TRUE(shadow()->TEST_InSync());
+    ASSERT_EQ(generations + 1, store_->generations);
+  }
+  // Busy: another object with the same epoch claims the DB, which raises the
+  // commit sequence.
+  MockManifestStore other(data_, /*epoch=*/1);
+  ManifestStoreOpenOptions open_options;
+  open_options.commit_id = "other";
+  ManifestDbRowResult claimed;
+  ASSERT_OK(other.Open(open_options, &claimed));
+  PutAndFlush("busy");
+  WaitForShadow();
+  ASSERT_FALSE(shadow()->TEST_InSync());
+  PutAndFlush("after busy");
+  WaitForShadow();
+  ASSERT_TRUE(shadow()->TEST_InSync());
+  CloseAndExpectStoreMatches(options);
+}
+
+// A copy of a live shadow DB (a checkpoint, with the same db id) is opened
+// read-write in shadow mode with the same store key and a newer epoch. The
+// copy claims the store, so the store fences the source. The MANIFEST file is
+// the authority of the source, so only its shadow mode stops: it makes no more
+// store calls, its writes go on, and it has no background error.
+TEST_F(DBManifestStoreShadowTest, FencedStoreStopsOnlyShadowMode) {
+  Options options = ShadowOptions();
+  Reopen(options);
+  PutAndFlush("k1");
+  WaitForShadow();
+  ASSERT_TRUE(shadow()->TEST_InSync());
+  const std::string copy_path = dbname_ + "_copy";
+  ASSERT_NO_FATAL_FAILURE(CreateCheckpointCopy(copy_path));
+  Options copy_options = options;
+  copy_options.manifest_store =
+      std::make_shared<MockManifestStore>(data_, /*epoch=*/2);
+  std::unique_ptr<DB> copy;
+  ASSERT_OK(DB::Open(copy_options, copy_path, &copy));
+  ManifestStoreShadow* copy_shadow = ShadowOf(copy.get());
+  copy_shadow->TEST_WaitForIdle();
+  ASSERT_TRUE(copy_shadow->TEST_InSync());
+  ASSERT_EQ(2u, data_->StoredEpoch());
+
+  PutAndFlush("k2");
+  WaitForShadow();
+  ASSERT_TRUE(shadow()->Stopped());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  const int calls = store_->TotalCalls();
+  PutAndFlush("k3");
+  ASSERT_EQ("v", Get("k3"));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  Close();
+  ASSERT_EQ(calls, store_->TotalCalls());
+
+  // The copy keeps the store in sync with its own MANIFEST.
+  ASSERT_OK(copy->Put(WriteOptions(), "c1", "v"));
+  ASSERT_OK(copy->Flush(FlushOptions()));
+  copy_shadow->TEST_WaitForIdle();
+  ASSERT_TRUE(copy_shadow->TEST_InSync());
+  copy.reset();
+  ASSERT_OK(DestroyDir(env_, copy_path));
+}
+
+// Shadow mode never writes rows to a DB in store mode: it does not claim the DB
+// when the store row says so before the claim, and it stops after its claim
+// when a store-mode instance takes over the DB between the read and the claim.
+// An authority value above kStore, which a newer binary wrote, is treated the
+// same way.
+TEST_F(DBManifestStoreShadowTest, NeverWritesStoreModeDb) {
+  struct Case {
+    bool before_claim;
+    std::string db_row;
+  };
+  // 3 is an example of an authority value that this release does not know.
+  // A field id of 0 makes a DB row that does not parse; the mock store cannot
+  // merge a claim into it, so it is only stored before the claim.
+  const std::string store_mode_row = StoreModeDbRow();
+  const std::string unknown_row = StoreModeDbRow(3);
+  const std::string bad_row("\x00\x00", 2);
+  for (const Case& c : {Case{true, store_mode_row}, Case{false, store_mode_row},
+                        Case{true, unknown_row}, Case{false, unknown_row},
+                        Case{true, bad_row}}) {
+    const bool before_claim = c.before_claim;
+    SCOPED_TRACE(std::to_string(before_claim) + " " +
+                 Slice(c.db_row).ToString(/*hex=*/true));
+    data_ = std::make_shared<MockManifestStoreData>();
+    store_ = std::make_shared<RecordingManifestStore>(data_, /*epoch=*/1);
+    MockManifestStore store_mode(data_, /*epoch=*/1);
+    auto write_store_mode_row = [&](uint64_t expected_commit_sequence) {
+      ManifestCommit commit;
+      commit.expected_commit_sequence = expected_commit_sequence;
+      commit.commit_id = "store mode";
+      commit.db_row.fields = c.db_row;
+      ASSERT_OK(store_mode.Commit(commit));
+    };
+    if (before_claim) {
+      write_store_mode_row(0);
+    } else {
+      // A DB row in shadow mode, which a store-mode instance replaces right
+      // before the shadow claim.
+      ASSERT_OK(DestroyDB(dbname_, CurrentOptions()));
+      Reopen(ShadowOptions());
+      WaitForShadow();
+      Close();
+      store_ = std::make_shared<RecordingManifestStore>(data_, /*epoch=*/1);
+      store_->before_open = [&]() {
+        ManifestDbRowResult current;
+        ASSERT_OK(store_mode.ReadDbRow(&current));
+        write_store_mode_row(current.state.commit_sequence);
+      };
+    }
+    Options options = ShadowOptions();
+    Reopen(options);
+    PutAndFlush("k");
+    WaitForShadow();
+    ASSERT_TRUE(shadow()->Stopped());
+    ASSERT_EQ(0, store_->generations);
+    ASSERT_EQ(0, store_->commits);
+    ManifestDbRowResult row;
+    ASSERT_OK(store_mode.ReadDbRow(&row));
+    ASSERT_EQ(c.db_row, row.db_row.fields);
+    // Writes go on.
+    PutAndFlush("k2");
+    ASSERT_EQ("v", Get("k2"));
+    Close();
+  }
+}
+
+// Two DBs use the same store key by mistake. The second DB finds a DB row with
+// the id of the first DB and never claims it, so it neither replaces the rows
+// of the first DB nor fences it with its newer epoch.
+TEST_F(DBManifestStoreShadowTest, NeverWritesAnotherDbsStore) {
+  Options other_options = ShadowOptions();
+  other_options.write_dbid_to_manifest = true;
+  other_options.create_if_missing = true;
+  const std::string other_path = dbname_ + "_other";
+  ASSERT_OK(DestroyDB(other_path, other_options));
+  {
+    std::unique_ptr<DB> other;
+    ASSERT_OK(DB::Open(other_options, other_path, &other));
+    ASSERT_OK(other->Put(WriteOptions(), "k", "v"));
+    ASSERT_OK(other->Flush(FlushOptions()));
+  }
+  ASSERT_EQ(1u, data_->StoredEpoch());
+  ManifestDbRowResult before;
+  MockManifestStore reader(data_, /*epoch=*/std::nullopt);
+  ASSERT_OK(reader.ReadDbRow(&before));
+
+  store_ = std::make_shared<RecordingManifestStore>(data_, /*epoch=*/2);
+  Options options = ShadowOptions();
+  Reopen(options);
+  PutAndFlush("k");
+  WaitForShadow();
+  ASSERT_TRUE(shadow()->Stopped());
+  ASSERT_EQ(0, store_->opens);
+  ASSERT_EQ(0, store_->commits);
+  ASSERT_EQ(0, store_->generations);
+  ASSERT_EQ(1u, data_->StoredEpoch());
+  ManifestDbRowResult after;
+  ASSERT_OK(reader.ReadDbRow(&after));
+  ASSERT_EQ(before.state.commit_sequence, after.state.commit_sequence);
+  ASSERT_EQ(before.db_row.fields, after.db_row.fields);
+  Close();
+  ASSERT_OK(DestroyDB(other_path, other_options));
+}
+
+// DestroyDB() with the store keeps the rows that shadow mode wrote. A
+// checkpoint is a copy of the DB folder with the same db id, so DestroyDB() of
+// the copy cannot tell the copy from the live source. It must never remove the
+// rows of the source or fence the source, even with a store object of a newer
+// epoch.
+TEST_F(DBManifestStoreShadowTest, DestroyKeepsShadowRows) {
+  Options options = ShadowOptions();
+  Reopen(options);
+  PutAndFlush("k1");
+  WaitForShadow();
+  ASSERT_TRUE(shadow()->TEST_InSync());
+  const std::string copy_path = dbname_ + "_copy";
+  ASSERT_NO_FATAL_FAILURE(CreateCheckpointCopy(copy_path));
+
+  Options destroy_options = options;
+  destroy_options.manifest_store =
+      std::make_shared<MockManifestStore>(data_, /*epoch=*/2);
+  ASSERT_OK(DestroyDB(copy_path, destroy_options));
+  MockManifestStore reader(data_, /*epoch=*/std::nullopt);
+  ManifestDbRowResult db_row;
+  ASSERT_OK(reader.ReadDbRow(&db_row));
+  ASSERT_EQ(1u, data_->StoredEpoch());
+
+  // The source keeps running and the store stays in sync with it.
+  PutAndFlush("k2");
+  WaitForShadow();
+  ASSERT_FALSE(shadow()->Stopped());
+  ASSERT_TRUE(shadow()->TEST_InSync());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  CloseAndExpectStoreMatches(options);
+
+  // DestroyDB() of the source itself also keeps the rows.
+  ASSERT_OK(DestroyDB(dbname_, options));
+  ASSERT_OK(reader.ReadDbRow(&db_row));
+}
+
+// Moving a DB into the store (DB::Open() with manifest_store_migrate) takes
+// over the rows that shadow mode wrote only when their last commit is a close
+// commit. Otherwise a shadow DB may still use them: here a checkpoint of a
+// live shadow DB, with the same db id, tries to move into the store. The enter
+// is refused, and the source keeps its rows and its shadow mode. After the
+// source closes, the same enter works. Then the checkpoint, opened in shadow
+// mode, finds the DB in store mode with its own db id and never claims it.
+TEST_F(DBManifestStoreShadowTest, EnterTakesOverOnlyClosedShadowRows) {
+  Options options = ShadowOptions();
+  Reopen(options);
+  PutAndFlush("k1");
+  WaitForShadow();
+  const std::string copy_path = dbname_ + "_copy";
+  ASSERT_NO_FATAL_FAILURE(CreateCheckpointCopy(copy_path));
+  Options enter_options = options;
+  enter_options.manifest_store_shadow = false;
+  enter_options.manifest_store_migrate = true;
+  enter_options.manifest_store =
+      std::make_shared<MockManifestStore>(data_, /*epoch=*/2);
+  std::unique_ptr<DB> entered;
+  ASSERT_EQ(Status::Code::kInvalidArgument,
+            DB::Open(enter_options, copy_path, &entered).code());
+  ASSERT_EQ(1u, data_->StoredEpoch());
+  PutAndFlush("k2");
+  WaitForShadow();
+  ASSERT_TRUE(shadow()->TEST_InSync());
+
+  // After a close with the store in sync, the last commit is a close
+  // commit, and the source moves into the store.
+  Close();
+  ASSERT_OK(DB::Open(enter_options, dbname_, &entered));
+  ASSERT_TRUE(static_cast_with_check<DBImpl>(entered.get())
+                  ->GetVersionSet()
+                  ->IsStoreMode());
+  std::string value;
+  ASSERT_OK(entered->Get(ReadOptions(), "k2", &value));
+  ASSERT_EQ("v", value);
+  entered.reset();
+
+  std::shared_ptr<RecordingManifestStore> copy_store =
+      std::make_shared<RecordingManifestStore>(data_, /*epoch=*/3);
+  Options copy_options = options;
+  copy_options.manifest_store = copy_store;
+  std::unique_ptr<DB> copy;
+  ASSERT_OK(DB::Open(copy_options, copy_path, &copy));
+  ManifestStoreShadow* copy_shadow = ShadowOf(copy.get());
+  copy_shadow->TEST_WaitForIdle();
+  ASSERT_TRUE(copy_shadow->Stopped());
+  ASSERT_EQ(0, copy_store->opens.load());
+  ASSERT_EQ(2u, data_->StoredEpoch());
+  copy.reset();
+  ASSERT_OK(DestroyDir(env_, copy_path));
+  // The test fixture cannot destroy a DB in store mode without the store.
+  ASSERT_OK(DestroyDB(dbname_, enter_options));
+}
+
+// The compare tool lists each difference with its row key.
+TEST_F(DBManifestStoreShadowTest, CompareFindsInjectedMismatch) {
+  Options options = ShadowOptions();
+  Reopen(options);
+  PutAndFlush("a");
+  PutAndFlush("b");
+  PutAndFlush("c");
+  CloseAndExpectStoreMatches(options);
+
+  // Change the size of the first file, delete the second file row, add a WAL
+  // row, and change the next file number of the DB row.
+  MockManifestStore writer(data_, /*epoch=*/1);
+  CollectRowsVisitor collector;
+  ASSERT_OK(writer.Scan(ManifestScanOptions(), &collector));
+  std::vector<ManifestRow> files;
+  for (const ManifestRow& row : collector.rows_) {
+    if (row.key.type == ManifestRowType::kFile) {
+      files.push_back(row);
+    }
+  }
+  ASSERT_EQ(3u, files.size());
+  ManifestCommit commit;
+  commit.expected_commit_sequence = collector.db_row_.state.commit_sequence;
+  commit.commit_id = "inject";
+  commit.db_row = collector.db_row_.db_row;
+  commit.db_row.fields = ReplaceManifestField(
+      commit.db_row.fields,
+      lossless_cast<uint32_t>(ManifestDbField::kNextFileNumber), Varint(1000));
+  ManifestRow changed = files[0];
+  changed.fields = ReplaceManifestField(
+      changed.fields, lossless_cast<uint32_t>(ManifestFileField::kFileSize),
+      Varint(1));
+  commit.upserts.push_back(changed);
+  const std::string wal_fields = EncodeManifestRowFields(
+      {{lossless_cast<uint32_t>(ManifestWalField::kSyncedSize), Varint(10)}});
+  commit.upserts.push_back(
+      ManifestRow{ManifestRowKey{ManifestRowType::kWal, 0, 999}, wal_fields});
+  commit.deletes.push_back(files[1].key);
+  ASSERT_OK(writer.Commit(commit));
+
+  std::vector<std::string> differences;
+  std::vector<std::string> warnings;
+  ASSERT_NO_FATAL_FAILURE(
+      Compare(options, {kDefaultColumnFamilyName}, &differences, &warnings));
+  const std::string file0 = "file (column family 0, number " +
+                            std::to_string(files[0].key.number) + ")";
+  const std::string file1 = "file (column family 0, number " +
+                            std::to_string(files[1].key.number) + ")";
+  const std::vector<std::string> expected = {
+      "DB row: fields 6 differ", file0 + ": fields 3 differ",
+      file1 + ": only in the MANIFEST", "WAL 999: only in the store"};
+  ASSERT_EQ(expected, differences);
+  // The last commit is not a close commit.
+  ASSERT_EQ(1u, warnings.size());
+}
+
+#ifndef NDEBUG
+// The compare tool never writes or reopens the MANIFEST, also when the options
+// have reuse_manifest_on_open.
+TEST_F(DBManifestStoreShadowTest, CompareLeavesManifestUnchanged) {
+  Options options = ShadowOptions();
+  options.reuse_manifest_on_open = true;
+  Reopen(options);
+  PutAndFlush("a");
+  Close();
+  std::string current;
+  ASSERT_OK(ReadFileToString(env_, CurrentFileName(dbname_), &current));
+  ASSERT_FALSE(current.empty());
+  const std::string manifest =
+      dbname_ + "/" + current.substr(0, current.size() - 1);
+  std::string manifest_before;
+  ASSERT_OK(ReadFileToString(env_, manifest, &manifest_before));
+  std::atomic<int> reopens{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ReopenManifestForAppend:Reopened",
+      [&](void*) { ++reopens; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Defer cleanup([&]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  std::vector<std::string> differences;
+  std::vector<std::string> warnings;
+  ASSERT_NO_FATAL_FAILURE(
+      Compare(options, {kDefaultColumnFamilyName}, &differences, &warnings));
+  ASSERT_EQ(std::vector<std::string>{}, differences);
+  ASSERT_EQ(0, reopens.load());
+  std::string manifest_after;
+  ASSERT_OK(ReadFileToString(env_, manifest, &manifest_after));
+  ASSERT_EQ(manifest_before, manifest_after);
+  // A DB open with the same options reopens the MANIFEST for append, so the
+  // sync point above works.
+  Reopen(options);
+  ASSERT_EQ(1, reopens.load());
+  Close();
+}
+
+// Each new MANIFEST file replaces the rows with the rows of its snapshot.
+// Values that change in memory without a MANIFEST write
+// (marked_for_compaction, the log number of an empty column family) are known
+// differences, so no warning is logged, and the store still matches the
+// MANIFEST.
+TEST_F(DBManifestStoreShadowTest, NewManifestFileReplacesRows) {
+  Options options = ShadowOptions();
+  // Every MANIFEST write starts a new MANIFEST file.
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  // Without blob garbage collection, a compaction leaves partial garbage in
+  // a blob file that still holds a live value.
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  CreateAndReopenWithCF({"empty"}, options);
+  std::atomic<int> new_manifests{0};
+  std::vector<std::string> unexpected;
+  port::Mutex unexpected_mutex;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeNewManifest",
+      [&](void*) { ++new_manifests; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestStoreShadow::UnexpectedDifference", [&](void* arg) {
+        MutexLock lock(&unexpected_mutex);
+        unexpected.push_back(*static_cast<std::string*>(arg));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // The first blob file holds "x" and the first value of "a".
+  ASSERT_OK(Put(0, "x", "v"));
+  for (int i = 0; i < 8; ++i) {
+    PutAndFlush("a");
+  }
+  WaitForShadow();
+  // A new MANIFEST file commits only the rows that changed, for example the new
+  // file and blob file rows and the column family rows, not all eight file
+  // rows.
+  PutAndFlush("b");
+  WaitForShadow();
+  ASSERT_LT(store_->LastCommitUpserts(), 8u);
+  // The files stay marked for compaction in memory, because automatic
+  // compactions are off. The next new MANIFEST file records them as marked.
+  ASSERT_OK(experimental::SuggestCompactRange(db_.get(), handles_[0], nullptr,
+                                              nullptr));
+  PutAndFlush("c");
+  // The compaction drops the overwritten values of "a". The first blob file
+  // keeps "x" and gets garbage; the next new MANIFEST file records it.
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[0], nullptr, nullptr));
+  PutAndFlush("d");
+  WaitForShadow();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_GE(new_manifests.load(), 3);
+  ASSERT_EQ(std::vector<std::string>{}, unexpected);
+  CloseAndExpectStoreMatches(options, {kDefaultColumnFamilyName, "empty"});
+}
+
+// A slow store call never blocks writes. While a full copy waits between its
+// snapshot and its store call, flushes and a compaction finish. Files that
+// are created and compacted away during the wait never reach the store, and
+// no commit deletes them.
+TEST_F(DBManifestStoreShadowTest, SlowStoreDoesNotBlockWrites) {
+  // One LOW thread, as with default options. Shadow mode adds its own thread,
+  // so the compaction below runs while the shadow job holds one.
+  env_->SetBackgroundThreads(1, Env::LOW);
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"ManifestStoreShadow::RunJob:TookRows",
+        "DBManifestStoreShadowTest::JobTookRows"},
+       {"DBManifestStoreShadowTest::ReleaseStore",
+        "ManifestStoreShadow::RunJob:BeforeStoreCall"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  Options options = ShadowOptions();
+  Reopen(options);
+  // The full copy has taken its snapshot of the rows.
+  TEST_SYNC_POINT("DBManifestStoreShadowTest::JobTookRows");
+  // The forced compaction rewrites both files and deletes them, instead of
+  // moving them to the next level.
+  PutAndFlush("a");
+  PutAndFlush("b");
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(0, store_->TotalCalls());
+  TEST_SYNC_POINT("DBManifestStoreShadowTest::ReleaseStore");
+  WaitForShadow();
+  // The first job made the full copy. The changes after its snapshot need
+  // one more job, which the next MANIFEST write schedules if the first job
+  // did not.
+  PutAndFlush("c");
+  WaitForShadow();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->LoadDependency({});
+  ASSERT_TRUE(shadow()->TEST_InSync());
+  ASSERT_EQ(0, store_->DeletesOfUnstoredRows());
+  CloseAndExpectStoreMatches(options);
+}
+
+// Close waits for the store call in progress. When that call fails, close
+// sends no last commit, so the compare tool warns that the store may be
+// behind. When it succeeds, close sends the last commit and the store
+// matches.
+TEST_F(DBManifestStoreShadowTest, CloseWithSlowStore) {
+  for (const bool fail : {true, false}) {
+    SCOPED_TRACE(fail);
+    Options options = ShadowOptions();
+    Reopen(options);
+    PutAndFlush("a");
+    WaitForShadow();
+    SyncPoint::GetInstance()->LoadDependency(
+        {{"ManifestStoreShadow::Close:Start",
+          "DBManifestStoreShadowTest::ReleaseStore"},
+         {"DBManifestStoreShadowTest::ReleaseStore",
+          "ManifestStoreShadow::RunJob:BeforeStoreCall"}});
+    SyncPoint::GetInstance()->EnableProcessing();
+    if (fail) {
+      data_->SetNextFault(MockManifestStoreData::Fault::kTimedOutNotApplied);
+    }
+    PutAndFlush("b");
+    port::Thread release(
+        []() { TEST_SYNC_POINT("DBManifestStoreShadowTest::ReleaseStore"); });
+    Close();
+    release.join();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->LoadDependency({});
+    std::vector<std::string> differences;
+    std::vector<std::string> warnings;
+    ASSERT_NO_FATAL_FAILURE(
+        Compare(options, {kDefaultColumnFamilyName}, &differences, &warnings));
+    if (fail) {
+      ASSERT_EQ(1u, warnings.size());
+      ASSERT_FALSE(differences.empty());
+    } else {
+      ASSERT_EQ(std::vector<std::string>{}, warnings);
+      ASSERT_EQ(std::vector<std::string>{}, differences);
+    }
+  }
+}
+
+// All shadow DBs of the process run one job at a time, also when they use
+// different Env objects. The second DB uses an EnvWrapper, which runs its jobs
+// in the thread pools of the first Env. Starting from one LOW thread, as with
+// default options, the first DB holds the job slot while its store call is
+// slow. The second DB keeps collecting changes, and its compactions still run,
+// because the slow store call uses the extra LOW thread, not the compaction
+// thread. When the slow call ends, the second DB gets the slot without another
+// MANIFEST write.
+TEST_F(DBManifestStoreShadowTest, OneJobAtATimeForAllEnvs) {
+  env_->SetBackgroundThreads(1, Env::LOW);
+  std::atomic<int> jobs{0};
+  SyncPoint::GetInstance()->SetCallBack("ManifestStoreShadow::RunJob:Start",
+                                        [&](void*) { ++jobs; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::shared_ptr<BlockingRoundsStore> slow_store =
+      std::make_shared<BlockingRoundsStore>(data_, /*epoch=*/1);
+  const Defer cleanup([&]() {
+    slow_store->ReleaseAll();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  Options options = ShadowOptions();
+  options.manifest_store = slow_store;
+  Reopen(options);
+  ASSERT_TRUE(slow_store->WaitForRounds(1));
+
+  EnvWrapper env2(env_);
+  Options options2 = options;
+  options2.env = &env2;
+  const std::string path2 = dbname_ + "_2";
+  std::shared_ptr<RecordingManifestStore> store2;
+  std::unique_ptr<DB> db2;
+  ASSERT_NO_FATAL_FAILURE(OpenOtherShadowDb(path2, &options2, &store2, &db2));
+  for (const char* key : {"a", "b"}) {
+    ASSERT_OK(db2->Put(WriteOptions(), key, "v"));
+    ASSERT_OK(db2->Flush(FlushOptions()));
+  }
+  ASSERT_OK(db2->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(1, jobs.load());
+  ASSERT_EQ(0, store2->TotalCalls());
+
+  slow_store->ReleaseAll();
+  ASSERT_NO_FATAL_FAILURE(CloseOtherShadowDb(path2, options2, &db2));
+  WaitForShadow();
+  CloseAndExpectStoreMatches(options);
+}
+
+// The job slot goes to the shadow DBs in the order they asked for it. DB A
+// has a slow store and gets a MANIFEST write during each store call, so it
+// always has more work. DB B asks for the slot while A's first round runs. B
+// runs its round before A's second round, because A joins the back of the
+// queue when its round ends.
+TEST_F(DBManifestStoreShadowTest, JobSlotGoesToTheFirstWaitingDb) {
+  std::shared_ptr<BlockingRoundsStore> slow_store =
+      std::make_shared<BlockingRoundsStore>(data_, /*epoch=*/1);
+  const Defer cleanup([&]() { slow_store->ReleaseAll(); });
+  Options options = ShadowOptions();
+  options.manifest_store = slow_store;
+  Reopen(options);
+  ASSERT_TRUE(slow_store->WaitForRounds(1));
+  PutAndFlush("a1");
+
+  Options options_b = ShadowOptions();
+  const std::string path_b = dbname_ + "_b";
+  std::shared_ptr<RecordingManifestStore> store_b;
+  std::unique_ptr<DB> db_b;
+  ASSERT_NO_FATAL_FAILURE(
+      OpenOtherShadowDb(path_b, &options_b, &store_b, &db_b));
+  ASSERT_EQ(0, store_b->TotalCalls());
+
+  // A's first round ends. B's full copy runs before A's second round starts.
+  slow_store->ReleaseRounds(1);
+  ASSERT_TRUE(slow_store->WaitForRounds(2));
+  ASSERT_EQ(1, store_b->generations.load());
+  PutAndFlush("a2");
+  slow_store->ReleaseAll();
+  WaitForShadow();
+  ASSERT_NO_FATAL_FAILURE(CloseOtherShadowDb(path_b, options_b, &db_b));
+  CloseAndExpectStoreMatches(options);
+}
+
+// A MANIFEST write that starts a new MANIFEST file and then fails frees the
+// rows of the new file's snapshot before it takes the DB mutex again, because
+// these rows grow with the number of live files.
+TEST_F(DBManifestStoreShadowTest, FailedRolloverFreesSnapshotRowsEarly) {
+  Options options = ShadowOptions();
+  // Each MANIFEST write starts a new MANIFEST file.
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+  Reopen(options);
+  PutAndFlush("a");
+  WaitForShadow();
+  std::atomic<int> failed_rollovers{0};
+  std::atomic<int> relocks{0};
+  std::atomic<int> relocks_with_rows{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSetCurrentFile", [&](void* arg) {
+        if (failed_rollovers.fetch_add(1) == 0) {
+          *static_cast<IOStatus*>(arg) = IOStatus::IOError("injected");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeRelock", [&](void* arg) {
+        ++relocks;
+        if (!static_cast<ManifestRows*>(arg)->cfs.empty()) {
+          ++relocks_with_rows;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Defer cleanup([&]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(Put("b", "v"));
+  ASSERT_NOK(Flush());
+  ASSERT_GE(failed_rollovers.load(), 1);
+  ASSERT_GE(relocks.load(), 1);
+  ASSERT_EQ(0, relocks_with_rows.load());
+  Close();
+}
+
+// ReplaceWithSnapshot() logs each difference between the old rows and the
+// rows of a new MANIFEST file, except the known in-memory differences. Each
+// case starts from the same old rows, files 10 and 11, and uses a shadow that
+// never starts, so no store call runs.
+TEST_F(DBManifestStoreShadowTest, ReportsUnexpectedSnapshotDifferences) {
+  const uint32_t size_id =
+      lossless_cast<uint32_t>(ManifestFileField::kFileSize);
+  const uint32_t marked_id =
+      lossless_cast<uint32_t>(ManifestFileField::kMarkedForCompaction);
+  auto file_key = [](uint64_t number) {
+    return ManifestRowKey{ManifestRowType::kFile, /*cf_id=*/0, number};
+  };
+  auto file_row = [&](uint64_t number, uint64_t size, bool marked) {
+    // ManifestRowField holds Slices, so the values must outlive `fields`.
+    const std::string size_value = Varint(size);
+    const std::string marked_value(1, marked ? 1 : 0);
+    std::vector<ManifestRowField> fields = {{size_id, size_value},
+                                            {marked_id, marked_value}};
+    std::sort(fields.begin(), fields.end(),
+              [](const ManifestRowField& a, const ManifestRowField& b) {
+                return a.id < b.id;
+              });
+    return ManifestRow{file_key(number), EncodeManifestRowFields(fields)};
+  };
+  // The DB row comes first; ReplaceWithSnapshot() does not compare it.
+  auto snapshot = [](std::vector<ManifestRow> files) {
+    files.insert(files.begin(), ManifestRow{ManifestRowKey{}, "DB row"});
+    return files;
+  };
+  const std::string file10 = ManifestRowKeyToString(file_key(10));
+  const std::string file11 = ManifestRowKeyToString(file_key(11));
+  const std::string file12 = ManifestRowKeyToString(file_key(12));
+  struct Case {
+    std::vector<ManifestRow> new_files;
+    std::vector<std::string> expected;
+  };
+  const std::vector<Case> cases = {
+      // A wrong file size is one report.
+      {{file_row(10, 101, false), file_row(11, 200, false)},
+       {file10 + ": fields " + std::to_string(size_id) + " differ"}},
+      // marked_for_compaction is a known in-memory difference.
+      {{file_row(10, 100, true), file_row(11, 200, false)}, {}},
+      // A row only in the new rows.
+      {{file_row(10, 100, false), file_row(11, 200, false),
+        file_row(12, 300, false)},
+       {file12 + ": only in the new MANIFEST file"}},
+      // A row only in the old rows.
+      {{file_row(10, 100, false)},
+       {file11 + ": only in the old MANIFEST file"}},
+  };
+  std::vector<std::string> reported;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestStoreShadow::UnexpectedDifference",
+      [&](void* arg) { reported.push_back(*static_cast<std::string*>(arg)); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Defer cleanup([&]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  for (size_t i = 0; i < cases.size(); ++i) {
+    SCOPED_TRACE(i);
+    reported.clear();
+    ManifestStoreShadow shadow(store_, env_, env_->GetSystemClock().get(),
+                               /*info_log=*/nullptr, /*feature_version=*/1,
+                               /*retry_interval_us=*/0, "session");
+    shadow.ReplaceWithSnapshot(
+        snapshot({file_row(10, 100, false), file_row(11, 200, false)}));
+    shadow.Apply(ManifestCommit());
+    shadow.ReplaceWithSnapshot(snapshot(cases[i].new_files));
+    ASSERT_EQ(cases[i].expected, reported);
+  }
+}
+#endif  // NDEBUG
+
+// A row that is added and deleted again between two rounds leaves no changed
+// key, so the changed keys stay bounded by the number of rows while a DB
+// waits for the job slot. The shadow never starts, so no round runs.
+TEST_F(DBManifestStoreShadowTest, AddedAndDeletedRowLeavesNoChangedKey) {
+  ManifestStoreShadow shadow(store_, env_, env_->GetSystemClock().get(),
+                             /*info_log=*/nullptr, /*feature_version=*/1,
+                             /*retry_interval_us=*/0, "session");
+  shadow.ReplaceWithSnapshot({ManifestRow{ManifestRowKey{}, "DB row"}});
+  shadow.Apply(ManifestCommit());
+  ASSERT_EQ(0u, shadow.TEST_NumChangedKeys());
+  for (uint64_t number = 10; number < 20; ++number) {
+    const ManifestRowKey key{ManifestRowType::kFile, /*cf_id=*/0, number};
+    ManifestCommit add;
+    add.upserts.push_back(ManifestRow{key, "file row"});
+    shadow.Apply(std::move(add));
+    ASSERT_EQ(1u, shadow.TEST_NumChangedKeys());
+    ManifestCommit remove;
+    remove.deletes.push_back(key);
+    shadow.Apply(std::move(remove));
+    ASSERT_EQ(0u, shadow.TEST_NumChangedKeys());
+  }
 }
 
 namespace {

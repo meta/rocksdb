@@ -121,6 +121,93 @@ int ValidateFileScopedWalWriteFaultFlags() {
   return 0;
 }
 
+int ValidateManifestStoreFlags() {
+  if (!FLAGS_use_manifest_store) {
+    if (FLAGS_manifest_store_shadow || FLAGS_manifest_store_fault_one_in > 0 ||
+        FLAGS_manifest_store_fence_at_reopen_one_in > 0 ||
+        FLAGS_manifest_store_rollback_one_in > 0 ||
+        FLAGS_manifest_store_copy_mode != 0) {
+      return ReturnValidationError(
+          "--manifest_store_* flags require --use_manifest_store");
+    }
+    return 0;
+  }
+  if (FLAGS_manifest_store_copy_mode < 0 ||
+      FLAGS_manifest_store_copy_mode > 2) {
+    return ReturnValidationError(
+        "--manifest_store_copy_mode must be 0, 1 or 2");
+  }
+  // A fence only stops shadow mode of the old DB, which the reopen does not
+  // check, so it adds no coverage there. The copy mode and the rollback belong
+  // to store mode only.
+  if (FLAGS_manifest_store_shadow &&
+      (FLAGS_manifest_store_fence_at_reopen_one_in > 0 ||
+       FLAGS_manifest_store_rollback_one_in > 0 ||
+       FLAGS_manifest_store_copy_mode != 0)) {
+    return ReturnValidationError(
+        "--manifest_store_shadow cannot be used with "
+        "--manifest_store_fence_at_reopen_one_in, "
+        "--manifest_store_rollback_one_in or --manifest_store_copy_mode");
+  }
+  // In sync copy mode a failed write of the MANIFEST file copy stops the DB
+  // with a non-retryable error. An injected file system write fault on the copy
+  // keeps the "injected" text in that error, so the db_stress write loops retry
+  // it until the run ends, and the run makes no progress. So sync copy mode
+  // runs without file system write faults.
+  if (FLAGS_manifest_store_copy_mode ==
+          static_cast<int>(ManifestCopyMode::kSync) &&
+      (FLAGS_write_fault_one_in > 0 || FLAGS_metadata_write_fault_one_in > 0)) {
+    return ReturnValidationError(
+        "--manifest_store_copy_mode=2 cannot be used with "
+        "--write_fault_one_in or --metadata_write_fault_one_in");
+  }
+  // db_stress does not run these features with --use_manifest_store (store
+  // mode and shadow mode). Each entry gives its reason. Where a reason holds
+  // only in store mode, shadow mode refuses the flag too, to keep one rule for
+  // both modes.
+  struct RefusedFlag {
+    bool set;
+    const char* flag;
+    const char* reason;
+  };
+  const RefusedFlag refused[] = {
+      {FLAGS_read_only, "--read_only",
+       "db_stress opens the primary DB with the test store only with a "
+       "writer object, so it has no read-only open of the primary"},
+      {FLAGS_best_efforts_recovery, "--best_efforts_recovery",
+       "every DB open function returns InvalidArgument for it with a store "
+       "(DBImpl::CheckManifestStoreOptions())"},
+      {FLAGS_get_live_files_apis_one_in > 0, "--get_live_files_apis_one_in",
+       "DB::GetLiveFiles() returns NotSupported in store mode"},
+      {FLAGS_open_read_only_one_in > 0, "--open_read_only_one_in",
+       "the read-only instance would get the writer store object and "
+       "manifest_store_migrate of the primary; db_stress has no code to give "
+       "it a reader object"},
+      {FLAGS_remote_compaction_worker_threads > 0,
+       "--remote_compaction_worker_threads",
+       "the remote compaction worker of db_stress has no way to get a store "
+       "object"},
+      {FLAGS_use_blob_db, "--use_blob_db",
+       "db_stress has not run the stacked BlobDB with a store"},
+      {FLAGS_ttl != -1, "--ttl",
+       "db_stress has not run DBWithTTL with a store"},
+      {FLAGS_track_options_file_number_in_manifest,
+       "--track_options_file_number_in_manifest",
+       "the db_stress checks of this option read the MANIFEST file, which is a "
+       "stub in store mode, so db_stress skips them"},
+      {FLAGS_test_cf_lifecycle, "--test_cf_lifecycle",
+       "its checks compare the OPTIONS files with the MANIFEST file, which is "
+       "a stub in store mode"},
+  };
+  for (const RefusedFlag& r : refused) {
+    if (r.set) {
+      return ReturnValidationError("--use_manifest_store does not work with ",
+                                   r.flag, ": ", r.reason);
+    }
+  }
+  return 0;
+}
+
 int ValidateCfLifecycleFlags() {
   if (FLAGS_cf_lifecycle_fault_target < 0 ||
       FLAGS_cf_lifecycle_fault_target > 2) {
@@ -309,6 +396,12 @@ int db_stress_tool(int argc, char** argv) {
   }
   {
     int rc = ValidateCfLifecycleFlags();
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  {
+    int rc = ValidateManifestStoreFlags();
     if (rc != 0) {
       return rc;
     }

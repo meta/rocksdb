@@ -567,6 +567,11 @@ class CompactionJob {
   // compaction), meaning no floor is sent. Setting these requires DBMutex.
   uint64_t min_manifest_file_number_ = 0;
   uint64_t min_manifest_file_size_ = 0;
+  // In store mode (see db/manifest_store_state.h), this field holds the commit
+  // sequence of the last applied store commit, the floor that the worker
+  // checks. It is captured together with the two values above. It is zero in
+  // file mode, and zero when the two values above are zero.
+  uint64_t min_store_commit_sequence_ = 0;
 
   // Remote subcompactions run concurrently and validate their blob garbage
   // before moving output into the primary. This aggregate prevents each
@@ -726,6 +731,17 @@ struct CompactionServiceInput {
   // See DBOptions::remote_compaction_manifest_floor.
   uint64_t min_manifest_file_number = 0;
   uint64_t min_manifest_file_size = 0;
+
+  // The floor in store mode (see db/manifest_store_state.h). In store mode
+  // the MANIFEST file is a stub, so the file number and size above say nothing
+  // about the metadata. This field holds the commit sequence of the last store
+  // commit that applied when the primary scheduled this compaction. The worker
+  // refuses a scan of the store with a smaller commit sequence, as it refuses
+  // an older MANIFEST view above. Zero means no floor: a primary in file
+  // mode, an older primary, or DBOptions::remote_compaction_manifest_floor off.
+  // An older worker skips this field, and cannot open a DB in store mode
+  // anyway.
+  uint64_t min_store_commit_sequence = 0;
 
   // The primary's values. The worker opens the DB as a secondary, which
   // sanitizes them to 0 as a read-only DB. They are sent here rather than

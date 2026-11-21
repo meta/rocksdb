@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "db_stress_tool/db_stress_common.h"
+#include "db_stress_tool/db_stress_manifest_store.h"
 #include "db_stress_tool/db_stress_shared_state.h"
 #include "env/composite_env_wrapper.h"
 #include "rocksdb/experimental.h"
@@ -638,6 +639,91 @@ class StressTest {
   void RecordManifestStateBeforeReopen();
   void VerifyManifestNotRewritten();
 
+  // Store mode and shadow mode (--use_manifest_store). The terms stub MANIFEST
+  // and authority are defined in "Store mode: overview" in
+  // db/manifest_store_state.h, and copy mode in "MANIFEST file copy" in the
+  // same file. The DB row is the row of ManifestRowType::kDb in
+  // include/rocksdb/manifest_store.h. See ManifestStoreDirForDb() for the store
+  // of a DB, and FileManifestStore for the store.
+  //
+  // Order of the store steps at a reopen and at the next open:
+  //   Reopen(), old DB still open            Open(), next DB
+  //   1. store faults off, WaitForCompact()  7. ListColumnFamiliesBeforeOpen()
+  //      (only with store faults; it         8. FinishInterruptedRollback()
+  //      returns at once on a background     9. SetManifestStoreForOpen(): new
+  //      error)                                 store object, faults off
+  //   2. maybe CancelAllBackgroundWork()     10. DB::Open()
+  //   3. SyncWAL() or FlushWAL(true)         11. VerifyMetadataModeAfterOpen(),
+  //   4. MaybeFenceManifestStore()               then store faults on
+  //   5. CleanUpColumnFamilies(), maybe
+  //      Close()
+  //   6. CompareShadowStoreAfterClose()
+  //      (shadow mode), then
+  //      MaybeRollBackManifestStore()
+  //      (store mode)
+  // The first open of a run starts at step 7.
+
+  // Lists the column families of the DB before an open.
+  // DB::ListColumnFamilies() returns NotSupported for a DB in store mode whose
+  // last open stopped while it created the DB or moved it into the store. A DB
+  // whose last open stopped while it moved the DB into the store is listed from
+  // the MANIFEST file that the stub names, or, when that file was deleted after
+  // the switch, from the store, whose authority must then be kStore. A DB
+  // whose last open stopped while it created the DB has no acknowledged write,
+  // so this returns NotFound, and the next DB::Open() finishes the create.
+  Status ListColumnFamiliesBeforeOpen(std::vector<std::string>* names);
+
+  // Returns a new test store object for the DB of this test: a writer with a
+  // new epoch when `writer` is true, otherwise a reader. `fault_one_in` sets
+  // its store faults (0 = never).
+  std::shared_ptr<FileManifestStore> NewTestManifestStore(
+      bool writer, uint64_t fault_one_in = 0) const;
+
+  // Sets manifest_store_ and options_.manifest_store to a new writer object
+  // with a new epoch for the next open attempt. It also sets the mode options:
+  // manifest_store_shadow, manifest_store_migrate (store mode only) and
+  // manifest_store_copy_mode.
+  void SetManifestStoreForOpen();
+
+  // At a reopen, before the old DB closes: a new store object claims the DB, so
+  // the old DB is fenced and its later MANIFEST writes fail with IOFenced. When
+  // `can_flush` is true and the active memtable of a column family has
+  // entries, it checks that a flush of the old DB fails with IOFenced, or with
+  // an injected file system error that stops the flush first.
+  void MaybeFenceManifestStore(ThreadState* thread, bool can_flush);
+
+  // At a reopen, after the old DB closed: moves the DB back to file mode with
+  // RollBackManifestStore(). The next open moves it into the store again.
+  void MaybeRollBackManifestStore(ThreadState* thread);
+
+  // Before a read-write open: finishes a rollback that stopped after CURRENT
+  // named a normal MANIFEST file but before the DB row commit. Then the DB row
+  // still says store mode (authority kStore), and store mode refuses to move
+  // such a DB into the store. A rollback without the store always ends this
+  // way. A rollback with the store ends this way when a kill stops it before
+  // its DB row commit. This calls RollBackManifestStore() with the store, which
+  // sets the DB row to file mode and keeps the MANIFEST file.
+  void FinishInterruptedRollback();
+
+  // After a read-write open: checks that CURRENT names a stub MANIFEST in the
+  // "done" state, so the DB is in store mode. In shadow mode it checks that
+  // CURRENT names a normal MANIFEST file, so the DB stays in file mode.
+  void VerifyMetadataModeAfterOpen();
+
+  // Shadow mode, at a reopen after the old DB closed: compares the test store
+  // with the MANIFEST (CompareManifestStoreWithManifest()). Any difference
+  // fails the run, except in two cases, where the store may be behind and the
+  // compare is skipped with a line on stdout. A commit id is
+  // <DB session id>-<counter>, and a close commit id ends with "-close" (see
+  // ManifestCommitIdGenerator in db/manifest_store_state.h).
+  // 1. The store has no DB row, or its last commit id does not start with
+  //    `session_id` + "-", where `session_id` is the DB session id of the old
+  //    DB. This function checks it.
+  // 2. CompareManifestStoreWithManifest() returns a warning: the last commit
+  //    is not a close commit, or the authority is not kShadow (see
+  //    db/manifest_rows.h).
+  void CompareShadowStoreAfterClose(const std::string& session_id);
+
   int db_index_;
   std::string db_label_;
   std::string db_path_;
@@ -691,6 +777,11 @@ class StressTest {
   // compaction cannot append to the MANIFEST before
   // VerifyManifestNotRewritten() measures it.
   bool auto_compactions_paused_for_manifest_verify_ = false;
+  // The store object of the open DB in store mode, or the store that the open
+  // DB copies its MANIFEST state to in shadow mode. Null without
+  // --use_manifest_store. db_stress refuses --read_only with store mode, so
+  // every open of the primary DB uses this writer object.
+  std::shared_ptr<FileManifestStore> manifest_store_;
 };
 
 // Load options from OPTIONS file and populate `options`.

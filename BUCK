@@ -90,6 +90,9 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/logs_with_prep_tracker.cc",
         "db/malloc_stats.cc",
         "db/manifest_ops.cc",
+        "db/manifest_rows.cc",
+        "db/manifest_store_shadow.cc",
+        "db/manifest_store_state.cc",
         "db/memtable.cc",
         "db/memtable_list.cc",
         "db/merge_helper.cc",
@@ -420,6 +423,7 @@ cpp_library_wrapper(name="rocksdb_test_lib", srcs=[
         "db/db_test_util.cc",
         "db/db_with_timestamp_test_util.cc",
         "table/mock_table.cc",
+        "test_util/mock_manifest_store.cc",
         "test_util/mock_time_env.cc",
         "test_util/secondary_cache_test_util.cc",
         "test_util/simple_external_table_factory.cc",
@@ -448,6 +452,7 @@ cpp_library_wrapper(name="rocksdb_with_faiss_test_lib", srcs=[
         "db/db_test_util.cc",
         "db/db_with_timestamp_test_util.cc",
         "table/mock_table.cc",
+        "test_util/mock_manifest_store.cc",
         "test_util/mock_time_env.cc",
         "test_util/secondary_cache_test_util.cc",
         "test_util/simple_external_table_factory.cc",
@@ -500,6 +505,7 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "db_stress_tool/db_stress_filters.cc",
         "db_stress_tool/db_stress_gflags.cc",
         "db_stress_tool/db_stress_listener.cc",
+        "db_stress_tool/db_stress_manifest_store.cc",
         "db_stress_tool/db_stress_shared_state.cc",
         "db_stress_tool/db_stress_structured_key_value.cc",
         "db_stress_tool/db_stress_test_base.cc",
@@ -509,6 +515,7 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "db_stress_tool/expected_value.cc",
         "db_stress_tool/multi_ops_txns_stress.cc",
         "db_stress_tool/no_batched_ops_stress.cc",
+        "test_util/mock_manifest_store.cc",
         "test_util/simple_external_table_factory.cc",
         "test_util/testutil.cc",
         "tools/block_cache_analyzer/block_cache_trace_analyzer.cc",
@@ -520,6 +527,7 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "db_stress_tool/db_stress_driver.h",
         "db_stress_tool/db_stress_filters.h",
         "db_stress_tool/db_stress_listener.h",
+        "db_stress_tool/db_stress_manifest_store.h",
         "db_stress_tool/db_stress_shared_state.h",
         "db_stress_tool/db_stress_structured_key_value.h",
         "db_stress_tool/db_stress_test_base.h",
@@ -527,6 +535,7 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "db_stress_tool/expected_state.h",
         "db_stress_tool/expected_value.h",
         "db_stress_tool/multi_ops_txns_stress.h",
+        "test_util/mock_manifest_store.h",
         "test_util/simple_external_table_factory.h",
         "test_util/testutil.h",
         "tools/block_cache_analyzer/block_cache_trace_analyzer.h",
@@ -535,6 +544,8 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
 
 
 cpp_library_wrapper(name="rocksdb_stress_structured_key_value_lib", srcs=["db_stress_tool/db_stress_structured_key_value.cc"], deps=[":rocksdb_lib"], headers=["db_stress_tool/db_stress_structured_key_value.h"], link_whole=False, extra_test_libs=False)
+
+cpp_library_wrapper(name="rocksdb_stress_manifest_store_lib", srcs=["db_stress_tool/db_stress_manifest_store.cc"], deps=[":rocksdb_test_lib"], headers=["db_stress_tool/db_stress_manifest_store.h"], link_whole=False, extra_test_libs=False)
 
 cpp_binary_wrapper(name="ldb", srcs=["tools/ldb.cc"], deps=[":rocksdb_tools_lib"], extra_preprocessor_flags=[], extra_bench_libs=False)
 
@@ -5040,6 +5051,12 @@ cpp_unittest_wrapper(name="db_logical_block_size_cache_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="db_manifest_store_test",
+            srcs=["db/db_manifest_store_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="db_memtable_test",
             srcs=["db/db_memtable_test.cc"],
             deps=[":rocksdb_test_lib"],
@@ -5115,6 +5132,12 @@ cpp_unittest_wrapper(name="db_sst_test",
 cpp_unittest_wrapper(name="db_statistics_test",
             srcs=["db/db_statistics_test.cc"],
             deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="db_stress_manifest_store_test",
+            srcs=["db_stress_tool/db_stress_manifest_store_test.cc"],
+            deps=[":rocksdb_stress_manifest_store_lib", ":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
 
