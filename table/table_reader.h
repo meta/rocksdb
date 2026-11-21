@@ -298,6 +298,16 @@ class TableReader {
         "Exact blob reference metadata is not supported");
   }
 
+  // Reads and validates every reference data block without scanning the table's
+  // key/value entries, including blocks of legacy direct references.
+  virtual Status VerifyBlobReferenceMetadata(
+      const ReadOptions& read_options, const Slice& expected_descriptor) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
   // Prepare work that can be done before the real Get()
   virtual void Prepare(const Slice& /*target*/) {}
 
