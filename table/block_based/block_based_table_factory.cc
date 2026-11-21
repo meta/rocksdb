@@ -639,6 +639,20 @@ BlockBasedTableFactory::BlockBasedTableFactory(
                 table_options_.block_cache),
             SystemClock::Default().get(), release_delay_micros);
   }
+
+  const auto blob_reference_charged =
+      table_options_.cache_usage_options.options_overrides
+          .at(CacheEntryRole::kBlobReferenceMetadataBuildingBuffer)
+          .charged;
+  if (table_options_.block_cache &&
+      (blob_reference_charged == CacheEntryRoleOptions::Decision::kEnabled ||
+       blob_reference_charged == CacheEntryRoleOptions::Decision::kFallback)) {
+    shared_state_->blob_reference_cache_res_mgr =
+        std::make_shared<ConcurrentCacheReservationManager>(
+            std::make_shared<CacheReservationManagerImpl<
+                CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>>(
+                table_options_.block_cache));
+  }
 }
 
 void BlockBasedTableFactory::InitializeOptions() {
@@ -825,8 +839,9 @@ TableBuilder* BlockBasedTableFactory::NewTableBuilder(
     WritableFileWriter* file) const {
   // BlockBasedTableBuilder self-detects embedded-blob mode from
   // table_builder_options.embedded_blob_options.
-  return new BlockBasedTableBuilder(table_options_, table_builder_options,
-                                    file);
+  return new BlockBasedTableBuilder(
+      table_options_, table_builder_options, file,
+      shared_state_->blob_reference_cache_res_mgr);
 }
 
 Status BlockBasedTableFactory::ValidateOptions(
@@ -1025,6 +1040,7 @@ Status BlockBasedTableFactory::ValidateOptions(
     const CacheEntryRoleOptions options = options_overrides_iter->second;
     static const std::set<CacheEntryRole> kMemoryChargingSupported = {
         CacheEntryRole::kCompressionDictionaryBuildingBuffer,
+        CacheEntryRole::kBlobReferenceMetadataBuildingBuffer,
         CacheEntryRole::kFilterConstruction,
         CacheEntryRole::kBlockBasedTableReader,
         CacheEntryRole::kFileMetadata,
