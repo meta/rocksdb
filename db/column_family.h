@@ -466,6 +466,24 @@ class ColumnFamilyData {
   uint32_t blob_reference_census_failures() const {
     return blob_reference_census_failures_;
   }
+  // Indirect blob GC idle time: the DB clock time since which this column
+  // family has had GC candidates and no GC job began, or 0. A census publish
+  // with candidates while no GC job runs, and the end of a GC job that leaves
+  // candidates, start it; a GC job start and a publish without candidates
+  // clear it.
+  void NoteIndirectBlobGcCandidates(uint64_t now_micros) {
+    uint64_t expected = 0;
+    indirect_blob_gc_candidates_since_micros_.compare_exchange_strong(
+        expected, now_micros, std::memory_order_relaxed);
+  }
+  void ClearIndirectBlobGcCandidates() {
+    indirect_blob_gc_candidates_since_micros_.store(0,
+                                                    std::memory_order_relaxed);
+  }
+  uint64_t IndirectBlobGcCandidatesSinceMicros() const {
+    return indirect_blob_gc_candidates_since_micros_.load(
+        std::memory_order_relaxed);
+  }
 
   // REQUIRES: DB mutex held.
   BlobReferenceCensus* GetOrCreateBlobReferenceCensus();
@@ -869,6 +887,7 @@ class ColumnFamilyData {
   ColumnFamilyData* next_blob_reference_census_ = nullptr;
   uint64_t blob_reference_census_retry_micros_ = 0;
   uint32_t blob_reference_census_failures_ = 0;
+  std::atomic<uint64_t> indirect_blob_gc_candidates_since_micros_{0};
 
   // Read outside the DB mutex by compaction workers (acquire-loaded roughly
   // every 1024 records in ProcessKeyValueCompaction). Given its own cache line
