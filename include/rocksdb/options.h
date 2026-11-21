@@ -3598,6 +3598,14 @@ struct CompactionServiceOptionsOverride {
   std::shared_ptr<MergeOperator> merge_operator = nullptr;
   const CompactionFilter* compaction_filter = nullptr;
   std::shared_ptr<CompactionFilterFactory> compaction_filter_factory = nullptr;
+  // If not set, the worker uses the prefix extractor from the primary's OPTIONS
+  // file (or from `options_map`), so that output files get the same prefix
+  // filters as files compacted on the primary. That holds only if the worker
+  // can create that extractor: one that is not registered with the worker's
+  // object registry, such as a custom SliceTransform, loads as null, and
+  // OpenAndCompact() logs a warning and writes the output files without a
+  // prefix filter. Set "prefix_extractor" to "nullptr" in `options_map` to
+  // compact without a prefix extractor.
   std::shared_ptr<const SliceTransform> prefix_extractor = nullptr;
   // If null, the column family uses the table factory loaded from the OPTIONS
   // file the primary referenced when it scheduled the compaction. That file is
