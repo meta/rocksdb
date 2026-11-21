@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "db/blob/blob_gen2_format.h"
 #include "db/version_edit.h"
 #include "port/likely.h"
 #include "rocksdb/flush_block_policy.h"
@@ -115,6 +116,16 @@ class BlockBasedTableBuilder : public TableBuilder {
                            uint64_t original_value_offset,
                            const Slice& stored_payload,
                            CompressionType compression);
+
+  // Streaming counterpart. The source verifies the exact stored bytes with the
+  // stored CRC. If the source fails, the caller must abandon the whole output
+  // and must not publish it.
+  Status AddBlobRelocation(uint64_t origin_file_number,
+                           uint64_t original_value_offset,
+                           uint64_t stored_value_size,
+                           CompressionType compression,
+                           uint32_t stored_checksum,
+                           const VerifiedBlobStoredSource& source);
 
   // Returns the encoded directory and tail size after Finish() succeeds.
   // Otherwise returns the builder's error status, or InvalidArgument if the
@@ -391,10 +402,18 @@ struct BlobRelocationTableFileInfo {
 // - Table options: MakeBlobRelocationTableOptions(`table_options`).
 // - Other settings: from `mutable_cf_options`, with blob indirection and the
 //   prefix extractor turned off.
-// - Data blocks: written with kNoCompression. They hold only location entries
-//   (see db/blob/blob_relocation_file.h). The builder writes each value
-//   itself, outside the data blocks, already in stored form, as an embedded
-//   blob record.
+// - Data blocks: they hold only location entries (see
+//   db/blob/blob_relocation_file.h). They use the column family's
+//   bottommost_compression if it is set, else its compression. Bottommost comes
+//   first because a relocation file holds values that indirect blob GC moved
+//   out of old files, and such long-lived data is like bottommost data (a
+//   design choice). The builder writes each value itself, outside the data
+//   blocks, already in stored form, as an embedded blob record; values are
+//   never recompressed.
+// - No dictionary and no parallel compression: both hold data blocks back
+//   (dictionary training buffers them, and parallel compression writes them
+//   later from other threads), but the records must be written to the file
+//   between the data blocks in order.
 //
 // `comparator` must use the bytewise comparator and outlive the builder. If
 // starting the file fails, the builder is abandoned and `*builder` is reset, so

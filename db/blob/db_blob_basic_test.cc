@@ -31,6 +31,7 @@
 #include "db/db_with_timestamp_test_util.h"
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
+#include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
@@ -49,6 +50,7 @@
 #include "rocksdb/utilities/replayer.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/block_based/block_based_table_factory.h"
+#include "table/block_based/block_based_table_reader.h"
 #include "table/table_builder.h"
 #include "test_util/sync_point.h"
 #include "util/compression.h"
@@ -147,6 +149,20 @@ class DBBlobBasicTest : public DBTestBase {
     options.disable_auto_compactions = true;
     options.num_levels = 3;
     options.level_compaction_dynamic_level_bytes = false;
+    return options;
+  }
+
+  // Blob indirection is on. Indirect blob GC stays off, because blob GC and
+  // auto compaction are disabled.
+  Options IndirectBlobGCOptions() {
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = false;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    options.env->SetBackgroundThreads(2, Env::Priority::LOW);
     return options;
   }
 
@@ -2405,6 +2421,53 @@ TEST_F(DBBlobBasicTest, SequentialL0FilesDoNotStall) {
   }
 }
 
+TEST_F(DBBlobBasicTest, BlobReferenceReadChecksSharedOutputRoom) {
+  // Indirect blob GC reads all generation numbers of one input into one live
+  // set, so several requests of a batch read share one output. Each request is
+  // checked against the room left after the earlier requests for the same
+  // output. The output has room for one reference, so the second request gets
+  // Aborted (as for a census mismatch), not Corruption, and adds nothing.
+  Options options = IndirectBlobGCOptions();
+  // Each value goes to its own blob file, so each generation number has one
+  // reference.
+  options.blob_file_size = 1;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k0", "value0"));
+  ASSERT_OK(Put("k1", "value1"));
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  std::vector<uint64_t> generations;
+  for (const auto& file : storage->GetBlobFiles()) {
+    generations.push_back(file->GetBlobFileNumber());
+  }
+  ASSERT_EQ(generations.size(), 2U);
+  std::sort(generations.begin(), generations.end());
+  ASSERT_EQ(storage->LevelFiles(0).size(), 1U);
+  const FileMetaData& sst = *storage->LevelFiles(0)[0];
+
+  std::array<BlobReferenceGroup, 2> keys;
+  std::vector<BlobReferenceGroupRead> requests(2);
+  std::vector<BlobReference> output;
+  output.reserve(1);
+  for (size_t i = 0; i < 2; ++i) {
+    keys[i].encoding_class = BlobReferenceEncodingClass::kIndirectUnflattened;
+    keys[i].generation_file_number = generations[i];
+    keys[i].origin_file_number = generations[i];
+    requests[i].group = &keys[i];
+    requests[i].output = &output;
+  }
+  ASSERT_EQ(output.capacity(), 1U);
+  ASSERT_OK(cfd->table_cache()->ReadBlobReferences(
+      ReadOptions(), FileOptions(), cfd->internal_comparator(), sst,
+      cfd->GetLatestMutableCFOptions(), &requests));
+  ASSERT_OK(requests[0].status);
+  ASSERT_TRUE(requests[1].status.IsAborted()) << requests[1].status.ToString();
+  ASSERT_EQ(output.size(), 1U);
+  ASSERT_EQ(output[0].generation_file_number, generations[0]);
+}
+
 TEST_F(DBBlobBasicTest, BlobReferenceCensusCatchesDeletionDuringInitialScan) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
@@ -4161,6 +4224,434 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusFullCompactionWithConcurrentFlush) {
   ASSERT_EQ(Get("key0"), "blob_value2");
   ASSERT_EQ(Get("key3"), "blob_value2");
   ASSERT_EQ(Get("key5"), "blob_flushed");
+}
+
+TEST_F(DBBlobBasicTest, ReadBlobReferencesFailureKeepsEarlierOutput) {
+  // Indirect blob GC reads every SST of one input into one output, one call per
+  // SST. When the read of a later SST fails on the first block of its group,
+  // the references that the earlier call appended stay in the output.
+  if (encrypted_env_) {
+    // test::CorruptFile() rewrites the whole SST. The encrypted env gives the
+    // new file a new random encryption prefix, but the open table reader keeps
+    // the old one. That reader then decrypts the whole file to garbage, so the
+    // read does not see just one flipped bit.
+    ROCKSDB_GTEST_BYPASS("Test corrupts an SST that has an open reader");
+    return;
+  }
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  // Flush output is always coarse, so the test hook makes these flushes exact.
+  ASSERT_OK(Put("a", "value_a"));
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  ASSERT_OK(Put("b", "value_b"));
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const std::vector<FileMetaData*>& files =
+      cfd->current()->storage_info()->LevelFiles(0);
+  ASSERT_EQ(files.size(), 2U);
+  const FileMetaData& first = *files[0];
+  const FileMetaData& second = *files[1];
+  const BlobReferenceIndex first_index = ReadBlobReferenceIndexForTest(first);
+  const BlobReferenceIndex second_index = ReadBlobReferenceIndexForTest(second);
+  ASSERT_EQ(first_index.groups.size(), 1U);
+  ASSERT_EQ(second_index.groups.size(), 1U);
+  const BlobReferenceGroup first_group = first_index.groups[0].group;
+  const BlobReferenceGroup second_group = second_index.groups[0].group;
+
+  std::vector<BlobReference> output;
+  output.reserve(static_cast<size_t>(first_group.reference_count +
+                                     second_group.reference_count));
+  const auto read = [&](const FileMetaData& file,
+                        const BlobReferenceGroup& group, Status* status) {
+    std::vector<BlobReferenceGroupRead> requests(1);
+    requests[0].group = &group;
+    requests[0].output = &output;
+    ASSERT_OK(cfd->table_cache()->ReadBlobReferences(
+        ReadOptions(), FileOptions(), cfd->internal_comparator(), file,
+        cfd->GetLatestMutableCFOptions(), &requests));
+    *status = requests[0].status;
+  };
+  Status status;
+  read(first, first_group, &status);
+  ASSERT_OK(status);
+  ASSERT_EQ(output.size(), first_group.reference_count);
+
+  // A flipped bit in the first (and only) reference data block of the second
+  // SST makes its read fail before it appends anything.
+  ASSERT_OK(
+      test::CorruptFile(env_, MakeTableFileName(dbname_, second.fd.GetNumber()),
+                        static_cast<int>(second_index.blocks[0].offset() + 1),
+                        /*bytes_to_corrupt=*/1, /*verify_checksum=*/false));
+  read(second, second_group, &status);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_EQ(output.size(), first_group.reference_count);
+  ASSERT_EQ(output[0].generation_file_number,
+            first_group.generation_file_number);
+}
+
+TEST_F(DBBlobBasicTest, ReadBlobReferencesBatchReadsEachBlockOnce) {
+  // Small blob files first, so several small groups share a reference data
+  // block, then one large blob file, so one group spans several blocks. One
+  // compaction puts every reference into one SST.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.blob_file_size = 32 << 10;
+  options.disable_auto_compactions = true;
+  options.target_file_size_base = 1 << 30;
+  DestroyAndReopen(options);
+  for (int i = 0; i < 10000; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(10 + i % 23, 'v')));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->SetOptions({{"blob_file_size", "8388608"}}));
+  for (int i = 10000; i < 40000; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(10 + i % 23, 'v')));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const FileMetaData* const sst = OnlySstForTest(cfd);
+  ASSERT_NE(sst, nullptr);
+  const FileMetaData& file = *sst;
+  const BlobReferenceIndex index = ReadBlobReferenceIndexForTest(file);
+  std::vector<BlobReferenceGroup> groups;
+  for (const BlobReferenceIndexEntry& entry : index.groups) {
+    groups.push_back(entry.group);
+  }
+  bool shared_block = false;
+  size_t spanning_group = groups.size();
+  for (size_t g = 0; g + 1 < index.groups.size(); ++g) {
+    shared_block |=
+        index.groups[g].start_block == index.groups[g + 1].start_block;
+    if (index.groups[g + 1].start_block >= index.groups[g].start_block + 3) {
+      spanning_group = g;
+    }
+  }
+  if (index.blocks.size() >= index.groups.back().start_block + 3) {
+    spanning_group = index.groups.size() - 1;
+  }
+  ASSERT_TRUE(shared_block);
+  ASSERT_LT(spanning_group, groups.size());
+
+  // Reads `selected` groups in one batch; each output is reserved first.
+  const auto read_batch =
+      [&](const std::vector<const BlobReferenceGroup*>& selected,
+          std::vector<std::vector<BlobReference>>* outputs,
+          std::vector<BlobReferenceGroupRead>* requests) {
+        outputs->assign(selected.size(), {});
+        requests->assign(selected.size(), {});
+        for (size_t i = 0; i < selected.size(); ++i) {
+          (*outputs)[i].reserve(
+              static_cast<size_t>(selected[i]->reference_count));
+          (*requests)[i].group = selected[i];
+          (*requests)[i].output = &(*outputs)[i];
+        }
+        return cfd->table_cache()->ReadBlobReferences(
+            ReadOptions(), FileOptions(), cfd->internal_comparator(), file,
+            cfd->GetLatestMutableCFOptions(), requests);
+      };
+  std::vector<const BlobReferenceGroup*> all;
+  for (const BlobReferenceGroup& group : groups) {
+    all.push_back(&group);
+  }
+
+  // Count the MultiRead calls, their read requests and their bytes.
+  size_t multi_reads = 0;
+  size_t read_requests = 0;
+  uint64_t bytes_read = 0;
+  uint64_t largest_call = 0;
+  // A batch budget of the largest on-disk block, so the reads split into
+  // several batches.
+  uint64_t test_batch_bytes = 0;
+  for (const BlockHandle& handle : index.blocks) {
+    test_batch_bytes = std::max<uint64_t>(
+        test_batch_bytes, BlockBasedTable::BlockSizeWithTrailer(handle));
+  }
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTable::ReadBlobReferenceDataBlocks:BatchBytes",
+      [&](void* arg) {
+        *static_cast<size_t*>(arg) = static_cast<size_t>(test_batch_bytes);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTable::ReadBlobReferenceDataBlocks:MultiRead", [&](void* arg) {
+        const auto* requests = static_cast<std::vector<FSReadRequest>*>(arg);
+        uint64_t call_bytes = 0;
+        for (const FSReadRequest& request : *requests) {
+          call_bytes += request.len;
+        }
+        ++multi_reads;
+        read_requests += requests->size();
+        bytes_read += call_bytes;
+        largest_call = std::max(largest_call, call_bytes);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::vector<std::vector<BlobReference>> batch_outputs;
+  std::vector<BlobReferenceGroupRead> requests;
+  ASSERT_OK(read_batch(all, &batch_outputs, &requests));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  for (const BlobReferenceGroupRead& request : requests) {
+    ASSERT_OK(request.status);
+  }
+  // Every block is needed and read exactly once. The blocks are adjacent in the
+  // file, so each MultiRead call is one coalesced request, and the calls split
+  // at the batch budget.
+  ASSERT_GT(index.blocks.size(), 2U);
+  uint64_t all_block_bytes = 0;
+  for (const BlockHandle& handle : index.blocks) {
+    all_block_bytes += BlockBasedTable::BlockSizeWithTrailer(handle);
+  }
+  EXPECT_EQ(bytes_read, all_block_bytes);
+  EXPECT_EQ(read_requests, multi_reads);
+  EXPECT_LE(largest_call, test_batch_bytes);
+  EXPECT_GE(multi_reads,
+            (all_block_bytes + test_batch_bytes - 1) / test_batch_bytes);
+  EXPECT_GE(multi_reads, 2U);
+
+  // The batch gives the same references as reading each group alone.
+  uint64_t total = 0;
+  for (size_t g = 0; g < groups.size(); ++g) {
+    std::vector<std::vector<BlobReference>> single;
+    std::vector<BlobReferenceGroupRead> single_request;
+    ASSERT_OK(read_batch({&groups[g]}, &single, &single_request));
+    ASSERT_OK(single_request[0].status);
+    ASSERT_EQ(single[0].size(), groups[g].reference_count);
+    // The read reports the index totals of the group.
+    EXPECT_EQ(single_request[0].found_reference_count,
+              groups[g].reference_count);
+    EXPECT_EQ(single_request[0].found_stored_value_bytes,
+              groups[g].stored_value_bytes);
+    EXPECT_EQ(single_request[0].found_record_bytes, groups[g].record_bytes);
+    ASSERT_EQ(batch_outputs[g].size(), single[0].size());
+    for (size_t i = 0; i < single[0].size(); ++i) {
+      EXPECT_EQ(batch_outputs[g][i].original_value_offset,
+                single[0][i].original_value_offset);
+      EXPECT_EQ(batch_outputs[g][i].stable_checksum,
+                single[0][i].stable_checksum);
+    }
+    total += single[0].size();
+  }
+  EXPECT_EQ(total, 40000U);
+
+  // Unsorted or repeated requests are rejected.
+  ASSERT_GE(all.size(), 2U);
+  EXPECT_TRUE(read_batch({all[1], all[0]}, &batch_outputs, &requests)
+                  .IsInvalidArgument());
+  EXPECT_TRUE(read_batch({all[0], all[0]}, &batch_outputs, &requests)
+                  .IsInvalidArgument());
+
+  // A group the SST does not have (NotFound), or one larger than its output
+  // (Aborted), fails only its own request and leaves its output empty.
+  BlobReferenceGroup missing = groups.back();
+  missing.generation_file_number += 1000;
+  missing.origin_file_number += 1000;
+  BlobReferenceGroup too_large = groups[1];
+  --too_large.reference_count;
+  // Fresh outputs, so each has exactly the reserved capacity.
+  std::vector<std::vector<BlobReference>> fresh_outputs;
+  ASSERT_OK(read_batch({&groups[0], &too_large, &groups[2], &missing},
+                       &fresh_outputs, &requests));
+  EXPECT_OK(requests[0].status);
+  EXPECT_TRUE(requests[1].status.IsAborted());
+  EXPECT_TRUE(fresh_outputs[1].empty());
+  EXPECT_OK(requests[2].status);
+  EXPECT_TRUE(requests[3].status.IsNotFound());
+  EXPECT_TRUE(fresh_outputs[3].empty());
+
+  // A flipped bit in a middle block of the spanning group fails only that
+  // group's request. The encrypted env cannot run this part: see the comment
+  // in ReadBlobReferencesFailureKeepsEarlierOutput.
+  if (encrypted_env_) {
+    return;
+  }
+  const size_t middle_block = index.groups[spanning_group].start_block + 1;
+  ASSERT_OK(test::CorruptFile(
+      env_, MakeTableFileName(dbname_, file.fd.GetNumber()),
+      static_cast<int>(index.blocks[middle_block].offset() + 1),
+      /*bytes_to_corrupt=*/1, /*verify_checksum=*/false));
+  ASSERT_OK(read_batch(all, &batch_outputs, &requests));
+  for (size_t g = 0; g < groups.size(); ++g) {
+    if (g == spanning_group) {
+      EXPECT_TRUE(requests[g].status.IsCorruption());
+      EXPECT_TRUE(batch_outputs[g].empty());
+    } else {
+      EXPECT_OK(requests[g].status) << g;
+      EXPECT_EQ(batch_outputs[g].size(), groups[g].reference_count) << g;
+    }
+  }
+}
+
+namespace {
+
+// Opens a new table reader for `file`, outside the shared table cache.
+Status OpenFreshTableReaderForTest(ColumnFamilyData* cfd,
+                                   const FileMetaData& file,
+                                   std::unique_ptr<TableReader>* reader) {
+  TableCacheOpenOptions open_options;
+  open_options.open_ephemeral_table_reader = true;
+  open_options.avoid_shared_metadata_cache = true;
+  TableCache::TypedHandle* handle = nullptr;
+  TableReader* raw_reader = nullptr;
+  return cfd->table_cache()->FindTable(
+      ReadOptions(), FileOptions(), cfd->internal_comparator(), file, &handle,
+      cfd->GetLatestMutableCFOptions(), &raw_reader, /*no_io=*/false,
+      /*file_read_hist=*/nullptr, /*skip_filters=*/true, /*level=*/-1,
+      /*prefetch_index_and_filter_in_cache=*/false,
+      /*max_file_size_for_l0_meta_pin=*/0, file.temperature,
+      /*pin_table_handle=*/false, /*file_open_metadata=*/nullptr, reader,
+      open_options);
+}
+
+}  // namespace
+
+TEST_F(DBBlobBasicTest, BlobReferenceReadReportsDecodedIndexSize) {
+  // Indirect blob GC charges the decoded reference index of each SST at its
+  // real size, which ReadBlobReferences() reports through `after_index_read`.
+  // With blob_file_size = 1, each value gets its own blob file, so the SST has
+  // one group per value. Each BlobReferenceIndexEntry is 56 bytes, so 1300
+  // groups need about 71 KB (1300 x 56 bytes) of decoded index, which is more
+  // than 64 KB. So a fixed estimate of the index size, such as 64 KB, would be
+  // too small, and the read must report the real size.
+  constexpr int kGroups = 1300;
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.blob_file_size = 1;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  for (int i = 0; i < kGroups; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), "value" + std::to_string(i)));
+  }
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const FileMetaData* const sst = OnlySstForTest(cfd);
+  ASSERT_NE(sst, nullptr);
+  const BlobReferenceIndex index = ReadBlobReferenceIndexForTest(*sst);
+  ASSERT_EQ(index.groups.size(), static_cast<size_t>(kGroups));
+  const BlobReferenceGroup group = index.groups.back().group;
+  std::unique_ptr<TableReader> reader;
+  ASSERT_OK(OpenFreshTableReaderForTest(cfd, *sst, &reader));
+
+  // The callback records the reported size and charges it to the cache, as
+  // indirect blob GC does. After a successful read, the lambda checks that the
+  // cache holds at least the reported size.
+  const auto read = [&](const std::shared_ptr<Cache>& cache,
+                        size_t* reported_bytes,
+                        std::vector<BlobReference>* references) {
+    CacheReservationManagerImpl<CacheEntryRole::kIndirectBlobGcWorkingMemory>
+        charge(cache);
+    references->reserve(1);
+    std::vector<BlobReferenceGroupRead> requests(1);
+    requests[0].group = &group;
+    requests[0].output = references;
+    const Status status = reader->ReadBlobReferences(
+        ReadOptions(), sst->blob_reference_descriptor,
+        [&](size_t index_bytes) {
+          *reported_bytes = index_bytes;
+          return charge.UpdateCacheReservation(index_bytes);
+        },
+        &requests);
+    if (status.ok()) {
+      EXPECT_OK(requests[0].status);
+      EXPECT_GE(cache->GetPinnedUsage(), *reported_bytes);
+    }
+    return status;
+  };
+  size_t reported_bytes = 0;
+  std::vector<BlobReference> references;
+  // A 16 MB strict cache has room for the charge, so the read succeeds.
+  ASSERT_OK(read(NewLRUCache(16 << 20, /*num_shard_bits=*/0,
+                             /*strict_capacity_limit=*/true),
+                 &reported_bytes, &references));
+  ASSERT_GE(reported_bytes, kGroups * sizeof(BlobReferenceIndexEntry));
+  ASSERT_GT(reported_bytes, size_t{64} << 10);
+  ASSERT_EQ(references.size(), 1U);
+
+  // A strict 32 KB cache fails the charge. CacheReservationManager reserves
+  // memory in dummy entries of kSizeDummyEntry (256 KB), so this cache cannot
+  // hold even one entry for the index. The read returns that status before it
+  // reads any data block, and the output stays empty.
+  reported_bytes = 0;
+  references.clear();
+  const Status status = read(NewLRUCache(32 << 10, /*num_shard_bits=*/0,
+                                         /*strict_capacity_limit=*/true),
+                             &reported_bytes, &references);
+  ASSERT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  ASSERT_GT(reported_bytes, size_t{64} << 10);
+  ASSERT_TRUE(references.empty());
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceBlockChecksumMismatchIsCorruption) {
+  // A flipped bit in a group's start block fails the block checksum.
+  // ReadBlobReferences fails the request with Corruption.
+  // ReadBlobReferenceGroups (the census read, which reads only the index block)
+  // still succeeds. A flipped bit in the index block makes
+  // ReadBlobReferenceGroups fail too.
+  FlushManyBlobReferenceGroups();
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const FileMetaData* const sst = OnlySstForTest(cfd);
+  ASSERT_NE(sst, nullptr);
+  const FileMetaData& file = *sst;
+  ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+  const BlobReferenceIndex index = ReadBlobReferenceIndexForTest(file);
+  ASSERT_GE(index.groups.size(), 2U);
+  const BlobReferenceIndexEntry& entry = index.groups[1];
+  const BlobReferenceGroup& group = entry.group;
+  const std::string file_name = MakeTableFileName(dbname_, file.fd.GetNumber());
+  ASSERT_OK(test::CorruptFile(
+      env_, file_name,
+      static_cast<int>(index.blocks[entry.start_block].offset() + 1),
+      /*bytes_to_corrupt=*/1, /*verify_checksum=*/false));
+
+  std::unique_ptr<TableReader> reader;
+  ASSERT_OK(OpenFreshTableReaderForTest(cfd, file, &reader));
+  std::vector<BlobReferenceGroup> groups;
+  ASSERT_OK(reader->ReadBlobReferenceGroups(
+      ReadOptions(), file.blob_reference_descriptor,
+      /*before_allocation=*/nullptr, &groups));
+  EXPECT_EQ(groups.size(), index.groups.size());
+  std::vector<BlobReference> references;
+  references.reserve(static_cast<size_t>(group.reference_count));
+  std::vector<BlobReferenceGroupRead> requests(1);
+  requests[0].group = &group;
+  requests[0].output = &references;
+  ASSERT_OK(
+      reader->ReadBlobReferences(ReadOptions(), file.blob_reference_descriptor,
+                                 /*after_index_read=*/nullptr, &requests));
+  ASSERT_TRUE(requests[0].status.IsCorruption());
+  ASSERT_TRUE(references.empty());
+
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(
+      file.blob_reference_descriptor, &descriptor));
+  ASSERT_OK(test::CorruptFile(
+      env_, file_name, static_cast<int>(descriptor.index_handle.offset() + 1),
+      /*bytes_to_corrupt=*/1, /*verify_checksum=*/false));
+  reader.reset();
+  ASSERT_OK(OpenFreshTableReaderForTest(cfd, file, &reader));
+  ASSERT_TRUE(reader
+                  ->ReadBlobReferenceGroups(
+                      ReadOptions(), file.blob_reference_descriptor,
+                      /*before_allocation=*/nullptr, &groups)
+                  .IsCorruption());
 }
 
 TEST_F(DBBlobBasicTest, BlobReferenceMetadataSurvivesTrivialMove) {

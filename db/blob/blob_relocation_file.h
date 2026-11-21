@@ -123,7 +123,9 @@
 //   padding only wastes space. The table builder also turns off compression
 //   sampling (BlockBasedTableBuilder::StartBlobRelocationFile()), because
 //   sampling reports stats for user data and these data blocks hold only
-//   location entries.
+//   location entries. The data blocks that hold location entries (location
+//   blocks) use the column family's SST compression (see
+//   NewBlobRelocationTableBuilder()).
 //
 // Directory
 // ---------
@@ -176,6 +178,13 @@
 //   value (callers send only  range bytes are
 //   strict parts)             read, not the record
 //                             trailer
+//   raw read (GC copies the   stored CRC, and the   never (the value is not
+//   stored bytes)             record checksum       decompressed)
+//                             unless the file uses
+//                             kNoChecksum
+//
+// Relocation files always use kCRC32c or kNoChecksum (see
+// MakeBlobRelocationTableOptions()).
 
 namespace ROCKSDB_NAMESPACE {
 
