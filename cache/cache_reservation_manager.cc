@@ -216,6 +216,8 @@ template class CacheReservationManagerImpl<CacheEntryRole::kWriteBuffer>;
 template class CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>;
 template class CacheReservationManagerImpl<
     CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>;
+template class CacheReservationManagerImpl<
+    CacheEntryRole::kBlobReferenceCensus>;
 template class CacheReservationManagerImpl<CacheEntryRole::kBlobCache>;
 template class CacheReservationManagerImpl<CacheEntryRole::kReadaheadBuffer>;
 

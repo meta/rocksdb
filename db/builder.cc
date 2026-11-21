@@ -16,6 +16,7 @@
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_garbage_meter.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/dbformat.h"
@@ -68,6 +69,19 @@ void ExtractTimestampFromTableProperties(const TableProperties& tp,
   auto max_ts_iter = tp.user_collected_properties.find("rocksdb.timestamp_max");
   if (max_ts_iter != tp.user_collected_properties.end()) {
     meta->max_timestamp = max_ts_iter->second;
+  }
+}
+
+void ExtractBlobReferenceDescriptorFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta) {
+  assert(meta != nullptr);
+  meta->blob_reference_legacy_metadata = false;
+  const auto descriptor =
+      tp.user_collected_properties.find(kBlobReferenceDescriptorPropertyName);
+  if (descriptor == tp.user_collected_properties.end()) {
+    meta->blob_reference_descriptor.clear();
+  } else {
+    meta->blob_reference_descriptor = descriptor->second;
   }
 }
 
@@ -433,6 +447,14 @@ Status BuildTable(
       tp = builder
                ->GetTableProperties();  // refresh now that builder is finished
       ExtractTimestampFromTableProperties(tp, meta);
+      ExtractBlobReferenceDescriptorFromTableProperties(tp, meta);
+      meta->blob_reference_summary = builder->GetBlobReferenceSstSummary();
+      TEST_SYNC_POINT_CALLBACK("BuildTable:BlobReferenceSummary", meta);
+      if (meta->blob_reference_summary != nullptr &&
+          meta->blob_reference_summary->file_number != meta->fd.GetNumber()) {
+        s = Status::Corruption(
+            "Blob reference summary is for another SST file number");
+      }
       if (memtable_payload_bytes != nullptr &&
           memtable_garbage_bytes != nullptr) {
         const CompactionIterationStats& ci_stats = c_iter.iter_stats();

@@ -9,6 +9,7 @@
 
 #include "db/version_edit_handler.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <sstream>
 
@@ -908,6 +909,25 @@ void VersionEditHandlerPointInTime::ResetAtomicUpdateState() {
 
 void VersionEditHandlerPointInTime::CheckIterationResult(
     const log::Reader& reader, Status* s) {
+  if (s->ok() && read_only_ && allow_incomplete_valid_version_) {
+    // Best-efforts recovery never marks a relocation file lost. When the
+    // current state needs a missing relocation file, a read-write open falls
+    // back to an older complete Version. It then writes a new MANIFEST, so the
+    // DB stays at that point and every later open sees the same state. A
+    // read-only open cannot write the MANIFEST. Its fallback would show old
+    // values of keys that later edits overwrote or deleted, while the MANIFEST
+    // still holds the later state. So the read-only open fails instead.
+    // Secondary and follower catch-up keep their usual rule of complete
+    // Versions only. Only the final builder state counts: a file that an old
+    // edit added and a later edit deleted is ignored.
+    for (const auto& entry : builders_) {
+      if (entry.second->version_builder()->HasMissingBlobRelocationFiles()) {
+        *s = Status::NotFound(
+            "Current MANIFEST requires a missing relocation file");
+        break;
+      }
+    }
+  }
   VersionEditHandler::CheckIterationResult(reader, s);
   assert(s != nullptr);
   if (s->ok()) {
@@ -1520,11 +1540,12 @@ Status ManifestTailer::VerifyFile(ColumnFamilyData* cfd,
 }
 
 namespace {
-// Prints one line with the blob indirection state of a column family for
-// "ldb manifest_dump": the per-CF format fence, the relocation files and the
-// routes (see "MANIFEST records" in db/blob/blob_relocation_manifest.h). A
-// column family without the fence, relocation files or routes prints nothing,
-// so the dump of a DB that does not use blob indirection does not change.
+// Prints the blob indirection state of a column family for "ldb
+// manifest_dump": the per-CF format fence, the relocation files and the routes
+// (see "MANIFEST records" in db/blob/blob_relocation_manifest.h), then the
+// kind of reference metadata of its SSTs. A column family without the fence,
+// relocation files or routes prints nothing, so the dump of a DB that does not
+// use blob indirection does not change.
 void PrintBlobIndirectionSummary(const VersionStorageInfo& vstorage) {
   const VersionStorageInfo::BlobRelocationFiles& files =
       vstorage.GetBlobRelocationFiles();
@@ -1545,6 +1566,32 @@ void PrintBlobIndirectionSummary(const VersionStorageInfo& vstorage) {
           " values), routes: %zu\n",
           vstorage.GetBlobIndirectionFormatVersion(), files.size(), file_bytes,
           values, route_count);
+  // The kind of blob reference metadata of each SST (see
+  // db/blob/blob_reference_metadata.h). Indirect blob GC does not collect a
+  // blob file numbered at or above the lowest frontier of the coarse SSTs. The
+  // coarse frontier of an SST is the oldest indirect-origin file number a
+  // coarse SST may reference (see "Coarse SST" in
+  // db/blob/blob_reference_metadata.h).
+  size_t exact_ssts = 0;
+  size_t coarse_ssts = 0;
+  size_t legacy_ssts = 0;
+  for (int level = 0; level < vstorage.num_levels(); ++level) {
+    for (const FileMetaData* f : vstorage.LevelFiles(level)) {
+      if (!f->blob_reference_descriptor.empty()) {
+        ++exact_ssts;
+      } else if (f->oldest_coarse_indirect_origin_file_number !=
+                 kInvalidBlobFileNumber) {
+        ++coarse_ssts;
+      } else if (f->blob_reference_legacy_metadata) {
+        ++legacy_ssts;
+      }
+    }
+  }
+  fprintf(stdout,
+          "--- blob reference metadata --- exact SSTs: %zu, coarse SSTs: %zu "
+          "(lowest frontier %" PRIu64 "), legacy SSTs: %zu\n",
+          exact_ssts, coarse_ssts,
+          vstorage.OldestCoarseIndirectOriginFileNumber(), legacy_ssts);
 }
 }  // namespace
 

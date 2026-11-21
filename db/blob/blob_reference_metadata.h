@@ -279,6 +279,42 @@
 // block checksum. The descriptor has its own CRC, and the index totals must
 // match it. With BlockBasedTableOptions::checksum = kNoChecksum, corrupt
 // metadata is detected only when it breaks the format or order checks.
+//
+// Coarse SST
+//
+// Background: exact reference metadata needs collector memory while the SST is
+// built (see "Writer" above). To save that memory, a table builder (the
+// intended writer) can skip the collector. A "coarse SST" is an SST built
+// without exact reference metadata. Instead it records one file number, its
+// frontier. An SST that has the full list is an "exact SST".
+//
+// Frontier: the oldest indirect origin that the coarse SST references
+// (FileMetaData::oldest_coarse_indirect_origin_file_number). For example,
+// frontier 12 (an example file number) means that the SST may reference blob
+// file 12 or any newer indirect origin, but indirect blob GC cannot know which
+// ones.
+//   - kInvalidBlobFileNumber (0): the SST is not a coarse SST. A coarse SST
+//     always has a frontier above 0; VersionEdit decoding rejects a coarse
+//     frontier of 0.
+//   - Any other value: the SST pins every indirect-origin file number at or
+//     above the frontier.
+// "Pin" here means that GC must treat the file as used and must not collect
+// it. It is not the base RocksDB meaning (a Version, block or iterator that
+// stays alive while something references it).
+//
+// A coarse SST never holds a flattened reference: its writer must not write
+// one, and the code in this file does not check it. So each indirect reference
+// of a coarse SST has generation number == origin, and one number (the oldest
+// origin) is enough.
+//
+// The Version keeps the lowest frontier of all its SSTs
+// (VersionStorageInfo::OldestCoarseIndirectOriginFileNumber()). An
+// indirect-origin blob file at or above it is "coarse pinned"
+// (VersionStorageInfo::IsCoarseIndirectOriginBlobPinned()), and the census
+// keeps it out of the GC candidate heap. IsCoarseIndirectOriginBlobPinned()
+// compares only the file number with the frontier, so it also returns true
+// for a relocation file at or above the frontier. The census heap applies the
+// pin only to indirect-origin blob files.
 
 #pragma once
 
@@ -898,6 +934,17 @@ class BlobReferenceMetadataCollector {
 Status DecodeBlobReferenceIndex(
     const Slice& input, const BlobReferenceMetadataDescriptor& descriptor,
     BlobReferenceIndex* index);
+
+// Sets `*groups` to the groups of a decoded index that are not kDirect, in key
+// order. These are the groups that a BlobReferenceSstSummary holds and the
+// census reads. DecodeBlobReferenceIndex() has already validated the index.
+// When set, `before_allocation` gets the size in bytes of the group buffer
+// before the buffer is allocated. If it returns non-OK, this function returns
+// that status and leaves `*groups` unchanged.
+Status CopyIndirectBlobReferenceGroups(
+    const BlobReferenceIndex& index,
+    const std::function<Status(size_t buffer_bytes)>& before_allocation,
+    std::vector<BlobReferenceGroup>* groups);
 
 // Decodes the runs of one index group, one data block at a time. This is the
 // only decoder of reference runs, so every check of a group walk is here:
