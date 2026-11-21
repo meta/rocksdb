@@ -410,6 +410,8 @@ DECLARE_bool(two_write_queues);
 DECLARE_bool(use_only_the_last_commit_time_batch_for_recovery);
 DECLARE_uint64(wp_snapshot_cache_bits);
 DECLARE_uint64(wp_commit_cache_bits);
+DECLARE_int64(txn_write_batch_flush_threshold);
+DECLARE_bool(txn_rollback_merge_operands);
 
 DECLARE_bool(adaptive_readahead);
 DECLARE_bool(async_io);

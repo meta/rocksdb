@@ -587,7 +587,7 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
   friend class WritePreparedTransactionTest_SmallestUnCommittedSeq_Test;
   friend class WriteUnpreparedTxn;
   friend class WriteUnpreparedTxnDB;
-  friend class WriteUnpreparedTransactionTest_RecoveryTest_Test;
+  friend class WriteUnpreparedTransactionTest;
   friend class MultiOpsTxnsStressTest;
 
   void Init(const TransactionDBOptions& txn_db_opts);
