@@ -162,10 +162,15 @@ class CacheReservationManager;
 //    writer queue, GC checks under the DB mutex that the job is still
 //    registered with the census, that each input is unchanged, and that no
 //    coarse SST pins an input (see "Stale job"). The edit adds the outputs and
-//    routes each live generation number of an input to the input's output. It
-//    re-points the routes into a relocation input to the output, deletes the
-//    routes that no SST uses, writes the blob file retirement of each normal
-//    input, and deletes each relocation input.
+//    routes generation numbers to them:
+//    - A relocation input that gets an output routes all its generation
+//      numbers to that output, held or not.
+//    - A normal input routes its file number (its only generation number) to
+//      its output only when that number is live.
+//    - An input without an output loses every route into it. None of its
+//      generation numbers can be live (an invariant check; see "Stale job").
+//    Then the edit writes the blob file retirement of each normal input, and
+//    deletes each relocation input.
 //
 // Parts: the job is built from five parts that work without the DB. This file
 // holds the first three.

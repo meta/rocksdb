@@ -539,6 +539,8 @@ struct BlockBasedTableOptions {
   // in-memory summary of the SST. The blob reference census keeps that
   // summary, and so its charge, until it has added the SST to its counts. This
   // can last until a later census build.
+  // A compaction also charges here the lists it uses to check the blob
+  // references of its outputs. If that charge fails, the compaction fails.
   // If such memory usage exceeds the available space left in the block cache
   // at some point (i.e, causing a cache full under
   // `LRUCacheOptions::strict_capacity_limit` = true), the SST build fails with
