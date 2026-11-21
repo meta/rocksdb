@@ -681,6 +681,12 @@ static void rocksdb_roundtrip_test_rocksdb_options(void) {
   rocksdb_options_set_blob_file_writable_file_max_buffer_size(obj, 0);
   CheckCondition(
       rocksdb_options_get_blob_file_writable_file_max_buffer_size(obj) == 0);
+  rocksdb_options_set_blob_indirection_max_references_per_sst(obj, 1);
+  CheckCondition(
+      rocksdb_options_get_blob_indirection_max_references_per_sst(obj) == 1);
+  rocksdb_options_set_blob_indirection_max_references_per_sst(obj, 0);
+  CheckCondition(
+      rocksdb_options_get_blob_indirection_max_references_per_sst(obj) == 0);
   rocksdb_options_set_block_protection_bytes_per_key(obj, 1);
   CheckCondition(rocksdb_options_get_block_protection_bytes_per_key(obj) == 1);
   rocksdb_options_set_block_protection_bytes_per_key(obj, 0);

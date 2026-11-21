@@ -82,6 +82,8 @@ class BlockBasedTableBuilder : public TableBuilder {
   TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
                                TableBuilderAddContext* context) override;
 
+  bool BlobReferenceLimitReached() const override;
+
   // Relocation file building. Indirect blob GC writes the live values it copies
   // into a relocation file, which is a block-based table (see
   // db/blob/blob_relocation_file.h). Create the builder with
@@ -194,9 +196,10 @@ class BlockBasedTableBuilder : public TableBuilder {
   void AddImpl(const Slice& key, const Slice& value,
                const BlobIndex* decoded_blob_index);
 
-  // Feeds the blob references of one entry to the reference collector.
-  // Returns false, with the builder status set, on an error. AddImpl() calls
-  // it only when the SST collects references. ROCKSDB_NOINLINE keeps it out of
+  // Feeds the blob references of one entry to the reference collector, or
+  // records the coarse classification. Returns false, with the builder status
+  // set, on an error. AddImpl() calls it only when the SST collects references
+  // or tracks the classification. ROCKSDB_NOINLINE keeps it out of
   // AddImpl(), so the base path stays small.
   ROCKSDB_NOINLINE bool AddBlobReferences(const Slice& entry_ikey,
                                           const Slice& entry_value,

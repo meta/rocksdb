@@ -10,15 +10,41 @@
 // included). This list is the "exact reference metadata". Its users are the
 // census (live bytes and garbage per blob file) and indirect blob GC: they
 // learn from it which blob values an SST keeps without reading its key-value
-// data. See "Readers" below. The table builder writes it only when
-// enable_blob_indirection is on, and not for SstFileWriter output or an SST
-// whose column family is unknown (those SSTs stay in the legacy form). It is
-// called "exact" because it lists every such reference, not an estimate, so a
-// reader can tell exactly which values the SST keeps.
+// data. See "Readers" below. It is called "exact" because it lists every such
+// reference, not an estimate, so a reader can tell exactly which values the
+// SST keeps.
+//
+// The caller of the table builder decides which SSTs get it
+// (TableBuilderOptions::collect_blob_reference_metadata). When
+// enable_blob_indirection is on, or the DB has used it before:
+//   - a compaction output at L1 or deeper gets exact metadata;
+//   - a compaction output at L0 gets it only when an input has it, or when
+//     the compaction is bottommost (see
+//     Compaction::CollectExactBlobReferences());
+//   - flush output gets only a coarse classification (see "Coarse SST" and
+//     "Coarse classification property" below).
+// SstFileWriter output gets neither. It can hold only same-file (embedded)
+// blob references (SstFileWriter::OpenWithEmbeddedBlobs), never a reference to
+// a blob file, so it has nothing to list. It stays in the legacy form.
 //
 // "Legacy" means "written the way base RocksDB writes it, without blob
 // indirection". For example, a legacy reference is a kBlob or kBlobTTL index,
 // and a legacy SST has no exact reference metadata.
+//
+// Reference cap and epoch runs: the collector keeps all references of an SST
+// in memory until the SST is finished. So compaction starts a new output once
+// an exact output holds blob_indirection_max_references_per_sst references
+// (the reference cap; the code calls it the blob reference limit). The option
+// comment in include/rocksdb/advanced_options.h gives the memory numbers.
+// A compaction to L0 is a special case. It happens only in a few cases:
+// universal compaction with num_levels = 1 (every compaction writes to L0);
+// universal compaction when the sorted run right after the picked runs is an
+// L0 file; leveled intra-L0 compaction; and CompactFiles() with output level
+// 0. In base RocksDB such an output is always one L0 file. With blob
+// indirection, the cap can cut it into several exact L0 files that share one
+// epoch number (an epoch run). Every compaction picker takes all files of an
+// epoch run or none of them (see VersionStorageInfo::ExpandExactL0Inputs() for
+// why).
 //
 // Terms (generation number, origin, original offset, relocation file, old file
 // and route are defined in blob_index.h):
@@ -315,6 +341,32 @@
 // compares only the file number with the frontier, so it also returns true
 // for a relocation file at or above the frontier. The census heap applies the
 // pin only to indirect-origin blob files.
+//
+// Coarse classification property
+//
+// "Coarse SST" above defines a coarse SST and its frontier: the one file number
+// it records instead of a reference list, the oldest indirect origin that it
+// may reference. This section says where the frontier is stored and which
+// builders write coarse SSTs.
+//
+// Property: a coarse SST stores its frontier in the table property
+// kBlobReferenceClassificationPropertyName ("coarse classification", 16 bytes;
+// see EncodeBlobReferenceClassification()). Compaction and flush read it back
+// into FileMetaData::oldest_coarse_indirect_origin_file_number. The builder
+// writes the property for every SST that it builds without exact metadata
+// when track_blob_reference_classification is set, also when the SST has no
+// indirect reference. So the property alone does not make an SST coarse.
+// With frontier 0 (no indirect reference), the SST is stored as a legacy SST
+// (see ExtractBlobReferenceClassificationFromTableProperties() in
+// db/builder.cc). With any other frontier, it is a coarse SST.
+//
+// Builders: the table builder writes only this property, and no exact
+// metadata, in three cases:
+//   - flush output;
+//   - WAL recovery flush output;
+//   - a compaction output at L0 when no input has exact metadata and the
+//     compaction is not bottommost (see
+//     Compaction::CollectExactBlobReferences()).
 
 #pragma once
 
@@ -341,6 +393,31 @@ namespace ROCKSDB_NAMESPACE {
 extern const char kBlobReferenceDescriptorPropertyName[];
 // Meta-index name of the index block.
 extern const char kBlobReferenceIndexBlockName[];
+// Table property that holds the coarse classification.
+extern const char kBlobReferenceClassificationPropertyName[];
+
+// Encodes the coarse classification (see "Coarse classification property"
+// above) as 16 bytes: format version (Fixed32, value 1), frontier (Fixed64),
+// and a CRC32C of the first 12 bytes (Fixed32).
+void EncodeBlobReferenceClassification(uint64_t frontier, std::string* output);
+// Returns Corruption if the size, version or CRC is wrong, or if the frontier
+// is above kFileNumberMask. Returns InvalidArgument for a null `frontier`.
+Status DecodeBlobReferenceClassification(const Slice& input,
+                                         uint64_t* frontier);
+
+// Valid range of blob_indirection_max_references_per_sst.
+//   - Upper bound: the metadata of one SST has at most 2^20 data blocks
+//     (kMaxDataBlockCount in the .cc file) of about 16 KB, so it holds about
+//     16 GB of entries. On disk, one entry uses about 8 to 12 bytes
+//     (estimate), so that is about 1.4G to 2G references. The upper bound 2^28
+//     (256M) stays well under that, so an output at the cap plus one key's
+//     history still fits the format. In memory, the collector uses about the
+//     on-disk entry size plus a small chunk overhead, about 8 to 14 bytes per
+//     reference (an estimate; see "Memory usage" below), so 256M references
+//     use about 2 to 3.5 GB of collector memory.
+//   - Lower bound: 4096, a fixed choice (not measured).
+inline constexpr uint64_t kMinBlobIndirectionMaxReferencesPerSst = 4096;
+inline constexpr uint64_t kMaxBlobIndirectionMaxReferencesPerSst = 1ULL << 28;
 
 // How a reference is encoded in its BlobIndex. It is stored on disk and is
 // the first part of the group key and sort order.
@@ -524,12 +601,11 @@ struct BlobReferenceMetadataDescriptor {
   uint64_t stored_value_bytes = 0;
   // Column family of the SST. max() means unknown; DecodeFrom() rejects it.
   uint32_t column_family_id = std::numeric_limits<uint32_t>::max();
-  // High and low halves of the relocation-state fingerprint: a 128-bit hash
-  // of the routes and relocation files of the Version that the SST was built
-  // from. It is reserved for a check that compares the routes of an SST built
-  // in another place (for example, by remote compaction) with the routes of
-  // the job that asked for it. 0 means not set. The table builder always
-  // writes 0, and DecodeFrom() does not check it.
+  // High and low halves of a 128-bit fingerprint of the relocation state
+  // (relocation files and routes) that the SST was built with. A compaction
+  // output stores the fingerprint of the compaction's input Version (see
+  // VersionStorageInfo::ComputeBlobRelocationStateFingerprint()). 0 means not
+  // set. DecodeFrom() does not check it.
   uint64_t route_snapshot_fingerprint_high = 0;
   uint64_t route_snapshot_fingerprint_low = 0;
   // The file number the SST had when it was built. It can differ from the
