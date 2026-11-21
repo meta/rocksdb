@@ -24,6 +24,7 @@
 #include "cache/cache_key.h"
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
@@ -3291,6 +3292,15 @@ BlockType BlockBasedTable::GetBlockTypeForMetaBlockByName(
   }
 
   if (meta_block_name.starts_with(kIndexFactoryMetaPrefix)) {
+    return BlockType::kUserDefinedIndex;
+  }
+
+  // The blob reference index block has no BlockType of its own.
+  // VerifyChecksumInMetaBlocks() reads every block in the meta-index and needs
+  // a type for each (an unknown name fails the assert below).
+  // kUserDefinedIndex blocks are kept as plain bytes (Block_kUserDefinedIndex
+  // in block_cache.h is a BlockContents), so no code parses them as a Block.
+  if (meta_block_name == kBlobReferenceIndexBlockName) {
     return BlockType::kUserDefinedIndex;
   }
 
