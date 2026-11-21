@@ -8412,6 +8412,19 @@ TEST_F(CacheUsageOptionsOverridesTest, SanitizeAndValidateOptions) {
   }
   Destroy(options);
 
+  // The exact blob reference metadata collector can use a large build buffer.
+  // Its cache role, kBlobReferenceMetadataBuildingBuffer, accepts an explicit
+  // charging override like the other build buffers.
+  table_options = BlockBasedTableOptions();
+  table_options.cache_usage_options.options_overrides.insert(
+      {CacheEntryRole::kBlobReferenceMetadataBuildingBuffer,
+       {/*.charged = */ CacheEntryRoleOptions::Decision::kDisabled}});
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Destroy(options);
+  s = TryReopen(options);
+  EXPECT_OK(s);
+  Destroy(options);
+
   // To test option validation on unsupported CacheEntryRole
   table_options = BlockBasedTableOptions();
   table_options.cache_usage_options.options_overrides.insert(
