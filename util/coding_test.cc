@@ -117,6 +117,30 @@ TEST(Coding, Varint32) {
   ASSERT_EQ(p, s.data() + s.size());
 }
 
+TEST(Coding, CanonicalVarint) {
+  // 0x85 0x00 is an overlong encoding of 5; the minimal one is 0x05.
+  const std::string overlong("\x85\x00", 2);
+  const std::string minimal("\x05", 1);
+  {
+    Slice input(overlong);
+    uint32_t value = 0;
+    ASSERT_FALSE(GetCanonicalVarint32(&input, &value));
+    input = Slice(minimal);
+    ASSERT_TRUE(GetCanonicalVarint32(&input, &value));
+    ASSERT_EQ(value, 5U);
+    ASSERT_TRUE(input.empty());
+  }
+  {
+    Slice input(overlong);
+    uint64_t value = 0;
+    ASSERT_FALSE(GetCanonicalVarint64(&input, &value));
+    input = Slice(minimal);
+    ASSERT_TRUE(GetCanonicalVarint64(&input, &value));
+    ASSERT_EQ(value, 5U);
+    ASSERT_TRUE(input.empty());
+  }
+}
+
 TEST(Coding, Varint64) {
   // Construct the list of values to check
   std::vector<uint64_t> values;

@@ -84,6 +84,9 @@ enum class CacheEntryRole {
   kBlobCache,
   // Readahead (prefetch) buffers' charge to account for their memory usage
   kReadaheadBuffer,
+  // Buffers that record the blob references of an SST while the SST is built
+  // (only with enable_blob_indirection)
+  kBlobReferenceMetadataBuildingBuffer,
   // Default bucket, for miscellaneous cache entries. Do not use for
   // entries that could potentially add up to large usage.
   kMisc,

@@ -870,6 +870,59 @@ TEST(FileMetaDataTest, UpdateBoundariesBlobIndex) {
   }
 }
 
+// Compaction passes its own decode of each output BlobIndex to
+// UpdateBoundaries(). The status and oldest_blob_file_number must be the same
+// as when UpdateBoundaries() decodes the value itself.
+TEST(FileMetaDataTest, UpdateBoundariesWithDecodedBlobIndex) {
+  std::string legacy;
+  BlobIndex::EncodeBlob(&legacy, /*file_number=*/25, /*offset=*/1000,
+                        /*size=*/100, kNoCompression);
+  std::string ttl;
+  BlobIndex::EncodeBlobTTL(&ttl, /*expiration=*/9876543210,
+                           /*file_number=*/15, /*offset=*/2000, /*size=*/500,
+                           kNoCompression);
+  std::string inlined_ttl;
+  BlobIndex::EncodeInlinedTTL(&inlined_ttl, /*expiration=*/9876543210, "value");
+  std::string invalid_file;
+  BlobIndex::EncodeBlob(&invalid_file, kInvalidBlobFileNumber,
+                        /*offset=*/10000, /*size=*/1000, kNoCompression);
+  std::string unflattened;
+  BlobIndex::EncodeUnflattenedIndirectBlob(&unflattened,
+                                           {.origin_file_number = 20,
+                                            .original_value_offset = 200,
+                                            .stored_value_size = 60,
+                                            .compression = kNoCompression,
+                                            .stable_checksum = 1234,
+                                            .stored_checksum = 0});
+  std::string flattened;
+  BlobIndex::EncodeIndirectBlob(&flattened, /*generation=*/40,
+                                {.origin_file_number = 30,
+                                 .original_value_offset = 300,
+                                 .stored_value_size = 70,
+                                 .compression = kZSTD,
+                                 .stable_checksum = 5678,
+                                 .stored_checksum = 8765});
+
+  for (const std::string& value :
+       {legacy, ttl, inlined_ttl, invalid_file, unflattened, flattened}) {
+    BlobIndex decoded;
+    ASSERT_OK(decoded.DecodeFrom(value));
+    SCOPED_TRACE(decoded.DebugString(/*output_hex=*/true));
+
+    FileMetaData self_decoded;
+    FileMetaData caller_decoded;
+    const Status status = self_decoded.UpdateBoundaries(
+        "foo", value, /*seqno=*/100, kTypeBlobIndex);
+    EXPECT_EQ(caller_decoded
+                  .UpdateBoundaries("foo", value, /*seqno=*/100, kTypeBlobIndex,
+                                    &decoded)
+                  .ToString(),
+              status.ToString());
+    EXPECT_EQ(caller_decoded.oldest_blob_file_number,
+              self_decoded.oldest_blob_file_number);
+  }
+}
+
 class SubcompactionProgressTest : public VersionEditTest {
  protected:
   static constexpr uint64_t kTestFileSize = 1024;

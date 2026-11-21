@@ -529,7 +529,22 @@ struct BlockBasedTableOptions {
   // (iii) Compatible existing behavior:
   // Same as kDisabled.
   //
-  // (f) Other CacheEntryRole
+  // (f) CacheEntryRole::kBlobReferenceMetadataBuildingBuffer
+  // (i) If kEnabled:
+  // Charge memory usage of the buffers that record the blob references of an
+  // SST while the SST is built. The SST stores these references as its exact
+  // blob reference metadata. Only SSTs built with blob indirection (see
+  // `enable_blob_indirection`) use these buffers.
+  // If such memory usage exceeds the available space left in the block cache
+  // at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), the SST build fails with
+  // Status::MemoryLimit(), and so does the job that writes the SST.
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kEnabled.
+  //
+  // (g) Other CacheEntryRole
   // Not supported.
   // `Status::kNotSupported` will be returned if
   // `CacheEntryRoleOptions::charged` is set to {`kEnabled`, `kDisabled`}.
