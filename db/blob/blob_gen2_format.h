@@ -7,14 +7,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <string>
 
 #include "cache/cache_key.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/io_status.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
+#include "util/aligned_buffer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -46,6 +50,24 @@ enum ChecksumType : char;
 // the byte source (a RandomAccessFileReader) and the checksum context (checksum
 // type + base context checksum), both passed in by the caller.
 inline constexpr size_t kSimpleGen2BlobTrailerSize = 5;
+
+// Chunk size for streaming one stored value: 256 KB. The value is a choice, not
+// a measurement. Indirect blob GC streams only values that are too large for
+// one batch read, so a streamed value takes a few chunk reads instead of many
+// small ones. The cost is memory: each streamed value uses one chunk buffer.
+// Memory use does not depend on the value size.
+inline constexpr size_t kBlobRelocationStreamChunkSize = 256 * 1024;
+
+// Receives each chunk of a streamed value. The Slice is valid only during the
+// call. The consumer's output is valid only if the stream returns OK.
+using BlobChunkConsumer = std::function<Status(const Slice&)>;
+
+// A source streams one stored payload to a consumer in chunks. When it returns
+// OK, it has delivered exactly the declared payload and checked its stored CRC
+// (payload plus compression byte). When the consumer returns an error, the
+// source must stop at once and keep no chunk Slice.
+using VerifiedBlobStoredSource =
+    std::function<Status(const BlobChunkConsumer&)>;
 // Largest payload size a SimpleGen2Blob record may have. It is UINT32_MAX, the
 // 32-bit value size limit of the table format, or less when size_t cannot hold
 // the payload plus the trailer. Writers and readers reject larger sizes.
@@ -181,6 +203,44 @@ void ReadSimpleGen2BlobRanges(const ReadOptions& read_options,
                               RandomAccessFileReader* file, size_t num_records,
                               SimpleGen2RangeReadRequest* reqs);
 
+// Holds the bytes that ReadCoalescedRanges() results point into.
+struct CoalescedReadBuffers {
+  std::unique_ptr<char[]> buffer;
+  AlignedBuffer direct_io_buffer;
+};
+
+// Reads `num_ranges` byte ranges of `file` with one MultiRead. The ranges are
+// sorted by offset.
+//   - Merging: with `coalesce_bytes` > 0, a range whose gap (the bytes between
+//     it and the end of the previous read) is at most `coalesce_bytes` joins
+//     that read, while the read stays at most `max_read_bytes`.
+//   - Buffer limit: reads are issued in offset order while their buffer bytes
+//     (direct-I/O alignment included) stay at most `max_total_bytes`. The first
+//     read is always issued. The ranges of later reads get Incomplete, and the
+//     caller reads them in a later call.
+//   - Errors: a range that overlaps an earlier one fails with Corruption. If
+//     the bytes of the issued reads do not fit in size_t, every range that did
+//     not fail with Corruption gets MemoryLimit.
+// On success results[i] points into `buffers`. statuses[i] is the outcome of
+// range i. `num_reads` and `read_bytes`, when set, receive the number of reads
+// issued and their bytes (merged gaps included).
+void ReadCoalescedRanges(const ReadOptions& read_options,
+                         RandomAccessFileReader* file, uint64_t coalesce_bytes,
+                         uint64_t max_read_bytes, uint64_t max_total_bytes,
+                         size_t num_ranges, const uint64_t* offsets,
+                         const size_t* lengths, Slice* results,
+                         Status* statuses, CoalescedReadBuffers* buffers,
+                         size_t* num_reads, uint64_t* read_bytes);
+
+// Checks one whole SimpleGen2Blob record already read into memory: its size,
+// its compression marker and its context-modified record checksum.
+Status VerifySimpleGen2BlobRecord(ChecksumType checksum_type,
+                                  uint32_t base_context_checksum,
+                                  const Slice& record, size_t payload_size,
+                                  uint64_t record_offset,
+                                  CompressionType expected_compression,
+                                  const std::string& file_name);
+
 // Writes a SimpleGen2Blob record for `payload` at the current end of `file`,
 // which the caller asserts is byte offset `record_offset`. Appends the payload
 // bytes followed by the 5-byte trailer (compression marker + context-modified
@@ -197,5 +257,28 @@ IOStatus WriteSimpleGen2BlobRecord(WritableFileWriter* file,
                                    uint32_t base_context_checksum,
                                    uint64_t record_offset, const Slice& payload,
                                    CompressionType compression);
+
+// Reads one stored payload in chunks of kBlobRelocationStreamChunkSize (256
+// KB), so memory use does not depend on the value size, and checks the
+// stored CRC of the whole payload. The caller checks the file bounds. For a
+// relocation file it also checks the record trailer first. The consumer can
+// receive bytes before the check ends, so its output must not be published
+// unless this function returns OK.
+Status StreamAndVerifyBlobStoredPayload(
+    const ReadOptions& read_options, RandomAccessFileReader* file,
+    uint64_t record_offset, uint64_t payload_size, CompressionType compression,
+    uint32_t stored_checksum, const BlobChunkConsumer& consumer);
+
+// Writes a record from a verified source without holding the whole payload in
+// memory. The source has already computed the CRC32C of the stored bytes, so
+// the writer only masks it and adds the destination file's checksum context.
+// Only kCRC32c and kNoChecksum are supported; other types return
+// InvalidArgument. If the source fails, or delivers too few or too many bytes,
+// the function returns an error and the partial file must not be published.
+Status WriteSimpleGen2BlobRecordStream(
+    WritableFileWriter* file, const WriteOptions& write_options,
+    ChecksumType checksum_type, uint32_t base_context_checksum,
+    uint64_t record_offset, uint64_t payload_size, CompressionType compression,
+    uint32_t stored_checksum, const VerifiedBlobStoredSource& source);
 
 }  // namespace ROCKSDB_NAMESPACE
