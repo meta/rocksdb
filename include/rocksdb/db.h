@@ -1974,6 +1974,31 @@ class DB {
     //      entries being pinned in blob cache.
     static const std::string kBlobCachePinnedUsage;
 
+    // "rocksdb.indirect-blob-gc-stats" - returns a map of the indirect blob GC
+    // state of the column family. Keys: census-state (ready, building, failed,
+    // or none without blob indirection), census-unready-micros (0 when ready),
+    // census-consecutive-failures, census-builds, census-bytes (an estimate of
+    // the census memory that stays: the worker state and the change log;
+    // rocksdb.block-cache-entry-stats has the exact total of the census cache
+    // role, including short-lived copies), route-count, relocation-file-count,
+    // relocation-file-bytes, relocation-garbage-bytes, tracked-files (the files
+    // in the census candidate heap, which GC may pick, including files below
+    // the garbage threshold; suppressed files and files pinned by the coarse
+    // frontier are not counted), garbage-bytes-collectable,
+    // garbage-bytes-suppressed, coarse-pinned-files, coarse-pinned-bytes,
+    // coarse-pinned-garbage-bytes. Every *-micros key is a duration, never a
+    // timestamp.
+    static const std::string kIndirectBlobGcStats;
+
+    // "rocksdb.blob-reference-census-unready-micros" - returns how long the
+    // blob reference census of the column family has been unready, in
+    // microseconds (a duration, not a timestamp). 0 means that it is ready, or
+    // that the column family does not use blob indirection. While it is
+    // unready, the work that needs the census waits. The LOG warning comes
+    // from the periodic stats dump; with stats_dump_period_sec = 0, use this
+    // property.
+    static const std::string kBlobReferenceCensusUnreadyMicros;
+
     // "rocksdb.blob-indirection-format-version" - returns the blob indirection
     // format version of the column family (the per-CF format fence). 0 means
     // that the column family has no format fence yet (no SST built with

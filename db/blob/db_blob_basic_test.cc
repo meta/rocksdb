@@ -23,6 +23,7 @@
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_sequential_reader.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/blob/blob_reference_metadata.h"
 #include "db/blob/blob_relocation_manifest.h"
 #include "db/column_family.h"
@@ -269,6 +270,192 @@ class DBBlobBasicTest : public DBTestBase {
     ASSERT_EQ(TotalTableFiles(), 1);
   }
 
+  std::shared_ptr<const BlobReferenceCensusState> GetCensusSnapshot(
+      ColumnFamilyData* cfd) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    return cfd->blob_reference_census()->TEST_GetReadyState(
+        cfd->current()->GetVersionNumber());
+  }
+
+  // The number of SSTs in the current Version of the default CF that have
+  // exact blob reference metadata (a reference descriptor).
+  size_t CountExactSsts() {
+    VersionStorageInfo* const storage = dbfull()
+                                            ->GetVersionSet()
+                                            ->GetColumnFamilySet()
+                                            ->GetDefault()
+                                            ->current()
+                                            ->storage_info();
+    size_t count = 0;
+    for (int level = 0; level < storage->num_levels(); ++level) {
+      for (const FileMetaData* file : storage->LevelFiles(level)) {
+        count += file->blob_reference_descriptor.empty() ? 0 : 1;
+      }
+    }
+    return count;
+  }
+
+  // Builds a census for the current Version from the reference indexes of its
+  // SSTs, and checks that the live census has the same generation numbers, SSTs
+  // and totals.
+  void ExpectCensusMatchesVersion() {
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    // Pin the current Version (a reference taken under the DB mutex, so that
+    // a background install cannot free it), then read the census state of that
+    // version number. If a background install replaced the Version before the
+    // census caught up with it, try again with the new Version, at most
+    // kAttempts (10) times.
+    constexpr int kAttempts = 10;
+    Version* version = nullptr;
+    std::shared_ptr<const BlobReferenceCensusState> census;
+    for (int attempt = 0; attempt < kAttempts && census == nullptr; ++attempt) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      {
+        InstrumentedMutexLock lock(dbfull()->mutex());
+        if (version != nullptr) {
+          version->Unref();
+        }
+        version = cfd->current();
+        version->Ref();
+      }
+      // Read without the DB mutex: the copy takes the census worker mutex.
+      census = cfd->blob_reference_census()->TEST_GetReadyState(
+          version->GetVersionNumber());
+    }
+    auto unref = Defer([this, version]() {
+      InstrumentedMutexLock lock(dbfull()->mutex());
+      version->Unref();
+    });
+    ASSERT_NE(census, nullptr);
+    std::vector<std::shared_ptr<const BlobReferenceSstSummary>> files;
+    VersionStorageInfo* const storage = version->storage_info();
+    for (int level = 0; level < storage->num_levels(); ++level) {
+      for (FileMetaData* file : storage->LevelFiles(level)) {
+        if (file->blob_reference_descriptor.empty()) {
+          continue;
+        }
+        std::shared_ptr<const BlobReferenceSstSummary> summary;
+        ASSERT_OK(cfd->table_cache()->ReadBlobReferenceSstSummary(
+            ReadOptions(), FileOptions(), cfd->internal_comparator(), *file,
+            version->GetMutableCFOptions(), &summary,
+            /*reservation_manager=*/nullptr));
+        files.push_back(std::move(summary));
+      }
+    }
+    std::shared_ptr<BlobReferenceCensusState> expected;
+    ASSERT_OK(BlobReferenceCensus::BuildState(version->GetVersionNumber(),
+                                              files, &expected));
+    std::string difference;
+    EXPECT_TRUE(expected->SameMemberships(*census, &difference)) << difference;
+  }
+
+  // Options with a block cache that tracks the kBlobReferenceCensus charge.
+  Options CensusChargeTrackingOptions(
+      std::shared_ptr<
+          TargetCacheChargeTrackingCache<CacheEntryRole::kBlobReferenceCensus>>*
+          cache) {
+    *cache = std::make_shared<
+        TargetCacheChargeTrackingCache<CacheEntryRole::kBlobReferenceCensus>>(
+        NewLRUCache(64 << 20));
+    BlockBasedTableOptions table_options;
+    table_options.block_cache = *cache;
+    Options options = GetDefaultOptions();
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    return options;
+  }
+
+  // Counts census rebuild installs and SST reads by the census build.
+  struct CensusEventCounter {
+    CensusEventCounter() = default;
+    CensusEventCounter(const CensusEventCounter&) = delete;
+    CensusEventCounter& operator=(const CensusEventCounter&) = delete;
+    CensusEventCounter(CensusEventCounter&&) = delete;
+    CensusEventCounter& operator=(CensusEventCounter&&) = delete;
+    std::atomic<int> rebuilds{0};
+    std::atomic<int> reads{0};
+    void Start() {
+      SyncPoint::GetInstance()->SetCallBack(
+          "BlobReferenceCensus::Install:Rebuild",
+          [this](void*) { ++rebuilds; });
+      SyncPoint::GetInstance()->SetCallBack(
+          "DBImpl::BuildBlobReferenceCensus:ReadSst",
+          [this](void*) { ++reads; });
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+    ~CensusEventCounter() {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    }
+  };
+
+  // Opens the DB with small blob files (2 MB) and flushes kManyGroupsKeyCount
+  // keys into one SST. The references of the SST form several groups, one per
+  // blob file. A group spans more than one reference data block, and a group
+  // can start inside a block that the previous group also uses. `compression`
+  // is the table compression, which also compresses the reference data blocks.
+  static constexpr int kManyGroupsKeyCount = 120000;
+  Options FlushManyBlobReferenceGroups(
+      CompressionType compression = kNoCompression) {
+    Options options = GetDefaultOptions();
+    options.compression = compression;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.min_blob_size = 0;
+    options.blob_file_size = 2 << 20;
+    options.disable_auto_compactions = true;
+    // Keep every reference in one SST, also when it is compacted.
+    options.target_file_size_base = 1 << 30;
+    options.create_if_missing = true;
+    DestroyAndReopen(options);
+    for (int i = 0; i < kManyGroupsKeyCount; ++i) {
+      EXPECT_OK(Put(Key(i), std::string(10 + i % 23, 'v')));
+    }
+    EXPECT_OK(Flush());
+    return options;
+  }
+
+  // The only SST of `cfd`, at any level, or nullptr if there is not exactly
+  // one.
+  static const FileMetaData* OnlySstForTest(ColumnFamilyData* cfd) {
+    const VersionStorageInfo* storage = cfd->current()->storage_info();
+    const FileMetaData* result = nullptr;
+    for (int level = 0; level < storage->num_levels(); ++level) {
+      for (const FileMetaData* file : storage->LevelFiles(level)) {
+        if (result != nullptr) {
+          return nullptr;
+        }
+        result = file;
+      }
+    }
+    return result;
+  }
+
+  // Reads and decodes the reference index of an SST from its file.
+  BlobReferenceIndex ReadBlobReferenceIndexForTest(const FileMetaData& file) {
+    BlobReferenceMetadataDescriptor descriptor;
+    EXPECT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(
+        file.blob_reference_descriptor, &descriptor));
+    std::string contents;
+    EXPECT_OK(ReadFileToString(
+        env_, MakeTableFileName(dbname_, file.fd.GetNumber()), &contents));
+    BlobReferenceIndex index;
+    const BlockHandle& handle = descriptor.index_handle;
+    if (handle.offset() + handle.size() > contents.size()) {
+      ADD_FAILURE() << "Reference index is past the end of the file";
+      return index;
+    }
+    EXPECT_OK(DecodeBlobReferenceIndex(
+        Slice(contents.data() + handle.offset(), handle.size()), descriptor,
+        &index));
+    return index;
+  }
+
   Status ApplyVersionEdit(VersionEdit* edit, bool new_descriptor_log) {
     assert(edit != nullptr);
     DBImpl* db_impl = dbfull();
@@ -384,6 +571,47 @@ class BlobFileChecksumCapturingFS : public FileSystemWrapper {
   int capture_count_ = 0;
 };
 
+TEST_F(DBBlobBasicTest, BlobReferenceCensusShutdownAfterDispatch) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  Close();
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"DBImpl::BGWorkBlobReferenceCensus:BeforeBuildReady",
+        "DBBlobBasicTest::CensusShutdownWorkerDispatched"},
+       {"DBBlobBasicTest::ReleaseCensusShutdownWorker",
+        "DBImpl::BGWorkBlobReferenceCensus:BeforeBuildWait"},
+       {"DBImpl::BGWorkBlobReferenceCensus:Done",
+        "DBBlobBasicTest::CensusShutdownWorkerDone"}});
+  sync_point->EnableProcessing();
+  bool released = false;
+  const Defer cleanup([&] {
+    if (!released) {
+      TEST_SYNC_POINT("DBBlobBasicTest::ReleaseCensusShutdownWorker");
+    }
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Reopen(options);
+  TEST_SYNC_POINT("DBBlobBasicTest::CensusShutdownWorkerDispatched");
+  // The worker has taken a live CF from the queue, but shutdown starts before
+  // the build sets up its state, so the build returns at once. In
+  // ASSERT_STATUS_CHECKED builds, the default OK status that this path does not
+  // use must still be marked as checked.
+  dbfull()->CancelAllBackgroundWork(/*wait=*/false);
+  TEST_SYNC_POINT("DBBlobBasicTest::ReleaseCensusShutdownWorker");
+  released = true;
+  TEST_SYNC_POINT("DBBlobBasicTest::CensusShutdownWorkerDone");
+  Close();
+}
 TEST_F(DBBlobBasicTest, FifoRejectsOwnStickyFenceAfterPolicyDisable) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;
@@ -422,27 +650,19 @@ TEST_F(DBBlobBasicTest, FifoRejectsOnlyOwnColumnFamilyFence) {
   ASSERT_OK(db_->Flush(FlushOptions(), handle));
   delete handle;
   Close();
-  // The first open writes a new MANIFEST that holds the DB-global format fence.
-  // The second open replays it. Blob indirection, and so the per-CF fence, is
-  // not supported with FIFO compaction (CheckBlobIndirectionCompactionStyle()).
-  // Neither open sets the per-CF fence on the FIFO default CF, so both opens
-  // succeed.
-  for (int open = 0; open < 2; ++open) {
-    SCOPED_TRACE(open);
-    std::vector<ColumnFamilyHandle*> handles;
-    std::unique_ptr<DB> database;
-    ASSERT_OK(DB::Open(DBOptions(legacy), dbname_,
-                       {{kDefaultColumnFamilyName, ColumnFamilyOptions(legacy)},
-                        {"feature", feature}},
-                       &handles, &database));
-    std::string value;
-    ASSERT_OK(database->Get(ReadOptions(), handles[1], "key", &value));
-    ASSERT_EQ(value, "value");
-    for (ColumnFamilyHandle* opened : handles) {
-      delete opened;
-    }
-    database.reset();
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> database;
+  ASSERT_OK(DB::Open(DBOptions(legacy), dbname_,
+                     {{kDefaultColumnFamilyName, ColumnFamilyOptions(legacy)},
+                      {"feature", feature}},
+                     &handles, &database));
+  std::string value;
+  ASSERT_OK(database->Get(ReadOptions(), handles[1], "key", &value));
+  ASSERT_EQ(value, "value");
+  for (ColumnFamilyHandle* opened : handles) {
+    delete opened;
   }
+  database.reset();
 }
 
 TEST_F(DBBlobBasicTest, FifoRejectsFeatureButPreservesLegacyBlobDb) {
@@ -547,7 +767,8 @@ TEST_F(DBBlobBasicTest, FencedInstallsKeepTheDbMutex) {
 TEST_F(DBBlobBasicTest, ReplacedVersionRelocationStateIsFreedUnlocked) {
   // Each flush of a fenced CF changes its blob files, so the new Version gets
   // its own relocation state. The replaced Version is destroyed under the DB
-  // mutex, and its state is handed to a JobContext and freed without it.
+  // mutex. When it is the last owner of its relocation state, it hands the
+  // state to a JobContext, which frees it without the mutex.
   Options options = GetDefaultOptions();
   options.create_if_missing = true;
   options.disable_auto_compactions = true;
@@ -579,8 +800,13 @@ TEST_F(DBBlobBasicTest, ReplacedVersionRelocationStateIsFreedUnlocked) {
   }
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
-  EXPECT_GE(deferred.load(), 2);
-  EXPECT_GE(freed.load(), 1);
+  // The census can also own a replaced Version's relocation state, through its
+  // change log or its worker. Then the census frees that state later, without
+  // the DB mutex, and the Version does not hand it to a JobContext. So the test
+  // only checks that a state handed to a JobContext is freed.
+  if (deferred.load() > 0) {
+    EXPECT_GE(freed.load(), 1);
+  }
   // FindObsoleteFiles() moved every deferred state into a JobContext, so none
   // is left in the VersionSet.
   dbfull()->TEST_LockMutex();
@@ -828,6 +1054,1460 @@ TEST_F(DBBlobBasicTest, BlobIndirectionWritesExactSstMetadata) {
             strlen("blob_value_1") + strlen("blob_value_2"));
 }
 
+TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsAndTracksInstalledSsts) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+  ASSERT_OK(Put("key1", "blob_value_1"));
+  ASSERT_OK(Put("key2", "blob_value_2"));
+  ASSERT_OK(Flush());
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  auto census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->SstFileNumbers().size(), 1);
+
+  // The census is built in the background after open. Reopen now that the
+  // format fence exists, so the initial build reads the recovered SST.
+  Reopen(options);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->SstFileNumbers().size(), 1);
+  ASSERT_EQ(census->generation_count(), 1);
+
+  ASSERT_OK(Put("key3", "blob_value_3"));
+  ASSERT_OK(Flush());
+  census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->SstFileNumbers().size(), 2);
+
+  ASSERT_OK(Delete("key1"));
+  ASSERT_OK(Delete("key2"));
+  ASSERT_OK(Delete("key3"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->generation_count(), 0);
+}
+
+TEST_F(DBBlobBasicTest, SetOptionsOnFencedColumnFamilyPublishesAtomically) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  auto* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_FALSE(cfd->GetLatestMutableCFOptions().disable_auto_compactions);
+
+  // With the format fence, the options publication also prepares a census
+  // install. A reader that takes the DB mutex during SetOptions must see the
+  // options, Version and SuperVersion all old or all new.
+  std::unique_ptr<port::Thread> reader;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WakeUpAndNotDone", [&](void* arg) {
+        if (reader != nullptr) {
+          return;
+        }
+        auto* mu = static_cast<InstrumentedMutex*>(arg);
+        reader = std::make_unique<port::Thread>([mu, cfd]() {
+          InstrumentedMutexLock l(mu);
+          const bool disabled =
+              cfd->GetLatestMutableCFOptions().disable_auto_compactions;
+          ASSERT_EQ(
+              disabled,
+              cfd->current()->GetMutableCFOptions().disable_auto_compactions);
+          ASSERT_EQ(disabled,
+                    cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
+        });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db_->SetDBOptions({{"max_open_files", "100"}}));
+  ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "true"}}));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_NE(reader, nullptr);
+  reader->join();
+  ASSERT_TRUE(cfd->GetLatestMutableCFOptions().disable_auto_compactions);
+  ASSERT_TRUE(cfd->current()->GetMutableCFOptions().disable_auto_compactions);
+  ASSERT_TRUE(cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusCatchesDeletionDuringInitialScan) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  uint64_t starting_file_number = 0;
+  for (int level = 1; level < options.num_levels; ++level) {
+    const auto& files = cfd->current()->storage_info()->LevelFiles(level);
+    if (!files.empty()) {
+      starting_file_number = files.front()->fd.GetNumber();
+      break;
+    }
+  }
+  ASSERT_NE(starting_file_number, 0);
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"DBBlobBasicTest::ReleaseCensusScan",
+        "DBImpl::BuildBlobReferenceCensus:BeforeReadFile"}});
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] { sync_point->DisableProcessing(); });
+
+  Reopen(options);
+  ASSERT_OK(DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(),
+                               /*begin=*/nullptr, /*end=*/nullptr));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetFileMetaDataByNumber(
+                starting_file_number),
+            nullptr);
+  TEST_SYNC_POINT("DBBlobBasicTest::ReleaseCensusScan");
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  const std::vector<uint64_t> files = census->SstFileNumbers();
+  ASSERT_EQ(std::count(files.begin(), files.end(), starting_file_number), 0);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusReplaysLegacySnapshotMarker) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+  ASSERT_OK(Put("legacy", "legacy_blob_value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("feature", "feature_blob_value"));
+  ASSERT_OK(Flush());
+
+  VersionEdit rotate;
+  rotate.SetColumnFamily(/*column_family_id=*/0);
+  ASSERT_OK(ApplyVersionEdit(&rotate, /*new_descriptor_log=*/true));
+
+  Close();
+  options.enable_blob_indirection = true;
+  Reopen(options);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->SstFileNumbers().size(), 1);
+  ASSERT_EQ(census->generation_count(), 1);
+  ASSERT_EQ(Get("legacy"), "legacy_blob_value");
+  ASSERT_EQ(Get("feature"), "feature_blob_value");
+}
+
+TEST_F(DBBlobBasicTest,
+       BlobReferenceCensusFailureDoesNotAbortFlushAndRebuilds) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+
+  ASSERT_OK(Put("first", "first_blob_value"));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  std::atomic<int> injected{0};
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:PrepareCensusInstall",
+      [&](void* argument) {
+        ++injected;
+        *static_cast<Status*>(argument) =
+            Status::IOError("injected census-only read failure");
+      });
+  // A rebuild reads the reference index of every SST again.
+  std::atomic<int> rebuild_reads{0};
+  sync_point->SetCallBack("DBImpl::BuildBlobReferenceCensus:ReadSst",
+                          [&](void*) { ++rebuild_reads; });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  // The census install of the second flush fails to prepare. The flush still
+  // commits, and the census is rebuilt for the new Version.
+  ASSERT_OK(Put("second", "second_blob_value"));
+  ASSERT_OK(Flush());
+  ASSERT_GE(injected.load(), 1);
+  ASSERT_EQ(Get("first"), "first_blob_value");
+  ASSERT_EQ(Get("second"), "second_blob_value");
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  // The rebuild read both SSTs.
+  ASSERT_GE(rebuild_reads.load(), 2);
+  sync_point->DisableProcessing();
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusAtReopenMatchesBuildTime) {
+  // After the flush, the census uses the summary from the table builder. After
+  // reopen, the census reads the groups from the reference index of the SST.
+  // Both must give the same census.
+  const Options options = FlushManyBlobReferenceGroups();
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const FileMetaData* const sst = OnlySstForTest(cfd);
+  ASSERT_NE(sst, nullptr);
+  const uint64_t file_number = sst->fd.GetNumber();
+  const auto built = GetCensusSnapshot(cfd);
+  ASSERT_NE(built, nullptr);
+  ASSERT_GE(built->generation_count(), 3U);
+  ASSERT_EQ(built->SstFileNumbers(), std::vector<uint64_t>{file_number});
+  // Check the layout: there are more data blocks than groups, and at least one
+  // group starts inside a block (run_offset > 0).
+  const BlobReferenceIndex index = ReadBlobReferenceIndexForTest(*sst);
+  ASSERT_GT(index.blocks.size(), index.groups.size());
+  ASSERT_TRUE(std::any_of(index.groups.begin(), index.groups.end(),
+                          [](const BlobReferenceIndexEntry& entry) {
+                            return entry.run_offset > 0;
+                          }));
+
+  Reopen(options);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto loaded = GetCensusSnapshot(cfd);
+  ASSERT_NE(loaded, nullptr);
+  std::string difference;
+  EXPECT_TRUE(built->SameMemberships(*loaded, &difference)) << difference;
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusReusesTableCacheReader) {
+  // With max_open_files=-1, the DB open loads the table reader of every SST
+  // before the census builds. The census then reads the reference index
+  // through that reader and opens no new reader, so it does not read the table
+  // tail of the SST again.
+  Options options = FlushManyBlobReferenceGroups();
+  options.max_open_files = -1;
+  std::atomic<int> fresh_opens{0};
+  std::atomic<int> cache_hits{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::FindTable:FreshTableReader",
+      [&](void*) { fresh_opens.fetch_add(1); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::GetBlobReferenceReader:Lookup", [&](void* argument) {
+        if (static_cast<Status*>(argument)->ok()) {
+          cache_hits.fetch_add(1);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Reopen(options);
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // The debug self-check after a publish (DBImpl::CheckBlobReferenceCensus())
+  // may read the SST once more, through the same table cache reader.
+  EXPECT_EQ(fresh_opens.load(), 0);
+  EXPECT_GE(cache_hits.load(), 1);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusMissDoesNotFillTableCache) {
+  // With a limited table cache, the reader of an SST may be missing from the
+  // table cache. The census then opens an ephemeral reader and does not insert
+  // it, so a census build never evicts the reader of another SST.
+  // max_open_files=20 gives a table cache capacity of 10 (the DB keeps 10 file
+  // handles for other files). The open then loads at most capacity / 4 = 2
+  // readers, so most of the L1 SSTs are not in the table cache when the census
+  // builds.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.target_file_size_base = 16 << 10;
+  options.max_open_files = 20;
+  options.create_if_missing = true;
+  DestroyAndReopen(options);
+  for (int i = 0; i < 8000; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(100, 'v')));
+  }
+  ASSERT_OK(Flush());
+  // Compact into several exact SSTs at L1.
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 1;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_GE(NumTableFilesAtLevel(1), 4);
+  std::atomic<int> fresh_opens{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::FindTable:FreshTableReader",
+      [&](void*) { fresh_opens.fetch_add(1); });
+  // The census build at reopen waits after it starts until the test has read
+  // the table cache usage.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BuildBlobReferenceCensus:NewBuildReady",
+        "DBBlobBasicTest::MissBuildStarted"},
+       {"DBBlobBasicTest::MissUsageRead",
+        "DBImpl::BuildBlobReferenceCensus:NewBuildWait"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  Reopen(options);
+  TEST_SYNC_POINT("DBBlobBasicTest::MissBuildStarted");
+  const size_t usage_before_build = dbfull()->TEST_table_cache()->GetUsage();
+  TEST_SYNC_POINT("DBBlobBasicTest::MissUsageRead");
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_GE(fresh_opens.load(), 2);
+  EXPECT_EQ(dbfull()->TEST_table_cache()->GetUsage(), usage_before_build);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusAppliesCompactionRemovedGroups) {
+  // A compaction that does not remove every SST reads the summaries of its
+  // inputs and passes them to the census in its edit. So the census applies a
+  // delta and is not rebuilt. The job charges the summaries to
+  // kBlobReferenceCensus while it holds them.
+  std::shared_ptr<
+      TargetCacheChargeTrackingCache<CacheEntryRole::kBlobReferenceCensus>>
+      cache;
+  Options options = CensusChargeTrackingOptions(&cache);
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(Put("b", "blob_b"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("c", "blob_c"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const auto& file : metadata.levels[0].files) {
+    inputs.push_back(file.name);
+  }
+  ASSERT_EQ(inputs.size(), 2U);
+  const size_t charge_before = cache->GetCacheCharge();
+  size_t charge_during = 0;
+  SyncPoint::GetInstance()->SetCallBack("CompactionJob::Run():End", [&](void*) {
+    charge_during = cache->GetCacheCharge();
+  });
+  CensusEventCounter counter;
+  counter.Start();
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/1));
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_EQ(counter.rebuilds.load(), 0);
+  EXPECT_EQ(counter.reads.load(), 0);
+  // The summaries are charged from the read at the start of the job until the
+  // census has applied the install.
+  EXPECT_GT(charge_during, charge_before);
+  EXPECT_EQ(cache->GetCacheCharge(), charge_before);
+  ASSERT_EQ(Get("a"), "blob_a");
+  ASSERT_EQ(Get("b"), "blob_b");
+  ASSERT_EQ(Get("c"), "blob_c");
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusSkipsTrivialMove) {
+  // A trivial move deletes and re-adds the same SST in one edit, so the census
+  // has no change to apply and does not rebuild.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("b", "blob_b"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  std::atomic<int> changed_files{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:CensusRemovalWithoutGroups",
+      [&](void*) { ++changed_files; });
+  CensusEventCounter counter;
+  counter.Start();
+  MoveFilesToLevel(/*level=*/2);
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_EQ(counter.rebuilds.load(), 0);
+  EXPECT_EQ(changed_files.load(), 0);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsForSstWithoutSummary) {
+  // If a new exact SST has no summary at install (a bug, injected here), the
+  // commit still succeeds. The census is rebuilt from the SSTs on disk and is
+  // not ready until the rebuild ends.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  ASSERT_EQ(census->missing_summary_rebuild_count(), 0U);
+
+  CensusEventCounter counter;
+  SyncPoint::GetInstance()->SetCallBack(
+      "BuildTable:BlobReferenceSummary", [](void* arg) {
+        static_cast<FileMetaData*>(arg)->blob_reference_summary.reset();
+      });
+  // Debug builds assert on the missing summary. This callback turns the assert
+  // off, so the test checks the release behavior.
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:CensusAdditionWithoutSummary",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBBlobBasicTest::CensusNotReadyChecked",
+        "DBImpl::BGWorkBlobReferenceCensus:BeforeBuildWait"}});
+  counter.Start();
+  ASSERT_OK(Put("b", "blob_b"));
+  ASSERT_OK(Flush());
+  EXPECT_EQ(census->missing_summary_rebuild_count(), 1U);
+  EXPECT_EQ(counter.rebuilds.load(), 1);
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_FALSE(census->IsReady(cfd->current()->GetVersionNumber()));
+  }
+  TEST_SYNC_POINT("DBBlobBasicTest::CensusNotReadyChecked");
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_TRUE(census->IsReady(cfd->current()->GetVersionNumber()));
+  }
+  ASSERT_EQ(Get("a"), "blob_a");
+  ASSERT_EQ(Get("b"), "blob_b");
+}
+
+TEST_F(DBBlobBasicTest, FlushThreadAppliesCensusWithoutCensusJob) {
+  // Every LOW-pool thread is busy, so the census job stays in its run queue
+  // and does not run. After its install, the flush thread applies the flush's
+  // census delta and publishes the census for the new Version (see "Apply
+  // after an install" in db/blob/blob_reference_census.h).
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  // The first flush thread can still be in its own apply step after Flush()
+  // returns. Wait for it, so the sync point below comes from the second flush.
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+
+  const int low_threads = env_->GetBackgroundThreads(Env::Priority::LOW);
+  std::vector<test::SleepingBackgroundTask> sleeping_tasks(low_threads);
+  for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+    env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &task,
+                   Env::Priority::LOW);
+    task.WaitUntilSleeping();
+  }
+  auto wake = Defer([&sleeping_tasks] {
+    for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+      task.WakeUp();
+      task.WaitUntilDone();
+    }
+  });
+  // The sync point is reached at the end of every apply step.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::ApplyBlobReferenceCensusAfterInstall:Done",
+        "DBBlobBasicTest::BeforeInlineApplyCheck"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(Put("b", "blob_b"));
+  ASSERT_OK(Flush());
+  TEST_SYNC_POINT("DBBlobBasicTest::BeforeInlineApplyCheck");
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_TRUE(census->IsReady(cfd->current()->GetVersionNumber()));
+  }
+  for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+    task.WakeUp();
+    task.WaitUntilDone();
+  }
+  sleeping_tasks.clear();
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ASSERT_EQ(Get("b"), "blob_b");
+}
+
+TEST_F(DBBlobBasicTest, FlushReturnsAfterSuperVersionWithCensusCleanup) {
+  // Background: a Flush(wait=true) caller waits on bg_cv_ until the flushed
+  // memtables are gone from the immutable list. The flush job passes a
+  // callback to its MANIFEST write (the writer callback). The writer callback
+  // removes the flushed memtables. After the MANIFEST write returns, the
+  // flush job installs its new SuperVersion while it still holds the DB
+  // mutex. So a Flush() caller that sees the memtables removed also sees the
+  // new SuperVersion, as long as the DB mutex is not released between the
+  // writer callback and the SuperVersion install.
+  //
+  // A flush of a CF with blob indirection also installs census state. After
+  // VersionSet::ProcessManifestWrites() installs the new Versions, it frees
+  // the old census state while the DB mutex is released (the census cleanup,
+  // sync point "VersionSet::ProcessManifestWrites:CleanupUnlocked").
+  //
+  // Ordering rule: the writer callback runs only after the census cleanup
+  // takes the DB mutex again. Another thread can signal bg_cv_ while the
+  // census cleanup runs. If the writer callback ran before the census
+  // cleanup, that signal would let Flush() return while the SuperVersion
+  // still has the old Version without the new L0 file.
+  //
+  // Test steps (the checked flush is the second flush, of key "b"):
+  // 1. In the census cleanup of the checked flush, the test reads the number
+  //    of immutable memtables of the CF and then wakes the Flush() caller.
+  // 2. If that number is 0, the rule is broken. Then the flush thread waits
+  //    until Flush() has returned and the test thread has read the
+  //    SuperVersion. So Flush() returns while the SuperVersion has only 1 L0
+  //    file, and both checks at the end fail.
+  // 3. After Flush() returns, the test checks that the memtable was still in
+  //    the list during the census cleanup and that the SuperVersion has the
+  //    new L0 file.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  // Flush once first and wait for all background work, so that only the
+  // checked flush below writes to the MANIFEST while the callbacks are set.
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+
+  // The flush thread sets this right before its MANIFEST write, so the next
+  // cleanup is the one of the checked flush.
+  std::atomic<bool> flush_commit_started{false};
+  std::atomic<int> cleanup_count{0};
+  // The number of immutable memtables of the CF during the cleanup of the
+  // checked flush, or -1 if that cleanup did not run.
+  std::atomic<int> memtables_during_cleanup{-1};
+  std::promise<void> flush_returned;
+  std::shared_future<void> flush_returned_future =
+      flush_returned.get_future().share();
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTableList::TryInstallMemtableFlushResults:AfterComputeMinWalToKeep",
+      [&](void*) { flush_commit_started.store(true); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:CleanupUnlocked", [&](void*) {
+        cleanup_count.fetch_add(1);
+        if (!flush_commit_started.exchange(false)) {
+          return;
+        }
+        int memtables = 0;
+        {
+          InstrumentedMutexLock lock(dbfull()->mutex());
+          memtables = cfd->imm()->NumNotFlushed();
+        }
+        memtables_during_cleanup.store(memtables);
+        // Signal bg_cv_ in the way any other thread can, to wake the waiting
+        // Flush() caller.
+        dbfull()->TEST_SignalAllBgCv();
+        if (memtables == 0) {
+          flush_returned_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  // Releases a waiting flush thread on every exit path. It is declared after
+  // `cleanup`, so it runs first. This order matters because `cleanup` waits
+  // for running sync point callbacks, and a callback that waits on
+  // `flush_returned_future` would block `cleanup` forever.
+  bool flush_returned_set = false;
+  auto set_flush_returned = [&]() {
+    if (!flush_returned_set) {
+      flush_returned_set = true;
+      flush_returned.set_value();
+    }
+  };
+  auto release_flush_thread = Defer(set_flush_returned);
+
+  ASSERT_OK(Put("b", "blob_b"));
+  const Status flush_status = Flush();
+  int super_version_l0_files = 0;
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    super_version_l0_files =
+        cfd->GetSuperVersion()->current->storage_info()->NumLevelFiles(0);
+  }
+  set_flush_returned();
+  ASSERT_OK(flush_status);
+  ASSERT_GT(cleanup_count.load(), 0);
+  EXPECT_EQ(memtables_during_cleanup.load(), 1);
+  EXPECT_EQ(super_version_l0_files, 2);
+  ASSERT_EQ(Get("b"), "blob_b");
+}
+
+TEST_F(DBBlobBasicTest, CensusInlineFailureStopsLaterInlineApplies) {
+  // Every LOW-pool thread is busy, so only flush threads apply census deltas.
+  //   1. The first flush's apply fails (the test injects Corruption after the
+  //      delta is applied). The thread stores the failure in
+  //      BlobReferenceCensusBuildContext::failure.
+  //   2. The second flush's apply sees the stored failure and applies nothing,
+  //      so the failed delta is not applied again and the census stays not
+  //      ready.
+  //   3. When the LOW threads are free, the census job fails the build with the
+  //      stored failure and builds the census again.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+
+  const int low_threads = env_->GetBackgroundThreads(Env::Priority::LOW);
+  std::vector<test::SleepingBackgroundTask> sleeping_tasks(low_threads);
+  for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+    env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &task,
+                   Env::Priority::LOW);
+    task.WaitUntilSleeping();
+  }
+  auto wake = Defer([&sleeping_tasks] {
+    for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+      task.WakeUp();
+      task.WaitUntilDone();
+    }
+  });
+  std::mutex mutex;
+  std::condition_variable cv;
+  int applies_done = 0;
+  std::atomic<int> apply_calls{0};
+  std::atomic<int> new_builds{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ApplyBlobReferenceCensusDeltas:ApplyStatus",
+      [&](void* argument) {
+        if (apply_calls.fetch_add(1) == 0) {
+          *static_cast<Status*>(argument) = Status::Corruption("injected");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ApplyBlobReferenceCensusAfterInstall:Done", [&](void*) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++applies_done;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BuildBlobReferenceCensus:NewBuildReady",
+      [&](void*) { new_builds.fetch_add(1); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BGWorkBlobReferenceCensus:FailureRetryDelay",
+      [](void* argument) { *static_cast<uint64_t*>(argument) = 0; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  const auto wait_for_applies = [&](int count) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return cv.wait_for(lock, std::chrono::seconds(30),
+                       [&] { return applies_done >= count; });
+  };
+  ASSERT_OK(Put("b", "blob_b"));
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(wait_for_applies(1));
+  ASSERT_OK(Put("c", "blob_c"));
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(wait_for_applies(2));
+  EXPECT_EQ(apply_calls.load(), 1);
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_FALSE(census->IsReady(cfd->current()->GetVersionNumber()));
+  }
+  for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+    task.WakeUp();
+    task.WaitUntilDone();
+  }
+  sleeping_tasks.clear();
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_GE(new_builds.load(), 1);
+  ASSERT_EQ(Get("c"), "blob_c");
+}
+
+TEST_F(DBBlobBasicTest, CensusJobFailureStopsInlineApplyBeforeFailBuild) {
+  // A census job run that fails releases worker_run_mutex() before it calls
+  // FailBuild(). The failed delta is still queued in the build context. A
+  // flush that ends in between must apply nothing:
+  //   1. An indirect blob GC job pauses the worker, so the first flush's apply
+  //      step gets TryAgain and leaves its delta queued.
+  //   2. The GC job ends. The census job applies the delta in its catch-up,
+  //      and the test injects a failure there. The run stops after it releases
+  //      the run lock and before FailBuild().
+  //   3. A second flush ends in that window. Its apply step sees the stored
+  //      failure and applies nothing.
+  //   4. The run goes on, fails the build, and the census is built again.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  uint64_t gc_token = 0;
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    ASSERT_OK(
+        census->BeginGcJob(cfd->current()->GetVersionNumber(), &gc_token));
+  }
+  std::mutex mutex;
+  std::condition_variable cv;
+  int applies_done = 0;
+  std::atomic<bool> inject{false};
+  std::atomic<bool> injected{false};
+  std::atomic<int> inline_applies{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BuildBlobReferenceCensus:CatchUpApplyStatus",
+      [&](void* argument) {
+        Status* const status = static_cast<Status*>(argument);
+        if (status->ok() && inject.load() && !injected.exchange(true)) {
+          *status = Status::Corruption("injected");
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ApplyBlobReferenceCensusDeltas:ApplyStatus",
+      [&](void*) { inline_applies.fetch_add(1); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ApplyBlobReferenceCensusAfterInstall:Done", [&](void*) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++applies_done;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BGWorkBlobReferenceCensus:FailureRetryDelay",
+      [](void* argument) { *static_cast<uint64_t*>(argument) = 0; });
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BGWorkBlobReferenceCensus:FailedRunReady",
+        "DBBlobBasicTest::JobRunFailed"},
+       {"DBBlobBasicTest::SecondFlushApplied",
+        "DBImpl::BGWorkBlobReferenceCensus:FailedRunWait"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  // If an assertion below returns early, still let the blocked census run go
+  // on, so that the DB can close.
+  bool released = false;
+  auto release_run = Defer([&released] {
+    if (!released) {
+      TEST_SYNC_POINT("DBBlobBasicTest::SecondFlushApplied");
+    }
+  });
+  const auto wait_for_applies = [&](int count) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return cv.wait_for(lock, std::chrono::seconds(30),
+                       [&] { return applies_done >= count; });
+  };
+  ASSERT_OK(Put("b", "blob_b"));
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(wait_for_applies(1));
+  inject.store(true);
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    census->EndGcJob(gc_token);
+  }
+  // The periodic task runs the census job again (the GC pause put it in the
+  // retry list).
+  TEST_SYNC_POINT("DBBlobBasicTest::JobRunFailed");
+  EXPECT_TRUE(injected.load());
+  const int inline_applies_before = inline_applies.load();
+  ASSERT_OK(Put("c", "blob_c"));
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(wait_for_applies(2));
+  EXPECT_EQ(inline_applies.load(), inline_applies_before);
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_FALSE(census->IsReady(cfd->current()->GetVersionNumber()));
+  }
+  released = true;
+  TEST_SYNC_POINT("DBBlobBasicTest::SecondFlushApplied");
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ASSERT_EQ(Get("c"), "blob_c");
+}
+
+TEST_F(DBBlobBasicTest, CensusApplyAfterInstallVisitsOnlyJobColumnFamilies) {
+  // Every LOW-pool thread is busy, so the census job does not run. An indirect
+  // blob GC job on column family "one" keeps its census paused, so a flush of
+  // "one" leaves it queued for the census job. A later flush of the default
+  // column family then visits only the default column family in its apply step,
+  // not "one".
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"one"}, options);
+  ASSERT_OK(Put(0, "a", "blob_a"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Put(1, "a", "blob_a"));
+  ASSERT_OK(Flush(1));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ColumnFamilyData* const one =
+      static_cast_with_check<ColumnFamilyHandleImpl>(handles_[1])->cfd();
+  BlobReferenceCensus* const one_census = one->blob_reference_census();
+  uint64_t gc_token = 0;
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    ASSERT_OK(
+        one_census->BeginGcJob(one->current()->GetVersionNumber(), &gc_token));
+  }
+
+  const int low_threads = env_->GetBackgroundThreads(Env::Priority::LOW);
+  std::vector<test::SleepingBackgroundTask> sleeping_tasks(low_threads);
+  for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+    env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &task,
+                   Env::Priority::LOW);
+    task.WaitUntilSleeping();
+  }
+  auto wake = Defer([&sleeping_tasks] {
+    for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+      task.WakeUp();
+      task.WaitUntilDone();
+    }
+  });
+  std::mutex mutex;
+  std::condition_variable cv;
+  int applies_done = 0;
+  std::vector<uint32_t> visited;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ApplyBlobReferenceCensusDeltas:Start", [&](void* argument) {
+        std::lock_guard<std::mutex> lock(mutex);
+        visited.push_back(static_cast<ColumnFamilyData*>(argument)->GetID());
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::ApplyBlobReferenceCensusAfterInstall:Done", [&](void*) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++applies_done;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  const auto wait_for_applies = [&](int count) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return cv.wait_for(lock, std::chrono::seconds(30),
+                       [&] { return applies_done >= count; });
+  };
+  ASSERT_OK(Put(1, "b", "blob_b"));
+  ASSERT_OK(Flush(1));
+  ASSERT_TRUE(wait_for_applies(1));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(visited, std::vector<uint32_t>{one->GetID()});
+    visited.clear();
+  }
+  ASSERT_OK(Put(0, "b", "blob_b"));
+  ASSERT_OK(Flush(0));
+  ASSERT_TRUE(wait_for_applies(2));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(visited, std::vector<uint32_t>{0});
+  }
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_FALSE(one_census->IsReady(one->current()->GetVersionNumber()));
+    one_census->EndGcJob(gc_token);
+  }
+  for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+    task.WakeUp();
+    task.WaitUntilDone();
+  }
+  sleeping_tasks.clear();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(Get(1, "b"), "blob_b");
+}
+
+TEST_F(DBBlobBasicTest, CensusApplyAfterInstallWaitsForGcSnapshot) {
+  // A registered indirect blob GC job pauses the worker until it copies its
+  // snapshot. The flush thread's apply step then gets TryAgain and leaves the
+  // delta in the build context for the census job, so the census is not ready.
+  // After the GC job ends, the census job applies the delta and publishes.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  uint64_t gc_token = 0;
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    ASSERT_OK(
+        census->BeginGcJob(cfd->current()->GetVersionNumber(), &gc_token));
+  }
+  ASSERT_OK(Put("b", "blob_b"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_FALSE(census->IsReady(cfd->current()->GetVersionNumber()));
+    const std::shared_ptr<BlobReferenceCensusBuildContext> context =
+        census->GetBuildContext();
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(context->pending_deltas.size(), 1U);
+    census->EndGcJob(gc_token);
+  }
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ASSERT_EQ(Get("b"), "blob_b");
+}
+
+TEST_F(DBBlobBasicTest, CensusRestartBuildOverflowBacksOffThenFinishes) {
+  // The change log limit is lowered to 1 byte (restart limit 4 bytes), so every
+  // queued delta after the first overflows it.
+  //   1. Three flushes while the test holds the worker run lock: the census
+  //      cursor overflows, and the census job restarts the build with the
+  //      restart limit.
+  //   2. The restarted build stops right after its build cursor opened. Three
+  //      more flushes overflow its restart limit. The build fails, the job
+  //      bumps BLOB_DB_CENSUS_RESTART_OVERFLOW_COUNT, and it retries after a
+  //      backoff (the test sets the backoff to 0).
+  //   3. The test stops lowering the limit. The retried build, which still has
+  //      the restart limit, publishes.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+
+  // The callbacks run on background threads and share this state. It lives
+  // on the heap, so it stays valid until the last callback returns.
+  struct State {
+    std::atomic<bool> tiny_limit{false};
+    std::atomic<int> backoffs{0};
+  };
+  auto state = std::make_shared<State>();
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("BlobReferenceCensus::AppendChange:Limit",
+                          [state](void* arg) {
+                            if (state->tiny_limit.load()) {
+                              *static_cast<size_t*>(arg) = 1;
+                            }
+                          });
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:FailureRetryDelay",
+                          [state](void* arg) {
+                            state->backoffs.fetch_add(1);
+                            *static_cast<uint64_t*>(arg) = 0;
+                          });
+  // The first new build after EnableProcessing() is the restarted build: it
+  // waits after its build cursor opened until the test has made its flushes.
+  sync_point->LoadDependency(
+      {{"DBImpl::BuildBlobReferenceCensus:NewBuildReady",
+        "DBBlobBasicTest::RestartBuildStopped"},
+       {"DBBlobBasicTest::RestartFlushesDone",
+        "DBImpl::BuildBlobReferenceCensus:NewBuildWait"}});
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  // Step 1.
+  state->tiny_limit.store(true);
+  {
+    std::lock_guard<std::mutex> run_lock(census->worker_run_mutex());
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_OK(Put("k" + std::to_string(i), "blob_k"));
+      ASSERT_OK(Flush());
+    }
+  }
+  // Step 2.
+  TEST_SYNC_POINT("DBBlobBasicTest::RestartBuildStopped");
+  ASSERT_EQ(census->overflow_restart_count(), 1U);
+  for (int i = 3; i < 6; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "blob_k"));
+    ASSERT_OK(Flush());
+  }
+  state->tiny_limit.store(false);
+  TEST_SYNC_POINT("DBBlobBasicTest::RestartFlushesDone");
+  // Step 3.
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_EQ(
+      options.statistics->getTickerCount(BLOB_DB_CENSUS_RESTART_OVERFLOW_COUNT),
+      1U);
+  EXPECT_GE(state->backoffs.load(), 1);
+  EXPECT_EQ(census->overflow_restart_count(), 1U);
+  ASSERT_EQ(Get("k5"), "blob_k");
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsAfterFileDeletion) {
+  // DeleteFilesInRange removes SSTs without passing their summaries, so the
+  // census is rebuilt and then matches the Version.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("m", "blob_m"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(/*level=*/1);
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  CensusEventCounter counter;
+  counter.Start();
+  const Slice begin("a");
+  const Slice end("b");
+  ASSERT_OK(
+      DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &begin, &end));
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_EQ(counter.rebuilds.load(), 1);
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+  ASSERT_EQ(Get("m"), "blob_m");
+}
+
+TEST_F(DBBlobBasicTest, CensusScanKeepsReadSstWhileGcJobPauses) {
+  // An indirect blob GC job registers while the census is ready. Then
+  // DeleteFilesInRange starts a rebuild before the job copies its snapshot, so
+  // the job still pauses the worker during the rebuild's scan of the SSTs:
+  //   1. The scan reads the first SST. A flush then queues a delta.
+  //   2. The catch-up after the read gets TryAgain. The scan keeps the summary
+  //      it read as a seed and stops; the build is incomplete.
+  //   3. After the GC job ends, the census job runs again. The scan adds the
+  //      SST from the seed without reading it again.
+  // So every SST is read once, and the census then matches the Version.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.target_file_size_base = 16 << 10;
+  DestroyAndReopen(options);
+  for (int i = 0; i < 8000; ++i) {
+    ASSERT_OK(Put(Key(i), std::string(100, 'v')));
+  }
+  ASSERT_OK(Flush());
+  // Compact into several exact SSTs at L1.
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 1;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_GE(NumTableFilesAtLevel(1), 3);
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  std::string first_smallest;
+  std::string first_largest;
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    const FileMetaData* const first =
+        cfd->current()->storage_info()->LevelFiles(1).front();
+    first_smallest = first->smallest.user_key().ToString();
+    first_largest = first->largest.user_key().ToString();
+  }
+  uint64_t gc_token = 0;
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    ASSERT_OK(
+        census->BeginGcJob(cfd->current()->GetVersionNumber(), &gc_token));
+  }
+  std::atomic<int> sst_reads{0};
+  std::atomic<int> sst_adds{0};
+  std::mutex mutex;
+  std::condition_variable cv;
+  int job_runs_done = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BGWorkBlobReferenceCensus:Done", [&](void*) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++job_runs_done;
+        cv.notify_all();
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BuildBlobReferenceCensus:ReadSst",
+      [&](void*) { sst_reads.fetch_add(1); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BuildBlobReferenceCensus:AfterReadFile",
+      [&](void*) { sst_adds.fetch_add(1); });
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BuildBlobReferenceCensus:ReadSst",
+        "DBBlobBasicTest::FirstSstRead"},
+       {"DBBlobBasicTest::FlushQueued",
+        "DBImpl::BuildBlobReferenceCensus:AfterReadFile"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  // If an assertion below returns early, still let the blocked census run go
+  // on, so that the DB can close.
+  bool flush_queued = false;
+  auto release_run = Defer([&flush_queued] {
+    if (!flush_queued) {
+      TEST_SYNC_POINT("DBBlobBasicTest::FlushQueued");
+    }
+  });
+  const Slice begin(first_smallest);
+  const Slice end(first_largest);
+  ASSERT_OK(
+      DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &begin, &end));
+  const int starting_ssts = NumTableFilesAtLevel(1);
+  TEST_SYNC_POINT("DBBlobBasicTest::FirstSstRead");
+  ASSERT_OK(Put("z", "blob_z"));
+  ASSERT_OK(Flush());
+  int runs_before = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    runs_before = job_runs_done;
+  }
+  flush_queued = true;
+  TEST_SYNC_POINT("DBBlobBasicTest::FlushQueued");
+  // The blocked run gets TryAgain after the read and ends. Later runs only get
+  // TryAgain until the GC job ends, so the test ends it now.
+  bool run_ended = false;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    run_ended = cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return job_runs_done > runs_before; });
+  }
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_FALSE(census->IsReady(cfd->current()->GetVersionNumber()));
+    census->EndGcJob(gc_token);
+  }
+  ASSERT_TRUE(run_ended);
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_EQ(sst_reads.load(), starting_ssts);
+  // The first SST passes AfterReadFile twice: once after its read, and once
+  // when the scan adds it from the seed.
+  EXPECT_EQ(sst_adds.load(), starting_ssts + 1);
+  ASSERT_EQ(Get("z"), "blob_z");
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusOverflowRestartsBuildOnce) {
+  // The test sets the change log limit to 1 byte. While the initial build
+  // waits, flush installs overflow its change log. The build restarts once with
+  // no limit and then completes, instead of restarting after every overflow.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "blob_a"));
+  ASSERT_OK(Flush());
+  Close();
+
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("BlobReferenceCensus::AppendChange:Limit",
+                          [](void* arg) { *static_cast<size_t*>(arg) = 1; });
+  sync_point->LoadDependency(
+      {{"DBBlobBasicTest::FlushedDuringBuild",
+        "DBImpl::BuildBlobReferenceCensus:BeforeReadFile"}});
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+  });
+  Reopen(options);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "blob_value"));
+    ASSERT_OK(Flush());
+  }
+  TEST_SYNC_POINT("DBBlobBasicTest::FlushedDuringBuild");
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  EXPECT_EQ(cfd->blob_reference_census()->overflow_restart_count(), 1U);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusSelfCheckRunsAfterPublish) {
+  // After a publish, debug builds can compare the census with a census built
+  // from the SSTs of the Version (DBImpl::CheckBlobReferenceCensus()). This
+  // test forces the check after every publish. The check must pass after
+  // flushes, a partial compaction and a full compaction.
+  std::atomic<int> checks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CheckBlobReferenceCensus:Force", [&](void* arg) {
+        *static_cast<bool*>(arg) = true;
+        ++checks;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("a", "blob_a" + std::to_string(i)));
+    ASSERT_OK(Put("k" + std::to_string(i), "blob_value"));
+    ASSERT_OK(Flush());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+  }
+  MoveFilesToLevel(/*level=*/1);
+  ASSERT_OK(Put("z", "blob_z"));
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_GT(checks.load(), 0);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusFullCompactionInstallsByDelta) {
+  // A full compaction (every SST is an input) reads the summaries of its inputs
+  // at job start, like any compaction. Its install applies a census delta: the
+  // census is not rebuilt and reads no SST.
+  std::shared_ptr<
+      TargetCacheChargeTrackingCache<CacheEntryRole::kBlobReferenceCensus>>
+      cache;
+  Options options = CensusChargeTrackingOptions(&cache);
+  DestroyAndReopen(options);
+  // Every SST covers the whole key range, so the compaction is not a series
+  // of trivial moves. A first compaction writes exact SSTs below L0, so the
+  // full compaction below has exact inputs.
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_OK(Put("key0", "blob_value" + std::to_string(i)));
+    ASSERT_OK(Put("key3", "blob_value" + std::to_string(i)));
+    ASSERT_OK(Put("key" + std::to_string(i), "blob_value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+    if (i == 3) {
+      ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    }
+  }
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  const size_t exact_inputs = CountExactSsts();
+  ASSERT_GT(exact_inputs, 0U);
+  std::atomic<int> input_reads{0};
+  std::atomic<int> removals_without_groups{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:CensusRemovalWithoutGroups",
+      [&](void*) { ++removals_without_groups; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ReadInputBlobReferenceSummaries:Status", [&](void* arg) {
+        ASSERT_OK(*static_cast<Status*>(arg));
+        ++input_reads;
+      });
+  CensusEventCounter counter;
+  counter.Start();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  // The job reads the summary of each exact input once.
+  EXPECT_EQ(static_cast<size_t>(input_reads.load()), exact_inputs);
+  EXPECT_EQ(removals_without_groups.load(), 0);
+  EXPECT_EQ(counter.rebuilds.load(), 0);
+  EXPECT_EQ(counter.reads.load(), 0);
+  ASSERT_EQ(Get("key0"), "blob_value5");
+  ASSERT_EQ(Get("key1"), "blob_value1");
+  ASSERT_EQ(Get("key3"), "blob_value5");
+  ASSERT_EQ(Get("key4"), "blob_value4");
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusFullCompactionWithConcurrentFlush) {
+  // A flush installs an SST while a full compaction runs. The compaction read
+  // the summaries of its inputs at job start, so its install applies a census
+  // delta, and the census is not rebuilt.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  // A first compaction writes exact SSTs below L0, so the full compaction below
+  // has exact inputs.
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("key0", "blob_value" + std::to_string(i)));
+    ASSERT_OK(Put("key3", "blob_value" + std::to_string(i)));
+    ASSERT_OK(Flush());
+    if (i == 2) {
+      ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    }
+  }
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  ASSERT_GT(CountExactSsts(), 0U);
+  std::atomic<int> removals_without_groups{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:CensusRemovalWithoutGroups",
+      [&](void*) { ++removals_without_groups; });
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"CompactionJob::Run():Start",
+        "BlobReferenceCensusFullCompactionWithConcurrentFlush:Flush"},
+       {"BlobReferenceCensusFullCompactionWithConcurrentFlush:Flushed",
+        "CompactionJob::Run():End"}});
+  CensusEventCounter counter;
+  counter.Start();
+  port::Thread compaction([this]() {
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  });
+  TEST_SYNC_POINT("BlobReferenceCensusFullCompactionWithConcurrentFlush:Flush");
+  ASSERT_OK(Put("key5", "blob_flushed"));
+  ASSERT_OK(Flush());
+  TEST_SYNC_POINT(
+      "BlobReferenceCensusFullCompactionWithConcurrentFlush:Flushed");
+  compaction.join();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  EXPECT_EQ(counter.rebuilds.load(), 0);
+  EXPECT_EQ(removals_without_groups.load(), 0);
+  ASSERT_EQ(Get("key0"), "blob_value4");
+  ASSERT_EQ(Get("key3"), "blob_value4");
+  ASSERT_EQ(Get("key5"), "blob_flushed");
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceMetadataSurvivesTrivialMove) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto& l0_files = cfd->current()->storage_info()->LevelFiles(0);
+  ASSERT_EQ(l0_files.size(), 1);
+  const uint64_t file_number = l0_files.front()->fd.GetNumber();
+  ASSERT_FALSE(l0_files.front()->blob_reference_descriptor.empty());
+
+  MoveFilesToLevel(/*level=*/1);
+  const auto& l1_files = cfd->current()->storage_info()->LevelFiles(1);
+  ASSERT_EQ(l1_files.size(), 1);
+  ASSERT_EQ(l1_files.front()->fd.GetNumber(), file_number);
+  ASSERT_FALSE(l1_files.front()->blob_reference_descriptor.empty());
+
+  Reopen(options);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  const std::vector<uint64_t> files = census->SstFileNumbers();
+  ASSERT_EQ(std::count(files.begin(), files.end(), file_number), 1);
+  ASSERT_EQ(Get("key"), "blob_value");
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceMetadataSurvivesWalRecoveryFlush) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.avoid_flush_during_recovery = false;
+  Reopen(options);
+
+  ASSERT_OK(Put("flushed", "flushed_blob_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("recovered", "recovered_blob_value"));
+
+  Close();
+  Reopen(options);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(Get("flushed"), "flushed_blob_value");
+  ASSERT_EQ(Get("recovered"), "recovered_blob_value");
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  size_t file_count = 0;
+  for (int level = 0; level < cfd->NumberLevels(); ++level) {
+    for (const FileMetaData* file :
+         cfd->current()->storage_info()->LevelFiles(level)) {
+      ++file_count;
+      ASSERT_FALSE(file->blob_reference_descriptor.empty());
+      ASSERT_FALSE(file->blob_reference_legacy_metadata);
+    }
+  }
+  ASSERT_GE(file_count, 2);
+  const auto census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->SstFileNumbers().size(), file_count);
+}
+
 TEST_F(DBBlobBasicTest, BlobIndirectionReadsCompressedUnflattenedIndexes) {
   if (!CompressionTypeSupported(kZSTD)) {
     ROCKSDB_GTEST_SKIP("ZSTD is required for this test");
@@ -957,6 +2637,169 @@ TEST_F(DBBlobBasicTest, FlattenedReferenceReadChecksOriginInReader) {
   const Status status =
       db_->Get(ReadOptions(), db_->DefaultColumnFamily(), "outside", &result);
   ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+}
+
+TEST_F(DBBlobBasicTest, CensusStartsWhenFenceIsWrittenAfterOpen) {
+  // A new DB has no format fence at open, so open schedules no census. The
+  // first flush writes the fence, and installing its SuperVersion starts the
+  // census. The test does not call TEST_WaitForBlobReferenceCensus(), which
+  // would schedule the census by itself.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.create_if_missing = true;
+  DestroyAndReopen(options);
+  ASSERT_FALSE(dbfull()
+                   ->GetVersionSet()
+                   ->GetColumnFamilySet()
+                   ->GetDefault()
+                   ->current()
+                   ->storage_info()
+                   ->HasBlobIndirectionFormat());
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BGWorkBlobReferenceCensus:Start",
+        "DBBlobBasicTest::CensusStartsWhenFenceIsWrittenAfterOpen:Wait"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  TEST_SYNC_POINT(
+      "DBBlobBasicTest::CensusStartsWhenFenceIsWrittenAfterOpen:Wait");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(dbfull()
+                  ->GetVersionSet()
+                  ->GetColumnFamilySet()
+                  ->GetDefault()
+                  ->current()
+                  ->storage_info()
+                  ->HasBlobIndirectionFormat());
+  ASSERT_EQ(Get("key"), "value");
+}
+
+TEST_F(DBBlobBasicTest, BlobRelocationLossAndFingerprintSurviveReopen) {
+  // The test routes a new, unused file number (routed_generation), which stands
+  // for an old blob file, to a relocation file (relocation_file_number). The
+  // fingerprint of the relocation state must be the same after a reopen and
+  // after a MANIFEST snapshot. Then a loss record (MarkBlobPhysicalFileLost())
+  // marks the relocation file lost, so a read that follows the route returns
+  // NotFound. The lost mark and the new fingerprint must also stay the same
+  // after a reopen and after a snapshot.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+
+  VersionSet* version_set = dbfull()->GetVersionSet();
+  ColumnFamilyData* cfd = version_set->GetColumnFamilySet()->GetDefault();
+  dbfull()->TEST_LockMutex();
+  const uint64_t routed_generation = version_set->NewFileNumber();
+  const uint64_t relocation_file_number = version_set->NewFileNumber();
+  dbfull()->TEST_UnlockMutex();
+  const std::string expected = "relocated-value";
+  const uint64_t original_value_offset = 100;
+  Options relocation_options = options;
+  relocation_options.cf_paths.clear();
+  relocation_options.cf_paths.emplace_back(dbname_, /*target_size=*/0);
+  BlockBasedTableOptions table_options;
+  relocation_options.table_factory.reset(
+      NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(relocation_options);
+  const MutableCFOptions mutable_options(relocation_options);
+  BlobRelocationFileMetadata metadata;
+  uint64_t relocation_file_size = 0;
+  WriteRelocationFileForDBTest(
+      immutable_options, mutable_options, table_options, cfd->GetID(),
+      relocation_file_number,
+      {{routed_generation, original_value_offset, expected, kNoCompression}},
+      &metadata, &relocation_file_size);
+  VersionEdit install;
+  install.SetColumnFamily(cfd->GetID());
+  install.AddBlobRelocationFile(BlobRelocationFileAddition(
+      relocation_file_number, relocation_file_size,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      metadata.encoded_directory, metadata.tail_size));
+  install.SetBlobRelocationRoute(
+      BlobRelocationRoute(routed_generation, relocation_file_number));
+  ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
+  {
+    std::string blob_index;
+    const uint32_t stable_checksum =
+        crc32c::Value(expected.data(), expected.size());
+    BlobIndex::EncodeIndirectBlob(
+        &blob_index, routed_generation,
+        {.origin_file_number = routed_generation,
+         .original_value_offset = original_value_offset,
+         .stored_value_size = expected.size(),
+         .compression = kNoCompression,
+         .stable_checksum = stable_checksum,
+         .stored_checksum = BlobIndex::ExtendChecksumWithCompression(
+             stable_checksum, kNoCompression)});
+    WriteBatch batch;
+    ASSERT_OK(
+        WriteBatchInternal::PutBlobIndex(&batch, 0, "routed", blob_index));
+    ASSERT_OK(db_->Write(WriteOptions(), &batch));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_EQ(Get("routed"), expected);
+
+  const auto fingerprint = [&]() {
+    const VersionStorageInfo* storage = dbfull()
+                                            ->GetVersionSet()
+                                            ->GetColumnFamilySet()
+                                            ->GetDefault()
+                                            ->current()
+                                            ->storage_info();
+    return std::make_pair(storage->GetBlobRelocationStateFingerprintHigh(),
+                          storage->GetBlobRelocationStateFingerprintLow());
+  };
+  const auto reopen_both_ways = [&]() {
+    Close();
+    Reopen(options);
+    const auto replayed = fingerprint();
+    VersionEdit snapshot;
+    snapshot.SetColumnFamily(/*column_family_id=*/0);
+    EXPECT_OK(ApplyVersionEdit(&snapshot, /*new_descriptor_log=*/true));
+    Close();
+    Reopen(options);
+    EXPECT_EQ(fingerprint(), replayed);
+    return replayed;
+  };
+  const auto before_loss = fingerprint();
+  ASSERT_EQ(reopen_both_ways(), before_loss);
+  ASSERT_EQ(Get("routed"), expected);
+
+  VersionEdit loss;
+  loss.SetColumnFamily(0);
+  loss.MarkBlobPhysicalFileLost(relocation_file_number);
+  ASSERT_OK(ApplyVersionEdit(&loss, /*new_descriptor_log=*/false));
+  const auto after_loss = fingerprint();
+  ASSERT_NE(after_loss, before_loss);
+  const auto check_lost = [&]() {
+    const VersionStorageInfo* storage = dbfull()
+                                            ->GetVersionSet()
+                                            ->GetColumnFamilySet()
+                                            ->GetDefault()
+                                            ->current()
+                                            ->storage_info();
+    ASSERT_TRUE(storage->HasLostBlobRelocationFiles());
+    ASSERT_TRUE(storage->GetBlobRelocationFileMetaData(relocation_file_number)
+                    ->IsMarkedLost());
+    PinnableSlice value;
+    const Status status =
+        db_->Get(ReadOptions(), db_->DefaultColumnFamily(), "routed", &value);
+    ASSERT_TRUE(status.IsNotFound()) << status.ToString();
+    ASSERT_EQ(Get("key"), "value");
+  };
+  // LogAndApply alone installs no SuperVersion; reopen to read the new
+  // Version.
+  ASSERT_EQ(reopen_both_ways(), after_loss);
+  check_lost();
 }
 
 TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
@@ -1104,14 +2947,30 @@ TEST_F(DBBlobBasicTest, BlobFileRetirementSurvivesReplayAndManifestSnapshot) {
   const std::string expected = "relocated-value";
   ASSERT_OK(Put(key, expected));
   ASSERT_OK(Flush());
+  // Write a second blob file whose only value is then deleted. After a
+  // compaction that rewrites every SST, no SST uses that file. The file still
+  // stays in the Version, because an indirect-origin blob file stays until a
+  // blob file retirement record removes it.
+  ASSERT_OK(Put("doomed", "doomed-value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("doomed"));
+  ASSERT_OK(Flush());
+  {
+    CompactRangeOptions rewrite_all;
+    rewrite_all.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(rewrite_all, nullptr, nullptr));
+  }
 
   VersionSet* version_set = dbfull()->GetVersionSet();
   ColumnFamilyData* cfd = version_set->GetColumnFamilySet()->GetDefault();
   const VersionStorageInfo* storage = cfd->current()->storage_info();
-  ASSERT_EQ(storage->GetBlobFiles().size(), 1U);
+  ASSERT_EQ(storage->GetBlobFiles().size(), 2U);
   const uint64_t origin_file_number =
       storage->GetBlobFiles().front()->GetBlobFileNumber();
+  const uint64_t empty_file_number =
+      storage->GetBlobFiles().back()->GetBlobFileNumber();
   ASSERT_TRUE(storage->GetBlobFiles().front()->IsIndirectOrigin());
+  ASSERT_TRUE(storage->GetBlobFiles().back()->IsIndirectOrigin());
   const uint64_t original_value_offset =
       BlobLogHeader::kSize + BlobLogRecord::kHeaderSize + key.size();
 
@@ -1135,9 +2994,12 @@ TEST_F(DBBlobBasicTest, BlobFileRetirementSurvivesReplayAndManifestSnapshot) {
       immutable_options, mutable_options, table_options, cfd->GetID(),
       relocation_file_number, records, &metadata, &relocation_file_size);
 
-  // The indirect blob GC install edit, in one record batch: add the relocation
-  // file, route the collected blob file to it, and record the blob file
-  // retirement of the collected blob file.
+  // The test writes by hand an edit with the same form as an indirect blob GC
+  // install edit, in one record batch. It adds relocation file
+  // relocation_file_number, routes origin_file_number to it, and records the
+  // blob file retirement of origin_file_number. It also records the blob file
+  // retirement of empty_file_number with no route, because no SST uses that
+  // file.
   VersionEdit install;
   install.SetColumnFamily(cfd->GetID());
   install.AddBlobRelocationFile(BlobRelocationFileAddition(
@@ -1147,6 +3009,7 @@ TEST_F(DBBlobBasicTest, BlobFileRetirementSurvivesReplayAndManifestSnapshot) {
   install.SetBlobRelocationRoute(
       BlobRelocationRoute(origin_file_number, relocation_file_number));
   install.RetireBlobFile(origin_file_number);
+  install.RetireBlobFile(empty_file_number);
   ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
   // After its blob file retirement, this MANIFEST rejects adding the collected
   // file back.
@@ -1168,17 +3031,21 @@ TEST_F(DBBlobBasicTest, BlobFileRetirementSurvivesReplayAndManifestSnapshot) {
                                             ->current()
                                             ->storage_info();
     ASSERT_EQ(current->GetBlobFileMetaData(origin_file_number), nullptr);
+    ASSERT_EQ(current->GetBlobFileMetaData(empty_file_number), nullptr);
     ASSERT_EQ(current->GetBlobRelocationRouteTarget(origin_file_number),
               relocation_file_number);
+    ASSERT_EQ(current->GetBlobRelocationRouteTarget(empty_file_number),
+              kInvalidBlobFileNumber);
     ASSERT_EQ(Get(key), expected);
   };
   check();
   // Reopen from incremental records, then from a MANIFEST snapshot, without
-  // the collected file (the DB may have deleted it already).
+  // the collected files (the DB may have deleted them already).
   Close();
-  const Status deleted =
-      env_->DeleteFile(BlobFileName(dbname_, origin_file_number));
-  ASSERT_TRUE(deleted.ok() || deleted.IsNotFound()) << deleted.ToString();
+  for (uint64_t file_number : {origin_file_number, empty_file_number}) {
+    const Status deleted = env_->DeleteFile(BlobFileName(dbname_, file_number));
+    ASSERT_TRUE(deleted.ok() || deleted.IsNotFound()) << deleted.ToString();
+  }
   Reopen(options);
   check();
   VersionEdit snapshot;
@@ -2201,11 +4068,51 @@ TEST_F(DBBlobBasicTest, BlobIndirectionFormatFenceSurvivesActivatedCfDrop) {
                                           ->GetDefault()
                                           ->current()
                                           ->storage_info();
-  // The new MANIFEST keeps the DB-global fence after the only fenced CF was
-  // dropped. It does not set the per-CF fence on the default CF.
   ASSERT_FALSE(storage->HasBlobIndirectionFormat());
   ASSERT_EQ(dbfull()->GetVersionSet()->TEST_GetDbBlobIndirectionFormatVersion(),
             kBlobIndirectionManifestFormatVersion);
+}
+
+TEST_F(DBBlobBasicTest,
+       BlobIndirectionSnapshotDoesNotActivateUnrelatedColumnFamily) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+
+  ASSERT_OK(Put("legacy", "legacy_blob_value"));
+  ASSERT_OK(Flush());
+
+  ColumnFamilyHandle* activated = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(ColumnFamilyOptions(options), "activated",
+                                    &activated));
+  ASSERT_OK(db_->SetOptions(activated, {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(
+      db_->Put(WriteOptions(), activated, "feature", "feature_blob_value"));
+  ASSERT_OK(db_->Flush(FlushOptions(), activated));
+
+  VersionEdit rotate;
+  rotate.SetColumnFamily(/*column_family_id=*/0);
+  ASSERT_OK(ApplyVersionEdit(&rotate, /*new_descriptor_log=*/true));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(activated));
+  ASSERT_OK(TryReopenWithColumnFamilies({"default", "activated"}, options));
+
+  VersionSet* version_set = dbfull()->GetVersionSet();
+  ColumnFamilyData* default_cfd =
+      version_set->GetColumnFamilySet()->GetDefault();
+  ColumnFamilyData* activated_cfd =
+      version_set->GetColumnFamilySet()->GetColumnFamily("activated");
+  ASSERT_NE(activated_cfd, nullptr);
+  ASSERT_FALSE(
+      default_cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_TRUE(
+      activated_cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_EQ(version_set->TEST_GetDbBlobIndirectionFormatVersion(),
+            kBlobIndirectionManifestFormatVersion);
+  ASSERT_EQ(Get("legacy"), "legacy_blob_value");
+  std::string feature_value;
+  ASSERT_OK(db_->Get(ReadOptions(), handles_[1], "feature", &feature_value));
+  ASSERT_EQ(feature_value, "feature_blob_value");
 }
 
 TEST_F(DBBlobBasicTest, BlobRelocationRecordsApplyToOwnColumnFamily) {
@@ -2592,6 +4499,52 @@ TEST_F(DBBlobBasicTest, BlobIndirectionFailsFlushWhenMetadataCannotBeCharged) {
   ASSERT_OK(Put("key", "blob_value"));
   const Status status = Flush();
   EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceCensusChargesItsOwnCacheRole) {
+  for (const bool charged : {true, false}) {
+    SCOPED_TRACE(charged);
+    BlockBasedTableOptions table_options;
+    table_options.block_cache = NewLRUCache(64 << 20);
+    if (!charged) {
+      table_options.cache_usage_options
+          .options_overrides[CacheEntryRole::kBlobReferenceCensus] = {
+          CacheEntryRoleOptions::Decision::kDisabled};
+    }
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    for (int file = 0; file < 4; ++file) {
+      for (int key = 0; key < 16; ++key) {
+        ASSERT_OK(Put("key" + std::to_string(file * 16 + key),
+                      std::string(1024, 'v')));
+      }
+      ASSERT_OK(Flush());
+    }
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
+
+    // The census has its own line in the block cache entry stats.
+    std::map<std::string, std::string> values;
+    ASSERT_TRUE(
+        db_->GetMapProperty(DB::Properties::kBlockCacheEntryStats, &values));
+    const std::string census_key = BlockCacheEntryStatsMapKeys::UsedBytes(
+        CacheEntryRole::kBlobReferenceCensus);
+    ASSERT_EQ(values.count(census_key), 1);
+    const uint64_t census_bytes = std::stoull(values[census_key]);
+    if (charged) {
+      ASSERT_GT(census_bytes, 0);
+    } else {
+      ASSERT_EQ(census_bytes, 0);
+    }
+    ASSERT_EQ(Get("key0"), std::string(1024, 'v'));
+  }
 }
 
 TEST_F(DBBlobBasicTest, BlobFileChecksumInFileOptions) {
@@ -4173,6 +6126,56 @@ TEST_F(DBBlobBasicTest, BestEffortsRecoveryFencedKeepsNormalBlobBelowOldest) {
   EXPECT_EQ(Get("a"), "NOT_FOUND");
   EXPECT_EQ(Get("m"), "value-m");
   EXPECT_EQ(Get("late"), "value-late");
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsRecoveryFencedNeedsUnretiredOrigin) {
+  // The save rule keeps an indirect origin until a blob file retirement record
+  // removes it, even when all its values count as garbage. So best-efforts
+  // recovery in a fenced column family counts a missing, unretired indirect
+  // origin as needed, whatever its garbage count, and does not accept a point
+  // that lists it.
+  //
+  // Indirect origin O holds the first value of "x". A new value and a full
+  // compaction make all of O garbage, but no GC retires O. Then O is deleted
+  // from disk. Every point after O's addition lists O, so recovery falls back
+  // to the first point, an empty DB: no read returns Corruption.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("x", "old-x"));
+  ASSERT_OK(Flush());
+  const uint64_t origin = GetBlobFileNumbers().back();
+  ASSERT_OK(Put("x", "new-x"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact;
+  compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  {
+    const auto meta =
+        cfd->current()->storage_info()->GetBlobFileMetaData(origin);
+    ASSERT_NE(meta, nullptr);
+    ASSERT_TRUE(meta->IsIndirectOrigin());
+    ASSERT_TRUE(meta->GetLinkedSsts().empty());
+    ASSERT_EQ(meta->GetGarbageBlobCount(), meta->GetTotalBlobCount());
+  }
+  ASSERT_OK(Put("late", "value-late"));
+  ASSERT_OK(Flush());
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, origin)));
+
+  options.best_efforts_recovery = true;
+  ASSERT_OK(TryReopen(options));
+  for (const char* key : {"x", "late"}) {
+    std::string value;
+    const Status s = db_->Get(ReadOptions(), key, &value);
+    ASSERT_TRUE(s.IsNotFound()) << key << ": " << s.ToString();
+  }
 }
 
 TEST_F(DBBlobBasicTest, BestEffortsBlobDbRepairRecordsMissingBlobFile) {
@@ -7780,6 +9783,833 @@ TEST_F(DBBlobBasicTest, GetApproximateSizesConservesMixedMetadataBudget) {
   const uint64_t distribution_change =
       after[1] > before[1] ? after[1] - before[1] : before[1] - after[1];
   ASSERT_GT(distribution_change, physical_blob_size / 100);
+}
+
+namespace {
+
+// The keys that "rocksdb.indirect-blob-gc-stats" reports from the census diff
+// on. Later diffs add more keys, so the tests check that these keys exist, not
+// that the map has exactly these keys.
+constexpr const char* kCensusSignalKeys[] = {"census-state",
+                                             "census-unready-micros",
+                                             "census-consecutive-failures",
+                                             "census-builds",
+                                             "census-bytes",
+                                             "route-count",
+                                             "relocation-file-count",
+                                             "relocation-file-bytes",
+                                             "tracked-files",
+                                             "garbage-bytes-collectable",
+                                             "garbage-bytes-suppressed",
+                                             "coarse-pinned-files",
+                                             "coarse-pinned-bytes",
+                                             "coarse-pinned-garbage-bytes",
+                                             "relocation-garbage-bytes"};
+
+// The census tests read the census LOG lines (INFO when a build is ready, WARN
+// from DumpStats when the census stays unready). This logger keeps every line
+// with its level, so a test can count the lines that contain a text.
+class CensusSignalLog : public Logger {
+ public:
+  CensusSignalLog() : Logger(InfoLogLevel::DEBUG_LEVEL) {}
+
+  using Logger::Logv;
+  void Logv(const InfoLogLevel log_level, const char* format,
+            va_list ap) override {
+    char buffer[4096];
+    vsnprintf(buffer, sizeof(buffer), format, ap);
+    std::lock_guard<std::mutex> lock(mutex_);
+    lines_.emplace_back(log_level, buffer);
+  }
+
+  // Returns the lines at `log_level` that contain `text`.
+  std::vector<std::string> Find(InfoLogLevel log_level,
+                                const std::string& text) const {
+    std::vector<std::string> found;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& line : lines_) {
+      if (line.first == log_level &&
+          line.second.find(text) != std::string::npos) {
+        found.push_back(line.second);
+      }
+    }
+    return found;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::pair<InfoLogLevel, std::string>> lines_;
+};
+
+// The DB clock of the census tests: the real clock plus an offset that the
+// test adds. A test moves DB time forward by minutes without a sleep, and
+// timers and condition variables still work in real time.
+class CensusSignalClock : public SystemClockWrapper {
+ public:
+  explicit CensusSignalClock(const std::shared_ptr<SystemClock>& target)
+      : SystemClockWrapper(target) {}
+
+  static const char* kClassName() { return "CensusSignalClock"; }
+  const char* Name() const override { return kClassName(); }
+  uint64_t NowMicros() override {
+    return target_->NowMicros() + offset_micros_.load();
+  }
+  uint64_t NowNanos() override {
+    return target_->NowNanos() + offset_micros_.load() * 1000;
+  }
+  void Advance(uint64_t micros) { offset_micros_.fetch_add(micros); }
+
+ private:
+  std::atomic<uint64_t> offset_micros_{0};
+};
+
+// The 10 minutes after which DumpStats warns about an unready census
+// (kCensusUnreadyWarnMicros in DBImpl::DumpStats()).
+constexpr uint64_t kCensusUnreadyWarnMicros = 10ULL * 60 * 1000 * 1000;
+constexpr char kCensusReadyLine[] = "Blob reference census is ready at Version";
+constexpr char kCensusUnreadyLine[] =
+    "Blob reference census has been unready for";
+
+// Options for the census tests: blob indirection with every value in a blob
+// file, and no automatic compaction or blob GC, so the tests decide when the
+// census changes.
+Options CensusSignalOptions(Options options) {
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  // The tests call DumpStats() directly, so the periodic dump does not add
+  // lines.
+  options.stats_dump_period_sec = 0;
+  return options;
+}
+
+std::map<std::string, std::string> GetCensusSignals(DB* db) {
+  std::map<std::string, std::string> stats;
+  EXPECT_TRUE(db->GetMapProperty(DB::Properties::kIndirectBlobGcStats, &stats));
+  for (const char* key : kCensusSignalKeys) {
+    EXPECT_EQ(stats.count(key), 1U) << key;
+  }
+  return stats;
+}
+
+// Returns the number of a numeric key of "rocksdb.indirect-blob-gc-stats".
+uint64_t GetCensusSignal(DB* db, const std::string& key) {
+  const std::map<std::string, std::string> stats = GetCensusSignals(db);
+  const auto it = stats.find(key);
+  EXPECT_NE(it, stats.end()) << key;
+  return it == stats.end() ? 0 : std::stoull(it->second);
+}
+
+std::string GetCensusState(DB* db) {
+  return GetCensusSignals(db)["census-state"];
+}
+
+uint64_t GetCensusUnreadyProperty(DB* db) {
+  uint64_t value = 0;
+  EXPECT_TRUE(db->GetIntProperty(
+      DB::Properties::kBlobReferenceCensusUnreadyMicros, &value));
+  return value;
+}
+
+// Reads the number that follows `prefix` in `line` (0 when it is not there).
+uint64_t NumberAfter(const std::string& line, const std::string& prefix) {
+  const size_t position = line.find(prefix);
+  if (position == std::string::npos) {
+    return 0;
+  }
+  return std::strtoull(line.c_str() + position + prefix.size(), nullptr, 10);
+}
+
+}  // namespace
+
+TEST_F(DBBlobBasicTest, CloseWaitsForCensusCallbackCleanup) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool callback_entered = false;
+  bool close_waiting = false;
+  bool release_callback = false;
+  std::atomic<bool> closed{false};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Done", [&](void*) {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    callback_entered = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return release_callback; });
+  });
+  sync_point->SetCallBack("DBImpl::~DBImpl:WaitJob", [&](void*) {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    close_waiting = true;
+    gate_cv.notify_all();
+  });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate_cv.wait(lock, [&] { return callback_entered; });
+  }
+  port::Thread closer([&] {
+    Close();
+    closed.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate_cv.wait(lock, [&] { return close_waiting; });
+    EXPECT_FALSE(closed.load());
+    release_callback = true;
+    gate_cv.notify_all();
+  }
+  closer.join();
+  EXPECT_TRUE(closed.load());
+}
+
+TEST_F(DBBlobBasicTest, CensusSignalsStayOffWithoutBlobIndirection) {
+  // A DB with blob files but without blob indirection has no census. Every
+  // census signal must stay at its "off" value: census-state is "none", every
+  // number is 0, the census LOG lines never appear, and rocksdb.blob-stats has
+  // the base RocksDB text without a relocation file count.
+  auto log = std::make_shared<CensusSignalLog>();
+  auto clock = std::make_shared<CensusSignalClock>(env_->GetSystemClock());
+  std::unique_ptr<Env> clock_env(new CompositeEnvWrapper(env_, clock));
+  auto cleanup = Defer([this] { Close(); });
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  options.enable_blob_indirection = false;
+  options.env = clock_env.get();
+  options.info_log = log;
+  Reopen(options);
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), std::string(1024, 'v')));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  const std::map<std::string, std::string> stats = GetCensusSignals(db_.get());
+  for (const auto& entry : stats) {
+    EXPECT_EQ(entry.second, entry.first == "census-state" ? "none" : "0")
+        << entry.first;
+  }
+  ASSERT_EQ(GetCensusUnreadyProperty(db_.get()), 0U);
+
+  // Even after more than 10 minutes, DumpStats has no census to warn about.
+  clock->Advance(kCensusUnreadyWarnMicros + 60ULL * 1000 * 1000);
+  dbfull()->DumpStats();
+  EXPECT_TRUE(log->Find(InfoLogLevel::WARN_LEVEL, kCensusUnreadyLine).empty());
+  EXPECT_TRUE(log->Find(InfoLogLevel::INFO_LEVEL, kCensusReadyLine).empty());
+
+  std::string blob_stats;
+  ASSERT_TRUE(db_->GetProperty(DB::Properties::kBlobStats, &blob_stats));
+  EXPECT_EQ(blob_stats.rfind("Number of blob files: 1\n", 0), 0U) << blob_stats;
+  EXPECT_EQ(blob_stats.find("relocation files"), std::string::npos)
+      << blob_stats;
+}
+
+TEST_F(DBBlobBasicTest, CensusSignalsTrackBuildAndGarbage) {
+  // After a census build, the map reports a ready census with memory and
+  // tracked files, and the LOG has the "ready" line. After deletes and a
+  // compaction, the census publishes collectable garbage.
+  auto log = std::make_shared<CensusSignalLog>();
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  options.info_log = log;
+  Reopen(options);
+  // The census starts when the first flush writes the format fence.
+  ASSERT_EQ(GetCensusState(db_.get()), "none");
+
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), std::string(4096, 'v')));
+  }
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+  EXPECT_EQ(GetCensusSignal(db_.get(), "census-unready-micros"), 0U);
+  EXPECT_EQ(GetCensusUnreadyProperty(db_.get()), 0U);
+  EXPECT_EQ(GetCensusSignal(db_.get(), "census-consecutive-failures"), 0U);
+  EXPECT_GE(GetCensusSignal(db_.get(), "census-builds"), 1U);
+  EXPECT_GT(GetCensusSignal(db_.get(), "census-bytes"), 0U);
+  // Every value is still live, so no garbage is reported yet.
+  EXPECT_EQ(GetCensusSignal(db_.get(), "garbage-bytes-collectable"), 0U);
+  EXPECT_EQ(GetCensusSignal(db_.get(), "route-count"), 0U);
+  EXPECT_EQ(GetCensusSignal(db_.get(), "relocation-file-count"), 0U);
+  EXPECT_EQ(GetCensusSignal(db_.get(), "relocation-file-bytes"), 0U);
+  EXPECT_FALSE(log->Find(InfoLogLevel::INFO_LEVEL, kCensusReadyLine).empty());
+
+  // Three of the four values become garbage in their blob file.
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+  EXPECT_GT(GetCensusSignal(db_.get(), "tracked-files"), 0U);
+  EXPECT_GE(GetCensusSignal(db_.get(), "garbage-bytes-collectable"),
+            3U * 4096U);
+  EXPECT_EQ(GetCensusSignal(db_.get(), "garbage-bytes-suppressed"), 0U);
+  ASSERT_EQ(Get("key3"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, CensusSignalsReportHeldBuild) {
+  // While a census build is held, the census is "building": its unready time
+  // grows, both unready signals agree, and change log entries add to
+  // census-bytes. After 10 minutes DumpStats warns. When the build finishes,
+  // the census is ready, the change log is freed, and the "ready" LOG line
+  // reports how long the build took.
+  auto log = std::make_shared<CensusSignalLog>();
+  auto clock = std::make_shared<CensusSignalClock>(env_->GetSystemClock());
+  std::unique_ptr<Env> clock_env(new CompositeEnvWrapper(env_, clock));
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  bool released = false;
+  auto cleanup = Defer([&] {
+    if (!released) {
+      TEST_SYNC_POINT("DBBlobBasicTest::CensusSignalsReleaseBuild");
+    }
+    Close();
+    sync_point->DisableProcessing();
+    sync_point->LoadDependency({});
+  });
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  options.env = clock_env.get();
+  options.info_log = log;
+  Reopen(options);
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  Close();
+
+  // Hold the build that starts at open after its build cursor opened. The
+  // build has started, so the census has an unready start time, and the cursor
+  // keeps the change log entries of later installs.
+  sync_point->LoadDependency(
+      {{"DBImpl::BuildBlobReferenceCensus:NewBuildReady",
+        "DBBlobBasicTest::CensusSignalsBuildHeld"},
+       {"DBBlobBasicTest::CensusSignalsReleaseBuild",
+        "DBImpl::BuildBlobReferenceCensus:NewBuildWait"}});
+  sync_point->EnableProcessing();
+  Reopen(options);
+  TEST_SYNC_POINT("DBBlobBasicTest::CensusSignalsBuildHeld");
+  ASSERT_EQ(GetCensusState(db_.get()), "building");
+  EXPECT_EQ(GetCensusSignal(db_.get(), "census-consecutive-failures"), 0U);
+
+  // The unready time is a duration. The int property and the map key read the
+  // same value, so the property is between two reads of the key.
+  clock->Advance(1000 * 1000);
+  const uint64_t unready_before =
+      GetCensusSignal(db_.get(), "census-unready-micros");
+  const uint64_t unready_property = GetCensusUnreadyProperty(db_.get());
+  const uint64_t unready_after =
+      GetCensusSignal(db_.get(), "census-unready-micros");
+  EXPECT_GE(unready_before, 1000U * 1000U);
+  EXPECT_LE(unready_before, unready_property);
+  EXPECT_LE(unready_property, unready_after);
+
+  // Each flush installs a new Version while the build cursor holds the change
+  // log, so the log grows and census-bytes goes up.
+  uint64_t bytes = GetCensusSignal(db_.get(), "census-bytes");
+  EXPECT_GT(bytes, 0U);
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put("held" + std::to_string(i), std::string(4096, 'h')));
+    ASSERT_OK(Flush());
+    const uint64_t grown = GetCensusSignal(db_.get(), "census-bytes");
+    EXPECT_GT(grown, bytes);
+    bytes = grown;
+  }
+  ASSERT_EQ(GetCensusState(db_.get()), "building");
+
+  // Below 10 minutes DumpStats does not warn. Above, it warns once per call.
+  dbfull()->DumpStats();
+  EXPECT_TRUE(log->Find(InfoLogLevel::WARN_LEVEL, kCensusUnreadyLine).empty());
+  clock->Advance(kCensusUnreadyWarnMicros);
+  dbfull()->DumpStats();
+  const std::vector<std::string> warnings =
+      log->Find(InfoLogLevel::WARN_LEVEL, kCensusUnreadyLine);
+  ASSERT_EQ(warnings.size(), 1U);
+  EXPECT_GT(NumberAfter(warnings[0], kCensusUnreadyLine),
+            kCensusUnreadyWarnMicros / 1000000);
+  EXPECT_NE(
+      warnings[0].find("(state: building, failed builds in a row (max 6): 0)"),
+      std::string::npos)
+      << warnings[0];
+
+  const size_t ready_lines_before =
+      log->Find(InfoLogLevel::INFO_LEVEL, kCensusReadyLine).size();
+  TEST_SYNC_POINT("DBBlobBasicTest::CensusSignalsReleaseBuild");
+  released = true;
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+  EXPECT_EQ(GetCensusSignal(db_.get(), "census-unready-micros"), 0U);
+  EXPECT_EQ(GetCensusUnreadyProperty(db_.get()), 0U);
+  // The publish frees the change log entries that the build cursor held.
+  EXPECT_LT(GetCensusSignal(db_.get(), "census-bytes"), bytes);
+  const std::vector<std::string> ready_lines =
+      log->Find(InfoLogLevel::INFO_LEVEL, kCensusReadyLine);
+  ASSERT_GT(ready_lines.size(), ready_lines_before);
+  // The held build took more than 10 minutes of DB time.
+  EXPECT_GT(NumberAfter(ready_lines[ready_lines_before], " after "),
+            kCensusUnreadyWarnMicros / 1000);
+  // A ready census gives no more warnings.
+  dbfull()->DumpStats();
+  EXPECT_EQ(log->Find(InfoLogLevel::WARN_LEVEL, kCensusUnreadyLine).size(), 1U);
+  ASSERT_EQ(Get("held1"), std::string(4096, 'h'));
+}
+
+TEST_F(DBBlobBasicTest, CensusSignalsReportFailedBuild) {
+  // A census build that fails makes the census "failed" and counts the failure.
+  // After 10 minutes DumpStats warns with the failed state. When the next build
+  // succeeds, the census is ready, the failure count is 0, and census-builds
+  // went up.
+  auto log = std::make_shared<CensusSignalLog>();
+  auto clock = std::make_shared<CensusSignalClock>(env_->GetSystemClock());
+  std::unique_ptr<Env> clock_env(new CompositeEnvWrapper(env_, clock));
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  std::mutex mutex;
+  std::condition_variable cv;
+  int finished_jobs = 0;
+  std::atomic<bool> inject_failure{true};
+  auto cleanup = Defer([&] {
+    Close();
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  options.env = clock_env.get();
+  options.info_log = log;
+  Reopen(options);
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  // A forced compaction writes an SST with exact reference metadata, which
+  // the census build at open reads.
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  Close();
+
+  sync_point->SetCallBack(
+      "DBImpl::BuildBlobReferenceCensus:ReadFileStatus", [&](void* arg) {
+        if (inject_failure.load()) {
+          *static_cast<Status*>(arg) = Status::IOError("injected failure");
+        }
+      });
+  // A long retry delay (one day) keeps the periodic retry from running a
+  // second build while the test checks the failed state.
+  sync_point->SetCallBack(
+      "DBImpl::BGWorkBlobReferenceCensus:FailureRetryDelay", [](void* arg) {
+        *static_cast<uint64_t*>(arg) = 24ULL * 3600 * 1000 * 1000;
+      });
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Done", [&](void*) {
+    std::lock_guard<std::mutex> lock(mutex);
+    ++finished_jobs;
+    cv.notify_all();
+  });
+  sync_point->EnableProcessing();
+  Reopen(options);
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return finished_jobs >= 1; }));
+  }
+  ASSERT_EQ(GetCensusState(db_.get()), "failed");
+  EXPECT_EQ(GetCensusSignal(db_.get(), "census-consecutive-failures"), 1U);
+  const uint64_t failed_builds = GetCensusSignal(db_.get(), "census-builds");
+  EXPECT_GE(failed_builds, 1U);
+  clock->Advance(1000 * 1000);
+  EXPECT_GE(GetCensusSignal(db_.get(), "census-unready-micros"), 1000U * 1000U);
+  EXPECT_GE(GetCensusUnreadyProperty(db_.get()), 1000U * 1000U);
+
+  dbfull()->DumpStats();
+  EXPECT_TRUE(log->Find(InfoLogLevel::WARN_LEVEL, kCensusUnreadyLine).empty());
+  clock->Advance(kCensusUnreadyWarnMicros);
+  dbfull()->DumpStats();
+  const std::vector<std::string> warnings =
+      log->Find(InfoLogLevel::WARN_LEVEL, kCensusUnreadyLine);
+  ASSERT_EQ(warnings.size(), 1U);
+  EXPECT_NE(
+      warnings[0].find("(state: failed, failed builds in a row (max 6): 1)"),
+      std::string::npos)
+      << warnings[0];
+
+  // Move past the retry delay. The wait moves the census to the run queue, and
+  // the new build succeeds.
+  inject_failure.store(false);
+  clock->Advance(2 * 24ULL * 3600 * 1000 * 1000);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+  EXPECT_EQ(GetCensusSignal(db_.get(), "census-consecutive-failures"), 0U);
+  EXPECT_GT(GetCensusSignal(db_.get(), "census-builds"), failed_builds);
+  EXPECT_EQ(GetCensusSignal(db_.get(), "census-unready-micros"), 0U);
+  EXPECT_EQ(GetCensusUnreadyProperty(db_.get()), 0U);
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, CensusSignalsCountRelocationFilesAndRoutes) {
+  // The relocation file and route keys of the map, and the relocation file
+  // count in rocksdb.blob-stats, follow the relocation state of the current
+  // Version. Without relocation files, rocksdb.blob-stats has the base RocksDB
+  // text; with them, it adds "(+N relocation files)".
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  Reopen(options);
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  std::string blob_stats;
+  ASSERT_TRUE(db_->GetProperty(DB::Properties::kBlobStats, &blob_stats));
+  EXPECT_EQ(blob_stats.rfind("Number of blob files: 1\n", 0), 0U) << blob_stats;
+  EXPECT_EQ(blob_stats.find("relocation files"), std::string::npos)
+      << blob_stats;
+
+  BlobPhysicalFile relocation_file;
+  ASSERT_NO_FATAL_FAILURE(InstallOneRelocationFile(options, &relocation_file));
+  EXPECT_EQ(GetCensusSignal(db_.get(), "relocation-file-count"), 1U);
+  EXPECT_GT(GetCensusSignal(db_.get(), "relocation-file-bytes"), 0U);
+  EXPECT_EQ(GetCensusSignal(db_.get(), "route-count"), 0U);
+  blob_stats.clear();
+  ASSERT_TRUE(db_->GetProperty(DB::Properties::kBlobStats, &blob_stats));
+  const size_t relocation_files = dbfull()
+                                      ->GetVersionSet()
+                                      ->GetColumnFamilySet()
+                                      ->GetDefault()
+                                      ->current()
+                                      ->storage_info()
+                                      ->GetBlobRelocationFiles()
+                                      .size();
+  ASSERT_EQ(relocation_files, 1U);
+  EXPECT_EQ(blob_stats.rfind("Number of blob files: 1 (+" +
+                                 std::to_string(relocation_files) +
+                                 " relocation files)\n",
+                             0),
+            0U)
+      << blob_stats;
+
+  // A route from an old file number (not a live file) to the relocation file.
+  VersionSet* const version_set = dbfull()->GetVersionSet();
+  dbfull()->TEST_LockMutex();
+  const uint64_t routed_generation = version_set->NewFileNumber();
+  dbfull()->TEST_UnlockMutex();
+  VersionEdit route;
+  route.SetColumnFamily(0);
+  route.SetBlobRelocationRoute(BlobRelocationRoute(
+      routed_generation, relocation_file.open_info.file_number));
+  ASSERT_OK(ApplyVersionEdit(&route, /*new_descriptor_log=*/false));
+  EXPECT_EQ(GetCensusSignal(db_.get(), "route-count"), 1U);
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, PauseBackgroundWorkWaitsForRunningCensusJob) {
+  // The census job is background work: it reads SSTs, stores GC candidates in
+  // the current Version and schedules compactions. So PauseBackgroundWork()
+  // must wait for a running census job and return only after the job ends,
+  // without a deadlock.
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool pause_waiting = false;
+  std::atomic<int> finished_jobs{0};
+  bool released = false;
+  std::unique_ptr<port::Thread> pauser;
+  auto cleanup = Defer([&] {
+    if (!released) {
+      TEST_SYNC_POINT("DBBlobBasicTest::PauseReleaseCensusJob");
+    }
+    if (pauser != nullptr) {
+      pauser->join();
+    }
+    Close();
+    sync_point->DisableProcessing();
+    sync_point->LoadDependency({});
+    sync_point->ClearAllCallBacks();
+  });
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  Reopen(options);
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  Close();
+
+  // Hold the census job that starts at open before it builds.
+  sync_point->LoadDependency(
+      {{"DBImpl::BGWorkBlobReferenceCensus:BeforeBuildReady",
+        "DBBlobBasicTest::PauseCensusJobHeld"},
+       {"DBBlobBasicTest::PauseReleaseCensusJob",
+        "DBImpl::BGWorkBlobReferenceCensus:BeforeBuildWait"}});
+  sync_point->SetCallBack("DBImpl::PauseBackgroundWork:Wait", [&](void*) {
+    std::lock_guard<std::mutex> lock(mutex);
+    pause_waiting = true;
+    cv.notify_all();
+  });
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Done",
+                          [&](void*) { finished_jobs.fetch_add(1); });
+  sync_point->EnableProcessing();
+  Reopen(options);
+  TEST_SYNC_POINT("DBBlobBasicTest::PauseCensusJobHeld");
+
+  std::atomic<bool> pause_returned{false};
+  Status pause_status;
+  int finished_at_return = -1;
+  pauser.reset(new port::Thread([&] {
+    pause_status = dbfull()->PauseBackgroundWork();
+    finished_at_return = finished_jobs.load();
+    pause_returned.store(true);
+  }));
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return pause_waiting; }));
+  }
+  // The census job is still held, so the pause still waits.
+  EXPECT_FALSE(pause_returned.load());
+  TEST_SYNC_POINT("DBBlobBasicTest::PauseReleaseCensusJob");
+  released = true;
+  pauser->join();
+  pauser.reset();
+  ASSERT_OK(pause_status);
+  EXPECT_GE(finished_at_return, 1);
+  ASSERT_OK(dbfull()->ContinueBackgroundWork());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, ContinueBackgroundWorkSchedulesPausedCensusJob) {
+  // While background work is paused, a Version install that leaves the census
+  // behind does not start the census job. ContinueBackgroundWork() schedules
+  // the job again by itself, and the census becomes ready.
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  std::mutex mutex;
+  std::condition_variable cv;
+  int started_jobs = 0;
+  int finished_jobs = 0;
+  bool paused = false;
+  auto cleanup = Defer([&] {
+    if (paused) {
+      EXPECT_OK(dbfull()->ContinueBackgroundWork());
+    }
+    Close();
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  Reopen(options);
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Start",
+                          [&](void*) {
+                            std::lock_guard<std::mutex> lock(mutex);
+                            ++started_jobs;
+                          });
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Done", [&](void*) {
+    std::lock_guard<std::mutex> lock(mutex);
+    ++finished_jobs;
+    cv.notify_all();
+  });
+  sync_point->EnableProcessing();
+  ASSERT_OK(dbfull()->PauseBackgroundWork());
+  paused = true;
+  // A flush or compaction cannot run while paused, so install a new Version
+  // directly. The census must catch up with it in its job.
+  VersionEdit edit;
+  edit.SetColumnFamily(0);
+  ASSERT_OK(ApplyVersionEdit(&edit, /*new_descriptor_log=*/false));
+  ASSERT_EQ(GetCensusState(db_.get()), "building");
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(started_jobs, 0);
+  }
+
+  // Do not call TEST_WaitForBlobReferenceCensus() before the job ends: it
+  // schedules the job itself. Wait for the job that ContinueBackgroundWork()
+  // schedules.
+  paused = false;
+  ASSERT_OK(dbfull()->ContinueBackgroundWork());
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30),
+                            [&] { return finished_jobs >= 1; }));
+    EXPECT_GE(started_jobs, 1);
+  }
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, PausedCensusJobDoesNotStartWhenRequested) {
+  // While background work is paused, a request to schedule the census job
+  // (what a Version install makes) keeps the column family in the queue and
+  // does not start the job. After ContinueBackgroundWork() the census becomes
+  // ready.
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  std::atomic<int> started_jobs{0};
+  bool paused = false;
+  auto cleanup = Defer([&] {
+    if (paused) {
+      EXPECT_OK(dbfull()->ContinueBackgroundWork());
+    }
+    Close();
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  Reopen(options);
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Start",
+                          [&](void*) { started_jobs.fetch_add(1); });
+  sync_point->EnableProcessing();
+  ASSERT_OK(dbfull()->PauseBackgroundWork());
+  paused = true;
+  VersionEdit edit;
+  edit.SetColumnFamily(0);
+  ASSERT_OK(ApplyVersionEdit(&edit, /*new_descriptor_log=*/false));
+  ASSERT_EQ(GetCensusState(db_.get()), "building");
+  // The test wait asks to schedule the census job of every column family and
+  // then waits for a scheduled job. While paused, no job is scheduled, so the
+  // wait returns at once and the census stays behind.
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  EXPECT_EQ(started_jobs.load(), 0);
+  ASSERT_EQ(GetCensusState(db_.get()), "building");
+
+  paused = false;
+  ASSERT_OK(dbfull()->ContinueBackgroundWork());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  EXPECT_GE(started_jobs.load(), 1);
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, CensusUnreadyTimeStartsWhenCensusIsCreated) {
+  // A Version install that adds the format fence creates the census of the
+  // column family before it writes the MANIFEST. When that MANIFEST write
+  // fails, no census install follows, and the census job is not scheduled.
+  // The census then exists without a build. Its unready time must still count
+  // from its creation, so census-unready-micros and the int property do not
+  // report 0 while the census is unready.
+  auto clock = std::make_shared<CensusSignalClock>(env_->GetSystemClock());
+  std::unique_ptr<Env> clock_env(new CompositeEnvWrapper(env_, clock));
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  std::atomic<bool> fail_manifest{false};
+  bool released = false;
+  auto cleanup = Defer([&] {
+    if (!released) {
+      TEST_SYNC_POINT("DBBlobBasicTest::CensusCreatedReleaseJob");
+    }
+    Close();
+    sync_point->DisableProcessing();
+    sync_point->LoadDependency({});
+    sync_point->ClearAllCallBacks();
+  });
+  Options options = CensusSignalOptions(GetDefaultOptions());
+  options.env = clock_env.get();
+  options.create_if_missing = true;
+  // The test resumes by hand, so an automatic resume cannot install a Version
+  // (and start the unready time) before the checks.
+  options.max_bgerror_resume_count = 0;
+  DestroyAndReopen(options);
+  ASSERT_EQ(GetCensusState(db_.get()), "none");
+
+  // If a census job starts, hold it before it starts the build (before
+  // BeginBuild()), so only the census creation can set the unready time.
+  sync_point->LoadDependency(
+      {{"DBBlobBasicTest::CensusCreatedReleaseJob",
+        "DBImpl::BGWorkBlobReferenceCensus:BeforeBuildWait"}});
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+        if (fail_manifest.load()) {
+          // A retryable error lets Resume() recover the DB below.
+          IOStatus error = IOStatus::IOError("injected failure");
+          error.SetRetryable(true);
+          *static_cast<IOStatus*>(arg) = error;
+        }
+      });
+  sync_point->EnableProcessing();
+  // The first flush writes the format fence. Its MANIFEST write fails.
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  fail_manifest.store(true);
+  ASSERT_NOK(Flush());
+  fail_manifest.store(false);
+  ASSERT_EQ(GetCensusState(db_.get()), "building");
+  clock->Advance(1000 * 1000);
+  EXPECT_GE(GetCensusSignal(db_.get(), "census-unready-micros"), 1000U * 1000U);
+  EXPECT_GE(GetCensusUnreadyProperty(db_.get()), 1000U * 1000U);
+
+  TEST_SYNC_POINT("DBBlobBasicTest::CensusCreatedReleaseJob");
+  released = true;
+  ASSERT_OK(dbfull()->Resume());
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(GetCensusState(db_.get()), "ready");
+  EXPECT_EQ(GetCensusSignal(db_.get(), "census-unready-micros"), 0U);
+  EXPECT_EQ(GetCensusUnreadyProperty(db_.get()), 0U);
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, EveryPropertyHasAStringForm) {
+  // DB::GetProperty() asserts that each property has a string, int or DBImpl
+  // string handler, and db_stress reads every property with it. A property
+  // with only a map handler would crash a debug build there.
+  for (const auto& [name, info] : InternalStats::ppt_name_to_info) {
+    SCOPED_TRACE(name);
+    EXPECT_TRUE(info.handle_string != nullptr || info.handle_int != nullptr ||
+                info.handle_string_dbimpl != nullptr);
+  }
+  // The blob indirection properties work in every form that they support,
+  // with the feature off and on.
+  for (const bool indirection : {false, true}) {
+    SCOPED_TRACE(indirection ? "indirection on" : "indirection off");
+    Options options = CurrentOptions();
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = indirection;
+    options.min_blob_size = 0;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", std::string(4096, 'v')));
+    ASSERT_OK(Flush());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+
+    std::string value;
+    std::map<std::string, std::string> map_value;
+    ASSERT_TRUE(db_->GetProperty(DB::Properties::kIndirectBlobGcStats, &value));
+    ASSERT_TRUE(
+        db_->GetMapProperty(DB::Properties::kIndirectBlobGcStats, &map_value));
+    EXPECT_EQ(map_value["census-state"], indirection ? "ready" : "none");
+    // The string form has one "key=value" line per map key.
+    std::string expected;
+    for (const auto& [key, key_value] : map_value) {
+      expected.append(key).append("=").append(key_value).append("\n");
+    }
+    EXPECT_EQ(value, expected);
+
+    for (const std::string& name :
+         {DB::Properties::kBlobIndirectionFormatVersion,
+          DB::Properties::kBlobReferenceCensusUnreadyMicros}) {
+      SCOPED_TRACE(name);
+      uint64_t int_value = 0;
+      ASSERT_TRUE(db_->GetProperty(name, &value));
+      ASSERT_TRUE(db_->GetIntProperty(name, &int_value));
+      EXPECT_EQ(value, std::to_string(int_value));
+    }
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
