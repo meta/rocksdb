@@ -638,7 +638,17 @@ Status DBImpl::Recover(
   if (!s.ok()) {
     return s;
   }
-
+  if (!read_only) {
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd == nullptr || cfd->IsDropped()) {
+        continue;
+      }
+      s = cfd->ValidateBlobIndirectionOptionsAfterRecovery();
+      if (!s.ok()) {
+        return s;
+      }
+    }
+  }
   if (s.ok() && !read_only) {
     for (auto cfd : *versions_->GetColumnFamilySet()) {
       const auto& moptions = cfd->GetLatestMutableCFOptions();
@@ -2187,6 +2197,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
   // Note that here we treat flush as level 0 compaction in internal stats
   InternalStats::CompactionStats flush_stats(CompactionReason::kFlush,
                                              1 /* count */);
+  bool output_built_with_indirection = false;
   {
     ScopedArenaPtr<InternalIterator> iter(
         logical_strip_timestamp
@@ -2204,6 +2215,8 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     // Get the latest mutable cf options while the mutex is still locked
     const MutableCFOptions mutable_cf_options_copy =
         cfd->GetLatestMutableCFOptions();
+    output_built_with_indirection =
+        mutable_cf_options_copy.enable_blob_indirection;
     bool paranoid_file_checks =
         cfd->GetLatestMutableCFOptions().paranoid_file_checks;
 
@@ -2347,6 +2360,10 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
 
   if (s.ok() && has_output) {
     edit->AddFile(level, meta);
+    // The WAL recovery flush can be the first job that writes indirect
+    // BlobIndexes. So, like a normal flush, it sets the per-CF format fence
+    // when its SST was built with enable_blob_indirection on.
+    edit->MaybeSetBlobIndirectionFormatFence(output_built_with_indirection);
 
     for (const auto& blob : blob_file_additions) {
       edit->AddBlobFile(blob);
