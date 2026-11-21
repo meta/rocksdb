@@ -34,6 +34,7 @@
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/logging.h"
@@ -1314,6 +1315,21 @@ struct BlockBasedTableBuilder::Rep {
   std::shared_ptr<CacheReservationManager>
       compression_dict_buffer_cache_res_mgr;
   std::unique_ptr<BlobReferenceMetadataCollector> blob_reference_collector;
+  std::unique_ptr<BlobRelocationDirectoryBuilder>
+      blob_relocation_directory_builder;
+  std::optional<BlobRelocationFileMetadata> blob_relocation_file_metadata;
+  // The open group of a relocation file: values whose location entry is not
+  // written yet (see PrepareBlobRelocationGroup()).
+  struct BlobRelocationGroupState {
+    uint64_t origin_file_number = 0;
+    uint64_t first_record_offset = 0;
+    // Where the next record of the group must start (debug check only).
+    uint64_t next_record_offset = 0;
+    size_t count = 0;
+    std::array<BlobRelocationGroupValue, kBlobRelocationGroupSize> values;
+    // Encoding buffer of the location entry value.
+    std::string encoded;
+  } blob_relocation_group;
   const bool use_delta_encoding_for_index_values;
   std::unique_ptr<FilterBlockBuilder> filter_builder;
   OffsetableCacheKey base_cache_key;
@@ -2270,7 +2286,10 @@ void BlockBasedTableBuilder::AddImpl(const Slice& ikey, const Slice& value,
   Slice entry_value = value;
 
   if (IsValueType(value_type)) {
-    if (r->embedded_blob_options) {
+    // A relocation file writes its records itself; its kTypeValue entries are
+    // location entries, which stay in the data blocks.
+    if (r->embedded_blob_options &&
+        r->blob_relocation_directory_builder == nullptr) {
       if (!MaybeExtractEmbeddedBlobs(seq, value_type, &entry_ikey,
                                      &entry_value)) {
         return;  // failed status already recorded
@@ -3364,7 +3383,9 @@ IOStatus BlockBasedTableBuilder::io_status() const {
 
 bool BlockBasedTableBuilder::ok() const { return rep_->StatusOk(); }
 
-Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(const Slice& payload) {
+Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(
+    const Slice& payload, CompressionType compression,
+    uint64_t* record_offset) {
   Rep* r = rep_.get();
   assert(r->embedded_blob_options);
   // Inline blob writing requires single-threaded writes so the running table
@@ -3373,8 +3394,8 @@ Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(const Slice& payload) {
 
   // Embedded blob payloads share the 32-bit value-size limit with the rest of
   // the table format; enforcing it here keeps record sizes in range and gives
-  // an early, cheap corruption check.
-  if (payload.size() > std::numeric_limits<uint32_t>::max()) {
+  // an early, cheap size check.
+  if (payload.size() > kMaxSimpleGen2BlobPayloadSize) {
     return Status::InvalidArgument("Embedded blob value is too large");
   }
 
@@ -3385,8 +3406,6 @@ Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(const Slice& payload) {
   // The builder's running table offset equals the current file size, so the
   // record begins exactly here.
   const uint64_t offset = r->get_offset();
-  // Placeholder for future embedded blob compression support.
-  const CompressionType compression = kNoCompression;
   IOStatus io_s = WriteSimpleGen2BlobRecord(
       r->file, r->write_options, r->table_options.checksum,
       r->base_context_checksum, offset, payload, compression);
@@ -3403,6 +3422,202 @@ Status BlockBasedTableBuilder::WriteEmbeddedBlobRecord(const Slice& payload) {
   BlobIndex::EncodeBlob(&r->embedded_blob_state->blob_index_buf,
                         kCurrentFileBlobIndexFileNumber, offset, payload.size(),
                         compression);
+  if (record_offset != nullptr) {
+    *record_offset = offset;
+  }
+  return Status::OK();
+}
+
+Status BlockBasedTableBuilder::StartBlobRelocationFile() {
+  Rep* r = rep_.get();
+  if (!ok()) {
+    return status();
+  }
+  if (r->blob_relocation_directory_builder != nullptr ||
+      r->props.num_entries != 0 || r->get_offset() != 0 ||
+      r->embedded_blob_options == nullptr) {
+    return Status::InvalidArgument(
+        "Blob relocation file must start on a fresh embedded table builder");
+  }
+  if (r->props.orig_file_number == 0 || r->props.db_session_id.empty()) {
+    return Status::InvalidArgument(
+        "Blob relocation file requires persisted file identity");
+  }
+  if (r->internal_comparator.user_comparator() != BytewiseComparator()) {
+    return Status::InvalidArgument(
+        "Blob relocation file requires the bytewise comparator without "
+        "timestamps");
+  }
+  assert(!r->IsParallelCompressionActive());
+
+  IOOptions io_options;
+  IOStatus io_status =
+      WritableFileWriter::PrepareIOOptions(r->write_options, io_options);
+  if (io_status.ok()) {
+    io_status = r->file->Append(
+        Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize),
+        io_options);
+  }
+  if (!io_status.ok()) {
+    r->SetIOStatus(io_status);
+    return io_status;
+  }
+  r->set_offset(kBlobRelocationFilePrefixSize);
+  // Compression sampling reports stats for user data blocks; relocation data
+  // blocks hold only location entries.
+  r->sample_for_compression = 0;
+  r->blob_relocation_directory_builder =
+      std::make_unique<BlobRelocationDirectoryBuilder>();
+  return Status::OK();
+}
+
+Status BlockBasedTableBuilder::AddBlobRelocationServedFile(
+    uint64_t file_number) {
+  Rep* r = rep_.get();
+  if (r->blob_relocation_directory_builder == nullptr) {
+    return Status::InvalidArgument("Blob relocation file has not been started");
+  }
+  if (!ok()) {
+    return status();
+  }
+  // A relocation file serves only file numbers smaller than its own. Every file
+  // number it serves (an input file of indirect blob GC, or an old file number
+  // routed to one) was allocated before this file was created, and file numbers
+  // only grow. Serving its own number would make a route to itself.
+  if (file_number >= r->props.orig_file_number) {
+    Status invalid = Status::InvalidArgument(
+        "Blob relocation file can serve only older files");
+    r->SetStatus(invalid);
+    return invalid;
+  }
+  Status add_status =
+      r->blob_relocation_directory_builder->AddServedFile(file_number);
+  if (!add_status.ok()) {
+    r->SetStatus(add_status);
+  }
+  return add_status;
+}
+
+Status BlockBasedTableBuilder::AddBlobRelocation(uint64_t origin_file_number,
+                                                 uint64_t original_value_offset,
+                                                 const Slice& stored_payload,
+                                                 CompressionType compression) {
+  Rep* r = rep_.get();
+  if (r->blob_relocation_directory_builder == nullptr) {
+    return Status::InvalidArgument("Blob relocation file has not been started");
+  }
+  if (!ok()) {
+    return status();
+  }
+  if (stored_payload.size() > kMaxSimpleGen2BlobPayloadSize) {
+    return Status::InvalidArgument("Blob relocation value is too large");
+  }
+  if (!CompressionTypeSupported(compression)) {
+    return Status::InvalidArgument(
+        "Blob relocation compression type is not supported");
+  }
+
+  if (origin_file_number >= r->props.orig_file_number) {
+    Status invalid = Status::InvalidArgument(
+        "Blob relocation origin must be older than the file");
+    r->SetStatus(invalid);
+    return invalid;
+  }
+  if (stored_payload.empty()) {
+    return Status::InvalidArgument("Blob relocation value is empty");
+  }
+  Status add_status = r->blob_relocation_directory_builder->Add(
+      origin_file_number, original_value_offset, stored_payload.size(),
+      compression);
+  if (!add_status.ok()) {
+    r->SetStatus(add_status);
+    return add_status;
+  }
+  PrepareBlobRelocationGroup(origin_file_number);
+  if (!ok()) {
+    return status();
+  }
+  uint64_t record_offset = 0;
+  add_status =
+      WriteEmbeddedBlobRecord(stored_payload, compression, &record_offset);
+  if (!add_status.ok()) {
+    return add_status;
+  }
+  AddToBlobRelocationGroup(origin_file_number, original_value_offset,
+                           stored_payload.size(), record_offset);
+  return status();
+}
+
+void BlockBasedTableBuilder::PrepareBlobRelocationGroup(
+    uint64_t origin_file_number) {
+  const Rep::BlobRelocationGroupState& group = rep_->blob_relocation_group;
+  // An open group is never full: AddToBlobRelocationGroup() writes a full
+  // group at once.
+  if (group.count != 0 && group.origin_file_number != origin_file_number) {
+    FinishBlobRelocationGroup();
+  }
+}
+
+void BlockBasedTableBuilder::AddToBlobRelocationGroup(
+    uint64_t origin_file_number, uint64_t original_value_offset,
+    uint64_t stored_value_size, uint64_t record_offset) {
+  Rep::BlobRelocationGroupState& group = rep_->blob_relocation_group;
+  if (group.count == 0) {
+    group.origin_file_number = origin_file_number;
+    group.first_record_offset = record_offset;
+  }
+  // The records of one group are back to back (see
+  // PrepareBlobRelocationGroup()).
+  assert(group.count == 0 || record_offset == group.next_record_offset);
+  group.next_record_offset =
+      record_offset + stored_value_size + kSimpleGen2BlobTrailerSize;
+  group.values[group.count].original_value_offset = original_value_offset;
+  group.values[group.count].stored_value_size = stored_value_size;
+  ++group.count;
+  if (group.count == kBlobRelocationGroupSize) {
+    FinishBlobRelocationGroup();
+  }
+}
+
+void BlockBasedTableBuilder::FinishBlobRelocationGroup() {
+  Rep::BlobRelocationGroupState& group = rep_->blob_relocation_group;
+  if (group.count == 0) {
+    return;
+  }
+  EncodeBlobRelocationGroup(group.first_record_offset, group.values.data(),
+                            group.count, &group.encoded);
+  // Build the 24-byte internal key on the stack: the 16-byte relocation key
+  // of the group's last value, then 8 bytes that pack sequence 0 and
+  // kTypeValue. The type is kTypeValue because the value is a location entry,
+  // not a BlobIndex. Add() keeps it in the data block because this builder is
+  // in relocation mode (see the check of blob_relocation_directory_builder in
+  // Add()).
+  char internal_key[kBlobRelocationKeySize + kNumInternalBytes];
+  EncodeBlobRelocationKeyTo(group.origin_file_number,
+                            group.values[group.count - 1].original_value_offset,
+                            internal_key);
+  EncodeFixed64(internal_key + kBlobRelocationKeySize,
+                PackSequenceAndType(0, kTypeValue));
+  TEST_SYNC_POINT_CALLBACK(
+      "BlockBasedTableBuilder::FinishBlobRelocationGroup:InternalKey",
+      internal_key);
+  group.count = 0;
+  Add(Slice(internal_key, sizeof(internal_key)), group.encoded);
+}
+
+Status BlockBasedTableBuilder::GetBlobRelocationFileMetadata(
+    BlobRelocationFileMetadata* metadata) const {
+  if (metadata == nullptr) {
+    return Status::InvalidArgument("Null blob relocation metadata output");
+  }
+  if (!ok()) {
+    return status();
+  }
+  if (!rep_->blob_relocation_file_metadata.has_value()) {
+    return Status::InvalidArgument("Blob relocation file is not finished");
+  }
+  *metadata = *rep_->blob_relocation_file_metadata;
+  metadata->tail_size = GetTailSize();
   return Status::OK();
 }
 
@@ -3428,7 +3643,8 @@ Status BlockBasedTableBuilder::BuildEmbeddedWideColumnEntity(const Slice& value,
     if (column_value.size() < min_blob_size) {
       continue;
     }
-    s = WriteEmbeddedBlobRecord(column_value);
+    s = WriteEmbeddedBlobRecord(column_value, kNoCompression,
+                                /*record_offset=*/nullptr);
     if (!s.ok()) {
       return s;
     }
@@ -3468,7 +3684,8 @@ bool BlockBasedTableBuilder::MaybeExtractEmbeddedBlobs(SequenceNumber seq,
     if (value->size() < r->embedded_blob_options->min_blob_size) {
       return true;  // leave small values inline
     }
-    Status s = WriteEmbeddedBlobRecord(*value);
+    Status s = WriteEmbeddedBlobRecord(*value, kNoCompression,
+                                       /*record_offset=*/nullptr);
     if (!s.ok()) {
       r->SetStatus(std::move(s));
       return false;
@@ -3755,9 +3972,13 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
     // rep_->props.index_size is set in WriteIndexBlock(), which has direct
     // access to the index block handle (needed for accurate kCustomOnly stub
     // reporting).
-    rep_->props.comparator_name = rep_->ioptions.user_comparator != nullptr
-                                      ? rep_->ioptions.user_comparator->Name()
-                                      : "nullptr";
+    const bool is_blob_relocation_file =
+        rep_->blob_relocation_directory_builder != nullptr;
+    rep_->props.comparator_name =
+        is_blob_relocation_file ? BytewiseComparator()->Name()
+                                : (rep_->ioptions.user_comparator != nullptr
+                                       ? rep_->ioptions.user_comparator->Name()
+                                       : "nullptr");
     rep_->props.merge_operator_name =
         rep_->ioptions.merge_operator != nullptr
             ? rep_->ioptions.merge_operator->Name()
@@ -3832,7 +4053,7 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
           rep_->uncompressible_input_data_bytes.LoadRelaxed();
     }
     rep_->props.user_defined_timestamps_persisted =
-        rep_->persist_user_defined_timestamps;
+        is_blob_relocation_file ? false : rep_->persist_user_defined_timestamps;
 
     if (rep_->embedded_blob_state) {
       std::string encoded_stats;
@@ -4240,6 +4461,10 @@ Status BlockBasedTableBuilder::Finish() {
     }
   }
 #endif  // !NDEBUG
+  // The last location entry of a relocation file.
+  if (r->blob_relocation_directory_builder != nullptr) {
+    FinishBlobRelocationGroup();
+  }
   // To make sure properties block is able to keep the accurate size of index
   // block, we will finish writing all index entries first, in Flush().
   Flush(/*first_key_in_next_block=*/nullptr);
@@ -4254,6 +4479,20 @@ Status BlockBasedTableBuilder::Finish() {
   // Persist the AutoSkip estimate for the next file this thread emits (workers,
   // if any, have joined so the estimate is now quiescent).
   r->AutoSkipWriteBack();
+
+  if (ok() && r->blob_relocation_directory_builder != nullptr) {
+    BlobRelocationDirectory directory;
+    BlobRelocationFileMetadata metadata;
+    Status directory_status = r->blob_relocation_directory_builder->Finish(
+        &directory, &metadata.encoded_directory);
+    if (directory_status.ok()) {
+      r->props.user_collected_properties[kBlobRelocationDirectoryPropertyName] =
+          metadata.encoded_directory;
+      r->blob_relocation_file_metadata = std::move(metadata);
+    } else {
+      r->SetStatus(std::move(directory_status));
+    }
+  }
 
   // The census and indirect blob GC read the exact blob reference metadata; a
   // normal table open does not. So these blocks are written before the tail
@@ -4452,5 +4691,43 @@ const std::string BlockBasedTable::kObsoleteFilterBlockPrefix = "filter.";
 const std::string BlockBasedTable::kFullFilterBlockPrefix = "fullfilter.";
 const std::string BlockBasedTable::kPartitionedFilterBlockPrefix =
     "partitionedfilter.";
+
+Status NewBlobRelocationTableBuilder(
+    const ImmutableOptions& ioptions,
+    const MutableCFOptions& mutable_cf_options,
+    const BlockBasedTableOptions& table_options,
+    const ReadOptions& read_options, const WriteOptions& write_options,
+    const InternalKeyComparator& comparator,
+    const BlobRelocationTableFileInfo& file_info, WritableFileWriter* file,
+    std::unique_ptr<BlockBasedTableBuilder>* builder) {
+  assert(builder != nullptr);
+  MutableCFOptions relocation_options = mutable_cf_options;
+  relocation_options.enable_blob_indirection = false;
+  relocation_options.prefix_extractor.reset();
+  relocation_options.table_factory = std::make_shared<BlockBasedTableFactory>(
+      MakeBlobRelocationTableOptions(table_options));
+  InternalTblPropCollFactories collectors;
+  const CompressionOptions no_compression_options;
+  EmbeddedBlobSstBuilderOptions embedded_options;
+  embedded_options.min_blob_size = 0;
+  const TableBuilderOptions builder_options(
+      ioptions, relocation_options, read_options, write_options, comparator,
+      &collectors, kNoCompression, no_compression_options,
+      file_info.column_family_id, file_info.column_family_name, /*level=*/-1,
+      kUnknownNewestKeyTime, /*is_bottommost=*/false, file_info.reason,
+      /*oldest_key_time=*/0, file_info.db_id, file_info.db_session_id,
+      file_info.target_file_size, file_info.file_number, kMaxSequenceNumber,
+      Slice(file_info.db_name), /*is_remote_compaction=*/false,
+      &embedded_options);
+  builder->reset(static_cast_with_check<BlockBasedTableBuilder>(
+      relocation_options.table_factory->NewTableBuilder(builder_options,
+                                                        file)));
+  const Status status = (*builder)->StartBlobRelocationFile();
+  if (!status.ok()) {
+    (*builder)->Abandon();
+    builder->reset();
+  }
+  return status;
+}
 
 }  // namespace ROCKSDB_NAMESPACE
