@@ -132,6 +132,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"optimize_filters_for_hits", "true"},
       {"enable_blob_files", "true"},
       {"enable_blob_indirection", "true"},
+      {"pin_blob_relocation_location_blocks", "true"},
       {"min_blob_size", "1K"},
       {"blob_file_size", "1G"},
       {"blob_file_writable_file_max_buffer_size", "128K"},
@@ -295,6 +296,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.experimental_mempurge_threshold, 0.003);
   ASSERT_EQ(new_cf_opt.enable_blob_files, true);
   ASSERT_EQ(new_cf_opt.enable_blob_indirection, true);
+  ASSERT_EQ(new_cf_opt.pin_blob_relocation_location_blocks, true);
   ASSERT_EQ(new_cf_opt.min_blob_size, 1ULL << 10);
   ASSERT_EQ(new_cf_opt.blob_file_size, 1ULL << 30);
   ASSERT_EQ(new_cf_opt.blob_file_writable_file_max_buffer_size, 128ULL << 10);
@@ -2738,6 +2740,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
       {"optimize_filters_for_hits", "true"},
       {"enable_blob_files", "true"},
       {"enable_blob_indirection", "true"},
+      {"pin_blob_relocation_location_blocks", "true"},
       {"min_blob_size", "1K"},
       {"blob_file_size", "1G"},
       {"blob_file_writable_file_max_buffer_size", "128K"},
@@ -2898,6 +2901,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.verify_output_flags, VerifyOutputFlags::kVerifyNone);
   ASSERT_EQ(new_cf_opt.enable_blob_files, true);
   ASSERT_EQ(new_cf_opt.enable_blob_indirection, true);
+  ASSERT_EQ(new_cf_opt.pin_blob_relocation_location_blocks, true);
   ASSERT_EQ(new_cf_opt.min_blob_size, 1ULL << 10);
   ASSERT_EQ(new_cf_opt.blob_file_size, 1ULL << 30);
   ASSERT_EQ(new_cf_opt.blob_file_writable_file_max_buffer_size, 128ULL << 10);

@@ -40,6 +40,7 @@
 #include "port/port.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/merging_iterator.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
@@ -686,7 +687,10 @@ ColumnFamilyData::ColumnFamilyData(
                                       db_session_id, fast_sst_open, name_));
     blob_file_cache_.reset(
         new BlobFileCache(_table_cache, &ioptions(), soptions(), id_,
-                          internal_stats_->GetBlobFileReadHist(), io_tracer));
+                          internal_stats_->GetBlobFileReadHist(), io_tracer,
+                          GetBlockBasedTableWriterOptions(
+                              mutable_cf_options_.table_factory.get()),
+                          db_session_id, block_cache_tracer));
     blob_source_.reset(new BlobSource(ioptions_, mutable_cf_options_, db_id,
                                       db_session_id, blob_file_cache_.get()));
     // Let the table cache route same-file ("embedded") blob reads through the
