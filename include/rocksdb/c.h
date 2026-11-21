@@ -3896,6 +3896,9 @@ extern ROCKSDB_LIBRARY_API void rocksdb_try_catch_up_with_primary(
 
 /* SliceTransform */
 
+/* in_domain may be NULL, in which case every key is treated as in the domain
+   and transform must accept any key (including zero-length keys, seek targets,
+   and iterator bounds) while preserving prefix ordering invariants. */
 extern ROCKSDB_LIBRARY_API rocksdb_slicetransform_t*
 rocksdb_slicetransform_create(void* state, void (*destructor)(void*),
                               char* (*transform)(void*, const char* key,

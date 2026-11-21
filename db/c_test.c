@@ -521,6 +521,153 @@ static const char* CmpName(void* arg) {
   return "foo";
 }
 
+// Custom slice transform: the prefix is the key up to and including its first
+// ':', or the whole key if it has none.
+typedef struct {
+  int in_domain_calls;
+  int destructor_calls;
+} ColonPrefixState;
+
+static void ColonPrefixDestroy(void* arg) {
+  ((ColonPrefixState*)arg)->destructor_calls++;
+}
+
+static char* ColonPrefixTransform(void* arg, const char* key, size_t length,
+                                  size_t* dst_length) {
+  (void)arg;
+  const char* colon = length == 0 ? NULL : memchr(key, ':', length);
+  *dst_length = colon == NULL ? length : (size_t)(colon - key) + 1;
+  return (char*)key;
+}
+
+static unsigned char ColonPrefixInDomainAll(void* arg, const char* key,
+                                            size_t length) {
+  (void)key;
+  (void)length;
+  ((ColonPrefixState*)arg)->in_domain_calls++;
+  return 1;
+}
+
+static unsigned char ColonPrefixInDomainOnlyColon(void* arg, const char* key,
+                                                  size_t length) {
+  ((ColonPrefixState*)arg)->in_domain_calls++;
+  return length != 0 && memchr(key, ':', length) != NULL;
+}
+
+static const char* ColonPrefixName(void* arg) {
+  (void)arg;
+  return "colon_prefix";
+}
+
+// Opens a DB whose prefix extractor uses ColonPrefixTransform with the given
+// in_domain callback, which may be NULL, and checks point lookups and prefix
+// seeks over keys in an SST file and in the memtable. If all_keys_in_domain is
+// non-zero, empty and colon-less keys are expected to be bounded by their own
+// prefix; otherwise seeking to "" is expected to fall back to total-order
+// iteration.
+static void CheckColonPrefixSeeks(unsigned char (*in_domain)(void*, const char*,
+                                                             size_t),
+                                  ColonPrefixState* state,
+                                  int all_keys_in_domain) {
+  char* err = NULL;
+  rocksdb_options_t* options = rocksdb_options_create();
+  rocksdb_options_set_create_if_missing(options, 1);
+  // Disable auto-compactions and wait on the explicit flush below so callbacks
+  // do not run concurrently with the test thread updating state.
+  rocksdb_options_set_disable_auto_compactions(options, 1);
+  rocksdb_options_set_prefix_extractor(
+      options, rocksdb_slicetransform_create(state, ColonPrefixDestroy,
+                                             ColonPrefixTransform, in_domain,
+                                             ColonPrefixName));
+  // With a prefix bloom filter, the memtable checks each inserted key against
+  // the extractor's domain.
+  rocksdb_options_set_memtable_prefix_bloom_size_ratio(options, 0.1);
+  rocksdb_block_based_table_options_t* table_options =
+      rocksdb_block_based_options_create();
+  rocksdb_block_based_options_set_filter_policy(
+      table_options, rocksdb_filterpolicy_create_bloom_full(10));
+  rocksdb_block_based_options_set_whole_key_filtering(table_options, 0);
+  rocksdb_options_set_block_based_table_factory(options, table_options);
+
+  rocksdb_destroy_db(options, dbname, &err);
+  CheckNoError(err);
+  rocksdb_t* db = rocksdb_open(options, dbname, &err);
+  CheckNoError(err);
+
+  rocksdb_writeoptions_t* woptions = rocksdb_writeoptions_create();
+  const char* sst_keys[] = {"", "a:1", "a:2", "b:1", "z"};
+  for (size_t i = 0; i < sizeof(sst_keys) / sizeof(sst_keys[0]); i++) {
+    rocksdb_put(db, woptions, sst_keys[i], strlen(sst_keys[i]), "v", 1, &err);
+    CheckNoError(err);
+  }
+  rocksdb_flushoptions_t* flush_options = rocksdb_flushoptions_create();
+  rocksdb_flushoptions_set_wait(flush_options, 1);
+  rocksdb_flush(db, flush_options, &err);
+  CheckNoError(err);
+  rocksdb_put(db, woptions, "a:3", 3, "v", 1, &err);
+  CheckNoError(err);
+
+  // Check point lookups through both memtable and SST prefix filters.
+  rocksdb_readoptions_t* get_roptions = rocksdb_readoptions_create();
+  CheckGet(db, get_roptions, "", "v");
+  CheckGet(db, get_roptions, "a:1", "v");
+  CheckGet(db, get_roptions, "a:3", "v");
+  CheckGet(db, get_roptions, "b:1", "v");
+  CheckGet(db, get_roptions, "z", "v");
+  CheckGet(db, get_roptions, "c:1", NULL);
+  rocksdb_readoptions_destroy(get_roptions);
+
+  rocksdb_readoptions_t* roptions = rocksdb_readoptions_create();
+  rocksdb_readoptions_set_prefix_same_as_start(roptions, 1);
+  rocksdb_iterator_t* iter = rocksdb_create_iterator(db, roptions);
+  rocksdb_iter_seek(iter, "a:", 2);
+  CheckCondition(rocksdb_iter_valid(iter));
+  CheckIter(iter, "a:1", "v");
+  rocksdb_iter_next(iter);
+  CheckCondition(rocksdb_iter_valid(iter));
+  CheckIter(iter, "a:2", "v");
+  rocksdb_iter_next(iter);
+  CheckCondition(rocksdb_iter_valid(iter));
+  CheckIter(iter, "a:3", "v");
+  rocksdb_iter_next(iter);
+  CheckCondition(!rocksdb_iter_valid(iter));
+  rocksdb_iter_seek(iter, "b:", 2);
+  CheckCondition(rocksdb_iter_valid(iter));
+  CheckIter(iter, "b:1", "v");
+  rocksdb_iter_next(iter);
+  CheckCondition(!rocksdb_iter_valid(iter));
+  rocksdb_iter_seek(iter, "c:", 2);
+  CheckCondition(!rocksdb_iter_valid(iter));
+  rocksdb_iter_seek(iter, "", 0);
+  CheckCondition(rocksdb_iter_valid(iter));
+  CheckIter(iter, "", "v");
+  rocksdb_iter_next(iter);
+  if (all_keys_in_domain) {
+    CheckCondition(!rocksdb_iter_valid(iter));
+    rocksdb_iter_seek(iter, "z", 1);
+    CheckCondition(rocksdb_iter_valid(iter));
+    CheckIter(iter, "z", "v");
+    rocksdb_iter_next(iter);
+    CheckCondition(!rocksdb_iter_valid(iter));
+  } else {
+    // "" is out of domain, so prefix_same_as_start falls back to total order.
+    CheckCondition(rocksdb_iter_valid(iter));
+    CheckIter(iter, "a:1", "v");
+  }
+  rocksdb_iter_get_error(iter, &err);
+  CheckNoError(err);
+
+  rocksdb_iter_destroy(iter);
+  rocksdb_readoptions_destroy(roptions);
+  rocksdb_flushoptions_destroy(flush_options);
+  rocksdb_writeoptions_destroy(woptions);
+  rocksdb_close(db);
+  rocksdb_destroy_db(options, dbname, &err);
+  CheckNoError(err);
+  rocksdb_block_based_options_destroy(table_options);
+  rocksdb_options_destroy(options);
+}
+
 // Custom compaction filter
 static void CFilterDestroy(void* arg) { (void)arg; }
 static const char* CFilterName(void* arg) {
@@ -3656,6 +3803,28 @@ int main(int argc, char** argv) {
                                 expected_cf_names, NULL);
     }
     rocksdb_destroy_db(options, dbname, &err);
+  }
+
+  StartPhase("prefix_extractor_callbacks");
+  {
+    // A NULL in_domain puts every key in the extractor's domain.
+    ColonPrefixState null_state = {0};
+    CheckColonPrefixSeeks(NULL, &null_state, 1);
+    CheckCondition(null_state.destructor_calls == 1);
+
+    // Non-NULL in_domain returning 1 for all keys behaves the same and is
+    // called by RocksDB.
+    ColonPrefixState all_state = {0};
+    CheckColonPrefixSeeks(ColonPrefixInDomainAll, &all_state, 1);
+    CheckCondition(all_state.in_domain_calls > 0);
+    CheckCondition(all_state.destructor_calls == 1);
+
+    // Non-NULL in_domain returning 0 for keys without ':' still treats those
+    // keys as out of domain.
+    ColonPrefixState colon_only_state = {0};
+    CheckColonPrefixSeeks(ColonPrefixInDomainOnlyColon, &colon_only_state, 0);
+    CheckCondition(colon_only_state.in_domain_calls > 0);
+    CheckCondition(colon_only_state.destructor_calls == 1);
   }
 
   // Check memory usage stats
