@@ -1737,11 +1737,13 @@ Status ColumnFamilyData::ValidateOptions(
   return s;
 }
 
-Status ColumnFamilyData::SetOptions(
+Status ColumnFamilyData::PrepareMutableCFOptions(
     const DBOptions& db_opts,
-    const std::unordered_map<std::string, std::string>& options_map) {
+    const std::unordered_map<std::string, std::string>& options_map,
+    MutableCFOptions* mutable_cf_options) const {
+  assert(mutable_cf_options != nullptr);
   ColumnFamilyOptions cf_opts =
-      BuildColumnFamilyOptions(initial_cf_options_, mutable_cf_options_);
+      BuildColumnFamilyOptions(initial_cf_options_, *mutable_cf_options);
   ConfigOptions config_opts;
   config_opts.mutable_options_only = true;
 #ifndef NDEBUG
@@ -1757,9 +1759,25 @@ Status ColumnFamilyData::SetOptions(
     s = ValidateOptions(db_opts, cf_opts);
   }
   if (s.ok()) {
-    mutable_cf_options_ = MutableCFOptions(cf_opts);
-    mutable_cf_options_.RefreshDerivedOptions(ioptions_);
-    options_install_pending_ = true;
+    *mutable_cf_options = MutableCFOptions(cf_opts);
+    mutable_cf_options->RefreshDerivedOptions(ioptions_);
+  }
+  return s;
+}
+
+void ColumnFamilyData::PublishMutableCFOptions(
+    const MutableCFOptions& mutable_cf_options) {
+  mutable_cf_options_ = mutable_cf_options;
+  options_install_pending_ = true;
+}
+
+Status ColumnFamilyData::SetOptions(
+    const DBOptions& db_opts,
+    const std::unordered_map<std::string, std::string>& options_map) {
+  MutableCFOptions mutable_cf_options(mutable_cf_options_);
+  Status s = PrepareMutableCFOptions(db_opts, options_map, &mutable_cf_options);
+  if (s.ok()) {
+    PublishMutableCFOptions(mutable_cf_options);
   }
   return s;
 }
