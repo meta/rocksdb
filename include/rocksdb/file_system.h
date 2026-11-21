@@ -95,6 +95,52 @@ enum FSSupportedOps {
                               // the verify_and_reconstruct_read flag in
                               // IOOptions.
   kFSPrefetch,                // Supports prefetch operations
+  // Set by a file system where a written file appears all at once at
+  // Close(), for example some remote file systems. When this bit is set,
+  // RocksDB writes CURRENT, IDENTITY and OPTIONS-<number> directly under their
+  // final names, without a temp file or a rename. IDENTITY and OPTIONS writes
+  // save the temp file and the rename. A CURRENT write trades them for one
+  // more directory sync, described below.
+  //
+  // RocksDB writes these files as `<db_path>/CURRENT`, `<db_path>/IDENTITY`
+  // and `<db_path>/OPTIONS-<number>`, and does not tell the file system which
+  // file it opens. So the file system must recognize them by base name. The
+  // DB path can be any directory, so the rule must work under any path. In
+  // this comment, a file is published when its new content becomes visible
+  // under its name. Each such file, created with NewWritableFile() and then
+  // closed, must have these properties:
+  // 1. The file is not published before Close() returns OK. Sync() and
+  //    Fsync() must not publish it.
+  // 2. Close() atomically replaces any existing file with the same name.
+  // 3. The new content is durable under the file name when Close() returns
+  //    OK.
+  // 4. If Close() fails or the process crashes, the name shows the old
+  //    content or the new content (or no file, if there was none), never a mix
+  //    or a part.
+  // 5. The FSWritableFile destructor must not publish the file when Close()
+  //    has not returned OK. When RocksDB writes CURRENT and IDENTITY of the
+  //    DB and the OPTIONS files of the DB, it destroys the file without
+  //    calling Close() after a failed Append() or Sync(). Other writers of
+  //    these names, such as a checkpoint or PersistRocksDBOptions(), may still
+  //    call Close() after a failed Append() or Sync(). The file system may
+  //    then fail that Close() or publish the partial content. Both are
+  //    allowed, because those callers return the first error.
+  // For OPTIONS-<number>, the name is always new, so property 2 never applies.
+  // All other files keep the normal FileSystem semantics.
+  //
+  // RocksDB still calls Sync() (Fsync() for OPTIONS files) before Close().
+  // Before it writes CURRENT, RocksDB opens the DB directory, syncs it and
+  // closes it, so that the directory entry of the new MANIFEST that CURRENT
+  // names is durable before CURRENT is. After Close(), RocksDB also syncs the
+  // directory when it has a directory for the file. All these directory syncs
+  // must keep their normal meaning: they make the directory entries of new
+  // files durable.
+  //
+  // FileSystemWrapper forwards SupportedOps() to its target, so a wrapper keeps
+  // this bit by default. A wrapper that changes when written content becomes
+  // visible (for example, one that buffers writes or deletes unsynced files on
+  // a simulated crash) must override SupportedOps() and clear this bit.
+  kAtomicReplaceOnClose,
 };
 
 // Per-request options that can be passed down to the FileSystem

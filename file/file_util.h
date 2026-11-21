@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 #pragma once
+#include <functional>
 #include <string>
 
 #include "file/filename.h"
@@ -146,5 +147,163 @@ inline bool CheckFSFeatureSupport(FileSystem* fs, FSSupportedOps feat) {
   }
   return false;
 }
+
+// Atomic small-file writes
+//
+// Background: RocksDB keeps three small files that a reader must never see
+// half written: CURRENT, IDENTITY and the OPTIONS file. For example, a
+// partial CURRENT file after a crash makes the DB impossible to open. So
+// RocksDB does not write these files in place. AtomicFileWriter writes such a
+// file in one of two ways.
+//
+// Temp-file write. This works on every file system:
+// 1. Write the new content to a temp file, sync it and close it.
+// 2. Optionally check the temp file, for example read it back. The OPTIONS
+//    file uses this step.
+// 3. Rename the temp file over the final file. The rename is atomic, so a
+//    reader sees the old content or the new content.
+// 4. Sync the directory, which makes the new name durable.
+// If step 1, 2 or 3 fails, the writer deletes the temp file, and the final
+// file keeps its old content.
+//
+// Direct write. A file system that sets FSSupportedOps::kAtomicReplaceOnClose
+// promises that CURRENT, IDENTITY and OPTIONS files appear atomically and
+// durably at Close() (include/rocksdb/file_system.h has the full contract).
+// For these files on such a file system, the temp file and the rename protect
+// nothing, so the writer skips them:
+// 1. Open the final file, append the new content, sync it and close it.
+// 2. Sync the directory, as in step 4 above.
+// If step 1 fails before Close(), the writer neither closes nor deletes the
+// file, so the final file keeps its old content. If Close() fails, the name
+// shows the old or the new content (contract property 4). The writer returns
+// the error and does not delete the file. Before a direct write of CURRENT,
+// SetCurrentFile() also syncs the DB directory; file/filename.cc explains why.
+//
+// Callers get the writer from NewAtomicFileWriter(). It returns the direct
+// writer when AtomicFileWriteOptions::atomic_replace_on_close is true, and the
+// temp-file writer otherwise.
+
+// Settings of one writer, given to NewAtomicFileWriter(). The writer uses them
+// for every Write() call. The first fields apply to both ways of writing. The
+// fields marked "Temp-file steps only" apply only to the temp-file write.
+struct AtomicFileWriteOptions {
+  // Whether the file system sets FSSupportedOps::kAtomicReplaceOnClose. When
+  // true, the writer writes the final file directly, then syncs the directory,
+  // and ignores the other temp-file fields. `check_before_rename` is not
+  // allowed then (see below). The caller checks the bit once, for example when
+  // a DB opens, and passes the result here, because FileSystem::SupportedOps()
+  // can be costly. For example, PosixFileSystem may set up an io_uring on each
+  // thread that calls it.
+  bool atomic_replace_on_close = false;
+
+  // How the new content is made durable before the file is closed: true calls
+  // FSWritableFile::Fsync(), false calls FSWritableFile::Sync().
+  bool use_fsync = false;
+
+  // Directory sync after the final file is in place: after the rename of the
+  // temp file, or after the Close() of a direct write. The sync makes the
+  // directory entries of new files in the directory durable. For a temp-file
+  // write of CURRENT into the DB directory, it also makes the entry of a new
+  // MANIFEST durable. Before a direct write of CURRENT, SetCurrentFile() also
+  // syncs the DB directory; file/filename.cc explains why. Set at most one of
+  // the two:
+  // - `dir`: an open directory handle. The writer syncs it and does not
+  //   close it.
+  // - `dir_path_to_open`: the writer opens this directory, syncs it and
+  //   closes it with SyncDirectoryAtPath().
+  // When both are empty, the writer does not sync the directory.
+  FSDirectory* dir = nullptr;
+  std::string dir_path_to_open;
+
+  // Temp-file steps only. Name of the temp file that holds the new content
+  // until the rename. It must be in the same directory as the final file,
+  // because a rename is atomic only inside one file system, and the directory
+  // sync covers only one directory. Must not be empty.
+  std::string temp_name;
+
+  // Temp-file steps only. When not null, the rename and the delete of the
+  // temp file go through this Env instead of the FileSystem, so that
+  // overrides of Env::RenameFile() and Env::DeleteFile() apply.
+  // Env::RenameFile() takes no IOOptions, so that rename carries no
+  // IOOptions::type.
+  Env* env = nullptr;
+
+  // Temp-file steps only. When set, the writer calls it after the temp file
+  // is closed and before the rename, for example to read the temp file back
+  // and check its content. A non-OK result stops the write: the writer
+  // deletes the temp file (through `env` when set), does not rename it and
+  // returns the result. A direct write has no step between Close() and the
+  // moment the new content becomes visible, so it does not support this
+  // check: with `atomic_replace_on_close`, setting it makes Write() return
+  // InvalidArgument.
+  std::function<IOStatus()> check_before_rename;
+
+  // Temp-file steps only. Which failures delete the temp file. When false,
+  // the writer deletes it only when the write, the check or the rename fails.
+  // When true, it also tries to delete it when the directory sync fails. After
+  // a successful rename the temp file no longer exists, so that delete finds
+  // nothing, and both settings leave the same files on disk. The only effect
+  // is one more DeleteFile() call that a FileSystem or Env wrapper sees. The
+  // writer ignores the status of the delete in all cases. SetIdentityFile()
+  // sets it, so that an IDENTITY write also makes this delete call after a
+  // directory sync failure. AtomicFileWriterTest in env/env_test.cc checks it
+  // (the IDENTITY cases with a failed directory open, sync or close).
+  bool delete_temp_after_any_failure = false;
+
+  // Temp-file steps only. Prefix of the test sync points and kill points, for
+  // example "SetCurrentFile". When not empty, the writer runs:
+  // - TEST_SYNC_POINT_CALLBACK("<prefix>:BeforeRename") after the temp file
+  //   is written and checked and before the rename, and
+  //   TEST_SYNC_POINT_CALLBACK("<prefix>:AfterRename") after the rename. Both
+  //   pass a pointer to the IOStatus, so a callback can change the result.
+  //   The BeforeRename point runs even when the write or the check failed.
+  // - TEST_KILL_RANDOM_WITH_WEIGHT("<prefix>:0") just before the rename and
+  //   "<prefix>:1" just after it, with weight REDUCE_ODDS2.
+  // When empty, the writer has no sync points and no kill points.
+  std::string sync_point_prefix;
+};
+
+// Replaces a whole small file with new content, so that a reader sees the old
+// or the new content, never a part of it. The temp-file write gets this from
+// the rename. The direct write gets it from the kAtomicReplaceOnClose
+// contract. Both write the content from one in-memory string with one
+// Append(). CURRENT, IDENTITY and the DB OPTIONS file use it. See the overview
+// above.
+class AtomicFileWriter {
+ public:
+  virtual ~AtomicFileWriter() = default;
+
+  // Replaces the content of `final_name` with `contents`. `opts` applies to
+  // each IO of the write, and `file_opts` to opening the new file. If Write()
+  // returns an error, the caller must not assume that `final_name` still has
+  // the old content: an error after the replace, for example from the
+  // directory sync, leaves the new content in `final_name`. When Write() fails
+  // before the replace, `final_name` keeps its old content, or stays absent if
+  // it did not exist.
+  virtual IOStatus Write(const std::string& final_name, const Slice& contents,
+                         const IOOptions& opts,
+                         const FileOptions& file_opts) = 0;
+};
+
+// Returns a writer that writes one file atomically through `fs`, with the
+// settings in `options`. Each caller creates one writer for each file write,
+// because `options.temp_name` belongs to one final file. The writer runs the
+// steps of the direct write when `options.atomic_replace_on_close` is true,
+// and the steps of the temp-file write otherwise, as the overview above
+// describes. `fs` and the pointers in `options` must stay valid while the
+// writer is used. The same applies to anything that `check_before_rename`
+// captures.
+std::unique_ptr<AtomicFileWriter> NewAtomicFileWriter(
+    FileSystem* fs, const AtomicFileWriteOptions& options);
+
+// Opens the directory `dirname`, syncs it with `fsync_opts` and closes it.
+// A NotSupported status from the close is ignored, because the default
+// FSDirectory::Close() returns it (Directories::Close() in
+// db/db_impl/db_impl.h explains this). The atomic writer uses it for
+// `dir_path_to_open`, and SetCurrentFile() uses it to sync the DB directory
+// before a direct write of CURRENT.
+IOStatus SyncDirectoryAtPath(FileSystem* fs, const std::string& dirname,
+                             const IOOptions& opts,
+                             const DirFsyncOptions& fsync_opts);
 
 }  // namespace ROCKSDB_NAMESPACE

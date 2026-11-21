@@ -617,7 +617,8 @@ class CompactionJobTestBase : public testing::Test {
     ASSERT_OK(s);
     // Make "CURRENT" file that points to the new manifest file.
     s = SetCurrentFile(WriteOptions(), fs_.get(), dbname_, 1,
-                       Temperature::kUnknown, nullptr);
+                       Temperature::kUnknown, nullptr,
+                       /*atomic_replace_on_close=*/false);
 
     ASSERT_OK(s);
 

@@ -7776,22 +7776,126 @@ Status DBImpl::PersistOptionsFile(
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteOptionsFile:PersistOptions",
                            const_cast<DBOptions*>(&db_options));
 
-  const std::string file_name =
-      TempOptionsFileName(GetName(), versions_->NewFileNumber());
+  // This function writes the file in one of two ways, chosen by
+  // FSSupportedOps::kAtomicReplaceOnClose in include/rocksdb/file_system.h
+  // ("the bit"). The file numbers below are examples:
+  //
+  //               temp-file write (no bit)        direct write (bit)
+  //   file        two: OPTIONS-000012.dbtmp,       one: OPTIONS-000012
+  //   numbers     renamed to OPTIONS-000013
+  //   verify      in Write(), before the rename   after Write(), when the
+  //                                               file is already visible
+  //   on failure  deletes the temp file; a        this function deletes
+  //               failed directory sync keeps     OPTIONS-000012 if it
+  //               OPTIONS-000013                  exists, also after a
+  //                                               failed directory sync
+  //
+  // After a failed temp-file write, the deletes run in this order. A failed
+  // append, fsync or close deletes the temp file through the FileSystem
+  // (WriteTempFile()), then through Env (Write()). A failed open, verify or
+  // rename deletes it through Env only. A failed directory sync deletes
+  // nothing: the temp file is already renamed, so the new OPTIONS file stays.
+  // This function then deletes the temp file through Env once more, only if it
+  // still exists. The deletes repeat on purpose. Each delete is best effort, so
+  // a later delete retries an earlier one that failed. The deletes through Env
+  // let Env overrides, such as the test Envs named in step 3, see them. When
+  // the first delete works, the later ones find nothing, so the repeats do not
+  // change which files stay on disk.
+  //
+  // 1. Pick the file names.
+  const bool atomic_replace_on_close = versions_->atomic_replace_on_close();
+  std::string temp_file_name;
+  if (!atomic_replace_on_close) {
+    temp_file_name = TempOptionsFileName(GetName(), versions_->NewFileNumber());
+  }
   *options_file_number = versions_->NewFileNumber();
+  const std::string final_file_name =
+      OptionsFileName(GetName(), *options_file_number);
+  // The file that Write() creates: the temp file, or the final file of a
+  // direct write. The verify reads it, and the cleanup deletes it after a
+  // failure.
+  const std::string& written_file_name =
+      atomic_replace_on_close ? final_file_name : temp_file_name;
 
-  Status s = PersistRocksDBOptions(write_options, db_options, cf_names, cf_opts,
-                                   file_name, fs_.get());
+  // 2. Serialize the options.
+  const ConfigOptions config_options = OptionsFileConfigOptions(db_options);
+  std::string contents;
+  Status s = SerializeRocksDBOptions(config_options, db_options, cf_names,
+                                     cf_opts, &contents);
+  // Reads the written file back and checks that it parses to the same
+  // options.
+  auto verify = [&]() {
+    return RocksDBOptionsParser::VerifyRocksDBOptionsFromFile(
+        config_options, db_options, cf_names, cf_opts, written_file_name,
+        fs_.get());
+  };
+  // 3. Write the file. The temp-file write verifies it inside Write().
   if (s.ok()) {
-    s = RenameTempFileToOptionsFile(file_name, *options_file_number,
-                                    options_file_size);
+    AtomicFileWriteOptions atomic_opts;
+    atomic_opts.atomic_replace_on_close = atomic_replace_on_close;
+    atomic_opts.use_fsync = true;
+    atomic_opts.dir_path_to_open = GetName();
+    if (!atomic_replace_on_close) {
+      // Write the temp file, read it back and verify it, then rename it to the
+      // final name. The rename and the delete go through Env, so that Env
+      // overrides apply. For example, the test Envs SpecialEnv and
+      // FaultInjectionTestEnv override Env::RenameFile() and
+      // Env::DeleteFile().
+      atomic_opts.temp_name = temp_file_name;
+      atomic_opts.env = GetEnv();
+      atomic_opts.check_before_rename = [&]() {
+        return status_to_io_status(verify());
+      };
+    }
+    IOOptions opts;
+    s = PrepareIOFromWriteOptions(write_options, opts);
+    opts.type = IOType::kMetadata;
+    FileOptions file_opts;
+    file_opts.temperature = db_options.metadata_write_temperature;
+    file_opts.io_options.type = IOType::kMetadata;
+    if (s.ok()) {
+      // Test sync point. It runs before Write() opens the temp file or, for a
+      // direct write, the final file. PersistRocksDBOptions() uses the same
+      // name, so tests that turn the file system off here work for both
+      // PersistRocksDBOptions() and this function.
+      TEST_SYNC_POINT("PersistRocksDBOptions:create");
+      s = NewAtomicFileWriter(fs_.get(), atomic_opts)
+              ->Write(final_file_name, contents, opts, file_opts);
+      // Test sync point. It runs after Write() returns, also when it failed.
+      // For a temp-file write this is after the verify, the rename and the
+      // directory sync. For a direct write the verify runs below.
+      TEST_SYNC_POINT("PersistRocksDBOptions:written");
+    }
+    // 4. For a direct write, verify the file.
+    if (s.ok() && atomic_replace_on_close) {
+      // A direct write has no step between Close() and the moment the file
+      // becomes visible, so the verify runs after the write. Between Close()
+      // and the end of the verify, other readers can see an unverified
+      // OPTIONS file. If the process crashes in this window, the file stays,
+      // and LoadLatestOptions() may pick it because it is the newest. A bad
+      // file comes from a serialization bug or a storage error, and the verify
+      // catches both. If the verify fails, the file is deleted below. Deleting
+      // it is safe: OPTIONS file names are unique, and the file is not yet
+      // recorded as the latest OPTIONS file. If that delete also fails, the
+      // unverified file stays as the newest OPTIONS file until a later OPTIONS
+      // file is written.
+      s = verify();
+    }
+  }
+  if (s.ok()) {
+    *options_file_size = contents.size();
   }
 
-  if (!s.ok() && GetEnv()->FileExists(file_name).ok()) {
-    if (!GetEnv()->DeleteFile(file_name).ok()) {
+  // 5. After a failure, delete the file that Write() created: the temp file, or
+  // the final file of a direct write. If the writer wrote a temp file and
+  // failed, it already tried to delete it, and this tries once more in case
+  // that delete failed. After an earlier failure no such file exists, and
+  // this check finds nothing. The delete goes through Env, like the rename.
+  if (!s.ok() && GetEnv()->FileExists(written_file_name).ok()) {
+    if (!GetEnv()->DeleteFile(written_file_name).ok()) {
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
-                     "Unable to delete temp options file %s",
-                     file_name.c_str());
+                     "Unable to delete options file %s",
+                     written_file_name.c_str());
     }
   }
   if (!s.ok()) {
@@ -7944,50 +8048,6 @@ Status DBImpl::DeleteObsoleteOptionsFiles(bool schedule_only) {
     }
   }
   return Status::OK();
-}
-
-Status DBImpl::RenameTempFileToOptionsFile(const std::string& file_name,
-                                           uint64_t options_file_number,
-                                           uint64_t* options_file_size) {
-  Status s;
-
-  assert(options_file_size != nullptr);
-  std::string options_file_name =
-      OptionsFileName(GetName(), options_file_number);
-  Env* env = GetEnv();
-  assert(env != nullptr);
-  s = env->GetFileSize(file_name, options_file_size);
-  if (s.ok()) {
-    // Retry if the file name happen to conflict with an existing one.
-    // Env::RenameFile() takes no IOOptions, so this rename is not tagged with
-    // IOType::kMetadata. It stays on Env so that Env overrides still apply.
-    s = env->RenameFile(file_name, options_file_name);
-    IOOptions dir_opts;
-    dir_opts.type = IOType::kMetadata;
-    std::unique_ptr<FSDirectory> dir_obj;
-    if (s.ok()) {
-      s = fs_->NewDirectory(GetName(), dir_opts, &dir_obj, nullptr);
-    }
-    if (s.ok()) {
-      s = dir_obj->FsyncWithDirOptions(dir_opts, nullptr,
-                                       DirFsyncOptions(options_file_name));
-    }
-    if (s.ok()) {
-      Status temp_s = dir_obj->Close(dir_opts, nullptr);
-      // The default Close() could return "NotSupproted" and we bypass it
-      // if it is not impelmented. Detailed explanations can be found in
-      // db/db_impl/db_impl.h
-      if (!temp_s.ok()) {
-        if (temp_s.IsNotSupported()) {
-          temp_s.PermitUncheckedError();
-        } else {
-          s = temp_s;
-        }
-      }
-    }
-  }
-
-  return s;
 }
 
 void DBImpl::MaybeDeleteObsoleteOptionsFiles() {

@@ -1934,9 +1934,15 @@ class DBImpl : public DB
   Status WriteOptionsFile(const WriteOptions& write_options,
                           bool db_mutex_already_held);
 
-  // Writes, renames, and directory-syncs an OPTIONS snapshot, but does not
-  // publish it in VersionSet. The caller must either commit its file number in
-  // MANIFEST or leave it as an unreferenced orphan.
+  // Writes and verifies a new OPTIONS file and syncs the DB directory, but
+  // does not record it in VersionSet. Without
+  // FSSupportedOps::kAtomicReplaceOnClose the file is written under a temp
+  // name, verified, then renamed (two file numbers). With the bit it is written
+  // under its final name and verified after Close() (one file number). After a
+  // failure it deletes the file it created, with one exception: when the
+  // directory sync after the rename fails, the temp-file write keeps the new
+  // OPTIONS file. The caller must either commit the file number in MANIFEST
+  // or leave the file as an unreferenced orphan.
   Status PersistOptionsFile(const WriteOptions& write_options,
                             const DBOptions& db_options,
                             const std::vector<std::string>& cf_names,
@@ -1960,9 +1966,6 @@ class DBImpl : public DB
   // The following two functions can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
   // 2. db_mutex is NOT held
-  Status RenameTempFileToOptionsFile(const std::string& file_name,
-                                     uint64_t options_file_number,
-                                     uint64_t* options_file_size);
   void MaybeDeleteObsoleteOptionsFiles();
   Status DeleteObsoleteOptionsFiles(bool schedule_only);
 

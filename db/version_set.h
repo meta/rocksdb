@@ -1666,6 +1666,14 @@ class VersionSet {
 
   bool unchanging() const { return unchanging_; }
 
+  // Whether the file system sets FSSupportedOps::kAtomicReplaceOnClose. It is
+  // checked once, when the VersionSet is created, because
+  // FileSystem::SupportedOps() can be costly (see
+  // AtomicFileWriteOptions::atomic_replace_on_close in file/file_util.h).
+  // ProcessManifestWrites(), DBImpl::NewDB(), DBImpl::SetupDBId() and
+  // DBImpl::PersistOptionsFile() use it.
+  bool atomic_replace_on_close() const { return atomic_replace_on_close_; }
+
   // Allocate and return a new file number
   uint64_t NewFileNumber() { return next_file_number_.fetch_add(1); }
 
@@ -2288,6 +2296,7 @@ class VersionSet {
                            InstrumentedMutex* mu);
 
   const bool unchanging_;
+  const bool atomic_replace_on_close_;
   bool closed_;
 };
 
