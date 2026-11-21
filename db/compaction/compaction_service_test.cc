@@ -324,6 +324,37 @@ class UnregisteredFilterPolicy : public FilterPolicy {
   std::unique_ptr<const FilterPolicy> base_policy_;
 };
 
+class UnregisteredPrefixTransform : public SliceTransform {
+ public:
+  const char* Name() const override { return "UnregisteredPrefixTransform"; }
+  Slice Transform(const Slice& key) const override {
+    return Slice(key.data(), std::min<size_t>(key.size(), 4));
+  }
+  bool InDomain(const Slice& /*key*/) const override { return true; }
+};
+
+// Counts messages at WARN level or above that contain `needle`.
+class WarningCountingLogger : public Logger {
+ public:
+  explicit WarningCountingLogger(std::string needle)
+      : Logger(InfoLogLevel::WARN_LEVEL), needle_(std::move(needle)) {}
+
+  using Logger::Logv;
+  void Logv(const char* format, va_list ap) override {
+    char message[1024];
+    vsnprintf(message, sizeof(message), format, ap);
+    if (strstr(message, needle_.c_str()) != nullptr) {
+      count_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  int count() const { return count_.load(std::memory_order_relaxed); }
+
+ private:
+  const std::string needle_;
+  std::atomic<int> count_{0};
+};
+
 }  // namespace
 
 class MyTestCompactionService : public CompactionService {
@@ -541,6 +572,8 @@ class MyTestCompactionService : public CompactionService {
                                const std::string& value) {
     worker_options_override_[name] = value;
   }
+
+  void ClearPrefixExtractorOverride() { options_.prefix_extractor = nullptr; }
 
   void GetResult(CompactionServiceResult* deserialized) {
     CompactionServiceResult::Read(result_, deserialized).PermitUncheckedError();
@@ -1435,6 +1468,81 @@ TEST_F(CompactionServiceTest, PendingRemoteCompactionDoesNotPinObsoleteSsts) {
       ASSERT_EQ("v1", Get(cf, Key(i)));
     }
   }
+}
+
+TEST_F(CompactionServiceTest, PrefixExtractorFromOptionsFileWhenNotOverridden) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.prefix_extractor.reset(NewCappedPrefixTransform(4));
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  ReopenWithCompactionService(&options);
+  GetCompactionService()->ClearPrefixExtractorOverride();
+
+  for (int file = 0; file < 2; ++file) {
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_OK(Put("aaaa" + std::to_string(i), "v" + std::to_string(file)));
+      ASSERT_OK(Put("cccc" + std::to_string(i), "v" + std::to_string(file)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_GE(GetCompactionService()->GetCompactionNum(), 1);
+
+  TablePropertiesCollection fname_to_props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&fname_to_props));
+  ASSERT_EQ(fname_to_props.size(), 1);
+  for (const auto& [fname, props] : fname_to_props) {
+    ASSERT_EQ(props->prefix_extractor_name,
+              options.prefix_extractor->AsString())
+        << fname;
+  }
+
+  Statistics* primary_statistics = GetPrimaryStatistics();
+  ASSERT_OK(primary_statistics->Reset());
+  ReadOptions read_options;
+  read_options.prefix_same_as_start = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("bbbb");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(
+      primary_statistics->getTickerCount(LAST_LEVEL_SEEK_FILTERED) +
+          primary_statistics->getTickerCount(NON_LAST_LEVEL_SEEK_FILTERED),
+      1);
+}
+
+TEST_F(CompactionServiceTest, UnregisteredPrefixExtractorLogsWarning) {
+  auto logger = std::make_shared<WarningCountingLogger>(
+      "cannot create prefix_extractor=");
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.info_log = logger;
+  options.prefix_extractor = std::make_shared<UnregisteredPrefixTransform>();
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  ReopenWithCompactionService(&options);
+  GetCompactionService()->ClearPrefixExtractorOverride();
+
+  for (int file = 0; file < 2; ++file) {
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_OK(Put("aaaa" + std::to_string(i), "v" + std::to_string(file)));
+      ASSERT_OK(Put("cccc" + std::to_string(i), "v" + std::to_string(file)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_GE(GetCompactionService()->GetCompactionNum(), 1);
+
+  TablePropertiesCollection fname_to_props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&fname_to_props));
+  ASSERT_EQ(fname_to_props.size(), 1);
+  for (const auto& [fname, props] : fname_to_props) {
+    ASSERT_EQ(props->prefix_extractor_name, "nullptr") << fname;
+  }
+  ASSERT_GE(logger->count(), 1);
 }
 
 TEST_F(CompactionServiceTest, BasicCompactions) {

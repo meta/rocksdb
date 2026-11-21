@@ -2146,6 +2146,28 @@ Status CheckTableFactoryFromOptionsFile(const ConfigOptions& config_options,
   }
   return Status::OK();
 }
+
+// Returns the prefix_extractor value that `options_map`, or else the OPTIONS
+// file, sets for the column family, or an empty string if neither sets one.
+std::string PrefixExtractorFromOptions(
+    const RocksDBOptionsParser& parser, const std::string& cf_name,
+    const std::unordered_map<std::string, std::string>& options_map) {
+  const std::string kPrefixExtractor = "prefix_extractor";
+  if (const auto it = options_map.find(kPrefixExtractor);
+      it != options_map.end()) {
+    return it->second;
+  }
+  const std::vector<std::string>& cf_names = *parser.cf_names();
+  for (size_t i = 0; i < cf_names.size(); ++i) {
+    if (cf_names[i] != cf_name) {
+      continue;
+    }
+    const auto& cf_opt_map = parser.cf_opt_maps()->at(i);
+    const auto it = cf_opt_map.find(kPrefixExtractor);
+    return it == cf_opt_map.end() ? std::string() : it->second;
+  }
+  return std::string();
+}
 }  // namespace
 
 Status DB::OpenAndCompact(
@@ -2240,7 +2262,22 @@ Status DB::OpenAndCompact(
       cf.options.compaction_filter = override_options.compaction_filter;
       cf.options.compaction_filter_factory =
           override_options.compaction_filter_factory;
-      cf.options.prefix_extractor = override_options.prefix_extractor;
+      if (override_options.prefix_extractor != nullptr) {
+        cf.options.prefix_extractor = override_options.prefix_extractor;
+      } else if (cf.options.prefix_extractor == nullptr) {
+        // Parsing the OPTIONS file ignores a prefix extractor it cannot
+        // create, so the output files would silently lose their prefix
+        // filters.
+        const std::string requested = PrefixExtractorFromOptions(
+            options_parser, cf.name, override_options.options_map);
+        if (!requested.empty() && requested != kNullptrString) {
+          ROCKS_LOG_WARN(db_options.info_log,
+                         "Remote compaction cannot create prefix_extractor=%s "
+                         "of column family %s, so its output files have no "
+                         "prefix filter",
+                         requested.c_str(), cf.name.c_str());
+        }
+      }
       if (override_options.table_factory) {
         cf.options.table_factory = override_options.table_factory;
       } else {
