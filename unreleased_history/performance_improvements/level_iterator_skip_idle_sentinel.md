@@ -1,0 +1,1 @@
+Iterators below L0 no longer return a file boundary key to the merging iterator when the file has no range tombstones and the level has no next file to move to, such as when a prefix seek runs out of its prefix. After such a prefix seek, the level keeps the file's iterator, so a later seek into the same file reuses it or the file's table reader.

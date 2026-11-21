@@ -3087,14 +3087,15 @@ TEST_F(DBRangeDelTest, SentinelKeyCommonCaseTest) {
   IterKey target;
   target.SetInternalKey(k, kMaxSequenceNumber, kValueTypeForSeek);
   level_iter->Seek(target.GetInternalKey());
-  // The last Key(9) is a sentinel key.
-  VerifyIteratorKey(level_iter, {Key(8), Key(9), Key(9)});
+  // Key(8) is L1_1's sentinel key. L1_2 is the last file and has no range
+  // tombstones, so no sentinel key follows Key(9).
+  VerifyIteratorKey(level_iter, {Key(8), Key(9)});
   ASSERT_TRUE(!level_iter->Valid() && level_iter->status().ok());
 
   k = Key(6);
   target.SetInternalKey(k, kMaxSequenceNumber, kValueTypeForSeek);
   level_iter->Seek(target.GetInternalKey());
-  VerifyIteratorKey(level_iter, {Key(6), Key(8), Key(9), Key(9)});
+  VerifyIteratorKey(level_iter, {Key(6), Key(8), Key(9)});
   ASSERT_TRUE(!level_iter->Valid() && level_iter->status().ok());
 
   k = Key(4);
@@ -3110,8 +3111,8 @@ TEST_F(DBRangeDelTest, SentinelKeyCommonCaseTest) {
                     false);
 
   level_iter->SeekToFirst();
-  VerifyIteratorKey(level_iter, {Key(1), Key(2), Key(2), Key(5), Key(6), Key(8),
-                                 Key(9), Key(9)});
+  VerifyIteratorKey(level_iter,
+                    {Key(1), Key(2), Key(2), Key(5), Key(6), Key(8), Key(9)});
   ASSERT_TRUE(!level_iter->Valid() && level_iter->status().ok());
 
   level_iter->SeekToLast();
@@ -4363,6 +4364,135 @@ TEST_F(DBRangeDelTest, SeekForPrevTest) {
   }
   ASSERT_OK(iter2->status());
   iter2.reset();
+}
+
+// Below L0, a level iterator whose file runs out of point keys returns the
+// file's largest key as a sentinel. The sentinel keeps the file's range
+// tombstones in the merging iterator's heap, and when the merging iterator
+// moves past it, the level moves on to the next file and the merging iterator
+// adds that file's tombstones. A file with no range tombstones and no next file
+// to move to needs neither.
+class DBRangeDelSentinelTest : public DBRangeDelTest {
+ protected:
+  // Two L1 files without range tombstones, holding prefixes
+  // {p000, p002, p004} and {p010, p012}.
+  void OpenWithTwoFileLevel() {
+    DestroyAndReopen(PrefixFilterOptions(CurrentOptions()));
+    for (const char* key : {"p000:a", "p002:a", "p004:a"}) {
+      ASSERT_OK(Put(key, "v"));
+    }
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(1);
+    for (const char* key : {"p010:a", "p012:a"}) {
+      ASSERT_OK(Put(key, "v"));
+    }
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(1);
+    ASSERT_EQ("0,2", FilesPerLevel());
+  }
+
+  void CountSentinels() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelIterator::TrySetDeleteRangeSentinel:Set",
+        [this](void* /*arg*/) { sentinels_++; });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  std::atomic<int> sentinels_{0};
+};
+
+TEST_F(DBRangeDelSentinelTest, NoSentinelWhenPrefixRunsOutInFile) {
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  CountSentinels();
+  ReadOptions read_options;
+  read_options.prefix_same_as_start = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  // p001 sorts into the first file, which has no key with that prefix, and the
+  // second file starts with another prefix.
+  iter->Seek("p001");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+}
+
+TEST_F(DBRangeDelSentinelTest, NoSentinelWhenLastFileRunsOut) {
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  CountSentinels();
+  ReadOptions read_options;
+  read_options.prefix_same_as_start = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p011");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+}
+
+TEST_F(DBRangeDelSentinelTest, NoSentinelWhenUpperBoundEndsBeforeNextFile) {
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  CountSentinels();
+  Slice upper_bound("p005");
+  ReadOptions read_options;
+  read_options.total_order_seek = true;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p004");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("p004:a", iter->key());
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+}
+
+TEST_F(DBRangeDelSentinelTest, TombstoneInFileOutlivesPrefixRunningOut) {
+  DestroyAndReopen(PrefixFilterOptions(CurrentOptions()));
+  ASSERT_OK(Put("p001:b", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  // The first L1 file deletes p001:b but holds no p001 key itself, so a p001
+  // seek runs out of keys in it while its tombstone still has to apply.
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "p001",
+                             "p002"));
+  ASSERT_OK(Put("p000:a", "v"));
+  ASSERT_OK(Put("p002:a", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(Put("p010:a", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,2,1", FilesPerLevel());
+
+  ReadOptions read_options;
+  read_options.prefix_same_as_start = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p001");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
+TEST_F(DBRangeDelSentinelTest, TombstoneInNextFileAppliesAfterNext) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("b5", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  // The first L1 file has no tombstones. The second one deletes b5, so the
+  // merging iterator must pick up its tombstone when Next() moves the level
+  // onto it.
+  ASSERT_OK(Put("a1", "v"));
+  ASSERT_OK(Put("a2", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(
+      db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "b0", "b9"));
+  ASSERT_OK(Put("c1", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,2,1", FilesPerLevel());
+
+  ASSERT_EQ(std::vector<std::string>({"a1", "a2", "c1"}),
+            ScanAllKeys(db_.get(), ReadOptions(), /*forward=*/true));
 }
 
 }  // namespace ROCKSDB_NAMESPACE
