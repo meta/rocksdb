@@ -17,6 +17,7 @@
 
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_garbage.h"
+#include "db/blob/blob_relocation_manifest.h"
 #include "db/dbformat.h"
 #include "db/wal_edit.h"
 #include "memory/arena.h"
@@ -31,6 +32,10 @@
 #include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class BlobIndex;
+
+struct BlobReferenceSstSummary;
 
 // Tag numbers for serialized VersionEdit.  These numbers are written to
 // disk and should not be changed. The number should be forward compatible so
@@ -61,6 +66,23 @@ enum Tag : uint32_t {
 
   kBlobFileAddition = 400,
   kBlobFileGarbage,
+  // Required tags for blob indirection (see "MANIFEST records" in
+  // db/blob/blob_relocation_manifest.h). kBlobIndirectionFormatVersion is the
+  // per-CF format fence and kDbBlobIndirectionFormatVersion is the DB-global
+  // format fence; both store kBlobIndirectionManifestFormatVersion (2).
+  kBlobIndirectionFormatVersion,
+  kBlobRelocationFileAddition,
+  kBlobRelocationFileDeletion,
+  kBlobRelocationRoute,
+  kBlobRelocationRouteDeletion,
+  kDbBlobIndirectionFormatVersion,
+  // Required: records the accepted loss of a relocation file. A binary that
+  // ignored it could return an older value or an old cache entry.
+  kBlobPhysicalFileLoss,
+  // Required: removes an indirect-origin blob file that indirect blob GC has
+  // collected. A binary that ignored it would keep a removed file in the
+  // Version.
+  kBlobFileRetirement,
 
   // Mask for an unidentified tag from the future which can be safely ignored.
   kTagSafeIgnoreMask = 1 << 13,
@@ -128,9 +150,13 @@ enum NewFileCustomTag : uint32_t {
 
   // Forward incompatible (aka unignorable) fields
   kPathId,
+  kBlobReferenceDescriptor = kCustomTagNonSafeIgnoreMask | 18,
+  kBlobReferenceLegacyMetadata = kCustomTagNonSafeIgnoreMask | 19,
+  kOldestCoarseIndirectOriginFileNumber = kCustomTagNonSafeIgnoreMask | 20,
 };
 
 class VersionSet;
+class VersionStorageInfo;
 
 constexpr uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
 constexpr uint64_t kUnknownOldestAncestorTime = 0;
@@ -379,6 +405,53 @@ struct FileMetaData {
   // via FileOptions::file_metadata on subsequent opens. Empty if not available.
   std::string file_open_metadata;
 
+  // Encoded BlobReferenceMetadataDescriptor of the exact blob reference
+  // metadata in this SST. The encoding ends with a CRC32C. The MANIFEST stores
+  // a nonempty value as an unignorable NewFile field, so an older RocksDB
+  // cannot open the DB and drop it.
+  // - Empty: the SST has no exact metadata. Every SST of a CF without the
+  //   format fence has an empty descriptor. In a CF with the fence, an SST with
+  //   an empty descriptor has a coarse frontier (the oldest indirect-origin
+  //   file number a coarse SST may reference; see
+  //   oldest_coarse_indirect_origin_file_number), or it is a legacy SST (see
+  //   blob_reference_legacy_metadata).
+  // - Nonempty: the SST has exact metadata. A descriptor with zero references
+  //   means the SST keeps no blob reference, so recovery can tell an empty
+  //   reference set from missing metadata.
+  std::string blob_reference_descriptor;
+  // Summary of the exact references of a newly built SST, taken from its table
+  // builder. Not persisted. BuildTable() (used by flush, WAL recovery at open
+  // and RepairDB) and local compaction set it on their output files before the
+  // edit is queued, so the census can add the SST without reopening it.
+  // VersionBuilder drops it, so Version files do not keep it; later readers
+  // read the SST's reference index.
+  std::shared_ptr<const BlobReferenceSstSummary> blob_reference_summary;
+  // Marks an SST in a CF with the format fence that has no descriptor and no
+  // coarse frontier, so that recovery accepts the SST. There are two cases: an
+  // SST created before the format was activated, and an SST whose coarse
+  // classification has frontier 0 (it has no indirect references; see
+  // ExtractBlobReferenceClassificationFromTableProperties()). VersionBuilder
+  // sets it in memory for such an SST. A MANIFEST snapshot sets it for every
+  // SST of a fenced CF that has no descriptor and no coarse frontier, and
+  // writes it as an unignorable NewFile field. Edits that copy the file
+  // metadata (AddExistingFile()) carry it. Why the snapshot writes it: in a
+  // snapshot the format fence comes before (or in the same edit as) the SSTs of
+  // the CF, so replay checks every SST as one added after the fence. The marker
+  // lets replay accept an SST that has no descriptor and no coarse frontier.
+  bool blob_reference_legacy_metadata = false;
+  // Coarse frontier of a coarse SST: an SST that may hold kIndirectBlob
+  // references but has no exact reference metadata, so it does not list them.
+  // Instead it records only the oldest indirect-origin file number that it
+  // references (its coarse frontier). The SST may reference any indirect origin
+  // at or above this number, so indirect blob GC treats all of them as in use
+  // ("pinned"). kInvalidBlobFileNumber means the SST is not a coarse SST. This
+  // field is separate from oldest_blob_file_number, which is the lowest normal
+  // blob file number that the SST keeps alive, through a direct reference or
+  // through an indirect reference whose generation number is its origin and has
+  // no route (see UpdateFileMetaDataBoundaries() in version_edit.cc). See
+  // "Coarse SST" in db/blob/blob_reference_metadata.h.
+  uint64_t oldest_coarse_indirect_origin_file_number = kInvalidBlobFileNumber;
+
   // Skips prefetching index and filter blocks into block cache on file open,
   // not persisted in MANIFEST. NOTE: false does not guarantee prefetching
   // either (e.g. when index and filter blocks are not cached in block cache).
@@ -423,6 +496,31 @@ struct FileMetaData {
   // the last key to be the largest).
   Status UpdateBoundaries(const Slice& key, const Slice& value,
                           SequenceNumber seqno, ValueType value_type);
+
+  // Same as above. `decoded_blob_index`, if not nullptr, is the caller's decode
+  // of a kTypeBlobIndex `value`. It saves a second decode.
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const BlobIndex* decoded_blob_index);
+
+  // Like UpdateBoundaries() above, for compaction output when the input
+  // Version has the indirection format. `blob_relocation_storage` is the
+  // storage info of the compaction's pinned input Version. A flattened
+  // reference (generation number != origin), or a reference whose generation
+  // number has a route in `blob_relocation_storage`, does not set
+  // oldest_blob_file_number. Its value is in a relocation file, so it does not
+  // keep a normal blob file alive. Flush, RepairDB and compaction without the
+  // indirection format use the overload above.
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const VersionStorageInfo& blob_relocation_storage);
+
+  // Same as above, with the caller's decode of a kTypeBlobIndex `value` (or
+  // nullptr).
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const VersionStorageInfo& blob_relocation_storage,
+                          const BlobIndex* decoded_blob_index);
 
   // Unlike UpdateBoundaries, ranges do not need to be presented in any
   // particular order.
@@ -497,6 +595,9 @@ struct FileMetaData {
     return kUnknownNewestKeyTime;
   }
 
+  // Memory used by blob_reference_summary, or 0 if it is null.
+  size_t BlobReferenceSummaryMemoryUsage() const;
+
   // WARNING: manual update to this function is needed
   // whenever a new string property is added to FileMetaData
   // to reduce approximation error.
@@ -512,7 +613,9 @@ struct FileMetaData {
 #endif  // ROCKSDB_MALLOC_USABLE_SIZE
     usage += smallest.size() + largest.size() + file_checksum.size() +
              file_checksum_func_name.size() + min_timestamp.size() +
-             max_timestamp.size() + file_open_metadata.size();
+             max_timestamp.size() + file_open_metadata.size() +
+             blob_reference_descriptor.size();
+    usage += BlobReferenceSummaryMemoryUsage();
     return usage;
   }
 
@@ -963,6 +1066,16 @@ class VersionEdit {
     files_to_quarantine_.push_back(blob_file_number);
   }
 
+  void AddBlobFile(uint64_t blob_file_number, uint64_t total_blob_count,
+                   uint64_t total_blob_bytes, std::string checksum_method,
+                   std::string checksum_value, bool is_indirect_origin) {
+    blob_file_additions_.emplace_back(
+        blob_file_number, total_blob_count, total_blob_bytes,
+        std::move(checksum_method), std::move(checksum_value),
+        is_indirect_origin);
+    files_to_quarantine_.push_back(blob_file_number);
+  }
+
   void AddBlobFile(BlobFileAddition blob_file_addition) {
     blob_file_additions_.emplace_back(std::move(blob_file_addition));
     files_to_quarantine_.push_back(
@@ -1020,6 +1133,125 @@ class VersionEdit {
   }
   bool HasDroppedBlobFiles() const { return !dropped_blob_files_.empty(); }
 
+  void SetBlobIndirectionFormatVersion(uint32_t format_version) {
+    has_blob_indirection_format_version_ = true;
+    blob_indirection_format_version_ = format_version;
+  }
+  bool HasBlobIndirectionFormatVersion() const {
+    return has_blob_indirection_format_version_;
+  }
+  uint32_t GetBlobIndirectionFormatVersion() const {
+    assert(HasBlobIndirectionFormatVersion());
+    return blob_indirection_format_version_;
+  }
+
+  // The DB-global fence marks the whole DB; the per-CF fence above marks one
+  // column family. They are separate records so that a MANIFEST snapshot does
+  // not activate the format for the default column family only because another
+  // column family uses blob indirection.
+  void SetDbBlobIndirectionFormatVersion(uint32_t format_version) {
+    has_db_blob_indirection_format_version_ = true;
+    db_blob_indirection_format_version_ = format_version;
+  }
+  bool HasDbBlobIndirectionFormatVersion() const {
+    return has_db_blob_indirection_format_version_;
+  }
+  uint32_t GetDbBlobIndirectionFormatVersion() const {
+    assert(HasDbBlobIndirectionFormatVersion());
+    return db_blob_indirection_format_version_;
+  }
+
+  // The one fence rule for flush, WAL-recovery flush and compaction: an edit
+  // that adds an SST built with enable_blob_indirection on sets the per-CF
+  // format fence. The first such edit activates the format.
+  void MaybeSetBlobIndirectionFormatFence(bool output_built_with_indirection) {
+    if (output_built_with_indirection && !new_files_.empty()) {
+      SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+    }
+  }
+
+  // True if this edit sets a nonzero per-CF or DB-global format fence, or has a
+  // relocation file, route or blob file retirement record (these records need
+  // the fence). An accepted-loss record does not count.
+  bool SetsBlobIndirectionState() const {
+    return (has_blob_indirection_format_version_ &&
+            blob_indirection_format_version_ != 0) ||
+           (has_db_blob_indirection_format_version_ &&
+            db_blob_indirection_format_version_ != 0) ||
+           !blob_relocation_file_additions_.empty() ||
+           !blob_relocation_file_deletions_.empty() ||
+           !blob_relocation_routes_.empty() ||
+           !blob_relocation_route_deletions_.empty() ||
+           !blob_file_retirements_.empty();
+  }
+
+  void AddBlobRelocationFile(BlobRelocationFileAddition addition) {
+    blob_relocation_file_additions_.emplace_back(std::move(addition));
+    // Like SST and blob file additions: if the MANIFEST write fails, the new
+    // file is kept (quarantined) instead of deleted, because the write may
+    // have reached disk.
+    files_to_quarantine_.push_back(
+        blob_relocation_file_additions_.back().GetFileNumber());
+  }
+  const std::vector<BlobRelocationFileAddition>&
+  GetBlobRelocationFileAdditions() const {
+    return blob_relocation_file_additions_;
+  }
+
+  void DeleteBlobRelocationFile(uint64_t file_number) {
+    blob_relocation_file_deletions_.push_back(file_number);
+  }
+  const std::vector<uint64_t>& GetBlobRelocationFileDeletions() const {
+    return blob_relocation_file_deletions_;
+  }
+
+  // Records an accepted loss of physical blob file `file_number`.
+  void MarkBlobPhysicalFileLost(uint64_t file_number) {
+    blob_physical_file_losses_.push_back(file_number);
+  }
+  const std::vector<uint64_t>& GetBlobPhysicalFileLosses() const {
+    return blob_physical_file_losses_;
+  }
+
+  // Removes indirect-origin blob file `file_number`, which indirect blob GC has
+  // collected. A file with live values also gets route[file_number] in the
+  // same edit; an empty file leaves without a route.
+  void RetireBlobFile(uint64_t file_number) {
+    blob_file_retirements_.push_back(file_number);
+  }
+  const std::vector<uint64_t>& GetBlobFileRetirements() const {
+    return blob_file_retirements_;
+  }
+
+  void SetBlobRelocationRoute(BlobRelocationRoute route) {
+    blob_relocation_routes_.emplace_back(std::move(route));
+  }
+  const std::vector<BlobRelocationRoute>& GetBlobRelocationRoutes() const {
+    return blob_relocation_routes_;
+  }
+
+  // Deletes the route of old file `old_file_number`.
+  void DeleteBlobRelocationRoute(uint64_t old_file_number) {
+    blob_relocation_route_deletions_.push_back(old_file_number);
+  }
+  const std::vector<uint64_t>& GetBlobRelocationRouteDeletions() const {
+    return blob_relocation_route_deletions_;
+  }
+
+  // Reference summaries of the exact SSTs that this edit deletes (see
+  // GetDeletedFiles()). They are kept only in memory, never written to the
+  // MANIFEST. Compaction sets them from its inputs. The blob reference census
+  // uses them to subtract the references of those SSTs. If the edit deletes an
+  // exact SST whose summary is missing here, the census is rebuilt instead.
+  void SetBlobReferenceSummariesOfDeletedFiles(
+      std::vector<std::shared_ptr<const BlobReferenceSstSummary>> summaries) {
+    blob_reference_summaries_of_deleted_files_ = std::move(summaries);
+  }
+  const std::vector<std::shared_ptr<const BlobReferenceSstSummary>>&
+  GetBlobReferenceSummariesOfDeletedFiles() const {
+    return blob_reference_summaries_of_deleted_files_;
+  }
+
   // Add a WAL (either just created or closed).
   // AddWal and DeleteWalsBefore cannot be called on the same VersionEdit.
   void AddWal(WalNumber number, WalMetadata metadata = WalMetadata()) {
@@ -1053,7 +1285,14 @@ class VersionEdit {
   size_t NumEntries() const {
     return new_files_.size() + deleted_files_.size() +
            blob_file_additions_.size() + blob_file_garbages_.size() +
-           wal_additions_.size() + !wal_deletion_.IsEmpty();
+           blob_relocation_file_additions_.size() +
+           blob_relocation_file_deletions_.size() +
+           blob_physical_file_losses_.size() + blob_file_retirements_.size() +
+           blob_relocation_routes_.size() +
+           blob_relocation_route_deletions_.size() +
+           has_blob_indirection_format_version_ +
+           has_db_blob_indirection_format_version_ + wal_additions_.size() +
+           !wal_deletion_.IsEmpty();
   }
 
   void SetColumnFamily(uint32_t column_family_id) {
@@ -1226,9 +1465,24 @@ class VersionEdit {
   // Compaction cursors for round-robin compaction policy
   CompactCursors compact_cursors_;
   NewFiles new_files_;
+
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;
   std::vector<uint64_t> dropped_blob_files_;
+
+  bool has_blob_indirection_format_version_ = false;
+  uint32_t blob_indirection_format_version_ = 0;
+  bool has_db_blob_indirection_format_version_ = false;
+  uint32_t db_blob_indirection_format_version_ = 0;
+  std::vector<BlobRelocationFileAddition> blob_relocation_file_additions_;
+  std::vector<uint64_t> blob_relocation_file_deletions_;
+  std::vector<uint64_t> blob_physical_file_losses_;
+  std::vector<uint64_t> blob_file_retirements_;
+  std::vector<BlobRelocationRoute> blob_relocation_routes_;
+  std::vector<uint64_t> blob_relocation_route_deletions_;
+  std::vector<std::shared_ptr<const BlobReferenceSstSummary>>
+      blob_reference_summaries_of_deleted_files_;
+
   WalAdditions wal_additions_;
 
   std::string db_id_;

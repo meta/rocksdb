@@ -229,6 +229,10 @@ class Compaction {
   // moving a single input file to the next level (no merging or splitting)
   bool IsTrivialMove() const;
 
+  // True if L0 file `file` holds coarse (pinning) blob metadata that must be
+  // rewritten as exact metadata when it leaves L0, so it cannot be moved.
+  static bool MustRewriteCoarseL0File(const FileMetaData& file);
+
   // The split user key in the output level if this compaction is required to
   // split the output files according to the existing cursor in the output
   // level under round-robin compaction policy. Empty indicates no required
@@ -453,6 +457,24 @@ class Compaction {
   bool enable_blob_garbage_collection() const {
     return enable_blob_garbage_collection_;
   }
+
+  // Returns true when the output must have exact reference metadata: the DB
+  // uses blob indirection (the option is on, or the Version has the format),
+  // and one of these holds: the output level is L1 or deeper, the compaction
+  // is bottommost (at any level, including L0), or an L0 input already has
+  // exact metadata. Otherwise the output gets at most the coarse
+  // classification. Called during unlocked job preparation.
+  //
+  // Why: a flush and an L0 compaction that is not bottommost stay coarse to
+  // save collector memory. Their data gets exact metadata when a later
+  // compaction rewrites it into L1 or deeper, or in a bottommost compaction.
+  // An output never loses exact metadata that an input has, because a coarse
+  // output would pin files again that the census already tracks exactly. A
+  // bottommost compaction always makes exact output, so coarse data gets exact
+  // metadata at the latest when a bottommost compaction rewrites it. This also
+  // holds with universal compaction and num_levels = 1, where no output goes
+  // to L1.
+  bool CollectExactBlobReferences() const;
 
   double blob_garbage_collection_age_cutoff() const {
     return blob_garbage_collection_age_cutoff_;

@@ -91,7 +91,6 @@ Status SstFileManagerImpl::OnDeleteFile(const std::string& file_path) {
 }
 
 void SstFileManagerImpl::OnCompactionCompletion(Compaction* c) {
-  MutexLock l(&mu_);
   uint64_t size_added_by_compaction = 0;
   for (size_t i = 0; i < c->num_input_levels(); i++) {
     for (size_t j = 0; j < c->num_input_files(i); j++) {
@@ -99,8 +98,13 @@ void SstFileManagerImpl::OnCompactionCompletion(Compaction* c) {
       size_added_by_compaction += filemeta->fd.GetFileSize();
     }
   }
-  assert(cur_compactions_reserved_size_ >= size_added_by_compaction);
-  cur_compactions_reserved_size_ -= size_added_by_compaction;
+  OnCompactionCompletion(size_added_by_compaction);
+}
+
+void SstFileManagerImpl::OnCompactionCompletion(uint64_t reserved_size) {
+  MutexLock l(&mu_);
+  assert(cur_compactions_reserved_size_ >= reserved_size);
+  cur_compactions_reserved_size_ -= reserved_size;
 }
 
 Status SstFileManagerImpl::OnMoveFile(const std::string& old_path,
@@ -168,11 +172,33 @@ bool SstFileManagerImpl::EnoughRoomForCompaction(
       size_added_by_compaction += filemeta->fd.GetFileSize();
     }
   }
+  return EnoughRoomForCompactionLocked(
+      size_added_by_compaction,
+      [&]() {
+        return TableFileName(cfd->ioptions().cf_paths,
+                             inputs[0][0]->fd.GetNumber(),
+                             inputs[0][0]->fd.GetPathId());
+      },
+      bg_error);
+}
 
+bool SstFileManagerImpl::EnoughRoomForCompaction(
+    uint64_t size_added_by_compaction, const std::string& output_path,
+    const Status& bg_error) {
+  MutexLock l(&mu_);
+  return EnoughRoomForCompactionLocked(
+      size_added_by_compaction, [&]() { return output_path; }, bg_error);
+}
+
+bool SstFileManagerImpl::EnoughRoomForCompactionLocked(
+    uint64_t size_added_by_compaction,
+    const std::function<std::string()>& free_space_path,
+    const Status& bg_error) {
+  mu_.AssertHeld();
   // Update cur_compactions_reserved_size_ so concurrent compaction
   // don't max out space
-  size_t needed_headroom = cur_compactions_reserved_size_ +
-                           size_added_by_compaction + compaction_buffer_size_;
+  uint64_t needed_headroom = cur_compactions_reserved_size_ +
+                             size_added_by_compaction + compaction_buffer_size_;
   if (max_allowed_space_ != 0 &&
       (needed_headroom + total_files_size_ > max_allowed_space_)) {
     return false;
@@ -183,11 +209,9 @@ bool SstFileManagerImpl::EnoughRoomForCompaction(
   // misbehaving DB instance and prevent it from slowing down compactions of
   // other DB instances
   if (bg_error.IsNoSpace() && CheckFreeSpace()) {
-    auto fn =
-        TableFileName(cfd->ioptions().cf_paths, inputs[0][0]->fd.GetNumber(),
-                      inputs[0][0]->fd.GetPathId());
     uint64_t free_space = 0;
-    Status s = fs_->GetFreeSpace(fn, IOOptions(), &free_space, nullptr);
+    Status s =
+        fs_->GetFreeSpace(free_space_path(), IOOptions(), &free_space, nullptr);
     s.PermitUncheckedError();  // TODO: Check the status
     // needed_headroom is based on current size reserved by compactions,
     // minus any files created by running compactions as they would count
@@ -202,7 +226,7 @@ bool SstFileManagerImpl::EnoughRoomForCompaction(
       ROCKS_LOG_ERROR(logger_,
                       "free space [%" PRIu64
                       " bytes] is less than "
-                      "needed headroom [%" ROCKSDB_PRIszt " bytes]\n",
+                      "needed headroom [%" PRIu64 " bytes]\n",
                       free_space, needed_headroom);
       return false;
     }

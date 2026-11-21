@@ -1051,80 +1051,120 @@ Status InstallMemtableAtomicFlushResults(
     assert(0 == num_entries);
   }
 
-  // this can release and reacquire the mutex.
+  // An atomic flush installs the results of several column families in one
+  // LogAndApply call, with one writer per column family. The callback of the
+  // first writer (publish_atomic_flush) updates the memtable lists of the whole
+  // group under the DB mutex. On success, it runs under the DB mutex at the end
+  // of the batch, after the install of the new Versions (see the callback
+  // contract in VersionSet::LogAndApply()). The batch can release the DB mutex
+  // for a short time between the install and the callbacks, to free relocation
+  // state or census state (see publish_batch_callbacks in
+  // VersionSet::ProcessManifestWrites()). The callbacks of the other writers
+  // are empty, so each memtable list changes exactly once. If LogAndApply()
+  // returns before the batch starts, no callback runs, and the code right after
+  // the call runs publish_atomic_flush itself. For an atomic flush this happens
+  // only when every column family was dropped while its writers waited: the
+  // flush always has edits and passes no pre_cb.
+  bool published = false;
+  const auto publish_atomic_flush = [&](const Status& status) {
+    published = true;
+    for (size_t k = 0; k != cfds.size(); ++k) {
+      auto* imm = (imm_lists == nullptr) ? cfds[k]->imm() : imm_lists->at(k);
+      imm->InstallNewVersion();
+    }
+
+    if (status.ok() || status.IsColumnFamilyDropped()) {
+      for (size_t i = 0; i != cfds.size(); ++i) {
+        if (cfds[i]->IsDropped()) {
+          continue;
+        }
+        auto* imm = (imm_lists == nullptr) ? cfds[i]->imm() : imm_lists->at(i);
+        for (auto m : *mems_list[i]) {
+          assert(m->GetFileNumber() > 0);
+          uint64_t mem_id = m->GetID();
+
+          const VersionEdit* const edit = m->GetEdits();
+          assert(edit);
+
+          if (edit->GetBlobFileAdditions().empty()) {
+            ROCKS_LOG_BUFFER(log_buffer,
+                             "[%s] Level-0 commit table #%" PRIu64
+                             ": memtable #%" PRIu64 " done",
+                             cfds[i]->GetName().c_str(), m->GetFileNumber(),
+                             mem_id);
+          } else {
+            ROCKS_LOG_BUFFER(log_buffer,
+                             "[%s] Level-0 commit table #%" PRIu64
+                             " (+%zu blob files)"
+                             ": memtable #%" PRIu64 " done",
+                             cfds[i]->GetName().c_str(), m->GetFileNumber(),
+                             edit->GetBlobFileAdditions().size(), mem_id);
+          }
+
+          imm->current_->Remove(m, to_delete);
+          imm->UpdateCachedValuesFromMemTableListVersion();
+          imm->ResetTrimHistoryNeeded();
+        }
+      }
+    } else {
+      for (size_t i = 0; i != cfds.size(); ++i) {
+        auto* imm = (imm_lists == nullptr) ? cfds[i]->imm() : imm_lists->at(i);
+        for (auto m : *mems_list[i]) {
+          uint64_t mem_id = m->GetID();
+
+          const VersionEdit* const edit = m->GetEdits();
+          assert(edit);
+
+          if (edit->GetBlobFileAdditions().empty()) {
+            ROCKS_LOG_BUFFER(log_buffer,
+                             "[%s] Level-0 commit table #%" PRIu64
+                             ": memtable #%" PRIu64 " failed",
+                             cfds[i]->GetName().c_str(), m->GetFileNumber(),
+                             mem_id);
+          } else {
+            ROCKS_LOG_BUFFER(log_buffer,
+                             "[%s] Level-0 commit table #%" PRIu64
+                             " (+%zu blob files)"
+                             ": memtable #%" PRIu64 " failed",
+                             cfds[i]->GetName().c_str(), m->GetFileNumber(),
+                             edit->GetBlobFileAdditions().size(), mem_id);
+          }
+
+          m->SetFlushCompleted(false);
+          m->SetFlushInProgress(false);
+          m->GetEdits()->Clear();
+          m->SetFileNumber(0);
+          imm->num_flush_not_started_++;
+        }
+        imm->imm_flush_needed.store(true, std::memory_order_release);
+      }
+    }
+  };
+  std::vector<std::function<void(const Status&)>> manifest_wcbs(cfds.size());
+  manifest_wcbs.front() = publish_atomic_flush;
+
+  // LogAndApply can release the DB mutex and take it again.
   s = vset->LogAndApply(cfds, read_options, write_options, edit_lists, mu,
-                        db_directory);
-
-  for (size_t k = 0; k != cfds.size(); ++k) {
-    auto* imm = (imm_lists == nullptr) ? cfds[k]->imm() : imm_lists->at(k);
-    imm->InstallNewVersion();
-  }
-
-  if (s.ok() || s.IsColumnFamilyDropped()) {
-    for (size_t i = 0; i != cfds.size(); ++i) {
-      if (cfds[i]->IsDropped()) {
-        continue;
-      }
-      auto* imm = (imm_lists == nullptr) ? cfds[i]->imm() : imm_lists->at(i);
-      for (auto m : *mems_list[i]) {
-        assert(m->GetFileNumber() > 0);
-        uint64_t mem_id = m->GetID();
-
-        const VersionEdit* const edit = m->GetEdits();
-        assert(edit);
-
-        if (edit->GetBlobFileAdditions().empty()) {
-          ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit table #%" PRIu64
-                           ": memtable #%" PRIu64 " done",
-                           cfds[i]->GetName().c_str(), m->GetFileNumber(),
-                           mem_id);
-        } else {
-          ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit table #%" PRIu64
-                           " (+%zu blob files)"
-                           ": memtable #%" PRIu64 " done",
-                           cfds[i]->GetName().c_str(), m->GetFileNumber(),
-                           edit->GetBlobFileAdditions().size(), mem_id);
-        }
-
-        imm->current_->Remove(m, to_delete);
-        imm->UpdateCachedValuesFromMemTableListVersion();
-        imm->ResetTrimHistoryNeeded();
-      }
+                        db_directory,
+                        /*new_descriptor_log=*/false,
+                        /*column_family_options=*/nullptr, manifest_wcbs);
+  // LogAndApply() returns without calling any callback when every column
+  // family of the group was dropped while its writers waited in the MANIFEST
+  // queue. Update the memtable lists here in that case, with the same result.
+  if (!published) {
+    // That early return always has an error. An OK status here would remove
+    // the flushed memtables although nothing was committed, so treat it as
+    // Corruption.
+    assert(!s.ok());
+    if (s.ok()) {
+      s = Status::Corruption(
+          "Atomic flush install returned OK without running its callback");
     }
-  } else {
-    for (size_t i = 0; i != cfds.size(); ++i) {
-      auto* imm = (imm_lists == nullptr) ? cfds[i]->imm() : imm_lists->at(i);
-      for (auto m : *mems_list[i]) {
-        uint64_t mem_id = m->GetID();
-
-        const VersionEdit* const edit = m->GetEdits();
-        assert(edit);
-
-        if (edit->GetBlobFileAdditions().empty()) {
-          ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit table #%" PRIu64
-                           ": memtable #%" PRIu64 " failed",
-                           cfds[i]->GetName().c_str(), m->GetFileNumber(),
-                           mem_id);
-        } else {
-          ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit table #%" PRIu64
-                           " (+%zu blob files)"
-                           ": memtable #%" PRIu64 " failed",
-                           cfds[i]->GetName().c_str(), m->GetFileNumber(),
-                           edit->GetBlobFileAdditions().size(), mem_id);
-        }
-
-        m->SetFlushCompleted(false);
-        m->SetFlushInProgress(false);
-        m->GetEdits()->Clear();
-        m->SetFileNumber(0);
-        imm->num_flush_not_started_++;
-      }
-      imm->imm_flush_needed.store(true, std::memory_order_release);
-    }
+    TEST_SYNC_POINT_CALLBACK(
+        "MemTableList::InstallMemtableAtomicFlushResults:"
+        "PublishWithoutCallback",
+        &s);
+    publish_atomic_flush(s);
   }
 
   return s;

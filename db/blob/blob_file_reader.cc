@@ -5,27 +5,82 @@
 
 #include "db/blob/blob_file_reader.h"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
+#include <cinttypes>
+#include <limits>
 #include <string>
+#include <tuple>
+#include <vector>
 
 #include "db/blob/blob_contents.h"
+#include "db/blob/blob_gen2_format.h"
+#include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_relocation_file.h"
+#include "db/blob/same_file_blob_reader.h"
+#include "db/dbformat.h"
+#include "db/version_edit.h"
 #include "file/file_prefetch_buffer.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
+#include "logging/logging.h"
 #include "monitoring/statistics_impl.h"
 #include "options/cf_options.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "table/block_based/block_based_table_reader.h"
+#include "table/embedded_blob_sst.h"
 #include "table/format.h"
+#include "table/internal_iterator.h"
 #include "table/multiget_context.h"
+#include "table/table_builder.h"
+#include "table/table_reader.h"
 #include "test_util/sync_point.h"
 #include "util/aligned_buffer.h"
+#include "util/cast_util.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 #include "util/stop_watch.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+// Checks that `blob_index` is a valid indirect index whose stored payload can
+// be in a relocation file, and that an uncompressed range fits in the value.
+// Returns Corruption for bad metadata or for a range of a compressed value (as
+// in base RocksDB), and InvalidArgument for an out-of-bounds range.
+Status ValidateRelocationBlobReadRequest(const BlobIndex& blob_index,
+                                         uint64_t range_offset,
+                                         size_t range_length) {
+  if (!blob_index.IsIndirect()) {
+    return Status::Corruption("Invalid stable blob relocation lookup");
+  }
+  Status status = blob_index.Validate();
+  if (!status.ok()) {
+    return status;
+  }
+  if (blob_index.size() > kMaxSimpleGen2BlobPayloadSize ||
+      !CompressionTypeSupported(blob_index.compression())) {
+    return Status::Corruption("Unsupported blob relocation payload");
+  }
+  if (range_length != kWholeBlobLength &&
+      blob_index.compression() != kNoCompression) {
+    // As in base RocksDB, a range of a compressed value is not supported.
+    return Status::Corruption("Cannot range-read a compressed blob");
+  }
+  if (range_length != kWholeBlobLength &&
+      (range_offset > blob_index.size() ||
+       range_length > blob_index.size() - range_offset)) {
+    return Status::InvalidArgument("Blob relocation range is out of bounds");
+  }
+  return Status::OK();
+}
+
+}  // namespace
 
 Status BlobFileReader::Create(
     const ImmutableOptions& immutable_options, const ReadOptions& read_options,
@@ -43,7 +98,8 @@ Status BlobFileReader::Create(
     const Status s =
         OpenFile(immutable_options, file_options, blob_file_read_hist,
                  blob_file_number, io_tracer, &file_size, &file_reader,
-                 /*skip_footer_size_check=*/skip_footer_validation);
+                 /*skip_footer_size_check=*/skip_footer_validation,
+                 /*is_relocation_file=*/false);
     if (!s.ok()) {
       return s;
     }
@@ -58,7 +114,7 @@ Status BlobFileReader::Create(
   {
     const Status s =
         ReadHeader(file_reader.get(), read_options, column_family_id,
-                   statistics, &compression_type);
+                   blob_file_number, statistics, &compression_type);
     if (!s.ok()) {
       return s;
     }
@@ -92,7 +148,7 @@ Status BlobFileReader::OpenFile(
     HistogramImpl* blob_file_read_hist, uint64_t blob_file_number,
     const std::shared_ptr<IOTracer>& io_tracer, uint64_t* file_size,
     std::unique_ptr<RandomAccessFileReader>* file_reader,
-    bool skip_footer_size_check) {
+    bool skip_footer_size_check, bool is_relocation_file) {
   assert(file_size);
   assert(file_reader);
 
@@ -110,7 +166,8 @@ Status BlobFileReader::OpenFile(
   std::unique_ptr<FSRandomAccessFile> file;
   FileOptions reader_file_opts = file_opts;
 
-  if (skip_footer_size_check && reader_file_opts.use_direct_reads) {
+  if (skip_footer_size_check && !is_relocation_file &&
+      reader_file_opts.use_direct_reads) {
     reader_file_opts.use_direct_reads = false;
   }
 
@@ -136,11 +193,16 @@ Status BlobFileReader::OpenFile(
     }
   }
 
-  if (!skip_footer_size_check &&
+  if (is_relocation_file &&
+      *file_size < kBlobRelocationFilePrefixSize + Footer::kMinEncodedLength) {
+    return Status::Corruption("Malformed blob relocation file");
+  }
+  if (!is_relocation_file && !skip_footer_size_check &&
       *file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
     return Status::Corruption("Malformed blob file");
   }
-  if (skip_footer_size_check && *file_size < BlobLogHeader::kSize) {
+  if (!is_relocation_file && skip_footer_size_check &&
+      *file_size < BlobLogHeader::kSize) {
     return Status::Corruption("Malformed blob file");
   }
 
@@ -160,6 +222,7 @@ Status BlobFileReader::OpenFile(
 Status BlobFileReader::ReadHeader(const RandomAccessFileReader* file_reader,
                                   const ReadOptions& read_options,
                                   uint32_t column_family_id,
+                                  uint64_t blob_file_number,
                                   Statistics* statistics,
                                   CompressionType* compression_type) {
   assert(file_reader);
@@ -203,6 +266,9 @@ Status BlobFileReader::ReadHeader(const RandomAccessFileReader* file_reader,
 
   if (header.column_family_id != column_family_id) {
     return Status::Corruption("Column family ID mismatch");
+  }
+  if (header.version == kVersion2 && header.file_number != blob_file_number) {
+    return Status::Corruption("Blob file number mismatch");
   }
 
   *compression_type = header.compression;
@@ -323,13 +389,23 @@ BlobFileReader::BlobFileReader(
   assert(file_reader_);
 }
 
+BlobFileReader::BlobFileReader(
+    std::unique_ptr<BlobRelocationFileReader> relocation)
+    : file_size_(relocation->file_size()),
+      compression_type_(kNoCompression),
+      clock_(nullptr),
+      statistics_(nullptr),
+      has_footer_(true),
+      relocation_(std::move(relocation)) {}
+
 BlobFileReader::~BlobFileReader() = default;
 
 Status BlobFileReader::GetBlob(
     const ReadOptions& read_options, const Slice& user_key, uint64_t offset,
     uint64_t value_size, CompressionType compression_type,
     FilePrefetchBuffer* prefetch_buffer, MemoryAllocator* allocator,
-    std::unique_ptr<BlobContents>* result, uint64_t* bytes_read) const {
+    std::unique_ptr<BlobContents>* result, uint64_t* bytes_read,
+    std::optional<uint32_t>* value_crc32c) const {
   assert(result);
 
   const uint64_t key_size = user_key.size();
@@ -401,7 +477,8 @@ Status BlobFileReader::GetBlob(
                            &record_slice);
 
   if (read_options.verify_checksums) {
-    const Status s = VerifyBlob(record_slice, user_key, value_size);
+    const Status s =
+        VerifyBlob(record_slice, user_key, value_size, value_crc32c);
     if (!s.ok()) {
       return s;
     }
@@ -410,9 +487,9 @@ Status BlobFileReader::GetBlob(
   const Slice value_slice(record_slice.data() + adjustment, value_size);
 
   {
-    const Status s = UncompressBlobIfNeeded(value_slice, compression_type,
-                                            decompressor_.get(), allocator,
-                                            clock_, statistics_, result);
+    const Status s = UncompressBlobContentsIfNeeded(
+        value_slice, compression_type, decompressor_.get(), allocator, clock_,
+        statistics_, result);
     if (!s.ok()) {
       return s;
     }
@@ -500,6 +577,165 @@ Status BlobFileReader::GetBlobRange(const ReadOptions& read_options,
   }
 
   return Status::OK();
+}
+
+Status BlobFileReader::StreamStoredBlobForRelocation(
+    const ReadOptions& read_options, const BlobIndex& blob_index,
+    const BlobChunkConsumer& consumer) const {
+  Status status = blob_index.Validate();
+  if (!status.ok()) {
+    return status;
+  }
+  if (!blob_index.IsIndirect()) {
+    return Status::NotSupported(
+        "Stored streaming requires a stable blob index");
+  }
+  if (relocation_ != nullptr) {
+    return Status::InvalidArgument(
+        "Normal stored-blob stream used on a relocation file");
+  }
+  if (blob_index.compression() != compression_type_ ||
+      !IsValidBlobOffset(blob_index.original_value_offset(), /*key_size=*/0,
+                         blob_index.size(), file_size_, has_footer_)) {
+    return Status::Corruption("Invalid streaming normal blob reference");
+  }
+  RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, blob_index.size());
+  PERF_COUNTER_ADD(blob_read_count, 1);
+  PERF_COUNTER_ADD(blob_read_byte, blob_index.size());
+  PERF_TIMER_GUARD(blob_read_time);
+  return StreamAndVerifyBlobStoredPayload(
+      read_options, file_reader_.get(), blob_index.original_value_offset(),
+      blob_index.size(), blob_index.compression(), blob_index.stored_checksum(),
+      consumer);
+}
+
+void BlobFileReader::MultiGetStoredBlobsForRelocation(
+    const ReadOptions& read_options, uint64_t coalesce_bytes,
+    size_t num_requests, StoredNormalBlobReadRequest* requests,
+    uint64_t max_stored_value_size, CoalescedReadBuffers* buffers,
+    uint64_t* bytes_read) const {
+  if (bytes_read != nullptr) {
+    *bytes_read = 0;
+  }
+  if (num_requests == 0 || requests == nullptr) {
+    return;
+  }
+  if (buffers == nullptr) {
+    for (size_t i = 0; i < num_requests; ++i) {
+      if (requests[i].status != nullptr) {
+        *requests[i].status =
+            Status::InvalidArgument("Missing blob GC read buffers");
+      }
+    }
+    return;
+  }
+
+  std::vector<size_t> request_indexes;
+  std::vector<uint64_t> offsets;
+  std::vector<size_t> lengths;
+  request_indexes.reserve(num_requests);
+  offsets.reserve(num_requests);
+  lengths.reserve(num_requests);
+  uint64_t total_read_size = 0;
+  for (size_t i = 0; i < num_requests; ++i) {
+    StoredNormalBlobReadRequest& request = requests[i];
+    if (request.status == nullptr) {
+      continue;
+    }
+    Status& request_status = *request.status;
+    request_status = Status::OK();
+    if (request.stored_payload != nullptr) {
+      *request.stored_payload = Slice();
+    }
+    if (relocation_ != nullptr) {
+      request_status = Status::InvalidArgument(
+          "Normal stored-blob read used on a relocation file");
+      continue;
+    }
+    if (request.stored_value_size > max_stored_value_size) {
+      request_status =
+          Status::MemoryLimit("Stored blob exceeds relocation read limit");
+      continue;
+    }
+    if (request.stored_value_size > std::numeric_limits<size_t>::max() ||
+        !IsValidBlobOffset(request.offset, /*key_size=*/0,
+                           request.stored_value_size, file_size_,
+                           has_footer_)) {
+      request_status =
+          Status::Corruption("Invalid stored blob relocation range");
+      continue;
+    }
+    if (request.compression != compression_type_) {
+      request_status =
+          Status::Corruption("Compression type mismatch when relocating blob");
+      continue;
+    }
+    if (!offsets.empty()) {
+      assert(offsets.back() <= request.offset);
+    }
+    if (request.stored_value_size >
+        std::numeric_limits<uint64_t>::max() - total_read_size) {
+      request_status = Status::Corruption("Stored blob read size overflow");
+      continue;
+    }
+    total_read_size += request.stored_value_size;
+    request_indexes.push_back(i);
+    offsets.push_back(request.offset);
+    lengths.push_back(static_cast<size_t>(request.stored_value_size));
+  }
+  if (request_indexes.empty()) {
+    return;
+  }
+
+  TEST_SYNC_POINT(
+      "BlobFileReader::MultiGetStoredBlobsForRelocation:ReadFromFile");
+  std::vector<Slice> results(request_indexes.size());
+  std::vector<Status> statuses(request_indexes.size());
+  size_t num_reads = 0;
+  uint64_t read_bytes = 0;
+  {
+    PERF_TIMER_GUARD(blob_read_time);
+    // Buffer limit: the requested bytes plus at most max_stored_value_size
+    // bytes of gaps (see ReadCoalescedRanges()).
+    ReadCoalescedRanges(
+        read_options, file_reader_.get(), coalesce_bytes, max_stored_value_size,
+        total_read_size +
+            std::min(max_stored_value_size,
+                     std::numeric_limits<uint64_t>::max() - total_read_size),
+        request_indexes.size(), offsets.data(), lengths.data(), results.data(),
+        statuses.data(), buffers, &num_reads, &read_bytes);
+  }
+  // Bytes read from the file, merged gaps included.
+  RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, read_bytes);
+  PERF_COUNTER_ADD(blob_read_count, num_reads);
+  PERF_COUNTER_ADD(blob_read_byte, read_bytes);
+
+  TEST_SYNC_POINT_CALLBACK(
+      "BlobFileReader::MultiGetStoredBlobsForRelocation:TamperWithResult",
+      &statuses);
+  uint64_t successful_bytes = 0;
+  for (size_t i = 0; i < request_indexes.size(); ++i) {
+    StoredNormalBlobReadRequest& request = requests[request_indexes[i]];
+    assert(request.status != nullptr);
+    Status& request_status = *request.status;
+    request_status = statuses[i];
+    if (!request_status.ok()) {
+      continue;
+    }
+    if (BlobIndex::ComputeStoredChecksum(results[i], request.compression) !=
+        request.stored_checksum) {
+      request_status =
+          Status::Corruption("Stored checksum mismatch while relocating blob");
+      continue;
+    }
+    if (request.stored_payload != nullptr) {
+      *request.stored_payload = results[i];
+    }
+    successful_bytes += results[i].size();
+  }
+  if (bytes_read != nullptr) {
+    *bytes_read = successful_bytes;
+  }
 }
 
 void BlobFileReader::MultiGetBlob(
@@ -593,6 +829,8 @@ void BlobFileReader::MultiGetBlob(
   s = file_reader_->PrepareIOOptions(read_options, opts, &dbg);
   if (s.ok()) {
     AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
+    TEST_SYNC_POINT_CALLBACK("BlobFileReader::MultiGetBlob:Requests",
+                             &read_reqs);
     s = file_reader_->MultiRead(opts, read_reqs.data(), read_reqs.size(),
                                 &direct_io_context, &dbg);
   }
@@ -644,7 +882,8 @@ void BlobFileReader::MultiGetBlob(
 
     // Verify checksums if enabled
     if (read_options.verify_checksums) {
-      *req->status = VerifyBlob(record_slice, *req->user_key, req->len);
+      *req->status =
+          VerifyBlob(record_slice, *req->user_key, req->len, req->value_crc32c);
       if (!req->status->ok()) {
         continue;
       }
@@ -652,7 +891,7 @@ void BlobFileReader::MultiGetBlob(
 
     // Uncompress blob if needed
     Slice value_slice(record_slice.data() + adjustments[j - 1], req->len);
-    *req->status = UncompressBlobIfNeeded(
+    *req->status = UncompressBlobContentsIfNeeded(
         value_slice, compression_type_, decompressor_.get(), allocator, clock_,
         statistics_, &blob_reqs[i].second);
     if (req->status->ok()) {
@@ -776,6 +1015,8 @@ void BlobFileReader::MultiGetBlobRange(
   s = file_reader_->PrepareIOOptions(read_options, opts, &dbg);
   if (s.ok()) {
     AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
+    TEST_SYNC_POINT_CALLBACK("BlobFileReader::MultiGetBlobRange:Requests",
+                             &read_reqs);
     s = file_reader_->MultiRead(opts, read_reqs.data(), read_reqs.size(),
                                 &direct_io_context, &dbg);
   }
@@ -842,7 +1083,8 @@ void BlobFileReader::MultiGetBlobRange(
 }
 
 Status BlobFileReader::VerifyBlob(const Slice& record_slice,
-                                  const Slice& user_key, uint64_t value_size) {
+                                  const Slice& user_key, uint64_t value_size,
+                                  std::optional<uint32_t>* value_crc32c) {
   PERF_TIMER_GUARD(blob_checksum_time);
 
   BlobLogRecord record;
@@ -876,56 +1118,601 @@ Status BlobFileReader::VerifyBlob(const Slice& record_slice,
     TEST_SYNC_POINT_CALLBACK("BlobFileReader::VerifyBlob:CheckBlobCRC",
                              &record);
 
-    const Status s = record.CheckBlobCRC();
-    if (!s.ok()) {
-      return s;
+    if (value_crc32c != nullptr) {
+      const uint32_t value_crc =
+          crc32c::Value(record.value.data(), record.value.size());
+      const uint32_t blob_crc = crc32c::Mask(crc32c::Crc32cCombine(
+          crc32c::Value(record.key.data(), record.key.size()), value_crc,
+          record.value.size()));
+      if (blob_crc != record.blob_crc) {
+        return Status::Corruption("Blob CRC mismatch");
+      }
+      *value_crc32c = value_crc;
+    } else {
+      const Status s = record.CheckBlobCRC();
+      if (!s.ok()) {
+        return s;
+      }
     }
   }
 
   return Status::OK();
 }
 
-Status BlobFileReader::UncompressBlobIfNeeded(
-    const Slice& value_slice, CompressionType compression_type,
-    Decompressor* decompressor, MemoryAllocator* allocator, SystemClock* clock,
-    Statistics* statistics, std::unique_ptr<BlobContents>* result) {
-  assert(result);
+BlobRelocationFileReader::BlobRelocationFileReader(uint32_t column_family_id,
+                                                   uint64_t file_size)
+    : column_family_id_(column_family_id),
+      file_size_(file_size),
+      internal_comparator_(BytewiseComparator()) {}
 
-  if (compression_type == kNoCompression) {
-    BlobContentsCreator::Create(result, nullptr, value_slice, kNoCompression,
-                                allocator);
-    return Status::OK();
+struct BlobRelocationFileReader::PinnedLocationBlocks {
+  BlockBasedTable::PinnedDataBlocks blocks;
+};
+
+BlobRelocationFileReader::~BlobRelocationFileReader() = default;
+
+size_t BlobRelocationFileReader::pinned_location_block_bytes() const {
+  return pinned_location_blocks_ != nullptr
+             ? pinned_location_blocks_->blocks.memory_bytes
+             : 0;
+}
+
+BlockBasedTable* BlobRelocationFileReader::table() const {
+  return static_cast_with_check<BlockBasedTable>(table_reader_.get());
+}
+
+Status BlobRelocationFileReader::Open(
+    const ImmutableOptions& immutable_options, const ReadOptions& read_options,
+    const FileOptions& file_options, HistogramImpl* blob_file_read_hist,
+    uint32_t column_family_id, const BlobPhysicalFile& file,
+    const std::string& db_session_id, const TableFactory& factory,
+    CompressionManager* compression_manager,
+    uint8_t block_protection_bytes_per_key, bool pin_location_blocks,
+    const std::shared_ptr<IOTracer>& io_tracer,
+    BlockCacheTracer* block_cache_tracer,
+    std::unique_ptr<BlobRelocationFileReader>* reader) {
+  assert(reader != nullptr);
+  if (!file.is_relocation || file.open_info.file_number == 0 ||
+      file.file_size == 0 || db_session_id.empty() || file.tail_size == 0 ||
+      file.tail_size > file.file_size) {
+    return Status::InvalidArgument("Invalid blob relocation file metadata");
   }
 
-  assert(decompressor);
+  uint64_t file_size = 0;
+  std::unique_ptr<RandomAccessFileReader> file_reader;
+  Status status = BlobFileReader::OpenFile(
+      immutable_options, file_options, blob_file_read_hist,
+      file.open_info.file_number, io_tracer, &file_size, &file_reader,
+      /*skip_footer_size_check=*/false, /*is_relocation_file=*/true);
+  if (!status.ok()) {
+    return status;
+  }
+  if (file_size != file.file_size) {
+    return Status::Corruption("Blob relocation file size mismatch");
+  }
+  // No separate prefix read: `file.is_relocation` already says this is a
+  // relocation file, and the table footer, file number, tail size and directory
+  // digest checked below identify it.
 
-  Decompressor::Args args;
-  args.compression_type = compression_type;
-  args.compressed_data = value_slice;
-
-  Status s = decompressor->ExtractUncompressedSize(args);
-  if (!s.ok()) {
-    return Status::Corruption(s.ToString());
+  std::unique_ptr<BlobRelocationFileReader> relocation(
+      new BlobRelocationFileReader(column_family_id, file_size));
+  const std::shared_ptr<const SliceTransform> no_prefix_extractor;
+  TableReaderOptions table_reader_options(
+      immutable_options, no_prefix_extractor, compression_manager, file_options,
+      relocation->internal_comparator_, block_protection_bytes_per_key,
+      /*skip_filters=*/true, /*immortal=*/false,
+      /*force_direct_prefetch=*/false, /*level=*/-1, block_cache_tracer);
+  table_reader_options.cur_file_num = file.open_info.file_number;
+  table_reader_options.cur_db_session_id = db_session_id;
+  table_reader_options.tail_size = file.tail_size;
+  status = factory.NewTableReader(read_options, table_reader_options,
+                                  std::move(file_reader), file_size,
+                                  &relocation->table_reader_,
+                                  /*prefetch_index_and_filter_in_cache=*/true);
+  if (!status.ok()) {
+    return status;
   }
 
-  CacheAllocationPtr output = AllocateBlock(args.uncompressed_size, allocator);
-
-  {
-    PERF_TIMER_GUARD(blob_decompress_time);
-    StopWatch stop_watch(clock, statistics, BLOB_DB_DECOMPRESSION_MICROS);
-    s = decompressor->DecompressBlock(args, output.get());
+  const std::shared_ptr<const TableProperties> properties =
+      relocation->table_reader_->GetTableProperties();
+  if (properties == nullptr) {
+    return Status::Corruption("Blob relocation file has no table properties");
+  }
+  relocation->tail_size_ =
+      FileMetaData::CalculateTailSize(file_size, *properties);
+  if (relocation->tail_size_ != file.tail_size) {
+    return Status::Corruption("Blob relocation metadata tail size mismatch");
+  }
+  if (properties->column_family_id != column_family_id) {
+    return Status::Corruption("Blob relocation column family mismatch");
+  }
+  if (properties->orig_file_number != file.open_info.file_number ||
+      properties->db_session_id.empty()) {
+    return Status::Corruption("Blob relocation file identity is missing");
+  }
+  const auto directory_it = properties->user_collected_properties.find(
+      kBlobRelocationDirectoryPropertyName);
+  const auto stats_it = properties->user_collected_properties.find(
+      kEmbeddedBlobSstStatsPropertyName);
+  if (directory_it == properties->user_collected_properties.end() ||
+      stats_it == properties->user_collected_properties.end()) {
+    return Status::Corruption("Blob relocation file metadata is missing");
+  }
+  // The directory is checked here, then only its totals and digest are kept:
+  // a lookup proves a value exists by its key match (CheckEntry).
+  Slice encoded_directory = directory_it->second;
+  TEST_SYNC_POINT_CALLBACK("BlobRelocationFileReader::Open:EncodedDirectory",
+                           &encoded_directory);
+  BlobRelocationDirectory directory;
+  status = BlobRelocationDirectory::DecodeFrom(encoded_directory, &directory);
+  if (!status.ok()) {
+    return status;
+  }
+  status = directory.ValidateForFileSize(file_size);
+  if (!status.ok()) {
+    return status;
+  }
+  // Check that every origin and served file is older than the file itself,
+  // that the directory (a table property) fits in the tail, and that the
+  // records fit between the prefix and the tail.
+  if (directory.origins().back().origin_file_number >=
+          file.open_info.file_number ||
+      directory.served_file_numbers().back() >= file.open_info.file_number) {
+    return Status::Corruption(
+        "Blob relocation directory names a file that is not older");
+  }
+  if (directory.encoded_size() > file.tail_size ||
+      file_size - file.tail_size < kBlobRelocationFilePrefixSize ||
+      directory.total_record_bytes() >
+          file_size - file.tail_size - kBlobRelocationFilePrefixSize) {
+    return Status::Corruption("Blob relocation directory exceeds its region");
+  }
+  relocation->total_entries_ = directory.total_entries();
+  relocation->total_record_bytes_ = directory.total_record_bytes();
+  relocation->directory_digest_ = directory.directory_digest();
+  if (relocation->directory_digest_ != file.directory_digest) {
+    return Status::Corruption("Blob relocation directory digest mismatch");
+  }
+  EmbeddedBlobStats stats;
+  status = DecodeEmbeddedBlobStats(stats_it->second, &stats);
+  if (!status.ok()) {
+    return status;
+  }
+  const uint64_t entry_count = relocation->total_entries_;
+  const bool trailer_bytes_overflow =
+      entry_count >
+      std::numeric_limits<uint64_t>::max() / kSimpleGen2BlobTrailerSize;
+  const uint64_t trailer_bytes =
+      trailer_bytes_overflow ? 0 : entry_count * kSimpleGen2BlobTrailerSize;
+  // One location entry per group of up to kBlobRelocationGroupSize values of
+  // one origin (see "Location entry" in db/blob/blob_relocation_file.h). The
+  // directory entry counts give the exact number of groups. The group counts
+  // inside the entries are checked when a lookup decodes an entry; checking
+  // their sum here would read every location block at open.
+  uint64_t group_count = 0;
+  for (const BlobRelocationOrigin& origin : directory.origins()) {
+    group_count += (origin.entry_count + kBlobRelocationGroupSize - 1) /
+                   kBlobRelocationGroupSize;
+  }
+  if (!stats.HasRecords() || stats.blob_count != entry_count ||
+      properties->num_entries != group_count || trailer_bytes_overflow ||
+      stats.payload_bytes >
+          std::numeric_limits<uint64_t>::max() - trailer_bytes ||
+      stats.payload_bytes + trailer_bytes != relocation->total_record_bytes_) {
+    return Status::Corruption("Blob relocation file entry totals mismatch");
   }
 
-  TEST_SYNC_POINT_CALLBACK(
-      "BlobFileReader::UncompressBlobIfNeeded:TamperWithResult", &s);
+  // The encoded directory in the table properties is not needed after open.
+  relocation->table()->DropUserCollectedProperty(
+      kBlobRelocationDirectoryPropertyName);
 
-  if (!s.ok()) {
-    return Status::Corruption(s.ToString());
+  if (pin_location_blocks) {
+    TEST_SYNC_POINT("BlobRelocationFileReader::Open:PinLocationBlocks");
+    auto pinned = std::make_unique<PinnedLocationBlocks>();
+    const Status pin_status =
+        relocation->table()->PinDataBlocks(read_options, &pinned->blocks);
+    if (pin_status.ok()) {
+      relocation->pinned_location_blocks_ = std::move(pinned);
+    } else {
+      // Not an open failure: normal lookups read the same blocks.
+      ROCKS_LOG_WARN(immutable_options.logger,
+                     "Cannot keep the location blocks of blob relocation file "
+                     "#%" PRIu64 " in memory; using normal lookups: %s",
+                     file.open_info.file_number, pin_status.ToString().c_str());
+    }
   }
 
-  result->reset(new BlobContents(std::move(output), args.uncompressed_size));
-
+  *reader = std::move(relocation);
   return Status::OK();
+}
+
+Status BlobRelocationFileReader::PrepareLookup(
+    const BlobIndex& stable_blob_index, uint64_t range_offset,
+    size_t range_length) const {
+  return ValidateRelocationBlobReadRequest(stable_blob_index, range_offset,
+                                           range_length);
+}
+
+void BlobRelocationFileReader::EncodeLookupKey(
+    const BlobIndex& stable_blob_index, char* lookup_key) {
+  EncodeBlobRelocationKeyTo(stable_blob_index.origin_file_number(),
+                            stable_blob_index.original_value_offset(),
+                            lookup_key);
+  EncodeFixed64(lookup_key + kBlobRelocationKeySize,
+                PackSequenceAndType(kMaxSequenceNumber, kValueTypeForSeek));
+}
+
+Status BlobRelocationFileReader::CheckEntry(const BlobIndex& stable_blob_index,
+                                            const Slice& internal_key,
+                                            const Slice& value,
+                                            BlobIndex* same_file_blob_index,
+                                            DecodedGroupCache* cache) {
+  assert(same_file_blob_index != nullptr);
+  // The lookup found the first location entry at or after the lookup key. It
+  // holds the value only if it has the same origin. Its key holds the origin
+  // and the original offset of the group's last value, so with the same origin
+  // that offset is at or after the requested offset.
+  const BlobRelocationGroup* group = nullptr;
+  BlobRelocationGroup decoded;
+  if (cache != nullptr && cache->valid && internal_key == cache->internal_key) {
+    group = &cache->group;
+  } else {
+    ParsedInternalKey parsed_key;
+    Status status = ParseInternalKey(internal_key, &parsed_key,
+                                     /*log_err_key=*/false);
+    if (!status.ok()) {
+      return status;
+    }
+    uint64_t origin_file_number = 0;
+    uint64_t last_original_value_offset = 0;
+    status = DecodeBlobRelocationKey(parsed_key.user_key, &origin_file_number,
+                                     &last_original_value_offset);
+    if (!status.ok() || parsed_key.sequence != 0 ||
+        parsed_key.type != kTypeValue) {
+      return Status::Corruption("Invalid blob relocation entry key");
+    }
+    if (origin_file_number != stable_blob_index.origin_file_number()) {
+      return Status::Corruption("Blob relocation entry is missing");
+    }
+    TEST_SYNC_POINT("BlobRelocationFileReader::CheckEntry:Decode");
+    if (cache != nullptr) {
+      cache->valid = false;
+    }
+    BlobRelocationGroup* const target =
+        cache != nullptr ? &cache->group : &decoded;
+    status =
+        DecodeBlobRelocationGroup(value, last_original_value_offset, target);
+    if (!status.ok()) {
+      return status;
+    }
+    if (cache != nullptr) {
+      cache->internal_key.assign(internal_key.data(), internal_key.size());
+      cache->origin_file_number = origin_file_number;
+      cache->valid = true;
+    }
+    group = target;
+  }
+  const BlobRelocationGroup::Value* const found =
+      group->Find(stable_blob_index.original_value_offset());
+  if (found == nullptr) {
+    return Status::Corruption("Blob relocation entry is missing");
+  }
+  // A same-file BlobIndex on the stack: type, file number, record offset,
+  // stored size and compression. The location entry has no compression type:
+  // the record's compression marker must match the one of
+  // `stable_blob_index`, and the record read checks that.
+  char encoded[2 + 2 * kMaxVarint64Length + 1];
+  char* end = encoded;
+  *end++ = static_cast<char>(BlobIndex::Type::kBlob);
+  end = EncodeVarint64(end, kCurrentFileBlobIndexFileNumber);
+  end = EncodeVarint64(end, found->record_offset);
+  end = EncodeVarint64(end, found->stored_value_size);
+  *end++ = static_cast<char>(stable_blob_index.compression());
+  Status status = same_file_blob_index->DecodeFrom(
+      Slice(encoded, static_cast<size_t>(end - encoded)));
+  if (!status.ok()) {
+    return status;
+  }
+  if (same_file_blob_index->size() != stable_blob_index.size()) {
+    return Status::Corruption("Blob relocation entry metadata mismatch");
+  }
+  return Status::OK();
+}
+
+void BlobRelocationFileReader::MultiGetBlob(const ReadOptions& read_options,
+                                            MemoryAllocator* allocator,
+                                            size_t num_reads,
+                                            RelocationBlobReadRequest* requests,
+                                            uint64_t* bytes_read) const {
+  if (bytes_read != nullptr) {
+    *bytes_read = 0;
+  }
+  if (num_reads == 0) {
+    return;
+  }
+  assert(requests != nullptr);
+
+  // Checks each request once, then looks up the valid ones in key order. The
+  // lookup keys and the same-file requests of one batch
+  // (MultiGetContext::MAX_BATCH_SIZE) live on the stack. The lookup order is on
+  // the stack while the call has at most one batch of requests. The record
+  // reads and the cached key of the decoded group can still allocate on the
+  // heap.
+  constexpr size_t kBatch = MultiGetContext::MAX_BATCH_SIZE;
+  autovector<size_t, kBatch> lookup_order;
+  for (size_t i = 0; i < num_reads; ++i) {
+    RelocationBlobReadRequest& request = requests[i];
+    assert(request.blob_index != nullptr);
+    assert(request.output != nullptr);
+    assert(request.status != nullptr);
+    request.output->allocator = allocator;
+    request.output->contents.reset();
+    request.output->gen2 = SimpleGen2ReadExtras();
+    *request.status = PrepareLookup(*request.blob_index, request.range_offset,
+                                    request.range_length);
+    if (request.status->ok()) {
+      lookup_order.push_back(i);
+    }
+  }
+  std::sort(lookup_order.begin(), lookup_order.end(),
+            [requests](size_t lhs, size_t rhs) {
+              const BlobIndex& left = *requests[lhs].blob_index;
+              const BlobIndex& right = *requests[rhs].blob_index;
+              return std::make_tuple(left.origin_file_number(),
+                                     left.original_value_offset()) <
+                     std::make_tuple(right.origin_file_number(),
+                                     right.original_value_offset());
+            });
+
+  uint64_t total_bytes_read = 0;
+  constexpr size_t kLookupKeySize = kBlobRelocationKeySize + kNumInternalBytes;
+  for (size_t begin = 0; begin < lookup_order.size(); begin += kBatch) {
+    const size_t count = std::min(lookup_order.size() - begin, kBatch);
+    // One raw lookup of the batch's keys. Pinned or cached data blocks need no
+    // read. MultiGetRawEntries() reads the missing blocks, with one batched
+    // read when two or more are missing.
+    std::array<char, kBatch * kLookupKeySize> lookup_key_bytes;
+    std::array<Slice, kBatch> lookup_keys;
+    for (size_t k = 0; k < count; ++k) {
+      char* const lookup_key = lookup_key_bytes.data() + k * kLookupKeySize;
+      EncodeLookupKey(*requests[lookup_order[begin + k]].blob_index,
+                      lookup_key);
+      lookup_keys[k] = Slice(lookup_key, kLookupKeySize);
+    }
+    autovector<BlobIndex, kBatch> same_file_blob_indexes;
+    same_file_blob_indexes.resize(count);
+    // Keys are sorted, so the keys that fall in one location entry come one
+    // after another: the entry is decoded once for all of them.
+    DecodedGroupCache group_cache;
+    const auto on_entry = [&](size_t k, const Status& lookup_status,
+                              const Slice& internal_key, const Slice& value) {
+      RelocationBlobReadRequest& request = requests[lookup_order[begin + k]];
+      if (lookup_status.IsNotFound()) {
+        *request.status =
+            Status::Corruption("Blob relocation entry is missing");
+      } else if (!lookup_status.ok()) {
+        *request.status = lookup_status;
+      } else {
+        *request.status = CheckEntry(*request.blob_index, internal_key, value,
+                                     &same_file_blob_indexes[k], &group_cache);
+      }
+    };
+    if (pinned_location_blocks_ != nullptr) {
+      table()->MultiGetRawEntriesPinned(pinned_location_blocks_->blocks, count,
+                                        lookup_keys.data(), on_entry);
+    } else {
+      table()->MultiGetRawEntries(read_options, count, lookup_keys.data(),
+                                  on_entry);
+    }
+
+    // The table pins nothing into these; each value goes to
+    // request.output->contents.
+    autovector<PinnableSlice, kBatch> unused_results;
+    autovector<SameFileBlobReadRequest, kBatch> same_file_requests;
+    for (size_t k = 0; k < count; ++k) {
+      RelocationBlobReadRequest& request = requests[lookup_order[begin + k]];
+      if (!request.status->ok()) {
+        continue;
+      }
+      // Same rule as for normal blob files: check the record checksum only when
+      // verify_checksums is set and the check needs no extra read (see the
+      // read table in db/blob/blob_relocation_file.h).
+      const BlobVerifyPolicy verify_policy =
+          BlobVerifyPolicy::kVerifyIfNoAmplification;
+      unused_results.emplace_back();
+      SameFileBlobReadRequest same_file_request;
+      same_file_request.blob_index = &same_file_blob_indexes[k];
+      same_file_request.range_offset = request.range_offset;
+      same_file_request.range_length = request.range_length;
+      same_file_request.verify_policy = verify_policy;
+      same_file_request.result = &unused_results.back();
+      same_file_request.status = request.status;
+      same_file_request.standalone = request.output;
+      same_file_requests.push_back(same_file_request);
+    }
+    if (!same_file_requests.empty()) {
+      // At most kBatch requests, so they are contiguous in the inline storage.
+      table()->MultiGetSameFileBlob(read_options, same_file_requests.size(),
+                                    &same_file_requests[0]);
+    }
+
+    // Add the record size estimate to `bytes_read`. It does not count the
+    // index and data block reads.
+    for (size_t k = 0; k < count; ++k) {
+      const RelocationBlobReadRequest& request =
+          requests[lookup_order[begin + k]];
+      if (!request.status->ok() || request.output->gen2.copied) {
+        continue;
+      }
+      const BlobIndex& blob_index = *request.blob_index;
+      total_bytes_read += request.range_length == kWholeBlobLength
+                              ? blob_index.size() + kSimpleGen2BlobTrailerSize
+                              : request.range_length;
+    }
+  }
+  if (bytes_read != nullptr) {
+    *bytes_read = total_bytes_read;
+  }
+}
+
+std::unique_ptr<InternalIterator> BlobRelocationFileReader::NewLookupIterator(
+    ReadOptions* lookup_options) const {
+  assert(lookup_options != nullptr);
+  lookup_options->iterate_lower_bound = nullptr;
+  lookup_options->iterate_upper_bound = nullptr;
+  lookup_options->async_io = false;
+  lookup_options->readahead_size = 0;
+  // Relocation table values are location entries (kTypeValue). With
+  // kBlobRelocationFileRead no wrapper iterator touches the values before
+  // FindBlobIndex checks them.
+  return std::unique_ptr<InternalIterator>(table_reader_->NewIterator(
+      *lookup_options, /*prefix_extractor=*/nullptr, /*arena=*/nullptr,
+      /*skip_filters=*/true, TableReaderCaller::kBlobRelocationFileRead,
+      /*compaction_readahead_size=*/0,
+      /*allow_unprepared_value=*/false));
+}
+
+Status BlobRelocationFileReader::FindBlobIndex(
+    InternalIterator* iterator, const BlobIndex& stable_blob_index,
+    BlobIndex* same_file_blob_index, DecodedGroupCache* cache) const {
+  assert(iterator != nullptr);
+  assert(same_file_blob_index != nullptr);
+  Status status =
+      PrepareLookup(stable_blob_index, /*range_offset=*/0, kWholeBlobLength);
+  if (!status.ok()) {
+    return status;
+  }
+  if (cache != nullptr && cache->valid &&
+      cache->origin_file_number == stable_blob_index.origin_file_number()) {
+    const BlobRelocationGroup& group = cache->group;
+    const uint64_t offset = stable_blob_index.original_value_offset();
+    if (offset >= group.values[0].original_value_offset &&
+        offset <= group.values[group.count - 1].original_value_offset) {
+      return CheckEntry(stable_blob_index, Slice(cache->internal_key), Slice(),
+                        same_file_blob_index, cache);
+    }
+  }
+  // The internal lookup key, built on the stack: kBlobRelocationKeySize (16
+  // bytes) + kNumInternalBytes (8 bytes).
+  char lookup_key[kBlobRelocationKeySize + kNumInternalBytes];
+  EncodeLookupKey(stable_blob_index, lookup_key);
+  iterator->Seek(Slice(lookup_key, sizeof(lookup_key)));
+  if (!iterator->Valid()) {
+    status = iterator->status();
+    return status.ok() ? Status::Corruption("Blob relocation entry is missing")
+                       : status;
+  }
+  return CheckEntry(stable_blob_index, iterator->key(), iterator->value(),
+                    same_file_blob_index, cache);
+}
+
+void BlobRelocationFileReader::MultiGetStoredBlobs(
+    const ReadOptions& read_options, uint64_t coalesce_bytes,
+    size_t num_requests, StoredRelocationFileReadRequest* requests,
+    uint64_t max_stored_value_size, CoalescedReadBuffers* buffers,
+    uint64_t* bytes_read) const {
+  if (bytes_read != nullptr) {
+    *bytes_read = 0;
+  }
+  if (num_requests == 0) {
+    return;
+  }
+  if (requests == nullptr) {
+    return;
+  }
+
+  using OrderedRequest = std::tuple<uint64_t, uint64_t, size_t>;
+  std::vector<OrderedRequest> order;
+  order.reserve(num_requests);
+  for (size_t i = 0; i < num_requests; ++i) {
+    StoredRelocationFileReadRequest& request = requests[i];
+    if (request.status == nullptr) {
+      continue;
+    }
+    Status& request_status = *request.status;
+    request_status = Status::OK();
+    if (request.stored_payload != nullptr) {
+      *request.stored_payload = Slice();
+    }
+    if (request.origin_file_number == 0 ||
+        request.stored_value_size > max_stored_value_size) {
+      request_status =
+          Status::MemoryLimit("Invalid or oversized stored relocation request");
+      continue;
+    }
+    order.emplace_back(request.origin_file_number,
+                       request.original_value_offset, i);
+  }
+  std::sort(order.begin(), order.end());
+
+  ReadOptions lookup_options(read_options);
+  std::unique_ptr<InternalIterator> iterator =
+      NewLookupIterator(&lookup_options);
+  std::vector<BlobIndex> same_file_indexes(num_requests);
+  // Requests are sorted, so the requests of one location entry come one after
+  // another and share one seek and one decode.
+  DecodedGroupCache group_cache;
+  std::vector<StoredSameFileBlobReadRequest> same_file_requests;
+  same_file_requests.reserve(order.size());
+  for (const OrderedRequest& ordered_request : order) {
+    const size_t index = std::get<2>(ordered_request);
+    StoredRelocationFileReadRequest& request = requests[index];
+    assert(request.status != nullptr);
+    Status& request_status = *request.status;
+    // BlobIndex has no setters, so build the stable index by encoding and
+    // decoding it. DecodeFrom() checks the identity fields; FindBlobIndex()
+    // runs the full Validate().
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(
+        &encoded, request.origin_file_number,
+        {.origin_file_number = request.origin_file_number,
+         .original_value_offset = request.original_value_offset,
+         .stored_value_size = request.stored_value_size,
+         .compression = request.compression,
+         .stable_checksum = request.stable_checksum,
+         .stored_checksum = request.stored_checksum});
+    BlobIndex stable_index;
+    request_status = stable_index.DecodeFrom(Slice(encoded));
+    if (!request_status.ok()) {
+      continue;
+    }
+    request_status = FindBlobIndex(iterator.get(), stable_index,
+                                   &same_file_indexes[index], &group_cache);
+    if (!request_status.ok()) {
+      continue;
+    }
+    same_file_requests.push_back(StoredSameFileBlobReadRequest{
+        same_file_indexes[index], request.stored_payload, request_status,
+        request.stored_checksum});
+  }
+  if (!same_file_requests.empty()) {
+    table()->MultiGetStoredSameFileBlob(
+        read_options, coalesce_bytes, same_file_requests.size(),
+        same_file_requests.data(), max_stored_value_size, buffers, bytes_read);
+  }
+}
+
+Status BlobRelocationFileReader::StreamStoredBlob(
+    const ReadOptions& read_options, const BlobIndex& blob_index,
+    const BlobChunkConsumer& consumer) const {
+  Status status = blob_index.Validate();
+  if (!status.ok()) {
+    return status;
+  }
+  if (!blob_index.IsIndirect()) {
+    return Status::NotSupported(
+        "Stored streaming requires a stable blob index");
+  }
+  ReadOptions lookup_options(read_options);
+  std::unique_ptr<InternalIterator> iterator =
+      NewLookupIterator(&lookup_options);
+  BlobIndex physical_index;
+  status = FindBlobIndex(iterator.get(), blob_index, &physical_index,
+                         /*cache=*/nullptr);
+  return status.ok() ? table()->StreamStoredSameFileBlob(
+                           read_options, physical_index,
+                           blob_index.stored_checksum(), consumer)
+                     : status;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

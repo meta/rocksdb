@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -84,9 +85,18 @@ class SstFileManagerImpl : public SstFileManager {
                                const std::vector<CompactionInputFiles>& inputs,
                                const Status& bg_error);
 
+  // Same check as above, for background work that has no CompactionInputFiles,
+  // such as indirect blob GC. `estimated_output_size` is the number of bytes
+  // the job expects to write. On success, it reserves that many bytes. The
+  // caller releases them with OnCompactionCompletion(uint64_t).
+  bool EnoughRoomForCompaction(uint64_t estimated_output_size,
+                               const std::string& output_path,
+                               const Status& bg_error);
+
   // Bookkeeping so total_file_sizes_ goes back to normal after compaction
   // finishes
   void OnCompactionCompletion(Compaction* c);
+  void OnCompactionCompletion(uint64_t reserved_size);
 
   uint64_t GetCompactionsReservedSize();
 
@@ -185,6 +195,14 @@ class SstFileManagerImpl : public SstFileManager {
   void OnDeleteFileImpl(const std::string& file_path);
 
   void ClearError();
+
+  // The body of both EnoughRoomForCompaction() overloads. REQUIRES: mu_ held.
+  // `free_space_path` returns the path whose file system free space is
+  // checked; it is called only after a NoSpace error.
+  bool EnoughRoomForCompactionLocked(
+      uint64_t size_added_by_compaction,
+      const std::function<std::string()>& free_space_path,
+      const Status& bg_error);
   bool CheckFreeSpace() {
     return bg_err_.severity() == Status::Severity::kSoftError;
   }
