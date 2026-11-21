@@ -35,6 +35,7 @@
 #include "cache/cache_helpers.h"
 #include "db/blob/blob_file_meta.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_relocation_manifest.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_picker.h"
@@ -53,6 +54,7 @@
 #include "monitoring/instrumented_mutex.h"
 #include "options/db_options.h"
 #include "options/offpeak_time_info.h"
+#include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_checksum.h"
@@ -62,6 +64,7 @@
 #include "util/autovector.h"
 #include "util/coro_utils.h"
 #include "util/hash_containers.h"
+#include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -70,6 +73,7 @@ class Writer;
 }
 
 class BlobIndex;
+struct BlobPhysicalFile;
 class Compaction;
 class LogBuffer;
 class LookupKey;
@@ -571,6 +575,128 @@ class VersionStorageInfo {
     dropped_blob_files_ = std::move(dropped_blob_files);
   }
 
+  using BlobRelocationFiles = BlobRelocationState::Files;
+
+  void ShareBlobRelocationState(const VersionStorageInfo& base) {
+    blob_relocation_state_ = base.blob_relocation_state_;
+  }
+
+  // Moves out the relocation state before this Version is destroyed under the
+  // DB mutex (see VersionSet::FreeBlobRelocationState()).
+  std::shared_ptr<void> ReleaseBlobRelocationState() {
+    return std::move(blob_relocation_state_);
+  }
+
+  // Called by ~Version() under the DB mutex. When this Version is the last
+  // owner of its relocation state, frees the relocation file metadata now and
+  // returns the rest: the file table, which holds only memory and its cache
+  // reservation. The metadata must be freed now, while the column family is
+  // alive, because its deleter uses the column family's options (cf_paths) and
+  // blob file cache. The caller frees the table later without the mutex.
+  // Returns null when other owners remain. The use_count() check can race with
+  // another owner that drops its reference at the same time. Then whichever
+  // side drops the last reference frees the whole state.
+  std::shared_ptr<void> ReleaseBlobRelocationStateForDeferredFree();
+
+  // The state's file table does not own its blob file entries: this Version's
+  // blob file vector does. A holder that may outlive the Version can use the
+  // relocation files and routes, but must not read a blob file entry of the
+  // table.
+  std::shared_ptr<const BlobRelocationState> GetBlobRelocationState() const {
+    return blob_relocation_state_;
+  }
+  void AddBlobRelocationFile(
+      std::shared_ptr<BlobRelocationFileMetaData> metadata);
+  void AddBlobRelocationRoute(const BlobRelocationRoute& route);
+  void DeleteBlobRelocationFile(uint64_t file_number);
+  void DeleteBlobRelocationRoute(uint64_t old_file_number);
+
+  // Applies the buffered file table edits of the calls above. The table must be
+  // sealed before anyone reads it. VersionBuilder::SaveBlobFilesAndCheckTo()
+  // calls it once per saved Version; PrepareForVersionAppend() calls it again,
+  // which does nothing when the state is already sealed.
+  void SealBlobRelocationState();
+
+  // Sorted by file number.
+  const BlobRelocationFiles& GetBlobRelocationFiles() const {
+    return BlobRelocationStateForRead().files();
+  }
+  size_t GetBlobRelocationRouteCount() const {
+    return BlobRelocationStateForRead().route_count();
+  }
+  // Visits every route, in no particular order.
+  template <typename Fn>
+  void ForEachBlobRelocationRoute(Fn&& fn) const {
+    BlobRelocationStateForRead().ForEachRoute(std::forward<Fn>(fn));
+  }
+
+  // The file table: file number -> live blob file, live relocation file or
+  // route (see BlobFileTable). It is filled only when this Version has the
+  // per-CF format fence (HasBlobIndirectionFormat()); otherwise it is empty.
+  const BlobFileTable& GetBlobFileTable() const {
+    return BlobRelocationStateForRead().table();
+  }
+
+  std::shared_ptr<BlobRelocationFileMetaData> GetBlobRelocationFileMetaData(
+      uint64_t file_number) const;
+  // Raw-pointer lookups for the read path; valid while this Version lives.
+  const BlobFileMetaData* PeekBlobFileMetaData(uint64_t file_number) const {
+    const auto it = GetBlobFileMetaDataLB(file_number);
+    return it != blob_files_.end() && (*it)->GetBlobFileNumber() == file_number
+               ? it->get()
+               : nullptr;
+  }
+  const BlobRelocationFileMetaData* PeekBlobRelocationFileMetaData(
+      uint64_t file_number) const {
+    return BlobRelocationStateForRead().PeekFile(file_number);
+  }
+
+  // The target of the route of old file `old_file_number`, or
+  // kInvalidBlobFileNumber.
+  uint64_t GetBlobRelocationRouteTarget(uint64_t old_file_number) const {
+    return BlobRelocationStateForRead().FindRouteTarget(old_file_number);
+  }
+
+  // The number of routes to relocation file `target_file_number`.
+  size_t GetBlobRelocationRouteTargetCount(uint64_t target_file_number) const {
+    return BlobRelocationStateForRead().RouteCount(target_file_number);
+  }
+
+  void SetBlobIndirectionFormatVersion(uint32_t format_version) {
+    blob_indirection_format_version_ = format_version;
+  }
+  uint32_t GetBlobIndirectionFormatVersion() const {
+    return blob_indirection_format_version_;
+  }
+  bool HasBlobIndirectionFormat() const {
+    return blob_indirection_format_version_ != 0;
+  }
+
+  // Brings the file table of a fenced Version up to date with its blob files:
+  // `rebuild` adds every live blob file (the first fenced Version); otherwise
+  // only the blob files in `changed_blob_file_numbers` are set or erased. A
+  // rebuilt table charges its memory to `cache_res_mgr` (may be null).
+  void SyncBlobFileTable(
+      const std::vector<uint64_t>& changed_blob_file_numbers, bool rebuild,
+      std::shared_ptr<CacheReservationManager> cache_res_mgr);
+  // Checks the relocation state and the file table. A release build skips a
+  // state that is already marked validated: an inherited state, or a new state
+  // after MarkBlobRelocationChangesValidated(). A debug build always checks
+  // that the table agrees with the blob file and relocation file vectors.
+  Status ValidateBlobRelocationState() const;
+
+  // VersionBuilder::Apply() checks every changed relocation file and route,
+  // also in release builds: a route target is a live relocation file, the old
+  // file of a route is not a live file, file numbers do not collide, and no
+  // route forms a chain. The inherited state is immutable and was already
+  // checked. So the new state is valid without a scan of the untouched routes,
+  // and this call marks it validated.
+  void MarkBlobRelocationChangesValidated() const {
+    if (blob_relocation_state_ != nullptr) {
+      blob_relocation_state_->MarkValidated();
+    }
+  }
+
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   struct BlobStats {
     uint64_t total_file_size = 0;
@@ -641,6 +767,11 @@ class VersionStorageInfo {
 
   void TEST_AddFileMarkedForPeriodicCompaction(int level, FileMetaData* f) {
     files_marked_for_periodic_compaction_.emplace_back(level, f);
+  }
+
+  const PeriodicCompactionPhaseParams& TEST_GetPeriodicCompactionPhaseParams()
+      const {
+    return periodic_compaction_phase_params_;
   }
 
   // REQUIRES: PrepareForVersionAppend has been called
@@ -845,6 +976,23 @@ class VersionStorageInfo {
 
   // See GetDroppedBlobFiles().
   std::vector<uint64_t> dropped_blob_files_;
+
+  // The live relocation files, routes and file table of this Version (see
+  // BlobRelocationState). It can be null when there are none; readers then see
+  // an empty state. Copy-on-write: a Version that changes none of them shares
+  // its base Version's state. Only an unpublished builder makes a private copy
+  // (MutableBlobRelocationState()); the copy shares every file table shard it
+  // does not change. LogAndApply and the secondary catch-up make this copy
+  // without the DB mutex; recovery makes it with the mutex held. An old Version
+  // keeps its own state alive. The state has no deletion history: a deleted
+  // file or route simply leaves it.
+  std::shared_ptr<BlobRelocationState> blob_relocation_state_;
+  const BlobRelocationState& BlobRelocationStateForRead() const {
+    STATIC_AVOID_DESTRUCTION(BlobRelocationState, empty);
+    return blob_relocation_state_ != nullptr ? *blob_relocation_state_ : empty;
+  }
+  BlobRelocationState& MutableBlobRelocationState();
+  uint32_t blob_indirection_format_version_ = 0;
 
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.
@@ -1138,7 +1286,10 @@ class Version {
   // TTL/inlined/same-file or compressed blob index (the lazy caller only routes
   // uncompressed separate-file references here; other cases take the
   // whole-value GetBlob path). The caller must ensure range_offset +
-  // range_length <= blob_index.size().
+  // range_length <= blob_index.size(). For an indirect index, a range of an
+  // uncompressed value never checks a CRC. Callers send only strict parts of a
+  // value (see ReadPathBlobResolver::ResolveColumnRange), and a range is not
+  // turned into a whole read.
   Status GetBlobRange(const ReadOptions& read_options, const Slice& user_key,
                       const BlobIndex& blob_index, uint64_t range_offset,
                       size_t range_length, PinnableSlice* value,
@@ -1299,6 +1450,16 @@ class Version {
       int level, bool allow_unprepared_value);
 
  private:
+  // Resolves indirect `blob_index` to the physical file that holds its bytes.
+  // GetBlob, GetBlobRange and both MultiGet paths call it after a stable blob
+  // cache miss. It looks up the generation number in the file table: a live
+  // file takes one lookup, and a route takes two (the target is always a live
+  // relocation file). It returns Corruption when the generation number is
+  // unknown, when a route target is missing, or when a normal blob file is not
+  // the indirect origin of the reference.
+  Status ResolveBlobPhysicalFile(const BlobIndex& blob_index,
+                                 BlobPhysicalFile* physical_file) const;
+
   Env* env_;
   SystemClock* clock_;
 
@@ -1316,6 +1477,12 @@ class Version {
   const Comparator* user_comparator() const {
     return storage_info_.user_comparator_;
   }
+
+  // Debug builds only. A stable blob cache hit skips the blob file and route
+  // lookup, so a hit for a BlobIndex whose file this Version does not have
+  // would go unnoticed. This asserts that the file or route of `blob_index` is
+  // in this Version.
+  void AssertStableCacheHitHasFile(const BlobIndex& blob_index) const;
 
   // Returns true if the filter blocks in the specified level will not be
   // checked during read operations. In certain cases (trivial move or preload),
@@ -1390,12 +1557,19 @@ class Version {
   uint64_t version_number_;
   std::shared_ptr<IOTracer> io_tracer_;
 
+  // `periodic_compaction_phase_params` are the phasing parameters of this
+  // Version. std::nullopt (the default) means the current parameters of the
+  // VersionSet. For a SetOptions() call that moves the phasing anchor,
+  // LogAndApply() passes the parameters for the new anchor, which is not
+  // published yet (see VersionSet::PrepareCompactionPhaseReanchor()).
   Version(ColumnFamilyData* cfd, VersionSet* vset, const FileOptions& file_opt,
           const MutableCFOptions& mutable_cf_options,
           const std::shared_ptr<IOTracer>& io_tracer,
           uint64_t version_number = 0,
           EpochNumberRequirement epoch_number_requirement =
-              EpochNumberRequirement::kMustPresent);
+              EpochNumberRequirement::kMustPresent,
+          std::optional<PeriodicCompactionPhaseParams>
+              periodic_compaction_phase_params = std::nullopt);
 
   ~Version();
 
@@ -1424,6 +1598,42 @@ class AtomicGroupReadBuffer {
  private:
   uint64_t read_edits_in_atomic_group_ = 0;
   std::vector<VersionEdit> replay_buffer_;
+};
+
+// The new options that SetOptions publishes together with the new Versions
+// (see VersionSet::LogAndApply()). SetOptions owns it.
+//
+// How the options of one SetOptions() call are published:
+//   1. DBImpl::SetOptions() fills one entry per column family with a copy of
+//      the latest options.
+//   2. LogAndApply() gives each ManifestWriter a pointer to its entry. A batch
+//      that holds a SetOptions() call holds only the writers of that call.
+//      SetOptions() edits are dummy edits, and a batch of dummy edits ends at
+//      the caller's last writer. On the test-only MANIFEST path (a test clears
+//      the dummy flag through the sync point DBImpl::SetOptions:dummy_edit),
+//      the grouping rule for prepared options in
+//      VersionSet::ProcessManifestWrites() keeps the call alone in its batch.
+//   3. When the call reaches the head of the MANIFEST writer queue, pre_cb
+//      applies the input maps to the entries under the DB mutex
+//      (ColumnFamilyData::PrepareMutableCFOptions()).
+//   4. VersionSet::ProcessManifestWrites() builds each new Version with its
+//      entry, and with the phasing parameters of the new anchor if one is set.
+//   5. In the same mutex hold as AppendVersion(), it commits the anchor and
+//      calls ColumnFamilyData::PublishMutableCFOptions() with the options of
+//      each new Version.
+struct MutableCFOptionsPublication {
+  // The new options of each column family, one entry per element of the
+  // `cfds` argument of LogAndApply(), stored by value. Each column family
+  // appears once. The pre_cb of SetOptions() writes the entries through
+  // SetOptions' own non-const reference, under the DB mutex, before any
+  // Version is built. LogAndApply() only reads them. The vector is not resized
+  // after LogAndApply() starts, because each ManifestWriter keeps the address
+  // of its entry.
+  autovector<MutableCFOptions> new_mutable_cf_options;
+  // If set, the new periodic compaction phasing anchor (see
+  // VersionSet::PrepareCompactionPhaseReanchor()). The new Versions are built
+  // with it, and it is published with them.
+  std::optional<uint64_t> compaction_phase_anchor_time;
 };
 
 // VersionSet is the collection of versions of all the column families of the
@@ -1526,9 +1736,26 @@ class VersionSet {
                        column_family_options, {manifest_wcb}, pre_cb);
   }
 
-  // The across-multi-cf batch version. If edit_lists contain more than
-  // 1 version edits, caller must ensure that no edit in the []list is column
-  // family manipulation.
+  // The batch version for several column families. If edit_lists hold more than
+  // one edit, no edit may add or drop a column family. Also, either every edit
+  // or no edit is a dummy edit that writes nothing to the MANIFEST (only
+  // SetOptions makes these). `options_publication` is set only by
+  // SetOptions(). It holds the new options (one entry per element of `cfds`)
+  // and an optional new phasing anchor. LogAndApply() publishes both with the
+  // new Versions. When it is set, each column family may appear only once in
+  // `cfds`, because all writers of one column family share one Version.
+  //
+  // LogAndApply() can release the DB mutex while it waits in the MANIFEST
+  // writer queue, and also during the batch, both when it writes a MANIFEST
+  // record and when it gets dummy edits and writes nothing (see
+  // VersionSet::ProcessManifestWrites()). The callbacks in `manifest_wcbs` run
+  // once per batch, under the DB mutex, at the end of the batch: on success
+  // after the new Versions are installed, and on a failure inside the batch
+  // with the error. The DB mutex is not released between the callbacks and the
+  // point where the writers of the batch are marked done. They do not run if
+  // LogAndApply() returns before the batch starts: when there are no edits,
+  // when every column family is dropped, or when pre_cb fails. They must not
+  // call user code or do I/O.
   virtual Status LogAndApply(
       const autovector<ColumnFamilyData*>& cfds,
       const ReadOptions& read_options, const WriteOptions& write_options,
@@ -1538,9 +1765,65 @@ class VersionSet {
       const ColumnFamilyOptions* new_cf_options = nullptr,
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs = {},
       const std::function<Status()>& pre_cb = {},
-      int max_file_opening_threads = 1);
+      int max_file_opening_threads = 1,
+      const MutableCFOptionsPublication* options_publication = nullptr);
 
   void WakeUpWaitingManifestWriters();
+
+  // Freeing relocation state
+  //
+  // Why: the relocation state of a fenced Version (mainly its file table) can
+  // be large, and freeing it under the DB mutex can stall writers. Versions,
+  // builders and file reference counts still change only under the DB mutex.
+  // Holders are std::shared_ptr<void> because they hold different types (a
+  // Version's BlobRelocationState, a state whose files were released, or a
+  // builder's change maps), and the free step only needs to drop the last
+  // reference.
+  //
+  // There are two paths:
+  //   1. Explicit release (the candidate Versions of a failed LogAndApply
+  //      batch, the builders of every LogAndApply batch, and the Versions and
+  //      builders that ManifestTailer deletes): the caller moves the state
+  //      into `holders` with VersionStorageInfo::ReleaseBlobRelocationState()
+  //      and VersionBuilder::ReleaseBlobRelocationChanges(), destroys the
+  //      Version or builder under the mutex, and then calls this function,
+  //      which frees the state without the mutex.
+  //   2. ~Version(), when the last reference to a Version is dropped (under the
+  //      DB mutex), and only if this Version is the last owner of its
+  //      relocation state (Versions can share one state): the Version frees its
+  //      relocation file metadata under the mutex, because the metadata deleter
+  //      uses the column family. It hands only the file table to
+  //      AddObsoleteBlobRelocationState()
+  //      (VersionStorageInfo::ReleaseBlobRelocationStateForDeferredFree()). The
+  //      next DBImpl::FindObsoleteFiles() moves the table to its JobContext
+  //      (TakeObsoleteBlobRelocationStates()), and JobContext::Clean() frees it
+  //      without the mutex. This also works while file deletion is disabled.
+  //
+  // Lifecycle of a relocation file (its metadata, cached reader and disk
+  // file):
+  //   1. The last owner of the file's metadata drops it: usually the last
+  //      Version that lists the file, destroyed under the DB mutex, or, for a
+  //      failed LogAndApply batch or the ManifestTailer, relocation state that
+  //      is freed without the mutex.
+  //   2. The metadata deleter (VersionBuilder) adds the file to the obsolete
+  //      blob files and drops a remembered failed open. It does not evict the
+  //      cached reader, because a reader open can hold the stripe mutex of the
+  //      file (see BlobFileCache::Evict()).
+  //   3. The file table is freed without the DB mutex (path 1 or path 2
+  //      above).
+  //   4. DBImpl::PurgeObsoleteFiles() evicts the cached reader
+  //      (TableCache::Evict()), checks that the file starts with the
+  //      relocation file prefix, and deletes the file.
+  //
+  // This function (path 1) first drops every holder that is null or shared with
+  // another owner, because freeing it frees nothing. If a holder is left, it
+  // releases `mu`, frees the holders, and locks `mu` again;
+  // `unlocked_sync_point` fires while `mu` is released. Otherwise (for example,
+  // legacy Versions and builders give up nothing) `mu` stays held. File
+  // reference counts are not touched here: they change only under `mu`.
+  static void FreeBlobRelocationState(
+      std::vector<std::shared_ptr<void>>* holders, InstrumentedMutex* mu,
+      const char* unlocked_sync_point);
 
   // Recover the last saved descriptor (MANIFEST) from persistent storage.
   // Unlike `unchanging` on the VersionSet, `read_only` here and in other
@@ -1921,7 +2204,28 @@ class VersionSet {
   void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata);
 
   void AddObsoleteBlobFile(uint64_t blob_file_number, std::string path) {
+    MutexLock lock(&obsolete_blob_files_mutex_);
     obsolete_blob_files_.emplace_back(blob_file_number, std::move(path));
+  }
+
+  // Keeps the file table of a destroyed Version's relocation state, which can
+  // be large, so that it is freed later without the DB mutex (path 2 of
+  // "Freeing relocation state" at FreeBlobRelocationState()).
+  void AddObsoleteBlobRelocationState(std::shared_ptr<void> state) {
+    MutexLock lock(&obsolete_blob_files_mutex_);
+    obsolete_blob_relocation_states_.push_back(std::move(state));
+  }
+
+  // Moves out the states kept by AddObsoleteBlobRelocationState(). The caller
+  // frees them without the DB mutex (JobContext::Clean()).
+  void TakeObsoleteBlobRelocationStates(
+      std::vector<std::shared_ptr<void>>* states) {
+    MutexLock lock(&obsolete_blob_files_mutex_);
+    states->insert(
+        states->end(),
+        std::make_move_iterator(obsolete_blob_relocation_states_.begin()),
+        std::make_move_iterator(obsolete_blob_relocation_states_.end()));
+    obsolete_blob_relocation_states_.clear();
   }
 
   // Obsolete blob files numbered at or above `min_pending_output`, and
@@ -1969,12 +2273,46 @@ class VersionSet {
   PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParams(
       uint32_t cf_id) const;
 
-  // (Re)anchor periodic-compaction phasing to now and refresh the cached phase
-  // params on every column family's current Version. Called when a CF's
-  // periodic_compaction_seconds changes via SetOptions, so a turn-down's newly
-  // past-due cohort is spread (over the phase grid within ~N/4 of now) instead
-  // of firing all at once. Caller must hold the DB mutex.
-  void ReanchorCompactionPhase();
+  // Periodic compaction phasing anchor (used only when
+  // DBOptions::periodic_compaction_phase_recovery_percent > 0). The anchor is
+  // the time from which PeriodicCompactionPhaser::TriggerTime() spreads
+  // catch-up compactions. A catch-up compaction is a periodic compaction of a
+  // file that is already due. A lower periodic_compaction_seconds can make many
+  // files due at the same time. So when an options map of any column family
+  // sets periodic_compaction_seconds and the LogAndApply() step of the call
+  // succeeds, DBImpl::SetOptions() moves the anchor to the current time. This
+  // also happens when the value does not change, unless the call returns early
+  // because no option changes. Like the new options, the anchor stays moved
+  // even if a later step of the call fails. It does not move when there is no
+  // clock or the clock fails. TriggerTime() then spreads these compactions out
+  // after the anchor instead of running them all at once. The anchor is
+  // DB-wide, so it also applies to the column families that keep their period.
+  // The move has two steps, so that the new Versions can be built with the new
+  // anchor before it is published:
+  // 1. PrepareCompactionPhaseReanchor() reads the clock.
+  // 2. CommitCompactionPhaseReanchor() publishes the anchor, inside
+  //    LogAndApply(), together with the new options and Versions.
+  // Until step 2, the live phaser and the current Versions keep the old
+  // anchor.
+
+  // Step 1: returns a new phasing anchor (the current time) for SetOptions(),
+  // without changing the live phasing state. If there is no clock or the clock
+  // fails, it returns no anchor, and SetOptions() keeps the current one.
+  std::optional<uint64_t> PrepareCompactionPhaseReanchor() const;
+
+  // Returns the phasing parameters that column family `cf_id` would get with
+  // the anchor `anchor_time`, without changing the live phasing state.
+  // LogAndApply() uses it to build a new Version for SetOptions() before the
+  // anchor is published.
+  PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParamsAtAnchor(
+      uint32_t cf_id, uint64_t anchor_time) const;
+
+  // Step 2: publishes a phasing anchor, and refreshes the cached phasing
+  // parameters in the current Version of every column family that is not
+  // dropped. The new Versions that SetOptions() prepared already have these
+  // parameters.
+  // REQUIRES: DB mutex held.
+  void CommitCompactionPhaseReanchor(uint64_t anchor_time);
 
   const ImmutableDBOptions* db_options() const { return db_options_; }
 
@@ -2017,6 +2355,9 @@ class VersionSet {
   size_t TEST_GetManifestPreallocationSize() {
     return manifest_preallocation_size_;
   }
+  uint32_t TEST_GetDbBlobIndirectionFormatVersion() const {
+    return blob_indirection_format_version_;
+  }
 
   // Appends a kColumnFamilyDrop record for each id in cf_ids to the MANIFEST
   // file at manifest_path, whose valid content length is manifest_size bytes.
@@ -2036,6 +2377,7 @@ class VersionSet {
   friend class Version;
   friend class VersionEditHandler;
   friend class VersionEditHandlerPointInTime;
+  friend class ManifestTailer;
   friend class DumpManifestHandler;
   friend class DBImpl;
   friend class DBImplReadOnly;
@@ -2079,7 +2421,8 @@ class VersionSet {
       const std::unordered_map<uint32_t, MutableCFState>& curr_state,
       const VersionEdit& wal_additions,
       const OptionsFileManifestState& options_file_manifest_state,
-      log::Writer* log, IOStatus& io_s);
+      uint32_t blob_indirection_format_version, log::Writer* log,
+      IOStatus& io_s);
 
   // Reopen the existing MANIFEST file for append at the end of Recover()
   // when reuse_manifest_on_open is set, so the next LogAndApply appends
@@ -2119,6 +2462,8 @@ class VersionSet {
 
   void AppendVersion(ColumnFamilyData* column_family_data, Version* v);
 
+  void RefreshCurrentVersionCompactionPhaseParams();
+
   ColumnFamilyData* CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                        const ReadOptions& read_options,
                                        const VersionEdit* edit, bool read_only,
@@ -2156,6 +2501,19 @@ class VersionSet {
   uint64_t options_file_size_;
   bool has_committed_options_file_number_;
   uint64_t pending_manifest_file_number_;
+  // The DB-global format fence (0 = not set). A format fence is the MANIFEST
+  // record that marks blob indirection as in use (see "MANIFEST records" in
+  // db/blob/blob_relocation_manifest.h). The per-CF fence is in
+  // VersionStorageInfo. This one stays set when the last fenced column family
+  // is dropped, and every new MANIFEST writes it as its first record
+  // (WriteCurrentStateToManifest()).
+  uint32_t blob_indirection_format_version_ = 0;
+  // The relocation files deleted, the blob files removed by blob file
+  // retirement, and the routes deleted in the current MANIFEST. See the "no
+  // re-add" rule at RejectReaddedBlobRelocationState(). Protected by the DB
+  // mutex.
+  UnorderedSet<uint64_t> manifest_removed_blob_physical_files_;
+  UnorderedSet<uint64_t> manifest_deleted_blob_relocation_routes_;
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
   // last sequence in the WAL visible to reads.
@@ -2239,7 +2597,17 @@ class VersionSet {
   // Obsolete files, or during DB shutdown any files not referenced by what's
   // left of the in-memory LSM state.
   std::vector<ObsoleteFileInfo> obsolete_files_;
+  // Protects obsolete_blob_files_ and obsolete_blob_relocation_states_.
+  // Relocation state can be freed without the DB mutex (see
+  // FreeBlobRelocationState()); the deleter of a relocation file's metadata
+  // then adds the file to obsolete_blob_files_.
+  port::Mutex obsolete_blob_files_mutex_;
   std::vector<ObsoleteBlobFileInfo> obsolete_blob_files_;
+  // File tables of destroyed Versions' relocation state, freed without the DB
+  // mutex. Their relocation file metadata was already freed under it
+  // (VersionStorageInfo::ReleaseBlobRelocationStateForDeferredFree()), so they
+  // do not depend on any column family.
+  std::vector<std::shared_ptr<void>> obsolete_blob_relocation_states_;
   std::vector<std::string> obsolete_manifests_;
 
   // env options for all reads and writes except compactions
@@ -2279,13 +2647,39 @@ class VersionSet {
       bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
       bool new_cf_options_are_sanitized,
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-      const std::function<Status()>& pre_cb, int max_file_opening_threads);
+      const std::function<Status()>& pre_cb, int max_file_opening_threads,
+      const MutableCFOptionsPublication* options_publication);
 
   void LogAndApplyCFHelper(VersionEdit* edit,
                            SequenceNumber* max_last_sequence);
   Status LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b,
                            VersionEdit* edit, SequenceNumber* max_last_sequence,
                            InstrumentedMutex* mu);
+  // The "no re-add" rule. File numbers are never reused. So an edit that adds
+  // back a relocation file, a route, or a blob file that an earlier edit of the
+  // same MANIFEST deleted (or removed by blob file retirement) is a writer bug.
+  // LogAndApply applies the rule when it writes, so the bug cannot first show
+  // up at the next open. The rule is checked in three places:
+  //   1. VersionBuilder rejects a re-added relocation file or route within the
+  //      edits it applies: one LogAndApply batch, or the whole MANIFEST at
+  //      replay (IsBlobRelocationFileDeletedInBuilder() and
+  //      IsBlobRelocationRouteDeletedInBuilder()).
+  //   2. This function rejects a re-add of a number that an earlier batch of
+  //      the current MANIFEST deleted. RecordBlobRelocationDeletions() keeps
+  //      that history in manifest_removed_blob_physical_files_ and
+  //      manifest_deleted_blob_relocation_routes_.
+  //   3. With reuse_manifest_on_open, the open keeps writing to the replayed
+  //      MANIFEST. VersionEditHandler::TakeBlobRelocationDeletions() then seeds
+  //      the history of (2) with the deletions found in the replay.
+  Status RejectReaddedBlobRelocationState(const VersionEdit& edit) const;
+
+  // Adds the relocation files and routes that `edits` delete, and the blob
+  // files that their blob file retirement records remove, to the deletion
+  // history of the current MANIFEST. RejectReaddedBlobRelocationState() uses
+  // this history to reject an edit that adds them back. When `new_manifest` is
+  // true, the history is cleared first.
+  void RecordBlobRelocationDeletions(const autovector<VersionEdit*>& edits,
+                                     bool new_manifest);
 
   const bool unchanging_;
   bool closed_;
@@ -2370,7 +2764,8 @@ class ReactiveVersionSet : public VersionSet {
 
   Status MaybeSwitchManifest(
       log::Reader::Reporter* reporter,
-      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader);
+      std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+      InstrumentedMutex* db_mutex);
 
   // Opens the MANIFEST at `manifest_path` with a new reader that reports to
   // `reporter`.
@@ -2411,6 +2806,8 @@ class ReactiveVersionSet : public VersionSet {
   // Defers initial SecondaryDB SST validation and opening until after
   // OpenAsSecondary returns. Catch-up remains synchronous.
   const bool defer_sst_file_opening_;
+  // Debug check that catch-ups do not overlap (see ReadAndApply()).
+  bool manifest_tail_in_progress_ = false;
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options_;
   using VersionSet::LogAndApply;
@@ -2425,7 +2822,8 @@ class ReactiveVersionSet : public VersionSet {
       bool /*new_descriptor_log*/, const ColumnFamilyOptions* /*new_cf_option*/,
       const std::vector<std::function<void(const Status&)>>& /*manifest_wcbs*/,
       const std::function<Status()>& /*pre_cb*/,
-      int /*max_file_opening_threads*/) override {
+      int /*max_file_opening_threads*/,
+      const MutableCFOptionsPublication* /*options_publication*/) override {
     return Status::NotSupported("not supported in reactive mode");
   }
 

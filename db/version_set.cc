@@ -1049,6 +1049,16 @@ Version::~Version() {
   prev_->next_ = next_;
   next_->prev_ = prev_;
 
+  // The file table of the relocation state can be large. When this Version is
+  // its last owner, free the table later without the DB mutex (see
+  // VersionSet::AddObsoleteBlobRelocationState()).
+  std::shared_ptr<void> relocation_state =
+      storage_info_.ReleaseBlobRelocationStateForDeferredFree();
+  if (relocation_state != nullptr) {
+    TEST_SYNC_POINT("Version::~Version:DeferRelocationState");
+    vset_->AddObsoleteBlobRelocationState(std::move(relocation_state));
+  }
+
   // Drop references to files
   for (int level = 0; level < storage_info_.num_levels_; level++) {
     for (size_t i = 0; i < storage_info_.files_[level].size(); i++) {
@@ -2870,7 +2880,9 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
                  const MutableCFOptions& mutable_cf_options,
                  const std::shared_ptr<IOTracer>& io_tracer,
                  uint64_t version_number,
-                 EpochNumberRequirement epoch_number_requirement)
+                 EpochNumberRequirement epoch_number_requirement,
+                 std::optional<PeriodicCompactionPhaseParams>
+                     periodic_compaction_phase_params)
     : env_(vset->env_),
       clock_(vset->clock_),
       cfd_(column_family_data),
@@ -2897,7 +2909,8 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
           vset->offpeak_time_option(),
           cfd_ == nullptr
               ? PeriodicCompactionPhaseParams{}
-              : vset->GetPeriodicCompactionPhaseParams(cfd_->GetID())),
+              : periodic_compaction_phase_params.value_or(
+                    vset->GetPeriodicCompactionPhaseParams(cfd_->GetID()))),
       vset_(vset),
       next_(this),
       prev_(this),
@@ -2909,6 +2922,96 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
       version_number_(version_number),
       io_tracer_(io_tracer) {}
 
+void Version::AssertStableCacheHitHasFile(const BlobIndex& blob_index) const {
+#ifdef NDEBUG
+  (void)blob_index;
+#else
+  // The generation number is a file or a route in the BlobFileTable, or, when
+  // the BlobFileTable is empty and the generation number equals the origin, the
+  // origin is a normal blob file (see ResolveBlobPhysicalFile()). This does not
+  // call ResolveBlobPhysicalFile(), so tests can count the read path's lookups
+  // with its sync point.
+  const BlobFileTable& table = storage_info_.GetBlobFileTable();
+  assert(
+      table.Find(blob_index.generation_file_number()) != 0 ||
+      (table.size() == 0 &&
+       blob_index.generation_file_number() == blob_index.origin_file_number() &&
+       storage_info_.PeekBlobFileMetaData(blob_index.origin_file_number()) !=
+           nullptr));
+#endif
+}
+
+Status Version::ResolveBlobPhysicalFile(const BlobIndex& blob_index,
+                                        BlobPhysicalFile* physical_file) const {
+  assert(physical_file != nullptr);
+  TEST_SYNC_POINT("Version::ResolveBlobPhysicalFile");
+  if (!blob_index.IsIndirect()) {
+    return Status::InvalidArgument("BlobIndex does not have a stable identity");
+  }
+
+  const uint64_t generation = blob_index.generation_file_number();
+  const uint64_t origin = blob_index.origin_file_number();
+  // A Version with the per-CF format fence keeps every live blob file,
+  // relocation file and route in its file table. So a direct read needs one
+  // table lookup, and a routed read needs two.
+  const BlobFileTable& table = storage_info_.GetBlobFileTable();
+  uint64_t value = table.Find(generation);
+  // The file numbers of a reference, for Corruption messages.
+  const auto numbers = [&](uint64_t target) {
+    return "generation " + std::to_string(generation) + ", origin " +
+           std::to_string(origin) +
+           (target == 0 ? std::string()
+                        : ", route target " + std::to_string(target));
+  };
+  if (BlobFileTable::IsRoute(value)) {
+    // A target is never a route key, so this is the last hop.
+    const uint64_t target = BlobFileTable::RouteTarget(value);
+    value = table.Find(target);
+    if (!BlobFileTable::IsRelocationFile(value)) {
+      return Status::Corruption("Blob relocation route target is missing",
+                                numbers(target));
+    }
+    RecordTick(db_statistics_, BLOB_DB_INDIRECT_READ_ROUTED);
+  }
+  if (value == 0 && table.size() == 0 && generation == origin &&
+      storage_info_.PeekBlobFileMetaData(origin) != nullptr) {
+    // This branch only gives a better Corruption message. It handles an empty
+    // file table. A Version without the per-CF format fence has no file table,
+    // and none of its blob files is an indirect origin (VersionBuilder rejects
+    // an indirect-origin blob file without the fence). A fenced Version with an
+    // empty table has no blob files. So a kIndirectBlob reference to a blob
+    // file of this Version must not reach this branch.
+    return Status::Corruption("Indirect blob generation is not relocatable",
+                              numbers(0));
+  }
+  if (value == 0) {
+    return Status::Corruption("Invalid indirect blob physical file",
+                              numbers(0));
+  }
+  if (BlobFileTable::IsBlobFile(value)) {
+    // A live normal blob file: the value has not moved. So the generation
+    // number must be the origin, and the file must be an indirect origin.
+    const BlobFileMetaData* const normal = BlobFileTable::AsBlobFile(value);
+    if (generation != origin || !normal->IsIndirectOrigin()) {
+      return Status::Corruption("Indirect blob generation is not relocatable",
+                                numbers(0));
+    }
+    *physical_file =
+        BlobPhysicalFile{BlobFileOpenInfo{origin, normal->GetChecksumValue(),
+                                          normal->GetChecksumMethod()},
+                         normal->GetBlobFileSize()};
+    return Status::OK();
+  }
+  // A relocation file: the generation number itself (a flattened reference) or
+  // a route target. The reader seeks (origin, original offset), finds the group
+  // of values that can hold it, and checks that the group has the same origin
+  // and the exact original offset. Otherwise the read fails with Corruption.
+  const BlobRelocationFileMetaData* const relocation =
+      BlobFileTable::AsRelocationFile(value);
+  *physical_file = relocation->GetAddition().ToPhysicalFile();
+  return Status::OK();
+}
+
 Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
                         const BlobIndex& blob_index,
                         FilePrefetchBuffer* prefetch_buffer,
@@ -2919,9 +3022,34 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
     return Status::Corruption("Unexpected TTL/inlined blob index");
   }
 
-  const uint64_t blob_file_number = blob_index.file_number();
+  assert(blob_source_);
+  value->Reset();
+  if (blob_index.IsIndirect()) {
+    // An indirect value is looked up in the stable blob cache first, before the
+    // route and file lookup (see BlobSource::GetIndirectBlobFromCache()).
+    Status status = blob_source_->GetIndirectBlobFromCache(
+        blob_index, /*range_offset=*/0, kWholeBlobLength, value);
+    if (!status.IsNotFound()) {
+      if (status.ok()) {
+        AssertStableCacheHitHasFile(blob_index);
+      }
+      return status;
+    }
+    BlobPhysicalFile physical_file;
+    status = ResolveBlobPhysicalFile(blob_index, &physical_file);
+    if (!status.ok()) {
+      return status;
+    }
+    return blob_source_->GetIndirectBlob(read_options, user_key, blob_index,
+                                         physical_file, mutable_cf_options_,
+                                         /*range_offset=*/0, kWholeBlobLength,
+                                         prefetch_buffer, value, bytes_read,
+                                         /*cache_checked=*/true);
+  }
 
-  auto blob_file_meta = storage_info_.GetBlobFileMetaData(blob_file_number);
+  const uint64_t blob_file_number = blob_index.file_number();
+  const std::shared_ptr<BlobFileMetaData> blob_file_meta =
+      storage_info_.GetBlobFileMetaData(blob_file_number);
   if (!blob_file_meta) {
     // INTEGRITY CHECK -- do not weaken. The blob index must reference a known
     // external blob file. No metadata (including file_number 0, the
@@ -2932,8 +3060,6 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
     return UnknownBlobFileStatus(storage_info_, blob_file_number);
   }
 
-  assert(blob_source_);
-  value->Reset();
   const BlobFileOpenInfo blob_file{blob_file_number,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
@@ -2955,15 +3081,40 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
     return Status::Corruption("Unexpected TTL/inlined blob index");
   }
 
-  // A strict sub-range of a compressed blob cannot be decompressed in
-  // isolation; the caller resolves such columns whole and slices instead.
+  // A value cannot be range-read when it is compressed, because a byte range
+  // cannot be decompressed alone; callers read the whole value and slice it.
+  // A range read of an uncompressed value checks no CRC. Callers send only
+  // strict parts of a value (see ReadPathBlobResolver::ResolveColumnRange).
   if (blob_index.compression() != kNoCompression) {
     return Status::Corruption("Cannot range-read a compressed blob");
   }
 
-  const uint64_t blob_file_number = blob_index.file_number();
+  assert(blob_source_);
+  value->Reset();
+  if (blob_index.IsIndirect()) {
+    // As in GetBlob, the stable blob cache comes first for an indirect value.
+    Status status = blob_source_->GetIndirectBlobFromCache(
+        blob_index, range_offset, range_length, value);
+    if (!status.IsNotFound()) {
+      if (status.ok()) {
+        AssertStableCacheHitHasFile(blob_index);
+      }
+      return status;
+    }
+    BlobPhysicalFile physical_file;
+    status = ResolveBlobPhysicalFile(blob_index, &physical_file);
+    if (!status.ok()) {
+      return status;
+    }
+    return blob_source_->GetIndirectBlob(
+        read_options, user_key, blob_index, physical_file, mutable_cf_options_,
+        range_offset, range_length, /*prefetch_buffer=*/nullptr, value,
+        bytes_read, /*cache_checked=*/true);
+  }
 
-  auto blob_file_meta = storage_info_.GetBlobFileMetaData(blob_file_number);
+  const uint64_t blob_file_number = blob_index.file_number();
+  const std::shared_ptr<BlobFileMetaData> blob_file_meta =
+      storage_info_.GetBlobFileMetaData(blob_file_number);
   if (!blob_file_meta) {
     // INTEGRITY CHECK -- see Version::GetBlob. No metadata (including
     // file_number 0, the same-file "embedded" sentinel) means a corrupt index
@@ -2971,8 +3122,6 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
     return UnknownBlobFileStatus(storage_info_, blob_file_number);
   }
 
-  assert(blob_source_);
-  value->Reset();
   const BlobFileOpenInfo blob_file{blob_file_number,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
@@ -2981,6 +3130,30 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
       blob_index.compression(), range_offset, range_length, value, bytes_read);
 }
+
+namespace {
+
+size_t GetOrCreateIndirectFileBatch(
+    const BlobPhysicalFile& file,
+    autovector<BlobFileIndirectReadRequests>* batches,
+    UnorderedMap<uint64_t, size_t>* current_batch_by_file) {
+  assert(batches != nullptr);
+  assert(current_batch_by_file != nullptr);
+  const auto existing = current_batch_by_file->find(file.open_info.file_number);
+  if (existing != current_batch_by_file->end() &&
+      (*batches)[existing->second].requests.size() <
+          MultiGetContext::MAX_BATCH_SIZE) {
+    return existing->second;
+  }
+
+  const size_t index = batches->size();
+  (*current_batch_by_file)[file.open_info.file_number] = index;
+  batches->push_back(BlobFileIndirectReadRequests{
+      file, std::vector<IndirectBlobReadRequest>()});
+  return index;
+}
+
+}  // namespace
 
 void Version::MultiGetBlobLazy(const ReadOptions& read_options,
                                autovector<LazyBlobReadRequest>& reqs) const {
@@ -2998,8 +3171,10 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
   // of that file's current (most recently started, still fillable) batch.
   autovector<BlobFileReadRequests> whole_reqs;
   autovector<BlobFileRangeReadRequests> range_reqs;
+  autovector<BlobFileIndirectReadRequests> indirect_reqs;
   std::unordered_map<uint64_t, size_t> whole_idx;
   std::unordered_map<uint64_t, size_t> range_idx;
+  UnorderedMap<uint64_t, size_t> indirect_idx;
 
   for (auto& req : reqs) {
     assert(req.user_key);
@@ -3012,9 +3187,33 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
       *req.status = Status::Corruption("Unexpected TTL/inlined blob index");
       continue;
     }
+    if (blob_index.IsIndirect()) {
+      // A stable blob cache hit is filled at once. Only misses are resolved,
+      // grouped by file and read.
+      *req.status = blob_source_->GetIndirectBlobFromCache(
+          blob_index, req.range_offset, req.range_length, req.result);
+      if (!req.status->IsNotFound()) {
+        if (req.status->ok()) {
+          AssertStableCacheHitHasFile(blob_index);
+        }
+        continue;
+      }
+      BlobPhysicalFile physical_file;
+      *req.status = ResolveBlobPhysicalFile(blob_index, &physical_file);
+      if (!req.status->ok()) {
+        continue;
+      }
+      const size_t idx = GetOrCreateIndirectFileBatch(
+          physical_file, &indirect_reqs, &indirect_idx);
+      indirect_reqs[idx].requests.push_back(IndirectBlobReadRequest{
+          *req.user_key, &blob_index, req.range_offset, req.range_length,
+          req.result, req.status, /*cache_checked=*/true});
+      continue;
+    }
 
     const uint64_t file_number = blob_index.file_number();
-    auto blob_file_meta = storage_info_.GetBlobFileMetaData(file_number);
+    const std::shared_ptr<BlobFileMetaData> blob_file_meta =
+        storage_info_.GetBlobFileMetaData(file_number);
     if (!blob_file_meta) {
       // INTEGRITY CHECK -- see Version::GetBlob. A same-file/embedded reference
       // (file_number 0) must be resolved via SameFileBlobReader, not here.
@@ -3084,6 +3283,12 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     blob_source_->MultiGetBlobRange(read_options, range_reqs,
                                     /*bytes_read=*/nullptr);
   }
+  for (BlobFileIndirectReadRequests& file_requests : indirect_reqs) {
+    std::vector<IndirectBlobReadRequest>& batch = file_requests.requests;
+    blob_source_->MultiGetIndirectBlobFromOneFile(
+        read_options, file_requests.file, mutable_cf_options_, batch.size(),
+        batch.data(), /*bytes_read=*/nullptr);
+  }
 }
 
 void Version::MultiGetBlob(
@@ -3092,10 +3297,15 @@ void Version::MultiGetBlob(
   assert(!blob_ctxs.empty());
 
   autovector<BlobFileReadRequests> blob_reqs;
+  autovector<BlobFileIndirectReadRequests> indirect_file_reqs;
+  UnorderedMap<uint64_t, size_t> indirect_file_indexes;
 
   for (auto& ctx : blob_ctxs) {
     const auto file_number = ctx.first;
-    const auto blob_file_meta = storage_info_.GetBlobFileMetaData(file_number);
+    // Looked up at the first legacy reference only: an indirect reference
+    // reads the stable blob cache first and resolves its file on a miss.
+    std::shared_ptr<BlobFileMetaData> blob_file_meta;
+    bool blob_file_meta_looked_up = false;
 
     autovector<BlobReadRequest> blob_reqs_in_file;
     BlobReadContexts& blobs_in_file = ctx.second;
@@ -3113,17 +3323,47 @@ void Version::MultiGetBlob(
         key_context->columns->Reset();
       }
 
+      if (blob_index.HasTTL() || blob_index.IsInlined()) {
+        *key_context->s =
+            Status::Corruption("Unexpected TTL/inlined blob index");
+        continue;
+      }
+
+      if (blob_index.IsIndirect()) {
+        // A stable blob cache hit is filled at once. Only misses are resolved
+        // and read.
+        *key_context->s = blob_source_->GetIndirectBlobFromCache(
+            blob_index, /*range_offset=*/0, kWholeBlobLength, &blob.result);
+        if (!key_context->s->IsNotFound()) {
+          if (key_context->s->ok()) {
+            AssertStableCacheHitHasFile(blob_index);
+          }
+          continue;
+        }
+        BlobPhysicalFile physical_file;
+        *key_context->s = ResolveBlobPhysicalFile(blob_index, &physical_file);
+        if (!key_context->s->ok()) {
+          continue;
+        }
+        const size_t request_index = GetOrCreateIndirectFileBatch(
+            physical_file, &indirect_file_reqs, &indirect_file_indexes);
+        indirect_file_reqs[request_index].requests.push_back(
+            IndirectBlobReadRequest{
+                key_context->get_context->ukey_to_get_blob_value(), &blob_index,
+                /*range_offset=*/0, kWholeBlobLength, &blob.result,
+                key_context->s, /*cache_checked=*/true});
+        continue;
+      }
+
+      if (!blob_file_meta_looked_up) {
+        blob_file_meta = storage_info_.GetBlobFileMetaData(file_number);
+        blob_file_meta_looked_up = true;
+      }
       if (!blob_file_meta) {
         // INTEGRITY CHECK -- do not weaken; see Version::GetBlob and
         // FileMetaData::UpdateBoundaries. A same-file/embedded reference must
         // be resolved before reaching the integrated-BlobDB read path.
         *key_context->s = UnknownBlobFileStatus(storage_info_, file_number);
-        continue;
-      }
-
-      if (blob_index.HasTTL() || blob_index.IsInlined()) {
-        *key_context->s =
-            Status::Corruption("Unexpected TTL/inlined blob index");
         continue;
       }
 
@@ -3144,6 +3384,12 @@ void Version::MultiGetBlob(
   if (blob_reqs.size() > 0) {
     blob_source_->MultiGetBlob(read_options, blob_reqs,
                                /*bytes_read=*/nullptr);
+  }
+  for (BlobFileIndirectReadRequests& file_requests : indirect_file_reqs) {
+    std::vector<IndirectBlobReadRequest>& requests = file_requests.requests;
+    blob_source_->MultiGetIndirectBlobFromOneFile(
+        read_options, file_requests.file, mutable_cf_options_, requests.size(),
+        requests.data(), /*bytes_read=*/nullptr);
   }
 
   for (auto& ctx : blob_ctxs) {
@@ -3432,6 +3678,7 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
+  SealBlobRelocationState();
   ComputeCompensatedSizes();
   UpdateNumNonEmptyLevels();
   CalculateBaseBytes(immutable_options, mutable_cf_options);
@@ -4393,6 +4640,149 @@ void VersionStorageInfo::AddBlobFile(
                                     blob_file_meta->GetBlobFileNumber()));
 
   blob_files_.emplace_back(std::move(blob_file_meta));
+}
+
+void VersionStorageInfo::AddBlobRelocationFile(
+    std::shared_ptr<BlobRelocationFileMetaData> metadata) {
+  MutableBlobRelocationState().SetFile(std::move(metadata));
+}
+
+void VersionStorageInfo::AddBlobRelocationRoute(
+    const BlobRelocationRoute& route) {
+  MutableBlobRelocationState().SetRoute(route);
+}
+
+std::shared_ptr<BlobRelocationFileMetaData>
+VersionStorageInfo::GetBlobRelocationFileMetaData(uint64_t file_number) const {
+  return BlobRelocationStateForRead().FindFile(file_number);
+}
+
+void VersionStorageInfo::SyncBlobFileTable(
+    const std::vector<uint64_t>& changed_blob_file_numbers, bool rebuild,
+    std::shared_ptr<CacheReservationManager> cache_res_mgr) {
+  if (blob_indirection_format_version_ == 0 ||
+      (!rebuild && changed_blob_file_numbers.empty())) {
+    // No format fence, or no blob file changed: keep the shared state.
+    return;
+  }
+  BlobRelocationState& state = MutableBlobRelocationState();
+  if (rebuild) {
+    // The first fenced Version: every live blob file enters the table.
+    state.SetCacheReservationManager(std::move(cache_res_mgr));
+    for (const std::shared_ptr<BlobFileMetaData>& file : blob_files_) {
+      state.SetBlobFile(file.get());
+    }
+    return;
+  }
+  for (uint64_t file_number : changed_blob_file_numbers) {
+    const BlobFileMetaData* file = PeekBlobFileMetaData(file_number);
+    if (file != nullptr) {
+      state.SetBlobFile(file);
+    } else {
+      state.DeleteBlobFile(file_number);
+    }
+  }
+}
+
+Status VersionStorageInfo::ValidateBlobRelocationState() const {
+  if (blob_indirection_format_version_ == 0) {
+    // VersionBuilder rejects each indirect-origin blob file addition without
+    // the fence, so a legacy Version build does not scan its blob files here.
+    if (!GetBlobRelocationFiles().empty() ||
+        GetBlobRelocationRouteCount() != 0 || GetBlobFileTable().size() != 0) {
+      return Status::Corruption(
+          "Blob relocation state exists without the format fence");
+    }
+    return Status::OK();
+  }
+  if (blob_indirection_format_version_ !=
+      kBlobIndirectionManifestFormatVersion) {
+    return Status::NotSupported("Unknown blob indirection format fence");
+  }
+  const BlobRelocationState& state = BlobRelocationStateForRead();
+  if (state.AggregateOverflow()) {
+    return Status::Corruption("Blob relocation physical-byte sum overflow");
+  }
+#ifdef NDEBUG
+  if (state.validated()) {
+    // The inherited immutable state has already been checked; the builder
+    // checked each change. Do not rescan every unchanged entry for each
+    // ordinary flush.
+    return Status::OK();
+  }
+#endif  // NDEBUG
+  const BlobFileTable& table = state.table();
+  // Check that the table agrees with the blob file and relocation file vectors:
+  // every live blob file and relocation file is in the table with the same
+  // metadata, and every other entry is a route.
+  size_t relocation_entries = 0;
+  size_t blob_entries = 0;
+  size_t route_entries = 0;
+  Status status;
+  table.ForEach([&](uint64_t file_number, uint64_t value, uint32_t count) {
+    if (!status.ok()) {
+      return;
+    }
+    if (count != 0 && !BlobFileTable::IsRelocationFile(value)) {
+      status = Status::Corruption("Blob file table has a stray route count");
+      return;
+    }
+    if (BlobFileTable::IsBlobFile(value)) {
+      ++blob_entries;
+      if (PeekBlobFileMetaData(file_number) !=
+          BlobFileTable::AsBlobFile(value)) {
+        status =
+            Status::Corruption("Blob file table disagrees with blob files");
+      }
+    } else if (BlobFileTable::IsRelocationFile(value)) {
+      // The metadata and the per-target count are checked below.
+      ++relocation_entries;
+    } else {
+      ++route_entries;
+      const uint64_t target = BlobFileTable::RouteTarget(value);
+      const BlobRelocationRoute route(file_number, target);
+      status = route.Validate();
+      if (!status.ok()) {
+        return;
+      }
+      // The target is a live relocation file, never a route key or a blob file
+      // (no chains, one hop).
+      if (!BlobFileTable::IsRelocationFile(table.Find(target))) {
+        status = Status::Corruption("Invalid blob relocation route target");
+      }
+    }
+  });
+  if (!status.ok()) {
+    return status;
+  }
+  if (blob_entries != blob_files_.size() ||
+      relocation_entries != state.files().size() ||
+      route_entries != state.route_count()) {
+    return Status::Corruption("Blob file table disagrees with its counts");
+  }
+  UnorderedMap<uint64_t, size_t> route_counts;
+  state.ForEachRoute([&](const BlobRelocationRoute& route) {
+    ++route_counts[route.GetTargetFileNumber()];
+  });
+  for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+       state.files()) {
+    if (metadata == nullptr || metadata->GetFileNumber() == 0 ||
+        state.PeekFile(metadata->GetFileNumber()) != metadata.get() ||
+        GetFileLocation(metadata->GetFileNumber()).IsValid()) {
+      return Status::Corruption("Invalid blob relocation file index");
+    }
+    status = metadata->GetAddition().Validate();
+    if (!status.ok()) {
+      return status;
+    }
+    const auto count = route_counts.find(metadata->GetFileNumber());
+    if (state.RouteCount(metadata->GetFileNumber()) !=
+        (count != route_counts.end() ? count->second : 0)) {
+      return Status::Corruption("Invalid blob relocation route count");
+    }
+  }
+  state.MarkValidated();
+  return Status::OK();
 }
 
 VersionStorageInfo::BlobFiles::const_iterator
@@ -5538,6 +5928,11 @@ void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,
 
     live_blob_files->emplace_back(meta->GetBlobFileNumber());
   }
+  for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+       storage_info_.GetBlobRelocationFiles()) {
+    assert(metadata != nullptr);
+    live_blob_files->emplace_back(metadata->GetFileNumber());
+  }
 }
 
 void Version::RemoveLiveFiles(
@@ -5555,7 +5950,9 @@ void Version::RemoveLiveFiles(
       std::remove_if(
           blob_delete_candidates.begin(), blob_delete_candidates.end(),
           [this](ObsoleteBlobFileInfo& x) {
-            return storage_info()->GetBlobFileMetaData(x.GetBlobFileNumber());
+            return storage_info()->GetBlobFileMetaData(x.GetBlobFileNumber()) ||
+                   storage_info()->GetBlobRelocationFileMetaData(
+                       x.GetBlobFileNumber());
           }),
       blob_delete_candidates.end());
 }
@@ -5633,18 +6030,29 @@ struct VersionSet::ManifestWriter {
   ColumnFamilyData* cfd;
   const autovector<VersionEdit*>& edit_list;
   const std::function<void(const Status&)> manifest_write_callback;
+  // Set only by DBImpl::SetOptions() (see MutableCFOptionsPublication).
+  // new_mutable_cf_options points to the entry of this column family.
+  // compaction_phase_anchor_time is the same for every writer of the call.
+  // ProcessManifestWrites() builds each new Version with these values and
+  // publishes them at install time.
+  const MutableCFOptions* new_mutable_cf_options;
+  std::optional<uint64_t> compaction_phase_anchor_time;
   int max_file_opening_threads;
 
   explicit ManifestWriter(
       InstrumentedMutex* mu, ColumnFamilyData* _cfd,
       const autovector<VersionEdit*>& e,
       const std::function<void(const Status&)>& manifest_wcb,
+      const MutableCFOptions* _new_mutable_cf_options,
+      std::optional<uint64_t> _compaction_phase_anchor_time,
       int _max_file_opening_threads = 1)
       : done(false),
         cv(mu),
         cfd(_cfd),
         edit_list(e),
         manifest_write_callback(manifest_wcb),
+        new_mutable_cf_options(_new_mutable_cf_options),
+        compaction_phase_anchor_time(_compaction_phase_anchor_time),
         max_file_opening_threads(_max_file_opening_threads) {}
   // No copying allowed
   ManifestWriter(const ManifestWriter&) = delete;
@@ -5902,6 +6310,9 @@ Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
 VersionSet::~VersionSet() {
   // Must clean up column families to make all files "obsolete"
   column_family_set_.reset();
+  // Free the deferred file tables. They hold only memory and a cache
+  // reservation, so freeing them needs no column family.
+  obsolete_blob_relocation_states_.clear();
 
   for (auto& file : obsolete_files_) {
     // NOTE: DB is shutting down, so file is probably not obsolete, just
@@ -5918,6 +6329,7 @@ VersionSet::~VersionSet() {
     file.DeleteMetadata();
   }
   obsolete_files_.clear();
+  obsolete_blob_files_.clear();
   io_status_.PermitUncheckedError();
 }
 
@@ -5969,6 +6381,9 @@ void VersionSet::Reset() {
   options_file_size_ = 0;
   has_committed_options_file_number_ = false;
   pending_manifest_file_number_ = 0;
+  blob_indirection_format_version_ = 0;
+  manifest_removed_blob_physical_files_.clear();
+  manifest_deleted_blob_relocation_routes_.clear();
   last_sequence_.store(0);
   last_allocated_sequence_.store(0);
   last_published_sequence_.store(0);
@@ -5984,6 +6399,10 @@ void VersionSet::Reset() {
   last_compacted_manifest_file_size_ = 0;
   TuneMaxManifestFileSize();
   obsolete_files_.clear();
+  {
+    MutexLock lock(&obsolete_blob_files_mutex_);
+    obsolete_blob_files_.clear();
+  }
   obsolete_manifests_.clear();
   wals_.Reset();
 }
@@ -6022,16 +6441,7 @@ void VersionSet::UpdatedMutableDbOptions(
       // the current Version) rather than only when the next Version is built.
       // Safe because periodic_compaction_phase_params_ is read only under the
       // DB mutex, which is held here.
-      for (auto* cfd : *column_family_set_) {
-        if (cfd->IsDropped()) {
-          continue;
-        }
-        Version* v = cfd->current();
-        if (v != nullptr) {
-          v->storage_info_.periodic_compaction_phase_params_ =
-              GetPeriodicCompactionPhaseParams(cfd->GetID());
-        }
-      }
+      RefreshCurrentVersionCompactionPhaseParams();
     }
   }
 
@@ -6043,17 +6453,26 @@ PeriodicCompactionPhaseParams VersionSet::GetPeriodicCompactionPhaseParams(
   return periodic_compaction_phaser_.ParamsForCf(cf_id);
 }
 
-void VersionSet::ReanchorCompactionPhase() {
-  // Caller holds the DB mutex. Move the phasing anchor to now and refresh each
-  // CF's current Version's cached params, mirroring the refresh done for
-  // seed/recovery changes in UpdatedMutableDbOptions(). Used when a CF's
-  // periodic_compaction_seconds changes, so a turn-down's newly past-due cohort
-  // is spread rather than fired at once. Re-anchoring is DB-level and benign to
-  // CFs whose interval did not change (their not-past-due files keep phasing).
+std::optional<uint64_t> VersionSet::PrepareCompactionPhaseReanchor() const {
   int64_t now = 0;
   if (clock_ != nullptr && clock_->GetCurrentTime(&now).ok()) {
-    periodic_compaction_phaser_.Reanchor(static_cast<uint64_t>(now));
+    return static_cast<uint64_t>(now);
   }
+  return std::nullopt;
+}
+
+PeriodicCompactionPhaseParams
+VersionSet::GetPeriodicCompactionPhaseParamsAtAnchor(
+    uint32_t cf_id, uint64_t anchor_time) const {
+  return periodic_compaction_phaser_.ParamsForCfAtAnchor(cf_id, anchor_time);
+}
+
+void VersionSet::CommitCompactionPhaseReanchor(uint64_t anchor_time) {
+  periodic_compaction_phaser_.Reanchor(anchor_time);
+  RefreshCurrentVersionCompactionPhaseParams();
+}
+
+void VersionSet::RefreshCurrentVersionCompactionPhaseParams() {
   for (auto* cfd : *column_family_set_) {
     if (cfd->IsDropped()) {
       continue;
@@ -6113,30 +6532,46 @@ Status VersionSet::ProcessManifestWrites(
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
 
+  const auto publish_batch_callbacks = [&](const Status& status) {
+    mu->AssertHeld();
+    // Runs the writer callbacks once for the whole batch. They finish
+    // in-memory changes that belong with this batch, for example removing the
+    // flushed memtables. Only finish_batch() calls this, at the end of this
+    // function, after the cleanup that can briefly release the DB mutex. So
+    // while that cleanup runs, other threads cannot see the callback effects
+    // yet. For example, a Flush() caller cannot see its memtables removed
+    // before the flush job installs its SuperVersion. See the callback
+    // contract in the comment of VersionSet::LogAndApply().
+    for (ManifestWriter* writer : manifest_writers_) {
+      if (writer->manifest_write_callback) {
+        writer->manifest_write_callback(status);
+      }
+      if (writer == last_writer) {
+        break;
+      }
+    }
+  };
+
   // Takes this batch, from the queue head through `last_writer`, off
-  // manifest_writers_: records `s` on each writer, runs its callback, and wakes
-  // writers other threads wait on, then the next batch's leader. Every return
-  // path must do this, because the writers in `writers` live on the caller's
-  // stack and a queued pointer to one would outlive them.
+  // manifest_writers_. First it runs the batch callbacks (see
+  // publish_batch_callbacks). Then it records `s` on each writer, marks it
+  // done and signals it. Last, it signals the leader of the next batch. Every
+  // return path must do this, because the writers in `writers` live on the
+  // caller's stack and a queued pointer to one would outlive them.
   auto finish_batch = [&](const Status& s) {
+    // The callbacks run here on every path: with an OK status after the new
+    // Versions are installed, or with the error of a failed batch.
+    publish_batch_callbacks(s);
     while (true) {
       ManifestWriter* ready = manifest_writers_.front();
       manifest_writers_.pop_front();
-      bool need_signal = true;
-      for (const auto& w : writers) {
-        if (&w == ready) {
-          need_signal = false;
-          break;
-        }
-      }
       ready->status = s;
       ready->done = true;
-      if (ready->manifest_write_callback) {
-        (ready->manifest_write_callback)(s);
-      }
-      if (need_signal) {
-        ready->cv.Signal();
-      }
+      // Only the first writer of a caller can have a waiting thread, so the
+      // signal does nothing for the other writers. Signalling every writer
+      // avoids a search of `writers` for each writer, which costs quadratic
+      // time in a large multi-column-family batch.
+      ready->cv.Signal();
       if (ready == last_writer) {
         break;
       }
@@ -6165,12 +6600,39 @@ Status VersionSet::ProcessManifestWrites(
   autovector<const autovector<uint64_t>*> files_to_quarantine_if_commit_fail;
   autovector<uint64_t> limbo_descriptor_log_file_number;
 
+  // Versions and builders are destroyed under the mutex; only their relocation
+  // state, which can be large, is freed without it.
+  const auto discard_candidate_versions = [&] {
+    std::vector<std::shared_ptr<void>> holders;
+    for (Version* version : versions) {
+      holders.push_back(version->storage_info()->ReleaseBlobRelocationState());
+      delete version;
+    }
+    versions.clear();
+    FreeBlobRelocationState(&holders, mu,
+                            "VersionSet::ProcessManifestWrites:"
+                            "CandidateRelocationStateFreedUnlocked");
+  };
+  const auto release_builder_guards = [&] {
+    std::vector<std::shared_ptr<void>> holders;
+    for (const auto& guard : builder_guards) {
+      holders.push_back(
+          guard->version_builder()->ReleaseBlobRelocationChanges());
+    }
+    builder_guards.clear();
+    FreeBlobRelocationState(&holders, mu,
+                            "VersionSet::ProcessManifestWrites:"
+                            "BuilderRelocationEditsFreedUnlocked");
+  };
+
   // Tracking `max_last_sequence` is needed to ensure we write
   // `VersionEdit::last_sequence_`s in non-decreasing order according to the
   // recovery code's requirement. It also allows us to defer updating
   // `descriptor_last_sequence_` until the apply phase, after the log phase
   // succeeds.
   SequenceNumber max_last_sequence = descriptor_last_sequence_;
+  uint32_t pending_blob_indirection_format_version =
+      blob_indirection_format_version_;
 
   bool skip_manifest_write =
       first_writer.edit_list.front()->IsNoManifestWriteDummy();
@@ -6182,6 +6644,8 @@ Status VersionSet::ProcessManifestWrites(
     batch_edits_ts_sz.push_back(std::nullopt);
   } else {
     auto it = manifest_writers_.cbegin();
+    // True once the batch holds every writer of the leader's caller.
+    bool past_leader_caller = false;
     size_t group_start = std::numeric_limits<size_t>::max();
     Status batch_apply_status;
     for (;;) {
@@ -6191,13 +6655,19 @@ Status VersionSet::ProcessManifestWrites(
           std::max(batch_max_file_opening_threads,
                    last_writer->max_file_opening_threads);
       assert(last_writer != nullptr);
-      assert(last_writer->cfd != nullptr);
-      if (!batch_apply_status.ok()) {
+      ColumnFamilyData* const writer_cfd = last_writer->cfd;
+      // Only a column family add has a null cfd, and a column family add or
+      // drop is always processed alone above. So a null cfd here is a caller
+      // bug. Fail the batch instead of crashing in release builds.
+      if (writer_cfd == nullptr) {
+        batch_apply_status =
+            Status::Corruption("null column family in MANIFEST writer");
+      } else if (!batch_apply_status.ok()) {
         // An earlier edit failed, so apply no more edits, but keep grouping
         // until the loop conditions below end the batch as usual. LogAndApply()
         // returns once a caller's first writer is done, so none of its writers
         // may be left queued.
-      } else if (last_writer->cfd->IsDropped()) {
+      } else if (writer_cfd->IsDropped()) {
         // If we detect a dropped CF at this point, and the corresponding
         // version edits belong to an atomic group, then we need to find out
         // the preceding version edits in the same atomic group, and update
@@ -6230,12 +6700,10 @@ Status VersionSet::ProcessManifestWrites(
           }
         }
       } else {
-        // We do a linear search on versions because versions is small.
-        // TODO(yanqin) maybe consider unordered_map
         Version* version = nullptr;
         VersionBuilder* builder = nullptr;
         for (int i = 0; i != static_cast<int>(versions.size()); ++i) {
-          uint32_t cf_id = last_writer->cfd->GetID();
+          uint32_t cf_id = writer_cfd->GetID();
           if (versions[i]->cfd()->GetID() == cf_id) {
             version = versions[i];
             assert(!builder_guards.empty() &&
@@ -6250,13 +6718,21 @@ Status VersionSet::ProcessManifestWrites(
           // WAL and OPTIONS protocol manipulations do not change LSM Versions.
           if (!last_writer->IsAllVersionIndependentEdits()) {
             version = new Version(
-                last_writer->cfd, this, file_options_,
-                last_writer->cfd ? last_writer->cfd->GetLatestMutableCFOptions()
-                                 : MutableCFOptions(*new_cf_options),
-                io_tracer_, current_version_number_++);
+                writer_cfd, this, file_options_,
+                last_writer->new_mutable_cf_options != nullptr
+                    ? *last_writer->new_mutable_cf_options
+                    : writer_cfd->GetLatestMutableCFOptions(),
+                io_tracer_, current_version_number_++,
+                EpochNumberRequirement::kMustPresent,
+                last_writer->compaction_phase_anchor_time.has_value()
+                    ? std::make_optional(
+                          GetPeriodicCompactionPhaseParamsAtAnchor(
+                              writer_cfd->GetID(),
+                              *last_writer->compaction_phase_anchor_time))
+                    : std::nullopt);
             versions.push_back(version);
             builder_guards.emplace_back(new BaseReferencedVersionBuilder(
-                last_writer->cfd, last_writer->cfd->current()));
+                writer_cfd, writer_cfd->current()));
             builder = builder_guards.back()->version_builder();
           }
           assert(last_writer->IsAllVersionIndependentEdits() || builder);
@@ -6264,7 +6740,7 @@ Status VersionSet::ProcessManifestWrites(
           TEST_SYNC_POINT_CALLBACK(
               "VersionSet::ProcessManifestWrites:NewVersion", version);
         }
-        const Comparator* ucmp = last_writer->cfd->user_comparator();
+        const Comparator* ucmp = writer_cfd->user_comparator();
         assert(ucmp);
         std::optional<size_t> edit_ts_sz = ucmp->timestamp_size();
         for (const auto& e : last_writer->edit_list) {
@@ -6277,13 +6753,32 @@ Status VersionSet::ProcessManifestWrites(
           } else if (group_start != std::numeric_limits<size_t>::max()) {
             group_start = std::numeric_limits<size_t>::max();
           }
-          batch_apply_status = LogAndApplyHelper(last_writer->cfd, builder, e,
-                                                 &max_last_sequence, mu);
+          // The re-add check runs once the batch has the format fence: the DB
+          // already has it, an earlier edit of this batch set it, or this edit
+          // sets blob indirection state (see
+          // VersionEdit::SetsBlobIndirectionState()). Only an edit in a fenced
+          // batch can hold relocation records, so a legacy batch does no new
+          // work here.
+          if (pending_blob_indirection_format_version != 0 ||
+              e->SetsBlobIndirectionState()) {
+            batch_apply_status = RejectReaddedBlobRelocationState(*e);
+          }
+          if (batch_apply_status.ok()) {
+            batch_apply_status = LogAndApplyHelper(writer_cfd, builder, e,
+                                                   &max_last_sequence, mu);
+          }
           if (!batch_apply_status.ok()) {
             break;  // inner for-`e` loop
           }
           batch_edits.push_back(e);
           batch_edits_ts_sz.push_back(edit_ts_sz);
+          if (e->HasBlobIndirectionFormatVersion()) {
+            pending_blob_indirection_format_version =
+                e->GetBlobIndirectionFormatVersion();
+          } else if (e->HasDbBlobIndirectionFormatVersion()) {
+            pending_blob_indirection_format_version =
+                e->GetDbBlobIndirectionFormatVersion();
+          }
         }
       }
       // Loop increment/conditions
@@ -6292,7 +6787,29 @@ Status VersionSet::ProcessManifestWrites(
         break;
       }
       if (skip_manifest_write) {
-        // no grouping when skipping manifest write
+        // A batch that writes nothing to the MANIFEST (from SetOptions) holds
+        // all the writers of its one caller, and ends at that caller's last
+        // writer. It never takes a writer of a later caller, whose edits can
+        // need a MANIFEST write or can name a column family that is already in
+        // this batch.
+        if (last_writer == &writers.back()) {
+          break;
+        }
+        continue;
+      }
+      // Grouping rule for prepared options: once the batch holds all writers
+      // of the leader's caller, stop if the leader has prepared options, or
+      // before a next writer that has prepared options. The writers of one
+      // caller are queued together, so every writer after writers.back()
+      // belongs to another caller. The rule matters only on the test-only
+      // MANIFEST path of SetOptions; see step 2 in the
+      // MutableCFOptionsPublication comment in version_set.h.
+      if (last_writer == &writers.back()) {
+        past_leader_caller = true;
+      }
+      if (past_leader_caller &&
+          (first_writer.new_mutable_cf_options != nullptr ||
+           (*it)->new_mutable_cf_options != nullptr)) {
         break;
       }
       const auto* next = (*it)->edit_list.front();
@@ -6304,9 +6821,8 @@ Status VersionSet::ProcessManifestWrites(
       }
     }
     if (!batch_apply_status.ok()) {
-      for (auto v : versions) {
-        delete v;
-      }
+      discard_candidate_versions();
+      release_builder_guards();
       finish_batch(batch_apply_status);
       return batch_apply_status;
     }
@@ -6314,12 +6830,10 @@ Status VersionSet::ProcessManifestWrites(
       assert(!builder_guards.empty() &&
              builder_guards.size() == versions.size());
       auto* builder = builder_guards[i]->version_builder();
-      Status s = builder->SaveTo(versions[i]->storage_info());
+      Status s = builder->SaveTableFilesTo(versions[i]->storage_info());
       if (!s.ok()) {
-        // free up the allocated memory
-        for (auto v : versions) {
-          delete v;
-        }
+        discard_candidate_versions();
+        release_builder_guards();
         finish_batch(s);
         return s;
       }
@@ -6361,8 +6875,7 @@ Status VersionSet::ProcessManifestWrites(
     k = i;
   }
   if (skip_manifest_write) {
-    // no grouping when skipping manifest write
-    assert(last_writer == &first_writer);
+    assert(last_writer == &writers.back());
   }
 #endif  // NDEBUG
 
@@ -6431,27 +6944,68 @@ Status VersionSet::ProcessManifestWrites(
 
   uint64_t new_manifest_file_size = 0;
   Status s;
+  // True if blob finalization failed. That failure happens before any MANIFEST
+  // record is written, so the error path below keeps the current MANIFEST
+  // writer.
+  bool blob_finalization_failed = false;
   IOStatus io_s;
   IOStatus manifest_io_status;
   manifest_io_status.PermitUncheckedError();
   std::unique_ptr<log::Writer> new_desc_log_ptr;
   // Save before releasing mu
   uint64_t manifest_preallocation_size = manifest_preallocation_size_;
+  // Calls VersionBuilder::SaveBlobFilesAndCheckTo() for every new Version, with
+  // the DB mutex released. A column family add or drop builds no new Version,
+  // so for that batch this does nothing. This is safe in both the MANIFEST path
+  // and the no-MANIFEST path, because this batch stays at the head of
+  // manifest_writers_ while the mutex is released, and only the batch at the
+  // head installs Versions. Both paths check this in debug builds after they
+  // lock mu again below.
+  const auto finalize_blob_files = [&]() {
+    TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeBlobFinalization");
+    assert(builder_guards.size() == versions.size());
+    Status status;
+    for (size_t i = 0; status.ok() && i < versions.size(); ++i) {
+      status = builder_guards[i]->version_builder()->SaveBlobFilesAndCheckTo(
+          versions[i]->storage_info());
+    }
+    TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:AfterBlobFinalization");
+    blob_finalization_failed = !status.ok();
+    return status;
+  };
   if (skip_manifest_write) {
+    // As in the MANIFEST path below, PrepareAppend() runs without the DB
+    // mutex. The new Versions are not shared yet. PrepareAppend() can also
+    // fill in the stats of FileMetaData objects that older Versions share.
+    // This is the same as in the MANIFEST path, and only the batch at the head
+    // of manifest_writers_ does it.
+    mu->Unlock();
+    s = finalize_blob_files();
     if (s.ok()) {
       constexpr bool update_stats = true;
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
-        // NOTE: normally called with DB mutex released, but we don't
-        // want to release the DB mutex in this mode of LogAndApply
         versions[i]->PrepareAppend(read_options, update_stats);
       }
     }
+    mu->Lock();
+    // As in the MANIFEST path below: while the DB mutex was released, this
+    // batch stayed at the head of manifest_writers_, so the base Version of
+    // each builder is still the current Version of its column family.
+#ifndef NDEBUG
+    assert(manifest_writers_.front() == &first_writer);
+    assert(builder_guards.size() == versions.size());
+    for (size_t i = 0; i < versions.size(); ++i) {
+      assert(versions[i]->cfd_->current() == builder_guards[i]->base_version());
+    }
+#endif  // NDEBUG
   } else {
     FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
     mu->Unlock();
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestStart");
     TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:WriteManifest", nullptr);
-    if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+    s = finalize_blob_files();
+    if (s.ok() &&
+        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         assert(!builder_guards.empty() &&
                builder_guards.size() == versions.size());
@@ -6486,9 +7040,9 @@ Status VersionSet::ProcessManifestWrites(
             CreateManifestWriter(std::move(descriptor_file), descriptor_fname,
                                  opt_file_opts, manifest_preallocation_size);
         raw_desc_log_ptr = new_desc_log_ptr.get();
-        s = WriteCurrentStateToManifest(write_options, curr_state,
-                                        wal_additions, options_manifest_state,
-                                        raw_desc_log_ptr, io_s);
+        s = WriteCurrentStateToManifest(
+            write_options, curr_state, wal_additions, options_manifest_state,
+            pending_blob_indirection_format_version, raw_desc_log_ptr, io_s);
         assert(s == io_s);
       }
       if (!io_s.ok()) {
@@ -6601,9 +7155,26 @@ Status VersionSet::ProcessManifestWrites(
     LogFlush(db_options_->info_log);
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestDone");
     mu->Lock();
+    // While the DB mutex was released, this batch stayed at the head of
+    // manifest_writers_. Only the batch at the head installs Versions, so the
+    // current Version of each column family is still the base Version of its
+    // builder, and the new Versions built on top of it are still valid. The
+    // checks below verify this in debug builds.
+#ifndef NDEBUG
+    assert(!manifest_writers_.empty());
+    assert(manifest_writers_.front() == &first_writer);
+    if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+      assert(builder_guards.size() == versions.size());
+      for (size_t i = 0; i < versions.size(); ++i) {
+        assert(versions[i]->cfd_->current() ==
+               builder_guards[i]->base_version());
+      }
+    }
+#endif
   }
 
   if (s.ok()) {
+    blob_indirection_format_version_ = pending_blob_indirection_format_version;
     // Apply WAL edits, DB mutex must be held.
     for (auto& e : batch_edits) {
       if (e->IsWalAddition()) {
@@ -6687,12 +7258,47 @@ Status VersionSet::ProcessManifestWrites(
         MarkMinLogNumberToKeep(last_min_log_number_to_keep);
       }
 
+#ifndef NDEBUG
+      // Only the first caller's writers can carry prepared options (see the
+      // grouping rule for prepared options in the loop above). The first
+      // caller's writers are the first writers.size() writers of the queue.
+      {
+        size_t position = 0;
+        for (ManifestWriter* writer : manifest_writers_) {
+          assert(position < writers.size() ||
+                 writer->new_mutable_cf_options == nullptr);
+          if (writer == last_writer) {
+            break;
+          }
+          ++position;
+        }
+      }
+#endif  // NDEBUG
+      // Publish the options of a DBImpl::SetOptions() call: step 5 in the
+      // MutableCFOptionsPublication comment in version_set.h. A batch that
+      // holds a SetOptions() call holds only its writers, so first_writer
+      // decides for the whole batch. CommitCompactionPhaseReanchor() also
+      // refreshes the phasing parameters in the current Version of every
+      // column family that is not dropped. This matters for the column
+      // families that are not in this call.
+      if (first_writer.new_mutable_cf_options != nullptr) {
+        if (first_writer.compaction_phase_anchor_time.has_value()) {
+          CommitCompactionPhaseReanchor(
+              *first_writer.compaction_phase_anchor_time);
+        }
+        for (Version* version : versions) {
+          version->cfd_->PublishMutableCFOptions(
+              version->GetMutableCFOptions());
+        }
+      }
+
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         ColumnFamilyData* cfd = versions[i]->cfd_;
         AppendVersion(cfd, versions[i]);
       }
     }
     if (!skip_manifest_write) {
+      RecordBlobRelocationDeletions(batch_edits, new_descriptor_log);
       for (const auto* edit : batch_edits) {
         assert(edit != nullptr);
         if (edit->HasCommittedOptionsFileNumber()) {
@@ -6708,6 +7314,10 @@ Status VersionSet::ProcessManifestWrites(
       manifest_last_valid_record_end_file_number_ = manifest_file_number_;
       prev_log_number_ = first_writer.edit_list.front()->GetPrevLogNumber();
     }
+  } else if (blob_finalization_failed) {
+    // Nothing was written to the MANIFEST. As for a SaveTableFilesTo() failure,
+    // drop the new Versions and keep the current MANIFEST writer.
+    discard_candidate_versions();
   } else {
     std::string version_edits;
     for (auto& e : batch_edits) {
@@ -6716,9 +7326,7 @@ Status VersionSet::ProcessManifestWrites(
     ROCKS_LOG_ERROR(db_options_->info_log,
                     "Error in committing version edit to MANIFEST: %s",
                     version_edits.c_str());
-    for (auto v : versions) {
-      delete v;
-    }
+    discard_candidate_versions();
     // If manifest append failed for whatever reason, the file could be
     // corrupted. So we need to force the next version update to start a
     // new manifest file.
@@ -6785,8 +7393,29 @@ Status VersionSet::ProcessManifestWrites(
   }
 #endif  // NDEBUG
 
+  release_builder_guards();
   finish_batch(s);
   return s;
+}
+
+void VersionSet::FreeBlobRelocationState(
+    std::vector<std::shared_ptr<void>>* holders, InstrumentedMutex* mu,
+    [[maybe_unused]] const char* unlocked_sync_point) {
+  assert(holders != nullptr);
+  mu->AssertHeld();
+  // A holder that is not the last owner frees nothing; drop it here.
+  holders->erase(std::remove_if(holders->begin(), holders->end(),
+                                [](const std::shared_ptr<void>& holder) {
+                                  return holder.use_count() != 1;
+                                }),
+                 holders->end());
+  if (holders->empty()) {
+    return;
+  }
+  mu->Unlock();
+  TEST_SYNC_POINT_CALLBACK(unlocked_sync_point, mu);
+  holders->clear();
+  mu->Lock();
 }
 
 void VersionSet::WakeUpWaitingManifestWriters() {
@@ -6806,12 +7435,13 @@ Status VersionSet::LogAndApply(
     InstrumentedMutex* mu, FSDirectory* dir_contains_current_file,
     bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
     const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-    const std::function<Status()>& pre_cb, int max_file_opening_threads) {
+    const std::function<Status()>& pre_cb, int max_file_opening_threads,
+    const MutableCFOptionsPublication* options_publication) {
   return LogAndApplyImpl(column_family_datas, read_options, write_options,
                          edit_lists, mu, dir_contains_current_file,
                          new_descriptor_log, new_cf_options,
                          /*new_cf_options_are_sanitized=*/false, manifest_wcbs,
-                         pre_cb, max_file_opening_threads);
+                         pre_cb, max_file_opening_threads, options_publication);
 }
 
 Status VersionSet::LogAndApplyColumnFamilyAddWithSanitizedOptions(
@@ -6829,7 +7459,8 @@ Status VersionSet::LogAndApplyColumnFamilyAddWithSanitizedOptions(
                          /*new_descriptor_log=*/false, &sanitized_options,
                          /*new_cf_options_are_sanitized=*/true,
                          /*manifest_wcbs=*/{}, /*pre_cb=*/{},
-                         /*max_file_opening_threads=*/1);
+                         /*max_file_opening_threads=*/1,
+                         /*options_publication=*/nullptr);
 }
 
 Status VersionSet::LogAndApplyImpl(
@@ -6840,7 +7471,8 @@ Status VersionSet::LogAndApplyImpl(
     bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
     bool new_cf_options_are_sanitized,
     const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-    const std::function<Status()>& pre_cb, int max_file_opening_threads) {
+    const std::function<Status()>& pre_cb, int max_file_opening_threads,
+    const MutableCFOptionsPublication* options_publication) {
   mu->AssertHeld();
   int num_edits = 0;
   for (const auto& elist : edit_lists) {
@@ -6850,16 +7482,31 @@ Status VersionSet::LogAndApplyImpl(
     return Status::OK();
   } else if (num_edits > 1) {
 #ifndef NDEBUG
+    const bool no_manifest_batch =
+        edit_lists.front().front()->IsNoManifestWriteDummy();
     for (const auto& edit_list : edit_lists) {
       for (const auto& edit : edit_list) {
         assert(!edit->IsColumnFamilyManipulation());
-        assert(!edit->IsNoManifestWriteDummy());
+        assert(edit->IsNoManifestWriteDummy() == no_manifest_batch);
       }
     }
 #endif /* ! NDEBUG */
   }
 
   int num_cfds = static_cast<int>(column_family_datas.size());
+#ifndef NDEBUG
+  if (options_publication != nullptr) {
+    // ProcessManifestWrites() gives all writers of one column family one shared
+    // Version, built with the options of the first writer. The options of the
+    // other writers would be lost, so when `options_publication` is set,
+    // each column family may appear only once in `column_family_datas`.
+    UnorderedSet<ColumnFamilyData*> unique_cfds;
+    for (ColumnFamilyData* cfd : column_family_datas) {
+      assert(cfd != nullptr);
+      assert(unique_cfds.insert(cfd).second);
+    }
+  }
+#endif
   if (num_cfds == 1 && column_family_datas[0] == nullptr) {
     assert(edit_lists.size() == 1 && edit_lists[0].size() == 1);
     assert(edit_lists[0][0]->IsColumnFamilyAdd());
@@ -6868,12 +7515,22 @@ Status VersionSet::LogAndApplyImpl(
   std::deque<ManifestWriter> writers;
   if (num_cfds > 0) {
     assert(static_cast<size_t>(num_cfds) == edit_lists.size());
+    assert(options_publication == nullptr ||
+           static_cast<size_t>(num_cfds) ==
+               options_publication->new_mutable_cf_options.size());
   }
   for (int i = 0; i < num_cfds; ++i) {
     const auto wcb =
         manifest_wcbs.empty() ? [](const Status&) {} : manifest_wcbs[i];
-    writers.emplace_back(mu, column_family_datas[i], edit_lists[i], wcb,
-                         max_file_opening_threads);
+    writers.emplace_back(
+        mu, column_family_datas[i], edit_lists[i], wcb,
+        options_publication == nullptr
+            ? nullptr
+            : &options_publication->new_mutable_cf_options[i],
+        options_publication == nullptr
+            ? std::nullopt
+            : options_publication->compaction_phase_anchor_time,
+        max_file_opening_threads);
     manifest_writers_.push_back(&writers[i]);
   }
   assert(!writers.empty());
@@ -6944,6 +7601,53 @@ void VersionSet::LogAndApplyCFHelper(VersionEdit* edit,
     // if we drop column family, we have to make sure to save max column
     // family, so that we don't reuse existing ID
     edit->SetMaxColumnFamily(column_family_set_->GetMaxColumnFamily());
+  }
+}
+
+Status VersionSet::RejectReaddedBlobRelocationState(
+    const VersionEdit& edit) const {
+  for (const BlobRelocationFileAddition& addition :
+       edit.GetBlobRelocationFileAdditions()) {
+    if (manifest_removed_blob_physical_files_.count(addition.GetFileNumber()) !=
+        0) {
+      return Status::Corruption(
+          "Relocation file was deleted earlier in this MANIFEST");
+    }
+  }
+  for (const BlobFileAddition& addition : edit.GetBlobFileAdditions()) {
+    if (manifest_removed_blob_physical_files_.count(
+            addition.GetBlobFileNumber()) != 0) {
+      return Status::Corruption(
+          "Blob file was retired earlier in this MANIFEST");
+    }
+  }
+  for (const BlobRelocationRoute& route : edit.GetBlobRelocationRoutes()) {
+    if (manifest_deleted_blob_relocation_routes_.count(
+            route.GetOldFileNumber()) != 0) {
+      return Status::Corruption(
+          "Relocation route was deleted earlier in this MANIFEST");
+    }
+  }
+  return Status::OK();
+}
+
+void VersionSet::RecordBlobRelocationDeletions(
+    const autovector<VersionEdit*>& edits, bool new_manifest) {
+  if (new_manifest) {
+    // The snapshot that starts a MANIFEST has no deletion history.
+    manifest_removed_blob_physical_files_.clear();
+    manifest_deleted_blob_relocation_routes_.clear();
+  }
+  for (const VersionEdit* edit : edits) {
+    manifest_removed_blob_physical_files_.insert(
+        edit->GetBlobRelocationFileDeletions().begin(),
+        edit->GetBlobRelocationFileDeletions().end());
+    manifest_removed_blob_physical_files_.insert(
+        edit->GetBlobFileRetirements().begin(),
+        edit->GetBlobFileRetirements().end());
+    manifest_deleted_blob_relocation_routes_.insert(
+        edit->GetBlobRelocationRouteDeletions().begin(),
+        edit->GetBlobRelocationRouteDeletions().end());
   }
 }
 
@@ -7328,6 +8032,8 @@ Status VersionSet::Recover(
 
   uint64_t current_manifest_file_size = 0;
   uint64_t log_number = 0;
+  UnorderedSet<uint64_t> removed_blob_physical_files;
+  UnorderedSet<uint64_t> deleted_blob_relocation_routes;
   {
     force_new_manifest_on_open_ = false;
     VersionSet::LogReporter reporter;
@@ -7350,6 +8056,8 @@ Status VersionSet::Recover(
       handler.GetDbId(db_id);
     }
     if (s.ok()) {
+      handler.TakeBlobRelocationDeletions(&removed_blob_physical_files,
+                                          &deleted_blob_relocation_routes);
       RecoverEpochNumbers();
     }
     if (log_status) {
@@ -7384,6 +8092,14 @@ Status VersionSet::Recover(
   if (s.ok() && !read_only && db_options_->reuse_manifest_on_open &&
       manifest_recovery_last_valid_record_end_ > 0) {
     s = ReopenManifestForAppend(manifest_path);
+    if (s.ok() && descriptor_log_ != nullptr) {
+      // Appends go to the replayed MANIFEST, which already holds these
+      // deletions.
+      manifest_removed_blob_physical_files_ =
+          std::move(removed_blob_physical_files);
+      manifest_deleted_blob_relocation_routes_ =
+          std::move(deleted_blob_relocation_routes);
+    }
   }
 
   return s;
@@ -8053,6 +8769,22 @@ Status VersionSet::GetLiveFilesChecksumInfo(FileChecksumList* checksum_list) {
         return s;
       }
     }
+
+    for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+         vstorage->GetBlobRelocationFiles()) {
+      assert(metadata != nullptr);
+      std::string checksum_value = metadata->GetChecksumValue();
+      std::string checksum_method = metadata->GetChecksumMethod();
+      if (checksum_method.empty()) {
+        checksum_value = kUnknownFileChecksum;
+        checksum_method = kUnknownFileChecksumFuncName;
+      }
+      s = checksum_list->InsertOneFileChecksum(metadata->GetFileNumber(),
+                                               checksum_value, checksum_method);
+      if (!s.ok()) {
+        return s;
+      }
+    }
   }
 
   return s;
@@ -8135,7 +8867,8 @@ Status VersionSet::WriteCurrentStateToManifest(
     const std::unordered_map<uint32_t, MutableCFState>& curr_state,
     const VersionEdit& wal_additions,
     const OptionsFileManifestState& options_file_manifest_state,
-    log::Writer* log, IOStatus& io_s) {
+    uint32_t blob_indirection_format_version, log::Writer* log,
+    IOStatus& io_s) {
   // TODO: Break up into multiple records to reduce memory usage on recovery?
 
   // WARNING: This method doesn't hold a mutex!!
@@ -8145,6 +8878,24 @@ Status VersionSet::WriteCurrentStateToManifest(
   // LogAndApply (the same single thread), so we're safe to iterate.
 
   assert(io_s.ok());
+  if (log == nullptr) {
+    return Status::InvalidArgument("null MANIFEST writer");
+  }
+  if (blob_indirection_format_version != 0) {
+    VersionEdit format_fence;
+    format_fence.SetColumnFamily(0);
+    format_fence.SetDbBlobIndirectionFormatVersion(
+        blob_indirection_format_version);
+    std::string record;
+    if (!format_fence.EncodeTo(&record)) {
+      return Status::Corruption(
+          "Unable to encode DB-global blob indirection format fence");
+    }
+    io_s = log->AddRecord(write_options, record);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+  }
   if (db_options_->write_dbid_to_manifest) {
     VersionEdit edit_for_db_id;
     assert(!db_id_.empty());
@@ -8255,7 +9006,7 @@ Status VersionSet::WriteCurrentStateToManifest(
 
         edit.AddBlobFile(blob_file_number, meta->GetTotalBlobCount(),
                          meta->GetTotalBlobBytes(), meta->GetChecksumMethod(),
-                         meta->GetChecksumValue());
+                         meta->GetChecksumValue(), meta->IsIndirectOrigin());
         if (meta->GetGarbageBlobCount() > 0) {
           edit.AddBlobFileGarbage(blob_file_number, meta->GetGarbageBlobCount(),
                                   meta->GetGarbageBlobBytes());
@@ -8265,6 +9016,19 @@ Status VersionSet::WriteCurrentStateToManifest(
       for (const uint64_t blob_file_number : vstorage->GetDroppedBlobFiles()) {
         edit.AddDroppedBlobFile(blob_file_number);
       }
+      if (vstorage->HasBlobIndirectionFormat()) {
+        edit.SetBlobIndirectionFormatVersion(
+            vstorage->GetBlobIndirectionFormatVersion());
+      }
+      for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+           vstorage->GetBlobRelocationFiles()) {
+        assert(metadata != nullptr);
+        edit.AddBlobRelocationFile(metadata->GetAddition());
+      }
+      vstorage->ForEachBlobRelocationRoute(
+          [&](const BlobRelocationRoute& route) {
+            edit.SetBlobRelocationRoute(route);
+          });
 
       const auto iter = curr_state.find(cfd->GetID());
       assert(iter != curr_state.end());
@@ -8697,7 +9461,8 @@ void VersionSet::AddLiveFiles(std::vector<uint64_t>* live_table_files,
         total_table_files += vstorage->LevelFiles(level).size();
       }
 
-      total_blob_files += vstorage->GetBlobFiles().size();
+      total_blob_files += vstorage->GetBlobFiles().size() +
+                          vstorage->GetBlobRelocationFiles().size();
     }
   }
 
@@ -8947,15 +9712,18 @@ void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
   // min_pending_output still holds back blob files: VersionBuilder can report
   // one obsolete without it having been part of an installed Version, so the
   // reasoning above does not apply to them.
-  std::vector<ObsoleteBlobFileInfo> pending_blob_files;
-  for (auto& blob_file : obsolete_blob_files_) {
-    if (blob_file.GetBlobFileNumber() < min_pending_output) {
-      blob_files->emplace_back(std::move(blob_file));
-    } else {
-      pending_blob_files.emplace_back(std::move(blob_file));
+  {
+    MutexLock lock(&obsolete_blob_files_mutex_);
+    std::vector<ObsoleteBlobFileInfo> pending_blob_files;
+    for (auto& blob_file : obsolete_blob_files_) {
+      if (blob_file.GetBlobFileNumber() < min_pending_output) {
+        blob_files->emplace_back(std::move(blob_file));
+      } else {
+        pending_blob_files.emplace_back(std::move(blob_file));
+      }
     }
+    obsolete_blob_files_.swap(pending_blob_files);
   }
-  obsolete_blob_files_.swap(pending_blob_files);
 
   obsolete_manifests_.swap(*manifest_filenames);
 }
@@ -9052,6 +9820,13 @@ uint64_t VersionSet::GetTotalBlobFileSize(Version* dummy_versions) {
         all_versions_blob_file_size += meta->GetBlobFileSize();
       }
     }
+    for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
+         vstorage->GetBlobRelocationFiles()) {
+      assert(metadata != nullptr);
+      if (unique_blob_files.insert(metadata->GetFileNumber()).second) {
+        all_versions_blob_file_size += metadata->GetFileSize();
+      }
+    }
   }
 
   return all_versions_blob_file_size;
@@ -9129,7 +9904,8 @@ Status ReactiveVersionSet::Recover(
   manifest_reporter->reset(new LogReporter());
   static_cast_with_check<LogReporter>(manifest_reporter->get())->status =
       manifest_reader_status->get();
-  Status s = MaybeSwitchManifest(manifest_reporter->get(), manifest_reader);
+  Status s = MaybeSwitchManifest(manifest_reporter->get(), manifest_reader,
+                                 /*db_mutex=*/nullptr);
   if (!s.ok()) {
     return s;
   }
@@ -9167,11 +9943,17 @@ Status ReactiveVersionSet::ReadAndApply(
   if (!resume_after_manifest_read_error_ && !manifest_tailer_->status().ok()) {
     return manifest_tailer_->status();
   }
+  // A catch-up releases the DB mutex to decode records, check files and build
+  // Versions. The caller holds its catch-up mutex
+  // (DBImplSecondary::catch_up_mutex_), so catch-ups never overlap.
+  assert(!manifest_tail_in_progress_);
+  manifest_tail_in_progress_ = true;
   Status s;
   log::Reader* reader = manifest_reader->get();
   assert(reader);
-  s = MaybeSwitchManifest(reader->GetReporter(), manifest_reader);
+  s = MaybeSwitchManifest(reader->GetReporter(), manifest_reader, mu);
   if (!s.ok()) {
+    manifest_tail_in_progress_ = false;
     return s;
   }
   // See resume_after_manifest_read_error_ for the steps of a resume. Every
@@ -9183,6 +9965,7 @@ Status ReactiveVersionSet::ReadAndApply(
     if (manifest_reader->get() == reader) {
       s = ReopenManifestAfterReadError(manifest_reader, manifest_read_status);
       if (!s.ok()) {
+        manifest_tail_in_progress_ = false;
         return s;
       }
     } else {
@@ -9192,7 +9975,10 @@ Status ReactiveVersionSet::ReadAndApply(
     resume_after_manifest_read_error_ = false;
   }
   assert(manifest_tailer_->status().ok());
+  manifest_tailer_->SetCatchUpDBMutex(mu);
   manifest_tailer_->Iterate(*(manifest_reader->get()), manifest_read_status);
+  manifest_tailer_->ClearCatchUpDBMutex();
+  manifest_tail_in_progress_ = false;
   s = manifest_tailer_->status();
   if (manifest_reader->get()->hasReadError()) {
     resume_after_manifest_read_error_ = true;
@@ -9310,7 +10096,8 @@ bool ReactiveVersionSet::NewestStateHasMissingFiles() {
 
 Status ReactiveVersionSet::MaybeSwitchManifest(
     log::Reader::Reporter* reporter,
-    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    InstrumentedMutex* db_mutex) {
   assert(manifest_reader != nullptr);
   Status s;
   std::string manifest_path;
@@ -9351,7 +10138,7 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
     ROCKS_LOG_INFO(db_options_->info_log, "Switched to new manifest: %s\n",
                    manifest_path.c_str());
     if (manifest_tailer_) {
-      manifest_tailer_->PrepareToReadNewManifest();
+      manifest_tailer_->PrepareToReadNewManifest(db_mutex);
     }
   } else if (s.IsPathNotFound()) {
     // This can happen if the primary switches to a new MANIFEST after the
@@ -9374,6 +10161,41 @@ uint64_t ReactiveVersionSet::TEST_read_edits_in_atomic_group() const {
 std::vector<VersionEdit>& ReactiveVersionSet::replay_buffer() {
   assert(manifest_tailer_);
   return manifest_tailer_->GetReadBuffer().replay_buffer();
+}
+
+BlobRelocationState& VersionStorageInfo::MutableBlobRelocationState() {
+  if (blob_relocation_state_ == nullptr) {
+    blob_relocation_state_ = std::make_shared<BlobRelocationState>();
+  } else if (blob_relocation_state_.use_count() != 1) {
+    blob_relocation_state_ =
+        std::make_shared<BlobRelocationState>(*blob_relocation_state_);
+  }
+  return *blob_relocation_state_;
+}
+
+std::shared_ptr<void>
+VersionStorageInfo::ReleaseBlobRelocationStateForDeferredFree() {
+  std::shared_ptr<BlobRelocationState> state =
+      std::move(blob_relocation_state_);
+  if (state == nullptr || state.use_count() != 1) {
+    return nullptr;
+  }
+  state->ReleaseFiles();
+  return state;
+}
+
+void VersionStorageInfo::SealBlobRelocationState() {
+  if (blob_relocation_state_ != nullptr && !blob_relocation_state_->sealed()) {
+    blob_relocation_state_->Seal();
+  }
+}
+
+void VersionStorageInfo::DeleteBlobRelocationFile(uint64_t file_number) {
+  MutableBlobRelocationState().DeleteFile(file_number);
+}
+
+void VersionStorageInfo::DeleteBlobRelocationRoute(uint64_t old_file_number) {
+  MutableBlobRelocationState().DeleteRoute(old_file_number);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
