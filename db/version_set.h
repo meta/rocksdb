@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -84,6 +85,8 @@ class MergeIteratorBuilder;
 class SystemClock;
 class ManifestTailer;
 struct ManifestRows;
+struct ManifestRowChanges;
+class ManifestStoreState;
 class FilePickerMultiGet;
 class MultiScanArgs;
 
@@ -1554,6 +1557,61 @@ class VersionSet {
                  bool no_error_if_files_missing = false, bool is_retry = false,
                  Status* log_status = nullptr);
 
+  // Recovers in store mode (see db/manifest_store_state.h) from `records`,
+  // the full-state VersionEdit records that ManifestRowsToRecords() made from
+  // the rows of the store. The normal recovery code replays them from memory.
+  // `stub_number` is the number of the stub MANIFEST that CURRENT names; it
+  // becomes manifest_file_number(), so the obsolete file purge keeps the stub
+  // and deletes older stubs. Recover() never reads the store.
+  Status RecoverFromStore(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      bool read_only, const std::vector<std::string>& records,
+      uint64_t stub_number, std::string* db_id);
+
+  // Makes the stub `stub_number` the MANIFEST file, for a VersionSet that was
+  // recovered from the MANIFEST file just before DB::Open() moved the DB into
+  // the store (see RecoverFromStore()).
+  void SetStubManifestNumber(uint64_t stub_number) {
+    manifest_file_number_ = stub_number;
+    manifest_file_size_ = 0;
+  }
+
+  // Store mode state. A VersionSet with this state commits each MANIFEST write
+  // to the store instead of writing the MANIFEST file. DBImpl sets it during
+  // DB::Open(), before the first MANIFEST write.
+  void SetManifestStoreState(std::unique_ptr<ManifestStoreState> state);
+
+  // True only for a VersionSet of a read-write DB instance in store mode. A
+  // read-only instance in store mode has no store mode state, because it
+  // never writes the MANIFEST.
+  bool IsStoreMode() const { return manifest_store_state_ != nullptr; }
+
+  // Prepares the MANIFEST file copy (see db/manifest_store_state.h) at
+  // DB::Open() in store mode, before the first commit, as the copy mode of the
+  // DB row says. First it marks the file numbers of all files and copies in
+  // the DB folder as used, so that the copy and later files never reuse a
+  // number (DB::Open() raises the next file number only later). Then:
+  // - off: deletes the pointer file and all copies;
+  // - background: writes a new copy that is not sync-marked and points the
+  //   pointer to it. If that fails with an error other than IOFenced, it
+  //   deletes the pointer and the copies instead, and the next commit tries a
+  //   new copy;
+  // - sync: writes a new sync-marked copy and points the pointer to it.
+  // Older copies are deleted. Any other failure fails DB::Open(), so a
+  // pointer never names a sync-marked copy that misses a commit.
+  // REQUIRES: DB mutex held, during DB::Open() only.
+  Status StartManifestCopyAtOpen(const WriteOptions& write_options,
+                                 FSDirectory* dir);
+
+  // Sets the function that returns the smallest file number that RocksDB may
+  // still use for a file that no committed Version names yet
+  // (DBImpl::MinFileNumberInUse()), or the largest uint64_t value.
+  // Store mode writes it into the DB row with each commit. It is called with
+  // the DB mutex held.
+  void SetMinFileNumberInUseFunc(std::function<uint64_t()> func) {
+    min_file_number_in_use_func_ = std::move(func);
+  }
+
   // Do a best-efforts recovery (Options.best_efforts_recovery=true) from all
   // available MANIFEST files. Similar to `Recover` with these differences:
   // 1) not only the latest MANIFEST can be used, if it's not available or
@@ -1994,7 +2052,8 @@ class VersionSet {
   // Sets `rows` to the structured MANIFEST rows of the current state (see
   // db/manifest_rows.h). Rows of dropped column families are not included. It
   // copies the metadata of every live file while the DB mutex is held, so it
-  // is meant for tests, debug checks and tools, not for the write path.
+  // is meant for tests, debug checks, tools and DB::Open() in store mode (the
+  // enter and the timestamp rewrite), not for the write path.
   // Defined in db/manifest_rows.cc, like the other row functions of
   // VersionSet.
   // REQUIRES: DB mutex held.
@@ -2083,6 +2142,17 @@ class VersionSet {
         : log_number(_log_number), full_history_ts_low(std::move(ts_low)) {}
   };
 
+  // Fills the state that a new MANIFEST file or a new MANIFEST file copy
+  // starts with (WriteCurrentStateToManifest()): the mutable state of each
+  // column family, the live WALs and the OPTIONS file state.
+  // `curr_state` is a std::unordered_map, not UnorderedMap, because that is
+  // the parameter type of WriteCurrentStateToManifest().
+  // REQUIRES: DB mutex held.
+  void GetStateForNewManifest(
+      std::unordered_map<uint32_t, MutableCFState>* curr_state,
+      VersionEdit* wal_additions,
+      OptionsFileManifestState* options_manifest_state) const;
+
   // Save current contents to *log
   Status WriteCurrentStateToManifest(
       const WriteOptions& write_options,
@@ -2143,8 +2213,12 @@ class VersionSet {
   // holding DB mutex if outside of DB startup.
   void TuneMaxManifestFileSize();
 
-  // Protected by DB mutex. Debug builds also read it without the mutex (see
-  // "Threads" at debug_manifest_rows_).
+  // Protected by DB mutex. In a VersionSet that is not read-only (file mode
+  // or store mode), only the thread that runs ProcessManifestWrites() changes
+  // it after recovery, so that thread also reads it without the mutex: in
+  // BuildManifestBatchRowChanges() in store mode (CommitBatchToStore()), and
+  // in DebugCheckRowsBeforeInstall() in debug builds (see "Threads" at
+  // debug_manifest_rows_).
   WalSet wals_;
 
   std::unique_ptr<ColumnFamilySet> column_family_set_;
@@ -2230,6 +2304,15 @@ class VersionSet {
   // MANIFEST before returning so normal writable operation never appends to
   // the old tail.
   bool force_new_manifest_on_open_;
+
+  // Store mode state, see SetManifestStoreState().
+  std::unique_ptr<ManifestStoreState> manifest_store_state_;
+  // See SetMinFileNumberInUseFunc().
+  std::function<uint64_t()> min_file_number_in_use_func_;
+  // Store mode: the writer of the MANIFEST file copy, or null. Only the
+  // thread that runs ProcessManifestWrites() uses it, and DB::Open() and
+  // Close() when no write runs.
+  std::unique_ptr<log::Writer> copy_log_;
 
   // Size of the populated manifest file last time it was re-written from
   // scratch.
@@ -2350,6 +2433,88 @@ class VersionSet {
   // Sets the DB row and the WAL rows of `rows` from the current state. See
   // GetManifestRows(). Defined in db/manifest_rows.cc.
   void SetManifestDbRowAndWals(ManifestRows* rows) const;
+
+  // Builds the row changes of one batch of ProcessManifestWrites() with
+  // BuildManifestRowChanges(), from the rows before the batch in `old_rows`
+  // (only its DB row and column family rows are read). The arguments are the
+  // values of ProcessManifestWrites(). For a column family drop, the dropped
+  // column family `first_cfd` with its current Version is added to
+  // `new_versions`. Defined in db/manifest_rows.cc.
+  //
+  // Threads: runs without the DB mutex. Only the thread that runs
+  // ProcessManifestWrites() installs Versions and changes wals_, so the
+  // current Version of a dropped column family and wals_ do not change here.
+  Status BuildManifestBatchRowChanges(
+      const autovector<VersionEdit*>& batch_edits,
+      const autovector<Version*>& new_versions,
+      const std::vector<std::unique_ptr<BaseReferencedVersionBuilder>>&
+          builder_guards,
+      ColumnFamilyData* first_cfd, const ColumnFamilyOptions* new_cf_options,
+      const ManifestRows& old_rows, ManifestRowChanges* changes) const;
+
+  // Commits one batch to the store in store mode, without the DB mutex. See
+  // ManifestStoreState::CommitBatch(). `min_file_number_in_use` is the value
+  // of min_file_number_in_use_func_, read with the DB mutex held. Returns the
+  // error of BuildManifestBatchRowChanges() with `*io_s` OK, or the result of
+  // the commit, also in `*io_s`. Defined in db/manifest_rows.cc.
+  Status CommitBatchToStore(
+      const autovector<VersionEdit*>& batch_edits,
+      const autovector<Version*>& new_versions,
+      const std::vector<std::unique_ptr<BaseReferencedVersionBuilder>>&
+          builder_guards,
+      ColumnFamilyData* first_cfd, const ColumnFamilyOptions* new_cf_options,
+      uint64_t min_file_number_in_use, IOStatus* io_s);
+
+  // Writes a new MANIFEST file copy: the marker, the state of
+  // WriteCurrentStateToManifest() from `curr_state`, `wal_additions` and
+  // `options_state`, then `db_fields` (the next file number, last sequence,
+  // prev log number and max column family), then `batch_edits`. Syncs it,
+  // points the pointer file to it, and deletes older copies. Runs in the
+  // thread that runs ProcessManifestWrites(), without the DB mutex, or in
+  // DB::Open(), with the DB mutex held. `file_opts` and `preallocation_size`
+  // are snapshots of mutable options taken with the DB mutex held.
+  // `curr_state` comes from GetStateForNewManifest().
+  IOStatus WriteNewManifestCopy(
+      const WriteOptions& write_options,
+      const std::unordered_map<uint32_t, MutableCFState>& curr_state,
+      const VersionEdit& wal_additions,
+      const OptionsFileManifestState& options_state,
+      const VersionEdit& db_fields, const autovector<VersionEdit*>& batch_edits,
+      const autovector<std::optional<size_t>>& batch_edits_ts_sz,
+      bool sync_marked, const FileOptions& file_opts,
+      uint64_t preallocation_size, FSDirectory* dir);
+
+  // Updates the copy after a successful store commit: writes a new copy when
+  // `new_copy` is true (no copy yet, or the copy reached the limit of the
+  // MANIFEST file rule, from max_manifest_file_size and
+  // max_manifest_space_amp_pct), else appends the batch edits, with a sync in
+  // sync mode. `file_opts` and `preallocation_size` are snapshots of mutable
+  // options taken with the DB mutex held, because this runs without it.
+  // Returns OK, or the error that stops the DB: IOFenced from any copy
+  // operation, or any copy error in sync mode. In background mode it drops
+  // the copy after other errors, so that the next commit writes a new copy.
+  IOStatus UpdateManifestCopy(
+      const WriteOptions& write_options, bool new_copy,
+      const std::unordered_map<uint32_t, MutableCFState>& curr_state,
+      const VersionEdit& wal_additions,
+      const OptionsFileManifestState& options_state,
+      const VersionEdit& db_fields, const autovector<VersionEdit*>& batch_edits,
+      const autovector<std::optional<size_t>>& batch_edits_ts_sz,
+      const FileOptions& file_opts, uint64_t preallocation_size,
+      FSDirectory* dir);
+
+  // The `db_fields` edit of WriteNewManifestCopy() from the current state.
+  // REQUIRES: DB mutex held.
+  VersionEdit ManifestCopyDbFields() const;
+
+  // Replays the MANIFEST records that `reader` reads, for Recover() and
+  // RecoverFromStore(). On OK, sets `*db_id` (if not null), `*log_number` and
+  // `*read_size` (the bytes read).
+  Status ReplayManifest(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      bool read_only, bool no_error_if_files_missing,
+      std::unique_ptr<SequentialFileReader> reader, std::string* db_id,
+      Status* log_status, uint64_t* log_number, uint64_t* read_size);
 
 #ifndef NDEBUG
   // Phase 1 of the debug check, see debug_manifest_rows_. Defined in

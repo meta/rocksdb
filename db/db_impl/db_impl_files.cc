@@ -141,6 +141,30 @@ uint64_t DBImpl::MinObsoleteSstNumberToKeep() {
   return std::numeric_limits<uint64_t>::max();
 }
 
+uint64_t DBImpl::MinFileNumberInUse() {
+  mutex_.AssertHeld();
+  uint64_t min_number = MinObsoleteSstNumberToKeep();
+  if (!listener_pending_outputs_.empty()) {
+    min_number = std::min(min_number, *listener_pending_outputs_.begin());
+  }
+  for (const auto& [first_file_number, num_files] :
+       pending_ingestion_outputs_) {
+    min_number = std::min(min_number, first_file_number);
+  }
+  UnorderedSet<uint64_t> blob_files;
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    BlobFilePartitionManager* mgr = cfd->blob_partition_manager();
+    if (mgr != nullptr) {
+      mgr->GetActiveBlobFileNumbers(&blob_files);
+      mgr->GetProtectedBlobFileNumbers(&blob_files);
+    }
+  }
+  for (uint64_t number : blob_files) {
+    min_number = std::min(min_number, number);
+  }
+  return min_number;
+}
+
 uint64_t DBImpl::GetObsoleteSstFilesSize() {
   mutex_.AssertHeld();
   return versions_->GetObsoleteSstFilesSize();

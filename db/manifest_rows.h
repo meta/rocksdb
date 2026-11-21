@@ -41,9 +41,10 @@ struct ColumnFamilyOptions;
 // "batch" for these edits and "MANIFEST write" for writing them.
 // - VersionSet::GetManifestRows() reads the current state into rows.
 // - BuildManifestRowChanges() turns one batch into the rows to write and the
-//   rows to delete, and ApplyManifestRowChanges() applies them to rows. Only a
-//   debug check in VersionSet::ProcessManifestWrites() uses them. It compares
-//   the result with the new Versions (see VersionSet::debug_manifest_rows_).
+//   rows to delete, and ApplyManifestRowChanges() applies them to rows. In
+//   store mode (db/manifest_store_state.h), VersionSet::ProcessManifestWrites()
+//   commits these changes to the store. A debug check also compares the result
+//   with the new Versions (see VersionSet::debug_manifest_rows_).
 // - ManifestRowsToRecords() turns rows into encoded "full-state" VersionEdit
 //   records, like the ones that VersionSet::WriteCurrentStateToManifest()
 //   writes at the start of a new MANIFEST file. The existing recovery code
@@ -52,7 +53,7 @@ struct ColumnFamilyOptions;
 //   and from the public rows of include/rocksdb/manifest_store.h, which an
 //   external metadata store keeps.
 //
-// The rows hold every field that recovery reads from a MANIFEST. Three kinds
+// The rows hold every field that recovery reads from a MANIFEST. These kinds
 // of VersionEdit content have no row field:
 // - kInAtomicGroup: an atomic group is always complete inside one MANIFEST
 //   write. The rows have no atomic group marker, so a user of the row changes
@@ -62,6 +63,9 @@ struct ColumnFamilyOptions;
 //   rewritten.
 // - kSubcompactionProgress: only remote compaction workers write it, to their
 //   own progress file, never to the DB MANIFEST.
+// - kManifestStoreStub and kManifestCopyMarker: the records of the stub
+//   MANIFEST and of the MANIFEST file copy in store mode
+//   (db/manifest_store_state.h). They describe those files, not the DB.
 // Deprecated tags (kNewFile, kNewFile2, kNewFile3, the *_DEPRECATED tags) are
 // only read from old MANIFEST files, and their content is held in the rows
 // below in its current form. When you add a VersionEdit tag, follow the
@@ -360,13 +364,13 @@ bool ManifestRowsEqual(const ManifestRows& a, const ManifestRows& b,
 // two functions below convert between them. Their parameters say which form
 // they hold: `internal_rows` or `public_rows`.
 
-// The DB row fields of the public rows (include/rocksdb/manifest_store.h) that
-// ManifestDbRow does not hold. RocksDB owns and writes these fields. They are
-// not the store-owned values of the DB row (ManifestStoreDbState). The defaults
-// are those of a DB whose MANIFEST file is the authority
-// (ManifestAuthority::kFile). The caller sets in_flight_file_number; this file
-// does not compute it. Its default 0 means that every file must be kept, which
-// is always safe.
+// The DB row fields of the public rows (include/rocksdb/manifest_store.h)
+// that ManifestDbRow does not hold. RocksDB owns and writes these fields. They
+// are not the store-owned values of the DB row (ManifestStoreDbState). The
+// defaults are those of a DB whose MANIFEST file is the authority
+// (ManifestAuthority::kFile). The caller sets in_flight_file_number (in store
+// mode, ManifestStoreState::CommitBatch() does). Its default 0 means that
+// every file must be kept, which is always safe.
 struct ManifestDbRowExtraFields {
   uint32_t row_format_version = kManifestRowFormatVersionLatest;
   ManifestAuthority authority = ManifestAuthority::kFile;
@@ -395,6 +399,18 @@ Status ManifestRowsToPublicRows(const ManifestRows& internal_rows,
                                 const ManifestDbRowExtraFields& extra_fields,
                                 uint32_t feature_version,
                                 std::vector<ManifestRow>* public_rows);
+
+// Converts the row changes of one batch to a public commit: the whole new DB
+// row (from `changes.db` and `extra_fields`), the upserts and the deletes,
+// with the fields in the canonical encoding as ManifestRowsToPublicRows()
+// writes them. `feature_version` is as for ManifestRowsToPublicRows().
+//
+// Errors: returns InvalidArgument for a `feature_version` out of range.
+Status ManifestRowChangesToCommit(const ManifestRowChanges& changes,
+                                  const ManifestDbRowExtraFields& extra_fields,
+                                  uint32_t feature_version,
+                                  uint64_t expected_commit_sequence,
+                                  std::string commit_id, ManifestCommit* out);
 
 // Converts public rows back to `internal_rows` and `extra_fields`.
 // `public_db_row` is the DB row, and `public_rows` holds the other rows in any

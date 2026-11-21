@@ -51,6 +51,7 @@
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/malloc_stats.h"
+#include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/memtable_list.h"
 #include "db/merge_context.h"
@@ -546,7 +547,8 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
       // switch to a new MANIFEST anyway. The old MANIFEST can be corrupted.
       // Therefore, force writing a dummy version edit because we do not know
       // whether there are flush jobs with non-empty data to flush, triggering
-      // appends to MANIFEST.
+      // appends to MANIFEST. In store mode, RocksDB does not start a new
+      // MANIFEST file. The empty edit is a normal commit to the store.
       VersionEdit edit;
       auto cfh =
           static_cast_with_check<ColumnFamilyHandleImpl>(default_cf_handle_);
@@ -1137,6 +1139,7 @@ void DBImpl::MaybeRegisterFlushInitiator() {
 }
 
 Status DBImpl::CloseHelper() {
+  closing_.store(true, std::memory_order_release);
   // End a live tune cycle first: it reverts a change being watched through
   // SetOptions(), which needs the DB fully working.
   // The tuner also holds a column family handle, released here.
@@ -7462,7 +7465,38 @@ Status DB::ListColumnFamilies(const DBOptions& db_options,
                               const std::string& name,
                               std::vector<std::string>* column_families) {
   const std::shared_ptr<FileSystem>& fs = db_options.env->GetFileSystem();
-  return VersionSet::ListColumnFamilies(column_families, name, fs.get());
+  if (db_options.manifest_store == nullptr) {
+    return VersionSet::ListColumnFamilies(column_families, name, fs.get());
+  }
+  // Store mode (see db/manifest_store_state.h). A DB whose CURRENT names a
+  // normal MANIFEST file is listed from the file, for example before
+  // DB::Open() moves it into the store.
+  CurrentManifestInfo current;
+  Status s = ReadCurrentManifestInfo(fs.get(), name, &current);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!current.exists || !current.is_stub) {
+    return VersionSet::ListColumnFamilies(column_families, name, fs.get());
+  }
+  if (current.stub.state != ManifestStubState::kDone) {
+    return Status::NotSupported(
+        "Store mode: a mode change is not finished; open the DB read-write "
+        "to finish it");
+  }
+  ManifestStoreScan scan;
+  s = ScanManifestStore(db_options.manifest_store.get(), /*consistent=*/true,
+                        &scan);
+  if (!s.ok()) {
+    return s;
+  }
+  column_families->clear();
+  for (const auto& [cf_id, cf_rows] : scan.rows.cfs) {
+    if (!cf_rows.cf.dropped) {
+      column_families->push_back(cf_rows.cf.name);
+    }
+  }
+  return Status::OK();
 }
 
 Snapshot::~Snapshot() = default;
@@ -7492,17 +7526,44 @@ Status DestroyDB(const std::string& dbname, const Options& options,
   const std::string lockname = LockFileName(dbname);
   Status result = env->LockFile(lockname, &lock);
   if (result.ok()) {
+    // A DB in store mode keeps its metadata in a ManifestStore (see
+    // db/manifest_store_state.h). Deleting the files would leave the rows,
+    // and a later DB::Open() with create_if_missing would not create a new
+    // DB on top of them.
+    CurrentManifestInfo current;
+    Status current_s =
+        ReadCurrentManifestInfo(soptions.fs.get(), dbname, &current);
+    // A stub that this binary cannot decode (current_s not OK) is still a
+    // stub.
+    if (current.is_stub) {
+      current_s.PermitUncheckedError();
+      env->UnlockFile(lock).PermitUncheckedError();
+      return Status::NotSupported(
+          "DestroyDB() does not support a DB in store mode yet");
+    }
     if (sfm) {
       sfm->WaitForEmptyTrashInDirectory(dbname);
     }
     // Ignore error in case directory does not exist
-    soptions.fs
-        ->GetChildren(dbname, io_opts, &filenames,
-                      /*IODebugContext*=*/nullptr)
-        .PermitUncheckedError();
+    Status list_s = soptions.fs->GetChildren(dbname, io_opts, &filenames,
+                                             /*IODebugContext*=*/nullptr);
+    // An I/O error while reading CURRENT or its MANIFEST leaves open whether
+    // CURRENT names a stub. When the folder can be listed, files would be
+    // deleted, so the error is returned and nothing is deleted. A MANIFEST that
+    // CURRENT names but that does not exist (PathNotFound) is not a stub,
+    // because RocksDB points CURRENT to a new stub before it deletes the old
+    // one. That case and a broken CURRENT or MANIFEST (Corruption) are deleted
+    // as a file-mode DB.
+    if (current_s.IsIOError() && !current_s.IsPathNotFound() && list_s.ok()) {
+      env->UnlockFile(lock).PermitUncheckedError();
+      return current_s;
+    }
+    current_s.PermitUncheckedError();
+    list_s.PermitUncheckedError();
 
     uint64_t number;
     FileType type;
+    bool is_copy_pointer = false;
     InfoLogPrefix info_log_prefix(!soptions.db_log_dir.empty(), dbname);
     for (const auto& fname : filenames) {
       if (DeleteScheduler::IsTrashFile(fname)) {
@@ -7531,6 +7592,12 @@ Status DestroyDB(const std::string& dbname, const Options& options,
         } else {
           del = env->DeleteFile(path_to_delete);
         }
+        if (!del.ok() && result.ok()) {
+          result = del;
+        }
+      } else if (ParseManifestCopyFileName(fname, &number, &is_copy_pointer)) {
+        // A MANIFEST file copy that a rollback from store mode left.
+        Status del = env->DeleteFile(dbname + "/" + fname);
         if (!del.ok() && result.ok()) {
           result = del;
         }
@@ -8777,6 +8844,14 @@ Status DBImpl::CommitFileIngestionHandles(
           directories_.GetDbDir(), false /* new_descriptor_log */,
           nullptr /* new_cf_options */, manifest_wcbs, {} /* pre_cb */,
           max_file_opening_threads);
+      if (KeepFilesAfterStoreError(status)) {
+        // The commit may have applied in the store, so the store rows can name
+        // the ingested files (see KeepFilesAfterStoreError()). The handles
+        // still roll back, but they keep the files.
+        for (auto* job : ingestion_jobs) {
+          job->KeepInternalFiles();
+        }
+      }
       // It is safe to update VersionSet last seqno here after LogAndApply since
       // LogAndApply persists last sequence number from VersionEdits,
       // which are from file's largest seqno and not from VersionSet.
@@ -8894,8 +8969,11 @@ Status DBImpl::CommitFileIngestionHandles(
     sv_ctx.Clean();
   }
   if (!status.ok()) {
-    // The atomic commit failed; nothing was made visible. The handles are NOT
-    // consumed, so each one's destructor rolls it back
+    // The atomic commit failed, and no new Version was installed. The handles
+    // are NOT consumed, so each one's destructor rolls it back. In file mode
+    // the rollback deletes the ingested files. In store mode, when
+    // LogAndApply() failed and KeepFilesAfterStoreError() is true, the
+    // commit may have applied in the store, so the rollback keeps them.
     return status;
   }
 
@@ -9043,6 +9121,8 @@ Status DBImpl::CreateColumnFamilyWithImport(
                                         &mutex_, directories_.GetDbDir());
         if (status.ok()) {
           InstallSuperVersionForConfigChange(cfd, &sv_context);
+        } else if (KeepFilesAfterStoreError(status)) {
+          import_job.KeepInternalFiles();
         }
       }
 
