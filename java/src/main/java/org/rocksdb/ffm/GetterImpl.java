@@ -24,4 +24,14 @@ final class GetterImpl extends WithDB implements Getter {
     throwOnError(error, message -> String.format("rocksdb_get() %s", message));
     return dereference(value, valueLength);
   }
+
+  @Override
+  public MemorySegment get(RocksdbReadoptions readOptions, ColumnFamilyHandle columnFamilyHandle, MemorySegment key) throws RocksFFMException {
+    MemorySegment valueLength = allocator.allocateFrom(ValueLayout.JAVA_LONG, 0L);
+    MemorySegment error = allocator.allocateFrom(ValueLayout.ADDRESS, NULL);
+    MemorySegment value =
+      rocksdb_c_api.rocksdb_get_cf(db, readOptions.nativeSegment(), columnFamilyHandle.nativeSegment(), key, key.byteSize(), valueLength, error);
+    throwOnError(error, message -> String.format("rocksdb_get() %s", message));
+    return dereference(value, valueLength);
+  }
 }
