@@ -81,6 +81,7 @@ LIB_SOURCES =                                                   \
   db/malloc_stats.cc                                            \
   db/manifest_ops.cc                                            \
   db/manifest_rows.cc                                           \
+  db/manifest_store_shadow.cc                                   \
   db/manifest_store_state.cc                                    \
   db/memtable.cc                                                \
   db/memtable_list.cc                                           \

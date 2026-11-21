@@ -36,6 +36,14 @@ std::string ManifestCommitIdGenerator::Next() {
          std::to_string(counter_.fetch_add(1, std::memory_order_relaxed));
 }
 
+std::string ManifestCommitIdGenerator::NextCloseId() {
+  return Next() + kCloseSuffix;
+}
+
+bool ManifestCommitIdGenerator::IsCloseId(const std::string& commit_id) {
+  return Slice(commit_id).ends_with(kCloseSuffix);
+}
+
 namespace {
 
 // The version of the stub payload. A reader returns NotSupported for any
@@ -118,22 +126,6 @@ class StringWritableFile : public FSWritableFile {
 
  private:
   std::string* const data_;
-};
-
-// Collects the rows of a scan.
-class CollectRowsVisitor : public ManifestRowVisitor {
- public:
-  Status OnDbRow(const ManifestDbRowResult& db_row) override {
-    db_row_ = db_row;
-    return Status::OK();
-  }
-  Status OnRow(const ManifestRow& row) override {
-    rows_.push_back(row);
-    return Status::OK();
-  }
-
-  ManifestDbRowResult db_row_;
-  std::vector<ManifestRow> rows_;
 };
 
 // Returns a plain IOError with the message `msg`. It has no retryable flag,

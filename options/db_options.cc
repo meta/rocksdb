@@ -696,6 +696,12 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, manifest_store_migrate),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kCompareNever | OptionTypeFlags::kDontSerialize}},
+        // Shadow mode belongs with `manifest_store`, which is not written to
+        // the OPTIONS file, so it is not written either.
+        {"manifest_store_shadow",
+         {offsetof(struct ImmutableDBOptions, manifest_store_shadow),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kCompareNever | OptionTypeFlags::kDontSerialize}},
 };
 
 const std::string OptionsHelper::kDBOptionsName = "DBOptions";
@@ -916,7 +922,8 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       manifest_store(options.manifest_store),
       manifest_store_migrate(options.manifest_store_migrate),
       manifest_store_copy_mode(options.manifest_store_copy_mode),
-      manifest_row_feature_version(options.manifest_row_feature_version) {
+      manifest_row_feature_version(options.manifest_row_feature_version),
+      manifest_store_shadow(options.manifest_store_shadow) {
   fs = env->GetFileSystem();
   clock = env->GetSystemClock().get();
   logger = info_log.get();
@@ -1124,6 +1131,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    manifest_store_migrate);
   ROCKS_LOG_HEADER(log, "            Options.manifest_store_copy_mode: %d",
                    static_cast<int>(manifest_store_copy_mode));
+  ROCKS_LOG_HEADER(log, "            Options.manifest_store_shadow: %d",
+                   manifest_store_shadow);
 }
 
 bool ImmutableDBOptions::IsWalDirSameAsDBPath() const {

@@ -99,9 +99,9 @@ struct ManifestRow {
 
 // Which source holds the authoritative metadata of a DB. The DB row stores
 // it in ManifestDbField::kAuthority. These values and the ManifestCopyMode
-// values are fixed because stores keep them. RocksDB does not write kShadow
-// yet. A reader returns NotSupported for an authority value that it does not
-// know, because a newer binary wrote it.
+// values are fixed because stores keep them. RocksDB writes kShadow in shadow
+// mode (DBOptions::manifest_store_shadow). A reader returns NotSupported for an
+// authority value that it does not know, because a newer binary wrote it.
 enum class ManifestAuthority : uint8_t {
   // The MANIFEST file, as without a store.
   kFile = 0,
@@ -390,9 +390,12 @@ std::string EncodeManifestRowFields(
 // Background: an application implements ManifestStore on top of its own
 // database (for example a replicated key-value store) and gives one object to
 // RocksDB in DBOptions::manifest_store. The DB is then in store mode: the
-// rows in the store hold its metadata. The types below define what a store
-// must do. The application creates a store object for one DB, with its own
-// key for the DB and the epoch.
+// rows in the store hold its metadata. With DBOptions::manifest_store_shadow
+// the DB stays in file mode instead: the MANIFEST file stays the authority, and
+// RocksDB copies each MANIFEST write to the store in the background, as
+// described at that option. The types below define what a store must do. The
+// application creates a store object for one DB, with its own key for the DB
+// and the epoch.
 //
 // Terms:
 // - Epoch (store epoch): a number that the application gives to a store
@@ -438,7 +441,9 @@ std::string EncodeManifestRowFields(
 // - Move an existing DB into the store: WriteGeneration().
 // - DestroyDB(): Destroy(), then RocksDB deletes the files. After a rollback,
 //   DestroyDB() of the DB in file mode also calls Destroy() when the rows have
-//   the db id of the DB and authority kFile.
+//   the db id of the DB and authority kFile. DestroyDB() keeps the rows that
+//   shadow mode wrote (authority kShadow); call Destroy() once no DB uses
+//   them.
 //
 // Not supported in store mode: DB::GetLiveFiles() (the MANIFEST file is only
 // a stub, so DB::GetLiveFilesStorageInfo() gives the MANIFEST content in
@@ -548,12 +553,14 @@ struct ManifestGeneration {
 // first when there is no DB row) and change nothing.
 //
 // Calls: RocksDB makes at most one call at a time on the store object of one
-// DB instance. DB::ListColumnFamilies(), RollBackManifestStore() and
-// DestroyDB() call the store from the caller's thread, so do not pass them a
-// store object that an open DB uses. Every call must return in a bounded time
-// (the store applies its own timeout), because DB::Open() and DB::Close() wait
-// for calls in flight. A method added to this class has a default
-// implementation that returns NotSupported, so that existing stores still
+// DB instance. In shadow mode these calls come from a background thread, and
+// the last commit at close from the thread that closes the DB.
+// DB::ListColumnFamilies(), RollBackManifestStore() and DestroyDB() call the
+// store from the caller's thread, so do not pass them a store object that an
+// open DB uses. Every call must return in a bounded time (the store applies its
+// own timeout), because DB::Open() and DB::Close() wait for calls in flight. A
+// method added to this class has a default implementation that
+// returns NotSupported, so that existing stores still
 // build.
 class ManifestStore : public Customizable {
  public:

@@ -89,6 +89,7 @@ struct ManifestRows;
 struct ManifestRowChanges;
 class ManifestStoreState;
 struct ManifestStoreRead;
+class ManifestStoreShadow;
 class FilePickerMultiGet;
 class MultiScanArgs;
 
@@ -1701,6 +1702,9 @@ class VersionSet {
   // Prints the metadata of a DB in store mode (see db/manifest_store_state.h)
   // like DumpManifest(): a consistent scan of `store`, turned into the records
   // of a MANIFEST (ManifestRowsToRecords()). The store object needs no epoch.
+  // It returns InvalidArgument when the DB row has authority kFile and
+  // NotSupported when it has authority kShadow, because the MANIFEST file is
+  // then the authority.
   Status DumpManifestFromStore(
       Options& options, ManifestStore* store, bool verbose, bool hex, bool json,
       const std::vector<ColumnFamilyDescriptor>& cf_descs);
@@ -2118,6 +2122,15 @@ class VersionSet {
   // REQUIRES: DB mutex held.
   static void ReleaseCheckpointRowsRefs(CheckpointRowsRefs* refs);
 
+  // Turns on shadow mode (see ManifestStoreShadow): after each successful
+  // MANIFEST write, ProcessManifestWrites() hands the row changes to `shadow`.
+  // DBImpl calls this before recovery, so that the first MANIFEST write of
+  // DB::Open() is handed over too. `shadow` must outlive the last MANIFEST
+  // write.
+  void SetManifestStoreShadow(ManifestStoreShadow* shadow) {
+    manifest_store_shadow_ = shadow;
+  }
+
   void TEST_CreateAndAppendVersion(ColumnFamilyData* cfd) {
     assert(cfd);
 
@@ -2212,13 +2225,18 @@ class VersionSet {
       VersionEdit* wal_additions,
       OptionsFileManifestState* options_manifest_state) const;
 
-  // Save current contents to *log
+  // Save current contents to *log. When `snapshot_rows` is not null, it is set
+  // to the rows (db/manifest_rows.h) of what the function writes: the DB id
+  // (only with write_dbid_to_manifest), the last sequence, the min log number
+  // to keep, the committed OPTIONS file number, the WALs and all column family
+  // rows. The next file number, the prev log number and the max column family
+  // are left at 0, because the edits of the same MANIFEST write record them.
   Status WriteCurrentStateToManifest(
       const WriteOptions& write_options,
       const std::unordered_map<uint32_t, MutableCFState>& curr_state,
       const VersionEdit& wal_additions,
       const OptionsFileManifestState& options_file_manifest_state,
-      log::Writer* log, IOStatus& io_s);
+      log::Writer* log, IOStatus& io_s, ManifestRows* snapshot_rows = nullptr);
 
   // Reopen the existing MANIFEST file for append at the end of Recover()
   // when reuse_manifest_on_open is set, so the next LogAndApply appends
@@ -2388,6 +2406,25 @@ class VersionSet {
   size_t manifest_preallocation_size_ = 0;
   // Saved copy from (Mutable)DBOptions
   bool verify_manifest_content_on_close_ = false;
+
+  // Shadow mode, see SetManifestStoreShadow(). Null when it is off.
+  ManifestStoreShadow* manifest_store_shadow_ = nullptr;
+  // The base rows of shadow mode: the DB row and the column family rows of the
+  // MANIFEST state before the next MANIFEST write. Only the thread that runs
+  // ProcessManifestWrites() uses them.
+  //
+  // Background: BuildManifestRowChanges() needs the DB row and the column
+  // family rows from before a write, because it writes a column family row and
+  // the DB row whole. It does not read file, blob file or WAL rows (it takes
+  // the WALs from `wals_`), so the base keeps none of them, which saves memory.
+  //
+  // The base is null before the first MANIFEST write in shadow mode, and it
+  // becomes null again after a failed MANIFEST write, after a failed build of
+  // the row changes, and after shadow mode stops. When the base is null, the
+  // next MANIFEST write starts a new MANIFEST file. Its snapshot
+  // (WriteCurrentStateToManifest()) gives the full state again, and
+  // ManifestStoreShadow::ReplaceWithSnapshot() aligns the shadow rows with it.
+  std::unique_ptr<ManifestRows> shadow_base_rows_;
 
 #ifndef NDEBUG
   // The structured MANIFEST rows (db/manifest_rows.h) of the installed state,
@@ -2582,6 +2619,22 @@ class VersionSet {
       bool read_only, bool no_error_if_files_missing,
       std::unique_ptr<SequentialFileReader> reader, std::string* db_id,
       Status* log_status, uint64_t* log_number, uint64_t* read_size);
+
+  // Shadow mode: hands the row changes of a successful MANIFEST write to
+  // manifest_store_shadow_. `snapshot_rows` holds the rows that
+  // WriteCurrentStateToManifest() wrote when the write started a new MANIFEST
+  // file, and is null otherwise. Runs without the DB mutex. The cost is that of
+  // BuildManifestRowChanges() (the batch, the blob files of the changed column
+  // families and the live WALs), plus work that is linear in the number of live
+  // files when the write starts a new MANIFEST file.
+  // Defined in db/manifest_store_shadow.cc.
+  void HandOffToManifestStoreShadow(
+      const autovector<VersionEdit*>& batch_edits,
+      const autovector<Version*>& versions,
+      const std::vector<std::unique_ptr<BaseReferencedVersionBuilder>>&
+          builder_guards,
+      ColumnFamilyData* first_cfd, const ColumnFamilyOptions* new_cf_options,
+      ManifestRows* snapshot_rows);
 
 #ifndef NDEBUG
   // Phase 1 of the debug check, see debug_manifest_rows_. Defined in
