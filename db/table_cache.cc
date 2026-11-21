@@ -619,8 +619,36 @@ bool TableCache::GetFromRowCache(const Slice& user_key, IterKey& row_cache_key,
   return found;
 }
 
+bool TableCache::RangeTombstonesMayCoverUserKey(
+    const Comparator* user_comparator, const FileMetaData& file_meta,
+    const Slice& user_key) {
+  TEST_SYNC_POINT("TableCache::RangeTombstonesMayCoverUserKey");
+  assert(user_comparator != nullptr);
+  if (file_meta.smallest.size() == 0 || file_meta.largest.size() == 0) {
+    return true;
+  }
+  if (user_comparator->CompareWithoutTimestamp(
+          user_key, file_meta.smallest.user_key()) < 0) {
+    return false;
+  }
+  const int cmp_largest = user_comparator->CompareWithoutTimestamp(
+      user_key, file_meta.largest.user_key());
+  if (cmp_largest != 0) {
+    return cmp_largest < 0;
+  }
+  SequenceNumber largest_seq = 0;
+  ValueType largest_type = kTypeDeletion;
+  UnPackSequenceAndType(ExtractInternalKeyFooter(file_meta.largest.Encode()),
+                        &largest_seq, &largest_type);
+  // The exclusive end of a cut range tombstone: the file holds nothing for
+  // this user key.
+  return !(largest_seq == kMaxSequenceNumber &&
+           largest_type == kTypeRangeDeletion);
+}
+
 void TableCache::UpdateRangeTombstoneSeqnums(
     const ReadOptions& options, TableReader* t,
+    const Comparator* user_comparator, const FileMetaData* l0_file,
     MultiGetContext::Range& table_range) {
   std::unique_ptr<FragmentedRangeTombstoneIterator> latest_range_del_iter;
   bool track_newer_versions = false;
@@ -655,6 +683,11 @@ void TableCache::UpdateRangeTombstoneSeqnums(
   }
   if (range_del_iter != nullptr || latest_range_del_iter != nullptr) {
     for (auto iter = table_range.begin(); iter != table_range.end(); ++iter) {
+      if (l0_file != nullptr &&
+          !RangeTombstonesMayCoverUserKey(user_comparator, *l0_file,
+                                          iter->ukey_with_ts)) {
+        continue;
+      }
       if (latest_range_del_iter != nullptr &&
           iter->get_context->NeedToTrackNewerVersions()) {
         const SequenceNumber covering_seq =
@@ -731,7 +764,9 @@ Status TableCache::MultiGetFilter(
     // Update the range tombstone sequence numbers for the keys here
     // as TableCache::MultiGet may or may not be called, and even if it
     // is, it may be called with fewer keys in the rangedue to filtering.
-    UpdateRangeTombstoneSeqnums(options, t, tombstone_range);
+    UpdateRangeTombstoneSeqnums(
+        options, t, internal_comparator.user_comparator(),
+        level == 0 ? &file_meta : nullptr, tombstone_range);
   }
   if (mget_range->empty() && *handle) {
     cache_.Release(*handle);

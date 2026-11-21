@@ -620,6 +620,110 @@ TEST_F(DBSecondaryTest, InternalCompactionMultiLevels) {
   //  cfh, input1, &result));
 }
 
+TEST_F(DBSecondaryTest, CatchUpAfterPrimaryDeletesObsoleteNormalBlobFile) {
+  // In a column family with the blob indirection format fence, the primary
+  // turns enable_blob_indirection off and writes a normal blob file, which
+  // later becomes obsolete and is deleted. The secondary tails the MANIFEST
+  // that has the file's addition. Its catch-up (ManifestTailer) must still
+  // accept the newest point, so the obsolete file does not count as a missing
+  // needed file.
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "value-fence"));
+  ASSERT_OK(Flush());
+  options.enable_blob_indirection = false;
+  Reopen(options);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+
+  // No catch-up runs between the file's addition and its deletion, so the
+  // catch-up below applies the addition when the file is already gone.
+  ASSERT_OK(Put("a", "old-a"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("a", "new-a"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact;
+  compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_OK(Put("late", "value-late"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "late", &value));
+  ASSERT_EQ(value, "value-late");
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ(value, "new-a");
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "fence", &value));
+  ASSERT_EQ(value, "value-fence");
+}
+
+TEST_F(DBSecondaryTest, CatchUpAfterPrimaryDropsNormalBlobBelowOldest) {
+  // In a column family with the blob indirection format fence, the primary
+  // turns enable_blob_indirection off, writes normal blob file N, and then
+  // removes, with DeleteFilesInRange(), the only SST that links N. N is then
+  // below the oldest blob file of every remaining SST, so it leaves the
+  // Version and is deleted. The secondary tails the MANIFEST that has N's
+  // addition. Its catch-up must still accept the newest point.
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  // The fence SST holds an inline value, so it has no oldest blob file.
+  options.min_blob_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "value-fence"));
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(dbfull()
+                  ->GetVersionSet()
+                  ->GetColumnFamilySet()
+                  ->GetDefault()
+                  ->current()
+                  ->storage_info()
+                  ->HasBlobIndirectionFormat());
+  MoveFilesToLevel(2);
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  Reopen(options);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+
+  ASSERT_OK(Put("a", "value-a"));
+  ASSERT_OK(Flush());
+  const uint64_t normal = GetBlobFileNumbers().back();
+  // DeleteFilesInRange() does not delete L0 files. No catch-up runs between
+  // N's addition and its deletion, so the catch-up below applies the addition
+  // when N is already gone.
+  MoveFilesToLevel(1);
+  ASSERT_OK(Put("m", "value-m"));
+  ASSERT_OK(Flush());
+  const Slice begin("a");
+  const Slice end("b");
+  ASSERT_OK(
+      DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &begin, &end));
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+  ASSERT_TRUE(env_->FileExists(BlobFileName(dbname_, normal)).IsNotFound());
+  ASSERT_OK(Put("late", "value-late"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "late", &value));
+  ASSERT_EQ(value, "value-late");
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "m", &value));
+  ASSERT_EQ(value, "value-m");
+}
+
 TEST_F(DBSecondaryTest, GetMergeOperands) {
   Options options;
   options.merge_operator = MergeOperators::CreateStringAppendOperator();
