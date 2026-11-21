@@ -52,6 +52,7 @@
 #include "db/log_writer.h"
 #include "db/malloc_stats.h"
 #include "db/manifest_rows.h"
+#include "db/manifest_store_shadow.h"
 #include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/memtable_list.h"
@@ -1360,6 +1361,14 @@ Status DBImpl::CloseHelper() {
       }
     }
   }
+  // Shadow mode: the MANIFEST gets no more writes, so send the last changes.
+  // Close() waits for the shadow job and makes a store call, so it runs
+  // without the DB mutex.
+  if (manifest_store_shadow_ != nullptr) {
+    mutex_.Unlock();
+    manifest_store_shadow_->Close();
+    mutex_.Lock();
+  }
 
   // Drain obsolete-file purge work started AFTER the early CloseHelper wait
   // near the top of this method. A late SuperVersion cleanup -- a dropped
@@ -2380,8 +2389,14 @@ Status DBImpl::SetDBOptions(
                                              Env::Priority::HIGH);
         }
         if (max_compactions_increased) {
-          env_->IncBackgroundThreadsIfNeeded(new_bg_job_limits.max_compactions,
-                                             Env::Priority::LOW);
+          // Shadow mode keeps its extra LOW thread (see
+          // DBImpl::CreateManifestStoreShadow()).
+          env_->IncBackgroundThreadsIfNeeded(
+              new_bg_job_limits.max_compactions +
+                  (manifest_store_shadow_ != nullptr
+                       ? ManifestStoreShadow::kMaxJobsPerProcess
+                       : 0),
+              Env::Priority::LOW);
         }
         if (offpeak_time_changed) {
           versions_->ChangeOffpeakTimeOption(
@@ -7560,7 +7575,10 @@ Status ReadFileModeDbId(FileSystem* fs, const std::string& dbname,
 // (see ManifestStore::Destroy()). DestroyDB() of that DB in file mode, with
 // the store in the options, removes them when they have the db id of the DB.
 // It leaves other rows alone, because they belong to another DB or to a DB in
-// store mode.
+// store mode. It also keeps the rows that shadow mode wrote (authority
+// kShadow): a copy of the DB folder, such as a checkpoint, has the same db id,
+// and its DestroyDB() must never remove the rows of a live source DB or fence
+// it.
 IOStatus DestroyRolledBackRows(ManifestStore* store, const std::string& db_id) {
   if (db_id.empty()) {
     return IOStatus::OK();

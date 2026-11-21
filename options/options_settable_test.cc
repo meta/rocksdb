@@ -581,6 +581,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "use_separate_remote_compaction_pool=true;"
       "use_session_tmp_dir_for_remote_compaction=true;"
       "manifest_row_feature_version=1;"
+      "manifest_store_shadow=true;"
       "reuse_manifest_on_open=true;",
       new_options));
 

@@ -2536,23 +2536,28 @@ TEST_F(OptionsTest, ManifestStoreOptions) {
 
   // An options string can set the store, but the store is never written back,
   // so the OPTIONS file does not hold it. The feature version is written.
+  // Shadow mode belongs with the store, so it is not written either.
   DBOptions db_opts;
   ASSERT_OK(GetDBOptionsFromString(
       cfg_opts, DBOptions(),
-      std::string("manifest_store=") + MockManifestStore::kClassName(),
+      std::string("manifest_store_shadow=true;manifest_store=") +
+          MockManifestStore::kClassName(),
       &db_opts));
   ASSERT_NE(db_opts.manifest_store, nullptr);
+  ASSERT_TRUE(db_opts.manifest_store_shadow);
   std::string opts_str;
   ASSERT_OK(GetStringFromDBOptions(cfg_opts, db_opts, &opts_str));
   ASSERT_EQ(std::string::npos, opts_str.find("manifest_store"));
   ASSERT_NE(std::string::npos,
             opts_str.find("manifest_row_feature_version=1;"));
 
-  // The reloaded options have no store. They still verify as equal to the
-  // original options, because the store option is never compared.
+  // The reloaded options have no store and no shadow mode. They still verify
+  // as equal to the original options, because these options are never
+  // compared.
   DBOptions new_opt;
   ASSERT_OK(GetDBOptionsFromString(cfg_opts, DBOptions(), opts_str, &new_opt));
   ASSERT_EQ(nullptr, new_opt.manifest_store);
+  ASSERT_FALSE(new_opt.manifest_store_shadow);
   ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(cfg_opts, db_opts, new_opt));
 
   // The parser reads any feature version. With a store, the DB open functions

@@ -125,7 +125,9 @@ struct ImmutableDBOptions;
 // the db id of the stub, calls ManifestStore::Destroy(), and then deletes the
 // files. After a rollback, it also removes the rows that the rollback left
 // when they have the db id of the DB (see DestroyDB() in
-// db/db_impl/db_impl.cc).
+// db/db_impl/db_impl.cc). It keeps the rows that shadow mode
+// (db/manifest_store_shadow.h) wrote, because a copy of a live shadow DB has
+// the same db id.
 //
 // Write path (VersionSet::ProcessManifestWrites()): RocksDB turns each batch
 // of VersionEdits into row changes and sends them to the store as one
@@ -154,25 +156,39 @@ struct ImmutableDBOptions;
 // Mode changes: DBImpl::CreateDbInManifestStore() creates a new DB in the
 // store, DBImpl::EnterManifestStore() moves a file-mode DB into the store,
 // and RollBackManifestStore() moves a DB back to file mode. The MANIFEST file
-// copy (below) makes a rollback without the store possible.
+// copy (below) makes a rollback without the store possible. Shadow mode
+// (db/manifest_store_shadow.h) is a step before an enter: the DB stays in file
+// mode and copies its metadata to the store. An enter takes over the rows of
+// shadow mode only when their last commit is a close commit, which a shadow
+// DB writes when it closes with the store in sync. Users must close every
+// shadow DB before an enter (see "Close ids and the enter" at
+// ManifestStoreShadow).
 
-// Returns true when `options` (DBOptions or ImmutableDBOptions) give a store,
-// so that a reader (a read-only, secondary or follower instance, or a remote
-// compaction worker) reads the metadata from the store instead of the
-// MANIFEST file. Three checks answer "is the metadata in the store?" for
+// Returns true when `options` (DBOptions or ImmutableDBOptions) hold a store
+// (manifest_store is set) and manifest_store_shadow is false. Shadow mode
+// (DBOptions::manifest_store_shadow) keeps the MANIFEST file as the authority,
+// and the store only follows it. When this returns true, a reader (a
+// read-only, secondary or follower instance, or a remote compaction worker)
+// reads the metadata from the store instead of the MANIFEST file, and
+// DB::Open() opens the DB in store mode. In shadow mode the DB stays in file
+// mode, and only the ManifestStoreShadow class (db/manifest_store_shadow.h)
+// uses the store. Three checks answer "is the metadata in the store?" for
 // different callers:
 //
 //   Check                        Used by
 //   ---------------------------  --------------------------------------------
-//   VersionSet::IsStoreMode()    a primary, whose VersionSet commits to the
+//   VersionSet::IsStoreMode()    a primary after DB::Open() has finished
+//                                recovery, whose VersionSet commits to the
 //                                store
 //   StoreModeOptions(options)    the readers above, which have no
+//                                ManifestStoreState, and DB::Open() of a
+//                                primary until recovery has created its
 //                                ManifestStoreState
 //   DBImpl::MetadataInStore()    the copy paths (checkpoints, backups), which
 //                                run on a primary or a reader
 template <typename DbOptions>
 bool StoreModeOptions(const DbOptions& options) {
-  return options.manifest_store != nullptr;
+  return options.manifest_store != nullptr && !options.manifest_store_shadow;
 }
 
 // Makes the commit ids of one DB instance. A commit id is the DB session id
@@ -182,6 +198,21 @@ class ManifestCommitIdGenerator {
  public:
   explicit ManifestCommitIdGenerator(std::string db_session_id);
   std::string Next();
+
+  // Returns the id of the last commit of a shadow DB instance at close (see
+  // ManifestStoreShadow): Next() with the suffix kCloseSuffix. A reader of the
+  // store that sees such an id in the DB row knows that the last shadow DB
+  // instance that reached the store closed with the store in sync. It does not
+  // know whether a shadow DB was opened again since then, because a new
+  // instance writes to the store only after its first MANIFEST write and the
+  // end of DB::Open() (see "Close ids and the enter" at ManifestStoreShadow).
+  std::string NextCloseId();
+
+  // Returns true if `commit_id` ends with kCloseSuffix, as the ids from
+  // NextCloseId() do.
+  static bool IsCloseId(const std::string& commit_id);
+
+  static constexpr const char* kCloseSuffix = "-close";
 
  private:
   const std::string db_session_id_;
@@ -197,6 +228,22 @@ enum class ManifestStubState : uint8_t {
   // A DB whose MANIFEST file holds the metadata is being moved into the
   // store. The stub records that MANIFEST file and its size.
   kEntering = 2,
+};
+
+// Collects the DB row and the rows of a ManifestStore::Scan().
+class CollectRowsVisitor : public ManifestRowVisitor {
+ public:
+  Status OnDbRow(const ManifestDbRowResult& db_row) override {
+    db_row_ = db_row;
+    return Status::OK();
+  }
+  Status OnRow(const ManifestRow& row) override {
+    rows_.push_back(row);
+    return Status::OK();
+  }
+
+  ManifestDbRowResult db_row_;
+  std::vector<ManifestRow> rows_;
 };
 
 // The content of a stub MANIFEST.

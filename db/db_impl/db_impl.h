@@ -100,6 +100,7 @@ class MemTable;
 class PersistentStatsHistoryIterator;
 class TableCache;
 class TaskLimiterToken;
+class ManifestStoreShadow;
 class Version;
 class VersionEdit;
 class VersionSet;
@@ -733,8 +734,9 @@ class DBImpl : public DB
   // file is only a stub (see db/manifest_store_state.h). A primary is in store
   // mode when its VersionSet commits to the store. A read-only, secondary or
   // follower instance (read_only_ is true) has no ManifestStoreState. It reads
-  // the rows when its options hold a store. Paths that copy the files of the DB
-  // use this to give the MANIFEST from memory instead of the stub.
+  // the rows when its options hold a store and
+  // DBOptions::manifest_store_shadow is false. Paths that copy the files of the
+  // DB use this to give the MANIFEST from memory instead of the stub.
   bool MetadataInStore() const {
     return versions_->IsStoreMode() ||
            (read_only_ && StoreModeOptions(immutable_db_options_));
@@ -1648,6 +1650,10 @@ class DBImpl : public DB
 
   Status TEST_SwitchWAL();
 
+  ManifestStoreShadow* TEST_GetManifestStoreShadow() const {
+    return manifest_store_shadow_.get();
+  }
+
   bool TEST_UnableToReleaseOldestLog() { return unable_to_release_oldest_log_; }
 
   bool TEST_IsLogGettingFlushed() {
@@ -1948,6 +1954,10 @@ class DBImpl : public DB
   // Declared before versions_ so memtables cannot outlive their allocation
   // accounting target during destruction.
   std::unique_ptr<FlushInitiator> wbm_flush_initiator_;
+  // Shadow mode (DBOptions::manifest_store_shadow), null when it is off.
+  // Declared before versions_, which keeps a pointer to it, so that it is
+  // destroyed after versions_.
+  std::unique_ptr<ManifestStoreShadow> manifest_store_shadow_;
   std::unique_ptr<VersionSet> versions_;
   // Flag to check whether we allocated and own the info log file
   bool own_info_log_;
@@ -3775,17 +3785,28 @@ class DBImpl : public DB
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
 
-  // Checks DBOptions::manifest_store and manifest_row_feature_version. Every
-  // DB open function calls it before it changes anything on disk:
-  // DBImpl::Open(), both DB::OpenForReadOnly() functions,
-  // DBImplSecondary::OpenAsSecondaryImpl() and DB::OpenAsFollower(). Without a
-  // store it returns OK and does not read the feature version, which only
-  // matters for a store. With a store, the results are:
+  // Checks DBOptions::manifest_store, manifest_store_shadow and
+  // manifest_row_feature_version. Every DB open function calls it before it
+  // changes anything on disk: DBImpl::Open(), both DB::OpenForReadOnly()
+  // functions, DBImplSecondary::OpenAsSecondaryImpl() and DB::OpenAsFollower().
+  // Without a store it does not read the feature version, which only matters
+  // for a store. It returns InvalidArgument when manifest_store_shadow is true,
+  // and OK otherwise. With a store, the results are:
   // - InvalidArgument when the feature version is not from 1 to
-  //   kManifestRowFeatureVersionLatest;
-  // - InvalidArgument with best_efforts_recovery or
-  //   best_efforts_blob_db_repair.
+  //   kManifestRowFeatureVersionLatest, in store mode and in shadow mode;
+  // - with manifest_store_shadow, InvalidArgument with best_efforts_recovery or
+  //   manifest_store_migrate;
+  // - without manifest_store_shadow, InvalidArgument with
+  //   best_efforts_recovery or best_efforts_blob_db_repair.
+  // With a store and manifest_store_shadow, DBImpl::Open() runs shadow mode
+  // (see ManifestStoreShadow): the DB stays in file mode, and the other open
+  // functions do not use the store.
   static Status CheckManifestStoreOptions(const DBOptions& db_options);
+
+  // Shadow mode: creates manifest_store_shadow_ and hands it to versions_.
+  // DBImpl::Open() calls it before recovery when
+  // DBOptions::manifest_store_shadow is true.
+  void CreateManifestStoreShadow();
 
   // Validate self-consistency of DB options and its consistency with cf options
   static Status ValidateOptions(

@@ -2363,8 +2363,9 @@ TEST_F(DBManifestStoreTest, EnterKeepsDbId) {
 
 TEST_F(DBManifestStoreTest, EnterFromShadowAuthority) {
   WriteFileModeDb();
-  // A DB row with authority kShadow, which this release never writes, does
-  // not stop the enter.
+  // A DB row with authority kShadow (written by shadow mode) stops the enter
+  // while its last commit is not a close commit, because a shadow DB may still
+  // write the rows. After a close commit, the enter takes over the rows.
   ManifestDbRowExtraFields extra;
   extra.authority = ManifestAuthority::kShadow;
   std::vector<ManifestRow> rows;
@@ -2374,6 +2375,15 @@ TEST_F(DBManifestStoreTest, EnterFromShadowAuthority) {
   create.commit_id = "shadow mode";
   create.db_row = rows.front();
   ASSERT_OK(MockManifestStore(data_, ++last_epoch_).Commit(create));
+  ASSERT_EQ(
+      Status::Code::kInvalidArgument,
+      TryReopenWithColumnFamilies({"default", "one"}, MigrateOptions()).code());
+  ManifestCommit close;
+  close.expected_commit_sequence = 1;
+  close.commit_id =
+      std::string("shadow mode") + ManifestCommitIdGenerator::kCloseSuffix;
+  close.db_row = rows.front();
+  ASSERT_OK(MockManifestStore(data_, last_epoch_).Commit(close));
 #ifndef NDEBUG  // Uses sync points.
   // An enter that stops before its switch leaves an "entering" stub. Its
   // claim set the authority to kFile, so the next open restarts the enter

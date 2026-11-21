@@ -118,6 +118,7 @@ struct ImmutableDBOptions {
   bool manifest_store_migrate;
   ManifestCopyMode manifest_store_copy_mode;
   uint32_t manifest_row_feature_version;
+  bool manifest_store_shadow;
 
   // Beginning convenience/helper objects that are not part of the base
   // DBOptions

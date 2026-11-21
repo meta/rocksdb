@@ -320,6 +320,7 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
       immutable_db_options.manifest_store_copy_mode;
   options.manifest_row_feature_version =
       immutable_db_options.manifest_row_feature_version;
+  options.manifest_store_shadow = immutable_db_options.manifest_store_shadow;
 }
 
 ColumnFamilyOptions BuildColumnFamilyOptions(

@@ -3149,7 +3149,10 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
 // id of the DB from the MANIFEST, or from the IDENTITY file when the MANIFEST
 // cannot be read up to its db id. Then it reads the DB row. When the row has
 // that db id and authority kFile (the rows that RollBackManifestStore()
-// left), it removes the rows.
+// left), it removes the rows. It keeps the rows that shadow mode
+// (DBOptions::manifest_store_shadow) wrote (authority kShadow), because a copy
+// of the DB folder has the same db id and must not remove the rows of a live
+// source DB.
 //
 // Errors (nothing is deleted):
 // - InvalidArgument in store mode when the DB row in the store has the db id

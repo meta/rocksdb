@@ -2187,8 +2187,11 @@ struct DBOptions {
   // in the store. A DB whose CURRENT names a normal MANIFEST file needs
   // manifest_store_migrate. include/rocksdb/manifest_store.h lists the paths
   // that store mode does not support (for example DB::GetLiveFiles() and
-  // RepairDB()). DB::Open() returns InvalidArgument when best_efforts_recovery
-  // or best_efforts_blob_db_repair is also set. The object is not written to
+  // RepairDB()). When manifest_store_shadow is false, every DB open function
+  // returns InvalidArgument when best_efforts_recovery or
+  // best_efforts_blob_db_repair is also set. With manifest_store_shadow, the
+  // MANIFEST file stays the authority and the store only follows it (see
+  // manifest_store_shadow). The object is not written to
   // the OPTIONS file, because it belongs to one DB instance.
   std::shared_ptr<ManifestStore> manifest_store = nullptr;
 
@@ -2206,7 +2209,7 @@ struct DBOptions {
   // rollback without the store was not finished with a call that reaches the
   // store (see RollBackManifestStore()).
   // It is not written to the OPTIONS file, because it describes one
-  // DB::Open().
+  // DB::Open(). It cannot be used with manifest_store_shadow.
   bool manifest_store_migrate = false;
 
   // EXPERIMENTAL
@@ -2229,6 +2232,109 @@ struct DBOptions {
   // value is not checked, so an OPTIONS file from a later release with a larger
   // value still opens.
   uint32_t manifest_row_feature_version = 1;
+
+  // EXPERIMENTAL
+  // Shadow mode, a step before store mode: the MANIFEST file stays the
+  // authority, and RocksDB also writes the same metadata to `manifest_store`
+  // in the background, so that the application can check the store with real
+  // traffic before it moves the DB into the store. Requires `manifest_store`.
+  //
+  // What the store gets: the rows of the state that recovery from the MANIFEST
+  // file gives. Each MANIFEST write is committed as row changes after the
+  // MANIFEST write succeeds, by a job in the Env LOW priority pool, so no store
+  // call runs in a user write or a MANIFEST write. Many MANIFEST writes that
+  // happen during one store call become one commit. After the DB is closed,
+  // the ldb command compare_manifest_store lists every difference between the
+  // store and the MANIFEST.
+  //
+  // Behavior:
+  // - The first MANIFEST write while shadow mode is on starts a new MANIFEST
+  //   file, also with reuse_manifest_on_open. This write is usually inside
+  //   DB::Open(). After that write, and once DB::Open() succeeds, RocksDB sends
+  //   all rows to the store (a full copy). An open that writes no MANIFEST
+  //   record sends the full copy at the first MANIFEST write after the open.
+  // - Store errors never fail writes, and shadow mode never sets a background
+  //   error. After an error, RocksDB writes all rows again after a wait that
+  //   starts at bgerror_resume_retry_interval, doubles after each failure in a
+  //   row, and stops growing at 64 times that value. The next try starts at
+  //   the first MANIFEST write after the wait. The info LOG shows each error.
+  // - When the store says that another DB instance with a newer epoch owns it
+  //   (IOFenced), shadow mode stops for this DB instance and logs an error.
+  //   Writes go on. For example, a copy of the DB folder (a checkpoint or a
+  //   restored backup) that is opened in shadow mode with the same store and a
+  //   newer epoch takes over the store this way, because it has the same DB
+  //   id.
+  // - When the store holds a DB in store mode, a DB row with an authority
+  //   value that this release does not know (written by a newer binary), a DB
+  //   row that does not parse, or a DB row with another DB id (another DB uses
+  //   the same store), shadow mode stops for this DB instance and writes no
+  //   rows to the store. Writes go on. If a store-mode instance takes over the
+  //   store while shadow mode claims it, the claim can raise the commit
+  //   sequence once before shadow mode stops (see "Terms" in
+  //   include/rocksdb/manifest_store.h for claim and commit sequence).
+  // - Close waits for the store call in progress. When the store is in sync
+  //   (the last store call succeeded and no full copy is needed), close
+  //   commits the remaining changes with a close commit id. When that commit
+  //   succeeds, the info LOG says that the store is in sync at close.
+  // - All shadow DBs of the process run at most one store job at a time, also
+  //   when they use different Env objects. Each DB makes sure that the LOW
+  //   pool of its Env has one thread more than its compaction limit, so a slow
+  //   store call does not take a compaction thread.
+  //   A DB that needs a job while another DB runs one keeps its changes in
+  //   memory and waits for its turn.
+  // - Store calls must time out (see "Calls" at ManifestStore). One hung call
+  //   blocks the store jobs of all shadow DBs of the process until it
+  //   returns.
+  //
+  // Moving a shadow DB into the store: DB::Open() with manifest_store_migrate
+  // (without shadow mode) takes over the rows of shadow mode only when the
+  // last commit has a close commit id. A close commit id marks the last close
+  // of a shadow DB instance that reached the store. It does not show a shadow
+  // DB that was opened again and has made no store call yet, so close every
+  // shadow DB of the DB, including copies of its folder (which have the same
+  // DB id), before the move. The open returns InvalidArgument when:
+  // - a shadow DB of the DB is open and has written to the store;
+  // - a shadow DB crashed;
+  // - a shadow DB closed while the store was not in sync (after a store error,
+  //   a close during the full copy, or a failed close commit). A later shadow
+  //   open also writes new commits, so the last commit is again not a close
+  //   commit until that instance closes.
+  // To fix it:
+  // 1. Close every shadow DB of the DB.
+  // 2. If the open still fails, reopen the DB in shadow mode, write and flush
+  //    until the info LOG shows that the full copy finished, close it, and
+  //    check that the close logged that the store is in sync.
+  // 3. Or, if no DB uses the rows, call ManifestStore::Destroy(). The move
+  //    writes all rows from the MANIFEST file anyway.
+  // DestroyDB() keeps the rows that shadow mode wrote, because a copy of the
+  // DB folder has the same DB id; call ManifestStore::Destroy() once no DB
+  // uses them.
+  //
+  // Other rules:
+  // - A DB row without a DB id matches any DB. With write_dbid_to_manifest
+  //   false the DB row has no DB id, so shadow mode cannot tell that two DBs
+  //   use the same store by mistake. Give each DB its own store.
+  // - Read-only, secondary and follower instances never call the store.
+  //
+  // Cost: each MANIFEST write builds its row changes after the write, without
+  // the DB mutex, before the write completes. This reads the edits of the
+  // write, the blob files of the column families it changes and the live
+  // WALs. A new MANIFEST file also encodes all rows once.
+  //
+  // Memory: the DB keeps the encoded rows of the MANIFEST state, about 300
+  // bytes for each live SST file (an estimate: about 200 bytes of encoded
+  // fields plus the map entry), so about 30 MB for 100,000 files. A full copy
+  // to the store can hold one more copy of the encoded rows while it runs. A
+  // new MANIFEST file also holds the rows of its snapshot in decoded and
+  // encoded form for a short time, about 1 KB more for each live SST file (an
+  // estimate). This memory is not charged to any cache or memory budget.
+  //
+  // Not written to the OPTIONS file, like `manifest_store`. Every DB open
+  // function returns InvalidArgument for true without `manifest_store`, or
+  // with best_efforts_recovery or manifest_store_migrate. DB::Open() and
+  // DB::OpenForReadOnly() also return InvalidArgument when CURRENT names a
+  // stub (a DB in store mode, or one that is moving into it).
+  bool manifest_store_shadow = false;
 
   // End EXPERIMENTAL
 };
@@ -3733,7 +3839,8 @@ struct CompactionServiceOptionsOverride {
   // it never claims the DB, so it never fences the primary. Each
   // DB::OpenAndCompact() call is its own DB instance, so give each concurrent
   // call its own object, or a thread-safe one, and never the object that the
-  // primary uses. Null for a primary in file mode.
+  // primary uses. Null for a primary in file mode, also for a primary that
+  // uses manifest_store_shadow.
   std::shared_ptr<ManifestStore> manifest_store = nullptr;
 
   // Only compaction generated SST files use this user defined table properties
