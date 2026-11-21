@@ -1315,6 +1315,7 @@ struct BlockBasedTableBuilder::Rep {
   std::shared_ptr<CacheReservationManager>
       compression_dict_buffer_cache_res_mgr;
   std::unique_ptr<BlobReferenceMetadataCollector> blob_reference_collector;
+  std::shared_ptr<const BlobReferenceSstSummary> blob_reference_summary;
   std::unique_ptr<BlobRelocationDirectoryBuilder>
       blob_relocation_directory_builder;
   std::optional<BlobRelocationFileMetadata> blob_relocation_file_metadata;
@@ -4155,7 +4156,7 @@ void BlockBasedTableBuilder::WriteBlobReferenceMetadata(
         rep_->single_threaded_compressed_output.Reset();
         return rep_->GetStatus();
       },
-      &descriptor, /*summary=*/nullptr);
+      &descriptor, &rep_->blob_reference_summary);
   if (!status.ok()) {
     rep_->SetStatus(status);
     return;
@@ -4171,6 +4172,11 @@ void BlockBasedTableBuilder::WriteBlobReferenceMetadata(
     rep_->SetStatus(Status::Corruption(
         "Duplicate blob reference descriptor table property"));
   }
+}
+
+std::shared_ptr<const BlobReferenceSstSummary>
+BlockBasedTableBuilder::GetBlobReferenceSstSummary() const {
+  return ok() ? rep_->blob_reference_summary : nullptr;
 }
 
 void BlockBasedTableBuilder::WriteCompressionDictBlock(

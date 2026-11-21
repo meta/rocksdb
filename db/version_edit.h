@@ -35,6 +35,8 @@ namespace ROCKSDB_NAMESPACE {
 
 class BlobIndex;
 
+struct BlobReferenceSstSummary;
+
 // Tag numbers for serialized VersionEdit.  These numbers are written to
 // disk and should not be changed. The number should be forward compatible so
 // users can down-grade RocksDB safely. A future Tag is ignored by doing '&'
@@ -148,6 +150,9 @@ enum NewFileCustomTag : uint32_t {
 
   // Forward incompatible (aka unignorable) fields
   kPathId,
+  kBlobReferenceDescriptor = kCustomTagNonSafeIgnoreMask | 18,
+  kBlobReferenceLegacyMetadata = kCustomTagNonSafeIgnoreMask | 19,
+  kOldestCoarseIndirectOriginFileNumber = kCustomTagNonSafeIgnoreMask | 20,
 };
 
 class VersionSet;
@@ -399,6 +404,50 @@ struct FileMetaData {
   // via FileOptions::file_metadata on subsequent opens. Empty if not available.
   std::string file_open_metadata;
 
+  // Encoded BlobReferenceMetadataDescriptor of the exact blob reference
+  // metadata in this SST. The encoding ends with a CRC32C. The MANIFEST stores
+  // a nonempty value as an unignorable NewFile field, so an older RocksDB
+  // cannot open the DB and drop it.
+  // - Empty: the SST has no exact metadata. Every SST of a CF without the
+  //   format fence has an empty descriptor. In a CF with the fence, an SST with
+  //   an empty descriptor has a coarse frontier (the oldest indirect-origin
+  //   file number a coarse SST may reference; see
+  //   oldest_coarse_indirect_origin_file_number), or it is a legacy SST (see
+  //   blob_reference_legacy_metadata).
+  // - Nonempty: the SST has exact metadata. A descriptor with zero references
+  //   means the SST keeps no blob reference, so recovery can tell an empty
+  //   reference set from missing metadata.
+  std::string blob_reference_descriptor;
+  // Summary of the exact references of a newly built SST, taken from its table
+  // builder. Not persisted. BuildTable() (used by flush, WAL recovery at open
+  // and RepairDB) and local compaction set it on their output files before the
+  // edit is queued, so the census can add the SST without reopening it.
+  // VersionBuilder drops it, so Version files do not keep it; later readers
+  // read the SST's reference index.
+  std::shared_ptr<const BlobReferenceSstSummary> blob_reference_summary;
+  // Marks an SST that has no descriptor and no coarse frontier, in a CF with
+  // the format fence, so that recovery accepts the SST. Such an SST was created
+  // before the format was activated. VersionBuilder sets it in memory for such
+  // an SST. A MANIFEST snapshot sets it for every SST of a fenced CF that has
+  // no descriptor and no coarse frontier, and writes it as an unignorable
+  // NewFile field. Edits that copy the file metadata (AddExistingFile()) carry
+  // it. Why the snapshot writes it: in a snapshot the format fence comes before
+  // (or in the same edit as) the SSTs of the CF, so replay checks every SST as
+  // one added after the fence. The marker lets replay accept an SST that has no
+  // descriptor and no coarse frontier.
+  bool blob_reference_legacy_metadata = false;
+  // Coarse frontier of a coarse SST: an SST that may hold kIndirectBlob
+  // references but has no exact reference metadata, so it does not list them.
+  // Instead it records only the oldest indirect-origin file number that it
+  // references (its coarse frontier). The SST may reference any indirect origin
+  // at or above this number, so indirect blob GC treats all of them as in use
+  // ("pinned"). kInvalidBlobFileNumber means the SST is not a coarse SST. This
+  // field is separate from oldest_blob_file_number, which is the lowest blob
+  // file number that any blob reference in the SST names (for an indirect
+  // reference, its generation number). See "Coarse SST" in
+  // db/blob/blob_reference_metadata.h.
+  uint64_t oldest_coarse_indirect_origin_file_number = kInvalidBlobFileNumber;
+
   // Skips prefetching index and filter blocks into block cache on file open,
   // not persisted in MANIFEST. NOTE: false does not guarantee prefetching
   // either (e.g. when index and filter blocks are not cached in block cache).
@@ -523,6 +572,9 @@ struct FileMetaData {
     return kUnknownNewestKeyTime;
   }
 
+  // Memory used by blob_reference_summary, or 0 if it is null.
+  size_t BlobReferenceSummaryMemoryUsage() const;
+
   // WARNING: manual update to this function is needed
   // whenever a new string property is added to FileMetaData
   // to reduce approximation error.
@@ -538,7 +590,9 @@ struct FileMetaData {
 #endif  // ROCKSDB_MALLOC_USABLE_SIZE
     usage += smallest.size() + largest.size() + file_checksum.size() +
              file_checksum_func_name.size() + min_timestamp.size() +
-             max_timestamp.size() + file_open_metadata.size();
+             max_timestamp.size() + file_open_metadata.size() +
+             blob_reference_descriptor.size();
+    usage += BlobReferenceSummaryMemoryUsage();
     return usage;
   }
 
@@ -1161,6 +1215,20 @@ class VersionEdit {
     return blob_relocation_route_deletions_;
   }
 
+  // Reference summaries of the exact SSTs that this edit deletes (see
+  // GetDeletedFiles()). They are kept only in memory, never written to the
+  // MANIFEST. Compaction sets them from its inputs. The blob reference census
+  // uses them to subtract the references of those SSTs. If the edit deletes an
+  // exact SST whose summary is missing here, the census is rebuilt instead.
+  void SetBlobReferenceSummariesOfDeletedFiles(
+      std::vector<std::shared_ptr<const BlobReferenceSstSummary>> summaries) {
+    blob_reference_summaries_of_deleted_files_ = std::move(summaries);
+  }
+  const std::vector<std::shared_ptr<const BlobReferenceSstSummary>>&
+  GetBlobReferenceSummariesOfDeletedFiles() const {
+    return blob_reference_summaries_of_deleted_files_;
+  }
+
   // Add a WAL (either just created or closed).
   // AddWal and DeleteWalsBefore cannot be called on the same VersionEdit.
   void AddWal(WalNumber number, WalMetadata metadata = WalMetadata()) {
@@ -1389,6 +1457,8 @@ class VersionEdit {
   std::vector<uint64_t> blob_file_retirements_;
   std::vector<BlobRelocationRoute> blob_relocation_routes_;
   std::vector<uint64_t> blob_relocation_route_deletions_;
+  std::vector<std::shared_ptr<const BlobReferenceSstSummary>>
+      blob_reference_summaries_of_deleted_files_;
 
   WalAdditions wal_additions_;
 
