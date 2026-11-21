@@ -1273,6 +1273,39 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   double blob_garbage_collection_force_threshold = 1.0;
 
+  // Experimental. Used by indirect blob GC with enable_blob_indirection. GC
+  // reads the live values of an input file in offset order. Two neighbor values
+  // are read with one I/O when the bytes between them (dead values, and in a
+  // normal blob file also the next record's header and key) are at most this
+  // many; a larger gap starts a new read, so dead regions are skipped. One read
+  // is at most 1 MB. 0 reads each value on its own.
+  //
+  // Default: 16384 (16 KB). This is the read unit of remote file systems. Blob
+  // values are large, so a gap of this size holds only a few dead values, and
+  // merging reads costs little extra I/O.
+  //
+  // Dynamically changeable through the SetOptions() API
+  uint64_t indirect_blob_gc_read_coalesce_bytes = 16384;
+
+  // Experimental. Used by indirect blob GC with enable_blob_indirection. GC
+  // rewrites a blob file only when at least this fraction of the file's record
+  // bytes is garbage (records that no SST references). The census picks
+  // candidate files with this rule, and the GC job checks the rule again with
+  // the exact live bytes before it copies anything.
+  //
+  // GC copies the live values of a file to a new file and then deletes the old
+  // file. A low value frees space sooner, but GC copies more: at value r, GC
+  // copies up to (1 - r) / r live bytes for each garbage byte it frees. That is
+  // 1 byte at 0.5 and 3 bytes at 0.25 (computed from the definition). A high
+  // value makes GC copy less, but more garbage stays on disk.
+  //
+  // Valid range: (0, 1]. Other values fail with InvalidArgument.
+  // Default: 0.5 (GC never copies more live bytes than the garbage it frees)
+  //
+  // Dynamically changeable through the SetOptions() API. A new value applies
+  // from the next census run.
+  double indirect_blob_gc_garbage_ratio = 0.5;
+
   // Compaction readahead for blob files.
   //
   // Default: 0

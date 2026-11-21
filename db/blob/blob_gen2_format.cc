@@ -681,7 +681,8 @@ Status StreamAndVerifyBlobStoredPayload(
     return Status::InvalidArgument("Invalid stored blob stream");
   }
   // The chunk buffer (kBlobRelocationStreamChunkSize, 256 KB) is too large for
-  // the stack, so it is on the heap.
+  // the stack, so it is on the heap. Indirect blob GC charges it in its I/O
+  // workspace (see DBImpl::IndirectBlobGCJob).
   std::unique_ptr<char[]> scratch(new char[kBlobRelocationStreamChunkSize]);
   uint64_t position = 0;
   uint32_t checksum = 0;

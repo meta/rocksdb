@@ -169,6 +169,9 @@ struct MutableCFOptions {
             options.pin_blob_relocation_location_blocks),
         blob_indirection_max_references_per_sst(
             options.blob_indirection_max_references_per_sst),
+        indirect_blob_gc_read_coalesce_bytes(
+            options.indirect_blob_gc_read_coalesce_bytes),
+        indirect_blob_gc_garbage_ratio(options.indirect_blob_gc_garbage_ratio),
         min_blob_size(options.min_blob_size),
         blob_file_size(options.blob_file_size),
         blob_file_writable_file_max_buffer_size(
@@ -250,6 +253,8 @@ struct MutableCFOptions {
         enable_blob_indirection(false),
         pin_blob_relocation_location_blocks(false),
         blob_indirection_max_references_per_sst(1 << 20),
+        indirect_blob_gc_read_coalesce_bytes(16384),
+        indirect_blob_gc_garbage_ratio(0.5),
         min_blob_size(0),
         blob_file_size(0),
         blob_file_writable_file_max_buffer_size(0),
@@ -361,6 +366,8 @@ struct MutableCFOptions {
   bool enable_blob_indirection;
   bool pin_blob_relocation_location_blocks;
   uint64_t blob_indirection_max_references_per_sst;
+  uint64_t indirect_blob_gc_read_coalesce_bytes;
+  double indirect_blob_gc_garbage_ratio;
   uint64_t min_blob_size;
   uint64_t blob_file_size;
   uint64_t blob_file_writable_file_max_buffer_size;

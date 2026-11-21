@@ -235,14 +235,39 @@ Status BlobFileCache::OpenBlobFileReaderUncached(
     const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
     std::unique_ptr<BlobFileReader>* blob_file_reader,
     bool allow_footer_skip_retry) {
+  return OpenBlobFileReaderUncached(read_options, blob_file, blob_file_reader,
+                                    allow_footer_skip_retry,
+                                    /*prefer_direct_reads=*/false);
+}
+
+Status BlobFileCache::OpenBlobFileReaderUncached(
+    const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+    std::unique_ptr<BlobFileReader>* blob_file_reader,
+    bool allow_footer_skip_retry, bool prefer_direct_reads) {
   assert(blob_file_reader);
   assert(!*blob_file_reader);
 
   Statistics* const statistics = immutable_options_->stats;
   RecordTick(statistics, NO_FILE_OPENS);
 
-  Status s = OpenBlobFileReader(read_options, blob_file,
-                                allow_footer_skip_retry, blob_file_reader);
+  Status s;
+  FileOptions file_options = GetFileOptions(blob_file);
+  // See OpenBlobFileReaderUncached() in blob_file_cache.h.
+  if (prefer_direct_reads && !file_options.use_mmap_reads) {
+    file_options.use_direct_reads = true;
+    s = BlobFileReader::Create(
+        *immutable_options_, read_options, file_options, column_family_id_,
+        blob_file_read_hist_, blob_file.file_number, io_tracer_,
+        /*skip_footer_validation=*/false, blob_file_reader);
+    if (s.ok()) {
+      return s;
+    }
+    // The file system may not support direct reads; the buffered open below
+    // reports any real error again.
+    blob_file_reader->reset();
+  }
+  s = OpenBlobFileReader(read_options, blob_file, allow_footer_skip_retry,
+                         blob_file_reader);
   if (!s.ok()) {
     RecordTick(statistics, NO_FILE_ERRORS);
   }

@@ -84,7 +84,8 @@ struct BlobReferenceGroupRead {
 
   // The destructor marks `status` as checked. A caller may skip the request
   // statuses after the whole call fails, or after it stops at the first failed
-  // request. Those skipped statuses are not ignored errors.
+  // request (indirect blob GC does this in ReadLiveSets()). Those skipped
+  // statuses are not ignored errors.
   BlobReferenceGroupRead() = default;
   BlobReferenceGroupRead(const BlobReferenceGroupRead&) = default;
   BlobReferenceGroupRead(BlobReferenceGroupRead&&) = default;

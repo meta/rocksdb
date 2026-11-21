@@ -1309,9 +1309,24 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
-  return is_table_builder_supported_ &&
-         !mutable_cf_options_.disable_auto_compactions &&
-         compaction_picker_->NeedsCompaction(current_->storage_info());
+  if (!is_table_builder_supported_ ||
+      mutable_cf_options_.disable_auto_compactions) {
+    return false;
+  }
+  Version* const current = current_;
+  if (current == nullptr) {
+    return false;
+  }
+  if (compaction_picker_->NeedsCompaction(current->storage_info())) {
+    return true;
+  }
+  return mutable_cf_options_.enable_blob_files &&
+         mutable_cf_options_.enable_blob_garbage_collection &&
+         mutable_cf_options_.enable_blob_indirection &&
+         current->storage_info()->BlobPhysicalFileForIndirectBlobGC() !=
+             kInvalidBlobFileNumber &&
+         blob_reference_census() != nullptr &&
+         blob_reference_census()->IsReady(current->GetVersionNumber());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -1683,6 +1698,13 @@ Status ColumnFamilyData::ValidateOptions(
         "blob_indirection_max_references_per_sst must be in [" +
         std::to_string(kMinBlobIndirectionMaxReferencesPerSst) + ", " +
         std::to_string(kMaxBlobIndirectionMaxReferencesPerSst) + "]");
+  }
+  // The negated form also rejects NaN. At 0, GC would pick files with no
+  // garbage, and then could not make its outputs smaller than its inputs.
+  if (!(cf_options.indirect_blob_gc_garbage_ratio > 0.0 &&
+        cf_options.indirect_blob_gc_garbage_ratio <= 1.0)) {
+    return Status::InvalidArgument(
+        "indirect_blob_gc_garbage_ratio must be in (0, 1]");
   }
   if (cf_options.enable_blob_indirection &&
       cf_options.enable_blob_direct_write) {
