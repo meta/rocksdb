@@ -21,6 +21,7 @@
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_reference_census.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -1673,6 +1674,15 @@ Status ColumnFamilyData::ValidateOptions(
   if (cf_options.enable_blob_indirection && !cf_options.enable_blob_files) {
     return Status::InvalidArgument(
         "enable_blob_indirection requires enable_blob_files=true");
+  }
+  if (cf_options.blob_indirection_max_references_per_sst <
+          kMinBlobIndirectionMaxReferencesPerSst ||
+      cf_options.blob_indirection_max_references_per_sst >
+          kMaxBlobIndirectionMaxReferencesPerSst) {
+    return Status::InvalidArgument(
+        "blob_indirection_max_references_per_sst must be in [" +
+        std::to_string(kMinBlobIndirectionMaxReferencesPerSst) + ", " +
+        std::to_string(kMaxBlobIndirectionMaxReferencesPerSst) + "]");
   }
   if (cf_options.enable_blob_indirection &&
       cf_options.enable_blob_direct_write) {

@@ -1119,11 +1119,13 @@ void DBImpl::NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
   if (shutting_down_.load(std::memory_order_acquire)) {
     return;
   }
+  // The stall decision counts L0 sorted runs, where an exact epoch run counts
+  // once (see VersionStorageInfo::NumL0SortedRuns()), so these flags do too.
   bool triggered_writes_slowdown =
-      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+      (cfd->current()->storage_info()->NumL0SortedRuns() >=
        mutable_cf_options.level0_slowdown_writes_trigger);
   bool triggered_writes_stop =
-      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+      (cfd->current()->storage_info()->NumL0SortedRuns() >=
        mutable_cf_options.level0_stop_writes_trigger);
   // release lock while notifying events
   mutex_.Unlock();
@@ -1164,11 +1166,13 @@ void DBImpl::NotifyOnFlushCompleted(
   if (shutting_down_.load(std::memory_order_acquire)) {
     return;
   }
+  // The stall decision counts L0 sorted runs, where an exact epoch run counts
+  // once (see VersionStorageInfo::NumL0SortedRuns()), so these flags do too.
   bool triggered_writes_slowdown =
-      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+      (cfd->current()->storage_info()->NumL0SortedRuns() >=
        mutable_cf_options.level0_slowdown_writes_trigger);
   bool triggered_writes_stop =
-      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+      (cfd->current()->storage_info()->NumL0SortedRuns() >=
        mutable_cf_options.level0_stop_writes_trigger);
   // release lock while notifying events
   mutex_.Unlock();
@@ -4224,7 +4228,8 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
         out_table_properties ? *out_table_properties : TableProperties(),
         TableFileCreationReason::kCompaction, io_s,
         out_file_metadata.file_checksum,
-        out_file_metadata.file_checksum_func_name);
+        out_file_metadata.file_checksum_func_name,
+        /*blob_references=*/nullptr);
     unfinished_out_fname.clear();
 
     out_files->push_back(std::move(out_file_metadata));
@@ -4236,7 +4241,8 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
         &event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
         unfinished_out_fname, job_id, FileDescriptor(), kInvalidBlobFileNumber,
         TableProperties(), TableFileCreationReason::kCompaction, io_s,
-        kUnknownFileChecksum, kUnknownFileChecksumFuncName);
+        kUnknownFileChecksum, kUnknownFileChecksumFuncName,
+        /*blob_references=*/nullptr);
   }
   return io_s;
 }
@@ -4347,8 +4353,9 @@ BackgroundJobPressure DBImpl::CaptureBackgroundJobPressure() const {
   // Uses the same inputs as RecalculateWriteStallConditions() in
   // column_family.cc:
   //   - l0_delay_trigger_count(): sorted run count used for write stall
-  //     decisions. Equals NumLevelFiles(0) for level compaction; for universal
-  //     compaction, also counts non-empty levels from L1+ as sorted runs.
+  //     decisions. Equals the L0 sorted run count for level compaction (see
+  //     VersionStorageInfo::NumL0SortedRuns()); for universal compaction, also
+  //     counts non-empty levels from L1+ as sorted runs.
   //   - estimated_compaction_needed_bytes(): pending compaction bytes.
   // Prefers slowdown/soft triggers (gradual); falls back to stop/hard triggers.
   // level0_slowdown_writes_trigger is sanitized to always be > 0;

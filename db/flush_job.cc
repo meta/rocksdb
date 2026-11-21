@@ -1069,6 +1069,17 @@ Status FlushJob::WriteLevel0Table() {
               ? preclude_last_level_min_seqno_
               : std::min(earliest_snapshot_, preclude_last_level_min_seqno_),
           dbname_ /*db_name*/);
+      tboptions.track_blob_reference_classification =
+          UsesBlobIndirection(mutable_cf_options_, base_->storage_info());
+      // Flush output gets only the coarse classification. A flushed SST holds
+      // no flattened reference (the builder returns Corruption for one), so one
+      // frontier file number is enough: the oldest indirect-origin file number
+      // the SST may reference (see "Coarse SST" in
+      // db/blob/blob_reference_metadata.h). The flush needs no collector memory
+      // and stays one output file.
+      tboptions.collect_blob_reference_metadata = false;
+      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:TableBuilderOptions",
+                               &tboptions);
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
           cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
