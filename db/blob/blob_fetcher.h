@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "db/blob/blob_constants.h"
+#include "db/dbformat.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
 
@@ -29,6 +30,18 @@ class SameFileBlobReader;
 class BlobFetcher {
  public:
   virtual ~BlobFetcher() = default;
+
+  // Hook for compaction to skip blob values whose files are known to be lost.
+  // The base class reports no loss, and no override exists yet.
+  // CompactionIterator calls it before it fetches any column or cache entry.
+  // For a wide-column entity, an override reports lost only when every blob
+  // column is lost.
+  virtual Status IsBlobValueLost(ValueType /*type*/, const Slice& /*value*/,
+                                 bool* lost) const {
+    *lost = false;
+    return Status::OK();
+  }
+  virtual bool HasBlobValueLoss() const { return false; }
 
   // Convenience overload: decodes `blob_index_slice` into a BlobIndex and
   // dispatches to the virtual overload below. Non-virtual; shared by all

@@ -883,7 +883,16 @@ class ColumnFamilyData {
   // blob_reference_census_failures_ counts failed builds in a row (capped at
   // 6). After a failure, the retry delay is 1 second, doubled for each failure
   // in a row, so at most 32 seconds.
+  //
+  // blob_reference_census_running_ is true while the census job runs this CF.
+  // blob_reference_census_rerun_ is set when the CF needed a census run during
+  // that time: an install during the run can publish the census itself (the
+  // apply after an install), and then NeedsWorkerRun() is false when the run
+  // ends. Route retirement runs only in the census job, so the flag makes the
+  // job run the CF once more.
   bool queued_for_blob_reference_census_ = false;
+  bool blob_reference_census_running_ = false;
+  bool blob_reference_census_rerun_ = false;
   ColumnFamilyData* next_blob_reference_census_ = nullptr;
   uint64_t blob_reference_census_retry_micros_ = 0;
   uint32_t blob_reference_census_failures_ = 0;

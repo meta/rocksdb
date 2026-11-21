@@ -234,6 +234,23 @@ TEST(BlobGarbageMeterTest, SameFileBlobIndex) {
   ASSERT_TRUE(blob_garbage_meter.flows().empty());
 }
 
+TEST(BlobGarbageMeterTest, FlattenedIndirectBlobIndex) {
+  const InternalKey key("user_key", /*seq=*/123, kTypeBlobIndex);
+  std::string value;
+  BlobIndex::EncodeIndirectBlob(&value, 7,
+                                {.origin_file_number = 4,
+                                 .original_value_offset = 123,
+                                 .stored_value_size = 456,
+                                 .compression = kNoCompression,
+                                 .stable_checksum = 789,
+                                 .stored_checksum = 0});
+
+  BlobGarbageMeter blob_garbage_meter;
+  ASSERT_OK(blob_garbage_meter.ProcessInFlow(key.Encode(), value));
+  ASSERT_OK(blob_garbage_meter.ProcessOutFlow(key.Encode(), value));
+  ASSERT_TRUE(blob_garbage_meter.flows().empty());
+}
+
 TEST(BlobGarbageMeterTest, CorruptInternalKey) {
   constexpr char corrupt_key[] = "i_am_corrupt";
   const Slice key_slice(corrupt_key);

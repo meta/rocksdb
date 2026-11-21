@@ -78,8 +78,21 @@ constexpr uint64_t kIndirectBlobGCReadBatchBytes = 1024 * 1024;
 // status and payload entries, and the record trailer. With the 1 MB batch, this
 // bounds a batch to at most 2048 values.
 constexpr uint64_t kIndirectBlobGCBatchBytesPerValue = 512;
-// At most 8 inputs per indirect blob GC job (a fixed limit, not tuned). It
-// matches kBlobGcMaxSelectedFiles (8), the number of candidates that the census
+// Route retirement (DBImpl::RetireBlobRelocationRoutes()) runs in the census
+// job after each census publish. It writes route deletion records for routes
+// that have no holder (no SST uses their generation number). It writes one
+// MANIFEST edit when one call can delete 64 such routes, or when such routes
+// have waited 10 minutes. Both values are fixed choices, not measured. A
+// pending route costs only Version memory and space in a new MANIFEST snapshot,
+// so a large batch and a long wait are cheap. Batching is only a cost choice.
+// Skipping routes that a running compaction may write is a correctness rule
+// (see "Compaction safety protocol for blob relocation" in
+// db/compaction/compaction_job.h).
+constexpr uint64_t kBlobRouteRetirementBatchSize = 64;
+constexpr uint64_t kBlobRouteRetirementMaxPendingMicros =
+    10ULL * 60 * 1000 * 1000;
+// At most 8 inputs per GC job (a fixed limit, not tuned). It matches
+// kBlobGcMaxSelectedFiles (8), the number of candidates that the census
 // publishes to the Version.
 constexpr size_t kIndirectBlobGCMaxInputs = 8;
 // At most 8 outputs per indirect blob GC job (a fixed limit, not tuned). When
@@ -177,6 +190,180 @@ std::shared_ptr<Cache> GetIndirectBlobGcWorkingMemoryCache(
 }
 
 }  // namespace
+
+Status DBImpl::RetireBlobRelocationRoutes(
+    ColumnFamilyData* cfd,
+    const BlobReferenceCensus::RetirementSelection& selected,
+    bool* made_progress) {
+  // The steps are in the comment at the declaration in db_impl.h.
+  BlobReferenceCensus& census = *cfd->blob_reference_census();
+  if (selected.front() == 0) {
+    // No generation number was selected, so no batch is pending.
+    census.SetRetirementPendingSinceMicros(0);
+    return Status::OK();
+  }
+  mutex_.Lock();
+  Version* const version = cfd->current();
+  if (cfd->IsDropped() || shutting_down_.load(std::memory_order_acquire)) {
+    mutex_.Unlock();
+    return Status::ShutdownInProgress();
+  }
+  version->Ref();
+  mutex_.Unlock();
+  Defer release_version([&] {
+    InstrumentedMutexLock lock(&mutex_);
+    version->UnrefAndFreeBlobRelocationState(&mutex_);
+  });
+  std::set<uint64_t> generations;
+  for (uint64_t generation : selected) {
+    if (generation == 0) {
+      break;
+    }
+    generations.insert(generation);
+  }
+  std::shared_ptr<BlobReferenceCensusState> state;
+  Status status = census.ReadSelectedSnapshot(
+      version->GetVersionNumber(), generations,
+      GetIndirectBlobGcWorkingMemoryCache(version->GetMutableCFOptions()),
+      &state);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RetireBlobRelocationRoutes:SnapshotStatus",
+                           &status);
+  if (!status.ok()) {
+    return status;
+  }
+  // Step 3: true if `generation` is a live blob file or relocation file in the
+  // input Version of a running compaction of this column family. Such a
+  // compaction may write it as a flattened number.
+  const auto held_by_running_compaction = [&](uint64_t generation) {
+    mutex_.AssertHeld();
+    for (const Compaction* compaction :
+         *cfd->compaction_picker()->compactions_in_progress()) {
+      const Version* const input = compaction->input_version();
+      // In the pinned Version `generation` is a route, not a live file.
+      if (input == nullptr || input == version) {
+        continue;
+      }
+      const uint64_t value =
+          input->storage_info()->GetBlobFileTable().Find(generation);
+      if (value != 0 && !BlobFileTable::IsRoute(value)) {
+        TEST_SYNC_POINT_CALLBACK(
+            "DBImpl::RetireBlobRelocationRoutes:HeldByRunningCompaction",
+            &generation);
+        return true;
+      }
+    }
+    return false;
+  };
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  std::vector<uint64_t> targets;
+  std::vector<uint64_t> retired_generations;
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    for (uint64_t generation : generations) {
+      const uint64_t target =
+          version->storage_info()->GetBlobRelocationRouteTarget(generation);
+      // A route into an input of the running indirect blob GC job waits: the
+      // job's install checks the route count of that input. If the input gets
+      // an output, the GC edit re-points this route to it, and a later call
+      // can delete it.
+      if (state->GetSstCount(generation) == 0 &&
+          !version->storage_info()->IsCoarseIndirectOriginBlobPinned(
+              generation) &&
+          target != kInvalidBlobFileNumber && !census.IsGcInputFile(target) &&
+          !held_by_running_compaction(generation)) {
+        edit.DeleteBlobRelocationRoute(generation);
+        targets.push_back(target);
+        retired_generations.push_back(generation);
+      }
+    }
+  }
+  if (edit.GetBlobRelocationRouteDeletions().empty()) {
+    census.SetRetirementPendingSinceMicros(0);
+    return Status::OK();
+  }
+  // A route with no holder costs only Version memory, so routes are deleted in
+  // batches: a full selection, or routes pending for a while. This saves a
+  // MANIFEST write and a Version install per flattening compaction.
+  uint64_t batch_size = kBlobRouteRetirementBatchSize;
+  uint64_t max_pending_micros = kBlobRouteRetirementMaxPendingMicros;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RetireBlobRelocationRoutes:BatchSize",
+                           &batch_size);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RetireBlobRelocationRoutes:MaxPending",
+                           &max_pending_micros);
+  const uint64_t now_micros = immutable_db_options_.clock->NowMicros();
+  const uint64_t pending_since = census.RetirementPendingSinceMicros();
+  if (edit.GetBlobRelocationRouteDeletions().size() < batch_size &&
+      (pending_since == 0 || now_micros - pending_since < max_pending_micros)) {
+    if (pending_since == 0) {
+      census.SetRetirementPendingSinceMicros(now_micros);
+    }
+    TEST_SYNC_POINT("DBImpl::RetireBlobRelocationRoutes:Deferred");
+    return Status::OK();
+  }
+  SuperVersionContext sv_context(true);
+  bool intent = false;
+  const auto precondition = [&]() -> Status {
+    mutex_.AssertHeld();
+    // LogAndApply() already fails a dropped column family before it runs the
+    // precondition; the IsDropped() check is a cheap defensive check.
+    if (cfd->IsDropped() || cfd->current() != version ||
+        !census.IsReady(version->GetVersionNumber())) {
+      return Status::TryAgain("Blob route retirement proof changed");
+    }
+    for (uint64_t target : targets) {
+      if (census.IsGcInputFile(target)) {
+        return Status::TryAgain("Blob route retirement target is a GC input");
+      }
+    }
+    for (uint64_t generation : retired_generations) {
+      if (held_by_running_compaction(generation)) {
+        return Status::TryAgain(
+            "Blob route retirement source is held by a running compaction");
+      }
+    }
+    if (!intent) {
+      Status result = census.BeginMetadataCommit();
+      intent = result.ok();
+      return result;
+    }
+    return Status::OK();
+  };
+  TEST_SYNC_POINT("DBImpl::RetireBlobRelocationRoutes:BeforeLogAndApply");
+  mutex_.Lock();
+  if (error_handler_.IsBGWorkStopped()) {
+    // Background work is stopped; this optional cleanup writes nothing.
+    mutex_.Unlock();
+    return Status::Incomplete("Background work is stopped");
+  }
+  status = versions_->LogAndApply(
+      cfd, ReadOptions(Env::IOActivity::kCompaction),
+      WriteOptions(Env::IOActivity::kCompaction), &edit, &mutex_,
+      directories_.GetDbDir(), false, nullptr, {}, precondition);
+  if (intent) {
+    if (!status.ok() && !versions_->io_status().ok()) {
+      // The census worker wrote to the MANIFEST and the result is unknown. Set
+      // a background error, so MANIFEST recovery decides the result. Step 6 of
+      // the RetireBlobRelocationRoutes() comment in db_impl.h says what happens
+      // until then. The background error also stops all background work until
+      // recovery.
+      error_handler_.SetBGError(versions_->io_status(),
+                                BackgroundErrorReason::kManifestWrite);
+    }
+    census.EndMetadataCommit(status.ok() || versions_->io_status().ok());
+  }
+  if (status.ok()) {
+    RecordTick(stats_, BLOB_RELOCATION_ROUTES_RETIRED,
+               edit.GetBlobRelocationRouteDeletions().size());
+    InstallSuperVersionAndScheduleWork(cfd, &sv_context,
+                                       /*defer_snapshot_refresh=*/false);
+    census.SetRetirementPendingSinceMicros(0);
+    *made_progress = true;
+  }
+  mutex_.Unlock();
+  sv_context.Clean();
+  return status;
+}
 
 // Background: indirect blob GC collects whole blob files (normal blob files
 // or relocation files) into new relocation files, without an LSM compaction.
@@ -837,8 +1024,10 @@ Status DBImpl::IndirectBlobGCJob::Start() {
   // not wait behind the background rate limiter.
   manifest_write_options = WriteOptions(Env::IOActivity::kCompaction);
   sfm_background_error = db_->error_handler_.GetBGError();
-  status =
-      blob_reference_census->BeginGcJob(input_version_number, &gc_job_token);
+  // Under the DB mutex, so a route retirement that has not reached the
+  // MANIFEST queue head sees these inputs in its precondition.
+  status = blob_reference_census->BeginGcJob(
+      input_version_number, candidate_physical_file_numbers, &gc_job_token);
   if (!status.ok()) {
     input_version->UnrefAndFreeBlobRelocationState(&db_->mutex_);
     if (status.IsBusy()) {
@@ -2419,8 +2608,9 @@ Status DBImpl::IndirectBlobGCJob::BuildEdit() {
 
   // A generation number is live if an SST holds it in the census snapshot,
   // which shows the input Version. A running compaction can write only
-  // generation numbers that its input SSTs hold, so this is enough (see
-  // "Install protocol" in Install()).
+  // generation numbers that its input SSTs hold (counted here), or route
+  // targets of such numbers when it flattens (covered by
+  // keeps_all_generations below). See "Install protocol" in Install().
   const auto generation_is_live = [&](uint64_t generation) {
     return census->GetSstCount(generation) != 0;
   };
@@ -2429,9 +2619,21 @@ Status DBImpl::IndirectBlobGCJob::BuildEdit() {
                ? input.output_index
                : std::numeric_limits<size_t>::max();
   };
+  // A relocation input that has an output keeps all of its generation
+  // numbers, held or not. A compaction may have flattened a reference to
+  // one of them after the census snapshot (see "Install protocol" in
+  // Install()). An input without an output keeps no route. None of its
+  // generation numbers can be live: point 4 of "Install protocol" (in the list
+  // after "This is safe") says why no compaction can flatten to such an input,
+  // so this is an invariant check below.
+  const auto keeps_all_generations = [&](const PhysicalInput& input) {
+    return input.normal_metadata == nullptr &&
+           output_of(input) != std::numeric_limits<size_t>::max();
+  };
   for (size_t input_index : eligible_inputs) {
     const PhysicalInput& input = inputs[input_index];
-    if (std::none_of(input.generations.begin(), input.generations.end(),
+    if (!keeps_all_generations(input) &&
+        std::none_of(input.generations.begin(), input.generations.end(),
                      generation_is_live)) {
       continue;
     }
@@ -2469,10 +2671,15 @@ Status DBImpl::IndirectBlobGCJob::BuildEdit() {
     published_relocated_value_bytes += output.value_bytes;
   }
 
-  // Each live generation number of an input is routed to the input's output
-  // (for a relocation input this re-points the routes into it); a routed
-  // generation number that no SST uses loses its route. The input leaves the
-  // Version.
+  // Each generation number that an input keeps, including the input's own
+  // file number, gets a route to the input's output. For a relocation
+  // input, this re-points the routes into it. Which numbers an input keeps:
+  //   - A relocation input with an output keeps all of them, held or not.
+  //   - Any other input keeps only its live ones.
+  // A routed generation number that the input does not keep loses its
+  // route. Then the input leaves the Version: a normal input by blob file
+  // retirement, a relocation input by relocation file deletion. Route
+  // retirement later deletes the kept routes that no SST holds.
   for (size_t input_index : eligible_inputs) {
     const PhysicalInput& input = inputs[input_index];
     const size_t output_index = output_of(input);
@@ -2481,9 +2688,11 @@ Status DBImpl::IndirectBlobGCJob::BuildEdit() {
                 output_needed[output_index]
             ? outputs[output_index].file_number
             : kInvalidBlobFileNumber;
+    const bool keep_all = output_file_number != kInvalidBlobFileNumber &&
+                          keeps_all_generations(input);
     for (uint64_t generation : input.generations) {
       const bool routed = generation != input.file_number;
-      if (generation_is_live(generation)) {
+      if (keep_all || generation_is_live(generation)) {
         if (output_file_number == kInvalidBlobFileNumber) {
           // Invariant: the same census snapshot decides liveness here and
           // the outputs in DecideInputs() (see the check above).
@@ -2517,9 +2726,11 @@ Status DBImpl::IndirectBlobGCJob::BuildEdit() {
 //     "Coarse SST" in db/blob/blob_reference_metadata.h), which pins file 28.
 //   - Invariant check (invariant_failed()), which cannot fail: a relocation
 //     input has the same metadata and the same number of routes into it.
-//     Only indirect blob GC adds or removes routes and relocation files,
-//     and only one GC job runs per CF (indirect_blob_gc_cfs_in_progress_),
-//     so an equal route count means the same routes.
+//     Only indirect blob GC adds routes or removes relocation files, and
+//     only one GC job runs per CF (indirect_blob_gc_cfs_in_progress_).
+//     Route retirement skips the routes into the inputs of the running GC
+//     job (IsGcInputFile()). So an equal route count means the same
+//     routes.
 Status DBImpl::IndirectBlobGCJob::ValidatePhysicalInputs() {
   db_->mutex_.AssertHeld();
   Version* const current = column_family.current();
@@ -2618,28 +2829,36 @@ void DBImpl::IndirectBlobGCJob::Install() {
 
   SuperVersionContext superversion_context(/*create_superversion=*/true);
   // Install protocol: the job installs its edit with one LogAndApply() call.
-  // The edit comes from the census snapshot and the routes of the input
-  // Version. The job does not follow the Version changes after its snapshot.
-  //
-  // Why the snapshot is enough: the edit removes the route of a generation
-  // number that the snapshot shows as unused, and it removes every input. This
-  // is safe only if no SST that the snapshot does not count holds a
-  // generation number of an input. No job adds such an SST after the
-  // snapshot:
-  // - A compaction keeps or drops the references of its input SSTs and never
-  //   adds a reference to an existing blob file. So every SST added after the
-  //   snapshot got its references from SSTs of the input Version, directly or
-  //   through earlier compactions.
-  // - A flush references only the new blob files that it writes. They are not
-  //   inputs of this job.
-  // - Ingestion and import are assumed to add no SST with kIndirectBlob
-  //   references. This code does not check it.
-  // So the snapshot can only count a holder too many (an SST that a later
-  // compaction removed). The edit then keeps a route that no SST needs, which
-  // is safe. The routes of the input Version are also still current: only
-  // indirect blob GC changes routes, and this job holds the only GC job
-  // registration of the census. ValidatePhysicalInputs() also checks that the
-  // number of routes into each relocation input is unchanged.
+  // The census snapshot and the routes in the edit come from the input
+  // Version. The job does not follow the Version changes after it. This is
+  // safe, because the edit never misses a route that an SST needs:
+  //   1. Most changes after the snapshot add no holder of an input's
+  //      generation number. A compaction keeps or drops the references of its
+  //      input SSTs, which the snapshot already counts. A flush writes
+  //      indirect references only to the new blob files that it creates, which
+  //      are never inputs of this job. Ingestion and import are assumed to
+  //      write no indirect reference; this code does not check it.
+  //   2. Flattening can add a holder that the snapshot does not count. A
+  //      compaction rewrites a generation number to its route target in the
+  //      compaction's own input Version (see
+  //      CompactionIterator::FlattenBlobIndexIfNeeded()). That Version can be
+  //      older than this job's input Version. Example (the file numbers are
+  //      examples only): compaction C is picked while route 10 -> 400 exists.
+  //      Then an earlier indirect blob GC job moves file 400 into file 500 and
+  //      writes routes 400 -> 500 and 10 -> 500. This job starts on file 500.
+  //      No SST holds 400, so 400 is an unheld generation number of input 500.
+  //      Now C runs with its old Version, rewrites generation number 10 to 400
+  //      and installs. The snapshot does not count this new holder of 400.
+  //   3. BuildEdit() covers such a holder: a relocation input that has an
+  //      output routes every generation number to that output, held or not
+  //      (keeps_all_generations). In the example, route 400 -> output exists.
+  //   4. An input without an output has no holder of any of its generation
+  //      numbers in the snapshot. A compaction that flattens to one of them
+  //      holds a generation number that routes to the same input (GC re-points
+  //      every route into an input), and the snapshot counts that holder. So
+  //      nothing can flatten to such an input.
+  // So the edit can keep a route too many, which route retirement deletes
+  // later, but it never misses one.
   //
   // The precondition of the call runs under the DB mutex at the MANIFEST queue
   // head, and again after the unlocked apply of the edit (see the pre_cb
@@ -2652,15 +2871,16 @@ void DBImpl::IndirectBlobGCJob::Install() {
   //   4. It checks the inputs again (ValidatePhysicalInputs()).
   //   5. On its first run, it starts the metadata commit
   //      (BeginMetadataCommit()). Until EndMetadataCommit() after the MANIFEST
-  //      write, no other GC job or metadata commit can start. When the write
-  //      result is unknown, BeginGcJob() returns Busy until recovery.
+  //      write, no other GC job or metadata commit (for example, a route
+  //      retirement) can start. When the write result is unknown, BeginGcJob()
+  //      returns Busy until recovery, and a new metadata commit returns
+  //      TryAgain.
   // Flushes and compactions do not wait for the GC job or its commit. A
-  // compaction that runs during the job writes only generation numbers that
-  // its input SSTs hold, and those SSTs are in the census snapshot.
-  //
-  // metadata_commit_intent is true after BeginMetadataCommit() succeeded, so
-  // that EndMetadataCommit() runs after LogAndApply(). other_install_during_job
-  // stays true when the precondition never runs.
+  // compaction that runs during the job keeps a number that the snapshot
+  // counts (protocol step 1), keeps a number that an earlier flatten wrote
+  // (protocol steps 2 and 3; for example, compaction C1 flattens 10 to 400
+  // and compaction C2 then keeps 400), or flattens to a number that protocol
+  // steps 3 and 4 cover. So no running compaction can make the edit unsafe.
   bool metadata_commit_intent = false;
   bool other_install_during_job = true;
   status = db_->versions_->LogAndApply(
@@ -2940,6 +3160,8 @@ Status DBImpl::IndirectBlobGCJob::Finish() {
 // with `message`.
 Status DBImpl::IndirectBlobGCJob::stale_input(const char* message) {
   stale_input_is_retryable = true;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:StaleInput",
+                           const_cast<char*>(message));
   return Status::TryAgain(message);
 }
 
@@ -5007,10 +5229,10 @@ Status DBImpl::CompactFilesImpl(
 Status DBImpl::PauseBackgroundWork() {
   InstrumentedMutexLock guard_lock(&mutex_);
   bg_compaction_paused_++;
-  // The blob reference census job is background work too: it reads SSTs,
-  // stores GC candidates in the current Version and schedules compactions. So
-  // wait for it. ScheduleBlobReferenceCensus() does not start it again while
-  // paused.
+  // The blob reference census job is background work too: it reads SSTs, stores
+  // GC candidates in the current Version, schedules compactions and writes the
+  // MANIFEST (route retirement). So wait for it. ScheduleBlobReferenceCensus()
+  // does not start it again while paused.
   while (CompactionsScheduled() > 0 || remote_compaction_pool_jobs_ > 0 ||
          bg_flush_scheduled_ > 0 || bg_wbm_flush_scheduled_ > 0 ||
          bg_blob_reference_census_state_ ==
@@ -8993,6 +9215,13 @@ Status DBImpl::BackgroundCompaction(
     // Should handle error?
     compaction_job.Run().PermitUncheckedError();
     TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun");
+#ifndef NDEBUG
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    if (sync_point != nullptr) {
+      sync_point->Process(
+          "DBImpl::BackgroundCompaction:NonTrivial:AfterRun:WaitForRelocation");
+    }
+#endif
     mutex_.Lock();
 
     if (immutable_db_options().compaction_service != nullptr) {
