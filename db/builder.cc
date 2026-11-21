@@ -113,6 +113,26 @@ Status ExtractBlobReferenceClassificationFromTableProperties(
   return status;
 }
 
+Status RejectBlobIndirectionTableProperties(const TableProperties& props,
+                                            const char* operation) {
+  FileMetaData metadata;
+  ExtractBlobReferenceDescriptorFromTableProperties(props, &metadata);
+  Status status =
+      ExtractBlobReferenceClassificationFromTableProperties(props, &metadata);
+  if (!status.ok()) {
+    return status;
+  }
+  if (!metadata.blob_reference_descriptor.empty() ||
+      metadata.oldest_coarse_indirect_origin_file_number !=
+          kInvalidBlobFileNumber) {
+    return Status::NotSupported(
+        std::string(operation) +
+        " does not carry blob indirection metadata (relocation files and "
+        "routes)");
+  }
+  return Status::OK();
+}
+
 Status BuildTable(
     const std::string& dbname, VersionSet* versions,
     const ImmutableDBOptions& db_options, const TableBuilderOptions& tboptions,

@@ -553,6 +553,12 @@ class ReadOnlyMemTable {
   // These are used to manage memtable flushes to storage
   bool flush_in_progress_{false};  // started the flush
   bool flush_completed_{false};    // finished the flush
+  // True if a flush picked this memtable with enable_blob_indirection on. Only
+  // the first memtable of such a flush holds this mark, and it holds one
+  // MemTableList activation count. The mark stays until the memtable is
+  // installed or rolled back, also when flushes finish out of order. Protected
+  // by the DB mutex.
+  bool pending_blob_indirection_activation_ = false;
   uint64_t file_number_{0};
 
   // The updates to be applied to the transaction log when this
