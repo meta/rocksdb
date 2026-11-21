@@ -8,11 +8,20 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
+#include <initializer_list>
+#include <limits>
+#include <set>
 #include <tuple>
 
 #include "db/column_family.h"
 #include "db/version_set.h"
+#include "rocksdb/file_checksum.h"
+#include "rocksdb/manifest_store.h"
+#include "rocksdb/utilities/customizable_util.h"
+#include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
+#include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -677,6 +686,844 @@ bool ManifestRowsEqual(const ManifestRows& a, const ManifestRows& b,
     *diff = where;
   }
   return false;
+}
+
+// ======== Public rows ========
+//
+// The code below encodes and decodes the public rows of
+// include/rocksdb/manifest_store.h: ManifestRowsToPublicRows(),
+// PublicRowsToManifestRows() and their helpers, and the canonical field
+// encoding (ParseManifestRowFields(), EncodeManifestRowFields()). The code
+// above works only on the internal rows.
+
+namespace {
+
+// Reads a varint that uses the fewest bytes for its value. GetVarint32() and
+// GetVarint64() also accept longer forms and ignore the bits of the last byte
+// that do not fit the type, so this checks the number of bytes read and the
+// last byte. A varint32 has 32 bits, so its fifth byte may use only its low 4
+// bits; a varint64 has 64 bits, so its tenth byte may use only its lowest bit.
+template <typename T>
+bool GetShortestVarint(Slice* input, T* value) {
+  constexpr ptrdiff_t kMaxLength = sizeof(T) == 4 ? 5 : 10;
+  constexpr char kUnusedBits = sizeof(T) == 4 ? '\xF0' : '\xFE';
+  const char* start = input->data();
+  bool ok = false;
+  if constexpr (sizeof(T) == 4) {
+    ok = GetVarint32(input, value);
+  } else {
+    ok = GetVarint64(input, value);
+  }
+  if (!ok) {
+    return false;
+  }
+  const ptrdiff_t length = input->data() - start;
+  if (length == kMaxLength && (start[kMaxLength - 1] & kUnusedBits) != 0) {
+    return false;
+  }
+  return length == VarintLength(*value);
+}
+
+// Reads a value size in its shortest form, then that many bytes.
+bool GetShortestSlice(Slice* input, Slice* result) {
+  uint32_t size = 0;
+  if (!GetShortestVarint(input, &size) || input->size() < size) {
+    return false;
+  }
+  *result = Slice(input->data(), size);
+  input->remove_prefix(size);
+  return true;
+}
+
+// Builds the canonical encoding of one row. Callers add the fields in
+// increasing ID order and leave out the fields that hold their default.
+class FieldWriter {
+ public:
+  template <typename Id>
+  void Bytes(Id id, const Slice& value) {
+    const uint32_t raw_id = lossless_cast<uint32_t>(id);
+    assert(raw_id > last_id_);
+    assert(value.size() <= std::numeric_limits<uint32_t>::max());
+    last_id_ = raw_id;
+    PutVarint32(&encoded_, raw_id);
+    PutLengthPrefixedSlice(&encoded_, value);
+  }
+
+  // varint32 and varint64 give the same bytes for the same value, so this
+  // writes both.
+  template <typename Id>
+  void Varint(Id id, uint64_t value) {
+    std::string buf;
+    PutVarint64(&buf, value);
+    Bytes(id, buf);
+  }
+
+  // Writes `value` unless it equals `default_value`, because a row leaves out
+  // the fields that hold their default.
+  template <typename Id>
+  void VarintUnlessDefault(Id id, uint64_t value, uint64_t default_value) {
+    if (value != default_value) {
+      Varint(id, value);
+    }
+  }
+
+  // The same for a bytes value.
+  template <typename Id>
+  void BytesUnlessDefault(Id id, const Slice& value,
+                          const Slice& default_value) {
+    if (value != default_value) {
+      Bytes(id, value);
+    }
+  }
+
+  // Writes a bool or an enum value as one byte.
+  template <typename Id>
+  void Byte(Id id, uint8_t value) {
+    const char c = lossless_cast<char>(value);
+    Bytes(id, Slice(&c, 1));
+  }
+
+  std::string Release() { return std::move(encoded_); }
+
+ private:
+  std::string encoded_;
+  uint32_t last_id_ = 0;
+};
+
+std::string EncodeDbRow(const ManifestDbRow& db,
+                        const ManifestDbRowExtraFields& extra_fields) {
+  using F = ManifestDbField;
+  FieldWriter w;
+  w.Varint(F::kRowFormatVersion, extra_fields.row_format_version);
+  w.Byte(F::kAuthority, lossless_cast<uint8_t>(extra_fields.authority));
+  w.Byte(F::kCopyMode, lossless_cast<uint8_t>(extra_fields.copy_mode));
+  w.VarintUnlessDefault(F::kCopyFileNumber, extra_fields.copy_file_number, 0);
+  w.BytesUnlessDefault(F::kDbId, db.db_id, "");
+  w.Varint(F::kNextFileNumber, db.next_file_number);
+  w.Varint(F::kInFlightFileNumber, extra_fields.in_flight_file_number);
+  w.Varint(F::kLastSequence, db.last_sequence);
+  w.VarintUnlessDefault(F::kPrevLogNumber, db.prev_log_number, 0);
+  w.VarintUnlessDefault(F::kMinLogNumberToKeep, db.min_log_number_to_keep, 0);
+  w.VarintUnlessDefault(F::kMaxColumnFamily, db.max_column_family, 0);
+  if (db.committed_options_file_number.has_value()) {
+    w.Varint(F::kCommittedOptionsFileNumber, *db.committed_options_file_number);
+  }
+  return w.Release();
+}
+
+std::string EncodeCfRow(const ManifestCfRow& cf) {
+  using F = ManifestCfField;
+  FieldWriter w;
+  w.Bytes(F::kName, cf.name);
+  w.Bytes(F::kComparatorName, cf.comparator_name);
+  w.VarintUnlessDefault(F::kTimestampSize, cf.timestamp_size, 0);
+  if (!cf.persist_user_defined_timestamps) {
+    w.Byte(F::kPersistUserDefinedTimestamps, 0);
+  }
+  w.VarintUnlessDefault(F::kLogNumber, cf.log_number, 0);
+  w.BytesUnlessDefault(F::kFullHistoryTsLow, cf.full_history_ts_low, "");
+  std::string cursors;
+  for (size_t level = 0; level < cf.compact_cursors.size(); ++level) {
+    const InternalKey& cursor = cf.compact_cursors[level];
+    if (cursor.size() != 0) {
+      PutVarint32(&cursors, static_cast<uint32_t>(level));
+      PutLengthPrefixedSlice(&cursors, cursor.Encode());
+    }
+  }
+  w.BytesUnlessDefault(F::kCompactCursors, cursors, "");
+  std::string dropped_blob_files;
+  for (uint64_t number : cf.dropped_blob_files) {
+    PutVarint64(&dropped_blob_files, number);
+  }
+  w.BytesUnlessDefault(F::kDroppedBlobFiles, dropped_blob_files, "");
+  if (cf.dropped) {
+    w.Byte(F::kDropped, 1);
+  }
+  return w.Release();
+}
+
+std::string EncodeFileRow(const ManifestFileRow& row) {
+  using F = ManifestFileField;
+  const FileMetaData& f = row.meta;
+  FieldWriter w;
+  w.VarintUnlessDefault(F::kLevel, lossless_cast<uint32_t>(row.level), 0);
+  w.VarintUnlessDefault(F::kPathId, f.fd.GetPathId(), 0);
+  w.Varint(F::kFileSize, f.fd.GetFileSize());
+  w.Bytes(F::kSmallest, f.smallest.Encode());
+  w.Bytes(F::kLargest, f.largest.Encode());
+  w.Varint(F::kSmallestSeqno, f.fd.smallest_seqno);
+  w.Varint(F::kLargestSeqno, f.fd.largest_seqno);
+  if (f.marked_for_compaction) {
+    w.Byte(F::kMarkedForCompaction, 1);
+  }
+  w.VarintUnlessDefault(F::kOldestBlobFileNumber, f.oldest_blob_file_number,
+                        kInvalidBlobFileNumber);
+  w.Varint(F::kOldestAncestorTime, f.oldest_ancestor_time);
+  w.Varint(F::kFileCreationTime, f.file_creation_time);
+  w.Varint(F::kEpochNumber, f.epoch_number);
+  w.BytesUnlessDefault(F::kFileChecksum, f.file_checksum, kUnknownFileChecksum);
+  w.BytesUnlessDefault(F::kFileChecksumFuncName, f.file_checksum_func_name,
+                       kUnknownFileChecksumFuncName);
+  if (f.temperature != Temperature::kUnknown) {
+    w.Byte(F::kTemperature, lossless_cast<uint8_t>(f.temperature));
+  }
+  w.BytesUnlessDefault(F::kMinTimestamp, f.min_timestamp, "");
+  w.BytesUnlessDefault(F::kMaxTimestamp, f.max_timestamp, "");
+  if (f.unique_id != kNullUniqueId64x2) {
+    UniqueId64x2 unique_id = f.unique_id;
+    w.Bytes(F::kUniqueId, EncodeUniqueIdBytes(&unique_id));
+  }
+  w.VarintUnlessDefault(F::kCompensatedRangeDeletionSize,
+                        f.compensated_range_deletion_size, 0);
+  w.VarintUnlessDefault(F::kTailSize, f.tail_size, 0);
+  if (!f.user_defined_timestamps_persisted) {
+    w.Byte(F::kUserDefinedTimestampsPersisted, 0);
+  }
+  w.BytesUnlessDefault(F::kFileOpenMetadata, f.file_open_metadata, "");
+  w.VarintUnlessDefault(F::kDbOwnershipStartTime, f.db_ownership_start_time,
+                        kUnknownDbOwnershipStartTime);
+  w.VarintUnlessDefault(F::kDataFileProvenance, f.data_file_provenance, 0);
+  return w.Release();
+}
+
+std::string EncodeBlobFileRow(const ManifestBlobFileRow& row) {
+  using F = ManifestBlobFileField;
+  const BlobFileAddition& addition = row.addition;
+  FieldWriter w;
+  w.Varint(F::kTotalBlobCount, addition.GetTotalBlobCount());
+  w.Varint(F::kTotalBlobBytes, addition.GetTotalBlobBytes());
+  w.BytesUnlessDefault(F::kChecksumMethod, addition.GetChecksumMethod(), "");
+  w.BytesUnlessDefault(F::kChecksumValue, addition.GetChecksumValue(), "");
+  w.VarintUnlessDefault(F::kGarbageBlobCount, row.garbage_blob_count, 0);
+  w.VarintUnlessDefault(F::kGarbageBlobBytes, row.garbage_blob_bytes, 0);
+  return w.Release();
+}
+
+std::string EncodeWalRow(const WalMetadata& wal) {
+  FieldWriter w;
+  if (wal.HasSyncedSize()) {
+    w.Varint(ManifestWalField::kSyncedSize, wal.GetSyncedSizeInBytes());
+  }
+  return w.Release();
+}
+
+// The reader of public rows. The functions below are in bottom-up order. The
+// calls go:
+//   PublicRowsToManifestRows()
+//     -> DecodeDbRow() for the DB row
+//     -> DecodeRow() for each other row. It reads column family and WAL rows
+//        itself, and calls DecodeFileRow() and DecodeBlobFileRow().
+//   Each of these calls ReadRowFields(), which calls a Read*Field() function
+//   for each field. The Read*Field() functions use the Get*Value() helpers,
+//   GetEnumByte(), ReadCompactCursors() and ReadDroppedBlobFiles().
+//   PublicRowsToManifestRows() runs CheckTimestampKeySizes() last.
+
+// The largest compaction cursor level that a reader accepts. A column family
+// row keeps its cursors in a vector indexed by level, so a corrupt level must
+// not make the reader allocate a huge vector. Real DBs have far fewer levels
+// (ColumnFamilyOptions::num_levels is 7 by default); the bound is a sanity
+// limit, not a RocksDB limit.
+constexpr uint32_t kMaxCompactCursorLevel = 1 << 16;
+
+Status BadValue(uint32_t id) {
+  return Status::Corruption("Bad value in manifest row field " +
+                            std::to_string(id));
+}
+
+// Handles a field ID that the reader does not know.
+Status UnknownField(uint32_t id) {
+  if ((id & kManifestFieldMustUnderstand) != 0) {
+    return Status::NotSupported(
+        "Manifest row has an unknown must-understand field " +
+        std::to_string(id));
+  }
+  return Status::OK();
+}
+
+// Each Get*Value() function returns true if `value` holds exactly one value of
+// its type.
+bool GetVarint64Value(Slice value, uint64_t* out) {
+  return GetShortestVarint(&value, out) && value.empty();
+}
+
+bool GetVarint32Value(Slice value, uint32_t* out) {
+  return GetShortestVarint(&value, out) && value.empty();
+}
+
+bool GetBoolValue(const Slice& value, bool* out) {
+  if (value.size() != 1 || lossless_cast<uint8_t>(value[0]) > 1) {
+    return false;
+  }
+  *out = value[0] == 1;
+  return true;
+}
+
+// Returns true if `key` is long enough to be an internal key and its value
+// type is one that a key in RocksDB metadata can have.
+bool IsInternalKey(const Slice& key) {
+  return key.size() >= kNumInternalBytes &&
+         IsExtendedValueType(ExtractValueType(key));
+}
+
+bool GetInternalKeyValue(const Slice& value, InternalKey* out) {
+  if (!IsInternalKey(value)) {
+    return false;
+  }
+  out->DecodeFrom(value);
+  return true;
+}
+
+Status CheckValue(bool ok, uint32_t id) {
+  return ok ? Status::OK() : BadValue(id);
+}
+
+// Reads a one-byte enum value whose largest known value is `max`. A larger
+// value is NotSupported, because a newer release may have added it.
+template <typename Enum>
+Status GetEnumByte(const Slice& value, uint32_t id, Enum max, Enum* out) {
+  if (value.size() != 1) {
+    return BadValue(id);
+  }
+  if (lossless_cast<uint8_t>(value[0]) > lossless_cast<uint8_t>(max)) {
+    return Status::NotSupported("Unknown value of manifest row field " +
+                                std::to_string(id));
+  }
+  *out = lossless_cast<Enum>(value[0]);
+  return Status::OK();
+}
+
+// Parses the fields of `row`, calls `read_field` for each field, then checks
+// that the row has each field ID in `required`.
+template <typename ReadField>
+Status ReadRowFields(const ManifestRow& row,
+                     std::initializer_list<uint32_t> required,
+                     const ReadField& read_field) {
+  std::vector<ManifestRowField> fields;
+  Status s = ParseManifestRowFields(row.fields, &fields);
+  for (size_t i = 0; s.ok() && i < fields.size(); ++i) {
+    s = read_field(fields[i]);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  for (uint32_t id : required) {
+    std::vector<ManifestRowField>::const_iterator it = std::lower_bound(
+        fields.begin(), fields.end(), id,
+        [](const ManifestRowField& f, uint32_t v) { return f.id < v; });
+    if (it == fields.end() || it->id != id) {
+      return Status::Corruption("Manifest row misses field " +
+                                std::to_string(id));
+    }
+  }
+  return Status::OK();
+}
+
+// Field id casts: each Read*Field() function below casts the field id to its
+// field enum and switches on it. The id can be a value that the enum does not
+// name, and a static analyzer reports such a cast as out of range. The cast is
+// defined, because each field enum has a fixed underlying type, and an unknown
+// id reaches the UnknownField() call after the switch.
+Status ReadDbField(const ManifestRowField& field, ManifestDbRow* db,
+                   ManifestDbRowExtraFields* extra_fields) {
+  using F = ManifestDbField;
+  const Slice& v = field.value;
+  uint64_t u64 = 0;
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  switch (lossless_cast<F>(field.id)) {
+    case F::kRowFormatVersion:
+      // ParseManifestRowFields() accepts only fields in increasing ID order,
+      // and ReadRowFields() stops at the first error. So this field (ID 1) is
+      // read first, and a newer version gives NotSupported before any other
+      // field can give Corruption. A row whose field encoding cannot be parsed
+      // is still Corruption.
+      if (!GetVarint32Value(v, &extra_fields->row_format_version) ||
+          extra_fields->row_format_version == 0) {
+        return BadValue(field.id);
+      }
+      if (extra_fields->row_format_version > kManifestRowFormatVersionLatest) {
+        return Status::NotSupported(
+            "Manifest row format version " +
+            std::to_string(extra_fields->row_format_version) +
+            " is newer than this release");
+      }
+      return Status::OK();
+    case F::kAuthority:
+      return GetEnumByte(v, field.id, ManifestAuthority::kStore,
+                         &extra_fields->authority);
+    case F::kCopyMode:
+      return GetEnumByte(v, field.id, ManifestCopyMode::kSync,
+                         &extra_fields->copy_mode);
+    case F::kCopyFileNumber:
+      return CheckValue(GetVarint64Value(v, &extra_fields->copy_file_number),
+                        field.id);
+    case F::kDbId:
+      db->db_id = v.ToString();
+      return Status::OK();
+    case F::kNextFileNumber:
+      return CheckValue(GetVarint64Value(v, &db->next_file_number), field.id);
+    case F::kInFlightFileNumber:
+      return CheckValue(
+          GetVarint64Value(v, &extra_fields->in_flight_file_number), field.id);
+    case F::kLastSequence:
+      return CheckValue(GetVarint64Value(v, &db->last_sequence), field.id);
+    case F::kPrevLogNumber:
+      return CheckValue(GetVarint64Value(v, &db->prev_log_number), field.id);
+    case F::kMinLogNumberToKeep:
+      return CheckValue(GetVarint64Value(v, &db->min_log_number_to_keep),
+                        field.id);
+    case F::kMaxColumnFamily:
+      return CheckValue(GetVarint32Value(v, &db->max_column_family), field.id);
+    case F::kCommittedOptionsFileNumber:
+      if (!GetVarint64Value(v, &u64)) {
+        return BadValue(field.id);
+      }
+      db->committed_options_file_number = u64;
+      return Status::OK();
+  }
+  return UnknownField(field.id);
+}
+
+Status ReadCompactCursors(Slice v, uint32_t id,
+                          std::vector<InternalKey>* cursors) {
+  while (!v.empty()) {
+    uint32_t level = 0;
+    Slice key;
+    if (!GetShortestVarint(&v, &level) || !GetShortestSlice(&v, &key) ||
+        level > kMaxCompactCursorLevel || level < cursors->size() ||
+        !IsInternalKey(key)) {
+      return BadValue(id);
+    }
+    cursors->resize(level + 1);
+    cursors->back().DecodeFrom(key);
+  }
+  return Status::OK();
+}
+
+Status ReadDroppedBlobFiles(Slice v, uint32_t id,
+                            std::vector<uint64_t>* numbers) {
+  while (!v.empty()) {
+    uint64_t number = 0;
+    if (!GetShortestVarint(&v, &number) ||
+        (!numbers->empty() && number <= numbers->back())) {
+      return BadValue(id);
+    }
+    numbers->push_back(number);
+  }
+  return Status::OK();
+}
+
+Status ReadCfField(const ManifestRowField& field, ManifestCfRow* cf) {
+  using F = ManifestCfField;
+  const Slice& v = field.value;
+  uint32_t u32 = 0;
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  switch (lossless_cast<F>(field.id)) {
+    case F::kName:
+      cf->name = v.ToString();
+      return Status::OK();
+    case F::kComparatorName:
+      cf->comparator_name = v.ToString();
+      return Status::OK();
+    case F::kTimestampSize:
+      if (!GetVarint32Value(v, &u32)) {
+        return BadValue(field.id);
+      }
+      cf->timestamp_size = u32;
+      return Status::OK();
+    case F::kPersistUserDefinedTimestamps:
+      return CheckValue(GetBoolValue(v, &cf->persist_user_defined_timestamps),
+                        field.id);
+    case F::kLogNumber:
+      return CheckValue(GetVarint64Value(v, &cf->log_number), field.id);
+    case F::kFullHistoryTsLow:
+      cf->full_history_ts_low = v.ToString();
+      return Status::OK();
+    case F::kCompactCursors:
+      return ReadCompactCursors(v, field.id, &cf->compact_cursors);
+    case F::kDroppedBlobFiles:
+      return ReadDroppedBlobFiles(v, field.id, &cf->dropped_blob_files);
+    case F::kDropped:
+      return CheckValue(GetBoolValue(v, &cf->dropped), field.id);
+  }
+  return UnknownField(field.id);
+}
+
+// FileDescriptor keeps the path id in the 2 high bits of the packed file
+// number, so a path id is at most 3, as in a MANIFEST file.
+constexpr uint32_t kMaxPathId = 3;
+
+// Reads one field of a file row. FileDescriptor packs the file number and the
+// path id, so the path id goes to `path_id`, and DecodeFileRow() rebuilds the
+// FileDescriptor after all fields are read.
+Status ReadFileField(const ManifestRowField& field, ManifestFileRow* row,
+                     uint32_t* path_id) {
+  using F = ManifestFileField;
+  const Slice& v = field.value;
+  FileMetaData& f = row->meta;
+  FileDescriptor& fd = f.fd;
+  uint32_t u32 = 0;
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  switch (lossless_cast<F>(field.id)) {
+    case F::kLevel:
+      if (!GetVarint32Value(v, &u32) ||
+          u32 > lossless_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return BadValue(field.id);
+      }
+      row->level = lossless_cast<int>(u32);
+      return Status::OK();
+    case F::kPathId:
+      return CheckValue(GetVarint32Value(v, path_id) && *path_id <= kMaxPathId,
+                        field.id);
+    case F::kFileSize:
+      return CheckValue(GetVarint64Value(v, &fd.file_size), field.id);
+    case F::kSmallest:
+      return CheckValue(GetInternalKeyValue(v, &f.smallest), field.id);
+    case F::kLargest:
+      return CheckValue(GetInternalKeyValue(v, &f.largest), field.id);
+    case F::kSmallestSeqno:
+      return CheckValue(GetVarint64Value(v, &fd.smallest_seqno), field.id);
+    case F::kLargestSeqno:
+      return CheckValue(GetVarint64Value(v, &fd.largest_seqno), field.id);
+    case F::kMarkedForCompaction:
+      return CheckValue(GetBoolValue(v, &f.marked_for_compaction), field.id);
+    case F::kOldestBlobFileNumber:
+      return CheckValue(GetVarint64Value(v, &f.oldest_blob_file_number),
+                        field.id);
+    case F::kOldestAncestorTime:
+      return CheckValue(GetVarint64Value(v, &f.oldest_ancestor_time), field.id);
+    case F::kFileCreationTime:
+      return CheckValue(GetVarint64Value(v, &f.file_creation_time), field.id);
+    case F::kEpochNumber:
+      return CheckValue(GetVarint64Value(v, &f.epoch_number), field.id);
+    case F::kFileChecksum:
+      f.file_checksum = v.ToString();
+      return Status::OK();
+    case F::kFileChecksumFuncName:
+      f.file_checksum_func_name = v.ToString();
+      return Status::OK();
+    case F::kTemperature: {
+      if (v.size() != 1) {
+        return BadValue(field.id);
+      }
+      // Like a MANIFEST file reader, keep kUnknown for a temperature value
+      // that is not below Temperature::kLastTemperature. The raw byte is
+      // compared before the cast, so that no out of range enum value is made.
+      const uint8_t raw = lossless_cast<uint8_t>(v[0]);
+      if (raw < lossless_cast<uint8_t>(Temperature::kLastTemperature)) {
+        f.temperature = lossless_cast<Temperature>(raw);
+      }
+      return Status::OK();
+    }
+    case F::kMinTimestamp:
+      f.min_timestamp = v.ToString();
+      return Status::OK();
+    case F::kMaxTimestamp:
+      f.max_timestamp = v.ToString();
+      return Status::OK();
+    case F::kUniqueId:
+      return CheckValue(DecodeUniqueIdBytes(v.ToString(), &f.unique_id).ok(),
+                        field.id);
+    case F::kCompensatedRangeDeletionSize:
+      return CheckValue(GetVarint64Value(v, &f.compensated_range_deletion_size),
+                        field.id);
+    case F::kTailSize:
+      return CheckValue(GetVarint64Value(v, &f.tail_size), field.id);
+    case F::kUserDefinedTimestampsPersisted:
+      return CheckValue(GetBoolValue(v, &f.user_defined_timestamps_persisted),
+                        field.id);
+    case F::kFileOpenMetadata:
+      f.file_open_metadata = v.ToString();
+      return Status::OK();
+    case F::kDbOwnershipStartTime:
+      return CheckValue(GetVarint64Value(v, &f.db_ownership_start_time),
+                        field.id);
+    case F::kDataFileProvenance:
+      return CheckValue(GetVarint32Value(v, &f.data_file_provenance), field.id);
+  }
+  return UnknownField(field.id);
+}
+
+struct BlobFileFields {
+  uint64_t total_blob_count = 0;
+  uint64_t total_blob_bytes = 0;
+  std::string checksum_method;
+  std::string checksum_value;
+};
+
+Status ReadBlobFileField(const ManifestRowField& field, BlobFileFields* blob,
+                         ManifestBlobFileRow* row) {
+  using F = ManifestBlobFileField;
+  const Slice& v = field.value;
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  switch (lossless_cast<F>(field.id)) {
+    case F::kTotalBlobCount:
+      return CheckValue(GetVarint64Value(v, &blob->total_blob_count), field.id);
+    case F::kTotalBlobBytes:
+      return CheckValue(GetVarint64Value(v, &blob->total_blob_bytes), field.id);
+    case F::kChecksumMethod:
+      blob->checksum_method = v.ToString();
+      return Status::OK();
+    case F::kChecksumValue:
+      blob->checksum_value = v.ToString();
+      return Status::OK();
+    case F::kGarbageBlobCount:
+      return CheckValue(GetVarint64Value(v, &row->garbage_blob_count),
+                        field.id);
+    case F::kGarbageBlobBytes:
+      return CheckValue(GetVarint64Value(v, &row->garbage_blob_bytes),
+                        field.id);
+  }
+  return UnknownField(field.id);
+}
+
+Status ReadWalField(const ManifestRowField& field, WalMetadata* wal) {
+  uint64_t size = 0;
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+  switch (lossless_cast<ManifestWalField>(field.id)) {
+    case ManifestWalField::kSyncedSize:
+      if (!GetVarint64Value(field.value, &size)) {
+        return BadValue(field.id);
+      }
+      wal->SetSyncedSizeInBytes(size);
+      // The largest 64-bit value means an unknown size, which a writer
+      // leaves out instead.
+      return CheckValue(wal->HasSyncedSize(), field.id);
+  }
+  return UnknownField(field.id);
+}
+
+template <typename Field>
+uint32_t Id(Field f) {
+  return lossless_cast<uint32_t>(f);
+}
+
+Status DecodeDbRow(const ManifestRow& row, ManifestDbRow* db,
+                   ManifestDbRowExtraFields* extra_fields) {
+  const ManifestRowKey& key = row.key;
+  if (key.type != ManifestRowType::kDb || key.cf_id != 0 || key.number != 0) {
+    return Status::Corruption("Bad manifest DB row key");
+  }
+  using F = ManifestDbField;
+  return ReadRowFields(row,
+                       {Id(F::kRowFormatVersion), Id(F::kAuthority),
+                        Id(F::kCopyMode), Id(F::kNextFileNumber),
+                        Id(F::kInFlightFileNumber), Id(F::kLastSequence)},
+                       [&](const ManifestRowField& field) {
+                         return ReadDbField(field, db, extra_fields);
+                       });
+}
+
+Status DecodeFileRow(const ManifestRow& row, ManifestFileRow* out) {
+  if (row.key.number > kFileNumberMask) {
+    return Status::Corruption("Manifest file row number is too large");
+  }
+  using F = ManifestFileField;
+  uint32_t path_id = 0;
+  Status s = ReadRowFields(
+      row,
+      {Id(F::kFileSize), Id(F::kSmallest), Id(F::kLargest),
+       Id(F::kSmallestSeqno), Id(F::kLargestSeqno), Id(F::kOldestAncestorTime),
+       Id(F::kFileCreationTime), Id(F::kEpochNumber)},
+      [&](const ManifestRowField& field) {
+        return ReadFileField(field, out, &path_id);
+      });
+  if (s.ok()) {
+    const FileDescriptor& fd = out->meta.fd;
+    out->meta.fd = FileDescriptor(row.key.number, path_id, fd.file_size,
+                                  fd.smallest_seqno, fd.largest_seqno);
+  }
+  return s;
+}
+
+Status DecodeBlobFileRow(const ManifestRow& row, ManifestBlobFileRow* out) {
+  using F = ManifestBlobFileField;
+  BlobFileFields blob;
+  Status s =
+      ReadRowFields(row, {Id(F::kTotalBlobCount), Id(F::kTotalBlobBytes)},
+                    [&](const ManifestRowField& field) {
+                      return ReadBlobFileField(field, &blob, out);
+                    });
+  if (s.ok() && blob.checksum_method.empty() != blob.checksum_value.empty()) {
+    s = Status::Corruption(
+        "Manifest blob file row has only one of checksum method and value");
+  }
+  if (s.ok()) {
+    out->addition = BlobFileAddition(
+        row.key.number, blob.total_blob_count, blob.total_blob_bytes,
+        std::move(blob.checksum_method), std::move(blob.checksum_value));
+  }
+  return s;
+}
+
+// Checks that each key of a column family that uses user-defined timestamps
+// is long enough to hold a timestamp. The check runs after all rows are
+// decoded, because the column family row may come after its file rows.
+Status CheckTimestampKeySizes(const ManifestCfRows& cf_rows) {
+  const size_t min_size = kNumInternalBytes + cf_rows.cf.timestamp_size;
+  for (const auto& [number, file] : cf_rows.files) {
+    if (file.meta.smallest.size() < min_size ||
+        file.meta.largest.size() < min_size) {
+      return Status::Corruption(
+          "Manifest file row key is shorter than the timestamp size");
+    }
+  }
+  for (const InternalKey& cursor : cf_rows.cf.compact_cursors) {
+    if (cursor.size() != 0 && cursor.size() < min_size) {
+      return Status::Corruption(
+          "Manifest compaction cursor is shorter than the timestamp size");
+    }
+  }
+  return Status::OK();
+}
+
+Status RepeatedKey() { return Status::Corruption("Repeated manifest row key"); }
+
+// Decodes one row other than the DB row into `out`. `cfs_with_row` collects
+// the ids of the column families whose row it decoded.
+Status DecodeRow(const ManifestRow& row, ManifestRows* out,
+                 std::set<uint32_t>* cfs_with_row) {
+  const ManifestRowKey& key = row.key;
+  switch (key.type) {
+    case ManifestRowType::kDb:
+      return Status::Corruption("More than one manifest DB row");
+    case ManifestRowType::kColumnFamily: {
+      if (key.number != 0) {
+        return Status::Corruption("Bad manifest column family row key");
+      }
+      if (!cfs_with_row->insert(key.cf_id).second) {
+        return RepeatedKey();
+      }
+      ManifestCfRow* cf = &out->cfs[key.cf_id].cf;
+      using F = ManifestCfField;
+      return ReadRowFields(row, {Id(F::kName), Id(F::kComparatorName)},
+                           [&](const ManifestRowField& field) {
+                             return ReadCfField(field, cf);
+                           });
+    }
+    case ManifestRowType::kFile: {
+      std::pair<std::map<uint64_t, ManifestFileRow>::iterator, bool> inserted =
+          out->cfs[key.cf_id].files.try_emplace(key.number);
+      if (!inserted.second) {
+        return RepeatedKey();
+      }
+      return DecodeFileRow(row, &inserted.first->second);
+    }
+    case ManifestRowType::kBlobFile: {
+      std::pair<std::map<uint64_t, ManifestBlobFileRow>::iterator, bool>
+          inserted = out->cfs[key.cf_id].blob_files.try_emplace(key.number);
+      if (!inserted.second) {
+        return RepeatedKey();
+      }
+      return DecodeBlobFileRow(row, &inserted.first->second);
+    }
+    case ManifestRowType::kWal: {
+      if (key.cf_id != 0) {
+        return Status::Corruption("Bad manifest WAL row key");
+      }
+      std::pair<std::map<WalNumber, WalMetadata>::iterator, bool> inserted =
+          out->wals.try_emplace(key.number);
+      if (!inserted.second) {
+        return RepeatedKey();
+      }
+      return ReadRowFields(row, {}, [&](const ManifestRowField& field) {
+        return ReadWalField(field, &inserted.first->second);
+      });
+    }
+  }
+  return Status::Corruption("Unknown manifest row type");
+}
+
+}  // namespace
+
+Status ManifestRowsToPublicRows(const ManifestRows& internal_rows,
+                                const ManifestDbRowExtraFields& extra_fields,
+                                uint32_t feature_version,
+                                std::vector<ManifestRow>* public_rows) {
+  if (feature_version < 1 ||
+      feature_version > kManifestRowFeatureVersionLatest) {
+    return Status::InvalidArgument("Bad manifest row feature version " +
+                                   std::to_string(feature_version));
+  }
+  public_rows->clear();
+  public_rows->push_back(
+      ManifestRow{ManifestRowKey{ManifestRowType::kDb, 0, 0},
+                  EncodeDbRow(internal_rows.db, extra_fields)});
+  for (const auto& [cf_id, cf_rows] : internal_rows.cfs) {
+    public_rows->push_back(
+        ManifestRow{ManifestRowKey{ManifestRowType::kColumnFamily, cf_id, 0},
+                    EncodeCfRow(cf_rows.cf)});
+    for (const auto& [number, file] : cf_rows.files) {
+      public_rows->push_back(
+          ManifestRow{ManifestRowKey{ManifestRowType::kFile, cf_id, number},
+                      EncodeFileRow(file)});
+    }
+    for (const auto& [number, blob_file] : cf_rows.blob_files) {
+      public_rows->push_back(
+          ManifestRow{ManifestRowKey{ManifestRowType::kBlobFile, cf_id, number},
+                      EncodeBlobFileRow(blob_file)});
+    }
+  }
+  for (const auto& [number, wal] : internal_rows.wals) {
+    public_rows->push_back(ManifestRow{
+        ManifestRowKey{ManifestRowType::kWal, 0, number}, EncodeWalRow(wal)});
+  }
+  return Status::OK();
+}
+
+Status PublicRowsToManifestRows(const ManifestRow& public_db_row,
+                                const std::vector<ManifestRow>& public_rows,
+                                ManifestRows* internal_rows,
+                                ManifestDbRowExtraFields* extra_fields) {
+  *internal_rows = ManifestRows();
+  *extra_fields = ManifestDbRowExtraFields();
+  Status s = DecodeDbRow(public_db_row, &internal_rows->db, extra_fields);
+  std::set<uint32_t> cfs_with_row;
+  for (size_t i = 0; s.ok() && i < public_rows.size(); ++i) {
+    s = DecodeRow(public_rows[i], internal_rows, &cfs_with_row);
+  }
+  if (s.ok() && cfs_with_row.size() != internal_rows->cfs.size()) {
+    s = Status::Corruption(
+        "Manifest file or blob file row without a column family row");
+  }
+  for (std::map<uint32_t, ManifestCfRows>::const_iterator it =
+           internal_rows->cfs.begin();
+       s.ok() && it != internal_rows->cfs.end(); ++it) {
+    s = CheckTimestampKeySizes(it->second);
+  }
+  return s;
+}
+
+Status ParseManifestRowFields(const Slice& encoded,
+                              std::vector<ManifestRowField>* fields) {
+  fields->clear();
+  Slice input = encoded;
+  while (!input.empty()) {
+    ManifestRowField field;
+    if (!GetShortestVarint(&input, &field.id) ||
+        !GetShortestSlice(&input, &field.value)) {
+      return Status::Corruption("Bad manifest row field encoding");
+    }
+    if (field.id == 0 || (!fields->empty() && field.id <= fields->back().id)) {
+      return Status::Corruption("Bad manifest row field ID order");
+    }
+    fields->push_back(field);
+  }
+  return Status::OK();
+}
+
+std::string EncodeManifestRowFields(
+    const std::vector<ManifestRowField>& fields) {
+  FieldWriter w;
+  for (const ManifestRowField& field : fields) {
+    w.Bytes(field.id, field.value);
+  }
+  return w.Release();
+}
+
+Status ManifestStore::CreateFromString(const ConfigOptions& config_options,
+                                       const std::string& value,
+                                       std::shared_ptr<ManifestStore>* result) {
+  return LoadSharedObject<ManifestStore>(config_options, value, result);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

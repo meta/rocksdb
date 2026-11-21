@@ -22,6 +22,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/flush_block_policy.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/table.h"
@@ -31,6 +32,7 @@
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_builder.h"
 #include "table/format.h"
+#include "test_util/mock_manifest_store.h"
 #include "test_util/sync_point.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
@@ -133,6 +135,81 @@ TEST_F(DBBasicTest, OpenWhenOpen) {
   ASSERT_EQ(Status::Code::kIOError, s.code());
   ASSERT_EQ(Status::SubCode::kNone, s.subcode());
   ASSERT_TRUE(strstr(s.getState(), "lock ") != nullptr);
+}
+
+// Every DB open function rejects a store (this release does not support store
+// mode) and, with a store, a feature version out of range, before it changes
+// anything on disk.
+//
+// DB::OpenAndCompact() loads its options from the OPTIONS file and the
+// options map of CompactionServiceOptionsOverride. Both reach the same
+// secondary open function as DB::OpenAsSecondary(), which checks them.
+TEST_F(DBBasicTest, ManifestStoreOptionsAreCheckedAtOpen) {
+  Close();
+  // A path where no DB exists, so that the test can check that a failed open
+  // with create_if_missing does not create it.
+  const std::string new_path = dbname_ + "_manifest_store";
+  ASSERT_OK(DestroyDB(new_path, CurrentOptions()));
+  const std::string secondary_path = dbname_ + "_secondary";
+  struct OpenCase {
+    const char* name;
+    std::function<Status(const Options&)> open;
+  };
+  const std::vector<OpenCase> open_cases = {
+      {"Open",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::Open(create, new_path, &db);
+       }},
+      {"OpenForReadOnly",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         return DB::OpenForReadOnly(options, dbname_, &db);
+       }},
+      {"OpenForReadOnly with column families",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         std::vector<ColumnFamilyHandle*> handles;
+         return DB::OpenForReadOnly(options, dbname_,
+                                    {{kDefaultColumnFamilyName, options}},
+                                    &handles, &db);
+       }},
+      {"OpenAsSecondary",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         return DB::OpenAsSecondary(options, dbname_, secondary_path, &db);
+       }},
+      {"OpenAsFollower",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::OpenAsFollower(create, new_path, dbname_, &db);
+       }},
+  };
+  for (const OpenCase& c : open_cases) {
+    SCOPED_TRACE(c.name);
+    Options options = CurrentOptions();
+    options.manifest_store = std::make_shared<MockManifestStore>(
+        std::make_shared<MockManifestStoreData>(), /*epoch=*/1);
+    ASSERT_EQ(Status::Code::kNotSupported, c.open(options).code());
+    for (uint32_t feature_version :
+         {0u, kManifestRowFeatureVersionLatest + 1}) {
+      options.manifest_row_feature_version = feature_version;
+      ASSERT_EQ(Status::Code::kInvalidArgument, c.open(options).code());
+    }
+    ASSERT_EQ(Status::kNotFound, env_->FileExists(new_path).code());
+  }
+
+  // Without a store, the feature version is not checked. So a DB opens with the
+  // value of a later release, for example one read from its OPTIONS file.
+  Options options = CurrentOptions();
+  options.manifest_row_feature_version = kManifestRowFeatureVersionLatest + 1;
+  Reopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_EQ("v", Get("k"));
 }
 
 namespace {
