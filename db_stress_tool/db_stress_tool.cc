@@ -121,6 +121,27 @@ int ValidateFileScopedWalWriteFaultFlags() {
   return 0;
 }
 
+int ValidateAtomicReplaceOnCloseFlags() {
+  if (!FLAGS_atomic_replace_on_close) {
+    return 0;
+  }
+  // Both modes need the file system without the atomic-replace emulation:
+  // --file_scope_wal_write_faults checks WAL recovery with no other change to
+  // the file system, and --verify_cpu_corruption_dir needs a run without any
+  // fault injection file system behavior.
+  if (FLAGS_file_scope_wal_write_faults) {
+    return ReturnValidationError(
+        "--atomic_replace_on_close is incompatible with "
+        "--file_scope_wal_write_faults");
+  }
+  if (!FLAGS_verify_cpu_corruption_dir.empty()) {
+    return ReturnValidationError(
+        "--atomic_replace_on_close is incompatible with "
+        "--verify_cpu_corruption_dir");
+  }
+  return 0;
+}
+
 int ValidateCfLifecycleFlags() {
   if (FLAGS_cf_lifecycle_fault_target < 0 ||
       FLAGS_cf_lifecycle_fault_target > 2) {
@@ -303,6 +324,12 @@ int db_stress_tool(int argc, char** argv) {
   }
   {
     int rc = ValidateFileScopedWalWriteFaultFlags();
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  {
+    int rc = ValidateAtomicReplaceOnCloseFlags();
     if (rc != 0) {
       return rc;
     }

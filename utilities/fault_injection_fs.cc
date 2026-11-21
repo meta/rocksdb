@@ -285,14 +285,17 @@ TestFSWritableFile::TestFSWritableFile(const std::string& fname,
                                        const FileOptions& file_opts,
                                        std::unique_ptr<FSWritableFile>&& f,
                                        FaultInjectionTestFS* fs,
-                                       bool reopened_for_write)
+                                       bool reopened_for_write,
+                                       const std::string& atomic_temp_name)
     : state_(fname),
       file_opts_(file_opts),
       target_(std::move(f)),
       should_forward_close_(true),
       fs_(fs),
       unsync_data_loss_(fs_->InjectUnsyncedDataLoss()),
-      reopened_for_write_(reopened_for_write) {
+      reopened_for_write_(reopened_for_write),
+      atomic_temp_name_(atomic_temp_name),
+      atomic_replace_(!atomic_temp_name.empty()) {
   assert(target_ != nullptr);
   assert(state_.pos_at_last_append_ == 0);
   assert(state_.pos_at_last_sync_ == 0);
@@ -312,7 +315,17 @@ TestFSWritableFile::~TestFSWritableFile() {
     ThreadStatusUtil::SetThreadOperation(
         ThreadStatus::OperationType::OP_UNKNOWN);
   }
-  CloseImpl(IOOptions(), nullptr).PermitUncheckedError();
+  if (atomic_replace_) {
+    // Destroying an atomic-replace file without a successful Close() must
+    // publish nothing (contract property 5 of kAtomicReplaceOnClose).
+    MutexLock l(&mutex_);
+    if (should_forward_close_) {
+      should_forward_close_ = false;
+      DiscardAtomicFile();
+    }
+  } else {
+    CloseImpl(IOOptions(), nullptr).PermitUncheckedError();
+  }
   if (thread_op != ThreadStatus::OperationType::OP_UNKNOWN) {
     ThreadStatusUtil::SetThreadOperation(thread_op);
   }
@@ -337,7 +350,7 @@ IOStatus TestFSWritableFile::Append(const Slice& data, const IOOptions& options,
     return s;
   }
 
-  if (target_->use_direct_io() || !unsync_data_loss_) {
+  if (!atomic_replace_ && (target_->use_direct_io() || !unsync_data_loss_)) {
     // TODO(hx235): buffer data for direct IO write to simulate data loss like
     // non-direct IO write
     s = target_->Append(data, options, dbg);
@@ -392,7 +405,7 @@ IOStatus TestFSWritableFile::Append(
     return IOStatus::Corruption(msg);
   }
 
-  if (target_->use_direct_io() || !unsync_data_loss_) {
+  if (!atomic_replace_ && (target_->use_direct_io() || !unsync_data_loss_)) {
     // TODO(hx235): buffer data for direct IO write to simulate data loss like
     // non-direct IO write
     s = target_->Append(data, options, dbg);
@@ -423,7 +436,11 @@ IOStatus TestFSWritableFile::Truncate(uint64_t size, const IOOptions& options,
     return s;
   }
 
-  s = target_->Truncate(size, options, dbg);
+  if (atomic_replace_) {
+    state_.buffer_.resize(static_cast<size_t>(size));
+  } else {
+    s = target_->Truncate(size, options, dbg);
+  }
   if (s.ok()) {
     state_.pos_at_last_append_ = size;
   }
@@ -440,6 +457,11 @@ IOStatus TestFSWritableFile::PositionedAppend(const Slice& data,
   }
   if (fs_->ShouldDataCorruptionBeforeWrite()) {
     return IOStatus::Corruption("Data is corrupted!");
+  }
+  if (atomic_replace_) {
+    // RocksDB writes CURRENT, IDENTITY and OPTIONS files with Append() only.
+    return IOStatus::NotSupported(
+        "PositionedAppend on an atomic-replace file: " + state_.filename_);
   }
   IOStatus s = ValidateWrite("PositionedAppend");
   if (!s.ok()) {
@@ -472,6 +494,11 @@ IOStatus TestFSWritableFile::PositionedAppend(
   }
   if (fs_->ShouldDataCorruptionBeforeWrite()) {
     return IOStatus::Corruption("Data is corrupted!");
+  }
+  if (atomic_replace_) {
+    // RocksDB writes CURRENT, IDENTITY and OPTIONS files with Append() only.
+    return IOStatus::NotSupported(
+        "PositionedAppend on an atomic-replace file: " + state_.filename_);
   }
   IOStatus s = ValidateWrite("PositionedAppend");
   if (!s.ok()) {
@@ -529,12 +556,27 @@ IOStatus TestFSWritableFile::CloseImpl(const IOOptions& options,
   // close attempt even if fault injection aborts the metadata close path.
   fs_->WritableFileClosed(state_);
   if (!fs_->IsFilesystemActive()) {
+    if (atomic_replace_) {
+      DiscardAtomicFile();
+    }
     return fs_->GetError();
   }
   IOStatus io_s = fs_->MaybeInjectThreadLocalError(
       FaultInjectionIOType::kMetadataWrite, options, "Close", state_.filename_);
   if (!io_s.ok()) {
+    if (atomic_replace_) {
+      if (fs_->InjectCloseErrorAfterPublish()) {
+        // The file is published, but the caller sees the injected error.
+        IOStatus publish_s = PublishAtomicFile(options, dbg);
+        return publish_s.ok() ? io_s : publish_s;
+      }
+      DiscardAtomicFile();
+    }
     return io_s;
+  }
+
+  if (atomic_replace_) {
+    return PublishAtomicFile(options, dbg);
   }
 
   // Drop buffered data that was never synced because close is not a syncing
@@ -542,6 +584,48 @@ IOStatus TestFSWritableFile::CloseImpl(const IOOptions& options,
   state_.buffer_.resize(0);
   io_s = target_->Close(options, dbg);
   return io_s;
+}
+
+IOStatus TestFSWritableFile::PublishAtomicFile(const IOOptions& options,
+                                               IODebugContext* dbg) {
+  assert(atomic_replace_);
+  IOStatus io_s = target_->Append(state_.buffer_, options, dbg);
+  if (io_s.ok()) {
+    io_s = target_->Sync(options, dbg);
+  }
+  if (io_s.ok()) {
+    target_open_ = false;
+    io_s = target_->Close(options, dbg);
+  }
+  if (io_s.ok()) {
+    // Rename on the target directly, so that this file system does not track
+    // the published file.
+    io_s = fs_->target()->RenameFile(atomic_temp_name_, state_.filename_,
+                                     options, dbg);
+  }
+  state_.buffer_.clear();
+  if (io_s.ok()) {
+    // Forget the crash state of an older file with this name, so that a
+    // simulated crash does not delete or revert the published file.
+    fs_->UntrackFile(state_.filename_);
+  } else {
+    DiscardAtomicFile();
+  }
+  return io_s;
+}
+
+void TestFSWritableFile::DiscardAtomicFile() {
+  assert(atomic_replace_);
+  state_.buffer_.clear();
+  // Cleanup after a failure or without a Close(). The file is not published
+  // either way, so the status of the cleanup does not matter.
+  if (target_open_) {
+    target_open_ = false;
+    target_->Close(IOOptions(), nullptr).PermitUncheckedError();
+  }
+  fs_->target()
+      ->DeleteFile(atomic_temp_name_, IOOptions(), nullptr)
+      .PermitUncheckedError();
 }
 
 IOStatus TestFSWritableFile::Flush(const IOOptions&, IODebugContext*) {
@@ -557,6 +641,11 @@ IOStatus TestFSWritableFile::Sync(const IOOptions& options,
   MutexLock l(&mutex_);
   if (!fs_->IsFilesystemActive()) {
     return fs_->GetError();
+  }
+  if (atomic_replace_) {
+    // An atomic-replace file keeps its data in memory until Close(), and a
+    // sync must not publish it (contract property 1 of kAtomicReplaceOnClose).
+    return IOStatus::OK();
   }
   if (target_->use_direct_io()) {
     // For Direct IO mode, we don't buffer anything in TestFSWritableFile.
@@ -578,6 +667,10 @@ IOStatus TestFSWritableFile::RangeSync(uint64_t offset, uint64_t nbytes,
   MutexLock l(&mutex_);
   if (!fs_->IsFilesystemActive()) {
     return fs_->GetError();
+  }
+  if (atomic_replace_) {
+    // See Sync().
+    return IOStatus::OK();
   }
   // Assumes caller passes consecutive byte ranges.
   uint64_t sync_limit = offset + nbytes;
@@ -1130,6 +1223,10 @@ IOStatus FaultInjectionTestFS::NewWritableFile(
     return GetError();
   }
 
+  if (IsAtomicReplaceFile(fname)) {
+    return NewAtomicReplaceFile(fname, file_opts, result, dbg);
+  }
+
   if (IsFilesystemDirectWritable()) {
     return target()->NewWritableFile(fname, file_opts, result, dbg);
   }
@@ -1163,6 +1260,51 @@ IOStatus FaultInjectionTestFS::NewWritableFile(
       // dropping unsynced files.
       list[dir_and_name.second] = kNewFileNoOverwrite;
     }
+  }
+  return io_s;
+}
+
+bool FaultInjectionTestFS::IsAtomicReplaceFile(const std::string& fname) {
+  if (!AtomicReplaceOnClose()) {
+    return false;
+  }
+  uint64_t number = 0;
+  FileType type;
+  if (!ParseFileName(TestFSGetDirAndName(fname).second, &number, &type)) {
+    return false;
+  }
+  return type == kCurrentFile || type == kIdentityFile || type == kOptionsFile;
+}
+
+bool FaultInjectionTestFS::InjectCloseErrorAfterPublish() {
+  ErrorContext* ctx = GetErrorContextFromFaultInjectionIOType(
+      FaultInjectionIOType::kMetadataWrite);
+  return ctx != nullptr && ctx->rand.OneIn(2);
+}
+
+IOStatus FaultInjectionTestFS::NewAtomicReplaceFile(
+    const std::string& fname, const FileOptions& file_opts,
+    std::unique_ptr<FSWritableFile>* result, IODebugContext* dbg) {
+  if (!IsFilesystemDirectWritable()) {
+    IOStatus io_s = MaybeInjectThreadLocalError(
+        FaultInjectionIOType::kWrite, file_opts.io_options, "NewWritableFile",
+        fname, {}, FaultInjectionTestFS::ErrorOperation::kOpen);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+  }
+  auto dir_and_name = TestFSGetDirAndName(fname);
+  const std::string temp_name =
+      dir_and_name.first + "/" + kAtomicTempFilePrefix + dir_and_name.second;
+  // Close() writes the whole content with one append, which may not be
+  // aligned for direct IO.
+  FileOptions temp_opts(file_opts);
+  temp_opts.use_direct_writes = false;
+  IOStatus io_s = target()->NewWritableFile(temp_name, temp_opts, result, dbg);
+  if (io_s.ok()) {
+    result->reset(new TestFSWritableFile(fname, file_opts, std::move(*result),
+                                         this, /*reopened_for_write=*/false,
+                                         temp_name));
   }
   return io_s;
 }

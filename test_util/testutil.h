@@ -551,6 +551,90 @@ class SeqStringSource : public FSSequentialFile {
   std::atomic<int>* read_count_;
 };
 
+// FileSystem for tests that sets FSSupportedOps::kAtomicReplaceOnClose and
+// keeps its contract for the small files that RocksDB writes with
+// AtomicFileWriter (file/file_util.h): CURRENT, IDENTITY, OPTIONS-* and
+// *.dbtmp. Without the bit, RocksDB writes these files through a temp file and
+// a rename, and this file system handles that path too. For such a file,
+// appended data stays in memory, and nothing is visible under the file name
+// until Close() returns OK. Close() then writes the content to the target file
+// system. A file that is destroyed before Close() returns OK publishes nothing.
+// Other files go to the target unchanged. Close() does not make the publish
+// crash-safe on the target, so use this file system only in tests without
+// simulated crashes. A failure of the target during Close() can also remove the
+// old file, so tests must not make the target fail.
+//
+// The file system records events in order, as strings with base file names:
+// "create <name>" for a new temp file (*.dbtmp) or MANIFEST file,
+// "rename <src> <dst>", "publish <name>" for a Close() that makes a file
+// visible, "dirsync <name>" for a directory sync whose DirFsyncOptions name a
+// file, and "dirsync" for a directory sync that names no file. It can also
+// fail one step of writing or reading such a file, including the directory
+// sync that names it, or one directory sync that names no file.
+class AtomicReplaceOnCloseFS : public FileSystemWrapper {
+ public:
+  explicit AtomicReplaceOnCloseFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  static const char* kClassName() { return "AtomicReplaceOnCloseFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  void SupportedOps(int64_t& supported_ops) override;
+
+  // Whether SupportedOps() sets kAtomicReplaceOnClose. The default is true.
+  // The file behavior stays the same either way, so a test can compare the
+  // calls that RocksDB makes with and without the bit.
+  void SetBitInSupportedOps(bool set_bit);
+
+  // Makes `step` fail with an IOError for each file whose base name starts
+  // with `file_name_prefix`, for example "CURRENT" or "OPTIONS-". The steps
+  // are "open", "append", "sync" (Sync() or Fsync()) and "close" of a
+  // writable file; "close after publish": Close() publishes the file and then
+  // returns an IOError, like a Close() whose result is lost; "dir sync": a
+  // directory sync whose DirFsyncOptions name the file; and "read" (opening
+  // the file with NewSequentialFile()). An empty `file_name_prefix` makes no
+  // step fail.
+  void SetFailure(const std::string& file_name_prefix, const std::string& step);
+
+  // Makes the next directory sync that names no file return an IOError. Later
+  // directory syncs succeed. For example, a test calls it from a sync point
+  // just before the directory sync that should fail.
+  void FailNextDirSyncWithoutName();
+
+  // Returns the events since the last call.
+  std::vector<std::string> TakeEvents();
+
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override;
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override;
+  IOStatus RenameFile(const std::string& src, const std::string& dst,
+                      const IOOptions& options, IODebugContext* dbg) override;
+  IOStatus NewDirectory(const std::string& name, const IOOptions& io_opts,
+                        std::unique_ptr<FSDirectory>* result,
+                        IODebugContext* dbg) override;
+
+  // Returns an IOError if `step` for `fname` is the injected failure.
+  IOStatus MaybeFail(const std::string& fname, const std::string& step);
+
+  // Returns an IOError once after FailNextDirSyncWithoutName().
+  IOStatus MaybeFailDirSyncWithoutName();
+
+  // Adds `event` to the events.
+  void RecordEvent(const std::string& event);
+
+ private:
+  port::Mutex mutex_;
+  bool set_bit_ = true;
+  std::string fail_file_name_prefix_;
+  std::string fail_step_;
+  bool fail_next_dir_sync_without_name_ = false;
+  std::vector<std::string> events_;
+};
+
 class StringFS : public FileSystemWrapper {
  public:
   class StringSink : public FSWritableFile {
@@ -599,6 +683,13 @@ class StringFS : public FileSystemWrapper {
 
   static const char* kClassName() { return "StringFS"; }
   const char* Name() const override { return kClassName(); }
+
+  // Clears FSSupportedOps::kAtomicReplaceOnClose, because written content is
+  // visible in the string before Close().
+  void SupportedOps(int64_t& supported_ops) override {
+    target()->SupportedOps(supported_ops);
+    supported_ops &= ~(int64_t{1} << FSSupportedOps::kAtomicReplaceOnClose);
+  }
 
   const std::string& GetContent(const std::string& f) { return files_[f]; }
 
