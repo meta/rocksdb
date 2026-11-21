@@ -541,6 +541,8 @@ struct BlockBasedTableOptions {
   // can last until a later census build.
   // A compaction also charges here the lists it uses to check the blob
   // references of its outputs. If that charge fails, the compaction fails.
+  // For a remote compaction, a failed charge of the list of allowed
+  // generation numbers makes the primary run the job locally instead.
   // If such memory usage exceeds the available space left in the block cache
   // at some point (i.e, causing a cache full under
   // `LRUCacheOptions::strict_capacity_limit` = true), the SST build fails with

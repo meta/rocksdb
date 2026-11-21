@@ -1665,6 +1665,17 @@ class Version {
   // write.
   Status ValidateBlobReferenceGeneration(uint64_t generation) const;
 
+  // Like ValidateBlobReferenceGeneration(), and also checks that `origin` fits
+  // the kind of file that the generation number `generation` refers to. A live
+  // normal blob file holds only its own values (origin == generation). A live
+  // relocation file is newer than every origin it holds (origin < generation).
+  // A route's old file number (its key in the Version file table) is either an
+  // old normal blob file (origin == generation, unflattened) or an old
+  // relocation file (origin < generation), so it needs origin <= generation.
+  // Remote compaction uses it for the groups of an output SST before the
+  // primary installs the SST.
+  Status ValidateBlobReferenceGroup(uint64_t generation, uint64_t origin) const;
+
   InternalIterator* TEST_GetLevelIterator(
       const ReadOptions& read_options, MergeIteratorBuilder* merge_iter_builder,
       int level, bool allow_unprepared_value);
