@@ -12,13 +12,19 @@
 
 #include <inttypes.h>
 
+#include <optional>
+
+#include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/builder.h"
 #include "logging/logging.h"
+#include "monitoring/statistics_impl.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 void CompactionOutputs::NewBuilder(const TableBuilderOptions& tboptions) {
   builder_.reset(NewTableBuilder(tboptions, file_writer_.get()));
+  builder_collects_blob_references_ = tboptions.collect_blob_reference_metadata;
 }
 
 Status CompactionOutputs::Finish(
@@ -56,6 +62,14 @@ Status CompactionOutputs::Finish(
     meta->user_defined_timestamps_persisted =
         static_cast<bool>(tp.user_defined_timestamps_persisted);
     ExtractTimestampFromTableProperties(tp, meta);
+    ExtractBlobReferenceDescriptorFromTableProperties(tp, meta);
+    s = ExtractBlobReferenceClassificationFromTableProperties(tp, meta);
+    meta->blob_reference_summary = builder_->GetBlobReferenceSstSummary();
+    if (meta->blob_reference_summary != nullptr &&
+        meta->blob_reference_summary->file_number != meta->fd.GetNumber()) {
+      s = Status::Corruption(
+          "Blob reference summary is for another SST file number");
+    }
   }
   current_output().finished = true;
   stats_.bytes_written += current_bytes;
@@ -64,6 +78,21 @@ Status CompactionOutputs::Finish(
   worker_cpu_micros_ += builder_->GetWorkerCPUMicros();
 
   return s;
+}
+
+Status CompactionOutputs::UpdateTableProperties(
+    const TableProperties& table_properties) {
+  current_output().table_properties =
+      std::make_shared<TableProperties>(table_properties);
+  ExtractBlobReferenceDescriptorFromTableProperties(table_properties,
+                                                    &current_output().meta);
+  return ExtractBlobReferenceClassificationFromTableProperties(
+      table_properties, &current_output().meta);
+}
+
+Status CompactionOutputs::UpdateTableProperties() {
+  TableProperties table_properties = GetTableProperties();
+  return UpdateTableProperties(table_properties);
 }
 
 IOStatus CompactionOutputs::WriterSyncClose(const Status& input_status,
@@ -406,6 +435,27 @@ void CompactionOutputs::PrepareNewOutputForFirstKey(
   }
 }
 
+void CompactionOutputs::NoteBlobReferenceLimitCut(const Slice& next_key) {
+  current_output().closed_by_blob_reference_limit = true;
+  const ImmutableOptions& ioptions = compaction_->immutable_options();
+  RecordTick(ioptions.stats, COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS);
+  ROCKS_LOG_INFO(
+      ioptions.info_log,
+      "[%s] Compaction output table builder requested a new table before "
+      "key %s for file #%" PRIu64 ". reason: %s",
+      compaction_->column_family_data()->GetName().c_str(),
+      ioptions.allow_data_in_errors ? next_key.ToString(/*hex=*/true).c_str()
+                                    : "hidden",
+      current_output().meta.fd.GetNumber(),
+      TableBuilderNewTableReasonToString(
+          TableBuilderNewTableReason::kBlobReferenceLimit));
+}
+
+const BlobIndex* CompactionOutputs::DecodeOutputBlobIndex(const Slice& value) {
+  return output_blob_index_.DecodeFrom(value).ok() ? &output_blob_index_
+                                                   : nullptr;
+}
+
 Status CompactionOutputs::AddToOutput(
     CompactionIterator& c_iter, const CompactionFileOpenFunc& open_file_func,
     const CompactionFileCloseFunc& close_file_func,
@@ -428,6 +478,19 @@ Status CompactionOutputs::AddToOutput(
     cut_before = true;
   } else {
     cut_before = ShouldStopBefore(c_iter) && HasBuilder();
+    // An output is full when it holds blob_indirection_max_references_per_sst
+    // references. A full output takes no new user key, so the history of one
+    // user key (all its kept versions) is never split. An output may pass the
+    // limit by one key's history.
+    if (!cut_before && builder_collects_blob_references_ && HasBuilder() &&
+        builder_->BlobReferenceLimitReached() &&
+        !LargestUserKeyEquals(c_iter.user_key())) {
+      // The LargestUserKeyEquals() check above keeps the versions of one user
+      // key in one file. Version::Get() in L0 depends on it: it stops at the
+      // first file that holds the key.
+      NoteBlobReferenceLimitCut(c_iter.key());
+      cut_before = true;
+    }
   }
   if (cut_before) {
     const Slice next_table_min_key = c_iter.key();
@@ -479,6 +542,15 @@ Status CompactionOutputs::AddToOutput(
 
   assert(builder_ != nullptr);
   const Slice& value = c_iter.value();
+  // Decode a kTypeBlobIndex value once, and share the decode with the table
+  // builder, the blob garbage meter and the file metadata update below. If the
+  // decode fails, each of them decodes again and reports the error as usual.
+  // Other keys do no extra work: DecodeOutputBlobIndex() is out of line and
+  // builds no BlobIndex on this path.
+  const BlobIndex* shared_blob_index = nullptr;
+  if (c_iter.ikey().type == kTypeBlobIndex) {
+    shared_blob_index = DecodeOutputBlobIndex(value);
+  }
   bool retried_after_new_table = false;
   while (true) {
     s = current_output().validator.CanAdd(key);
@@ -487,6 +559,7 @@ Status CompactionOutputs::AddToOutput(
     }
 
     TableBuilderAddContext add_context;
+    add_context.decoded_blob_index = shared_blob_index;
     const TableBuilderAddResult add_result =
         builder_->TryAdd(key, value, &add_context);
 
@@ -580,7 +653,7 @@ Status CompactionOutputs::AddToOutput(
   current_output_file_size_ = builder_->EstimatedFileSize();
 
   if (blob_garbage_meter_) {
-    s = blob_garbage_meter_->ProcessOutFlow(key, value);
+    s = blob_garbage_meter_->ProcessOutFlow(key, value, shared_blob_index);
   }
 
   if (!s.ok()) {
@@ -594,7 +667,7 @@ Status CompactionOutputs::AddToOutput(
         std::min(smallest_preferred_seqno_, preferred_seqno);
   }
   s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
-                                             ikey.type);
+                                             ikey.type, shared_blob_index);
 
   return s;
 }

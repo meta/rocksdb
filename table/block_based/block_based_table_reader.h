@@ -9,13 +9,16 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
 #include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_gen2_format.h"
 #include "db/blob/same_file_blob_reader.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/seqno_to_time_mapping.h"
@@ -228,7 +231,21 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   // by the embedded blob stats property.
   bool HasEmbeddedBlobRecords() const;
 
-  // Reads a single same-file blob record referenced by `blob_index`.
+  // Removes one user-collected property from this reader's table properties, to
+  // save memory when the caller keeps a decoded copy. It replaces the shared
+  // properties object with a copy, so call it right after open, before the
+  // reader is shared. Debug builds assert that no read has started. No-op when
+  // the property is not present.
+  void DropUserCollectedProperty(const std::string& name);
+
+  // Remembers that a read has started, in debug builds only, so that
+  // DropUserCollectedProperty() can assert that it runs before any read. The
+  // read entry points call it. Release builds do nothing.
+  void MarkReadStarted() const;
+
+  // Reads a single same-file blob record referenced by `blob_index` and copies
+  // the value into `value`. Decompresses it when the index says it is
+  // compressed. Incomplete for a kBlockCacheTier read.
   Status ResolveEmbeddedBlob(const ReadOptions& read_options,
                              const BlobIndex& blob_index,
                              std::string* value) const;
@@ -236,9 +253,24 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   // Like ResolveEmbeddedBlob, but reads the payload into a heap buffer owned by
   // `value` (via a registered cleanup) and pins it, avoiding a copy. Use on the
   // Get()/MultiGet() path so the resolved value can be pinned into the output.
+  // Decompresses into a new buffer when the index says it is compressed.
   Status ResolveEmbeddedBlobPinned(const ReadOptions& read_options,
                                    const BlobIndex& blob_index,
                                    PinnableSlice* value) const;
+
+  // Takes the stored payload in `stored` and returns the value in `*contents`:
+  // `stored` itself when uncompressed (the trailer stays unused at its end),
+  // else a new buffer from `allocator` with the decompressed value.
+  Status DecompressEmbeddedBlob(CacheAllocationPtr stored, size_t payload_size,
+                                CompressionType compression,
+                                MemoryAllocator* allocator,
+                                std::unique_ptr<BlobContents>* contents) const;
+
+  // DecompressEmbeddedBlob, then pins the whole value into `value`.
+  Status DecompressAndPinEmbeddedBlob(CacheAllocationPtr stored,
+                                      size_t payload_size,
+                                      CompressionType compression,
+                                      PinnableSlice* value) const;
 
   // Like ResolveEmbeddedBlobPinned, but routes the read through the CFD's
   // BlobSource so the payload is served from / inserted into the blob value
@@ -255,9 +287,8 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   // [range_offset, range_offset + range_length) of an uncompressed same-file
   // payload (skipping the trailer + checksum verification, and never inserting
   // into the blob cache). The caller must ensure range_offset + range_length <=
-  // blob_index.size(). Requires a BlobSource (rep_->blob_source_ != nullptr):
-  // byte-range embedded reads are only issued on the lazy read path, which
-  // always has one, so there is no direct-pinned range variant.
+  // blob_index.size(). Requires a BlobSource (rep_->blob_source_ != nullptr);
+  // readers without one use ReadSimpleGen2BlobRange in GetSameFileBlob.
   Status ResolveEmbeddedBlobRangeCached(const ReadOptions& read_options,
                                         const BlobIndex& blob_index,
                                         uint64_t range_offset,
@@ -266,22 +297,133 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
 
   // SameFileBlobReader: resolve a same-file blob reference (whole value or a
   // sub-range) for GetContext's zero-copy wide-column resolution on the
-  // Get()/MultiGet() path and for the lazy read path. A whole-value read routes
-  // through the blob cache (ResolveEmbeddedBlobCached) when a BlobSource is
-  // wired, else a direct pinned read (ResolveEmbeddedBlobPinned); a sub-range
-  // read routes through ResolveEmbeddedBlobRangeCached (requires a BlobSource).
+  // Get()/MultiGet() path and for the lazy read path. Cases:
+  // - Whole value: through the blob cache (ResolveEmbeddedBlobCached) when a
+  //   BlobSource is wired, else a direct pinned read
+  //   (ResolveEmbeddedBlobPinned).
+  // - Uncompressed range with a BlobSource: ResolveEmbeddedBlobRangeCached.
+  // - Uncompressed range without a BlobSource: a raw ReadSimpleGen2BlobRange,
+  //   no checksum, no cache.
+  // - Compressed range: returns Corruption, as in base RocksDB. A byte range of
+  //   a compressed record cannot be decompressed alone, so callers read the
+  //   whole value and slice it.
   // See BlobVerifyPolicy / kWholeBlobLength for the range + verify semantics.
   Status GetSameFileBlob(const ReadOptions& read_options,
                          const BlobIndex& blob_index, uint64_t range_offset,
                          size_t range_length, BlobVerifyPolicy verify_policy,
                          PinnableSlice* value) const override;
 
-  // Batched counterpart of GetSameFileBlob: coalesces the cache-miss reads of
-  // multiple embedded (same-file) records in this SST into a single MultiRead
-  // (one for whole records, one for sub-ranges). Force-verify reads
-  // (kVerifyIfPresent) fall back to per-record GetSameFileBlob.
+  // Batched counterpart of GetSameFileBlob.
+  // - With a BlobSource (DB-owned SSTs): forced-verify requests
+  //   (kVerifyIfPresent) take the scalar GetSameFileBlob path. The other whole
+  //   records and uncompressed sub-ranges go to BlobSource's batched reads,
+  //   which use the blob cache.
+  // - Without a BlobSource (standalone readers, such as relocation tables):
+  //   whole records are read in at most two batches, one with the caller's
+  //   checksum setting and one with forced verification. Uncompressed ranges
+  //   are read raw, without a checksum check, and a range is never turned into
+  //   a whole read. Callers send only strict parts of a value (see
+  //   ReadPathBlobResolver::ResolveColumnRange). A kBlockCacheTier read returns
+  //   Incomplete.
+  // In both cases a compressed range fails with Corruption, as in
+  // GetSameFileBlob(), before any other check (also for a kBlockCacheTier
+  // read).
   void MultiGetSameFileBlob(const ReadOptions& read_options, size_t num_reads,
                             SameFileBlobReadRequest* reqs) const override;
+
+  // Raw lookups of `num_keys` internal keys, for relocation tables. The keys
+  // must be sorted. The caller (BlobRelocationFileReader) checks the
+  // entries. For each key, calls `on_entry(i, status, internal_key, value)`
+  // with one of:
+  // - the entry that DataBlockIter::SeekForGet finds in the key's data block
+  //   (without a data block hash index, the first entry at or after keys[i]);
+  // - NotFound, when the key is past the last entry or SeekForGet finds no
+  //   entry;
+  // - the error of the index or of the key's data block.
+  // The data blocks are first looked up in the block cache. The missing blocks
+  // are read with one read (a batched read when more than one block is missing)
+  // and inserted into the block cache, like the normal block read path. Keys in
+  // the same block share it. Values are raw: same-file blob indexes are not
+  // resolved. Requires num_keys <= MultiGetContext::MAX_BATCH_SIZE. `on_entry`
+  // is called through a plain function pointer, so a capturing lambda needs no
+  // heap allocation.
+  template <typename OnEntry>
+  void MultiGetRawEntries(const ReadOptions& read_options, size_t num_keys,
+                          const Slice* keys, const OnEntry& on_entry) const {
+    MultiGetRawEntriesImpl(
+        read_options, num_keys, keys,
+        [](const void* arg, size_t key_index, const Status& status,
+           const Slice& internal_key, const Slice& value) {
+          (*static_cast<const OnEntry*>(arg))(key_index, status, internal_key,
+                                              value);
+        },
+        &on_entry);
+  }
+
+  // Like MultiGetSameFileBlob(), but used only by indirect blob GC: it returns
+  // the exact stored bytes. It checks the stored CRC and, unless the file uses
+  // kNoChecksum, the record checksum. It reads whole records with
+  // ReadCoalescedRanges() (gap `coalesce_bytes`, one read at most
+  // `max_stored_bytes`). Payloads point into `buffers`. Requests past
+  // `max_stored_bytes` of total stored bytes get MemoryLimit. A request past
+  // the buffer limit (see ReadCoalescedRanges()) is not read and gets
+  // Status::Incomplete. The caller retries it later.
+  void MultiGetStoredSameFileBlob(const ReadOptions& read_options,
+                                  uint64_t coalesce_bytes, size_t num_reads,
+                                  StoredSameFileBlobReadRequest* reqs,
+                                  uint64_t max_stored_bytes,
+                                  CoalescedReadBuffers* buffers,
+                                  uint64_t* bytes_read) const;
+  Status StreamStoredSameFileBlob(const ReadOptions& read_options,
+                                  const BlobIndex& blob_index,
+                                  uint32_t stored_checksum,
+                                  const BlobChunkConsumer& consumer) const;
+
+  // Every data block of a table, read once and held in memory, with the last
+  // user key of each block. The relocation file reader keeps one when
+  // pin_blob_relocation_location_blocks is on, so its lookups need no index
+  // or block cache lookup (see PinDataBlocks() and MultiGetRawEntriesPinned()).
+  struct PinnedDataBlocks {
+    // The index key of each block. Relocation tables use no index key
+    // shortening, so it is the user key of the block's last entry.
+    std::vector<std::string> last_user_keys;
+    // Each block, held through its block cache handle (so it is charged to
+    // the block cache and not evicted), or owned when the table has no block
+    // cache. With allow_mmap_reads and no compression, a block points into the
+    // memory-mapped file instead.
+    std::vector<CachableEntry<Block_kData>> blocks;
+    // The memory that the blocks use.
+    size_t memory_bytes = 0;
+  };
+
+  // Reads every data block of this table into `*pinned`. With a block cache,
+  // each block is held through its cache handle. `read_options` gives only
+  // the I/O settings: the blocks are always read and charged, with no time
+  // limit (see the comment in the function). Returns the error of a failed
+  // block read or block cache insert (for example MemoryLimit with
+  // strict_capacity_limit), and Incomplete if the block cache did not take a
+  // block that owns its bytes. On an error, the caller drops `*pinned` and
+  // uses MultiGetRawEntries() instead.
+  Status PinDataBlocks(const ReadOptions& read_options,
+                       PinnedDataBlocks* pinned) const;
+
+  // MultiGetRawEntries() over the blocks in `pinned`: a binary search over the
+  // last keys finds the block of each key, and a seek in that block finds the
+  // entry. It does no index lookup, block cache lookup or I/O. The keys must
+  // be sorted, and the results are the same as MultiGetRawEntries().
+  template <typename OnEntry>
+  void MultiGetRawEntriesPinned(const PinnedDataBlocks& pinned, size_t num_keys,
+                                const Slice* keys,
+                                const OnEntry& on_entry) const {
+    MultiGetRawEntriesPinnedImpl(
+        pinned, num_keys, keys,
+        [](const void* arg, size_t key_index, const Status& status,
+           const Slice& internal_key, const Slice& value) {
+          (*static_cast<const OnEntry*>(arg))(key_index, status, internal_key,
+                                              value);
+        },
+        &on_entry);
+  }
 
   // If `value` is a same-file BlobIndex, materializes the referenced payload
   // and updates `resolved_internal_key` to the corresponding value type. Leaves
@@ -391,6 +533,15 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   void SetupForCompaction() override;
 
   std::shared_ptr<const TableProperties> GetTableProperties() const override;
+
+  Status ReadBlobReferenceGroups(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const std::function<Status(size_t buffer_bytes)>& before_allocation,
+      std::vector<BlobReferenceGroup>* groups) const override;
+  Status ReadBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const std::function<Status(size_t index_bytes)>& after_index_read,
+      std::vector<BlobReferenceGroupRead>* requests) const override;
 
   const SeqnoToTimeMapping& GetSeqnoToTimeMapping() const;
 
@@ -544,6 +695,32 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
   void operator=(const TableReader&) = delete;
 
  private:
+  // MultiGetRawEntries calls `on_entry(on_entry_arg, ...)` for each key.
+  using RawEntryCallback = void (*)(const void* arg, size_t key_index,
+                                    const Status& status,
+                                    const Slice& internal_key,
+                                    const Slice& value);
+  void MultiGetRawEntriesImpl(const ReadOptions& read_options, size_t num_keys,
+                              const Slice* keys, RawEntryCallback on_entry,
+                              const void* on_entry_arg) const;
+  // Reads the data blocks `handles` (at most MultiGetContext::MAX_BATCH_SIZE)
+  // into `blocks`, with one status per block in `statuses`. Each block is
+  // looked up in the block cache first. Two or more missing blocks are read
+  // with one batched read (RetrieveMultipleBlocks()); one missing block takes
+  // the normal block read path. With allow_mmap_reads, RetrieveMultipleBlocks()
+  // reads the blocks one at a time. A kBlockCacheTier read fails a missing
+  // block with Incomplete. If the compression dictionary cannot be read, every
+  // block gets that error. MultiGetRawEntries() and PinDataBlocks() use it.
+  void RetrieveDataBlocks(
+      const ReadOptions& read_options,
+      const autovector<BlockHandle, MultiGetContext::MAX_BATCH_SIZE>& handles,
+      BlockCacheLookupContext* lookup_context,
+      CachableEntry<Block_kData>* blocks, Status* statuses) const;
+  void MultiGetRawEntriesPinnedImpl(const PinnedDataBlocks& pinned,
+                                    size_t num_keys, const Slice* keys,
+                                    RawEntryCallback on_entry,
+                                    const void* on_entry_arg) const;
+
   friend class MockedBlockBasedTable;
   friend class BlockBasedTableReaderTestVerifyChecksum_ChecksumMismatch_Test;
   BlockCacheTracer* const block_cache_tracer_;
@@ -558,7 +735,6 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
                                     size_t compaction_readahead_size,
                                     bool allow_unprepared_value,
                                     const Slice* seek_target);
-
   void UpdateCacheHitMetrics(BlockType block_type, GetContext* get_context,
                              size_t usage) const;
   void UpdateCacheMissMetrics(BlockType block_type,
@@ -912,6 +1088,11 @@ struct BlockBasedTable::Rep {
   bool index_key_includes_seq = true;
   bool index_value_is_full = true;
 
+#ifndef NDEBUG
+  // Debug only: set by the first read (see BlockBasedTable::MarkReadStarted()).
+  mutable std::atomic<bool> read_started{false};
+#endif  // NDEBUG
+
   // Restart intervals read from table properties (0 if not available)
   uint32_t data_block_restart_interval = 0;
   uint32_t index_block_restart_interval = 0;
@@ -930,6 +1111,9 @@ struct BlockBasedTable::Rep {
   // repair, external-file ingestion prevalidation, etc.); in that case
   // embedded reads fall back to a direct (uncached) read.
   BlobSource* blob_source_ = nullptr;
+  // Decompressor for compressed embedded blob records, created once at open
+  // when the SST has embedded blobs.
+  std::shared_ptr<Decompressor> embedded_blob_decompressor;
 
   // Whether block checksums in metadata blocks were verified on open.
   // This is only to mostly maintain current dubious behavior of VerifyChecksum
@@ -1022,6 +1206,12 @@ struct BlockBasedTable::Rep {
     return usage;
   }
 };
+
+inline void BlockBasedTable::MarkReadStarted() const {
+#ifndef NDEBUG
+  rep_->read_started.store(true, std::memory_order_relaxed);
+#endif  // NDEBUG
+}
 
 // This is an adapter class for `WritableFile` to be used for `std::ostream`.
 // The adapter wraps a `WritableFile`, which can be passed to a `std::ostream`

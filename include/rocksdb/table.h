@@ -529,7 +529,62 @@ struct BlockBasedTableOptions {
   // (iii) Compatible existing behavior:
   // Same as kDisabled.
   //
-  // (f) Other CacheEntryRole
+  // (f) CacheEntryRole::kBlobReferenceMetadataBuildingBuffer
+  // (i) If kEnabled:
+  // Charge memory usage of the buffers that record the blob references of an
+  // SST while the SST is built. The SST stores these references as its exact
+  // blob reference metadata. Only SSTs built with blob indirection (see
+  // `enable_blob_indirection`) use these buffers.
+  // When the SST is finished, the charge of these buffers moves to the
+  // in-memory summary of the SST. The blob reference census keeps that
+  // summary, and so its charge, until it has added the SST to its counts. This
+  // can last until a later census build.
+  // If such memory usage exceeds the available space left in the block cache
+  // at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), the SST build fails with
+  // Status::MemoryLimit(), and so does the job that writes the SST.
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kEnabled.
+  //
+  // (g) CacheEntryRole::kBlobReferenceCensus
+  // (i) If kEnabled:
+  // Charge memory usage of the blob reference census, the in-memory reverse
+  // index from blob files to the SSTs that reference them. The charge covers
+  // the census, its build state, its queued changes, and the SST summaries
+  // that a compaction reads for the census. Only a column family that uses
+  // blob indirection (see `enable_blob_indirection`) has a census.
+  // If such memory usage exceeds the available space left in the block cache
+  // at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), the census is not ready
+  // until a later build succeeds. A failed build is tried again after a
+  // delay. A compaction that cannot charge the summaries of its input SSTs
+  // still runs, and the census is rebuilt after it. No flush, compaction or
+  // write fails because of this charge.
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kEnabled.
+  //
+  // (h) CacheEntryRole::kIndirectBlobGcWorkingMemory
+  // (i) If kEnabled:
+  // Charge memory usage of indirect blob GC jobs. Indirect blob GC is a
+  // background job that copies the live values out of a few blob files with
+  // a lot of garbage (see `enable_blob_indirection`). A job charges the live
+  // references of its input files, its copy of the census entries of these
+  // files, its list of planned SST reads, its SST readers, and its read
+  // buffers.
+  // If such memory usage exceeds the available space left in the block cache
+  // at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), GC skips the files that
+  // it cannot charge and tries them again later. The GC job does not fail.
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kEnabled.
+  //
+  // (i) Other CacheEntryRole
   // Not supported.
   // `Status::kNotSupported` will be returned if
   // `CacheEntryRoleOptions::charged` is set to {`kEnabled`, `kDisabled`}.
