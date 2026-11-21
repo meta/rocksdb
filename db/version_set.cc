@@ -27,6 +27,7 @@
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/file_pri.h"
@@ -61,6 +62,7 @@
 #include "rocksdb/experimental.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/write_buffer_manager.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/compaction_merging_iterator.h"
 #include "table/format.h"
 #include "table/get_context.h"
@@ -2859,6 +2861,10 @@ VersionStorageInfo::VersionStorageInfo(
       offpeak_time_option_(std::move(offpeak_time_option)),
       periodic_compaction_phase_params_(periodic_compaction_phase_params) {
   if (ref_vstorage != nullptr) {
+    blob_relocation_state_fingerprint_high_ =
+        ref_vstorage->blob_relocation_state_fingerprint_high_;
+    blob_relocation_state_fingerprint_low_ =
+        ref_vstorage->blob_relocation_state_fingerprint_low_;
     accumulated_file_size_ = ref_vstorage->accumulated_file_size_;
     accumulated_raw_key_size_ = ref_vstorage->accumulated_raw_key_size_;
     accumulated_raw_value_size_ = ref_vstorage->accumulated_raw_value_size_;
@@ -3006,6 +3012,10 @@ Status Version::ResolveBlobPhysicalFile(const BlobIndex& blob_index,
   // a route target. The reader seeks (origin, original offset), finds the group
   // of values that can hold it, and checks that the group has the same origin
   // and the exact original offset. Otherwise the read fails with Corruption.
+  if (BlobFileTable::IsLost(value)) {
+    // An accepted loss: the file and every old file routed to it are gone.
+    return Status::NotFound("Blob relocation file is marked lost");
+  }
   const BlobRelocationFileMetaData* const relocation =
       BlobFileTable::AsRelocationFile(value);
   *physical_file = relocation->GetAddition().ToPhysicalFile();
@@ -4248,7 +4258,8 @@ void VersionStorageInfo::ComputeCompactionScore(
   ComputeFilesMarkedForForcedBlobGC(
       mutable_cf_options.blob_garbage_collection_age_cutoff,
       mutable_cf_options.blob_garbage_collection_force_threshold,
-      mutable_cf_options.enable_blob_garbage_collection);
+      mutable_cf_options.enable_blob_garbage_collection,
+      mutable_cf_options.enable_blob_indirection);
   ComputeFilesMarkedForReadTriggeredCompaction(
       mutable_cf_options.read_triggered_compaction_threshold,
       immutable_options.compaction_style);
@@ -4453,100 +4464,10 @@ void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
     double blob_garbage_collection_age_cutoff,
     double blob_garbage_collection_force_threshold,
     bool enable_blob_garbage_collection) {
-  files_marked_for_forced_blob_gc_.clear();
-  if (!(enable_blob_garbage_collection &&
-        blob_garbage_collection_age_cutoff > 0.0 &&
-        blob_garbage_collection_force_threshold < 1.0)) {
-    return;
-  }
-
-  if (blob_files_.empty()) {
-    return;
-  }
-
-  // Number of blob files eligible for GC based on age
-  const size_t cutoff_count = static_cast<size_t>(
-      blob_garbage_collection_age_cutoff * blob_files_.size());
-  if (!cutoff_count) {
-    return;
-  }
-
-  // Compute the sum of total and garbage bytes over the batch of blob files
-  // currently eligible for garbage collection based on
-  // blob_garbage_collection_age_cutoff, and if the garbage ratio exceeds
-  // blob_garbage_collection_force_threshold, schedule compaction for the
-  // SST files that reference the oldest batch of blob files. Here is a toy
-  // example. Let's assume we have three SSTs 1, 2, and 3, and four blob files
-  // 10, 11, 12, and 13, which correspond to the range that is eligible for GC
-  // and satisfy the garbage ratio threshold. Also, let's say SSTs 1 and 2 both
-  // rely on blob file 10 and potentially some higher-numbered ones, while SST 3
-  // relies on blob file 12 and potentially some higher-numbered ones. Then, the
-  // SST to oldest blob file mapping is as follows:
-  //
-  // SST file number               Oldest blob file number
-  // 1                             10
-  // 2                             10
-  // 3                             12
-  //
-  // This is what the same thing looks like from the blob files' POV. (Note that
-  // the linked SSTs simply denote the inverse mapping of the above.)
-  //
-  // Blob file number              Linked SST set
-  // 10                            {1, 2}
-  // 11                            {}
-  // 12                            {3}
-  // 13                            {}
-  //
-  // Then, the oldest batch of blob files consists of blob files 10 and 11,
-  // and we can get rid of them by forcing the compaction of SSTs 1 and 2.
-  const auto& oldest_meta = blob_files_.front();
-  assert(oldest_meta);
-
-  const auto& linked_ssts = oldest_meta->GetLinkedSsts();
-  if (linked_ssts.empty()) {
-    // SST files that reference the oldest blob file are linked to an older,
-    // dropped blob file instead, so the SST files to compact are unknown.
-    assert(!dropped_blob_files_.empty());
-    return;
-  }
-
-  size_t count = 1;
-  uint64_t sum_total_blob_bytes = oldest_meta->GetTotalBlobBytes();
-  uint64_t sum_garbage_blob_bytes = oldest_meta->GetGarbageBlobBytes();
-
-  assert(cutoff_count <= blob_files_.size());
-
-  for (; count < cutoff_count; ++count) {
-    const auto& meta = blob_files_[count];
-    assert(meta);
-
-    sum_total_blob_bytes += meta->GetTotalBlobBytes();
-    sum_garbage_blob_bytes += meta->GetGarbageBlobBytes();
-  }
-
-  if (sum_garbage_blob_bytes <
-      blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
-    return;
-  }
-
-  for (uint64_t sst_file_number : linked_ssts) {
-    const FileLocation location = GetFileLocation(sst_file_number);
-    assert(location.IsValid());
-
-    const int level = location.GetLevel();
-    assert(level >= 0);
-
-    const size_t pos = location.GetPosition();
-
-    FileMetaData* const sst_meta = files_[level][pos];
-    assert(sst_meta);
-
-    if (sst_meta->being_compacted) {
-      continue;
-    }
-
-    files_marked_for_forced_blob_gc_.emplace_back(level, sst_meta);
-  }
+  ComputeFilesMarkedForForcedBlobGC(blob_garbage_collection_age_cutoff,
+                                    blob_garbage_collection_force_threshold,
+                                    enable_blob_garbage_collection,
+                                    /*enable_blob_indirection=*/false);
 }
 
 void VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction(
@@ -5090,6 +5011,13 @@ void VersionStorageInfo::GenerateBottommostFiles() {
 
 void VersionStorageInfo::GenerateFileLocationIndex() {
   size_t num_files = 0;
+  // Also compute the smallest coarse frontier (the oldest indirect-origin file
+  // number a coarse SST may reference) over all SSTs. A coarse SST can use any
+  // generation number at or above its frontier, so the census treats every
+  // indirect origin at or above the smallest frontier as in use (pinned). This
+  // SST walk already runs outside the DB mutex, so the census reads the result
+  // without scanning the SSTs under the mutex.
+  oldest_coarse_indirect_origin_file_number_ = kInvalidBlobFileNumber;
 
   for (int level = 0; level < num_levels_; ++level) {
     num_files += files_[level].size();
@@ -5103,6 +5031,13 @@ void VersionStorageInfo::GenerateFileLocationIndex() {
       assert(meta);
 
       const uint64_t file_number = meta->fd.GetNumber();
+      const uint64_t frontier = meta->oldest_coarse_indirect_origin_file_number;
+      if (frontier != kInvalidBlobFileNumber &&
+          (oldest_coarse_indirect_origin_file_number_ ==
+               kInvalidBlobFileNumber ||
+           frontier < oldest_coarse_indirect_origin_file_number_)) {
+        oldest_coarse_indirect_origin_file_number_ = frontier;
+      }
 
       assert(file_locations_.find(file_number) == file_locations_.end());
       file_locations_.emplace(file_number, FileLocation(level, pos));
@@ -5237,6 +5172,19 @@ bool Version::Unref() {
     return true;
   }
   return false;
+}
+
+void Version::UnrefAndFreeBlobRelocationState(InstrumentedMutex* mu) {
+  assert(mu != nullptr);
+  mu->AssertHeld();
+  assert(refs_ >= 1);
+  std::vector<std::shared_ptr<void>> holders;
+  if (refs_ == 1) {
+    holders.push_back(storage_info_.ReleaseBlobRelocationState());
+  }
+  Unref();
+  VersionSet::FreeBlobRelocationState(
+      &holders, mu, "Version::UnrefAndFreeBlobRelocationState:Unlocked");
 }
 
 bool VersionStorageInfo::OverlapInLevel(int level,
@@ -5836,6 +5784,12 @@ uint64_t VersionStorageInfo::EstimateLiveDataSize() const {
     size += meta->GetTotalBlobBytes();
     size -= meta->GetGarbageBlobBytes();
   }
+  // Relocation files: add the full file size and subtract the garbage record
+  // bytes from the census. Only record bytes are subtracted, so the file
+  // metadata counts as live. The census garbage is a lower bound, and it is 0
+  // until the census publishes it for this Version.
+  size += BlobRelocationStateForRead().PhysicalFileBytes();
+  size -= blob_relocation_garbage_bytes_.load(std::memory_order_relaxed);
 
   return size;
 }
@@ -6521,6 +6475,303 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
   v->next_->prev_ = v;
 }
 
+struct VersionSet::BlobReferenceCensusInstallBatch {
+  // One entry per new Version: the reservation from
+  // BlobReferenceCensus::BeginInstallPreparation(), or 0 if the Version needs
+  // no install. Empty if no Version of the batch needs one.
+  std::vector<uint64_t> reservations;
+  // The column family of each entry of `reservations`.
+  std::vector<ColumnFamilyData*> reservation_cfds;
+  // One prepared install per new Version (step 2).
+  std::vector<BlobReferenceCensusPreparedInstall> installs;
+  // The old census states that the installs replaced (step 3).
+  std::vector<BlobReferenceCensusGarbage> obsolete_garbage;
+  // The census state of a dropped column family.
+  BlobReferenceCensusGarbage dropped_garbage;
+};
+
+void VersionSet::ReserveBlobReferenceCensusInstalls(
+    const autovector<Version*>& versions, uint32_t pending_format_version,
+    BlobReferenceCensusInstallBatch* batch) const {
+  assert(batch != nullptr);
+  const auto needs_census_for_version =
+      [pending_format_version](Version* version) {
+        return version->cfd()
+                   ->current()
+                   ->storage_info()
+                   ->HasBlobIndirectionFormat() ||
+               (pending_format_version != 0 &&
+                version->GetMutableCFOptions().enable_blob_indirection);
+      };
+  bool needs_census_install = false;
+  if (pending_format_version != 0) {
+    for (Version* version : versions) {
+      if (needs_census_for_version(version)) {
+        needs_census_install = true;
+        break;
+      }
+    }
+  }
+  if (needs_census_install) {
+    // Reserve a census install for each new Version that needs one
+    // (BeginInstallPreparation() is O(1)). Other Versions get reservation 0.
+    batch->reservations.reserve(versions.size());
+    batch->reservation_cfds.reserve(versions.size());
+    for (Version* version : versions) {
+      ColumnFamilyData* cfd = version->cfd();
+      batch->reservation_cfds.push_back(cfd);
+      if (needs_census_for_version(version)) {
+        batch->reservations.push_back(
+            cfd->GetOrCreateBlobReferenceCensus()->BeginInstallPreparation());
+      } else {
+        batch->reservations.push_back(0);
+      }
+    }
+  }
+}
+
+Status VersionSet::BuildBlobReferenceCensusDelta(
+    const autovector<VersionEdit*>& batch_edits, Version* version,
+    std::shared_ptr<BlobReferenceCensusDelta>* delta) const {
+  assert(version != nullptr);
+  assert(delta != nullptr);
+  ColumnFamilyData* const cfd = version->cfd();
+  assert(cfd != nullptr);
+  *delta = std::make_shared<BlobReferenceCensusDelta>();
+  (*delta)->base_version_number = cfd->current()->GetVersionNumber();
+  (*delta)->version_number = version->GetVersionNumber();
+  (*delta)->forward_state = version->storage_info()->GetBlobRelocationState();
+  (*delta)->coarse_indirect_origin_frontier =
+      version->storage_info()->OldestCoarseIndirectOriginFileNumber();
+
+  std::map<uint64_t, const FileMetaData*> added_files;
+  std::set<uint64_t> removed_files;
+  std::map<uint64_t, std::shared_ptr<const BlobReferenceSstSummary>>
+      deleted_summaries;
+  std::set<uint64_t> changed_routes;
+  std::set<uint64_t> changed_physical_files;
+  changed_physical_files.insert(
+      version->storage_info()->RemovedBlobFiles().begin(),
+      version->storage_info()->RemovedBlobFiles().end());
+  for (const VersionEdit* edit : batch_edits) {
+    if (edit->GetColumnFamily() != cfd->GetID()) {
+      continue;
+    }
+    for (const BlobRelocationRoute& route : edit->GetBlobRelocationRoutes()) {
+      changed_routes.insert(route.GetOldFileNumber());
+    }
+    for (uint64_t source : edit->GetBlobRelocationRouteDeletions()) {
+      changed_routes.insert(source);
+    }
+    for (const BlobRelocationFileAddition& file :
+         edit->GetBlobRelocationFileAdditions()) {
+      changed_physical_files.insert(file.GetFileNumber());
+    }
+    for (uint64_t file_number : edit->GetBlobRelocationFileDeletions()) {
+      changed_physical_files.insert(file_number);
+    }
+    for (uint64_t file_number : edit->GetBlobPhysicalFileLosses()) {
+      changed_physical_files.insert(file_number);
+    }
+    for (const BlobFileAddition& file : edit->GetBlobFileAdditions()) {
+      changed_physical_files.insert(file.GetBlobFileNumber());
+    }
+    for (const BlobFileGarbage& file : edit->GetBlobFileGarbages()) {
+      changed_physical_files.insert(file.GetBlobFileNumber());
+    }
+    for (uint64_t file_number : edit->GetBlobFileRetirements()) {
+      changed_physical_files.insert(file_number);
+    }
+    for (const std::shared_ptr<const BlobReferenceSstSummary>& summary :
+         edit->GetBlobReferenceSummariesOfDeletedFiles()) {
+      if (summary != nullptr) {
+        deleted_summaries.emplace(summary->file_number, summary);
+      }
+    }
+    for (const auto& deletion : edit->GetDeletedFiles()) {
+      const uint64_t file_number = deletion.second;
+      if (added_files.erase(file_number) != 0) {
+        continue;
+      }
+      removed_files.insert(file_number);
+    }
+    for (const auto& addition : edit->GetNewFiles()) {
+      const FileMetaData& file = addition.second;
+      const uint64_t file_number = file.fd.GetNumber();
+      if (removed_files.erase(file_number) != 0) {
+        // A trivial move deletes and re-adds the same physical SST at a
+        // different level. The SST keeps the same references, so the census
+        // does not change.
+        continue;
+      }
+      if (!added_files.emplace(file_number, &file).second) {
+        return Status::Corruption(
+            "Duplicate SST addition in blob reference census delta");
+      }
+    }
+  }
+
+  (*delta)->removed_files.assign(removed_files.begin(), removed_files.end());
+  // To remove an exact SST, the delta needs the SST's reference summary
+  // from the edit (GetBlobReferenceSummariesOfDeletedFiles()). Every change,
+  // also a full compaction, is applied as a delta. If a removed exact SST has
+  // no summary there (for example, the compaction could not read it, or
+  // DeleteFilesInRange removed it), the census is rebuilt on the new
+  // Version instead. So a missing summary never fails the commit.
+  const VersionStorageInfo* const base_storage = cfd->current()->storage_info();
+  (*delta)->removed_summaries.reserve(removed_files.size());
+  for (uint64_t file_number : removed_files) {
+    if ((*delta)->rebuild) {
+      break;
+    }
+    const auto summary = deleted_summaries.find(file_number);
+    if (summary != deleted_summaries.end()) {
+      (*delta)->removed_summaries.push_back(summary->second);
+      continue;
+    }
+    const FileMetaData* const file =
+        base_storage->GetFileMetaDataByNumber(file_number);
+    if (file == nullptr || !file->blob_reference_descriptor.empty()) {
+      TEST_SYNC_POINT_CALLBACK(
+          "VersionSet::ProcessManifestWrites:CensusRemovalWithoutGroups",
+          &file_number);
+      (*delta)->rebuild = true;
+    }
+  }
+  (*delta)->changed_routes.assign(changed_routes.begin(), changed_routes.end());
+  (*delta)->changed_physical_files.assign(changed_physical_files.begin(),
+                                          changed_physical_files.end());
+  const std::shared_ptr<const BlobRelocationState> base_forward_state =
+      cfd->current()->storage_info()->GetBlobRelocationState();
+  if ((*delta)->forward_state != nullptr &&
+      (*delta)->forward_state != base_forward_state) {
+    const BlobRelocationState empty;
+    (*delta)->retained_forward_state_bytes =
+        (*delta)->forward_state->IncrementalRetentionBytes(
+            base_forward_state != nullptr ? *base_forward_state : empty,
+            (*delta)->changed_physical_files);
+  }
+  (*delta)->physical_files.reserve(changed_physical_files.size());
+  for (uint64_t file_number : changed_physical_files) {
+    BlobGcPhysicalFileSummary summary;
+    summary.file_number = file_number;
+    const std::shared_ptr<BlobFileMetaData> normal =
+        version->storage_info()->GetBlobFileMetaData(file_number);
+    if (normal != nullptr && normal->IsIndirectOrigin()) {
+      summary.total_record_bytes = normal->GetTotalBlobBytes();
+      summary.is_indirect_origin = true;
+    } else {
+      const std::shared_ptr<BlobRelocationFileMetaData> relocated =
+          version->storage_info()->GetBlobRelocationFileMetaData(file_number);
+      if (relocated != nullptr) {
+        summary.total_record_bytes = relocated->GetTotalRecordBytes();
+        summary.is_lost = relocated->IsMarkedLost();
+      }
+    }
+    (*delta)->physical_files.push_back(summary);
+  }
+  for (const auto& addition : added_files) {
+    const FileMetaData& file = *addition.second;
+    if (file.blob_reference_descriptor.empty()) {
+      if (version->storage_info()->HasBlobIndirectionFormat() &&
+          !file.blob_reference_legacy_metadata &&
+          file.oldest_coarse_indirect_origin_file_number ==
+              kInvalidBlobFileNumber) {
+        return Status::Corruption(
+            "An SST added to a fenced column family has no exact blob "
+            "reference metadata, legacy marker or coarse frontier");
+      }
+      continue;
+    }
+    if (file.blob_reference_summary == nullptr) {
+      // Flush and compaction prepare the summary of a new exact SST before they
+      // queue the edit. Recovered SSTs do not come here, ingestion into a
+      // fenced CF is rejected, and RepairDB rejects a DB that uses the format.
+      // So a missing summary is a bug. The SST has its reference metadata on
+      // disk, so the commit goes ahead and the census is rebuilt from disk.
+      // Indirect blob GC waits for the rebuild.
+#ifndef NDEBUG
+      // Debug builds stop here; a test sets `expected` to check the
+      // release behavior below.
+      bool expected = false;
+      TEST_SYNC_POINT_CALLBACK(
+          "VersionSet::ProcessManifestWrites:CensusAdditionWithoutSummary",
+          &expected);
+      assert(expected);
+#endif  // NDEBUG
+      ROCKS_LOG_ERROR(db_options_->info_log,
+                      "New exact SST has no prepared blob reference "
+                      "summary; the blob reference census is rebuilt. "
+                      "CF %s, SST #%" PRIu64,
+                      cfd->GetName().c_str(), addition.first);
+      cfd->blob_reference_census()->NoteMissingSummaryRebuild();
+      (*delta)->rebuild = true;
+      continue;
+    }
+    (*delta)->added_files.emplace_back(file.blob_reference_summary);
+  }
+  if ((*delta)->rebuild) {
+    (*delta)->removed_summaries.clear();
+  }
+
+  return Status::OK();
+}
+
+Status VersionSet::PrepareBlobReferenceCensusInstalls(
+    const autovector<VersionEdit*>& batch_edits,
+    const autovector<Version*>& versions,
+    BlobReferenceCensusInstallBatch* batch) const {
+  assert(batch != nullptr);
+  if (batch->reservations.empty()) {
+    return Status::OK();
+  }
+  batch->installs.clear();
+  batch->installs.resize(versions.size());
+  batch->obsolete_garbage.reserve(versions.size());
+  for (size_t version_index = 0; version_index < versions.size();
+       ++version_index) {
+    if (batch->reservations[version_index] == 0) {
+      continue;
+    }
+    Version* const version = versions[version_index];
+    assert(version != nullptr);
+    ColumnFamilyData* const cfd = version->cfd();
+    std::shared_ptr<BlobReferenceCensusDelta> delta;
+    Status status = BuildBlobReferenceCensusDelta(batch_edits, version, &delta);
+    if (!status.ok()) {
+      return status;
+    }
+    std::shared_ptr<Cache> log_block_cache;
+    const BlockBasedTableOptions* const table_options =
+        GetBlockBasedTableWriterOptions(
+            version->GetMutableCFOptions().table_factory.get());
+    if (table_options != nullptr && table_options->block_cache != nullptr &&
+        table_options->cache_usage_options.options_overrides
+                .at(CacheEntryRole::kBlobReferenceCensus)
+                .charged != CacheEntryRoleOptions::Decision::kDisabled) {
+      log_block_cache = table_options->block_cache;
+    }
+    // A failure to prepare the census install does not fail the commit: the
+    // census is invalidated and rebuilt instead. The sync point lets a test
+    // inject such a failure.
+    TEST_SYNC_POINT_CALLBACK(
+        "VersionSet::ProcessManifestWrites:PrepareCensusInstall", &status);
+    if (status.ok()) {
+      status = cfd->blob_reference_census()->PrepareInstallWithCache(
+          std::move(delta), batch->reservations[version_index],
+          std::move(log_block_cache), &batch->installs[version_index]);
+    }
+    if (!status.ok()) {
+      status = cfd->blob_reference_census()->PrepareInvalidation(
+          batch->reservations[version_index], &batch->installs[version_index]);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+  }
+  return Status::OK();
+}
+
 Status VersionSet::ProcessManifestWrites(
     std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
     FSDirectory* dir_contains_current_file, bool new_descriptor_log,
@@ -6597,6 +6848,7 @@ Status VersionSet::ProcessManifestWrites(
   autovector<std::optional<size_t>> batch_edits_ts_sz;
   autovector<Version*> versions;
   std::vector<std::unique_ptr<BaseReferencedVersionBuilder>> builder_guards;
+  BlobReferenceCensusInstallBatch census_batch;
   autovector<const autovector<uint64_t>*> files_to_quarantine_if_commit_fail;
   autovector<uint64_t> limbo_descriptor_log_file_number;
 
@@ -6954,6 +7206,9 @@ Status VersionSet::ProcessManifestWrites(
   std::unique_ptr<log::Writer> new_desc_log_ptr;
   // Save before releasing mu
   uint64_t manifest_preallocation_size = manifest_preallocation_size_;
+  // Step 1 of the census install (see BlobReferenceCensusInstallBatch).
+  ReserveBlobReferenceCensusInstalls(
+      versions, pending_blob_indirection_format_version, &census_batch);
   // Calls VersionBuilder::SaveBlobFilesAndCheckTo() for every new Version, with
   // the DB mutex released. A column family add or drop builds no new Version,
   // so for that batch this does nothing. This is safe in both the MANIFEST path
@@ -6986,6 +7241,12 @@ Status VersionSet::ProcessManifestWrites(
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         versions[i]->PrepareAppend(read_options, update_stats);
       }
+    }
+    // Step 2 of the census install. Run it after PrepareAppend(), which
+    // computes the coarse frontier that the census delta carries.
+    if (s.ok()) {
+      s = PrepareBlobReferenceCensusInstalls(batch_edits, versions,
+                                             &census_batch);
     }
     mu->Lock();
     // As in the MANIFEST path below: while the DB mutex was released, this
@@ -7058,8 +7319,13 @@ Status VersionSet::ProcessManifestWrites(
         for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
           versions[i]->PrepareAppend(read_options, update_stats);
         }
+        // Step 2 of the census install. Run it after PrepareAppend(), which
+        // computes the coarse frontier that the census delta carries.
+        s = PrepareBlobReferenceCensusInstalls(batch_edits, versions,
+                                               &census_batch);
       }
-
+    }
+    if (s.ok()) {
       // Write new records to MANIFEST log
 #ifndef NDEBUG
       size_t idx = 0;
@@ -7188,6 +7454,8 @@ Status VersionSet::ProcessManifestWrites(
     }
   }
 
+  const bool recovering_manifest_authority =
+      s.ok() && new_descriptor_log && !skip_manifest_write && !io_status_.ok();
   if (!io_s.ok()) {
     if (io_status_.ok()) {
       io_status_ = io_s;
@@ -7225,6 +7493,8 @@ Status VersionSet::ProcessManifestWrites(
     } else if (first_writer.edit_list.front()->IsColumnFamilyDrop()) {
       assert(batch_edits.size() == 1);
       assert(max_last_sequence == descriptor_last_sequence_);
+      census_batch.dropped_garbage =
+          first_writer.cfd->CancelBlobReferenceCensus();
       first_writer.cfd->SetDropped();
       first_writer.cfd->UnrefAndTryDelete();
     } else {
@@ -7295,6 +7565,13 @@ Status VersionSet::ProcessManifestWrites(
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
         ColumnFamilyData* cfd = versions[i]->cfd_;
         AppendVersion(cfd, versions[i]);
+        // Step 3 of the census install.
+        if (!census_batch.installs.empty() &&
+            census_batch.reservations[i] != 0) {
+          census_batch.obsolete_garbage.emplace_back(
+              cfd->blob_reference_census()->Install(census_batch.installs[i]));
+          cfd->blob_reference_census()->NoteUnready(clock_->NowMicros());
+        }
       }
     }
     if (!skip_manifest_write) {
@@ -7313,6 +7590,19 @@ Status VersionSet::ProcessManifestWrites(
       manifest_last_valid_record_end_ = new_manifest_file_size;
       manifest_last_valid_record_end_file_number_ = manifest_file_number_;
       prev_log_number_ = first_writer.edit_list.front()->GetPrevLogNumber();
+    }
+    if (recovering_manifest_authority) {
+      // An earlier MANIFEST write failed, so it may or may not be on disk, and
+      // descriptor_log_ was reset. This write created a new MANIFEST with a
+      // full snapshot of all CFs and published it through CURRENT, so the
+      // on-disk state is known again. Only such a write calls
+      // ResolveMetadataCommitAmbiguity() on the census of every CF. A normal
+      // successful append does not.
+      for (ColumnFamilyData* cfd : *column_family_set_) {
+        if (cfd->blob_reference_census() != nullptr) {
+          cfd->blob_reference_census()->ResolveMetadataCommitAmbiguity();
+        }
+      }
     }
   } else if (blob_finalization_failed) {
     // Nothing was written to the MANIFEST. As for a SaveTableFilesTo() failure,
@@ -7374,6 +7664,56 @@ Status VersionSet::ProcessManifestWrites(
     }
   }
 
+  // The caller of a successful options publication installs the SuperVersions
+  // after this returns, so census payloads are freed after that, without the
+  // mutex. See ReleaseDeferredPublicationCleanup().
+  const bool defer_publication_cleanup =
+      s.ok() && first_writer.new_mutable_cf_options != nullptr;
+  if (defer_publication_cleanup) {
+    for (size_t index = 0; index < census_batch.reservations.size(); ++index) {
+      if (census_batch.reservations[index] != 0) {
+        census_batch.reservation_cfds[index]
+            ->blob_reference_census()
+            ->CancelInstallPreparation(census_batch.reservations[index]);
+      }
+    }
+    census_batch.reservations.clear();
+    for (auto& install : census_batch.installs) {
+      deferred_publication_census_installs_.push_back(std::move(install));
+    }
+    census_batch.installs.clear();
+    for (auto& garbage : census_batch.obsolete_garbage) {
+      deferred_publication_census_garbage_.push_back(std::move(garbage));
+    }
+    census_batch.obsolete_garbage.clear();
+  }
+  if (!census_batch.installs.empty() || !census_batch.reservations.empty() ||
+      !census_batch.obsolete_garbage.empty()) {
+    // Step 4 of the census install:
+    // 1. Under the DB mutex, cancel the unused census reservations. A
+    //    cancellation can wake a census build that waits between slices, and
+    //    that changes the census queue of its CF.
+    // 2. Without the mutex, free the large objects: the census installs and the
+    //    old census state.
+    for (size_t index = 0; index < census_batch.reservations.size(); ++index) {
+      if (census_batch.reservations[index] != 0) {
+        census_batch.reservation_cfds[index]
+            ->blob_reference_census()
+            ->CancelInstallPreparation(census_batch.reservations[index]);
+      }
+    }
+    mu->Unlock();
+    TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:CleanupUnlocked");
+    std::vector<BlobReferenceCensusPreparedInstall>().swap(
+        census_batch.installs);
+    std::vector<uint64_t>().swap(census_batch.reservations);
+    std::vector<ColumnFamilyData*>().swap(census_batch.reservation_cfds);
+    std::vector<BlobReferenceCensusGarbage>().swap(
+        census_batch.obsolete_garbage);
+    census_batch.dropped_garbage = {};
+    mu->Lock();
+  }
+
   pending_manifest_file_number_ = 0;
 
 #ifndef NDEBUG
@@ -7396,6 +7736,24 @@ Status VersionSet::ProcessManifestWrites(
   release_builder_guards();
   finish_batch(s);
   return s;
+}
+
+void VersionSet::ReleaseDeferredPublicationCleanup(InstrumentedMutex* mu) {
+  mu->AssertHeld();
+  if (deferred_publication_census_installs_.empty() &&
+      deferred_publication_census_garbage_.empty()) {
+    return;
+  }
+  std::vector<BlobReferenceCensusPreparedInstall> census_installs;
+  census_installs.swap(deferred_publication_census_installs_);
+  std::vector<BlobReferenceCensusGarbage> census_garbage;
+  census_garbage.swap(deferred_publication_census_garbage_);
+  mu->Unlock();
+  TEST_SYNC_POINT_CALLBACK(
+      "VersionSet::ReleaseDeferredPublicationCleanup:Unlocked", mu);
+  census_installs.clear();
+  census_garbage.clear();
+  mu->Lock();
 }
 
 void VersionSet::FreeBlobRelocationState(
@@ -8993,6 +9351,12 @@ Status VersionSet::WriteCurrentStateToManifest(
           // so live SSTs still benefit from fast_sst_open after a MANIFEST
           // rotation.
           edit.AddExistingFile(level, *f, /*provenance_flags_to_set=*/0);
+          FileMetaData& snapshot_file = edit.GetMutableNewFiles().back().second;
+          snapshot_file.blob_reference_legacy_metadata =
+              vstorage->HasBlobIndirectionFormat() &&
+              f->blob_reference_descriptor.empty() &&
+              f->oldest_coarse_indirect_origin_file_number ==
+                  kInvalidBlobFileNumber;
         }
       }
 
@@ -9024,6 +9388,9 @@ Status VersionSet::WriteCurrentStateToManifest(
            vstorage->GetBlobRelocationFiles()) {
         assert(metadata != nullptr);
         edit.AddBlobRelocationFile(metadata->GetAddition());
+        if (metadata->IsMarkedLost()) {
+          edit.MarkBlobPhysicalFileLost(metadata->GetFileNumber());
+        }
       }
       vstorage->ForEachBlobRelocationRoute(
           [&](const BlobRelocationRoute& route) {
@@ -10163,6 +10530,146 @@ std::vector<VersionEdit>& ReactiveVersionSet::replay_buffer() {
   return manifest_tailer_->GetReadBuffer().replay_buffer();
 }
 
+void VersionStorageInfo::ComputeBlobRelocationStateFingerprint() {
+  BlobRelocationStateForRead().ComputeFingerprint(
+      blob_indirection_format_version_,
+      &blob_relocation_state_fingerprint_high_,
+      &blob_relocation_state_fingerprint_low_);
+}
+
+bool VersionStorageInfo::IsBlobReferenceLost(const BlobIndex& index) const {
+  if (!index.IsIndirect() || !HasLostBlobRelocationFiles()) {
+    return false;
+  }
+  // A reference is lost when its generation is a lost relocation file, or an
+  // old file routed to a lost relocation file.
+  const BlobFileTable& table = GetBlobFileTable();
+  uint64_t value = table.Find(index.generation_file_number());
+  if (BlobFileTable::IsRoute(value)) {
+    value = table.Find(BlobFileTable::RouteTarget(value));
+  }
+  return BlobFileTable::IsLost(value);
+}
+
+void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
+    double blob_garbage_collection_age_cutoff,
+    double blob_garbage_collection_force_threshold,
+    bool enable_blob_garbage_collection, bool enable_blob_indirection) {
+  files_marked_for_forced_blob_gc_.clear();
+  if (!(enable_blob_garbage_collection &&
+        blob_garbage_collection_age_cutoff > 0.0 &&
+        blob_garbage_collection_force_threshold < 1.0)) {
+    return;
+  }
+
+  if (blob_files_.empty()) {
+    return;
+  }
+  // With enable_blob_indirection on, compaction keeps the references to an
+  // indirect origin as they are. So compacting the SSTs linked to the oldest
+  // file never frees it, and the same SSTs would be marked again and again.
+  // Instead, the census ranks such files by garbage ratio as indirect blob GC
+  // candidates (see SetBlobGcCandidates()).
+  if (enable_blob_indirection && blob_files_.front()->IsIndirectOrigin()) {
+    return;
+  }
+
+  // Number of blob files eligible for GC based on age
+  const size_t cutoff_count = static_cast<size_t>(
+      blob_garbage_collection_age_cutoff * blob_files_.size());
+  if (!cutoff_count) {
+    return;
+  }
+
+  // Compute the sum of total and garbage bytes over the batch of blob files
+  // currently eligible for garbage collection based on
+  // blob_garbage_collection_age_cutoff, and if the garbage ratio exceeds
+  // blob_garbage_collection_force_threshold, schedule compaction for the
+  // SST files that reference the oldest batch of blob files. Here is a toy
+  // example. Let's assume we have three SSTs 1, 2, and 3, and four blob files
+  // 10, 11, 12, and 13, which correspond to the range that is eligible for GC
+  // and satisfy the garbage ratio threshold. Also, let's say SSTs 1 and 2 both
+  // rely on blob file 10 and potentially some higher-numbered ones, while SST 3
+  // relies on blob file 12 and potentially some higher-numbered ones. Then, the
+  // SST to oldest blob file mapping is as follows:
+  //
+  // SST file number               Oldest blob file number
+  // 1                             10
+  // 2                             10
+  // 3                             12
+  //
+  // This is what the same thing looks like from the blob files' POV. (Note that
+  // the linked SSTs simply denote the inverse mapping of the above.)
+  //
+  // Blob file number              Linked SST set
+  // 10                            {1, 2}
+  // 11                            {}
+  // 12                            {3}
+  // 13                            {}
+  //
+  // Then, the oldest batch of blob files consists of blob files 10 and 11,
+  // and we can get rid of them by forcing the compaction of SSTs 1 and 2.
+  const auto& oldest_meta = blob_files_.front();
+  assert(oldest_meta);
+
+  const auto& linked_ssts = oldest_meta->GetLinkedSsts();
+  // In a fenced CF an SST links only the blob file named by its
+  // oldest_blob_file_number. So the oldest blob file has no linked SSTs when no
+  // SST references it, or when each SST that references it has an older file as
+  // its oldest_blob_file_number, and blob file retirement already removed that
+  // file. Examples: an indirect origin that no SST references any more, which
+  // waits for a blob file retirement record, and a normal blob file or indirect
+  // origin newer than a retired indirect origin. An indirect origin reaches
+  // this check only with enable_blob_indirection off (with it on, the check
+  // above already returned). A normal blob file can reach it with either
+  // setting. No SST can be compacted to free such a file, so mark nothing. In
+  // any CF, the SSTs that reference the oldest blob file can also be linked to
+  // an older, dropped blob file instead (see GetDroppedBlobFiles()), so the
+  // SSTs to compact are unknown.
+  if (linked_ssts.empty()) {
+    assert(HasBlobIndirectionFormat() || !dropped_blob_files_.empty());
+    return;
+  }
+
+  size_t count = 1;
+  uint64_t sum_total_blob_bytes = oldest_meta->GetTotalBlobBytes();
+  uint64_t sum_garbage_blob_bytes = oldest_meta->GetGarbageBlobBytes();
+
+  assert(cutoff_count <= blob_files_.size());
+
+  for (; count < cutoff_count; ++count) {
+    const auto& meta = blob_files_[count];
+    assert(meta);
+
+    sum_total_blob_bytes += meta->GetTotalBlobBytes();
+    sum_garbage_blob_bytes += meta->GetGarbageBlobBytes();
+  }
+
+  if (sum_garbage_blob_bytes <
+      blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
+    return;
+  }
+
+  for (uint64_t sst_file_number : linked_ssts) {
+    const FileLocation location = GetFileLocation(sst_file_number);
+    assert(location.IsValid());
+
+    const int level = location.GetLevel();
+    assert(level >= 0);
+
+    const size_t pos = location.GetPosition();
+
+    FileMetaData* const sst_meta = files_[level][pos];
+    assert(sst_meta);
+
+    if (sst_meta->being_compacted) {
+      continue;
+    }
+
+    files_marked_for_forced_blob_gc_.emplace_back(level, sst_meta);
+  }
+}
+
 BlobRelocationState& VersionStorageInfo::MutableBlobRelocationState() {
   if (blob_relocation_state_ == nullptr) {
     blob_relocation_state_ = std::make_shared<BlobRelocationState>();
@@ -10196,6 +10703,93 @@ void VersionStorageInfo::DeleteBlobRelocationFile(uint64_t file_number) {
 
 void VersionStorageInfo::DeleteBlobRelocationRoute(uint64_t old_file_number) {
   MutableBlobRelocationState().DeleteRoute(old_file_number);
+}
+
+void VersionStorageInfo::SetBlobGcCandidates(
+    const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files) {
+  blob_files_for_indirect_blob_gc_ = files;
+  blob_files_for_indirect_blob_gc_count_ = 0;
+  for (uint64_t file_number : files) {
+    if (file_number == kInvalidBlobFileNumber) {
+      break;
+    }
+    ++blob_files_for_indirect_blob_gc_count_;
+  }
+}
+
+void VersionStorageInfo::SuppressBlobFileForIndirectBlobGC(
+    uint64_t physical_file_number) {
+  for (size_t i = 0; i < empty_blob_files_for_indirect_blob_gc_.size(); ++i) {
+    if (empty_blob_files_for_indirect_blob_gc_[i] == physical_file_number) {
+      std::move(empty_blob_files_for_indirect_blob_gc_.begin() + i + 1,
+                empty_blob_files_for_indirect_blob_gc_.end(),
+                empty_blob_files_for_indirect_blob_gc_.begin() + i);
+      empty_blob_files_for_indirect_blob_gc_.back() = 0;
+      break;
+    }
+  }
+  for (size_t i = 0; i < blob_files_for_indirect_blob_gc_count_; ++i) {
+    if (blob_files_for_indirect_blob_gc_[i] == physical_file_number) {
+      for (size_t next = i + 1; next < blob_files_for_indirect_blob_gc_count_;
+           ++next) {
+        blob_files_for_indirect_blob_gc_[next - 1] =
+            blob_files_for_indirect_blob_gc_[next];
+      }
+      blob_files_for_indirect_blob_gc_
+          [--blob_files_for_indirect_blob_gc_count_] = 0;
+      return;
+    }
+  }
+}
+
+void VersionStorageInfo::DeferBlobFilesForIndirectBlobGC(
+    const std::vector<uint64_t>& physical_file_numbers) {
+  for (uint64_t file_number : physical_file_numbers) {
+    for (size_t i = 0; i < blob_files_for_indirect_blob_gc_count_; ++i) {
+      if (blob_files_for_indirect_blob_gc_[i] != file_number) {
+        continue;
+      }
+      for (size_t next = i + 1; next < blob_files_for_indirect_blob_gc_count_;
+           ++next) {
+        blob_files_for_indirect_blob_gc_[next - 1] =
+            blob_files_for_indirect_blob_gc_[next];
+      }
+      blob_files_for_indirect_blob_gc_[blob_files_for_indirect_blob_gc_count_ -
+                                       1] = file_number;
+      break;
+    }
+  }
+}
+
+uint64_t VersionStorageInfo::BlobPhysicalFileForIndirectBlobGC() const {
+  return blob_files_for_indirect_blob_gc_count_ != 0
+             ? blob_files_for_indirect_blob_gc_[0]
+             : kInvalidBlobFileNumber;
+}
+
+void VersionStorageInfo::GetBlobPhysicalFilesForIndirectBlobGC(
+    size_t max_files, std::vector<uint64_t>* physical_file_numbers) const {
+  assert(physical_file_numbers != nullptr);
+  physical_file_numbers->clear();
+  const size_t count =
+      std::min(max_files, blob_files_for_indirect_blob_gc_count_);
+  for (size_t i = 0; i < count; ++i) {
+    physical_file_numbers->push_back(blob_files_for_indirect_blob_gc_[i]);
+  }
+}
+
+void VersionStorageInfo::GetEmptyBlobGcCandidates(
+    size_t max_files, std::vector<uint64_t>* files) const {
+  assert(files != nullptr);
+  files->clear();
+  for (size_t i = 0;
+       i < std::min(max_files, empty_blob_files_for_indirect_blob_gc_.size());
+       ++i) {
+    if (empty_blob_files_for_indirect_blob_gc_[i] == kInvalidBlobFileNumber) {
+      break;
+    }
+    files->push_back(empty_blob_files_for_indirect_blob_gc_[i]);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
