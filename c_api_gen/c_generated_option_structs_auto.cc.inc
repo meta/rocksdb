@@ -1359,6 +1359,16 @@ unsigned char rocksdb_options_get_enable_blob_indirection(
   return opt->rep.enable_blob_indirection;
 }
 
+void rocksdb_options_set_pin_blob_relocation_location_blocks(
+    rocksdb_options_t* opt, unsigned char v) {
+  opt->rep.pin_blob_relocation_location_blocks = v;
+}
+
+unsigned char rocksdb_options_get_pin_blob_relocation_location_blocks(
+    rocksdb_options_t* opt) {
+  return opt->rep.pin_blob_relocation_location_blocks;
+}
+
 void rocksdb_options_set_min_blob_size(rocksdb_options_t* opt, uint64_t v) {
   opt->rep.min_blob_size = v;
 }
