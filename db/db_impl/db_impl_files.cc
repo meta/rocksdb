@@ -13,6 +13,7 @@
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/db_impl/db_impl.h"
 #include "db/event_helpers.h"
 #include "db/memtable_list.h"
@@ -66,8 +67,11 @@ Env::IOActivity GetCurrentThreadIOActivityForMetadataRead() {
 
 // A full-scan obsolete-file purge can observe a newly created direct-write
 // blob file before it is added to the manager's active-file set. Those
-// in-flight files are still missing their footer, so conservatively keep any
-// footer-less blob file here rather than risk deleting a live write-path file.
+// in-flight files are still missing their footer, so keep a footer-less blob
+// file here rather than risk deleting a live write-path file. One exception: a
+// blob relocation file also has no footer, but it starts with
+// kBlobRelocationFilePrefix, and blob direct write never writes one. So the
+// purge deletes a footer-less file with this prefix (see below).
 bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
                                   const FileOptions& file_options,
                                   const std::string& blob_file_path) {
@@ -86,10 +90,6 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
     return !io_s.IsPathNotFound();
   }
 
-  if (file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
-    return true;
-  }
-
   FileOptions read_file_options = file_options;
   read_file_options.use_direct_reads = false;
 
@@ -98,21 +98,49 @@ bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
   if (!io_s.ok()) {
     return !io_s.IsPathNotFound();
   }
-
-  std::array<char, BlobLogFooter::kSize> scratch{};
-  Slice footer_slice;
-  io_s = file->Read(file_size - BlobLogFooter::kSize, BlobLogFooter::kSize,
-                    io_options, &footer_slice, scratch.data(), dbg);
-  if (!io_s.ok()) {
-    return !io_s.IsPathNotFound();
-  }
-
-  if (footer_slice.size() != BlobLogFooter::kSize) {
+  if (file == nullptr) {
     return true;
   }
 
-  BlobLogFooter footer;
-  return !footer.DecodeFrom(footer_slice).ok();
+  if (file_size >= BlobLogHeader::kSize + BlobLogFooter::kSize) {
+    std::array<char, BlobLogFooter::kSize> scratch{};
+    Slice footer_slice;
+    io_s = file->Read(file_size - BlobLogFooter::kSize, BlobLogFooter::kSize,
+                      io_options, &footer_slice, scratch.data(), dbg);
+    if (!io_s.ok()) {
+      return !io_s.IsPathNotFound();
+    }
+    BlobLogFooter footer;
+    if (footer_slice.size() == BlobLogFooter::kSize &&
+        footer.DecodeFrom(footer_slice).ok()) {
+      return false;
+    }
+  }
+
+  // The file has no valid blob log footer. Only such a file gets the
+  // relocation-prefix read; a blob file with a valid footer costs no extra
+  // read.
+  if (file_size >= kBlobRelocationFilePrefixSize) {
+    std::array<char, kBlobRelocationFilePrefixSize> prefix_scratch{};
+    Slice prefix_slice;
+    io_s = file->Read(/*offset=*/0, kBlobRelocationFilePrefixSize, io_options,
+                      &prefix_slice, prefix_scratch.data(), dbg);
+    // Lets a test fail the prefix read.
+    TEST_SYNC_POINT_CALLBACK("ShouldKeepFooterlessBlobFile:PrefixRead", &io_s);
+    if (!io_s.ok()) {
+      return !io_s.IsPathNotFound();
+    }
+    if (prefix_slice ==
+        Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize)) {
+      // A blob relocation file starts with kBlobRelocationFilePrefix
+      // ("RDBRLC01") and has no blob log footer. It reaches this check only
+      // after no Version owns it, so the purge deletes it. Blob direct write
+      // never writes a relocation file, so here a missing footer does not
+      // mean a blob file that is still being written.
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -227,6 +255,12 @@ bool DBImpl::IsFileDeletionsEnabled() const {
 void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
                                bool no_full_scan) {
   mutex_.AssertHeld();
+
+  // Move the relocation state of destroyed Versions to the JobContext;
+  // job_context->Clean() frees it without the DB mutex. This runs before the
+  // check below, so the state is freed also while file deletion is disabled.
+  versions_->TakeObsoleteBlobRelocationStates(
+      &job_context->blob_relocation_states_to_free);
 
   // if deletion is disabled, do nothing
   if (disable_delete_obsolete_files_ > 0) {
@@ -604,6 +638,14 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
   }
 
   for (const auto& blob_file : state.blob_delete_files) {
+    // The file is obsolete, so evict its cached reader now, before the keep
+    // decision below. The decision can keep the file (for example after an I/O
+    // error while it reads the file), but the file has then left the obsolete
+    // list, so a reader left here would stay cached with its file descriptor
+    // and its pinned location blocks until a full-scan purge. An eviction is
+    // always safe: a later read opens the file again. It takes no DB mutex and
+    // no stripe mutex (TableCache::Evict() of the shared cache).
+    TableCache::Evict(table_cache_.get(), blob_file.GetBlobFileNumber());
     candidate_files.emplace_back(BlobFileName(blob_file.GetBlobFileNumber()),
                                  blob_file.GetPath());
   }

@@ -388,6 +388,13 @@ class ColumnFamilyData {
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
 
+  // Runs only when the DB is opened for writing (not read-only), after
+  // MANIFEST recovery. If enable_blob_indirection is on or the CF has the
+  // format fence, it checks that the compaction style is supported. If the CF
+  // has the fence, it also checks that blob direct write is off and that the
+  // table factory can write Block-Based Tables. REQUIRES: DB mutex held.
+  Status ValidateBlobIndirectionOptionsAfterRecovery() const;
+
   // Test-only, not public API. Until the indirect blob GC stack is complete,
   // ValidateOptions rejects enable_blob_indirection unless a test allows it.
   static void TEST_SetAllowBlobIndirection(bool allow);
