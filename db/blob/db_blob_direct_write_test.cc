@@ -33,6 +33,7 @@
 #include "db/db_with_timestamp_test_util.h"
 #include "db/wide/wide_column_test_util.h"
 #include "env/composite_env_wrapper.h"
+#include "file/file_util.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
 #include "port/stack_trace.h"
@@ -41,12 +42,14 @@
 #include "rocksdb/sst_file_manager.h"
 #include "rocksdb/trace_reader_writer.h"
 #include "rocksdb/trace_record.h"
+#include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/replayer.h"
 #include "test_util/sync_point.h"
 #include "util/compression.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
 #include "utilities/fault_injection_env.h"
+#include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -377,6 +380,19 @@ class DBBlobDirectWriteTest : public DBTestBase {
 
   Options GetDirectWriteOptions() {
     return wide_column_test_util::GetDirectWriteOptions(GetDefaultOptions());
+  }
+
+  // Returns how many times `fn` syncs a blob file (BlobLogWriter::Sync()).
+  // Sealing a file syncs it once, in AppendFooter().
+  int CountBlobFileSyncs(const std::function<void()>& fn) {
+    std::atomic<int> syncs{0};
+    SyncPoint::GetInstance()->SetCallBack("BlobLogWriter::Sync",
+                                          [&](void* /*arg*/) { ++syncs; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    fn();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    return syncs.load();
   }
 
   size_t CountBlobFiles() {
@@ -2328,6 +2344,10 @@ TEST_F(DBBlobDirectWriteTest, FailedBlobSealLeavesMemtableFlushable) {
     Defer close_db([this]() { Close(); });
     const std::string value(1024, 'v');
     ASSERT_OK(Put("key", value));
+    // Sync the blob file now. An atomic flush first syncs the closed WALs and,
+    // before them, the blob files. With nothing left to sync, the first blob
+    // sync of the flush is the footer sync of the seal.
+    ASSERT_OK(db_->SyncWAL());
 
     // The flush fails to sync the footer of the blob file holding "key".
     SyncPoint::GetInstance()->SetCallBack("BlobLogWriter::Sync", [&](void*) {
@@ -2344,6 +2364,109 @@ TEST_F(DBBlobDirectWriteTest, FailedBlobSealLeavesMemtableFlushable) {
                                     &flush_pending));
     ASSERT_EQ(1U, flush_pending);
   }
+}
+
+// Writes "first", then "second". With a tiny blob_file_size, "second" rolls
+// the file of "first" over, and the seal of that file fails. If
+// `sync_before_seal`, SyncWAL() runs before "second", so the failed file has
+// no unsynced records. Sets `*seal_status` to the error of the failed Put()
+// and returns the status of the SyncWAL() that follows.
+Status SyncWALAfterFailedRolloverSeal(DBTestBase* test, bool sync_before_seal,
+                                      Status* seal_status) {
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(test->env_));
+  Options options =
+      wide_column_test_util::GetDirectWriteOptions(test->CurrentOptions());
+  options.env = fault_env.get();
+  options.blob_file_size = 1;
+  options.listeners.emplace_back(
+      std::make_shared<DisableAutoRecoveryListener>());
+  test->DestroyAndReopen(options);
+  Defer close_db([test]() { test->Close(); });
+  const std::string value(1024, 'v');
+  EXPECT_OK(test->Put("first", value));
+  if (sync_before_seal) {
+    EXPECT_OK(test->db_->SyncWAL());
+  }
+
+  // The seal of the full file fails to sync its footer.
+  SyncPoint::GetInstance()->SetCallBack("BlobLogWriter::Sync", [&](void*) {
+    fault_env->SetFilesystemActive(false, Status::NoSpace("injected"));
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  *seal_status = test->Put("second", value);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  fault_env->SetFilesystemActive(true);
+  return test->db_->SyncWAL();
+}
+
+// A file whose seal failed cannot be synced again. While it has unsynced
+// records, SyncWAL() must fail with the seal error, so that no WAL record
+// that points to those records becomes durable.
+TEST_F(DBBlobDirectWriteTest, SyncWALReturnsErrorOfFailedRolloverSeal) {
+  Status seal_status;
+  Status s = SyncWALAfterFailedRolloverSeal(this, /*sync_before_seal=*/false,
+                                            &seal_status);
+  ASSERT_TRUE(seal_status.IsNoSpace()) << seal_status.ToString();
+  ASSERT_EQ(s.code(), seal_status.code()) << s.ToString();
+  ASSERT_TRUE(s.IsNoSpace()) << s.ToString();
+}
+
+// An earlier SyncWAL() already synced every record of the file whose seal
+// failed, so the file needs no sync, and the next SyncWAL() succeeds.
+TEST_F(DBBlobDirectWriteTest, SyncWALSkipsFailedSealOfSyncedFile) {
+  Status seal_status;
+  Status s = SyncWALAfterFailedRolloverSeal(this, /*sync_before_seal=*/true,
+                                            &seal_status);
+  ASSERT_TRUE(seal_status.IsNoSpace()) << seal_status.ToString();
+  ASSERT_OK(s);
+}
+
+// With the WAL off, no WAL file is ever closed, so the closed-WAL sync before
+// a flush in a DB with 2 column families syncs no WAL. It must then sync no
+// blob file either: "other" keeps its unsynced blob file, and the flush of
+// "default", which has no blob file to seal, syncs no blob file.
+TEST_F(DBBlobDirectWriteTest, ClosedWalSyncWithWalOffSkipsBlobSync) {
+  Options options = GetDirectWriteOptions();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, handles_[1], "large", std::string(1024, 'v')));
+  ASSERT_OK(db_->Put(no_wal, handles_[0], "small", "s"));
+  ASSERT_EQ(CountBlobFileSyncs([&]() { ASSERT_OK(Flush(0)); }), 0);
+}
+
+// An atomic flush runs the closed-WAL sync with any number of column
+// families. With the WAL off it syncs no WAL, so the only blob sync of the
+// flush is the seal of the one blob file.
+TEST_F(DBBlobDirectWriteTest, AtomicFlushWithWalOffSkipsBlobSync) {
+  Options options = GetDirectWriteOptions();
+  options.atomic_flush = true;
+  DestroyAndReopen(options);
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, "large", std::string(1024, 'v')));
+  ASSERT_EQ(CountBlobFileSyncs([&]() { ASSERT_OK(Flush()); }), 1);
+}
+
+// The WAL is on. The flush of "default" switches the WAL and syncs the closed
+// WAL. A large value then goes to "other" without a WAL record, so the current
+// WAL stays empty, and the flush of "other" switches no WAL. Its closed-WAL
+// sync finds no WAL left to sync, so the only blob sync of that flush is the
+// seal of the blob file of "other".
+TEST_F(DBBlobDirectWriteTest, ClosedWalSyncOfSyncedWalsSkipsBlobSync) {
+  Options options = GetDirectWriteOptions();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  ASSERT_OK(Put(0, "a", "s"));
+  ASSERT_OK(Put(1, "b", "s"));
+  ASSERT_OK(Flush(0));
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, handles_[1], "large", std::string(1024, 'v')));
+  ASSERT_EQ(CountBlobFileSyncs([&]() { ASSERT_OK(Flush(1)); }), 1);
 }
 
 TEST_F(DBBlobDirectWriteTest, FailedBlobFooterSyncFailsRetriedFlush) {
@@ -2402,6 +2525,488 @@ TEST_F(DBBlobDirectWriteTest, CloseAfterFailedBlobSeal) {
     fault_env->SetFilesystemActive(true);
   }
 }
+
+// Lets one thread wait, without polling, until another thread reports that
+// an event happened.
+class TestEvent {
+ public:
+  TestEvent() : cv_(&mu_) {}
+
+  void Set() {
+    mu_.Lock();
+    set_ = true;
+    cv_.SignalAll();
+    mu_.Unlock();
+  }
+
+  // Returns false if the event is not set within kTimeoutMicros, so that a
+  // broken test fails instead of hanging. The 5 minutes are far more than the
+  // tests need, and less than a typical test runner timeout.
+  bool Wait() {
+    constexpr uint64_t kTimeoutMicros = 5ULL * 60 * 1000 * 1000;
+    const uint64_t deadline =
+        SystemClock::Default()->NowMicros() + kTimeoutMicros;
+    mu_.Lock();
+    while (!set_ && !cv_.TimedWait(deadline)) {
+    }
+    const bool set = set_;
+    mu_.Unlock();
+    return set;
+  }
+
+ private:
+  port::Mutex mu_;
+  port::CondVar cv_;
+  bool set_ = false;
+};
+
+class DBBlobDirectWritePowerLossTest : public DBBlobDirectWriteTest {
+ public:
+  ~DBBlobDirectWritePowerLossTest() override { Close(); }
+
+ protected:
+  DBBlobDirectWritePowerLossTest()
+      : fault_fs_(
+            std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem())),
+        fault_env_(NewCompositeEnv(fault_fs_)) {
+    fault_fs_->SetInjectUnsyncedDataLoss(true);
+  }
+
+  Options GetPowerLossOptions() {
+    Options options = GetDirectWriteOptions();
+    options.env = fault_env_.get();
+    return options;
+  }
+
+  void SimulatePowerLoss() {
+    fault_fs_->SetFilesystemActive(false);
+    Close();
+    fault_fs_->SetFilesystemActive(true);
+    ASSERT_OK(fault_fs_->DropUnsyncedFileData());
+    ASSERT_OK(
+        fault_fs_->DeleteFilesCreatedAfterLastDirSync(IOOptions(), nullptr));
+  }
+
+  void AssertDefaultColumnFamilyScanOk() {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    }
+    ASSERT_OK(iter->status());
+  }
+
+  // After a power loss, WAL replay inserts BlobIndex entries that point into
+  // blob files that are not in the MANIFEST. Close() checks that no obsolete
+  // file is still in the table cache, and it would report these files, so
+  // disable file deletions first.
+  void CloseKeepingRecoveredBlobFiles() {
+    ASSERT_OK(db_->DisableFileDeletions());
+    Close();
+  }
+
+  // Used by the SyncWAL() concurrency tests. Called from the
+  // DBImpl::SyncWalImpl:BeforeSyncWAL callback, between the blob sync and the
+  // WAL sync. Starts `*writer`, which writes "concurrent", and waits until
+  // that write is held back or done (`*blocked_or_done`).
+  void StartConcurrentWrite(const std::string& value,
+                            TestEvent* blocked_or_done, port::Thread* writer) {
+    *writer = port::Thread([this, &value, blocked_or_done]() {
+      // Set the event even if Put() fails, so that the callback returns.
+      Defer set_event([blocked_or_done]() { blocked_or_done->Set(); });
+      EXPECT_OK(Put("concurrent", value));
+    });
+    EXPECT_TRUE(blocked_or_done->Wait());
+  }
+
+  // Used by the SyncWAL() concurrency tests. Simulates a power loss, reopens,
+  // and checks that "before" survived and that "concurrent" is either fully
+  // present or absent.
+  void VerifyConcurrentWriteAfterPowerLoss(const Options& options,
+                                           const std::string& value) {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    SimulatePowerLoss();
+    Reopen(options);
+    ASSERT_EQ(Get("before"), value);
+    std::string concurrent_value;
+    Status s = db_->Get(ReadOptions(), "concurrent", &concurrent_value);
+    ASSERT_TRUE(s.IsNotFound() || (s.ok() && concurrent_value == value))
+        << s.ToString();
+    AssertDefaultColumnFamilyScanOk();
+    CloseKeepingRecoveredBlobFiles();
+  }
+
+  std::shared_ptr<FaultInjectionTestFS> fault_fs_;
+  std::unique_ptr<Env> fault_env_;
+};
+
+enum class WalSyncTrigger {
+  kSyncWAL,
+  kFlushWALWithSync,
+  kSyncWriteWithoutBlob,
+  kSyncWriteToOtherColumnFamily,
+  kFlushOtherColumnFamily,
+};
+
+class DBBlobDirectWriteWalSyncTest
+    : public DBBlobDirectWritePowerLossTest,
+      public testing::WithParamInterface<WalSyncTrigger> {};
+
+TEST_P(DBBlobDirectWriteWalSyncTest, PersistsEarlierDirectWrite) {
+  const WalSyncTrigger trigger = GetParam();
+  Options options = GetPowerLossOptions();
+  options.manual_wal_flush = trigger == WalSyncTrigger::kFlushWALWithSync;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+
+  const std::string value(200, 'v');
+  ASSERT_OK(Put(0, "key", value));
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  switch (trigger) {
+    case WalSyncTrigger::kSyncWAL:
+      ASSERT_OK(db_->SyncWAL());
+      break;
+    case WalSyncTrigger::kFlushWALWithSync:
+      ASSERT_OK(db_->FlushWAL(/*sync=*/true));
+      break;
+    case WalSyncTrigger::kSyncWriteWithoutBlob:
+      ASSERT_OK(db_->Put(sync_write, handles_[0], "small", "s"));
+      break;
+    case WalSyncTrigger::kSyncWriteToOtherColumnFamily:
+      ASSERT_OK(db_->Put(sync_write, handles_[1], "other", value));
+      break;
+    case WalSyncTrigger::kFlushOtherColumnFamily:
+      ASSERT_OK(Put(1, "other", value));
+      ASSERT_OK(Flush(1));
+      break;
+  }
+  SimulatePowerLoss();
+
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "other"}, options);
+  ASSERT_EQ(Get(0, "key"), value);
+  AssertDefaultColumnFamilyScanOk();
+  CloseKeepingRecoveredBlobFiles();
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DBBlobDirectWriteWalSyncTest, DBBlobDirectWriteWalSyncTest,
+    ::testing::Values(WalSyncTrigger::kSyncWAL,
+                      WalSyncTrigger::kFlushWALWithSync,
+                      WalSyncTrigger::kSyncWriteWithoutBlob,
+                      WalSyncTrigger::kSyncWriteToOtherColumnFamily,
+                      WalSyncTrigger::kFlushOtherColumnFamily));
+
+// A write that starts while SyncWAL() runs must wait until the WAL sync ends.
+// Otherwise its WAL record could become durable before its blob bytes are
+// synced.
+TEST_F(DBBlobDirectWritePowerLossTest,
+       SyncWALKeepsConcurrentDirectWriteOutOfSyncedWal) {
+  Options options = GetPowerLossOptions();
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  ASSERT_OK(Put("before", value));
+
+  // Set when the concurrent writer queues behind the SyncWAL() writer (the
+  // expected case) or when its Put() returns (SyncWAL() let the write run
+  // between the blob sync and the WAL sync).
+  TestEvent writer_blocked_or_done;
+  port::Thread concurrent_writer;
+  bool sync_callback_ran = false;
+  // On any failure, release and join the writer so the test fails cleanly.
+  Defer cleanup([&]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    writer_blocked_or_done.Set();
+    if (concurrent_writer.joinable()) {
+      concurrent_writer.join();
+    }
+  });
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait", [&](void* arg) {
+        // A leader also passes this point. Only a writer that is not the
+        // leader waits behind another writer.
+        auto* w = static_cast<WriteThread::Writer*>(arg);
+        if (w->state != WriteThread::STATE_GROUP_LEADER) {
+          writer_blocked_or_done.Set();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalImpl:BeforeSyncWAL", [&](void* /*arg*/) {
+        if (sync_callback_ran) {
+          return;
+        }
+        sync_callback_ran = true;
+        StartConcurrentWrite(value, &writer_blocked_or_done,
+                             &concurrent_writer);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db_->SyncWAL());
+  ASSERT_TRUE(sync_callback_ran);
+  concurrent_writer.join();
+  VerifyConcurrentWriteAfterPowerLoss(options, value);
+}
+
+// SyncWAL() starts while another thread holds LockWAL(), and that thread
+// calls UnlockWAL() during the sync. Writes must stay stopped until the WAL
+// sync ends.
+TEST_F(DBBlobDirectWritePowerLossTest,
+       SyncWALKeepsWritesStoppedAfterConcurrentUnlockWAL) {
+  Options options = GetPowerLossOptions();
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  ASSERT_OK(Put("before", value));
+
+  TestEvent locked;
+  TestEvent unlock_requested;
+  TestEvent unlocked;
+  // Set when the concurrent writer is stopped by the write controller (the
+  // expected case) or when its Put() returns (SyncWAL() let the write run
+  // between the blob sync and the WAL sync).
+  TestEvent writer_blocked_or_done;
+  port::Thread lock_owner;
+  port::Thread concurrent_writer;
+  bool sync_callback_ran = false;
+  // On any failure, release and join both threads so the test fails cleanly.
+  Defer cleanup([&]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    unlock_requested.Set();
+    writer_blocked_or_done.Set();
+    if (lock_owner.joinable()) {
+      lock_owner.join();
+    }
+    if (concurrent_writer.joinable()) {
+      concurrent_writer.join();
+    }
+  });
+  lock_owner = port::Thread([&]() {
+    Defer set_unlocked([&]() { unlocked.Set(); });
+    Status s = db_->LockWAL();
+    locked.Set();
+    if (!s.ok()) {
+      ADD_FAILURE() << s.ToString();
+      return;
+    }
+    EXPECT_TRUE(unlock_requested.Wait());
+    EXPECT_OK(db_->UnlockWAL());
+  });
+  ASSERT_TRUE(locked.Wait());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::DelayWrite:Wait",
+      [&](void* /*arg*/) { writer_blocked_or_done.Set(); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalImpl:BeforeSyncWAL", [&](void* /*arg*/) {
+        if (sync_callback_ran) {
+          return;
+        }
+        sync_callback_ran = true;
+        unlock_requested.Set();
+        EXPECT_TRUE(unlocked.Wait());
+        StartConcurrentWrite(value, &writer_blocked_or_done,
+                             &concurrent_writer);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db_->SyncWAL());
+  ASSERT_TRUE(sync_callback_ran);
+  lock_owner.join();
+  concurrent_writer.join();
+  VerifyConcurrentWriteAfterPowerLoss(options, value);
+}
+
+TEST_F(DBBlobDirectWritePowerLossTest,
+       SyncWritePersistsBlobFileRotatedAtMemtableSwitch) {
+  Options options = GetPowerLossOptions();
+  options.max_write_buffer_number = 4;
+  DestroyAndReopen(options);
+
+  test::SleepingBackgroundTask blocked_flush;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &blocked_flush,
+                 Env::Priority::HIGH);
+  blocked_flush.WaitUntilSleeping();
+  const std::string rotated_value(200, 'r');
+  const std::string synced_value(200, 's');
+  ASSERT_OK(Put("rotated", rotated_value));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  ASSERT_OK(db_->Put(sync_write, "synced", synced_value));
+
+  // The rotated file of the switched memtable is a deferred file. The blocked
+  // flush did not seal it, so only the sync write can have synced it.
+  // Deactivate the file system before the flush runs, so the flush cannot
+  // seal and sync the file either.
+  fault_fs_->SetFilesystemActive(false);
+  blocked_flush.WakeUp();
+  blocked_flush.WaitUntilDone();
+  SimulatePowerLoss();
+
+  Reopen(options);
+  ASSERT_EQ(Get("rotated"), rotated_value);
+  ASSERT_EQ(Get("synced"), synced_value);
+  AssertDefaultColumnFamilyScanOk();
+  CloseKeepingRecoveredBlobFiles();
+}
+
+TEST_F(DBBlobDirectWritePowerLossTest,
+       SyncWritePersistsNewBlobFileWithSeparateWalDir) {
+  Options options = GetPowerLossOptions();
+  options.wal_dir = alternative_wal_dir_;
+  DestroyAndReopen(options);
+
+  const std::string value(200, 'v');
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  ASSERT_OK(db_->Put(sync_write, "key", value));
+  SimulatePowerLoss();
+
+  Reopen(options);
+  ASSERT_EQ(Get("key"), value);
+  AssertDefaultColumnFamilyScanOk();
+  CloseKeepingRecoveredBlobFiles();
+}
+
+// Blob direct write with a non-default first path for the column family:
+// cf_paths={alt} (GetParam() is true) or db_paths={alt} (false). Its blob
+// files must be written, synced, read, purged and copied in that directory.
+class DBBlobDirectWritePathTest : public DBBlobDirectWritePowerLossTest,
+                                  public testing::WithParamInterface<bool> {
+ protected:
+  // Only a power-loss test uses the fault injection file system. Other tests
+  // read blob files that are still open for writing, which that file system
+  // does not support for unsynced data.
+  Options GetPathOptions(bool power_loss = false) {
+    Options options =
+        power_loss ? GetPowerLossOptions() : GetDirectWriteOptions();
+    alt_dir_ = dbname_ + "_blob_path";
+    // DestroyDB() does not clean this directory, so remove the files that an
+    // earlier test left there.
+    DestroyDir(env_, alt_dir_).PermitUncheckedError();
+    if (GetParam()) {
+      options.cf_paths = {{alt_dir_, std::numeric_limits<uint64_t>::max()}};
+    } else {
+      options.db_paths = {{alt_dir_, std::numeric_limits<uint64_t>::max()}};
+    }
+    return options;
+  }
+
+  std::set<uint64_t> BlobFilesIn(const std::string& dir) {
+    std::vector<std::string> files;
+    EXPECT_OK(env_->GetChildren(dir, &files));
+    std::set<uint64_t> result;
+    for (const auto& file : files) {
+      uint64_t number = 0;
+      FileType type = kWalFile;
+      if (ParseFileName(file, &number, &type) && type == kBlobFile) {
+        result.insert(number);
+      }
+    }
+    return result;
+  }
+
+  // Checks "key" and "entity" with Get(), MultiGet(), GetEntity() and an
+  // iterator.
+  void VerifyValues(DB* db, const std::string& value,
+                    const WideColumns& columns) {
+    std::string result;
+    ASSERT_OK(db->Get(ReadOptions(), "key", &result));
+    ASSERT_EQ(result, value);
+    std::vector<std::string> keys{"key"};
+    std::vector<Slice> key_slices(keys.begin(), keys.end());
+    std::vector<std::string> values;
+    std::vector<Status> statuses =
+        db->MultiGet(ReadOptions(), key_slices, &values);
+    ASSERT_OK(statuses[0]);
+    ASSERT_EQ(values[0], value);
+    PinnableWideColumns entity;
+    ASSERT_OK(db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), "entity",
+                            &entity));
+    ASSERT_EQ(entity.columns(), columns);
+    std::unique_ptr<Iterator> iter(db->NewIterator(ReadOptions()));
+    iter->Seek("key");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->value(), value);
+    ASSERT_OK(iter->status());
+  }
+
+  std::string alt_dir_;
+};
+
+TEST_P(DBBlobDirectWritePathTest, ReadsFromFirstPath) {
+  Options options = GetPathOptions();
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  const std::string column_value(200, 'c');
+  const WideColumns columns{{kDefaultWideColumnName, column_value},
+                            {"small", "s"}};
+  ASSERT_OK(Put("key", value));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "entity",
+                           columns));
+  VerifyValues(db_.get(), value, columns);
+  ASSERT_FALSE(BlobFilesIn(alt_dir_).empty());
+  ASSERT_TRUE(BlobFilesIn(dbname_).empty());
+
+  ASSERT_OK(Flush());
+  VerifyValues(db_.get(), value, columns);
+  Reopen(options);
+  VerifyValues(db_.get(), value, columns);
+  ASSERT_TRUE(BlobFilesIn(dbname_).empty());
+}
+
+// A sync write syncs the blob file and the directory entry in alt, so both
+// survive a power loss.
+TEST_P(DBBlobDirectWritePathTest, SyncWriteSurvivesPowerLoss) {
+  Options options = GetPathOptions(/*power_loss=*/true);
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  ASSERT_OK(db_->Put(sync_write, "key", value));
+  SimulatePowerLoss();
+
+  Reopen(options);
+  ASSERT_EQ(Get("key"), value);
+  CloseKeepingRecoveredBlobFiles();
+}
+
+// The blob files of a dropped column family are obsolete. The purge must find
+// and delete them in alt.
+TEST_P(DBBlobDirectWritePathTest, ObsoleteBlobFilesArePurged) {
+  Options options = GetPathOptions();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  ASSERT_OK(Put(1, "key", std::string(200, 'v')));
+  ASSERT_OK(Flush(1));
+  const std::set<uint64_t> dropped_files = BlobFilesIn(alt_dir_);
+  ASSERT_FALSE(dropped_files.empty());
+
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handles_[1]));
+  handles_.resize(1);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  for (uint64_t file_number : dropped_files) {
+    ASSERT_EQ(BlobFilesIn(alt_dir_).count(file_number), 0U) << file_number;
+  }
+}
+
+// Checkpoints do not support db_paths or cf_paths, also with blob direct
+// write.
+TEST_P(DBBlobDirectWritePathTest, CheckpointIsNotSupported) {
+  Options options = GetPathOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", std::string(200, 'v')));
+
+  const std::string checkpoint_dir = dbname_ + "_checkpoint";
+  Checkpoint* raw_checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &raw_checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint(raw_checkpoint);
+  Status s = checkpoint->CreateCheckpoint(checkpoint_dir,
+                                          /*log_size_for_flush=*/0);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+}
+
+INSTANTIATE_TEST_CASE_P(DBBlobDirectWritePathTest, DBBlobDirectWritePathTest,
+                        ::testing::Bool());
 
 class DBBlobDirectWriteWithTimestampTest : public DBBasicTestWithTimestampBase {
  protected:

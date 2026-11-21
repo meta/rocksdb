@@ -864,12 +864,11 @@ Status DBImpl::WritePreprocessedPutEntityBatch(
   return s;
 }
 
-Status DBImpl::SyncBlobDirectWriteManagers(
+Status DBImpl::FlushBlobDirectWriteManagers(
     const WriteOptions& write_options,
     const BlobDirectWriteContext& blob_direct_write_ctx) {
   for (auto* mgr : blob_direct_write_ctx.touched_managers) {
-    Status blob_s = write_options.sync ? mgr->SyncAllOpenFiles(write_options)
-                                       : mgr->FlushAllOpenFiles(write_options);
+    Status blob_s = mgr->FlushAllOpenFiles(write_options);
     if (!blob_s.ok()) {
       return blob_s;
     }
@@ -885,6 +884,39 @@ Status DBImpl::SyncBlobDirectWriteManagers(
     }
   }
 
+  return Status::OK();
+}
+
+Status DBImpl::SyncBlobDirectWriteFiles(const WriteOptions& write_options) {
+  if (!HasAnyBlobDirectWriteColumnFamily()) {
+    return Status::OK();
+  }
+  std::vector<std::shared_ptr<BlobFilePartitionManager>> managers;
+  // Reserve outside the DB mutex. The count can change before the lock, so it
+  // is only a capacity hint.
+  managers.reserve(blob_direct_write_cf_count_.load(std::memory_order_relaxed));
+  {
+    InstrumentedMutexLock l(&mutex_);
+    for (auto* cfd : *versions_->GetColumnFamilySet()) {
+      // Skip dropped column families. A drop is in the MANIFEST before
+      // IsDropped() is set, and WAL recovery ignores records of a column
+      // family that is not in the MANIFEST, so their blob files do not need
+      // to be durable.
+      if (cfd->IsDropped()) {
+        continue;
+      }
+      if (std::shared_ptr<BlobFilePartitionManager> mgr =
+              cfd->blob_partition_manager_handle()) {
+        managers.push_back(std::move(mgr));
+      }
+    }
+  }
+  for (const auto& mgr : managers) {
+    Status s = mgr->SyncAllOpenFiles(write_options);
+    if (!s.ok()) {
+      return s;
+    }
+  }
   return Status::OK();
 }
 
@@ -1075,8 +1107,8 @@ Status DBImpl::WriteImpl(
     if (!blob_s.ok()) {
       return blob_s;
     }
-    blob_s = SyncBlobDirectWriteManagers(write_options,
-                                         blob_direct_write_ctx.value());
+    blob_s = FlushBlobDirectWriteManagers(write_options,
+                                          blob_direct_write_ctx.value());
     if (!blob_s.ok()) {
       return blob_s;
     }
@@ -1246,8 +1278,8 @@ Status DBImpl::WriteImpl(
             my_batch, write_options.protection_bytes_per_key);
       }
       if (status.ok() && blob_direct_write_ctx.has_value()) {
-        status = SyncBlobDirectWriteManagers(write_options,
-                                             blob_direct_write_ctx.value());
+        status = FlushBlobDirectWriteManagers(write_options,
+                                              blob_direct_write_ctx.value());
       }
     }
 
@@ -1276,8 +1308,8 @@ Status DBImpl::WriteImpl(
         }
       }
       if (status.ok()) {
-        status = SyncBlobDirectWriteManagers(write_options,
-                                             blob_direct_write_ctx.value());
+        status = FlushBlobDirectWriteManagers(write_options,
+                                              blob_direct_write_ctx.value());
       }
     }
   }
@@ -2443,6 +2475,10 @@ IOStatus DBImpl::WriteGroupToWAL(const WriteThread::WriteGroup& write_group,
     cached_recoverable_state_empty_ = false;
   }
 
+  if (io_s.ok() && need_wal_sync) {
+    // Sync blob files first. See SyncBlobDirectWriteFiles().
+    io_s = status_to_io_status(SyncBlobDirectWriteFiles(write_options));
+  }
   if (io_s.ok() && need_wal_sync) {
     StopWatch sw(immutable_db_options_.clock, stats_, WAL_FILE_SYNC_MICROS);
     // It's safe to access logs_ with unlocked mutex_ here because:

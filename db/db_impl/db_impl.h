@@ -2174,11 +2174,30 @@ class DBImpl : public DB
       const WriteOptions& write_options, WriteBatch* batch,
       WriteBatch* trace_batch,
       const DeferredPutEntityBatch* deferred_put_entities = nullptr);
-  // Flushes or syncs all blob direct-write managers touched by the current
-  // transformed write before the write can proceed.
-  Status SyncBlobDirectWriteManagers(
+
+  // Runs the write-path step for the blob files that the current transformed
+  // write touched. Each blob append already hands its data to the OS
+  // (flush-on-write), so readers can see the values, and FlushAllOpenFiles()
+  // has nothing more to do. This function does not sync. A sync write gets
+  // its blob files synced by SyncBlobDirectWriteFiles() before the WAL sync.
+  Status FlushBlobDirectWriteManagers(
       const WriteOptions& write_options,
       const BlobDirectWriteContext& blob_direct_write_ctx);
+
+  // Syncs the blob direct write files of every live column family and the
+  // directory entries of new blob files (see "Durability" in the
+  // BlobFilePartitionManager class comment). Blob direct write puts a large
+  // value into a blob file and writes only a BlobIndex to the WAL. A WAL sync
+  // makes every earlier WAL record durable, so the blob bytes those records
+  // point to must be durable first. Every WAL sync that can make such a record
+  // durable calls this function right before it fsyncs a WAL:
+  // WriteGroupToWAL() for a sync write, and SyncWalImpl() for SyncWAL(),
+  // FlushWAL(true) and the sync of closed WALs before a flush. Apart from
+  // sealing a file (when WriteBlob() rotates a full file, and at flush), this
+  // is the only place that syncs blob direct write files. A new WAL sync path
+  // must call it too.
+  // REQUIRES: mutex_ not held.
+  Status SyncBlobDirectWriteFiles(const WriteOptions& write_options);
 
   Status PipelinedWriteImpl(const WriteOptions& options, WriteBatch* updates,
                             WriteBatch* trace_batch,
