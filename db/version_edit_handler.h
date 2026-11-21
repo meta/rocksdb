@@ -449,6 +449,12 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
   Status VerifyFile(ColumnFamilyData* cfd, const std::string& fpath, int level,
                     const FileMetaData& fmeta) override;
 
+  // In store mode, a catch-up does not check a blob file again when the
+  // current Version already holds it with the same total blob count and bytes.
+  // VerifyFile() gives the reason.
+  Status VerifyBlobFile(ColumnFamilyData* cfd, uint64_t blob_file_num,
+                        const BlobFileAddition& blob_addition) override;
+
   void PrepareToReadNewManifest() {
     initialized_ = false;
     ResetReadState();

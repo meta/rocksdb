@@ -62,6 +62,12 @@ enum Tag : uint32_t {
   kBlobFileAddition = 400,
   kBlobFileGarbage,
 
+  // The only record of a stub MANIFEST, the file that CURRENT names when the
+  // rows in a ManifestStore (include/rocksdb/manifest_store.h) are the
+  // authority. It is not safe to ignore, so a reader that does not know store
+  // mode fails instead of reading an empty DB. See db/manifest_store_state.h.
+  kManifestStoreStub = 500,
+
   // Mask for an unidentified tag from the future which can be safely ignored.
   kTagSafeIgnoreMask = 1 << 13,
 
@@ -79,6 +85,9 @@ enum Tag : uint32_t {
   kLastCompactedManifestFileSize,
   kCommittedOptionsFileNumber,
   kDroppedBlobFile,
+  // The first record of a MANIFEST file copy in store mode. Readers skip it,
+  // so a copy is also a valid MANIFEST file. See db/manifest_store_state.h.
+  kManifestCopyMarker,
 };
 
 enum SubcompactionProgressPerLevelCustomTag : uint32_t {
@@ -930,7 +939,17 @@ class VersionEdit {
   // fresh. `provenance_flags_to_set` are DataFileProvenance flag bits to set
   // on the added file, recording what is happening to it (0 for none).
   void AddExistingFile(int level, const FileMetaData& f,
-                       uint32_t provenance_flags_to_set);
+                       uint32_t provenance_flags_to_set) {
+    AddExistingFile(level, f, provenance_flags_to_set, f.marked_for_compaction);
+  }
+
+  // Same, with `marked_for_compaction` given by the caller. A caller that
+  // reads `f` without the DB mutex uses it, because
+  // FileMetaData::marked_for_compaction of a file in a Version changes under
+  // the DB mutex (DB::SuggestCompactRange()).
+  void AddExistingFile(int level, const FileMetaData& f,
+                       uint32_t provenance_flags_to_set,
+                       bool marked_for_compaction);
 
   const NewFiles& GetNewFiles() const { return new_files_; }
 

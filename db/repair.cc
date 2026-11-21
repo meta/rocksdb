@@ -66,6 +66,7 @@
 #include "db/dbformat.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
+#include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
@@ -205,6 +206,22 @@ class Repairer {
     if (!status.ok()) {
       return status;
     }
+    // A DB in store mode keeps its metadata in a ManifestStore (see
+    // db/manifest_store_state.h). Rebuilding a MANIFEST file from the SST
+    // files would split the DB from its rows.
+    CurrentManifestInfo current;
+    Status current_s =
+        ReadCurrentManifestInfo(env_->GetFileSystem().get(), dbname_, &current);
+    // A stub that this binary cannot decode (current_s not OK) is still a
+    // stub.
+    if (current.is_stub) {
+      current_s.PermitUncheckedError();
+      return Status::NotSupported(
+          "RepairDB() does not support a DB in store mode");
+    }
+    // A broken CURRENT or MANIFEST is what RepairDB() repairs, so other
+    // errors are ignored here.
+    current_s.PermitUncheckedError();
     status = FindFiles();
     DBImpl* db_impl = nullptr;
     if (status.ok()) {

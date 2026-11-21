@@ -548,6 +548,11 @@ class DB {
   // and return the list of all column families in that DB
   // through column_families argument. The ordering of
   // column families in column_families is unspecified.
+  //
+  // For a DB in store mode (see DBOptions::manifest_store), pass the store in
+  // db_options.manifest_store. The function then reads the column families
+  // from the store with a consistent scan, without a claim. Without the
+  // store, a DB in store mode returns NotSupported.
   static Status ListColumnFamilies(const DBOptions& db_options,
                                    const std::string& name,
                                    std::vector<std::string>* column_families);
@@ -2589,6 +2594,13 @@ class DB {
   // live copies (Checkpoint, backups, etc.) or other storage-related purposes.
   // If creating a live copy, use DisableFileDeletions() before and
   // EnableFileDeletions() after to prevent deletions.
+  // For a DB in store mode (DBOptions::manifest_store), the MANIFEST entry has
+  // its content in LiveFileStorageInfo::replacement_contents. In store mode the
+  // MANIFEST file on disk is only a small stub that holds no metadata. A caller
+  // that copies the MANIFEST file by name copies that stub. Opened without a
+  // store, such a copy fails with NotSupported. Never open it with a store
+  // object of the source DB: that open claims the rows of the source DB, and
+  // the source DB stops.
   // For LSM-tree metadata, use Get*MetaData() functions instead.
   virtual Status GetLiveFilesStorageInfo(
       const LiveFilesStorageInfoOptions& opts,
@@ -2646,6 +2658,10 @@ class DB {
   // a lossless backup, GetLiveFilesStorageInfo() is strongly recommended
   // instead, because it ensures a single consistent view of all files is
   // captured in one call.
+  //
+  // For a DB in store mode (DBOptions::manifest_store) this function returns
+  // NotSupported: the MANIFEST file on disk is only a stub, so no file can be
+  // copied as the MANIFEST. GetLiveFilesStorageInfo() works in store mode.
   virtual Status GetLiveFiles(std::vector<std::string>&,
                               uint64_t* manifest_file_size,
                               bool flush_memtable = true) = 0;
@@ -2706,6 +2722,10 @@ class DB {
   // - Otherwise, the temperature is set to the CF's default_write_temperature.
   // (Landing in the last level does not currently guarantee using
   // last_level_temperature - TODO)
+  //
+  // In store mode (DBOptions::manifest_store), an error return can behave as
+  // described at IngestExternalFiles() and
+  // IngestExternalFileOptions::link_files.
   virtual Status IngestExternalFile(
       ColumnFamilyHandle* column_family,
       const std::vector<std::string>& external_files,
@@ -2722,6 +2742,9 @@ class DB {
   // If this function returns OK, all column families' ingestion must succeed.
   // If this function returns NOK, or the process crashes, then non-of the
   // files will be ingested into the database after recovery.
+  // In store mode (DBOptions::manifest_store), an IOError return can mean that
+  // the store applied the commit and the DB stopped. The next DB::Open() then
+  // shows the ingested files.
   // Note that it is possible for application to observe a mixed state during
   // the execution of this function. If the user performs range scan over the
   // column families with iterators, iterator on one column family may return
@@ -2775,7 +2798,12 @@ class DB {
   // passed to a single IngestExternalFiles() call, in the order the handles
   // appear in `handles` (so for overlapping keys a later handle's data wins).
   // Handles that target the same column family must have been prepared with the
-  // same IngestExternalFileOptions. On failure all handles are rolled back.
+  // same IngestExternalFileOptions. On failure all handles are rolled back. In
+  // store mode (DBOptions::manifest_store), the rollback can keep the ingested
+  // files, which can be hard links to the input files (see
+  // IngestExternalFileOptions::link_files). An IOError return in store mode can
+  // mean that the store applied the commit and the DB stopped. The next
+  // DB::Open() then shows the ingested files.
   virtual Status CommitFileIngestionHandles(
       std::vector<std::unique_ptr<FileIngestionHandle>> handles) = 0;
 
@@ -2800,10 +2828,16 @@ class DB {
   // move, the call makes a best effort to delete the specified files at
   // external_file_path on successful return, logging any failure to delete
   // rather than returning in Status. Files are not modified on any error
-  // return, and a best effort is made to remove any newly-created files.
+  // return, and a best effort is made to remove any newly-created files. In
+  // store mode (DBOptions::manifest_store), an error return can keep the
+  // newly-created files, which can be hard links to the input files (see
+  // ImportColumnFamilyOptions::move_files).
   // On error return, column family handle returned will be nullptr.
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
+  // In store mode, an IOError return can mean that the store applied the
+  // commit and the DB stopped. The next DB::Open() then shows the column family
+  // with the imported files.
   // Import never brings blob files, so it returns NotSupported if any file in
   // `metadata` references blob files (oldest_blob_file_number != 0). Importing
   // files without blob references into a column family with
@@ -3105,6 +3139,28 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
 
 // Destroy the contents of the specified database.
 // Be very careful using this method.
+//
+// Store mode (see DBOptions::manifest_store): pass the store in
+// options.manifest_store. DestroyDB() removes the rows with
+// ManifestStore::Destroy() first, then deletes the files. Without the store
+// it returns NotSupported.
+//
+// File mode with a store in options.manifest_store: DestroyDB() reads the db
+// id of the DB from the MANIFEST, or from the IDENTITY file when the MANIFEST
+// cannot be read up to its db id. Then it reads the DB row. When the row has
+// that db id and authority kFile (the rows that RollBackManifestStore()
+// left), it removes the rows.
+//
+// Errors (nothing is deleted):
+// - InvalidArgument in store mode when the DB row in the store has the db id
+//   of another DB. In file mode, DestroyDB() leaves the rows of another DB
+//   alone and returns no error.
+// - The decode error when this binary cannot decode the stub MANIFEST that
+//   CURRENT names.
+// - The error of the IDENTITY file read, of the DB row read or decode, or of
+//   ManifestStore::Destroy().
+// - The I/O error when it cannot read CURRENT or the MANIFEST that CURRENT
+//   names (other than a missing file) and the folder can be listed.
 Status DestroyDB(const std::string& name, const Options& options,
                  const std::vector<ColumnFamilyDescriptor>& column_families =
                      std::vector<ColumnFamilyDescriptor>());

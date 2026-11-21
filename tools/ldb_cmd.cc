@@ -27,6 +27,8 @@
 #include "db/dbformat.h"
 #include "db/log_reader.h"
 #include "db/manifest_ops.h"
+#include "db/manifest_rows.h"
+#include "db/manifest_store_state.h"
 #include "db/version_set.h"
 #include "db/version_util.h"
 #include "db/wide/wide_column_serialization.h"
@@ -40,6 +42,7 @@
 #include "rocksdb/experimental.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/utilities/backup_engine.h"
@@ -73,6 +76,7 @@ const std::string LDBCommand::ARG_DB = "db";
 const std::string LDBCommand::ARG_PATH = "path";
 const std::string LDBCommand::ARG_SECONDARY_PATH = "secondary_path";
 const std::string LDBCommand::ARG_LEADER_PATH = "leader_path";
+const std::string LDBCommand::ARG_MANIFEST_STORE = "manifest_store";
 const std::string LDBCommand::ARG_HEX = "hex";
 const std::string LDBCommand::ARG_KEY_HEX = "key_hex";
 const std::string LDBCommand::ARG_VALUE_HEX = "value_hex";
@@ -576,6 +580,23 @@ LDBCommand::LDBCommand(const std::map<std::string, std::string>& options,
       IsFlagPresent(flags, ARG_ENABLE_BLOB_GARBAGE_COLLECTION);
   config_options_.ignore_unknown_options =
       IsFlagPresent(flags, ARG_IGNORE_UNKNOWN_OPTIONS);
+
+  // The store is created here, so that a bad value fails before any DB access.
+  itr = options.find(ARG_MANIFEST_STORE);
+  if (itr != options.end()) {
+    Status s = ManifestStore::CreateFromString(config_options_, itr->second,
+                                               &manifest_store_);
+    // CreateFromString() returns OK and no object for an unknown name when
+    // unsupported options are ignored (the default).
+    if (s.ok() && manifest_store_ == nullptr) {
+      s = Status::NotFound("No registered ManifestStore", itr->second);
+    }
+    if (!s.ok()) {
+      exec_state_ = LDBCommandExecuteResult::Failed(
+          "Cannot create the store of --" + ARG_MANIFEST_STORE + ": " +
+          s.ToString());
+    }
+  }
 }
 
 void LDBCommand::OpenDB() {
@@ -734,6 +755,7 @@ std::vector<std::string> LDBCommand::BuildCmdLineOptions(
                                   ARG_DB,
                                   ARG_SECONDARY_PATH,
                                   ARG_LEADER_PATH,
+                                  ARG_MANIFEST_STORE,
                                   ARG_BLOOM_BITS,
                                   ARG_BLOCK_SIZE,
                                   ARG_UNIFORM_CV_THRESHOLD,
@@ -1223,6 +1245,41 @@ void LDBCommand::OverrideBaseCFOptions(ColumnFamilyOptions* cf_opts) {
   }
 }
 
+namespace {
+// Loads the OPTIONS file whose number the DB row of `store` records. A DB can
+// record the number of its committed OPTIONS file in its metadata
+// (committed_options_file_number). For such a DB, LoadLatestOptions() reads
+// the committed number from the MANIFEST file, because the newest OPTIONS file
+// in the folder may not be committed. In store mode (see
+// db/manifest_store_state.h) the MANIFEST file is a stub, so
+// LoadLatestOptions() returns NotSupported, and the number is in the DB row of
+// the store.
+Status LoadCommittedOptionsFromStore(
+    const ConfigOptions& config_options, const std::string& db_path,
+    ManifestStore* store, DBOptions* db_options,
+    std::vector<ColumnFamilyDescriptor>* cf_descs) {
+  ManifestDbRowResult db_row;
+  IOStatus io_s = store->ReadDbRow(&db_row);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  ManifestRows rows;
+  ManifestDbRowExtraFields extra_fields;
+  Status s = PublicRowsToManifestRows(db_row.db_row, /*rows=*/{}, &rows,
+                                      &extra_fields);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!rows.db.committed_options_file_number.has_value()) {
+    return Status::NotFound("The DB row records no OPTIONS file");
+  }
+  return LoadOptionsFromFile(
+      config_options,
+      OptionsFileName(db_path, *rows.db.committed_options_file_number),
+      db_options, cf_descs);
+}
+}  // namespace
+
 // First, initializes the options state using the OPTIONS file when enabled.
 // Second, overrides the options according to the CLI arguments and the
 // specific subcommand being run.
@@ -1234,6 +1291,11 @@ void LDBCommand::PrepareOptions() {
     config_options_.env = options_.env;
     Status s = LoadLatestOptions(config_options_, db_path_, &options_,
                                  &column_families_from_options);
+    if (s.IsNotSupported() && manifest_store_ != nullptr) {
+      s = LoadCommittedOptionsFromStore(config_options_, db_path_,
+                                        manifest_store_.get(), &options_,
+                                        &column_families_from_options);
+    }
     if (!s.ok() && !s.IsNotFound()) {
       // Option file exists but load option file error.
       std::string current_version = std::to_string(ROCKSDB_MAJOR) + "." +
@@ -1269,6 +1331,12 @@ void LDBCommand::PrepareOptions() {
 
   if (options_.env == Env::Default()) {
     options_.env = config_options_.env;
+  }
+  // The OPTIONS file never holds the store (it is not serialized), so it is
+  // set after the options are loaded, before DB::ListColumnFamilies() below
+  // and before every DB open.
+  if (manifest_store_ != nullptr) {
+    options_.manifest_store = manifest_store_;
   }
 
   OverrideBaseOptions();
@@ -1668,9 +1736,11 @@ void DBLoaderCommand::DoCommand() {
 
 namespace {
 
-void DumpManifestFile(Options options, std::string file, bool verbose, bool hex,
-                      bool json,
-                      const std::vector<ColumnFamilyDescriptor>& cf_descs) {
+// Prints the MANIFEST file `file`, or the metadata in `store` when `store` is
+// not null (a DB in store mode). Returns the error of the dump.
+Status DumpManifestOrStore(
+    Options options, std::string file, ManifestStore* store, bool verbose,
+    bool hex, bool json, const std::vector<ColumnFamilyDescriptor>& cf_descs) {
   EnvOptions sopt;
   std::string dbname("dummy");
   std::shared_ptr<Cache> tc(NewLRUCache(options.max_open_files - 10,
@@ -1689,7 +1759,18 @@ void DumpManifestFile(Options options, std::string file, bool verbose, bool hex,
                       /*db_id=*/"", /*db_session_id=*/"",
                       options.daily_offpeak_time_utc,
                       /*error_handler=*/nullptr, /*unchanging=*/true);
-  Status s = versions.DumpManifest(options, file, verbose, hex, json, cf_descs);
+  if (store != nullptr) {
+    return versions.DumpManifestFromStore(options, store, verbose, hex, json,
+                                          cf_descs);
+  }
+  return versions.DumpManifest(options, file, verbose, hex, json, cf_descs);
+}
+
+void DumpManifestFile(Options options, std::string file, bool verbose, bool hex,
+                      bool json,
+                      const std::vector<ColumnFamilyDescriptor>& cf_descs) {
+  Status s = DumpManifestOrStore(std::move(options), file, /*store=*/nullptr,
+                                 verbose, hex, json, cf_descs);
   if (!s.ok()) {
     fprintf(stderr, "Error in processing file %s %s\n", file.c_str(),
             s.ToString().c_str());
@@ -1785,6 +1866,19 @@ ManifestDumpCommand::ManifestDumpCommand(
 
 void ManifestDumpCommand::DoCommand() {
   PrepareOptions();
+  // A DB in store mode keeps its metadata in the store, and its MANIFEST file
+  // is only a stub. So with --manifest_store and without --path, the command
+  // prints the rows of the store as MANIFEST records.
+  if (manifest_store_ != nullptr && path_.empty()) {
+    Status s =
+        DumpManifestOrStore(options_, /*file=*/"", manifest_store_.get(),
+                            verbose_, is_key_hex_, json_, column_families_);
+    if (!s.ok()) {
+      exec_state_ = LDBCommandExecuteResult::Failed(
+          "Cannot dump the metadata in the store: " + s.ToString());
+    }
+    return;
+  }
   std::string manifestfile;
 
   if (!path_.empty()) {
@@ -4881,25 +4975,38 @@ void DBFileDumperCommand::DoCommand() {
   // dumping manifest file, sst files and blob files.
   std::cout << "Manifest File" << std::endl;
   std::cout << "==============================" << std::endl;
-  std::string manifest_filename;
-  s = ReadFileToString(db_->GetEnv(), CurrentFileName(db_->GetName()),
-                       &manifest_filename);
-  if (!s.ok() || manifest_filename.empty() ||
-      manifest_filename.back() != '\n') {
-    std::cerr << "Error when reading CURRENT file "
-              << CurrentFileName(db_->GetName()) << std::endl;
-  }
-  // remove the trailing '\n'
-  manifest_filename.resize(manifest_filename.size() - 1);
-  std::string manifest_filepath = db_->GetName() + "/" + manifest_filename;
-  // Correct concatenation of filepath and filename:
-  // Check that there is no double slashes (or more!) when concatenation
-  // happens.
-  manifest_filepath = NormalizePath(manifest_filepath);
+  if (manifest_store_ != nullptr) {
+    // In store mode, the stub that CURRENT names holds no metadata, so the
+    // rows of the store are dumped as MANIFEST records.
+    s = DumpManifestOrStore(options_, /*file=*/"", manifest_store_.get(),
+                            /*verbose=*/false, /*hex=*/false, /*json=*/false,
+                            column_families_);
+    if (!s.ok()) {
+      exec_state_ = LDBCommandExecuteResult::Failed(
+          "Cannot dump the rows of --manifest_store: " + s.ToString());
+      return;
+    }
+  } else {
+    std::string manifest_filename;
+    s = ReadFileToString(db_->GetEnv(), CurrentFileName(db_->GetName()),
+                         &manifest_filename);
+    if (!s.ok() || manifest_filename.empty() ||
+        manifest_filename.back() != '\n') {
+      std::cerr << "Error when reading CURRENT file "
+                << CurrentFileName(db_->GetName()) << std::endl;
+    }
+    // remove the trailing '\n'
+    manifest_filename.resize(manifest_filename.size() - 1);
+    std::string manifest_filepath = db_->GetName() + "/" + manifest_filename;
+    // Correct concatenation of filepath and filename:
+    // Check that there is no double slashes (or more!) when concatenation
+    // happens.
+    manifest_filepath = NormalizePath(manifest_filepath);
 
-  std::cout << manifest_filepath << std::endl;
-  DumpManifestFile(options_, manifest_filepath, false, false, false,
-                   column_families_);
+    std::cout << manifest_filepath << std::endl;
+    DumpManifestFile(options_, manifest_filepath, false, false, false,
+                     column_families_);
+  }
   std::cout << std::endl;
 
   std::vector<ColumnFamilyMetaData> column_families;

@@ -301,11 +301,22 @@ Status ImportColumnFamilyJob::Run() {
   return s;
 }
 
+void ImportColumnFamilyJob::KeepInternalFiles() {
+  for (auto& files_to_import_per_cf : files_to_import_) {
+    for (auto& f : files_to_import_per_cf) {
+      f.internal_file_path.clear();
+    }
+  }
+}
+
 void ImportColumnFamilyJob::Cleanup(const Status& status) {
   if (!status.ok()) {
     // We failed to add files to the database remove all the files we copied.
     for (auto& files_to_import_per_cf : files_to_import_) {
       for (auto& f : files_to_import_per_cf) {
+        if (f.internal_file_path.empty()) {
+          continue;
+        }
         const auto s =
             fs_->DeleteFile(f.internal_file_path, IOOptions(), nullptr);
         if (!s.ok()) {
