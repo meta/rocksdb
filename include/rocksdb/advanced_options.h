@@ -1087,6 +1087,68 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   bool enable_blob_files = false;
 
+  // Experimental, and not complete yet. Option validation returns NotSupported
+  // for this option until the rest of the feature is in place.
+  //
+  // Purpose: let indirect blob GC move the live values out of a blob file that
+  // has a lot of garbage without rewriting the SSTs that point to them. When
+  // this option is on, each new blob value gets a kIndirectBlob BlobIndex,
+  // which keeps the value's identity (origin file and offset) when GC moves it,
+  // and each SST built by flush or compaction saves the exact list of blob
+  // references it keeps. See db/blob/blob_reference_metadata.h for how it
+  // works.
+  //
+  // Requirements and limits (option validation checks these after the
+  // NotSupported check above):
+  //   - enable_blob_files must be true (else InvalidArgument).
+  //   - The table format must be block-based (else NotSupported).
+  //   - enable_blob_direct_write must be false (else NotSupported).
+  //   - The FIFO compaction style is not supported (NotSupported). FIFO
+  //     column families that do not set this option keep their existing
+  //     BlobDB behavior.
+  // Turning the option off stops new values from using kIndirectBlob. The
+  // SSTs and blob files that were already written keep their format.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through the SetOptions() API
+  bool enable_blob_indirection = false;
+
+  // Experimental. Used only with enable_blob_indirection.
+  //
+  // Purpose: make reads of values that indirect blob GC moved into relocation
+  // files faster. A relocation file keeps the location of each value in its
+  // data blocks (the "location blocks"), which take a few bytes per relocated
+  // value. With this option on, a relocation file reader reads all of its
+  // location blocks when it opens and keeps them in memory while it is open.
+  // A lookup then needs no index or block cache lookup, so warm Gets and
+  // MultiGets of relocated values get faster.
+  //
+  // Cost:
+  //   - The kept blocks are charged to the block cache, and they stay there
+  //     while the reader is open. Without a block cache, they stay in the
+  //     reader's own memory and are not charged. With allow_mmap_reads and no
+  //     compression, the blocks point into the mapped file and are not
+  //     charged.
+  //   - Opening a relocation file reads all of its location blocks, so the
+  //     open takes longer and reads more bytes.
+  //   - With strict_capacity_limit, the kept blocks hold block cache capacity
+  //     that eviction cannot free, so other block cache inserts can fail
+  //     instead of evicting older blocks. If the block cache cannot charge the
+  //     blocks, the reader logs a warning and does normal lookups for that
+  //     file.
+  //
+  // When to use: when all kept location blocks are small compared with the
+  // block cache. Otherwise they push SST blocks out of the cache, and cold
+  // reads can get slower.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through the SetOptions() API. A reader reads the
+  // option when it opens, so a change applies to the relocation files that are
+  // opened after it.
+  bool pin_blob_relocation_location_blocks = false;
+
   // The size of the smallest value to be stored separately in a blob file.
   // Values which have an uncompressed size smaller than this threshold are
   // stored alongside the keys in SST files in the usual fashion. A value of

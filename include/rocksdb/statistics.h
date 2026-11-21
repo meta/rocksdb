@@ -691,6 +691,27 @@ enum Tickers : uint32_t {
   // hide. An iterator can count an entry again when it moves back to it.
   BLOB_DB_DROPPED_BLOB_READ_COUNT,
 
+  // Number of times a blob reference census build overflowed its change log
+  // again after an overflow restart, before it published. The census then
+  // retries after a backoff (DBs that use enable_blob_indirection).
+  BLOB_DB_CENSUS_RESTART_OVERFLOW_COUNT,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // times a relocation file reader failed to open (the file is missing,
+  // corrupt, or could not be read). Opens of normal blob files count in
+  // NO_FILE_ERRORS only.
+  BLOB_RELOCATION_FILE_OPEN_FAILURES,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // reads that got the remembered result of an earlier failed relocation file
+  // open, without opening the file again (see BlobFileCache).
+  BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // blob cache misses that found the value through a route (the reference names
+  // an old file whose live values moved to a relocation file).
+  BLOB_DB_INDIRECT_READ_ROUTED,
+
   TICKER_ENUM_MAX
 };
 
