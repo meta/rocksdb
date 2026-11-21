@@ -801,7 +801,11 @@ class CompactionIterator {
   // A lost value is treated as deleted, but the iterator does not write a
   // Delete. The record keeps its Put type and its reference, so SingleDelete
   // and conflict checks still work. Only the normal rules for hidden or
-  // obsolete records can drop it.
+  // obsolete records can drop it. In a CompactionJob run this stays false:
+  // when the input Version marks a file lost, CompactionJob puts a
+  // MissingBlobRepairIterator in front of this iterator, which turns lost
+  // references into deletions first. It is for other users that set a blob
+  // fetcher without that iterator (BuildTable() for flush and recovery).
   bool lost_blob_value_{false};
   // Fixed for one compaction or flush, so the per-key paths read these bools
   // instead of a virtual call. blob_value_loss_possible_: the blob fetcher's

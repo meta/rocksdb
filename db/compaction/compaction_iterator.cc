@@ -294,7 +294,8 @@ void CompactionIterator::SetBlobFetcher(const Version* version,
 
 bool CompactionIterator::CheckBlobValueLoss() {
   bool lost = false;
-  status_ = blob_fetcher_->IsBlobValueLost(ikey_.type, value_, &lost);
+  status_ = blob_fetcher_->IsBlobValueLost(ikey_.type, value_, &lost,
+                                           /*repaired_entity=*/nullptr);
   if (!status_.ok()) {
     return false;
   }

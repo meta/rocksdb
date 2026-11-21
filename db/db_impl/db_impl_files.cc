@@ -1317,6 +1317,9 @@ Status DBImpl::MaybeUpdateNextFileNumber(RecoveryContext* recovery_ctx) {
       if ((type == kTableFile || type == kBlobFile)) {
         recovery_ctx->existing_data_files_.push_back(normalized_fpath);
       }
+      if (type == kBlobFile) {
+        recovery_ctx->blob_file_numbers_by_path_[path].insert(number);
+      }
     }
   }
   if (!s.ok()) {

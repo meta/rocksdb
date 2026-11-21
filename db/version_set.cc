@@ -2994,9 +2994,9 @@ Status Version::ValidateBlobReferenceGeneration(uint64_t generation) const {
     }
     return Status::Corruption("Indirect blob generation is not relocatable");
   }
-  if (BlobFileTable::IsLost(value)) {
-    return Status::NotFound("Blob relocation file is marked lost");
-  }
+  // A relocation file marked lost by a loss record (kBlobPhysicalFileLoss) is
+  // still a legal generation number, so a compaction that reads a reference to
+  // it does not fail. Loss repair replaces such a reference with a deletion.
   return Status::OK();
 }
 
@@ -3095,11 +3095,49 @@ Status Version::ResolveBlobPhysicalFile(const BlobIndex& blob_index,
   // and the exact original offset. Otherwise the read fails with Corruption.
   if (BlobFileTable::IsLost(value)) {
     // An accepted loss: the file and every old file routed to it are gone.
-    return Status::NotFound("Blob relocation file is marked lost");
+    // Reads and compactions check for loss before they fetch, so a fetch that
+    // gets here is a bug. Return Corruption, as base RocksDB does for a value
+    // in a dropped blob file.
+    return Status::Corruption("Blob relocation file is marked lost");
   }
   const BlobRelocationFileMetaData* const relocation =
       BlobFileTable::AsRelocationFile(value);
   *physical_file = relocation->GetAddition().ToPhysicalFile();
+  return Status::OK();
+}
+
+Status Version::IsBlobValueLost(ValueType type, const Slice& value, bool* lost,
+                                std::string* repaired_entity) const {
+  assert(lost != nullptr);
+  *lost = false;
+  if (repaired_entity != nullptr) {
+    repaired_entity->clear();
+  }
+  if (!storage_info_.HasLostBlobRelocationFiles()) {
+    return Status::OK();
+  }
+  if (type == kTypeBlobIndex) {
+    BlobIndex index;
+    const Status status = index.DecodeFrom(value);
+    if (!status.ok()) {
+      return status;
+    }
+    *lost = storage_info_.IsBlobReferenceLost(index);
+  } else if (type == kTypeWideColumnEntity) {
+    WideColumnSerialization::BlobColumnRemoval removal;
+    const Status status = WideColumnSerialization::RemoveBlobColumns(
+        value,
+        [this](const BlobIndex& index) {
+          return storage_info_.IsBlobReferenceLost(index);
+        },
+        repaired_entity, removal);
+    *lost = removal == WideColumnSerialization::BlobColumnRemoval::kAll;
+    if (repaired_entity != nullptr &&
+        removal != WideColumnSerialization::BlobColumnRemoval::kSome) {
+      repaired_entity->clear();
+    }
+    return status;
+  }
   return Status::OK();
 }
 
@@ -6062,6 +6100,13 @@ Env::WriteLifeTimeHint VersionStorageInfo::CalculateSSTWriteHint(
 
 void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,
                            std::vector<uint64_t>* live_blob_files) const {
+  AddLiveFiles(live_table_files, live_blob_files,
+               /*skip_marked_lost=*/false);
+}
+
+void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,
+                           std::vector<uint64_t>* live_blob_files,
+                           bool skip_marked_lost) const {
   assert(live_table_files);
   assert(live_blob_files);
 
@@ -6083,6 +6128,9 @@ void Version::AddLiveFiles(std::vector<uint64_t>* live_table_files,
   for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
        storage_info_.GetBlobRelocationFiles()) {
     assert(metadata != nullptr);
+    if (skip_marked_lost && metadata->IsMarkedLost()) {
+      continue;
+    }
     live_blob_files->emplace_back(metadata->GetFileNumber());
   }
 }
@@ -9177,17 +9225,45 @@ Status VersionSet::TryRecover(
     return Status::Corruption("Cannot locate MANIFEST file in " + dbname_);
   }
   Status s;
+  repair_fallback_crossed_gc_ = false;
+  bool newest_manifest = true;
   std::string manifest_path =
       manifest_picker.GetNextManifest(&manifest_file_number_, nullptr);
   while (!manifest_path.empty()) {
     s = TryRecoverFromOneManifest(manifest_path, column_families, read_only,
                                   db_id, has_missing_table_file);
-    if (s.ok() || !manifest_picker.Valid()) {
+    // A fallback past an indirect blob GC edit fails the open (see
+    // VersionEditHandlerPointInTime::CheckRepairFallbackAgainstGc()). An older
+    // MANIFEST file never saw that edit, so it is not tried.
+    if (s.ok() || !manifest_picker.Valid() || repair_fallback_crossed_gc_) {
       break;
     }
     Reset();
+    newest_manifest = false;
     manifest_path =
         manifest_picker.GetNextManifest(&manifest_file_number_, nullptr);
+  }
+  if (s.ok() && !newest_manifest && db_options_->best_efforts_blob_db_repair) {
+    // An older MANIFEST file does not know the indirect blob GC edits of the
+    // newer ones, so the check against GC edits cannot run. If a column family
+    // with blob indirection would drop blob files or mark relocation files lost
+    // there, fail the open instead of risking the loss of values that a
+    // relocation file on disk still holds.
+    for (ColumnFamilyData* cfd : *column_family_set_) {
+      if (cfd->IsDropped() || cfd->current() == nullptr) {
+        continue;
+      }
+      const VersionStorageInfo* const storage = cfd->current()->storage_info();
+      if (storage->HasBlobIndirectionFormat() &&
+          (!storage->GetDroppedBlobFiles().empty() ||
+           storage->HasLostBlobRelocationFiles())) {
+        s = Status::Corruption(
+            "best_efforts_blob_db_repair would use an older MANIFEST file that "
+            "drops blob files of column family " +
+            cfd->GetName() + ", which has blob indirection");
+        break;
+      }
+    }
   }
   return s;
 }
@@ -9248,6 +9324,37 @@ void VersionSet::LogDroppedBlobFiles() const {
   for (ColumnFamilyData* cfd : *column_family_set_) {
     if (cfd->IsDropped()) {
       continue;
+    }
+    const VersionStorageInfo* const storage = cfd->current()->storage_info();
+    if (storage->HasLostBlobRelocationFiles()) {
+      // One line per column family. It names at most kMaxLoggedLostFileNumbers
+      // (16) files, so that the line stays short when many files are lost. The
+      // property rocksdb.blob-relocation-lost-files has the count. Also
+      // `ldb manifest_dump` prints the count, and `ldb manifest_dump --verbose`
+      // prints each loss record (BlobPhysicalFileLoss) with its file number.
+      constexpr size_t kMaxLoggedLostFileNumbers = 16;
+      size_t lost_count = 0;
+      std::string numbers;
+      for (const auto& file : storage->GetBlobRelocationFiles()) {
+        if (!file->IsMarkedLost()) {
+          continue;
+        }
+        if (lost_count < kMaxLoggedLostFileNumbers) {
+          numbers.append(" #");
+          AppendNumberTo(&numbers, file->GetFileNumber());
+        }
+        ++lost_count;
+      }
+      if (lost_count > kMaxLoggedLostFileNumbers) {
+        numbers.append(" and ");
+        AppendNumberTo(&numbers, lost_count - kMaxLoggedLostFileNumbers);
+        numbers.append(" more");
+      }
+      ROCKS_LOG_ERROR(db_options_->info_log,
+                      "[%s] Lost blob relocation files after best-efforts "
+                      "BlobDB repair (reads of their values return "
+                      "NotFound): count %" ROCKSDB_PRIszt ", files%s",
+                      cfd->GetName().c_str(), lost_count, numbers.c_str());
     }
     const std::vector<uint64_t>& dropped_blob_files =
         cfd->current()->storage_info()->GetDroppedBlobFiles();
@@ -9757,6 +9864,9 @@ Status VersionSet::GetLiveFilesChecksumInfo(FileChecksumList* checksum_list) {
     for (const std::shared_ptr<BlobRelocationFileMetaData>& metadata :
          vstorage->GetBlobRelocationFiles()) {
       assert(metadata != nullptr);
+      if (metadata->IsMarkedLost()) {
+        continue;
+      }
       std::string checksum_value = metadata->GetChecksumValue();
       std::string checksum_method = metadata->GetChecksumMethod();
       if (checksum_method.empty()) {
@@ -11167,8 +11277,10 @@ bool VersionStorageInfo::IsBlobReferenceLost(const BlobIndex& index) const {
   if (!index.IsIndirect() || !HasLostBlobRelocationFiles()) {
     return false;
   }
-  // A reference is lost when its generation is a lost relocation file, or an
+  // A reference is lost when its generation is a lost relocation file or an
   // old file routed to a lost relocation file.
+  // A lost file exists only in a Version with the format fence, so the file
+  // table holds every live file.
   const BlobFileTable& table = GetBlobFileTable();
   uint64_t value = table.Find(index.generation_file_number());
   if (BlobFileTable::IsRoute(value)) {

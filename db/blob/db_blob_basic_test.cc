@@ -18,6 +18,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "cache/cache_helpers.h"
@@ -375,6 +376,31 @@ class DBBlobBasicTest : public DBTestBase {
     ASSERT_EQ(blob_index.file_number(), blob_file_number);
   }
 
+  // Reopens the DB and marks the relocation files `lost_files` lost while the
+  // DB opens. The open writes the loss records into its new MANIFEST, so the
+  // loss is durable. The hook (VersionBuilder::MarkBlobFileLostForTest) works
+  // only for relocation files. A test that loses a normal or indirect-origin
+  // blob file deletes it and opens with best_efforts_blob_db_repair instead
+  // (see RepairOptions()).
+  Status TryReopenWithLostBlobFiles(const Options& options,
+                                    std::vector<uint64_t> lost_files) {
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "VersionBuilder::MarkBlobFileLostForTest", [lost_files](void* arg) {
+          auto* const file = static_cast<std::pair<uint64_t, bool*>*>(arg);
+          if (std::find(lost_files.begin(), lost_files.end(), file->first) !=
+              lost_files.end()) {
+            *file->second = true;
+          }
+        });
+    // Processing stays enabled, so callbacks that the test set before keep
+    // working.
+    sync_point->EnableProcessing();
+    const Status status = TryReopen(options);
+    sync_point->ClearCallBack("VersionBuilder::MarkBlobFileLostForTest");
+    return status;
+  }
+
   // Writes "a" and "c" (plus an older "b" if `preserve_older_value`) to one
   // blob file and "b" and "d" to a newer one, compacts both into one SST file
   // that references both blob files, then closes the DB and deletes the newer
@@ -480,6 +506,32 @@ class DBBlobBasicTest : public DBTestBase {
     Reopen(RepairOptions(options));
     ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{*missing_blob_file});
     ASSERT_EQ(TotalTableFiles(), 1);
+  }
+
+  // Checks that each blob file in `files` is dropped: it is listed in
+  // GetDroppedBlobFiles() and is not in the Version.
+  void AssertBlobFilesDropped(const std::vector<uint64_t>& files) {
+    const std::vector<uint64_t> dropped = GetDroppedBlobFiles();
+    for (uint64_t file : files) {
+      ASSERT_NE(std::find(dropped.begin(), dropped.end(), file), dropped.end())
+          << file;
+      ASSERT_FALSE(HasBlobFile(file)) << file;
+    }
+  }
+
+  // Closes the DB, deletes the normal or indirect-origin blob files `files`,
+  // and reopens with best_efforts_blob_db_repair. The open records each
+  // deleted file as dropped (MANIFEST record kDroppedBlobFile) and removes it
+  // from the Version. Reads treat the values in a dropped file as deleted, and
+  // a compaction turns the references into deletions.
+  void DeleteBlobFilesAndRepairOpen(const Options& options,
+                                    const std::vector<uint64_t>& files) {
+    Close();
+    for (uint64_t file : files) {
+      ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, file)));
+    }
+    Reopen(RepairOptions(options));
+    ASSERT_NO_FATAL_FAILURE(AssertBlobFilesDropped(files));
   }
 
   std::shared_ptr<const BlobReferenceCensusState> GetCensusSnapshot(
@@ -2655,6 +2707,218 @@ TEST_F(DBBlobBasicTest, IndirectBlobGCSignalsStayZeroWithoutIndirection) {
   ASSERT_EQ(idle, 0U);
   dbfull()->DumpStats();
   ASSERT_EQ(log->Count({"Indirect blob GC"}), 0U);
+}
+
+// Checks the lost relocation file signals. Indirect blob GC moves the live
+// values of one blob file, a plain value and the default column of an entity,
+// into a relocation file. The relocation file is then deleted, and an open
+// with best_efforts_blob_db_repair marks it lost. The test checks:
+//  - one ERROR line for the lost file at that open;
+//  - rocksdb.blob-relocation-lost-files and the lost-relocation-files map key,
+//    which are 0 before the loss and 1 after it;
+//  - BLOB_DB_LOST_BLOB_READ_COUNT, which counts each Get and iterator read
+//    that finds a lost value, also when an entity keeps its other columns.
+TEST_F(DBBlobBasicTest, LostRelocationFileSignals) {
+  Options options = IndirectBlobGCOptions();
+  // Values of 1 KB or more go to blob files, so the entity column "inline"
+  // stays in the SST.
+  options.min_blob_size = 1024;
+  options.enable_blob_garbage_collection = true;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), large));
+  }
+  ASSERT_OK(Put("lost", large));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "partial", {{"", large}, {"inline", "i"}}));
+  ASSERT_OK(Put("healthy", "inline"));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  // Four of the six values become garbage.
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t relocation = RouteTarget(origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+
+  const auto read_lost_files = [&](uint64_t* property, std::string* map_key) {
+    ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlobRelocationLostFiles,
+                                    property));
+    std::map<std::string, std::string> gc_stats;
+    ASSERT_TRUE(
+        db_->GetMapProperty(DB::Properties::kIndirectBlobGcStats, &gc_stats));
+    ASSERT_EQ(gc_stats.count("lost-relocation-files"), 1U);
+    *map_key = gc_stats["lost-relocation-files"];
+  };
+  uint64_t lost_files = 1;
+  std::string lost_files_key;
+  ASSERT_NO_FATAL_FAILURE(read_lost_files(&lost_files, &lost_files_key));
+  ASSERT_EQ(lost_files, 0U);
+  ASSERT_EQ(lost_files_key, "0");
+  Statistics* const statistics = options.statistics.get();
+  ASSERT_EQ(Get("lost"), large);
+  ASSERT_EQ(statistics->getTickerCount(BLOB_DB_LOST_BLOB_READ_COUNT), 0U);
+
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+  Options repair_options = RepairOptions(options);
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  repair_options.info_log = log;
+  ASSERT_OK(TryReopen(repair_options));
+  ASSERT_EQ(log->Count({"[ERROR] ", "Lost blob relocation files",
+                        "count 1, files #" + std::to_string(relocation)}),
+            1U);
+  ASSERT_NO_FATAL_FAILURE(read_lost_files(&lost_files, &lost_files_key));
+  ASSERT_EQ(lost_files, 1U);
+  ASSERT_EQ(lost_files_key, "1");
+
+  // A read of a value outside the lost file does not count.
+  const auto lost_reads = [&]() {
+    return statistics->getTickerCount(BLOB_DB_LOST_BLOB_READ_COUNT);
+  };
+  const uint64_t before = lost_reads();
+  ASSERT_EQ(Get("healthy"), "inline");
+  ASSERT_EQ(lost_reads(), before);
+  // Get of the lost plain value: NotFound, and one count.
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "lost", &value).IsNotFound());
+  ASSERT_EQ(lost_reads(), before + 1);
+  // Get of the entity: it keeps its "inline" column, and the lost default
+  // column reads as empty. One count.
+  ASSERT_OK(db_->Get(ReadOptions(), "partial", &value));
+  ASSERT_EQ(value, "");
+  ASSERT_EQ(lost_reads(), before + 2);
+  // A forward scan skips the lost value, returns the entity without its lost
+  // column, and counts both.
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    std::vector<std::string> keys;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+      if (iter->key() == "partial") {
+        const WideColumns expected{{"inline", "i"}};
+        ASSERT_EQ(iter->columns(), expected);
+      }
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(keys, (std::vector<std::string>{"healthy", "partial"}));
+  }
+  ASSERT_GE(lost_reads(), before + 4);
+  Close();
+}
+
+// Checks that a DB without blob indirection has no lost relocation file
+// signal: after a best-efforts repair open that drops a missing blob file,
+// the lost-files property stays 0 and reads do not count lost values.
+TEST_F(DBBlobBasicTest, LostRelocationFileSignalsStayZeroWithoutIndirection) {
+  Options options = MissingBlobRepairOptions();
+  options.statistics = CreateDBStatistics();
+  uint64_t missing_blob_file = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(CreateSstWithMissingBlobFile(
+      options, /*preserve_older_value=*/false, /*delete_oldest=*/false,
+      &missing_blob_file));
+  ASSERT_OK(TryReopen(RepairOptions(options)));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{missing_blob_file});
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "b", &value).IsNotFound());
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(ScanAll(), "a=va;c=vc;");
+  uint64_t lost_files = 1;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlobRelocationLostFiles,
+                                  &lost_files));
+  ASSERT_EQ(lost_files, 0U);
+  ASSERT_EQ(options.statistics->getTickerCount(BLOB_DB_LOST_BLOB_READ_COUNT),
+            0U);
+}
+
+// Checks the lost-files ERROR line when more files are lost than the line
+// names. Indirect blob GC moves the live value of each of 17 blob files into
+// its own relocation file. All 17 relocation files are then deleted, and an
+// open with best_efforts_blob_db_repair marks them lost. The line names
+// kMaxLoggedLostFileNumbers (16) files, the lowest file numbers, and ends with
+// "and 1 more". The lost-files property has the full count.
+TEST_F(DBBlobBasicTest, ManyLostRelocationFilesLogShortLine) {
+  Options options = IndirectBlobGCOptions();
+  options.enable_blob_garbage_collection = true;
+  DestroyAndReopen(options);
+  // 17 is one more than the number of files that the line names.
+  constexpr int kFiles = 17;
+  const std::string large(4096, 'v');
+  std::vector<uint64_t> origins;
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  for (int f = 0; f < kFiles; ++f) {
+    // One live value and three values that become garbage per blob file.
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(Put("f" + std::to_string(f) + "-" + std::to_string(i), large));
+    }
+    ASSERT_OK(Flush());
+    origins.push_back(cfd->current()
+                          ->storage_info()
+                          ->GetBlobFiles()
+                          .back()
+                          ->GetBlobFileNumber());
+  }
+  for (int f = 0; f < kFiles; ++f) {
+    for (int i = 1; i < 4; ++i) {
+      ASSERT_OK(Delete("f" + std::to_string(f) + "-" + std::to_string(i)));
+    }
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  std::vector<uint64_t> relocations;
+  for (uint64_t origin : origins) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+    const uint64_t relocation = RouteTarget(origin);
+    ASSERT_NE(relocation, kInvalidBlobFileNumber);
+    relocations.push_back(relocation);
+  }
+  std::sort(relocations.begin(), relocations.end());
+  relocations.erase(std::unique(relocations.begin(), relocations.end()),
+                    relocations.end());
+  ASSERT_EQ(relocations.size(), static_cast<size_t>(kFiles));
+
+  Close();
+  for (uint64_t relocation : relocations) {
+    ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+  }
+  Options repair_options = RepairOptions(options);
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  repair_options.info_log = log;
+  ASSERT_OK(TryReopen(repair_options));
+  // The 16 lowest file numbers, in order, then "and 1 more".
+  std::string named;
+  for (int f = 0; f + 1 < kFiles; ++f) {
+    named += " #" + std::to_string(relocations[f]);
+  }
+  ASSERT_EQ(log->Count({"[ERROR] ", "Lost blob relocation files",
+                        "count 17, files" + named + " and 1 more"}),
+            1U);
+  // The highest file number is not named.
+  ASSERT_EQ(log->Count({"Lost blob relocation files",
+                        "#" + std::to_string(relocations.back())}),
+            0U);
+  uint64_t lost_files = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kBlobRelocationLostFiles,
+                                  &lost_files));
+  ASSERT_EQ(lost_files, static_cast<uint64_t>(kFiles));
+  Close();
 }
 
 TEST_F(DBBlobBasicTest, ExactReferenceBudgetKeepsCompleteL0Histories) {
@@ -9693,6 +9957,49 @@ TEST_F(DBBlobBasicTest, CensusRestartBuildOverflowBacksOffThenFinishes) {
   ASSERT_EQ(Get("k5"), "blob_k");
 }
 
+TEST_F(DBBlobBasicTest, TailingIteratorDoesNotReadFreedVersion) {
+  // A tailing iterator keeps the blob fetcher of the Version it was made with.
+  // Flushes during the scan install new Versions, and the tailing iterator then
+  // drops its reference, so that Version can be freed. With no lost blob file,
+  // the iterator must not read that Version to parse a key (an ASAN build
+  // reports such a read as heap-use-after-free). After the flushes the test
+  // reads only keys (allow_unprepared_value), because reading a blob value
+  // still uses that Version in base RocksDB, which this test does not cover.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), "blob" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ReadOptions read_options;
+  read_options.tailing = true;
+  read_options.allow_unprepared_value = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->SeekToFirst();
+  int seen = 0;
+  for (; iter->Valid() && seen < 5; iter->Next(), ++seen) {
+    ASSERT_TRUE(iter->PrepareValue());
+    ASSERT_EQ(iter->value().ToString(),
+              "blob" + iter->key().ToString().substr(3));
+  }
+  for (int round = 0; round < 3; ++round) {
+    ASSERT_OK(Put("x" + std::to_string(round), "blob_x"));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  for (; iter->Valid(); iter->Next()) {
+    ++seen;
+    ASSERT_TRUE(iter->status().ok());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_GE(seen, 10);
+}
+
 TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsAfterFileDeletion) {
   // DeleteFilesInRange removes SSTs without passing their summaries, so the
   // census is rebuilt and then matches the Version.
@@ -12911,6 +13218,67 @@ TEST_F(DBBlobBasicTest, RelocationPinDoesNotBlockVersionRelease) {
   ASSERT_OK(deletion_status);
   ASSERT_OK(open_status);
   EXPECT_TRUE(weak_installed.expired());
+}
+
+TEST_F(DBBlobBasicTest, BestEffortsRecoveryMissingRoutedRelocationFile) {
+  // Best-efforts recovery never marks a blob file lost. With a missing
+  // relocation file that a route of a live value targets, it opens a
+  // consistent earlier point in time: every route targets a live relocation
+  // file, and nothing is marked lost.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("keep", large));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), large));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t relocation =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  ASSERT_OK(Put("later", large));
+  ASSERT_OK(Flush());
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+
+  ASSERT_TRUE(TryReopen(options).IsNotFound());
+  options.best_efforts_recovery = true;
+  // Every Version from the first flush on needs the origin file (which indirect
+  // blob GC deleted) or the relocation file (which is missing). So recovery
+  // goes back to the point before the first flush, where neither "keep" nor
+  // "later" exists.
+  ASSERT_OK(TryReopen(options));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  EXPECT_FALSE(storage->HasLostBlobRelocationFiles());
+  EXPECT_EQ(storage->GetBlobRelocationFileMetaData(relocation), nullptr);
+  storage->ForEachBlobRelocationRoute([&](const BlobRelocationRoute& route) {
+    EXPECT_NE(
+        storage->GetBlobRelocationFileMetaData(route.GetTargetFileNumber()),
+        nullptr);
+  });
+  EXPECT_EQ(Get("keep"), "NOT_FOUND");
+  EXPECT_EQ(Get("later"), "NOT_FOUND");
 }
 
 TEST_F(DBBlobBasicTest, BlobRelocationDeletionIsElidedFromManifestSnapshot) {
@@ -21650,6 +22018,80 @@ TEST_F(DBBlobBasicTest, IndirectBlobGCStreamsLargeValuesTwice) {
   ASSERT_EQ(Get("key4"), value);
 }
 
+TEST_F(DBBlobBasicTest, LostRelocationFileStillChecksOrigin) {
+  // Remote output validation (Version::ValidateBlobReferenceGroup) accepts a
+  // reference group whose generation number is a relocation file marked lost.
+  // The origin rule still applies: the origin must be older than the generation
+  // number.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  const std::string key = "key";
+  const std::string value = "value-in-a-lost-relocation-file";
+  ASSERT_OK(Put(key, value));
+  ASSERT_OK(Flush());
+
+  VersionSet* version_set = dbfull()->GetVersionSet();
+  ColumnFamilyData* cfd = version_set->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+  ASSERT_GT(origin_file_number, 1U);
+  const uint64_t value_offset =
+      BlobLogHeader::kSize + BlobLogRecord::kHeaderSize + key.size();
+  dbfull()->TEST_LockMutex();
+  const uint64_t relocation_file_number = version_set->NewFileNumber();
+  dbfull()->TEST_UnlockMutex();
+  Options relocation_options = options;
+  relocation_options.cf_paths.clear();
+  relocation_options.cf_paths.emplace_back(dbname_, /*target_size=*/0);
+  BlockBasedTableOptions table_options;
+  relocation_options.table_factory.reset(
+      NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(relocation_options);
+  const MutableCFOptions mutable_options(relocation_options);
+  BlobRelocationFileMetadata metadata;
+  uint64_t relocation_file_size = 0;
+  WriteRelocationFileForDBTest(
+      immutable_options, mutable_options, table_options, cfd->GetID(),
+      relocation_file_number,
+      {{origin_file_number, value_offset, value, kNoCompression}}, &metadata,
+      &relocation_file_size);
+
+  VersionEdit install;
+  install.SetColumnFamily(cfd->GetID());
+  install.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  install.AddBlobRelocationFile(BlobRelocationFileAddition(
+      relocation_file_number, relocation_file_size,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      metadata.encoded_directory, metadata.tail_size));
+  ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
+  VersionEdit lost;
+  lost.SetColumnFamily(cfd->GetID());
+  lost.MarkBlobPhysicalFileLost(relocation_file_number);
+  ASSERT_OK(ApplyVersionEdit(&lost, /*new_descriptor_log=*/false));
+
+  // A relocation file marked lost is still a legal generation number for a
+  // reference group (Version::ValidateBlobReferenceGroup). The origin rule of a
+  // relocation file still applies: the origin must be older than the generation
+  // number.
+  const Version* const current = cfd->current();
+  ASSERT_OK(current->ValidateBlobReferenceGroup(relocation_file_number,
+                                                origin_file_number));
+  const Status status = current->ValidateBlobReferenceGroup(
+      relocation_file_number, relocation_file_number);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("does not match its generation number"),
+            std::string::npos);
+}
+
 TEST_F(DBBlobBasicTest, RelocationPropertiesIncludePhysicalOverheadAndGarbage) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
@@ -21716,6 +22158,2131 @@ TEST_F(DBBlobBasicTest, RelocationPropertiesIncludePhysicalOverheadAndGarbage) {
                 .total_garbage_size,
             stats.total_garbage_size);
   ASSERT_EQ(Get("key3"), value);
+}
+
+TEST_F(DBBlobBasicTest, RelocationFileCheckOnOpenUsesDirectoryListing) {
+  // Open checks that each relocation file the MANIFEST does not mark lost
+  // exists, in the CF's first cf_path. A read-write open reuses the directory
+  // listing it already makes; a read-only open lists the path once. Neither
+  // calls FileExists for the relocation file. A missing file fails both
+  // opens.
+  class CountingFS : public FileSystemWrapper {
+   public:
+    explicit CountingFS(const std::shared_ptr<FileSystem>& target)
+        : FileSystemWrapper(target) {}
+    const char* Name() const override { return "CountingFS"; }
+    IOStatus FileExists(const std::string& fname, const IOOptions& opts,
+                        IODebugContext* dbg) override {
+      if (fname == watched) {
+        ++watched_exists;
+      }
+      return target()->FileExists(fname, opts, dbg);
+    }
+    // Only the relocation file: obsolete-file deletion may call FileExists
+    // for other blob files.
+    std::string watched;
+    std::atomic<int> watched_exists{0};
+  };
+  const auto fs = std::make_shared<CountingFS>(env_->GetFileSystem());
+  CompositeEnvWrapper counting_env(env_, fs);
+  Options options = GetDefaultOptions();
+  options.env = &counting_env;
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  const std::string first_path = dbname_ + "/cf_first";
+  options.cf_paths = {{first_path, 1 << 30}, {dbname_ + "/cf_second", 1 << 30}};
+  DestroyAndReopen(options);
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t relocation_file_number =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(relocation_file_number, kInvalidBlobFileNumber);
+  const std::string relocation_path =
+      BlobFileName(first_path, relocation_file_number);
+  ASSERT_OK(env_->FileExists(relocation_path));
+  Close();
+  fs->watched = relocation_path;
+
+  int listings = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::CheckRelocationFilesExist:ListDirectory",
+      [&](void*) { ++listings; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  // Present: both opens pass. Read-write: no listing of its own, no
+  // FileExists; read-only: one listing of the first cf_path.
+  ASSERT_OK(TryReopen(options));
+  EXPECT_EQ(listings, 0);
+  EXPECT_EQ(fs->watched_exists.load(), 0);
+  ASSERT_EQ(Get("key3"), value);
+  Close();
+  std::unique_ptr<DB> readonly_db;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &readonly_db));
+  EXPECT_EQ(listings, 1);
+  EXPECT_EQ(fs->watched_exists.load(), 0);
+  readonly_db.reset();
+
+  // Missing: both opens fail closed.
+  const std::string saved = relocation_path + ".saved";
+  ASSERT_OK(env_->RenameFile(relocation_path, saved));
+  const Status missing = TryReopen(options);
+  EXPECT_TRUE(missing.IsNotFound()) << missing.ToString();
+  // The message names the file, its number and the CF.
+  EXPECT_NE(missing.ToString().find(relocation_path), std::string::npos)
+      << missing.ToString();
+  EXPECT_NE(missing.ToString().find(
+                "#" + std::to_string(relocation_file_number) + ", CF default"),
+            std::string::npos)
+      << missing.ToString();
+  EXPECT_NE(missing.ToString().find("restore the file"), std::string::npos);
+  EXPECT_TRUE(DB::OpenForReadOnly(options, dbname_, &readonly_db).IsNotFound());
+  ASSERT_EQ(readonly_db, nullptr);
+  ASSERT_OK(env_->RenameFile(saved, relocation_path));
+  ASSERT_OK(TryReopen(options));
+  ASSERT_EQ(Get("key3"), value);
+  Close();
+}
+
+TEST_F(DBBlobBasicTest, RelocationLossIsStickyPointDeletion) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  options.blob_cache = NewLRUCache(8 * 1024 * 1024);
+  Reopen(options);
+  ASSERT_OK(Put("lost", "old_inline"));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "entity",
+                           {{"", "old_entity"}}));
+  ASSERT_OK(Flush());
+  const Snapshot* const old_snapshot = db_->GetSnapshot();
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("lost", large));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "entity",
+                           {{"", "inline"}, {"large", large}}));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), large));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t missing =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(missing, kInvalidBlobFileNumber);
+  const std::string path = BlobFileName(dbname_, missing);
+  const std::string saved = path + ".saved";
+  ASSERT_EQ(Get("lost"), large);  // Populate the shared stable-value cache.
+  ASSERT_OK(Put("healthy", large));
+  ASSERT_OK(Flush());
+  db_->ReleaseSnapshot(old_snapshot);
+  Close();
+  ASSERT_OK(options.env->RenameFile(path, saved));
+  ASSERT_FALSE(TryReopen(options).ok());
+  std::unique_ptr<DB> readonly_db;
+  ASSERT_FALSE(DB::OpenForReadOnly(options, dbname_, &readonly_db).ok());
+  ASSERT_EQ(readonly_db, nullptr);
+  ASSERT_OK(TryReopenWithLostBlobFiles(options, {missing}));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()
+                  ->storage_info()
+                  ->GetBlobRelocationFileMetaData(missing)
+                  ->IsMarkedLost());
+
+  const auto check_reads = [&] {
+    std::string value;
+    EXPECT_TRUE(db_->Get(ReadOptions(), "lost", &value).IsNotFound());
+    // The default column is inline. Losing the other column drops only that
+    // column; the older entity stays hidden.
+    EXPECT_OK(db_->Get(ReadOptions(), "entity", &value));
+    EXPECT_EQ(value, "inline");
+    PinnableWideColumns entity;
+    EXPECT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
+                             "entity", &entity));
+    EXPECT_EQ(entity.columns(), WideColumns({{"", "inline"}}));
+    EXPECT_EQ(Get("healthy"), large);
+    std::vector<Slice> keys{"entity", "lost", "healthy"};
+    std::vector<std::string> values;
+    const std::vector<Status> statuses =
+        db_->MultiGet(ReadOptions(), keys, &values);
+    EXPECT_OK(statuses[0]);
+    EXPECT_EQ(values[0], "inline");
+    EXPECT_TRUE(statuses[1].IsNotFound());
+    EXPECT_OK(statuses[2]);
+    for (const bool lazy : {false, true}) {
+      ReadOptions read_options;
+      read_options.allow_unprepared_value = lazy;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+      iter->SeekToFirst();
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(iter->key(), "entity");
+      ASSERT_TRUE(iter->PrepareValue());
+      EXPECT_EQ(iter->columns(), WideColumns({{"", "inline"}}));
+      iter->Next();
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(iter->key(), "healthy");
+      iter->Next();
+      EXPECT_FALSE(iter->Valid());
+      EXPECT_OK(iter->status());
+      iter->SeekToLast();
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(iter->key(), "healthy");
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid());
+      EXPECT_EQ(iter->key(), "entity");
+      ASSERT_TRUE(iter->PrepareValue());
+      EXPECT_EQ(iter->columns(), WideColumns({{"", "inline"}}));
+      iter->Prev();
+      EXPECT_FALSE(iter->Valid());
+      EXPECT_OK(iter->status());
+    }
+  };
+  check_reads();
+  // A restored copy of the lost file does not bring its values back.
+  ASSERT_OK(options.env->RenameFile(saved, path));
+  Reopen(options);
+  check_reads();
+  VersionEdit snapshot_edit;
+  ASSERT_OK(ApplyVersionEdit(&snapshot_edit, /*new_descriptor_log=*/true));
+  Reopen(options);
+  check_reads();
+  const std::string checkpoint_path = dbname_ + "_loss_checkpoint";
+  std::unique_ptr<Checkpoint> checkpoint;
+  Checkpoint* raw_checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &raw_checkpoint));
+  checkpoint.reset(raw_checkpoint);
+  ASSERT_OK(checkpoint->CreateCheckpoint(checkpoint_path));
+  std::unique_ptr<DB> checkpoint_db;
+  ASSERT_OK(DB::Open(options, checkpoint_path, &checkpoint_db));
+  std::string value;
+  ASSERT_TRUE(checkpoint_db->Get(ReadOptions(), "lost", &value).IsNotFound());
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), "entity", &value));
+  ASSERT_EQ(value, "inline");
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), "healthy", &value));
+  ASSERT_EQ(value, large);
+  checkpoint_db.reset();
+  ASSERT_OK(DestroyDB(checkpoint_path, options));
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  check_reads();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ(
+      cfd->current()->storage_info()->GetBlobRelocationFileMetaData(missing),
+      nullptr);
+  Reopen(options);
+  check_reads();
+}
+
+namespace {
+// Value types of the internal entries of `user_key`, newest first.
+std::vector<ValueType> InternalTypesForKey(DBImpl* db,
+                                           const std::string& user_key) {
+  Arena arena;
+  ReadOptions read_options;
+  ScopedArenaPtr<InternalIterator> iter(
+      db->NewInternalIterator(read_options, &arena, kMaxSequenceNumber));
+  iter->Seek(
+      InternalKey(user_key, kMaxSequenceNumber, kValueTypeForSeek).Encode());
+  std::vector<ValueType> result;
+  while (iter->Valid()) {
+    ParsedInternalKey key;
+    EXPECT_OK(ParseInternalKey(iter->key(), &key, true));
+    if (key.user_key != user_key) {
+      break;
+    }
+    result.push_back(key.type);
+    iter->Next();
+  }
+  EXPECT_OK(iter->status());
+  return result;
+}
+}  // namespace
+
+// Runs census, loss repair compaction and indirect blob GC until no blob file
+// is marked lost, or `max_rounds` is reached.
+#define WAIT_FOR_LOSS_REPAIR(cfd_expr, max_rounds)     \
+  for (int round = 0; round < (max_rounds); ++round) { \
+    dbfull()->TEST_WaitForBlobReferenceCensus();       \
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());        \
+    if (!(cfd_expr)                                    \
+             ->current()                               \
+             ->storage_info()                          \
+             ->HasLostBlobRelocationFiles()) {         \
+      break;                                           \
+    }                                                  \
+  }
+
+TEST_F(DBBlobBasicTest, LossRepairDropsReferencesAndDeletesFiles) {
+  // Deletes three files: a relocation file, an indirect origin whose holders
+  // (SSTs that reference it) have exact metadata, and an indirect origin held
+  // only by a coarse L0 SST (one that records only its oldest origin). An open
+  // with best_efforts_blob_db_repair marks the relocation file lost and records
+  // the two origins as dropped (removed from the Version). A compaction that
+  // rewrites the holders drops the references, and indirect blob GC deletes the
+  // lost relocation file without reading it. A normal open then works.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto newest_blob_file = [&] {
+    return cfd->current()
+        ->storage_info()
+        ->GetBlobFiles()
+        .back()
+        ->GetBlobFileNumber();
+  };
+
+  ASSERT_OK(Put("relocated", large));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), large));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t relocated_origin = newest_blob_file();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {relocated_origin}));
+  const uint64_t lost_relocation =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(
+          relocated_origin);
+  ASSERT_NE(lost_relocation, kInvalidBlobFileNumber);
+
+  ASSERT_OK(Put("lost_value", large));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "partial", {{"", "inline"}, {"big", large}}));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                           "all_lost", {{"a", large}, {"b", large}}));
+  ASSERT_OK(Flush());
+  const uint64_t lost_origin = newest_blob_file();
+  ASSERT_OK(Put("healthy", large));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ASSERT_OK(Put("coarse", large));
+  ASSERT_OK(Flush());
+  const uint64_t lost_coarse_origin = newest_blob_file();
+  {
+    const auto& l0 = cfd->current()->storage_info()->LevelFiles(0);
+    ASSERT_EQ(l0.size(), 1U);
+    ASSERT_TRUE(l0[0]->blob_reference_descriptor.empty());
+    ASSERT_NE(l0[0]->oldest_coarse_indirect_origin_file_number,
+              kInvalidBlobFileNumber);
+  }
+  Close();
+  for (uint64_t file : {lost_relocation, lost_origin, lost_coarse_origin}) {
+    ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, file)));
+  }
+
+  // A normal open fails on the missing files.
+  ASSERT_FALSE(TryReopen(options).ok());
+  Reopen(RepairOptions(options));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()
+                  ->storage_info()
+                  ->GetBlobRelocationFileMetaData(lost_relocation)
+                  ->IsMarkedLost());
+  ASSERT_NO_FATAL_FAILURE(
+      AssertBlobFilesDropped({lost_origin, lost_coarse_origin}));
+
+  const auto check_reads = [&] {
+    std::string value;
+    for (const char* key : {"relocated", "lost_value", "all_lost", "coarse"}) {
+      EXPECT_TRUE(db_->Get(ReadOptions(), key, &value).IsNotFound()) << key;
+    }
+    EXPECT_EQ(Get("healthy"), large);
+    EXPECT_OK(db_->Get(ReadOptions(), "partial", &value));
+    EXPECT_EQ(value, "inline");
+    PinnableWideColumns entity;
+    EXPECT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
+                             "partial", &entity));
+    EXPECT_EQ(entity.columns(), WideColumns({{"", "inline"}}));
+    std::vector<std::string> keys;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+    EXPECT_OK(iter->status());
+    EXPECT_EQ(keys, (std::vector<std::string>{"healthy", "partial"}));
+  };
+  check_reads();
+
+  // Nothing repairs the holders until a compaction rewrites them.
+  std::vector<uint64_t> holders;
+  {
+    const VersionStorageInfo* storage = cfd->current()->storage_info();
+    for (int level = 0; level < storage->num_levels(); ++level) {
+      for (const FileMetaData* file : storage->LevelFiles(level)) {
+        holders.push_back(file->fd.GetNumber());
+      }
+    }
+  }
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  WAIT_FOR_LOSS_REPAIR(cfd, 10);
+  {
+    const VersionStorageInfo* storage = cfd->current()->storage_info();
+    EXPECT_FALSE(storage->HasLostBlobRelocationFiles());
+    EXPECT_EQ(storage->GetBlobRelocationFileMetaData(lost_relocation), nullptr);
+    EXPECT_EQ(storage->GetBlobFileMetaData(lost_origin), nullptr);
+    EXPECT_EQ(storage->GetBlobFileMetaData(lost_coarse_origin), nullptr);
+    for (int level = 0; level < storage->num_levels(); ++level) {
+      for (const FileMetaData* file : storage->LevelFiles(level)) {
+        EXPECT_EQ(
+            std::find(holders.begin(), holders.end(), file->fd.GetNumber()),
+            holders.end());
+      }
+    }
+  }
+  // Only deletions, kept where newer than an overlapping deeper SST, remain.
+  for (const char* key : {"relocated", "lost_value", "all_lost", "coarse"}) {
+    for (ValueType type : InternalTypesForKey(dbfull(), key)) {
+      EXPECT_EQ(type, kTypeDeletion) << key;
+    }
+  }
+  check_reads();
+  EXPECT_OK(dbfull()->TEST_GetBGError());
+
+  Reopen(options);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  EXPECT_FALSE(cfd->current()->storage_info()->HasLostBlobRelocationFiles());
+  check_reads();
+}
+
+TEST_F(DBBlobBasicTest, DroppedOriginLetsCompactionRepair) {
+  // A lost origin file, as in LostIndirectOriginFailsCompactionWithoutRetry,
+  // but the DB opens with best_efforts_blob_db_repair, so the origin file is
+  // recorded as dropped. A dropped generation number is an accepted generation
+  // number, not an unreadable one: the compaction succeeds and drops the
+  // references.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  for (const char* prefix : {"a", "b"}) {
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_OK(Put(prefix + std::to_string(i), value));
+    }
+    ASSERT_OK(Flush());
+  }
+  CompactRangeOptions compact;
+  compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto& blob_files = cfd->current()->storage_info()->GetBlobFiles();
+  ASSERT_EQ(blob_files.size(), 2U);
+  const uint64_t lost = blob_files.back()->GetBlobFileNumber();
+  ASSERT_NO_FATAL_FAILURE(DeleteBlobFilesAndRepairOpen(options, {lost}));
+  // The dropped record is sticky: a normal open (and a new MANIFEST) keeps
+  // it, and a checkpoint does not try to copy the dropped file.
+  Reopen(options);
+  VersionEdit snapshot_edit;
+  ASSERT_OK(ApplyVersionEdit(&snapshot_edit, /*new_descriptor_log=*/true));
+  Reopen(options);
+  ASSERT_NO_FATAL_FAILURE(AssertBlobFilesDropped({lost}));
+  ASSERT_EQ(Get("b0"), "NOT_FOUND");
+  ASSERT_EQ(Get("a0"), value);
+  const std::string checkpoint_path = dbname_ + "_origin_loss_checkpoint";
+  {
+    Checkpoint* raw_checkpoint = nullptr;
+    ASSERT_OK(Checkpoint::Create(db_.get(), &raw_checkpoint));
+    std::unique_ptr<Checkpoint> checkpoint(raw_checkpoint);
+    ASSERT_OK(checkpoint->CreateCheckpoint(checkpoint_path));
+    std::unique_ptr<DB> checkpoint_db;
+    ASSERT_OK(DB::Open(options, checkpoint_path, &checkpoint_db));
+    std::string read;
+    ASSERT_TRUE(checkpoint_db->Get(ReadOptions(), "b0", &read).IsNotFound());
+    checkpoint_db.reset();
+    ASSERT_OK(DestroyDB(checkpoint_path, options));
+  }
+
+  std::atomic<int> failed_sources{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ValidateBlobRelocationInputGenerations:Status",
+      [&](void* arg) {
+        if (!static_cast<Status*>(arg)->ok()) {
+          ++failed_sources;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Status s = db_->CompactRange(compact, nullptr, nullptr);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(s);
+  EXPECT_EQ(failed_sources.load(), 0);
+  EXPECT_OK(dbfull()->TEST_GetBGError());
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_EQ(Get("a" + std::to_string(i)), value);
+    EXPECT_EQ(Get("b" + std::to_string(i)), "NOT_FOUND");
+    EXPECT_TRUE(InternalTypesForKey(dbfull(), "b" + std::to_string(i)).empty());
+  }
+  Close();
+}
+
+TEST_F(DBBlobBasicTest, DroppedOriginRepairKeepsSnapshotDeletion) {
+  // An indirect-origin blob file is deleted, and an open with
+  // best_efforts_blob_db_repair records it as dropped. A snapshot and an older
+  // value below keep the repair deletion. It keeps the sequence of the dropped
+  // value, so the older value stays hidden, also from the snapshot. Once the
+  // snapshot is gone, both are removed.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "old-inline"));
+  ASSERT_OK(Put("zzz", "old-inline"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions deepest;
+  deepest.change_level = true;
+  deepest.target_level = 3;
+  ASSERT_OK(db_->CompactRange(deepest, nullptr, nullptr));
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("key", large));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t lost = cfd->current()
+                            ->storage_info()
+                            ->GetBlobFiles()
+                            .back()
+                            ->GetBlobFileNumber();
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr, true));
+  ASSERT_NO_FATAL_FAILURE(DeleteBlobFilesAndRepairOpen(options, {lost}));
+  ASSERT_EQ(Get("key"), "NOT_FOUND");
+  ASSERT_EQ(InternalTypesForKey(dbfull(), "key"),
+            (std::vector<ValueType>{kTypeBlobIndex, kTypeValue}));
+  const Snapshot* const snapshot = db_->GetSnapshot();
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr, true));
+  ASSERT_EQ(InternalTypesForKey(dbfull(), "key"),
+            (std::vector<ValueType>{kTypeDeletion, kTypeValue}));
+  ReadOptions read_options;
+  read_options.snapshot = snapshot;
+  std::string value;
+  ASSERT_TRUE(db_->Get(read_options, "key", &value).IsNotFound());
+  ASSERT_EQ(Get("key"), "NOT_FOUND");
+  db_->ReleaseSnapshot(snapshot);
+  CompactRangeOptions bottommost;
+  bottommost.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(bottommost, nullptr, nullptr));
+  ASSERT_TRUE(InternalTypesForKey(dbfull(), "key").empty());
+  ASSERT_EQ(Get("key"), "NOT_FOUND");
+  ASSERT_EQ(Get("zzz"), "old-inline");
+}
+
+TEST_F(DBBlobBasicTest, UniversalCompactionRepairsDroppedOrigin) {
+  // An indirect-origin blob file is deleted, and an open with
+  // best_efforts_blob_db_repair records it as dropped. A universal compaction
+  // that rewrites the sorted run that holds the dropped origin turns its
+  // references into deletions. An entity keeps its other columns.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 4;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("keep", large));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("lost", large));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "entity",
+                           {{"", "inline"}, {"big", large}}));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t lost = cfd->current()
+                            ->storage_info()
+                            ->GetBlobFiles()
+                            .back()
+                            ->GetBlobFileNumber();
+  CompactRangeOptions compact;
+  compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  ASSERT_NO_FATAL_FAILURE(DeleteBlobFilesAndRepairOpen(options, {lost}));
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_FALSE(HasBlobFile(lost));
+  EXPECT_TRUE(InternalTypesForKey(dbfull(), "lost").empty());
+  EXPECT_EQ(Get("keep"), large);
+  EXPECT_EQ(Get("lost"), "NOT_FOUND");
+  EXPECT_EQ(Get("entity"), "inline");
+  EXPECT_OK(dbfull()->TEST_GetBGError());
+  Reopen(options);
+  EXPECT_EQ(Get("entity"), "inline");
+  EXPECT_EQ(Get("lost"), "NOT_FOUND");
+}
+
+#undef WAIT_FOR_LOSS_REPAIR
+
+namespace {
+// Counts compactions that ask the service, and runs every one locally.
+class CountingLocalCompactionService : public CompactionService {
+ public:
+  const char* Name() const override { return "CountingLocalCompactionService"; }
+  CompactionServiceScheduleResponse Schedule(
+      const CompactionServiceJobInfo& /*info*/,
+      const std::string& /*compaction_service_input*/) override {
+    ++schedules;
+    return CompactionServiceScheduleResponse(
+        CompactionServiceJobStatus::kUseLocal);
+  }
+  CompactionServiceJobStatus Wait(const std::string& /*scheduled_job_id*/,
+                                  std::string* /*result*/) override {
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+  std::atomic<int> schedules{0};
+};
+
+Options LossRepairOptions(Options options) {
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  return options;
+}
+}  // namespace
+
+class DBBlobRepairFlagTest : public DBBlobBasicTest {
+ protected:
+  // Options for the tests below: blob indirection, indirect blob GC, and manual
+  // compactions only. Values of 4 KB go to blob files (min_blob_size = 1 KB).
+  Options IndirectionOptions() const {
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = true;
+    options.disable_auto_compactions = true;
+    options.min_blob_size = 1024;
+    return options;
+  }
+
+  // Writes key `key` with a large value and four large dead values to one new
+  // blob file, deletes the dead values, and returns the blob file number.
+  // Indirect blob GC can then relocate the file, because most of it is garbage.
+  uint64_t WriteOriginWithGarbage(const std::string& key) {
+    const std::string large(4096, 'v');
+    EXPECT_OK(Put(key, large));
+    for (int i = 0; i < 4; ++i) {
+      EXPECT_OK(Put(key + "_dead" + std::to_string(i), large));
+    }
+    EXPECT_OK(Flush());
+    const uint64_t origin = CurrentCfd()
+                                ->current()
+                                ->storage_info()
+                                ->GetBlobFiles()
+                                .back()
+                                ->GetBlobFileNumber();
+    for (int i = 0; i < 4; ++i) {
+      EXPECT_OK(Delete(key + "_dead" + std::to_string(i)));
+    }
+    EXPECT_OK(Flush());
+    return origin;
+  }
+
+  ColumnFamilyData* CurrentCfd() {
+    return dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  }
+
+  // Returns the path of the MANIFEST file that the CURRENT file names.
+  std::string CurrentManifestPath() {
+    std::string current;
+    EXPECT_OK(ReadFileToString(env_, CurrentFileName(dbname_), &current));
+    if (!current.empty() && current.back() == '\n') {
+      current.pop_back();
+    }
+    return dbname_ + "/" + current;
+  }
+
+  // Flushes key `key` with an inline value and moves its SST to L1 without a
+  // rewrite. Returns the SST file name, relative to the DB directory.
+  std::string MoveInlineSstToLevel1(const std::string& key) {
+    EXPECT_OK(Put(key, "inline"));
+    EXPECT_OK(Flush());
+    CompactRangeOptions move_options;
+    move_options.change_level = true;
+    move_options.target_level = 1;
+    const Slice key_slice(key);
+    EXPECT_OK(db_->CompactRange(move_options, &key_slice, &key_slice));
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::string moved_sst;
+    for (const LiveFileMetaData& file : files) {
+      if (file.smallestkey == key) {
+        EXPECT_EQ(file.level, 1);
+        moved_sst = file.relative_filename;
+      }
+    }
+    EXPECT_FALSE(moved_sst.empty());
+    return moved_sst;
+  }
+
+  // Reads the BlobIndex that `key` maps to.
+  BlobIndex GetBlobIndex(const std::string& key) {
+    PinnableSlice value;
+    bool is_blob_index = false;
+    DBImpl::GetImplOptions get_options;
+    get_options.column_family = db_->DefaultColumnFamily();
+    get_options.value = &value;
+    get_options.is_blob_index = &is_blob_index;
+    EXPECT_OK(dbfull()->GetImpl(ReadOptions(), key, get_options));
+    EXPECT_TRUE(is_blob_index);
+    BlobIndex blob_index;
+    EXPECT_OK(blob_index.DecodeFrom(value));
+    return blob_index;
+  }
+
+  // The number of entries in all SSTs of the default column family.
+  uint64_t TotalEntriesInTables() {
+    TablePropertiesCollection properties;
+    EXPECT_OK(db_->GetPropertiesOfAllTables(&properties));
+    uint64_t entries = 0;
+    for (const auto& entry : properties) {
+      entries += entry.second->num_entries;
+    }
+    return entries;
+  }
+
+  // Fetches the value of `blob_index` directly through the current Version,
+  // without the read path's loss check.
+  Status FetchDirectly(const std::string& key, const BlobIndex& blob_index) {
+    Version* version = nullptr;
+    {
+      InstrumentedMutexLock lock(dbfull()->mutex());
+      version = CurrentCfd()->current();
+      version->Ref();
+    }
+    PinnableSlice value;
+    const Status status = version->GetBlob(ReadOptions(), key, blob_index,
+                                           /*prefetch_buffer=*/nullptr, &value,
+                                           /*bytes_read=*/nullptr);
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    version->Unref();
+    return status;
+  }
+};
+
+TEST_F(DBBlobRepairFlagTest, MissingRelocationFileIsMarkedLost) {
+  // With best_efforts_blob_db_repair, a missing relocation file is marked lost
+  // instead of making the open fall back in time. Every user read treats its
+  // values as deleted: Get, MultiGet, an iterator (also with unprepared
+  // values), GetEntity and a merge over the lost value. A fetch that skips the
+  // read path's loss check gets Corruption.
+  Options options = IndirectionOptions();
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+  const uint64_t origin = WriteOriginWithGarbage("lost");
+  ASSERT_OK(Put("healthy", "inline"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {origin}));
+  const uint64_t relocation =
+      CurrentCfd()->current()->storage_info()->GetBlobRelocationRouteTarget(
+          origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  const BlobIndex lost_index = GetBlobIndex("lost");
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+
+  // Without the flag, the open fails and names the flag.
+  const Status without_flag = TryReopen(options);
+  ASSERT_TRUE(without_flag.IsNotFound()) << without_flag.ToString();
+  ASSERT_NE(without_flag.ToString().find("best_efforts_blob_db_repair"),
+            std::string::npos);
+
+  ASSERT_OK(TryReopen(RepairOptions(options)));
+  ASSERT_TRUE(CurrentCfd()
+                  ->current()
+                  ->storage_info()
+                  ->GetBlobRelocationFileMetaData(relocation)
+                  ->IsMarkedLost());
+
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "lost", &value).IsNotFound());
+  std::vector<Slice> keys{"lost", "healthy"};
+  std::vector<std::string> values;
+  const std::vector<Status> statuses =
+      db_->MultiGet(ReadOptions(), keys, &values);
+  ASSERT_TRUE(statuses[0].IsNotFound());
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1], "inline");
+  PinnableWideColumns entity;
+  ASSERT_TRUE(
+      db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "lost", &entity)
+          .IsNotFound());
+  for (const bool allow_unprepared_value : {false, true}) {
+    ReadOptions read_options;
+    read_options.allow_unprepared_value = allow_unprepared_value;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    std::vector<std::string> seen;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      ASSERT_TRUE(iter->PrepareValue());
+      seen.push_back(iter->key().ToString());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(seen, std::vector<std::string>{"healthy"});
+  }
+  ASSERT_OK(Merge("lost", "operand"));
+  ASSERT_EQ(Get("lost"), "operand");
+
+  // The direct fetch of the lost value fails with Corruption.
+  ASSERT_TRUE(FetchDirectly("lost", lost_index).IsCorruption());
+
+  // The open wrote the loss record into its new MANIFEST, so a later open
+  // without the flag succeeds although the file is still missing.
+  Close();
+  ASSERT_OK(TryReopen(options));
+  ASSERT_TRUE(CurrentCfd()
+                  ->current()
+                  ->storage_info()
+                  ->GetBlobRelocationFileMetaData(relocation)
+                  ->IsMarkedLost());
+  ASSERT_EQ(Get("lost"), "operand");
+}
+
+TEST_F(DBBlobRepairFlagTest, VerifyFileChecksumsSkipsLostRelocationFile) {
+  // VerifyFileChecksums() skips a relocation file that a repair open marked
+  // lost, as GetLiveFiles() does, so the call succeeds while the file is
+  // missing. It still checks every other relocation file: a wrong byte in a
+  // relocation file that is not lost fails the call.
+  Options options = IndirectionOptions();
+  options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
+  DestroyAndReopen(options);
+  const uint64_t lost_origin = WriteOriginWithGarbage("lost");
+  const uint64_t kept_origin = WriteOriginWithGarbage("kept");
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {lost_origin}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {kept_origin}));
+  const VersionStorageInfo* storage = CurrentCfd()->current()->storage_info();
+  const uint64_t lost_relocation =
+      storage->GetBlobRelocationRouteTarget(lost_origin);
+  const uint64_t kept_relocation =
+      storage->GetBlobRelocationRouteTarget(kept_origin);
+  ASSERT_NE(lost_relocation, kInvalidBlobFileNumber);
+  ASSERT_NE(kept_relocation, kInvalidBlobFileNumber);
+  ASSERT_NE(lost_relocation, kept_relocation);
+  ASSERT_OK(db_->VerifyFileChecksums(ReadOptions()));
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, lost_relocation)));
+
+  ASSERT_OK(TryReopen(RepairOptions(options)));
+  storage = CurrentCfd()->current()->storage_info();
+  ASSERT_TRUE(
+      storage->GetBlobRelocationFileMetaData(lost_relocation)->IsMarkedLost());
+  ASSERT_FALSE(
+      storage->GetBlobRelocationFileMetaData(kept_relocation)->IsMarkedLost());
+  ASSERT_OK(db_->VerifyFileChecksums(ReadOptions()));
+
+  // Change one byte in the middle of the relocation file that is not lost.
+  const std::string kept_path = BlobFileName(dbname_, kept_relocation);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, kept_path, &contents));
+  ASSERT_FALSE(contents.empty());
+  contents[contents.size() / 2] ^= 0x01;
+  ASSERT_OK(WriteStringToFile(env_, contents, kept_path, /*should_sync=*/true));
+  const Status corrupt = db_->VerifyFileChecksums(ReadOptions());
+  ASSERT_TRUE(corrupt.IsCorruption()) << corrupt.ToString();
+}
+
+TEST_F(DBBlobRepairFlagTest, LostRelocationFileCompactsFlattenedReference) {
+  // After indirect blob GC, a compaction rewrites the SST with a flattened
+  // reference: its generation number is the relocation file. A flattened
+  // reference does not set oldest_blob_file_number, so the base dropped-file
+  // gate never selects this SST. After the relocation file is marked lost, the
+  // loss mark alone makes the next compaction write a Delete for the key. An
+  // older value in L2 keeps that compaction from being bottommost, so the
+  // Delete stays in its output.
+  Options options = IndirectionOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("lost", "older"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  const uint64_t origin = WriteOriginWithGarbage("lost");
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {origin}));
+  const uint64_t relocation =
+      CurrentCfd()->current()->storage_info()->GetBlobRelocationRouteTarget(
+          origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  const auto level1_file = [&]() {
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    std::string name;
+    for (const LiveFileMetaData& file : files) {
+      if (file.level == 1) {
+        EXPECT_TRUE(name.empty());
+        name = file.name;
+      }
+    }
+    return name;
+  };
+  // Rewrite the L1 file in place: the reference becomes flattened.
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), {level1_file()}, 1));
+  ASSERT_EQ(GetBlobIndex("lost").generation_file_number(), relocation);
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  for (const LiveFileMetaData& file : files) {
+    ASSERT_EQ(file.oldest_blob_file_number, kInvalidBlobFileNumber);
+  }
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+  ASSERT_OK(TryReopen(RepairOptions(options)));
+
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), {level1_file()}, 1));
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  uint64_t deletions = 0;
+  for (const auto& entry : properties) {
+    deletions += entry.second->num_deletions;
+  }
+  ASSERT_EQ(deletions, 1U);
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "lost", &value).IsNotFound());
+}
+
+TEST_F(DBBlobRepairFlagTest, FallbackPastGcEditFails) {
+  // Example (the file numbers are examples): indirect blob GC moves origins 10
+  // and 11 into relocation file 30, and origin 12 into relocation file 31, then
+  // deletes 10, 11 and 12. A non-L0 SST that was added before those GC edits is
+  // missing, and relocation file 30 is missing too. The repair open falls back
+  // to the point before that SST was added, which is before the GC edits. That
+  // point still names 10, 11 and 12; they are gone from disk, so the flag would
+  // drop them, and their values would read as deleted although file 31 holds
+  // some of them. So the open fails with Corruption that names the files GC
+  // removed.
+  Options options = IndirectionOptions();
+  DestroyAndReopen(options);
+  const uint64_t first = WriteOriginWithGarbage("a");
+  const uint64_t second = WriteOriginWithGarbage("b");
+  const uint64_t third = WriteOriginWithGarbage("c");
+  ASSERT_OK(BuildExactSstAtLevel1());
+  // The SST of this small inline value is the one that goes missing.
+  const std::string moved_sst = MoveInlineSstToLevel1("z");
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(
+      dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {first, second}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {third}));
+  const uint64_t first_relocation =
+      CurrentCfd()->current()->storage_info()->GetBlobRelocationRouteTarget(
+          first);
+  ASSERT_NE(first_relocation, kInvalidBlobFileNumber);
+  ASSERT_OK(dbfull()->TEST_WaitForPurge());
+  Close();
+  ASSERT_OK(env_->DeleteFile(dbname_ + "/" + moved_sst));
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, first_relocation)));
+
+  const Status status = TryReopen(RepairOptions(options));
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("older than a blob GC edit"),
+            std::string::npos);
+  ASSERT_NE(status.ToString().find("#" + std::to_string(first)),
+            std::string::npos);
+  ASSERT_NE(status.ToString().find("#" + std::to_string(third)),
+            std::string::npos);
+}
+
+TEST_F(DBBlobRepairFlagTest, FallbackWithoutGcEditKeepsBaseBehavior) {
+  // Control: a non-L0 SST is missing, but no indirect blob GC edit follows the
+  // point that the repair open falls back to. The blob file of key "a" is
+  // missing too. GC did not remove it, so best_efforts_blob_db_repair records
+  // it as dropped and its values read as deleted. The open succeeds as in base
+  // RocksDB. Key "z" is gone, which shows that the open fell back.
+  Options options = IndirectionOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  const uint64_t blob_file = CurrentCfd()
+                                 ->current()
+                                 ->storage_info()
+                                 ->GetBlobFiles()
+                                 .front()
+                                 ->GetBlobFileNumber();
+  const std::string moved_sst = MoveInlineSstToLevel1("z");
+  Close();
+  ASSERT_OK(env_->DeleteFile(dbname_ + "/" + moved_sst));
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, blob_file)));
+
+  ASSERT_OK(TryReopen(RepairOptions(options)));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{blob_file});
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "z", &value).IsNotFound());
+  ASSERT_TRUE(db_->Get(ReadOptions(), "a", &value).IsNotFound());
+}
+
+TEST_F(DBBlobRepairFlagTest, FallbackPastGcEditDoesNotTryOlderManifest) {
+  // The DB directory has two MANIFEST files: the newest one, and a copy of an
+  // older one that was saved before indirect blob GC ran. The newest MANIFEST
+  // file fails the open as in FallbackPastGcEditFails. The older MANIFEST file
+  // never saw the GC edit, so the open must not try it next: it would drop the
+  // origin file that GC removed, and the purge at open would delete the
+  // relocation file.
+  Options options = IndirectionOptions();
+  DestroyAndReopen(options);
+  const uint64_t origin = WriteOriginWithGarbage("a");
+  ASSERT_OK(BuildExactSstAtLevel1());
+  Close();
+  const std::string older_manifest = CurrentManifestPath();
+  CopyFile(older_manifest, older_manifest + ".saved");
+
+  Reopen(options);
+  const std::string moved_sst = MoveInlineSstToLevel1("z");
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {origin}));
+  const uint64_t relocation =
+      CurrentCfd()->current()->storage_info()->GetBlobRelocationRouteTarget(
+          origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  ASSERT_OK(dbfull()->TEST_WaitForPurge());
+  Close();
+  ASSERT_NE(CurrentManifestPath(), older_manifest);
+  ASSERT_OK(env_->RenameFile(older_manifest + ".saved", older_manifest));
+  ASSERT_OK(env_->DeleteFile(dbname_ + "/" + moved_sst));
+
+  const Status status = TryReopen(RepairOptions(options));
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("older than a blob GC edit"),
+            std::string::npos);
+  ASSERT_OK(env_->FileExists(BlobFileName(dbname_, relocation)));
+}
+
+TEST_F(DBBlobRepairFlagTest, OlderManifestThatDropsBlobFilesFails) {
+  // The newest MANIFEST file is empty, so the repair open tries an older
+  // MANIFEST file, which was saved before indirect blob GC ran. That file does
+  // not know the GC edit, so it would drop the origin file that GC removed, and
+  // the purge at open would delete the relocation file. So the open fails. In
+  // the control, no GC ran: the older MANIFEST file drops nothing, and the open
+  // succeeds as in base RocksDB.
+  for (const bool run_gc : {true, false}) {
+    SCOPED_TRACE("run_gc=" + std::to_string(run_gc));
+    Options options = IndirectionOptions();
+    DestroyAndReopen(options);
+    const uint64_t origin = WriteOriginWithGarbage("a");
+    ASSERT_OK(BuildExactSstAtLevel1());
+    Close();
+    const std::string older_manifest = CurrentManifestPath();
+    CopyFile(older_manifest, older_manifest + ".saved");
+
+    Reopen(options);
+    if (run_gc) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {origin}));
+      ASSERT_OK(dbfull()->TEST_WaitForPurge());
+    }
+    Close();
+    const std::string newest_manifest = CurrentManifestPath();
+    ASSERT_NE(newest_manifest, older_manifest);
+    ASSERT_OK(env_->RenameFile(older_manifest + ".saved", older_manifest));
+    ASSERT_OK(WriteStringToFile(env_, "", newest_manifest));
+
+    const Status status = TryReopen(RepairOptions(options));
+    if (run_gc) {
+      ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+      ASSERT_NE(status.ToString().find("older MANIFEST file"),
+                std::string::npos);
+    } else {
+      ASSERT_OK(status);
+      ASSERT_EQ(Get("a"), std::string(4096, 'v'));
+    }
+  }
+}
+
+TEST_F(DBBlobRepairFlagTest, MissingRelocationFileAloneNeedsNoFallback) {
+  // Control: only relocation file 30 of the example is missing. The repair open
+  // marks it lost and keeps the newest point: the later indirect blob GC edits
+  // stay, and the values of the other relocation file stay readable.
+  Options options = IndirectionOptions();
+  DestroyAndReopen(options);
+  const uint64_t first = WriteOriginWithGarbage("a");
+  const uint64_t second = WriteOriginWithGarbage("b");
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {first}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {second}));
+  const VersionStorageInfo* storage = CurrentCfd()->current()->storage_info();
+  const uint64_t first_relocation =
+      storage->GetBlobRelocationRouteTarget(first);
+  const uint64_t second_relocation =
+      storage->GetBlobRelocationRouteTarget(second);
+  ASSERT_NE(first_relocation, kInvalidBlobFileNumber);
+  ASSERT_NE(second_relocation, kInvalidBlobFileNumber);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, first_relocation)));
+  ASSERT_OK(TryReopen(RepairOptions(options)));
+  storage = CurrentCfd()->current()->storage_info();
+  ASSERT_TRUE(
+      storage->GetBlobRelocationFileMetaData(first_relocation)->IsMarkedLost());
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(second), second_relocation);
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "a", &value).IsNotFound());
+  ASSERT_EQ(Get("b"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobRepairFlagTest, EntityWithLostAndDroppedColumnsIsDeleted) {
+  // Entity "e" has two blob columns in two blob files. The first file also
+  // holds four dead values, so indirect blob GC moves its live value, column
+  // "a", into a relocation file. Then the relocation file is missing, so the
+  // repair open marks it lost. The blob file of column "b" is missing too, so
+  // best_efforts_blob_db_repair records it as dropped. No column of "e" is
+  // left, so every read treats "e" as deleted: Get and both iterator
+  // directions, also when the iterator reseeks instead of skipping
+  // (max_sequential_skip_in_iterations 0) and when it prepares values on demand
+  // (allow_unprepared_value). A merge over "e" merges over no base value.
+  Options options = IndirectionOptions();
+  // A flush writes the blobs in key order. Each blob record takes about 4.1 KB:
+  // a 4096-byte value, the record header (BlobLogRecord::kHeaderSize, 32
+  // bytes) and a key of up to 7 bytes. The blob file header
+  // (BlobLogHeader::kSize) adds 30 bytes. A blob file closes after the first
+  // record that brings its size to blob_file_size or more. 18000 bytes is more
+  // than the header and four records (about 16.5 KB), so the first file closes
+  // after the four dead values and column "a" (about 20.7 KB). Column "b" then
+  // goes to a second file.
+  options.blob_file_size = 18000;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("c_dead" + std::to_string(i), std::string(4096, 'x')));
+  }
+  ASSERT_OK(Put("d", "inline"));
+  ASSERT_OK(db_->PutEntity(
+      WriteOptions(), db_->DefaultColumnFamily(), "e",
+      {{"a", std::string(4096, 'a')}, {"b", std::string(4096, 'b')}}));
+  ASSERT_OK(Put("f", "inline"));
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("c_dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  const auto& blob_files =
+      CurrentCfd()->current()->storage_info()->GetBlobFiles();
+  ASSERT_EQ(blob_files.size(), 2U);
+  const uint64_t origin_a = blob_files.front()->GetBlobFileNumber();
+  const uint64_t origin_b = blob_files.back()->GetBlobFileNumber();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {origin_a}));
+  const uint64_t relocation =
+      CurrentCfd()->current()->storage_info()->GetBlobRelocationRouteTarget(
+          origin_a);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, origin_b)));
+  ASSERT_OK(TryReopen(RepairOptions(options)));
+  ASSERT_EQ(GetDroppedBlobFiles(), std::vector<uint64_t>{origin_b});
+
+  const auto check_scans = [&](const std::vector<std::string>& expected,
+                               bool allow_unprepared_value) {
+    ReadOptions read_options;
+    read_options.allow_unprepared_value = allow_unprepared_value;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    const auto entry = [&]() {
+      EXPECT_TRUE(iter->PrepareValue());
+      return iter->key().ToString() + "=" + iter->value().ToString();
+    };
+    std::vector<std::string> forward;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      forward.push_back(entry());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(forward, expected);
+    std::vector<std::string> reverse;
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      reverse.insert(reverse.begin(), entry());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(reverse, expected);
+  };
+  const auto check_reads = [&](const std::string& expected_e) {
+    std::string value;
+    const Status status = db_->Get(ReadOptions(), "e", &value);
+    if (expected_e.empty()) {
+      ASSERT_TRUE(status.IsNotFound()) << status.ToString();
+    } else {
+      ASSERT_OK(status);
+      ASSERT_EQ(value, expected_e);
+    }
+    std::vector<std::string> expected{"d=inline", "f=inline"};
+    if (!expected_e.empty()) {
+      expected.insert(expected.begin() + 1, "e=" + expected_e);
+    }
+    for (const char* max_skip : {"8", "0"}) {
+      ASSERT_OK(
+          db_->SetOptions(db_->DefaultColumnFamily(),
+                          {{"max_sequential_skip_in_iterations", max_skip}}));
+      for (const bool allow_unprepared_value : {false, true}) {
+        SCOPED_TRACE(std::string("max_skip=") + max_skip +
+                     " allow_unprepared_value=" +
+                     std::to_string(allow_unprepared_value));
+        check_scans(expected, allow_unprepared_value);
+      }
+    }
+  };
+  check_reads(/*expected_e=*/"");
+  ASSERT_OK(Merge("e", "op"));
+  check_reads(/*expected_e=*/"op");
+}
+
+TEST_F(DBBlobRepairFlagTest, CorruptRelocationFileIsMarkedLost) {
+  // A relocation file that is on disk but one byte short is corrupt. The
+  // repair open marks it lost, as it does for a missing file. The open writes
+  // the loss record into its new MANIFEST, so a later open without the flag
+  // succeeds and still treats the values of that file as deleted.
+  Options options = IndirectionOptions();
+  DestroyAndReopen(options);
+  const uint64_t origin = WriteOriginWithGarbage("lost");
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(CurrentCfd(), {origin}));
+  const uint64_t relocation =
+      CurrentCfd()->current()->storage_info()->GetBlobRelocationRouteTarget(
+          origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  Close();
+  const std::string path = BlobFileName(dbname_, relocation);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, path, &contents));
+  ASSERT_FALSE(contents.empty());
+  contents.pop_back();
+  ASSERT_OK(WriteStringToFile(env_, contents, path));
+
+  ASSERT_OK(TryReopen(RepairOptions(options)));
+  for (const bool repair_open : {true, false}) {
+    SCOPED_TRACE("repair_open=" + std::to_string(repair_open));
+    if (!repair_open) {
+      Close();
+      ASSERT_OK(TryReopen(options));
+    }
+    ASSERT_TRUE(CurrentCfd()
+                    ->current()
+                    ->storage_info()
+                    ->GetBlobRelocationFileMetaData(relocation)
+                    ->IsMarkedLost());
+    std::string value;
+    ASSERT_TRUE(db_->Get(ReadOptions(), "lost", &value).IsNotFound());
+  }
+}
+
+// Tests for repair of blob files a DB cannot read. A normal or
+// indirect-origin blob file is deleted and recorded as dropped (see
+// DropAndReopen()). A relocation file is marked lost (see
+// TryReopenWithLostBlobFiles()). Compactions turn references into such files
+// into deletions.
+class DBBlobLossRepairTest : public DBBlobBasicTest {
+ protected:
+  uint64_t NewestBlobFile() {
+    return dbfull()
+        ->GetVersionSet()
+        ->GetColumnFamilySet()
+        ->GetDefault()
+        ->current()
+        ->storage_info()
+        ->GetBlobFiles()
+        .back()
+        ->GetBlobFileNumber();
+  }
+
+  // Deletes the normal or indirect-origin blob files `files` and reopens with
+  // best_efforts_blob_db_repair (see DeleteBlobFilesAndRepairOpen()), so each
+  // file is recorded as dropped. The DB runs automatic compactions unless
+  // `auto_compactions` is false.
+  void DropAndReopen(Options options, const std::vector<uint64_t>& files,
+                     bool auto_compactions = true) {
+    options.disable_auto_compactions = !auto_compactions;
+    ASSERT_NO_FATAL_FAILURE(DeleteBlobFilesAndRepairOpen(options, files));
+  }
+
+  ColumnFamilyData* Cfd() {
+    return dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  }
+
+  // Returns true if a relocation file is marked lost.
+  bool HasLoss() {
+    return Cfd()->current()->storage_info()->HasLostBlobRelocationFiles();
+  }
+
+  // Compacts the whole key range, so that every holder of a dropped or lost
+  // file is rewritten and loses its references. Then runs census, compaction
+  // and indirect blob GC until no lost relocation file is left, at most 10
+  // rounds.
+  void WaitForLossRepair() {
+    CompactRangeOptions compact;
+    compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+    for (int round = 0; round < 10 && HasLoss(); ++round) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    }
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+};
+
+TEST_F(DBBlobLossRepairTest, CoarseHolderWithHealthyOriginIsRepairedOnce) {
+  // A coarse L0 file pins every origin at or above its oldest origin, so it is
+  // a possible holder of a newer dropped origin even when it holds a healthy
+  // older one. One compaction of the whole range repairs the holders. After
+  // it, more census rounds start no more compactions.
+  for (const bool universal : {false, true}) {
+    SCOPED_TRACE(universal);
+    Options options = LossRepairOptions(GetDefaultOptions());
+    if (universal) {
+      options.compaction_style = kCompactionStyleUniversal;
+      options.num_levels = 1;
+    }
+    DestroyAndReopen(options);
+    const std::string large(4096, 'v');
+    ASSERT_OK(Put("a", large));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("b", large));
+    ASSERT_OK(Flush());
+    const uint64_t lost = NewestBlobFile();
+    ASSERT_EQ(Cfd()->current()->storage_info()->NumLevelFiles(0), 2);
+    std::atomic<int> compactions{0};
+    SyncPoint::GetInstance()->SetCallBack("CompactionJob::Run():Start",
+                                          [&](void*) { ++compactions; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DropAndReopen(options, {lost});
+    WaitForLossRepair();
+    const int after_repair = compactions.load();
+    // More census rounds do not start more compactions.
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_FALSE(HasBlobFile(lost));
+    EXPECT_GE(after_repair, 1);
+    EXPECT_LE(after_repair, 3);
+    EXPECT_EQ(compactions.load(), after_repair);
+    EXPECT_TRUE(InternalTypesForKey(dbfull(), "b").empty());
+    EXPECT_EQ(Get("a"), large);
+    EXPECT_EQ(Get("b"), "NOT_FOUND");
+    EXPECT_OK(dbfull()->TEST_GetBGError());
+  }
+}
+
+TEST_F(DBBlobLossRepairTest, PartialEntityEndToEnd) {
+  // Each blob goes to its own blob file, so one entity has one dropped and one
+  // healthy blob column. The dropped column is the default column: Get returns
+  // an empty value, GetEntity and iterators return the other columns, also
+  // after the repair compaction and a normal reopen.
+  Options options = LossRepairOptions(GetDefaultOptions());
+  options.blob_file_size = 1;
+  DestroyAndReopen(options);
+  const std::string lost_value(4096, 'l');
+  const std::string healthy_value(4096, 'h');
+  ASSERT_OK(db_->PutEntity(
+      WriteOptions(), db_->DefaultColumnFamily(), "e",
+      {{"", lost_value}, {"healthy", healthy_value}, {"inline", "i"}}));
+  ASSERT_OK(Flush());
+  const auto& blob_files = Cfd()->current()->storage_info()->GetBlobFiles();
+  ASSERT_EQ(blob_files.size(), 2U);
+  // Columns are written in name order, so the default column is first.
+  const uint64_t lost = blob_files.front()->GetBlobFileNumber();
+  DropAndReopen(options, {lost});
+
+  const WideColumns expected{{"healthy", healthy_value}, {"inline", "i"}};
+  const auto check_reads = [&] {
+    std::string value = "unchanged";
+    ASSERT_OK(db_->Get(ReadOptions(), "e", &value));
+    EXPECT_EQ(value, "");
+    PinnableWideColumns entity;
+    ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "e",
+                             &entity));
+    EXPECT_EQ(entity.columns(), expected);
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->SeekToFirst();
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->value(), "");
+    EXPECT_EQ(iter->columns(), expected);
+    iter->Next();
+    EXPECT_FALSE(iter->Valid());
+    iter->SeekToLast();
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->columns(), expected);
+    ASSERT_OK(iter->status());
+  };
+  check_reads();
+  WaitForLossRepair();
+  EXPECT_OK(dbfull()->TEST_GetBGError());
+  check_reads();
+  Reopen(options);
+  check_reads();
+}
+
+TEST_F(DBBlobLossRepairTest, MergeOverDroppedBaseAndPartialEntity) {
+  // A merge over a value in a dropped blob file merges over no base; a merge
+  // over a partial entity uses the remaining columns. Get, both iterator
+  // directions and the repair compaction agree.
+  Options options = LossRepairOptions(GetDefaultOptions());
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("m", large));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "p",
+                           {{"", large}, {"x", "inline"}}));
+  ASSERT_OK(Flush());
+  const uint64_t lost = NewestBlobFile();
+  ASSERT_OK(Merge("m", "op"));
+  ASSERT_OK(Merge("p", "op"));
+  ASSERT_OK(Flush());
+  DropAndReopen(options, {lost});
+
+  // As for any entity without a default column, the merge appends to an
+  // empty default value.
+  const WideColumns expected_p{{"", ",op"}, {"x", "inline"}};
+  const auto check_reads = [&] {
+    EXPECT_EQ(Get("m"), "op");
+    EXPECT_EQ(Get("p"), ",op");
+    PinnableWideColumns entity;
+    ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "p",
+                             &entity));
+    EXPECT_EQ(entity.columns(), expected_p);
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->SeekToFirst();
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "m");
+    EXPECT_EQ(iter->value(), "op");
+    iter->Next();
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p");
+    EXPECT_EQ(iter->columns(), expected_p);
+    iter->Next();
+    EXPECT_FALSE(iter->Valid());
+    iter->SeekToLast();
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "p");
+    EXPECT_EQ(iter->columns(), expected_p);
+    iter->Prev();
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), "m");
+    EXPECT_EQ(iter->value(), "op");
+    iter->Prev();
+    EXPECT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  };
+  check_reads();
+  WaitForLossRepair();
+  EXPECT_OK(dbfull()->TEST_GetBGError());
+  check_reads();
+  CompactRangeOptions compact;
+  compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  check_reads();
+}
+
+TEST_F(DBBlobLossRepairTest, SingleDeletePairsWithDroppedPutInOneCompaction) {
+  // A SingleDelete and its Put, whose value is in a dropped blob file, are in
+  // the same compaction. They pair up, like with skip_missing_blob_files: no
+  // contract Corruption, and both go away.
+  Options options = LossRepairOptions(GetDefaultOptions());
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("sd", large));
+  ASSERT_OK(Put("keep", "inline"));
+  ASSERT_OK(Flush());
+  const uint64_t lost = NewestBlobFile();
+  ASSERT_OK(db_->SingleDelete(WriteOptions(), "sd"));
+  ASSERT_OK(Flush());
+  DropAndReopen(options, {lost}, /*auto_compactions=*/false);
+  CompactRangeOptions compact;
+  compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  EXPECT_OK(dbfull()->TEST_GetBGError());
+  EXPECT_TRUE(InternalTypesForKey(dbfull(), "sd").empty());
+  EXPECT_EQ(Get("sd"), "NOT_FOUND");
+  EXPECT_EQ(Get("keep"), "inline");
+}
+
+TEST_F(DBBlobLossRepairTest,
+       DroppedFileRepairRunsLocallyWithCompactionService) {
+  // While SSTs may reference a dropped blob file, compactions of them do not
+  // ask the compaction service. After the repair compaction removes the
+  // references, the dropped file is forgotten and compactions ask again.
+  Options options = LossRepairOptions(GetDefaultOptions());
+  auto service = std::make_shared<CountingLocalCompactionService>();
+  options.compaction_service = service;
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("a", large));
+  ASSERT_OK(Put("z", "inline"));
+  ASSERT_OK(Flush());
+  const uint64_t lost = NewestBlobFile();
+  ASSERT_OK(Put("b", "inline"));
+  ASSERT_OK(Flush());
+  service->schedules = 0;
+  DropAndReopen(options, {lost}, /*auto_compactions=*/false);
+  // One compaction moves both L0 files to L1.
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  EXPECT_EQ(service->schedules.load(), 0);
+  EXPECT_TRUE(GetDroppedBlobFiles().empty());
+  EXPECT_EQ(Get("a"), "NOT_FOUND");
+  ASSERT_OK(Put("c", "inline"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  EXPECT_GT(service->schedules.load(), 0);
+  EXPECT_EQ(Get("z"), "inline");
+}
+
+TEST_F(DBBlobLossRepairTest, LostRelocationFileIsDeletedWithBlobGcDisabled) {
+  // With enable_blob_garbage_collection off, a lost relocation file is still
+  // deleted after a compaction removes the references to it. Indirect blob GC
+  // first moves the live value "b" of its origin file into a relocation file.
+  // Then the DB reopens with enable_blob_garbage_collection off and the
+  // relocation file marked lost.
+  Options options = LossRepairOptions(GetDefaultOptions());
+  DestroyAndReopen(options);
+  const std::string large(4096, 'v');
+  ASSERT_OK(Put("a", large));
+  ASSERT_OK(Flush());
+  const uint64_t healthy = NewestBlobFile();
+  ASSERT_OK(Put("b", large));
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), large));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t origin = NewestBlobFile();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(Cfd(), {origin}));
+  const uint64_t relocation =
+      Cfd()->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+  options.disable_auto_compactions = false;
+  options.enable_blob_garbage_collection = false;
+  ASSERT_OK(TryReopenWithLostBlobFiles(options, {relocation}));
+  ASSERT_TRUE(HasLoss());
+  WaitForLossRepair();
+  EXPECT_FALSE(HasLoss());
+  EXPECT_EQ(Cfd()->current()->storage_info()->GetBlobRelocationFileMetaData(
+                relocation),
+            nullptr);
+  EXPECT_NE(Cfd()->current()->storage_info()->GetBlobFileMetaData(healthy),
+            nullptr);
+  EXPECT_EQ(Get("a"), large);
+  EXPECT_EQ(Get("b"), "NOT_FOUND");
+  EXPECT_OK(dbfull()->TEST_GetBGError());
+}
+
+TEST_F(DBBlobLossRepairTest, UserDefinedTimestamps) {
+  // With user-defined timestamps, the value of "lost" at timestamp 10 is in a
+  // blob file that repair drops. An older version of "lost" at timestamp 5 is
+  // stored inline in the SST, so it stays readable. The dropped value must
+  // read as a deletion at its own timestamp and sequence number:
+  // - a read at timestamp 20 returns NotFound, because the deletion at
+  //   timestamp 10 hides the older version;
+  // - a read at timestamp 7 returns the older version, because the deletion
+  //   at timestamp 10 is newer than the read.
+  // A deletion with a wrong timestamp would change one of these reads. A
+  // wrong sequence number or value type may not change them. So the test
+  // checks the reads before and after loss repair, and after repair it also
+  // checks the internal entries of "lost": the compaction turns the dropped
+  // Put into a deletion with the same timestamp and sequence number.
+  Options options = LossRepairOptions(GetDefaultOptions());
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  DestroyAndReopen(options);
+  const auto make_ts = [](uint64_t value) {
+    std::string ts;
+    PutFixed64(&ts, value);
+    return ts;
+  };
+  const std::string older_ts = make_ts(5);
+  const std::string ts = make_ts(10);
+  const std::string large(4096, 'v');
+  ASSERT_OK(db_->Put(WriteOptions(), "lost", older_ts, "older"));
+  const SequenceNumber older_seq = db_->GetLatestSequenceNumber();
+  ASSERT_OK(db_->Put(WriteOptions(), "old", ts, "inline"));
+  ASSERT_OK(db_->Put(WriteOptions(), "lost", ts, large));
+  const SequenceNumber lost_seq = db_->GetLatestSequenceNumber();
+  ASSERT_OK(Flush());
+  const uint64_t lost = NewestBlobFile();
+  ASSERT_OK(BuildExactSstAtLevel1());
+  DropAndReopen(options, {lost});
+
+  const auto get_at = [&](uint64_t read_at, const std::string& key,
+                          std::string* value, std::string* value_ts) {
+    const std::string read_ts = make_ts(read_at);
+    Slice read_ts_slice(read_ts);
+    ReadOptions read_options;
+    read_options.timestamp = &read_ts_slice;
+    return db_->Get(read_options, key, value, value_ts);
+  };
+  const auto check_reads = [&] {
+    std::string value;
+    std::string value_ts;
+    ASSERT_EQ(get_at(20, "lost", &value, &value_ts).code(),
+              Status::Code::kNotFound);
+    ASSERT_OK(get_at(7, "lost", &value, &value_ts));
+    EXPECT_EQ(value, "older");
+    EXPECT_EQ(value_ts, older_ts);
+    ASSERT_OK(get_at(20, "old", &value, &value_ts));
+    EXPECT_EQ(value, "inline");
+    EXPECT_EQ(value_ts, ts);
+
+    // An iterator at timestamp 20 also skips "lost"; at timestamp 7 it shows
+    // the older version.
+    for (const uint64_t read_at : {uint64_t{20}, uint64_t{7}}) {
+      SCOPED_TRACE("iterator at timestamp " + std::to_string(read_at));
+      const std::string read_ts = make_ts(read_at);
+      Slice read_ts_slice(read_ts);
+      ReadOptions read_options;
+      read_options.timestamp = &read_ts_slice;
+      std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+      std::vector<std::string> seen;
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString() + "@" +
+                       std::to_string(DecodeFixed64(iter->timestamp().data())) +
+                       "=" + iter->value().ToString());
+      }
+      ASSERT_OK(iter->status());
+      if (read_at == 20) {
+        EXPECT_EQ(seen, std::vector<std::string>({"old@10=inline"}));
+      } else {
+        EXPECT_EQ(seen, std::vector<std::string>({"lost@5=older"}));
+      }
+    }
+  };
+  check_reads();
+  WaitForLossRepair();
+  EXPECT_OK(dbfull()->TEST_GetBGError());
+  EXPECT_FALSE(HasBlobFile(lost));
+  check_reads();
+
+  // Internal entries of "lost", newest first: the repair deletion keeps the
+  // timestamp and sequence number of the dropped Put, and the older Put is
+  // unchanged.
+  using Entry = std::tuple<std::string, SequenceNumber, ValueType>;
+  std::vector<Entry> entries;
+  {
+    // The iterator keeps a reference to its ReadOptions, so they must outlive
+    // it.
+    const ReadOptions read_options;
+    Arena arena;
+    ScopedArenaPtr<InternalIterator> iter(dbfull()->NewInternalIterator(
+        read_options, &arena, kMaxSequenceNumber));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      ParsedInternalKey key;
+      ASSERT_OK(ParseInternalKey(iter->key(), &key, true));
+      if (StripTimestampFromUserKey(key.user_key, ts.size()) != "lost") {
+        continue;
+      }
+      entries.emplace_back(
+          ExtractTimestampFromUserKey(key.user_key, ts.size()).ToString(),
+          key.sequence, key.type);
+    }
+    ASSERT_OK(iter->status());
+  }
+  EXPECT_EQ(entries,
+            std::vector<Entry>({Entry{ts, lost_seq, kTypeDeletionWithTimestamp},
+                                Entry{older_ts, older_seq, kTypeValue}}));
+}
+
+TEST_F(DBBlobBasicTest, LostKeysDoNotBecomeReadPathRangeTombstones) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  Reopen(options);
+  const std::string large(4096, 'v');
+  const std::array<std::string, 4> lost_keys{
+      {"lost0", "lost1", "lost2", "lost3"}};
+  for (const std::string& key : lost_keys) {
+    ASSERT_OK(Put(key, large));
+  }
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), large));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t lost =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(lost, kInvalidBlobFileNumber);
+  const std::string path = BlobFileName(dbname_, lost);
+  // Live keys on both sides of the lost keys end any tombstone run.
+  ASSERT_OK(Put("a_live", "before"));
+  ASSERT_OK(Put("z_live", "after"));
+  ASSERT_OK(Flush());
+  Close();
+  ASSERT_OK(options.env->DeleteFile(path));
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  ASSERT_OK(TryReopenWithLostBlobFiles(options, {lost}));
+
+  // A lost key reads as a deletion but keeps its Put identity. It must never
+  // be turned into a real range tombstone in the memtable.
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "a_live");
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "z_live");
+  iter->Next();
+  EXPECT_FALSE(iter->Valid());
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "z_live");
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "a_live");
+  iter->Prev();
+  EXPECT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  iter.reset();
+  EXPECT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+  for (const std::string& key : lost_keys) {
+    std::string value;
+    EXPECT_TRUE(db_->Get(ReadOptions(), key, &value).IsNotFound());
+  }
+
+  // Reverse iteration tracks runs separately; check it from a fresh memtable.
+  options.statistics = CreateDBStatistics();
+  ASSERT_OK(TryReopen(options));
+  iter.reset(db_->NewIterator(ReadOptions()));
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "z_live");
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "a_live");
+  iter->Prev();
+  EXPECT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  iter.reset();
+  EXPECT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+}
+
+TEST_F(DBBlobBasicTest, RepairedLostPutBreaksLaterSingleDeleteContract) {
+  // Documented limitation, as with skip_missing_blob_files: loss repair turns
+  // the lost Put into a Delete. A legal SingleDelete written later meets that
+  // Delete in a later compaction, which fails the SingleDelete contract.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 1024;
+  DestroyAndReopen(options);
+  // The deeper SST's bounds overlap "lost", without another Put for that key.
+  // Thus a later SingleDelete is legal, but the intermediate compaction
+  // cannot drop the repair deletion.
+  ASSERT_OK(Put("aaa", "old-inline"));
+  ASSERT_OK(Put("zzz", "old-inline"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions deepest;
+  deepest.change_level = true;
+  deepest.target_level = 3;
+  ASSERT_OK(db_->CompactRange(deepest, nullptr, nullptr));
+  const std::string value(4096, 'v');
+  ASSERT_OK(Put("lost", value));
+  for (int i = 0; i != 3; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i != 3; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr, true));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t lost =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(lost, kInvalidBlobFileNumber);
+  Close();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, lost)));
+  ASSERT_OK(TryReopenWithLostBlobFiles(options, {lost}));
+  // The overlapping deeper SST is not in this compaction's inputs.
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr, true));
+  ASSERT_EQ(Get("lost"), "NOT_FOUND");
+  const auto types = [&] {
+    Arena arena;
+    ReadOptions read_options;
+    ScopedArenaPtr<InternalIterator> iter(dbfull()->NewInternalIterator(
+        read_options, &arena, kMaxSequenceNumber));
+    iter->Seek(
+        InternalKey("lost", kMaxSequenceNumber, kValueTypeForSeek).Encode());
+    std::vector<ValueType> result;
+    while (iter->Valid()) {
+      ParsedInternalKey key;
+      EXPECT_OK(ParseInternalKey(iter->key(), &key, true));
+      if (key.user_key != "lost") {
+        break;
+      }
+      result.push_back(key.type);
+      iter->Next();
+    }
+    EXPECT_OK(iter->status());
+    return result;
+  };
+  ASSERT_EQ(types(), (std::vector<ValueType>{kTypeDeletion}));
+  const Snapshot* const snapshot = db_->GetSnapshot();
+  bool snapshot_released = false;
+  const Defer release_snapshot([&] {
+    if (!snapshot_released) {
+      db_->ReleaseSnapshot(snapshot);
+    }
+  });
+  ASSERT_OK(db_->SingleDelete(WriteOptions(), "lost"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr, nullptr, true));
+  ASSERT_EQ(types(),
+            (std::vector<ValueType>{kTypeSingleDeletion, kTypeDeletion}));
+  ReadOptions read_options;
+  read_options.snapshot = snapshot;
+  std::string actual;
+  ASSERT_TRUE(db_->Get(read_options, "lost", &actual).IsNotFound());
+  ASSERT_EQ(Get("lost"), "NOT_FOUND");
+  // Without the snapshot, the SingleDelete meets the repair deletion.
+  db_->ReleaseSnapshot(snapshot);
+  snapshot_released = true;
+  CompactRangeOptions bottommost;
+  bottommost.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  const Status s = db_->CompactRange(bottommost, nullptr, nullptr);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(s.ToString().find("violating the contract of SingleDelete"),
+            std::string::npos)
+      << s.ToString();
+  Reopen(options);
+  ASSERT_EQ(Get("lost"), "NOT_FOUND");
+  ASSERT_EQ(Get("aaa"), "old-inline");
+  ASSERT_EQ(Get("zzz"), "old-inline");
+}
+
+TEST_F(DBBlobBasicTest, CloseWaitsForCensusCallbackCleanup) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool callback_entered = false;
+  bool close_waiting = false;
+  bool release_callback = false;
+  std::atomic<bool> closed{false};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Done", [&](void*) {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    callback_entered = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return release_callback; });
+  });
+  sync_point->SetCallBack("DBImpl::~DBImpl:WaitJob", [&](void*) {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    close_waiting = true;
+    gate_cv.notify_all();
+  });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate_cv.wait(lock, [&] { return callback_entered; });
+  }
+  port::Thread closer([&] {
+    Close();
+    closed.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate_cv.wait(lock, [&] { return close_waiting; });
+    EXPECT_FALSE(closed.load());
+    release_callback = true;
+    gate_cv.notify_all();
+  }
+  closer.join();
+  EXPECT_TRUE(closed.load());
+}
+
+TEST_F(DBBlobBasicTest, MissingBlobRepairRejectsBlobIndirectionState) {
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  const std::string value(4096, 'v');
+
+  // The option is on.
+  Options options = MissingBlobRepairOptions();
+  options.enable_blob_indirection = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", value));
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(db_->CompactRange(repair, nullptr, nullptr).IsNotSupported());
+
+  // The option is off, but the format fence stays.
+  ASSERT_OK(db_->SetOptions({{"enable_blob_indirection", "false"}}));
+  ASSERT_TRUE(db_->CompactRange(repair, nullptr, nullptr).IsNotSupported());
+  ASSERT_EQ(Get("key"), value);
+
+  // The option is off and no fence is set yet, but an enabled flush is still
+  // building the first output.
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", value));
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool entered = false;
+  bool released = false;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("FlushJob::WriteLevel0Table:TableBuilderOptions",
+                          [&](void*) {
+                            std::unique_lock<std::mutex> lock(gate_mutex);
+                            entered = true;
+                            gate_cv.notify_all();
+                            gate_cv.wait(lock, [&] { return released; });
+                          });
+  sync_point->EnableProcessing();
+  auto release_flush = [&]() {
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      released = true;
+    }
+    gate_cv.notify_all();
+  };
+  auto cleanup = Defer([&] {
+    release_flush();
+    EXPECT_OK(dbfull()->TEST_WaitForFlushMemTable());
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  FlushOptions flush_options;
+  flush_options.wait = false;
+  ASSERT_OK(db_->Flush(flush_options));
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(30),
+                                 [&] { return entered; }));
+  }
+  ASSERT_OK(db_->SetOptions({{"enable_blob_indirection", "false"}}));
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  {
+    InstrumentedMutexLock lock(dbfull()->TEST_Mutex());
+    ASSERT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+    ASSERT_TRUE(cfd->HasPendingBlobIndirectionOutput());
+  }
+  ASSERT_TRUE(db_->CompactRange(repair, nullptr, nullptr).IsNotSupported());
+  release_flush();
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_EQ(Get("key"), value);
+}
+
+TEST_F(DBBlobBasicTest, MissingBlobRepairRechecksPickedCompaction) {
+  // The early check passes on a plain column family. The option is turned on
+  // before the compaction is picked, so the picked compaction is rejected
+  // and its input files are released.
+  Options options = MissingBlobRepairOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Flush());
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RunManualCompaction:0", [&](void*) {
+    ASSERT_OK(db_->SetOptions({{"enable_blob_indirection", "true"}}));
+  });
+  sync_point->EnableProcessing();
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  ASSERT_TRUE(db_->CompactRange(repair, nullptr, nullptr).IsNotSupported());
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "vb");
+}
+
+TEST_F(DBBlobBasicTest, MissingBlobRepairRunsOnPlainColumnFamily) {
+  // Another column family with blob indirection state does not change the
+  // repair of a plain column family.
+  Options options = MissingBlobRepairOptions();
+  uint64_t missing_blob_file = 0;
+  ASSERT_NO_FATAL_FAILURE(
+      RecoverMissingNonOldestBlob(options, false, &missing_blob_file));
+  Options indirect_options = options;
+  indirect_options.enable_blob_indirection = true;
+  CreateColumnFamilies({"indirect"}, indirect_options);
+  ColumnFamilyHandle* const indirect = handles_.back();
+  ASSERT_OK(db_->Put(WriteOptions(), indirect, "key", std::string(4096, 'i')));
+  ASSERT_OK(db_->Flush(FlushOptions(), indirect));
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  ASSERT_TRUE(
+      db_->CompactRange(repair, indirect, nullptr, nullptr).IsNotSupported());
+  ASSERT_OK(db_->CompactRange(repair, nullptr, nullptr));
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("c"), "vc");
+  std::string value;
+  ASSERT_EQ(db_->Get(ReadOptions(), "b", &value).code(), Status::kNotFound);
+  ASSERT_EQ(db_->Get(ReadOptions(), "d", &value).code(), Status::kNotFound);
+  ASSERT_OK(db_->Get(ReadOptions(), indirect, "key", &value));
+  ASSERT_EQ(value, std::string(4096, 'i'));
+}
+
+TEST_F(DBBlobBasicTest, MissingBlobRepairKeepsRelocatedValues) {
+  // After indirect blob GC relocates the live values and deletes their origin
+  // blob file, the SSTs still reference that origin. A repair that treats the
+  // origin as missing would drop live values, so it is rejected.
+  Options options = MissingBlobRepairOptions();
+  options.enable_blob_indirection = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("older", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  for (const std::string& key : keys) {
+    ASSERT_OK(Put(key, std::string(4096, key.back())));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t origin_file_number = GetBlobFileNumbers().back();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  {
+    InstrumentedMutexLock lock(dbfull()->TEST_Mutex());
+    const VersionStorageInfo* const storage = cfd->current()->storage_info();
+    ASSERT_EQ(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+    ASSERT_NE(storage->GetBlobRelocationRouteTarget(origin_file_number),
+              kInvalidBlobFileNumber);
+  }
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_TRUE(
+      env_->FileExists(BlobFileName(dbname_, origin_file_number)).IsNotFound());
+
+  CompactRangeOptions repair;
+  repair.skip_missing_blob_files = true;
+  ASSERT_TRUE(db_->CompactRange(repair, nullptr, nullptr).IsNotSupported());
+  ASSERT_OK(db_->SetOptions({{"enable_blob_indirection", "false"}}));
+  ASSERT_TRUE(db_->CompactRange(repair, nullptr, nullptr).IsNotSupported());
+  for (int reopen = 0; reopen < 2; ++reopen) {
+    SCOPED_TRACE(reopen);
+    if (reopen != 0) {
+      Reopen(options);
+      ASSERT_TRUE(db_->CompactRange(repair, nullptr, nullptr).IsNotSupported());
+    }
+    ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+    ASSERT_EQ(Get(keys.back()), std::string(4096, keys.back().back()));
+  }
 }
 
 namespace {
@@ -21856,59 +24423,6 @@ uint64_t NumberAfter(const std::string& line, const std::string& prefix) {
 }
 
 }  // namespace
-
-TEST_F(DBBlobBasicTest, CloseWaitsForCensusCallbackCleanup) {
-  Options options = GetDefaultOptions();
-  options.enable_blob_files = true;
-  options.enable_blob_indirection = true;
-  options.min_blob_size = 0;
-  options.disable_auto_compactions = true;
-  Reopen(options);
-  dbfull()->TEST_WaitForBlobReferenceCensus();
-
-  std::mutex gate_mutex;
-  std::condition_variable gate_cv;
-  bool callback_entered = false;
-  bool close_waiting = false;
-  bool release_callback = false;
-  std::atomic<bool> closed{false};
-  SyncPoint* const sync_point = SyncPoint::GetInstance();
-  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Done", [&](void*) {
-    std::unique_lock<std::mutex> lock(gate_mutex);
-    callback_entered = true;
-    gate_cv.notify_all();
-    gate_cv.wait(lock, [&] { return release_callback; });
-  });
-  sync_point->SetCallBack("DBImpl::~DBImpl:WaitJob", [&](void*) {
-    std::lock_guard<std::mutex> lock(gate_mutex);
-    close_waiting = true;
-    gate_cv.notify_all();
-  });
-  sync_point->EnableProcessing();
-  auto cleanup = Defer([sync_point] {
-    sync_point->DisableProcessing();
-    sync_point->ClearAllCallBacks();
-  });
-  ASSERT_OK(Put("key", "blob_value"));
-  ASSERT_OK(Flush());
-  {
-    std::unique_lock<std::mutex> lock(gate_mutex);
-    gate_cv.wait(lock, [&] { return callback_entered; });
-  }
-  port::Thread closer([&] {
-    Close();
-    closed.store(true);
-  });
-  {
-    std::unique_lock<std::mutex> lock(gate_mutex);
-    gate_cv.wait(lock, [&] { return close_waiting; });
-    EXPECT_FALSE(closed.load());
-    release_callback = true;
-    gate_cv.notify_all();
-  }
-  closer.join();
-  EXPECT_TRUE(closed.load());
-}
 
 TEST_F(DBBlobBasicTest, CensusSignalsStayOffWithoutBlobIndirection) {
   // A DB with blob files but without blob indirection has no census. Every

@@ -1329,12 +1329,24 @@ Status CompactionJob::ValidateBlobRelocationInputGenerations() {
   // the output writes the generation number (kept), its route target
   // (flattened), or neither. ValidateBlobReferenceGeneration() follows the
   // route of the generation number, so one check per group covers both.
-  // A number that the input Version cannot read (for example, its blob file
-  // was lost) fails the job: a later run on the same input files cannot do
-  // better.
+  // A number that the input Version cannot resolve fails the job: a later run
+  // on the same input files cannot do better. A dropped origin passes (see
+  // below), and so does a lost file, which stays in the Version marked lost.
   return ForEachIndirectInputReferenceGroup(
       [input](const BlobReferenceGroup& group) {
         const uint64_t generation = group.generation_file_number;
+        if (input->storage_info()->GetBlobRelocationRouteTarget(generation) ==
+                kInvalidBlobFileNumber &&
+            input->storage_info()->IsDroppedBlobFile(generation)) {
+          // best_efforts_blob_db_repair dropped this origin, so it is not in
+          // the Version. The compaction turns its references into deletions
+          // (MissingBlobRepairIterator), so the output never writes it.
+          // A dropped origin has no route: indirect blob GC adds a route only
+          // in the edit that retires a file from the Version, and a repair
+          // open drops only files that are in the Version. So the route test
+          // is a guard: a number with a route gets the normal check below.
+          return Status::OK();
+        }
         Status status = input->ValidateBlobReferenceGeneration(generation);
         TEST_SYNC_POINT_CALLBACK(
             "CompactionJob::ValidateBlobRelocationInputGenerations:Status",
@@ -1888,11 +1900,15 @@ void CompactionJob::NotifyOnSubcompactionCompleted(
 }
 
 bool CompactionJob::ShouldUseLocalCompaction(SubcompactionState* sub_compact) {
-  if (sub_compact->compaction->RepairsMissingBlobReferences()) {
-    // Remote workers do not receive skip_missing_blob_files, and result
-    // validation rejects garbage updates for blob files absent from the
-    // primary's input Version, which repair produces. Keep repair local until
-    // the service supports this policy.
+  if (sub_compact->compaction->RepairsMissingBlobReferences() ||
+      sub_compact->compaction->RepairsLostBlobReferences()) {
+    // Missing-file repair: remote workers do not receive
+    // skip_missing_blob_files, and result validation rejects garbage updates
+    // for blob files absent from the primary's input Version, which repair
+    // produces. Keep it local until the service supports this policy.
+    // Loss repair is kept local too. This is a conservative choice: a worker
+    // reads the loss records from the MANIFEST and could repair the
+    // references itself, but its result is not checked for that.
     sub_compact->compaction_job_stats.is_remote_compaction = false;
     return true;
   }
@@ -2162,7 +2178,8 @@ InternalIterator* CompactionJob::CreateInputIterator(
   }
 
   if (sub_compact->compaction->DoesInputReferenceBlobFiles() ||
-      sub_compact->compaction->RepairsMissingBlobReferences()) {
+      sub_compact->compaction->RepairsMissingBlobReferences() ||
+      sub_compact->compaction->RepairsLostBlobReferences()) {
     BlobGarbageMeter* meter = sub_compact->Current().GetBlobGarbageMeter();
     if (meter == nullptr) {
       meter = sub_compact->Current().CreateBlobGarbageMeter();
@@ -2178,11 +2195,27 @@ InternalIterator* CompactionJob::CreateInputIterator(
     input = iterators.trim_history_iter.get();
   }
 
-  if (sub_compact->compaction->RepairsMissingBlobReferences()) {
+  if (sub_compact->compaction->RepairsMissingBlobReferences() ||
+      sub_compact->compaction->RepairsLostBlobReferences()) {
+    // MissingBlobRepairIterator::Mode has two cases:
+    // - With skip_missing_blob_files, Mode::kMissingFiles repairs references
+    //   to every absent blob file. The option is allowed only on a column
+    //   family without blob indirection state
+    //   (CheckSkipMissingBlobFilesSupported()), and such a column family never
+    //   has a lost file.
+    // - Without it, Mode::kDroppedOrLostFiles repairs references to dropped
+    //   blob files (best_efforts_blob_db_repair) and to lost relocation files.
+    // CompactionIterator reads the output of MissingBlobRepairIterator.
+    // MissingBlobRepairIterator turns each lost reference, and each entity
+    // whose columns are all lost or dropped, into a Delete. It removes the
+    // lost columns of other entities. So in a CompactionJob run,
+    // CompactionIterator never sees a lost value, and its lost_blob_value_
+    // path does not run.
     iterators.missing_blob_repair = std::make_unique<MissingBlobRepairIterator>(
         input, sub_compact->compaction->input_version()->storage_info(), ts_sz,
-        /*only_dropped_blob_files=*/
-        !sub_compact->compaction->skip_missing_blob_files());
+        sub_compact->compaction->skip_missing_blob_files()
+            ? MissingBlobRepairIterator::Mode::kMissingFiles
+            : MissingBlobRepairIterator::Mode::kDroppedOrLostFiles);
     input = iterators.missing_blob_repair.get();
   }
 
@@ -2244,7 +2277,8 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
           db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
           /*must_count_input_entries=*/
           compaction->DoesInputReferenceBlobFiles() ||
-              compaction->RepairsMissingBlobReferences(),
+              compaction->RepairsMissingBlobReferences() ||
+              compaction->RepairsLostBlobReferences(),
           allow_blob_index_flattening, compaction, compaction_filter,
           shutting_down_, db_options_.info_log, full_history_ts_low,
           preserve_seqno_after_, nullptr /* input_version */,

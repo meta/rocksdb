@@ -341,6 +341,8 @@ static const std::string live_blob_file_garbage_size =
 static const std::string blob_cache_capacity = "blob-cache-capacity";
 static const std::string blob_cache_usage = "blob-cache-usage";
 static const std::string blob_cache_pinned_usage = "blob-cache-pinned-usage";
+static const std::string blob_relocation_lost_files =
+    "blob-relocation-lost-files";
 static const std::string indirect_blob_gc_idle_micros_with_candidates =
     "indirect-blob-gc-idle-micros-with-candidates";
 static const std::string indirect_blob_gc_stats = "indirect-blob-gc-stats";
@@ -478,6 +480,8 @@ const std::string DB::Properties::kBlobCacheUsage =
     rocksdb_prefix + blob_cache_usage;
 const std::string DB::Properties::kBlobCachePinnedUsage =
     rocksdb_prefix + blob_cache_pinned_usage;
+const std::string DB::Properties::kBlobRelocationLostFiles =
+    rocksdb_prefix + blob_relocation_lost_files;
 const std::string DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates =
     rocksdb_prefix + indirect_blob_gc_idle_micros_with_candidates;
 const std::string DB::Properties::kIndirectBlobGcStats =
@@ -696,6 +700,9 @@ const UnorderedMap<std::string, DBPropertyInfo>
         {DB::Properties::kBlobCachePinnedUsage,
          {false, nullptr, &InternalStats::HandleBlobCachePinnedUsage, nullptr,
           nullptr}},
+        {DB::Properties::kBlobRelocationLostFiles,
+         {false, nullptr, &InternalStats::HandleBlobRelocationLostFiles,
+          nullptr, nullptr}},
         {DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates,
          {false, nullptr,
           &InternalStats::HandleIndirectBlobGcIdleMicrosWithCandidates, nullptr,
@@ -1133,6 +1140,8 @@ bool InternalStats::HandleIndirectBlobGcStats(
       std::to_string(vstorage->GetBlobRelocationFiles().size());
   (*values)["relocation-file-bytes"] =
       std::to_string(vstorage->GetBlobRelocationFileBytes());
+  (*values)["lost-relocation-files"] =
+      std::to_string(vstorage->GetLostBlobRelocationFileCount());
   (*values)["coarse-sst-count"] = std::to_string(vstorage->CoarseSstCount());
   (*values)["lowest-coarse-frontier"] =
       std::to_string(vstorage->OldestCoarseIndirectOriginFileNumber());
@@ -1181,6 +1190,15 @@ bool InternalStats::HandleIndirectBlobGcIdleMicrosWithCandidates(
     uint64_t* value, DBImpl* /*db*/, Version* /*version*/) {
   assert(value);
   *value = IndirectBlobGcIdleMicrosWithCandidates();
+  return true;
+}
+
+bool InternalStats::HandleBlobRelocationLostFiles(uint64_t* value,
+                                                  DBImpl* /*db*/,
+                                                  Version* /*version*/) {
+  assert(value);
+  assert(cfd_);
+  *value = cfd_->current()->storage_info()->GetLostBlobRelocationFileCount();
   return true;
 }
 

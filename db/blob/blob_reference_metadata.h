@@ -18,9 +18,9 @@
 // (TableBuilderOptions::collect_blob_reference_metadata). When
 // enable_blob_indirection is on, or the DB has used it before:
 //   - a compaction output at L1 or deeper gets exact metadata;
-//   - a compaction output at L0 gets it only when an input has it, or when
-//     the compaction is bottommost (see
-//     Compaction::CollectExactBlobReferences());
+//   - a compaction output at L0 gets it only when an input has it, when the
+//     compaction is bottommost, or when the column family has a lost
+//     relocation file (see Compaction::CollectExactBlobReferences());
 //   - flush output gets only a coarse classification (see "Coarse SST" and
 //     "Coarse classification property" below).
 // SstFileWriter output gets neither. It can hold only same-file (embedded)
@@ -372,9 +372,9 @@
 // metadata, in three cases:
 //   - flush output;
 //   - WAL recovery flush output;
-//   - a compaction output at L0 when no input has exact metadata and the
-//     compaction is not bottommost (see
-//     Compaction::CollectExactBlobReferences()).
+//   - a compaction output at L0 when no input has exact metadata, the
+//     compaction is not bottommost, and the column family has no lost
+//     relocation file (see Compaction::CollectExactBlobReferences()).
 
 #pragma once
 
