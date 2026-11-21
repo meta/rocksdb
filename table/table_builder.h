@@ -33,6 +33,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Slice;
+class BlobIndex;
 class BlobSource;
 
 struct TableReaderOptions {
@@ -241,6 +242,12 @@ inline const char* TableBuilderNewTableReasonToString(
 struct TableBuilderAddContext {
   TableBuilderNewTableReason new_table_reason =
       TableBuilderNewTableReason::kNone;
+  // Input, optional. When the value is a kTypeBlobIndex, the caller can pass
+  // its own decode of the value here, so that the builder does not decode it
+  // again. Compaction decodes each output BlobIndex once and shares it with
+  // the builder, the blob garbage meter and the file metadata update.
+  // nullptr: the builder decodes the value itself.
+  const BlobIndex* decoded_blob_index = nullptr;
 };
 
 // TableBuilder provides the interface used to build a Table

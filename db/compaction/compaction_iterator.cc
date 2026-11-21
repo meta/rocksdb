@@ -2178,7 +2178,7 @@ Status CompactionIterator::OutputHasExternalBlobReferences(
     return Status::OK();
   }
   if (ikey_.type == kTypeWideColumnEntity) {
-    return WideColumnSerialization::ForEachBlobFileNumber(
+    return WideColumnSerialization::ForEachBlobIndex(
         value_, [has_external_refs](const BlobIndex& index) {
           if (!index.IsInlined() && !index.IsSameFile()) {
             *has_external_refs = true;
