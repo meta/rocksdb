@@ -12,6 +12,7 @@
 
 #include "db/blob/blob_relocation_file.h"
 #include "db/blob/blob_relocation_manifest.h"
+#include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
@@ -1343,6 +1344,51 @@ TEST_F(LdbCmdTest, ManifestDumpPrintsBlobIndirectionSummary) {
   EXPECT_NE(output.find(expected), std::string::npos) << output;
   EXPECT_NE(output.find("db blob indirection format version " +
                         std::to_string(kBlobIndirectionManifestFormatVersion)),
+            std::string::npos)
+      << output;
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+TEST_F(LdbCmdTest, ManifestDumpPrintsBlobReferenceMetadata) {
+  ColumnFamilyData::TEST_SetAllowBlobIndirection(true);
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_blob_reference_metadata");
+  ASSERT_OK(DestroyDB(dbname, options));
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname, &db));
+  ASSERT_OK(db->Put(WriteOptions(), "key1", "value1"));
+  ASSERT_OK(db->Put(WriteOptions(), "key2", "value2"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+  // A compaction to L1 always writes exact reference metadata.
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db->CompactRange(compact_options, nullptr, nullptr));
+  db.reset();
+
+  const std::string db_argument = "--db=" + dbname;
+  const char* arguments[] = {"./ldb", db_argument.c_str(), "manifest_dump",
+                             "--verbose"};
+  testing::internal::CaptureStdout();
+  const int result =
+      LDBCommandRunner::RunCommand(4, arguments, options, LDBOptions(),
+                                   /*column_families=*/nullptr);
+  const std::string output = testing::internal::GetCapturedStdout();
+  ASSERT_EQ(result, 0);
+  // The AddFile record of the compaction output.
+  EXPECT_NE(
+      output.find(
+          " blob_references: exact (2 references, 12 stored value bytes)"),
+      std::string::npos)
+      << output;
+  EXPECT_NE(output.find("--- blob reference metadata --- exact SSTs: 1, coarse "
+                        "SSTs: 0 (lowest frontier 0), legacy SSTs: 0"),
             std::string::npos)
       << output;
   ASSERT_OK(DestroyDB(dbname, options));
