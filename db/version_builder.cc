@@ -2176,7 +2176,8 @@ class VersionBuilder::Rep : public MutableScalars {
       // a fenced CF this is allowed only for a level move: the SST is already
       // in this Version and the same edit deletes it from its current level.
       // Such an SST can be older than the fence. Every SST built after the
-      // fence has a descriptor, also when it keeps no blob reference.
+      // fence has a descriptor, a coarse frontier, or the legacy marker
+      // (blob_reference_legacy_metadata), also when it keeps no blob reference.
       const uint64_t file_number = meta.fd.GetNumber();
       const int current_level = GetCurrentLevelForTableFile(file_number);
       if (current_level ==

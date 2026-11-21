@@ -27,6 +27,32 @@ namespace ROCKSDB_NAMESPACE {
 const char kBlobReferenceDescriptorPropertyName[] =
     "rocksdb.blob.reference-descriptor";
 const char kBlobReferenceIndexBlockName[] = "rocksdb.blob.reference-index";
+const char kBlobReferenceClassificationPropertyName[] =
+    "rocksdb.blob.reference-classification";
+
+void EncodeBlobReferenceClassification(uint64_t frontier, std::string* output) {
+  output->clear();
+  PutFixed32(output, 1);  // Format version 1.
+  PutFixed64(output, frontier);
+  PutFixed32(output, crc32c::Value(output->data(), output->size()));
+}
+
+Status DecodeBlobReferenceClassification(const Slice& input,
+                                         uint64_t* frontier) {
+  if (frontier == nullptr) {
+    return Status::InvalidArgument("Null coarse blob frontier output");
+  }
+  if (input.size() != 16 || DecodeFixed32(input.data()) != 1 ||
+      crc32c::Value(input.data(), 12) != DecodeFixed32(input.data() + 12)) {
+    return Status::Corruption("Invalid blob reference classification");
+  }
+  *frontier = DecodeFixed64(input.data() + 4);
+  if (*frontier > kFileNumberMask) {
+    return Status::Corruption("Invalid coarse blob indirect-origin frontier");
+  }
+  return Status::OK();
+}
+
 namespace {
 
 constexpr uint32_t kDescriptorMagic = 0x42475244U;  // BGRD

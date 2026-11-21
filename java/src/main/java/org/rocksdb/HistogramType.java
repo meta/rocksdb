@@ -291,6 +291,13 @@ public enum HistogramType {
    */
   IO_DISPATCHER_ASYNC_READ_PREFETCH_LEAD_MICROS((byte) 0x4E),
 
+  /**
+   * Number of blob references in each compaction output SST that has exact
+   * blob reference metadata (DBs that use or have used
+   * enable_blob_indirection).
+   */
+  COMPACTION_OUTPUT_BLOB_REFERENCES((byte) 0x4F),
+
   // 0x3E is reserved for backwards compatibility on current minor version.
   HISTOGRAM_ENUM_MAX((byte) 0x3E);
 
