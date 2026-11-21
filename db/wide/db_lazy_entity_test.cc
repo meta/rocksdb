@@ -1621,6 +1621,50 @@ TEST_F(DBLazyEntityTest, BatchForceVerifyNotSkippedAcrossDuplicateKeys) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
+// Two reads of the same embedded record in one batch make one storage read,
+// and the read statistics count it once, for whole values and for ranges.
+TEST_F(DBLazyEntityTest, BatchEmbeddedDuplicateReadCountsOnce) {
+  Options options = GetLazyTestOptions();
+  DestroyAndReopen(options);
+  const std::string value(2000, 'd');
+  IngestEmbeddedEntity(
+      options, "ek",
+      WideColumns{{kDefaultWideColumnName, "inline"}, {"data", value}});
+  const std::array<Slice, 2> key_slices{Slice("ek"), Slice("ek")};
+  for (const bool range : {false, true}) {
+    SCOPED_TRACE(range);
+    LazyWideColumnsBatch batch;
+    std::array<Status, 2> get_statuses;
+    db_->MultiGetEntityLazy(ReadOptions(), db_->DefaultColumnFamily(),
+                            key_slices.size(), key_slices.data(), &batch,
+                            get_statuses.data());
+    ASSERT_OK(get_statuses[0]);
+    ASSERT_OK(get_statuses[1]);
+    const uint64_t reads_before = LazyReadCount(options);
+    const uint64_t bytes_before = BlobBytesRead(options);
+    std::array<PinnableSlice, 2> results;
+    std::array<Status, 2> statuses;
+    std::array<LazyColumnReadRequest, 2> reads;
+    for (size_t i = 0; i < reads.size(); ++i) {
+      reads[i].column = &batch[i][1];
+      if (range) {
+        reads[i].offset = 10;
+        reads[i].length = 100;
+      }
+      reads[i].result = &results[i];
+      reads[i].status = &statuses[i];
+    }
+    ASSERT_OK(batch.MultiResolve(reads.size(), reads.data()));
+    for (size_t i = 0; i < reads.size(); ++i) {
+      ASSERT_OK(statuses[i]);
+      EXPECT_EQ(results[i], range ? value.substr(10, 100) : value);
+    }
+    EXPECT_EQ(LazyReadCount(options), reads_before + 1);
+    EXPECT_EQ(BlobBytesRead(options) - bytes_before,
+              range ? 100U : value.size() + 5U);
+  }
+}
+
 // A read that omits its status out-param is a caller error (there is nowhere to
 // report that read's outcome), so MultiResolve fails the whole call with
 // InvalidArgument rather than silently resolving.
