@@ -400,7 +400,8 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
     // Make "CURRENT" file that points to the new manifest file.
     s = SetCurrentFile(write_options, fs_.get(), dbname_, 1,
                        immutable_db_options_.metadata_write_temperature,
-                       directories_.GetDbDir());
+                       directories_.GetDbDir(),
+                       versions_->atomic_replace_on_close());
     if (new_filenames) {
       new_filenames->emplace_back(
           manifest.substr(manifest.find_last_of("/\\") + 1));

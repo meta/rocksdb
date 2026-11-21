@@ -439,6 +439,16 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   FaultInjectionTestFS& operator=(FaultInjectionTestFS&&) = delete;
   ~FaultInjectionTestFS() override { fs_error_.PermitUncheckedError(); }
 
+  // Clears FSSupportedOps::kAtomicReplaceOnClose. For every file, including
+  // CURRENT, IDENTITY and OPTIONS files, written content is visible before
+  // Close(), a writable file closes itself when it is destroyed, and a
+  // simulated crash drops unsynced data. So this file system does not keep
+  // the contract of the bit, even if its target does.
+  void SupportedOps(int64_t& supported_ops) override {
+    target()->SupportedOps(supported_ops);
+    supported_ops &= ~(int64_t{1} << FSSupportedOps::kAtomicReplaceOnClose);
+  }
+
   static const char* kClassName() { return "FaultInjectionTestFS"; }
   const char* Name() const override { return kClassName(); }
 

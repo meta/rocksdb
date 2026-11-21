@@ -1211,7 +1211,7 @@ Status DBImpl::SetupDBId(const WriteOptions& write_options, bool read_only,
   if (!read_only && immutable_db_options_.write_identity_file) {
     s = SetIdentityFile(write_options, env_, dbname_,
                         immutable_db_options_.metadata_write_temperature,
-                        db_id_);
+                        versions_->atomic_replace_on_close(), db_id_);
   }
   // NOTE: an obsolete IDENTITY file with write_identity_file=false is handled
   // elsewhere, so that it's only deleted after successful recovery
