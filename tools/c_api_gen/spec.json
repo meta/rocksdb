@@ -1070,6 +1070,52 @@
         },
         {
           "kind": "status_method",
+          "name": "rocksdb_transaction_singledelete",
+          "call_expr": "txn->rep->SingleDelete",
+          "params": [
+            {
+              "kind": "scalar",
+              "c_type": "rocksdb_transaction_t*",
+              "name": "txn"
+            },
+            {
+              "kind": "slice",
+              "name": "key",
+              "len_name": "klen"
+            }
+          ],
+          "method_args": [
+            "Slice(key, klen)"
+          ]
+        },
+        {
+          "kind": "status_method",
+          "name": "rocksdb_transaction_singledelete_cf",
+          "call_expr": "txn->rep->SingleDelete",
+          "params": [
+            {
+              "kind": "scalar",
+              "c_type": "rocksdb_transaction_t*",
+              "name": "txn"
+            },
+            {
+              "kind": "scalar",
+              "c_type": "rocksdb_column_family_handle_t*",
+              "name": "column_family"
+            },
+            {
+              "kind": "slice",
+              "name": "key",
+              "len_name": "klen"
+            }
+          ],
+          "method_args": [
+            "column_family->rep",
+            "Slice(key, klen)"
+          ]
+        },
+        {
+          "kind": "status_method",
           "name": "rocksdb_transaction_commit",
           "call_expr": "txn->rep->Commit",
           "params": [

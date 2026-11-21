@@ -42,6 +42,13 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transaction_delete_cf(
     rocksdb_transaction_t* txn, rocksdb_column_family_handle_t* column_family,
     const char* key, size_t klen, char** errptr);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_transaction_singledelete(
+    rocksdb_transaction_t* txn, const char* key, size_t klen, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_transaction_singledelete_cf(
+    rocksdb_transaction_t* txn, rocksdb_column_family_handle_t* column_family,
+    const char* key, size_t klen, char** errptr);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_transaction_commit(
     rocksdb_transaction_t* txn, char** errptr);
 
