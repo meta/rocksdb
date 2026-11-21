@@ -11,8 +11,12 @@
 #include <string>
 #include <vector>
 
+#include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
+#include "db/builder.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
+#include "db/wide/wide_column_serialization.h"
 #include "file/file_util.h"
 #include "file/random_access_file_reader.h"
 #include "logging/logging.h"
@@ -389,6 +393,16 @@ Status ImportColumnFamilyJob::GetIngestedFileInfo(
 
   // Get the external file properties
   auto props = table_reader->GetTableProperties();
+  // Every SST that can hold indirect references carries an exact reference
+  // descriptor or a coarse frontier other than 0 in its table properties (the
+  // coarse frontier is the oldest indirect-origin file number a coarse SST may
+  // reference). So this O(1) property check replaces a scan of all entries. An
+  // SST whose classification has frontier 0 holds only legacy references and is
+  // accepted.
+  status = RejectBlobIndirectionTableProperties(*props, "Import");
+  if (!status.ok()) {
+    return status;
+  }
 
   // Set original_seqno to 0.
   file_to_import->original_seqno = 0;

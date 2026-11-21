@@ -1973,6 +1973,54 @@ class DB {
     // "rocksdb.blob-cache-pinned-usage" - returns the memory size for the
     //      entries being pinned in blob cache.
     static const std::string kBlobCachePinnedUsage;
+
+    // "rocksdb.indirect-blob-gc-idle-micros-with-candidates" - returns how long
+    // the column family has had indirect blob GC candidates while no GC job
+    // began, in microseconds (a duration). A large value means that GC is
+    // starved, for example by LSM compactions. 0 means no candidates, or a GC
+    // job began since the candidates appeared. The LOG warning comes from the
+    // periodic stats dump; with stats_dump_period_sec = 0, use this property.
+    static const std::string kIndirectBlobGcIdleMicrosWithCandidates;
+
+    // "rocksdb.indirect-blob-gc-stats" - returns a map of the indirect blob GC
+    // state of the column family. Keys: census-state (ready, building, failed,
+    // or none without blob indirection), census-unready-micros (0 when ready),
+    // census-consecutive-failures, census-builds, census-bytes (an estimate of
+    // the census memory that stays: the worker state and the change log;
+    // rocksdb.block-cache-entry-stats has the exact total of the census cache
+    // role, including short-lived copies), route-count, relocation-file-count,
+    // relocation-file-bytes, relocation-garbage-bytes, tracked-files (the files
+    // in the census candidate heap, which GC may pick, including files below
+    // the garbage threshold; suppressed files and files pinned by the coarse
+    // frontier are not counted), garbage-bytes-collectable,
+    // garbage-bytes-suppressed, coarse-pinned-files, coarse-pinned-bytes,
+    // coarse-pinned-garbage-bytes, coarse-sst-count, lowest-coarse-frontier,
+    // idle-micros-with-candidates, retirement-pending-micros,
+    // corrupt-input-files (the number of files that GC skips now because it
+    // found corruption in them) and corrupt-input-file-list (at most 8 file
+    // numbers, lowest first, comma separated; the list is partial when the
+    // count is above 8). A corrupt file stays in the list until it changes, the
+    // census is rebuilt, or the coarse frontier rises (relocation files only).
+    // The list also holds a file whose corrupt data made GC set a background
+    // error (with paranoid_checks). Every *-micros key is a duration, never a
+    // timestamp.
+    static const std::string kIndirectBlobGcStats;
+
+    // "rocksdb.blob-reference-census-unready-micros" - returns how long the
+    // blob reference census of the column family has been unready, in
+    // microseconds (a duration, not a timestamp). 0 means that it is ready, or
+    // that the column family does not use blob indirection. While it is
+    // unready, the work that needs the census waits. The LOG warning comes
+    // from the periodic stats dump; with stats_dump_period_sec = 0, use this
+    // property.
+    static const std::string kBlobReferenceCensusUnreadyMicros;
+
+    // "rocksdb.blob-indirection-format-version" - returns the blob indirection
+    // format version of the column family (the per-CF format fence). 0 means
+    // that the column family has no format fence yet (no SST built with
+    // enable_blob_indirection on was installed). A release that does not know
+    // the format cannot open a DB where it is not 0.
+    static const std::string kBlobIndirectionFormatVersion;
   };
 
   // DB implementations export properties about their state via this method.
@@ -2805,9 +2853,16 @@ class DB {
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
   // Import never brings blob files, so it returns NotSupported if any file in
-  // `metadata` references blob files (oldest_blob_file_number != 0). Importing
-  // files without blob references into a column family with
-  // `enable_blob_files` is allowed.
+  // `metadata` references blob files (oldest_blob_file_number != 0). It also
+  // returns NotSupported if the table properties of a file show that the file
+  // can hold blob indirection references. Such a file can have
+  // oldest_blob_file_number 0, so the first check does not catch it. The
+  // exported `metadata` cannot carry the blob indirection state that such a
+  // file needs (see Checkpoint::ExportColumnFamily in utilities/checkpoint.h).
+  // A column family that uses or has used enable_blob_indirection can write
+  // such files, also after the option is turned off. SST files that pass both
+  // checks can be imported, also when `options` turns on enable_blob_files for
+  // the new column family.
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,
       const ImportColumnFamilyOptions& import_options,
