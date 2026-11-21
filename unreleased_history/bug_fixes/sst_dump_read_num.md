@@ -1,0 +1,1 @@
+Fixed `sst_dump --read_num` exceeding its entry limit when reading multiple SST files, and a `--to` or `--prefix` range end using up part of the limit. Files after the limit is reached are no longer opened, so they no longer appear in `--show_properties` or `--show_summary` output.
