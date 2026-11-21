@@ -6154,7 +6154,29 @@ void StressTest::Open(SharedState* shared, bool reopen) {
             // Injected errors might happen in background compactions. We
             // wait for all compactions to finish to make sure DB is in
             // clean state before executing queries.
-            s = db_->GetRootDB()->WaitForCompact(WaitForCompactOptions());
+            //
+            // This wait is only cleanup, so it has a time limit of 5 minutes.
+            // With a small periodic_compaction_seconds or compaction_ttl, new
+            // periodic or TTL compactions can start as fast as old ones end,
+            // and the wait would never return. 5 minutes is well below the
+            // crash test's final verification limit (verify_timeout, 1200 s).
+            // A timeout means no background error was seen during the wait,
+            // so the test goes on while compactions keep running.
+            //
+            // TSAN builds wait without a time limit. A timed wait makes
+            // WaitForCompact() wait on a std::condition_variable with
+            // wait_for(), which calls pthread_cond_clockwait(). The TSAN
+            // runtime of GCC 11 does not intercept that call, so TSAN misses
+            // the unlock inside the wait and reports false double locks, data
+            // races and lock-order inversions.
+            WaitForCompactOptions wait_for_compact_options;
+#ifndef __SANITIZE_THREAD__
+            wait_for_compact_options.timeout = std::chrono::minutes(5);
+#endif  // __SANITIZE_THREAD__
+            s = db_->GetRootDB()->WaitForCompact(wait_for_compact_options);
+            if (s.IsTimedOut()) {
+              s = Status::OK();
+            }
             if (!s.ok()) {
               CleanUpColumnFamilies();
               db_owner_.reset();

@@ -11,6 +11,7 @@
 #include <memory>
 
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_write_batch_transformer.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -914,8 +915,12 @@ Status DBImpl::Recover(
       std::sort(wals.begin(), wals.end());
 
       bool corrupted_wal_found = false;
-      s = RecoverLogFiles(wals, &next_sequence, read_only, is_retry,
-                          &corrupted_wal_found, recovery_ctx);
+      s = MaybeCreateBlobRecoveryResolver(files_in_wal_dir);
+      if (s.ok()) {
+        s = RecoverLogFiles(wals, &next_sequence, read_only, is_retry,
+                            &corrupted_wal_found, recovery_ctx);
+      }
+      FinishBlobRecoveryResolver(read_only, s);
       if (corrupted_wal_found && recovered_seq != nullptr) {
         *recovered_seq = next_sequence;
       }
@@ -927,6 +932,9 @@ Status DBImpl::Recover(
       }
     }
   }
+
+  // Blob files created from here on belong to this DB session.
+  min_session_blob_file_number_ = versions_->current_next_file_number();
 
   if (read_only) {
     TEST_SYNC_POINT("DBImpl::Recover:BeforeReadOnlyLegacyOptionsDirectoryScan");
@@ -1270,6 +1278,102 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
   return status;
 }
 
+Status DBImpl::MaybeCreateBlobRecoveryResolver(
+    const std::vector<std::string>& files_in_wal_dir) {
+  mutex_.AssertHeld();
+  assert(blob_recovery_resolver_ == nullptr);
+
+  // After a crash, blob direct write leaves blob files that are not in the
+  // MANIFEST yet. Other blob files outside the MANIFEST (for example, obsolete
+  // files not deleted yet) are listed too, but no WAL record refers to them.
+  // Every blob directory is listed, even when no column family has
+  // enable_blob_files or enable_blob_direct_write set now. The previous
+  // session may have used blob direct write.
+  bool uses_blob_direct_write = false;
+  UnorderedSet<uint64_t> registered_blob_files;
+  // Directories that can hold blob files. Each column family writes its blob
+  // files to its first cf_paths entry.
+  std::vector<std::string> blob_dirs;
+  for (auto* cfd : *versions_->GetColumnFamilySet()) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    if (cfd->ioptions().enable_blob_direct_write) {
+      uses_blob_direct_write = true;
+    }
+    for (const auto& meta : cfd->current()->storage_info()->GetBlobFiles()) {
+      registered_blob_files.insert(meta->GetBlobFileNumber());
+    }
+    const std::string& dir = cfd->ioptions().cf_paths.front().path;
+    if (std::find(blob_dirs.begin(), blob_dirs.end(), dir) == blob_dirs.end()) {
+      blob_dirs.push_back(dir);
+    }
+  }
+
+  UnorderedSet<uint64_t> unregistered_blob_files;
+  const std::string normalized_wal_dir =
+      NormalizePath(immutable_db_options_.GetWalDir());
+  IOOptions io_opts;
+  io_opts.do_not_recurse = true;
+  for (const std::string& dir : blob_dirs) {
+    // Reuse the WAL directory listing that recovery already has.
+    std::vector<std::string> listed_children;
+    const std::vector<std::string>* children = &files_in_wal_dir;
+    if (NormalizePath(dir) != normalized_wal_dir) {
+      IOStatus io_s = fs_->GetChildren(dir, io_opts, &listed_children,
+                                       /*IODebugContext*=*/nullptr);
+      if (io_s.IsNotFound() || io_s.IsPathNotFound()) {
+        continue;
+      }
+      if (!io_s.ok()) {
+        return io_s;
+      }
+      children = &listed_children;
+    }
+    for (const std::string& child : *children) {
+      uint64_t number = 0;
+      FileType type = kWalFile;
+      if (ParseFileName(child, &number, &type) && type == kBlobFile &&
+          registered_blob_files.count(number) == 0) {
+        unregistered_blob_files.insert(number);
+      }
+    }
+  }
+  // If there are no unregistered blob files, the resolver is needed only when
+  // a column family has blob direct write on. Then it reports a WAL record
+  // whose blob file is missing as corrupted. Other DBs replay without the
+  // extra pass over each record.
+  if (!uses_blob_direct_write && unregistered_blob_files.empty()) {
+    return Status::OK();
+  }
+  blob_recovery_resolver_ = std::make_unique<BlobDirectWriteRecoveryResolver>(
+      versions_->GetColumnFamilySet(), file_options_,
+      std::move(unregistered_blob_files));
+  return Status::OK();
+}
+
+void DBImpl::FinishBlobRecoveryResolver(bool read_only, const Status& status) {
+  mutex_.AssertHeld();
+  if (blob_recovery_resolver_ == nullptr) {
+    return;
+  }
+  const auto& referenced_files = blob_recovery_resolver_->referenced_files();
+  if (status.ok() && !read_only) {
+    for (const auto& [file_number, wal_number] : referenced_files) {
+      uint64_t& max_wal_number = wal_replay_blob_files_[file_number];
+      max_wal_number = std::max(max_wal_number, wal_number);
+    }
+  }
+  if (blob_recovery_resolver_->resolved_value_count() > 0) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "WAL replay read %" PRIu64
+                   " values from %zu blob files that are not in the MANIFEST",
+                   blob_recovery_resolver_->resolved_value_count(),
+                   referenced_files.size());
+  }
+  blob_recovery_resolver_.reset();
+}
+
 void DBImpl::SetupLogFilesRecovery(
     const std::vector<uint64_t>& wal_numbers,
     std::unordered_map<int, VersionEdit>* version_edits, int* job_id,
@@ -1603,6 +1707,34 @@ Status DBImpl::ProcessLogRecord(
     logFileDropped();
     assert(process_status.ok());
     return process_status;
+  }
+
+  // Before the WAL filter and the insert, make each value that is in an
+  // unregistered blob file (see BlobDirectWriteRecoveryResolver) raw again.
+  // The WAL filter then sees the values that the application wrote, and the
+  // resolver records the blob files of the record even if the filter skips
+  // it. If a value cannot be read, nothing of the record is inserted, and the
+  // record is reported as a corrupted WAL record, like a record that fails to
+  // insert, so wal_recovery_mode decides what happens.
+  std::unique_ptr<WriteBatch> resolved_batch;
+  if (blob_recovery_resolver_ != nullptr) {
+    process_status = blob_recovery_resolver_->Resolve(wal_number, *batch_to_use,
+                                                      &resolved_batch);
+    if (process_status.IsCorruption()) {
+      reporter->Corruption(record.size(), process_status);
+      return Status::OK();
+    }
+    if (process_status.ok() && resolved_batch != nullptr) {
+      // Give the rewritten batch the same protection info (8 bytes per key)
+      // that InitializeWriteBatchForLogRecord() gives every replayed batch, so
+      // the memtable insert checks it the same way.
+      process_status = WriteBatchInternal::UpdateProtectionInfo(
+          resolved_batch.get(), 8 /* bytes_per_key */);
+      batch_to_use = resolved_batch.get();
+    }
+    if (!process_status.ok()) {
+      return process_status;
+    }
   }
 
   // For the default case of wal_filter == nullptr, always performs no-op

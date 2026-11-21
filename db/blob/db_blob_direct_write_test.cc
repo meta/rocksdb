@@ -14,6 +14,7 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -33,6 +34,7 @@
 #include "db/db_with_timestamp_test_util.h"
 #include "db/wide/wide_column_test_util.h"
 #include "env/composite_env_wrapper.h"
+#include "file/file_util.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
 #include "port/stack_trace.h"
@@ -41,12 +43,16 @@
 #include "rocksdb/sst_file_manager.h"
 #include "rocksdb/trace_reader_writer.h"
 #include "rocksdb/trace_record.h"
+#include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/replayer.h"
+#include "rocksdb/utilities/transaction.h"
+#include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
 #include "util/compression.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
 #include "utilities/fault_injection_env.h"
+#include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -377,6 +383,19 @@ class DBBlobDirectWriteTest : public DBTestBase {
 
   Options GetDirectWriteOptions() {
     return wide_column_test_util::GetDirectWriteOptions(GetDefaultOptions());
+  }
+
+  // Returns how many times `fn` syncs a blob file (BlobLogWriter::Sync()).
+  // Sealing a file syncs it once, in AppendFooter().
+  int CountBlobFileSyncs(const std::function<void()>& fn) {
+    std::atomic<int> syncs{0};
+    SyncPoint::GetInstance()->SetCallBack("BlobLogWriter::Sync",
+                                          [&](void* /*arg*/) { ++syncs; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    fn();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    return syncs.load();
   }
 
   size_t CountBlobFiles() {
@@ -2328,6 +2347,10 @@ TEST_F(DBBlobDirectWriteTest, FailedBlobSealLeavesMemtableFlushable) {
     Defer close_db([this]() { Close(); });
     const std::string value(1024, 'v');
     ASSERT_OK(Put("key", value));
+    // Sync the blob file now. An atomic flush first syncs the closed WALs and,
+    // before them, the blob files. With nothing left to sync, the first blob
+    // sync of the flush is the footer sync of the seal.
+    ASSERT_OK(db_->SyncWAL());
 
     // The flush fails to sync the footer of the blob file holding "key".
     SyncPoint::GetInstance()->SetCallBack("BlobLogWriter::Sync", [&](void*) {
@@ -2344,6 +2367,109 @@ TEST_F(DBBlobDirectWriteTest, FailedBlobSealLeavesMemtableFlushable) {
                                     &flush_pending));
     ASSERT_EQ(1U, flush_pending);
   }
+}
+
+// Writes "first", then "second". With a tiny blob_file_size, "second" rolls
+// the file of "first" over, and the seal of that file fails. If
+// `sync_before_seal`, SyncWAL() runs before "second", so the failed file has
+// no unsynced records. Sets `*seal_status` to the error of the failed Put()
+// and returns the status of the SyncWAL() that follows.
+Status SyncWALAfterFailedRolloverSeal(DBTestBase* test, bool sync_before_seal,
+                                      Status* seal_status) {
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(test->env_));
+  Options options =
+      wide_column_test_util::GetDirectWriteOptions(test->CurrentOptions());
+  options.env = fault_env.get();
+  options.blob_file_size = 1;
+  options.listeners.emplace_back(
+      std::make_shared<DisableAutoRecoveryListener>());
+  test->DestroyAndReopen(options);
+  Defer close_db([test]() { test->Close(); });
+  const std::string value(1024, 'v');
+  EXPECT_OK(test->Put("first", value));
+  if (sync_before_seal) {
+    EXPECT_OK(test->db_->SyncWAL());
+  }
+
+  // The seal of the full file fails to sync its footer.
+  SyncPoint::GetInstance()->SetCallBack("BlobLogWriter::Sync", [&](void*) {
+    fault_env->SetFilesystemActive(false, Status::NoSpace("injected"));
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  *seal_status = test->Put("second", value);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  fault_env->SetFilesystemActive(true);
+  return test->db_->SyncWAL();
+}
+
+// A file whose seal failed cannot be synced again. While it has unsynced
+// records, SyncWAL() must fail with the seal error, so that no WAL record
+// that points to those records becomes durable.
+TEST_F(DBBlobDirectWriteTest, SyncWALReturnsErrorOfFailedRolloverSeal) {
+  Status seal_status;
+  Status s = SyncWALAfterFailedRolloverSeal(this, /*sync_before_seal=*/false,
+                                            &seal_status);
+  ASSERT_TRUE(seal_status.IsNoSpace()) << seal_status.ToString();
+  ASSERT_EQ(s.code(), seal_status.code()) << s.ToString();
+  ASSERT_TRUE(s.IsNoSpace()) << s.ToString();
+}
+
+// An earlier SyncWAL() already synced every record of the file whose seal
+// failed, so the file needs no sync, and the next SyncWAL() succeeds.
+TEST_F(DBBlobDirectWriteTest, SyncWALSkipsFailedSealOfSyncedFile) {
+  Status seal_status;
+  Status s = SyncWALAfterFailedRolloverSeal(this, /*sync_before_seal=*/true,
+                                            &seal_status);
+  ASSERT_TRUE(seal_status.IsNoSpace()) << seal_status.ToString();
+  ASSERT_OK(s);
+}
+
+// With the WAL off, no WAL file is ever closed, so the closed-WAL sync before
+// a flush in a DB with 2 column families syncs no WAL. It must then sync no
+// blob file either: "other" keeps its unsynced blob file, and the flush of
+// "default", which has no blob file to seal, syncs no blob file.
+TEST_F(DBBlobDirectWriteTest, ClosedWalSyncWithWalOffSkipsBlobSync) {
+  Options options = GetDirectWriteOptions();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, handles_[1], "large", std::string(1024, 'v')));
+  ASSERT_OK(db_->Put(no_wal, handles_[0], "small", "s"));
+  ASSERT_EQ(CountBlobFileSyncs([&]() { ASSERT_OK(Flush(0)); }), 0);
+}
+
+// An atomic flush runs the closed-WAL sync with any number of column
+// families. With the WAL off it syncs no WAL, so the only blob sync of the
+// flush is the seal of the one blob file.
+TEST_F(DBBlobDirectWriteTest, AtomicFlushWithWalOffSkipsBlobSync) {
+  Options options = GetDirectWriteOptions();
+  options.atomic_flush = true;
+  DestroyAndReopen(options);
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, "large", std::string(1024, 'v')));
+  ASSERT_EQ(CountBlobFileSyncs([&]() { ASSERT_OK(Flush()); }), 1);
+}
+
+// The WAL is on. The flush of "default" switches the WAL and syncs the closed
+// WAL. A large value then goes to "other" without a WAL record, so the current
+// WAL stays empty, and the flush of "other" switches no WAL. Its closed-WAL
+// sync finds no WAL left to sync, so the only blob sync of that flush is the
+// seal of the blob file of "other".
+TEST_F(DBBlobDirectWriteTest, ClosedWalSyncOfSyncedWalsSkipsBlobSync) {
+  Options options = GetDirectWriteOptions();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  ASSERT_OK(Put(0, "a", "s"));
+  ASSERT_OK(Put(1, "b", "s"));
+  ASSERT_OK(Flush(0));
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, handles_[1], "large", std::string(1024, 'v')));
+  ASSERT_EQ(CountBlobFileSyncs([&]() { ASSERT_OK(Flush(1)); }), 1);
 }
 
 TEST_F(DBBlobDirectWriteTest, FailedBlobFooterSyncFailsRetriedFlush) {
@@ -2402,6 +2528,1254 @@ TEST_F(DBBlobDirectWriteTest, CloseAfterFailedBlobSeal) {
     fault_env->SetFilesystemActive(true);
   }
 }
+
+// Lets one thread wait, without polling, until another thread reports that
+// an event happened.
+class TestEvent {
+ public:
+  TestEvent() : cv_(&mu_) {}
+
+  void Set() {
+    mu_.Lock();
+    set_ = true;
+    cv_.SignalAll();
+    mu_.Unlock();
+  }
+
+  // Returns false if the event is not set within kTimeoutMicros, so that a
+  // broken test fails instead of hanging. The 5 minutes are far more than the
+  // tests need, and less than a typical test runner timeout.
+  bool Wait() {
+    constexpr uint64_t kTimeoutMicros = 5ULL * 60 * 1000 * 1000;
+    const uint64_t deadline =
+        SystemClock::Default()->NowMicros() + kTimeoutMicros;
+    mu_.Lock();
+    while (!set_ && !cv_.TimedWait(deadline)) {
+    }
+    const bool set = set_;
+    mu_.Unlock();
+    return set;
+  }
+
+ private:
+  port::Mutex mu_;
+  port::CondVar cv_;
+  bool set_ = false;
+};
+
+class DBBlobDirectWritePowerLossTest : public DBBlobDirectWriteTest {
+ public:
+  ~DBBlobDirectWritePowerLossTest() override { Close(); }
+
+ protected:
+  DBBlobDirectWritePowerLossTest()
+      : fault_fs_(
+            std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem())),
+        fault_env_(NewCompositeEnv(fault_fs_)) {
+    fault_fs_->SetInjectUnsyncedDataLoss(true);
+  }
+
+  Options GetPowerLossOptions() {
+    Options options = GetDirectWriteOptions();
+    options.env = fault_env_.get();
+    return options;
+  }
+
+  // DBTestBase sets wal_recovery_mode to kTolerateCorruptedTailRecords. These
+  // tests use kPointInTimeRecovery, the RocksDB default and the mode the crash
+  // test uses, so that a WAL record whose blob value is lost ends replay
+  // instead of failing the open.
+  Options GetWalRecoveryOptions() {
+    Options options = GetPowerLossOptions();
+    options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+    return options;
+  }
+
+  void SimulatePowerLoss() {
+    fault_fs_->SetFilesystemActive(false);
+    Close();
+    fault_fs_->SetFilesystemActive(true);
+    ASSERT_OK(fault_fs_->DropUnsyncedFileData());
+    ASSERT_OK(
+        fault_fs_->DeleteFilesCreatedAfterLastDirSync(IOOptions(), nullptr));
+  }
+
+  void AssertDefaultColumnFamilyScanOk() {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    }
+    ASSERT_OK(iter->status());
+  }
+
+  // Used by the SyncWAL() concurrency tests. Called from the
+  // DBImpl::SyncWalImpl:BeforeSyncWAL callback, between the blob sync and the
+  // WAL sync. Starts `*writer`, which writes "concurrent", and waits until
+  // that write is held back or done (`*blocked_or_done`).
+  void StartConcurrentWrite(const std::string& value,
+                            TestEvent* blocked_or_done, port::Thread* writer) {
+    *writer = port::Thread([this, &value, blocked_or_done]() {
+      // Set the event even if Put() fails, so that the callback returns.
+      Defer set_event([blocked_or_done]() { blocked_or_done->Set(); });
+      EXPECT_OK(Put("concurrent", value));
+    });
+    EXPECT_TRUE(blocked_or_done->Wait());
+  }
+
+  // Used by the SyncWAL() concurrency tests. Simulates a power loss, reopens,
+  // and checks that "before" survived and that "concurrent" is either fully
+  // present or absent.
+  void VerifyConcurrentWriteAfterPowerLoss(const Options& options,
+                                           const std::string& value) {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    SimulatePowerLoss();
+    Reopen(options);
+    ASSERT_EQ(Get("before"), value);
+    std::string concurrent_value;
+    Status s = db_->Get(ReadOptions(), "concurrent", &concurrent_value);
+    ASSERT_TRUE(s.IsNotFound() || (s.ok() && concurrent_value == value))
+        << s.ToString();
+    AssertDefaultColumnFamilyScanOk();
+  }
+
+  std::shared_ptr<FaultInjectionTestFS> fault_fs_;
+  std::unique_ptr<Env> fault_env_;
+};
+
+enum class WalSyncTrigger {
+  kSyncWAL,
+  kFlushWALWithSync,
+  kSyncWriteWithoutBlob,
+  kSyncWriteToOtherColumnFamily,
+  kFlushOtherColumnFamily,
+};
+
+class DBBlobDirectWriteWalSyncTest
+    : public DBBlobDirectWritePowerLossTest,
+      public testing::WithParamInterface<WalSyncTrigger> {};
+
+TEST_P(DBBlobDirectWriteWalSyncTest, PersistsEarlierDirectWrite) {
+  const WalSyncTrigger trigger = GetParam();
+  Options options = GetPowerLossOptions();
+  options.manual_wal_flush = trigger == WalSyncTrigger::kFlushWALWithSync;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+
+  const std::string value(200, 'v');
+  ASSERT_OK(Put(0, "key", value));
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  switch (trigger) {
+    case WalSyncTrigger::kSyncWAL:
+      ASSERT_OK(db_->SyncWAL());
+      break;
+    case WalSyncTrigger::kFlushWALWithSync:
+      ASSERT_OK(db_->FlushWAL(/*sync=*/true));
+      break;
+    case WalSyncTrigger::kSyncWriteWithoutBlob:
+      ASSERT_OK(db_->Put(sync_write, handles_[0], "small", "s"));
+      break;
+    case WalSyncTrigger::kSyncWriteToOtherColumnFamily:
+      ASSERT_OK(db_->Put(sync_write, handles_[1], "other", value));
+      break;
+    case WalSyncTrigger::kFlushOtherColumnFamily:
+      ASSERT_OK(Put(1, "other", value));
+      ASSERT_OK(Flush(1));
+      break;
+  }
+  SimulatePowerLoss();
+
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "other"}, options);
+  ASSERT_EQ(Get(0, "key"), value);
+  AssertDefaultColumnFamilyScanOk();
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DBBlobDirectWriteWalSyncTest, DBBlobDirectWriteWalSyncTest,
+    ::testing::Values(WalSyncTrigger::kSyncWAL,
+                      WalSyncTrigger::kFlushWALWithSync,
+                      WalSyncTrigger::kSyncWriteWithoutBlob,
+                      WalSyncTrigger::kSyncWriteToOtherColumnFamily,
+                      WalSyncTrigger::kFlushOtherColumnFamily));
+
+// A write that starts while SyncWAL() runs must wait until the WAL sync ends.
+// Otherwise its WAL record could become durable before its blob bytes are
+// synced.
+TEST_F(DBBlobDirectWritePowerLossTest,
+       SyncWALKeepsConcurrentDirectWriteOutOfSyncedWal) {
+  Options options = GetPowerLossOptions();
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  ASSERT_OK(Put("before", value));
+
+  // Set when the concurrent writer queues behind the SyncWAL() writer (the
+  // expected case) or when its Put() returns (SyncWAL() let the write run
+  // between the blob sync and the WAL sync).
+  TestEvent writer_blocked_or_done;
+  port::Thread concurrent_writer;
+  bool sync_callback_ran = false;
+  // On any failure, release and join the writer so the test fails cleanly.
+  Defer cleanup([&]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    writer_blocked_or_done.Set();
+    if (concurrent_writer.joinable()) {
+      concurrent_writer.join();
+    }
+  });
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait", [&](void* arg) {
+        // A leader also passes this point. Only a writer that is not the
+        // leader waits behind another writer.
+        auto* w = static_cast<WriteThread::Writer*>(arg);
+        if (w->state != WriteThread::STATE_GROUP_LEADER) {
+          writer_blocked_or_done.Set();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalImpl:BeforeSyncWAL", [&](void* /*arg*/) {
+        if (sync_callback_ran) {
+          return;
+        }
+        sync_callback_ran = true;
+        StartConcurrentWrite(value, &writer_blocked_or_done,
+                             &concurrent_writer);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db_->SyncWAL());
+  ASSERT_TRUE(sync_callback_ran);
+  concurrent_writer.join();
+  VerifyConcurrentWriteAfterPowerLoss(options, value);
+}
+
+// SyncWAL() starts while another thread holds LockWAL(), and that thread
+// calls UnlockWAL() during the sync. Writes must stay stopped until the WAL
+// sync ends.
+TEST_F(DBBlobDirectWritePowerLossTest,
+       SyncWALKeepsWritesStoppedAfterConcurrentUnlockWAL) {
+  Options options = GetPowerLossOptions();
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  ASSERT_OK(Put("before", value));
+
+  TestEvent locked;
+  TestEvent unlock_requested;
+  TestEvent unlocked;
+  // Set when the concurrent writer is stopped by the write controller (the
+  // expected case) or when its Put() returns (SyncWAL() let the write run
+  // between the blob sync and the WAL sync).
+  TestEvent writer_blocked_or_done;
+  port::Thread lock_owner;
+  port::Thread concurrent_writer;
+  bool sync_callback_ran = false;
+  // On any failure, release and join both threads so the test fails cleanly.
+  Defer cleanup([&]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    unlock_requested.Set();
+    writer_blocked_or_done.Set();
+    if (lock_owner.joinable()) {
+      lock_owner.join();
+    }
+    if (concurrent_writer.joinable()) {
+      concurrent_writer.join();
+    }
+  });
+  lock_owner = port::Thread([&]() {
+    Defer set_unlocked([&]() { unlocked.Set(); });
+    Status s = db_->LockWAL();
+    locked.Set();
+    if (!s.ok()) {
+      ADD_FAILURE() << s.ToString();
+      return;
+    }
+    EXPECT_TRUE(unlock_requested.Wait());
+    EXPECT_OK(db_->UnlockWAL());
+  });
+  ASSERT_TRUE(locked.Wait());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::DelayWrite:Wait",
+      [&](void* /*arg*/) { writer_blocked_or_done.Set(); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWalImpl:BeforeSyncWAL", [&](void* /*arg*/) {
+        if (sync_callback_ran) {
+          return;
+        }
+        sync_callback_ran = true;
+        unlock_requested.Set();
+        EXPECT_TRUE(unlocked.Wait());
+        StartConcurrentWrite(value, &writer_blocked_or_done,
+                             &concurrent_writer);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db_->SyncWAL());
+  ASSERT_TRUE(sync_callback_ran);
+  lock_owner.join();
+  concurrent_writer.join();
+  VerifyConcurrentWriteAfterPowerLoss(options, value);
+}
+
+TEST_F(DBBlobDirectWritePowerLossTest,
+       SyncWritePersistsBlobFileRotatedAtMemtableSwitch) {
+  Options options = GetPowerLossOptions();
+  options.max_write_buffer_number = 4;
+  DestroyAndReopen(options);
+
+  test::SleepingBackgroundTask blocked_flush;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &blocked_flush,
+                 Env::Priority::HIGH);
+  blocked_flush.WaitUntilSleeping();
+  const std::string rotated_value(200, 'r');
+  const std::string synced_value(200, 's');
+  ASSERT_OK(Put("rotated", rotated_value));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  ASSERT_OK(db_->Put(sync_write, "synced", synced_value));
+
+  // The rotated file of the switched memtable is a deferred file. The blocked
+  // flush did not seal it, so only the sync write can have synced it.
+  // Deactivate the file system before the flush runs, so the flush cannot
+  // seal and sync the file either.
+  fault_fs_->SetFilesystemActive(false);
+  blocked_flush.WakeUp();
+  blocked_flush.WaitUntilDone();
+  SimulatePowerLoss();
+
+  Reopen(options);
+  ASSERT_EQ(Get("rotated"), rotated_value);
+  ASSERT_EQ(Get("synced"), synced_value);
+  AssertDefaultColumnFamilyScanOk();
+}
+
+TEST_F(DBBlobDirectWritePowerLossTest,
+       SyncWritePersistsNewBlobFileWithSeparateWalDir) {
+  Options options = GetPowerLossOptions();
+  options.wal_dir = alternative_wal_dir_;
+  DestroyAndReopen(options);
+
+  const std::string value(200, 'v');
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  ASSERT_OK(db_->Put(sync_write, "key", value));
+  SimulatePowerLoss();
+
+  Reopen(options);
+  ASSERT_EQ(Get("key"), value);
+  AssertDefaultColumnFamilyScanOk();
+}
+
+// Tests for WAL replay of values in blob files that are not in the MANIFEST
+// yet ("unregistered blob files"). Each test writes with the WAL on, crashes
+// before the memtable is flushed, and checks what the next open recovers.
+class DBBlobDirectWriteWalRecoveryTest : public DBBlobDirectWritePowerLossTest {
+ protected:
+  DBBlobDirectWriteWalRecoveryTest() {
+    // Write through to the real files, so that a simulated process crash
+    // keeps the unsynced data, and the tests can change the files directly.
+    // In this mode, SimulatePowerLoss() cannot drop unsynced data. Tests that
+    // need a real power loss use DBBlobDirectWriteWalRecoveryPowerLossTest.
+    fault_fs_->SetInjectUnsyncedDataLoss(false);
+  }
+
+  // Stops the DB like a killed process: unsynced data stays in the files.
+  void SimulateProcessCrash() {
+    fault_fs_->SetFilesystemActive(false);
+    Close();
+    fault_fs_->SetFilesystemActive(true);
+  }
+
+  std::set<uint64_t> BlobFilesOnDisk() {
+    std::vector<std::string> files;
+    EXPECT_OK(env_->GetChildren(dbname_, &files));
+    std::set<uint64_t> result;
+    for (const auto& file : files) {
+      uint64_t number = 0;
+      FileType type = kWalFile;
+      if (ParseFileName(file, &number, &type) && type == kBlobFile) {
+        result.insert(number);
+      }
+    }
+    return result;
+  }
+
+  // Blob files on disk that no column family's current Version has.
+  std::set<uint64_t> UnregisteredBlobFiles() {
+    std::set<uint64_t> result = BlobFilesOnDisk();
+    for (auto* cfd : *dbfull()->GetVersionSet()->GetColumnFamilySet()) {
+      for (const auto& meta : cfd->current()->storage_info()->GetBlobFiles()) {
+        result.erase(meta->GetBlobFileNumber());
+      }
+    }
+    return result;
+  }
+
+  static std::string LargeValue(int i) {
+    return std::string(200, static_cast<char>('a' + i % 26)) +
+           std::to_string(i);
+  }
+  static std::string Key(int i) { return "key" + std::to_string(i); }
+};
+
+class DBBlobDirectWriteWalRecoveryAvoidFlushTest
+    : public DBBlobDirectWriteWalRecoveryTest,
+      public testing::WithParamInterface<bool> {};
+
+// Values in unregistered blob files come back after a crash. With a flush
+// during recovery, the values move to new blob files and the old files are
+// deleted. Without it, the old files stay until the WAL that refers to them
+// is obsolete, so a second crash recovers the same values again.
+TEST_P(DBBlobDirectWriteWalRecoveryAvoidFlushTest, RecoversValuesFromWal) {
+  const bool avoid_flush_during_recovery = GetParam();
+  Options options = GetWalRecoveryOptions();
+  options.avoid_flush_during_recovery = avoid_flush_during_recovery;
+  options.blob_direct_write_partitions = 2;
+  DestroyAndReopen(options);
+
+  // Keys 0..9 end up in MANIFEST blob files, keys 10..29 in unregistered ones.
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(Key(i), LargeValue(i)));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 10; i < 30; ++i) {
+    ASSERT_OK(Put(Key(i), LargeValue(i)));
+  }
+  ASSERT_OK(Put("small", "s"));
+  ASSERT_OK(Delete(Key(3)));
+  ASSERT_OK(Put(Key(11), LargeValue(111)));
+
+  const std::set<uint64_t> unregistered = UnregisteredBlobFiles();
+  ASSERT_FALSE(unregistered.empty());
+  SimulateProcessCrash();
+
+  auto verify = [&]() {
+    for (int i = 0; i < 30; ++i) {
+      if (i == 3) {
+        ASSERT_EQ(Get(Key(i)), "NOT_FOUND");
+      } else {
+        ASSERT_EQ(Get(Key(i)), LargeValue(i == 11 ? 111 : i)) << i;
+      }
+    }
+    ASSERT_EQ(Get("small"), "s");
+    AssertDefaultColumnFamilyScanOk();
+  };
+
+  Reopen(options);
+  verify();
+  dbfull()->TEST_DeleteObsoleteFiles();
+  std::set<uint64_t> on_disk = BlobFilesOnDisk();
+  for (uint64_t file_number : unregistered) {
+    ASSERT_EQ(on_disk.count(file_number) > 0, avoid_flush_during_recovery)
+        << file_number;
+  }
+
+  if (avoid_flush_during_recovery) {
+    // The WAL is still live, so a second crash replays it again.
+    SimulateProcessCrash();
+    Reopen(options);
+    verify();
+    ASSERT_OK(Flush());
+    dbfull()->TEST_DeleteObsoleteFiles();
+    on_disk = BlobFilesOnDisk();
+    for (uint64_t file_number : unregistered) {
+      ASSERT_EQ(on_disk.count(file_number), 0U) << file_number;
+    }
+  }
+
+  Reopen(options);
+  verify();
+}
+
+INSTANTIATE_TEST_CASE_P(DBBlobDirectWriteWalRecoveryAvoidFlushTest,
+                        DBBlobDirectWriteWalRecoveryAvoidFlushTest,
+                        ::testing::Bool());
+
+class DBBlobDirectWriteWalRecoveryModeTest
+    : public DBBlobDirectWriteWalRecoveryTest,
+      public testing::WithParamInterface<WALRecoveryMode> {};
+
+// A WAL record whose blob record is torn is handled like a corrupted WAL
+// record.
+TEST_P(DBBlobDirectWriteWalRecoveryModeTest, TornBlobRecord) {
+  const WALRecoveryMode mode = GetParam();
+  Options options = GetWalRecoveryOptions();
+  options.wal_recovery_mode = mode;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("before", "b"));
+  ASSERT_OK(Put("first", LargeValue(1)));
+  ASSERT_OK(Put("second", LargeValue(2)));
+  ASSERT_OK(Put("after", "a"));
+  const std::set<uint64_t> unregistered = UnregisteredBlobFiles();
+  ASSERT_EQ(unregistered.size(), 1U);
+  SimulateProcessCrash();
+
+  // Cut the last byte of the blob record of "second".
+  const std::string blob_file = BlobFileName(dbname_, *unregistered.begin());
+  uint64_t file_size = 0;
+  ASSERT_OK(env_->GetFileSize(blob_file, &file_size));
+  ASSERT_OK(test::TruncateFile(env_, blob_file, file_size - 1));
+
+  Status s = TryReopen(options);
+  switch (mode) {
+    case WALRecoveryMode::kTolerateCorruptedTailRecords:
+    case WALRecoveryMode::kAbsoluteConsistency:
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+      return;
+    case WALRecoveryMode::kPointInTimeRecovery:
+      ASSERT_OK(s);
+      // Replay stops before "second", so the later "after" is gone too.
+      ASSERT_EQ(Get("after"), "NOT_FOUND");
+      break;
+    case WALRecoveryMode::kSkipAnyCorruptedRecords:
+      ASSERT_OK(s);
+      break;
+  }
+  ASSERT_EQ(Get("before"), "b");
+  ASSERT_EQ(Get("first"), LargeValue(1));
+  ASSERT_EQ(Get("second"), "NOT_FOUND");
+  AssertDefaultColumnFamilyScanOk();
+  Reopen(options);
+  ASSERT_EQ(Get("first"), LargeValue(1));
+  ASSERT_EQ(Get("second"), "NOT_FOUND");
+}
+
+// A WAL record whose blob file is gone is handled like a corrupted WAL record.
+TEST_P(DBBlobDirectWriteWalRecoveryModeTest, MissingBlobFile) {
+  const WALRecoveryMode mode = GetParam();
+  Options options = GetWalRecoveryOptions();
+  options.wal_recovery_mode = mode;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("before", "b"));
+  ASSERT_OK(Put("first", LargeValue(1)));
+  ASSERT_OK(Put("after", "a"));
+  const std::set<uint64_t> unregistered = UnregisteredBlobFiles();
+  ASSERT_EQ(unregistered.size(), 1U);
+  SimulateProcessCrash();
+  ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, *unregistered.begin())));
+
+  Status s = TryReopen(options);
+  switch (mode) {
+    case WALRecoveryMode::kTolerateCorruptedTailRecords:
+    case WALRecoveryMode::kAbsoluteConsistency:
+      ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+      return;
+    case WALRecoveryMode::kPointInTimeRecovery:
+      ASSERT_OK(s);
+      ASSERT_EQ(Get("after"), "NOT_FOUND");
+      break;
+    case WALRecoveryMode::kSkipAnyCorruptedRecords:
+      ASSERT_OK(s);
+      break;
+  }
+  ASSERT_EQ(Get("before"), "b");
+  ASSERT_EQ(Get("first"), "NOT_FOUND");
+  AssertDefaultColumnFamilyScanOk();
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DBBlobDirectWriteWalRecoveryModeTest, DBBlobDirectWriteWalRecoveryModeTest,
+    ::testing::Values(WALRecoveryMode::kTolerateCorruptedTailRecords,
+                      WALRecoveryMode::kAbsoluteConsistency,
+                      WALRecoveryMode::kPointInTimeRecovery,
+                      WALRecoveryMode::kSkipAnyCorruptedRecords));
+
+// A failed blob read leaves the whole WAL record out, even when an earlier
+// entry of the same batch could be read.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, TornBlobDropsWholeBatch) {
+  Options options = GetWalRecoveryOptions();
+  DestroyAndReopen(options);
+
+  WriteBatch batch;
+  ASSERT_OK(batch.Put("small", "s"));
+  ASSERT_OK(batch.Put("first", LargeValue(1)));
+  ASSERT_OK(batch.Put("second", LargeValue(2)));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  const std::set<uint64_t> unregistered = UnregisteredBlobFiles();
+  ASSERT_EQ(unregistered.size(), 1U);
+  SimulateProcessCrash();
+
+  const std::string blob_file = BlobFileName(dbname_, *unregistered.begin());
+  uint64_t file_size = 0;
+  ASSERT_OK(env_->GetFileSize(blob_file, &file_size));
+  ASSERT_OK(test::TruncateFile(env_, blob_file, file_size - 1));
+
+  Reopen(options);
+  ASSERT_EQ(Get("small"), "NOT_FOUND");
+  ASSERT_EQ(Get("first"), "NOT_FOUND");
+  ASSERT_EQ(Get("second"), "NOT_FOUND");
+}
+
+// Wide-column entities with blob columns come back with all columns inline.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, RecoversWideColumnEntity) {
+  Options options = GetWalRecoveryOptions();
+  DestroyAndReopen(options);
+
+  // WideColumn keeps Slices, so the values must outlive `columns`.
+  const std::string default_value = LargeValue(1);
+  const std::string large_value = LargeValue(2);
+  const WideColumns columns{{kDefaultWideColumnName, default_value},
+                            {"large", large_value},
+                            {"small", "x"}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "entity",
+                           columns));
+  ASSERT_FALSE(UnregisteredBlobFiles().empty());
+  SimulateProcessCrash();
+
+  auto verify = [&]() {
+    PinnableWideColumns result;
+    ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
+                             "entity", &result));
+    ASSERT_EQ(result.columns(), columns);
+  };
+  Reopen(options);
+  verify();
+  Reopen(options);
+  verify();
+}
+
+// Recovery flushes write new files while the WAL is replayed. They must not
+// take the number of an unregistered blob file that a later WAL record reads.
+TEST_F(DBBlobDirectWriteWalRecoveryTest,
+       FlushDuringReplayDoesNotReuseBlobFileNumbers) {
+  Options options = GetWalRecoveryOptions();
+  // The memtable holds only BlobIndex entries before the crash, but raw values
+  // during replay, so replay fills it many times.
+  options.write_buffer_size = 64 << 10;
+  options.max_write_buffer_number = 8;
+  options.blob_file_size = 1 << 20;
+  DestroyAndReopen(options);
+
+  const int kNumKeys = 400;
+  const std::string value_suffix(2000, 'v');
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), LargeValue(i) + value_suffix));
+  }
+  ASSERT_FALSE(UnregisteredBlobFiles().empty());
+  SimulateProcessCrash();
+
+  Reopen(options);
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_EQ(Get(Key(i)), LargeValue(i) + value_suffix) << i;
+  }
+  Reopen(options);
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_EQ(Get(Key(i)), LargeValue(i) + value_suffix) << i;
+  }
+}
+
+// Each column family resolves only its own records. One column family is
+// flushed before the crash, so its WAL records are skipped at replay.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, MultipleColumnFamilies) {
+  Options options = GetWalRecoveryOptions();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+
+  ASSERT_OK(Put(0, "a", LargeValue(1)));
+  ASSERT_OK(Put(1, "b", LargeValue(2)));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Put(1, "c", LargeValue(3)));
+  ASSERT_OK(Put(0, "d", LargeValue(4)));
+  SimulateProcessCrash();
+
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "other"}, options);
+  ASSERT_EQ(Get(0, "a"), LargeValue(1));
+  ASSERT_EQ(Get(1, "b"), LargeValue(2));
+  ASSERT_EQ(Get(1, "c"), LargeValue(3));
+  ASSERT_EQ(Get(0, "d"), LargeValue(4));
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "other"}, options);
+  ASSERT_EQ(Get(0, "a"), LargeValue(1));
+  ASSERT_EQ(Get(1, "c"), LargeValue(3));
+}
+
+// One WAL record has large values for two column families. Column family
+// "other" is flushed after the write, so replay skips its entry and resolves
+// only the entry of the default column family.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, BatchWithSkippedColumnFamily) {
+  Options options = GetWalRecoveryOptions();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+
+  WriteBatch batch;
+  ASSERT_OK(batch.Put(handles_[0], "a", LargeValue(1)));
+  ASSERT_OK(batch.Put(handles_[1], "b", LargeValue(2)));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  ASSERT_OK(Flush(1));
+  SimulateProcessCrash();
+
+  for (int i = 0; i < 2; ++i) {
+    ReopenWithColumnFamilies({kDefaultColumnFamilyName, "other"}, options);
+    ASSERT_EQ(Get(0, "a"), LargeValue(1));
+    ASSERT_EQ(Get(1, "b"), LargeValue(2));
+  }
+}
+
+// A read-only open replays the WAL into memory and keeps the files.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, ReadOnlyOpen) {
+  Options options = GetWalRecoveryOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", LargeValue(1)));
+  const std::set<uint64_t> unregistered = UnregisteredBlobFiles();
+  ASSERT_EQ(unregistered.size(), 1U);
+  SimulateProcessCrash();
+
+  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_EQ(Get("a"), LargeValue(1));
+  Close();
+  ASSERT_EQ(BlobFilesOnDisk().count(*unregistered.begin()), 1U);
+
+  Reopen(options);
+  ASSERT_EQ(Get("a"), LargeValue(1));
+}
+
+class DBBlobDirectWriteWalRecoveryReadOnlyTest
+    : public DBBlobDirectWriteWalRecoveryTest,
+      public testing::WithParamInterface<bool> {};
+
+// A read-only open of a DB that another DB instance keeps writing. During the
+// read-only replay, the primary writes one more large value. The log reader
+// reads the WAL one block (log::kBlockSize, 32 KB) at a time. The new record
+// goes into a block that the reader has not read yet, so the replay still
+// reads it. With `new_blob_file`, the value goes to a blob file that did not
+// exist when recovery listed the directory. Otherwise it goes to the end of a
+// blob file that the replay has already opened.
+TEST_P(DBBlobDirectWriteWalRecoveryReadOnlyTest, OpenWhilePrimaryWrites) {
+  const bool new_blob_file = GetParam();
+  Options options = GetWalRecoveryOptions();
+  if (new_blob_file) {
+    // Each value fills its blob file, so the next value opens a new file.
+    options.blob_file_size = 1;
+  }
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", LargeValue(1)));
+  // Fill more than one WAL block (log::kBlockSize, 32 KB) with records whose
+  // values are small, so they stay inline.
+  const std::string long_key_suffix(1000, 'k');
+  for (int i = 0; i < 40; ++i) {
+    ASSERT_OK(Put(Key(i) + long_key_suffix, "f"));
+  }
+
+  int records_seen = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RecoverLogFiles:BeforeUpdateProtectionInfo:batch",
+      [&](void* /*arg*/) {
+        // The second record comes after "a", so the replay has already read
+        // "a" from its blob file.
+        if (++records_seen == 2) {
+          ASSERT_OK(Put("c", LargeValue(3)));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::unique_ptr<DB> read_only_db;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &read_only_db));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_GE(records_seen, 2);
+
+  auto verify = [&](const std::map<std::string, std::string>& expected) {
+    for (const auto& [key, expected_value] : expected) {
+      std::string value;
+      ASSERT_OK(read_only_db->Get(ReadOptions(), key, &value)) << key;
+      ASSERT_EQ(value, expected_value) << key;
+    }
+  };
+  verify({{"a", LargeValue(1)}, {"c", LargeValue(3)}});
+  read_only_db.reset();
+
+  // A second read-only open, after one more write, sees all values.
+  ASSERT_OK(Put("d", LargeValue(4)));
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &read_only_db));
+  verify({{"a", LargeValue(1)}, {"c", LargeValue(3)}, {"d", LargeValue(4)}});
+  read_only_db.reset();
+}
+
+INSTANTIATE_TEST_CASE_P(DBBlobDirectWriteWalRecoveryReadOnlyTest,
+                        DBBlobDirectWriteWalRecoveryReadOnlyTest,
+                        ::testing::Bool());
+
+// Replay reads values from more unregistered blob files than the resolver
+// keeps open at the same time (64), so it must close readers on the way.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, ManyUnregisteredBlobFiles) {
+  Options options = GetWalRecoveryOptions();
+  // Each value fills its blob file, so every value gets its own file.
+  options.blob_file_size = 1;
+  DestroyAndReopen(options);
+  const int kNumKeys = 100;
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), LargeValue(i)));
+  }
+  ASSERT_GT(UnregisteredBlobFiles().size(), 64U);
+  SimulateProcessCrash();
+
+  for (int round = 0; round < 2; ++round) {
+    Reopen(options);
+    for (int i = 0; i < kNumKeys; ++i) {
+      ASSERT_EQ(Get(Key(i)), LargeValue(i)) << i;
+    }
+  }
+}
+
+// WAL replay with a non-default first path for the column family:
+// cf_paths={alt} or db_paths={alt} (first parameter true or false), with or
+// without avoid_flush_during_recovery (second parameter). Recovery must find
+// the unregistered blob files in alt, and keep them there until the WAL that
+// refers to them is obsolete.
+class DBBlobDirectWriteWalRecoveryPathTest
+    : public DBBlobDirectWriteWalRecoveryTest,
+      public testing::WithParamInterface<std::tuple<bool, bool>> {
+ protected:
+  std::set<uint64_t> BlobFilesIn(const std::string& dir) {
+    std::vector<std::string> files;
+    EXPECT_OK(env_->GetChildren(dir, &files));
+    std::set<uint64_t> result;
+    for (const auto& file : files) {
+      uint64_t number = 0;
+      FileType type = kWalFile;
+      if (ParseFileName(file, &number, &type) && type == kBlobFile) {
+        result.insert(number);
+      }
+    }
+    return result;
+  }
+};
+
+TEST_P(DBBlobDirectWriteWalRecoveryPathTest, RecoversValuesInFirstPath) {
+  const bool use_cf_paths = std::get<0>(GetParam());
+  const bool avoid_flush_during_recovery = std::get<1>(GetParam());
+  Options options = GetWalRecoveryOptions();
+  options.avoid_flush_during_recovery = avoid_flush_during_recovery;
+  const std::string alt_dir = dbname_ + "_blob_path";
+  // DestroyDB() does not clean this directory, so remove the files that an
+  // earlier test left there.
+  DestroyDir(env_, alt_dir).PermitUncheckedError();
+  if (use_cf_paths) {
+    options.cf_paths = {{alt_dir, std::numeric_limits<uint64_t>::max()}};
+  } else {
+    options.db_paths = {{alt_dir, std::numeric_limits<uint64_t>::max()}};
+  }
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", LargeValue(1)));
+  ASSERT_OK(Put("b", LargeValue(2)));
+  const std::set<uint64_t> replayed_files = BlobFilesIn(alt_dir);
+  ASSERT_FALSE(replayed_files.empty());
+  ASSERT_TRUE(BlobFilesIn(dbname_).empty());
+  SimulateProcessCrash();
+
+  Reopen(options);
+  ASSERT_EQ(Get("a"), LargeValue(1));
+  ASSERT_EQ(Get("b"), LargeValue(2));
+  dbfull()->TEST_DeleteObsoleteFiles();
+  for (uint64_t file_number : replayed_files) {
+    // Without a flush during recovery, the WAL is still live and a second
+    // crash would replay it again, so the file must stay.
+    ASSERT_EQ(BlobFilesIn(alt_dir).count(file_number) > 0,
+              avoid_flush_during_recovery)
+        << file_number;
+  }
+  if (avoid_flush_during_recovery) {
+    ASSERT_OK(Flush());
+    dbfull()->TEST_DeleteObsoleteFiles();
+    for (uint64_t file_number : replayed_files) {
+      ASSERT_EQ(BlobFilesIn(alt_dir).count(file_number), 0U) << file_number;
+    }
+  }
+  ASSERT_TRUE(BlobFilesIn(dbname_).empty());
+
+  Reopen(options);
+  ASSERT_EQ(Get("a"), LargeValue(1));
+  ASSERT_EQ(Get("b"), LargeValue(2));
+}
+
+INSTANTIATE_TEST_CASE_P(DBBlobDirectWriteWalRecoveryPathTest,
+                        DBBlobDirectWriteWalRecoveryPathTest,
+                        ::testing::Combine(::testing::Bool(),
+                                           ::testing::Bool()));
+
+// WAL replay without a flush keeps the unregistered blob file, and the
+// MANIFEST does not have it. A checkpoint without a flush would copy the WAL
+// but not that file, so it must return NotSupported. A checkpoint with a
+// flush works. The reopen turns blob direct write off, so the DB has no active
+// blob direct write files, and only the kept file can make the checkpoint
+// fail.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, CheckpointAfterReplayWithoutFlush) {
+  Options options = GetWalRecoveryOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", LargeValue(1)));
+  ASSERT_EQ(UnregisteredBlobFiles().size(), 1U);
+  SimulateProcessCrash();
+
+  options.avoid_flush_during_recovery = true;
+  options.enable_blob_direct_write = false;
+  Reopen(options);
+  ASSERT_EQ(UnregisteredBlobFiles().size(), 1U);
+
+  const std::string checkpoint_dir = dbname_ + "_checkpoint";
+  ASSERT_OK(DestroyDB(checkpoint_dir, options));
+  Checkpoint* raw_checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &raw_checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint(raw_checkpoint);
+  Status s = checkpoint->CreateCheckpoint(
+      checkpoint_dir,
+      /*log_size_for_flush=*/std::numeric_limits<uint64_t>::max());
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+
+  ASSERT_OK(checkpoint->CreateCheckpoint(checkpoint_dir,
+                                         /*log_size_for_flush=*/0));
+  Options checkpoint_options = options;
+  checkpoint_options.env = env_;
+  std::unique_ptr<DB> checkpoint_db;
+  ASSERT_OK(
+      DB::OpenForReadOnly(checkpoint_options, checkpoint_dir, &checkpoint_db));
+  std::string value;
+  ASSERT_OK(checkpoint_db->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ(value, LargeValue(1));
+  checkpoint_db.reset();
+  ASSERT_OK(DestroyDB(checkpoint_dir, checkpoint_options));
+}
+
+// A crash with the WAL off leaves a footer-less blob file that no WAL record
+// refers to, and the next open has no WAL to replay. The open still moves the
+// next file number past that file (MaybeUpdateNextFileNumber()), so the files
+// it creates get larger numbers, and the purge deletes the leftover file. The
+// test gives the leftover file a number above every number in the MANIFEST,
+// as if the crashed session allocated it after its last MANIFEST write. A
+// blob file does not store its own number, so a rename is enough.
+TEST_F(DBBlobDirectWriteWalRecoveryTest,
+       LeftoverBlobFileWithoutWalIsDeletedAndNumberNotReused) {
+  Options options = GetWalRecoveryOptions();
+  DestroyAndReopen(options);
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, "a", LargeValue(1)));
+  const std::set<uint64_t> leftover = UnregisteredBlobFiles();
+  ASSERT_EQ(leftover.size(), 1U);
+  const uint64_t leftover_number =
+      dbfull()->GetVersionSet()->current_next_file_number() + 100;
+  SimulateProcessCrash();
+  ASSERT_OK(env_->RenameFile(BlobFileName(dbname_, *leftover.begin()),
+                             BlobFileName(dbname_, leftover_number)));
+
+  // The WAL files hold no records. Delete them, so that the next open has no
+  // WAL to replay.
+  std::vector<std::string> files;
+  ASSERT_OK(env_->GetChildren(dbname_, &files));
+  for (const auto& file : files) {
+    uint64_t number = 0;
+    FileType type = kTableFile;
+    if (ParseFileName(file, &number, &type) && type == kWalFile) {
+      ASSERT_OK(env_->DeleteFile(dbname_ + "/" + file));
+    }
+  }
+
+  Reopen(options);
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+  ASSERT_OK(Put("b", LargeValue(2)));
+  ASSERT_OK(Flush());
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  ASSERT_FALSE(live_files.empty());
+  for (const auto& meta : live_files) {
+    ASSERT_GT(meta.file_number, leftover_number);
+  }
+  for (uint64_t number : BlobFilesOnDisk()) {
+    if (number != leftover_number) {
+      ASSERT_GT(number, leftover_number);
+    }
+  }
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_EQ(BlobFilesOnDisk().count(leftover_number), 0U);
+  ASSERT_EQ(Get("b"), LargeValue(2));
+}
+
+// The values come back even if the next open turns blob direct write off, or
+// turns blob files off. With a separate WAL directory, recovery must still
+// list the DB directory to find the unregistered blob file.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, ReopenWithoutBlobDirectWrite) {
+  for (bool separate_wal_dir : {false, true}) {
+    for (bool enable_blob_files : {true, false}) {
+      SCOPED_TRACE("separate_wal_dir=" + std::to_string(separate_wal_dir) +
+                   " enable_blob_files=" + std::to_string(enable_blob_files));
+      Options options = GetWalRecoveryOptions();
+      if (separate_wal_dir) {
+        options.wal_dir = alternative_wal_dir_;
+      }
+      DestroyAndReopen(options);
+      ASSERT_OK(Put("a", LargeValue(1)));
+      ASSERT_EQ(UnregisteredBlobFiles().size(), 1U);
+      SimulateProcessCrash();
+
+      options.enable_blob_direct_write = false;
+      options.enable_blob_files = enable_blob_files;
+      Reopen(options);
+      ASSERT_EQ(Get("a"), LargeValue(1));
+      Reopen(options);
+      ASSERT_EQ(Get("a"), LargeValue(1));
+      Close();
+    }
+  }
+}
+
+// Like DBBlobDirectWriteWalRecoveryTest, but the file system keeps unsynced
+// data in memory, so SimulatePowerLoss() drops it.
+class DBBlobDirectWriteWalRecoveryPowerLossTest
+    : public DBBlobDirectWriteWalRecoveryTest {
+ protected:
+  DBBlobDirectWriteWalRecoveryPowerLossTest() {
+    fault_fs_->SetInjectUnsyncedDataLoss(true);
+  }
+};
+
+// After a power loss, synced writes come back and unsynced ones are lost, but
+// the DB opens and every recovered key is readable.
+TEST_F(DBBlobDirectWriteWalRecoveryPowerLossTest, PowerLossKeepsSyncedWrites) {
+  Options options = GetWalRecoveryOptions();
+  options.blob_direct_write_partitions = 4;
+  DestroyAndReopen(options);
+
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_OK(db_->Put(i % 5 == 0 ? sync_write : WriteOptions(), Key(i),
+                       LargeValue(i)));
+  }
+  SimulatePowerLoss();
+
+  Reopen(options);
+  // Point-in-time recovery keeps a prefix of the writes that includes every
+  // synced write.
+  bool lost = false;
+  for (int i = 0; i < 20; ++i) {
+    std::string value = Get(Key(i));
+    if (value == "NOT_FOUND") {
+      lost = true;
+    } else {
+      ASSERT_FALSE(lost) << "key " << i << " survived after a lost key";
+      ASSERT_EQ(value, LargeValue(i));
+    }
+    if (i <= 15 && i % 5 == 0) {
+      ASSERT_FALSE(lost) << i;
+    }
+  }
+  // No write after key 15 was synced, so the power loss dropped the last
+  // keys.
+  ASSERT_TRUE(lost);
+  AssertDefaultColumnFamilyScanOk();
+  Reopen(options);
+  AssertDefaultColumnFamilyScanOk();
+}
+
+// A WAL write group can merge a transformed batch (large value) with a batch
+// that has only small values. Both batches carry protection info, and both
+// writes come back after a crash.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, WriteGroupMixesProtectedBatches) {
+  Options options = GetWalRecoveryOptions();
+  DestroyAndReopen(options);
+
+  WriteOptions write_options;
+  write_options.protection_bytes_per_key = 8;
+  std::atomic<bool> follower_joined{false};
+  port::Thread follower_thread;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait2", [&](void* /*arg_leader*/) {
+        SyncPoint::GetInstance()->SetCallBack(
+            "WriteThread::JoinBatchGroup:Wait", [&](void* /*arg_follower*/) {
+              follower_joined = true;
+              SyncPoint::GetInstance()->DisableProcessing();
+            });
+        follower_thread = port::Thread(
+            [&]() { ASSERT_OK(db_->Put(write_options, "small", "s")); });
+        // The leader waits until the follower is in its write group.
+        while (!follower_joined) {
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db_->Put(write_options, "large", LargeValue(1)));
+  follower_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(follower_joined);
+
+  SimulateProcessCrash();
+  Reopen(options);
+  ASSERT_EQ(Get("large"), LargeValue(1));
+  ASSERT_EQ(Get("small"), "s");
+}
+
+// A 2PC transaction with a large value is committed, then the process
+// crashes. Recovery must bring the value back as committed, and must not
+// rebuild the transaction as a prepared one.
+TEST_F(DBBlobDirectWriteWalRecoveryTest, TwoPhaseCommit) {
+  Options options = GetWalRecoveryOptions();
+  Destroy(options);
+  const TransactionDBOptions txn_db_options;
+  auto open_txn_db = [&]() {
+    TransactionDB* txn_db = nullptr;
+    ASSERT_OK(TransactionDB::Open(options, txn_db_options, dbname_, &txn_db));
+    db_.reset(txn_db);
+  };
+  open_txn_db();
+  auto* txn_db = static_cast<TransactionDB*>(db_.get());
+  std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(WriteOptions()));
+  ASSERT_OK(txn->SetName("xid"));
+  ASSERT_OK(txn->Put("key", LargeValue(1)));
+  ASSERT_OK(txn->Prepare());
+  ASSERT_OK(txn->Commit());
+  txn.reset();
+  SimulateProcessCrash();
+
+  for (int i = 0; i < 2; ++i) {
+    open_txn_db();
+    txn_db = static_cast<TransactionDB*>(db_.get());
+    std::vector<Transaction*> prepared;
+    txn_db->GetAllPreparedTransactions(&prepared);
+    ASSERT_TRUE(prepared.empty());
+    ASSERT_EQ(Get("key"), LargeValue(1));
+    Close();
+  }
+}
+
+// Blob direct write with a non-default first path for the column family:
+// cf_paths={alt} (GetParam() is true) or db_paths={alt} (false). Its blob
+// files must be written, synced, read, purged and copied in that directory.
+class DBBlobDirectWritePathTest : public DBBlobDirectWritePowerLossTest,
+                                  public testing::WithParamInterface<bool> {
+ protected:
+  // Only a power-loss test uses the fault injection file system. Other tests
+  // read blob files that are still open for writing, which that file system
+  // does not support for unsynced data.
+  Options GetPathOptions(bool power_loss = false) {
+    Options options =
+        power_loss ? GetPowerLossOptions() : GetDirectWriteOptions();
+    alt_dir_ = dbname_ + "_blob_path";
+    // DestroyDB() does not clean this directory, so remove the files that an
+    // earlier test left there.
+    DestroyDir(env_, alt_dir_).PermitUncheckedError();
+    if (GetParam()) {
+      options.cf_paths = {{alt_dir_, std::numeric_limits<uint64_t>::max()}};
+    } else {
+      options.db_paths = {{alt_dir_, std::numeric_limits<uint64_t>::max()}};
+    }
+    return options;
+  }
+
+  std::set<uint64_t> BlobFilesIn(const std::string& dir) {
+    std::vector<std::string> files;
+    EXPECT_OK(env_->GetChildren(dir, &files));
+    std::set<uint64_t> result;
+    for (const auto& file : files) {
+      uint64_t number = 0;
+      FileType type = kWalFile;
+      if (ParseFileName(file, &number, &type) && type == kBlobFile) {
+        result.insert(number);
+      }
+    }
+    return result;
+  }
+
+  // Checks "key" and "entity" with Get(), MultiGet(), GetEntity() and an
+  // iterator.
+  void VerifyValues(DB* db, const std::string& value,
+                    const WideColumns& columns) {
+    std::string result;
+    ASSERT_OK(db->Get(ReadOptions(), "key", &result));
+    ASSERT_EQ(result, value);
+    std::vector<std::string> keys{"key"};
+    std::vector<Slice> key_slices(keys.begin(), keys.end());
+    std::vector<std::string> values;
+    std::vector<Status> statuses =
+        db->MultiGet(ReadOptions(), key_slices, &values);
+    ASSERT_OK(statuses[0]);
+    ASSERT_EQ(values[0], value);
+    PinnableWideColumns entity;
+    ASSERT_OK(db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), "entity",
+                            &entity));
+    ASSERT_EQ(entity.columns(), columns);
+    std::unique_ptr<Iterator> iter(db->NewIterator(ReadOptions()));
+    iter->Seek("key");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->value(), value);
+    ASSERT_OK(iter->status());
+  }
+
+  std::string alt_dir_;
+};
+
+TEST_P(DBBlobDirectWritePathTest, ReadsFromFirstPath) {
+  Options options = GetPathOptions();
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  const std::string column_value(200, 'c');
+  const WideColumns columns{{kDefaultWideColumnName, column_value},
+                            {"small", "s"}};
+  ASSERT_OK(Put("key", value));
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "entity",
+                           columns));
+  VerifyValues(db_.get(), value, columns);
+  ASSERT_FALSE(BlobFilesIn(alt_dir_).empty());
+  ASSERT_TRUE(BlobFilesIn(dbname_).empty());
+
+  ASSERT_OK(Flush());
+  VerifyValues(db_.get(), value, columns);
+  Reopen(options);
+  VerifyValues(db_.get(), value, columns);
+  ASSERT_TRUE(BlobFilesIn(dbname_).empty());
+}
+
+// A sync write syncs the blob file and the directory entry in alt, so both
+// survive a power loss.
+TEST_P(DBBlobDirectWritePathTest, SyncWriteSurvivesPowerLoss) {
+  Options options = GetPathOptions(/*power_loss=*/true);
+  DestroyAndReopen(options);
+  const std::string value(200, 'v');
+  WriteOptions sync_write;
+  sync_write.sync = true;
+  ASSERT_OK(db_->Put(sync_write, "key", value));
+  SimulatePowerLoss();
+
+  Reopen(options);
+  ASSERT_EQ(Get("key"), value);
+}
+
+// The blob files of a dropped column family are obsolete. The purge must find
+// and delete them in alt.
+TEST_P(DBBlobDirectWritePathTest, ObsoleteBlobFilesArePurged) {
+  Options options = GetPathOptions();
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  ASSERT_OK(Put(1, "key", std::string(200, 'v')));
+  ASSERT_OK(Flush(1));
+  const std::set<uint64_t> dropped_files = BlobFilesIn(alt_dir_);
+  ASSERT_FALSE(dropped_files.empty());
+
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handles_[1]));
+  handles_.resize(1);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  for (uint64_t file_number : dropped_files) {
+    ASSERT_EQ(BlobFilesIn(alt_dir_).count(file_number), 0U) << file_number;
+  }
+}
+
+// Checkpoints do not support db_paths or cf_paths, also with blob direct
+// write.
+TEST_P(DBBlobDirectWritePathTest, CheckpointIsNotSupported) {
+  Options options = GetPathOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", std::string(200, 'v')));
+
+  const std::string checkpoint_dir = dbname_ + "_checkpoint";
+  Checkpoint* raw_checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &raw_checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint(raw_checkpoint);
+  Status s = checkpoint->CreateCheckpoint(checkpoint_dir,
+                                          /*log_size_for_flush=*/0);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+}
+
+INSTANTIATE_TEST_CASE_P(DBBlobDirectWritePathTest, DBBlobDirectWritePathTest,
+                        ::testing::Bool());
 
 class DBBlobDirectWriteWithTimestampTest : public DBBasicTestWithTimestampBase {
  protected:

@@ -407,8 +407,12 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   // metadata.
   mutex_.Lock();
   bool wal_locked = false;
+  // A blob file that WAL replay kept is not in the MANIFEST either, so a copy
+  // of the live WALs without it cannot be opened. Handle it like an active
+  // blob direct write file.
   const bool needs_blob_direct_write_flush =
-      HasInFlightBlobDirectWriteFilesWithLockHeld();
+      HasInFlightBlobDirectWriteFilesWithLockHeld() ||
+      HasLiveWalReplayBlobFilesWithLockHeld();
   if (needs_blob_direct_write_flush && !flush_memtable) {
     mutex_.Unlock();
     return Status::NotSupported(

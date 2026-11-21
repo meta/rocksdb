@@ -305,6 +305,22 @@ TEST_P(TransactionTest, DirectWriteCommitPath) {
   options.allow_concurrent_memtable_write = false;
   options.blob_direct_write_partitions = 2;
   options.min_blob_size = 32;
+
+  if (txn_db_options.write_policy != WRITE_COMMITTED) {
+    // WritePrepared and WriteUnprepared reject blob direct write, both at
+    // open and when a column family is created.
+    ASSERT_TRUE(ReOpen().IsNotSupported());
+    options.enable_blob_direct_write = false;
+    ASSERT_OK(ReOpen());
+    ColumnFamilyOptions cf_options(options);
+    cf_options.enable_blob_direct_write = true;
+    ColumnFamilyHandle* handle = nullptr;
+    ASSERT_TRUE(db->CreateColumnFamily(cf_options, "blob_direct_write", &handle)
+                    .IsNotSupported());
+    ASSERT_EQ(handle, nullptr);
+    return;
+  }
+
   options.use_direct_reads = true;
   options.use_direct_io_for_flush_and_compaction = true;
 
