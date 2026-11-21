@@ -13,6 +13,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+inline constexpr size_t kBlobGcMaxSelectedFiles = 8;
+
 // WARNING: This value is == kCurrentFileBlobIndexFileNumber.
 // Use this name only where file number zero means "no valid blob file" or
 // "current file" is not understood/supported.

@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <memory>
 
 #include "rocksdb/cache.h"
@@ -37,6 +38,18 @@ CacheReservationManagerImpl<
     R>::CacheReservationHandle::~CacheReservationHandle() {
   Status s = cache_res_mgr_->ReleaseCacheReservation(incremental_memory_used_);
   s.PermitUncheckedError();
+}
+
+template <CacheEntryRole R>
+Status CacheReservationManagerImpl<R>::CacheReservationHandle::Resize(
+    std::size_t memory_used) {
+  const std::size_t others =
+      cache_res_mgr_->GetTotalMemoryUsed() - incremental_memory_used_;
+  if (memory_used > std::numeric_limits<std::size_t>::max() - others) {
+    return Status::MemoryLimit("Cache reservation size overflow");
+  }
+  incremental_memory_used_ = memory_used;
+  return cache_res_mgr_->UpdateCacheReservation(others + memory_used);
 }
 
 template <CacheEntryRole R>
@@ -201,6 +214,10 @@ template class CacheReservationManagerImpl<CacheEntryRole::kFilterConstruction>;
 template class CacheReservationManagerImpl<CacheEntryRole::kMisc>;
 template class CacheReservationManagerImpl<CacheEntryRole::kWriteBuffer>;
 template class CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>;
+template class CacheReservationManagerImpl<
+    CacheEntryRole::kBlobReferenceMetadataBuildingBuffer>;
+template class CacheReservationManagerImpl<
+    CacheEntryRole::kBlobReferenceCensus>;
 template class CacheReservationManagerImpl<CacheEntryRole::kBlobCache>;
 template class CacheReservationManagerImpl<CacheEntryRole::kReadaheadBuffer>;
 

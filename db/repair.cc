@@ -61,6 +61,8 @@
 
 #include <cinttypes>
 
+#include "db/blob/blob_log_format.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
@@ -72,6 +74,7 @@
 #include "db/version_edit.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
+#include "file/random_access_file_reader.h"
 #include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "options/cf_options.h"
@@ -81,6 +84,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/unique_id_impl.h"
+#include "test_util/sync_point.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -206,6 +210,9 @@ class Repairer {
       return status;
     }
     status = FindFiles();
+    if (status.ok()) {
+      status = CheckBlobIndirectionRepairAdmission();
+    }
     DBImpl* db_impl = nullptr;
     if (status.ok()) {
       // Discard older manifests and start a fresh one
@@ -280,6 +287,7 @@ class Repairer {
   InstrumentedMutex mutex_;
 
   std::vector<std::string> manifests_;
+  std::vector<std::string> blob_feature_probe_paths_;
   std::vector<FileDescriptor> table_fds_;
   std::vector<uint64_t> logs_;
   std::vector<TableInfo> tables_;
@@ -288,6 +296,165 @@ class Repairer {
   // acquired.
   FileLock* db_lock_;
   bool closed_;
+
+  Status UnsupportedBlobIndirectionRepair() {
+    Status status;
+    TEST_SYNC_POINT_CALLBACK("Repairer::BlobIndirectionDetected", &status);
+    return status.ok() ? Status::NotSupported(
+                             "RepairDB does not support a DB that uses blob "
+                             "indirection")
+                       : status;
+  }
+
+  Status CheckBlobIndirectionRepairAdmission() {
+    // Background: RepairDB writes a new MANIFEST from the files it finds. It
+    // does not support blob indirection: on a DB that uses it, RepairDB would
+    // lose the relocation files and routes that the old MANIFEST records. This
+    // check runs before RepairDB changes any file, and returns NotSupported if
+    // it finds feature evidence:
+    //   - in any MANIFEST: a format fence; a relocation file, route,
+    //     accepted-loss or blob file retirement record; a blob file addition
+    //     marked as an indirect origin; or a new SST record whose exact
+    //     reference metadata descriptor decodes, or that has a coarse frontier
+    //     (the oldest indirect-origin file number a coarse SST may reference).
+    //   - in any SST: an exact reference metadata descriptor that decodes, or
+    //     a coarse classification that decodes.
+    //   - in any blob file: a version 2 header, which only blob indirection
+    //     writes (see db/blob/blob_log_format.h).
+    // The search is best effort: it skips a file or record that it cannot read.
+    // So when it finds nothing, that does not prove that the DB never used the
+    // feature. But once it finds evidence, RepairDB never runs the legacy
+    // repair, which changes files.
+    class Reporter : public log::Reader::Reporter {
+     public:
+      void Corruption(size_t, const Status& status, uint64_t) override {
+        status.PermitUncheckedError();
+      }
+    };
+    for (const std::string& manifest : manifests_) {
+      std::unique_ptr<SequentialFileReader> file;
+      Status status = SequentialFileReader::Create(
+          env_->GetFileSystem(), dbname_ + "/" + manifest, file_options_, &file,
+          nullptr, nullptr);
+      TEST_SYNC_POINT_CALLBACK("Repairer::FeatureProbe", &status);
+      if (!status.ok()) {
+        continue;
+      }
+      Reporter reporter;
+      log::Reader reader(nullptr, std::move(file), &reporter, true, 0);
+      Slice record;
+      std::string scratch;
+      while (reader.ReadRecord(&record, &scratch)) {
+        VersionEdit edit;
+        status = edit.DecodeFrom(record);
+        if (!status.ok()) {
+          continue;
+        }
+        bool feature = edit.HasBlobIndirectionFormatVersion() ||
+                       edit.HasDbBlobIndirectionFormatVersion() ||
+                       !edit.GetBlobRelocationFileAdditions().empty() ||
+                       !edit.GetBlobRelocationFileDeletions().empty() ||
+                       !edit.GetBlobRelocationRoutes().empty() ||
+                       !edit.GetBlobRelocationRouteDeletions().empty() ||
+                       !edit.GetBlobPhysicalFileLosses().empty() ||
+                       !edit.GetBlobFileRetirements().empty();
+        for (const BlobFileAddition& addition : edit.GetBlobFileAdditions()) {
+          feature |= addition.IsIndirectOrigin();
+        }
+        for (const std::pair<int, FileMetaData>& addition :
+             edit.GetNewFiles()) {
+          if (!addition.second.blob_reference_descriptor.empty()) {
+            BlobReferenceMetadataDescriptor descriptor;
+            status = BlobReferenceMetadataDescriptor::DecodeFrom(
+                addition.second.blob_reference_descriptor, &descriptor);
+            feature |= status.ok();
+          }
+          feature |=
+              addition.second.oldest_coarse_indirect_origin_file_number !=
+              kInvalidBlobFileNumber;
+        }
+        if (feature) {
+          return UnsupportedBlobIndirectionRepair();
+        }
+      }
+    }
+    for (const FileDescriptor& fd : table_fds_) {
+      FileMetaData metadata;
+      uint64_t size = 0;
+      Status status = env_->GetFileSize(
+          TableFileName(db_options_.db_paths, fd.GetNumber(), fd.GetPathId()),
+          &size);
+      if (!status.ok()) {
+        continue;
+      }
+      metadata.fd = FileDescriptor(fd.GetNumber(), fd.GetPathId(), size);
+      std::shared_ptr<const TableProperties> properties;
+      ReadOptions read_options;
+      read_options.fill_cache = false;
+      status = table_cache_->GetTableProperties(
+          file_options_, read_options, icmp_, metadata, &properties,
+          default_mopts_, /*no_io=*/false, /*level=*/-1,
+          /*file_read_hist=*/nullptr,
+          /*prefetch_index_and_filter_in_cache=*/true);
+      if (!status.ok()) {
+        continue;
+      }
+      const UserCollectedProperties& collected =
+          properties->user_collected_properties;
+      const UserCollectedProperties::const_iterator descriptor =
+          collected.find(kBlobReferenceDescriptorPropertyName);
+      if (descriptor != collected.end()) {
+        BlobReferenceMetadataDescriptor decoded;
+        status = BlobReferenceMetadataDescriptor::DecodeFrom(descriptor->second,
+                                                             &decoded);
+        if (status.ok()) {
+          return UnsupportedBlobIndirectionRepair();
+        }
+      }
+      const UserCollectedProperties::const_iterator classification =
+          collected.find(kBlobReferenceClassificationPropertyName);
+      if (classification != collected.end()) {
+        uint64_t frontier = 0;
+        status = DecodeBlobReferenceClassification(classification->second,
+                                                   &frontier);
+        // Any valid classification, also frontier 0, shows that the DB used
+        // enable_blob_indirection. RepairDB cannot rebuild that state, so it
+        // refuses the DB instead of writing a MANIFEST without the blob
+        // indirection format marker.
+        if (status.ok()) {
+          return UnsupportedBlobIndirectionRepair();
+        }
+      }
+    }
+    for (const std::string& path : blob_feature_probe_paths_) {
+      uint64_t size = 0;
+      Status status = env_->GetFileSize(path, &size);
+      if (!status.ok()) {
+        continue;
+      }
+      std::unique_ptr<RandomAccessFileReader> reader;
+      status = RandomAccessFileReader::Create(env_->GetFileSystem(), path,
+                                              file_options_, &reader, nullptr);
+      if (!status.ok()) {
+        continue;
+      }
+      // A version 2 header needs no MANIFEST to read, and RepairDB often runs
+      // because the MANIFEST is damaged.
+      if (size >= BlobLogHeader::kSize) {
+        char header_scratch[BlobLogHeader::kSize];
+        Slice header_slice;
+        status = reader->Read(0, BlobLogHeader::kSize, IOOptions(),
+                              &header_slice, header_scratch, nullptr);
+        BlobLogHeader header;
+        if (status.ok() && header_slice.size() == BlobLogHeader::kSize &&
+            header.DecodeFrom(header_slice).ok() &&
+            header.version == kVersion2) {
+          return UnsupportedBlobIndirectionRepair();
+        }
+      }
+    }
+    return Status::OK();
+  }
 
   Status FindFiles() {
     std::vector<std::string> filenames;
@@ -331,6 +498,9 @@ class Repairer {
             } else if (type == kTableFile) {
               table_fds_.emplace_back(number, static_cast<uint32_t>(path_id),
                                       0);
+            } else if (type == kBlobFile) {
+              blob_feature_probe_paths_.push_back(to_search_paths[path_id] +
+                                                  "/" + filenames[i]);
             } else {
               // Ignore other files
             }
@@ -481,8 +651,16 @@ class Repairer {
       // TODO: plumb Env::IOActivity, Env::IOPriority
       const ReadOptions read_options;
       const WriteOptions write_option(Env::IO_HIGH);
+      // RepairDB runs only the legacy repair (see
+      // CheckBlobIndirectionRepairAdmission()), so build the converted SSTs
+      // with enable_blob_indirection off. An SST with exact reference metadata
+      // but no format fence would look like feature evidence to a later
+      // RepairDB, which would then refuse to run.
+      MutableCFOptions legacy_mutable_cf_options =
+          cfd->GetLatestMutableCFOptions();
+      legacy_mutable_cf_options.enable_blob_indirection = false;
       TableBuilderOptions tboptions(
-          cfd->ioptions(), cfd->GetLatestMutableCFOptions(), read_options,
+          cfd->ioptions(), legacy_mutable_cf_options, read_options,
           write_option, cfd->internal_comparator(),
           cfd->internal_tbl_prop_coll_factories(), kNoCompression,
           default_compression, cfd->GetID(), cfd->GetName(), -1 /* level */,
