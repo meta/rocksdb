@@ -358,6 +358,15 @@ class TestFSRandomAccessFile : public FSRandomAccessFile {
   IOStatus GetFileSize(uint64_t* file_size) override;
 
  private:
+  // A file can be read while it is still open for writing (for example, an
+  // active blob direct write file). With ReadUnsyncedData(), its unsynced data
+  // is only in the FileSystem's buffer. This extends `*result`, which holds
+  // what the target file returned for [offset, offset + n), with that
+  // buffered data, as a POSIX file system would show it.
+  IOStatus AddUnsyncedData(uint64_t offset, size_t n, const IOOptions& options,
+                           Slice* result, char* scratch,
+                           IODebugContext* dbg) const;
+
   std::string fname_;
   std::unique_ptr<FSRandomAccessFile> target_;
   FaultInjectionTestFS* fs_;
@@ -866,6 +875,11 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   // unsynced.
   void ReadUnsynced(const std::string& fname, uint64_t offset, size_t n,
                     Slice* result, char* scratch, int64_t* pos_at_last_sync);
+
+  // If this FileSystem tracks write state for `fname` (the file was written
+  // through it and not deleted), sets `*file_size` to its size including
+  // unsynced data. Otherwise leaves `*file_size` unchanged.
+  void MaybeGetUnsyncedFileSize(const std::string& fname, uint64_t* file_size);
 
   // Flush recently injected errors to the configured binary log file and sync
   // it to storage.

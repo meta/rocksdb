@@ -459,7 +459,7 @@ int db_stress_tool(int argc, char** argv) {
   }
   if (FLAGS_enable_blob_direct_write) {
     // Blob direct write is intentionally validated as a reduced-scope stress
-    // feature. We allow the WAL-disabled crash-test profile, including
+    // feature. We allow crash testing with the WAL on or off, including
     // wide-column PutEntity/GetEntity coverage, but reject best-efforts
     // recovery, parallel memtable/write-queue variants, transactions, remote
     // compaction, and APIs/features that depend on active-file snapshotting or
@@ -510,8 +510,8 @@ int db_stress_tool(int argc, char** argv) {
     }
     if (FLAGS_best_efforts_recovery) {
       return ReturnValidationError(
-          "blob direct write stress supports disable_wal-based crash "
-          "testing, not best-efforts recovery");
+          "blob direct write stress supports WAL-based or disable_wal-based "
+          "crash testing, not best-efforts recovery");
     }
     if (FLAGS_remote_compaction_worker_threads > 0) {
       return ReturnValidationError(

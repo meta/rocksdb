@@ -90,6 +90,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class Arena;
 class ArenaWrappedDBIter;
+class BlobDirectWriteRecoveryResolver;
 class Cleanable;
 class FileIngestionHandleImpl;
 class SameFileBlobReader;
@@ -2405,6 +2406,12 @@ class DBImpl : public DB
   // Returns true if any BDW column family still owns blob files that have not
   // yet been made visible through MANIFEST. Requires `mutex_` held.
   bool HasInFlightBlobDirectWriteFilesWithLockHeld();
+
+  // Returns true if WAL replay kept an unregistered blob file (see
+  // BlobDirectWriteRecoveryResolver) and a live WAL still refers to it (see
+  // `wal_replay_blob_files_`).
+  // REQUIRES: mutex_ held.
+  bool HasLiveWalReplayBlobFilesWithLockHeld();
   // Creates and attaches the per-CF blob direct-write partition manager when
   // the column family is opened with the feature enabled.
   void MaybeInitBlobDirectWriteColumnFamily(
@@ -2716,8 +2723,11 @@ class DBImpl : public DB
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                               const std::string& path_to_sync, FileType type,
                               uint64_t number);
-  // Returns true when a blob file must be preserved because it is still
-  // tracked by blob direct write or is still footer-less on disk.
+  // Returns true when a blob file must be kept: blob direct write still tracks
+  // it, or it was created in this DB session and has no footer yet. A
+  // footer-less file from an earlier session is left over from a crash, so it
+  // is not kept here. FindObsoleteFiles() keeps it while a live WAL refers to
+  // it.
   bool ShouldKeepBlobFileDuringPurge(uint64_t number,
                                      const std::string& blob_file_path);
 
@@ -2791,6 +2801,23 @@ class DBImpl : public DB
                          SequenceNumber* next_sequence, bool read_only,
                          bool is_retry, bool* corrupted_wal_found,
                          RecoveryContext* recovery_ctx);
+
+  // Creates `blob_recovery_resolver_` if WAL replay can meet values in
+  // unregistered blob files (see BlobDirectWriteRecoveryResolver).
+  // MaybeUpdateNextFileNumber() has already moved the next file number past
+  // those files, so a flush during recovery cannot reuse their numbers.
+  // `files_in_wal_dir` is the listing of the WAL directory that recovery
+  // already has.
+  // REQUIRES: mutex_ held.
+  Status MaybeCreateBlobRecoveryResolver(
+      const std::vector<std::string>& files_in_wal_dir);
+
+  // If `status` is OK and the DB is not read-only, adds the files that
+  // `blob_recovery_resolver_` read from to `wal_replay_blob_files_`. Then logs
+  // how many values were resolved and destroys the resolver. A read-only DB
+  // deletes no files, so it does not need the list.
+  // REQUIRES: mutex_ held.
+  void FinishBlobRecoveryResolver(bool read_only, const Status& status);
 
   void SetupLogFilesRecovery(
       const std::vector<uint64_t>& wal_numbers,
@@ -4314,6 +4341,39 @@ class DBImpl : public DB
   // manager. This keeps the read/write fast paths at O(1) when the feature is
   // completely disabled for the DB.
   std::atomic<uint32_t> blob_direct_write_cf_count_{0};
+
+  // Rewrites WAL records that point into unregistered blob files (see
+  // BlobDirectWriteRecoveryResolver). Set only while RecoverLogFiles() runs.
+  std::unique_ptr<BlobDirectWriteRecoveryResolver> blob_recovery_resolver_;
+
+  // Unregistered blob files (see BlobDirectWriteRecoveryResolver) that WAL
+  // replay read values from. Each file maps to the largest WAL number whose
+  // records refer to it. Protected by `mutex_`.
+  //
+  // Lifecycle of unregistered blob files:
+  // 1. At a read-write open, MaybeUpdateNextFileNumber() moves the next file
+  //    number past every file in the DB directories (the DB path, db_paths
+  //    and cf_paths), so every unregistered blob file has a number below
+  //    min_session_blob_file_number_.
+  // 2. When the open has WAL files to replay, MaybeCreateBlobRecoveryResolver()
+  //    lists the unregistered blob files, and WAL replay reads values from
+  //    some of them. If the open succeeds and is not read-only,
+  //    FinishBlobRecoveryResolver() records each such file here with the
+  //    largest WAL number that refers to it.
+  // 3. FindObsoleteFiles() keeps a recorded file while that WAL is live (WAL
+  //    number >= MinLogNumberToKeep()), because a later open replays that WAL
+  //    again and needs the file.
+  // 4. The next full obsolete-file scan deletes any other unregistered file
+  //    of an earlier session: ShouldKeepBlobFileDuringPurge() does not keep
+  //    it, because its number is below min_session_blob_file_number_.
+  UnorderedMap<uint64_t, uint64_t> wal_replay_blob_files_;
+
+  // The next file number when recovery finished. Blob files that this DB
+  // session creates after recovery have this number or a larger one. Every
+  // unregistered blob file found at a read-write open has a smaller number
+  // (see the lifecycle at `wal_replay_blob_files_`). Set once in Recover(),
+  // then read under `mutex_`.
+  uint64_t min_session_blob_file_number_ = 0;
 
   // if an attempt was made to flush all column families that
   // the oldest log depends on but uncommitted data in the oldest

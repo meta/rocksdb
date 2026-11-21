@@ -1225,17 +1225,31 @@ struct AdvancedColumnFamilyOptions {
   //  - only supports the ordered single-memtable-writer path; unordered,
   //    pipelined, two_write_queues, and allow_concurrent_memtable_write are
   //    not supported.
-  //  - crash recovery only supports blob files that were already made
-  //    manifest-visible by flush/SST creation; WAL replay of active
-  //    direct-write blob files is not currently supported.
+  //  - crash recovery replays the WAL. A WAL record that points into a blob
+  //    file that was not flushed yet is read back from that file and
+  //    inserted as a raw value. If the value cannot be read (missing file,
+  //    torn record or checksum mismatch), the record is handled like a
+  //    corrupted WAL record, so wal_recovery_mode decides what happens;
+  //    kTolerateCorruptedTailRecords fails the open. That mode tolerates only
+  //    a torn record at the end of the WAL. Here the WAL record is complete
+  //    and only its blob value is lost, so the mode treats it as real
+  //    corruption. kPointInTimeRecovery (the default) stops replay at that
+  //    record instead.
   //  - checkpoint/backup/live-files enumeration must flush pending
   //    direct-write state first; APIs that intentionally skip the flush, or
-  //    run while WAL is locked, can return NotSupported.
+  //    run while WAL is locked, can return NotSupported. This also holds for
+  //    checkpoint and backup after a WAL replay without a flush, while a live
+  //    WAL still refers to a blob file that the replay read from.
+  //    DB::GetLiveFiles() with flush_memtable=false checks neither case, so
+  //    its list can miss blob files that are not in the MANIFEST yet.
   //  - not compatible with MemPurge or user-defined timestamps.
   //  - DB::IngestWriteBatchWithIndex() is not supported while any live column
   //    family enables this option.
-  //  - read-only and secondary opens can read flushed/manifest-visible blob
-  //    files, but do not resolve still-active direct-write blob files.
+  //  - read-only opens replay the WAL in the same way. Secondary opens can
+  //    read flushed blob files, but do not resolve direct-write blob files
+  //    that were not flushed yet.
+  //  - TransactionDB with the WritePrepared or WriteUnprepared write policy
+  //    is not supported.
   //
   // An SstFileManager max allowed space is a soft limit for direct-write blob
   // files. Their bytes are already on disk when a file is sealed, so the seal

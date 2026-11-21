@@ -614,6 +614,14 @@ Status DBImpl::MaybeTransformBatchForBlobDirectWrite(
       (*batch)->HasMerge()) {
     return Status::OK();
   }
+  // The part of a batch after its WAL termination point goes only to the
+  // memtable. A 2PC commit batch uses this for its prepared writes, which the
+  // prepare already wrote to the WAL. The transform copies the whole batch
+  // without the termination point, so that part would reach the WAL. Keep such
+  // a batch raw. The flush moves its large values to blob files.
+  if (!(*batch)->GetWalTerminationPoint().is_cleared()) {
+    return Status::OK();
+  }
 
   // Quick check: skip the (potentially expensive) batch iteration when no
   // column family has blob direct write enabled. This also avoids Iterate()
@@ -646,6 +654,18 @@ Status DBImpl::MaybeTransformBatchForBlobDirectWrite(
     return s;
   }
   if (transformed) {
+    // A write group merges batches for the WAL, which requires all of them to
+    // agree on whether they carry protection info. Give the transformed batch
+    // the same protection as the batch it replaces.
+    const size_t protection_bytes_per_key =
+        (*batch)->GetProtectionBytesPerKey();
+    if (protection_bytes_per_key > 0) {
+      s = WriteBatchInternal::UpdateProtectionInfo(transformed_storage,
+                                                   protection_bytes_per_key);
+      if (!s.ok()) {
+        return s;
+      }
+    }
     *batch = transformed_storage;
     blob_direct_write_ctx->touched_managers.insert(batch_managers.begin(),
                                                    batch_managers.end());

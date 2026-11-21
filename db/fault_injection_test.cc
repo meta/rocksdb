@@ -651,6 +651,72 @@ TEST(FaultInjectionFSTest, ReadUnsyncedData) {
   }
 }
 
+// Random-access reads and the open file's size also include unsynced data,
+// like on a POSIX file system. Blob direct write reads blob files that are
+// still open for writing.
+TEST(FaultInjectionFSTest, RandomAccessReadUnsyncedData) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+  ASSERT_TRUE(fault_fs->ReadUnsyncedData());
+
+  auto seed = Random::GetTLSInstance()->Next();
+  for (int i = 0; i < 10; i++, seed++) {
+    SCOPED_TRACE("seed=" + std::to_string(seed));
+    Random rnd(seed);
+    uint32_t len = rnd.Uniform(10000) + 1;
+    std::string f =
+        test::PerThreadDBPath("random_read_unsynced." + std::to_string(seed));
+    std::string data = rnd.RandomString(len);
+
+    // Create a partially synced file that stays open for writing.
+    std::unique_ptr<FSWritableFile> w;
+    ASSERT_OK(fault_fs->NewWritableFile(f, {}, &w, nullptr));
+    uint32_t synced_len = rnd.Uniform(len + 1);
+    ASSERT_OK(w->Append(Slice(data.data(), synced_len), {}, nullptr));
+    if (synced_len > 0) {
+      ASSERT_OK(w->Sync({}, nullptr));
+    }
+    ASSERT_OK(w->Append(Slice(data.data() + synced_len, len - synced_len), {},
+                        nullptr));
+
+    std::unique_ptr<FSRandomAccessFile> r;
+    ASSERT_OK(fault_fs->NewRandomAccessFile(f, {}, &r, nullptr));
+    uint64_t file_size = 0;
+    ASSERT_OK(r->GetFileSize(&file_size));
+    ASSERT_EQ(len, file_size);
+
+    // Maybe a sync between opening the reader and reading.
+    if (rnd.OneIn(2)) {
+      ASSERT_OK(w->Sync({}, nullptr));
+    }
+
+    // Read a range that can span synced data, unsynced data, and the end of
+    // the file.
+    uint32_t offset = rnd.Uniform(len + 1);
+    uint32_t n = rnd.Uniform(len + 1) + 1;
+    std::unique_ptr<char[]> scratch(new char[n]);
+    Slice result;
+    ASSERT_OK(r->Read(offset, n, {}, &result, scratch.get(), nullptr));
+    const size_t expected_size = std::min<size_t>(n, len - offset);
+    ASSERT_EQ(expected_size, result.size());
+    ASSERT_EQ(0, result.compare(Slice(data.data() + offset, expected_size)));
+
+    // The same range through MultiRead.
+    std::unique_ptr<char[]> multi_scratch(new char[n]);
+    FSReadRequest req;
+    req.offset = offset;
+    req.len = n;
+    req.scratch = multi_scratch.get();
+    ASSERT_OK(r->MultiRead(&req, 1, {}, nullptr));
+    ASSERT_OK(req.status);
+    ASSERT_EQ(expected_size, req.result.size());
+    ASSERT_EQ(0,
+              req.result.compare(Slice(data.data() + offset, expected_size)));
+    ASSERT_OK(w->Close({}, nullptr));
+  }
+}
+
 TEST(FaultInjectionFSTest, FileOpenContractRejectsReadersWhileOpenForWrite) {
   std::shared_ptr<FaultInjectionTestFS> fault_fs =
       std::make_shared<FaultInjectionTestFS>(FileSystem::Default());

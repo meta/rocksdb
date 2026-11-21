@@ -66,8 +66,11 @@ Env::IOActivity GetCurrentThreadIOActivityForMetadataRead() {
 
 // A full-scan obsolete-file purge can observe a newly created direct-write
 // blob file before it is added to the manager's active-file set. Those
-// in-flight files are still missing their footer, so conservatively keep any
-// footer-less blob file here rather than risk deleting a live write-path file.
+// in-flight files are still missing their footer, so keep any footer-less blob
+// file here rather than risk deleting a live write-path file. The only caller,
+// DBImpl::ShouldKeepBlobFileDuringPurge(), calls this only for files of this
+// DB session. It has already decided that a footer-less file from an earlier
+// session is not kept.
 bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
                                   const FileOptions& file_options,
                                   const std::string& blob_file_path) {
@@ -273,6 +276,22 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
           &job_context->active_blob_direct_write_files);
       mgr->GetProtectedBlobFileNumbers(
           &job_context->active_blob_direct_write_files);
+    }
+  }
+  // Keep each blob file that WAL replay read values from while the WAL that
+  // refers to it is still live, because the next open replays that WAL again
+  // (see `wal_replay_blob_files_`). This reuses the keep list of active blob
+  // direct write files, but these files are not open for writing.
+  if (!wal_replay_blob_files_.empty()) {
+    const uint64_t min_log_number = MinLogNumberToKeep();
+    for (auto it = wal_replay_blob_files_.begin();
+         it != wal_replay_blob_files_.end();) {
+      if (it->second < min_log_number) {
+        it = wal_replay_blob_files_.erase(it);
+      } else {
+        job_context->active_blob_direct_write_files.insert(it->first);
+        ++it;
+      }
     }
   }
 
@@ -915,6 +934,12 @@ bool DBImpl::ShouldKeepBlobFileDuringPurge(uint64_t number,
       if (mgr != nullptr && mgr->IsTrackedBlobFileNumber(number)) {
         return true;
       }
+    }
+    // A footer-less file from an earlier DB session is not being written. It
+    // is left over from a crash, and FindObsoleteFiles() already keeps it
+    // while a live WAL refers to it (see `wal_replay_blob_files_`).
+    if (number < min_session_blob_file_number_) {
+      return false;
     }
   }
 
