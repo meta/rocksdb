@@ -305,6 +305,13 @@ public enum HistogramType {
    */
   INDIRECT_BLOB_GC_JOB_MICROS((byte) 0x50),
 
+  /**
+   * Used only by DBs that use or have used enable_blob_indirection. Number of
+   * blob references in each remote compaction output SST that the primary
+   * checked before the install.
+   */
+  REMOTE_COMPACT_OUTPUT_BLOB_REFERENCES((byte) 0x51),
+
   // 0x3E is reserved for backwards compatibility on current minor version.
   HISTOGRAM_ENUM_MAX((byte) 0x3E);
 

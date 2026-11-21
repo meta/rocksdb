@@ -2982,6 +2982,34 @@ Status Version::ValidateBlobReferenceGeneration(uint64_t generation) const {
   return Status::OK();
 }
 
+Status Version::ValidateBlobReferenceGroup(uint64_t generation,
+                                           uint64_t origin) const {
+  Status status = ValidateBlobReferenceGeneration(generation);
+  if (!status.ok()) {
+    return status;
+  }
+  const BlobFileTable& table = storage_info_.GetBlobFileTable();
+  const uint64_t value = table.Find(generation);
+  bool matches = false;
+  if (BlobFileTable::IsRoute(value)) {
+    // `generation` is a route's old file number: an old normal blob file
+    // (unflattened: origin == generation) or an old relocation file (flattened:
+    // origin < generation).
+    matches = origin <= generation;
+  } else if (BlobFileTable::IsRelocationFile(value)) {
+    matches = origin < generation;
+  } else {
+    // Here `generation` is a live normal blob file, also when the file table is
+    // empty. It holds only its own values.
+    matches = origin == generation;
+  }
+  if (!matches) {
+    return Status::Corruption(
+        "Blob reference origin does not match its generation number");
+  }
+  return Status::OK();
+}
+
 Status Version::ResolveBlobPhysicalFile(const BlobIndex& blob_index,
                                         BlobPhysicalFile* physical_file) const {
   assert(physical_file != nullptr);
