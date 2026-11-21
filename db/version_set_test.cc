@@ -1624,6 +1624,53 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   EXPECT_EQ(kGroupSize - 1, count);
 }
 
+// While the edit is applied without the DB mutex, the test checks that the
+// DB mutex is free and then makes the precondition invalid. The second pre_cb
+// run must fail the call. pre_cb must have run twice, and the current Version
+// must not change.
+TEST_F(VersionSetTest, UnlockedApplyRevalidatesPrecondition) {
+  NewDB();
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  const uint64_t original_version_number = cfd->current()->GetVersionNumber();
+
+  std::atomic<bool> precondition_valid{true};
+  size_t precondition_checks = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+  sync_point->SetCallBack("VersionSet::LogAndApplyHelper:ApplyUnlocked",
+                          [&](void*) {
+                            ASSERT_TRUE(mutex_.TryLock());
+                            mutex_.Unlock();
+                            precondition_valid.store(false);
+                          });
+  sync_point->EnableProcessing();
+
+  VersionEdit edit;
+  edit.SetDBId("candidate");
+  mutex_.Lock();
+  const Status status = versions_->LogAndApply(
+      cfd, read_options_, write_options_, &edit, &mutex_,
+      /*dir_contains_current_file=*/nullptr,
+      /*new_descriptor_log=*/false,
+      /*column_family_options=*/nullptr,
+      /*manifest_wcb=*/{}, [&]() {
+        ++precondition_checks;
+        if (!precondition_valid.load()) {
+          return Status::Incomplete("precondition changed during apply");
+        }
+        return Status::OK();
+      });
+  mutex_.Unlock();
+
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+  ASSERT_TRUE(status.IsIncomplete()) << status.ToString();
+  ASSERT_EQ(precondition_checks, 2U);
+  ASSERT_EQ(cfd->current()->GetVersionNumber(), original_version_number);
+}
+
 TEST_F(VersionSetTest, BlobFinalizationDoesNotHoldDBMutex) {
   NewDB();
 
@@ -1899,6 +1946,252 @@ TEST_F(VersionSetTest, FailedBatchSignalsWriterFromAnotherCaller) {
     next.SetDBId("next_db_id");
     return LogAndApplyToDefaultCF(next);
   }));
+}
+
+TEST_F(VersionSetTest, PreconditionedWriterIsNotGroupedBehindEarlierWriter) {
+  NewDB();
+
+  std::promise<void> first_manifest_write_started;
+  std::future<void> first_manifest_write_started_future =
+      first_manifest_write_started.get_future();
+  std::promise<void> release_first_manifest_write;
+  std::future<void> release_first_manifest_write_future =
+      release_first_manifest_write.get_future();
+  std::promise<void> plain_writer_queued;
+  std::future<void> plain_writer_queued_future =
+      plain_writer_queued.get_future();
+  std::promise<void> preconditioned_writer_queued;
+  std::future<void> preconditioned_writer_queued_future =
+      preconditioned_writer_queued.get_future();
+  std::atomic<int> queued_writers{0};
+  std::atomic<bool> block_first_manifest_write{true};
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+        const int num_queued =
+            queued_writers.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (num_queued == 2) {
+          plain_writer_queued.set_value();
+        } else if (num_queued == 3) {
+          preconditioned_writer_queued.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WriteManifestStart", [&](void*) {
+        if (block_first_manifest_write.exchange(false,
+                                                std::memory_order_relaxed)) {
+          first_manifest_write_started.set_value();
+          release_first_manifest_write_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Three writers: the leader blocks in its MANIFEST write, then the plain
+  // writer and the preconditioned writer queue behind it. The plain writer
+  // leads the next batch. That batch must not take the preconditioned writer,
+  // because its precondition runs only when it reaches the head of the queue.
+  Status leader_status;
+  Status plain_status;
+  Status preconditioned_status;
+  int precondition_calls = 0;
+  ASSERT_OK(RunOrAbortOnHang([&] {
+    VersionEdit leader_edit;
+    leader_edit.SetDBId("leader_db_id");
+    port::Thread leader(
+        [&] { leader_status = LogAndApplyToDefaultCF(leader_edit); });
+    first_manifest_write_started_future.wait();
+
+    VersionEdit plain_edit;
+    plain_edit.SetDBId("plain_db_id");
+    port::Thread plain(
+        [&] { plain_status = LogAndApplyToDefaultCF(plain_edit); });
+    plain_writer_queued_future.wait();
+
+    VersionEdit preconditioned_edit;
+    preconditioned_edit.SetDBId("preconditioned_db_id");
+    port::Thread preconditioned([&] {
+      mutex_.Lock();
+      preconditioned_status = versions_->LogAndApply(
+          versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+          write_options_, &preconditioned_edit, &mutex_,
+          /*dir_contains_current_file=*/nullptr,
+          /*new_descriptor_log=*/false,
+          /*column_family_options=*/nullptr, /*manifest_wcb=*/{}, [&] {
+            ++precondition_calls;
+            return Status::OK();
+          });
+      mutex_.Unlock();
+    });
+    preconditioned_writer_queued_future.wait();
+
+    release_first_manifest_write.set_value();
+    leader.join();
+    plain.join();
+    preconditioned.join();
+    return Status::OK();
+  }));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(leader_status);
+  ASSERT_OK(plain_status);
+  ASSERT_OK(preconditioned_status);
+  // If the plain writer's batch took the preconditioned writer, the
+  // preconditioned writer would finish without running its precondition.
+  ASSERT_GT(precondition_calls, 0);
+}
+
+// A LogAndApply() call that passes a precondition callback (pre_cb) is called
+// a preconditioned leader here, once it reaches the head of the MANIFEST
+// writer queue. A batch is the group of queued writers that one leader writes
+// to the MANIFEST together. The leader applies its edit without the DB mutex
+// (see VersionSet::LogAndApplyHelper()), so other callers can queue behind it
+// meanwhile. These tests check that such a leader is a batch barrier: its
+// batch holds only its own caller's writers, and a caller queued behind it
+// runs in a later batch with its own result.
+class VersionSetPreconditionBarrierTest : public VersionSetTest {
+ protected:
+  struct BarrierResult {
+    Status leader_status;
+    Status plain_status;
+    int precondition_checks = 0;
+    // The number of LogAndApply callers that led a batch. It is 2 when the
+    // plain writer ran in its own batch, and 1 when the leader's batch took
+    // it.
+    int batch_leaders = 0;
+  };
+
+  // Runs a preconditioned leader on the default column family. While the
+  // leader applies its edit without the DB mutex, a second thread queues a
+  // plain LogAndApply (no precondition) on column family kColumnFamilyName1.
+  // The plain edit sets the log number of that column family to
+  // `plain_log_number`. The leader's precondition passes on its first check.
+  // On the second check, after the unlocked apply, it fails when
+  // `fail_second_check` is true.
+  BarrierResult RunPreconditionedLeaderWithQueuedPlainWriter(
+      bool fail_second_check, uint64_t plain_log_number) {
+    BarrierResult result;
+    std::promise<void> plain_writer_queued;
+    std::future<void> plain_writer_queued_future =
+        plain_writer_queued.get_future();
+    std::atomic<bool> expect_plain_queue{false};
+    std::atomic<bool> plain_started{false};
+    std::unique_ptr<port::Thread> plain;
+    ColumnFamilyData* const plain_cfd =
+        versions_->GetColumnFamilySet()->GetColumnFamily(kColumnFamilyName1);
+    EXPECT_NE(plain_cfd, nullptr);
+    VersionEdit plain_edit;
+    plain_edit.SetColumnFamily(plain_cfd->GetID());
+    plain_edit.SetLogNumber(plain_log_number);
+
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    sync_point->SetCallBack(
+        "VersionSet::LogAndApplyHelper:ApplyUnlocked", [&](void*) {
+          if (plain_started.exchange(true, std::memory_order_relaxed)) {
+            return;
+          }
+          // The leader released the DB mutex, so the plain writer can take
+          // it and queue behind the leader before the leader continues.
+          expect_plain_queue.store(true, std::memory_order_relaxed);
+          plain.reset(new port::Thread([&] {
+            mutex_.Lock();
+            result.plain_status =
+                versions_->LogAndApply(plain_cfd, read_options_, write_options_,
+                                       &plain_edit, &mutex_, nullptr);
+            mutex_.Unlock();
+          }));
+          plain_writer_queued_future.wait();
+        });
+    sync_point->SetCallBack(
+        "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+          if (expect_plain_queue.exchange(false, std::memory_order_relaxed)) {
+            plain_writer_queued.set_value();
+          }
+        });
+    sync_point->SetCallBack("VersionSet::LogAndApply:WakeUpAndNotDone",
+                            [&](void*) { ++result.batch_leaders; });
+    sync_point->EnableProcessing();
+
+    EXPECT_OK(RunOrAbortOnHang([&] {
+      VersionEdit leader_edit;
+      leader_edit.SetDBId("leader_db_id");
+      mutex_.Lock();
+      result.leader_status = versions_->LogAndApply(
+          versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+          write_options_, &leader_edit, &mutex_,
+          /*dir_contains_current_file=*/nullptr,
+          /*new_descriptor_log=*/false,
+          /*column_family_options=*/nullptr,
+          /*manifest_wcb=*/{}, [&]() {
+            ++result.precondition_checks;
+            if (fail_second_check && result.precondition_checks >= 2) {
+              return Status::Incomplete("precondition changed during apply");
+            }
+            return Status::OK();
+          });
+      mutex_.Unlock();
+      if (plain != nullptr) {
+        plain->join();
+      }
+      return Status::OK();
+    }));
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    EXPECT_TRUE(plain_started.load());
+    return result;
+  }
+
+  // Checks that the log number of column family kColumnFamilyName1 is
+  // `log_number` now and after the VersionSet is recovered from the MANIFEST.
+  void VerifyPlainLogNumber(uint64_t log_number) {
+    ColumnFamilyData* cfd =
+        versions_->GetColumnFamilySet()->GetColumnFamily(kColumnFamilyName1);
+    ASSERT_NE(cfd, nullptr);
+    ASSERT_EQ(cfd->GetLogNumber(), log_number);
+    CloseDB();
+    ReopenDB();
+    cfd = versions_->GetColumnFamilySet()->GetColumnFamily(kColumnFamilyName1);
+    ASSERT_NE(cfd, nullptr);
+    ASSERT_EQ(cfd->GetLogNumber(), log_number);
+  }
+};
+
+TEST_F(VersionSetPreconditionBarrierTest,
+       FailedPreconditionDoesNotFailWriterQueuedDuringUnlockedApply) {
+  // The leader's precondition fails after the unlocked apply. The error
+  // belongs to the leader's caller only. The plain writer that queued while
+  // the DB mutex was released must run in its own batch, succeed, and have
+  // its edit in the MANIFEST.
+  NewDB();
+  const uint64_t plain_log_number = versions_->FetchAddFileNumber(1);
+  const BarrierResult result = RunPreconditionedLeaderWithQueuedPlainWriter(
+      /*fail_second_check=*/true, plain_log_number);
+  ASSERT_TRUE(result.leader_status.IsIncomplete())
+      << result.leader_status.ToString();
+  ASSERT_EQ(result.precondition_checks, 2);
+  ASSERT_OK(result.plain_status);
+  ASSERT_EQ(result.batch_leaders, 2);
+  VerifyPlainLogNumber(plain_log_number);
+}
+
+TEST_F(VersionSetPreconditionBarrierTest,
+       PassingPreconditionLeaderDoesNotTakeQueuedWriter) {
+  // The leader's precondition passes on both checks. The leader's batch still
+  // ends with its own caller's writers: a later caller could change the state
+  // that the precondition checked. So the plain writer leads its own batch.
+  NewDB();
+  const uint64_t plain_log_number = versions_->FetchAddFileNumber(1);
+  const BarrierResult result = RunPreconditionedLeaderWithQueuedPlainWriter(
+      /*fail_second_check=*/false, plain_log_number);
+  ASSERT_OK(result.leader_status);
+  ASSERT_EQ(result.precondition_checks, 2);
+  ASSERT_OK(result.plain_status);
+  ASSERT_EQ(result.batch_leaders, 2);
+  VerifyPlainLogNumber(plain_log_number);
 }
 
 TEST_F(VersionSetTest, FailedVersionBuildReleasesTheBatch) {
