@@ -1,0 +1,1588 @@
+Apache Maven 3.10.0 (c43a36b8d67be7e0805a411bc0898af1a51f5472)
+Maven home: /opt/homebrew/Cellar/maven/3.10.0/libexec
+Java version: 27.0.1, vendor: BellSoft, runtime: /Users/alan/.sdkman/candidates/java/27.0.1.0+11-librca
+Default locale: en_GB, platform encoding: UTF-8, time zone: Europe/London
+OS name: "mac os x", version: "26.7.2", arch: "aarch64", family: "mac"
+[DEBUG] Created lock factory selector; available lock factories [file-lock, rwlock-local, semaphore-local, noop]
+[DEBUG] Created adapter factory; available lock factories [noop, semaphore-local, file-lock, rwlock-local]; available name mappers [discriminating, file-gaecv, file-gav, file-hgaecv, file-hgav, file-static, gaecv, gav, static]
+[DEBUG] Created new class realm maven.api
+[DEBUG] Importing foreign packages into class realm maven.api
+[DEBUG]   Imported: javax.annotation.* < plexus.core
+[DEBUG]   Imported: javax.annotation.security.* < plexus.core
+[DEBUG]   Imported: javax.inject.* < plexus.core
+[DEBUG]   Imported: org.apache.maven.* < plexus.core
+[DEBUG]   Imported: org.apache.maven.artifact < plexus.core
+[DEBUG]   Imported: org.apache.maven.classrealm < plexus.core
+[DEBUG]   Imported: org.apache.maven.cli < plexus.core
+[DEBUG]   Imported: org.apache.maven.configuration < plexus.core
+[DEBUG]   Imported: org.apache.maven.exception < plexus.core
+[DEBUG]   Imported: org.apache.maven.execution < plexus.core
+[DEBUG]   Imported: org.apache.maven.execution.scope < plexus.core
+[DEBUG]   Imported: org.apache.maven.graph < plexus.core
+[DEBUG]   Imported: org.apache.maven.lifecycle < plexus.core
+[DEBUG]   Imported: org.apache.maven.model < plexus.core
+[DEBUG]   Imported: org.apache.maven.monitor < plexus.core
+[DEBUG]   Imported: org.apache.maven.plugin < plexus.core
+[DEBUG]   Imported: org.apache.maven.profiles < plexus.core
+[DEBUG]   Imported: org.apache.maven.project < plexus.core
+[DEBUG]   Imported: org.apache.maven.reporting < plexus.core
+[DEBUG]   Imported: org.apache.maven.repository < plexus.core
+[DEBUG]   Imported: org.apache.maven.rtinfo < plexus.core
+[DEBUG]   Imported: org.apache.maven.settings < plexus.core
+[DEBUG]   Imported: org.apache.maven.toolchain < plexus.core
+[DEBUG]   Imported: org.apache.maven.usability < plexus.core
+[DEBUG]   Imported: org.apache.maven.wagon.* < plexus.core
+[DEBUG]   Imported: org.apache.maven.wagon.authentication < plexus.core
+[DEBUG]   Imported: org.apache.maven.wagon.authorization < plexus.core
+[DEBUG]   Imported: org.apache.maven.wagon.events < plexus.core
+[DEBUG]   Imported: org.apache.maven.wagon.observers < plexus.core
+[DEBUG]   Imported: org.apache.maven.wagon.proxy < plexus.core
+[DEBUG]   Imported: org.apache.maven.wagon.repository < plexus.core
+[DEBUG]   Imported: org.apache.maven.wagon.resource < plexus.core
+[DEBUG]   Imported: org.codehaus.classworlds < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.* < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.classworlds < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.component < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.configuration < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.container < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.context < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.lifecycle < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.logging < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.personality < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.util.xml.Xpp3Dom < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.util.xml.pull.XmlPullParser < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.util.xml.pull.XmlPullParserException < plexus.core
+[DEBUG]   Imported: org.codehaus.plexus.util.xml.pull.XmlSerializer < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.* < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.artifact < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.collection < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.deployment < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.graph < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.impl < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.installation < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.internal.impl < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.metadata < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.repository < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.resolution < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.scope < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.spi < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.transfer < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.util < plexus.core
+[DEBUG]   Imported: org.eclipse.aether.version < plexus.core
+[DEBUG]   Imported: org.fusesource.jansi.* < plexus.core
+[DEBUG]   Imported: org.slf4j.* < plexus.core
+[DEBUG]   Imported: org.slf4j.event.* < plexus.core
+[DEBUG]   Imported: org.slf4j.helpers.* < plexus.core
+[DEBUG]   Imported: org.slf4j.spi.* < plexus.core
+[DEBUG] Populating class realm maven.api
+[INFO] Error stacktraces are turned on.
+[DEBUG] Message scheme: plain
+[DEBUG] Message terminal: DumbTerminal[name='Maven', type='dumb-color', size='Size[cols=0, rows=0]']
+[DEBUG] Reading global settings from /opt/homebrew/Cellar/maven/3.10.0/libexec/conf/settings.xml
+[DEBUG] Reading user settings from /Users/alan/.m2/settings.xml
+[DEBUG] Reading global toolchains from /opt/homebrew/Cellar/maven/3.10.0/libexec/conf/toolchains.xml
+[DEBUG] Reading user toolchains from /Users/alan/.m2/toolchains.xml
+[DEBUG] Using local repository at /Users/alan/.m2/repository
+[DEBUG] Selecting LocalRepositoryManager for /Users/alan/.m2/repository ()
+[DEBUG] Using manager EnhancedLocalRepositoryManager with priority 10.0 for /Users/alan/.m2/repository
+[DEBUG] Selecting LocalRepositoryManager for /Users/alan/.m2/repository ()
+[DEBUG] Using manager EnhancedLocalRepositoryManager with priority 10.0 for /Users/alan/.m2/repository
+[INFO] Scanning for projects...
+[DEBUG] Extension realms for project com.evolvedbinary.japigen:japi-generator:jar:1.0-SNAPSHOT: (none)
+[DEBUG] Looking up lifecycle mappings for packaging jar from ClassRealm[plexus.core, parent: null]
+[DEBUG] Creating adapter using nameMapper 'org.eclipse.aether.internal.impl.synccontext.named.InhibitingNameMapper@7308ffff' and factory 'org.eclipse.aether.named.providers.FileLockNamedLockFactory@6601cc93'
+[DEBUG] Selecting RepositoryLayout for central (https://repo.maven.apache.org/maven2, default, releases)
+[DEBUG] Using layout Maven2RepositoryLayout with priority 0.0 for https://repo.maven.apache.org/maven2
+[DEBUG] Group rules file for remote repository central (https://repo.maven.apache.org/maven2, default, releases) not available
+[DEBUG] Skipped remote request for /.meta/prefixes.txt, locally cached metadata up-to-date
+[DEBUG] Loaded prefixes for remote repository central from auto-discovered file '/Users/alan/.m2/repository/.meta/prefixes-central.txt'
+[INFO] Loaded 24447 auto-discovered prefixes for remote repository central (prefixes-central.txt)
+[DEBUG] Accepting locally cached artifact junit-bom-5.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] === REACTOR BUILD PLAN ================================================
+[DEBUG] Project: com.evolvedbinary.japigen:japi-generator:jar:1.0-SNAPSHOT
+[DEBUG] Tasks:   [clean, package]
+[DEBUG] Style:   Regular
+[DEBUG] =======================================================================
+[INFO] 
+[INFO] --------------< com.evolvedbinary.japigen:japi-generator >--------------
+[INFO] Building japi-generator 1.0-SNAPSHOT
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] Accepting locally cached artifact maven-clean-plugin-3.4.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-plugins-42.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-parent-42.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Selecting RepositoryLayout for apache.snapshots (https://repository.apache.org/snapshots, default, snapshots)
+[DEBUG] Using layout Maven2RepositoryLayout with priority 0.0 for https://repository.apache.org/snapshots
+[DEBUG] Group rules file for remote repository apache.snapshots (https://repository.apache.org/snapshots, default, snapshots) not available
+[DEBUG] Skipped remote request for /.meta/prefixes.txt, locally cached metadata up-to-date
+[DEBUG] Loaded prefixes for remote repository apache.snapshots from auto-discovered file '/Users/alan/.m2/repository/.meta/prefixes-apache.snapshots.txt'
+[INFO] Loaded 64 auto-discovered prefixes for remote repository apache.snapshots (prefixes-apache.snapshots.txt)
+[DEBUG] Accepting locally cached artifact apache-32.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Selecting Transporter for apache.snapshots (https://repository.apache.org/snapshots, default, snapshots)
+[DEBUG] Using transporter ApacheTransporter with priority 5.0 for https://repository.apache.org/snapshots
+[DEBUG] Verification of denied path org/junit/junit-bom/5.10.2/junit-bom-5.10.2.pom against apache.snapshots (https://repository.apache.org/snapshots, default, snapshots) failed
+org.eclipse.aether.spi.connector.transport.http.HttpTransporterException: HTTP Status: 404
+    at org.eclipse.aether.transport.apache.ApacheTransporter.implPeek (ApacheTransporter.java:419)
+    at org.eclipse.aether.spi.connector.transport.AbstractTransporter.peek (AbstractTransporter.java:49)
+    at org.eclipse.aether.internal.impl.filter.PrefixesRemoteRepositoryFilterSource$PrefixesFilter.remoteRepositoryServesPath (PrefixesRemoteRepositoryFilterSource.java:638)
+    at org.eclipse.aether.internal.impl.filter.PrefixesRemoteRepositoryFilterSource$PrefixesFilter.acceptPrefix (PrefixesRemoteRepositoryFilterSource.java:559)
+    at org.eclipse.aether.internal.impl.filter.PrefixesRemoteRepositoryFilterSource$PrefixesFilter.acceptArtifact (PrefixesRemoteRepositoryFilterSource.java:529)
+    at org.eclipse.aether.internal.impl.filter.DefaultRemoteRepositoryFilterManager$Participants.lambda$acceptArtifact$0 (DefaultRemoteRepositoryFilterManager.java:100)
+    at java.util.stream.Collectors.lambda$uniqKeysMapAccumulator$0 (Collectors.java:182)
+    at java.util.stream.ReduceOps$3ReducingSink.accept (ReduceOps.java:169)
+    at java.util.Collections$UnmodifiableMap$UnmodifiableEntrySet.lambda$entryConsumer$0 (Collections.java:1785)
+    at java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1884)
+    at java.util.Collections$UnmodifiableMap$UnmodifiableEntrySet$UnmodifiableEntrySetSpliterator.forEachRemaining (Collections.java:1810)
+    at java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:570)
+    at java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:560)
+    at java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)
+    at java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:265)
+    at java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:723)
+    at org.eclipse.aether.internal.impl.filter.DefaultRemoteRepositoryFilterManager$Participants.acceptArtifact (DefaultRemoteRepositoryFilterManager.java:99)
+    at org.eclipse.aether.internal.impl.DefaultArtifactResolver.resolve (DefaultArtifactResolver.java:278)
+    at org.eclipse.aether.internal.impl.DefaultArtifactResolver.resolveArtifacts (DefaultArtifactResolver.java:217)
+    at org.eclipse.aether.internal.impl.DefaultArtifactResolver.resolveArtifact (DefaultArtifactResolver.java:197)
+    at org.apache.maven.repository.internal.DefaultModelResolver.resolveModel (DefaultModelResolver.java:173)
+    at org.apache.maven.model.building.DefaultModelBuilder.importDependencyManagement (DefaultModelBuilder.java:1322)
+    at org.apache.maven.model.building.DefaultModelBuilder.build (DefaultModelBuilder.java:647)
+    at org.apache.maven.model.building.DefaultModelBuilder.build (DefaultModelBuilder.java:430)
+    at org.apache.maven.model.building.DefaultModelBuilder.build (DefaultModelBuilder.java:248)
+    at org.apache.maven.repository.internal.DefaultArtifactDescriptorReader.loadPom (DefaultArtifactDescriptorReader.java:360)
+    at org.apache.maven.repository.internal.DefaultArtifactDescriptorReader.readArtifactDescriptor (DefaultArtifactDescriptorReader.java:246)
+    at org.eclipse.aether.internal.impl.DefaultRepositorySystem.readArtifactDescriptor (DefaultRepositorySystem.java:273)
+    at org.apache.maven.plugin.internal.DefaultPluginDependenciesResolver.resolve (DefaultPluginDependenciesResolver.java:112)
+    at org.apache.maven.plugin.internal.DefaultMavenPluginManager.lambda$getPluginDescriptor$0 (DefaultMavenPluginManager.java:188)
+    at org.apache.maven.plugin.DefaultPluginDescriptorCache.get (DefaultPluginDescriptorCache.java:80)
+    at org.apache.maven.plugin.internal.DefaultMavenPluginManager.getPluginDescriptor (DefaultMavenPluginManager.java:186)
+    at org.apache.maven.plugin.internal.DefaultMavenPluginManager.getMojoDescriptor (DefaultMavenPluginManager.java:274)
+    at org.apache.maven.plugin.DefaultBuildPluginManager.getMojoDescriptor (DefaultBuildPluginManager.java:215)
+    at org.apache.maven.lifecycle.internal.DefaultLifecycleExecutionPlanCalculator.setupMojoExecution (DefaultLifecycleExecutionPlanCalculator.java:157)
+    at org.apache.maven.lifecycle.internal.DefaultLifecycleExecutionPlanCalculator.setupMojoExecutions (DefaultLifecycleExecutionPlanCalculator.java:145)
+    at org.apache.maven.lifecycle.internal.DefaultLifecycleExecutionPlanCalculator.calculateExecutionPlan (DefaultLifecycleExecutionPlanCalculator.java:124)
+    at org.apache.maven.lifecycle.internal.DefaultLifecycleExecutionPlanCalculator.calculateExecutionPlan (DefaultLifecycleExecutionPlanCalculator.java:137)
+    at org.apache.maven.lifecycle.internal.builder.BuilderCommon.resolveBuildPlan (BuilderCommon.java:96)
+    at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject (LifecycleModuleBuilder.java:101)
+    at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject (LifecycleModuleBuilder.java:74)
+    at org.apache.maven.lifecycle.internal.builder.singlethreaded.SingleThreadedBuilder.build (SingleThreadedBuilder.java:56)
+    at org.apache.maven.lifecycle.internal.LifecycleStarter.execute (LifecycleStarter.java:121)
+    at org.apache.maven.DefaultMaven.doExecute (DefaultMaven.java:267)
+    at org.apache.maven.DefaultMaven.doExecute (DefaultMaven.java:179)
+    at org.apache.maven.DefaultMaven.execute (DefaultMaven.java:105)
+    at org.apache.maven.cli.MavenCli.execute (MavenCli.java:1017)
+    at org.apache.maven.cli.MavenCli.doMain (MavenCli.java:299)
+    at org.apache.maven.cli.MavenCli.main (MavenCli.java:219)
+    at jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:104)
+    at java.lang.reflect.Method.invoke (Method.java:583)
+    at org.codehaus.plexus.classworlds.launcher.Launcher.launchEnhanced (Launcher.java:255)
+    at org.codehaus.plexus.classworlds.launcher.Launcher.launch (Launcher.java:201)
+    at org.codehaus.plexus.classworlds.launcher.Launcher.mainWithExitCode (Launcher.java:362)
+    at org.codehaus.plexus.classworlds.launcher.Launcher.main (Launcher.java:314)
+[DEBUG] Accepting locally cached artifact junit-bom-5.10.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-clean-plugin-3.4.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-resources-plugin-3.3.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-plugins-39.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-parent-39.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apache-29.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-resources-plugin-3.3.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-compiler-plugin-3.13.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Selecting RepositoryLayout for plexus.snapshots (https://oss.sonatype.org/content/repositories/plexus-snapshots, default, snapshots)
+[DEBUG] Using layout Maven2RepositoryLayout with priority 0.0 for https://oss.sonatype.org/content/repositories/plexus-snapshots
+[DEBUG] Group rules file for remote repository plexus.snapshots (https://oss.sonatype.org/content/repositories/plexus-snapshots, default, snapshots) not available
+[DEBUG] /.meta/prefixes.txt was not found in https://oss.sonatype.org/content/repositories/plexus-snapshots during a previous attempt. This failure was cached in the local repository and resolution is not be reattempted until the update interval of plexus.snapshots has elapsed or updates are forced
+[DEBUG] Prefix file for remote repository plexus.snapshots (https://oss.sonatype.org/content/repositories/plexus-snapshots, default, snapshots) not available
+[DEBUG] Accepting locally cached artifact maven-plugins-41.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-parent-41.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apache-31.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-compiler-plugin-3.13.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-surefire-plugin-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-surefire-plugin-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-jar-plugin-3.4.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-jar-plugin-3.4.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] Lifecycle clean -> [pre-clean, clean, post-clean]
+[DEBUG] Lifecycle default -> [validate, initialize, generate-sources, process-sources, generate-resources, process-resources, compile, process-classes, generate-test-sources, process-test-sources, generate-test-resources, process-test-resources, test-compile, process-test-classes, test, prepare-package, package, pre-integration-test, integration-test, post-integration-test, verify, install, deploy]
+[DEBUG] Lifecycle site -> [pre-site, site, post-site, site-deploy]
+[DEBUG] === PROJECT BUILD PLAN ================================================
+[DEBUG] Project:       com.evolvedbinary.japigen:japi-generator:1.0-SNAPSHOT
+[DEBUG] Dependencies (collect): []
+[DEBUG] Dependencies (resolve): [compile, runtime, test]
+[DEBUG] Repositories (dependencies): [central (https://repo.maven.apache.org/maven2, default, releases)]
+[DEBUG] Repositories (plugins)     : [central (https://repo.maven.apache.org/maven2, default, releases)]
+[DEBUG] -----------------------------------------------------------------------
+[DEBUG] Goal:          org.apache.maven.plugins:maven-clean-plugin:3.4.0:clean (default-clean)
+[DEBUG] Style:         Regular
+[DEBUG] Configuration: <?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <directory default-value="${project.build.directory}"/>
+  <excludeDefaultDirectories default-value="false">${maven.clean.excludeDefaultDirectories}</excludeDefaultDirectories>
+  <failOnError default-value="true">${maven.clean.failOnError}</failOnError>
+  <fast default-value="false">${maven.clean.fast}</fast>
+  <fastDir>${maven.clean.fastDir}</fastDir>
+  <fastMode default-value="background">${maven.clean.fastMode}</fastMode>
+  <followSymLinks default-value="false">${maven.clean.followSymLinks}</followSymLinks>
+  <outputDirectory default-value="${project.build.outputDirectory}"/>
+  <reportDirectory default-value="${project.build.outputDirectory}"/>
+  <retryOnError default-value="true">${maven.clean.retryOnError}</retryOnError>
+  <session default-value="${session}"/>
+  <skip default-value="false">${maven.clean.skip}</skip>
+  <testOutputDirectory default-value="${project.build.testOutputDirectory}"/>
+  <verbose>${maven.clean.verbose}</verbose>
+</configuration>
+[DEBUG] -----------------------------------------------------------------------
+[DEBUG] Goal:          org.apache.maven.plugins:maven-resources-plugin:3.3.1:resources (default-resources)
+[DEBUG] Style:         Regular
+[DEBUG] Configuration: <?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <addDefaultExcludes default-value="true"/>
+  <buildFilters default-value="${project.build.filters}"/>
+  <encoding default-value="${project.build.sourceEncoding}"/>
+  <escapeWindowsPaths default-value="true"/>
+  <fileNameFiltering default-value="false"/>
+  <includeEmptyDirs default-value="false"/>
+  <outputDirectory default-value="${project.build.outputDirectory}"/>
+  <overwrite default-value="false"/>
+  <project default-value="${project}"/>
+  <resources default-value="${project.resources}"/>
+  <session default-value="${session}"/>
+  <skip default-value="false">${maven.resources.skip}</skip>
+  <supportMultiLineFiltering default-value="false"/>
+  <useBuildFilters default-value="true"/>
+  <useDefaultDelimiters default-value="true"/>
+</configuration>
+[DEBUG] -----------------------------------------------------------------------
+[DEBUG] Goal:          org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile (default-compile)
+[DEBUG] Style:         Regular
+[DEBUG] Configuration: <?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <annotationProcessorPathsUseDepMgmt default-value="false"/>
+  <basedir default-value="${basedir}"/>
+  <buildDirectory default-value="${project.build.directory}"/>
+  <compilePath default-value="${project.compileClasspathElements}"/>
+  <compileSourceRoots default-value="${project.compileSourceRoots}"/>
+  <compilerId default-value="javac">${maven.compiler.compilerId}</compilerId>
+  <compilerReuseStrategy default-value="${reuseCreated}">${maven.compiler.compilerReuseStrategy}</compilerReuseStrategy>
+  <compilerVersion>${maven.compiler.compilerVersion}</compilerVersion>
+  <createMissingPackageInfoClass default-value="true">${maven.compiler.createMissingPackageInfoClass}</createMissingPackageInfoClass>
+  <debug default-value="true">${maven.compiler.debug}</debug>
+  <debugFileName default-value="javac"/>
+  <debuglevel>${maven.compiler.debuglevel}</debuglevel>
+  <enablePreview default-value="false">${maven.compiler.enablePreview}</enablePreview>
+  <encoding default-value="${project.build.sourceEncoding}">${encoding}</encoding>
+  <executable>${maven.compiler.executable}</executable>
+  <failOnError default-value="true">${maven.compiler.failOnError}</failOnError>
+  <failOnWarning default-value="false">${maven.compiler.failOnWarning}</failOnWarning>
+  <fileExtensions default-value="class,jar"/>
+  <forceJavacCompilerUse default-value="false">${maven.compiler.forceJavacCompilerUse}</forceJavacCompilerUse>
+  <forceLegacyJavacApi default-value="false">${maven.compiler.forceLegacyJavacApi}</forceLegacyJavacApi>
+  <fork default-value="false">${maven.compiler.fork}</fork>
+  <generatedSourcesDirectory default-value="${project.build.directory}/generated-sources/annotations"/>
+  <implicit>${maven.compiler.implicit}</implicit>
+  <maxmem>${maven.compiler.maxmem}</maxmem>
+  <meminitial>${maven.compiler.meminitial}</meminitial>
+  <mojoExecution default-value="${mojoExecution}"/>
+  <optimize default-value="false">${maven.compiler.optimize}</optimize>
+  <outputDirectory default-value="${project.build.outputDirectory}">${maven.compiler.outputDirectory}</outputDirectory>
+  <outputTimestamp default-value="${project.build.outputTimestamp}"/>
+  <parameters default-value="false">${maven.compiler.parameters}</parameters>
+  <proc>${maven.compiler.proc}</proc>
+  <project default-value="${project}"/>
+  <projectArtifact default-value="${project.artifact}"/>
+  <release>25</release>
+  <session default-value="${session}"/>
+  <showCompilationChanges default-value="false">${maven.compiler.showCompilationChanges}</showCompilationChanges>
+  <showDeprecation default-value="false">${maven.compiler.showDeprecation}</showDeprecation>
+  <showWarnings default-value="true">${maven.compiler.showWarnings}</showWarnings>
+  <skipMain>${maven.main.skip}</skipMain>
+  <skipMultiThreadWarning default-value="false">${maven.compiler.skipMultiThreadWarning}</skipMultiThreadWarning>
+  <source default-value="1.8">${maven.compiler.source}</source>
+  <staleMillis default-value="0">${lastModGranularityMs}</staleMillis>
+  <target default-value="1.8">${maven.compiler.target}</target>
+  <useIncrementalCompilation default-value="true">${maven.compiler.useIncrementalCompilation}</useIncrementalCompilation>
+  <verbose default-value="false">${maven.compiler.verbose}</verbose>
+</configuration>
+[DEBUG] -----------------------------------------------------------------------
+[DEBUG] Goal:          org.apache.maven.plugins:maven-resources-plugin:3.3.1:testResources (default-testResources)
+[DEBUG] Style:         Regular
+[DEBUG] Configuration: <?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <addDefaultExcludes default-value="true"/>
+  <buildFilters default-value="${project.build.filters}"/>
+  <encoding default-value="${project.build.sourceEncoding}"/>
+  <escapeWindowsPaths default-value="true"/>
+  <fileNameFiltering default-value="false"/>
+  <includeEmptyDirs default-value="false"/>
+  <outputDirectory default-value="${project.build.testOutputDirectory}"/>
+  <overwrite default-value="false"/>
+  <project default-value="${project}"/>
+  <resources default-value="${project.testResources}"/>
+  <session default-value="${session}"/>
+  <skip default-value="false">${maven.test.skip}</skip>
+  <supportMultiLineFiltering default-value="false"/>
+  <useBuildFilters default-value="true"/>
+  <useDefaultDelimiters default-value="true"/>
+</configuration>
+[DEBUG] -----------------------------------------------------------------------
+[DEBUG] Goal:          org.apache.maven.plugins:maven-compiler-plugin:3.13.0:testCompile (default-testCompile)
+[DEBUG] Style:         Regular
+[DEBUG] Configuration: <?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <annotationProcessorPathsUseDepMgmt default-value="false"/>
+  <basedir default-value="${basedir}"/>
+  <buildDirectory default-value="${project.build.directory}"/>
+  <compileSourceRoots default-value="${project.testCompileSourceRoots}"/>
+  <compilerId default-value="javac">${maven.compiler.compilerId}</compilerId>
+  <compilerReuseStrategy default-value="${reuseCreated}">${maven.compiler.compilerReuseStrategy}</compilerReuseStrategy>
+  <compilerVersion>${maven.compiler.compilerVersion}</compilerVersion>
+  <createMissingPackageInfoClass default-value="true">${maven.compiler.createMissingPackageInfoClass}</createMissingPackageInfoClass>
+  <debug default-value="true">${maven.compiler.debug}</debug>
+  <debugFileName default-value="javac-test"/>
+  <debuglevel>${maven.compiler.debuglevel}</debuglevel>
+  <enablePreview default-value="false">${maven.compiler.enablePreview}</enablePreview>
+  <encoding default-value="${project.build.sourceEncoding}">${encoding}</encoding>
+  <executable>${maven.compiler.executable}</executable>
+  <failOnError default-value="true">${maven.compiler.failOnError}</failOnError>
+  <failOnWarning default-value="false">${maven.compiler.failOnWarning}</failOnWarning>
+  <fileExtensions default-value="class,jar"/>
+  <forceJavacCompilerUse default-value="false">${maven.compiler.forceJavacCompilerUse}</forceJavacCompilerUse>
+  <forceLegacyJavacApi default-value="false">${maven.compiler.forceLegacyJavacApi}</forceLegacyJavacApi>
+  <fork default-value="false">${maven.compiler.fork}</fork>
+  <generatedTestSourcesDirectory default-value="${project.build.directory}/generated-test-sources/test-annotations"/>
+  <implicit>${maven.compiler.implicit}</implicit>
+  <maxmem>${maven.compiler.maxmem}</maxmem>
+  <meminitial>${maven.compiler.meminitial}</meminitial>
+  <mojoExecution default-value="${mojoExecution}"/>
+  <optimize default-value="false">${maven.compiler.optimize}</optimize>
+  <outputDirectory default-value="${project.build.testOutputDirectory}"/>
+  <outputTimestamp default-value="${project.build.outputTimestamp}"/>
+  <parameters default-value="false">${maven.compiler.parameters}</parameters>
+  <proc>${maven.compiler.proc}</proc>
+  <project default-value="${project}"/>
+  <release>25</release>
+  <session default-value="${session}"/>
+  <showCompilationChanges default-value="false">${maven.compiler.showCompilationChanges}</showCompilationChanges>
+  <showDeprecation default-value="false">${maven.compiler.showDeprecation}</showDeprecation>
+  <showWarnings default-value="true">${maven.compiler.showWarnings}</showWarnings>
+  <skip>${maven.test.skip}</skip>
+  <skipMultiThreadWarning default-value="false">${maven.compiler.skipMultiThreadWarning}</skipMultiThreadWarning>
+  <source default-value="1.8">${maven.compiler.source}</source>
+  <staleMillis default-value="0">${lastModGranularityMs}</staleMillis>
+  <target default-value="1.8">${maven.compiler.target}</target>
+  <testPath default-value="${project.testClasspathElements}"/>
+  <testRelease>${maven.compiler.testRelease}</testRelease>
+  <testSource>${maven.compiler.testSource}</testSource>
+  <testTarget>${maven.compiler.testTarget}</testTarget>
+  <useIncrementalCompilation default-value="true">${maven.compiler.useIncrementalCompilation}</useIncrementalCompilation>
+  <useModulePath default-value="true"/>
+  <verbose default-value="false">${maven.compiler.verbose}</verbose>
+</configuration>
+[DEBUG] -----------------------------------------------------------------------
+[DEBUG] Goal:          org.apache.maven.plugins:maven-surefire-plugin:3.3.0:test (default-test)
+[DEBUG] Style:         Regular
+[DEBUG] Configuration: <?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <additionalClasspathDependencies>${maven.test.additionalClasspathDependencies}</additionalClasspathDependencies>
+  <additionalClasspathElements>${maven.test.additionalClasspath}</additionalClasspathElements>
+  <argLine>${argLine}</argLine>
+  <basedir default-value="${basedir}"/>
+  <childDelegation default-value="false">${childDelegation}</childDelegation>
+  <classesDirectory default-value="${project.build.outputDirectory}"/>
+  <classpathDependencyExcludes>${maven.test.dependency.excludes}</classpathDependencyExcludes>
+  <debugForkedProcess>${maven.surefire.debug}</debugForkedProcess>
+  <dependenciesToScan>${dependenciesToScan}</dependenciesToScan>
+  <disableXmlReport default-value="false">${disableXmlReport}</disableXmlReport>
+  <enableAssertions default-value="true">${enableAssertions}</enableAssertions>
+  <enableProcessChecker>${surefire.enableProcessChecker}</enableProcessChecker>
+  <encoding default-value="${project.reporting.outputEncoding}">${surefire.encoding}</encoding>
+  <excludeJUnit5Engines>${surefire.excludeJUnit5Engines}</excludeJUnit5Engines>
+  <excludedEnvironmentVariables>${surefire.excludedEnvironmentVariables}</excludedEnvironmentVariables>
+  <excludedGroups>${excludedGroups}</excludedGroups>
+  <excludes>${surefire.excludes}</excludes>
+  <excludesFile>${surefire.excludesFile}</excludesFile>
+  <failIfNoSpecifiedTests default-value="true">${surefire.failIfNoSpecifiedTests}</failIfNoSpecifiedTests>
+  <failIfNoTests default-value="false">${failIfNoTests}</failIfNoTests>
+  <failOnFlakeCount default-value="0">${surefire.failOnFlakeCount}</failOnFlakeCount>
+  <forkCount default-value="1">${forkCount}</forkCount>
+  <forkNode>${surefire.forkNode}</forkNode>
+  <forkedProcessExitTimeoutInSeconds default-value="30">${surefire.exitTimeout}</forkedProcessExitTimeoutInSeconds>
+  <forkedProcessTimeoutInSeconds>${surefire.timeout}</forkedProcessTimeoutInSeconds>
+  <groups>${groups}</groups>
+  <includeJUnit5Engines>${surefire.includeJUnit5Engines}</includeJUnit5Engines>
+  <includes>${surefire.includes}</includes>
+  <includesFile>${surefire.includesFile}</includesFile>
+  <junitArtifactName default-value="junit:junit">${junitArtifactName}</junitArtifactName>
+  <jvm>${jvm}</jvm>
+  <objectFactory>${objectFactory}</objectFactory>
+  <parallel>${parallel}</parallel>
+  <parallelMavenExecution default-value="${session.parallel}"/>
+  <parallelOptimized default-value="true">${parallelOptimized}</parallelOptimized>
+  <parallelTestsTimeoutForcedInSeconds>${surefire.parallel.forcedTimeout}</parallelTestsTimeoutForcedInSeconds>
+  <parallelTestsTimeoutInSeconds>${surefire.parallel.timeout}</parallelTestsTimeoutInSeconds>
+  <perCoreThreadCount default-value="true">${perCoreThreadCount}</perCoreThreadCount>
+  <pluginArtifactMap>${plugin.artifactMap}</pluginArtifactMap>
+  <pluginDescriptor default-value="${plugin}"/>
+  <printSummary default-value="true">${surefire.printSummary}</printSummary>
+  <project default-value="${project}"/>
+  <projectArtifactMap>${project.artifactMap}</projectArtifactMap>
+  <projectBuildDirectory default-value="${project.build.directory}"/>
+  <redirectTestOutputToFile default-value="false">${maven.test.redirectTestOutputToFile}</redirectTestOutputToFile>
+  <reportFormat default-value="brief">${surefire.reportFormat}</reportFormat>
+  <reportNameSuffix default-value="">${surefire.reportNameSuffix}</reportNameSuffix>
+  <reportsDirectory default-value="${project.build.directory}/surefire-reports"/>
+  <rerunFailingTestsCount default-value="0">${surefire.rerunFailingTestsCount}</rerunFailingTestsCount>
+  <reuseForks default-value="true">${reuseForks}</reuseForks>
+  <runOrder default-value="filesystem">${surefire.runOrder}</runOrder>
+  <runOrderRandomSeed>${surefire.runOrder.random.seed}</runOrderRandomSeed>
+  <session default-value="${session}"/>
+  <shutdown default-value="exit">${surefire.shutdown}</shutdown>
+  <skip default-value="false">${maven.test.skip}</skip>
+  <skipAfterFailureCount default-value="0">${surefire.skipAfterFailureCount}</skipAfterFailureCount>
+  <skipExec>${maven.test.skip.exec}</skipExec>
+  <skipTests default-value="false">${skipTests}</skipTests>
+  <suiteXmlFiles>${surefire.suiteXmlFiles}</suiteXmlFiles>
+  <systemPropertiesFile>${surefire.systemPropertiesFile}</systemPropertiesFile>
+  <tempDir default-value="surefire">${tempDir}</tempDir>
+  <test>${test}</test>
+  <testClassesDirectory default-value="${project.build.testOutputDirectory}"/>
+  <testFailureIgnore default-value="false">${maven.test.failure.ignore}</testFailureIgnore>
+  <testNGArtifactName default-value="org.testng:testng">${testNGArtifactName}</testNGArtifactName>
+  <testSourceDirectory default-value="${project.build.testSourceDirectory}"/>
+  <threadCount>${threadCount}</threadCount>
+  <threadCountClasses default-value="0">${threadCountClasses}</threadCountClasses>
+  <threadCountMethods default-value="0">${threadCountMethods}</threadCountMethods>
+  <threadCountSuites default-value="0">${threadCountSuites}</threadCountSuites>
+  <trimStackTrace default-value="false">${trimStackTrace}</trimStackTrace>
+  <useFile default-value="true">${surefire.useFile}</useFile>
+  <useManifestOnlyJar default-value="true">${surefire.useManifestOnlyJar}</useManifestOnlyJar>
+  <useModulePath default-value="true">${surefire.useModulePath}</useModulePath>
+  <useSystemClassLoader default-value="true">${surefire.useSystemClassLoader}</useSystemClassLoader>
+  <useUnlimitedThreads default-value="false">${useUnlimitedThreads}</useUnlimitedThreads>
+  <workingDirectory>${basedir}</workingDirectory>
+</configuration>
+[DEBUG] -----------------------------------------------------------------------
+[DEBUG] Goal:          org.apache.maven.plugins:maven-jar-plugin:3.4.2:jar (default-jar)
+[DEBUG] Style:         Regular
+[DEBUG] Configuration: <?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <addDefaultExcludes default-value="true"/>
+  <archive>
+    <manifest>
+      <addClasspath>true</addClasspath>
+      <mainClass>org.rocksdb.japigen.JAPI</mainClass>
+    </manifest>
+  </archive>
+  <classesDirectory default-value="${project.build.outputDirectory}"/>
+  <detectMultiReleaseJar default-value="true">${maven.jar.detectMultiReleaseJar}</detectMultiReleaseJar>
+  <finalName default-value="${project.build.finalName}"/>
+  <forceCreation default-value="false">${maven.jar.forceCreation}</forceCreation>
+  <outputDirectory default-value="${project.build.directory}"/>
+  <outputTimestamp default-value="${project.build.outputTimestamp}"/>
+  <project default-value="${project}"/>
+  <session default-value="${session}"/>
+  <skipIfEmpty default-value="false"/>
+  <useDefaultManifestFile default-value="false">${jar.useDefaultManifestFile}</useDefaultManifestFile>
+</configuration>
+[DEBUG] =======================================================================
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact jackson-databind-2.22.4.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-jupiter-api-5.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-jupiter-params-5.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Selecting RepositoryLayout for central-snapshots (https://central.sonatype.com/repository/maven-snapshots, default, snapshots)
+[DEBUG] Using layout Maven2RepositoryLayout with priority 0.0 for https://central.sonatype.com/repository/maven-snapshots
+[DEBUG] Group rules file for remote repository central-snapshots (https://central.sonatype.com/repository/maven-snapshots, default, snapshots) not available
+[DEBUG] /.meta/prefixes.txt was not found in https://central.sonatype.com/repository/maven-snapshots during a previous attempt. This failure was cached in the local repository and resolution is not be reattempted until the update interval of central-snapshots has elapsed or updates are forced
+[DEBUG] Prefix file for remote repository central-snapshots (https://central.sonatype.com/repository/maven-snapshots, default, snapshots) not available
+[DEBUG] Accepting locally cached artifact opentest4j-1.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apiguardian-api-1.1.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-commons-1.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact jackson-base-2.22.4.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact jackson-bom-2.22.4.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact jackson-parent-2.22.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact oss-parent-79.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-bom-5.14.3.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact jackson-core-2.22.4.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact jackson-annotations-2.22.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=171584, ConflictMarker.markTime=40416, ConflictMarker.nodeCount=12, ConflictIdSorter.graphTime=90458, ConflictIdSorter.topsortTime=86250, ConflictIdSorter.conflictIdCount=8, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=1504916, ConflictResolver.conflictItemCount=11, BfDependencyCollector.collectTime=26306709, BfDependencyCollector.transformTime=2818625, BfDependencyCollector.runs=1}
+[DEBUG] com.evolvedbinary.japigen:japi-generator:jar:1.0-SNAPSHOT
+[DEBUG] +- org.junit.jupiter:junit-jupiter-api:jar:5.11.0 [test]
+[DEBUG] |  +- org.opentest4j:opentest4j:jar:1.3.0 [test]
+[DEBUG] |  +- org.junit.platform:junit-platform-commons:jar:1.11.0 [test]
+[DEBUG] |  \- org.apiguardian:apiguardian-api:jar:1.1.2 [test]
+[DEBUG] +- org.junit.jupiter:junit-jupiter-params:jar:5.11.0 [test]
+[DEBUG] \- com.fasterxml.jackson.core:jackson-databind:jar:2.22.4 [compile]
+[DEBUG]    +- com.fasterxml.jackson.core:jackson-annotations:jar:2.22 [compile]
+[DEBUG]    \- com.fasterxml.jackson.core:jackson-core:jar:2.22.4 [compile]
+[DEBUG] Accepting locally cached artifact junit-jupiter-api-5.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-jupiter-params-5.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact jackson-databind-2.22.4.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact opentest4j-1.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-commons-1.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apiguardian-api-1.1.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact jackson-annotations-2.22.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact jackson-core-2.22.4.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[INFO] 
+[INFO] --- clean:3.4.0:clean (default-clean) @ japi-generator ---
+[DEBUG] Accepting locally cached artifact maven-clean-plugin-3.4.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact plexus-utils-4.0.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-17.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=8292, ConflictMarker.markTime=31083, ConflictMarker.nodeCount=2, ConflictIdSorter.graphTime=2750, ConflictIdSorter.topsortTime=5083, ConflictIdSorter.conflictIdCount=2, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=38291, ConflictResolver.conflictItemCount=2, BfDependencyCollector.collectTime=7786875, BfDependencyCollector.transformTime=96042, BfDependencyCollector.runs=1}
+[DEBUG] org.apache.maven.plugins:maven-clean-plugin:jar:3.4.0
+[DEBUG] \- org.codehaus.plexus:plexus-utils:jar:4.0.1 [compile]
+[DEBUG] Accepting locally cached artifact maven-clean-plugin-3.4.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-utils-4.0.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Created new class realm plugin>org.apache.maven.plugins:maven-clean-plugin:3.4.0
+[DEBUG] Importing foreign packages into class realm plugin>org.apache.maven.plugins:maven-clean-plugin:3.4.0
+[DEBUG]   Imported:  < maven.api
+[DEBUG] Populating class realm plugin>org.apache.maven.plugins:maven-clean-plugin:3.4.0
+[DEBUG]   Included: org.apache.maven.plugins:maven-clean-plugin:jar:3.4.0
+[DEBUG]   Included: org.codehaus.plexus:plexus-utils:jar:4.0.1
+[DEBUG] Loading mojo org.apache.maven.plugins:maven-clean-plugin:3.4.0:clean from plugin realm ClassRealm[plugin>org.apache.maven.plugins:maven-clean-plugin:3.4.0, parent: jdk.internal.loader.ClassLoaders$AppClassLoader@5c647e05]
+[DEBUG] Configuring mojo execution 'org.apache.maven.plugins:maven-clean-plugin:3.4.0:clean:default-clean' with basic configurator -->
+[DEBUG]   (f) directory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target
+[DEBUG]   (f) excludeDefaultDirectories = false
+[DEBUG]   (f) failOnError = true
+[DEBUG]   (f) fast = false
+[DEBUG]   (f) fastMode = background
+[DEBUG]   (f) followSymLinks = false
+[DEBUG]   (f) outputDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG]   (f) reportDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG]   (f) retryOnError = true
+[DEBUG]   (f) session = org.apache.maven.execution.MavenSession@4b432e53
+[DEBUG]   (f) skip = false
+[DEBUG]   (f) testOutputDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes
+[DEBUG] -- end configuration --
+[INFO] Deleting /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire-reports/com.evolvedbinary.japigen.JAPITest.txt
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire-reports/2026-11-11T11-22-07_800-jvmRun1-commands.bin
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire-reports/TEST-com.evolvedbinary.japigen.JAPITest.xml
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire-reports/2026-11-11T11-22-07_800-jvmRun1-events.bin
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire-reports
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-test-sources/test-annotations
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-test-sources
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-archiver/pom.properties
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-archiver
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin/compile/default-compile/createdFiles.lst
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin/compile/default-compile/inputFiles.lst
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin/compile/default-compile
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin/compile
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin/testCompile/default-testCompile/createdFiles.lst
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin/testCompile/default-testCompile/inputFiles.lst
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin/testCompile/default-testCompile
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin/testCompile
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status/maven-compiler-plugin
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/maven-status
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/Lazy.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/AnalysedClass.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/JAPIFiles.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/AllClasses.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/AnalysedFunction.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/Receiver$Setter.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/Receiver$Getter.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/AnalysedFunction$Empty.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/Receiver$StatusSetter.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/Functions.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/Receiver$StringGetter.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/Receiver$StringSetter.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/Receiver$StatusGetter.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function/Receiver.class
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/function
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/Config.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/CFunction.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/Generator$1.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/JAPI.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/Generator.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/AllFunctions.class
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/JSONFile.class
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-sources/annotations
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-sources
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire/surefirebooter-20261111112207861_3.jar
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire/surefire-20261111112207861_1tmp
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire/surefire_0-20261111112207861_2tmp
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/japi-generator-1.0-SNAPSHOT.jar
+[INFO] Deleting file /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes/com/evolvedbinary/japigen/JAPITest.class
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes/com/evolvedbinary/japigen
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes/com/evolvedbinary
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes/com
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes
+[INFO] Deleting directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target
+[DEBUG] Skipping non-existing directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG] Skipping non-existing directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes
+[DEBUG] Skipping non-existing directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ japi-generator ---
+[DEBUG] Accepting locally cached artifact maven-resources-plugin-3.3.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact plexus-interpolation-1.26.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-filtering-3.3.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-io-2.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-lang3-3.12.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-components-39.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-utils-3.5.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-5.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-parent-52.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-parent-52.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-10.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apache-23.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apache-23.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact slf4j-api-1.7.36.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact javax.inject-1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-build-api-0.0.7.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact slf4j-parent-1.7.36.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-bom-5.7.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-bom-5.7.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-utils-3.5.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact spice-parent-15.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact forge-parent-5.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=23917, ConflictMarker.markTime=43541, ConflictMarker.nodeCount=13, ConflictIdSorter.graphTime=7917, ConflictIdSorter.topsortTime=7458, ConflictIdSorter.conflictIdCount=9, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=150416, ConflictResolver.conflictItemCount=13, BfDependencyCollector.collectTime=18423875, BfDependencyCollector.transformTime=245208, BfDependencyCollector.runs=1}
+[DEBUG] org.apache.maven.plugins:maven-resources-plugin:jar:3.3.1
+[DEBUG] +- org.codehaus.plexus:plexus-interpolation:jar:1.26 [runtime]
+[DEBUG] +- org.codehaus.plexus:plexus-utils:jar:3.5.1 [compile]
+[DEBUG] +- org.apache.maven.shared:maven-filtering:jar:3.3.1 [compile]
+[DEBUG] |  +- javax.inject:javax.inject:jar:1 [compile]
+[DEBUG] |  +- org.slf4j:slf4j-api:jar:1.7.36 [compile]
+[DEBUG] |  \- org.sonatype.plexus:plexus-build-api:jar:0.0.7 [compile]
+[DEBUG] +- commons-io:commons-io:jar:2.11.0 [compile]
+[DEBUG] \- org.apache.commons:commons-lang3:jar:3.12.0 [compile]
+[DEBUG] Accepting locally cached artifact maven-resources-plugin-3.3.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-interpolation-1.26.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-utils-3.5.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-filtering-3.3.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-io-2.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-lang3-3.12.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact javax.inject-1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact slf4j-api-1.7.36.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-build-api-0.0.7.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Created new class realm plugin>org.apache.maven.plugins:maven-resources-plugin:3.3.1
+[DEBUG] Importing foreign packages into class realm plugin>org.apache.maven.plugins:maven-resources-plugin:3.3.1
+[DEBUG]   Imported:  < maven.api
+[DEBUG] Populating class realm plugin>org.apache.maven.plugins:maven-resources-plugin:3.3.1
+[DEBUG]   Included: org.apache.maven.plugins:maven-resources-plugin:jar:3.3.1
+[DEBUG]   Included: org.codehaus.plexus:plexus-interpolation:jar:1.26
+[DEBUG]   Included: org.codehaus.plexus:plexus-utils:jar:3.5.1
+[DEBUG]   Included: org.apache.maven.shared:maven-filtering:jar:3.3.1
+[DEBUG]   Included: commons-io:commons-io:jar:2.11.0
+[DEBUG]   Included: org.apache.commons:commons-lang3:jar:3.12.0
+[DEBUG]   Included: org.sonatype.plexus:plexus-build-api:jar:0.0.7
+[DEBUG] Loading mojo org.apache.maven.plugins:maven-resources-plugin:3.3.1:resources from plugin realm ClassRealm[plugin>org.apache.maven.plugins:maven-resources-plugin:3.3.1, parent: jdk.internal.loader.ClassLoaders$AppClassLoader@5c647e05]
+[DEBUG] Configuring mojo execution 'org.apache.maven.plugins:maven-resources-plugin:3.3.1:resources:default-resources' with basic configurator -->
+[DEBUG]   (f) addDefaultExcludes = true
+[DEBUG]   (f) buildFilters = []
+[DEBUG]   (f) encoding = UTF-8
+[DEBUG]   (f) escapeWindowsPaths = true
+[DEBUG]   (f) fileNameFiltering = false
+[DEBUG]   (s) includeEmptyDirs = false
+[DEBUG]   (s) outputDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG]   (s) overwrite = false
+[DEBUG]   (f) project = MavenProject: com.evolvedbinary.japigen:japi-generator:1.0-SNAPSHOT @ /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/pom.xml
+[DEBUG]   (s) resources = [Resource {targetPath: null, filtering: false, FileSet {directory: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/resources, PatternSet [includes: {}, excludes: {}]}}]
+[DEBUG]   (f) session = org.apache.maven.execution.MavenSession@4b432e53
+[DEBUG]   (f) skip = false
+[DEBUG]   (f) supportMultiLineFiltering = false
+[DEBUG]   (f) useBuildFilters = true
+[DEBUG]   (s) useDefaultDelimiters = true
+[DEBUG] -- end configuration --
+[DEBUG] properties used:
+[DEBUG] apple.awt.application.name: Launcher
+[DEBUG] classworlds.conf: /opt/homebrew/Cellar/maven/3.10.0/libexec/bin/m2.conf
+[DEBUG] env.ANDROID_HOME: /Users/alan/Library/Android/sdk
+[DEBUG] env.COLORFGBG: 0;15
+[DEBUG] env.COLORTERM: truecolor
+[DEBUG] env.COMMAND_MODE: unix2003
+[DEBUG] env.FPATH: /Users/alan/.docker/completions:/opt/homebrew/share/zsh/site-functions:/usr/local/share/zsh/site-functions:/usr/share/zsh/site-functions:/usr/share/zsh/5.9/functions
+[DEBUG] env.GRADLE_HOME: /Users/alan/.sdkman/candidates/gradle/current
+[DEBUG] env.HOME: /Users/alan
+[DEBUG] env.HOMEBREW_CELLAR: /opt/homebrew/Cellar
+[DEBUG] env.HOMEBREW_PREFIX: /opt/homebrew
+[DEBUG] env.HOMEBREW_REPOSITORY: /opt/homebrew
+[DEBUG] env.INFOPATH: /opt/homebrew/share/info:
+[DEBUG] env.ITERM_PROFILE: Default
+[DEBUG] env.ITERM_SESSION_ID: w0t1p0:6AC8E139-273F-41FB-A2C1-38E97D020571
+[DEBUG] env.JAVA_HOME: /Users/alan/.sdkman/candidates/java/current
+[DEBUG] env.LANG: en_GB.UTF-8
+[DEBUG] env.LC_TERMINAL: iTerm2
+[DEBUG] env.LC_TERMINAL_VERSION: 3.7.6
+[DEBUG] env.LOGNAME: alan
+[DEBUG] env.LaunchInstanceID: F9F4971C-21C0-4542-B98C-4EDAE0E78C18
+[DEBUG] env.MAVEN_CMD_LINE_ARGS:  clean package -X
+[DEBUG] env.MAVEN_PROJECTBASEDIR: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] env.OLDPWD: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] env.OSLogRateLimit: 64
+[DEBUG] env.PATH: /Users/alan/.sdkman/candidates/java/current/bin:/Users/alan/.sdkman/candidates/gradle/current/bin:/Users/alan/perl5/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/Apple/usr/bin:/Library/TeX/texbin:/Applications/iTerm.app/Contents/Resources/utilities:/Users/alan/Library/Application Support/Coursier/bin
+[DEBUG] env.PERL5LIB: /Users/alan/perl5/lib/perl5
+[DEBUG] env.PERL_LOCAL_LIB_ROOT: /Users/alan/perl5
+[DEBUG] env.PERL_MB_OPT: --install_base "/Users/alan/perl5"
+[DEBUG] env.PERL_MM_OPT: INSTALL_BASE=/Users/alan/perl5
+[DEBUG] env.PWD: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] env.SDKMAN_BROKER_API: https://broker.sdkman.io
+[DEBUG] env.SDKMAN_CANDIDATES_API: https://api.sdkman.io/2
+[DEBUG] env.SDKMAN_CANDIDATES_DIR: /Users/alan/.sdkman/candidates
+[DEBUG] env.SDKMAN_DIR: /Users/alan/.sdkman
+[DEBUG] env.SDKMAN_PLATFORM: darwinarm64
+[DEBUG] env.SECURITYSESSIONID: 186b1
+[DEBUG] env.SHELL: /bin/zsh
+[DEBUG] env.SHLVL: 1
+[DEBUG] env.SSH_AUTH_SOCK: /var/run/com.apple.launchd.y5NsUOIaAM/Listeners
+[DEBUG] env.TERM: xterm-256color
+[DEBUG] env.TERMINFO_DIRS: /Applications/iTerm.app/Contents/Resources/terminfo:/usr/share/terminfo
+[DEBUG] env.TERM_FEATURES: T3LrMSc7UUw9Ts3BFGsSyHNoSxFP
+[DEBUG] env.TERM_PROGRAM: iTerm.app
+[DEBUG] env.TERM_PROGRAM_VERSION: 3.7.6
+[DEBUG] env.TERM_SESSION_ID: w0t1p0:6AC8E139-273F-41FB-A2C1-38E97D020571
+[DEBUG] env.TMPDIR: /var/folders/6m/zxwbkww52sd_m6c0df_32qp80000gn/T/
+[DEBUG] env.USER: alan
+[DEBUG] env.XPC_FLAGS: 0x0
+[DEBUG] env.XPC_SERVICE_NAME: 0
+[DEBUG] env.__CFBundleIdentifier: com.googlecode.iterm2
+[DEBUG] env.__CF_USER_TEXT_ENCODING: 0x1F5:0:2
+[DEBUG] env.binary_input: /Users/alan/.sdkman/tmp/java-27.0.1.0+11-librca.bin
+[DEBUG] env.local: 
+[DEBUG] env.zip_output: /Users/alan/.sdkman/tmp/java-27.0.1.0+11-librca.zip
+[DEBUG] file.encoding: UTF-8
+[DEBUG] file.separator: /
+[DEBUG] ftp.nonProxyHosts: local|*.local|169.254/16|*.169.254/16
+[DEBUG] http.nonProxyHosts: local|*.local|169.254/16|*.169.254/16
+[DEBUG] java.class.path: /opt/homebrew/Cellar/maven/3.10.0/libexec/boot/plexus-classworlds-2.12.1.jar
+[DEBUG] java.class.version: 71.0
+[DEBUG] java.home: /Users/alan/.sdkman/candidates/java/27.0.1.0+11-librca
+[DEBUG] java.io.tmpdir: /var/folders/6m/zxwbkww52sd_m6c0df_32qp80000gn/T/
+[DEBUG] java.library.path: /Users/alan/Library/Java/Extensions:/Library/Java/Extensions:/Network/Library/Java/Extensions:/System/Library/Java/Extensions:/usr/lib/java:.
+[DEBUG] java.runtime.name: OpenJDK Runtime Environment
+[DEBUG] java.runtime.version: 27.0.1+11
+[DEBUG] java.specification.name: Java Platform API Specification
+[DEBUG] java.specification.vendor: Oracle Corporation
+[DEBUG] java.specification.version: 27
+[DEBUG] java.vendor: BellSoft
+[DEBUG] java.vendor.url: https://bell-sw.com/
+[DEBUG] java.vendor.url.bug: https://bell-sw.com/support
+[DEBUG] java.version: 27.0.1
+[DEBUG] java.version.date: 2026-10-20
+[DEBUG] java.vm.compressedOopsMode: Non-zero based
+[DEBUG] java.vm.info: mixed mode, sharing
+[DEBUG] java.vm.name: OpenJDK 64-Bit Server VM
+[DEBUG] java.vm.specification.name: Java Virtual Machine Specification
+[DEBUG] java.vm.specification.vendor: Oracle Corporation
+[DEBUG] java.vm.specification.version: 27
+[DEBUG] java.vm.vendor: BellSoft
+[DEBUG] java.vm.version: 27.0.1+11
+[DEBUG] jdk.debug: release
+[DEBUG] library.jline.path: /opt/homebrew/Cellar/maven/3.10.0/libexec/lib/jline-native
+[DEBUG] line.separator: 
+
+[DEBUG] maven.build.timestamp: 2026-11-11T11:25:08Z
+[DEBUG] maven.build.version: Apache Maven 3.10.0 (c43a36b8d67be7e0805a411bc0898af1a51f5472)
+[DEBUG] maven.compiler.release: 25
+[DEBUG] maven.conf: /opt/homebrew/Cellar/maven/3.10.0/libexec/conf
+[DEBUG] maven.home: /opt/homebrew/Cellar/maven/3.10.0/libexec
+[DEBUG] maven.multiModuleProjectDirectory: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] maven.version: 3.10.0
+[DEBUG] native.encoding: UTF-8
+[DEBUG] org.jline.terminal.exec.redirectPipeCreationMode: native,reflection
+[DEBUG] os.arch: aarch64
+[DEBUG] os.name: Mac OS X
+[DEBUG] os.version: 26.7.2
+[DEBUG] path.separator: :
+[DEBUG] project.baseUri: file:/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/
+[DEBUG] project.build.outputTimestamp: 1980-02-01T00:00:00Z
+[DEBUG] project.build.sourceEncoding: UTF-8
+[DEBUG] project.reporting.outputEncoding: UTF-8
+[DEBUG] socksNonProxyHosts: local|*.local|169.254/16|*.169.254/16
+[DEBUG] stderr.encoding: UTF-8
+[DEBUG] stdin.encoding: UTF-8
+[DEBUG] stdout.encoding: UTF-8
+[DEBUG] sun.arch.data.model: 64
+[DEBUG] sun.boot.library.path: /Users/alan/.sdkman/candidates/java/27.0.1.0+11-librca/lib
+[DEBUG] sun.cpu.endian: little
+[DEBUG] sun.io.unicode.encoding: UnicodeBig
+[DEBUG] sun.java.command: org.codehaus.plexus.classworlds.launcher.Launcher clean package -X
+[DEBUG] sun.java.launcher: SUN_STANDARD
+[DEBUG] sun.jnu.encoding: UTF-8
+[DEBUG] sun.management.compiler: HotSpot 64-Bit Tiered Compilers
+[DEBUG] user.country: GB
+[DEBUG] user.dir: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] user.home: /Users/alan
+[DEBUG] user.language: en
+[DEBUG] user.name: alan
+[DEBUG] Using 'UTF-8' encoding to copy filtered resources.
+[DEBUG] Using 'UTF-8' encoding to copy filtered properties files.
+[DEBUG] resource with targetPath null
+directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/resources
+excludes []
+includes []
+[INFO] skip non existing resourceDirectory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/resources
+[DEBUG] no user filter components
+[INFO] 
+[INFO] --- compiler:3.13.0:compile (default-compile) @ japi-generator ---
+[DEBUG] Accepting locally cached artifact maven-compiler-plugin-3.13.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact plexus-compiler-api-2.15.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-java-1.2.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-utils-3.4.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-compiler-manager-2.15.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-incremental-1.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-compiler-2.15.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-languages-1.2.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-compiler-2.15.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-components-19.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-compiler-javac-2.15.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Using mirror insecure-repo (http://maven.indexdata.com) for apache.snapshots (http://repository.apache.org/snapshots).
+[DEBUG] Accepting locally cached artifact plexus-15.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-utils-4.0.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact slf4j-api-1.7.36.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Selecting RepositoryLayout for insecure-repo (http://maven.indexdata.com, default, snapshots)
+[DEBUG] Selecting RepositoryLayout for oss.snapshots (https://oss.sonatype.org/content/repositories/plexus-snapshots/, default, snapshots)
+[DEBUG] Accepting locally cached artifact plexus-compilers-2.15.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Using layout Maven2RepositoryLayout with priority 0.0 for http://maven.indexdata.com
+[DEBUG] Using layout Maven2RepositoryLayout with priority 0.0 for https://oss.sonatype.org/content/repositories/plexus-snapshots/
+[DEBUG] Accepting locally cached artifact junit-bom-5.10.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-io-2.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Prefix file for remote repository insecure-repo (http://maven.indexdata.com, default, snapshots) not available
+[DEBUG] Group rules file for remote repository oss.snapshots (https://oss.sonatype.org/content/repositories/plexus-snapshots/, default, snapshots) not available
+[DEBUG] Group rules file for remote repository insecure-repo (http://maven.indexdata.com, default, snapshots) not available
+[DEBUG] /.meta/prefixes.txt was not found in https://oss.sonatype.org/content/repositories/plexus-snapshots/ during a previous attempt. This failure was cached in the local repository and resolution is not be reattempted until the update interval of oss.snapshots has elapsed or updates are forced
+[DEBUG] Prefix file for remote repository oss.snapshots (https://oss.sonatype.org/content/repositories/plexus-snapshots/, default, snapshots) not available
+[DEBUG] Accepting locally cached artifact maven-parent-23.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-13.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apache-13.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-bom-5.9.3.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact javax.inject-1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact qdox-2.0.3.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact asm-9.6.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-xml-3.0.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact ow2-1.5.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact oss-parent-9.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=37625, ConflictMarker.markTime=49250, ConflictMarker.nodeCount=22, ConflictIdSorter.graphTime=15083, ConflictIdSorter.topsortTime=9959, ConflictIdSorter.conflictIdCount=14, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=288833, ConflictResolver.conflictItemCount=22, BfDependencyCollector.collectTime=23855542, BfDependencyCollector.transformTime=413417, BfDependencyCollector.runs=1}
+[DEBUG] org.apache.maven.plugins:maven-compiler-plugin:jar:3.13.0
+[DEBUG] +- org.apache.maven.shared:maven-shared-utils:jar:3.4.2 [compile]
+[DEBUG] |  +- org.slf4j:slf4j-api:jar:1.7.36 [compile]
+[DEBUG] |  \- commons-io:commons-io:jar:2.11.0 [compile]
+[DEBUG] +- org.apache.maven.shared:maven-shared-incremental:jar:1.1 [compile]
+[DEBUG] +- org.codehaus.plexus:plexus-java:jar:1.2.0 [compile]
+[DEBUG] |  +- org.ow2.asm:asm:jar:9.6 [compile]
+[DEBUG] |  \- com.thoughtworks.qdox:qdox:jar:2.0.3 [compile]
+[DEBUG] +- org.codehaus.plexus:plexus-compiler-api:jar:2.15.0 [compile]
+[DEBUG] +- org.codehaus.plexus:plexus-compiler-manager:jar:2.15.0 [compile]
+[DEBUG] |  +- javax.inject:javax.inject:jar:1 [compile]
+[DEBUG] |  \- org.codehaus.plexus:plexus-xml:jar:3.0.0 [compile]
+[DEBUG] +- org.codehaus.plexus:plexus-compiler-javac:jar:2.15.0 [runtime]
+[DEBUG] \- org.codehaus.plexus:plexus-utils:jar:4.0.0 [compile]
+[DEBUG] Accepting locally cached artifact maven-compiler-plugin-3.13.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-utils-3.4.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-incremental-1.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-java-1.2.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-compiler-api-2.15.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-compiler-manager-2.15.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-compiler-javac-2.15.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-utils-4.0.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact slf4j-api-1.7.36.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-io-2.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact asm-9.6.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact qdox-2.0.3.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact javax.inject-1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-xml-3.0.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Created new class realm plugin>org.apache.maven.plugins:maven-compiler-plugin:3.13.0
+[DEBUG] Importing foreign packages into class realm plugin>org.apache.maven.plugins:maven-compiler-plugin:3.13.0
+[DEBUG]   Imported:  < maven.api
+[DEBUG] Populating class realm plugin>org.apache.maven.plugins:maven-compiler-plugin:3.13.0
+[DEBUG]   Included: org.apache.maven.plugins:maven-compiler-plugin:jar:3.13.0
+[DEBUG]   Included: org.apache.maven.shared:maven-shared-utils:jar:3.4.2
+[DEBUG]   Included: org.apache.maven.shared:maven-shared-incremental:jar:1.1
+[DEBUG]   Included: org.codehaus.plexus:plexus-java:jar:1.2.0
+[DEBUG]   Included: org.codehaus.plexus:plexus-compiler-api:jar:2.15.0
+[DEBUG]   Included: org.codehaus.plexus:plexus-compiler-manager:jar:2.15.0
+[DEBUG]   Included: org.codehaus.plexus:plexus-compiler-javac:jar:2.15.0
+[DEBUG]   Included: org.codehaus.plexus:plexus-utils:jar:4.0.0
+[DEBUG]   Included: commons-io:commons-io:jar:2.11.0
+[DEBUG]   Included: org.ow2.asm:asm:jar:9.6
+[DEBUG]   Included: com.thoughtworks.qdox:qdox:jar:2.0.3
+[DEBUG]   Included: org.codehaus.plexus:plexus-xml:jar:3.0.0
+[DEBUG] Loading mojo org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile from plugin realm ClassRealm[plugin>org.apache.maven.plugins:maven-compiler-plugin:3.13.0, parent: jdk.internal.loader.ClassLoaders$AppClassLoader@5c647e05]
+[DEBUG] Configuring mojo execution 'org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile:default-compile' with basic configurator -->
+[DEBUG]   (f) annotationProcessorPathsUseDepMgmt = false
+[DEBUG]   (f) basedir = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG]   (f) buildDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target
+[DEBUG]   (f) compilePath = [/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes, /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.22.4/jackson-databind-2.22.4.jar, /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar, /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.22.4/jackson-core-2.22.4.jar]
+[DEBUG]   (f) compileSourceRoots = [/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java]
+[DEBUG]   (f) compilerId = javac
+[DEBUG]   (f) createMissingPackageInfoClass = true
+[DEBUG]   (f) debug = true
+[DEBUG]   (f) debugFileName = javac
+[DEBUG]   (f) enablePreview = false
+[DEBUG]   (f) encoding = UTF-8
+[DEBUG]   (f) failOnError = true
+[DEBUG]   (f) failOnWarning = false
+[DEBUG]   (f) fileExtensions = [jar, class]
+[DEBUG]   (f) forceJavacCompilerUse = false
+[DEBUG]   (f) forceLegacyJavacApi = false
+[DEBUG]   (f) fork = false
+[DEBUG]   (f) generatedSourcesDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-sources/annotations
+[DEBUG]   (f) mojoExecution = org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile {execution: default-compile}
+[DEBUG]   (f) optimize = false
+[DEBUG]   (f) outputDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG]   (f) outputTimestamp = 1980-02-01T00:00:00Z
+[DEBUG]   (f) parameters = false
+[DEBUG]   (f) project = MavenProject: com.evolvedbinary.japigen:japi-generator:1.0-SNAPSHOT @ /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/pom.xml
+[DEBUG]   (f) projectArtifact = com.evolvedbinary.japigen:japi-generator:jar:1.0-SNAPSHOT
+[DEBUG]   (s) release = 25
+[DEBUG]   (f) session = org.apache.maven.execution.MavenSession@4b432e53
+[DEBUG]   (f) showCompilationChanges = false
+[DEBUG]   (f) showDeprecation = false
+[DEBUG]   (f) showWarnings = true
+[DEBUG]   (f) skipMultiThreadWarning = false
+[DEBUG]   (f) source = 1.8
+[DEBUG]   (f) staleMillis = 0
+[DEBUG]   (s) target = 1.8
+[DEBUG]   (f) useIncrementalCompilation = true
+[DEBUG]   (f) verbose = false
+[DEBUG] -- end configuration --
+[DEBUG] Using compiler 'javac'.
+[DEBUG] Adding /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-sources/annotations to compile source roots:
+  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java
+[DEBUG] New compile source roots:
+  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java
+  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-sources/annotations
+[DEBUG] CompilerReuseStrategy: reuseCreated
+[DEBUG] useIncrementalCompilation enabled
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/function/Receiver.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/function/AnalysedFunction.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/Lazy.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/AllFunctions.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/JAPIFiles.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/Config.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/JAPI.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/Generator.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/JSONFile.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/AnalysedClass.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/function/Functions.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/AllClasses.java
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/CFunction.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/AllClasses.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/AllFunctions.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/AnalysedClass.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/CFunction.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/Config.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/Generator.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/JAPI.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/JAPIFiles.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/JSONFile.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/Lazy.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/function/AnalysedFunction.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/function/Functions.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java/org/rocksdb/japigen/function/Receiver.java
+[INFO] Recompiling the module because of changed source code.
+[DEBUG] Classpath:
+[DEBUG]  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG]  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.22.4/jackson-databind-2.22.4.jar
+[DEBUG]  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar
+[DEBUG]  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.22.4/jackson-core-2.22.4.jar
+[DEBUG] Source roots:
+[DEBUG]  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java
+[DEBUG]  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-sources/annotations
+[DEBUG] Command line options:
+[DEBUG] -d /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes -classpath /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes:/Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.22.4/jackson-databind-2.22.4.jar:/Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar:/Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.22.4/jackson-core-2.22.4.jar: -sourcepath /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/main/java:/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-sources/annotations: -s /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-sources/annotations -g --release 25 -encoding UTF-8 -XDuseUnsharedTable=true
+[DEBUG] incrementalBuildHelper#beforeRebuildExecution
+[INFO] Compiling 13 source files with javac [debug release 25] to target/classes
+[DEBUG] incrementalBuildHelper#afterRebuildExecution
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ japi-generator ---
+[DEBUG] Loading mojo org.apache.maven.plugins:maven-resources-plugin:3.3.1:testResources from plugin realm ClassRealm[plugin>org.apache.maven.plugins:maven-resources-plugin:3.3.1, parent: jdk.internal.loader.ClassLoaders$AppClassLoader@5c647e05]
+[DEBUG] Configuring mojo execution 'org.apache.maven.plugins:maven-resources-plugin:3.3.1:testResources:default-testResources' with basic configurator -->
+[DEBUG]   (f) addDefaultExcludes = true
+[DEBUG]   (f) buildFilters = []
+[DEBUG]   (f) encoding = UTF-8
+[DEBUG]   (f) escapeWindowsPaths = true
+[DEBUG]   (f) fileNameFiltering = false
+[DEBUG]   (s) includeEmptyDirs = false
+[DEBUG]   (s) outputDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes
+[DEBUG]   (s) overwrite = false
+[DEBUG]   (f) project = MavenProject: com.evolvedbinary.japigen:japi-generator:1.0-SNAPSHOT @ /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/pom.xml
+[DEBUG]   (s) resources = [Resource {targetPath: null, filtering: false, FileSet {directory: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/resources, PatternSet [includes: {}, excludes: {}]}}]
+[DEBUG]   (f) session = org.apache.maven.execution.MavenSession@4b432e53
+[DEBUG]   (f) skip = false
+[DEBUG]   (f) supportMultiLineFiltering = false
+[DEBUG]   (f) useBuildFilters = true
+[DEBUG]   (s) useDefaultDelimiters = true
+[DEBUG] -- end configuration --
+[DEBUG] properties used:
+[DEBUG] apple.awt.application.name: Launcher
+[DEBUG] classworlds.conf: /opt/homebrew/Cellar/maven/3.10.0/libexec/bin/m2.conf
+[DEBUG] env.ANDROID_HOME: /Users/alan/Library/Android/sdk
+[DEBUG] env.COLORFGBG: 0;15
+[DEBUG] env.COLORTERM: truecolor
+[DEBUG] env.COMMAND_MODE: unix2003
+[DEBUG] env.FPATH: /Users/alan/.docker/completions:/opt/homebrew/share/zsh/site-functions:/usr/local/share/zsh/site-functions:/usr/share/zsh/site-functions:/usr/share/zsh/5.9/functions
+[DEBUG] env.GRADLE_HOME: /Users/alan/.sdkman/candidates/gradle/current
+[DEBUG] env.HOME: /Users/alan
+[DEBUG] env.HOMEBREW_CELLAR: /opt/homebrew/Cellar
+[DEBUG] env.HOMEBREW_PREFIX: /opt/homebrew
+[DEBUG] env.HOMEBREW_REPOSITORY: /opt/homebrew
+[DEBUG] env.INFOPATH: /opt/homebrew/share/info:
+[DEBUG] env.ITERM_PROFILE: Default
+[DEBUG] env.ITERM_SESSION_ID: w0t1p0:6AC8E139-273F-41FB-A2C1-38E97D020571
+[DEBUG] env.JAVA_HOME: /Users/alan/.sdkman/candidates/java/current
+[DEBUG] env.LANG: en_GB.UTF-8
+[DEBUG] env.LC_TERMINAL: iTerm2
+[DEBUG] env.LC_TERMINAL_VERSION: 3.7.6
+[DEBUG] env.LOGNAME: alan
+[DEBUG] env.LaunchInstanceID: F9F4971C-21C0-4542-B98C-4EDAE0E78C18
+[DEBUG] env.MAVEN_CMD_LINE_ARGS:  clean package -X
+[DEBUG] env.MAVEN_PROJECTBASEDIR: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] env.OLDPWD: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] env.OSLogRateLimit: 64
+[DEBUG] env.PATH: /Users/alan/.sdkman/candidates/java/current/bin:/Users/alan/.sdkman/candidates/gradle/current/bin:/Users/alan/perl5/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/Apple/usr/bin:/Library/TeX/texbin:/Applications/iTerm.app/Contents/Resources/utilities:/Users/alan/Library/Application Support/Coursier/bin
+[DEBUG] env.PERL5LIB: /Users/alan/perl5/lib/perl5
+[DEBUG] env.PERL_LOCAL_LIB_ROOT: /Users/alan/perl5
+[DEBUG] env.PERL_MB_OPT: --install_base "/Users/alan/perl5"
+[DEBUG] env.PERL_MM_OPT: INSTALL_BASE=/Users/alan/perl5
+[DEBUG] env.PWD: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] env.SDKMAN_BROKER_API: https://broker.sdkman.io
+[DEBUG] env.SDKMAN_CANDIDATES_API: https://api.sdkman.io/2
+[DEBUG] env.SDKMAN_CANDIDATES_DIR: /Users/alan/.sdkman/candidates
+[DEBUG] env.SDKMAN_DIR: /Users/alan/.sdkman
+[DEBUG] env.SDKMAN_PLATFORM: darwinarm64
+[DEBUG] env.SECURITYSESSIONID: 186b1
+[DEBUG] env.SHELL: /bin/zsh
+[DEBUG] env.SHLVL: 1
+[DEBUG] env.SSH_AUTH_SOCK: /var/run/com.apple.launchd.y5NsUOIaAM/Listeners
+[DEBUG] env.TERM: xterm-256color
+[DEBUG] env.TERMINFO_DIRS: /Applications/iTerm.app/Contents/Resources/terminfo:/usr/share/terminfo
+[DEBUG] env.TERM_FEATURES: T3LrMSc7UUw9Ts3BFGsSyHNoSxFP
+[DEBUG] env.TERM_PROGRAM: iTerm.app
+[DEBUG] env.TERM_PROGRAM_VERSION: 3.7.6
+[DEBUG] env.TERM_SESSION_ID: w0t1p0:6AC8E139-273F-41FB-A2C1-38E97D020571
+[DEBUG] env.TMPDIR: /var/folders/6m/zxwbkww52sd_m6c0df_32qp80000gn/T/
+[DEBUG] env.USER: alan
+[DEBUG] env.XPC_FLAGS: 0x0
+[DEBUG] env.XPC_SERVICE_NAME: 0
+[DEBUG] env.__CFBundleIdentifier: com.googlecode.iterm2
+[DEBUG] env.__CF_USER_TEXT_ENCODING: 0x1F5:0:2
+[DEBUG] env.binary_input: /Users/alan/.sdkman/tmp/java-27.0.1.0+11-librca.bin
+[DEBUG] env.local: 
+[DEBUG] env.zip_output: /Users/alan/.sdkman/tmp/java-27.0.1.0+11-librca.zip
+[DEBUG] file.encoding: UTF-8
+[DEBUG] file.separator: /
+[DEBUG] ftp.nonProxyHosts: local|*.local|169.254/16|*.169.254/16
+[DEBUG] http.nonProxyHosts: local|*.local|169.254/16|*.169.254/16
+[DEBUG] java.class.path: /opt/homebrew/Cellar/maven/3.10.0/libexec/boot/plexus-classworlds-2.12.1.jar
+[DEBUG] java.class.version: 71.0
+[DEBUG] java.home: /Users/alan/.sdkman/candidates/java/27.0.1.0+11-librca
+[DEBUG] java.io.tmpdir: /var/folders/6m/zxwbkww52sd_m6c0df_32qp80000gn/T/
+[DEBUG] java.library.path: /Users/alan/Library/Java/Extensions:/Library/Java/Extensions:/Network/Library/Java/Extensions:/System/Library/Java/Extensions:/usr/lib/java:.
+[DEBUG] java.runtime.name: OpenJDK Runtime Environment
+[DEBUG] java.runtime.version: 27.0.1+11
+[DEBUG] java.specification.name: Java Platform API Specification
+[DEBUG] java.specification.vendor: Oracle Corporation
+[DEBUG] java.specification.version: 27
+[DEBUG] java.vendor: BellSoft
+[DEBUG] java.vendor.url: https://bell-sw.com/
+[DEBUG] java.vendor.url.bug: https://bell-sw.com/support
+[DEBUG] java.version: 27.0.1
+[DEBUG] java.version.date: 2026-10-20
+[DEBUG] java.vm.compressedOopsMode: Non-zero based
+[DEBUG] java.vm.info: mixed mode, sharing
+[DEBUG] java.vm.name: OpenJDK 64-Bit Server VM
+[DEBUG] java.vm.specification.name: Java Virtual Machine Specification
+[DEBUG] java.vm.specification.vendor: Oracle Corporation
+[DEBUG] java.vm.specification.version: 27
+[DEBUG] java.vm.vendor: BellSoft
+[DEBUG] java.vm.version: 27.0.1+11
+[DEBUG] jdk.debug: release
+[DEBUG] library.jline.path: /opt/homebrew/Cellar/maven/3.10.0/libexec/lib/jline-native
+[DEBUG] line.separator: 
+
+[DEBUG] maven.build.timestamp: 2026-11-11T11:25:09Z
+[DEBUG] maven.build.version: Apache Maven 3.10.0 (c43a36b8d67be7e0805a411bc0898af1a51f5472)
+[DEBUG] maven.compiler.release: 25
+[DEBUG] maven.conf: /opt/homebrew/Cellar/maven/3.10.0/libexec/conf
+[DEBUG] maven.home: /opt/homebrew/Cellar/maven/3.10.0/libexec
+[DEBUG] maven.multiModuleProjectDirectory: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] maven.version: 3.10.0
+[DEBUG] native.encoding: UTF-8
+[DEBUG] org.jline.terminal.exec.redirectPipeCreationMode: native,reflection
+[DEBUG] os.arch: aarch64
+[DEBUG] os.name: Mac OS X
+[DEBUG] os.version: 26.7.2
+[DEBUG] path.separator: :
+[DEBUG] project.baseUri: file:/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/
+[DEBUG] project.build.outputTimestamp: 1980-02-01T00:00:00Z
+[DEBUG] project.build.sourceEncoding: UTF-8
+[DEBUG] project.reporting.outputEncoding: UTF-8
+[DEBUG] socksNonProxyHosts: local|*.local|169.254/16|*.169.254/16
+[DEBUG] stderr.encoding: UTF-8
+[DEBUG] stdin.encoding: UTF-8
+[DEBUG] stdout.encoding: UTF-8
+[DEBUG] sun.arch.data.model: 64
+[DEBUG] sun.boot.library.path: /Users/alan/.sdkman/candidates/java/27.0.1.0+11-librca/lib
+[DEBUG] sun.cpu.endian: little
+[DEBUG] sun.io.unicode.encoding: UnicodeBig
+[DEBUG] sun.java.command: org.codehaus.plexus.classworlds.launcher.Launcher clean package -X
+[DEBUG] sun.java.launcher: SUN_STANDARD
+[DEBUG] sun.jnu.encoding: UTF-8
+[DEBUG] sun.management.compiler: HotSpot 64-Bit Tiered Compilers
+[DEBUG] user.country: GB
+[DEBUG] user.dir: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] user.home: /Users/alan
+[DEBUG] user.language: en
+[DEBUG] user.name: alan
+[DEBUG] Using 'UTF-8' encoding to copy filtered resources.
+[DEBUG] Using 'UTF-8' encoding to copy filtered properties files.
+[DEBUG] resource with targetPath null
+directory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/resources
+excludes []
+includes []
+[INFO] skip non existing resourceDirectory /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/resources
+[DEBUG] no user filter components
+[INFO] 
+[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ japi-generator ---
+[DEBUG] Loading mojo org.apache.maven.plugins:maven-compiler-plugin:3.13.0:testCompile from plugin realm ClassRealm[plugin>org.apache.maven.plugins:maven-compiler-plugin:3.13.0, parent: jdk.internal.loader.ClassLoaders$AppClassLoader@5c647e05]
+[DEBUG] Configuring mojo execution 'org.apache.maven.plugins:maven-compiler-plugin:3.13.0:testCompile:default-testCompile' with basic configurator -->
+[DEBUG]   (f) annotationProcessorPathsUseDepMgmt = false
+[DEBUG]   (f) basedir = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG]   (f) buildDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target
+[DEBUG]   (f) compileSourceRoots = [/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/java]
+[DEBUG]   (f) compilerId = javac
+[DEBUG]   (f) createMissingPackageInfoClass = true
+[DEBUG]   (f) debug = true
+[DEBUG]   (f) debugFileName = javac-test
+[DEBUG]   (f) enablePreview = false
+[DEBUG]   (f) encoding = UTF-8
+[DEBUG]   (f) failOnError = true
+[DEBUG]   (f) failOnWarning = false
+[DEBUG]   (f) fileExtensions = [jar, class]
+[DEBUG]   (f) forceJavacCompilerUse = false
+[DEBUG]   (f) forceLegacyJavacApi = false
+[DEBUG]   (f) fork = false
+[DEBUG]   (f) generatedTestSourcesDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-test-sources/test-annotations
+[DEBUG]   (f) mojoExecution = org.apache.maven.plugins:maven-compiler-plugin:3.13.0:testCompile {execution: default-testCompile}
+[DEBUG]   (f) optimize = false
+[DEBUG]   (f) outputDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes
+[DEBUG]   (f) outputTimestamp = 1980-02-01T00:00:00Z
+[DEBUG]   (f) parameters = false
+[DEBUG]   (f) project = MavenProject: com.evolvedbinary.japigen:japi-generator:1.0-SNAPSHOT @ /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/pom.xml
+[DEBUG]   (s) release = 25
+[DEBUG]   (f) session = org.apache.maven.execution.MavenSession@4b432e53
+[DEBUG]   (f) showCompilationChanges = false
+[DEBUG]   (f) showDeprecation = false
+[DEBUG]   (f) showWarnings = true
+[DEBUG]   (f) skipMultiThreadWarning = false
+[DEBUG]   (f) source = 1.8
+[DEBUG]   (f) staleMillis = 0
+[DEBUG]   (s) target = 1.8
+[DEBUG]   (f) testPath = [/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes, /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes, /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar, /Users/alan/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar, /Users/alan/.m2/repository/org/junit/platform/junit-platform-commons/1.11.0/junit-platform-commons-1.11.0.jar, /Users/alan/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar, /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.11.0/junit-jupiter-params-5.11.0.jar, /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.22.4/jackson-databind-2.22.4.jar, /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar, /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.22.4/jackson-core-2.22.4.jar]
+[DEBUG]   (f) useIncrementalCompilation = true
+[DEBUG]   (f) useModulePath = true
+[DEBUG]   (f) verbose = false
+[DEBUG] -- end configuration --
+[DEBUG] Using compiler 'javac'.
+[DEBUG] Adding /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-test-sources/test-annotations to test-compile source roots:
+  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/java
+[DEBUG] New test-compile source roots:
+  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/java
+  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-test-sources/test-annotations
+[DEBUG] CompilerReuseStrategy: reuseCreated
+[DEBUG] useIncrementalCompilation enabled
+[INFO] 	New dependency detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes/org/rocksdb/japigen/JSONFile.class
+[INFO] 	Stale source detected: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/java/com/evolvedbinary/japigen/JAPITest.java
+[INFO] 	Input tree files (+): /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/java/com/evolvedbinary/japigen/JAPITest.java
+[INFO] Recompiling the module because of changed dependency.
+[DEBUG] Classpath:
+[DEBUG]  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes
+[DEBUG]  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG]  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar
+[DEBUG]  /Users/alan/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar
+[DEBUG]  /Users/alan/.m2/repository/org/junit/platform/junit-platform-commons/1.11.0/junit-platform-commons-1.11.0.jar
+[DEBUG]  /Users/alan/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar
+[DEBUG]  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.11.0/junit-jupiter-params-5.11.0.jar
+[DEBUG]  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.22.4/jackson-databind-2.22.4.jar
+[DEBUG]  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar
+[DEBUG]  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.22.4/jackson-core-2.22.4.jar
+[DEBUG] Source roots:
+[DEBUG]  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/java
+[DEBUG]  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-test-sources/test-annotations
+[DEBUG] Command line options:
+[DEBUG] -d /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes -classpath /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes:/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes:/Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar:/Users/alan/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar:/Users/alan/.m2/repository/org/junit/platform/junit-platform-commons/1.11.0/junit-platform-commons-1.11.0.jar:/Users/alan/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar:/Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.11.0/junit-jupiter-params-5.11.0.jar:/Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.22.4/jackson-databind-2.22.4.jar:/Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar:/Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.22.4/jackson-core-2.22.4.jar: -sourcepath /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/java:/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-test-sources/test-annotations: -s /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/generated-test-sources/test-annotations -g --release 25 -encoding UTF-8 -XDuseUnsharedTable=true
+[DEBUG] incrementalBuildHelper#beforeRebuildExecution
+[INFO] Compiling 1 source file with javac [debug release 25] to target/test-classes
+[DEBUG] incrementalBuildHelper#afterRebuildExecution
+[INFO] 
+[INFO] --- surefire:3.3.0:test (default-test) @ japi-generator ---
+[DEBUG] Accepting locally cached artifact maven-surefire-plugin-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact surefire-extensions-api-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-api-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-surefire-common-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-booter-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-resolver-util-1.4.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-logger-api-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-shared-utils-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-common-artifact-filters-3.4.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-java-1.2.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-resolver-1.4.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-components-42.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-parent-33.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apache-21.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-extensions-spi-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact asm-9.6.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact qdox-2.0.3.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-resolver-api-1.4.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=43667, ConflictMarker.markTime=51625, ConflictMarker.nodeCount=25, ConflictIdSorter.graphTime=19375, ConflictIdSorter.topsortTime=12709, ConflictIdSorter.conflictIdCount=15, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=381250, ConflictResolver.conflictItemCount=25, BfDependencyCollector.collectTime=25326833, BfDependencyCollector.transformTime=523375, BfDependencyCollector.runs=1}
+[DEBUG] org.apache.maven.plugins:maven-surefire-plugin:jar:3.3.0
+[DEBUG] +- org.apache.maven.surefire:surefire-api:jar:3.3.0 [compile]
+[DEBUG] |  +- org.apache.maven.surefire:surefire-logger-api:jar:3.3.0 [compile]
+[DEBUG] |  \- org.apache.maven.surefire:surefire-shared-utils:jar:3.3.0 [compile]
+[DEBUG] +- org.apache.maven.surefire:surefire-extensions-api:jar:3.3.0 [compile]
+[DEBUG] \- org.apache.maven.surefire:maven-surefire-common:jar:3.3.0 [compile]
+[DEBUG]    +- org.apache.maven.surefire:surefire-booter:jar:3.3.0 [compile]
+[DEBUG]    |  \- org.apache.maven.surefire:surefire-extensions-spi:jar:3.3.0 [compile]
+[DEBUG]    +- org.apache.maven.resolver:maven-resolver-util:jar:1.4.1 [compile]
+[DEBUG]    |  \- org.apache.maven.resolver:maven-resolver-api:jar:1.4.1 [compile]
+[DEBUG]    +- org.apache.maven.shared:maven-common-artifact-filters:jar:3.4.0 [compile]
+[DEBUG]    |  \- org.slf4j:slf4j-api:jar:1.7.36 [compile]
+[DEBUG]    \- org.codehaus.plexus:plexus-java:jar:1.2.0 [compile]
+[DEBUG]       +- org.ow2.asm:asm:jar:9.6 [compile]
+[DEBUG]       \- com.thoughtworks.qdox:qdox:jar:2.0.3 [compile]
+[DEBUG] Accepting locally cached artifact maven-surefire-plugin-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-api-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-extensions-api-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-surefire-common-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-logger-api-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-shared-utils-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-booter-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-resolver-util-1.4.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-common-artifact-filters-3.4.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-java-1.2.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-extensions-spi-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-resolver-api-1.4.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact slf4j-api-1.7.36.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact asm-9.6.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact qdox-2.0.3.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Created new class realm plugin>org.apache.maven.plugins:maven-surefire-plugin:3.3.0
+[DEBUG] Importing foreign packages into class realm plugin>org.apache.maven.plugins:maven-surefire-plugin:3.3.0
+[DEBUG]   Imported:  < maven.api
+[DEBUG] Populating class realm plugin>org.apache.maven.plugins:maven-surefire-plugin:3.3.0
+[DEBUG]   Included: org.apache.maven.plugins:maven-surefire-plugin:jar:3.3.0
+[DEBUG]   Included: org.apache.maven.surefire:surefire-api:jar:3.3.0
+[DEBUG]   Included: org.apache.maven.surefire:surefire-extensions-api:jar:3.3.0
+[DEBUG]   Included: org.apache.maven.surefire:maven-surefire-common:jar:3.3.0
+[DEBUG]   Included: org.apache.maven.surefire:surefire-logger-api:jar:3.3.0
+[DEBUG]   Included: org.apache.maven.surefire:surefire-shared-utils:jar:3.3.0
+[DEBUG]   Included: org.apache.maven.surefire:surefire-booter:jar:3.3.0
+[DEBUG]   Included: org.apache.maven.shared:maven-common-artifact-filters:jar:3.4.0
+[DEBUG]   Included: org.codehaus.plexus:plexus-java:jar:1.2.0
+[DEBUG]   Included: org.apache.maven.surefire:surefire-extensions-spi:jar:3.3.0
+[DEBUG]   Included: org.ow2.asm:asm:jar:9.6
+[DEBUG]   Included: com.thoughtworks.qdox:qdox:jar:2.0.3
+[DEBUG] Loading mojo org.apache.maven.plugins:maven-surefire-plugin:3.3.0:test from plugin realm ClassRealm[plugin>org.apache.maven.plugins:maven-surefire-plugin:3.3.0, parent: jdk.internal.loader.ClassLoaders$AppClassLoader@5c647e05]
+[DEBUG] Configuring mojo execution 'org.apache.maven.plugins:maven-surefire-plugin:3.3.0:test:default-test' with basic configurator -->
+[DEBUG]   (f) additionalClasspathDependencies = []
+[DEBUG]   (s) additionalClasspathElements = []
+[DEBUG]   (s) basedir = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG]   (s) childDelegation = false
+[DEBUG]   (f) classesDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG]   (s) classpathDependencyExcludes = []
+[DEBUG]   (s) dependenciesToScan = []
+[DEBUG]   (s) disableXmlReport = false
+[DEBUG]   (s) enableAssertions = true
+[DEBUG]   (s) encoding = UTF-8
+[DEBUG]   (s) excludeJUnit5Engines = []
+[DEBUG]   (f) excludedEnvironmentVariables = []
+[DEBUG]   (s) excludes = []
+[DEBUG]   (s) failIfNoSpecifiedTests = true
+[DEBUG]   (s) failIfNoTests = false
+[DEBUG]   (s) failOnFlakeCount = 0
+[DEBUG]   (f) forkCount = 1
+[DEBUG]   (s) forkedProcessExitTimeoutInSeconds = 30
+[DEBUG]   (s) includeJUnit5Engines = []
+[DEBUG]   (s) includes = []
+[DEBUG]   (s) junitArtifactName = junit:junit
+[DEBUG]   (f) parallelMavenExecution = false
+[DEBUG]   (s) parallelOptimized = true
+[DEBUG]   (s) perCoreThreadCount = true
+[DEBUG]   (s) pluginArtifactMap = {org.apache.maven.plugins:maven-surefire-plugin=org.apache.maven.plugins:maven-surefire-plugin:maven-plugin:3.3.0:, org.apache.maven.surefire:surefire-api=org.apache.maven.surefire:surefire-api:jar:3.3.0:compile, org.apache.maven.surefire:surefire-extensions-api=org.apache.maven.surefire:surefire-extensions-api:jar:3.3.0:compile, org.apache.maven.surefire:maven-surefire-common=org.apache.maven.surefire:maven-surefire-common:jar:3.3.0:compile, org.apache.maven.surefire:surefire-logger-api=org.apache.maven.surefire:surefire-logger-api:jar:3.3.0:compile, org.apache.maven.surefire:surefire-shared-utils=org.apache.maven.surefire:surefire-shared-utils:jar:3.3.0:compile, org.apache.maven.surefire:surefire-booter=org.apache.maven.surefire:surefire-booter:jar:3.3.0:compile, org.apache.maven.resolver:maven-resolver-util=org.apache.maven.resolver:maven-resolver-util:jar:1.4.1:compile, org.apache.maven.shared:maven-common-artifact-filters=org.apache.maven.shared:maven-common-artifact-filters:jar:3.4.0:compile, org.codehaus.plexus:plexus-java=org.codehaus.plexus:plexus-java:jar:1.2.0:compile, org.apache.maven.surefire:surefire-extensions-spi=org.apache.maven.surefire:surefire-extensions-spi:jar:3.3.0:compile, org.apache.maven.resolver:maven-resolver-api=org.apache.maven.resolver:maven-resolver-api:jar:1.4.1:compile, org.slf4j:slf4j-api=org.slf4j:slf4j-api:jar:1.7.36:compile, org.ow2.asm:asm=org.ow2.asm:asm:jar:9.6:compile, com.thoughtworks.qdox:qdox=com.thoughtworks.qdox:qdox:jar:2.0.3:compile}
+[DEBUG]   (f) pluginDescriptor = Component Descriptor: role: 'org.apache.maven.plugin.Mojo', implementation: 'org.apache.maven.plugins.maven_surefire_plugin.HelpMojo', role hint: 'org.apache.maven.plugins:maven-surefire-plugin:3.3.0:help'
+role: 'org.apache.maven.plugin.Mojo', implementation: 'org.apache.maven.plugin.surefire.SurefirePlugin', role hint: 'org.apache.maven.plugins:maven-surefire-plugin:3.3.0:test'
+---
+[DEBUG]   (s) printSummary = true
+[DEBUG]   (s) project = MavenProject: com.evolvedbinary.japigen:japi-generator:1.0-SNAPSHOT @ /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/pom.xml
+[DEBUG]   (s) projectArtifactMap = {org.junit.jupiter:junit-jupiter-api=org.junit.jupiter:junit-jupiter-api:jar:5.11.0:test, org.opentest4j:opentest4j=org.opentest4j:opentest4j:jar:1.3.0:test, org.junit.platform:junit-platform-commons=org.junit.platform:junit-platform-commons:jar:1.11.0:test, org.apiguardian:apiguardian-api=org.apiguardian:apiguardian-api:jar:1.1.2:test, org.junit.jupiter:junit-jupiter-params=org.junit.jupiter:junit-jupiter-params:jar:5.11.0:test, com.fasterxml.jackson.core:jackson-databind=com.fasterxml.jackson.core:jackson-databind:jar:2.22.4:compile, com.fasterxml.jackson.core:jackson-annotations=com.fasterxml.jackson.core:jackson-annotations:jar:2.22:compile, com.fasterxml.jackson.core:jackson-core=com.fasterxml.jackson.core:jackson-core:jar:2.22.4:compile}
+[DEBUG]   (s) projectBuildDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target
+[DEBUG]   (s) redirectTestOutputToFile = false
+[DEBUG]   (s) reportFormat = brief
+[DEBUG]   (s) reportsDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire-reports
+[DEBUG]   (f) rerunFailingTestsCount = 0
+[DEBUG]   (f) reuseForks = true
+[DEBUG]   (s) runOrder = filesystem
+[DEBUG]   (s) session = org.apache.maven.execution.MavenSession@4b432e53
+[DEBUG]   (f) shutdown = exit
+[DEBUG]   (s) skip = false
+[DEBUG]   (f) skipAfterFailureCount = 0
+[DEBUG]   (s) skipTests = false
+[DEBUG]   (s) suiteXmlFiles = []
+[DEBUG]   (s) tempDir = surefire
+[DEBUG]   (s) testClassesDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes
+[DEBUG]   (s) testFailureIgnore = false
+[DEBUG]   (s) testNGArtifactName = org.testng:testng
+[DEBUG]   (s) testSourceDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/src/test/java
+[DEBUG]   (s) threadCountClasses = 0
+[DEBUG]   (s) threadCountMethods = 0
+[DEBUG]   (s) threadCountSuites = 0
+[DEBUG]   (s) trimStackTrace = false
+[DEBUG]   (s) useFile = true
+[DEBUG]   (s) useManifestOnlyJar = true
+[DEBUG]   (f) useModulePath = true
+[DEBUG]   (s) useSystemClassLoader = true
+[DEBUG]   (s) useUnlimitedThreads = false
+[DEBUG]   (s) workingDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen
+[DEBUG] -- end configuration --
+[DEBUG] Using JVM: /Users/alan/.sdkman/candidates/java/27.0.1.0+11-librca/bin/java with Java version 27.0
+[DEBUG] Resolved included and excluded patterns: **/Test*.java, **/*Test.java, **/*Tests.java, **/*TestCase.java, !**/*$*
+[DEBUG] Surefire report directory: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire-reports
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[DEBUG] Using the provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[DEBUG] Setting system property [basedir]=[/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen]
+[DEBUG] Setting system property [localRepository]=[/Users/alan/.m2/repository]
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact surefire-booter-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=19584, ConflictMarker.markTime=31708, ConflictMarker.nodeCount=9, ConflictIdSorter.graphTime=7458, ConflictIdSorter.topsortTime=6417, ConflictIdSorter.conflictIdCount=5, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=117250, ConflictResolver.conflictItemCount=8, BfDependencyCollector.collectTime=3765875, BfDependencyCollector.transformTime=192500, BfDependencyCollector.runs=1}
+[DEBUG] Accepting locally cached artifact surefire-booter-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-api-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-extensions-spi-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-shared-utils-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-logger-api-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Found implementation of fork node factory: org.apache.maven.plugin.surefire.extensions.LegacyForkNodeFactory
+[DEBUG] Using fork starter with configuration implementation org.apache.maven.plugin.surefire.booterclient.JarManifestForkConfiguration
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact surefire-junit-platform-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-providers-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact common-java5-3.3.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-launcher-1.9.3.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-engine-1.9.3.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apiguardian-api-1.1.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-commons-1.9.3.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact opentest4j-1.2.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=29833, ConflictMarker.markTime=40417, ConflictMarker.nodeCount=17, ConflictIdSorter.graphTime=15083, ConflictIdSorter.topsortTime=7292, ConflictIdSorter.conflictIdCount=10, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=183167, ConflictResolver.conflictItemCount=16, BfDependencyCollector.collectTime=10514209, BfDependencyCollector.transformTime=288000, BfDependencyCollector.runs=1}
+[DEBUG] Accepting locally cached artifact surefire-junit-platform-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact common-java5-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-shared-utils-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-engine-1.9.3.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-launcher-1.9.3.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-api-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact opentest4j-1.2.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-commons-1.9.3.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apiguardian-api-1.1.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact surefire-logger-api-3.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Test dependencies contain org.junit.jupiter:junit-jupiter-api. Resolving org.junit.jupiter:junit-jupiter-engine:5.11.0
+[DEBUG] Resolving artifact org.junit.jupiter:junit-jupiter-engine:5.11.0
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact junit-jupiter-engine-5.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-engine-1.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=22791, ConflictMarker.markTime=40417, ConflictMarker.nodeCount=12, ConflictIdSorter.graphTime=8625, ConflictIdSorter.topsortTime=6916, ConflictIdSorter.conflictIdCount=6, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=154083, ConflictResolver.conflictItemCount=11, BfDependencyCollector.collectTime=3628583, BfDependencyCollector.transformTime=244417, BfDependencyCollector.runs=1}
+[DEBUG] Accepting locally cached artifact junit-jupiter-engine-5.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-engine-1.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-jupiter-api-5.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apiguardian-api-1.1.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact opentest4j-1.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-commons-1.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Resolved artifact org.junit.jupiter:junit-jupiter-engine:5.11.0 to [org.junit.jupiter:junit-jupiter-engine:jar:5.11.0, org.junit.platform:junit-platform-engine:jar:1.11.0, org.junit.jupiter:junit-jupiter-api:jar:5.11.0, org.apiguardian:apiguardian-api:jar:1.1.2, org.opentest4j:opentest4j:jar:1.3.0, org.junit.platform:junit-platform-commons:jar:1.11.0]
+[DEBUG] Resolving artifact org.junit.platform:junit-platform-launcher:1.11.0
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact junit-platform-launcher-1.11.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=17125, ConflictMarker.markTime=17042, ConflictMarker.nodeCount=8, ConflictIdSorter.graphTime=6250, ConflictIdSorter.topsortTime=6250, ConflictIdSorter.conflictIdCount=5, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=111250, ConflictResolver.conflictItemCount=7, BfDependencyCollector.collectTime=2293708, BfDependencyCollector.transformTime=168750, BfDependencyCollector.runs=1}
+[DEBUG] Accepting locally cached artifact junit-platform-launcher-1.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-engine-1.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apiguardian-api-1.1.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact opentest4j-1.3.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-platform-commons-1.11.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Resolved artifact org.junit.platform:junit-platform-launcher:1.11.0 to [org.junit.platform:junit-platform-launcher:jar:1.11.0, org.junit.platform:junit-platform-engine:jar:1.11.0, org.apiguardian:apiguardian-api:jar:1.1.2, org.opentest4j:opentest4j:jar:1.3.0, org.junit.platform:junit-platform-commons:jar:1.11.0]
+[DEBUG] test classpath:  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar  /Users/alan/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar  /Users/alan/.m2/repository/org/junit/platform/junit-platform-commons/1.11.0/junit-platform-commons-1.11.0.jar  /Users/alan/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.11.0/junit-jupiter-params-5.11.0.jar  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.22.4/jackson-databind-2.22.4.jar  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.22.4/jackson-core-2.22.4.jar
+[DEBUG] provider classpath:  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-junit-platform/3.3.0/surefire-junit-platform-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-api/3.3.0/surefire-api-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-logger-api/3.3.0/surefire-logger-api-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-shared-utils/3.3.0/surefire-shared-utils-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/common-java5/3.3.0/common-java5-3.3.0.jar  /Users/alan/.m2/repository/org/junit/platform/junit-platform-engine/1.11.0/junit-platform-engine-1.11.0.jar  /Users/alan/.m2/repository/org/junit/platform/junit-platform-launcher/1.11.0/junit-platform-launcher-1.11.0.jar  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.11.0/junit-jupiter-engine-5.11.0.jar
+[DEBUG] test(compact) classpath:  test-classes  classes  junit-jupiter-api-5.11.0.jar  opentest4j-1.3.0.jar  junit-platform-commons-1.11.0.jar  apiguardian-api-1.1.2.jar  junit-jupiter-params-5.11.0.jar  jackson-databind-2.22.4.jar  jackson-annotations-2.22.jar  jackson-core-2.22.4.jar
+[DEBUG] provider(compact) classpath:  surefire-junit-platform-3.3.0.jar  surefire-api-3.3.0.jar  surefire-logger-api-3.3.0.jar  surefire-shared-utils-3.3.0.jar  common-java5-3.3.0.jar  junit-platform-engine-1.11.0.jar  junit-platform-launcher-1.11.0.jar  junit-jupiter-engine-5.11.0.jar
+[DEBUG] in-process classpath:  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-junit-platform/3.3.0/surefire-junit-platform-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-api/3.3.0/surefire-api-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-logger-api/3.3.0/surefire-logger-api-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-shared-utils/3.3.0/surefire-shared-utils-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/common-java5/3.3.0/common-java5-3.3.0.jar  /Users/alan/.m2/repository/org/junit/platform/junit-platform-engine/1.11.0/junit-platform-engine-1.11.0.jar  /Users/alan/.m2/repository/org/junit/platform/junit-platform-launcher/1.11.0/junit-platform-launcher-1.11.0.jar  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.11.0/junit-jupiter-engine-5.11.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/maven-surefire-common/3.3.0/maven-surefire-common-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-booter/3.3.0/surefire-booter-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-extensions-api/3.3.0/surefire-extensions-api-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-extensions-spi/3.3.0/surefire-extensions-spi-3.3.0.jar
+[DEBUG] in-process(compact) classpath:  surefire-junit-platform-3.3.0.jar  surefire-api-3.3.0.jar  surefire-logger-api-3.3.0.jar  surefire-shared-utils-3.3.0.jar  common-java5-3.3.0.jar  junit-platform-engine-1.11.0.jar  junit-platform-launcher-1.11.0.jar  junit-jupiter-engine-5.11.0.jar  maven-surefire-common-3.3.0.jar  surefire-booter-3.3.0.jar  surefire-extensions-api-3.3.0.jar  surefire-extensions-spi-3.3.0.jar
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[DEBUG] Determined Maven Process ID 11215
+[DEBUG] Fork Channel [1] connection string 'pipe://1' for the implementation class org.apache.maven.plugin.surefire.extensions.LegacyForkChannel
+[DEBUG] boot classpath:  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-booter/3.3.0/surefire-booter-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-api/3.3.0/surefire-api-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-extensions-spi/3.3.0/surefire-extensions-spi-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-shared-utils/3.3.0/surefire-shared-utils-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-logger-api/3.3.0/surefire-logger-api-3.3.0.jar  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/test-classes  /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar  /Users/alan/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar  /Users/alan/.m2/repository/org/junit/platform/junit-platform-commons/1.11.0/junit-platform-commons-1.11.0.jar  /Users/alan/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.11.0/junit-jupiter-params-5.11.0.jar  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.22.4/jackson-databind-2.22.4.jar  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar  /Users/alan/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.22.4/jackson-core-2.22.4.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/surefire-junit-platform/3.3.0/surefire-junit-platform-3.3.0.jar  /Users/alan/.m2/repository/org/apache/maven/surefire/common-java5/3.3.0/common-java5-3.3.0.jar  /Users/alan/.m2/repository/org/junit/platform/junit-platform-engine/1.11.0/junit-platform-engine-1.11.0.jar  /Users/alan/.m2/repository/org/junit/platform/junit-platform-launcher/1.11.0/junit-platform-launcher-1.11.0.jar  /Users/alan/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.11.0/junit-jupiter-engine-5.11.0.jar
+[DEBUG] boot(compact) classpath:  surefire-booter-3.3.0.jar  surefire-api-3.3.0.jar  surefire-extensions-spi-3.3.0.jar  surefire-shared-utils-3.3.0.jar  surefire-logger-api-3.3.0.jar  test-classes  classes  junit-jupiter-api-5.11.0.jar  opentest4j-1.3.0.jar  junit-platform-commons-1.11.0.jar  apiguardian-api-1.1.2.jar  junit-jupiter-params-5.11.0.jar  jackson-databind-2.22.4.jar  jackson-annotations-2.22.jar  jackson-core-2.22.4.jar  surefire-junit-platform-3.3.0.jar  common-java5-3.3.0.jar  junit-platform-engine-1.11.0.jar  junit-platform-launcher-1.11.0.jar  junit-jupiter-engine-5.11.0.jar
+[DEBUG] Forking command line: /bin/sh -c cd '/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen' && '/Users/alan/.sdkman/candidates/java/27.0.1.0+11-librca/bin/java' '-jar' '/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire/surefirebooter-20261111112509833_3.jar' '/Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/surefire' '2026-11-11T11-25-09_756-jvmRun1' 'surefire-20261111112509833_1tmp' 'surefire_0-20261111112509833_2tmp'
+[DEBUG] Fork Channel [1] connected to the client.
+[INFO] Running com.evolvedbinary.japigen.JAPITest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.025 s -- in com.evolvedbinary.japigen.JAPITest
+[DEBUG] Closing the fork 1 after saying GoodBye.
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] --- jar:3.4.2:jar (default-jar) @ japi-generator ---
+[DEBUG] Accepting locally cached artifact maven-jar-plugin-3.4.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Collector skip mode enabled: versionless (key function GACE)
+[DEBUG] Accepting locally cached artifact maven-archiver-3.6.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact file-management-3.1.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-archiver-4.9.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-components-41.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-shared-components-36.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-parent-36.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apache-26.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-io-2.16.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-io-3.4.2.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-interpolation-1.27.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-codec-1.16.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-compress-1.26.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-parent-69.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-16.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-16.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-parent-66.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-parent-66.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-bom-5.10.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact snappy-0.4.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact junit-bom-5.10.1.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact xz-1.9.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact zstd-jni-1.5.5-11.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-lang3-3.14.0.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-parent-64.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact apache-30.pom via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Dependency collection stats {ConflictMarker.analyzeTime=48834, ConflictMarker.markTime=39750, ConflictMarker.nodeCount=27, ConflictIdSorter.graphTime=21834, ConflictIdSorter.topsortTime=10875, ConflictIdSorter.conflictIdCount=16, ConflictIdSorter.conflictIdCycleCount=0, ConflictResolver.totalTime=197417, ConflictResolver.conflictItemCount=27, BfDependencyCollector.collectTime=23620625, BfDependencyCollector.transformTime=332250, BfDependencyCollector.runs=1}
+[DEBUG] org.apache.maven.plugins:maven-jar-plugin:jar:3.4.2
+[DEBUG] +- org.apache.maven.shared:file-management:jar:3.1.0 [compile]
+[DEBUG] |  +- org.codehaus.plexus:plexus-utils:jar:4.0.1 [compile]
+[DEBUG] |  \- commons-io:commons-io:jar:2.16.1 [compile]
+[DEBUG] +- org.apache.maven:maven-archiver:jar:3.6.2 [compile]
+[DEBUG] |  \- org.codehaus.plexus:plexus-interpolation:jar:1.27 [compile]
+[DEBUG] +- org.codehaus.plexus:plexus-archiver:jar:4.9.2 [compile]
+[DEBUG] |  +- org.codehaus.plexus:plexus-io:jar:3.4.2 [compile]
+[DEBUG] |  +- org.apache.commons:commons-compress:jar:1.26.1 [compile]
+[DEBUG] |  |  \- org.apache.commons:commons-lang3:jar:3.14.0 [compile]
+[DEBUG] |  +- commons-codec:commons-codec:jar:1.16.1 [compile]
+[DEBUG] |  +- org.iq80.snappy:snappy:jar:0.4 [compile]
+[DEBUG] |  +- org.tukaani:xz:jar:1.9 [runtime]
+[DEBUG] |  \- com.github.luben:zstd-jni:jar:1.5.5-11 [runtime]
+[DEBUG] +- javax.inject:javax.inject:jar:1 [compile]
+[DEBUG] \- org.slf4j:slf4j-api:jar:1.7.36 [compile]
+[DEBUG] Accepting locally cached artifact maven-jar-plugin-3.4.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact file-management-3.1.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact maven-archiver-3.6.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-archiver-4.9.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact javax.inject-1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact slf4j-api-1.7.36.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-utils-4.0.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-io-2.16.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-interpolation-1.27.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact plexus-io-3.4.2.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-compress-1.26.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-codec-1.16.1.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact snappy-0.4.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact xz-1.9.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact zstd-jni-1.5.5-11.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Accepting locally cached artifact commons-lang3-3.14.0.jar via legacy tracking key 'central' (current key function would produce 'central-8fac3ebd6edbaca3c794783fa38088af0aa128e7'); the entry will be upgraded on next download
+[DEBUG] Created new class realm plugin>org.apache.maven.plugins:maven-jar-plugin:3.4.2
+[DEBUG] Importing foreign packages into class realm plugin>org.apache.maven.plugins:maven-jar-plugin:3.4.2
+[DEBUG]   Imported:  < maven.api
+[DEBUG] Populating class realm plugin>org.apache.maven.plugins:maven-jar-plugin:3.4.2
+[DEBUG]   Included: org.apache.maven.plugins:maven-jar-plugin:jar:3.4.2
+[DEBUG]   Included: org.apache.maven.shared:file-management:jar:3.1.0
+[DEBUG]   Included: org.apache.maven:maven-archiver:jar:3.6.2
+[DEBUG]   Included: org.codehaus.plexus:plexus-archiver:jar:4.9.2
+[DEBUG]   Included: org.codehaus.plexus:plexus-utils:jar:4.0.1
+[DEBUG]   Included: commons-io:commons-io:jar:2.16.1
+[DEBUG]   Included: org.codehaus.plexus:plexus-interpolation:jar:1.27
+[DEBUG]   Included: org.codehaus.plexus:plexus-io:jar:3.4.2
+[DEBUG]   Included: org.apache.commons:commons-compress:jar:1.26.1
+[DEBUG]   Included: commons-codec:commons-codec:jar:1.16.1
+[DEBUG]   Included: org.iq80.snappy:snappy:jar:0.4
+[DEBUG]   Included: org.tukaani:xz:jar:1.9
+[DEBUG]   Included: com.github.luben:zstd-jni:jar:1.5.5-11
+[DEBUG]   Included: org.apache.commons:commons-lang3:jar:3.14.0
+[DEBUG] Loading mojo org.apache.maven.plugins:maven-jar-plugin:3.4.2:jar from plugin realm ClassRealm[plugin>org.apache.maven.plugins:maven-jar-plugin:3.4.2, parent: jdk.internal.loader.ClassLoaders$AppClassLoader@5c647e05]
+[DEBUG] Configuring mojo execution 'org.apache.maven.plugins:maven-jar-plugin:3.4.2:jar:default-jar' with basic configurator -->
+[DEBUG]   (f) addDefaultExcludes = true
+[DEBUG]   (s) addClasspath = true
+[DEBUG]   (s) mainClass = org.rocksdb.japigen.JAPI
+[DEBUG]   (s) manifest = org.apache.maven.archiver.ManifestConfiguration@7a78d380
+[DEBUG]   (f) archive = org.apache.maven.archiver.MavenArchiveConfiguration@2e1291a4
+[DEBUG]   (f) classesDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/classes
+[DEBUG]   (f) detectMultiReleaseJar = true
+[DEBUG]   (f) finalName = japi-generator-1.0-SNAPSHOT
+[DEBUG]   (f) forceCreation = false
+[DEBUG]   (f) outputDirectory = /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target
+[DEBUG]   (f) outputTimestamp = 1980-02-01T00:00:00Z
+[DEBUG]   (f) project = MavenProject: com.evolvedbinary.japigen:japi-generator:1.0-SNAPSHOT @ /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/pom.xml
+[DEBUG]   (f) session = org.apache.maven.execution.MavenSession@4b432e53
+[DEBUG]   (f) skipIfEmpty = false
+[DEBUG]   (f) useDefaultManifestFile = false
+[DEBUG] -- end configuration --
+[DEBUG] isUp2date: false (Destination /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/japi-generator-1.0-SNAPSHOT.jar not found.)
+[INFO] Building jar: /Users/alan/swProjects/evolvedBinary/rocksdb-evolved/java/japigen/target/japi-generator-1.0-SNAPSHOT.jar
+[DEBUG] adding directory META-INF/
+[DEBUG] adding entry META-INF/MANIFEST.MF
+[DEBUG] adding directory org/
+[DEBUG] adding directory org/rocksdb/
+[DEBUG] adding directory org/rocksdb/japigen/
+[DEBUG] adding directory org/rocksdb/japigen/function/
+[DEBUG] adding entry org/rocksdb/japigen/AllClasses.class
+[DEBUG] adding entry org/rocksdb/japigen/AllFunctions.class
+[DEBUG] adding entry org/rocksdb/japigen/AnalysedClass.class
+[DEBUG] adding entry org/rocksdb/japigen/CFunction.class
+[DEBUG] adding entry org/rocksdb/japigen/Config.class
+[DEBUG] adding entry org/rocksdb/japigen/Generator$1.class
+[DEBUG] adding entry org/rocksdb/japigen/Generator.class
+[DEBUG] adding entry org/rocksdb/japigen/JAPI.class
+[DEBUG] adding entry org/rocksdb/japigen/JAPIFiles.class
+[DEBUG] adding entry org/rocksdb/japigen/JSONFile.class
+[DEBUG] adding entry org/rocksdb/japigen/Lazy.class
+[DEBUG] adding entry org/rocksdb/japigen/function/AnalysedFunction$Empty.class
+[DEBUG] adding entry org/rocksdb/japigen/function/AnalysedFunction.class
+[DEBUG] adding entry org/rocksdb/japigen/function/Functions.class
+[DEBUG] adding entry org/rocksdb/japigen/function/Receiver$Getter.class
+[DEBUG] adding entry org/rocksdb/japigen/function/Receiver$Setter.class
+[DEBUG] adding entry org/rocksdb/japigen/function/Receiver$StatusGetter.class
+[DEBUG] adding entry org/rocksdb/japigen/function/Receiver$StatusSetter.class
+[DEBUG] adding entry org/rocksdb/japigen/function/Receiver$StringGetter.class
+[DEBUG] adding entry org/rocksdb/japigen/function/Receiver$StringSetter.class
+[DEBUG] adding entry org/rocksdb/japigen/function/Receiver.class
+[DEBUG] adding directory META-INF/maven/
+[DEBUG] adding directory META-INF/maven/com.evolvedbinary.japigen/
+[DEBUG] adding directory META-INF/maven/com.evolvedbinary.japigen/japi-generator/
+[DEBUG] adding entry META-INF/maven/com.evolvedbinary.japigen/japi-generator/pom.xml
+[DEBUG] adding entry META-INF/maven/com.evolvedbinary.japigen/japi-generator/pom.properties
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  2.012 s
+[INFO] Finished at: 2026-11-11T11:25:10Z
+[INFO] ------------------------------------------------------------------------
+[DEBUG] Shutting down used lock factories [file-lock]
+[DEBUG] Shutting down 'file-lock' factory

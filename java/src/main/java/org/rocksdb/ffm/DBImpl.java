@@ -1,0 +1,63 @@
+package org.rocksdb.ffm;
+
+import org.rocksdb.ffm.util.FFMSegment;
+
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SegmentAllocator;
+
+final class DBImpl extends WithDB implements DB {
+  DBImpl(SegmentAllocator allocator, MemorySegment db) {
+    super(allocator, db);
+  }
+
+  @Override
+  public Getter get() {
+    return new GetterImpl(allocator, db);
+  }
+
+  @Override
+  public Getter get(SegmentAllocator allocator) {
+    return new GetterImpl(allocator, db);
+  }
+
+  @Override
+  public Putter put() {
+    return new PutterImpl(allocator, db);
+  }
+
+  @Override
+  public Putter put(SegmentAllocator allocator) {
+    return new PutterImpl(allocator, db);
+  }
+
+  @Override
+  public MultiGetter multiGet() {
+    return new MultiGetter(allocator, db);
+  }
+
+  /**
+   * A multi-getter, but override the DB's allocator for allocations when performing the {@code }multiGet()}
+   *
+   * @param allocator to be used by the multi-getter, in place of the DB's allocator
+   * @return
+   */
+  @Override
+  public MultiGetter multiGet(SegmentAllocator allocator) {
+    return new MultiGetter(allocator, db);
+  }
+
+  @Override
+  public ColumnFamily columnFamily() {
+    return new ColumnFamilyImpl(allocator, db);
+  }
+
+  @Override
+  public ColumnFamily columnFamily(SegmentAllocator allocator) {
+    return new ColumnFamilyImpl(allocator, db);
+  }
+
+  @Override
+  public void close() {
+    rocksdb_c_api_2.rocksdb_close(db);
+  }
+}
