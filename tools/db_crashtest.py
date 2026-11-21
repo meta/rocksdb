@@ -1275,6 +1275,122 @@ blob_params = {
     "remote_compaction_worker_threads": 0,
 }
 
+# Indirect blob GC needs enable_blob_garbage_collection on. Every db_stress
+# start in the first 300 seconds after the first db_stress command sets the
+# option on, so that indirect blob GC builds up relocation files and routes.
+# SetOptions may still turn it off for a while when
+# allow_setting_blob_options_dynamically is set. After the 300 seconds, each
+# restart may also start with the option off, to cover turning it off while the
+# DB holds relocation files and routes. Building the argument parser in main()
+# already calls _blob_indirection_gc_choice(), so main() clears the start time
+# after the parser is built. The next call, for the first db_stress command,
+# sets it again, and the 300 seconds count from then. 300 seconds is a fixed
+# choice, not measured. The start time is kept in a one-item list, so that the
+# function can set it without a global statement.
+_BLOB_INDIRECTION_GC_ALWAYS_ON_SECONDS = 300
+_blob_indirection_gc_start_time = []
+
+
+def _blob_indirection_gc_choice():
+    now = time.time()
+    if not _blob_indirection_gc_start_time:
+        _blob_indirection_gc_start_time.append(now)
+    if now - _blob_indirection_gc_start_time[0] < _BLOB_INDIRECTION_GC_ALWAYS_ON_SECONDS:
+        return 1
+    return random.choice([0, 1])
+
+
+# Blob indirection with indirect blob GC. Small blob files and small values
+# make blob files cross the indirect blob GC garbage threshold
+# (indirect_blob_gc_garbage_ratio, randomized below) often. So indirect blob GC,
+# flattening and route retirement run many times in one test. Flattening is
+# step 6 in the top comment of db/blob/blob_relocation_manifest.h. The option
+# stays the same for the whole run (including restarts), so that values are
+# moved several times. blob_indirection_toggle_params covers turning the option
+# on and off.
+blob_indirection_params = {
+    "enable_blob_files": 1,
+    "enable_blob_indirection": 1,
+    "allow_setting_blob_indirection_dynamically": 0,
+    "use_blob_db": 0,
+    "enable_blob_direct_write": 0,
+    "enable_blob_garbage_collection": _blob_indirection_gc_choice,
+    # These two options control compaction-time blob GC. It still runs next to
+    # indirect blob GC, which ignores both options and uses
+    # indirect_blob_gc_garbage_ratio (randomized below). The age cutoffs cover
+    # the full range, from 0.0 (compaction moves no value by age) to 1.0 (every
+    # blob file is old enough). So the test also runs compaction-time blob GC
+    # on the values that it still handles, such as values written with the
+    # option off. For which values compaction-time blob GC handles, see
+    # CompactionIterator::GarbageCollectBlobIfNeeded() and
+    # VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC().
+    "blob_garbage_collection_age_cutoff": lambda: random.choice(
+        [0.0, 0.25, 0.5, 0.75, 1.0]
+    ),
+    "blob_garbage_collection_force_threshold": lambda: random.choice(
+        [0.5, 0.75, 1.0]
+    ),
+    "min_blob_size": lambda: random.choice([0, 8, 16]),
+    "blob_file_size": lambda: random.choice([262144, 1048576, 4194304]),
+    "blob_compression_type": lambda: random.choice(["none", "snappy", "lz4", "zstd"]),
+    "blob_file_starting_level": lambda: random.choice([0] * 4 + [1, 2]),
+    # With a small cap, compaction often starts a new output SST at the blob
+    # reference cap.
+    "blob_indirection_max_references_per_sst": lambda: random.choice(
+        [4096, 65536, 1048576]
+    ),
+    # Keeps the location blocks of relocation files in memory. With a block
+    # cache, the blocks are charged to it.
+    "pin_blob_relocation_location_blocks": lambda: random.randint(0, 1),
+    # A low ratio makes GC copy files that still hold many live values, and a
+    # high ratio makes GC skip more files.
+    "indirect_blob_gc_garbage_ratio": lambda: random.choice([0.25, 0.5, 0.75]),
+    # Lets SetOptions change blob options while the test runs, including
+    # enable_blob_garbage_collection, blob file size, the reference cap,
+    # pin_blob_relocation_location_blocks and indirect_blob_gc_garbage_ratio.
+    "allow_setting_blob_options_dynamically": lambda: random.choice([0, 1, 1]),
+    "use_blob_cache": lambda: random.randint(0, 1),
+    "use_shared_block_and_blob_cache": lambda: random.randint(0, 1),
+    "blob_cache_size": lambda: random.choice([1048576, 2097152, 4194304, 8388608]),
+    "prepopulate_blob_cache": lambda: random.randint(0, 1),
+    # A small key space and small memtables make overwrites, and so garbage,
+    # frequent enough for indirect blob GC to run in a short test. max_key is
+    # chosen once so that it stays the same across restarts. With 100000 keys,
+    # overwrites are rarer, so a short test may make too little garbage to write
+    # a relocation file. That is why 100000 is chosen only 1 in 4.
+    "max_key": random.choice([10000, 10000, 10000, 100000]),
+    "write_buffer_size": lambda: random.choice([256 * 1024, 1024 * 1024]),
+    "target_file_size_base": lambda: random.choice([256 * 1024, 1024 * 1024]),
+    # A write-heavy mix: with the default mix (35% writes) a short test makes
+    # too little garbage for indirect blob GC to run. The six shares add up to
+    # 100.
+    "readpercent": 20,
+    "prefixpercent": 5,
+    "writepercent": 55,
+    "delpercent": 14,
+    "delrangepercent": 1,
+    "iterpercent": 5,
+    # Running route retirement at once (instead of in batches of 64 routes or
+    # after a 10-minute wait, see kBlobRouteRetirementBatchSize in
+    # db_impl_compaction_flush.cc) makes route retirement and its kill point run
+    # in short tests.
+    "blob_indirection_retire_routes_at_once": lambda: random.choice([0, 1]),
+}
+
+# Same as blob_indirection_params, but the option is turned on and off with
+# SetOptions while the test runs, and chosen again at every restart. This
+# covers turning the option on for the first time, turning it off while the DB
+# holds relocation files and routes, and turning it on again.
+blob_indirection_toggle_params = dict(blob_indirection_params)
+blob_indirection_toggle_params.update(
+    {
+        "allow_setting_blob_indirection_dynamically": 1,
+        # Mostly on, so that indirect blob GC makes relocation files and
+        # routes before a restart or SetOptions turns the option off.
+        "enable_blob_indirection": lambda: random.choice([0, 1, 1, 1]),
+    }
+)
+
 blob_direct_write_params = {
     "enable_blob_files": 1,
     "enable_blob_direct_write": 1,
@@ -2317,6 +2433,22 @@ def finalize_and_sanitize(src_params):
         if dest_params.get("read_index", -1) > 0:
             dest_params["read_index"] = -1
 
+    # Blob indirection rules from ColumnFamilyData::ValidateOptions. Applied
+    # after the sanitization above, which can turn blob files off or change
+    # the compaction style or table format.
+    if (
+        dest_params.get("enable_blob_indirection", 0) == 1
+        or dest_params.get("allow_setting_blob_indirection_dynamically", 0) == 1
+    ) and (
+        dest_params.get("enable_blob_files", 0) == 0
+        or dest_params.get("enable_blob_direct_write", 0) == 1
+        or dest_params.get("use_blob_db", 0) == 1
+        or dest_params.get("compaction_style", 0) == 2  # FIFO
+        or dest_params.get("use_full_external_table", 0) == 1
+    ):
+        dest_params["enable_blob_indirection"] = 0
+        dest_params["allow_setting_blob_indirection_dynamically"] = 0
+
     # `db_stress` rejects either verification knob when `skip_verifydb` is set.
     # Must stay last: sanitization above can turn a verification knob back on
     # after `skip_verifydb` was decided.
@@ -2384,7 +2516,15 @@ def gen_cmd_params(args, unknown_params=None):
                 blob_direct_write_get_entity_params,
                 blob_direct_write_multi_get_entity_params,
             ]
+        # Blob indirection: mostly a fixed setting per run, sometimes toggled.
+        blob_profiles += [blob_indirection_params] * 4 + [
+            blob_indirection_toggle_params
+        ]
         params.update(random.choice(blob_profiles))
+    if args.test_blob_indirection:
+        params.update(blob_indirection_params)
+    if args.test_blob_indirection_toggle:
+        params.update(blob_indirection_toggle_params)
 
     if "compaction_style" not in params:
         # Default to leveled compaction. Tiered storage picks leveled or
@@ -2530,6 +2670,8 @@ def gen_cmd(params, unknown_params):
                 "stress_cmd",
                 "test_tiered_storage",
                 "test_full_external_table",
+                "test_blob_indirection",
+                "test_blob_indirection_toggle",
                 "cleanup_cmd",
                 "print_stderr_separately",
                 "verify_timeout",
@@ -3253,7 +3395,8 @@ def whitebox_crash_main(args, unknown_args):
                 "ops_per_thread": 100
                 * cmd_params["ops_per_thread"],
             }
-            # run with kill_random_test, with three modes.
+            # Run with kill_random_test in three modes, or in four with blob
+            # indirection (mode 3, see below).
             # Mode 0 covers all kill points. Mode 1 covers less kill points but
             # increases change of triggering them. Mode 2 covers even less
             # frequent kill points and further increases triggering change.
@@ -3286,8 +3429,50 @@ def whitebox_crash_main(args, unknown_args):
                         "PosixMmapFile::Allocate,WritableFileWriter::Flush",
                     }
                 )
-            # Run kill mode 0, 1 and 2 by turn.
-            kill_mode = (kill_mode + 1) % 3
+            elif kill_mode == 3:
+                # Kill mode 3 runs only with blob indirection.
+                #
+                # Goal: crash inside indirect blob GC and route retirement. Their
+                # kill points are DBImpl::RunIndirectBlobGC:* (before GC
+                # renames its outputs, and before and after its MANIFEST write)
+                # and DBImpl::RetireBlobRelocationRoutes:BeforeLogAndApply.
+                # These run rarely (estimate: a few times per minute in these
+                # tests, not measured). Mode 3 also runs route retirement at
+                # once instead of in batches, so that its kill point runs more
+                # often.
+                #
+                # Excluded points: file writes (WritableFileWriter,
+                # PosixMmapFile, PosixWritableFile, NewWritableFile), MANIFEST
+                # sync (SyncManifest), CURRENT (SetCurrentFile) and
+                # VersionSet::LogAndApply. These run much more often, so one of
+                # them would otherwise crash the process first.
+                #
+                # Odds: each kill point that is not excluded crashes the
+                # process with a chance of 1 in (kill_random_test x weight).
+                # The weight is the second argument of
+                # TEST_KILL_RANDOM_WITH_WEIGHT (test_util/sync_point.h), and
+                # TEST_KILL_RANDOM uses weight 1. So with kill_random_test 20,
+                # the GC and route retirement points crash about once in 20
+                # calls.
+                additional_opts.update(
+                    {
+                        "blob_indirection_retire_routes_at_once": 1,
+                        "kill_random_test": 20,
+                        "kill_exclude_prefixes": "WritableFileWriter,"
+                        "PosixMmapFile,PosixWritableFile,NewWritableFile,"
+                        "SyncManifest,SetCurrentFile,VersionSet::LogAndApply",
+                    }
+                )
+            # Run kill mode 0, 1 and 2 by turn, and mode 3 too with blob
+            # indirection.
+            kill_modes = (
+                4
+                if cmd_params.get("enable_blob_indirection", 0) == 1
+                or cmd_params.get("allow_setting_blob_indirection_dynamically", 0)
+                == 1
+                else 3
+            )
+            kill_mode = (kill_mode + 1) % kill_modes
         elif check_mode == 1:
             # normal run with universal compaction mode
             additional_opts = {
@@ -3419,6 +3604,8 @@ def main():
     parser.add_argument("--stress_cmd")
     parser.add_argument("--test_tiered_storage", action="store_true")
     parser.add_argument("--test_full_external_table", action="store_true")
+    parser.add_argument("--test_blob_indirection", action="store_true")
+    parser.add_argument("--test_blob_indirection_toggle", action="store_true")
     parser.add_argument("--cleanup_cmd")  # ignore old option for now
     parser.add_argument("--print_stderr_separately", action="store_true", default=False)
     parser.add_argument(
@@ -3437,6 +3624,8 @@ def main():
         + list(whitebox_simple_default_params.items())
         + list(blob_params.items())
         + list(blob_direct_write_params.items())
+        + list(blob_indirection_params.items())
+        + list(blob_indirection_toggle_params.items())
         + list(blob_direct_write_get_entity_params.items())
         + list(blob_direct_write_multi_get_entity_params.items())
         + list(ts_params.items())
@@ -3452,6 +3641,15 @@ def main():
 
     for k, v in all_params.items():
         parser.add_argument("--" + k, type=type(v() if callable(v) else v))
+    # Building the parser calls _blob_indirection_gc_choice(), which sets the
+    # start time, when blob_indirection_params or
+    # blob_indirection_toggle_params (a copy of it) gives the last
+    # "enable_blob_garbage_collection" entry of all_params (a later dict in
+    # all_params wins a shared key). Clear the start time in both cases, so
+    # that the 300 seconds with enable_blob_garbage_collection always on (see
+    # _BLOB_INDIRECTION_GC_ALWAYS_ON_SECONDS) count from the first db_stress
+    # command, whatever the dict order.
+    _blob_indirection_gc_start_time.clear()
     # unknown_args are passed directly to db_stress
 
     args, unknown_args = parser.parse_known_args(remain_args)

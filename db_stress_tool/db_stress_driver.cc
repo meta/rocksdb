@@ -211,6 +211,7 @@ bool RunStressTestImpl(SharedState* shared) {
         Status s = stress->EnableAutoCompaction();
         DB_STRESS_ASSERT_OK(s);
       }
+      stress->ReportBlobIndirectionState();
       fprintf(stdout, "%s %sStarting database operations\n",
               clock->TimeToString(now / 1000000).c_str(), db_label.c_str());
 
@@ -270,6 +271,7 @@ bool RunStressTestImpl(SharedState* shared) {
   }
 
   if (!FLAGS_verification_only) {
+    stress->ReportBlobIndirectionGc(shared);
     stress->PrintStatistics();
   }
 

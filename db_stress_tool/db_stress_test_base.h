@@ -148,6 +148,17 @@ class StressTest {
   virtual void VerifyDb(ThreadState* thread) const = 0;
   virtual void ContinuouslyVerifyDb(ThreadState* /*thread*/) const = 0;
   void PrintStatistics();
+
+  // Prints how much indirect blob GC work ran. With
+  // --blob_indirection_require_gc, fails the run if GC collected no input file.
+  void ReportBlobIndirectionGc(SharedState* shared) const;
+
+  // Prints the relocation files and routes that the DB holds just before the
+  // database operations start.
+  // Whitebox crash tests kill most runs, so they never print the end-of-run
+  // indirect blob GC report; this line shows the GC work that earlier runs made
+  // durable.
+  void ReportBlobIndirectionState() const;
   bool MightHaveUnsyncedDataLoss() {
     return FLAGS_sync_fault_injection || FLAGS_disable_wal ||
            FLAGS_manual_wal_flush_one_in > 0;

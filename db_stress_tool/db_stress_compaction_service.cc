@@ -36,6 +36,16 @@ CompactionServiceJobStatus DbStressCompactionService::Wait(
         if (StressTest::IsErrorInjectedAndRetryable(s)) {
           return CompactionServiceJobStatus::kUseLocal;
         }
+        // The primary reserves an estimated range of blob file numbers for the
+        // worker. When the worker needs more, nothing is installed and the job
+        // must run locally. Small blob files (blob indirection tests) hit this.
+        // The message comes from BlobFileBuilder
+        // (db/blob/blob_file_builder.cc). Keep the two strings the same.
+        if (s.IsIncomplete() &&
+            s.ToString().find("Blob file number range exhausted") !=
+                std::string::npos) {
+          return CompactionServiceJobStatus::kUseLocal;
+        }
         // Note: a MANIFEST-floor rejection from OpenAndCompact surfaces here as
         // Status::Incomplete. We intentionally do NOT map it to kUseLocal (as
         // the unit-test CompactionService does): the stress test does not yet
