@@ -7,16 +7,44 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
 
 #include "db/blob/blob_constants.h"
+#include "db/blob/blob_gen2_format.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 
+class BlobContents;
 class BlobIndex;
+class MemoryAllocator;
 class PinnableSlice;
 struct ReadOptions;
+
+// The inputs and outputs of one SameFileBlobReadRequest that only a
+// BlockBasedTable without a BlobSource uses, that is, a standalone table reader
+// such as the relocation file reader. Other readers ignore it. The caller owns
+// one per request and points the request's `standalone` at it. A request with
+// a non-null `standalone` gets its value in `contents` instead of in `result`.
+struct SameFileBlobStandaloneRead {
+  // Input: allocates the read and decompress buffers. May be null.
+  MemoryAllocator* allocator = nullptr;
+  // Output: the value or range as an owned buffer, so a caller can hand the
+  // buffer to a cache without a copy.
+  std::unique_ptr<BlobContents> contents;
+  // Outputs of the record read, passed down to the SimpleGen2 reader as is:
+  // - gen2.payload_crc32c: the CRC32C of a whole uncompressed value whose
+  //   record checksum was checked with kCRC32c and passed. The SimpleGen2
+  //   reader sets it for every checked record. MultiGetSameFileBlob() then
+  //   clears it unless the request reads a whole uncompressed value, because
+  //   only then is the payload CRC the logical CRC.
+  // - gen2.copied: true when this request was an exact duplicate in the batch
+  //   and got a copy instead of its own read.
+  SimpleGen2ReadExtras gen2;
+};
 
 // One request for SameFileBlobReader::MultiGetSameFileBlob (the batched
 // counterpart of GetSameFileBlob). See GetSameFileBlob for the per-field
@@ -28,6 +56,23 @@ struct SameFileBlobReadRequest {
   BlobVerifyPolicy verify_policy = BlobVerifyPolicy::kVerifyIfNoAmplification;
   PinnableSlice* result = nullptr;
   Status* status = nullptr;
+  // Standalone readers only (see SameFileBlobStandaloneRead); not owned. May be
+  // null.
+  SameFileBlobStandaloneRead* standalone = nullptr;
+};
+
+// One stored-byte read, used when indirect blob GC copies a value out of a
+// relocation file. The read checks the stored CRC of the value and, unless the
+// file uses kNoChecksum, the record checksum in the SimpleGen2 trailer. It
+// never decompresses the value. When stored_payload is not null, it receives
+// the exact stored bytes (which may be compressed or not). It points into the
+// call's CoalescedReadBuffers. When stored_payload is null, the read only
+// checks the value.
+struct StoredSameFileBlobReadRequest {
+  const BlobIndex& blob_index;
+  Slice* stored_payload = nullptr;
+  Status& status;
+  uint32_t stored_checksum = 0;
 };
 
 // Narrow interface for resolving a same-file ("embedded") blob reference
