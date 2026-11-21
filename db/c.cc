@@ -1100,7 +1100,8 @@ struct rocksdb_slicetransform_t : public SliceTransform {
   }
 
   bool InDomain(const Slice& src) const override {
-    return (*in_domain_)(state_, src.data(), src.size());
+    return in_domain_ == nullptr ||
+           (*in_domain_)(state_, src.data(), src.size());
   }
 };
 
