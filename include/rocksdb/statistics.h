@@ -799,6 +799,12 @@ enum Tickers : uint32_t {
   // files minus the size of the new relocation files.
   INDIRECT_BLOB_GC_BYTES_RECLAIMED,
 
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // feature-aware compactions that ran locally from the start because their
+  // output would be coarse, which the primary does not accept from a remote
+  // worker.
+  REMOTE_COMPACT_COARSE_FALLBACK_COUNT,
+
   TICKER_ENUM_MAX
 };
 
@@ -995,6 +1001,11 @@ enum Histograms : uint32_t {
   // each indirect blob GC job that began, from its start to its end, in
   // microseconds.
   INDIRECT_BLOB_GC_JOB_MICROS,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // blob references in each remote compaction output SST that the primary
+  // checked before the install.
+  REMOTE_COMPACT_OUTPUT_BLOB_REFERENCES,
 
   HISTOGRAM_ENUM_MAX
 };
