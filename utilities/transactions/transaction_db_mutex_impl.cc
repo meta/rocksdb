@@ -20,11 +20,22 @@ class TransactionDBMutexImpl : public TransactionDBMutex {
   TransactionDBMutexImpl() = default;
   ~TransactionDBMutexImpl() override = default;
 
+#if defined(__clang__)
+  [[clang::no_thread_safety_analysis]]
+#endif
   Status Lock() override;
 
+#if defined(__clang__)
+  [[clang::no_thread_safety_analysis]]
+#endif
   Status TryLockFor(int64_t timeout_time) override;
 
-  void UnLock() override { mutex_.unlock(); }
+#if defined(__clang__)
+  [[clang::no_thread_safety_analysis]]
+#endif
+  void UnLock() override {
+    mutex_.unlock();
+  }
 
   friend class TransactionDBCondVarImpl;
 
