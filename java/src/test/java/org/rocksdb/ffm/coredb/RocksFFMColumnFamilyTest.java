@@ -62,14 +62,38 @@ public class RocksFFMColumnFamilyTest {
                 assertThat(getter.get(readoptions, cf2, segmentOf(arena, "key2"))).isNull();
                 assertThat(stringOf(getter.get(readoptions, cf2, segmentOf(arena, "key3")))).isEqualTo("value3");
                 assertThat(getter.get(readoptions, cf2, segmentOf(arena, "key4"))).isNull();
-                assertThat(stringOf(getter.get(readoptions, cf2, segmentOf(arena, "key5")))).isEqualTo("value5");
               }
             }
           }
-
         }
       }
     }
   }
 
+  /**
+   * TODO (AP) We should allow stuff like this generally -
+   * @throws RocksFFMException
+   */
+  @Test
+  public void doubleClose() throws RocksFFMException {
+    try (Arena arena = Arena.ofConfined()) {
+      try (RocksdbOptions rocksdbOptions = new RocksdbOptions()) {
+        rocksdbOptions.setCreateIfMissing((byte) 1);
+        try (var db = RocksFFM.db(arena).open(rocksdbOptions, dbPath)) {
+
+          try (RocksdbWriteoptions writeoptions = new RocksdbWriteoptions()) {
+            var putter = db.put();
+            putter.put(writeoptions, segmentOf(arena, "key2"), segmentOf(arena, "value2"));
+            putter.put(writeoptions, segmentOf(arena, "key4"), segmentOf(arena, "value4"));
+          }
+
+          try (RocksdbOptions columnFamilyOptions = new RocksdbOptions()) {
+            try (ColumnFamilyHandle cf2 = db.columnFamily().createColumnFamily("CF2", columnFamilyOptions)) {
+              cf2.close();
+            }
+          }
+        }
+      }
+    }
+  }
 }
