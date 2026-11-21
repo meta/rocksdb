@@ -35,6 +35,7 @@ namespace ROCKSDB_NAMESPACE {
 class Slice;
 class BlobIndex;
 class BlobSource;
+struct BlobReferenceSstSummary;
 
 struct TableReaderOptions {
   // @param skip_filters Disables loading/accessing the filter block
@@ -337,6 +338,17 @@ class TableBuilder {
 
   // Returns table properties
   virtual TableProperties GetTableProperties() const = 0;
+
+  // Returns the immutable summary of the exact blob references this builder
+  // collected (see BlobReferenceSstSummary). Returns null if exact metadata was
+  // not enabled, Finish() has not run, or the build failed. BuildTable() (used
+  // by flush, WAL recovery and RepairDB) and compaction put it in the output's
+  // FileMetaData, so the MANIFEST install can add the SST to the census without
+  // reopening the new SST.
+  virtual std::shared_ptr<const BlobReferenceSstSummary>
+  GetBlobReferenceSstSummary() const {
+    return nullptr;
+  }
 
   // Return file checksum
   virtual std::string GetFileChecksum() const = 0;

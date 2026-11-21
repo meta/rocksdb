@@ -49,6 +49,15 @@ TableBuilder* NewTableBuilder(const TableBuilderOptions& tboptions,
 void ExtractTimestampFromTableProperties(const TableProperties& tp,
                                          FileMetaData* meta);
 
+// Copies the exact blob reference descriptor of a newly built SST from its
+// table properties (kBlobReferenceDescriptorPropertyName) to `meta`, which the
+// MANIFEST stores. If the SST has no descriptor, it clears
+// meta->blob_reference_descriptor. It also sets
+// meta->blob_reference_legacy_metadata to false: that marker is only for SSTs
+// created before the format was activated.
+void ExtractBlobReferenceDescriptorFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta);
+
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to number specified in meta. On success, the rest of
 // *meta will be filled with metadata about the generated table.
