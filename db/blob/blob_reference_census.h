@@ -502,6 +502,18 @@ class BlobGcCandidateHeap {
   Status AdjustLiveBytes(uint64_t file_number, uint64_t bytes, bool add);
   void DeletePhysicalFile(uint64_t file_number);
   bool IsIndirectOrigin(uint64_t file_number) const;
+
+  // True if a coarse SST may hold an unflattened reference with generation
+  // number `generation`: the coarse frontier is set and `generation` is at or
+  // above it. Coarse SSTs are not census holders, so route retirement keeps the
+  // route of such a generation number. Same rule as
+  // VersionStorageInfo::IsCoarseIndirectOriginBlobPinned(), applied to the
+  // census copy of the frontier.
+  bool IsCoarsePinnedGeneration(uint64_t generation) const {
+    return coarse_indirect_origin_frontier_ != 0 &&
+           generation >= coarse_indirect_origin_frontier_;
+  }
+
   // Returns the best kMaxSelectedFiles (8) files of the heap, ranked by
   // garbage ratio, highest first, with no garbage ratio limit. When `bytes` is
   // not null, it gets the bytes of each returned file.
@@ -820,9 +832,9 @@ class BlobReferenceCensusState {
   // The generation numbers in this copy; null means every generation number.
   std::shared_ptr<const std::set<uint64_t>> selected_generations_;
   // The block cache charge of this copy
-  // (CacheEntryRole::kIndirectBlobGcWorkingMemory, because the indirect blob GC
-  // job owns the copy), or null when the copy is not charged. The charge is the
-  // real size of the copy (SnapshotMemoryBound()).
+  // (CacheEntryRole::kIndirectBlobGcWorkingMemory, because indirect blob GC
+  // jobs and route retirement own such copies), or null when the copy is not
+  // charged. The charge is the real size of the copy (SnapshotMemoryBound()).
   std::shared_ptr<CacheReservationManager> reservation_manager_;
   size_t snapshot_memory_bound_ = 0;
 };
@@ -1082,7 +1094,19 @@ class BlobReferenceCensus {
   // metadata commit (BeginMetadataCommit()) is in progress. Returns Busy while
   // a metadata commit result is unknown, or if a GC job is already registered.
   // Returns Aborted after Cancel().
-  Status BeginGcJob(uint64_t version_number, uint64_t* token);
+  //
+  // `candidate_files` are the file numbers of the physical files that the GC
+  // job may take as input (its candidates). While the job is registered, route
+  // retirement skips every route whose target is one of them (IsGcInputFile()).
+  // Reason: the GC install checks, as an invariant, that the number of routes
+  // into each relocation input is unchanged (see ValidatePhysicalInputs()). A
+  // route deletion would break it: debug builds assert, and release builds end
+  // the job as stale with nothing installed.
+  Status BeginGcJob(uint64_t version_number,
+                    std::vector<uint64_t> candidate_files, uint64_t* token);
+  Status BeginGcJob(uint64_t version_number, uint64_t* token) {
+    return BeginGcJob(version_number, {}, token);
+  }
 
   // True while the GC job `token` is registered and the census is not
   // canceled.
@@ -1094,6 +1118,20 @@ class BlobReferenceCensus {
   // REQUIRES: DB mutex held. Ends the GC job `token` (no-op for another
   // token). O(1), no allocation.
   void EndGcJob(uint64_t token);
+
+  // True if `file_number` is one of the `candidate_files` of the registered
+  // indirect blob GC job (see BeginGcJob()).
+  bool IsGcInputFile(uint64_t file_number) const;
+
+  // Route retirement batching (see DBImpl::RetireBlobRelocationRoutes()).
+  // Returns the time (in microseconds) when routes that route retirement can
+  // delete were first left pending, or 0 when none are pending.
+  uint64_t RetirementPendingSinceMicros() const {
+    return retirement_pending_since_micros_.load(std::memory_order_relaxed);
+  }
+  void SetRetirementPendingSinceMicros(uint64_t micros) {
+    retirement_pending_since_micros_.store(micros, std::memory_order_relaxed);
+  }
 
   // Builds a copy of every generation number from a list of SST summaries.
   static Status BuildState(
@@ -1301,6 +1339,17 @@ class BlobReferenceCensus {
   BlobGcCandidateHeap::Selection SelectWorkerCandidates(
       uint64_t token, BlobGcCandidateHeap::SelectionBytes* bytes = nullptr);
   BlobGcCandidateHeap::Selection SelectWorkerEmptyCandidates(uint64_t token);
+
+  // Returns up to 64 (DBImpl's route retirement batch size,
+  // kBlobRouteRetirementBatchSize) routed generation numbers with no holder. It
+  // skips generation numbers at or above the coarse frontier, and generation
+  // numbers whose route target is an input of the running indirect blob GC job
+  // (IsGcInputFile()). It does not know the running compactions: route
+  // retirement checks them later (see DBImpl::RetireBlobRelocationRoutes()).
+  // The result is in visit order: it starts after the retirement cursor and
+  // wraps around. Unused entries are 0.
+  using RetirementSelection = std::array<uint64_t, 64>;
+  RetirementSelection SelectWorkerRetirementSources(uint64_t token);
   uint64_t WorkerRelocationGarbageBytes(uint64_t token) const;
   BlobGcCandidateHeap::Totals WorkerCandidateTotals(uint64_t token) const;
   BlobGcCandidateHeap::CorruptFileReport WorkerCorruptFileReport(
@@ -1442,6 +1491,21 @@ class BlobReferenceCensus {
     std::map<uint64_t, WorkerGeneration> generations;
     BlobCensusSlotTable slots;
     std::shared_ptr<const BlobRelocationState> forward_state;
+
+    // Generation numbers that have no holder but still have a route. Route
+    // retirement (DBImpl::RetireBlobRelocationRoutes()) can delete those
+    // routes.
+    std::set<uint64_t> retirement_generations;
+
+    // The last generation number that the previous retirement selection
+    // visited. The next selection starts after it in `retirement_generations`
+    // and wraps around.
+    uint64_t retirement_cursor = 0;
+
+    // Adds generation number `generation` to retirement_generations if
+    // forward_state has a route for it. The caller has found that no SST holds
+    // `generation`.
+    void MarkRetirementIfRouted(uint64_t generation);
     std::shared_ptr<Cache> block_cache;
     std::shared_ptr<CacheReservationManager> reservation_manager;
     // False until Finalize() at the end of the initial build. Before that, a
@@ -1516,6 +1580,10 @@ class BlobReferenceCensus {
   ChangeLogCursor build_cursor_;
   // The token of the registered GC job, or 0 (see BeginGcJob()).
   uint64_t gc_job_token_ = 0;
+  // The `candidate_files` of the registered indirect blob GC job (see
+  // BeginGcJob()), sorted. Empty when no GC job is registered.
+  std::vector<uint64_t> gc_input_files_;
+  std::atomic<uint64_t> retirement_pending_since_micros_{0};
   uint64_t next_build_token_ = 1;
   uint64_t next_reservation_id_ = 1;
   std::atomic<uint64_t> active_install_reservation_{0};

@@ -198,6 +198,8 @@ class FakeCompaction : public CompactionIterator::CompactionProxy {
 
   bool enable_blob_garbage_collection() const override { return false; }
 
+  bool enable_blob_indirection() const override { return true; }
+
   double blob_garbage_collection_age_cutoff() const override { return 0.0; }
 
   uint64_t blob_compaction_readahead_size() const override { return 0; }
@@ -334,8 +336,9 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
         nullptr /* blob_file_builder */, true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse_,
-        std::move(compaction), /*must_count_input_entries=*/false, filter,
-        &shutting_down_, /*info_log=*/nullptr, full_history_ts_low));
+        std::move(compaction), /*must_count_input_entries=*/false,
+        /*allow_blob_index_flattening=*/true, filter, &shutting_down_,
+        /*info_log=*/nullptr, full_history_ts_low));
     c_iter_->SetMissingBlobRepairIterator(repair_iter_.get());
   }
 
@@ -1279,6 +1282,37 @@ TEST_P(CompactionIteratorTest, EmptyResult) {
   c_iter_->SeekToFirst();
   ASSERT_OK(c_iter_->status());
   ASSERT_FALSE(c_iter_->Valid());
+}
+
+// A compaction without a blob file builder checks a value against the SST-only
+// blob output policy (SetSstOnlyBlobOutputPolicy()) only when the policy is
+// set. Without the policy, which is the usual case, a key does not call
+// DeclineSstOnlyBlobOutput(), so the per-key path stays as small as without
+// the policy code.
+TEST_P(CompactionIteratorTest, SstOnlyBlobOutputCheckedOnlyWithPolicy) {
+  int decline_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionIterator::DeclineSstOnlyBlobOutput",
+      [&](void* /*arg*/) { ++decline_calls; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  RunTest({test::KeyStr("a", 3, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+          {"value-a", "value-b"},
+          {test::KeyStr("a", 3, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+          {"value-a", "value-b"});
+  EXPECT_EQ(decline_calls, 0);
+
+  // With the policy set, a value of at least the minimum size (4 bytes here)
+  // fails the compaction with TryAgain.
+  InitIterators({test::KeyStr("a", 3, kTypeValue)}, {"value-a"}, {}, {},
+                kMaxSequenceNumber);
+  c_iter_->SetSstOnlyBlobOutputPolicy(/*min_blob_size=*/4);
+  c_iter_->SeekToFirst();
+  EXPECT_TRUE(c_iter_->status().IsTryAgain());
+  EXPECT_EQ(decline_calls, 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 // If there is a corruption after a single deletion, the compaction should fail.
@@ -3076,7 +3110,8 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
         &blob_file_builder, true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/, manual_compaction_canceled,
         nullptr /*compaction*/, false /*must_count_input_entries*/,
-        nullptr /*compaction_filter*/, &shutting_down);
+        false /*allow_blob_index_flattening*/, nullptr /*compaction_filter*/,
+        &shutting_down);
 
     c_iter.SeekToFirst();
     while (c_iter.Valid()) {
@@ -3370,6 +3405,10 @@ class FakeCompactionWithBlobGC : public CompactionIterator::CompactionProxy {
     return enable_blob_gc_;
   }
 
+  bool enable_blob_indirection() const override {
+    return enable_blob_indirection_;
+  }
+
   double blob_garbage_collection_age_cutoff() const override {
     return blob_gc_age_cutoff_;
   }
@@ -3393,6 +3432,7 @@ class FakeCompactionWithBlobGC : public CompactionIterator::CompactionProxy {
   // NOTE: Integration tests for entity blob GC with a real Version exist in
   // db_wide_basic_test.cc (CompactionFilterWithBlobGC test).
   bool enable_blob_gc_ = false;
+  bool enable_blob_indirection_ = true;
   double blob_gc_age_cutoff_ = 1.0;
 };
 
@@ -3527,7 +3567,8 @@ class WideColumnEntityBlobGCTest : public testing::Test {
         blob_file_builder.get(), true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/, manual_compaction_canceled,
         std::move(fake_compaction), false /*must_count_input_entries*/,
-        compaction_filter, &shutting_down);
+        true /*allow_blob_index_flattening*/, compaction_filter,
+        &shutting_down);
 
     c_iter.SeekToFirst();
     while (c_iter.Valid()) {
@@ -3961,7 +4002,7 @@ TEST_F(WideColumnEntityBlobGCTest, EagerBlobResolutionWithoutFetcher) {
       kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
       Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
       true, true, manual_compaction_canceled, std::move(fake_compaction), false,
-      &filter, &shutting_down);
+      true /*allow_blob_index_flattening*/, &filter, &shutting_down);
 
   c_iter.SeekToFirst();
   ASSERT_FALSE(c_iter.Valid());
@@ -4025,7 +4066,7 @@ TEST_F(WideColumnEntityBlobGCTest,
       kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
       Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
       true, true, manual_compaction_canceled, std::move(fake_compaction), false,
-      &keep_filter, &shutting_down);
+      true /*allow_blob_index_flattening*/, &keep_filter, &shutting_down);
 
   c_iter.SeekToFirst();
   ASSERT_TRUE(c_iter.Valid());
