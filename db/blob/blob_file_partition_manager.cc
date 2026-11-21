@@ -187,6 +187,7 @@ BlobFilePartitionManager::DetachPartitionFile(Partition* partition) {
   deferred.total_blob_bytes = partition->total_blob_bytes;
   deferred.garbage_blob_count = partition->garbage_blob_count;
   deferred.garbage_blob_bytes = partition->garbage_blob_bytes;
+  deferred.sync_required = partition->sync_required;
   ResetPartitionState(partition);
   return deferred;
 }
@@ -234,6 +235,7 @@ Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
     RemoveFilePartitionMapping(blob_file_number);
     return s;
   }
+  dir_sync_required_ = true;
 
   const bool perform_data_verification =
       checksum_handoff_file_types_.Contains(FileType::kBlobFile);
@@ -753,7 +755,71 @@ Status BlobFilePartitionManager::SyncAllOpenFiles(
     }
     partition->sync_required = false;
   }
+  // Syncs one deferred file: a file moved to a pending generation at a
+  // memtable switch, or a file whose seal failed while the current memtable
+  // was active (current_generation_failed_files_).
+  auto sync_deferred = [&](DeferredFile& deferred) -> Status {
+    if (!deferred.writer || !deferred.sync_required) {
+      return Status::OK();
+    }
+    // If the seal of this file failed, its writer is in an unknown state and
+    // cannot be synced. When it still has unsynced records, return the seal
+    // error. The WAL sync then fails, so no WAL record that points to those
+    // records becomes durable. The caller passes the error to
+    // WALIOStatusCheck(), which sets a background error when paranoid_checks
+    // is on (the default). The file keeps sync_required = true, so every later
+    // WAL sync returns the same error, and the flush of its generation fails
+    // with the same seal error.
+    if (!deferred.seal_status.ok()) {
+      return deferred.seal_status;
+    }
+    Status s = deferred.writer->Sync(write_options);
+    if (s.ok()) {
+      deferred.sync_required = false;
+    }
+    return s;
+  };
+  for (auto& failed : current_generation_failed_files_) {
+    Status s = sync_deferred(failed);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  for (auto& batch : pending_generations_) {
+    for (auto& deferred : batch.deferred_files) {
+      Status s = sync_deferred(deferred);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+  }
+  if (dir_sync_required_) {
+    Status s = SyncBlobDirectory(write_options);
+    if (!s.ok()) {
+      return s;
+    }
+    dir_sync_required_ = false;
+  }
   return Status::OK();
+}
+
+Status BlobFilePartitionManager::SyncBlobDirectory(
+    const WriteOptions& write_options) {
+  IOOptions io_options;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(write_options, io_options);
+  std::unique_ptr<FSDirectory> dir;
+  if (s.ok()) {
+    s = fs_->NewDirectory(db_path_, io_options, &dir, /*dbg=*/nullptr);
+  }
+  if (s.ok()) {
+    s = dir->FsyncWithDirOptions(
+        io_options, /*dbg=*/nullptr,
+        DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+  }
+  if (s.ok()) {
+    s = dir->Close(io_options, /*dbg=*/nullptr);
+  }
+  return s;
 }
 
 void BlobFilePartitionManager::GetActiveBlobFileNumbers(
