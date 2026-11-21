@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <variant>
 
@@ -64,6 +65,27 @@ Status GetFileChecksumsFromCurrentManifest(FileSystem* fs,
 Status GetDbIdentityFromManifest(FileSystem* fs,
                                  const std::string& manifest_path,
                                  std::string* db_id);
+
+// Reads the column families that a MANIFEST file records, without opening the
+// DB, as a map from column family ID (see ColumnFamilyHandle::GetID()) to name.
+// manifest_path is the path of one MANIFEST file, not a DB directory. The map
+// holds the default column family (ID 0) and each column family that a record
+// adds and no later record drops, so the whole file is read.
+//
+// A record that is truncated at the end of the file counts as the end of the
+// file, and the records of an atomic group that the file does not complete are
+// not applied. Returns Corruption when no record of the file is applied, for
+// example when the file is empty or its only record is truncated. Returns
+// the first error when the file cannot be read, a record fails its checksum, a
+// record cannot be decoded, the records of an atomic group are not consistent,
+// or a record adds a column family ID that the file already has or drops one
+// that it does not have.
+//
+// This function does not write. It can read the MANIFEST file of an open DB,
+// but the result can then be out of date on return.
+Status GetColumnFamiliesFromManifest(
+    FileSystem* fs, const std::string& manifest_path,
+    std::map<uint32_t, std::string>* column_families);
 
 struct UpdateManifestForFilesStateOptions {
   // When true, read current file temperatures from FileSystem and update in
