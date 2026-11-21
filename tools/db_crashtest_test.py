@@ -6,6 +6,7 @@
 import importlib.util
 import io
 import os
+import random
 import shutil
 import struct
 import sys
@@ -121,6 +122,7 @@ class DBCrashTestTest(unittest.TestCase):
             "txn": False,
             "optimistic_txn": False,
             "test_best_efforts_recovery": False,
+            "test_manifest_store": False,
             "enable_ts": False,
             "test_multiops_txn": False,
             "test_tiered_storage": False,
@@ -748,6 +750,139 @@ class DBCrashTestTest(unittest.TestCase):
                 }
             ),
         )
+
+    def test_manifest_store_profile(self):
+        db_crashtest = self.load_db_crashtest()
+        # finalize_and_sanitize() draws random values, so the test seeds the
+        # global random module, and restores its state at the end.
+        self.addCleanup(random.setstate, random.getstate())
+        args = self.build_mode_args(
+            test_type="blackbox",
+            test_manifest_store=True,
+            manifest_store_copy_mode=2,
+        )
+        random.seed(1)
+        params = db_crashtest.gen_cmd_params(args)
+        # The store lanes turn off remote compaction in their params, so the
+        # rule for remote compaction keeps the features below.
+        self.assertEqual(0, params["remote_compaction_worker_threads"])
+        # Features that the store lane turns off, and features that it keeps.
+        # The other fixed values keep the other rules of finalize_and_sanitize()
+        # from changing the values that this test checks.
+        params.update(
+            {
+                "backup_one_in": 1000,
+                "checkpoint_one_in": 1000,
+                "get_live_files_apis_one_in": 1000,
+                "test_secondary": 1,
+                "sync_fault_injection": 1,
+                "allow_resumption_one_in": 2,
+                "track_options_file_number_in_manifest": 1,
+                "read_only": 1,
+                "disable_wal": 0,
+                "test_batches_snapshots": 0,
+                "inplace_update_support": 0,
+                "use_trie_index": 0,
+                "file_scope_wal_write_faults": 0,
+                "enable_blob_direct_write": 0,
+                "reopen": 20,
+                "write_fault_one_in": 128,
+                "metadata_write_fault_one_in": 128,
+                "db": self.test_tmpdir,
+            }
+        )
+        finalized = db_crashtest.finalize_and_sanitize(params)
+
+        self.assertEqual(1, finalized["use_manifest_store"])
+        self.assertEqual(2, finalized["manifest_store_copy_mode"])
+        for name in ("backup_one_in", "checkpoint_one_in"):
+            self.assertEqual(1000, finalized[name], name)
+        self.assertEqual(1, finalized["test_secondary"])
+        self.assertEqual(1, finalized["sync_fault_injection"])
+        for name in (
+            "get_live_files_apis_one_in",
+            "remote_compaction_worker_threads",
+            "allow_resumption_one_in",
+            "track_options_file_number_in_manifest",
+            "read_only",
+            # Sync copy mode runs without file system write faults.
+            "write_fault_one_in",
+            "metadata_write_fault_one_in",
+        ):
+            self.assertEqual(0, finalized[name], name)
+        # Blackbox uses a huge ops_per_thread, so reopen is raised to reach a
+        # reopen before the kill.
+        self.assertEqual(finalized["ops_per_thread"] // 20000, finalized["reopen"])
+
+        # Copy mode off keeps the file system write faults.
+        copy_off = db_crashtest.finalize_and_sanitize(
+            dict(params, manifest_store_copy_mode=0)
+        )
+        self.assertEqual(128, copy_off["write_fault_one_in"])
+
+        # Batched-ops mode runs without store faults.
+        batched = db_crashtest.finalize_and_sanitize(
+            dict(
+                params,
+                test_batches_snapshots=1,
+                manifest_store_fault_one_in=1000,
+            )
+        )
+        self.assertEqual(1, batched["test_batches_snapshots"])
+        self.assertEqual(0, batched["manifest_store_fault_one_in"])
+
+        # Shadow mode runs without the copy mode, fences and rollbacks, and
+        # keeps store faults and file system write faults.
+        shadow = db_crashtest.finalize_and_sanitize(
+            dict(
+                params,
+                manifest_store_shadow=1,
+                test_batches_snapshots=0,
+                manifest_store_copy_mode=2,
+                manifest_store_fence_at_reopen_one_in=3,
+                manifest_store_rollback_one_in=5,
+                manifest_store_fault_one_in=1000,
+            )
+        )
+        self.assertEqual(1, shadow["manifest_store_shadow"])
+        self.assertEqual(0, shadow["manifest_store_copy_mode"])
+        self.assertEqual(0, shadow["manifest_store_fence_at_reopen_one_in"])
+        self.assertEqual(0, shadow["manifest_store_rollback_one_in"])
+        self.assertEqual(1000, shadow["manifest_store_fault_one_in"])
+        self.assertEqual(128, shadow["write_fault_one_in"])
+
+        # gen_cmd_params() picks test_secondary as 0 or 1 before the blob
+        # profile choice, so store lane series with test_secondary=0 can get a
+        # blob profile.
+        secondary_values = set()
+        blob_series = 0
+        for seed in range(200):
+            random.seed(seed)
+            series = db_crashtest.gen_cmd_params(args)
+            secondary_values.add(series["test_secondary"])
+            # The store lanes never pick the file-scoped WAL fault profile,
+            # which turns off reopen.
+            self.assertNotEqual(1, series.get("file_scope_wal_write_faults"))
+            if "enable_blob_files" in series:
+                blob_series += 1
+        self.assertEqual({0, 1}, secondary_values)
+        self.assertGreater(blob_series, 0)
+
+        # Lanes without --test_manifest_store pass no store flag.
+        plain_params = db_crashtest.gen_cmd_params(
+            self.build_mode_args(test_type="blackbox")
+        )
+        plain_params["db"] = self.test_tmpdir
+        plain = db_crashtest.finalize_and_sanitize(plain_params)
+        self.assertFalse(any(k.startswith("manifest_store") for k in plain))
+        self.assertNotIn("use_manifest_store", plain)
+
+        # The cleanup also removes the store.
+        with mock.patch.object(
+            db_crashtest.subprocess, "call", return_value=0
+        ) as cleanup_call:
+            db_crashtest.cleanup_after_success(self.test_tmpdir, 1, params)
+        self.assertIn("--use_manifest_store=1", cleanup_call.call_args.args[0])
 
     def test_full_external_table_profile(self):
         db_crashtest = self.load_db_crashtest()
@@ -2145,7 +2280,7 @@ class DBCrashTestTest(unittest.TestCase):
 
         db_crashtest.execute_cmd = fake_execute_cmd
         db_crashtest.print_fault_injection_log = lambda pid: None
-        db_crashtest.cleanup_after_success = lambda db_arg, num_dbs=1: cleanups.append(
+        db_crashtest.cleanup_after_success = lambda db_arg, num_dbs=1, params=None: cleanups.append(
             (db_arg, num_dbs)
         )
 
@@ -2189,7 +2324,7 @@ class DBCrashTestTest(unittest.TestCase):
 
         db_crashtest.execute_cmd = fake_execute_cmd
         db_crashtest.print_fault_injection_log = lambda pid: None
-        db_crashtest.cleanup_after_success = lambda db_arg, num_dbs=1: None
+        db_crashtest.cleanup_after_success = lambda db_arg, num_dbs=1, params=None: None
 
         db_crashtest.liveness_main(self.build_mode_args(duration=17), [])
 

@@ -103,6 +103,37 @@ class MockManifestStoreData {
   // applies its switch itself and does not set it.
   std::optional<Status::Code> HiddenApplyCode() const;
 
+  // Persistence for a store that must survive a process restart (the db_stress
+  // test store): Serialize() returns the stored state (the stored epoch, the DB
+  // row, the rows and the generation counter), and Deserialize() replaces the
+  // stored state with it. Neither covers the state of calls in progress or the
+  // test hooks: pending generations, the next fault, the read failures, a
+  // waiting late apply and the hidden apply code. Deserialize() returns
+  // Corruption for bad input.
+  //
+  // Layout of the serialized state, in this order:
+  //   "MockManifestStoreData1"   magic string; the last digit is the version
+  //   stored epoch               varint64
+  //   has DB row                 1 byte, 0 or 1
+  //   commit sequence            varint64
+  //   last commit id             length-prefixed string
+  //   generation                 varint64
+  //   generation counter         varint64
+  //   DB row fields              length-prefixed string
+  //   row count                  varint64
+  //   then, for each row:
+  //     row type                 1 byte
+  //     column family id         varint32
+  //     number                   varint64
+  //     fields                   length-prefixed string
+  std::string Serialize() const;
+  Status Deserialize(const Slice& input);
+
+  // Forgets a waiting late apply (kTimedOutLateApply), as if the store never
+  // finished that request. Call it before the object that made the call is
+  // destroyed.
+  void DropLateApply();
+
  private:
   friend class MockManifestStore;
 

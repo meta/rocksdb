@@ -61,6 +61,9 @@ _TEST_HEADERS = {
 
 # Libraries that tests need in addition to rocksdb_test_lib
 _TEST_EXTRA_DEPS = {
+    "db_stress_manifest_store_test": [
+        ":rocksdb_stress_manifest_store_lib",
+    ],
     "db_stress_structured_key_value_test": [
         ":rocksdb_stress_structured_key_value_lib",
     ],
@@ -73,6 +76,7 @@ _STRESS_LIB_HEADERS = [
     "db_stress_tool/db_stress_driver.h",
     "db_stress_tool/db_stress_filters.h",
     "db_stress_tool/db_stress_listener.h",
+    "db_stress_tool/db_stress_manifest_store.h",
     "db_stress_tool/db_stress_shared_state.h",
     "db_stress_tool/db_stress_structured_key_value.h",
     "db_stress_tool/db_stress_test_base.h",
@@ -80,6 +84,7 @@ _STRESS_LIB_HEADERS = [
     "db_stress_tool/expected_state.h",
     "db_stress_tool/expected_value.h",
     "db_stress_tool/multi_ops_txns_stress.h",
+    "test_util/mock_manifest_store.h",
     "test_util/simple_external_table_factory.h",
     "test_util/testutil.h",
     "tools/block_cache_analyzer/block_cache_trace_analyzer.h",
@@ -310,6 +315,14 @@ def generate_buck(repo_path, deps_map):
         ["db_stress_tool/db_stress_structured_key_value.cc"],
         [":rocksdb_lib"],
         headers=["db_stress_tool/db_stress_structured_key_value.h"],
+    )
+    # The test store of db_stress, which its unit test links without the rest
+    # of rocksdb_stress_lib.
+    BUCK.add_library(
+        "rocksdb_stress_manifest_store_lib",
+        ["db_stress_tool/db_stress_manifest_store.cc"],
+        [":rocksdb_test_lib"],
+        headers=["db_stress_tool/db_stress_manifest_store.h"],
     )
     # ldb binary
     BUCK.add_binary(

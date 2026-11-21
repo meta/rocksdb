@@ -20,6 +20,8 @@ CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --
 .PHONY: crash_test crash_test_with_atomic_flush crash_test_with_txn \
 	crash_test_with_wc_txn crash_test_with_wp_txn crash_test_with_wup_txn \
 	crash_test_with_best_efforts_recovery crash_test_with_ts \
+	crash_test_with_manifest_store_sync crash_test_with_manifest_store_off \
+	crash_test_with_manifest_store_shadow \
 	crash_test_with_multiops_wc_txn \
 	crash_test_with_multiops_wp_txn \
 	crash_test_with_multiops_wup_txn \
@@ -32,6 +34,9 @@ CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --
 	blackbox_crash_test_with_wup_txn \
 	blackbox_crash_test_with_txn blackbox_crash_test_with_ts \
 	blackbox_crash_test_with_best_efforts_recovery \
+	blackbox_crash_test_with_manifest_store_sync \
+	blackbox_crash_test_with_manifest_store_off \
+	blackbox_crash_test_with_manifest_store_shadow \
 	blackbox_crash_test_with_multiops_wc_txn \
 	blackbox_crash_test_with_multiops_wp_txn \
 	blackbox_crash_test_with_multiops_wup_txn \
@@ -44,6 +49,9 @@ CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --
 	whitebox_crash_test_with_txn whitebox_crash_test_with_ts \
 	whitebox_crash_test_with_optimistic_txn \
 	whitebox_crash_test_with_tiered_storage \
+	whitebox_crash_test_with_manifest_store_sync \
+	whitebox_crash_test_with_manifest_store_off \
+	whitebox_crash_test_with_manifest_store_shadow \
 	crash_test_db_cleanup \
 
 crash_test: $(DB_STRESS_CMD)
@@ -77,6 +85,25 @@ crash_test_with_optimistic_txn: $(DB_STRESS_CMD)
 	$(CRASHTEST_MAKE) blackbox_crash_test_with_optimistic_txn
 
 crash_test_with_best_efforts_recovery: blackbox_crash_test_with_best_efforts_recovery
+
+# Store mode (DBOptions::manifest_store) with the MANIFEST file copy in sync
+# mode, and without the copy.
+crash_test_with_manifest_store_sync: $(DB_STRESS_CMD)
+# Do not parallelize
+	$(CRASHTEST_MAKE) whitebox_crash_test_with_manifest_store_sync
+	$(CRASHTEST_MAKE) blackbox_crash_test_with_manifest_store_sync
+
+crash_test_with_manifest_store_off: $(DB_STRESS_CMD)
+# Do not parallelize
+	$(CRASHTEST_MAKE) whitebox_crash_test_with_manifest_store_off
+	$(CRASHTEST_MAKE) blackbox_crash_test_with_manifest_store_off
+
+# Shadow mode (DBOptions::manifest_store_shadow): the MANIFEST file stays the
+# authority, and each reopen compares the test store with the MANIFEST.
+crash_test_with_manifest_store_shadow: $(DB_STRESS_CMD)
+# Do not parallelize
+	$(CRASHTEST_MAKE) whitebox_crash_test_with_manifest_store_shadow
+	$(CRASHTEST_MAKE) blackbox_crash_test_with_manifest_store_shadow
 
 crash_test_with_ts: $(DB_STRESS_CMD)
 # Do not parallelize
@@ -120,6 +147,15 @@ blackbox_crash_test_with_wup_txn: $(DB_STRESS_CMD)
 
 blackbox_crash_test_with_best_efforts_recovery: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --test_best_efforts_recovery blackbox $(CRASH_TEST_EXT_ARGS)
+
+blackbox_crash_test_with_manifest_store_sync: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_manifest_store --manifest_store_copy_mode=2 blackbox $(CRASH_TEST_EXT_ARGS)
+
+blackbox_crash_test_with_manifest_store_off: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_manifest_store --manifest_store_copy_mode=0 blackbox $(CRASH_TEST_EXT_ARGS)
+
+blackbox_crash_test_with_manifest_store_shadow: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_manifest_store --manifest_store_shadow=1 blackbox $(CRASH_TEST_EXT_ARGS)
 
 blackbox_crash_test_with_ts: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --enable_ts blackbox $(CRASH_TEST_EXT_ARGS)
@@ -171,6 +207,18 @@ whitebox_crash_test_with_wup_txn: $(DB_STRESS_CMD)
 whitebox_crash_test_with_ts: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --enable_ts whitebox --random_kill_odd \
       $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
+
+whitebox_crash_test_with_manifest_store_sync: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_manifest_store --manifest_store_copy_mode=2 \
+      whitebox --random_kill_odd $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
+
+whitebox_crash_test_with_manifest_store_off: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_manifest_store --manifest_store_copy_mode=0 \
+      whitebox --random_kill_odd $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
+
+whitebox_crash_test_with_manifest_store_shadow: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_manifest_store --manifest_store_shadow=1 \
+      whitebox --random_kill_odd $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
 
 whitebox_crash_test_with_tiered_storage: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --test_tiered_storage whitebox --random_kill_odd \

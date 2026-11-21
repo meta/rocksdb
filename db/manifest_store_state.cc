@@ -280,11 +280,15 @@ IOStatus WriteManifestRecords(const ImmutableDBOptions& db_options,
       s = writer.Close(write_options);
     }
   }
+  // These kill points stop a stub switch: CURRENT names a new stub (at a
+  // create or an enter) or the MANIFEST file of a rollback.
+  TEST_KILL_RANDOM("WriteManifestRecords:BeforeSetCurrentFile");
   if (s.ok()) {
     s = SetCurrentFile(write_options, fs, dbname, number,
                        db_options.metadata_write_temperature,
                        dir_contains_current_file);
   }
+  TEST_KILL_RANDOM("WriteManifestRecords:AfterSetCurrentFile");
   return s;
 }
 
@@ -923,6 +927,7 @@ Status CommitFileAuthority(ManifestStore* store, const std::string& commit_id,
   commit.commit_id = commit_id;
   // ManifestRowsToPublicRows() puts the DB row first.
   commit.db_row = public_rows.front();
+  TEST_KILL_RANDOM("RollBackManifestStore:BeforeDbRowCommit");
   IOStatus io_s = store->Commit(commit);
   if (!io_s.ok()) {
     return Status::IOError(

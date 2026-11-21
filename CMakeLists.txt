@@ -1592,6 +1592,7 @@ if(WITH_TESTS)
         db/write_batch_test.cc
         db/write_callback_test.cc
         db/write_controller_test.cc
+        db_stress_tool/db_stress_manifest_store_test.cc
         db_stress_tool/db_stress_structured_key_value_test.cc
         env/env_test.cc
         env/io_posix_test.cc
@@ -1769,6 +1770,9 @@ if(WITH_TESTS)
   # The structured key-value codec of db_stress depends only on RocksDB.
   target_sources(db_stress_structured_key_value_test${ARTIFACT_SUFFIX} PRIVATE
     db_stress_tool/db_stress_structured_key_value.cc)
+  # The test store of db_stress depends only on RocksDB and the test library.
+  target_sources(db_stress_manifest_store_test${ARTIFACT_SUFFIX} PRIVATE
+    db_stress_tool/db_stress_manifest_store.cc)
 
   if(WIN32)
     # C executables must link to a shared object

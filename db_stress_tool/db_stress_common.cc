@@ -1220,7 +1220,26 @@ Status DestroyUnverifiedSubdir(const std::string& dirname) {
   return s;
 }
 
+std::string ManifestStoreDirForDb(const std::string& db_path) {
+  if (FLAGS_manifest_store_dir.empty()) {
+    return db_path + "_manifest_store";
+  }
+  const size_t slash = db_path.find_last_of('/');
+  return FLAGS_manifest_store_dir + "/" +
+         (slash == std::string::npos ? db_path : db_path.substr(slash + 1));
+}
+
 Status DbStressDestroyDb(const std::string& db_path) {
+  if (FLAGS_use_manifest_store) {
+    // Remove the test store and the DB folder directly. DestroyDB() would need
+    // a writer object of the store, and it keeps the rows of a shadow DB.
+    Status s = FileManifestStore::DestroyStore(raw_env,
+                                               ManifestStoreDirForDb(db_path));
+    if (!s.ok()) {
+      return s;
+    }
+    return DestroyDir(raw_env, db_path);
+  }
   Status s;
   Options options;
   // Use raw_env (no DbStressFSWrapper) because DbStressFSWrapper renames

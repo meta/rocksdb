@@ -392,6 +392,13 @@ DECLARE_int32(prepopulate_blob_cache);
 
 DECLARE_int32(approximate_size_one_in);
 DECLARE_bool(best_efforts_recovery);
+DECLARE_bool(use_manifest_store);
+DECLARE_bool(manifest_store_shadow);
+DECLARE_string(manifest_store_dir);
+DECLARE_int32(manifest_store_copy_mode);
+DECLARE_uint64(manifest_store_fault_one_in);
+DECLARE_int32(manifest_store_fence_at_reopen_one_in);
+DECLARE_int32(manifest_store_rollback_one_in);
 DECLARE_bool(skip_verifydb);
 DECLARE_string(verify_cpu_corruption_dir);
 DECLARE_bool(paranoid_file_checks);
@@ -951,7 +958,12 @@ Status InitUnverifiedSubdir(const std::string& dirname);
 
 // Destroy the DB at the given path under the env configured for db_stress.
 // Handles both regular DB and BlobDB, and cleans and removes the entire dir.
+// With --use_manifest_store, it also removes the test store of the DB.
 Status DbStressDestroyDb(const std::string& db_path);
+
+// The folder of the test store of the DB at `db_path` (see
+// --manifest_store_dir).
+std::string ManifestStoreDirForDb(const std::string& db_path);
 
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // GFLAGS
