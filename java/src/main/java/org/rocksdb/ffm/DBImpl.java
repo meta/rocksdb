@@ -10,11 +10,23 @@ final class DBImpl extends WithDB implements DB {
     super(allocator, db);
   }
 
+  @Override
   public Getter get() {
     return new GetterImpl(allocator, db);
   }
 
+  @Override
+  public Getter get(SegmentAllocator allocator) {
+    return new GetterImpl(allocator, db);
+  }
+
+  @Override
   public Putter put() {
+    return new PutterImpl(allocator, db);
+  }
+
+  @Override
+  public Putter put(SegmentAllocator allocator) {
     return new PutterImpl(allocator, db);
   }
 
