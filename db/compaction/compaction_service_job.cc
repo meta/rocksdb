@@ -252,6 +252,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   compaction_input.options_file_number = options_file_number_;
   compaction_input.min_manifest_file_number = min_manifest_file_number_;
   compaction_input.min_manifest_file_size = min_manifest_file_size_;
+  compaction_input.min_store_commit_sequence = min_store_commit_sequence_;
   compaction_input.preserve_internal_time_seconds =
       compaction->mutable_cf_options().preserve_internal_time_seconds;
   compaction_input.preclude_last_level_data_seconds =
@@ -1507,6 +1508,10 @@ static std::unordered_map<std::string, OptionTypeInfo> cs_input_type_info = {
       OptionTypeFlags::kNone}},
     {"min_manifest_file_size",
      {offsetof(struct CompactionServiceInput, min_manifest_file_size),
+      OptionType::kUInt64T, OptionVerificationType::kNormal,
+      OptionTypeFlags::kNone}},
+    {"min_store_commit_sequence",
+     {offsetof(struct CompactionServiceInput, min_store_commit_sequence),
       OptionType::kUInt64T, OptionVerificationType::kNormal,
       OptionTypeFlags::kNone}},
     {"preserve_internal_time_seconds",

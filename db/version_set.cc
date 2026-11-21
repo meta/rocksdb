@@ -8487,9 +8487,6 @@ Status VersionSet::DumpManifest(
     Options& options, std::string& dscname, bool verbose, bool hex, bool json,
     const std::vector<ColumnFamilyDescriptor>& cf_descs) {
   assert(options.env);
-  // TODO: plumb Env::IOActivity, Env::IOPriority
-  const ReadOptions read_options;
-
   std::vector<std::string> column_families;
   Status s = ListColumnFamiliesFromManifest(
       dscname, options.env->GetFileSystem().get(), &column_families);
@@ -8512,7 +8509,53 @@ Status VersionSet::DumpManifest(
         std::move(file), dscname, db_options_->log_readahead_size, io_tracer_);
     file_reader->SetIOType(IOType::kManifest);
   }
+  return DumpManifestRecords(options, column_families, std::move(file_reader),
+                             verbose, hex, json, cf_descs);
+}
 
+Status VersionSet::DumpManifestFromStore(
+    Options& options, ManifestStore* store, bool verbose, bool hex, bool json,
+    const std::vector<ColumnFamilyDescriptor>& cf_descs) {
+  assert(store != nullptr);
+  ManifestStoreScan scan;
+  Status s = ScanManifestStore(store, /*consistent=*/true, &scan);
+  // After a rollback, the rows stay in the store but the MANIFEST file is the
+  // authority, so the rows are old.
+  if (s.ok() && scan.extra_fields.authority == ManifestAuthority::kFile) {
+    s = Status::InvalidArgument(
+        "Store mode: the DB row says that the MANIFEST file is the authority "
+        "(the DB was rolled back to file mode)");
+  }
+  std::vector<std::string> records;
+  if (s.ok()) {
+    s = ManifestRowsToRecords(scan.rows, &records);
+  }
+  std::string bytes;
+  if (s.ok()) {
+    s = RecordsToManifestBytes(records, &bytes);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  std::vector<std::string> column_families;
+  for (const auto& [cf_id, cf_rows] : scan.rows.cfs) {
+    if (!cf_rows.cf.dropped) {
+      column_families.push_back(cf_rows.cf.name);
+    }
+  }
+  std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+      NewStringSequentialFile(std::move(bytes)), "manifest store rows"));
+  return DumpManifestRecords(options, column_families, std::move(file_reader),
+                             verbose, hex, json, cf_descs);
+}
+
+Status VersionSet::DumpManifestRecords(
+    Options& options, const std::vector<std::string>& column_families,
+    std::unique_ptr<SequentialFileReader> file_reader, bool verbose, bool hex,
+    bool json, const std::vector<ColumnFamilyDescriptor>& cf_descs) {
+  // TODO: plumb Env::IOActivity, Env::IOPriority
+  const ReadOptions read_options;
+  Status s;
   std::map<std::string, const ColumnFamilyDescriptor*> cf_name_to_desc;
   for (const auto& cf_desc : cf_descs) {
     cf_name_to_desc[cf_desc.name] = &cf_desc;
@@ -9541,6 +9584,63 @@ ReactiveVersionSet::ReactiveVersionSet(
 
 ReactiveVersionSet::~ReactiveVersionSet() = default;
 
+namespace {
+// Returns a reader of `bytes`, the rows of the store as MANIFEST records.
+std::unique_ptr<log::FragmentBufferedReader> NewStoreRowsReader(
+    std::string bytes, log::Reader::Reporter* reporter) {
+  std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+      NewStringSequentialFile(std::move(bytes)), "manifest store rows"));
+  return std::make_unique<log::FragmentBufferedReader>(
+      nullptr, std::move(file_reader), reporter, true /* checksum */,
+      0 /* log_number */);
+}
+
+// Turns `rows` into the bytes of a MANIFEST file with full-state records
+// (ManifestRowsToRecords()), for the replay of a secondary or follower (see
+// "Store mode in a secondary or follower" in version_set.h). With
+// `live_cf_ids` (a catch-up), it erases from `rows` the rows of the column
+// families that `live_cf_ids` does not list, so a later call with a smaller
+// set on the same rows is still correct. It also adds a drop record for each
+// column family that `live_cf_ids` lists and the rows list as dropped or do
+// not list. The open passes null: its instance has no column families yet.
+Status BuildStoreManifestBytes(const std::vector<uint32_t>* live_cf_ids,
+                               ManifestRows* rows, std::string* bytes) {
+  bytes->clear();
+  if (live_cf_ids != nullptr) {
+    for (std::map<uint32_t, ManifestCfRows>::iterator it = rows->cfs.begin();
+         it != rows->cfs.end();) {
+      it = std::binary_search(live_cf_ids->begin(), live_cf_ids->end(),
+                              it->first)
+               ? std::next(it)
+               : rows->cfs.erase(it);
+    }
+  }
+  std::vector<std::string> records;
+  Status s = ManifestRowsToRecords(*rows, &records);
+  if (!s.ok()) {
+    return s;
+  }
+  if (live_cf_ids != nullptr) {
+    for (uint32_t cf_id : *live_cf_ids) {
+      const std::map<uint32_t, ManifestCfRows>::const_iterator it =
+          rows->cfs.find(cf_id);
+      if (it != rows->cfs.end() && !it->second.cf.dropped) {
+        continue;
+      }
+      VersionEdit drop;
+      drop.SetColumnFamily(cf_id);
+      drop.DropColumnFamily();
+      std::string record;
+      if (!drop.EncodeTo(&record)) {
+        return Status::Corruption("Unable to encode a column family drop");
+      }
+      records.push_back(std::move(record));
+    }
+  }
+  return RecordsToManifestBytes(records, bytes);
+}
+}  // namespace
+
 Status ReactiveVersionSet::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
@@ -9554,7 +9654,11 @@ Status ReactiveVersionSet::Recover(
   manifest_reporter->reset(new LogReporter());
   static_cast_with_check<LogReporter>(manifest_reporter->get())->status =
       manifest_reader_status->get();
-  Status s = MaybeSwitchManifest(manifest_reporter->get(), manifest_reader);
+  Status s =
+      StoreModeOptions(*db_options_)
+          ? OpenStoreRead(manifest_reporter->get(), manifest_reader)
+          : MaybeSwitchManifest(manifest_reporter->get(), manifest_reader,
+                                /*store_read=*/nullptr);
   if (!s.ok()) {
     return s;
   }
@@ -9580,7 +9684,7 @@ Status ReactiveVersionSet::ReadAndApply(
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
     Status* manifest_read_status,
     std::unordered_set<ColumnFamilyData*>* cfds_changed,
-    std::vector<std::string>* files_to_delete) {
+    std::vector<std::string>* files_to_delete, ManifestStoreRead* store_read) {
   assert(manifest_reader != nullptr);
   assert(cfds_changed != nullptr);
   mu->AssertHeld();
@@ -9595,7 +9699,7 @@ Status ReactiveVersionSet::ReadAndApply(
   Status s;
   log::Reader* reader = manifest_reader->get();
   assert(reader);
-  s = MaybeSwitchManifest(reader->GetReporter(), manifest_reader);
+  s = MaybeSwitchManifest(reader->GetReporter(), manifest_reader, store_read);
   if (!s.ok()) {
     return s;
   }
@@ -9733,10 +9837,46 @@ bool ReactiveVersionSet::NewestStateHasMissingFiles() {
   return manifest_tailer_->NewestStateHasMissingFiles();
 }
 
+Status ReactiveVersionSet::ApplyStoreCatchUp(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    ManifestStoreRead* store_read) {
+  // Step 3 of "Store mode in a secondary or follower" in version_set.h. A
+  // concurrent catch-up can apply a newer scan first.
+  assert(manifest_tailer_ != nullptr);
+  if (store_read == nullptr ||
+      store_read->scan.db_row.state.commit_sequence <=
+          replayed_store_commit_sequence()) {
+    return Status::OK();
+  }
+  std::vector<uint32_t> live_cf_ids = LiveColumnFamilyIds();
+  // The live column families of a secondary or follower only shrink, so the
+  // rows that BuildStoreManifestBytes() erased are not needed again.
+  assert(std::includes(store_read->live_cf_ids.begin(),
+                       store_read->live_cf_ids.end(), live_cf_ids.begin(),
+                       live_cf_ids.end()));
+  if (live_cf_ids != store_read->live_cf_ids) {
+    store_read->live_cf_ids = std::move(live_cf_ids);
+    Status s = BuildStoreManifestBytes(
+        &store_read->live_cf_ids, &store_read->scan.rows, &store_read->bytes);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  ApplyStoreRead(reporter, manifest_reader, store_read);
+  manifest_tailer_->PrepareToReadNewManifest();
+  return Status::OK();
+}
+
 Status ReactiveVersionSet::MaybeSwitchManifest(
     log::Reader::Reporter* reporter,
-    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    ManifestStoreRead* store_read) {
   assert(manifest_reader != nullptr);
+  if (StoreModeOptions(*db_options_)) {
+    return ApplyStoreCatchUp(reporter, manifest_reader, store_read);
+  }
+  assert(store_read == nullptr);
   Status s;
   std::string manifest_path;
   s = GetCurrentManifestPath(dbname_, fs_.get(), /*is_retry=*/false,
@@ -9787,6 +9927,150 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
         "one.");
   }
   return s;
+}
+
+Status ReactiveVersionSet::OpenStoreRead(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
+  // No other thread uses this VersionSet yet, and it has no column families,
+  // so the records keep all rows and need no drop records.
+  ManifestStoreRead store_read;
+  Status s = ReadStore(&store_read);
+  if (s.ok()) {
+    opened_db_id_ = store_read.scan.rows.db.db_id;
+    s = BuildStoreManifestBytes(/*live_cf_ids=*/nullptr, &store_read.scan.rows,
+                                &store_read.bytes);
+  }
+  if (s.ok()) {
+    ApplyStoreRead(reporter, manifest_reader, &store_read);
+  }
+  return s;
+}
+
+Status ReactiveVersionSet::ReadStoreForCatchUp(
+    InstrumentedMutex* mu, std::unique_ptr<ManifestStoreRead>* store_read) {
+  assert(store_read != nullptr);
+  store_read->reset();
+  if (!StoreModeOptions(*db_options_)) {
+    return Status::OK();
+  }
+  std::unique_ptr<ManifestStoreRead> new_read;
+  {
+    std::lock_guard<std::mutex> lock(store_read_mutex_);
+    ManifestDbRowResult db_row;
+    IOStatus io_s = db_options_->manifest_store->ReadDbRow(&db_row);
+    if (!io_s.ok()) {
+      return Status::IOError("Store mode: cannot read the DB row: " +
+                             io_s.ToString());
+    }
+    // The rows at this path can belong to another DB now, for example one
+    // that was destroyed and created again with the same store. Its commit
+    // sequence can be lower than the replayed one, so the skip rule below
+    // would hide it. File mode returns the same error (ManifestTailer).
+    Status s = CheckManifestDbRowOwner(db_row.db_row, opened_db_id_);
+    if (s.IsInvalidArgument()) {
+      return Status::Corruption(
+          "Store mode: the DB row has another db id than the DB that this "
+          "instance opened (" +
+          opened_db_id_ +
+          "). The DB at this path was possibly created again. Reopen this "
+          "instance.");
+    }
+    if (!s.ok()) {
+      return s;
+    }
+    if (db_row.state.commit_sequence == replayed_store_commit_sequence()) {
+      return Status::OK();
+    }
+    new_read = std::make_unique<ManifestStoreRead>();
+    s = ReadStore(new_read.get());
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  {
+    InstrumentedMutexLock lock(mu);
+    new_read->live_cf_ids = LiveColumnFamilyIds();
+  }
+  Status s = BuildStoreManifestBytes(&new_read->live_cf_ids,
+                                     &new_read->scan.rows, &new_read->bytes);
+  if (s.ok()) {
+    *store_read = std::move(new_read);
+  }
+  TEST_SYNC_POINT("ReactiveVersionSet::ReadStoreForCatchUp:End");
+  return s;
+}
+
+Status ReactiveVersionSet::ReadStore(ManifestStoreRead* store_read) const {
+  CurrentManifestInfo current;
+  Status s = ReadCurrentManifestInfo(fs_.get(), dbname_, &current);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!current.exists || !current.is_stub) {
+    return Status::InvalidArgument(
+        "manifest_store is set, but CURRENT does not name a stub MANIFEST, so "
+        "the DB is not in store mode");
+  }
+  if (current.stub.state != ManifestStubState::kDone) {
+    return Status::NotSupported(
+        "Store mode: a mode change is not finished; the primary finishes it "
+        "when it opens the DB");
+  }
+  ManifestStoreScan& scan = store_read->scan;
+  s = ScanManifestStore(db_options_->manifest_store.get(), /*consistent=*/true,
+                        &scan);
+  if (!s.ok()) {
+    return s;
+  }
+  switch (scan.extra_fields.authority) {
+    case ManifestAuthority::kStore:
+      break;
+    case ManifestAuthority::kFile:
+      return Status::InvalidArgument(
+          "Store mode: the DB row says that the MANIFEST file is the "
+          "authority (the DB was rolled back to file mode)");
+    case ManifestAuthority::kShadow:
+      return Status::NotSupported(
+          "Store mode: the DB row says that the DB is in shadow mode");
+  }
+  if (scan.rows.db.db_id != current.stub.db_id) {
+    return Status::Corruption(
+        "Store mode: the db id of the DB row (" + scan.rows.db.db_id +
+        ") differs from the stub MANIFEST (" + current.stub.db_id + ")");
+  }
+  store_read->stub_number = current.number;
+  return Status::OK();
+}
+
+void ReactiveVersionSet::ApplyStoreRead(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    ManifestStoreRead* store_read) {
+  assert(store_read != nullptr);
+  manifest_reader->reset(
+      NewStoreRowsReader(std::move(store_read->bytes), reporter).release());
+  store_read->bytes.clear();
+  manifest_file_number_ = store_read->stub_number;
+  const uint64_t commit_sequence =
+      store_read->scan.db_row.state.commit_sequence;
+  replayed_store_commit_sequence_.store(commit_sequence,
+                                        std::memory_order_relaxed);
+  ROCKS_LOG_INFO(db_options_->info_log,
+                 "Read the rows of the manifest store at commit sequence "
+                 "%" PRIu64 "\n",
+                 commit_sequence);
+}
+
+std::vector<uint32_t> ReactiveVersionSet::LiveColumnFamilyIds() const {
+  std::vector<uint32_t> ids;
+  for (ColumnFamilyData* cfd : *column_family_set_) {
+    if (!cfd->IsDropped()) {
+      ids.push_back(cfd->GetID());
+    }
+  }
+  std::sort(ids.begin(), ids.end());
+  return ids;
 }
 
 #ifndef NDEBUG

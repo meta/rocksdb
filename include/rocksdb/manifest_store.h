@@ -425,17 +425,25 @@ std::string EncodeManifestRowFields(
 //    a consistent scan, so they work with an object without an epoch.
 // 3. Each metadata change (what RocksDB writes to the MANIFEST file when there
 //    is no store): one Commit() with the expected commit sequence.
+// 4. Readers that follow the primary: DB::OpenAsSecondary(),
+//    DB::OpenAsFollower() and the remote compaction worker, which gets the
+//    store from CompactionServiceOptionsOverride::manifest_store in
+//    DB::OpenAndCompact(), use a consistent Scan() at open. To catch up, a
+//    secondary and a follower call ReadDbRow(), and Scan() again only when the
+//    commit sequence changed. They never claim the DB, so they work with an
+//    object without an epoch.
 // Other cases:
 // - After Busy or an unknown outcome: ReadDbRow(), and compare
 //   last_commit_id with the commit id of the request.
 // - Move an existing DB into the store: WriteGeneration().
+// - DestroyDB(): Destroy(), then RocksDB deletes the files. After a rollback,
+//   DestroyDB() of the DB in file mode also calls Destroy() when the rows have
+//   the db id of the DB and authority kFile.
 //
-// Not supported in store mode yet: the live file APIs (DB::GetLiveFiles(),
-// DB::GetLiveFilesStorageInfo()) and so checkpoints and backups,
-// DB::OpenAsSecondary(), DB::OpenAsFollower(), DB::OpenAndCompact(),
-// DBOptions::compaction_service, RepairDB(), DestroyDB(), and the tools that
-// read the MANIFEST file (for example `ldb manifest_dump`). They return
-// NotSupported.
+// Not supported in store mode: DB::GetLiveFiles() (the MANIFEST file is only
+// a stub, so DB::GetLiveFilesStorageInfo() gives the MANIFEST content in
+// memory instead), RepairDB(), and the tools that read or rewrite the
+// MANIFEST file offline. They return NotSupported.
 
 // The DB row values that the store owns. The store sets them in each
 // successful commit and claim, and RocksDB never writes them.
@@ -540,12 +548,13 @@ struct ManifestGeneration {
 // first when there is no DB row) and change nothing.
 //
 // Calls: RocksDB makes at most one call at a time on the store object of one
-// DB instance. DB::ListColumnFamilies() and RollBackManifestStore() call the
-// store from the caller's thread, so do not pass them a store object that an
-// open DB uses. Every call must return in a bounded time (the store applies
-// its own timeout), because DB::Open() and DB::Close() wait for calls in
-// flight. A method added to this class has a default implementation that
-// returns NotSupported, so that existing stores still build.
+// DB instance. DB::ListColumnFamilies(), RollBackManifestStore() and
+// DestroyDB() call the store from the caller's thread, so do not pass them a
+// store object that an open DB uses. Every call must return in a bounded time
+// (the store applies its own timeout), because DB::Open() and DB::Close() wait
+// for calls in flight. A method added to this class has a default
+// implementation that returns NotSupported, so that existing stores still
+// build.
 class ManifestStore : public Customizable {
  public:
   ~ManifestStore() override = default;
@@ -603,7 +612,11 @@ class ManifestStore : public Customizable {
   virtual IOStatus WriteGeneration(const ManifestGeneration& request,
                                    uint64_t* generation) = 0;
 
-  // Removes all rows of this DB. Results: OK; IOFenced; any other status
+  // Removes all rows of this DB. DestroyDB() calls it for a DB in store mode,
+  // and for a DB in file mode whose rows a rollback left in the store.
+  // Results: OK, also when there is no DB row, so that a caller can repeat a
+  // DestroyDB() that stopped after this call; NotSupported for an object
+  // without an epoch, also when there is no DB row; IOFenced; any other status
   // (calling it again is safe).
   virtual IOStatus Destroy() = 0;
 };

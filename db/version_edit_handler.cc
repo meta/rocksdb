@@ -14,6 +14,7 @@
 
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_source.h"
+#include "db/manifest_store_state.h"
 #include "db/version_edit.h"
 #include "logging/logging.h"
 #include "monitoring/persistent_stats_history.h"
@@ -1268,11 +1269,50 @@ std::vector<std::string> ManifestTailer::GetAndClearIntermediateFiles() {
 Status ManifestTailer::VerifyFile(ColumnFamilyData* cfd,
                                   const std::string& fpath, int level,
                                   const FileMetaData& fmeta) {
+  // In store mode, each catch-up replays every live file as if the primary had
+  // switched to a new MANIFEST (see ReactiveVersionSet::ApplyStoreRead()). A
+  // file that the current Version of the column family already holds, with the
+  // same number and size, was checked when this instance added it (or is
+  // checked by the asynchronous file opening of the open, with
+  // DBOptions::open_files_async), and the primary does not delete a live file.
+  // So it is not checked again, and a catch-up checks only the new files, as in
+  // file mode. VerifyBlobFile() does the same for a blob file that the current
+  // Version holds with the same number and the same total blob count and
+  // bytes.
+  if (mode_ == Mode::kCatchUp &&
+      StoreModeOptions(*version_set_->db_options()) &&
+      cfd->current() != nullptr) {
+    const FileMetaData* current =
+        cfd->current()->storage_info()->GetFileMetaDataByNumber(
+            fmeta.fd.GetNumber());
+    if (current != nullptr &&
+        current->fd.GetFileSize() == fmeta.fd.GetFileSize()) {
+      return Status::OK();
+    }
+  }
   Status s =
       VersionEditHandlerPointInTime::VerifyFile(cfd, fpath, level, fmeta);
   // TODO: Open file or create hard link to prevent the file from being
   // deleted.
   return s;
+}
+
+Status ManifestTailer::VerifyBlobFile(ColumnFamilyData* cfd,
+                                      uint64_t blob_file_num,
+                                      const BlobFileAddition& blob_addition) {
+  if (mode_ == Mode::kCatchUp &&
+      StoreModeOptions(*version_set_->db_options()) &&
+      cfd->current() != nullptr) {
+    const std::shared_ptr<BlobFileMetaData> current =
+        cfd->current()->storage_info()->GetBlobFileMetaData(blob_file_num);
+    if (current != nullptr &&
+        current->GetTotalBlobCount() == blob_addition.GetTotalBlobCount() &&
+        current->GetTotalBlobBytes() == blob_addition.GetTotalBlobBytes()) {
+      return Status::OK();
+    }
+  }
+  return VersionEditHandlerPointInTime::VerifyBlobFile(cfd, blob_file_num,
+                                                       blob_addition);
 }
 
 void DumpManifestHandler::CheckIterationResult(const log::Reader& reader,

@@ -73,11 +73,48 @@ ManifestBlobFileRow MakeBlobFileRow(const BlobFileMetaData& meta) {
 
 // Returns the row of file `f` on `level`. AddExistingFile() copies only the
 // fields that a MANIFEST stores, so the row does not keep the table reader or
-// other in-memory state of the file.
-ManifestFileRow MakeFileRow(int level, const FileMetaData& f) {
+// other in-memory state of the file. When `marked_files` is not null, it gives
+// the files that are marked for compaction, so that
+// FileMetaData::marked_for_compaction, which changes under the DB mutex, is not
+// read (see VersionSet::GetManifestRowsWithoutFiles()).
+ManifestFileRow MakeFileRow(int level, const FileMetaData& f,
+                            const UnorderedSet<uint64_t>* marked_files) {
   VersionEdit edit;
-  edit.AddExistingFile(level, f, /*provenance_flags_to_set=*/0);
+  edit.AddExistingFile(level, f, /*provenance_flags_to_set=*/0,
+                       marked_files == nullptr
+                           ? f.marked_for_compaction
+                           : marked_files->count(f.fd.GetNumber()) > 0);
   return ManifestFileRow{level, std::move(edit.GetMutableNewFiles()[0].second)};
+}
+
+// Sets the file and blob file rows of `cf_rows` from `vstorage`.
+// `marked_files` is as in MakeFileRow().
+void SetManifestFileRows(const VersionStorageInfo& vstorage,
+                         const UnorderedSet<uint64_t>* marked_files,
+                         ManifestCfRows* cf_rows) {
+  for (int level = 0; level < vstorage.num_levels(); ++level) {
+    for (const FileMetaData* f : vstorage.LevelFiles(level)) {
+      cf_rows->files[f->fd.GetNumber()] = MakeFileRow(level, *f, marked_files);
+    }
+  }
+  for (const auto& meta : vstorage.GetBlobFiles()) {
+    cf_rows->blob_files[meta->GetBlobFileNumber()] = MakeBlobFileRow(*meta);
+  }
+}
+
+// Sets the column family row of `cfd` in `rows`, from `cfd` and `vstorage`,
+// the storage of its current Version, without its file rows. The compaction
+// cursors of `vstorage` change under the DB mutex.
+// REQUIRES: DB mutex held.
+ManifestCfRows& SetManifestCfRow(const ColumnFamilyData& cfd,
+                                 const VersionStorageInfo& vstorage,
+                                 ManifestRows* rows) {
+  assert(rows != nullptr);
+  ManifestCfRows& cf_rows = rows->cfs[cfd.GetID()];
+  cf_rows = ManifestCfRows();
+  cf_rows.cf = MakeManifestCfRow(cfd, vstorage, cfd.GetLogNumber(),
+                                 cfd.GetFullHistoryTsLow());
+  return cf_rows;
 }
 
 // Sets the column family row and the file and blob file rows of one column
@@ -86,19 +123,8 @@ ManifestFileRow MakeFileRow(int level, const FileMetaData& f) {
 // REQUIRES: DB mutex held.
 void SetManifestCfRows(const ColumnFamilyData& cfd,
                        const VersionStorageInfo& vstorage, ManifestRows* rows) {
-  assert(rows != nullptr);
-  ManifestCfRows& cf_rows = rows->cfs[cfd.GetID()];
-  cf_rows = ManifestCfRows();
-  cf_rows.cf = MakeManifestCfRow(cfd, vstorage, cfd.GetLogNumber(),
-                                 cfd.GetFullHistoryTsLow());
-  for (int level = 0; level < vstorage.num_levels(); ++level) {
-    for (const FileMetaData* f : vstorage.LevelFiles(level)) {
-      cf_rows.files[f->fd.GetNumber()] = MakeFileRow(level, *f);
-    }
-  }
-  for (const auto& meta : vstorage.GetBlobFiles()) {
-    cf_rows.blob_files[meta->GetBlobFileNumber()] = MakeBlobFileRow(*meta);
-  }
+  SetManifestFileRows(vstorage, /*marked_files=*/nullptr,
+                      &SetManifestCfRow(cfd, vstorage, rows));
 }
 
 }  // namespace
@@ -120,6 +146,10 @@ void VersionSet::SetManifestDbRowAndWals(ManifestRows* rows) const {
   rows->wals = wals_.GetWals();
 }
 
+uint64_t VersionSet::StoreAppliedCommitSequence() const {
+  return IsStoreMode() ? manifest_store_state_->applied_commit_sequence() : 0;
+}
+
 void VersionSet::GetManifestRows(ManifestRows* rows) const {
   assert(rows != nullptr);
   *rows = ManifestRows();
@@ -131,6 +161,52 @@ void VersionSet::GetManifestRows(ManifestRows* rows) const {
     }
     SetManifestCfRows(*cfd, *cfd->current()->storage_info(), rows);
   }
+}
+
+void VersionSet::GetManifestRowsWithoutFiles(
+    ManifestRows* rows, const UnorderedSet<uint32_t>* include_cf_ids,
+    CheckpointRowsRefs* refs) const {
+  assert(rows != nullptr);
+  assert(refs != nullptr);
+  *rows = ManifestRows();
+  SetManifestDbRowAndWals(rows);
+  for (ColumnFamilyData* cfd : *column_family_set_) {
+    if (cfd->IsDropped() || (include_cf_ids != nullptr &&
+                             include_cf_ids->count(cfd->GetID()) == 0)) {
+      continue;
+    }
+    Version* current = cfd->current();
+    const VersionStorageInfo& vstorage = *current->storage_info();
+    SetManifestCfRow(*cfd, vstorage, rows);
+    for (int level = 0; level < vstorage.num_levels(); ++level) {
+      for (const FileMetaData* f : vstorage.LevelFiles(level)) {
+        if (f->marked_for_compaction) {
+          refs->marked_files.insert(f->fd.GetNumber());
+        }
+      }
+    }
+    cfd->Ref();
+    current->Ref();
+    refs->versions.push_back(current);
+  }
+}
+
+void VersionSet::AddManifestFileRows(const CheckpointRowsRefs& refs,
+                                     ManifestRows* rows) {
+  assert(rows != nullptr);
+  for (Version* version : refs.versions) {
+    SetManifestFileRows(*version->storage_info(), &refs.marked_files,
+                        &rows->cfs[version->cfd()->GetID()]);
+  }
+}
+
+void VersionSet::ReleaseCheckpointRowsRefs(CheckpointRowsRefs* refs) {
+  for (Version* version : refs->versions) {
+    ColumnFamilyData* cfd = version->cfd();
+    version->Unref();
+    cfd->UnrefAndTryDelete();
+  }
+  refs->versions.clear();
 }
 
 Status BuildManifestRowChanges(
@@ -189,7 +265,8 @@ Status BuildManifestRowChanges(
     for (const auto& [level, meta] : e->GetNewFiles()) {
       const std::pair<uint32_t, uint64_t> key(cf_id, meta.fd.GetNumber());
       changes->file_deletes.erase(key);
-      changes->file_upserts[key] = MakeFileRow(level, meta);
+      changes->file_upserts[key] =
+          MakeFileRow(level, meta, /*marked_files=*/nullptr);
     }
     if (e->IsColumnFamilyAdd()) {
       assert(new_cf_options != nullptr);
@@ -455,7 +532,8 @@ void AssertCfRowsMatchVersion(const ManifestBatchVersion& v,
         continue;
       }
       if (changes.file_upserts.count({cf_id, number}) > 0) {
-        expected_cf.files[number] = MakeFileRow(level, *f);
+        expected_cf.files[number] =
+            MakeFileRow(level, *f, /*marked_files=*/nullptr);
         actual_cf.files[number] = it->second;
       }
     }
