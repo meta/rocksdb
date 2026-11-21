@@ -227,6 +227,17 @@ class CompactionPicker {
       CompactionInputFiles* start_level_inputs,
       std::function<bool(const FileMetaData*)> skip_marked_file);
 
+  // Grows the L0 set `inputs` until two rules add no file: (1) every L0 file
+  // that overlaps the key range of the set (only `starting_l0_file` and older
+  // files, when it is not null), and (2) every file of an epoch run that has a
+  // file in the set (VersionStorageInfo::ExpandExactL0Inputs()). A file of a
+  // run can widen the key range, so both steps repeat. With `search_first`
+  // false, the first round skips the overlap search. Sets `*grew` if the set
+  // got a new file. Returns false if ExpandExactL0Inputs() fails.
+  bool ExpandL0ToWholeRuns(VersionStorageInfo* vstorage,
+                           CompactionInputFiles* inputs, bool search_first,
+                           const FileMetaData* starting_l0_file, bool* grew);
+
   // @param starting_l0_file If not null, restricts L0 file selection to only
   //                         include files at or older than starting_l0_file.
   bool GetOverlappingL0Files(VersionStorageInfo* vstorage,

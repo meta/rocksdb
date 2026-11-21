@@ -16,3 +16,24 @@
 #define LIKELY(x) (x)
 #define UNLIKELY(x) (x)
 #endif
+
+// Keeps a function out of line, for a rarely run path, so that its caller
+// stays small.
+#if defined(__GNUC__) || defined(__clang__)
+#define ROCKSDB_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define ROCKSDB_NOINLINE __declspec(noinline)
+#else
+#define ROCKSDB_NOINLINE
+#endif
+
+// Marks a function that runs rarely, even with its feature on. The compiler
+// keeps it out of line and places it away from the hot code, so that the hot
+// code of its callers stays dense in the instruction cache.
+#if defined(__GNUC__) || defined(__clang__)
+#define ROCKSDB_COLD __attribute__((cold, noinline))
+#elif defined(_MSC_VER)
+#define ROCKSDB_COLD __declspec(noinline)
+#else
+#define ROCKSDB_COLD
+#endif

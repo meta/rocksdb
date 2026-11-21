@@ -283,10 +283,21 @@ bool CompactionPicker::ExpandInputsToCleanCut(const std::string& /*cf_name*/,
   assert(!inputs->empty());
 
   const int level = inputs->level;
-  // GetOverlappingInputs will always do the right thing for level-0.
-  // So we don't need to do any expansion if level == 0.
+  // For L0, the normal overlap expansion (GetOverlappingInputs) is enough for
+  // legacy files. Later picks must take all files of an epoch run (see
+  // VersionStorageInfo::ExpandExactL0Inputs()). A file of the run can widen the
+  // key range, so L0 is searched again for all files that overlap the wider
+  // range, until the set stops changing. Without exact files nothing is added.
   if (level == 0) {
-    return true;
+    bool expanded = false;
+    if (!ExpandL0ToWholeRuns(vstorage, inputs, /*search_first=*/false,
+                             /*starting_l0_file=*/nullptr, &expanded)) {
+      return false;
+    }
+    // The caller already checked the original inputs. So, as in base RocksDB,
+    // an L0 set that this function does not change is returned without the
+    // being_compacted check; only a set that grew is checked.
+    return !expanded || !AreFilesInCompaction(inputs->files);
   }
 
   InternalKey smallest;
@@ -497,6 +508,10 @@ Status CompactionPicker::GetCompactionInputsFromFileNumbers(
       message += std::to_string(fn);
     }
     return Status::InvalidArgument(message);
+  }
+
+  if (!vstorage->ExpandExactL0Inputs(&matched_input_files[0].files)) {
+    return Status::Aborted("Exact L0 input run is unavailable for compaction");
   }
 
   for (int level = first_non_empty_level; level <= last_non_empty_level;
@@ -1311,25 +1326,51 @@ void CompactionPicker::PickFilesMarkedForCompaction(
   start_level_inputs->files.clear();
 }
 
+bool CompactionPicker::ExpandL0ToWholeRuns(VersionStorageInfo* vstorage,
+                                           CompactionInputFiles* inputs,
+                                           bool search_first,
+                                           const FileMetaData* starting_l0_file,
+                                           bool* grew) {
+  *grew = false;
+  bool search = search_first;
+  while (true) {
+    const size_t before = inputs->size();
+    if (search) {
+      // GetOverlappingInputs() replaces the set with the L0 files that overlap
+      // its key range. The set keeps the starting file.
+      InternalKey smallest;
+      InternalKey largest;
+      GetRange(*inputs, &smallest, &largest);
+      inputs->files.clear();
+      vstorage->GetOverlappingInputs(0, &smallest, &largest, &inputs->files,
+                                     /*hint_index=*/-1, /*file_index=*/nullptr,
+                                     /*expand_range=*/true, starting_l0_file);
+    }
+    // ExpandExactL0Inputs() also puts the files back in epoch order.
+    if (!vstorage->ExpandExactL0Inputs(&inputs->files)) {
+      return false;
+    }
+    if (inputs->size() <= before) {
+      return true;
+    }
+    *grew = true;
+    search = true;
+  }
+}
+
 bool CompactionPicker::GetOverlappingL0Files(
     VersionStorageInfo* vstorage, CompactionInputFiles* start_level_inputs,
     int output_level, int* parent_index, const FileMetaData* starting_l0_file) {
   // Two level 0 compaction won't run at the same time, so don't need to worry
   // about files on level 0 being compacted.
   assert(level0_compactions_in_progress()->empty());
+  bool grew = false;
+  if (!ExpandL0ToWholeRuns(vstorage, start_level_inputs, /*search_first=*/true,
+                           starting_l0_file, &grew)) {
+    return false;
+  }
   InternalKey smallest;
   InternalKey largest;
-  GetRange(*start_level_inputs, &smallest, &largest);
-  // Note that the next call will discard the file we placed in
-  // c->inputs_[0] earlier and replace it with an overlapping set
-  // which will include the picked file.
-  start_level_inputs->files.clear();
-  vstorage->GetOverlappingInputs(0, &smallest, &largest,
-                                 &(start_level_inputs->files),
-                                 /*hint_index=*/-1,
-                                 /*file_index=*/nullptr,
-                                 /*expand_range=*/true,
-                                 /*starting_l0_file=*/starting_l0_file);
 
   // If we include more L0 files in the same compaction run it can
   // cause the 'smallest' and 'largest' key to get extended to a

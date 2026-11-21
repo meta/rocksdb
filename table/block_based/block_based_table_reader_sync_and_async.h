@@ -509,6 +509,7 @@ DEFINE_SYNC_AND_ASYNC(TBlockIter*, BlockBasedTable::NewDataBlockIterator)(
 DEFINE_SYNC_AND_ASYNC(Status, BlockBasedTable::Get)
 (const ReadOptions& read_options, const Slice& key, GetContext* get_context,
  const SliceTransform* prefix_extractor, bool skip_filters) {
+  MarkReadStarted();
   // Similar to Bloom filter !may_match
   // If timestamp is beyond the range of the table, skip
   if (!TimestampMayMatch(read_options)) {
@@ -723,7 +724,9 @@ DEFINE_SYNC_AND_ASYNC(Status, BlockBasedTable::Get)
 // If compression is enabled and also there is no compressed block cache,
 // the adjacent blocks are read out in one IO (combined read)
 // batch - A MultiGetRange with only those keys with unique data blocks not
-//         found in cache
+//         found in cache, one key per entry of `handles`. May be null for
+//         callers that have no MultiGetRange. Then all reads are synchronous,
+//         and no GetContext receives the statistics.
 // handles - A vector of block handles. Some of them me be NULL handles
 // scratch - An optional contiguous buffer to read compressed blocks into
 DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
@@ -736,9 +739,19 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
   const ImmutableOptions& ioptions = rep_->ioptions;
 
   if (ioptions.allow_mmap_reads) {
-    size_t idx_in_batch = 0;
-    for (auto mget_iter = batch->begin(); mget_iter != batch->end();
-         ++mget_iter, ++idx_in_batch) {
+    // No lambda here: in the coroutine version of this function, a lambda
+    // becomes a frame field whose type has no linkage, which gcc rejects
+    // (-Wsubobject-linkage). So the get contexts are collected first.
+    autovector<GetContext*, MultiGetContext::MAX_BATCH_SIZE> get_contexts;
+    if (batch != nullptr) {
+      for (auto mget_iter = batch->begin(); mget_iter != batch->end();
+           ++mget_iter) {
+        get_contexts.push_back(mget_iter->get_context);
+      }
+      assert(get_contexts.size() == handles->size());
+    }
+    for (size_t idx_in_batch = 0; idx_in_batch < handles->size();
+         ++idx_in_batch) {
       const BlockHandle& handle = (*handles)[idx_in_batch];
       if (handle.IsNull()) {
         continue;
@@ -747,12 +760,12 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
       // XXX: use_cache=true means double cache query?
       statuses[idx_in_batch] = RetrieveBlock(
           nullptr, options, handle, decomp,
-          &results[idx_in_batch].As<Block_kData>(), mget_iter->get_context,
+          &results[idx_in_batch].As<Block_kData>(),
+          batch == nullptr ? nullptr : get_contexts[idx_in_batch],
           /* lookup_context */ nullptr,
           /* for_compaction */ false, /* use_cache */ true,
           /* async_read */ false, /* use_block_cache_for_lookup */ true);
     }
-    assert(idx_in_batch == handles->size());
     CO_RETURN;
   }
 
@@ -777,8 +790,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
   size_t prev_len = 0;
   autovector<size_t, MultiGetContext::MAX_BATCH_SIZE> req_idx_for_block;
   autovector<size_t, MultiGetContext::MAX_BATCH_SIZE> req_offset_for_block;
-  for (auto mget_iter = batch->begin(); mget_iter != batch->end();
-       ++mget_iter, ++idx_in_batch) {
+  for (; idx_in_batch < handles->size(); ++idx_in_batch) {
     const BlockHandle& handle = (*handles)[idx_in_batch];
     if (handle.IsNull()) {
       continue;
@@ -853,7 +865,10 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
       // own, so adjacent blocks can read (and charge the rate limiter for) a
       // shared aligned page twice. Each request keeps its aligned buffer in
       // fs_scratch until the blocks below are parsed.
-      if (batch->context()->use_coro_read()) {
+      if (batch == nullptr) {
+        s = file->MultiRead(opts, &read_reqs[0], read_reqs.size(),
+                            &direct_io_context, &dbg);
+      } else if (batch->context()->use_coro_read()) {
         s = co_await file->MultiReadCoroutine(
             opts, &read_reqs[0], read_reqs.size(), &direct_io_context, &dbg);
       } else {
@@ -874,10 +889,8 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::RetrieveMultipleBlocks)
     }
   }
 
-  idx_in_batch = 0;
   size_t valid_batch_idx = 0;
-  for (auto mget_iter = batch->begin(); mget_iter != batch->end();
-       ++mget_iter, ++idx_in_batch) {
+  for (idx_in_batch = 0; idx_in_batch < handles->size(); ++idx_in_batch) {
     const BlockHandle& handle = (*handles)[idx_in_batch];
 
     if (handle.IsNull()) {
@@ -1003,6 +1016,7 @@ using MultiGetRange = MultiGetContext::Range;
 DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
 (const ReadOptions& read_options, const MultiGetRange* mget_range,
  const SliceTransform* prefix_extractor, bool skip_filters) {
+  MarkReadStarted();
   if (mget_range->empty()) {
     // Caller should ensure non-empty (performance bug)
     assert(false);

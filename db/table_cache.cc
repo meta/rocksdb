@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/dbformat.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/snapshot_impl.h"
@@ -25,6 +27,7 @@
 #include "options/options_helper.h"
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/statistics.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/get_context.h"
 #include "table/internal_iterator.h"
@@ -616,8 +619,36 @@ bool TableCache::GetFromRowCache(const Slice& user_key, IterKey& row_cache_key,
   return found;
 }
 
+bool TableCache::RangeTombstonesMayCoverUserKey(
+    const Comparator* user_comparator, const FileMetaData& file_meta,
+    const Slice& user_key) {
+  TEST_SYNC_POINT("TableCache::RangeTombstonesMayCoverUserKey");
+  assert(user_comparator != nullptr);
+  if (file_meta.smallest.size() == 0 || file_meta.largest.size() == 0) {
+    return true;
+  }
+  if (user_comparator->CompareWithoutTimestamp(
+          user_key, file_meta.smallest.user_key()) < 0) {
+    return false;
+  }
+  const int cmp_largest = user_comparator->CompareWithoutTimestamp(
+      user_key, file_meta.largest.user_key());
+  if (cmp_largest != 0) {
+    return cmp_largest < 0;
+  }
+  SequenceNumber largest_seq = 0;
+  ValueType largest_type = kTypeDeletion;
+  UnPackSequenceAndType(ExtractInternalKeyFooter(file_meta.largest.Encode()),
+                        &largest_seq, &largest_type);
+  // The exclusive end of a cut range tombstone: the file holds nothing for
+  // this user key.
+  return !(largest_seq == kMaxSequenceNumber &&
+           largest_type == kTypeRangeDeletion);
+}
+
 void TableCache::UpdateRangeTombstoneSeqnums(
     const ReadOptions& options, TableReader* t,
+    const Comparator* user_comparator, const FileMetaData* l0_file,
     MultiGetContext::Range& table_range) {
   std::unique_ptr<FragmentedRangeTombstoneIterator> latest_range_del_iter;
   bool track_newer_versions = false;
@@ -652,6 +683,11 @@ void TableCache::UpdateRangeTombstoneSeqnums(
   }
   if (range_del_iter != nullptr || latest_range_del_iter != nullptr) {
     for (auto iter = table_range.begin(); iter != table_range.end(); ++iter) {
+      if (l0_file != nullptr &&
+          !RangeTombstonesMayCoverUserKey(user_comparator, *l0_file,
+                                          iter->ukey_with_ts)) {
+        continue;
+      }
       if (latest_range_del_iter != nullptr &&
           iter->get_context->NeedToTrackNewerVersions()) {
         const SequenceNumber covering_seq =
@@ -728,7 +764,9 @@ Status TableCache::MultiGetFilter(
     // Update the range tombstone sequence numbers for the keys here
     // as TableCache::MultiGet may or may not be called, and even if it
     // is, it may be called with fewer keys in the rangedue to filtering.
-    UpdateRangeTombstoneSeqnums(options, t, tombstone_range);
+    UpdateRangeTombstoneSeqnums(
+        options, t, internal_comparator.user_comparator(),
+        level == 0 ? &file_meta : nullptr, tombstone_range);
   }
   if (mget_range->empty() && *handle) {
     cache_.Release(*handle);
@@ -760,6 +798,183 @@ Status TableCache::GetTableProperties(
     cache_.Release(table_handle);
   }
   return s;
+}
+
+Status TableCache::OpenEphemeralBlobReferenceReader(
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+    std::unique_ptr<TableReader>* reader) {
+  assert(reader != nullptr);
+  assert(*reader == nullptr);
+  if (file_meta.blob_reference_descriptor.empty()) {
+    return Status::InvalidArgument(
+        "SST does not require exact blob reference metadata");
+  }
+
+  TableCacheOpenOptions open_options;
+  open_options.open_ephemeral_table_reader = true;
+  open_options.avoid_shared_metadata_cache = true;
+  open_options.skip_filters = true;
+  TableReader* raw_reader = nullptr;
+  TypedHandle* handle = nullptr;
+  Status status =
+      FindTable(read_options, file_options, internal_comparator, file_meta,
+                &handle, mutable_cf_options, &raw_reader, false /* no_io */,
+                nullptr /* histogram */, true /* skip_filters */,
+                -1 /* level */, false /* prefetch_index_and_filter_in_cache */,
+                0 /* max_file_size_for_l0_meta_pin */, file_meta.temperature,
+                false /* pin_table_handle */, nullptr /* file_open_metadata */,
+                reader, open_options);
+  assert(handle == nullptr);
+  if (!status.ok()) {
+    return status;
+  }
+  assert(raw_reader != nullptr);
+  assert(reader->get() == raw_reader);
+  return Status::OK();
+}
+
+void TableCache::BlobReferenceReader::Reset() {
+  if (handle_ != nullptr) {
+    cache_->Release(handle_);
+    handle_ = nullptr;
+  }
+  owned_.reset();
+  reader_ = nullptr;
+}
+
+Status TableCache::GetBlobReferenceReader(
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+    BlobReferenceReader* reader) {
+  assert(reader != nullptr);
+  reader->Reset();
+  if (file_meta.blob_reference_descriptor.empty()) {
+    return Status::InvalidArgument(
+        "SST does not require exact blob reference metadata");
+  }
+  TableReader* cached = nullptr;
+  TypedHandle* handle = nullptr;
+  Status status =
+      FindTable(read_options, file_options, internal_comparator, file_meta,
+                &handle, mutable_cf_options, &cached, /*no_io=*/true);
+  TEST_SYNC_POINT_CALLBACK("TableCache::GetBlobReferenceReader:Lookup",
+                           &status);
+  if (status.ok()) {
+    assert(cached != nullptr);
+    reader->cache_ = &cache_;
+    reader->handle_ = handle;
+    reader->reader_ = cached;
+    return status;
+  }
+  if (handle != nullptr) {
+    cache_.Release(handle);
+  }
+  if (!status.IsIncomplete()) {
+    return status;
+  }
+  status = OpenEphemeralBlobReferenceReader(
+      read_options, file_options, internal_comparator, file_meta,
+      mutable_cf_options, &reader->owned_);
+  if (status.ok()) {
+    reader->reader_ = reader->owned_.get();
+  }
+  return status;
+}
+
+Status TableCache::ReadBlobReferenceSstSummary(
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+    std::shared_ptr<const BlobReferenceSstSummary>* summary,
+    const std::shared_ptr<CacheReservationManager>& reservation_manager) {
+  if (summary == nullptr) {
+    return Status::InvalidArgument("Null blob reference summary output");
+  }
+  if (file_meta.blob_reference_summary != nullptr) {
+    *summary = file_meta.blob_reference_summary;
+    return Status::OK();
+  }
+  BlobReferenceReader reader;
+  Status status =
+      GetBlobReferenceReader(read_options, file_options, internal_comparator,
+                             file_meta, mutable_cf_options, &reader);
+  return status.ok() ? ReadBlobReferenceSstSummary(
+                           read_options, *reader.get(), file_meta,
+                           mutable_cf_options, summary, reservation_manager)
+                     : status;
+}
+
+Status TableCache::ReadBlobReferenceSstSummary(
+    const ReadOptions& read_options, const TableReader& reader,
+    const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+    std::shared_ptr<const BlobReferenceSstSummary>* summary,
+    const std::shared_ptr<CacheReservationManager>& reservation_manager) {
+  if (summary == nullptr) {
+    return Status::InvalidArgument("Null blob reference summary output");
+  }
+  if (file_meta.blob_reference_summary != nullptr) {
+    *summary = file_meta.blob_reference_summary;
+    return Status::OK();
+  }
+  std::shared_ptr<BlobReferenceSstSummary> result =
+      std::make_shared<BlobReferenceSstSummary>();
+  result->file_number = file_meta.fd.GetNumber();
+  Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+      file_meta.blob_reference_descriptor, &result->descriptor);
+  if (!status.ok()) {
+    return status;
+  }
+  result->reservation_manager =
+      reservation_manager != nullptr
+          ? reservation_manager
+          : GetBlobReferenceCacheReservationManager(
+                mutable_cf_options.table_factory.get());
+  if (result->reservation_manager != nullptr) {
+    status = result->reservation_manager->MakeCacheReservation(
+        sizeof(*result), &result->reservation_handle);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  // Charge the group buffer before it is allocated.
+  status = reader.ReadBlobReferenceGroups(
+      read_options, file_meta.blob_reference_descriptor,
+      [&result](size_t buffer_bytes) -> Status {
+        return result->reservation_handle == nullptr
+                   ? Status::OK()
+                   : result->reservation_handle->Resize(sizeof(*result) +
+                                                        buffer_bytes);
+      },
+      &result->groups);
+  if (!status.ok()) {
+    return status;
+  }
+  if (result->reservation_handle != nullptr) {
+    status = result->reservation_handle->Resize(result->MemoryUsage());
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  *summary = std::move(result);
+  return Status::OK();
+}
+
+Status TableCache::ReadBlobReferences(
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& internal_comparator,
+    const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+    std::vector<BlobReferenceGroupRead>* requests) {
+  BlobReferenceReader reader;
+  Status status =
+      GetBlobReferenceReader(read_options, file_options, internal_comparator,
+                             file_meta, mutable_cf_options, &reader);
+  return status.ok() ? reader->ReadBlobReferences(
+                           read_options, file_meta.blob_reference_descriptor,
+                           /*after_index_read=*/nullptr, requests)
+                     : status;
 }
 
 Status TableCache::ApproximateKeyAnchors(
