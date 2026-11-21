@@ -3811,8 +3811,7 @@ class DBImpl : public DB
   InstrumentedMutex options_mutex_;
 
   // True when the OPTIONS file can lag the options or column families in
-  // effect: the last OPTIONS file write failed, SetOptions() changed options
-  // and then failed before it wrote the file, or a column family batch with
+  // effect: the last OPTIONS file write failed, or a column family batch with
   // track_options_file_number_in_manifest stopped part way. Then SetOptions()
   // and SetDBOptions() write the file even for a request that changes no
   // option. A successful WriteOptionsFile() clears it, and so does a tracked
@@ -3821,8 +3820,7 @@ class DBImpl : public DB
   bool options_file_stale_ = false;
 
   // True when the seqno-to-time worker can lag the time options of the column
-  // families: the last RegisterRecordSeqnoTimeWorker() failed, or SetOptions()
-  // changed options and then failed before it updated the worker. Then
+  // families, because the last RegisterRecordSeqnoTimeWorker() failed. Then
   // SetOptions() updates the worker even for a request that changes no option.
   // A successful RegisterRecordSeqnoTimeWorker() clears it. Protected by
   // options_mutex_.

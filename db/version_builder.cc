@@ -316,12 +316,33 @@ class VersionBuilder::Rep : public MutableScalars {
   // Dropped blob files (see VersionStorageInfo::GetDroppedBlobFiles())
   // recorded by the series of version edits.
   std::unordered_set<uint64_t> dropped_blob_files_;
+  // The smallest oldest_blob_file_number among the SSTs that the last
+  // SaveTableFilesTo() call saved. SaveBlobFilesAndCheckTo() drops every blob
+  // file with a smaller number, because no saved SST references it. If no saved
+  // SST references a blob file, the value is kInvalidBlobFileNumber and
+  // SaveBlobFilesAndCheckTo() drops all blob files. The two steps are separate
+  // public calls, and ProcessManifestWrites() releases the DB mutex between
+  // them. Both are const to match SaveTo(). So the value is kept in a mutable
+  // member instead of being passed through the caller.
+  mutable uint64_t saved_min_oldest_blob_file_num_ = kInvalidBlobFileNumber;
+#ifndef NDEBUG
+  // Debug check of the call order. SaveTableFilesTo() sets it, and the next
+  // SaveBlobFilesAndCheckTo() checks and clears it. So
+  // saved_min_oldest_blob_file_num_ is never used before a save, and never used
+  // twice for one save.
+  mutable bool table_files_saved_ = false;
+#endif  // NDEBUG
 
   std::shared_ptr<CacheReservationManager> file_metadata_cache_res_mgr_;
 
   ColumnFamilyData* cfd_;
   VersionEditHandler* version_edit_handler_;
   bool track_found_and_missing_files_;
+  // True once the consistency check of base_vstorage_ has passed. The base
+  // Version never changes during the builder's life, so Apply() checks it only
+  // until the first check passes. A failed check leaves this false, so the next
+  // Apply() reports the problem again.
+  bool base_checked_ = false;
   // If false, only a complete Version with all files consisting it found is
   // considered valid. If true, besides complete Version, if the Version is
   // never edited in an atomic group, an incomplete Version with only a suffix
@@ -1367,11 +1388,13 @@ class VersionBuilder::Rep : public MutableScalars {
   // Apply all of the edits in *edit to the current state.
   Status Apply(const VersionEdit* edit) {
     bool version_updated = false;
-    {
+    if (!base_checked_) {
+      TEST_SYNC_POINT("VersionBuilder::Apply:CheckBaseConsistency");
       const Status s = CheckConsistency(base_vstorage_);
       if (!s.ok()) {
         return s;
       }
+      base_checked_ = true;
     }
 
     // In tracking mode, snapshot how to undo this edit before mutating, so
@@ -2024,8 +2047,7 @@ class VersionBuilder::Rep : public MutableScalars {
     return true;
   }
 
-  // Save the current state in *vstorage.
-  Status SaveTo(VersionStorageInfo* vstorage) const {
+  Status SaveTableFilesTo(VersionStorageInfo* vstorage) const {
     assert(!track_found_and_missing_files_ || valid_version_available_);
     Status s;
 
@@ -2042,18 +2064,39 @@ class VersionBuilder::Rep : public MutableScalars {
       return s;
     }
 
-    const uint64_t min_oldest_blob_file_num = SaveSSTFilesTo(vstorage);
-
-    std::vector<uint64_t> dropped_blob_files;
-    SaveBlobFilesTo(vstorage, min_oldest_blob_file_num, &dropped_blob_files);
-
-    SaveDroppedBlobFilesTo(vstorage, min_oldest_blob_file_num,
-                           std::move(dropped_blob_files));
-
+    saved_min_oldest_blob_file_num_ = SaveSSTFilesTo(vstorage);
+#ifndef NDEBUG
+    table_files_saved_ = true;
+#endif  // NDEBUG
     SaveCompactCursorsTo(vstorage);
 
-    s = CheckConsistency(vstorage);
-    return s;
+    return Status::OK();
+  }
+
+  Status SaveBlobFilesAndCheckTo(VersionStorageInfo* vstorage) const {
+    assert(!track_found_and_missing_files_ || valid_version_available_);
+
+#ifndef NDEBUG
+    assert(table_files_saved_);
+    table_files_saved_ = false;
+#endif  // NDEBUG
+    std::vector<uint64_t> dropped_blob_files;
+    SaveBlobFilesTo(vstorage, saved_min_oldest_blob_file_num_,
+                    &dropped_blob_files);
+    SaveDroppedBlobFilesTo(vstorage, saved_min_oldest_blob_file_num_,
+                           std::move(dropped_blob_files));
+
+    return CheckConsistency(vstorage);
+  }
+
+  // Save the current state in *vstorage.
+  Status SaveTo(VersionStorageInfo* vstorage) const {
+    Status s = SaveTableFilesTo(vstorage);
+    if (!s.ok()) {
+      return s;
+    }
+
+    return SaveBlobFilesAndCheckTo(vstorage);
   }
 
   Status LoadTableHandlers(InternalStats* internal_stats, int max_threads,
@@ -2152,6 +2195,15 @@ Status VersionBuilder::Apply(const VersionEdit* edit) {
 
 Status VersionBuilder::SaveTo(VersionStorageInfo* vstorage) const {
   return rep_->SaveTo(vstorage);
+}
+
+Status VersionBuilder::SaveTableFilesTo(VersionStorageInfo* vstorage) const {
+  return rep_->SaveTableFilesTo(vstorage);
+}
+
+Status VersionBuilder::SaveBlobFilesAndCheckTo(
+    VersionStorageInfo* vstorage) const {
+  return rep_->SaveBlobFilesAndCheckTo(vstorage);
 }
 
 Status VersionBuilder::LoadTableHandlers(
