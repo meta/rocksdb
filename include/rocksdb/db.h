@@ -1986,8 +1986,8 @@ class DB {
     // the garbage threshold; suppressed files and files pinned by the coarse
     // frontier are not counted), garbage-bytes-collectable,
     // garbage-bytes-suppressed, coarse-pinned-files, coarse-pinned-bytes,
-    // coarse-pinned-garbage-bytes. Every *-micros key is a duration, never a
-    // timestamp.
+    // coarse-pinned-garbage-bytes, coarse-sst-count, lowest-coarse-frontier.
+    // Every *-micros key is a duration, never a timestamp.
     static const std::string kIndirectBlobGcStats;
 
     // "rocksdb.blob-reference-census-unready-micros" - returns how long the

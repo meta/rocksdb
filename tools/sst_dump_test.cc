@@ -514,6 +514,37 @@ TEST_F(SSTDumpToolTest, ShowBlobReferenceProperties) {
   cleanup(opts, file_path);
 }
 
+TEST_F(SSTDumpToolTest, ShowBlobReferenceClassification) {
+  // Frontier 12 is an example blob file number. The frontier is the oldest
+  // indirect-origin file number a coarse SST may reference (see "Coarse SST" in
+  // db/blob/blob_reference_metadata.h).
+  std::string encoded_classification;
+  EncodeBlobReferenceClassification(/*frontier=*/12, &encoded_classification);
+  Options opts;
+  opts.env = env();
+  opts.table_properties_collector_factories.emplace_back(
+      std::make_shared<FixedPropertiesCollectorFactory>(UserCollectedProperties{
+          {kBlobReferenceClassificationPropertyName, encoded_classification}}));
+  const std::string file_path = MakeFilePath("blob_reference_coarse.sst");
+  SstFileWriter writer(EnvOptions(), opts);
+  ASSERT_OK(writer.Open(file_path));
+  ASSERT_OK(writer.Put("key", "value"));
+  ASSERT_OK(writer.Finish());
+
+  char* usage[3];
+  auto cleanup_usage = CleanupUsage{usage};
+  PopulateCommandArgs(file_path, "--show_properties", usage);
+  ROCKSDB_NAMESPACE::SSTDumpTool tool;
+  testing::internal::CaptureStdout();
+  const int result = tool.Run(3, usage, opts);
+  const std::string output = testing::internal::GetCapturedStdout();
+  ASSERT_EQ(result, 0);
+  EXPECT_NE(output.find("coarse classification: frontier 12"),
+            std::string::npos);
+  EXPECT_EQ(output.find("exact metadata"), std::string::npos);
+  cleanup(opts, file_path);
+}
+
 namespace {
 using Compressor8A = test::CompressorCustomAlg<kCustomCompression8A>;
 class MyManager : public CompressionManager {
