@@ -164,13 +164,34 @@ Status BlobLogWriter::AddRecord(const WriteOptions& write_options,
   return s;
 }
 
+Status BlobLogWriter::AddRecordWithValueCrc(const WriteOptions& write_options,
+                                            const Slice& key, const Slice& val,
+                                            uint32_t value_crc32c,
+                                            uint64_t* key_offset,
+                                            uint64_t* blob_offset) {
+  assert(block_offset_ != 0);
+  assert(last_elem_type_ == kEtFileHdr || last_elem_type_ == kEtRecord);
+
+  std::string buf;
+  ConstructBlobHeader(&buf, key, val, 0, &value_crc32c);
+
+  return EmitPhysicalRecord(write_options, buf, key, val, key_offset,
+                            blob_offset);
+}
+
 void BlobLogWriter::ConstructBlobHeader(std::string* buf, const Slice& key,
                                         const Slice& val, uint64_t expiration) {
+  ConstructBlobHeader(buf, key, val, expiration, /*value_crc32c=*/nullptr);
+}
+
+void BlobLogWriter::ConstructBlobHeader(std::string* buf, const Slice& key,
+                                        const Slice& val, uint64_t expiration,
+                                        const uint32_t* value_crc32c) {
   BlobLogRecord record;
   record.key = key;
   record.value = val;
   record.expiration = expiration;
-  record.EncodeHeaderTo(buf);
+  record.EncodeHeaderTo(buf, value_crc32c);
 }
 
 Status BlobLogWriter::EmitPhysicalRecord(const WriteOptions& write_options,

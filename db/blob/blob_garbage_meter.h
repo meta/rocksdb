@@ -97,6 +97,10 @@ class BlobGarbageMeter {
 
   Status ProcessInFlow(const Slice& key, const Slice& value);
   Status ProcessOutFlow(const Slice& key, const Slice& value);
+  // Same as above. `decoded_blob_index`, if not nullptr, is the caller's
+  // decode of a kTypeBlobIndex `value`. It saves a second decode.
+  Status ProcessOutFlow(const Slice& key, const Slice& value,
+                        const BlobIndex* decoded_blob_index);
 
   void ProcessOutFlow(const BlobGarbageMeter& inflow) {
     for (const auto& [file_number, flow] : inflow.flows()) {
@@ -124,11 +128,13 @@ class BlobGarbageMeter {
                                         uint64_t* bytes);
   static Status ParseBlobIndexReference(const ParsedInternalKey& ikey,
                                         const Slice& value,
+                                        const BlobIndex* decoded_blob_index,
                                         uint64_t* blob_file_number,
                                         uint64_t* bytes);
 
   void AddFlow(uint64_t blob_file_number, uint64_t bytes, bool is_inflow);
-  Status ProcessFlow(const Slice& key, const Slice& value, bool is_inflow);
+  Status ProcessFlow(const Slice& key, const Slice& value, bool is_inflow,
+                     const BlobIndex* decoded_blob_index);
   Status ProcessEntityBlobReferences(const ParsedInternalKey& ikey,
                                      const Slice& value, bool is_inflow);
 
