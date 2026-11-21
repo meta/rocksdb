@@ -49,6 +49,29 @@ TableBuilder* NewTableBuilder(const TableBuilderOptions& tboptions,
 void ExtractTimestampFromTableProperties(const TableProperties& tp,
                                          FileMetaData* meta);
 
+// Copies the exact blob reference descriptor of a newly built SST from its
+// table properties (kBlobReferenceDescriptorPropertyName) to `meta`, which the
+// MANIFEST stores. If the SST has no descriptor, it clears
+// meta->blob_reference_descriptor. It also sets
+// meta->blob_reference_legacy_metadata to false.
+// ExtractBlobReferenceClassificationFromTableProperties() sets it again for an
+// SST whose classification has frontier 0 (see
+// FileMetaData::blob_reference_legacy_metadata). The frontier is the oldest
+// indirect-origin file number a coarse SST may reference, and frontier 0 means
+// that the SST has no indirect references (see "Coarse SST" in
+// db/blob/blob_reference_metadata.h).
+void ExtractBlobReferenceDescriptorFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta);
+Status ExtractBlobReferenceClassificationFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta);
+
+// Returns NotSupported if the properties carry blob indirection metadata (an
+// exact descriptor, or a coarse frontier that names an indirect origin): such
+// an SST may hold references that need routes of the DB that wrote it.
+// `operation` names the caller in the message. O(1); reads no data.
+Status RejectBlobIndirectionTableProperties(const TableProperties& props,
+                                            const char* operation);
+
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to number specified in meta. On success, the rest of
 // *meta will be filled with metadata about the generated table.

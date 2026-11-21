@@ -12,6 +12,8 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -20,6 +22,7 @@
 
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_completion_callback.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/compaction/compaction_outputs.h"
@@ -50,6 +53,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Arena;
+struct BlobReferenceSstSummary;
 class CompactionState;
 class ErrorHandler;
 class MemTable;
@@ -57,6 +61,7 @@ class MissingBlobRepairIterator;
 class SnapshotChecker;
 class SystemClock;
 class TableCache;
+struct CompactionServiceOutputFile;
 class Version;
 class VersionEdit;
 class VersionSet;
@@ -258,6 +263,12 @@ class CompactionJob {
 
   CompactionJobStats* job_stats_;
 
+  // Reference summaries of the exact input SSTs. Their memory is charged to
+  // CacheEntryRole::kBlobReferenceCensus when that role is charged. The job
+  // keeps them until the install edit hands them to the census.
+  std::vector<std::shared_ptr<const BlobReferenceSstSummary>>
+      input_blob_reference_summaries_;
+
   // Lower bound for the minimal sequence number whose write time is
   // preserved. See Prepare().
   SequenceNumber preserve_time_min_seqno_floor_ = 0;
@@ -328,6 +339,14 @@ class CompactionJob {
   void ReleaseSubcompactionResources();
 
   void InitializeCompactionRun();
+
+  // To remove an SST, the census delta needs the SST's reference summary. This
+  // reads the summary of every exact input SST while the job holds its inputs,
+  // so the install edit can hand them to the census. Every compaction reads
+  // them, also a full compaction, so every install updates the census with a
+  // delta. If a read fails, it stops, and the missing summary makes the census
+  // rebuild instead.
+  void ReadInputBlobReferenceSummaries();
   void RunSubcompactions();
   void RecordRemoteCompactionInputBlobFileCount();
   void UpdateTimingStats(uint64_t start_micros);
@@ -344,6 +363,126 @@ class CompactionJob {
   void AggregateSubcompactionOutputAndJobStats();
   Status VerifyCompactionRecordCounts(bool stats_built_from_input_table_prop,
                                       uint64_t num_input_range_del);
+
+  // Compaction safety protocol for blob relocation
+  //
+  // Background: the exact reference metadata of an SST stores its references
+  // in reference groups. A reference group is the references of one SST that
+  // share an encoding class, a generation number and an origin
+  // (BlobReferenceGroup). For each indirect reference group of its exact
+  // inputs, a compaction output writes one of:
+  //   - the group's own generation number (a kept number),
+  //   - the route target of that number in the job's input Version (a
+  //     flattened number; a route target is always a live relocation file),
+  //   - neither, when compaction-time blob GC rewrites the value.
+  // While the compaction runs, indirect blob GC and route retirement can
+  // change routes and remove files. This section explains why every number
+  // that the output writes can still be read when the output is installed.
+  // No compaction waits for, or is retried because of, GC or route retirement.
+  //
+  // Why a kept number stays readable: the job's input SSTs hold the number,
+  // and they stay in the current Version until the job installs, because SSTs
+  // that are being compacted cannot be removed. So the census counts the
+  // number as held, and route retirement deletes only routes that no SST
+  // holds. GC never removes a route into an input that gets an output (see
+  // "Install protocol" in DBImpl::IndirectBlobGCJob::Install()).
+  //
+  // Why a flattened number stays readable: an example with file numbers, all
+  // of them example values.
+  //   1. The job's input Version has route 12 -> 20. The output says 20.
+  //   2. GC moves relocation file 20 into file 30. Its edit adds route
+  //      20 -> 30, because GC keeps a route for every number of a relocation
+  //      input that gets an output. A read of 20 now goes to 30.
+  //   3. No installed SST holds 20 yet, so route retirement could see route
+  //      20 -> 30 as unused. It does not delete it, because of the rule
+  //      below: 20 is a live file in the input Version of a running
+  //      compaction. If retirement deleted it, the output would reference
+  //      20, but there would be neither a file 20 nor a route from 20. The
+  //      install check (step 3 of "Checks at install" below) would then fail
+  //      the compaction with Corruption.
+  // The rule (DBImpl::RetireBlobRelocationRoutes()): route retirement skips
+  // route G -> X while G is a live blob file or relocation file in the input
+  // Version of any compaction in CompactionPicker::compactions_in_progress_.
+  // It checks this under the DB mutex when it filters the selected routes
+  // (step 3 of DBImpl::RetireBlobRelocationRoutes()), and again in the
+  // precondition of its MANIFEST write. A compaction that is picked later
+  // has an input Version where G is already a route, and file numbers are
+  // never reused, so it cannot write G.
+  //
+  // The safety depends on these invariants:
+  //   - A compaction stays in compactions_in_progress_ until its output Version
+  //     is installed: VersionSet::LogAndApply() runs the compaction's MANIFEST
+  //     write callback, which calls Compaction::ReleaseCompactionFiles().
+  //     VersionSet::ProcessManifestWrites() runs that callback at its end (the
+  //     finish_batch step), after it installs the new Versions.
+  //   - A failed MANIFEST write leaves nothing that a later check misses, so no
+  //     compaction needs to wait for it or retry after it. The failed edit may
+  //     or may not be on disk. After the failure,
+  //     VersionSet::ProcessManifestWrites() drops the candidate Versions of the
+  //     batch and resets the MANIFEST log. So the next write starts a new
+  //     MANIFEST file with the in-memory state (WriteCurrentStateToManifest()),
+  //     which does not hold the failed edit. The new files of the failed batch
+  //     are quarantined (ErrorHandler::AddFilesToQuarantine()), so no purge
+  //     deletes a file that the failed edit may have added.
+  //   - Only GC adds routes, and at most one GC job runs per column family.
+  //     A route target is always a live relocation file (one hop).
+  //   - Route retirement skips the inputs of the running GC job
+  //     (BlobReferenceCensus::IsGcInputFile()).
+  //   - Ingestion and import reject indirect references. A flush references
+  //     only the new blob files of its own edit. A coarse SST holds no routed
+  //     or flattened numbers.
+  //   - Flattening uses only the job's input Version. A remote worker runs a
+  //     job only when its relocation state fingerprint matches the input
+  //     Version of the primary, and the primary accepts only remote output
+  //     numbers that its inputs hold or route to (see
+  //     PrepareRemoteAllowedBlobGenerations()).
+  //
+  // Checks at install:
+  //   1. Before the run, ValidateBlobRelocationInputGenerations() checks each
+  //      number in the job's own input Version. A number that cannot be
+  //      resolved there fails the job with Corruption. A lost file and a
+  //      dropped origin pass: the compaction turns their references into
+  //      deletions (MissingBlobRepairIterator), so the output never writes
+  //      them.
+  //   2. After the run, PrepareBlobRelocationOutputDependencies() records the
+  //      physical file that each output number resolves to in the input
+  //      Version (the output dependencies).
+  //   3. At install, ValidateBlobRelocationOutputDependencies() runs in the
+  //      LogAndApply() precondition against the new current Version. It checks
+  //      only dependencies whose file metadata object changed. If a number
+  //      cannot be read, the install fails with Corruption. This should never
+  //      happen: the check guards the invariants above, so that a future bug
+  //      fails loudly instead of losing data.
+  //
+  // Coarse L0 inputs have no reference list. Until the install, a coarse
+  // input is still in the current Version, and its coarse frontier (the oldest
+  // indirect-origin file number a coarse SST may reference) pins every
+  // generation number at or above it: route retirement keeps those routes, and
+  // GC does not select those indirect-origin blob files. Coarse output does not
+  // flatten.
+  //
+  // Cost: for each selected number, the rule does one BlobFileTable lookup per
+  // running compaction whose input Version is not the Version that route
+  // retirement pinned. Route retirement selects at most
+  // kBlobRouteRetirementBatchSize (64) numbers. It runs the rule up to 3 times
+  // per retirement commit, all under the DB mutex: once in the step 3 filter,
+  // then twice in the LogAndApply() precondition, which runs before and after
+  // the unlocked apply. The compaction itself pays only for checks 1-3. These
+  // numbers are estimates, not measurements.
+  //
+  // Memory: ReserveBlobRelocationDependencyMemory() charges the output
+  // dependencies of check 2, and the list of generation numbers that a remote
+  // output may name (remote_allowed_blob_generations_), to the block cache
+  // (CacheEntryRole::kBlobReferenceMetadataBuildingBuffer).
+  Status ValidateBlobRelocationInputGenerations();
+  // Calls `visit` for each indirect reference group of the job's exact inputs,
+  // in input order. It reads the reference summary of an input that has none
+  // in input_blob_reference_summaries_. Stops at the first non-OK status.
+  Status ForEachIndirectInputReferenceGroup(
+      const std::function<Status(const BlobReferenceGroup&)>& visit);
+  Status PrepareBlobRelocationOutputDependencies();
+  Status ReserveBlobRelocationDependencyMemory(size_t additional_bytes);
+  Status ValidateBlobRelocationOutputDependencies(const Version& current) const;
   void FinalizeCompactionRun(const Status& status,
                              bool stats_built_from_input_table_prop,
                              uint64_t num_input_range_del);
@@ -351,6 +490,30 @@ class CompactionJob {
   CompactionServiceJobStatus ProcessKeyValueCompactionWithCompactionService(
       SubcompactionState* sub_compact,
       CompactionFilter::MergeOrder merge_order);
+
+  // The strong check of one remote output file with exact blob reference
+  // metadata, before the primary adds the file to the compaction outputs. For a
+  // feature-aware job (blob_gc_protocol_version != 0), the import loop of
+  // ProcessKeyValueCompactionWithCompactionService() calls it for each output
+  // file. It checks the reported descriptor, the file identity, the metadata
+  // checksums and every indirect group of the output. When a check fails, it
+  // returns Corruption, or the status of the step that failed: the descriptor
+  // decode, the metadata read, the build of the allowed generation numbers (an
+  // input summary read or its memory charge), or a group check. The caller then
+  // deletes the imported files and runs the compaction locally. If that cleanup
+  // fails, the job fails instead. On success it sets
+  // `meta->blob_reference_descriptor` and `meta->blob_reference_summary`. The
+  // steps are numbered in the function.
+  // Called without the DB mutex.
+  Status ValidateRemoteExactBlobMetadata(
+      const CompactionServiceOutputFile& file,
+      const TableProperties& imported_table_properties,
+      const ReadOptions& read_options, ColumnFamilyData* cfd,
+      TableCache* table_cache, Version* input_version,
+      const MutableCFOptions& mutable_cf_options, FileMetaData* meta);
+  // Builds remote_allowed_blob_generations_ once per job from the indirect
+  // input groups and `input_version`. Called without the DB mutex.
+  Status PrepareRemoteAllowedBlobGenerations(const Version& input_version);
 
   struct CompactionIOStatsSnapshot {
     PerfLevel prev_perf_level = PerfLevel::kEnableTime;
@@ -552,6 +715,40 @@ class CompactionJob {
   // write times.
   SequenceNumber preserve_seqno_after_ = kMaxSequenceNumber;
 
+  // One output dependency: a physical file (a normal blob file or a relocation
+  // file) that the output SSTs depend on. The map key below is the file number.
+  // `normal` is set for a normal blob file and `relocation` for a relocation
+  // file. Each holds the metadata object of the input Version. At install, the
+  // same object in the current Version means that the file did not change, so
+  // its numbers need no second check.
+  struct BlobOutputDependency {
+    std::shared_ptr<SharedBlobFileMetaData> normal;
+    std::shared_ptr<BlobRelocationFileMetaData> relocation;
+    // The generation numbers of the output references that resolve to this
+    // file (the map key) in the input Version.
+    std::vector<uint64_t> sources;
+  };
+
+  std::map<uint64_t, BlobOutputDependency> blob_output_dependencies_;
+
+  // The generation numbers that a remote output may name (see
+  // PrepareRemoteAllowedBlobGenerations()), sorted. Built on first use.
+  std::vector<uint64_t> remote_allowed_blob_generations_;
+  bool remote_allowed_blob_generations_ready_ = false;
+  // The lowest coarse frontier
+  // (FileMetaData::oldest_coarse_indirect_origin_file_number) of this job's
+  // input SSTs, or kInvalidBlobFileNumber when no input is coarse. Built with
+  // remote_allowed_blob_generations_. A remote output may name a number that
+  // is not in remote_allowed_blob_generations_ only if it is at or above this
+  // frontier and is a coarse reference (see ValidateRemoteExactBlobMetadata(),
+  // step 5).
+  uint64_t remote_coarse_input_frontier_ = kInvalidBlobFileNumber;
+
+  // Charges blob_output_dependencies_ and remote_allowed_blob_generations_ to
+  // the block cache (see ReserveBlobRelocationDependencyMemory()).
+  std::shared_ptr<CacheReservationManager> blob_dependency_reservation_manager_;
+  size_t blob_dependency_reserved_bytes_ = 0;
+
   // Minimal sequence number to preclude the data from the last level. If the
   // key has bigger (newer) sequence number than this, it will be precluded from
   // the last level (output to proximal level).
@@ -607,6 +804,20 @@ class CompactionJob {
       CompactionFilter::MergeOrder /*merge_order*/) {
     return Status::OK();
   }
+
+  // True if the compaction iterator may flatten generation numbers. A local
+  // compaction may flatten. A remote compaction (the CompactionService worker
+  // side) flattens only in a feature-aware job whose column family has
+  // enable_blob_indirection on (see
+  // CompactionServiceCompactionJob::AllowBlobIndexFlattening()).
+  virtual bool AllowBlobIndexFlattening() const {
+    return !IsRemoteCompaction();
+  }
+
+  // False makes the job SST-only: a value that needs blob-file output ends the
+  // job with TryAgain (see CompactionIterator::SetSstOnlyBlobOutputPolicy()).
+  virtual bool AllowBlobFileCreation() const { return true; }
+
   // The rate limiter priority (io_priority) is determined dynamically here.
   // The Compaction Read and Write priorities are the same for different
   // scenarios, such as write stalled.
@@ -627,7 +838,7 @@ class CompactionJob {
       const FileMetaData* file_meta, const ReadOptions& read_options,
       std::shared_ptr<const TableProperties>* tp);
 
-  void RestoreCompactionOutputs(
+  Status RestoreCompactionOutputs(
       const ColumnFamilyData* cfd,
       const std::vector<std::shared_ptr<const TableProperties>>&
           output_files_table_properties,
@@ -745,6 +956,35 @@ struct CompactionServiceInput {
   int proximal_output_range_type = 0;
   SequenceNumber keep_in_last_level_through_seqno = 0;
 
+  // Fields of the feature-aware remote compaction contract. "blob_gc" in these
+  // names means the blob indirection feature of this stack, not legacy blob
+  // garbage collection.
+  //
+  // A job is feature-aware when its column family has the per-CF format fence
+  // (VersionStorageInfo::HasBlobIndirectionFormat()) or has
+  // enable_blob_indirection on. A non-zero blob_gc_protocol_version opts such
+  // a job into the contract. Older workers ignore these fields and return
+  // blob_gc_protocol_version 0, so the primary runs the job locally before it
+  // imports output. The options fingerprint
+  // (ComputeBlobGCCompactionServiceOptionsFingerprint()) covers:
+  //   - the protocol version, the CF id and the options file number;
+  //   - enable_blob_indirection and whether the job may flatten blob indexes;
+  //   - enable_blob_garbage_collection and blob_garbage_collection_age_cutoff;
+  //   - the format versions of the BlobIndex, the reference metadata, the
+  //     MANIFEST records and the relocation directory
+  //     (BlobRelocationDirectory::kFormatVersion), and the blob file header
+  //     version (kVersion2).
+  // blob_relocation_state_fingerprint_high and _low hold the relocation state
+  // fingerprint of the input Version: a hash of its relocation files, routes
+  // and format version (see
+  // VersionStorageInfo::ComputeBlobRelocationStateFingerprint()). Each output's
+  // BlobReferenceMetadataDescriptor stores the same value in
+  // route_snapshot_fingerprint_high and _low.
+  uint32_t blob_gc_protocol_version = 0;
+  uint64_t blob_gc_options_fingerprint = 0;
+  uint64_t blob_relocation_state_fingerprint_high = 0;
+  uint64_t blob_relocation_state_fingerprint_low = 0;
+
   // serialization interface to read and write the object
   static Status Read(const std::string& data_str, CompactionServiceInput* obj);
   Status Write(std::string* output);
@@ -849,6 +1089,21 @@ struct CompactionServiceResult {
   // proximal_level_stats
   InternalStats::CompactionStatsFull internal_stats;
 
+  // The worker's protocol version. It equals the request's version when the
+  // worker accepted the feature-aware contract. This includes a TryAgain
+  // result: the worker declines that way when the job needs new blob file
+  // output. It is 0 when the worker declined because the protocol version,
+  // its options fingerprint or its relocation state fingerprint differ, or
+  // because its Version has no per-CF format fence, or when the worker does
+  // not know the contract.
+  uint32_t blob_gc_protocol_version = 0;
+
+  // True when the worker rewrote the generation number of at least one
+  // reference to its route target (flatten). The primary declines the result
+  // when its own options do not allow flattening, and passes the flag on to
+  // the install.
+  bool has_flattened_blob_index = false;
+
   // serialization interface to read and write the object
   static Status Read(const std::string& data_str, CompactionServiceResult* obj);
   Status Write(std::string* output);
@@ -858,6 +1113,18 @@ struct CompactionServiceResult {
   bool TEST_Equals(CompactionServiceResult* other, std::string* mismatch);
 #endif  // NDEBUG
 };
+
+// The version of the feature-aware remote compaction contract (see the
+// CompactionServiceInput fields above).
+inline constexpr uint32_t kBlobGCCompactionServiceProtocolVersion = 1;
+
+// The primary and the worker both compute this hash of the contract inputs
+// listed at the CompactionServiceInput fields. The worker declines the job
+// when its hash differs from the request's.
+uint64_t ComputeBlobGCCompactionServiceOptionsFingerprint(
+    uint32_t column_family_id, uint64_t options_file_number,
+    bool enable_blob_indirection, bool enable_blob_garbage_collection,
+    double blob_garbage_collection_age_cutoff);
 
 // CompactionServiceCompactionJob is an read-only compaction job, it takes
 // input information from `compaction_service_input` and put result information
@@ -910,6 +1177,15 @@ class CompactionServiceCompactionJob : private CompactionJob {
   Status ValidateCompactionFilterMergeOrder(
       const CompactionFilter* compaction_filter,
       CompactionFilter::MergeOrder merge_order) override;
+  bool AllowBlobIndexFlattening() const override;
+
+  // A feature-aware job (non-zero protocol version) may not create blob files.
+  // When a value needs new blob output, the job ends with TryAgain
+  // (CompactionIterator::DeclineSstOnlyBlobOutput()).
+  bool AllowBlobFileCreation() const override {
+    return compaction_input_.blob_gc_protocol_version == 0;
+  }
+
   // Specific the compaction output path, otherwise it uses default DB path
   const std::string output_path_;
 

@@ -33,7 +33,9 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Slice;
+class BlobIndex;
 class BlobSource;
+struct BlobReferenceSstSummary;
 
 struct TableReaderOptions {
   // @param skip_filters Disables loading/accessing the filter block
@@ -169,6 +171,7 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
         db_name(_db_name),
         is_remote_compaction(_is_remote_compaction),
         cur_file_num(_cur_file_num),
+        collect_blob_reference_metadata(_moptions.enable_blob_indirection),
         embedded_blob_options(_embedded_blob_options) {}
 
   const ImmutableOptions& ioptions;
@@ -193,6 +196,34 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
   // END for FilterBuildingContext
 
   const uint64_t cur_file_num;
+  // Whether the SST gets exact blob reference metadata. The default is
+  // enable_blob_indirection. Flush sets false (coarse output). Compaction sets
+  // Compaction::CollectExactBlobReferences(), which is also true when the
+  // option is off but the DB has used it before (HasBlobIndirectionFormat).
+  // SstFileWriter sets false. The table builder does not check the column
+  // family, so a caller with an unknown column family that keeps the default
+  // collects exact metadata when enable_blob_indirection is on.
+  bool collect_blob_reference_metadata;
+  // Set by flush, WAL recovery flush and compaction when the DB uses or has
+  // used enable_blob_indirection. The two fields together give three cases:
+  // - collect_blob_reference_metadata true: exact metadata. This field is then
+  //   ignored.
+  // - collect_blob_reference_metadata false, this field true: a coarse SST. The
+  //   builder stores only the small classification property (flush, WAL
+  //   recovery flush, and a compaction to L0 that has no exact input, is not
+  //   bottommost, and runs while the column family has no lost relocation
+  //   file; see Compaction::CollectExactBlobReferences()).
+  // - Both false: no blob reference metadata (the DB never used the option,
+  //   and SstFileWriter).
+  bool track_blob_reference_classification = false;
+  // The relocation-state fingerprint (a 128-bit hash of the relocation files
+  // and routes) of the compaction's input Version (see
+  // VersionStorageInfo::ComputeBlobRelocationStateFingerprint()). It is stored
+  // in the exact-metadata descriptor and records which relocation state the
+  // output was built from. Only compaction sets it; every other builder
+  // leaves 0.
+  uint64_t blob_route_snapshot_fingerprint_high = 0;
+  uint64_t blob_route_snapshot_fingerprint_low = 0;
   // Non-null only for table builders that should write eligible large values as
   // same-file ("embedded") blob records. Currently only honored by
   // BlockBasedTableBuilder.
@@ -216,6 +247,7 @@ enum class TableBuilderNewTableReason : uint8_t {
   kSchemaVersionIncompatible,
   kUnsupportedEntryType,
   kBuilderPolicy,
+  kBlobReferenceLimit,
 };
 
 inline const char* TableBuilderNewTableReasonToString(
@@ -233,6 +265,8 @@ inline const char* TableBuilderNewTableReasonToString(
       return "UnsupportedEntryType";
     case TableBuilderNewTableReason::kBuilderPolicy:
       return "BuilderPolicy";
+    case TableBuilderNewTableReason::kBlobReferenceLimit:
+      return "BlobReferenceLimit";
   }
   assert(false);
   return "Invalid";
@@ -241,6 +275,12 @@ inline const char* TableBuilderNewTableReasonToString(
 struct TableBuilderAddContext {
   TableBuilderNewTableReason new_table_reason =
       TableBuilderNewTableReason::kNone;
+  // Input, optional. When the value is a kTypeBlobIndex, the caller can pass
+  // its own decode of the value here, so that the builder does not decode it
+  // again. Compaction decodes each output BlobIndex once and shares it with
+  // the builder, the blob garbage meter and the file metadata update.
+  // nullptr: the builder decodes the value itself.
+  const BlobIndex* decoded_blob_index = nullptr;
 };
 
 // TableBuilder provides the interface used to build a Table
@@ -299,6 +339,10 @@ class TableBuilder {
   // Number of calls to Add() so far.
   virtual uint64_t NumEntries() const = 0;
 
+  // True once the table holds blob_indirection_max_references_per_sst exact
+  // blob references. Compaction then starts a new output at the next user key.
+  virtual bool BlobReferenceLimitReached() const { return false; }
+
   // Whether the output file is completely empty. It has neither entries
   // or tombstones.
   virtual bool IsEmpty() const {
@@ -330,6 +374,17 @@ class TableBuilder {
 
   // Returns table properties
   virtual TableProperties GetTableProperties() const = 0;
+
+  // Returns the immutable summary of the exact blob references this builder
+  // collected (see BlobReferenceSstSummary). Returns null if exact metadata was
+  // not enabled, Finish() has not run, or the build failed. BuildTable() (used
+  // by flush, WAL recovery and RepairDB) and compaction put it in the output's
+  // FileMetaData, so the MANIFEST install can add the SST to the census without
+  // reopening the new SST.
+  virtual std::shared_ptr<const BlobReferenceSstSummary>
+  GetBlobReferenceSstSummary() const {
+    return nullptr;
+  }
 
   // Return file checksum
   virtual std::string GetFileChecksum() const = 0;

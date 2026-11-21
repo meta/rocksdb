@@ -1087,6 +1087,127 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   bool enable_blob_files = false;
 
+  // Experimental.
+  //
+  // Purpose: let indirect blob GC move the live values out of a blob file that
+  // has a lot of garbage without rewriting the SSTs that point to them. When
+  // this option is on, each new blob value gets a kIndirectBlob BlobIndex,
+  // which keeps the value's identity (origin file and offset) when GC moves it.
+  // Compaction outputs at L1 or deeper, outputs of a bottommost compaction,
+  // L0 compaction outputs with an exact input, and every compaction output
+  // while the column family has a lost relocation file save the exact list of
+  // blob references they keep. Flush outputs save only a coarse classification,
+  // and a later compaction rewrites them with the exact list. See
+  // db/blob/blob_reference_metadata.h for how it works.
+  //
+  // Requirements and limits (option validation checks these):
+  //   - enable_blob_files must be true (else InvalidArgument).
+  //   - The table format must be block-based (else NotSupported).
+  //   - enable_blob_direct_write must be false (else NotSupported).
+  //   - The FIFO compaction style is not supported (NotSupported). FIFO
+  //     column families that do not set this option keep their existing
+  //     BlobDB behavior.
+  // Turning the option off stops new values from using kIndirectBlob. The
+  // SSTs and blob files that were already written keep their format.
+  //
+  // Indirect blob GC writes moved values into relocation files. Blob files and
+  // relocation files that hold no live value are removed from the MANIFEST by
+  // background edits and then deleted. This also happens when
+  // disable_auto_compactions is true, or when this option, enable_blob_files or
+  // enable_blob_garbage_collection is off. The cleanup copies no value and
+  // rewrites no SST.
+  //
+  // This is a change from base RocksDB behavior. A blob file written without
+  // this option is dropped from the column family's file list, and then
+  // deleted, as soon as no SST links it and all its values count as garbage. A
+  // blob file written with this option on is not dropped by that rule, because
+  // SSTs can still find moved values through its file number. It stays until
+  // the cleanup above removes it. After the option is turned off, the same
+  // cleanup still removes such a file later. The cleanup runs on a compaction
+  // thread (Env::Priority::LOW pool) only when that thread finds no compaction
+  // to run, so under constant compaction work such files stay longer. Read-only
+  // and secondary instances never run the cleanup. They see a removal only when
+  // they read the MANIFEST that the primary wrote.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through the SetOptions() API
+  bool enable_blob_indirection = false;
+
+  // Experimental. Used only with enable_blob_indirection.
+  //
+  // Purpose: make reads of values that indirect blob GC moved into relocation
+  // files faster. A relocation file keeps the location of each value in its
+  // data blocks (the "location blocks"), which take a few bytes per relocated
+  // value. With this option on, a relocation file reader reads all of its
+  // location blocks when it opens and keeps them in memory while it is open.
+  // A lookup then needs no index or block cache lookup, so warm Gets and
+  // MultiGets of relocated values get faster.
+  //
+  // Cost:
+  //   - The kept blocks are charged to the block cache, and they stay there
+  //     while the reader is open. Without a block cache, they stay in the
+  //     reader's own memory and are not charged. With allow_mmap_reads and no
+  //     compression, the blocks point into the mapped file and are not
+  //     charged.
+  //   - Opening a relocation file reads all of its location blocks, so the
+  //     open takes longer and reads more bytes.
+  //   - With strict_capacity_limit, the kept blocks hold block cache capacity
+  //     that eviction cannot free, so other block cache inserts can fail
+  //     instead of evicting older blocks. If the block cache cannot charge the
+  //     blocks, the reader logs a warning and does normal lookups for that
+  //     file.
+  //
+  // When to use: when all kept location blocks are small compared with the
+  // block cache. Otherwise they push SST blocks out of the cache, and cold
+  // reads can get slower.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through the SetOptions() API. A reader reads the
+  // option when it opens, so a change applies to the relocation files that are
+  // opened after it.
+  bool pin_blob_relocation_location_blocks = false;
+
+  // Experimental. Applies to compaction outputs with exact blob reference
+  // metadata (the per-SST list of blob references that indirect blob GC reads).
+  // With enable_blob_indirection on, or after the DB has used it, these are
+  // outputs at L1 or deeper, outputs of a bottommost compaction, L0 outputs
+  // that have an exact input, and every compaction output while the column
+  // family has a lost relocation file. When such an output SST holds this
+  // many blob references, compaction starts a new output at the next user key.
+  //
+  // Build memory: while an SST is built, its blob references are kept in memory
+  // until the SST is finished, charged to the block cache. Each reference uses
+  // about the size of its encoded entry plus a small chunk overhead: about 8
+  // to 14 bytes (an estimate). A compressed value is at the high end, because
+  // its entry also stores the CRC of its stored bytes (see
+  // BlobReferenceMetadataCollector in db/blob/blob_reference_metadata.h). Many
+  // small groups in one SST cost more. This cap bounds that memory for each
+  // output being built. The default (1M references) uses about 8 to 14 MB. A
+  // lower value makes more, smaller output files.
+  //
+  // Output size: when every value is in a blob file, each SST row holds only
+  // the key and the BlobIndex, and the reference metadata adds a few bytes per
+  // reference. With small keys, an output at the default cap is well below the
+  // default target_file_size_base (64 MB). Larger keys or no compression make
+  // each row larger. With a larger target_file_size_base, raise this cap so
+  // that it does not cut outputs first. The build memory above then grows by
+  // about 8 to 14 bytes per extra reference.
+  //
+  // Soft limit: compaction starts a new output only before a new user key, once
+  // the output already holds the cap. The history of one user key (all of its
+  // versions that compaction keeps) is never split, so an output may pass the
+  // cap by one key's history.
+  //
+  // Scope: flush output carries no exact blob reference metadata, so this
+  // option applies to compaction outputs only.
+  //
+  // Valid range: [4096, 268435456] Default: 1048576
+  //
+  // Dynamically changeable through the SetOptions() API
+  uint64_t blob_indirection_max_references_per_sst = 1 << 20;
+
   // The size of the smallest value to be stored separately in a blob file.
   // Values which have an uncompressed size smaller than this threshold are
   // stored alongside the keys in SST files in the usual fashion. A value of
@@ -1170,6 +1291,39 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through the SetOptions() API
   double blob_garbage_collection_force_threshold = 1.0;
+
+  // Experimental. Used by indirect blob GC with enable_blob_indirection. GC
+  // reads the live values of an input file in offset order. Two neighbor values
+  // are read with one I/O when the bytes between them (dead values, and in a
+  // normal blob file also the next record's header and key) are at most this
+  // many; a larger gap starts a new read, so dead regions are skipped. One read
+  // is at most 1 MB. 0 reads each value on its own.
+  //
+  // Default: 16384 (16 KB). This is the read unit of remote file systems. Blob
+  // values are large, so a gap of this size holds only a few dead values, and
+  // merging reads costs little extra I/O.
+  //
+  // Dynamically changeable through the SetOptions() API
+  uint64_t indirect_blob_gc_read_coalesce_bytes = 16384;
+
+  // Experimental. Used by indirect blob GC with enable_blob_indirection. GC
+  // rewrites a blob file only when at least this fraction of the file's record
+  // bytes is garbage (records that no SST references). The census picks
+  // candidate files with this rule, and the GC job checks the rule again with
+  // the exact live bytes before it copies anything.
+  //
+  // GC copies the live values of a file to a new file and then deletes the old
+  // file. A low value frees space sooner, but GC copies more: at value r, GC
+  // copies up to (1 - r) / r live bytes for each garbage byte it frees. That is
+  // 1 byte at 0.5 and 3 bytes at 0.25 (computed from the definition). A high
+  // value makes GC copy less, but more garbage stays on disk.
+  //
+  // Valid range: (0, 1]. Other values fail with InvalidArgument.
+  // Default: 0.5 (GC never copies more live bytes than the garbage it frees)
+  //
+  // Dynamically changeable through the SetOptions() API. A new value applies
+  // from the next census run.
+  double indirect_blob_gc_garbage_ratio = 0.5;
 
   // Compaction readahead for blob files.
   //
