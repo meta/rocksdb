@@ -3646,6 +3646,50 @@ void BlockBasedTableBuilder::FinishBlobRelocationGroup() {
   Add(Slice(internal_key, sizeof(internal_key)), group.encoded);
 }
 
+Status BlockBasedTableBuilder::AddBlobRelocation(
+    uint64_t origin_file_number, uint64_t original_value_offset,
+    uint64_t stored_value_size, CompressionType compression,
+    uint32_t stored_checksum, const VerifiedBlobStoredSource& source) {
+  Rep* r = rep_.get();
+  if (!ok()) {
+    return status();
+  }
+  if (r->blob_relocation_directory_builder == nullptr ||
+      r->embedded_blob_options == nullptr || stored_value_size == 0 ||
+      stored_value_size > kMaxSimpleGen2BlobPayloadSize ||
+      !CompressionTypeSupported(compression)) {
+    return Status::InvalidArgument("Invalid streaming blob relocation");
+  }
+  assert(!r->IsParallelCompressionActive());
+  Status status = r->blob_relocation_directory_builder->Add(
+      origin_file_number, original_value_offset, stored_value_size,
+      compression);
+  if (status.ok()) {
+    PrepareBlobRelocationGroup(origin_file_number);
+    status = this->status();
+  }
+  const uint64_t offset = r->get_offset();
+  if (status.ok()) {
+    status = WriteSimpleGen2BlobRecordStream(
+        r->file, r->write_options, r->table_options.checksum,
+        r->base_context_checksum, offset, stored_value_size, compression,
+        stored_checksum, source);
+  }
+  if (!status.ok()) {
+    r->SetStatus(status);
+    return status;
+  }
+  if (!r->embedded_blob_state) {
+    r->embedded_blob_state = std::make_unique<Rep::EmbeddedBlobState>();
+  }
+  r->set_offset(offset + stored_value_size + kSimpleGen2BlobTrailerSize);
+  ++r->embedded_blob_state->stats.blob_count;
+  r->embedded_blob_state->stats.payload_bytes += stored_value_size;
+  AddToBlobRelocationGroup(origin_file_number, original_value_offset,
+                           stored_value_size, offset);
+  return this->status();
+}
+
 Status BlockBasedTableBuilder::GetBlobRelocationFileMetadata(
     BlobRelocationFileMetadata* metadata) const {
   if (metadata == nullptr) {
@@ -4770,14 +4814,27 @@ Status NewBlobRelocationTableBuilder(
   relocation_options.table_factory = std::make_shared<BlockBasedTableFactory>(
       MakeBlobRelocationTableOptions(table_options));
   InternalTblPropCollFactories collectors;
-  const CompressionOptions no_compression_options;
+  // Compression choice: see the NewBlobRelocationTableBuilder() comment in the
+  // header.
+  const bool use_bottommost =
+      mutable_cf_options.bottommost_compression != kDisableCompressionOption;
+  const CompressionType compression =
+      use_bottommost ? mutable_cf_options.bottommost_compression
+                     : mutable_cf_options.compression;
+  CompressionOptions compression_options =
+      use_bottommost && mutable_cf_options.bottommost_compression_opts.enabled
+          ? mutable_cf_options.bottommost_compression_opts
+          : mutable_cf_options.compression_opts;
+  compression_options.max_dict_bytes = 0;
+  compression_options.zstd_max_train_bytes = 0;
+  compression_options.parallel_threads = 1;
   EmbeddedBlobSstBuilderOptions embedded_options;
   embedded_options.min_blob_size = 0;
   const TableBuilderOptions builder_options(
       ioptions, relocation_options, read_options, write_options, comparator,
-      &collectors, kNoCompression, no_compression_options,
-      file_info.column_family_id, file_info.column_family_name, /*level=*/-1,
-      kUnknownNewestKeyTime, /*is_bottommost=*/false, file_info.reason,
+      &collectors, compression, compression_options, file_info.column_family_id,
+      file_info.column_family_name, /*level=*/-1, kUnknownNewestKeyTime,
+      /*is_bottommost=*/false, file_info.reason,
       /*oldest_key_time=*/0, file_info.db_id, file_info.db_session_id,
       file_info.target_file_size, file_info.file_number, kMaxSequenceNumber,
       Slice(file_info.db_name), /*is_remote_compaction=*/false,

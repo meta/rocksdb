@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 
+#include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_read_request.h"
 #include "db/blob/blob_relocation_file.h"
 #include "db/dbformat.h"
@@ -17,6 +18,7 @@
 #include "rocksdb/advanced_compression.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/rocksdb_namespace.h"
+#include "table/internal_iterator.h"
 #include "util/autovector.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -35,6 +37,56 @@ class BlockBasedTable;
 class BlockCacheTracer;
 class BlobRelocationFileReader;
 class TableReader;
+
+// One value that indirect blob GC reads from a normal blob file with
+// MultiGetStoredBlobsForRelocation(). GC fills the input fields from a
+// BlobRelocationLiveValue of its live set (see db/blob/blob_relocation_gc.h).
+// For a value in a relocation file, see StoredRelocationFileReadRequest.
+struct StoredNormalBlobReadRequest {
+  // Offset of the stored value in the blob file (not of its record header).
+  uint64_t offset = 0;
+  uint64_t stored_value_size = 0;
+  CompressionType compression = kNoCompression;
+
+  // Output: set to the stored bytes, which live in the call's
+  // CoalescedReadBuffers. If null, the value is read and checked with the
+  // stored CRC, but its bytes are not kept. Indirect blob GC always passes a
+  // non-null pointer.
+  Slice* stored_payload = nullptr;
+
+  // Output: the result of this request. A null `status` skips the request.
+  Status* status = nullptr;
+
+  // Input: the expected stored CRC of the value. The read fails with
+  // Corruption if the stored bytes do not match it.
+  uint32_t stored_checksum = 0;
+};
+
+// One value to read from a relocation file in
+// BlobRelocationFileReader::MultiGetStoredBlobs(). The read finds the value by
+// its stable identity (origin, original offset).
+struct StoredRelocationFileReadRequest {
+  uint64_t origin_file_number = 0;
+  uint64_t original_value_offset = 0;
+  uint64_t stored_value_size = 0;
+  CompressionType compression = kNoCompression;
+
+  // The logical CRC. The read needs it only to build the BlobIndex that it
+  // looks up. It is not checked, because the value is not decompressed.
+  uint32_t stable_checksum = 0;
+
+  // Output: set to the stored bytes, which live in the call's
+  // CoalescedReadBuffers. If null, the value is only checked.
+  Slice* stored_payload = nullptr;
+
+  // Output: the result of this request. A null `status` skips the request.
+  Status* status = nullptr;
+
+  // Input: the expected stored CRC of the value (see "Stored CRC" in the
+  // overview of db/blob/blob_relocation_gc.h). The read fails with Corruption
+  // if the stored bytes do not match it.
+  uint32_t stored_checksum = 0;
+};
 
 // Reads one blob file of either kind. BlobFileCache stores both kinds under one
 // cache entry type.
@@ -100,6 +152,39 @@ class BlobFileReader {
                       MemoryAllocator* allocator,
                       std::unique_ptr<BlobContents>* result,
                       uint64_t* bytes_read) const;
+
+  // Streams the exact stored bytes of a value in a normal blob file to
+  // `consumer` in bounded chunks, and checks them with the stored CRC. It never
+  // decompresses and never fills a cache. The consumer's output is valid only
+  // if the final status is OK. For relocation files, see
+  // BlobRelocationFileReader::StreamStoredBlob.
+  Status StreamStoredBlobForRelocation(const ReadOptions& read_options,
+                                       const BlobIndex& blob_index,
+                                       const BlobChunkConsumer& consumer) const;
+
+  // Reads the exact stored payload bytes of normal indirect-origin records and
+  // checks them with the stored checksum, without decompressing. The user key
+  // is not needed, because the kIndirectBlob index carries the checksums.
+  //   - Order: requests must be sorted by offset.
+  //   - Value limit: a request whose stored size is larger than
+  //     `max_stored_value_size` gets MemoryLimit.
+  //   - Merging: neighbor values share one read when the gap between them is
+  //     at most `coalesce_bytes`, and one read is at most
+  //     `max_stored_value_size` (see ReadCoalescedRanges()).
+  //   - Buffer limit: the requested bytes plus `max_stored_value_size`. A
+  //     request whose read would go past it is not read and gets
+  //     Status::Incomplete. The caller retries it in a later call.
+  //   - Null payload: a request with a null stored_payload is only checked;
+  //     its stored bytes are not returned. Other payloads point into `buffers`.
+  //   - Counters: BLOB_DB_BLOB_FILE_BYTES_READ and blob_read_byte count the
+  //     bytes read, merged gaps included.
+  void MultiGetStoredBlobsForRelocation(const ReadOptions& read_options,
+                                        uint64_t coalesce_bytes,
+                                        size_t num_requests,
+                                        StoredNormalBlobReadRequest* requests,
+                                        uint64_t max_stored_value_size,
+                                        CoalescedReadBuffers* buffers,
+                                        uint64_t* bytes_read) const;
 
   // offsets must be sorted in ascending order by caller.
   void MultiGetBlob(
@@ -286,6 +371,37 @@ class BlobRelocationFileReader {
                     size_t num_reads, RelocationBlobReadRequest* requests,
                     uint64_t* bytes_read) const;
 
+  // Reads values by their stable identity (origin, original offset). When
+  // stored_payload is set, it returns their exact stored bytes, for indirect
+  // blob GC to copy into a new relocation file. A request with a null
+  // stored_payload is only checked. Returned payloads point into `buffers`.
+  //   - Order: requests can be in any order; the read sorts them.
+  //   - Records: each read covers whole records, trailer included. Neighbor
+  //     records share one read when the gap between them is at most
+  //     `coalesce_bytes` (see ReadCoalescedRanges()).
+  //   - Limits: `max_stored_value_size` has more uses here than in
+  //     BlobFileReader::MultiGetStoredBlobsForRelocation(). A request whose
+  //     stored size is larger than it gets MemoryLimit, and so does a request
+  //     that would bring the total stored bytes of the call past it. It is
+  //     also the limit of one read and sets the buffer limit (see
+  //     BlockBasedTable::MultiGetStoredSameFileBlob(), where it is named
+  //     `max_stored_bytes`). A request past the buffer limit gets
+  //     Status::Incomplete, and the caller retries it in a later call.
+  //   - Counters: unlike the normal-file read, these reads update no blob read
+  //     ticker (BLOB_DB_BLOB_FILE_BYTES_READ) and no blob_read_* perf counter.
+  void MultiGetStoredBlobs(const ReadOptions& read_options,
+                           uint64_t coalesce_bytes, size_t num_requests,
+                           StoredRelocationFileReadRequest* requests,
+                           uint64_t max_stored_value_size,
+                           CoalescedReadBuffers* buffers,
+                           uint64_t* bytes_read) const;
+
+  // Like BlobFileReader::StreamStoredBlobForRelocation, for the value of
+  // indirect `blob_index` in this file.
+  Status StreamStoredBlob(const ReadOptions& read_options,
+                          const BlobIndex& blob_index,
+                          const BlobChunkConsumer& consumer) const;
+
   uint32_t column_family_id() const { return column_family_id_; }
   uint64_t file_size() const { return file_size_; }
   uint64_t tail_size() const { return tail_size_; }
@@ -300,6 +416,36 @@ class BlobRelocationFileReader {
   BlobRelocationFileReader(uint32_t column_family_id, uint64_t file_size);
   // The location blocks that Open() keeps; defined in the .cc file.
   struct PinnedLocationBlocks;
+
+  // Returns an iterator over the table that yields the raw location entries
+  // (packed groups, see db/blob/blob_relocation_file.h). Adjusts
+  // `*lookup_options` (no bounds, no readahead, no async I/O).
+  // `*lookup_options` must outlive the iterator.
+  std::unique_ptr<InternalIterator> NewLookupIterator(
+      ReadOptions* lookup_options) const;
+
+  // The last location entry that CheckEntry() decoded, so that a batch of
+  // sorted lookups decodes each entry once.
+  struct DecodedGroupCache {
+    bool valid = false;
+    std::string internal_key;
+    // The origin of the entry, from its key.
+    uint64_t origin_file_number = 0;
+    BlobRelocationGroup group;
+  };
+
+  // Finds the location entry of `stable_blob_index` and builds the same-file
+  // BlobIndex of its record in `*same_file_blob_index` (see CheckEntry()).
+  // When `cache` holds an entry of the same origin whose offsets cover the
+  // requested one, it uses that entry and does not seek. Returns the
+  // PrepareLookup() error when the request is not valid. Returns Corruption
+  // when the value is not in the file ("Blob relocation entry is missing"),
+  // when the entry is malformed, or when its stored size does not match.
+  // Returns the iterator status on an I/O error.
+  Status FindBlobIndex(InternalIterator* iterator,
+                       const BlobIndex& stable_blob_index,
+                       BlobIndex* same_file_blob_index,
+                       DecodedGroupCache* cache) const;
 
   BlockBasedTable* table() const;
 
@@ -317,15 +463,6 @@ class BlobRelocationFileReader {
   // lookup key.
   static void EncodeLookupKey(const BlobIndex& stable_blob_index,
                               char* lookup_key);
-
-  // Not a shared cache: it holds only the last location entry that
-  // CheckEntry() decoded in this batch, so that a batch of sorted lookups
-  // decodes each entry once.
-  struct DecodedGroupCache {
-    bool valid = false;
-    std::string internal_key;
-    BlobRelocationGroup group;
-  };
 
   // Checks after the lookup: the location entry found (the first entry at or
   // after the lookup key) has the requested origin and holds the requested
