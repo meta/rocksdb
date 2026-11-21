@@ -128,6 +128,9 @@ class BaseReferencedVersionBuilder {
   ~BaseReferencedVersionBuilder();
   VersionBuilder* version_builder() const { return version_builder_.get(); }
 
+  // The base Version that the builder applies edits to.
+  Version* version() const { return version_; }
+
  private:
   std::unique_ptr<VersionBuilder> version_builder_;
   Version* version_;
