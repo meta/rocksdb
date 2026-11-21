@@ -1116,6 +1116,9 @@ bool InternalStats::HandleIndirectBlobGcStats(
       std::to_string(vstorage->GetBlobRelocationFiles().size());
   (*values)["relocation-file-bytes"] =
       std::to_string(vstorage->GetBlobRelocationFileBytes());
+  (*values)["coarse-sst-count"] = std::to_string(vstorage->CoarseSstCount());
+  (*values)["lowest-coarse-frontier"] =
+      std::to_string(vstorage->OldestCoarseIndirectOriginFileNumber());
   const BlobGcCandidateHeap::Totals totals =
       census != nullptr ? census->PublishedTotals()
                         : BlobGcCandidateHeap::Totals{};

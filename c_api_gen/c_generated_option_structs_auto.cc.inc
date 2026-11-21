@@ -1369,6 +1369,16 @@ unsigned char rocksdb_options_get_pin_blob_relocation_location_blocks(
   return opt->rep.pin_blob_relocation_location_blocks;
 }
 
+void rocksdb_options_set_blob_indirection_max_references_per_sst(
+    rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.blob_indirection_max_references_per_sst = v;
+}
+
+uint64_t rocksdb_options_get_blob_indirection_max_references_per_sst(
+    rocksdb_options_t* opt) {
+  return opt->rep.blob_indirection_max_references_per_sst;
+}
+
 void rocksdb_options_set_min_blob_size(rocksdb_options_t* opt, uint64_t v) {
   opt->rep.min_blob_size = v;
 }

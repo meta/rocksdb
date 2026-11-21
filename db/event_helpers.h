@@ -16,6 +16,15 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// Blob reference fields of a table_file_creation event, for an SST with exact
+// blob reference metadata.
+struct TableFileBlobReferenceInfo {
+  uint64_t count = 0;
+  // True when the blob reference cap closed the output (see
+  // CompactionOutputs::Output::closed_by_blob_reference_limit).
+  bool closed_by_limit = false;
+};
+
 class EventHelpers {
  public:
   static void AppendCurrentTime(JSONWriter* json_writer);
@@ -35,7 +44,8 @@ class EventHelpers {
       uint64_t oldest_blob_file_number, const TableProperties& table_properties,
       TableFileCreationReason reason, const Status& s,
       const std::string& file_checksum,
-      const std::string& file_checksum_func_name);
+      const std::string& file_checksum_func_name,
+      const TableFileBlobReferenceInfo* blob_references);
   static void LogAndNotifyTableFileDeletion(
       EventLogger* event_logger, int job_id, uint64_t file_number,
       const std::string& file_path, const Status& status,

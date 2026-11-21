@@ -188,6 +188,7 @@ class TableCache {
                          const FileMetaData& file_meta, const Slice& k,
                          GetContext* get_context,
                          const MutableCFOptions& mutable_cf_options,
+                         bool check_l0_range,
                          HistogramImpl* file_read_hist = nullptr,
                          bool skip_filters = false, int level = -1,
                          size_t max_file_size_for_l0_meta_pin = 0);
@@ -227,6 +228,7 @@ class TableCache {
                          const FileMetaData& file_meta,
                          const MultiGetContext::Range* mget_range,
                          const MutableCFOptions& mutable_cf_options,
+                         bool check_l0_range,
                          HistogramImpl* file_read_hist = nullptr,
                          bool skip_filters = false,
                          bool skip_range_deletions = false, int level = -1,
@@ -429,9 +431,38 @@ class TableCache {
                         bool avoid_shared_metadata_cache = false);
 
   // Update the max_covering_tombstone_seq in the GetContext for each key based
-  // on the range deletions in the table
+  // on the range deletions in the table. `l0_file` is the file's metadata if
+  // it is in L0, else nullptr (see RangeTombstonesMayCoverUserKey()).
+  // Version::MultiGet() does not end a key's search on that seqno today, but
+  // the same check keeps the seqno correct for both Get and MultiGet.
   void UpdateRangeTombstoneSeqnums(const ReadOptions& options, TableReader* t,
+                                   const Comparator* user_comparator,
+                                   const FileMetaData* l0_file,
                                    MultiGetContext::Range& table_range);
+
+  // Returns false if `user_key` (with timestamp, if any) is outside the key
+  // range of L0 file `file_meta`, so no range tombstone of the file may cover
+  // it. A point lookup reads a file's range tombstones untruncated. With blob
+  // indirection, the reference cap can cut one output into an L0 epoch run (see
+  // "Reference cap and epoch runs" in db/blob/blob_reference_metadata.h), and a
+  // cut inside a range tombstone leaves the whole tombstone in both files.
+  // Version::Get() can ask the left file about the cut key: FilePicker skips
+  // its key range filter when all files are in L0 and there are at most 3 of
+  // them (version_set.cc, "Do key range filtering"), and its filter compares
+  // user keys, so it keeps the left file for a lookup at the cut key. Without
+  // this check, that file's tombstone could end the search before the neighbor
+  // file that holds the key. The callers run it only for L0 files that have
+  // range tombstones, and only when the caller passes check_l0_range to Get()
+  // or MultiGet(): Version passes it for an L0 file of a Version with the blob
+  // indirection format fence. Only such a Version can hold a cut L0 epoch run,
+  // because the reference cap applies only with the fence. Base L0 files are
+  // never cut and their bounds include their tombstones, so without the fence
+  // the base tombstone rules hold and the check is skipped with no per-key
+  // work. L1+ needs no check: FindFile() compares internal keys, so it never
+  // asks a file about a key past the file's exclusive end.
+  static bool RangeTombstonesMayCoverUserKey(const Comparator* user_comparator,
+                                             const FileMetaData& file_meta,
+                                             const Slice& user_key);
 
   // Create a key prefix for looking up the row cache. The prefix is of the
   // format row_cache_id + fd_number + seq_no. Later, the user key can be
