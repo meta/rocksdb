@@ -763,6 +763,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "sample_for_compression=0;"
       "enable_blob_files=true;"
       "enable_blob_indirection=true;"
+      "pin_blob_relocation_location_blocks=true;"
       "enable_blob_direct_write=true;"
       "min_blob_size=256;"
       "blob_file_size=1000000;"

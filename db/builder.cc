@@ -240,7 +240,8 @@ Status BuildTable(
                   tboptions.column_family_name, write_hint, io_tracer,
                   blob_callback, blob_creation_reason,
                   ioptions.cf_paths.front().path, &blob_file_paths,
-                  blob_file_additions)
+                  blob_file_additions,
+                  version != nullptr ? version->cfd()->blob_source() : nullptr)
             : nullptr);
 
     const std::atomic<bool> kManualCompactionCanceledFalse{false};
