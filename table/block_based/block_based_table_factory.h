@@ -63,6 +63,15 @@ class BlockBasedTableFactory : public TableFactory {
   Status FileIsValidTable(const IOOptions& io_options, FSRandomAccessFile& file,
                           uint64_t file_size, bool* matches) const override;
 
+  // Returns the cache reservation manager that charges the memory of the exact
+  // blob reference metadata collectors (see db/blob/blob_reference_metadata.h).
+  // All builders of this factory share it. Null when there is no block cache or
+  // charging for kBlobReferenceMetadataBuildingBuffer is disabled.
+  std::shared_ptr<CacheReservationManager>
+  GetBlobReferenceCacheReservationManager() const {
+    return shared_state_->blob_reference_cache_res_mgr;
+  }
+
   using TableFactory::NewTableReader;
   Status NewTableReader(
       const ReadOptions& ro, const TableReaderOptions& table_reader_options,
@@ -113,6 +122,9 @@ class BlockBasedTableFactory : public TableFactory {
   struct SharedState {
     std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr;
     std::shared_ptr<AtomicCacheReservationManager> readahead_cache_res_mgr;
+    // See GetBlobReferenceCacheReservationManager(). Each collector charges
+    // through its own reservation handle.
+    std::shared_ptr<CacheReservationManager> blob_reference_cache_res_mgr;
     TailPrefetchStats tail_prefetch_stats;
   };
   std::shared_ptr<SharedState> shared_state_;

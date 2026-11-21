@@ -61,6 +61,11 @@ bool GetFixed32(Slice* input, uint32_t* value);
 bool GetFixed16(Slice* input, uint16_t* value);
 bool GetVarint32(Slice* input, uint32_t* value);
 bool GetVarint64(Slice* input, uint64_t* value);
+// Like GetVarint32/64, but rejects overlong (non-minimal) encodings, so each
+// value has exactly one encoding. On failure `input` may be partly consumed;
+// callers treat that as corruption.
+bool GetCanonicalVarint32(Slice* input, uint32_t* value);
+bool GetCanonicalVarint64(Slice* input, uint64_t* value);
 bool GetVarsignedint64(Slice* input, int64_t* value);
 bool GetLengthPrefixedSlice(Slice* input, Slice* result);
 // This function assumes data is well-formed.
@@ -292,6 +297,18 @@ inline bool GetVarint64(Slice* input, uint64_t* value) {
     *input = Slice(q, static_cast<size_t>(limit - q));
     return true;
   }
+}
+
+inline bool GetCanonicalVarint32(Slice* input, uint32_t* value) {
+  const size_t before = input->size();
+  return GetVarint32(input, value) &&
+         before - input->size() == VarintLength(*value);
+}
+
+inline bool GetCanonicalVarint64(Slice* input, uint64_t* value) {
+  const size_t before = input->size();
+  return GetVarint64(input, value) &&
+         before - input->size() == VarintLength(*value);
 }
 
 inline bool GetVarsignedint64(Slice* input, int64_t* value) {
