@@ -89,7 +89,8 @@ DBTestBase::DBTestBase(const std::string& path, bool env_do_fsync)
     }
     EXPECT_OK(EncryptionProvider::CreateFromString(ConfigOptions(), provider_id,
                                                    &provider));
-    encrypted_env_ = NewEncryptedEnv(mem_env_ ? mem_env_ : base_env, provider);
+    encrypted_env_base_ = mem_env_ ? mem_env_ : base_env;
+    encrypted_env_ = NewEncryptedEnv(encrypted_env_base_, provider);
   }
   env_ = new SpecialEnv(encrypted_env_ ? encrypted_env_
                                        : (mem_env_ ? mem_env_ : base_env));
@@ -124,6 +125,12 @@ DBTestBase::~DBTestBase() {
   options.db_paths.emplace_back(dbname_ + "_3", 0);
   options.db_paths.emplace_back(dbname_ + "_4", 0);
   options.env = env_;
+  // With ENCRYPTED_ENV, destroy the DB with the env below the encrypted env.
+  // Some tests write files with Env::Default(), which the encrypted env
+  // cannot read, and DestroyDB() reads CURRENT.
+  if (encrypted_env_base_ != nullptr) {
+    options.env = encrypted_env_base_;
+  }
 
   if (getenv("KEEP_DB")) {  // NOLINT(concurrency-mt-unsafe)
     printf("DB is still at %s\n", dbname_.c_str());

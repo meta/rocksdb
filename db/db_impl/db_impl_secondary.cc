@@ -1240,6 +1240,11 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool recover_wal, bool trust_manifest_recovery) {
   *dbptr = nullptr;
+  Status check = DBImpl::CheckManifestStoreOptions(
+      db_options, /*store_mode_supported=*/false);
+  if (!check.ok()) {
+    return check;
+  }
   // Only normal DB::OpenAsSecondary recovery can defer SST opening.
   // `recover_wal` excludes OpenAndCompact even when no snapshot floor is
   // supplied, `open_files_async` is the explicit opt-in, and trust-MANIFEST

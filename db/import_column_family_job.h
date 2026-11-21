@@ -61,6 +61,11 @@ class ImportColumnFamilyJob {
   // Cleanup after successful/failed job
   void Cleanup(const Status& status);
 
+  // Makes Cleanup() keep the files that this job wrote into the DB
+  // (`internal_file_path`), as ExternalSstFileIngestionJob::KeepInternalFiles()
+  // does.
+  void KeepInternalFiles();
+
   VersionEdit* edit() { return &edit_; }
 
   const std::vector<std::vector<IngestedFileInfo>>& files_to_import() const {

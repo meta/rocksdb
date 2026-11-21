@@ -272,7 +272,12 @@ Status OpenForReadOnlyCheckExistence(const DBOptions& db_options,
 Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
                            std::unique_ptr<DB>* dbptr,
                            bool /*error_if_wal_file_exists*/) {
-  Status s = OpenForReadOnlyCheckExistence(options, dbname);
+  Status s =
+      DBImpl::CheckManifestStoreOptions(options, /*store_mode_supported=*/true);
+  if (!s.ok()) {
+    return s;
+  }
+  s = OpenForReadOnlyCheckExistence(options, dbname);
   if (!s.ok()) {
     return s;
   }
@@ -307,8 +312,13 @@ Status DB::OpenForReadOnly(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool error_if_wal_file_exists) {
+  Status s = DBImpl::CheckManifestStoreOptions(db_options,
+                                               /*store_mode_supported=*/true);
+  if (!s.ok()) {
+    return s;
+  }
   // If dbname does not exist in the file system, should not do anything
-  Status s = OpenForReadOnlyCheckExistence(db_options, dbname);
+  s = OpenForReadOnlyCheckExistence(db_options, dbname);
   if (!s.ok()) {
     return s;
   }
