@@ -77,6 +77,29 @@ Status NewManifestReader(FileSystem* fs, const std::string& manifest_path,
                                     true /* checksum */, 0 /* log_number */);
   return Status::OK();
 }
+
+// Counts the records that it applies, which tells a file with no applied
+// record apart from a MANIFEST file that records only the default column
+// family.
+class CountingListColumnFamiliesHandler : public ListColumnFamiliesHandler {
+ public:
+  explicit CountingListColumnFamiliesHandler(const ReadOptions& read_options)
+      : ListColumnFamiliesHandler(read_options) {}
+
+  uint64_t applied_records() const { return applied_records_; }
+
+ protected:
+  Status ApplyVersionEdit(VersionEdit& edit, ColumnFamilyData** cfd) override {
+    Status s = ListColumnFamiliesHandler::ApplyVersionEdit(edit, cfd);
+    if (s.ok()) {
+      ++applied_records_;
+    }
+    return s;
+  }
+
+ private:
+  uint64_t applied_records_ = 0;
+};
 }  // namespace
 
 Status GetFileChecksumsFromCurrentManifest(FileSystem* fs,
@@ -155,6 +178,38 @@ Status GetDbIdentityFromManifest(FileSystem* fs,
     return s;
   }
   return Status::NotFound("MANIFEST file records no DB ID", manifest_path);
+}
+
+Status GetColumnFamiliesFromManifest(
+    FileSystem* fs, const std::string& manifest_path,
+    std::map<uint32_t, std::string>* column_families) {
+  if (fs == nullptr) {
+    return Status::InvalidArgument("fs is nullptr");
+  }
+  if (column_families == nullptr) {
+    return Status::InvalidArgument("column_families is nullptr");
+  }
+  Status s;
+  ManifestReporter reporter;
+  reporter.status_ptr = &s;
+  std::unique_ptr<log::Reader> reader;
+  s = NewManifestReader(fs, manifest_path, &reporter, &reader);
+  if (!s.ok()) {
+    return s;
+  }
+
+  const ReadOptions read_options;
+  CountingListColumnFamiliesHandler handler(read_options);
+  handler.Iterate(*reader, &s);
+  if (!handler.status().ok()) {
+    return handler.status();
+  }
+  if (handler.applied_records() == 0) {
+    return Status::Corruption("MANIFEST file has no applied record",
+                              manifest_path);
+  }
+  *column_families = handler.GetColumnFamilyNames();
+  return Status::OK();
 }
 
 Status UpdateManifestForFilesState(
