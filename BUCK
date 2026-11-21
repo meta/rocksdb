@@ -90,6 +90,9 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/logs_with_prep_tracker.cc",
         "db/malloc_stats.cc",
         "db/manifest_ops.cc",
+        "db/manifest_rows.cc",
+        "db/manifest_store_shadow.cc",
+        "db/manifest_store_state.cc",
         "db/memtable.cc",
         "db/memtable_list.cc",
         "db/merge_helper.cc",
@@ -420,6 +423,7 @@ cpp_library_wrapper(name="rocksdb_test_lib", srcs=[
         "db/db_test_util.cc",
         "db/db_with_timestamp_test_util.cc",
         "table/mock_table.cc",
+        "test_util/mock_manifest_store.cc",
         "test_util/mock_time_env.cc",
         "test_util/secondary_cache_test_util.cc",
         "test_util/simple_external_table_factory.cc",
@@ -448,6 +452,7 @@ cpp_library_wrapper(name="rocksdb_with_faiss_test_lib", srcs=[
         "db/db_test_util.cc",
         "db/db_with_timestamp_test_util.cc",
         "table/mock_table.cc",
+        "test_util/mock_manifest_store.cc",
         "test_util/mock_time_env.cc",
         "test_util/secondary_cache_test_util.cc",
         "test_util/simple_external_table_factory.cc",
@@ -5036,6 +5041,12 @@ cpp_unittest_wrapper(name="db_log_iter_test",
 
 cpp_unittest_wrapper(name="db_logical_block_size_cache_test",
             srcs=["db/db_logical_block_size_cache_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="db_manifest_store_test",
+            srcs=["db/db_manifest_store_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

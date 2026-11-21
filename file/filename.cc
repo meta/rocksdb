@@ -175,6 +175,48 @@ std::string DescriptorFileName(const std::string& dbname, uint64_t number) {
   return dbname + "/" + DescriptorFileName(number);
 }
 
+namespace {
+const std::string kManifestCopyPrefix = "MANIFEST_COPY-";
+const std::string kManifestCopyPointerName = "MANIFEST_COPY_CURRENT";
+}  // namespace
+
+std::string ManifestCopyFileName(const std::string& dbname, uint64_t number) {
+  assert(number > 0);
+  char buf[100];
+  snprintf(buf, sizeof(buf), "%06llu", static_cast<unsigned long long>(number));
+  return dbname + "/" + kManifestCopyPrefix + buf;
+}
+
+std::string ManifestCopyPointerFileName(const std::string& dbname) {
+  return dbname + "/" + kManifestCopyPointerName;
+}
+
+std::string ManifestCopyPointerTempFileName(const std::string& dbname) {
+  return dbname + "/" + kManifestCopyPointerName + "." + kTempFileNameSuffix;
+}
+
+bool ParseManifestCopyFileName(const std::string& name, uint64_t* number,
+                               bool* is_pointer) {
+  if (name == kManifestCopyPointerName ||
+      name == kManifestCopyPointerName + "." + kTempFileNameSuffix) {
+    *is_pointer = true;
+    return true;
+  }
+  Slice rest(name);
+  if (!rest.starts_with(kManifestCopyPrefix)) {
+    return false;
+  }
+  rest.remove_prefix(kManifestCopyPrefix.size());
+  uint64_t num = 0;
+  if (rest.empty() || !ConsumeDecimalNumber(&rest, &num) || !rest.empty() ||
+      num == 0) {
+    return false;
+  }
+  *is_pointer = false;
+  *number = num;
+  return true;
+}
+
 std::string CurrentFileName(const std::string& dbname) {
   return dbname + "/" + kCurrentFileName;
 }

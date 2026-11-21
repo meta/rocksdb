@@ -15,6 +15,7 @@
 #include "db/db_impl/db_impl_metadata.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
+#include "db/manifest_store_state.h"
 #include "db/merge_context.h"
 #include "db/version_edit.h"
 #include "file/filename.h"
@@ -1074,15 +1075,22 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
   // read the manifest and apply new changes to the secondary instance
   std::unordered_set<ColumnFamilyData*> cfds_changed;
   JobContext job_context(0, true /*create_superversion*/);
+  auto* reactive_versions =
+      static_cast_with_check<ReactiveVersionSet>(versions_.get());
+  // In store mode the store is read before the DB mutex is taken (see "Store
+  // mode in a secondary or follower" at
+  // ReactiveVersionSet::ReadStoreForCatchUp()).
+  std::unique_ptr<ManifestStoreRead> store_read;
+  s = reactive_versions->ReadStoreForCatchUp(&mutex_, &store_read);
+  if (!s.ok()) {
+    return s;
+  }
   {
     InstrumentedMutexLock lock_guard(&mutex_);
     assert(manifest_reader_.get() != nullptr);
-    auto* reactive_versions =
-        static_cast_with_check<ReactiveVersionSet>(versions_.get());
-    s = reactive_versions->ReadAndApply(&mutex_, &manifest_reader_,
-                                        manifest_reader_status_.get(),
-                                        &cfds_changed,
-                                        /*files_to_delete=*/nullptr);
+    s = reactive_versions->ReadAndApply(
+        &mutex_, &manifest_reader_, manifest_reader_status_.get(),
+        &cfds_changed, /*files_to_delete=*/nullptr, store_read.get());
 
     ROCKS_LOG_INFO(immutable_db_options_.info_log, "Last sequence is %" PRIu64,
                    static_cast<uint64_t>(versions_->LastSequence()));
@@ -1240,6 +1248,10 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool recover_wal, bool trust_manifest_recovery) {
   *dbptr = nullptr;
+  Status check = DBImpl::CheckManifestStoreOptions(db_options);
+  if (!check.ok()) {
+    return check;
+  }
   // Only normal DB::OpenAsSecondary recovery can defer SST opening.
   // `recover_wal` excludes OpenAndCompact even when no snapshot floor is
   // supplied, `open_files_async` is the explicit opt-in, and trust-MANIFEST
@@ -2232,6 +2244,7 @@ Status DB::OpenAndCompact(
   db_options.listeners = override_options.listeners;
   db_options.compaction_service = nullptr;
   db_options.info_log = override_options.info_log;
+  db_options.manifest_store = override_options.manifest_store;
 
   const std::string output_path = RemoteCompactionJobDir(
       name, db_options.use_session_tmp_dir_for_remote_compaction,
@@ -2397,19 +2410,33 @@ Status DB::OpenAndCompact(
         recovered_number < compaction_input.min_manifest_file_number ||
         (recovered_number == compaction_input.min_manifest_file_number &&
          recovered_valid_size < compaction_input.min_manifest_file_size);
+    // In store mode (see db/manifest_store_state.h) the MANIFEST file is a
+    // stub, so the file check above does not apply. The commit sequence of the
+    // store scan replaces it as the floor: the worker must have replayed a
+    // scan at or above the commit sequence that the primary sent.
+    uint64_t recovered_commit_sequence = 0;
+    if (StoreModeOptions(db_options)) {
+      recovered_commit_sequence =
+          static_cast_with_check<ReactiveVersionSet>(recovered_versions)
+              ->replayed_store_commit_sequence();
+      below_floor = recovered_commit_sequence <
+                    compaction_input.min_store_commit_sequence;
+    }
     TEST_SYNC_POINT_CALLBACK(
         "DBImplSecondary::OpenAndCompact::ManifestFloorCheck", &below_floor);
     if (below_floor) {
       ROCKS_LOG_WARN(
           db_options.info_log,
           "Remote compaction recovered an older MANIFEST view (file number "
-          "%" PRIu64 " valid size %" PRIu64
+          "%" PRIu64 " valid size %" PRIu64 " store commit sequence %" PRIu64
           ") than the primary scheduled from "
           "(min file number %" PRIu64 " size %" PRIu64
+          " store commit sequence %" PRIu64
           "); declining so the job can fall back to local compaction.",
-          recovered_number, recovered_valid_size,
+          recovered_number, recovered_valid_size, recovered_commit_sequence,
           compaction_input.min_manifest_file_number,
-          compaction_input.min_manifest_file_size);
+          compaction_input.min_manifest_file_size,
+          compaction_input.min_store_commit_sequence);
       for (auto& handle : handles) {
         delete handle;
       }
