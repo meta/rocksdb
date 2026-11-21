@@ -334,7 +334,8 @@ class TableCache {
   // Reads, from one SST, the exact references of the sorted groups in
   // `requests` (see TableReader::ReadBlobReferences()), through a reader from
   // GetBlobReferenceReader(). Returns InvalidArgument for an SST without exact
-  // blob reference metadata. Only tests call it.
+  // blob reference metadata. Only tests call it. Indirect blob GC gets its
+  // reader with GetBlobReferenceReader() and reads its batch itself.
   Status ReadBlobReferences(const ReadOptions& read_options,
                             const FileOptions& file_options,
                             const InternalKeyComparator& internal_comparator,
@@ -400,6 +401,9 @@ class TableCache {
   }
 
  private:
+  // DBImpl gets per-job SST readers for indirect blob GC, outside the DB mutex.
+  friend class DBImpl;
+
   // Gets a reader for the exact blob reference metadata of `file_meta`. It
   // first looks for the SST's reader in the table cache without I/O (the pinned
   // reader of the SST, or a cache lookup). That reader already read the table
