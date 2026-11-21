@@ -14,6 +14,7 @@
 #include <tuple>
 
 #include "db/column_family.h"
+#include "db/manifest_store_state.h"
 #include "db/version_set.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/manifest_store.h"
@@ -307,6 +308,91 @@ void ApplyManifestRowChanges(const ManifestRowChanges& changes,
   }
 }
 
+namespace {
+// Pairs each new Version of a batch with its base Version (builder_guards[i]
+// holds the base Version of new_versions[i]). A column family drop is always
+// the only edit of its batch (see ProcessManifestWrites()), so checking the
+// first edit is enough. For a drop, the current Version of `first_cfd` is
+// added as both the base Version and the new Version. Only the thread that
+// runs ProcessManifestWrites() installs Versions, so the current Version
+// cannot change here.
+std::vector<ManifestBatchVersion> MakeManifestBatchVersions(
+    const autovector<VersionEdit*>& batch_edits,
+    const autovector<Version*>& new_versions,
+    const std::vector<std::unique_ptr<BaseReferencedVersionBuilder>>&
+        builder_guards,
+    ColumnFamilyData* first_cfd) {
+  std::vector<ManifestBatchVersion> batch_versions;
+  batch_versions.reserve(new_versions.size() + 1);
+  for (size_t i = 0; i < new_versions.size(); ++i) {
+    batch_versions.push_back({new_versions[i]->cfd(),
+                              builder_guards[i]->version()->storage_info(),
+                              new_versions[i]->storage_info()});
+  }
+  if (batch_edits.front()->IsColumnFamilyDrop()) {
+    const VersionStorageInfo* current = first_cfd->current()->storage_info();
+    batch_versions.push_back({first_cfd, current, current});
+  }
+  return batch_versions;
+}
+}  // namespace
+
+Status VersionSet::BuildManifestBatchRowChanges(
+    const autovector<VersionEdit*>& batch_edits,
+    const autovector<Version*>& new_versions,
+    const std::vector<std::unique_ptr<BaseReferencedVersionBuilder>>&
+        builder_guards,
+    ColumnFamilyData* first_cfd, const ColumnFamilyOptions* new_cf_options,
+    const ManifestRows& old_rows, ManifestRowChanges* changes) const {
+  // This reads wals_ without the DB mutex. Only this thread changes wals_,
+  // when it installs a write.
+  return BuildManifestRowChanges(
+      batch_edits,
+      MakeManifestBatchVersions(batch_edits, new_versions, builder_guards,
+                                first_cfd),
+      new_cf_options, old_rows, wals_, changes);
+}
+
+Status VersionSet::CommitBatchToStore(
+    const autovector<VersionEdit*>& batch_edits,
+    const autovector<Version*>& new_versions,
+    const std::vector<std::unique_ptr<BaseReferencedVersionBuilder>>&
+        builder_guards,
+    ColumnFamilyData* first_cfd, const ColumnFamilyOptions* new_cf_options,
+    uint64_t min_file_number_in_use, IOStatus* io_s) {
+  ManifestStoreState* state = manifest_store_state_.get();
+  assert(state != nullptr);
+  ManifestRowChanges changes;
+  state->PrepareRewrite();
+  Status s = BuildManifestBatchRowChanges(
+      batch_edits, new_versions, builder_guards, first_cfd, new_cf_options,
+      state->committed_rows(), &changes);
+  if (!s.ok()) {
+    // A WAL edit that the WAL set rejects. Installing the batch would fail
+    // for the same reason, so nothing is committed.
+    return s;
+  }
+  state->MergeRewrite(&changes);
+  *io_s = state->CommitBatch(changes, min_file_number_in_use);
+  if (io_s->ok() && batch_edits.front()->IsColumnFamilyDrop()) {
+    // The rows of the dropped column family stay in the store until later
+    // commits delete them (ManifestStoreState::QueueDroppedCfRows()).
+    const VersionStorageInfo* vstorage = first_cfd->current()->storage_info();
+    std::vector<uint64_t> files;
+    std::vector<uint64_t> blob_files;
+    for (int level = 0; level < vstorage->num_levels(); ++level) {
+      for (const FileMetaData* f : vstorage->LevelFiles(level)) {
+        files.push_back(f->fd.GetNumber());
+      }
+    }
+    for (const auto& blob_file : vstorage->GetBlobFiles()) {
+      blob_files.push_back(blob_file->GetBlobFileNumber());
+    }
+    state->QueueDroppedCfRows(first_cfd->GetID(), files, blob_files);
+  }
+  return *io_s;
+}
+
 #ifndef NDEBUG
 namespace {
 
@@ -390,21 +476,12 @@ void VersionSet::DebugCheckRowsBeforeInstall(
     ColumnFamilyData* first_cfd, const ColumnFamilyOptions* new_cf_options) {
   assert(debug_manifest_rows_ != nullptr);
   // This runs without the DB mutex (see "Threads" at debug_manifest_rows_).
-  std::vector<ManifestBatchVersion> batch_versions;
-  batch_versions.reserve(new_versions.size() + 1);
-  for (size_t i = 0; i < new_versions.size(); ++i) {
-    // builder_guards[i] holds the base Version of new_versions[i].
-    batch_versions.push_back({new_versions[i]->cfd(),
-                              builder_guards[i]->version()->storage_info(),
-                              new_versions[i]->storage_info()});
-  }
-  // A column family add or drop is always the only edit of its batch (see
-  // ProcessManifestWrites()), so checking the first edit is enough.
-  if (batch_edits.front()->IsColumnFamilyDrop()) {
-    const VersionStorageInfo* current = first_cfd->current()->storage_info();
-    batch_versions.push_back({first_cfd, current, current});
-  }
+  const std::vector<ManifestBatchVersion> batch_versions =
+      MakeManifestBatchVersions(batch_edits, new_versions, builder_guards,
+                                first_cfd);
   ManifestRowChanges changes;
+  // This reads wals_ without the DB mutex. Only the thread that runs
+  // ProcessManifestWrites() changes wals_ (see wals_ in db/version_set.h).
   if (!BuildManifestRowChanges(batch_edits, batch_versions, new_cf_options,
                                *debug_manifest_rows_, wals_, &changes)
            .ok()) {
@@ -1466,6 +1543,54 @@ Status ManifestRowsToPublicRows(const ManifestRows& internal_rows,
   for (const auto& [number, wal] : internal_rows.wals) {
     public_rows->push_back(ManifestRow{
         ManifestRowKey{ManifestRowType::kWal, 0, number}, EncodeWalRow(wal)});
+  }
+  return Status::OK();
+}
+
+Status ManifestRowChangesToCommit(const ManifestRowChanges& changes,
+                                  const ManifestDbRowExtraFields& extra_fields,
+                                  uint32_t feature_version,
+                                  uint64_t expected_commit_sequence,
+                                  std::string commit_id, ManifestCommit* out) {
+  if (feature_version < 1 ||
+      feature_version > kManifestRowFeatureVersionLatest) {
+    return Status::InvalidArgument("Bad manifest row feature version " +
+                                   std::to_string(feature_version));
+  }
+  *out = ManifestCommit();
+  out->expected_commit_sequence = expected_commit_sequence;
+  out->commit_id = std::move(commit_id);
+  out->db_row = ManifestRow{ManifestRowKey{ManifestRowType::kDb, 0, 0},
+                            EncodeDbRow(changes.db, extra_fields)};
+  for (const auto& [cf_id, cf] : changes.cf_upserts) {
+    out->upserts.push_back(
+        ManifestRow{ManifestRowKey{ManifestRowType::kColumnFamily, cf_id, 0},
+                    EncodeCfRow(cf)});
+  }
+  for (const auto& [key, file] : changes.file_upserts) {
+    out->upserts.push_back(ManifestRow{
+        ManifestRowKey{ManifestRowType::kFile, key.first, key.second},
+        EncodeFileRow(file)});
+  }
+  for (const auto& [key, blob_file] : changes.blob_file_upserts) {
+    out->upserts.push_back(ManifestRow{
+        ManifestRowKey{ManifestRowType::kBlobFile, key.first, key.second},
+        EncodeBlobFileRow(blob_file)});
+  }
+  for (const auto& [number, wal] : changes.wal_upserts) {
+    out->upserts.push_back(ManifestRow{
+        ManifestRowKey{ManifestRowType::kWal, 0, number}, EncodeWalRow(wal)});
+  }
+  for (const auto& key : changes.file_deletes) {
+    out->deletes.push_back(
+        ManifestRowKey{ManifestRowType::kFile, key.first, key.second});
+  }
+  for (const auto& key : changes.blob_file_deletes) {
+    out->deletes.push_back(
+        ManifestRowKey{ManifestRowType::kBlobFile, key.first, key.second});
+  }
+  for (WalNumber number : changes.wal_deletes) {
+    out->deletes.push_back(ManifestRowKey{ManifestRowType::kWal, 0, number});
   }
   return Status::OK();
 }

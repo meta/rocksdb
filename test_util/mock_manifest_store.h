@@ -32,11 +32,11 @@ namespace ROCKSDB_NAMESPACE {
 // Behavior that differs from a real store:
 // - Scan() copies all rows under a lock, then calls the visitor, so every
 //   scan returns the rows of one commit, whatever ManifestScanOptions says.
-// - A test chooses the next failure with MockManifestStoreData::SetNextFault().
-//   Without it, no call fails except for the reasons that the
-//   ManifestStore comments give: fenced, Busy, NotFound, NotSupported for a
-//   reader, TryAgain for a failed generation check, and the status of the
-//   visitor. Open() also returns Corruption when db_field_updates or the
+// - A test chooses the next failure with MockManifestStoreData::SetNextFault()
+//   and SetReadDbRowFailures(). Without them, no call fails except for the
+//   reasons that the ManifestStore comments give: fenced, Busy, NotFound,
+//   NotSupported for a reader, TryAgain for a failed generation check, and
+//   the status of the visitor. Open() also returns Corruption when db_field_updates or the
 //   stored DB row fields cannot be parsed.
 //
 // The tests of the store contract are ManifestStoreContractTest in
@@ -78,6 +78,11 @@ class MockManifestStoreData {
   // object leaves the fault for the next call.
   void SetNextFault(Fault fault);
 
+  // Makes the next `count` ReadDbRow() calls return IOError, separately from
+  // SetNextFault(), so that a test can fail the reads that follow a commit
+  // with an unknown outcome.
+  void SetReadDbRowFailures(int count);
+
   // Sets a function that WriteGeneration() calls after it writes each chunk
   // of rows, without holding the lock. A test can claim the DB with a newer
   // epoch there, to check that the remaining chunks are refused.
@@ -86,6 +91,10 @@ class MockManifestStoreData {
 
   // The newest epoch that claimed the DB.
   uint64_t StoredEpoch() const;
+
+  // The fault that the next call will use, so a test can check that no call
+  // used it.
+  Fault PendingFault() const;
 
   // The status code that the hidden apply returned for the last Open() or
   // Commit() call that failed with kTimedOutApplied or kTimedOutLateApply.
@@ -114,6 +123,7 @@ class MockManifestStoreData {
   // generation number.
   uint64_t generation_counter_ = 0;
   Fault next_fault_ = Fault::kNone;
+  int read_db_row_failures_ = 0;
   // A call that returned TimedOut with kTimedOutLateApply, applied at the
   // start of the next call.
   std::function<void()> late_apply_;

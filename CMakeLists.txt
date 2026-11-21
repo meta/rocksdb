@@ -840,6 +840,7 @@ set(SOURCES
         db/malloc_stats.cc
         db/manifest_ops.cc
         db/manifest_rows.cc
+        db/manifest_store_state.cc
         db/memtable.cc
         db/memtable_list.cc
         db/merge_helper.cc
@@ -1558,6 +1559,7 @@ if(WITH_TESTS)
         db/filename_test.cc
         db/flush_job_test.cc
         db/db_follower_test.cc
+        db/db_manifest_store_test.cc
         db/import_column_family_test.cc
         db/listener_test.cc
         db/log_test.cc

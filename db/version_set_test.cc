@@ -3130,6 +3130,10 @@ const char* ManifestRowFieldOfTag(Tag tag) {
       return "no row field: only controls MANIFEST file rewrites";
     case kCommittedOptionsFileNumber:
       return "ManifestDbField::kCommittedOptionsFileNumber";
+    case kManifestStoreStub:
+      return "no row field: only in the stub MANIFEST of store mode";
+    case kManifestCopyMarker:
+      return "no row field: only in a MANIFEST file copy of store mode";
     case kDroppedBlobFile:
       return "ManifestCfField::kDroppedBlobFiles";
   }

@@ -315,6 +315,9 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.calculate_sst_write_lifetime_hint_set =
       immutable_db_options.calculate_sst_write_lifetime_hint_set;
   options.manifest_store = immutable_db_options.manifest_store;
+  options.manifest_store_migrate = immutable_db_options.manifest_store_migrate;
+  options.manifest_store_copy_mode =
+      immutable_db_options.manifest_store_copy_mode;
   options.manifest_row_feature_version =
       immutable_db_options.manifest_row_feature_version;
 }

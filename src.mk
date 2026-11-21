@@ -81,6 +81,7 @@ LIB_SOURCES =                                                   \
   db/malloc_stats.cc                                            \
   db/manifest_ops.cc                                            \
   db/manifest_rows.cc                                           \
+  db/manifest_store_state.cc                                    \
   db/memtable.cc                                                \
   db/memtable_list.cc                                           \
   db/merge_helper.cc                                            \
@@ -537,6 +538,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/db_inplace_update_test.cc                                          \
   db/db_io_failure_test.cc                                              \
   db/db_iter_test.cc                                                    \
+  db/db_manifest_store_test.cc                                          \
   db/db_iter_stress_test.cc                                             \
   db/db_iterator_test.cc                                                \
   db/db_kv_checksum_test.cc                                             \
