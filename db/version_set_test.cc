@@ -24,14 +24,17 @@
 #include "db/db_test_util.h"
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
+#include "db/manifest_rows.h"
 #include "db/version_edit.h"
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/statistics.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/mock_table.h"
 #include "table/unique_id_impl.h"
+#include "test_util/mock_manifest_store.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -1447,6 +1450,28 @@ class VersionSetTestBase {
         write_options_, vedits, &mutex_, nullptr);
     mutex_.Unlock();
     return s;
+  }
+
+  // Writes `edit` for `cfd` and sets the column family of `edit` first, because
+  // LogAndApply() applies the log number and full_history_ts_low of an edit to
+  // the column family that the edit names.
+  Status LogAndApplyToCF(ColumnFamilyData* cfd, VersionEdit* edit) {
+    edit->SetColumnFamily(cfd->GetID());
+    mutex_.Lock();
+    Status s = versions_->LogAndApply(cfd, read_options_, write_options_, edit,
+                                      &mutex_, /*db_directory=*/nullptr);
+    mutex_.Unlock();
+    return s;
+  }
+
+  // Returns the structured MANIFEST rows (db/manifest_rows.h) of the current
+  // state.
+  ManifestRows GetManifestRows() {
+    ManifestRows rows;
+    mutex_.Lock();
+    versions_->GetManifestRows(&rows);
+    mutex_.Unlock();
+    return rows;
   }
 
   void CreateNewManifest() {
@@ -3020,6 +3045,1495 @@ TEST_F(VersionStorageInfoTest, AddRangeDeletionCompensatedFileSize) {
 
   auto meta = vstorage_.GetFileMetaDataByNumber(100U);
   ASSERT_EQ(meta->compensated_file_size, 100U + 1000U);
+}
+
+// Tells which field of the public rows (include/rocksdb/manifest_store.h)
+// holds the content of each VersionEdit tag, or "no row field". The switch has
+// no default case, so the build fails (-Wswitch with -Werror) when someone adds
+// a tag without listing it here. When that happens:
+// 1. Add a row field for the new tag in db/manifest_rows.h, or list the tag
+//    as not stored in the comment at the top of that file and skip to step 6.
+// 2. Set the field in db/manifest_rows.cc: for a DB field in
+//    VersionSet::SetManifestDbRowAndWals() and BuildManifestRowChanges(),
+//    for a column family field in MakeManifestCfRow() and in the column family
+//    add case of BuildManifestRowChanges(). A column family field that a
+//    MANIFEST write merges with the old row (like log_number and
+//    full_history_ts_low) also needs the loop over `batch_versions` of
+//    BuildManifestRowChanges().
+// 3. Write the field in ManifestRowsToRecords().
+// 4. For a column family field, compare it in SameCfRow(), which
+//    ManifestRowsEqual() uses.
+// 5. Add a field ID in include/rocksdb/manifest_store.h and choose its "must
+//    understand" bit. A new field with the bit belongs to a new feature
+//    version (see the header). Write the field in the Encode*Row() function and
+//    read it in the Read*Field() function of db/manifest_rows.cc; the switch
+//    there has no default case either.
+// 6. Add the case here, with the field ID.
+const char* ManifestRowFieldOfTag(Tag tag) {
+  switch (tag) {
+    case kComparator:
+      return "ManifestCfField::kComparatorName";
+    case kLogNumber:
+      return "ManifestCfField::kLogNumber";
+    case kNextFileNumber:
+      return "ManifestDbField::kNextFileNumber";
+    case kLastSequence:
+      return "ManifestDbField::kLastSequence";
+    case kCompactCursor:
+      return "ManifestCfField::kCompactCursors";
+    case kDeletedFile:
+      return "no row field: removes a file row";
+    case kNewFile:
+    case kNewFile2:
+    case kNewFile3:
+    case kBlobFileAddition_DEPRECATED:
+    case kBlobFileGarbage_DEPRECATED:
+      return "no row field: deprecated, read only from old MANIFEST files";
+    case kNewFile4:
+      return "a file row (ManifestFileField, see the custom fields below)";
+    case kPrevLogNumber:
+      return "ManifestDbField::kPrevLogNumber";
+    case kMinLogNumberToKeep:
+      return "ManifestDbField::kMinLogNumberToKeep";
+    case kColumnFamily:
+      return "no row field: the column family id in the row key";
+    case kColumnFamilyAdd:
+      return "ManifestCfField::kName";
+    case kColumnFamilyDrop:
+      return "ManifestCfField::kDropped";
+    case kMaxColumnFamily:
+      return "ManifestDbField::kMaxColumnFamily";
+    case kInAtomicGroup:
+      return "no row field: an atomic group is written in one MANIFEST write";
+    case kBlobFileAddition:
+      return "a blob file row (ManifestBlobFileField::kTotalBlobCount to "
+             "kChecksumValue)";
+    case kBlobFileGarbage:
+      return "ManifestBlobFileField::kGarbageBlobCount and kGarbageBlobBytes";
+    case kTagSafeIgnoreMask:
+      return "no row field: not a tag";
+    case kDbId:
+      return "ManifestDbField::kDbId";
+    case kWalAddition:
+    case kWalAddition2:
+      return "a WAL row (ManifestWalField::kSyncedSize)";
+    case kWalDeletion:
+    case kWalDeletion2:
+      return "no row field: removes WAL rows";
+    case kFullHistoryTsLow:
+      return "ManifestCfField::kFullHistoryTsLow";
+    case kPersistUserDefinedTimestamps:
+      return "ManifestCfField::kPersistUserDefinedTimestamps";
+    case kSubcompactionProgress:
+      return "no row field: never written to the DB MANIFEST";
+    case kLastCompactedManifestFileSize:
+      return "no row field: only controls MANIFEST file rewrites";
+    case kCommittedOptionsFileNumber:
+      return "ManifestDbField::kCommittedOptionsFileNumber";
+    case kDroppedBlobFile:
+      return "ManifestCfField::kDroppedBlobFiles";
+  }
+  return nullptr;
+}
+
+// Same as ManifestRowFieldOfTag() for the fields of a new file record. Each
+// field goes to a file row field (ManifestFileRow::meta in db/manifest_rows.h),
+// except kMinLogNumberToKeepHack, which carries the DB min log number to keep
+// inside a new file record and goes to the DB row.
+const char* ManifestRowFieldOfNewFileTag(NewFileCustomTag tag) {
+  switch (tag) {
+    case kTerminate:
+    case kCustomTagNonSafeIgnoreMask:
+      return "no row field: not a field";
+    case kMinLogNumberToKeepHack:
+      return "ManifestDbField::kMinLogNumberToKeep";
+    case kNeedCompaction:
+      return "ManifestFileField::kMarkedForCompaction";
+    case kOldestBlobFileNumber:
+      return "ManifestFileField::kOldestBlobFileNumber";
+    case kOldestAncestorTime:
+      return "ManifestFileField::kOldestAncestorTime";
+    case kFileCreationTime:
+      return "ManifestFileField::kFileCreationTime";
+    case kFileChecksum:
+      return "ManifestFileField::kFileChecksum";
+    case kFileChecksumFuncName:
+      return "ManifestFileField::kFileChecksumFuncName";
+    case kTemperature:
+      return "ManifestFileField::kTemperature";
+    case kMinTimestamp:
+      return "ManifestFileField::kMinTimestamp";
+    case kMaxTimestamp:
+      return "ManifestFileField::kMaxTimestamp";
+    case kUniqueId:
+      return "ManifestFileField::kUniqueId";
+    case kEpochNumber:
+      return "ManifestFileField::kEpochNumber";
+    case kCompensatedRangeDeletionSize:
+      return "ManifestFileField::kCompensatedRangeDeletionSize";
+    case kTailSize:
+      return "ManifestFileField::kTailSize";
+    case kUserDefinedTimestampsPersisted:
+      return "ManifestFileField::kUserDefinedTimestampsPersisted";
+    case kFileOpenMetadata:
+      return "ManifestFileField::kFileOpenMetadata";
+    case kDbOwnershipStartTime:
+      return "ManifestFileField::kDbOwnershipStartTime";
+    case kDataFileProvenance:
+      return "ManifestFileField::kDataFileProvenance";
+    case kPathId:
+      return "ManifestFileField::kPathId";
+  }
+  return nullptr;
+}
+
+TEST(ManifestRowsTagTest, EveryTagHasARowField) {
+  // The real check is at build time, in the switch statements above.
+  ASSERT_STREQ("ManifestCfField::kDroppedBlobFiles",
+               ManifestRowFieldOfTag(kDroppedBlobFile));
+  ASSERT_STREQ("ManifestFileField::kDataFileProvenance",
+               ManifestRowFieldOfNewFileTag(kDataFileProvenance));
+}
+
+// Checks the canonical encoding of row fields
+// (include/rocksdb/manifest_store.h) against bytes written by hand from the
+// format description.
+TEST(ManifestRowFieldsTest, EncodeAndParse) {
+  // Field 5 holds 3 bytes. Field 127 is the largest ID with a one-byte
+  // varint, and field 128 the smallest with two bytes. Field 200 has an empty
+  // value.
+  const std::string value5("abc");
+  const std::string value127(1, '\0');
+  const std::string value128(130, 'x');
+  // Field 0xFFFFFFFF, the largest ID, needs all 5 bytes of a varint32.
+  const std::vector<ManifestRowField> fields = {{5, value5},
+                                                {127, value127},
+                                                {128, value128},
+                                                {200, Slice()},
+                                                {0xFFFFFFFF, value5}};
+  // 128 is 0x80 0x01 in unsigned LEB128, 130 is 0x82 0x01, 200 is 0xC8 0x01,
+  // and 0xFFFFFFFF is 0xFF 0xFF 0xFF 0xFF 0x0F.
+  const std::string expected = std::string("\x05\x03") + value5 +
+                               std::string("\x7F\x01", 2) + value127 +
+                               std::string("\x80\x01\x82\x01") + value128 +
+                               std::string("\xC8\x01\x00", 3) +
+                               std::string("\xFF\xFF\xFF\xFF\x0F\x03") + value5;
+  const std::string encoded = EncodeManifestRowFields(fields);
+  ASSERT_EQ(expected, encoded);
+  // The MU bit is bit 6 of the ID: IDs 64 to 127 and 192 to 255 have it.
+  ASSERT_EQ(0u, 5u & kManifestFieldMustUnderstand);
+  ASSERT_NE(0u, 127u & kManifestFieldMustUnderstand);
+  ASSERT_EQ(0u, 128u & kManifestFieldMustUnderstand);
+  ASSERT_NE(0u, 200u & kManifestFieldMustUnderstand);
+
+  std::vector<ManifestRowField> parsed;
+  ASSERT_OK(ParseManifestRowFields(encoded, &parsed));
+  ASSERT_EQ(fields.size(), parsed.size());
+  for (size_t i = 0; i < fields.size(); ++i) {
+    ASSERT_EQ(fields[i].id, parsed[i].id);
+    ASSERT_EQ(fields[i].value, parsed[i].value);
+  }
+  ASSERT_OK(ParseManifestRowFields(Slice(), &parsed));
+  ASSERT_TRUE(parsed.empty());
+}
+
+// Pins the last field ID of each row type, and checks that it has no "must
+// understand" bit, so that renumbering the last ID or changing the bit breaks
+// the build.
+static_assert(
+    static_cast<uint32_t>(ManifestDbField::kCommittedOptionsFileNumber) == 12);
+static_assert(static_cast<uint32_t>(ManifestCfField::kDropped) == 9);
+static_assert(static_cast<uint32_t>(ManifestFileField::kDataFileProvenance) ==
+              24);
+static_assert(static_cast<uint32_t>(ManifestBlobFileField::kGarbageBlobBytes) ==
+              6);
+static_assert(static_cast<uint32_t>(ManifestWalField::kSyncedSize) == 1);
+static_assert(kManifestFieldMustUnderstand == 64);
+static_assert(
+    (static_cast<uint32_t>(ManifestDbField::kCommittedOptionsFileNumber) &
+     kManifestFieldMustUnderstand) == 0);
+static_assert((static_cast<uint32_t>(ManifestCfField::kDropped) &
+               kManifestFieldMustUnderstand) == 0);
+static_assert((static_cast<uint32_t>(ManifestFileField::kDataFileProvenance) &
+               kManifestFieldMustUnderstand) == 0);
+static_assert((static_cast<uint32_t>(ManifestBlobFileField::kGarbageBlobBytes) &
+               kManifestFieldMustUnderstand) == 0);
+static_assert((static_cast<uint32_t>(ManifestWalField::kSyncedSize) &
+               kManifestFieldMustUnderstand) == 0);
+
+TEST(ManifestRowFieldsTest, ParseRejectsBadEncoding) {
+  const std::string field1(
+      "\x01\x01"
+      "a",
+      3);
+  const std::string field2(
+      "\x02\x01"
+      "b",
+      3);
+  const std::vector<std::string> bad = {
+      // The value size runs past the end.
+      std::string("\x01\x05"
+                  "ab",
+                  4),
+      // The bytes end inside the field ID varint.
+      std::string("\x80", 1),
+      // The bytes end after the field ID.
+      std::string("\x01", 1),
+      // The IDs are out of order.
+      field2 + field1,
+      // An ID appears twice.
+      field1 + field1,
+      // Field ID 0.
+      std::string("\x00\x01"
+                  "a",
+                  3),
+      // An ID in a longer form than needed (1 as 0x81 0x00).
+      std::string("\x81\x00\x01"
+                  "a",
+                  4),
+      // A value size in a longer form than needed (1 as 0x81 0x00).
+      std::string("\x01\x81\x00"
+                  "a",
+                  4),
+      // A five-byte form of ID 1. GetVarint32() reads it as 1, and the
+      // shortest-form check rejects it.
+      std::string("\x81\x80\x80\x80\x00\x01"
+                  "a",
+                  7),
+      // A five-byte ID whose fifth byte has bits above the 32 bits of a
+      // varint32. GetVarint32() reads it as 2^28, which needs 5 bytes, so only
+      // the fifth-byte check rejects it.
+      std::string("\x80\x80\x80\x80\x11\x01"
+                  "a",
+                  7),
+  };
+  for (const std::string& bytes : bad) {
+    std::vector<ManifestRowField> parsed;
+    Status s = ParseManifestRowFields(bytes, &parsed);
+    ASSERT_EQ(Status::Code::kCorruption, s.code())
+        << Slice(bytes).ToString(true);
+  }
+}
+
+// Builds a state that sets every row field to a value that is not its default,
+// reads it into rows, writes the rows as a new MANIFEST file, recovers a new
+// VersionSet from that file and checks that it gives the same rows. It also
+// converts the rows to their public form (include/rocksdb/manifest_store.h)
+// and back.
+TEST_F(VersionSetTest, ManifestRowsRoundTrip) {
+  // A second DB path, so that a file can have path id 1. Both paths are the
+  // DB directory, so the dummy files below are found under either id.
+  imm_db_options_.db_paths.emplace_back(dbname_,
+                                        std::numeric_limits<uint64_t>::max());
+  NewDB();
+  // An OPTIONS file number that is not committed in the MANIFEST (the default
+  // with track_options_file_number_in_manifest false) is not a row field.
+  {
+    mutex_.Lock();
+    versions_->ApplyLegacyOptionsFileNumber(5);
+    mutex_.Unlock();
+    ASSERT_FALSE(
+        GetManifestRows().db.committed_options_file_number.has_value());
+  }
+  // A column family with user-defined timestamps that are not persisted, so
+  // that the file boundaries go through the timestamp removal on write.
+  Options udt_options;
+  udt_options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  udt_options.persist_user_defined_timestamps = false;
+  udt_options.table_factory = table_factory_;
+  ColumnFamilyData* udt_cfd = CreateColumnFamily("udt", udt_options);
+  column_families_.emplace_back("udt", udt_options);
+  // The column family kColumnFamilyName1 ("alice"), which NewDB() creates.
+  ColumnFamilyData* alice_cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(kColumnFamilyName1);
+  ASSERT_NE(nullptr, alice_cfd);
+  // Moves the next file number above the example file numbers below (up to 95),
+  // so that a new file of the VersionSet never takes one of them.
+  versions_->FetchAddFileNumber(100);
+
+  // LogAndApply() opens each new SST file, so the files must exist. Only their
+  // sizes are taken from the dummy files.
+  std::vector<FileMetaData> dummy_files;
+  CreateDummyTableFiles(
+      {SstInfo(10, kDefaultColumnFamilyName, "a"),
+       SstInfo(11, kDefaultColumnFamilyName, "c"),
+       SstInfo(12, kColumnFamilyName1, "e"), SstInfo(13, "udt", "g")},
+      &dummy_files);
+  std::map<uint64_t, uint64_t> file_sizes;
+  for (const FileMetaData& f : dummy_files) {
+    file_sizes[f.fd.GetNumber()] = f.fd.GetFileSize();
+  }
+  // The file numbers and values below are examples. Every field is set to a
+  // value that is not its default. The column families get lower sequence
+  // numbers in id order, which recovery accepts only if every record carries
+  // the DB last sequence.
+  auto make_file = [&](uint64_t number, uint32_t path_id,
+                       const std::string& smallest_key,
+                       const std::string& largest_key, SequenceNumber seq,
+                       uint64_t oldest_blob, bool udt) {
+    const std::string ts = udt ? test::EncodeInt(0) : "";
+    FileMetaData f(
+        number, path_id, file_sizes.at(number),
+        InternalKey(smallest_key + ts, seq, kTypeValue),
+        InternalKey(largest_key + ts, seq + 10, kTypeValue), seq, seq + 10,
+        /*marked_for_compact=*/true, Temperature::kWarm, oldest_blob,
+        /*_oldest_ancestor_time=*/111, /*_file_creation_time=*/222,
+        /*_epoch_number=*/number, "checksum", "checksum_func",
+        UniqueId64x2{number, 7}, /*_compensated_range_deletion_size=*/333,
+        /*_tail_size=*/444, /*_user_defined_timestamps_persisted=*/!udt,
+        udt ? test::EncodeInt(5) : "", udt ? test::EncodeInt(9) : "");
+    f.file_open_metadata = "open_metadata";
+    f.db_ownership_start_time = 555;
+    f.data_file_provenance =
+        DataFileProvenanceForOrigin(DataFileProvenance::Origin::kCompaction) |
+        kProvenanceMovedBetweenLevels;
+    return f;
+  };
+  VersionEdit default_edit;
+  default_edit.AddFile(0, make_file(10, /*path_id=*/1, "a", "b", 100,
+                                    /*oldest_blob=*/20, false));
+  default_edit.AddFile(2, make_file(11, /*path_id=*/0, "c", "d", 90,
+                                    kInvalidBlobFileNumber, false));
+  default_edit.AddBlobFile(20, /*total_blob_count=*/10,
+                           /*total_blob_bytes=*/1000, "checksum_method",
+                           "checksum_value");
+  default_edit.AddBlobFileGarbage(20, /*count=*/3, /*bytes=*/300);
+  default_edit.AddBlobFile(21, /*total_blob_count=*/5, /*total_blob_bytes=*/500,
+                           "", "");
+  default_edit.AddDroppedBlobFile(30);
+  default_edit.AddCompactCursor(2, InternalKey("c", 15, kTypeValue));
+  default_edit.SetLogNumber(45);
+  default_edit.SetMinLogNumberToKeep(40);
+  ASSERT_OK(LogAndApplyToCF(versions_->GetColumnFamilySet()->GetDefault(),
+                            &default_edit));
+
+  VersionEdit alice_edit;
+  alice_edit.AddFile(1, make_file(12, /*path_id=*/0, "e", "f", 50,
+                                  kInvalidBlobFileNumber, false));
+  alice_edit.SetLogNumber(46);
+  ASSERT_OK(LogAndApplyToCF(alice_cfd, &alice_edit));
+
+  VersionEdit udt_edit;
+  udt_edit.AddFile(1, make_file(13, /*path_id=*/0, "g", "h", 10,
+                                kInvalidBlobFileNumber, true));
+  udt_edit.SetFullHistoryTsLow(test::EncodeInt(3));
+  ASSERT_OK(LogAndApplyToCF(udt_cfd, &udt_edit));
+
+  // A dropped column family has no rows, but it still counts for the max
+  // column family.
+  ColumnFamilyData* dropped_cfd = CreateColumnFamily("dropped", cf_options_);
+  const uint32_t dropped_cf_id = dropped_cfd->GetID();
+  VersionEdit drop_edit;
+  drop_edit.DropColumnFamily();
+  ASSERT_OK(LogAndApplyToCF(dropped_cfd, &drop_edit));
+
+  VersionEdit wal_edit;
+  wal_edit.AddWal(50, WalMetadata(/*synced_size_bytes=*/123));
+  wal_edit.AddWal(51);
+  ASSERT_OK(LogAndApplyToDefaultCF(wal_edit));
+
+  VersionEdit options_edit;
+  options_edit.SetCommittedOptionsFileNumber(77);
+  options_edit.MarkOptionsFileManipulation();
+  // Each MANIFEST write sets the prev log number from its first edit, and a
+  // column family add or drop sets it to 0, so set it on the last write.
+  options_edit.SetPrevLogNumber(7);
+  ASSERT_OK(LogAndApplyToDefaultCF(options_edit));
+
+  ManifestRows rows_before = GetManifestRows();
+  // CloseDB() below deletes the ColumnFamilyData objects, so keep the ids.
+  const uint32_t udt_cf_id = udt_cfd->GetID();
+  const uint32_t alice_cf_id = alice_cfd->GetID();
+  ASSERT_FALSE(rows_before.db.db_id.empty());
+  // 110 is the largest sequence number of the files above: file 10 has
+  // sequence numbers up to 100 + 10.
+  ASSERT_EQ(110, rows_before.db.last_sequence);
+  ASSERT_EQ(7, rows_before.db.prev_log_number);
+  ASSERT_EQ(40, rows_before.db.min_log_number_to_keep);
+  ASSERT_EQ(dropped_cf_id, rows_before.db.max_column_family);
+  ASSERT_EQ(std::optional<uint64_t>(77),
+            rows_before.db.committed_options_file_number);
+  ASSERT_EQ(5, rows_before.cfs.size());
+  ASSERT_EQ(0, rows_before.cfs.count(dropped_cf_id));
+  ASSERT_EQ(2, rows_before.cfs[0].files.size());
+  ASSERT_EQ(1, rows_before.cfs[0].files[10].meta.fd.GetPathId());
+  ASSERT_EQ(555, rows_before.cfs[0].files[10].meta.db_ownership_start_time);
+  ASSERT_EQ(3, rows_before.cfs[0].blob_files[20].garbage_blob_count);
+  ASSERT_EQ(std::vector<uint64_t>{30},
+            rows_before.cfs[0].cf.dropped_blob_files);
+  // Levels 0 and 1 have no cursor, and the unset cursors after level 2 are left
+  // out.
+  ASSERT_EQ(3, rows_before.cfs[0].cf.compact_cursors.size());
+  ASSERT_TRUE(rows_before.cfs[0].cf.compact_cursors[0].unset());
+  ASSERT_TRUE(rows_before.cfs[0].cf.compact_cursors[1].unset());
+  ASSERT_EQ(InternalKey("c", 15, kTypeValue).Encode(),
+            rows_before.cfs[0].cf.compact_cursors[2].Encode());
+  ASSERT_EQ(46, rows_before.cfs[alice_cf_id].cf.log_number);
+  ASSERT_EQ(8, rows_before.cfs[udt_cf_id].cf.timestamp_size);
+  ASSERT_EQ(test::EncodeInt(3),
+            rows_before.cfs[udt_cf_id].cf.full_history_ts_low);
+  ASSERT_EQ(2, rows_before.wals.size());
+
+  // The public form of the rows (include/rocksdb/manifest_store.h) gives back
+  // the same rows, also for a dropped column family, and the same rows give
+  // the same bytes. The authority, copy mode and file numbers of the store
+  // fields are examples that differ from their defaults; the row format
+  // version has only one valid value.
+  {
+    ManifestRows with_dropped = rows_before;
+    with_dropped.cfs[alice_cf_id].cf.dropped = true;
+    const ManifestDbRowExtraFields extra_fields{
+        kManifestRowFormatVersionLatest, ManifestAuthority::kStore,
+        ManifestCopyMode::kSync, /*copy_file_number=*/91,
+        /*in_flight_file_number=*/92};
+    std::vector<ManifestRow> store_rows;
+    ASSERT_OK(ManifestRowsToPublicRows(with_dropped, extra_fields,
+                                       kManifestRowFeatureVersionLatest,
+                                       &store_rows));
+    // The DB row comes first.
+    ASSERT_EQ(ManifestRowType::kDb, store_rows[0].key.type);
+    // A store returns the other rows in any order.
+    std::vector<ManifestRow> others(store_rows.begin() + 1, store_rows.end());
+    std::reverse(others.begin(), others.end());
+    ManifestRows decoded;
+    ManifestDbRowExtraFields decoded_extra_fields;
+    ASSERT_OK(PublicRowsToManifestRows(store_rows[0], others, &decoded,
+                                       &decoded_extra_fields));
+    std::string diff;
+    ASSERT_TRUE(ManifestRowsEqual(with_dropped, decoded, &diff)) << diff;
+    ASSERT_EQ(extra_fields, decoded_extra_fields);
+
+    std::vector<ManifestRow> encoded_again;
+    ASSERT_OK(ManifestRowsToPublicRows(decoded, decoded_extra_fields,
+                                       kManifestRowFeatureVersionLatest,
+                                       &encoded_again));
+    ASSERT_EQ(store_rows.size(), encoded_again.size());
+    for (size_t i = 0; i < store_rows.size(); ++i) {
+      ASSERT_EQ(store_rows[i].key, encoded_again[i].key);
+      ASSERT_EQ(store_rows[i].fields, encoded_again[i].fields);
+    }
+  }
+  CloseDB();
+
+  // Write the rows as a new MANIFEST file and make CURRENT point to it.
+  std::vector<std::string> records;
+  ASSERT_OK(ManifestRowsToRecords(rows_before, &records));
+
+  // GetManifestRows() never gives a dropped column family row, so check here
+  // that ManifestRowsToRecords() skips one: the column family record and the
+  // file record of the column family are left out.
+  {
+    ManifestRows with_dropped = rows_before;
+    with_dropped.cfs[alice_cf_id].cf.dropped = true;
+    std::vector<std::string> fewer_records;
+    ASSERT_OK(ManifestRowsToRecords(with_dropped, &fewer_records));
+    ASSERT_EQ(records.size() - 2, fewer_records.size());
+  }
+  // An example MANIFEST number that no other file uses.
+  constexpr uint64_t kManifestNumber = 95;
+  std::unique_ptr<WritableFileWriter> file_writer;
+  ASSERT_OK(WritableFileWriter::Create(
+      fs_, DescriptorFileName(dbname_, kManifestNumber),
+      fs_->OptimizeForManifestWrite(env_options_), &file_writer, nullptr));
+  log::Writer writer(std::move(file_writer), /*log_number=*/0,
+                     /*recycle_log_files=*/false);
+  for (const std::string& record : records) {
+    ASSERT_OK(writer.AddRecord(write_options_, record));
+  }
+  ASSERT_OK(writer.Close(write_options_));
+  ASSERT_OK(SetCurrentFile(write_options_, fs_.get(), dbname_, kManifestNumber,
+                           Temperature::kUnknown,
+                           /*dir_contains_current_file=*/nullptr));
+
+  ReopenDB();
+  ManifestRows rows_after = GetManifestRows();
+  // Recovery sets the next file number to the recorded value plus one
+  // (VersionEditHandler::CheckIterationResult()), as after every reopen.
+  ASSERT_EQ(rows_before.db.next_file_number + 1,
+            rows_after.db.next_file_number);
+  rows_after.db.next_file_number = rows_before.db.next_file_number;
+  std::string diff;
+  ASSERT_TRUE(ManifestRowsEqual(rows_before, rows_after, &diff)) << diff;
+
+  // ManifestRowsEqual() reports a changed field.
+  ManifestRows changed = rows_after;
+  changed.cfs[0].files[10].meta.epoch_number++;
+  ASSERT_FALSE(ManifestRowsEqual(rows_before, changed, &diff));
+  ASSERT_EQ("column family 0 file rows", diff);
+  changed = rows_after;
+  changed.cfs[0].cf.compact_cursors[2] = InternalKey("d", 15, kTypeValue);
+  ASSERT_FALSE(ManifestRowsEqual(rows_before, changed, &diff));
+  ASSERT_EQ("column family 0 row", diff);
+  changed = rows_after;
+  changed.db.prev_log_number = 0;
+  ASSERT_FALSE(ManifestRowsEqual(rows_before, changed, &diff));
+  ASSERT_EQ("DB row", diff);
+}
+
+// Helpers for the tests of the public row form. A small set of rows: one
+// column family with one file, and one WAL. The values are examples.
+ManifestRows MakeSmallManifestRows() {
+  ManifestRows rows;
+  rows.db.db_id = "example-db-id";
+  rows.db.next_file_number = 10;
+  rows.db.last_sequence = 5;
+  ManifestCfRows& cf = rows.cfs[0];
+  cf.cf.name = kDefaultColumnFamilyName;
+  cf.cf.comparator_name = BytewiseComparator()->Name();
+  FileMetaData meta;
+  meta.fd = FileDescriptor(/*number=*/7, /*path_id=*/0, /*_file_size=*/100,
+                           /*_smallest_seqno=*/1, /*_largest_seqno=*/2);
+  meta.smallest = InternalKey("a", 1, kTypeValue);
+  meta.largest = InternalKey("b", 2, kTypeValue);
+  meta.epoch_number = 1;
+  cf.files[7] = ManifestFileRow{0, meta};
+  // A synced size of 0 is a known size, not "unknown".
+  rows.wals[3] = WalMetadata(0);
+  return rows;
+}
+
+// Returns the number of a field ID enum value.
+template <typename Field>
+constexpr uint32_t FieldId(Field field) {
+  return static_cast<uint32_t>(field);
+}
+
+// Returns `encoded` with field `id` set to `value`, or removed if `value` is
+// std::nullopt.
+std::string WithField(const std::string& encoded, uint32_t id,
+                      const std::optional<std::string>& value) {
+  std::vector<ManifestRowField> fields;
+  EXPECT_OK(ParseManifestRowFields(encoded, &fields));
+  std::vector<ManifestRowField> out;
+  bool added = false;
+  for (const ManifestRowField& f : fields) {
+    if (!added && f.id >= id) {
+      if (value.has_value()) {
+        out.push_back({id, *value});
+      }
+      added = true;
+      if (f.id == id) {
+        continue;
+      }
+    }
+    out.push_back(f);
+  }
+  if (!added && value.has_value()) {
+    out.push_back({id, *value});
+  }
+  return EncodeManifestRowFields(out);
+}
+
+std::string Varint(uint64_t v) {
+  std::string s;
+  PutVarint64(&s, v);
+  return s;
+}
+
+// Converts `rows` to the public form, lets `change` edit it, and converts it
+// back. Returns the status of the conversion back.
+Status PublicRowsRoundTrip(
+    const ManifestRows& rows,
+    const std::function<void(std::vector<ManifestRow>*)>& change,
+    ManifestRows* decoded) {
+  std::vector<ManifestRow> store_rows;
+  Status s =
+      ManifestRowsToPublicRows(rows, ManifestDbRowExtraFields(),
+                               kManifestRowFeatureVersionLatest, &store_rows);
+  if (!s.ok()) {
+    return s;
+  }
+  change(&store_rows);
+  ManifestDbRowExtraFields extra_fields;
+  return PublicRowsToManifestRows(
+      store_rows[0],
+      std::vector<ManifestRow>(store_rows.begin() + 1, store_rows.end()),
+      decoded, &extra_fields);
+}
+
+TEST(ManifestPublicRowsTest, RoundTripAndDefaults) {
+  // The writer leaves out every field that holds its default. The expected
+  // IDs come from the "always present" fields of the header, plus the fields
+  // that MakeSmallManifestRows() sets: the DB id, and the WAL synced size.
+  {
+    ManifestRows rows = MakeSmallManifestRows();
+    // A WAL whose synced size is unknown has no field.
+    rows.wals[4] = WalMetadata();
+    std::vector<ManifestRow> store_rows;
+    ASSERT_OK(ManifestRowsToPublicRows(rows, ManifestDbRowExtraFields(),
+                                       kManifestRowFeatureVersionLatest,
+                                       &store_rows));
+    const std::vector<std::vector<uint32_t>> expected_ids = {
+        {1, 2, 3, 5, 6, 7, 8}, {1, 2}, {3, 4, 5, 6, 7, 10, 11, 12}, {1}, {}};
+    ASSERT_EQ(expected_ids.size(), store_rows.size());
+    for (size_t i = 0; i < store_rows.size(); ++i) {
+      std::vector<ManifestRowField> fields;
+      ASSERT_OK(ParseManifestRowFields(store_rows[i].fields, &fields));
+      std::vector<uint32_t> ids;
+      for (const ManifestRowField& f : fields) {
+        ids.push_back(f.id);
+      }
+      ASSERT_EQ(expected_ids[i], ids) << "row " << i;
+    }
+  }
+
+  // The feature version must be from 1 to kManifestRowFeatureVersionLatest.
+  for (uint32_t feature_version : {0u, kManifestRowFeatureVersionLatest + 1}) {
+    std::vector<ManifestRow> store_rows;
+    ASSERT_EQ(Status::Code::kInvalidArgument,
+              ManifestRowsToPublicRows(MakeSmallManifestRows(),
+                                       ManifestDbRowExtraFields(),
+                                       feature_version, &store_rows)
+                  .code());
+  }
+
+  ManifestRows rows = MakeSmallManifestRows();
+  // The largest varint64 value.
+  rows.db.next_file_number = std::numeric_limits<uint64_t>::max();
+  ManifestRows decoded;
+  ASSERT_OK(
+      PublicRowsRoundTrip(rows, [](std::vector<ManifestRow>*) {}, &decoded));
+  std::string diff;
+  ASSERT_TRUE(ManifestRowsEqual(rows, decoded, &diff)) << diff;
+  ASSERT_TRUE(decoded.wals[3].HasSyncedSize());
+  ASSERT_EQ(0, decoded.wals[3].GetSyncedSizeInBytes());
+
+  // store_rows: [0] DB row, [1] column family row, [2] file row, [3] WAL row.
+  // These changes give the same rows: a field that holds its default
+  // explicitly, an empty list (no dropped blob files), a temperature value
+  // that this release does not know (read as kUnknown, the default), and an
+  // unknown field without the "must understand" bit (ID 63).
+  ASSERT_OK(PublicRowsRoundTrip(
+      rows,
+      [](std::vector<ManifestRow>* r) {
+        std::string& cf = (*r)[1].fields;
+        cf = WithField(cf, FieldId(ManifestCfField::kDroppedBlobFiles), "");
+        std::string& file = (*r)[2].fields;
+        file = WithField(file, FieldId(ManifestFileField::kPathId), Varint(0));
+        file =
+            WithField(file, FieldId(ManifestFileField::kTemperature), "\xFF");
+        file = WithField(file, 63, "x");
+      },
+      &decoded));
+  ASSERT_TRUE(ManifestRowsEqual(rows, decoded, &diff)) << diff;
+}
+
+// Compares the written bytes with bytes written by hand from the field ID
+// enums and their comments in include/rocksdb/manifest_store.h. A round trip
+// cannot find a bug that the writer and the reader share, such as two swapped
+// field IDs or a unique id in the wrong byte order. The values are examples,
+// and the fields not set below hold their default, so they are left out.
+TEST(ManifestPublicRowsTest, BytesMatchTheFieldTables) {
+  ManifestRows rows;
+  rows.db.db_id = "id";
+  rows.db.next_file_number = 10;
+  rows.db.last_sequence = 5;
+  ManifestCfRows& cf = rows.cfs[0];
+  cf.cf.name = "cf";
+  cf.cf.comparator_name = "c";
+  cf.cf.persist_user_defined_timestamps = false;
+  cf.cf.compact_cursors.resize(2);
+  cf.cf.compact_cursors[1] = InternalKey("k", 1, kTypeValue);
+  cf.cf.dropped_blob_files = {7};
+  FileMetaData meta;
+  meta.fd = FileDescriptor(/*number=*/12, /*path_id=*/2, /*_file_size=*/100,
+                           /*_smallest_seqno=*/1, /*_largest_seqno=*/2);
+  meta.smallest = InternalKey("a", 1, kTypeValue);
+  meta.largest = InternalKey("b", 2, kTypeValue);
+  meta.oldest_ancestor_time = 3;
+  meta.file_creation_time = 4;
+  meta.epoch_number = 5;
+  meta.temperature = Temperature::kCold;
+  meta.unique_id = {0x0102030405060708, 0x1112131415161718};
+  cf.files[12] = ManifestFileRow{/*level=*/1, meta};
+  rows.wals[3] = WalMetadata(300);
+
+  std::vector<ManifestRow> store_rows;
+  ASSERT_OK(ManifestRowsToPublicRows(rows, ManifestDbRowExtraFields(),
+                                     kManifestRowFeatureVersionLatest,
+                                     &store_rows));
+  // Each field is {ID, value size, value}. An internal key ends with an 8-byte
+  // little-endian trailer: (seqno << 8) | value type, and kTypeValue is 1.
+  const std::string kKeyA("a\x01\x01\0\0\0\0\0\0", 9);
+  const std::string kKeyB("b\x01\x02\0\0\0\0\0\0", 9);
+  const std::string kKeyK("k\x01\x01\0\0\0\0\0\0", 9);
+  const std::vector<ManifestRow> expected = {
+      // Row format version 1, authority kFile (0), copy mode kOff (0), DB id,
+      // next file number, in-flight file number 0, last sequence.
+      {{ManifestRowType::kDb, 0, 0},
+       std::string("\x01\x01\x01\x02\x01\x00\x03\x01\x00", 9) +
+           "\x05\x02id\x06\x01\x0A" + std::string("\x07\x01\x00", 3) +
+           "\x08\x01\x05"},
+      // Name, comparator name, persist user-defined timestamps false (0), one
+      // cursor {level 1, size 9, key} (11 bytes), dropped blob file 7.
+      {{ManifestRowType::kColumnFamily, 0, 0},
+       std::string("\x01\x02"
+                   "cf\x02\x01"
+                   "c\x04\x01\x00",
+                   10) +
+           "\x07\x0B\x01\x09" + kKeyK + "\x08\x01\x07"},
+      // Level, path id, file size, smallest, largest, smallest seqno, largest
+      // seqno, oldest ancestor time, file creation time, epoch number,
+      // temperature kCold (0x0C), unique id (16 bytes).
+      {{ManifestRowType::kFile, 0, 12},
+       "\x01\x01\x01\x02\x01\x02\x03\x01\x64\x04\x09" + kKeyA + "\x05\x09" +
+           kKeyB +
+           "\x06\x01\x01\x07\x01\x02\x0A\x01\x03\x0B\x01\x04\x0C\x01\x05"
+           "\x0F\x01\x0C\x12\x10"
+           "\x08\x07\x06\x05\x04\x03\x02\x01\x18\x17\x16\x15\x14\x13\x12\x11"},
+      // Synced size 300, which is 0xAC 0x02 as a varint.
+      {{ManifestRowType::kWal, 0, 3}, "\x01\x02\xAC\x02"},
+  };
+  ASSERT_EQ(expected.size(), store_rows.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    ASSERT_EQ(expected[i].key, store_rows[i].key) << "row " << i;
+    ASSERT_EQ(Slice(expected[i].fields).ToString(/*hex=*/true),
+              Slice(store_rows[i].fields).ToString(/*hex=*/true))
+        << "row " << i;
+  }
+
+  ManifestRows decoded;
+  ManifestDbRowExtraFields extra_fields;
+  ASSERT_OK(PublicRowsToManifestRows(
+      expected[0],
+      std::vector<ManifestRow>(expected.begin() + 1, expected.end()), &decoded,
+      &extra_fields));
+  std::string diff;
+  ASSERT_TRUE(ManifestRowsEqual(rows, decoded, &diff)) << diff;
+}
+
+TEST(ManifestPublicRowsTest, RejectsRowsItCannotRead) {
+  const ManifestRows rows = MakeSmallManifestRows();
+  const uint32_t kRowFormatVersion =
+      FieldId(ManifestDbField::kRowFormatVersion);
+  const uint32_t kAuthority = FieldId(ManifestDbField::kAuthority);
+  const uint32_t kCopyMode = FieldId(ManifestDbField::kCopyMode);
+  const uint32_t kNextFileNumber = FieldId(ManifestDbField::kNextFileNumber);
+  struct Case {
+    const char* name;
+    std::function<void(std::vector<ManifestRow>*)> change;
+    Status::Code code;
+  };
+  const std::vector<Case> cases = {
+      {"unknown must-understand field",
+       [](std::vector<ManifestRow>* r) {
+         (*r)[2].fields =
+             WithField((*r)[2].fields, kManifestFieldMustUnderstand, "x");
+       },
+       Status::kNotSupported},
+      {"newer row format version",
+       [&](std::vector<ManifestRow>* r) {
+         (*r)[0].fields =
+             WithField((*r)[0].fields, kRowFormatVersion,
+                       Varint(kManifestRowFormatVersionLatest + 1));
+       },
+       Status::kNotSupported},
+      {"newer row format version and a missing always-present field",
+       [&](std::vector<ManifestRow>* r) {
+         // The version is checked first, so the result is NotSupported.
+         std::string& db = (*r)[0].fields;
+         db = WithField(db, kRowFormatVersion,
+                        Varint(kManifestRowFormatVersionLatest + 1));
+         db = WithField(db, kNextFileNumber, std::nullopt);
+       },
+       Status::kNotSupported},
+      {"unknown authority",
+       [&](std::vector<ManifestRow>* r) {
+         (*r)[0].fields = WithField((*r)[0].fields, kAuthority, "\x03");
+       },
+       Status::kNotSupported},
+      {"unknown copy mode",
+       [&](std::vector<ManifestRow>* r) {
+         (*r)[0].fields = WithField((*r)[0].fields, kCopyMode, "\x03");
+       },
+       Status::kNotSupported},
+      {"missing always-present field",
+       [&](std::vector<ManifestRow>* r) {
+         (*r)[0].fields =
+             WithField((*r)[0].fields, kNextFileNumber, std::nullopt);
+       },
+       Status::kCorruption},
+      {"value varint in a longer form than needed",
+       [&](std::vector<ManifestRow>* r) {
+         (*r)[0].fields = WithField((*r)[0].fields, kNextFileNumber,
+                                    std::string("\x8A\x00", 2));
+       },
+       Status::kCorruption},
+      {"ten-byte value varint with bits above 64 bits",
+       [&](std::vector<ManifestRow>* r) {
+         // GetVarint64() reads 2^63 from these bytes, which needs 10 bytes, so
+         // only the check of the tenth byte rejects them.
+         (*r)[0].fields = WithField(
+             (*r)[0].fields, kNextFileNumber,
+             std::string("\x80\x80\x80\x80\x80\x80\x80\x80\x80\x03", 10));
+       },
+       Status::kCorruption},
+      {"path id above 3",
+       [](std::vector<ManifestRow>* r) {
+         (*r)[2].fields = WithField(
+             (*r)[2].fields, FieldId(ManifestFileField::kPathId), Varint(4));
+       },
+       Status::kCorruption},
+      {"file number above kFileNumberMask",
+       [](std::vector<ManifestRow>* r) {
+         (*r)[2].key.number = kFileNumberMask + 1;
+       },
+       Status::kCorruption},
+      {"blob file with a checksum method and no checksum value",
+       [](std::vector<ManifestRow>* r) {
+         using F = ManifestBlobFileField;
+         const std::string count = Varint(10);
+         const std::string bytes = Varint(1000);
+         r->push_back(ManifestRow{
+             ManifestRowKey{ManifestRowType::kBlobFile, 0, 9},
+             EncodeManifestRowFields(
+                 {{static_cast<uint32_t>(F::kTotalBlobCount), count},
+                  {static_cast<uint32_t>(F::kTotalBlobBytes), bytes},
+                  {static_cast<uint32_t>(F::kChecksumMethod), "crc32c"}})});
+       },
+       Status::kCorruption},
+      {"bool value 2",
+       [](std::vector<ManifestRow>* r) {
+         (*r)[2].fields = WithField(
+             (*r)[2].fields, FieldId(ManifestFileField::kMarkedForCompaction),
+             "\x02");
+       },
+       Status::kCorruption},
+      {"unique id of the wrong size",
+       [](std::vector<ManifestRow>* r) {
+         (*r)[2].fields =
+             WithField((*r)[2].fields, FieldId(ManifestFileField::kUniqueId),
+                       std::string(8, 'x'));
+       },
+       Status::kCorruption},
+      {"key with an unknown value type",
+       [](std::vector<ManifestRow>* r) {
+         // User key "a", seqno 1, and the example value type 0x7E, which
+         // RocksDB does not use.
+         std::string key = "a";
+         PutFixed64(&key, (uint64_t{1} << 8) | 0x7E);
+         (*r)[2].fields = WithField((*r)[2].fields,
+                                    FieldId(ManifestFileField::kSmallest), key);
+       },
+       Status::kCorruption},
+      {"file key shorter than the timestamp size",
+       [](std::vector<ManifestRow>* r) {
+         // The file keys have no timestamp, so they are 9 bytes, less than
+         // the 8-byte internal key trailer plus an 8-byte timestamp.
+         (*r)[1].fields =
+             WithField((*r)[1].fields, FieldId(ManifestCfField::kTimestampSize),
+                       Varint(8));
+       },
+       Status::kCorruption},
+      {"WAL synced size that means an unknown size",
+       [](std::vector<ManifestRow>* r) {
+         (*r)[3].fields =
+             WithField((*r)[3].fields, FieldId(ManifestWalField::kSyncedSize),
+                       Varint(std::numeric_limits<uint64_t>::max()));
+       },
+       Status::kCorruption},
+      {"compaction cursor shorter than the timestamp size",
+       [](std::vector<ManifestRow>* r) {
+         // Without the file row, only the cursor is checked. Its example key
+         // has no timestamp, so it is 9 bytes, less than the 8-byte internal
+         // key trailer plus an 8-byte timestamp.
+         r->erase(r->begin() + 2);
+         std::string cursors;
+         PutVarint32(&cursors, 1);
+         PutLengthPrefixedSlice(
+             &cursors, std::string("k\x01\x01\x00\x00\x00\x00\x00\x00", 9));
+         std::string& cf = (*r)[1].fields;
+         cf =
+             WithField(cf, FieldId(ManifestCfField::kTimestampSize), Varint(8));
+         cf = WithField(cf, FieldId(ManifestCfField::kCompactCursors), cursors);
+       },
+       Status::kCorruption},
+      {"compaction cursor level above 65536",
+       [](std::vector<ManifestRow>* r) {
+         std::string cursors;
+         PutVarint32(&cursors, 65537);
+         PutLengthPrefixedSlice(
+             &cursors, std::string("k\x01\x01\x00\x00\x00\x00\x00\x00", 9));
+         (*r)[1].fields =
+             WithField((*r)[1].fields,
+                       FieldId(ManifestCfField::kCompactCursors), cursors);
+       },
+       Status::kCorruption},
+      {"file level above the largest int",
+       [](std::vector<ManifestRow>* r) {
+         (*r)[2].fields =
+             WithField((*r)[2].fields, FieldId(ManifestFileField::kLevel),
+                       Varint(uint64_t{1} << 31));
+       },
+       Status::kCorruption},
+      {"dropped blob files not increasing",
+       [](std::vector<ManifestRow>* r) {
+         (*r)[1].fields = WithField((*r)[1].fields,
+                                    FieldId(ManifestCfField::kDroppedBlobFiles),
+                                    Varint(7) + Varint(7));
+       },
+       Status::kCorruption},
+      {"second DB row",
+       [](std::vector<ManifestRow>* r) { r->push_back((*r)[0]); },
+       Status::kCorruption},
+      {"DB row key with a column family id",
+       [](std::vector<ManifestRow>* r) { (*r)[0].key.cf_id = 1; },
+       Status::kCorruption},
+      {"unknown row type",
+       [](std::vector<ManifestRow>* r) {
+         // 9 is an example of a row type that this release does not know.
+         // The cast is defined, because ManifestRowType has a fixed
+         // underlying type.
+         // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+         (*r)[3].key.type = static_cast<ManifestRowType>(9);
+       },
+       Status::kCorruption},
+      {"compaction cursor levels not increasing",
+       [](std::vector<ManifestRow>* r) {
+         // Level 2, then level 1, each with an example 9-byte internal key.
+         const std::string key("k\x01\x01\x00\x00\x00\x00\x00\x00", 9);
+         std::string cursors;
+         for (uint32_t level : {2, 1}) {
+           PutVarint32(&cursors, level);
+           PutLengthPrefixedSlice(&cursors, key);
+         }
+         (*r)[1].fields =
+             WithField((*r)[1].fields,
+                       FieldId(ManifestCfField::kCompactCursors), cursors);
+       },
+       Status::kCorruption},
+      {"column family row key with a number",
+       [](std::vector<ManifestRow>* r) { (*r)[1].key.number = 1; },
+       Status::kCorruption},
+      {"WAL row key with a column family id",
+       [](std::vector<ManifestRow>* r) { (*r)[3].key.cf_id = 1; },
+       Status::kCorruption},
+      {"file row without its column family row",
+       [](std::vector<ManifestRow>* r) { r->erase(r->begin() + 1); },
+       Status::kCorruption},
+      {"repeated row key",
+       [](std::vector<ManifestRow>* r) { r->push_back((*r)[2]); },
+       Status::kCorruption},
+  };
+  for (const Case& c : cases) {
+    ManifestRows decoded;
+    Status s = PublicRowsRoundTrip(rows, c.change, &decoded);
+    ASSERT_EQ(c.code, s.code()) << c.name << ": " << s.ToString();
+  }
+}
+
+// Checks that `s` is IOFenced: code kIOError with subcode kIOFenced.
+void AssertIOFenced(const Status& s) {
+  ASSERT_EQ(Status::kIOError, s.code());
+  ASSERT_EQ(Status::kIOFenced, s.subcode());
+}
+
+// Tests of the ManifestStore contract (include/rocksdb/manifest_store.h),
+// run against MockManifestStore. They use mock-only fault hooks, and they call
+// the store directly; no DB uses it. The row fields, commit ids and epochs are
+// examples.
+class ManifestStoreContractTest : public testing::Test {
+ protected:
+  using Fault = MockManifestStoreData::Fault;
+  using RowKey = std::tuple<uint8_t, uint32_t, uint64_t>;
+
+  // Returns the encoded fields of a row with one field, ID 1, set to `value`.
+  static std::string Fields(const std::string& value) {
+    return EncodeManifestRowFields({{1, value}});
+  }
+
+  static ManifestRow DbRow(const std::string& value) {
+    return ManifestRow{ManifestRowKey{ManifestRowType::kDb, 0, 0},
+                       Fields(value)};
+  }
+
+  static ManifestRow FileRow(uint64_t number, const std::string& value) {
+    return ManifestRow{ManifestRowKey{ManifestRowType::kFile, 0, number},
+                       Fields(value)};
+  }
+
+  static ManifestCommit MakeCommit(uint64_t expected,
+                                   const std::string& commit_id,
+                                   std::vector<ManifestRow> upserts,
+                                   std::vector<ManifestRowKey> deletes) {
+    ManifestCommit commit;
+    commit.expected_commit_sequence = expected;
+    commit.commit_id = commit_id;
+    commit.db_row = DbRow(commit_id);
+    commit.upserts = std::move(upserts);
+    commit.deletes = std::move(deletes);
+    return commit;
+  }
+
+  // Collects the rows of a scan. `on_row` runs before each row is kept.
+  class Collector : public ManifestRowVisitor {
+   public:
+    Status OnDbRow(const ManifestDbRowResult& db_row) override {
+      db = db_row;
+      return Status::OK();
+    }
+    Status OnRow(const ManifestRow& row) override {
+      if (on_row) {
+        on_row();
+      }
+      rows[RowKey(static_cast<uint8_t>(row.key.type), row.key.cf_id,
+                  row.key.number)] = row.fields;
+      return Status::OK();
+    }
+
+    ManifestDbRowResult db;
+    std::map<RowKey, std::string> rows;
+    std::function<void()> on_row;
+  };
+
+  static RowKey FileKey(uint64_t number) {
+    return RowKey(static_cast<uint8_t>(ManifestRowType::kFile), 0, number);
+  }
+
+  std::shared_ptr<MockManifestStoreData> data_ =
+      std::make_shared<MockManifestStoreData>();
+  MockManifestStore store_{data_, /*epoch=*/1};
+};
+
+TEST_F(ManifestStoreContractTest, CommitResults) {
+  ManifestDbRowResult db_row;
+  // No DB row yet: Open and ReadDbRow return NotFound, and a commit that
+  // expects a DB row returns Busy.
+  ASSERT_EQ(Status::kNotFound,
+            store_.Open(ManifestStoreOpenOptions(), &db_row).code());
+  ASSERT_EQ(Status::kNotFound, store_.ReadDbRow(&db_row).code());
+  ASSERT_EQ(Status::kBusy, store_.Commit(MakeCommit(5, "c0", {}, {})).code());
+
+  // Expected commit sequence 0 creates the DB row with commit sequence 1. A
+  // second create returns Busy.
+  ASSERT_OK(store_.Commit(MakeCommit(0, "c1", {FileRow(7, "a")}, {})));
+  ASSERT_EQ(Status::kBusy, store_.Commit(MakeCommit(0, "c1b", {}, {})).code());
+  ASSERT_OK(store_.ReadDbRow(&db_row));
+  ASSERT_EQ(1u, db_row.state.commit_sequence);
+  ASSERT_EQ("c1", db_row.state.last_commit_id);
+  ASSERT_EQ(DbRow("c1").fields, db_row.db_row.fields);
+
+  // A commit with an old expected value returns Busy and changes nothing.
+  ASSERT_OK(store_.Commit(MakeCommit(1, "c2", {}, {})));
+  ASSERT_EQ(Status::kBusy, store_.Commit(MakeCommit(1, "c2b", {}, {})).code());
+  ASSERT_OK(store_.ReadDbRow(&db_row));
+  ASSERT_EQ(2u, db_row.state.commit_sequence);
+  ASSERT_EQ("c2", db_row.state.last_commit_id);
+
+  // Each fault, and the state that ReadDbRow shows after it.
+  struct FaultCase {
+    Fault fault;
+    Status::Code code;
+    bool applied;
+  };
+  const std::vector<FaultCase> cases = {
+      {Fault::kTryAgain, Status::kTryAgain, false},
+      {Fault::kTimedOutNotApplied, Status::kTimedOut, false},
+      {Fault::kTimedOutApplied, Status::kTimedOut, true},
+      {Fault::kTimedOutLateApply, Status::kTimedOut, true},
+  };
+  for (const FaultCase& c : cases) {
+    SCOPED_TRACE(static_cast<int>(c.fault));
+    ASSERT_OK(store_.ReadDbRow(&db_row));
+    const uint64_t sequence = db_row.state.commit_sequence;
+    const std::string commit_id = "f" + std::to_string(sequence);
+    data_->SetNextFault(c.fault);
+    ASSERT_EQ(c.code,
+              store_.Commit(MakeCommit(sequence, commit_id, {}, {})).code());
+    // For kTimedOutLateApply, this call applies the commit first.
+    ASSERT_OK(store_.ReadDbRow(&db_row));
+    ASSERT_EQ(c.applied ? sequence + 1 : sequence,
+              db_row.state.commit_sequence);
+    ASSERT_EQ(c.applied, db_row.state.last_commit_id == commit_id);
+    if (c.applied) {
+      // The commit that the caller saw as TimedOut really succeeded.
+      ASSERT_EQ(std::optional<Status::Code>(Status::kOk),
+                data_->HiddenApplyCode());
+    }
+  }
+}
+
+TEST_F(ManifestStoreContractTest, CommitIsAtomic) {
+  ASSERT_OK(store_.Commit(
+      MakeCommit(0, "c1", {FileRow(7, "a"), FileRow(8, "b")}, {})));
+  // One commit adds a row, replaces a row and deletes a row.
+  ASSERT_OK(store_.Commit(
+      MakeCommit(1, "c2", {FileRow(8, "b2"), FileRow(9, "c")},
+                 {ManifestRowKey{ManifestRowType::kFile, 0, 7}})));
+  Collector collector;
+  ASSERT_OK(store_.Scan(ManifestScanOptions(), &collector));
+  const std::map<RowKey, std::string> expected = {{FileKey(8), Fields("b2")},
+                                                  {FileKey(9), Fields("c")}};
+  ASSERT_EQ(expected, collector.rows);
+
+  // A commit that returns Busy applies none of its rows.
+  ASSERT_TRUE(
+      store_
+          .Commit(MakeCommit(1, "c3", {FileRow(10, "d")},
+                             {ManifestRowKey{ManifestRowType::kFile, 0, 8}}))
+          .IsBusy());
+  Collector after;
+  ASSERT_OK(store_.Scan(ManifestScanOptions(), &after));
+  ASSERT_EQ(expected, after.rows);
+}
+
+TEST_F(ManifestStoreContractTest, ClaimFencesOlderRequests) {
+  ASSERT_OK(store_.Commit(MakeCommit(0, "c1", {}, {})));
+  // A second object with a newer epoch claims the DB. The claim raises the
+  // commit sequence and merges the DB field update.
+  MockManifestStore newer(data_, /*epoch=*/2);
+  ManifestStoreOpenOptions open;
+  open.commit_id = "open2";
+  open.db_field_updates = EncodeManifestRowFields({{2, "x"}});
+  ManifestDbRowResult db_row;
+  ASSERT_OK(newer.Open(open, &db_row));
+  ASSERT_EQ(2u, data_->StoredEpoch());
+  ASSERT_EQ(2u, db_row.state.commit_sequence);
+  ASSERT_EQ("open2", db_row.state.last_commit_id);
+  ASSERT_EQ(EncodeManifestRowFields({{1, "c1"}, {2, "x"}}),
+            db_row.db_row.fields);
+
+  // Every request of the older object is now fenced, also with the right
+  // expected commit sequence.
+  ASSERT_NO_FATAL_FAILURE(
+      AssertIOFenced(store_.Commit(MakeCommit(2, "old", {}, {}))));
+  ASSERT_NO_FATAL_FAILURE(AssertIOFenced(store_.ReadDbRow(&db_row)));
+  Collector collector;
+  ASSERT_NO_FATAL_FAILURE(
+      AssertIOFenced(store_.Scan(ManifestScanOptions(), &collector)));
+  ASSERT_NO_FATAL_FAILURE(AssertIOFenced(store_.Open(open, &db_row)));
+
+  // A claim with the same epoch also fails requests prepared before it,
+  // because it raises the commit sequence.
+  const ManifestCommit prepared = MakeCommit(2, "prepared", {}, {});
+  open.commit_id = "open3";
+  ASSERT_OK(newer.Open(open, &db_row));
+  ASSERT_EQ(3u, db_row.state.commit_sequence);
+  ASSERT_EQ(Status::kBusy, newer.Commit(prepared).code());
+}
+
+TEST_F(ManifestStoreContractTest, GenerationSwitch) {
+  ASSERT_OK(store_.Commit(MakeCommit(0, "c1", {FileRow(1, "old")}, {})));
+  // Five rows, so three chunks of at most kGenerationChunkRows (2) rows.
+  ManifestGeneration generation;
+  generation.expected_commit_sequence = 1;
+  generation.commit_id = "g1";
+  generation.db_row = DbRow("g1");
+  std::map<RowKey, std::string> expected;
+  for (uint64_t number = 10; number < 15; ++number) {
+    generation.rows.push_back(FileRow(number, "new"));
+    expected[FileKey(number)] = Fields("new");
+  }
+
+  // A lost row fails the row count check, and a changed row (same count)
+  // fails the checksum check. The current generation does not change.
+  uint64_t generation_number = 0;
+  for (Fault fault :
+       {Fault::kLoseGenerationRow, Fault::kCorruptGenerationRow}) {
+    SCOPED_TRACE(static_cast<int>(fault));
+    data_->SetNextFault(fault);
+    ASSERT_TRUE(
+        store_.WriteGeneration(generation, &generation_number).IsTryAgain());
+    Collector before;
+    ASSERT_OK(store_.Scan(ManifestScanOptions(), &before));
+    ASSERT_EQ(1u, before.rows.size());
+    ASSERT_EQ(1u, before.db.state.commit_sequence);
+  }
+
+  // The switch replaces all rows other than the DB row.
+  ASSERT_OK(store_.WriteGeneration(generation, &generation_number));
+  Collector after;
+  ASSERT_OK(store_.Scan(ManifestScanOptions(), &after));
+  ASSERT_EQ(expected, after.rows);
+  ASSERT_EQ(generation_number, after.db.state.generation);
+  ASSERT_EQ(2u, after.db.state.commit_sequence);
+  ASSERT_EQ("g1", after.db.state.last_commit_id);
+
+  // A writer whose epoch is no longer the newest cannot add rows: a newer
+  // object claims the DB after the first chunk, and the second chunk is
+  // fenced. Three rows make two chunks, so the callback runs once.
+  MockManifestStore newer(data_, /*epoch=*/2);
+  int chunks_written = 0;
+  data_->SetAfterChunkCallback([&]() {
+    if (++chunks_written == 1) {
+      ManifestDbRowResult db_row;
+      ASSERT_OK(newer.Open(ManifestStoreOpenOptions(), &db_row));
+    }
+  });
+  generation.expected_commit_sequence = 2;
+  generation.rows = {FileRow(20, "stale"), FileRow(21, "stale"),
+                     FileRow(22, "stale")};
+  ASSERT_TRUE(
+      store_.WriteGeneration(generation, &generation_number).IsIOFenced());
+  ASSERT_EQ(1, chunks_written);
+  data_->SetAfterChunkCallback(nullptr);
+  Collector last;
+  ASSERT_OK(newer.Scan(ManifestScanOptions(), &last));
+  ASSERT_EQ(expected, last.rows);
+}
+
+TEST_F(ManifestStoreContractTest, ScanSeesOneCommit) {
+  ASSERT_OK(store_.Commit(
+      MakeCommit(0, "c1", {FileRow(7, "a"), FileRow(8, "b")}, {})));
+  // A commit runs during the scan, after the first row. The scan still
+  // returns the rows of the first commit only.
+  Collector collector;
+  bool committed = false;
+  collector.on_row = [&]() {
+    if (!committed) {
+      committed = true;
+      ASSERT_OK(store_.Commit(
+          MakeCommit(1, "c2", {FileRow(9, "c")},
+                     {ManifestRowKey{ManifestRowType::kFile, 0, 8}})));
+    }
+  };
+  ManifestScanOptions opts;
+  opts.consistent = true;
+  ASSERT_OK(store_.Scan(opts, &collector));
+  ASSERT_TRUE(committed);
+  const std::map<RowKey, std::string> expected = {{FileKey(7), Fields("a")},
+                                                  {FileKey(8), Fields("b")}};
+  ASSERT_EQ(expected, collector.rows);
+  ASSERT_EQ("c1", collector.db.state.last_commit_id);
+}
+
+TEST_F(ManifestStoreContractTest, UnknownFieldsAreKept) {
+  // Field 200 (an example; it has the MU bit, which a store ignores) is a field
+  // that this release does not know. The store keeps it, in rows and in the DB
+  // row.
+  const std::string row_fields =
+      EncodeManifestRowFields({{1, "a"}, {200, "future"}});
+  ManifestCommit commit = MakeCommit(0, "c1", {}, {});
+  commit.upserts = {
+      ManifestRow{ManifestRowKey{ManifestRowType::kFile, 0, 7}, row_fields}};
+  commit.db_row.fields =
+      EncodeManifestRowFields({{1, "a"}, {3, "x"}, {200, "future"}});
+  ASSERT_OK(store_.Commit(commit));
+
+  // The claim replaces field 1, removes field 3 (empty update value), and
+  // keeps field 200.
+  ManifestStoreOpenOptions open;
+  open.db_field_updates = EncodeManifestRowFields({{1, "b"}, {3, ""}});
+  ManifestDbRowResult db_row;
+  ASSERT_OK(store_.Open(open, &db_row));
+  ASSERT_EQ(EncodeManifestRowFields({{1, "b"}, {200, "future"}}),
+            db_row.db_row.fields);
+
+  Collector collector;
+  ASSERT_OK(store_.Scan(ManifestScanOptions(), &collector));
+  ASSERT_EQ(row_fields, collector.rows[FileKey(7)]);
+}
+
+TEST_F(ManifestStoreContractTest, ReaderWithoutEpoch) {
+  ASSERT_OK(store_.Commit(MakeCommit(0, "c1", {FileRow(7, "a")}, {})));
+  // A reader, for example for a secondary instance, has no epoch. A newer
+  // claim does not fence its reads.
+  MockManifestStore newer(data_, /*epoch=*/2);
+  ManifestDbRowResult db_row;
+  ASSERT_OK(newer.Open(ManifestStoreOpenOptions(), &db_row));
+  MockManifestStore reader(data_, std::nullopt);
+  ASSERT_OK(reader.ReadDbRow(&db_row));
+  ASSERT_EQ(2u, db_row.state.commit_sequence);
+  Collector collector;
+  ASSERT_OK(reader.Scan(ManifestScanOptions(), &collector));
+  ASSERT_EQ(1u, collector.rows.size());
+
+  // A reader cannot change rows.
+  uint64_t generation_number = 0;
+  ASSERT_TRUE(
+      reader.Open(ManifestStoreOpenOptions(), &db_row).IsNotSupported());
+  ASSERT_EQ(Status::kNotSupported,
+            reader.Commit(MakeCommit(2, "r", {}, {})).code());
+  ASSERT_TRUE(reader.WriteGeneration(ManifestGeneration(), &generation_number)
+                  .IsNotSupported());
+  ASSERT_EQ(Status::kNotSupported, reader.Destroy().code());
+}
+
+TEST_F(ManifestStoreContractTest, Destroy) {
+  ASSERT_OK(store_.Commit(MakeCommit(0, "c1", {FileRow(7, "a")}, {})));
+  // An object with an older epoch cannot destroy the DB.
+  MockManifestStore newer(data_, /*epoch=*/2);
+  ManifestDbRowResult db_row;
+  ASSERT_OK(newer.Open(ManifestStoreOpenOptions(), &db_row));
+  ASSERT_NO_FATAL_FAILURE(AssertIOFenced(store_.Destroy()));
+  ASSERT_OK(newer.Destroy());
+  ASSERT_EQ(Status::kNotFound, newer.ReadDbRow(&db_row).code());
+}
+
+// Runs MANIFEST writes of each kind that the structured MANIFEST row changes
+// (BuildManifestRowChanges()) handle. In debug builds, ProcessManifestWrites()
+// checks after each write that the row changes give the rows of the new
+// Versions, and stops the test if they do not. The test also checks that the
+// debug check ran for every write.
+TEST_F(VersionSetTest, ManifestRowChangesMatchVersions) {
+  NewDB();
+  int num_checks = 0;
+  // The callback captures num_checks, so remove it also when an ASSERT below
+  // ends the test early.
+  Defer clear_callbacks([]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::DebugCheckRowsAfterInstall:Done",
+      [&](void*) { ++num_checks; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  int num_writes = 0;
+  ColumnFamilySet* cf_set = versions_->GetColumnFamilySet();
+  ColumnFamilyData* default_cfd = cf_set->GetDefault();
+  ColumnFamilyData* alice_cfd = cf_set->GetColumnFamily(kColumnFamilyName1);
+  ASSERT_NE(nullptr, alice_cfd);
+  // Moves the next file number above the example file numbers below (up to 78),
+  // so that a new file of the VersionSet never takes one of them.
+  versions_->FetchAddFileNumber(100);
+  auto apply = [&](ColumnFamilyData* cfd, VersionEdit* edit) {
+    ++num_writes;
+    return LogAndApplyToCF(cfd, edit);
+  };
+
+  // The file numbers below are examples.
+  std::vector<FileMetaData> files;
+  CreateDummyTableFiles(
+      {SstInfo(10, kDefaultColumnFamilyName, "a", 0,
+               /*_epoch_number=*/1, /*_file_missing=*/false,
+               /*_oldest_blob_file_number=*/20),
+       SstInfo(11, kDefaultColumnFamilyName, "c", 0, 2),
+       SstInfo(12, kDefaultColumnFamilyName, "e", 0, 3, false, 20),
+       SstInfo(13, kColumnFamilyName1, "g", 0, 1)},
+      &files);
+
+  // New files and blob files.
+  VersionEdit add_files;
+  add_files.AddFile(0, files[0]);
+  add_files.AddFile(0, files[1]);
+  add_files.AddBlobFile(20, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+                        "", "");
+  add_files.AddBlobFile(21, /*total_blob_count=*/4, /*total_blob_bytes=*/400,
+                        "", "");
+  ASSERT_OK(apply(default_cfd, &add_files));
+
+  // A trivial move: file 11 leaves level 0 and comes back on level 1 in the
+  // same edit.
+  VersionEdit move;
+  move.DeleteFile(0, 11);
+  move.AddFile(1, files[1]);
+  ASSERT_OK(apply(default_cfd, &move));
+
+  // A compaction: file 10 is replaced by file 12, which also refers to blob
+  // file 20, and blob file 20 gets some garbage.
+  VersionEdit compaction;
+  compaction.DeleteFile(0, 10);
+  compaction.AddFile(1, files[2]);
+  compaction.AddBlobFileGarbage(20, /*count=*/3, /*bytes=*/300);
+  ASSERT_OK(apply(default_cfd, &compaction));
+
+  // Blob file 21 has no SST file that refers to it, so it leaves the Version
+  // once all of it is garbage. No edit says that it is gone.
+  VersionEdit blob_garbage;
+  blob_garbage.AddBlobFileGarbage(21, /*count=*/4, /*bytes=*/400);
+  ASSERT_OK(apply(default_cfd, &blob_garbage));
+
+  // One atomic group across two column families, in one MANIFEST write. The
+  // default column family gets two log numbers and two minimum log numbers to
+  // keep; the larger one counts each time.
+  {
+    VersionEdit default_first;
+    VersionEdit default_second;
+    VersionEdit alice_edit;
+    default_first.SetColumnFamily(default_cfd->GetID());
+    default_first.SetLogNumber(30);
+    default_first.SetMinLogNumberToKeep(20);
+    default_first.MarkAtomicGroup(2);
+    default_second.SetColumnFamily(default_cfd->GetID());
+    default_second.SetLogNumber(25);
+    default_second.SetMinLogNumberToKeep(15);
+    default_second.MarkAtomicGroup(1);
+    alice_edit.SetColumnFamily(alice_cfd->GetID());
+    alice_edit.AddFile(0, files[3]);
+    alice_edit.SetLogNumber(31);
+    alice_edit.MarkAtomicGroup(0);
+    ++num_writes;
+    mutex_.Lock();
+    Status s = versions_->LogAndApply(
+        {default_cfd, alice_cfd}, read_options_, write_options_,
+        {{&default_first, &default_second}, {&alice_edit}}, &mutex_,
+        /*dir_contains_current_file=*/nullptr);
+    mutex_.Unlock();
+    ASSERT_OK(s);
+    ASSERT_EQ(30, default_cfd->GetLogNumber());
+    ASSERT_EQ(20, versions_->min_log_number_to_keep());
+  }
+
+  // WAL rows: two WALs are added, then the first one is deleted.
+  VersionEdit add_wals;
+  add_wals.AddWal(40, WalMetadata(/*synced_size_bytes=*/100));
+  add_wals.AddWal(41);
+  ++num_writes;
+  ASSERT_OK(LogAndApplyToDefaultCF(add_wals));
+  VersionEdit delete_wals;
+  delete_wals.DeleteWalsBefore(41);
+  ++num_writes;
+  ASSERT_OK(LogAndApplyToDefaultCF(delete_wals));
+  // The WAL set rejects a second add of WAL 41. The MANIFEST write succeeds,
+  // installing it fails, and no check runs. The next write checks the rows
+  // again.
+  VersionEdit add_wal_again;
+  add_wal_again.AddWal(41);
+  ASSERT_EQ(Status::Code::kCorruption,
+            LogAndApplyToDefaultCF(add_wal_again).code());
+  VersionEdit after_wal_error;
+  after_wal_error.AddWal(42);
+  ++num_writes;
+  ASSERT_OK(LogAndApplyToDefaultCF(after_wal_error));
+
+  // A committed OPTIONS file number.
+  VersionEdit options_edit;
+  options_edit.SetCommittedOptionsFileNumber(77);
+  options_edit.MarkOptionsFileManipulation();
+  ++num_writes;
+  ASSERT_OK(LogAndApplyToDefaultCF(options_edit));
+  // Without track_options_file_number_in_manifest, a new OPTIONS file
+  // changes the number in memory only. The MANIFEST, and so the rows, keep
+  // the committed number.
+  mutex_.Lock();
+  versions_->ApplyLegacyOptionsFileNumber(78);
+  mutex_.Unlock();
+
+  // DB::CreateColumnFamily() takes the new column family id before its add
+  // edit is written, while other MANIFEST writes can still run.
+  mutex_.Lock();
+  cf_set->GetNextColumnFamilyID();
+  mutex_.Unlock();
+  VersionEdit between;
+  between.SetLogNumber(32);
+  ASSERT_OK(apply(default_cfd, &between));
+
+  // A column family add, and a drop of a column family that has a file. Its
+  // file row stays behind in the rows.
+  ++num_writes;
+  ASSERT_NE(nullptr, CreateColumnFamily("new_cf", cf_options_));
+  VersionEdit drop;
+  drop.DropColumnFamily();
+  ASSERT_OK(apply(alice_cfd, &drop));
+
+  // A write after the drop.
+  VersionEdit after_drop;
+  after_drop.SetLogNumber(50);
+  ASSERT_OK(apply(default_cfd, &after_drop));
+
+  // A dummy write that does not write the MANIFEST makes no row changes and
+  // runs no check.
+  VersionEdit dummy;
+  dummy.MarkNoManifestWriteDummy();
+  mutex_.Lock();
+  ASSERT_OK(versions_->LogAndApply(default_cfd, read_options_, write_options_,
+                                   &dummy, &mutex_,
+                                   /*dir_contains_current_file=*/nullptr));
+  mutex_.Unlock();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(num_writes, num_checks);
 }
 
 class VersionSetWithTimestampTest : public VersionSetTest {
