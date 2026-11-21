@@ -184,11 +184,19 @@ class WideColumnSerialization {
   // Returns Status::Corruption on decode errors.
   static Status HasBlobColumns(const Slice& input, bool& has_blob_columns);
 
-  // Lightweight extraction of blob file numbers from a V2 entity.
-  // Calls the callback for each blob column's BlobIndex. Avoids full
-  // deserialization of column names and inline values.
-  // Returns OK if no blob columns or not V2 (callback not invoked).
-  static Status ForEachBlobFileNumber(
+  // Calls `callback` once for each blob column's BlobIndex, in column order.
+  // Code that needs only the blob references of an entity (for example the
+  // table builder and BlobGarbageMeter) uses it instead of Deserialize().
+  //   - V1 entity: it cannot have blob columns. The function returns OK after
+  //     the header and does not check the rest of the entity.
+  //   - V2 entity without blob columns: the function returns OK after the
+  //     column types and does not check the rest of the entity.
+  //   - V2 entity with blob columns: the function checks the whole entity
+  //     (section sizes, name order, no trailing bytes), and decodes and
+  //     validates (BlobIndex::Validate()) every blob index. Only then does it
+  //     call `callback`, so a malformed entity fails before any callback runs.
+  // Column names and inline values are not copied.
+  static Status ForEachBlobIndex(
       const Slice& input,
       const std::function<Status(const BlobIndex&)>& callback);
 
@@ -337,6 +345,18 @@ class WideColumnSerialization {
   static Status DeserializeV2Impl(Slice& input, uint32_t num_columns,
                                   std::vector<WideColumn>& columns,
                                   std::vector<ValueType>& column_types);
+
+  // Walks the columns of a V2 entity. DeserializeV2Impl() and
+  // ForEachBlobIndex() both use it, so the V2 format checks are in one place.
+  // It parses sections 2-7 in one pass and checks the whole framing: the skip
+  // info, every column type, strict name order, and that the sections fill
+  // `input` exactly. It calls `visit(index, type, name, value)`, which returns
+  // a Status, for each column in order. With `stop_without_blobs`, it returns
+  // OK right after the type check when no column is a blob index, without
+  // visiting any column.
+  template <typename Visit>
+  static Status WalkV2Columns(Slice& input, uint32_t num_columns,
+                              bool stop_without_blobs, Visit&& visit);
 
   // Returns true if t is a supported per-column ValueType. Currently only
   // kTypeValue (inline) and kTypeBlobIndex are supported. Notably,
