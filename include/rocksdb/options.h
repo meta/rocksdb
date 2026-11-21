@@ -49,6 +49,7 @@ enum InfoLogLevel : unsigned char;
 class SstFileManager;
 class FilterPolicy;
 class Logger;
+class ManifestStore;
 class MergeOperator;
 class Snapshot;
 class MemTableRepFactory;
@@ -2158,6 +2159,26 @@ struct DBOptions {
   // re-opening of those files on DB open. This will help cut down DB open
   // latency on remote storage systems.
   bool fast_sst_open = false;
+
+  // EXPERIMENTAL
+  // The external metadata store (see include/rocksdb/manifest_store.h). Null
+  // (the default) means that the MANIFEST file holds the metadata. This
+  // release does not support store mode (a DB whose metadata lives in a
+  // ManifestStore): every DB open function returns NotSupported when this is
+  // set (or InvalidArgument for a bad manifest_row_feature_version). The object
+  // is not written to the OPTIONS file, because it belongs to one DB instance.
+  std::shared_ptr<ManifestStore> manifest_store = nullptr;
+
+  // EXPERIMENTAL
+  // The newest feature version of the public rows that RocksDB may write (see
+  // include/rocksdb/manifest_store.h). Raise it only after every binary that
+  // can open the DB knows the features of the new value, as with
+  // BlockBasedTableOptions::format_version. Valid values are 1 to
+  // kManifestRowFeatureVersionLatest. When manifest_store is set, every DB open
+  // function returns InvalidArgument for other values. Without a store, the
+  // value is not checked, so an OPTIONS file from a later release with a larger
+  // value still opens.
+  uint32_t manifest_row_feature_version = 1;
 
   // End EXPERIMENTAL
 };
