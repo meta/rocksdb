@@ -1598,6 +1598,27 @@ DEFINE_uint64(wp_commit_cache_bits, 23ull,
               "Number of bits to represent write-prepared transaction db's "
               "commit cache. Default: 23 (8M entries)");
 
+DEFINE_int64(txn_write_batch_flush_threshold, 0,
+             "Sets TransactionDBOptions::default_write_batch_flush_threshold. "
+             "With the WRITE_UNPREPARED write policy, a transaction whose "
+             "write batch grows larger than this many bytes writes the batch "
+             "to the DB before Prepare(). 0 means no limit. db_crashtest.py "
+             "does not set this flag because of a known WRITE_UNPREPARED bug: "
+             "DB open writes the rollback of a recovered transaction without "
+             "adding it to the commit cache, so the rollback of a later "
+             "transaction that writes the same key can restore the value of "
+             "the recovered transaction. Use this flag only in manual runs "
+             "without write fault injection: an injected write fault in "
+             "another thread can set a background error, and then the "
+             "read-your-own-write check fails to write its batch and stops "
+             "db_stress, or its failed rollback makes the transaction "
+             "destructor assert. Default: 0");
+
+DEFINE_bool(txn_rollback_merge_operands, false,
+            "Sets TransactionDBOptions::rollback_merge_operands. When false, "
+            "the rollback of a transaction does not undo its merge operands "
+            "that are already in the DB. Default: false");
+
 DEFINE_bool(adaptive_readahead, false,
             "Carry forward internal auto readahead size from one file to next "
             "file at each level during iteration");

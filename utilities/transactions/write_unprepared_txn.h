@@ -204,6 +204,7 @@ class WriteUnpreparedTxn : public WritePreparedTxn {
                           SequenceNumber* tracked_at_seq) override;
 
  private:
+  friend class WriteUnpreparedTransactionTest;
   friend class WriteUnpreparedTransactionTest_ReadYourOwnWrite_Test;
   friend class WriteUnpreparedTransactionTest_RecoveryTest_Test;
   friend class WriteUnpreparedTransactionTest_UnpreparedBatch_Test;
