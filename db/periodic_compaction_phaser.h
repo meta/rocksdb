@@ -62,6 +62,14 @@ class PeriodicCompactionPhaser {
   // recovery percent. Returns disabled params when phasing is off.
   PeriodicCompactionPhaseParams ParamsForCf(uint32_t cf_id) const;
 
+  // Returns the parameters that column family `cf_id` would get after
+  // Reanchor(anchor_time), without changing this phaser. SetOptions() uses this
+  // to build a new Version before it publishes the new anchor. When phasing is
+  // off (recovery percent 0), it returns the same disabled params as
+  // ParamsForCf() and ignores `anchor_time`.
+  PeriodicCompactionPhaseParams ParamsForCfAtAnchor(uint32_t cf_id,
+                                                    uint64_t anchor_time) const;
+
   // --- Stateless helpers (static; unit-tested directly) ---
 
   // Wall-clock time (unix seconds) at which a file with the given modification

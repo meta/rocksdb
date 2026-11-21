@@ -4,9 +4,11 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
+#include "db/blob/blob_log_format.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
@@ -60,7 +62,205 @@ class RepairTest : public DBTestBase {
     ASSERT_GT(verify_passed, 0);
     SyncPoint::GetInstance()->DisableProcessing();
   }
+
+  // Reads the path and the bytes of every file in the DB directory and in its
+  // lost/ subdirectory into `*files`. A test compares two snapshots to check
+  // that RepairDB changed, added or removed no file. The snapshot skips the
+  // info log files (LOG and LOG.old.*), because RepairDB starts a new info log
+  // even when it refuses to repair.
+  void SnapshotDbDir(std::map<std::string, std::string>* files) {
+    files->clear();
+    const InfoLogPrefix info_log_prefix(/*has_log_dir=*/false, dbname_);
+    for (const std::string& dir : {dbname_, dbname_ + "/lost"}) {
+      std::vector<std::string> names;
+      const Status status = env_->GetChildren(dir, &names);
+      if (status.IsNotFound()) {
+        continue;
+      }
+      ASSERT_OK(status);
+      for (const std::string& name : names) {
+        uint64_t number = 0;
+        FileType type;
+        if (name == "." || name == ".." ||
+            (ParseFileName(name, &number, info_log_prefix.prefix, &type) &&
+             type == kInfoLogFile)) {
+          continue;
+        }
+        const std::string path = dir + "/" + name;
+        bool is_dir = false;
+        ASSERT_OK(env_->IsDirectory(path, &is_dir));
+        if (is_dir) {
+          (*files)[path] = "<directory>";
+          continue;
+        }
+        ASSERT_OK(ReadFileToString(env_, path, &(*files)[path]));
+      }
+    }
+  }
+
+  // Reads the header version of every blob file in the DB directory into
+  // `*versions`.
+  void GetBlobFileHeaderVersions(std::vector<uint32_t>* versions) {
+    versions->clear();
+    std::unordered_map<std::string, uint64_t> blob_files;
+    ASSERT_OK(GetAllDataFiles(kBlobFile, &blob_files));
+    for (const auto& blob_file : blob_files) {
+      std::string bytes;
+      ASSERT_OK(ReadFileToString(env_, blob_file.first, &bytes));
+      ASSERT_GE(bytes.size(), BlobLogHeader::kSize);
+      BlobLogHeader header;
+      ASSERT_OK(header.DecodeFrom(Slice(bytes.data(), BlobLogHeader::kSize)));
+      versions->push_back(header.version);
+    }
+  }
+
+  // Deletes every file in the DB directory whose type is in `types`.
+  void DeleteDbFiles(const std::vector<FileType>& types) {
+    std::vector<std::string> names;
+    ASSERT_OK(env_->GetChildren(dbname_, &names));
+    for (const std::string& name : names) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(name, &number, &type) &&
+          std::find(types.begin(), types.end(), type) != types.end()) {
+        ASSERT_OK(env_->DeleteFile(dbname_ + "/" + name));
+      }
+    }
+  }
 };
+
+TEST_F(RepairTest, RefusesBlobIndirectionDbAndChangesNoFile) {
+  for (int scenario = 0; scenario != 3; ++scenario) {
+    Options options = CurrentOptions();
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", "value"));
+    ASSERT_OK(Flush());
+    Close();
+    std::vector<std::string> names;
+    ASSERT_OK(env_->GetChildren(dbname_, &names));
+    std::vector<std::pair<std::string, std::string>> original;
+    for (const std::string& name : names) {
+      uint64_t number = 0;
+      FileType type;
+      if (!ParseFileName(name, &number, &type) ||
+          (type != kCurrentFile && type != kDescriptorFile &&
+           type != kTableFile && type != kBlobFile && type != kWalFile)) {
+        continue;
+      }
+      std::string bytes;
+      ASSERT_OK(ReadFileToString(env_, dbname_ + "/" + name, &bytes));
+      original.emplace_back(name, std::move(bytes));
+    }
+    ASSERT_FALSE(original.empty());
+    if (scenario == 1) {
+      // The MANIFEST read fails. RepairDB must still find the evidence in the
+      // SST (its exact reference metadata) and refuse to run.
+      SyncPoint::GetInstance()->SetCallBack(
+          "Repairer::FeatureProbe", [](void* arg) {
+            *static_cast<Status*>(arg) = Status::IOError("optional probe");
+          });
+    } else if (scenario == 2) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "Repairer::BlobIndirectionDetected", [](void* arg) {
+            *static_cast<Status*>(arg) =
+                Status::IOError("after positive evidence");
+          });
+    }
+    SyncPoint::GetInstance()->EnableProcessing();
+    // Only durable evidence decides if the DB uses the feature, never the
+    // current option value. Here the option is off, but the files hold feature
+    // data, so RepairDB must still refuse and change no file.
+    options.enable_blob_indirection = false;
+    const Status repaired = RepairDB(dbname_, options);
+    if (scenario == 2) {
+      ASSERT_TRUE(repaired.IsIOError());
+    } else {
+      ASSERT_TRUE(repaired.IsNotSupported()) << repaired.ToString();
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    for (const auto& file : original) {
+      std::string bytes;
+      ASSERT_OK(ReadFileToString(env_, dbname_ + "/" + file.first, &bytes));
+      ASSERT_EQ(file.second, bytes) << file.first;
+    }
+  }
+}
+
+TEST_F(RepairTest, UnreadableManifestWithoutEvidenceRunsLegacyRepair) {
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  Close();
+  SyncPoint::GetInstance()->SetCallBack(
+      "Repairer::FeatureProbe", [](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("optional probe");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // The MANIFEST read fails, and no SST holds feature evidence, so RepairDB
+  // runs the legacy repair and keeps the data. This is not a proof that the DB
+  // never used the feature: RepairDB could not read the MANIFEST.
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  ASSERT_OK(RepairDB(dbname_, options));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  Reopen(options);
+  ASSERT_EQ("value", Get("key"));
+}
+
+TEST_F(RepairTest, NeverActivatedRepairWithPolicyEnabledKeepsLegacyOutput) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 128;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("legacy", "sst"));
+  ASSERT_OK(Flush());
+  // GetAllDataFiles() takes a std::unordered_map.
+  std::unordered_map<std::string, uint64_t> legacy_ssts;
+  ASSERT_OK(GetAllDataFiles(kTableFile, &legacy_ssts));
+  ASSERT_EQ(legacy_ssts.size(), 1U);
+
+  // The option is on, but no file holds feature evidence yet: the only SST was
+  // built with the option off, and the new write stays in the WAL.
+  options.enable_blob_indirection = true;
+  Reopen(options);
+  ASSERT_OK(Put("wal", "unflushed"));
+  Close();
+
+  ASSERT_OK(RepairDB(dbname_, options));
+  // The first repair converts the WAL to an SST without exact reference
+  // metadata, so a second repair finds no feature evidence and succeeds.
+  ASSERT_OK(RepairDB(dbname_, options));
+  Reopen(options);
+  EXPECT_EQ(Get("legacy"), "sst");
+  EXPECT_EQ(Get("wal"), "unflushed");
+  for (const auto& sst : legacy_ssts) {
+    ASSERT_OK(env_->FileExists(sst.first));
+  }
+  const VersionStorageInfo* const vstorage = dbfull()
+                                                 ->GetVersionSet()
+                                                 ->GetColumnFamilySet()
+                                                 ->GetDefault()
+                                                 ->current()
+                                                 ->storage_info();
+  size_t files = 0;
+  for (int level = 0; level < vstorage->num_levels(); ++level) {
+    for (const FileMetaData* file : vstorage->LevelFiles(level)) {
+      EXPECT_TRUE(file->blob_reference_descriptor.empty());
+      ++files;
+    }
+  }
+  EXPECT_EQ(files, 2U);
+}
 
 TEST_F(RepairTest, SortRepairedDBL0ByEpochNumber) {
   Options options = CurrentOptions();
@@ -101,6 +301,87 @@ TEST_F(RepairTest, SortRepairedDBL0ByEpochNumber) {
   EXPECT_EQ(level0_files[2]->epoch_number, 1);
   level1_files = GetLevelFileMetadatas(1 /* level*/);
   ASSERT_EQ(level1_files.size(), 0);
+}
+
+TEST_F(RepairTest, BlobIndirectionRepairLeavesDbDirUnchanged) {
+  // RepairDB does not support a DB that uses blob indirection. When it finds
+  // evidence of the feature, it must return NotSupported before it changes
+  // any file. The test runs two cases on a DB written with
+  // enable_blob_indirection:
+  //   1. The MANIFEST and CURRENT stay. The MANIFEST holds the evidence.
+  //   2. Every MANIFEST, CURRENT and every SST are deleted. Only the blob
+  //      files are left, so their version 2 header is the only evidence.
+  //      RepairDB often runs because the MANIFEST is lost, so it must find
+  //      this evidence without one.
+  // In both cases, the test compares a snapshot of the DB directory taken
+  // before and after RepairDB: no file is changed, added or removed.
+  for (const bool only_blob_files : {false, true}) {
+    SCOPED_TRACE("only_blob_files=" + std::to_string(only_blob_files));
+    Options options = CurrentOptions();
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key1", "value1"));
+    ASSERT_OK(Put("key2", "value2"));
+    ASSERT_OK(Flush());
+    Close();
+
+    std::vector<uint32_t> versions;
+    ASSERT_NO_FATAL_FAILURE(GetBlobFileHeaderVersions(&versions));
+    ASSERT_FALSE(versions.empty());
+    for (const uint32_t version : versions) {
+      ASSERT_EQ(version, kVersion2);
+    }
+    if (only_blob_files) {
+      ASSERT_NO_FATAL_FAILURE(
+          DeleteDbFiles({kDescriptorFile, kCurrentFile, kTableFile}));
+    }
+
+    std::map<std::string, std::string> before;
+    ASSERT_NO_FATAL_FAILURE(SnapshotDbDir(&before));
+    const Status repaired = RepairDB(dbname_, options);
+    ASSERT_TRUE(repaired.IsNotSupported()) << repaired.ToString();
+    std::map<std::string, std::string> after;
+    ASSERT_NO_FATAL_FAILURE(SnapshotDbDir(&after));
+    ASSERT_EQ(before, after);
+  }
+}
+
+TEST_F(RepairTest, LegacyBlobFilesRepairWithoutIndirection) {
+  // A DB that never used blob indirection writes blob files with a version 1
+  // header. Such a header is not evidence of the feature, so RepairDB runs the
+  // legacy repair on a lost MANIFEST: it succeeds, keeps the inline value and
+  // leaves the blob files in place. The legacy repair does not add blob files
+  // to the new MANIFEST, so the test does not read the value in the blob file.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 16;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("inline", "small"));
+  ASSERT_OK(Put("blob", "a value that goes to a blob file"));
+  ASSERT_OK(Flush());
+  Close();
+
+  std::vector<uint32_t> versions;
+  ASSERT_NO_FATAL_FAILURE(GetBlobFileHeaderVersions(&versions));
+  ASSERT_FALSE(versions.empty());
+  for (const uint32_t version : versions) {
+    ASSERT_EQ(version, kVersion1);
+  }
+  std::unordered_map<std::string, uint64_t> blob_files;
+  ASSERT_OK(GetAllDataFiles(kBlobFile, &blob_files));
+  ASSERT_NO_FATAL_FAILURE(DeleteDbFiles({kDescriptorFile}));
+
+  ASSERT_OK(RepairDB(dbname_, options));
+  for (const auto& blob_file : blob_files) {
+    ASSERT_OK(env_->FileExists(blob_file.first));
+  }
+  Reopen(options);
+  ASSERT_EQ(Get("inline"), "small");
 }
 
 TEST_F(RepairTest, LostManifest) {
