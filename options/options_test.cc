@@ -23,11 +23,13 @@
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/file_checksum.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/utilities/leveldb_options.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
 #include "table/block_based/filter_policy_internal.h"
+#include "test_util/mock_manifest_store.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/random.h"
@@ -2504,6 +2506,61 @@ TEST_F(OptionsTest, FileChecksumGenFactoryTest) {
       cfg_opts, new_opt.file_checksum_gen_factory.get(), &mismatch));
   ASSERT_TRUE(db_opts.file_checksum_gen_factory->AreEquivalent(
       cfg_opts, new_opt.file_checksum_gen_factory.get(), &mismatch));
+}
+
+TEST_F(OptionsTest, ManifestStoreOptions) {
+  ConfigOptions cfg_opts;
+  cfg_opts.ignore_unsupported_options = false;
+  cfg_opts.registry = ObjectRegistry::NewInstance();
+  cfg_opts.registry->AddLibrary("manifest-store-test")
+      ->AddFactory<ManifestStore>(
+          MockManifestStore::kClassName(),
+          [](const std::string& /*uri*/, std::unique_ptr<ManifestStore>* guard,
+             std::string* /*errmsg*/) {
+            guard->reset(new MockManifestStore(
+                std::make_shared<MockManifestStoreData>(), /*epoch=*/1));
+            return guard->get();
+          });
+
+  // CreateFromString() creates a registered store class, and fails for a
+  // name that no library registers.
+  std::shared_ptr<ManifestStore> store;
+  ASSERT_OK(ManifestStore::CreateFromString(
+      cfg_opts, MockManifestStore::kClassName(), &store));
+  ASSERT_NE(store, nullptr);
+  ASSERT_STREQ(MockManifestStore::kClassName(), store->Name());
+  ASSERT_EQ(
+      Status::Code::kNotSupported,
+      ManifestStore::CreateFromString(cfg_opts, "UnknownManifestStore", &store)
+          .code());
+
+  // An options string can set the store, but the store is never written back,
+  // so the OPTIONS file does not hold it. The feature version is written.
+  DBOptions db_opts;
+  ASSERT_OK(GetDBOptionsFromString(
+      cfg_opts, DBOptions(),
+      std::string("manifest_store=") + MockManifestStore::kClassName(),
+      &db_opts));
+  ASSERT_NE(db_opts.manifest_store, nullptr);
+  std::string opts_str;
+  ASSERT_OK(GetStringFromDBOptions(cfg_opts, db_opts, &opts_str));
+  ASSERT_EQ(std::string::npos, opts_str.find("manifest_store"));
+  ASSERT_NE(std::string::npos,
+            opts_str.find("manifest_row_feature_version=1;"));
+
+  // The reloaded options have no store. They still verify as equal to the
+  // original options, because the store option is never compared.
+  DBOptions new_opt;
+  ASSERT_OK(GetDBOptionsFromString(cfg_opts, DBOptions(), opts_str, &new_opt));
+  ASSERT_EQ(nullptr, new_opt.manifest_store);
+  ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(cfg_opts, db_opts, new_opt));
+
+  // The parser reads any feature version. With a store, the DB open functions
+  // check the range (see DBBasicTest.ManifestStoreOptionsAreCheckedAtOpen). The
+  // value 7 is an example.
+  ASSERT_OK(GetDBOptionsFromString(cfg_opts, DBOptions(),
+                                   "manifest_row_feature_version=7", &new_opt));
+  ASSERT_EQ(7u, new_opt.manifest_row_feature_version);
 }
 
 class TestTablePropertiesCollectorFactory

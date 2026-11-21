@@ -3598,6 +3598,19 @@ class DBImpl : public DB
 
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
+
+  // Checks DBOptions::manifest_store and manifest_row_feature_version. Every DB
+  // open function must call it first, before it changes anything on disk.
+  // DBBasicTest.ManifestStoreOptionsAreCheckedAtOpen calls each DB open
+  // function except DB::OpenAndCompact(), which reaches the check through the
+  // same secondary open function as DB::OpenAsSecondary(). Without a store it
+  // returns OK and does not read the feature version, which only matters for a
+  // store. With a store it returns InvalidArgument when the feature version is
+  // not from 1 to kManifestRowFeatureVersionLatest, and NotSupported otherwise,
+  // because this release does not support store mode (a DB whose metadata lives
+  // in a ManifestStore).
+  static Status CheckManifestStoreOptions(const DBOptions& db_options);
+
   // Validate self-consistency of DB options and its consistency with cf options
   static Status ValidateOptions(
       const DBOptions& db_options,
