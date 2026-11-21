@@ -129,12 +129,17 @@ class BlobFileCache {
   // to avoid effectively leaking the open file and assicated memory
   //
   // Only for normal blob files: it takes the stripe mutex of a normal blob
-  // file (mutex_), not relocation_mutex_.
+  // file (mutex_), not relocation_mutex_. PurgeObsoleteFiles() evicts the
+  // reader of a relocation file with TableCache::Evict(), which takes no
+  // stripe mutex (this cache shares its Cache with the table cache).
   void Evict(uint64_t blob_file_number);
 
   // Removes the remembered failed open of relocation file `file_number`, if
-  // any (see failed_relocation_opens_). It takes only
-  // failed_relocation_opens_mutex_.
+  // any (see failed_relocation_opens_). The deleter of a Version-owned
+  // relocation file calls it, with or without the DB mutex (see
+  // VersionSet::FreeBlobRelocationState()). It takes only
+  // failed_relocation_opens_mutex_. PurgeObsoleteFiles() evicts the cached
+  // reader later (see Evict()).
   void ForgetFailedRelocationOpen(uint64_t file_number);
 
   // Used to identify cache entries for blob files (not normally useful)
