@@ -1600,16 +1600,56 @@ class LevelIterator final : public InternalIterator {
   // The condition for returning sentinel is reaching the end of current
   // file_iter_: !Valid() && status.().ok().
   void TrySetDeleteRangeSentinel(const Slice& boundary_key);
+  void TrySetForwardSentinel();
   void ClearSentinel() { to_return_sentinel_ = false; }
+
+  // Whether SkipEmptyFileForward() stops at the current file when its point
+  // keys run out, instead of moving on to the next file.
+  bool NextFileUnreachable() {
+    return prefix_exhausted_ || file_index_ >= flevel_->num_files - 1 ||
+           KeyReachedUpperBound(file_smallest_key(file_index_ + 1));
+  }
+
+  // When TrySetForwardSentinel() leaves out the sentinel of a prefix seek that
+  // ran out of keys, the file iterator stays, as it did while the sentinel
+  // waited in the merging iterator's heap, so that a later seek into the file
+  // reuses it or the table reader of a prefix-filtered stand-in. Scans that
+  // run out of a level drop it rather than hold the file's blocks until they
+  // end, and so do files with range tombstones, which still get a sentinel.
+  bool KeepsFileIteratorAtEnd() const {
+    return (prefix_exhausted_ || prefix_filtered_table_ != nullptr) &&
+           range_tombstone_iter_ != nullptr &&
+           *range_tombstone_iter_ == nullptr;
+  }
 };
 
 void LevelIterator::TrySetDeleteRangeSentinel(const Slice& boundary_key) {
   assert(range_tombstone_iter_);
   if (file_iter_.iter() != nullptr && !file_iter_.Valid() &&
       file_iter_.status().ok()) {
+    TEST_SYNC_POINT("LevelIterator::TrySetDeleteRangeSentinel:Set");
     to_return_sentinel_ = true;
     sentinel_ = boundary_key;
   }
+}
+
+// A sentinel at the end of the current file keeps the file's range tombstones
+// in the merging iterator's heap, and once the merging iterator moves past it,
+// the level moves on to the next file and the merging iterator adds that file's
+// range tombstones. With no tombstones in the current file and no next file to
+// move to, the sentinel would only be one more key to push and pop.
+void LevelIterator::TrySetForwardSentinel() {
+  if (range_tombstone_iter_ == nullptr || file_iter_.Valid()) {
+    return;
+  }
+  // A file iterator stopped by the upper bound leaves no next file to reach.
+  if (*range_tombstone_iter_ == nullptr &&
+      (file_iter_.iter()->UpperBoundCheckResult() ==
+           IterBoundCheck::kOutOfBound ||
+       NextFileUnreachable())) {
+    return;
+  }
+  TrySetDeleteRangeSentinel(file_largest_key(file_index_));
 }
 
 void LevelIterator::Seek(const Slice& target) {
@@ -1692,12 +1732,11 @@ void LevelIterator::Seek(const Slice& target) {
         //
         // The flag is cleared in Seek*() calls. There is no need to clear the
         // flag in Prev() since Prev() will not be called when the flag is set
-        // for reasons explained below. If range_tombstone_iter_ is nullptr,
-        // then there is no file boundary sentinel key. Since
-        // !file_iter_.Valid() from the if condition above, this level iterator
-        // is !Valid(), so Prev() will not be called. If range_tombstone_iter_
-        // is not nullptr, there are two cases depending on if this level
-        // iterator reaches top of the heap in merging iterator (the upper
+        // for reasons explained below. If TrySetForwardSentinel() sets no file
+        // boundary sentinel key, then since !file_iter_.Valid() from the if
+        // condition above, this level iterator is !Valid(), so Prev() will not
+        // be called. If it sets one, there are two cases depending on if this
+        // level iterator reaches top of the heap in merging iterator (the upper
         // layer).
         //  If so, merging iterator will see the sentinel key, call
         //  NextAndGetResult() and the call to NextAndGetResult() will skip the
@@ -1712,9 +1751,7 @@ void LevelIterator::Seek(const Slice& target) {
       }
     }
 
-    if (range_tombstone_iter_) {
-      TrySetDeleteRangeSentinel(file_largest_key(file_index_));
-    }
+    TrySetForwardSentinel();
   }
   SkipEmptyFileForward();
   CheckMayBeOutOfLowerBound();
@@ -1763,11 +1800,9 @@ void LevelIterator::SeekToFirst() {
   InitFileIterator(0, /*seek_target=*/nullptr);
   if (file_iter_.iter() != nullptr) {
     file_iter_.SeekToFirst();
-    if (range_tombstone_iter_) {
-      // We do this in SeekToFirst() and SeekToLast() since
-      // we could have an empty file with only range tombstones.
-      TrySetDeleteRangeSentinel(file_largest_key(file_index_));
-    }
+    // We do this in SeekToFirst() and SeekToLast() since
+    // we could have an empty file with only range tombstones.
+    TrySetForwardSentinel();
   }
   SkipEmptyFileForward();
   CheckMayBeOutOfLowerBound();
@@ -1796,9 +1831,7 @@ void LevelIterator::Next() {
     ClearSentinel();
   } else {
     file_iter_.Next();
-    if (range_tombstone_iter_) {
-      TrySetDeleteRangeSentinel(file_largest_key(file_index_));
-    }
+    TrySetForwardSentinel();
   }
   SkipEmptyFileForward();
   SampleRead<false>();
@@ -1811,8 +1844,8 @@ bool LevelIterator::NextAndGetResult(IterateResult* result) {
   if (!is_valid) {
     if (to_return_sentinel_) {
       ClearSentinel();
-    } else if (range_tombstone_iter_) {
-      TrySetDeleteRangeSentinel(file_largest_key(file_index_));
+    } else {
+      TrySetForwardSentinel();
     }
     is_next_read_sequential_ = true;
     SkipEmptyFileForward();
@@ -1863,11 +1896,11 @@ bool LevelIterator::SkipEmptyFileForward() {
                IterBoundCheck::kOutOfBound))) {
     seen_empty_file = true;
     // Move to next file
-    if (file_index_ >= flevel_->num_files - 1 ||
-        KeyReachedUpperBound(file_smallest_key(file_index_ + 1)) ||
-        prefix_exhausted_) {
-      SetFileIterator(nullptr);
-      ClearRangeTombstoneIter();
+    if (NextFileUnreachable()) {
+      if (!KeepsFileIteratorAtEnd()) {
+        SetFileIterator(nullptr);
+        ClearRangeTombstoneIter();
+      }
       break;
     }
     // may init a new *range_tombstone_iter
@@ -1902,12 +1935,10 @@ bool LevelIterator::SkipEmptyFileForward() {
       } else {
         file_iter_.SeekToFirst();
       }
-      if (range_tombstone_iter_) {
-        if (*range_tombstone_iter_) {
-          (*range_tombstone_iter_)->SeekToFirst();
-        }
-        TrySetDeleteRangeSentinel(file_largest_key(file_index_));
+      if (range_tombstone_iter_ && *range_tombstone_iter_) {
+        (*range_tombstone_iter_)->SeekToFirst();
       }
+      TrySetForwardSentinel();
     }
   }
   return seen_empty_file;
