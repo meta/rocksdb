@@ -567,7 +567,22 @@ struct BlockBasedTableOptions {
   // (iii) Compatible existing behavior:
   // Same as kEnabled.
   //
-  // (h) Other CacheEntryRole
+  // (h) CacheEntryRole::kIndirectBlobGcWorkingMemory
+  // (i) If kEnabled:
+  // Charge memory usage of indirect blob GC. Indirect blob GC is a background
+  // job that copies the live values out of a blob file with a lot of garbage
+  // (see `enable_blob_indirection`). Its working memory holds the exact list
+  // of live references to the file.
+  // If such memory usage exceeds the available space left in the block cache
+  // at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), the charge fails with
+  // Status::MemoryLimit().
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kEnabled.
+  //
+  // (i) Other CacheEntryRole
   // Not supported.
   // `Status::kNotSupported` will be returned if
   // `CacheEntryRoleOptions::charged` is set to {`kEnabled`, `kDisabled`}.
