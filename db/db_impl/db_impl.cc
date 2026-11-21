@@ -995,9 +995,12 @@ void DBImpl::MaybeInitBlobDirectWriteColumnFamily(
       cf_options.blob_direct_write_partitions,
       cf_options.blob_direct_write_partition_strategy,
       [vs = versions_.get()]() { return vs->NewFileNumber(); }, fs_.get(),
-      immutable_db_options_.clock, stats_, file_options_, dbname_,
-      column_family_name, cf_options.blob_file_size,
-      immutable_db_options_.use_fsync,
+      immutable_db_options_.clock, stats_, file_options_,
+      // Blob files of a column family live in its first cf_paths entry (after
+      // sanitization, db_paths or the DB directory), where readers, the purge
+      // and checkpoints look for them.
+      cfd->ioptions().cf_paths.front().path, column_family_name,
+      cf_options.blob_file_size, immutable_db_options_.use_fsync,
       cf_options.blob_file_writable_file_max_buffer_size,
       cfd->blob_file_cache(), &blob_callback_, immutable_db_options_.listeners,
       immutable_db_options_.file_checksum_gen_factory.get(),
@@ -2578,9 +2581,56 @@ Status DBImpl::SyncWAL() {
   TEST_SYNC_POINT("DBImpl::SyncWAL:Begin");
   WriteOptions write_options;
   VersionEdit synced_wals;
+  // SyncWalImpl() first syncs the blob direct write files
+  // (SyncBlobDirectWriteFiles(), "the blob sync") and then the WALs. A write
+  // group appends a value's blob bytes before its WAL record, so SyncWAL()
+  // must keep write groups out from the blob sync to the end of the WAL sync.
+  // Otherwise a write group can append a blob and its WAL record between the
+  // two syncs, and the WAL sync makes that record durable without its blob
+  // bytes. There are two cases:
+  // 1. No thread holds LockWAL(): enter the write queue as an unbatched
+  //    writer.
+  // 2. A thread holds LockWAL(): writers are already stopped by the LockWAL()
+  //    stop token. The next writer then becomes the group leader, waits in
+  //    DelayWrite() and makes every later writer wait, so EnterUnbatched()
+  //    would wait until UnlockWAL(). If the caller holds LockWAL() itself, it
+  //    would deadlock. Take a second write stop token
+  //    (WriteController::GetStopToken()) instead, so writes stay stopped even
+  //    if the owner calls UnlockWAL() during this sync.
+  // With blob direct write, SyncWAL() therefore waits for running and stalled
+  // write groups (other than a LockWAL() stop), and new writes wait until the
+  // WAL sync ends.
+  WriteThread::Writer blob_sync_writer;
+  bool holds_write_thread = false;
+  std::unique_ptr<WriteControllerToken> blob_sync_stop_token;
+  if (HasAnyBlobDirectWriteColumnFamily()) {
+    // ColumnFamilyData::ValidateOptions() rejects blob direct write with
+    // two_write_queues, whose sync writes call SyncWAL() from inside the write
+    // thread.
+    assert(!two_write_queues_);
+    InstrumentedMutexLock l(&mutex_);
+    if (lock_wal_owner_thread_id_counts_.empty()) {
+      write_thread_.EnterUnbatched(&blob_sync_writer, &mutex_);
+      holds_write_thread = true;
+    } else {
+      blob_sync_stop_token = write_controller_.GetStopToken();
+    }
+  }
   Status s = SyncWalImpl(/*include_current_wal=*/true, write_options,
                          /*job_context=*/nullptr, &synced_wals,
                          /*error_recovery_in_prog=*/false);
+  if (holds_write_thread) {
+    InstrumentedMutexLock l(&mutex_);
+    write_thread_.ExitUnbatched(&blob_sync_writer);
+  }
+  if (blob_sync_stop_token) {
+    {
+      InstrumentedMutexLock l(&mutex_);
+      blob_sync_stop_token.reset();
+    }
+    // Wake the writers that wait in DelayWrite() for the stop to end.
+    bg_cv_.SignalAll();
+  }
 
   if (s.ok() && synced_wals.IsWalAddition()) {
     InstrumentedMutexLock l(&mutex_);
@@ -2666,6 +2716,29 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   RecordTick(stats_, WAL_FILE_SYNCED);
   IOOptions opts;
   IOStatus io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+  // Sync blob files first. See SyncBlobDirectWriteFiles(). wals_to_sync is
+  // fixed here. Closed WALs no longer grow, and the current WAL does not grow
+  // because SyncWAL() keeps write groups out while this runs. Skip the blob
+  // sync when the loop below syncs no WAL: then no WAL record becomes durable,
+  // and the fsyncs would only stall blob writers.
+  bool syncs_any_wal = false;
+  for (log::Writer* log : wals_to_sync) {
+    if (log->get_log_number() >
+        wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+      syncs_any_wal = true;
+      break;
+    }
+  }
+  bool blob_sync_failed = false;
+  if (io_s.ok() && syncs_any_wal) {
+    io_s = status_to_io_status(SyncBlobDirectWriteFiles(write_options));
+    if (!io_s.ok()) {
+      blob_sync_failed = true;
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "Blob direct write file sync before WAL sync failed: %s",
+                      io_s.ToString().c_str());
+    }
+  }
   std::list<log::Writer*> wals_internally_closed;
   uint64_t failed_wal_number = 0;
   bool failed_with_previous_error = false;
@@ -2723,8 +2796,10 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
     }
   }
   if (!io_s.ok()) {
-    ROCKS_LOG_ERROR(immutable_db_options_.info_log, "WAL Sync error %s",
-                    io_s.ToString().c_str());
+    if (!blob_sync_failed) {
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log, "WAL Sync error %s",
+                      io_s.ToString().c_str());
+    }
     // In case there is a fs error we should set it globally to prevent the
     // future writes
     // The live-WAL operation that first observed the I/O failure owns
