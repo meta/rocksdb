@@ -345,7 +345,10 @@
 // routed generation number. In normal operation a coarse SST never references
 // a relocation file or a routed number (a flush references only its own new
 // blob files, and a coarse L0 compaction has only coarse inputs and does not
-// flatten), so the relocation check is a safety margin.
+// flatten), so the relocation check is a safety margin. Route retirement still
+// skips any route source at or above the frontier. That is more conservative
+// than needed, because a coarse SST never holds a routed number, but it only
+// delays a retirement.
 //
 // Coarse classification property
 //

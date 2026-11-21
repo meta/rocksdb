@@ -705,6 +705,14 @@ enum Tickers : uint32_t {
   // key arrived (DBs that use or have used enable_blob_indirection).
   COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS,
 
+  // Used only by DBs that use or have used enable_blob_indirection (see its
+  // comment in advanced_options.h). When indirect blob GC moves the live
+  // values of a blob file to a relocation file, a route lets reads of the old
+  // file number find them. Route retirement removes a route from the MANIFEST
+  // when no SST and no running job needs it any more. This ticker counts the
+  // routes that route retirement removed.
+  BLOB_RELOCATION_ROUTES_RETIRED,
+
   // Used only by DBs that use or have used enable_blob_indirection. Number of
   // times a relocation file reader failed to open (the file is missing,
   // corrupt, or could not be read). Opens of normal blob files count in
