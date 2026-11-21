@@ -487,27 +487,37 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
         info.temperature = meta->temperature;
       }
     }
-    const auto& blob_files = vsi.GetBlobFiles();
-    for (const auto& meta : blob_files) {
-      assert(meta);
-
+    const auto AddBlobFile = [&](uint64_t file_number, uint64_t file_size,
+                                 const std::string& checksum_method,
+                                 const std::string& checksum) {
       results.emplace_back();
       LiveFileStorageInfo& info = results.back();
-
-      info.relative_filename = BlobFileName(meta->GetBlobFileNumber());
-      info.directory = GetDir(/* path_id */ 0);
-      info.file_number = meta->GetBlobFileNumber();
+      info.relative_filename = BlobFileName(file_number);
+      info.directory = GetDir(/*path_id=*/0);
+      info.file_number = file_number;
       info.file_type = kBlobFile;
-      info.size = meta->GetBlobFileSize();
+      info.size = file_size;
       if (opts.include_checksum_info) {
-        info.file_checksum_func_name = meta->GetChecksumMethod();
-        info.file_checksum = meta->GetChecksumValue();
+        info.file_checksum_func_name = checksum_method;
+        info.file_checksum = checksum;
         if (info.file_checksum_func_name.empty()) {
           info.file_checksum_func_name = kUnknownFileChecksumFuncName;
           info.file_checksum = kUnknownFileChecksum;
         }
       }
+    };
+    const auto& blob_files = vsi.GetBlobFiles();
+    for (const auto& meta : blob_files) {
+      assert(meta);
+      AddBlobFile(meta->GetBlobFileNumber(), meta->GetBlobFileSize(),
+                  meta->GetChecksumMethod(), meta->GetChecksumValue());
       // TODO?: info.temperature
+    }
+    // Relocation files live in the first cf_path, like normal blob files.
+    for (const auto& meta : vsi.GetBlobRelocationFiles()) {
+      assert(meta != nullptr);
+      AddBlobFile(meta->GetFileNumber(), meta->GetFileSize(),
+                  meta->GetChecksumMethod(), meta->GetChecksumValue());
     }
     if (pin_request != nullptr) {
       for (size_t i = first_result_of_cf; i < results.size(); ++i) {
