@@ -31,6 +31,59 @@ class WriteUnpreparedTransactionTest
             std::get<0>(GetParam()), std::get<1>(GetParam()),
             std::get<2>(GetParam()), std::get<3>(GetParam()),
             std::get<4>(GetParam())) {}
+
+ protected:
+  // Starts a transaction named "xid" with a flush threshold of 1 and returns
+  // it in "*txn". Before each new write, such a transaction writes its current
+  // write batch to the DB as an unprepared batch if that batch is not empty.
+  // For example, after four writes the DB has three unprepared batches, and
+  // the fourth write is only in the write batch of the transaction.
+  void BeginTxnWithOneWritePerBatch(Transaction** txn) {
+    TransactionOptions txn_options;
+    txn_options.write_batch_flush_threshold = 1;
+    Transaction* const new_txn =
+        db->BeginTransaction(WriteOptions(), txn_options);
+    ASSERT_NE(nullptr, new_txn);
+    *txn = new_txn;
+    ASSERT_OK(new_txn->SetName("xid"));
+  }
+
+  static size_t NumUnpreparedBatches(Transaction* txn) {
+    return static_cast_with_check<WriteUnpreparedTxn>(txn)
+        ->GetUnpreparedSequenceNumbers()
+        .size();
+  }
+
+  // Deletes "txn" without rolling it back, as if the process stopped before
+  // the transaction was prepared. Clearing the unprepared sequence numbers
+  // keeps the destructor from rolling back the transaction, so the next DB
+  // open has to do it.
+  static void DeleteWithoutRollback(Transaction* txn) {
+    static_cast_with_check<WriteUnpreparedTxn>(txn)->unprep_seqs_.clear();
+    delete txn;
+  }
+
+  // Simulates a crash. The WAL is synced first, so everything written to the
+  // DB survives, and the next DB open runs recovery on it.
+  void SimulateCrash() {
+    ASSERT_OK(db->FlushWAL(/*sync=*/true));
+    static_cast_with_check<WriteUnpreparedTxnDB>(db)->TEST_Crash();
+  }
+
+  // Reopens the DB and counts the rollback batches that recovery writes while
+  // it rolls back transactions that were not prepared.
+  Status ReOpenAndCountRollbackBatches(int* rollback_batches_written) {
+    *rollback_batches_written = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "WriteUnpreparedTxnDB::RollbackRecoveredTransaction:"
+        "AfterWriteRollbackBatch",
+        [rollback_batches_written](void*) { ++*rollback_batches_written; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Status s = ReOpenNoDelete();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    return s;
+  }
 };
 
 INSTANTIATE_TEST_CASE_P(
@@ -284,7 +337,6 @@ TEST_P(WriteUnpreparedTransactionTest, RecoveryTest) {
   write_options.disableWAL = false;
   TransactionOptions txn_options;
   std::vector<Transaction*> prepared_trans;
-  WriteUnpreparedTxnDB* wup_db;
   options.disable_auto_compactions = true;
 
   enum Action { UNPREPARED, ROLLBACK, COMMIT };
@@ -298,7 +350,6 @@ TEST_P(WriteUnpreparedTransactionTest, RecoveryTest) {
           // Reset database.
           prepared_trans.clear();
           ASSERT_OK(ReOpen());
-          wup_db = dynamic_cast<WriteUnpreparedTxnDB*>(db);
           if (!empty) {
             for (int i = 0; i < num_batches; i++) {
               ASSERT_OK(db->Put(WriteOptions(), "k" + std::to_string(i),
@@ -324,18 +375,14 @@ TEST_P(WriteUnpreparedTransactionTest, RecoveryTest) {
             }
           }
           if (a == UNPREPARED) {
-            // This is done to prevent the destructor from rolling back the
-            // transaction for us, since we want to pretend we crashed and
-            // test that recovery does the rollback.
-            wup_txn->unprep_seqs_.clear();
+            DeleteWithoutRollback(txn);
           } else {
             ASSERT_OK(txn->Prepare());
+            delete txn;
           }
-          delete txn;
 
           // Crash and run recovery code paths.
-          ASSERT_OK(wup_db->db_impl_->FlushWAL(true));
-          wup_db->TEST_Crash();
+          ASSERT_NO_FATAL_FAILURE(SimulateCrash());
           ASSERT_OK(ReOpenNoDelete());
           assert(db != nullptr);
 
@@ -373,6 +420,196 @@ TEST_P(WriteUnpreparedTransactionTest, RecoveryTest) {
         }
       }
     }
+  }
+}
+
+// Background: when DB open finds a transaction that has unprepared batches but
+// no prepare marker, it rolls the transaction back. It writes one rollback
+// batch for each unprepared batch, starting with the newest one. To build a
+// rollback batch it reads the value that each key had before the transaction.
+//
+// This test makes that read fail after the first rollback batch is written, so
+// DB open fails partway. The next DB open must still roll back every
+// unprepared batch, so no value from the transaction becomes visible.
+TEST_P(WriteUnpreparedTransactionTest, RecoveryRollbackWithReadError) {
+  // Without a block cache, every Get() of a key in an SST file reads the file,
+  // so the injected read error hits the old-value lookup.
+  BlockBasedTableOptions bbto;
+  bbto.no_block_cache = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  options.disable_auto_compactions = true;
+  ASSERT_OK(ReOpen());
+  fault_fs->SetFileTypesExcludedFromFaultInjection({FileType::kInfoLogFile});
+
+  // The old values live in an SST file, so the lookups read that file.
+  ASSERT_OK(db->Put(WriteOptions(), "k0", "before0"));
+  ASSERT_OK(db->Put(WriteOptions(), "k1", "before1"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  // After the four writes, the DB has three unprepared batches: "k0" with
+  // "value0", "k1", and "k0" with "value0b". "k2" is only in the write batch
+  // of the transaction. "k0" is in the first and the last batch, so a rollback
+  // that runs again must not read the rollback writes of the failed DB open
+  // (see below).
+  Transaction* txn = nullptr;
+  ASSERT_NO_FATAL_FAILURE(BeginTxnWithOneWritePerBatch(&txn));
+  ASSERT_OK(txn->Put("k0", "value0"));
+  ASSERT_OK(txn->Put("k1", "value1"));
+  ASSERT_OK(txn->Put("k0", "value0b"));
+  ASSERT_OK(txn->Put("k2", "value2"));
+  ASSERT_EQ(3, NumUnpreparedBatches(txn));
+  DeleteWithoutRollback(txn);
+  ASSERT_NO_FATAL_FAILURE(SimulateCrash());
+
+  // Recovery first rolls back the batch with "value0b" and writes "value0" for
+  // "k0". After that rollback batch is written, make all reads on this thread
+  // fail, so the lookup of "k1" fails.
+  int rollback_batches_written = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteUnpreparedTxnDB::RollbackRecoveredTransaction:"
+      "AfterWriteRollbackBatch",
+      [&](void*) {
+        if (++rollback_batches_written == 1) {
+          fault_fs->SetThreadLocalErrorContext(FaultInjectionIOType::kRead,
+                                               /*seed=*/0, /*one_in=*/1,
+                                               /*retryable=*/false,
+                                               /*has_data_loss=*/false);
+          fault_fs->EnableThreadLocalErrorInjection(
+              FaultInjectionIOType::kRead);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status s = ReOpenNoDelete();
+  fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kRead);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+  ASSERT_TRUE(FaultInjectionTestFS::IsInjectedError(s)) << s.ToString();
+  ASSERT_EQ(1, rollback_batches_written);
+  ASSERT_EQ(nullptr, db);
+
+  // Open again without read errors. Recovery must roll back all three
+  // unprepared batches again. The rollback of the oldest unprepared batch reads
+  // only data older than that batch, so it restores "before0", not the "value0"
+  // that the failed DB open wrote.
+  ASSERT_OK(ReOpenAndCountRollbackBatches(&rollback_batches_written));
+  ASSERT_EQ(3, rollback_batches_written);
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "k0", &value));
+  ASSERT_EQ("before0", value);
+  ASSERT_OK(db->Get(ReadOptions(), "k1", &value));
+  ASSERT_EQ("before1", value);
+  ASSERT_EQ(Status::Code::kNotFound,
+            db->Get(ReadOptions(), "k2", &value).code());
+
+  // The completed rollback wrote the rollback marker, so the next DB open does
+  // not find the transaction and writes no rollback batch.
+  ASSERT_OK(ReOpenAndCountRollbackBatches(&rollback_batches_written));
+  ASSERT_EQ(0, rollback_batches_written);
+  ASSERT_OK(db->Get(ReadOptions(), "k0", &value));
+  ASSERT_EQ("before0", value);
+  ASSERT_OK(db->Get(ReadOptions(), "k1", &value));
+  ASSERT_EQ("before1", value);
+}
+
+// With TransactionDBOptions::rollback_merge_operands set to false, recovery
+// does not roll back merge operands. An unprepared batch that holds only a
+// merge operand then has nothing to roll back. The test fixture sets the
+// "stringappend" merge operator. The test covers two positions of the
+// merge-only batch:
+// - In the middle: recovery writes no rollback batch for it. Writing it would
+//   break sequence number accounting: WriteImpl would allocate one sequence
+//   number that the memtable inserter does not count, and a debug assert in
+//   the write path catches that.
+// - Oldest: its rollback batch is the last one, so recovery writes it with
+//   only the rollback marker.
+// In both cases the other unprepared batches must be rolled back, the merge
+// operand must stay, the rollback marker must be written, and a write after
+// recovery must survive a reopen.
+TEST_P(WriteUnpreparedTransactionTest, RecoveryRollbackWithMergeOnlyBatch) {
+  txn_db_options.rollback_merge_operands = false;
+
+  struct TxnWrite {
+    bool is_merge;
+    const char* key;
+    const char* value;
+  };
+  struct TestCase {
+    const char* name;
+    // Each write except the last becomes one unprepared batch. The last write
+    // stays in the write batch of the transaction.
+    std::vector<TxnWrite> writes;
+    int expected_rollback_batches;
+  };
+  const std::vector<TestCase> test_cases = {
+      // Rollback batches for "k2" and "k0"; none for the merge-only batch.
+      {"merge-only batch in the middle",
+       {{false, "k0", "value0"},
+        {true, "k1", "operand1"},
+        {false, "k2", "value2"},
+        {false, "k3", "value3"}},
+       2},
+      // Rollback batches for "k2", "k0", and one with only the rollback
+      // marker for the merge-only batch.
+      {"merge-only batch oldest",
+       {{true, "k1", "operand1"},
+        {false, "k0", "value0"},
+        {false, "k2", "value2"},
+        {false, "k3", "value3"}},
+       3},
+  };
+
+  for (const TestCase& tc : test_cases) {
+    SCOPED_TRACE(tc.name);
+    ASSERT_OK(ReOpen());
+    ASSERT_OK(db->Put(WriteOptions(), "k0", "before0"));
+    ASSERT_OK(db->Put(WriteOptions(), "k2", "before2"));
+
+    Transaction* txn = nullptr;
+    ASSERT_NO_FATAL_FAILURE(BeginTxnWithOneWritePerBatch(&txn));
+    for (const TxnWrite& w : tc.writes) {
+      if (w.is_merge) {
+        ASSERT_OK(txn->Merge(w.key, w.value));
+      } else {
+        ASSERT_OK(txn->Put(w.key, w.value));
+      }
+    }
+    ASSERT_EQ(tc.writes.size() - 1, NumUnpreparedBatches(txn));
+    DeleteWithoutRollback(txn);
+    ASSERT_NO_FATAL_FAILURE(SimulateCrash());
+
+    int rollback_batches_written = 0;
+    ASSERT_OK(ReOpenAndCountRollbackBatches(&rollback_batches_written));
+    ASSERT_EQ(tc.expected_rollback_batches, rollback_batches_written);
+
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), "k0", &value));
+    ASSERT_EQ("before0", value);
+    ASSERT_OK(db->Get(ReadOptions(), "k2", &value));
+    ASSERT_EQ("before2", value);
+    ASSERT_EQ(Status::Code::kNotFound,
+              db->Get(ReadOptions(), "k3", &value).code());
+    // With rollback_merge_operands set to false, the merge operand stays.
+    // "k1" had no value before the transaction, so it now holds only the
+    // operand.
+    ASSERT_OK(db->Get(ReadOptions(), "k1", &value));
+    ASSERT_EQ("operand1", value);
+
+    // The completed rollback wrote the rollback marker, so the next DB open
+    // does not find the transaction and writes no rollback batch. A write
+    // after recovery survives that reopen, and the rollback holds.
+    ASSERT_OK(db->Put(WriteOptions(), "k4", "after4"));
+    ASSERT_OK(ReOpenAndCountRollbackBatches(&rollback_batches_written));
+    ASSERT_EQ(0, rollback_batches_written);
+    ASSERT_OK(db->Get(ReadOptions(), "k0", &value));
+    ASSERT_EQ("before0", value);
+    ASSERT_OK(db->Get(ReadOptions(), "k2", &value));
+    ASSERT_EQ("before2", value);
+    ASSERT_OK(db->Get(ReadOptions(), "k1", &value));
+    ASSERT_EQ("operand1", value);
+    ASSERT_OK(db->Get(ReadOptions(), "k4", &value));
+    ASSERT_EQ("after4", value);
   }
 }
 

@@ -1,0 +1,1 @@
+Fixed a bug in `TransactionDB` with the `WRITE_UNPREPARED` write policy: if DB open was interrupted by a crash or an error (such as a failed read) while rolling back a transaction that was never prepared, the next DB open could have exposed some of that transaction's writes as committed.

@@ -165,6 +165,14 @@ class StressTest {
       SharedState* shared,
       const std::vector<ColumnFamilyDescriptor>& cf_descriptors);
 
+  // Opens the pessimistic TransactionDB into txn_db_, db_, db_owner_ and
+  // db_aptr_. On failure, TransactionDB::Open() has already deleted the column
+  // family handles, so this function clears column_families_ without deleting
+  // them and resets txn_db_.
+  Status OpenTransactionDB(
+      SharedState* shared,
+      const std::vector<ColumnFamilyDescriptor>& cf_descriptors);
+
  protected:
   static int GetMinInjectedErrorCount(int error_count_1, int error_count_2) {
     if (error_count_1 > 0 && error_count_2 > 0) {

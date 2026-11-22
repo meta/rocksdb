@@ -25,6 +25,7 @@
 
 #include "db/wide/wide_columns_helper.h"
 #include "db_stress_tool/db_stress_common.h"
+#include "monitoring/thread_status_util.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "utilities/fault_injection_fs.h"
 
@@ -111,6 +112,57 @@ bool IsRetryableAtomicReplaceError(const Status& status) {
               std::string::npos);
 }
 
+// The read-your-own-write check in TestMultiGet() and TestMultiGetEntity()
+// adds random writes to a transaction, reads, and then rolls the transaction
+// back. With the WRITE_UNPREPARED write policy and a nonzero
+// --txn_write_batch_flush_threshold, these writes and the rollback write to the
+// DB. An object of this class covers one such write or rollback:
+// - It sets the thread operation to OP_UNKNOWN. The caller runs under
+//   OP_MULTIGET or OP_MULTIGETENTITY, and the env wrapper then expects every IO
+//   on this thread to be a read of that kind.
+// - It turns off injected write faults on this thread. The check tests reads,
+//   and without the flush threshold these writes do no IO at all, so no fault
+//   coverage is lost.
+// The destructor restores the thread operation and turns write faults back on.
+// FaultInjectionTestFS has no getter for the earlier fault state, so the
+// destructor does not read it. Turning faults back on restores that state:
+// OperateDb() keeps every thread-local fault type turned on between operations,
+// and code that turns faults off for a while, such as the existing code that
+// turns read faults back on after this check, turns them back on the same way.
+// If a thread has no fault context of a type, turning it on does nothing.
+class ScopedReadYourOwnWriteTxnWrite {
+ public:
+  explicit ScopedReadYourOwnWriteTxnWrite(FaultInjectionTestFS* fault_fs)
+      : fault_fs_(fault_fs),
+        saved_thread_op_(ThreadStatusUtil::GetThreadOperation()) {
+    ThreadStatusUtil::SetThreadOperation(
+        ThreadStatus::OperationType::OP_UNKNOWN);
+    if (fault_fs_) {
+      fault_fs_->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+      fault_fs_->DisableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataWrite);
+    }
+  }
+  ~ScopedReadYourOwnWriteTxnWrite() {
+    if (fault_fs_) {
+      fault_fs_->EnableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+      fault_fs_->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataWrite);
+    }
+    ThreadStatusUtil::SetThreadOperation(saved_thread_op_);
+  }
+  ScopedReadYourOwnWriteTxnWrite(const ScopedReadYourOwnWriteTxnWrite&) =
+      delete;
+  ScopedReadYourOwnWriteTxnWrite& operator=(
+      const ScopedReadYourOwnWriteTxnWrite&) = delete;
+  ScopedReadYourOwnWriteTxnWrite(ScopedReadYourOwnWriteTxnWrite&&) = delete;
+  ScopedReadYourOwnWriteTxnWrite& operator=(ScopedReadYourOwnWriteTxnWrite&&) =
+      delete;
+
+ private:
+  FaultInjectionTestFS* const fault_fs_;
+  const ThreadStatus::OperationType saved_thread_op_;
+};
 }  // namespace
 
 class NonBatchedOpsStressTest : public StressTest {
@@ -1251,7 +1303,11 @@ class NonBatchedOpsStressTest : public StressTest {
       db_->ReleaseSnapshot(readoptionscopy.snapshot);
     }
     if (use_txn) {
-      txn->Rollback().PermitUncheckedError();
+      {
+        ScopedReadYourOwnWriteTxnWrite scoped_write(
+            db_fault_injection_fs_.get());
+        txn->Rollback().PermitUncheckedError();
+      }
       // Enable back error injection disbled for transactions
       if (db_fault_injection_fs_) {
         db_fault_injection_fs_->EnableThreadLocalErrorInjection(
@@ -1787,7 +1843,11 @@ class NonBatchedOpsStressTest : public StressTest {
                       return txn->GetEntity(read_opts_copy, cfh, key, result);
                     });
 
-      txn->Rollback().PermitUncheckedError();
+      {
+        ScopedReadYourOwnWriteTxnWrite scoped_write(
+            db_fault_injection_fs_.get());
+        txn->Rollback().PermitUncheckedError();
+      }
       // Enable back error injection disbled for transactions
       if (db_fault_injection_fs_) {
         db_fault_injection_fs_->EnableThreadLocalErrorInjection(
@@ -3835,8 +3895,15 @@ class NonBatchedOpsStressTest : public StressTest {
         thread->shared->Get(column_family, key);
     bool may_exist = !ExpectedValueHelper::MustHaveNotExisted(expected_value,
                                                               expected_value);
-    if (!shared->AllowsOverwrite(key) && may_exist) {
-      // Just do read your write checks for keys that allow overwrites.
+    if (!shared->AllowsOverwrite(key) &&
+        (may_exist || FLAGS_txn_write_batch_flush_threshold > 0)) {
+      // Just do read your write checks for keys that allow overwrites. With a
+      // nonzero --txn_write_batch_flush_threshold, the writes of this check
+      // reach the DB (see ScopedReadYourOwnWriteTxnWrite), so skip every key
+      // that does not allow overwrites. The check could otherwise write a
+      // Delete for a key that must only be deleted with SingleDelete. It also
+      // avoids a race: "may_exist" is read before the transaction locks the
+      // key, so a concurrent first Put could make this write a second Put.
       return;
     }
 
@@ -3867,6 +3934,9 @@ class NonBatchedOpsStressTest : public StressTest {
 
       ExpectedValue new_expected_value;
 
+      // The write can write the batch of the transaction to the DB. See
+      // ScopedReadYourOwnWriteTxnWrite.
+      ScopedReadYourOwnWriteTxnWrite scoped_write(db_fault_injection_fs_.get());
       switch (op) {
         case Op::PutOrPutEntity:
         case Op::Merge: {
@@ -3881,7 +3951,18 @@ class NonBatchedOpsStressTest : public StressTest {
           const size_t sz = GenerateValue(value_base, value, sizeof(value));
           const Slice v(value, sz);
 
-          if (op == Op::PutOrPutEntity || !FLAGS_use_merge) {
+          // With a nonzero --txn_write_batch_flush_threshold, a Merge of this
+          // check can reach the DB before the transaction is rolled back. With
+          // --txn_rollback_merge_operands=false, the rollback does not undo
+          // merge operands that are in the DB, which is the documented behavior
+          // of TransactionDBOptions::rollback_merge_operands. The merge operand
+          // would then stay visible and break the expected values, so this case
+          // writes a Put instead.
+          const bool merge_may_stay_after_rollback =
+              FLAGS_txn_write_batch_flush_threshold > 0 &&
+              !FLAGS_txn_rollback_merge_operands;
+          if (op == Op::PutOrPutEntity || !FLAGS_use_merge ||
+              merge_may_stay_after_rollback) {
             if (FLAGS_use_put_entity_one_in > 0 &&
                 (value_base % FLAGS_use_put_entity_one_in) == 0) {
               s = txn->PutEntity(cfh, k, GenerateWideColumns(value_base, v));

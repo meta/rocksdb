@@ -5,8 +5,11 @@
 
 #include "utilities/transactions/write_unprepared_txn_db.h"
 
+#include <iterator>
+
 #include "db/arena_wrapped_db_iter.h"
 #include "rocksdb/utilities/transaction_db.h"
+#include "test_util/sync_point.h"
 #include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -55,8 +58,30 @@ Status WriteUnpreparedTxnDB::RollbackRecoveredTransaction(
     void Refresh(SequenceNumber) override {}
   };
 
-  // Iterate starting with largest sequence number.
+  // Each unprepared batch gets its own rollback batch. The loop starts with the
+  // unprepared batch that has the largest sequence number.
+  //
+  // Only the last rollback batch carries the rollback marker. This is the one
+  // for the unprepared batch with the smallest sequence number. When WAL replay
+  // sees a rollback marker, it drops the whole recovered transaction (see
+  // MemTableInserter::MarkRollback()). DB open can stop partway, because of a
+  // crash or an error. One such error is a failed read of the value that a key
+  // had before the transaction (its old value). The rollback batches already
+  // written then end with a Noop marker (kTypeNoop), not a rollback marker. The
+  // next DB open still finds the transaction and rolls it back again from the
+  // start.
+  //
+  // Running the rollback again gives the same result. Each old-value read sees
+  // only data with a sequence number below the first sequence number of its
+  // unprepared batch. All rollback batches have larger sequence numbers, so the
+  // read does not see them. This relies on the old versions of the keys staying
+  // in the DB until the rollback completes. TransactionDB::Open() sets
+  // allow_2pc, so DB open always flushes the recovered memtables. That flush
+  // runs before Initialize() installs the snapshot checker, so it uses
+  // DisableGCSnapshotChecker and keeps every version. Auto compaction stays
+  // disabled until Initialize() succeeds.
   for (auto it = rtxn->batches_.rbegin(); it != rtxn->batches_.rend(); ++it) {
+    const bool is_last_rollback_batch = std::next(it) == rtxn->batches_.rend();
     auto last_visible_txn = it->first - 1;
     const auto& batch = it->second.batch_;
     WriteBatch rollback_batch(0 /* reserved_bytes */, 0 /* max_bytes */,
@@ -168,8 +193,25 @@ Status WriteUnpreparedTxnDB::RollbackRecoveredTransaction(
       return s;
     }
 
-    // The Rollback marker will be used as a batch separator
-    s = WriteBatchInternal::MarkRollback(&rollback_batch, rtxn->name_);
+    if (is_last_rollback_batch) {
+      // The rollback marker also ends the batch, so the memtable inserter
+      // counts one sequence number for it.
+      s = WriteBatchInternal::MarkRollback(&rollback_batch, rtxn->name_);
+    } else if (WriteBatchInternal::Count(&rollback_batch) == 0) {
+      // This rollback batch has no keys. This happens, for example, when the
+      // unprepared batch has only merge operands and
+      // TransactionDBOptions::rollback_merge_operands is false. Do not write
+      // it. WriteImpl allocates one sequence number for this batch, but the
+      // memtable inserter does not count one for a batch that holds only a
+      // Noop marker, so the two would disagree (the write path asserts that
+      // they match). WritePreparedTxnDB skips empty batches for the same
+      // reason.
+      continue;
+    } else {
+      // This batch has no other marker, so a Noop marker ends it. The
+      // memtable inserter then counts one sequence number for it.
+      s = WriteBatchInternal::InsertNoop(&rollback_batch);
+    }
     if (!s.ok()) {
       return s;
     }
@@ -190,6 +232,9 @@ Status WriteUnpreparedTxnDB::RollbackRecoveredTransaction(
     if (db_impl_->immutable_db_options().two_write_queues) {
       db_impl_->SetLastPublishedSequence(seq_used);
     }
+    TEST_SYNC_POINT(
+        "WriteUnpreparedTxnDB::RollbackRecoveredTransaction:"
+        "AfterWriteRollbackBatch");
   }
 
   return Status::OK();
