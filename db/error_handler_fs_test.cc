@@ -9,8 +9,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <tuple>
 #include <utility>
 
 #include "db/db_test_util.h"
@@ -4806,6 +4809,136 @@ TEST_F(DBErrorHandlingFSTest, AtomicFlushErrorRecoveryTwoCFs) {
 
 INSTANTIATE_TEST_CASE_P(DBErrorHandlingFSTest, DBErrorHandlingFencingTest,
                         ::testing::Bool());
+
+// Records the status passed to OnBackgroundError() and optionally suppresses
+// it by resetting it to OK, as documented in EventListener. `on_suppress` runs
+// right before a suppression, e.g. to clear the fault so that the failed
+// background job can succeed when it is retried.
+class BGErrorRecordingListener : public EventListener {
+ public:
+  BGErrorRecordingListener(bool suppress, std::function<void()> on_suppress)
+      : suppress_(suppress), on_suppress_(std::move(on_suppress)) {}
+  ~BGErrorRecordingListener() override { seen_.PermitUncheckedError(); }
+
+  void OnBackgroundError(BackgroundErrorReason /*reason*/,
+                         Status* bg_error) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++count_;
+    seen_ = *bg_error;
+    if (suppress_) {
+      on_suppress_();
+      *bg_error = Status::OK();
+    }
+  }
+
+  int count() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return count_;
+  }
+
+  Status seen() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return seen_;
+  }
+
+ private:
+  const bool suppress_;
+  const std::function<void()> on_suppress_;
+  std::mutex mutex_;
+  int count_ = 0;
+  Status seen_;
+};
+
+class DBErrorHandlingListenerTest
+    : public DBErrorHandlingFSTest,
+      public testing::WithParamInterface<std::tuple<bool, bool>> {};
+
+// Regression test for https://github.com/facebook/rocksdb/issues/7503.
+// For retryable and (non file scope) data loss IO errors, the listener must
+// receive the non-OK background error with the severity the error handler
+// assigned, and resetting it to OK must keep the error from being set.
+TEST_P(DBErrorHandlingListenerTest, OnBackgroundErrorStatus) {
+  const bool data_loss = std::get<0>(GetParam());
+  const bool suppress = std::get<1>(GetParam());
+  auto listener = std::make_shared<BGErrorRecordingListener>(
+      suppress, [this]() { fault_fs_->SetFilesystemActive(true); });
+  Options options = GetDefaultOptions();
+  options.env = fault_env_.get();
+  options.create_if_missing = true;
+  options.listeners.emplace_back(listener);
+  // With suppression, auto resume is enabled to also check that a suppressed
+  // retryable error does not start recovery. Without suppression, it is
+  // disabled so that the background error can be inspected deterministically.
+  options.max_bgerror_resume_count = suppress ? 2 : 0;
+  options.bgerror_resume_retry_interval = 60 * 1000 * 1000;  // 60 seconds
+  DestroyAndReopen(options);
+
+  IOStatus error_msg = IOStatus::IOError("Injected IO error");
+  if (data_loss) {
+    error_msg.SetDataLoss(true);
+  } else {
+    error_msg.SetRetryable(true);
+  }
+  const Status::Severity expected_severity =
+      data_loss ? Status::Severity::kUnrecoverableError
+                : Status::Severity::kSoftError;
+
+  ASSERT_OK(Put(Key(1), "val1"));
+  std::atomic<bool> injected{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BuildTable:BeforeFinishBuildTable", [&](void*) {
+        if (!injected.exchange(true)) {
+          fault_fs_->SetFilesystemActive(false, error_msg);
+        }
+      });
+  // A waiting Flush() does not return when the error of its failed flush is
+  // suppressed, because a failed flush is only retried when another flush is
+  // scheduled. So wait for the failed background flush to finish instead.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BGWorkFlush:done",
+        "DBErrorHandlingListenerTest::OnBackgroundErrorStatus:FlushDone"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  FlushOptions flush_opts;
+  flush_opts.wait = false;
+  ASSERT_OK(dbfull()->Flush(flush_opts));
+  TEST_SYNC_POINT(
+      "DBErrorHandlingListenerTest::OnBackgroundErrorStatus:FlushDone");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  fault_fs_->SetFilesystemActive(true);
+
+  ASSERT_EQ(1, listener->count());
+  Status seen = listener->seen();
+  ASSERT_TRUE(seen.IsIOError()) << seen.ToString();
+  EXPECT_EQ(expected_severity, seen.severity());
+
+  Status bg_error = dbfull()->TEST_GetBGError();
+  if (suppress) {
+    ASSERT_OK(bg_error);
+    ASSERT_FALSE(dbfull()->TEST_IsRecoveryInProgress());
+    // The DB was not stopped, and a new flush also flushes the memtable of
+    // the failed flush. The failed flush still occupies a memtable slot, so
+    // allow a write stall instead of waiting for a retry that never comes.
+    ASSERT_OK(Put(Key(2), "val2"));
+    flush_opts.wait = true;
+    flush_opts.allow_write_stall = true;
+    ASSERT_OK(dbfull()->Flush(flush_opts));
+    ASSERT_EQ("val1", Get(Key(1)));
+    ASSERT_EQ("val2", Get(Key(2)));
+  } else {
+    ASSERT_TRUE(bg_error.IsIOError()) << bg_error.ToString();
+    ASSERT_EQ(expected_severity, bg_error.severity());
+    if (!data_loss) {
+      ASSERT_OK(dbfull()->Resume());
+      ASSERT_EQ("val1", Get(Key(1)));
+    }
+  }
+  Close();
+}
+
+INSTANTIATE_TEST_CASE_P(DBErrorHandlingFSTest, DBErrorHandlingListenerTest,
+                        ::testing::Combine(::testing::Bool(),
+                                           ::testing::Bool()));
 
 }  // namespace ROCKSDB_NAMESPACE
 
