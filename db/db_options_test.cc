@@ -2272,6 +2272,27 @@ TEST_F(DBOptionsTest, TrackedColumnFamilyChangeCommitsCurrentSnapshot) {
   }
 }
 
+TEST_F(DBOptionsTest, ReadIoExecutorThreadsNotSavedInOptionsFile) {
+  // A positive value also checks that the OPTIONS file written at open still
+  // verifies against the options that opened the DB.
+  Options options = CurrentOptions();
+  options.read_io_executor_threads = 1;
+  Reopen(options);
+
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + "/" + LatestOptionsFileName(),
+                             &contents));
+  ASSERT_EQ(contents.find("read_io_executor_threads"), std::string::npos);
+
+  ConfigOptions config_options;
+  config_options.env = env_;
+  DBOptions loaded;
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded, &cf_descs));
+  ASSERT_EQ(loaded.read_io_executor_threads,
+            DBOptions().read_io_executor_threads);
+}
+
 // Confirms the default value and serialization/parse round-trip of the new
 // option. No DB open required; exercises only the options-metadata layer.
 TEST_F(DBOptionsTest, UseDirectIoForCompactionReadsRoundTrip) {

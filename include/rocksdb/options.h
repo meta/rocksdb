@@ -822,7 +822,9 @@ struct DBOptions {
   // leaves the executor unchanged: until a DB or SstFileReader in the process
   // opens with a positive value, the default FileSystem has no executor,
   // starts no read threads or event loops, and the asynchronous read APIs fall
-  // back to synchronous reads. Negative values are rejected.
+  // back to synchronous reads. Negative values are rejected. Not written to
+  // the OPTIONS file; loading an OPTIONS file sets it only when the file
+  // carries it, as files written by older releases do.
   //
   // Default: 0
   int read_io_executor_threads = 0;

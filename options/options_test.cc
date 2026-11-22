@@ -1587,6 +1587,27 @@ TEST_F(OptionsTest, BestEffortsBlobDbRepairNotSerialized) {
       RocksDBOptionsParser::VerifyDBOptions(config_options, options, restored));
 }
 
+TEST_F(OptionsTest, ReadIoExecutorThreadsNotSerialized) {
+  ConfigOptions config_options;
+  config_options.input_strings_escaped = false;
+  DBOptions options;
+  // OPTIONS files written by earlier releases carry the option.
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                   "read_io_executor_threads=4", &options));
+  ASSERT_EQ(options.read_io_executor_threads, 4);
+  std::string serialized;
+  ASSERT_OK(GetStringFromDBOptions(config_options, options, &serialized));
+  ASSERT_EQ(serialized.find("read_io_executor_threads"), std::string::npos);
+  DBOptions restored;
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(), serialized,
+                                   &restored));
+  ASSERT_EQ(restored.read_io_executor_threads,
+            DBOptions().read_io_executor_threads);
+  config_options.sanity_level = ConfigOptions::kSanityLevelExactMatch;
+  ASSERT_OK(
+      RocksDBOptionsParser::VerifyDBOptions(config_options, options, restored));
+}
+
 TEST_F(OptionsTest, OptionsComposeDecompose) {
   // build an Options from DBOptions + CFOptions, then decompose it to verify
   // we get same constituent options.
