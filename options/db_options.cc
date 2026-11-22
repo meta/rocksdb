@@ -323,10 +323,14 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, max_file_opening_threads),
           OptionType::kInt, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        // Sizes a process-wide executor rather than describing the DB, so it
+        // is not saved in the OPTIONS file. Releases from before its default
+        // became 0 reject 0, so a saved 0 would stop them from opening the DB
+        // read-write with options loaded from that file.
         {"read_io_executor_threads",
          {offsetof(struct ImmutableDBOptions, read_io_executor_threads),
           OptionType::kInt, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone}},
+          OptionTypeFlags::kDontSerialize | OptionTypeFlags::kCompareNever}},
         {"table_cache_numshardbits",
          {offsetof(struct ImmutableDBOptions, table_cache_numshardbits),
           OptionType::kInt, OptionVerificationType::kNormal,
