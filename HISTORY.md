@@ -1,6 +1,10 @@
 # Rocksdb Change Log
 > NOTE: Entries for next release do not go here. Follow instructions in `unreleased_history/README.txt`
 
+## 11.15.1 (11/22/2026)
+### Bug Fixes
+* Fixed a compatibility regression in 11.15.0: OPTIONS files saved `read_io_executor_threads=0`, which releases 11.9 through 11.14 reject in a read-write `DB::Open()`, so those releases failed to open such a DB read-write with options loaded from the file (for example with `LoadLatestOptions()`). OPTIONS files written from now on omit `read_io_executor_threads`. Files written by earlier releases still carry their saved value until a release with this fix opens the DB read-write or calls `SetOptions()`.
+
 ## 11.15.0 (11/19/2026)
 ### New Features
 * Added `DBOptions::best_efforts_blob_db_repair`, which opens an integrated BlobDB whose blob files are missing. Unlike `best_efforts_recovery`, it keeps the SST files that reference them, records the missing blob files in the MANIFEST, and makes reads and later compactions treat the lost values as deleted instead of failing. The option is not saved in the OPTIONS file, so it applies only to the open that sets it.
