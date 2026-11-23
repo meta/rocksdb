@@ -5181,6 +5181,20 @@ class Benchmark {
         ErrorExit();
       }
 
+      if (FLAGS_multiread_for_update &&
+          (method == &Benchmark::MultiReadRandom ||
+           method == &Benchmark::MultiReadWhileWriting) &&
+          ((!FLAGS_transaction_db && !FLAGS_optimistic_transaction_db) ||
+           !FLAGS_multiread_batched || multiread_entity_ ||
+           multiread_entity_lazy_ || FLAGS_read_with_metadata ||
+           user_timestamp_size_ > 0)) {
+        fprintf(stderr,
+                "multiread_for_update requires transaction_db or "
+                "optimistic_transaction_db, and multiread_batched, without "
+                "entities, metadata, or timestamps\n");
+        ErrorExit();
+      }
+
       if (fresh_db) {
         DbStateMutationGuard mutation(this);
         if (FLAGS_use_existing_db) {
@@ -8412,17 +8426,8 @@ class Benchmark {
   // Calls MultiGet over a list of keys from a random distribution.
   // Returns the total number of keys found.
   void MultiReadRandom(ThreadState* thread) {
-    if (FLAGS_multiread_for_update &&
-        ((!FLAGS_transaction_db && !FLAGS_optimistic_transaction_db) ||
-         !FLAGS_multiread_batched || multiread_entity_ ||
-         multiread_entity_lazy_ || FLAGS_read_with_metadata ||
-         user_timestamp_size_ > 0)) {
-      fprintf(stderr,
-              "multiread_for_update requires transaction_db or "
-              "optimistic_transaction_db, and "
-              "multiread_batched, without entities, metadata, or timestamps\n");
-      db_bench_exit(1);
-    }
+    // multiread_for_update flag combinations are validated in Run().
+    assert(!FLAGS_multiread_for_update || FLAGS_multiread_batched);
     if (multiread_entity_ && user_timestamp_size_ > 0) {
       fprintf(stderr, "multireadentity does not support user timestamps\n");
       db_bench_exit(1);
@@ -8652,7 +8657,8 @@ class Benchmark {
           if (!s.ok()) {
             fprintf(stderr, "Transaction rollback failed: %s\n",
                     s.ToString().c_str());
-            db_bench_exit(1);
+            thread->shared->SetFatal(s, "MultiReadRandom rollback failed");
+            break;
           }
         } else if (FLAGS_read_with_metadata) {
           MultiGetOutputMetadata output_metadata;

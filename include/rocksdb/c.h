@@ -4489,6 +4489,16 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transaction_multi_get_for_update_cf(
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs);
 
+// Locks and reads num_keys keys from one column family, like
+// Transaction::MultiGetForUpdate() with PinnableSlice values. column_family
+// must not be NULL. values and errs are caller-provided arrays of num_keys
+// elements. For each key:
+//   - found: values[i] is set and errs[i] is NULL;
+//   - not found: values[i] and errs[i] are both NULL;
+//   - error: values[i] is NULL and errs[i] holds the error message.
+// Free each non-NULL values[i] with rocksdb_pinnableslice_destroy() and each
+// non-NULL errs[i] with rocksdb_free(). sorted_input means the keys are
+// already sorted by the column family's comparator.
 extern ROCKSDB_LIBRARY_API void
 rocksdb_transaction_batched_multi_get_for_update_cf(
     rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
@@ -4496,6 +4506,8 @@ rocksdb_transaction_batched_multi_get_for_update_cf(
     const char* const* keys_list, const size_t* keys_list_sizes,
     rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input);
 
+// Same as rocksdb_transaction_batched_multi_get_for_update_cf(), but takes
+// keys as an array of rocksdb_slice_t.
 extern ROCKSDB_LIBRARY_API void
 rocksdb_transaction_batched_multi_get_for_update_cf_slice(
     rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,

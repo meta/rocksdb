@@ -13334,8 +13334,9 @@ void rocksdb_transaction_multi_get_for_update(
   for (size_t i = 0; i < num_keys; i++) {
     keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  // Note: GetForUpdate only has vector-based API, no array-based PinnableSlice
-  // variant
+  // This wrapper uses the vector-based MultiGetForUpdate, which copies values
+  // into std::string. rocksdb_transaction_batched_multi_get_for_update_cf()
+  // uses the batched PinnableSlice overload for one column family.
   std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<Status> statuses =
@@ -13405,8 +13406,9 @@ void rocksdb_transaction_multi_get_for_update_cf(
     keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
     cfs[i] = column_families[i]->rep;
   }
-  // Note: GetForUpdate only has vector-based API, no array-based PinnableSlice
-  // variant
+  // MultiGetForUpdate has no multi-column-family batched PinnableSlice
+  // variant, so this uses the vector-based API, which copies values into
+  // std::string.
   std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<Status> statuses =

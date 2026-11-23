@@ -242,16 +242,6 @@ void WriteCommittedTxn::MultiGetForUpdate(const ReadOptions& read_options,
                                           size_t num_keys, const Slice* keys,
                                           PinnableSlice* values,
                                           Status* statuses, bool sorted_input) {
-  if (num_keys == 0) {
-    return;
-  }
-  if (read_options.io_activity != Env::IOActivity::kUnknown &&
-      read_options.io_activity != Env::IOActivity::kMultiGet) {
-    TransactionBaseImpl::MultiGetForUpdate(read_options, column_family,
-                                           num_keys, keys, values, statuses,
-                                           sorted_input);
-    return;
-  }
   column_family =
       column_family ? column_family : db_impl_->DefaultColumnFamily();
   if (!read_options.timestamp &&
@@ -271,19 +261,17 @@ void WriteCommittedTxn::MultiGetForUpdate(const ReadOptions& read_options,
     return;
   }
 
-  if (!read_options.timestamp) {
-    ReadOptions read_opts_copy = read_options;
-    char ts_buf[sizeof(kMaxTxnTimestamp)];
+  ReadOptions read_opts_copy = read_options;
+  char ts_buf[sizeof(kMaxTxnTimestamp)];
+  Slice ts;
+  if (!read_opts_copy.timestamp) {
     EncodeFixed64(ts_buf, read_timestamp_);
-    Slice ts(ts_buf, sizeof(ts_buf));
+    ts = Slice(ts_buf, sizeof(ts_buf));
     read_opts_copy.timestamp = &ts;
-    TransactionBaseImpl::MultiGetForUpdate(read_opts_copy, column_family,
-                                           num_keys, keys, values, statuses,
-                                           sorted_input);
-    return;
   }
-  TransactionBaseImpl::MultiGetForUpdate(read_options, column_family, num_keys,
-                                         keys, values, statuses, sorted_input);
+  TransactionBaseImpl::MultiGetForUpdate(read_opts_copy, column_family,
+                                         num_keys, keys, values, statuses,
+                                         sorted_input);
 }
 
 Status WriteCommittedTxn::GetEntityForUpdate(const ReadOptions& read_options,
