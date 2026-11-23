@@ -8,6 +8,16 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "util/crc32c.h"
 
+#include <algorithm>
+#include <cstdint>
+
+#ifndef OS_WIN
+#include <sys/mman.h>
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+#endif
+
 #include "test_util/testharness.h"
 #include "util/coding.h"
 #include "util/random.h"
@@ -168,6 +178,36 @@ TEST(CRC, Crc32cCombineBigSizeTest) {
   uint32_t crc1_2_combine = Crc32cCombine(crc1, crc2, size_2);
   ASSERT_EQ(crc1_2, crc1_2_combine);
 }
+
+#if !defined(OS_WIN) && SIZE_MAX > UINT32_MAX
+TEST(CRC, LargeBuffer) {
+  // Checksums over 2 GiB or more in one call must cover every byte.
+  // An untouched read-only anonymous mapping reads as zeros without
+  // committing memory.
+#ifdef ROCKSDB_VALGRIND_RUN
+  ROCKSDB_GTEST_SKIP("Too slow under valgrind");
+  return;
+#endif
+  const size_t kMapSize = (size_t{1} << 32) + 4096;
+  void* map = mmap(nullptr, kMapSize, PROT_READ,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (map == MAP_FAILED) {
+    ROCKSDB_GTEST_SKIP("Unable to reserve address space");
+    return;
+  }
+  const char* data = static_cast<const char*>(map);
+  for (size_t len : {(size_t{1} << 31) + 8, (size_t{1} << 32) + 8}) {
+    // Reference: the same bytes in 1 GiB pieces
+    const size_t kPiece = size_t{1} << 30;
+    uint32_t expected = 0;
+    for (size_t off = 0; off < len; off += kPiece) {
+      expected = Extend(expected, data + off, std::min(kPiece, len - off));
+    }
+    ASSERT_EQ(expected, Value(data, len)) << "len=" << len;
+  }
+  ASSERT_EQ(0, munmap(map, kMapSize));
+}
+#endif  // !OS_WIN && SIZE_MAX > UINT32_MAX
 
 }  // namespace ROCKSDB_NAMESPACE::crc32c
 

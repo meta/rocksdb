@@ -116,7 +116,7 @@ __attribute__((__no_sanitize_undefined__))
 uint32_t crc32c_arm64(uint32_t crc, unsigned char const* data, size_t len) {
   const uint8_t* buf8;
   const uint64_t* buf64 = (uint64_t*)data;
-  int length = (int)len;
+  size_t length = len;
   crc ^= 0xffffffff;
 
   /*
