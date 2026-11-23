@@ -443,6 +443,9 @@ class TestFs : public FileSystemWrapper {
     return FileSystemWrapper::CreateDirIfMissing(d, options, dbg);
   }
 
+  using DirectorySyncCallback = std::function<IOStatus(const std::string&)>;
+  DirectorySyncCallback before_directory_sync;
+
   void SetNewDirectoryFailure(bool fail) { new_directory_failure_ = fail; }
   IOStatus NewDirectory(const std::string& name, const IOOptions& io_opts,
                         std::unique_ptr<FSDirectory>* result,
@@ -450,7 +453,13 @@ class TestFs : public FileSystemWrapper {
     if (new_directory_failure_) {
       return IOStatus::IOError("SimulatedFailure");
     }
-    return FileSystemWrapper::NewDirectory(name, io_opts, result, dbg);
+    IOStatus status =
+        FileSystemWrapper::NewDirectory(name, io_opts, result, dbg);
+    if (status.ok() && *result != nullptr && before_directory_sync) {
+      *result = std::make_unique<TestDirectory>(std::move(*result), name,
+                                                &before_directory_sync);
+    }
+    return status;
   }
 
   void ClearFileOpenCounters() {
@@ -469,6 +478,30 @@ class TestFs : public FileSystemWrapper {
   int num_writers() { return num_writers_; }
 
  private:
+  class TestDirectory : public FSDirectoryWrapper {
+   public:
+    TestDirectory(std::unique_ptr<FSDirectory> directory, std::string name,
+                  const DirectorySyncCallback* callback)
+        : FSDirectoryWrapper(std::move(directory)),
+          name_(std::move(name)),
+          callback_(callback) {}
+
+    IOStatus FsyncWithDirOptions(const IOOptions& options, IODebugContext* dbg,
+                                 const DirFsyncOptions& dir_options) override {
+      if (*callback_) {
+        IOStatus status = (*callback_)(name_);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+      return FSDirectoryWrapper::FsyncWithDirOptions(options, dbg, dir_options);
+    }
+
+   private:
+    std::string name_;
+    const DirectorySyncCallback* callback_;
+  };
+
   port::Mutex mutex_;
   bool dummy_sequential_file_ = false;
   bool dummy_sequential_file_fail_reads_ = false;
@@ -1226,6 +1259,98 @@ TEST_P(BackupEngineTestWithParam, SharedFileRenameFailureDoesNotPublishBackup) {
   std::vector<BackupInfo> backups;
   backup_engine_->GetBackupInfo(&backups);
   ASSERT_TRUE(backups.empty());
+}
+
+class BackupDurabilityTest
+    : public BackupEngineTest,
+      public testing::WithParamInterface<BackupEngineTest::ShareOption> {};
+
+INSTANTIATE_TEST_CASE_P(SharingModes, BackupDurabilityTest,
+                        testing::Values(BackupEngineTest::kNoShare,
+                                        BackupEngineTest::kShareNoChecksum,
+                                        BackupEngineTest::kShareWithChecksum));
+
+// A power loss after metadata publication can expose missing backup files if
+// their directory entries were not synced first. Watch the metadata rename
+// itself because failure cleanup can remove a record that was already
+// published.
+TEST_P(BackupDurabilityTest, SyncDataDirectoriesBeforePublishingMetadata) {
+  engine_options_->sync = true;
+  const std::string private_parent = backupdir_ + "/private";
+  const std::string private_dir = private_parent + "/1";
+  const std::string shared_dir =
+      backupdir_ +
+      (GetParam() == kShareWithChecksum ? "/shared_checksum" : "/shared");
+  const std::string meta_dir = backupdir_ + "/meta";
+  const std::string& sst_dir =
+      GetParam() == kNoShare ? private_dir : shared_dir;
+  std::vector<std::string> data_dirs{private_dir, private_parent, backupdir_};
+  if (GetParam() != kNoShare) {
+    data_dirs.push_back(shared_dir);
+  }
+
+  std::vector<std::string> events;
+  std::string fail_sync_dir;
+  test_backup_fs_->before_directory_sync = [&](const std::string& name) {
+    const std::string dir =
+        EndsWith(name, "/") ? name.substr(0, name.size() - 1) : name;
+    if (dir == sst_dir) {
+      std::vector<std::string> files;
+      EXPECT_OK(backup_chroot_env_->GetChildren(name, &files));
+      EXPECT_TRUE(std::any_of(
+          files.begin(), files.end(),
+          [](const std::string& file) { return EndsWith(file, ".sst"); }));
+    }
+    events.push_back(dir);
+    if (dir == fail_sync_dir) {
+      return IOStatus::IOError("Injected directory fsync failure");
+    }
+    return IOStatus::OK();
+  };
+  OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
+                        GetParam());
+  FillDB(db_.get(), 0, 100, kFlushAll);
+  const std::string publish_event = "rename metadata";
+  test_backup_fs_->before_rename = [&](const std::string& src) {
+    if (StartsWith(src, meta_dir + "/")) {
+      events.push_back(publish_event);
+    }
+    return IOStatus::OK();
+  };
+
+  auto expect_unpublished = [&](const char* error) {
+    Status status = backup_engine_->CreateNewBackup(db_.get());
+    EXPECT_EQ(Status::kIOError, status.code());
+    EXPECT_NE(std::string::npos, status.ToString().find(error));
+    EXPECT_EQ(std::find(events.begin(), events.end(), publish_event),
+              events.end());
+    std::vector<BackupInfo> backups;
+    backup_engine_->GetBackupInfo(&backups);
+    EXPECT_TRUE(backups.empty());
+    events.clear();
+  };
+  for (const std::string& dir : data_dirs) {
+    SCOPED_TRACE(dir);
+    fail_sync_dir = dir;
+    expect_unpublished("Injected directory fsync failure");
+  }
+  fail_sync_dir.clear();
+  test_backup_fs_->SetNewDirectoryFailure(true);
+  expect_unpublished("SimulatedFailure");
+  test_backup_fs_->SetNewDirectoryFailure(false);
+
+  Status successful_backup = backup_engine_->CreateNewBackup(db_.get());
+  test_backup_fs_->before_rename = {};
+  test_backup_fs_->before_directory_sync = {};
+
+  ASSERT_OK(successful_backup);
+  const auto published = std::find(events.begin(), events.end(), publish_event);
+  ASSERT_NE(published, events.end());
+  for (const std::string& dir : data_dirs) {
+    EXPECT_NE(std::find(events.begin(), published, dir), published) << dir;
+    EXPECT_EQ(std::find(published + 1, events.end(), dir), events.end()) << dir;
+  }
+  EXPECT_NE(std::find(published + 1, events.end(), meta_dir), events.end());
 }
 
 TEST_F(BackupEngineTest, IncrementalRestore) {

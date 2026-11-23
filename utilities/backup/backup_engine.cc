@@ -1444,37 +1444,32 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
   }
   auto backup_time = backup_env_->NowMicros() - start_backup;
 
+  // StoreToFile() publishes metadata that references shared and private files.
+  // Their directory entries, including parent entries, must be durable first.
+  if (io_s.ok() && options_.sync) {
+    std::unique_ptr<FSDirectory> backup_private_directory;
+    io_s = backup_fs_->NewDirectory(private_dir, io_options_,
+                                    &backup_private_directory, nullptr);
+    for (FSDirectory* dir :
+         {shared_directory_.get(), backup_private_directory.get(),
+          private_directory_.get(), backup_directory_.get()}) {
+      if (!io_s.ok()) {
+        break;
+      }
+      if (dir != nullptr) {
+        io_s =
+            dir->FsyncWithDirOptions(io_options_, nullptr, DirFsyncOptions());
+      }
+    }
+  }
   if (io_s.ok()) {
     // persist the backup metadata on the disk
     io_s = new_backup->StoreToFile(options_.sync, options_.schema_version,
                                    schema_test_options_.get());
   }
-  if (io_s.ok() && options_.sync) {
-    std::unique_ptr<FSDirectory> backup_private_directory;
-    backup_fs_
-        ->NewDirectory(GetAbsolutePath(GetPrivateFileRel(new_backup_id, false)),
-                       io_options_, &backup_private_directory, nullptr)
-        .PermitUncheckedError();
-    if (backup_private_directory != nullptr) {
-      io_s = backup_private_directory->FsyncWithDirOptions(io_options_, nullptr,
-                                                           DirFsyncOptions());
-    }
-    if (io_s.ok() && private_directory_ != nullptr) {
-      io_s = private_directory_->FsyncWithDirOptions(io_options_, nullptr,
-                                                     DirFsyncOptions());
-    }
-    if (io_s.ok() && meta_directory_ != nullptr) {
-      io_s = meta_directory_->FsyncWithDirOptions(io_options_, nullptr,
-                                                  DirFsyncOptions());
-    }
-    if (io_s.ok() && shared_directory_ != nullptr) {
-      io_s = shared_directory_->FsyncWithDirOptions(io_options_, nullptr,
-                                                    DirFsyncOptions());
-    }
-    if (io_s.ok() && backup_directory_ != nullptr) {
-      io_s = backup_directory_->FsyncWithDirOptions(io_options_, nullptr,
-                                                    DirFsyncOptions());
-    }
+  if (io_s.ok() && options_.sync && meta_directory_ != nullptr) {
+    io_s = meta_directory_->FsyncWithDirOptions(io_options_, nullptr,
+                                                DirFsyncOptions());
   }
 
   if (io_s.ok()) {
