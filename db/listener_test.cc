@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -322,6 +323,77 @@ TEST_F(EventListenerTest, OnCompactionPreCommitOrdering) {
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// Records the level reported for each compaction input file, keyed by file
+// number.
+class CompactionInputLevelListener : public EventListener {
+ public:
+  void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
+    Record(ci, &begin_levels_);
+  }
+
+  void OnCompactionCompleted(DB* /*db*/, const CompactionJobInfo& ci) override {
+    Record(ci, &completed_levels_);
+  }
+
+  std::map<uint64_t, int> BeginLevels() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return begin_levels_;
+  }
+
+  std::map<uint64_t, int> CompletedLevels() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return completed_levels_;
+  }
+
+ private:
+  void Record(const CompactionJobInfo& ci, std::map<uint64_t, int>* levels) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& info : ci.input_file_infos) {
+      (*levels)[info.file_number] = info.level;
+    }
+  }
+
+  std::mutex mutex_;
+  std::map<uint64_t, int> begin_levels_;
+  std::map<uint64_t, int> completed_levels_;
+};
+
+TEST_F(EventListenerTest, CompactionInputFileLevel) {
+  // Compact L2 into L3, so that each input file's LSM level differs from the
+  // index of its input level within the compaction.
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "v1"));
+  ASSERT_OK(Put("z", "v1"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(3);
+  ASSERT_OK(Put("a", "v2"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_EQ("0,0,1,1", FilesPerLevel());
+
+  std::map<uint64_t, int> expected_levels;
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  for (const auto& f : files) {
+    expected_levels[f.file_number] = f.level;
+  }
+
+  // Attach the listener only now, so that the compactions above are not
+  // recorded.
+  auto* listener = new CompactionInputLevelListener();
+  options.listeners.emplace_back(listener);
+  Reopen(options);
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(2, nullptr, nullptr));
+  ASSERT_EQ("0,0,0,1", FilesPerLevel());
+
+  ASSERT_EQ(listener->BeginLevels(), expected_levels);
+  ASSERT_EQ(listener->CompletedLevels(), expected_levels);
 }
 
 class TestDBShutdownBeginListener : public EventListener {
