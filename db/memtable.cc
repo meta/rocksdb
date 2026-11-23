@@ -238,6 +238,29 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
               ? std::bind(&MemTable::ValidateKey, this, std::placeholders::_1,
                           std::placeholders::_2)
               : std::function<Status(const char*, bool)>(nullptr)) {
+  if (table_->OwnsKeys()) {
+    // These features read or rewrite entries through the encoded-entry layout,
+    // and user-defined timestamps track the newest key through a pointer into
+    // the caller's buffer (see MaybeUpdateNewestUDT), so a rep that keeps keys
+    // apart falls back to the skip list. experimental_mempurge_threshold is
+    // mutable, so it is also re-checked at flush time (see
+    // FlushJob::MemPurgeDecider).
+    if (moptions_.inplace_update_support || moptions_.paranoid_memory_checks ||
+        moptions_.memtable_verify_per_key_checksum_on_seek ||
+        mutable_cf_options.experimental_mempurge_threshold > 0.0 ||
+        comparator_.user_comparator()->timestamp_size() > 0) {
+      ROCKS_LOG_INFO(
+          ioptions.logger,
+          "A memtable rep that owns its keys was requested, but the column "
+          "family enables a feature that needs the encoded-entry layout; "
+          "falling back to a skip list.");
+      table_.reset(SkipListFactory().CreateMemTableRep(
+          comparator_, &arena_, mutable_cf_options.prefix_extractor.get(),
+          ioptions.logger, column_family_id));
+    } else {
+      table_owns_keys_ = true;
+    }
+  }
   UpdateFlushState();
   // something went wrong if we need to flush before inserting anything
   assert(!ShouldScheduleFlush());
@@ -414,19 +437,31 @@ Status MemTable::VerifyEntryChecksum(const char* entry,
   if (key_ptr == nullptr) {
     return Status::Corruption("Unable to parse internal key length");
   }
-  if (key_length < 8) {
+  return VerifyEntryChecksum(
+      MemTableRep::EntryView{Slice(key_ptr, key_length), key_ptr + key_length},
+      protection_bytes_per_key, allow_data_in_errors);
+}
+
+Status MemTable::VerifyEntryChecksum(const MemTableRep::EntryView& entry,
+                                     uint32_t protection_bytes_per_key,
+                                     bool allow_data_in_errors) {
+  if (protection_bytes_per_key == 0) {
+    return Status::OK();
+  }
+  const Slice& internal_key = entry.internal_key;
+  if (internal_key.size() < 8) {
     return Status::Corruption("Memtable entry internal key length too short.");
   }
-  Slice user_key = Slice(key_ptr, key_length - 8);
+  Slice user_key(internal_key.data(), internal_key.size() - 8);
 
-  const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);
+  const uint64_t tag = DecodeFixed64(user_key.data() + user_key.size());
   ValueType type;
   SequenceNumber seq;
   UnPackSequenceAndType(tag, &seq, &type);
 
   uint32_t value_length = 0;
-  const char* value_ptr = GetVarint32Ptr(
-      key_ptr + key_length, key_ptr + key_length + 5, &value_length);
+  const char* value_ptr =
+      GetVarint32Ptr(entry.value_part, entry.value_part + 5, &value_length);
   if (value_ptr == nullptr) {
     return Status::Corruption("Unable to parse internal key value");
   }
@@ -509,6 +544,7 @@ class MemTableIterator : public InternalIterator {
         ts_sz_(mem.ts_sz_),
         protection_bytes_per_key_(mem.moptions_.protection_bytes_per_key),
         valid_(false),
+        owns_keys_(kind == kPointEntries && mem.table_owns_keys_),
         value_pinned_(
             !mem.GetImmutableMemTableOptions()->inplace_update_support),
         arena_mode_(arena != nullptr),
@@ -678,6 +714,9 @@ class MemTableIterator : public InternalIterator {
   }
   Slice key() const override {
     assert(Valid());
+    if (owns_keys_) {
+      return iter_->entry().internal_key;
+    }
     return GetLengthPrefixedSlice(iter_->key());
   }
 
@@ -697,6 +736,9 @@ class MemTableIterator : public InternalIterator {
 
   Slice value() const override {
     assert(Valid());
+    if (owns_keys_) {
+      return GetLengthPrefixedSlice(iter_->entry().value_part);
+    }
     Slice key_slice = GetLengthPrefixedSlice(iter_->key());
     return GetLengthPrefixedSlice(key_slice.data() + key_slice.size());
   }
@@ -704,8 +746,9 @@ class MemTableIterator : public InternalIterator {
   Status status() const override { return status_; }
 
   bool IsKeyPinned() const override {
-    // memtable data is always pinned
-    return true;
+    // Encoded entries are pinned for the memtable's lifetime; a rep that
+    // owns keys may rebuild them on each move.
+    return !owns_keys_ || iter_->IsKeyPinned();
   }
 
   bool IsValuePinned() const override {
@@ -725,6 +768,7 @@ class MemTableIterator : public InternalIterator {
   size_t ts_sz_;
   uint32_t protection_bytes_per_key_;
   bool valid_;
+  bool owns_keys_;
   bool value_pinned_;
   bool arena_mode_;
   const bool paranoid_memory_checks_;
@@ -734,8 +778,11 @@ class MemTableIterator : public InternalIterator {
 
   void VerifyEntryChecksum() {
     if (protection_bytes_per_key_ > 0 && Valid()) {
-      status_ = MemTable::VerifyEntryChecksum(iter_->key(),
-                                              protection_bytes_per_key_);
+      status_ = owns_keys_ ? MemTable::VerifyEntryChecksum(
+                                 iter_->entry(), protection_bytes_per_key_,
+                                 allow_data_in_error_)
+                           : MemTable::VerifyEntryChecksum(
+                                 iter_->key(), protection_bytes_per_key_);
       if (!status_.ok()) {
         ROCKS_LOG_ERROR(logger_, "In MemtableIterator: %s", status_.getState());
       }
@@ -1156,28 +1203,55 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   // AddLogicallyRedundantRangeTombstone can also insert range tombstones.
   assert(type != kTypeRangeDeletion || allow_concurrent);
 
-  KeyHandle handle = table->Allocate(encoded_len, &buf);
+  const uint64_t packed = PackSequenceAndType(s, type);
+  KeyHandle handle;
+  Slice key_slice;
+  Slice encoded;
+  if (table == table_ && table_owns_keys_) {
+    // The rep keeps the key; the arena entry holds only the value part.
+    const uint32_t value_part_len =
+        VarintLength(val_size) + val_size + moptions_.protection_bytes_per_key;
+    char* value_part = nullptr;
+    handle = table->AllocateWithKey(key, packed, value_part_len, &value_part);
+    char* p = EncodeVarint32(value_part, val_size);
+    memcpy(p, value.data(), val_size);
+    UpdateEntryChecksum(kv_prot_info, key, value, type, s, p + val_size);
+    key_slice = key;
+    encoded =
+        Slice(value_part, value_part_len - moptions_.protection_bytes_per_key);
+    if (kv_prot_info != nullptr) {
+      Status status =
+          kv_prot_info->StripS(s)
+              .StripKVO(key, GetLengthPrefixedSlice(value_part), type)
+              .GetStatus();
+      if (!status.ok()) {
+        return status;
+      }
+    }
+  } else {
+    handle = table->Allocate(encoded_len, &buf);
 
-  char* p = EncodeVarint32(buf, internal_key_size);
-  memcpy(p, key.data(), key_size);
-  Slice key_slice(p, key_size);
-  p += key_size;
-  uint64_t packed = PackSequenceAndType(s, type);
-  EncodeFixed64(p, packed);
-  p += 8;
-  p = EncodeVarint32(p, val_size);
-  memcpy(p, value.data(), val_size);
-  assert((unsigned)(p + val_size - buf + moptions_.protection_bytes_per_key) ==
-         (unsigned)encoded_len);
+    char* p = EncodeVarint32(buf, internal_key_size);
+    memcpy(p, key.data(), key_size);
+    key_slice = Slice(p, key_size);
+    p += key_size;
+    EncodeFixed64(p, packed);
+    p += 8;
+    p = EncodeVarint32(p, val_size);
+    memcpy(p, value.data(), val_size);
+    assert(
+        (unsigned)(p + val_size - buf + moptions_.protection_bytes_per_key) ==
+        (unsigned)encoded_len);
 
-  UpdateEntryChecksum(kv_prot_info, key, value, type, s,
-                      buf + encoded_len - moptions_.protection_bytes_per_key);
-  Slice encoded(buf, encoded_len - moptions_.protection_bytes_per_key);
-  if (kv_prot_info != nullptr) {
-    TEST_SYNC_POINT_CALLBACK("MemTable::Add:Encoded", &encoded);
-    Status status = VerifyEncodedEntry(encoded, *kv_prot_info);
-    if (!status.ok()) {
-      return status;
+    UpdateEntryChecksum(kv_prot_info, key, value, type, s,
+                        buf + encoded_len - moptions_.protection_bytes_per_key);
+    encoded = Slice(buf, encoded_len - moptions_.protection_bytes_per_key);
+    if (kv_prot_info != nullptr) {
+      TEST_SYNC_POINT_CALLBACK("MemTable::Add:Encoded", &encoded);
+      Status status = VerifyEncodedEntry(encoded, *kv_prot_info);
+      if (!status.ok()) {
+        return status;
+      }
     }
   }
 
@@ -1186,8 +1260,12 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
 
   if (!allow_concurrent) {
     // Extract prefix for insert with hint. Hints are for point key table
-    // (`table_`) only, not `range_del_table_`.
-    if (table == table_ && insert_with_hint_prefix_extractor_ != nullptr &&
+    // (`table_`) only, not `range_del_table_`. Key-owning reps are excluded:
+    // their `key_slice` aliases the caller's key buffer, which is freed after
+    // the write, so the prefix stored in `insert_hints_` would dangle. The
+    // hint is only a lookup optimization, so skipping it is safe.
+    if (table == table_ && !table_owns_keys_ &&
+        insert_with_hint_prefix_extractor_ != nullptr &&
         insert_with_hint_prefix_extractor_->InDomain(key_slice)) {
       Slice prefix = insert_with_hint_prefix_extractor_->Transform(key_slice);
       bool res = table->InsertKeyWithHint(handle, &insert_hints_[prefix]);
@@ -1338,8 +1416,9 @@ struct Saver {
 };
 }  // anonymous namespace
 
-static bool SaveValue(void* arg, const char* entry) {
-  Saver* s = static_cast<Saver*>(arg);
+// `raw_entry` is the encoded entry, or nullptr for a rep that owns keys.
+static bool SaveValueImpl(Saver* s, const MemTableRep::EntryView& entry,
+                          const char** raw_entry) {
   assert(s != nullptr);
   assert(!s->value || !s->columns);
   assert(!*(s->found_final_value));
@@ -1351,10 +1430,9 @@ static bool SaveValue(void* arg, const char* entry) {
 
   assert(merge_context != nullptr);
 
-  // Refer to comments under MemTable::Add() for entry format.
   // Check that it belongs to same user key.
-  uint32_t key_length = 0;
-  const char* key_ptr = GetVarint32Ptr(entry, entry + 5, &key_length);
+  const size_t key_length = entry.internal_key.size();
+  const char* key_ptr = entry.internal_key.data();
   assert(key_length >= 8);
   Slice user_key_slice = Slice(key_ptr, key_length - 8);
   const Comparator* user_comparator =
@@ -1367,7 +1445,9 @@ static bool SaveValue(void* arg, const char* entry) {
   if (user_comparator->EqualWithoutTimestamp(user_key_slice,
                                              s->key->user_key())) {
     // Correct user key
-    TEST_SYNC_POINT_CALLBACK("Memtable::SaveValue:Found:entry", &entry);
+    if (raw_entry != nullptr) {
+      TEST_SYNC_POINT_CALLBACK("Memtable::SaveValue:Found:entry", raw_entry);
+    }
     std::optional<ReadLock> read_lock;
     if (s->inplace_update_support) {
       read_lock.emplace(s->mem->GetLock(s->key->user_key()));
@@ -1460,7 +1540,7 @@ static bool SaveValue(void* arg, const char* entry) {
           return false;
         }
 
-        Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
+        Slice v = GetLengthPrefixedSlice(entry.value_part);
 
         *(s->status) = Status::OK();
 
@@ -1477,7 +1557,7 @@ static bool SaveValue(void* arg, const char* entry) {
       }
       case kTypeValue:
       case kTypeValuePreferredSeqno: {
-        Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
+        Slice v = GetLengthPrefixedSlice(entry.value_part);
         if (type == kTypeValuePreferredSeqno) {
           v = ParsePackedValueForValue(v);
         }
@@ -1491,7 +1571,7 @@ static bool SaveValue(void* arg, const char* entry) {
         return false;
       }
       case kTypeWideColumnEntity: {
-        Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
+        Slice v = GetLengthPrefixedSlice(entry.value_part);
 
         *(s->status) = Status::OK();
         bool default_blob_index_returned = false;
@@ -1565,7 +1645,7 @@ static bool SaveValue(void* arg, const char* entry) {
         return false;
       }
       case kTypeMerge: {
-        Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
+        Slice v = GetLengthPrefixedSlice(entry.value_part);
         *(s->merge_in_progress) = true;
         *(s->found_final_value) = ReadOnlyMemTable::HandleTypeMerge(
             s->key->user_key(), v, s->inplace_update_support == false,
@@ -1591,6 +1671,20 @@ static bool SaveValue(void* arg, const char* entry) {
 
   // s->state could be Corrupt, merge or notfound
   return false;
+}
+
+// Refer to comments under MemTable::Add() for entry format.
+static bool SaveValue(void* arg, const char* entry) {
+  uint32_t key_length = 0;
+  const char* key_ptr = GetVarint32Ptr(entry, entry + 5, &key_length);
+  return SaveValueImpl(
+      static_cast<Saver*>(arg),
+      MemTableRep::EntryView{Slice(key_ptr, key_length), key_ptr + key_length},
+      &entry);
+}
+
+static bool SaveEntryValue(void* arg, const MemTableRep::EntryView& entry) {
+  return SaveValueImpl(static_cast<Saver*>(arg), entry, nullptr);
 }
 
 bool MemTable::Get(const LookupKey& key, std::string* value,
@@ -1729,8 +1823,12 @@ void MemTable::GetFromTable(
   saver.protection_bytes_per_key = moptions_.protection_bytes_per_key;
   saver.newer_version_present = newer_version_present;
 
-  if (!moptions_.paranoid_memory_checks &&
-      !moptions_.memtable_verify_per_key_checksum_on_seek) {
+  if (table_owns_keys_) {
+    // Validation options make the constructor fall back to an encoded-entry
+    // rep (see MemTable::MemTable).
+    table_->GetEntries(key, &saver, SaveEntryValue);
+  } else if (!moptions_.paranoid_memory_checks &&
+             !moptions_.memtable_verify_per_key_checksum_on_seek) {
     table_->Get(key, &saver, SaveValue);
   } else {
     Status check_s = table_->GetAndValidate(
@@ -1808,7 +1906,9 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
   }
 
   // Use batch lookup optimization when enabled
-  bool use_batch_optimization = moptions_.memtable_batch_lookup_optimization;
+  // The batched lookup reads encoded entries.
+  bool use_batch_optimization =
+      moptions_.memtable_batch_lookup_optimization && !table_owns_keys_;
   bool validate = moptions_.paranoid_memory_checks ||
                   moptions_.memtable_verify_per_key_checksum_on_seek;
 
@@ -2057,6 +2157,8 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
 Status MemTable::Update(SequenceNumber seq, ValueType value_type,
                         const Slice& key, const Slice& value,
                         const ProtectionInfoKVOS64* kv_prot_info) {
+  // In-place updates make the constructor fall back to an encoded-entry rep.
+  assert(!table_owns_keys_);
   LookupKey lkey(key, seq);
   Slice mem_key = lkey.memtable_key();
 
@@ -2120,6 +2222,7 @@ Status MemTable::Update(SequenceNumber seq, ValueType value_type,
 Status MemTable::UpdateCallback(SequenceNumber seq, const Slice& key,
                                 const Slice& delta,
                                 const ProtectionInfoKVOS64* kv_prot_info) {
+  assert(!table_owns_keys_);
   LookupKey lkey(key, seq);
   Slice memkey = lkey.memtable_key();
 
@@ -2224,15 +2327,13 @@ size_t MemTable::CountSuccessiveMergeEntries(const LookupKey& key,
   size_t num_successive_merges = 0;
 
   for (; iter->Valid() && num_successive_merges < limit; iter->Next()) {
-    const char* entry = iter->key();
-    uint32_t key_length = 0;
-    const char* iter_key_ptr = GetVarint32Ptr(entry, entry + 5, &key_length);
+    const Slice internal_key = iter->entry().internal_key;
     if (!comparator_.comparator.user_comparator()->Equal(
-            Slice(iter_key_ptr, key_length - 8), key.user_key())) {
+            ExtractUserKey(internal_key), key.user_key())) {
       break;
     }
 
-    const uint64_t tag = DecodeFixed64(iter_key_ptr + key_length - 8);
+    const uint64_t tag = ExtractInternalKeyFooter(internal_key);
     ValueType type;
     uint64_t unused;
     UnPackSequenceAndType(tag, &unused, &type);
@@ -2251,6 +2352,16 @@ void MemTableRep::Get(const LookupKey& k, void* callback_args,
   auto iter = GetDynamicPrefixIterator();
   for (iter->Seek(k.internal_key(), k.memtable_key().data());
        iter->Valid() && callback_func(callback_args, iter->key());
+       iter->Next()) {
+  }
+}
+
+void MemTableRep::GetEntries(const LookupKey& k, void* callback_args,
+                             bool (*callback_func)(void* arg,
+                                                   const EntryView& entry)) {
+  std::unique_ptr<Iterator> iter(GetIterator());
+  for (iter->Seek(k.internal_key(), k.memtable_key().data());
+       iter->Valid() && callback_func(callback_args, iter->entry());
        iter->Next()) {
   }
 }

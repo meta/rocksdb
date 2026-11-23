@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -1161,6 +1162,240 @@ TEST_F(DBMemTableTest, VectorConcurrentInsert) {
   ASSERT_OK(Flush(0));
   ASSERT_OK(Flush(1));
 }
+// A minimal key-owning MemTableRep, backed by a std::map keyed by internal
+// key, to exercise the OwnsKeys() interface (AllocateWithKey / GetEntries /
+// EntryView / Iterator::entry / IsKeyPinned) and the MemTable plumbing for
+// key-owning reps without depending on a production rep.
+namespace {
+// Test-only counter: how many times the owning read path (GetEntries) ran.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> g_owning_get_entries_calls{0};
+
+class OwningMapRep : public MemTableRep {
+ public:
+  // The test always uses the default bytewise comparator, so order internal
+  // keys with it directly rather than through the passed-in comparator.
+  OwningMapRep(const MemTableRep::KeyComparator& /*cmp*/, Allocator* allocator)
+      : MemTableRep(allocator),
+        ikc_(BytewiseComparator()),
+        entries_(KeyCmp{&ikc_}) {}
+
+  bool OwnsKeys() const override { return true; }
+
+  KeyHandle AllocateWithKey(const Slice& user_key, uint64_t packed_seq_type,
+                            size_t value_part_len, char** value_part) override {
+    pending_key_.assign(user_key.data(), user_key.size());
+    PutFixed64(&pending_key_, packed_seq_type);
+    char* buf = allocator_->Allocate(value_part_len);
+    pending_value_part_ = buf;
+    pending_value_part_len_ = value_part_len;
+    *value_part = buf;
+    return static_cast<KeyHandle>(buf);
+  }
+
+  void Insert(KeyHandle handle) override { InsertKey(handle); }
+
+  bool InsertKey(KeyHandle handle) override {
+    assert(static_cast<char*>(handle) == pending_value_part_);
+    (void)handle;
+    entries_[pending_key_] =
+        std::string(pending_value_part_, pending_value_part_len_);
+    return true;
+  }
+
+  bool Contains(const char* key) const override {
+    return entries_.count(GetLengthPrefixedSlice(key).ToString()) > 0;
+  }
+
+  void Get(const LookupKey& /*k*/, void* /*callback_args*/,
+           bool (* /*callback_func*/)(void* arg, const char* entry)) override {
+    assert(false);  // key-owning reps are read through GetEntries().
+  }
+
+  void GetEntries(const LookupKey& k, void* callback_args,
+                  bool (*callback_func)(void* arg,
+                                        const EntryView& entry)) override {
+    g_owning_get_entries_calls.fetch_add(1);
+    const Slice user_key = k.user_key();
+    for (auto it = entries_.lower_bound(k.internal_key().ToString());
+         it != entries_.end() && ExtractUserKey(it->first) == user_key; ++it) {
+      if (!callback_func(callback_args,
+                         EntryView{Slice(it->first), it->second.data()})) {
+        break;
+      }
+    }
+  }
+
+  size_t ApproximateMemoryUsage() override { return 0; }
+
+  MemTableRep::Iterator* GetIterator(Arena* arena) override {
+    if (arena != nullptr) {
+      void* mem = arena->AllocateAligned(sizeof(Iter));
+      return new (mem) Iter(&entries_);
+    }
+    return new Iter(&entries_);
+  }
+
+ private:
+  struct KeyCmp {
+    const InternalKeyComparator* ikc;
+    bool operator()(const std::string& a, const std::string& b) const {
+      return ikc->Compare(a, b) < 0;
+    }
+  };
+  using Map = std::map<std::string, std::string, KeyCmp>;
+
+  class Iter : public MemTableRep::Iterator {
+   public:
+    explicit Iter(const Map* m) : map_(m), it_(m->end()) {}
+    bool Valid() const override { return it_ != map_->end(); }
+    const char* key() const override { return it_->first.data(); }
+    EntryView entry() const override {
+      return EntryView{Slice(it_->first), it_->second.data()};
+    }
+    bool IsKeyPinned() const override { return false; }
+    void Next() override { ++it_; }
+    void Prev() override {
+      if (it_ == map_->begin()) {
+        it_ = map_->end();
+      } else {
+        --it_;
+      }
+    }
+    void Seek(const Slice& internal_key, const char* memtable_key) override {
+      const Slice target = memtable_key != nullptr
+                               ? GetLengthPrefixedSlice(memtable_key)
+                               : internal_key;
+      it_ = map_->lower_bound(target.ToString());
+    }
+    void SeekForPrev(const Slice& internal_key,
+                     const char* memtable_key) override {
+      const Slice target = memtable_key != nullptr
+                               ? GetLengthPrefixedSlice(memtable_key)
+                               : internal_key;
+      it_ = map_->lower_bound(target.ToString());
+      if (!Valid()) {
+        SeekToLast();
+      } else if (it_->first != target.ToString()) {
+        Prev();
+      }
+    }
+    void SeekToFirst() override { it_ = map_->begin(); }
+    void SeekToLast() override {
+      it_ = map_->empty() ? map_->end() : std::prev(map_->end());
+    }
+
+   private:
+    const Map* map_;
+    Map::const_iterator it_;
+  };
+
+  InternalKeyComparator ikc_;
+  Map entries_;
+  std::string pending_key_;
+  char* pending_value_part_ = nullptr;
+  size_t pending_value_part_len_ = 0;
+};
+
+class OwningMapRepFactory : public MemTableRepFactory {
+ public:
+  using MemTableRepFactory::CreateMemTableRep;
+  MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator& cmp,
+                                 Allocator* allocator,
+                                 const SliceTransform* /*transform*/,
+                                 Logger* /*logger*/) override {
+    return new OwningMapRep(cmp, allocator);
+  }
+  const char* Name() const override { return "OwningMapRepFactory"; }
+  bool IsInsertConcurrentlySupported() const override { return false; }
+};
+}  // namespace
+
+TEST_F(DBMemTableTest, OwnsKeysRoundTrip) {
+  Options options = CurrentOptions();
+  options.memtable_factory = std::make_shared<OwningMapRepFactory>();
+  options.allow_concurrent_memtable_write = false;
+  g_owning_get_entries_calls.store(0);
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("b", "vb1"));
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Put("b", "vb2"));  // overwrite; newest version wins
+
+  ASSERT_EQ("va", Get("a"));
+  ASSERT_EQ("vb2", Get("b"));
+  ASSERT_EQ("vc", Get("c"));
+  // The key-owning read path (GetEntries/EntryView) was actually used.
+  ASSERT_GT(g_owning_get_entries_calls.load(), 0);
+
+  // Forward iteration returns keys in order through the EntryView path.
+  std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+  std::string order;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    order += it->key().ToString() + "=" + it->value().ToString() + ";";
+  }
+  ASSERT_OK(it->status());
+  ASSERT_EQ("a=va;b=vb2;c=vc;", order);
+
+  // Flush reads the memtable through unpinned keys (IsKeyPinned()==false).
+  ASSERT_OK(Flush());
+  ASSERT_EQ("vb2", Get("b"));
+}
+
+TEST_F(DBMemTableTest, OwnsKeysFallsBackForInplaceUpdate) {
+  Options options = CurrentOptions();
+  options.memtable_factory = std::make_shared<OwningMapRepFactory>();
+  options.allow_concurrent_memtable_write = false;
+  options.inplace_update_support = true;  // forces the skip-list fallback
+  g_owning_get_entries_calls.store(0);
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("k", "v1"));
+  ASSERT_OK(Put("k", "v2"));
+  ASSERT_EQ("v2", Get("k"));
+  // Fallback means the owning rep's read path is never exercised.
+  ASSERT_EQ(0, g_owning_get_entries_calls.load());
+}
+
+TEST_F(DBMemTableTest, OwnsKeysFallsBackForUserTimestamp) {
+  Options options = CurrentOptions();
+  options.memtable_factory = std::make_shared<OwningMapRepFactory>();
+  options.allow_concurrent_memtable_write = false;
+  // A user comparator with timestamps forces the skip-list fallback. Without
+  // it, the key-owning write path makes MaybeUpdateNewestUDT store a pointer
+  // into the caller's WriteBatch key buffer, which is freed when the write
+  // returns; the next write and GetNewestUDT() then read freed memory
+  // (heap-use-after-free under ASan).
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  g_owning_get_entries_calls.store(0);
+  DestroyAndReopen(options);
+
+  auto encode_ts = [](uint64_t v) {
+    std::string ts;
+    PutFixed64(&ts, v);
+    return ts;
+  };
+  // Two separate writes, so the first WriteBatch buffer is freed before the
+  // second write reads the newest-UDT pointer.
+  ASSERT_OK(db_->Put(WriteOptions(), "k1", encode_ts(10), "v1"));
+  ASSERT_OK(db_->Put(WriteOptions(), "k2", encode_ts(11), "v2"));
+  ASSERT_OK(Flush());
+
+  // The rep owns keys, but the timestamp comparator forced a skip-list
+  // fallback, so the owning read path is never used.
+  ASSERT_EQ(0, g_owning_get_entries_calls.load());
+}
+
+// The MemTableRep key comparator exposes the wrapped user comparator so a rep
+// can check it was given a comparator it supports.
+TEST_F(DBMemTableTest, KeyComparatorExposesUserComparator) {
+  InternalKeyComparator ikc(BytewiseComparator());
+  MemTable::KeyComparator cmp(ikc);
+  const MemTableRep::KeyComparator& base = cmp;
+  ASSERT_EQ(base.user_comparator(), BytewiseComparator());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
