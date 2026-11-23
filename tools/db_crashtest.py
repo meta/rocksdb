@@ -533,6 +533,10 @@ default_params = {
     "write_fault_one_in": lambda: random.choice([0, 128, 1000]),
     "exclude_wal_from_write_fault_injection": 0,
     "file_scope_wal_write_faults": 0,
+    # Run about 1 in 4 crash tests on a file system that sets
+    # FSSupportedOps::kAtomicReplaceOnClose, so that CURRENT, IDENTITY and
+    # OPTIONS files are written directly instead of through a temp file.
+    "atomic_replace_on_close": lambda: random.choice([0, 0, 0, 1]),
     "open_metadata_write_fault_one_in": lambda: random.choice([0, 0, 8]),
     "open_metadata_read_fault_one_in": lambda: random.choice([0, 0, 8]),
     "open_write_fault_one_in": lambda: random.choice([0, 0, 16]),
@@ -2294,6 +2298,8 @@ def finalize_and_sanitize(src_params):
         dest_params["open_metadata_write_fault_one_in"] = 0
         dest_params["open_read_fault_one_in"] = 0
         dest_params["open_write_fault_one_in"] = 0
+        # See ValidateAtomicReplaceOnCloseFlags() in db_stress_tool.cc.
+        dest_params["atomic_replace_on_close"] = 0
 
     if dest_params.get("num_dbs", 1) > 1:
         # These features assume a single DB instance.
