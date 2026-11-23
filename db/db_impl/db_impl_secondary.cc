@@ -2021,7 +2021,8 @@ Status DBImplSecondary::CompactWithoutInstallation(
   // The worker re-derives per-key placement from its own MANIFEST view, which
   // can be newer than the primary's input version. The primary installs
   // proximal-level outputs according to its own decisions, so decline on any
-  // disagreement and let the CompactionService fall back to local compaction.
+  // disagreement. The result records the decline so that the primary runs the
+  // compaction locally, even if the CompactionService reports a failure.
   // A proximal_level of 0 means an older primary that sent no decisions.
   bool placement_mismatch =
       input.proximal_level != 0 &&
@@ -2048,6 +2049,8 @@ Status DBImplSecondary::CompactWithoutInstallation(
         "Remote compaction worker's per-key placement differs from the "
         "primary's");
     c->ReleaseCompactionFiles(s);
+    result->status = s;
+    result->per_key_placement_mismatch = true;
     return s;
   }
 

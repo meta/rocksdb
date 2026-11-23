@@ -1264,6 +1264,7 @@ TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteWireVersions) {
   CompactionServiceResult decoded;
   decoded.merge_before_filter_version = 1;
   decoded.merge_order_mismatch = true;
+  decoded.per_key_placement_mismatch = true;
   std::string legacy(sizeof(uint32_t), '\0');
   EncodeFixed32(&legacy[0], 1);
   legacy += "output_level=0;";
@@ -1271,6 +1272,7 @@ TEST_F(CompactionServiceTest, MergeBeforeFilterRemoteWireVersions) {
   ASSERT_OK(decoded.status);
   ASSERT_EQ(0, decoded.merge_before_filter_version);
   ASSERT_FALSE(decoded.merge_order_mismatch);
+  ASSERT_FALSE(decoded.per_key_placement_mismatch);
 }
 
 TEST_F(CompactionServiceTest, MergeBeforeFilterLocalSubcompactions) {
@@ -7827,6 +7829,91 @@ TEST_F(CompactionServiceTest, PerKeyPlacementMismatchFallsBackToLocal) {
             my_cs->GetCompactionNum() - altered.load());
   ASSERT_EQ("0,0,0,0,0,1", FilesPerLevel());
   ASSERT_EQ(GetSstSizeHelper(Temperature::kCold), 0);
+}
+
+// The worker opens the DB after the primary picked the compaction, so it can
+// see a proximal-level file that another compaction installed in between.
+// Then its per-key placement differs and it declines the job. The primary runs
+// the job locally even if the CompactionService reports the decline as a
+// failure, as db_stress does with remote_compaction_failure_fall_back_to_local
+// off.
+TEST_F(CompactionServiceTest, PerKeyPlacementDeclineRunsLocallyOnFailure) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleUniversal;
+  options.disable_auto_compactions = true;
+  options.last_level_temperature = Temperature::kCold;
+  options.num_levels = 7;
+  ReopenWithCompactionService(&options);
+  MyTestCompactionService* const my_cs = GetCompactionService();
+  my_cs->ReturnIncompleteAsFailure(true);
+
+  auto file_at_level = [&](int level, std::string* file_name) {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    ASSERT_EQ(metadata.levels[level].files.size(), 1);
+    const SstFileMetaData& file = metadata.levels[level].files.front();
+    *file_name = file.db_path + "/" + file.name;
+  };
+  std::string file_name;
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Flush());
+  file_at_level(0, &file_name);
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), {file_name}, 6));
+  std::string last_level_file;
+  file_at_level(6, &last_level_file);
+  ASSERT_OK(Put("x", "vx"));
+  ASSERT_OK(Flush());
+  std::string l0_file;
+  file_at_level(0, &l0_file);
+  ASSERT_EQ("1,0,0,0,0,0,1", FilesPerLevel());
+
+  // Per-key placement turns on for compactions into the last level. The
+  // proximal level (L5) is empty, so it is part of the proximal output range.
+  ASSERT_OK(
+      dbfull()->SetOptions({{"preclude_last_level_data_seconds", "10000"}}));
+
+  // While the compaction of the last-level file waits for its worker, another
+  // compaction moves key x into L5. x is outside the first compaction's key
+  // range, so the primary allows it.
+  std::atomic<int> waits{0};
+  Status move_status;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MyTestCompactionService::Wait:BeforeOpenAndCompact", [&](void*) {
+        if (waits.fetch_add(1) == 0) {
+          std::thread mover([&]() {
+            move_status = db_->CompactFiles(CompactionOptions(), {l0_file}, 5);
+          });
+          mover.join();
+        }
+      });
+  std::atomic<int> mismatches{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImplSecondary::CompactWithoutInstallation:PerKeyPlacementCheck",
+      [&](void* arg) {
+        if (*static_cast<bool*>(arg)) {
+          mismatches++;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Status s = db_->CompactFiles(CompactionOptions(), {last_level_file}, 6);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(move_status);
+  ASSERT_EQ(mismatches.load(), 1);
+  ASSERT_OK(s);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(my_cs->GetUseLocalInstallationCount(), 1);
+  ASSERT_EQ(CompactionServiceJobStatus::kUseLocal,
+            my_cs->GetFinalCompactionServiceJobStatus());
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_EQ(result.status.code(), Status::kIncomplete);
+  ASSERT_TRUE(result.per_key_placement_mismatch);
+  ASSERT_EQ("va", Get("a"));
+  ASSERT_EQ("vc", Get("c"));
+  ASSERT_EQ("vx", Get("x"));
 }
 
 // The primary never installs a proximal-level output for a compaction without
