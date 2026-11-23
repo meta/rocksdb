@@ -9541,6 +9541,161 @@ TEST_F(DBTest2, GetDbIdentityFromManifestTruncatedOrUndecodable) {
   ASSERT_EQ(Status::Code::kCorruption, s.code());
 }
 
+// The column families read from the MANIFEST file of an open DB, from the new
+// MANIFEST file that a reopen writes, and from that file after the DB closes,
+// match the handles of the DB. A dropped column family leaves a gap in the IDs
+// and is not in the map.
+TEST_F(DBTest2, GetColumnFamiliesFromManifest) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"one", "two", "three"}, options);
+  ASSERT_EQ(handles_.size(), 4);
+  ASSERT_EQ(handles_[2]->GetName(), "two");
+  ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+  std::map<uint32_t, std::string> expected;
+  for (ColumnFamilyHandle* handle : handles_) {
+    if (handle->GetName() != "two") {
+      expected[handle->GetID()] = handle->GetName();
+    }
+  }
+  ASSERT_EQ(expected.size(), 3);
+  ASSERT_EQ(expected.count(0), 1);
+
+  // The function does not write, so it works on a read-only file system.
+  std::shared_ptr<FileSystem> read_only_fs =
+      std::make_shared<ReadOnlyFileSystem>(env_->GetFileSystem());
+  const auto expect_column_families = [&](uint64_t manifest_number) {
+    std::map<uint32_t, std::string> column_families;
+    ASSERT_OK(experimental::GetColumnFamiliesFromManifest(
+        read_only_fs.get(), DescriptorFileName(dbname_, manifest_number),
+        &column_families));
+    ASSERT_EQ(expected, column_families);
+  };
+
+  const uint64_t first_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  expect_column_families(first_manifest);
+
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "one", "three"}, options);
+  const uint64_t second_manifest = dbfull()->TEST_Current_Manifest_FileNo();
+  ASSERT_NE(first_manifest, second_manifest);
+  for (ColumnFamilyHandle* handle : handles_) {
+    ASSERT_EQ(expected[handle->GetID()], handle->GetName());
+  }
+  expect_column_families(second_manifest);
+
+  Close();
+  expect_column_families(second_manifest);
+}
+
+namespace {
+VersionEdit AddColumnFamilyEdit(uint32_t id, const std::string& name) {
+  VersionEdit edit;
+  edit.AddColumnFamily(name);
+  edit.SetColumnFamily(id);
+  return edit;
+}
+
+// An AddColumnFamilyEdit() in an atomic group that has remaining_entries more
+// records after it.
+VersionEdit AtomicAddColumnFamilyEdit(uint32_t id, const std::string& name,
+                                      uint32_t remaining_entries) {
+  VersionEdit edit = AddColumnFamilyEdit(id, name);
+  edit.MarkAtomicGroup(remaining_entries);
+  return edit;
+}
+}  // namespace
+
+// A record that is truncated at the end of the file counts as the end of the
+// file, and an atomic group that the file does not complete is not applied, so
+// only the column families of the records before them are in the map.
+TEST_F(DBTest2, GetColumnFamiliesFromManifestTruncatedTail) {
+  FileSystem* fs = env_->GetFileSystem().get();
+  ASSERT_OK(env_->CreateDirIfMissing(dbname_));
+  const std::string path = dbname_ + "/manifest_with_column_families";
+  const std::string contents =
+      LogFileWithRecords({EncodeVersionEdit(AddColumnFamilyEdit(1, "one")),
+                          EncodeVersionEdit(AddColumnFamilyEdit(2, "two"))});
+  std::map<uint32_t, std::string> column_families;
+
+  ASSERT_OK(WriteStringToFile(fs, contents, path));
+  ASSERT_OK(
+      experimental::GetColumnFamiliesFromManifest(fs, path, &column_families));
+  const std::map<uint32_t, std::string> both{
+      {0, kDefaultColumnFamilyName}, {1, "one"}, {2, "two"}};
+  ASSERT_EQ(both, column_families);
+
+  ASSERT_OK(
+      WriteStringToFile(fs, contents.substr(0, contents.size() - 1), path));
+  ASSERT_OK(
+      experimental::GetColumnFamiliesFromManifest(fs, path, &column_families));
+  const std::map<uint32_t, std::string> first{{0, kDefaultColumnFamilyName},
+                                              {1, "one"}};
+  ASSERT_EQ(first, column_families);
+
+  ASSERT_OK(WriteStringToFile(
+      fs,
+      LogFileWithRecords(
+          {EncodeVersionEdit(AddColumnFamilyEdit(1, "one")),
+           EncodeVersionEdit(AtomicAddColumnFamilyEdit(2, "two", 1))}),
+      path));
+  ASSERT_OK(
+      experimental::GetColumnFamiliesFromManifest(fs, path, &column_families));
+  ASSERT_EQ(first, column_families);
+}
+
+// A missing file gives the file system error. A file with no applied record, a
+// record that fails its checksum or cannot be decoded, an atomic group that is
+// not consistent, a record that adds an ID that the file already has, and a
+// record that drops an ID that the file does not have give Corruption. A null
+// argument gives InvalidArgument.
+TEST_F(DBTest2, GetColumnFamiliesFromManifestErrors) {
+  FileSystem* fs = env_->GetFileSystem().get();
+  std::map<uint32_t, std::string> column_families;
+  Status s = experimental::GetColumnFamiliesFromManifest(
+      fs, DescriptorFileName(dbname_, 999999), &column_families);
+  ASSERT_EQ(Status::Code::kIOError, s.code());
+  ASSERT_EQ(Status::SubCode::kPathNotFound, s.subcode());
+
+  ASSERT_OK(env_->CreateDirIfMissing(dbname_));
+  const std::string path = dbname_ + "/manifest_with_column_families";
+  const std::string one =
+      LogFileWithRecords({EncodeVersionEdit(AddColumnFamilyEdit(1, "one"))});
+  VersionEdit drop;
+  drop.SetColumnFamily(5);
+  drop.DropColumnFamily();
+  std::string damaged = one;
+  damaged[log::kHeaderSize] ^= 1;
+  const std::vector<std::pair<std::string, std::string>> corrupt_files{
+      {"empty", ""},
+      {"truncated first record", one.substr(0, one.size() - 1)},
+      {"only record in an incomplete atomic group",
+       LogFileWithRecords(
+           {EncodeVersionEdit(AtomicAddColumnFamilyEdit(1, "one", 1))})},
+      {"checksum failure", damaged},
+      // Tag 0 is not a VersionEdit tag.
+      {"undecodable record", LogFileWithRecords({std::string(1, '\0')})},
+      {"atomic group with a normal record in it",
+       LogFileWithRecords(
+           {EncodeVersionEdit(AtomicAddColumnFamilyEdit(1, "one", 1)),
+            EncodeVersionEdit(AddColumnFamilyEdit(2, "two"))})},
+      {"ID added twice",
+       LogFileWithRecords({EncodeVersionEdit(AddColumnFamilyEdit(1, "one")),
+                           EncodeVersionEdit(AddColumnFamilyEdit(1, "two"))})},
+      {"drop of a missing ID", LogFileWithRecords({EncodeVersionEdit(drop)})}};
+  for (const auto& [description, contents] : corrupt_files) {
+    SCOPED_TRACE(description);
+    ASSERT_OK(WriteStringToFile(fs, contents, path));
+    s = experimental::GetColumnFamiliesFromManifest(fs, path, &column_families);
+    ASSERT_EQ(Status::Code::kCorruption, s.code());
+  }
+
+  ASSERT_OK(WriteStringToFile(fs, one, path));
+  s = experimental::GetColumnFamiliesFromManifest(nullptr, path,
+                                                  &column_families);
+  ASSERT_EQ(Status::Code::kInvalidArgument, s.code());
+  s = experimental::GetColumnFamiliesFromManifest(fs, path, nullptr);
+  ASSERT_EQ(Status::Code::kInvalidArgument, s.code());
+}
+
 // Parameterized by (allow_concurrent_memtable_write,
 // min_tombstones_for_range_conversion).
 class DBTestConcurrentRangeTombstoneConversions
