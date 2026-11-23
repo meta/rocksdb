@@ -910,6 +910,7 @@ set(SOURCES
         memtable/sorted_hash_rep.cc
         memtable/vectorrep.cc
         memtable/wbwi_memtable.cc
+        plugin/trie/trie_rep.cc
         memtable/write_buffer_manager.cc
         monitoring/histogram.cc
         monitoring/histogram_windowing.cc
@@ -1602,6 +1603,7 @@ if(WITH_TESTS)
         memtable/inlineskiplist_test.cc
         memtable/skiplist_test.cc
         memtable/write_buffer_manager_test.cc
+        plugin/trie/trie_rep_test.cc
         monitoring/histogram_test.cc
         monitoring/iostats_context_test.cc
         monitoring/statistics_test.cc
