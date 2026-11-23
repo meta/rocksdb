@@ -1,0 +1,1 @@
+Fixed an ignored error when RocksDB closes a file that it creates or copies. Checkpoint creation, column family export, external file ingestion and column family import (when they copy files instead of linking them), and `ldb update_manifest --rebind_options_file` now return the error from closing the new file instead of reporting success.

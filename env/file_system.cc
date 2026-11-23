@@ -223,7 +223,9 @@ IOStatus WriteStringToFile(FileSystem* fs, const Slice& data,
     s = file->Close(io_options, nullptr);
   }
   if (!s.ok()) {
-    fs->DeleteFile(fname, io_options, nullptr);
+    // Best-effort cleanup after an error. The original error is returned, so
+    // the status of the delete is ignored.
+    fs->DeleteFile(fname, io_options, nullptr).PermitUncheckedError();
   }
   return s;
 }
