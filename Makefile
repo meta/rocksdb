@@ -2235,6 +2235,9 @@ compressed_secondary_cache_test: $(OBJ_DIR)/cache/compressed_secondary_cache_tes
 lru_cache_test: $(OBJ_DIR)/cache/lru_cache_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+s3fifo_cache_test: $(OBJ_DIR)/cache/s3fifo_cache_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 tiered_secondary_cache_test: $(OBJ_DIR)/cache/tiered_secondary_cache_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
