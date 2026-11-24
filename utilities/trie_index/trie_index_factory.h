@@ -233,8 +233,8 @@ class TrieIndexIterator final : public IndexFactoryIterator {
  public:
   TrieIndexIterator(const Trie* trie, const Comparator* comparator);
 
-  // Prepare for a batch of scans. Keeps a pointer to the scan bounds, or
-  // discards them when num_opts is 0.
+  // Prepare for a batch of scans. Copies the scan bounds, or discards them
+  // when num_opts is 0.
   void Prepare(const ScanOptions scan_opts[], size_t num_opts) override;
   Status SeekAndGetResult(const Slice& target, IterateResult* result,
                           const SeekContext& context) override;
@@ -246,7 +246,7 @@ class TrieIndexIterator final : public IndexFactoryIterator {
 
  private:
   // Whether CheckBounds() can return anything but kInbound.
-  bool HasBounds() const { return num_scan_opts_ > 0; }
+  bool HasBounds() const { return !scan_opts_.empty(); }
 
   // Checks whether the current block may hold keys in the current scan.
   // reference_key is the key to compare against the limit: for Seek this is
@@ -261,7 +261,7 @@ class TrieIndexIterator final : public IndexFactoryIterator {
   // key.
   void RewindScan(const Slice& key);
   // Makes current_scan_idx_ the first range whose limit is above key, or
-  // num_scan_opts_ when there is none.
+  // scan_opts_.size() when there is none.
   void SelectScan(const Slice& key);
 
   // Fills *result from the iterator position after a call that returned s.
@@ -271,9 +271,8 @@ class TrieIndexIterator final : public IndexFactoryIterator {
 
   const Comparator* comparator_;
   TrieIterator iter_;
-  // The ranges of the last Prepare(), owned by the caller.
-  const ScanOptions* scan_opts_ = nullptr;
-  size_t num_scan_opts_ = 0;
+  // The ranges of the last Prepare(). The caller owns the underlying key bytes.
+  std::vector<ScanOptions> scan_opts_;
   size_t current_scan_idx_ = 0;
 };
 

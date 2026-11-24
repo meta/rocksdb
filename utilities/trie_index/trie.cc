@@ -66,11 +66,6 @@ constexpr size_t kMinBitmapChildren = 32;
 constexpr uint8_t kLongEntryMarker = 0xFF;
 constexpr uint32_t kShortEntryLimit = 15;
 
-// An iterator reserves room for keys up to this long when it is created.
-// Longer keys grow the buffer when reached, so one huge separator does not
-// make every iterator over the index allocate its length.
-constexpr size_t kInitialKeyCapacity = 256;
-
 // Header field positions.
 constexpr size_t kMagicPos = 0;
 constexpr size_t kVersionPos = 4;
@@ -932,6 +927,8 @@ Status Trie::Parse(const Slice& data) {
   // also keeps the arithmetic below from overflowing.
   if (bucket_size_ == 0 || num_separators_ > num_blocks_ ||
       (num_blocks_ == 0) != (num_separators_ == 0) ||
+      (num_separators_ == 0 &&
+       (prefix_len_ != 0 || max_separator_len_ != 0 || explicit_sizes_)) ||
       num_blocks_ / 4 > data.size() || prefix_len_ > max_separator_len_ ||
       id_width_ < 1 || id_width_ > 4) {
     return Corrupt("bad header");
@@ -1116,6 +1113,7 @@ Status Trie::ValidateTrie(uint64_t trie_size) {
     uint64_t head_len;
   };
   std::vector<Visit> stack;
+  stack.reserve(64);
   stack.push_back({trie_root_, 0});
   uint64_t next_bucket = 0;
   uint64_t visited = 0;
@@ -1212,10 +1210,9 @@ Status Trie::ValidateTrie(uint64_t trie_size) {
 
 TrieIterator::TrieIterator(const Trie* index)
     : index_(index), block_(index->num_blocks_) {
-  key_.reserve(std::max<size_t>(
-      index_->prefix_len_,
-      std::min<size_t>(index_->max_separator_len_, kInitialKeyCapacity)));
-  key_.assign(index_->prefix_, index_->prefix_len_);
+  if (index_->prefix_len_ > 0) {
+    key_.assign(index_->prefix_, index_->prefix_len_);
+  }
 }
 
 void TrieIterator::Invalidate() { block_ = index_->num_blocks_; }
@@ -1311,8 +1308,14 @@ void TrieIterator::Descend(const char* target, size_t target_len,
 
 uint64_t TrieIterator::SpellHead(const Candidate& candidate,
                                  const char* target) {
-  key_.resize(index_->prefix_len_);
-  key_.append(target, candidate.depth);
+  const size_t prefix_len = index_->prefix_len_;
+  key_.resize(prefix_len);
+  if (candidate.depth > 0) {
+    if (candidate.spell == Spell::kTerminal) {
+      key_.reserve(prefix_len + candidate.depth);
+    }
+    key_.append(target, candidate.depth);
+  }
   Node node;
   if (candidate.spell == Spell::kTerminal) {
     node.Parse(index_->trie_, candidate.node, index_->id_width_);
@@ -1452,7 +1455,7 @@ inline bool TrieIterator::ReadEntry(size_t len, Entry* entry) {
     bucket_pos_ = p;
   }
   if (drop > len || add > lossless_cast<size_t>(bucket_end_ - bucket_pos_) ||
-      len - drop + add > index_->max_separator_len_ - index_->prefix_len_) {
+      add > (index_->max_separator_len_ - index_->prefix_len_) - (len - drop)) {
     return false;
   }
   entry->shared = len - drop;
@@ -1469,6 +1472,7 @@ Status TrieIterator::DecodeNext() {
   if (!ReadEntry(key_.size() - prefix_len, &e)) {
     return Corrupt("bad bucket entry");
   }
+  key_.reserve(prefix_len + e.shared + e.suffix_len);
   key_.resize(prefix_len + e.shared);
   key_.append(e.suffix, e.suffix_len);
   return Status::OK();
@@ -1516,7 +1520,9 @@ Status TrieIterator::ScanBucket(const char* target, size_t target_len,
     }
     *found = true;
     *equal = is_equal;
-    key_.resize(index_->prefix_len_);
+    const size_t prefix_len = index_->prefix_len_;
+    key_.resize(prefix_len);
+    key_.reserve(prefix_len + e.shared + e.suffix_len);
     key_.append(target, e.shared);
     key_.append(e.suffix, e.suffix_len);
     return Status::OK();
@@ -1551,8 +1557,8 @@ Status TrieIterator::Seek(const Slice& target, uint64_t tag) {
   // Spelling a separator overwrites key_, so copy a target that points into
   // it, such as key().
   if (UNLIKELY(PointsInto(rest, key_))) {
-    target_.assign(rest, rest_len);
-    rest = target_.data();
+    scratch_.assign(rest, rest_len);
+    rest = scratch_.data();
   }
   // Every separator starts with the shared prefix. If target's first bytes
   // are larger, every separator is below target. If they are smaller, or

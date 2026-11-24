@@ -272,10 +272,12 @@ TrieIndexIterator::TrieIndexIterator(const Trie* trie,
 
 void TrieIndexIterator::Prepare(const ScanOptions scan_opts[],
                                 size_t num_opts) {
-  // num_opts == 0 (scan_opts may be null) discards the earlier ranges. The
-  // caller keeps scan_opts alive until then.
-  scan_opts_ = scan_opts;
-  num_scan_opts_ = num_opts;
+  // num_opts == 0 (scan_opts may be null) discards the earlier ranges.
+  if (num_opts == 0) {
+    scan_opts_.clear();
+  } else {
+    scan_opts_.assign(scan_opts, scan_opts + num_opts);
+  }
   current_scan_idx_ = 0;
 }
 
@@ -308,6 +310,9 @@ Status TrieIndexIterator::SeekAndGetResult(const Slice& target,
 }
 
 Status TrieIndexIterator::NextAndGetResult(IterateResult* result) {
+  if (!iter_.Valid()) {
+    return SetResult(Status::OK(), IterBoundCheck::kUnknown, result);
+  }
   // The bound check uses the separator before the step, so run it first.
   RewindScan(iter_.key());
   const IterBoundCheck bounds = CheckBounds(iter_.key());
@@ -324,7 +329,7 @@ Status TrieIndexIterator::SeekToFirstAndGetResult(IterateResult* result) {
 Status TrieIndexIterator::SeekToLastAndGetResult(IterateResult* result) {
   // The last block can be in any range, so a NextAndGetResult() after Prev()
   // moves back from past the last one.
-  current_scan_idx_ = num_scan_opts_;
+  current_scan_idx_ = scan_opts_.size();
   return SetResult(iter_.SeekToLast(), IterBoundCheck::kInbound, result);
 }
 
@@ -352,7 +357,7 @@ void TrieIndexIterator::RewindScan(const Slice& key) {
 
 void TrieIndexIterator::SelectScan(const Slice& key) {
   RewindScan(key);
-  while (current_scan_idx_ < num_scan_opts_ &&
+  while (current_scan_idx_ < scan_opts_.size() &&
          !BelowLimit(key, current_scan_idx_)) {
     current_scan_idx_++;
   }
@@ -365,7 +370,7 @@ IterBoundCheck TrieIndexIterator::CheckBounds(
     return IterBoundCheck::kInbound;
   }
 
-  if (current_scan_idx_ >= num_scan_opts_) {
+  if (current_scan_idx_ >= scan_opts_.size()) {
     return IterBoundCheck::kOutOfBound;
   }
 

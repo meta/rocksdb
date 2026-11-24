@@ -271,8 +271,8 @@ class IndexFactoryIterator {
   // @param num_opts   Number of elements in scan_opts. 0 discards the ranges
   //                   of an earlier Prepare(), so the iterator is unbounded
   //                   again.
-  // The caller keeps scan_opts and the keys it points to alive until the
-  // ranges are discarded or replaced by another Prepare().
+  // The caller keeps the keys pointed to by scan_opts alive until the ranges
+  // are discarded or replaced by another Prepare().
   virtual void Prepare(const ScanOptions scan_opts[], size_t num_opts) = 0;
 
   // Context for Seek, carrying the packed sequence+type tag of the

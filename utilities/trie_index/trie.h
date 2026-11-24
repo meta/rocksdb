@@ -425,9 +425,9 @@ class TrieIterator {
   static constexpr uint64_t kNoBucket = ~uint64_t{0};
   const Trie* index_;
   std::string key_;
+  // Scratch buffer for a Seek target that points into key_, and for the
+  // current separator during NextSeparator() and Prev() trie descents.
   std::string scratch_;
-  // Copy of a Seek target that points into key_.
-  std::string target_;
   // The head, with the shared prefix, of bucket prev_head_bucket_, which is
   // the bucket Prev() last found by descending the trie, and the bucket's
   // bounds in the bucket data. The trie does not change, so they stay valid

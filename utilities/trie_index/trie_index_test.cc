@@ -3625,6 +3625,48 @@ TEST_F(TrieIndexFactoryTest, ScanBoundsAfterAnyPositioning) {
   ASSERT_EQ(result.bound_check_result, kOut);
 }
 
+// Prepare() copies the ScanOptions descriptors, so callers only need to keep
+// the underlying key bytes alive, not the ScanOptions array itself.
+TEST_F(TrieIndexFactoryTest, PrepareCopiesScanOptions) {
+  auto ctx = BuildTrieAndGetIterator({
+      {"b", "c", 0, 500, 0, 0},
+      {"e", "f", 1000, 500, 0, 0},
+      {"h", "", 2000, 500, 0, 0},
+  });
+  const std::string start = "a";
+  const std::string limit = "d";
+  const std::string other_start = "x";
+  const std::string other_limit = "z";
+  {
+    std::vector<ScanOptions> scans = {ScanOptions(Slice(start), Slice(limit))};
+    ctx.iter->Prepare(scans.data(), scans.size());
+    // Overwrite before freeing so the test fails deterministically even
+    // without ASAN if Prepare() retained a raw pointer.
+    scans[0] = ScanOptions(Slice(other_start), Slice(other_limit));
+  }
+
+  IterateResult result;
+  ASSERT_OK(ctx.iter->SeekAndGetResult(Slice("a"), &result,
+                                       SeekCtx(kMaxSequenceNumber)));
+  ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
+  ASSERT_EQ(ctx.iter->value().offset, 0u);
+
+  ASSERT_OK(ctx.iter->NextAndGetResult(&result));
+  ASSERT_EQ(result.bound_check_result, IterBoundCheck::kInbound);
+  ASSERT_EQ(ctx.iter->value().offset, 1000u);
+
+  ASSERT_OK(ctx.iter->NextAndGetResult(&result));
+  ASSERT_EQ(result.bound_check_result, IterBoundCheck::kOutOfBound);
+
+  // Next() on an already-exhausted iterator with active scan bounds stays
+  // invalid (kUnknown) without reading stale key state.
+  ASSERT_OK(ctx.iter->SeekAndGetResult(Slice("z"), &result,
+                                       SeekCtx(kMaxSequenceNumber)));
+  ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
+  ASSERT_OK(ctx.iter->NextAndGetResult(&result));
+  ASSERT_EQ(result.bound_check_result, IterBoundCheck::kUnknown);
+}
+
 // ============================================================================
 // Parallel compression protocol tests
 // ============================================================================
@@ -4429,6 +4471,83 @@ TEST_F(TrieTest, FailedInitLeavesIndexEmpty) {
   }
 }
 
+// A default-constructed (uninitialized) Trie is empty and safe to iterate.
+TEST_F(TrieTest, DefaultConstructedTrieIsEmpty) {
+  Trie index;
+  TrieIterator it(&index);
+  ASSERT_FALSE(it.Valid());
+  ASSERT_OK(it.SeekToFirst());
+  ASSERT_FALSE(it.Valid());
+  ASSERT_OK(it.SeekToLast());
+  ASSERT_FALSE(it.Valid());
+  ASSERT_OK(it.Seek(Slice(nullptr, 0), kSeekTag));
+  ASSERT_FALSE(it.Valid());
+  ASSERT_OK(it.Next());
+  ASSERT_FALSE(it.Valid());
+  ASSERT_OK(it.Prev());
+  ASSERT_FALSE(it.Valid());
+}
+
+// An empty trie (0 blocks, 0 separators) cannot carry a shared prefix,
+// non-zero max_separator_len, or an explicit size table.
+TEST_F(TrieTest, RejectsNonEmptyFieldsInEmptyTrie) {
+  const std::string empty = Build({}, 8);
+  Trie index;
+  ASSERT_OK(index.Init(empty));
+
+  // Case 1: non-zero prefix_len and max_separator_len with matching padding.
+  {
+    std::string mutated = empty;
+    constexpr uint32_t kExtra = 8;
+    EncodeFixed32(&mutated[32], kExtra);  // prefix_len
+    EncodeFixed32(&mutated[36], kExtra);  // max_separator_len
+    for (size_t i = 0; i < 8; i++) {
+      const size_t pos = 56 + 8 * i;
+      const uint64_t off = DecodeFixed64(&mutated[pos]);
+      if (off != 0) {
+        EncodeFixed64(&mutated[pos], off + kExtra);
+      }
+    }
+    mutated.insert(kTrieHeaderSize, kExtra, 'p');
+    ASSERT_EQ(index.Init(mutated).code(), Status::Code::kCorruption);
+  }
+
+  // Case 2: non-zero max_separator_len with zero prefix_len and extra bucket
+  // data bytes.
+  {
+    std::string mutated = empty;
+    constexpr uint32_t kExtra = 8;
+    EncodeFixed32(&mutated[36], kExtra);  // max_separator_len
+    const uint64_t bucket_data_off = DecodeFixed64(&mutated[56 + 8 * 2]);
+    for (size_t i = 3; i < 8; i++) {
+      const size_t pos = 56 + 8 * i;
+      const uint64_t off = DecodeFixed64(&mutated[pos]);
+      if (off != 0) {
+        EncodeFixed64(&mutated[pos], off + kExtra);
+      }
+    }
+    mutated.insert(bucket_data_off, kExtra, '\0');
+    ASSERT_EQ(index.Init(mutated).code(), Status::Code::kCorruption);
+  }
+
+  // Case 3: explicit_sizes set on an empty trie with a valid 0-element size
+  // column (16 bytes: 8B count=0 + 8B padding).
+  {
+    std::string mutated = empty;
+    EncodeFixed64(&mutated[48], ~uint64_t{0});  // size_gap = kExplicitSizes
+    const uint64_t run_off = DecodeFixed64(&mutated[56 + 8 * 5]);
+    EncodeFixed64(&mutated[56 + 8 * 4], run_off);  // size_table_offset
+    constexpr uint64_t kEmptyColSize = 16;
+    for (size_t i = 5; i < 8; i++) {
+      const size_t pos = 56 + 8 * i;
+      EncodeFixed64(&mutated[pos],
+                    DecodeFixed64(&mutated[pos]) + kEmptyColSize);
+    }
+    mutated.insert(run_off, kEmptyColSize, '\0');
+    ASSERT_EQ(index.Init(mutated).code(), Status::Code::kCorruption);
+  }
+}
+
 TEST_F(TrieTest, SeparatorsOutOfOrder) {
   TrieBuilder builder(8);
   builder.AddBlock("b", {0, 10}, 0);
@@ -4839,6 +4958,196 @@ TEST_F(TrieTest, SingleBlock) {
     SCOPED_TRACE(target);
     ASSERT_OK(it.Seek(target, kSeekTag));
     ASSERT_FALSE(it.Valid());
+  }
+}
+
+// Exercises kLongPathMarker (path_len >= 255 with multi-byte varint32) in the
+// trie and kLongEntryMarker (drop >= 15, add >= 15, including multi-byte
+// varints >= 128) in bucket data, end to end through Init(), Seek(), Next()
+// and Prev().
+TEST_F(TrieTest, LongPathsAndLongBucketEntries) {
+  const std::string long_a(300, 'a');
+  const std::string long_b(300, 'b');
+  const std::string long_c(160, 'c');
+  const std::string long_d(160, 'd');
+  std::vector<std::string> keys = {
+      // Bucket 0 head (bucket_size=4): triggers a 300-byte compressed trie path
+      // under label '0' (after no global shared prefix because last key starts
+      // with '2').
+      "0" + long_a + "0",
+      // Same bucket: small drop, large add (>= 128 bytes -> multi-byte varint).
+      "0" + long_a + "1" + long_c,
+      // Same bucket: large drop (>= 128 bytes) and large add (>= 128 bytes).
+      "0" + long_a + "2" + long_d,
+      // Same bucket: large drop (>= 15 bytes), small add.
+      "0" + long_a + "3",
+      // Bucket 1 head: another 300-byte compressed trie path under label '1'.
+      "1" + long_b + "0",
+      "1" + long_b + "1" + long_c,
+      "2",
+  };
+  std::vector<Block> blocks;
+  blocks.reserve(keys.size());
+  uint64_t offset = 0;
+  for (const std::string& k : keys) {
+    blocks.push_back({k, {offset, 100}, 0});
+    offset += 105;
+  }
+  std::vector<std::string> targets = {
+      "",
+      "0",
+      "0" + std::string(100, 'a'),
+      "0" + long_a,
+      "0" + long_a + "0",
+      "0" + long_a + "1",
+      "0" + long_a + "1" + long_c,
+      "0" + long_a + "2",
+      "0" + long_a + "2" + long_d,
+      "0" + long_a + "3",
+      "0" + long_a + "4",
+      "1" + long_b,
+      "1" + long_b + "0",
+      "1" + long_b + "1" + long_c,
+      "2",
+      "3",
+  };
+  for (uint32_t bucket_size : {1u, 4u, 8u}) {
+    ASSERT_NO_FATAL_FAILURE(
+        Verify(blocks, bucket_size, targets, BasicSeekTags()));
+  }
+}
+
+// Exercises 3-byte child pointers (trie section > 64 KiB) and 3-byte bucket
+// ids (> 65,536 buckets), covering LoadLE() width 3 for both fields.
+TEST_F(TrieTest, ThreeBytePointersAndBucketIds) {
+  // Part 1: 3-byte child pointers (trie > 64 KiB).
+  {
+    std::vector<Block> blocks;
+    blocks.reserve(300);
+    for (uint64_t i = 0; i < 300; i++) {
+      char prefix[16];
+      snprintf(prefix, sizeof(prefix), "%04llu_",
+               static_cast<unsigned long long>(i));
+      blocks.push_back({std::string(prefix) +
+                            std::string(260, static_cast<char>('a' + i % 26)),
+                        {i * 105, 100},
+                        0});
+    }
+    std::string data = Build(blocks, /*bucket_size=*/1);
+    const uint64_t trie_off = DecodeFixed64(&data[56]);
+    const uint64_t bucket_table_off = DecodeFixed64(&data[56 + 8]);
+    ASSERT_GT(bucket_table_off - trie_off, 65535u);
+    Trie index;
+    ASSERT_OK(index.Init(data));
+    TrieIterator it(&index);
+    ASSERT_OK(it.SeekToFirst());
+    for (size_t i = 0; i < blocks.size(); i++) {
+      ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, i));
+      ASSERT_OK(it.Next());
+    }
+    ASSERT_FALSE(it.Valid());
+    ASSERT_OK(it.SeekToLast());
+    for (size_t i = blocks.size(); i-- > 0;) {
+      ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, i));
+      ASSERT_OK(it.Prev());
+    }
+    ASSERT_FALSE(it.Valid());
+    for (size_t i :
+         {size_t{0}, size_t{1}, size_t{149}, size_t{298}, size_t{299}}) {
+      ASSERT_OK(it.Seek(blocks[i].separator, kSeekTag));
+      ASSERT_NO_FATAL_FAILURE(ExpectAt(it, blocks, i));
+    }
+  }
+
+  // Part 2: 3-byte bucket ids (> 65,536 buckets).
+  {
+    constexpr uint64_t kCount = 65600;
+    TrieBuilder builder(/*bucket_size=*/1);
+    auto make_key = [](uint64_t i) {
+      char buf[4];
+      buf[0] = static_cast<char>((i >> 16) & 0xFF);
+      buf[1] = static_cast<char>((i >> 8) & 0xFF);
+      buf[2] = static_cast<char>(i & 0xFF);
+      return std::string(buf, 3);
+    };
+    for (uint64_t i = 0; i < kCount; i++) {
+      builder.AddBlock(make_key(i), {i * 105, 100}, 0);
+    }
+    std::string data;
+    ASSERT_OK(builder.Finish(&data));
+    // id_width at header offset 40 must be 3.
+    ASSERT_EQ(DecodeFixed32(&data[40]), 3u);
+    Trie index;
+    ASSERT_OK(index.Init(data));
+    TrieIterator it(&index);
+    ASSERT_OK(it.SeekToFirst());
+    ASSERT_TRUE(it.Valid());
+    ASSERT_EQ(it.key(), make_key(0));
+    ASSERT_EQ(it.value().offset, 0u);
+    ASSERT_OK(it.SeekToLast());
+    ASSERT_TRUE(it.Valid());
+    ASSERT_EQ(it.key(), make_key(kCount - 1));
+    ASSERT_EQ(it.value().offset, (kCount - 1) * 105);
+    for (uint64_t i :
+         {uint64_t{0}, uint64_t{255}, uint64_t{256}, uint64_t{65534},
+          uint64_t{65535}, uint64_t{65536}, uint64_t{65537}, kCount - 1}) {
+      ASSERT_OK(it.Seek(make_key(i), kSeekTag));
+      ASSERT_TRUE(it.Valid());
+      ASSERT_EQ(it.key(), make_key(i));
+      ASSERT_EQ(it.value().offset, i * 105);
+      if (i > 0) {
+        ASSERT_OK(it.Prev());
+        ASSERT_TRUE(it.Valid());
+        ASSERT_EQ(it.key(), make_key(i - 1));
+        ASSERT_OK(it.Next());
+        ASSERT_TRUE(it.Valid());
+        ASSERT_EQ(it.key(), make_key(i));
+      }
+    }
+  }
+}
+
+// Deterministically exercises FindBitmapLabel() across all four 64-bit word
+// boundaries (0, 63, 64, 127, 128, 191, 192, 255) and across empty middle
+// words so cross-word has_below/has_above loops are always covered.
+TEST_F(TrieTest, BitmapNodeWordBoundaries) {
+  // Case 1: labels at all word boundaries plus extra labels in word 0 and
+  // word 3, with word 1 and word 2 completely empty (>= 32 children total).
+  std::vector<uint8_t> sparse_words_labels;
+  for (int b = 0; b < 16; b++) {
+    sparse_words_labels.push_back(static_cast<uint8_t>(b));
+  }
+  sparse_words_labels.push_back(63);
+  sparse_words_labels.push_back(192);
+  for (int b = 240; b < 256; b++) {
+    sparse_words_labels.push_back(static_cast<uint8_t>(b));
+  }
+  // Case 2: labels straddling every 64-bit word boundary.
+  std::vector<uint8_t> all_boundaries_labels;
+  for (int w = 0; w < 4; w++) {
+    for (int off : {0, 1, 2, 15, 31, 47, 61, 62, 63}) {
+      all_boundaries_labels.push_back(static_cast<uint8_t>(w * 64 + off));
+    }
+  }
+
+  for (const auto& labels : {sparse_words_labels, all_boundaries_labels}) {
+    ASSERT_GE(labels.size(), 32u);
+    std::vector<Block> blocks;
+    blocks.reserve(labels.size());
+    uint64_t offset = 0;
+    for (uint8_t b : labels) {
+      blocks.push_back(
+          {std::string(1, static_cast<char>(b)), {offset, 100}, 0});
+      offset += 105;
+    }
+    std::vector<std::string> targets = {""};
+    for (int c = 0; c < 256; c++) {
+      const std::string s(1, static_cast<char>(c));
+      targets.push_back(s);
+      targets.push_back(s + std::string(1, '\0'));
+    }
+    ASSERT_NO_FATAL_FAILURE(
+        Verify(blocks, /*bucket_size=*/1, targets, {kSeekTag}));
   }
 }
 
