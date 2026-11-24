@@ -501,9 +501,12 @@ do
   if member_of_array "$checkout_ref" "${bak_forward_refs[@]}"
   then
     echo "== Use $checkout_ref to restore DB from $current_checkout_name"
-    rm -rf ${db_test_dir:?}/$checkout_ref
-    restore_db $current_bak_test_dir $db_test_dir/$checkout_ref
-    compare_db $db_test_dir/$checkout_ref $current_db_test_dir forward_${checkout_ref}_dump.txt 0
+    # Restore into a separate directory, keeping the DB generated using
+    # $checkout_ref for the current version to open below
+    restored_db=${current_db_test_dir}_restored_by_${checkout_ref}
+    restore_db $current_bak_test_dir $restored_db
+    compare_db $restored_db $current_db_test_dir forward_${checkout_ref}_dump.txt 0
+    rm -rf ${restored_db:?}
   fi
 
   # Remote compaction format compatibility: test that primary and worker from
