@@ -110,6 +110,14 @@ story, and no part of the summary should restate the patch in prose.
   underlying invariant violation. Answer the reader's first question directly,
   such as whether existing data could already be affected, and in which
   workloads.
+- When a failure depends on the order of operations, an option combination,
+  or a thread interleaving, include a worked example, ideally a text diagram
+  in a fenced code block (such as one column per thread): the option values,
+  the operations or per-thread steps in order, and the state after each,
+  ending in the observable failure. Keep only the options, steps and state
+  the failure depends on. If the example ends in an assertion, also say what
+  a release build does. Say whether the example was reproduced (for example
+  by the regression test) or derived from the code.
 - When useful, say how a bug was found and what testing gap let it through. If
   the origin should not be public, a task number is enough.
 - For a revert, say why, and what kind of workload or operation regressed.
