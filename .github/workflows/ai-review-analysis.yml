@@ -467,7 +467,7 @@ jobs:
           steps.check_existing.outputs.skip != 'true' &&
           inputs.provider == 'claude'
         id: classify_claude
-        uses: anthropics/claude-code-base-action@beta
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # beta
         with:
           prompt_file: /tmp/complexity_prompt.txt
           model: ${{ inputs.classifier_model }}
@@ -522,7 +522,7 @@ jobs:
         env:
           MAX_THINKING_TOKENS: ${{ steps.budget_claude.outputs.tokens }}
           CLAUDE_COMPLEXITY: ${{ steps.budget_claude.outputs.label }}
-        uses: anthropics/claude-code-base-action@beta
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # beta
         with:
           prompt_file: /tmp/prompt.txt
           model: ${{ inputs.default_model }}
@@ -562,7 +562,7 @@ jobs:
           inputs.provider == 'claude' &&
           steps.recover_claude.outputs.needs_recovery == 'true'
         id: format_recovery_claude
-        uses: anthropics/claude-code-base-action@beta
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # beta
         with:
           prompt_file: claude_md/ci_recovery_prompt.md
           model: ${{ inputs.recovery_model }}
@@ -866,7 +866,7 @@ jobs:
           steps.request.outputs.type == 'review' &&
           inputs.provider == 'claude'
         id: manual_classify_claude
-        uses: anthropics/claude-code-base-action@beta
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # beta
         with:
           prompt_file: /tmp/complexity_prompt.txt
           model: ${{ inputs.classifier_model }}
@@ -939,7 +939,7 @@ jobs:
         env:
           MAX_THINKING_TOKENS: ${{ steps.manual_budget_claude.outputs.tokens }}
           CLAUDE_COMPLEXITY: ${{ steps.manual_budget_claude.outputs.label }}
-        uses: anthropics/claude-code-base-action@beta
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # beta
         with:
           prompt_file: /tmp/prompt.txt
           model: ${{ inputs.selected_model != '' && inputs.selected_model || inputs.default_model }}
@@ -980,7 +980,7 @@ jobs:
           inputs.provider == 'claude' &&
           steps.manual_recover_claude.outputs.needs_recovery == 'true'
         id: manual_format_recovery_claude
-        uses: anthropics/claude-code-base-action@beta
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # beta
         with:
           prompt_file: claude_md/ci_recovery_prompt.md
           model: ${{ inputs.recovery_model }}
