@@ -404,6 +404,7 @@ S3FifoCacheShard::S3FifoCacheShard(
       max_length_(MaxLengthFor(std::max(capacity, max_capacity))),
       occupancy_(0),
       detached_pinned_usage_(0),
+      resident_hand_(nullptr),
       aside_slot_(SlotIndexAt(max_length_)),
       aside_unpinned_(false),
       mutex_(use_adaptive_mutex),
@@ -431,10 +432,11 @@ S3FifoCacheShard::S3FifoCacheShard(
     return;
   }
   // Make empty circular linked lists.
-  for (uint16_t queue : {kFifoSlot, aside_slot_}) {
+  for (uint16_t queue : {kProbationSlot, kResidentSlot, aside_slot_}) {
     Slot(queue)->next = queue;
     Slot(queue)->prev = queue;
   }
+  resident_hand_ = resident();
   used_length_ = std::min(kInitialLength, max_length_);
   length_info_.store(UsedLengthToLengthInfo(used_length_),
                      std::memory_order_relaxed);
@@ -483,7 +485,7 @@ void S3FifoCacheShard::EraseUnRefEntries() {
   autovector<S3FifoHandle*> last_reference_list;
   {
     DMutexLock l(mutex_);
-    for (S3FifoHandle* queue : {fifo(), aside()}) {
+    for (S3FifoHandle* queue : {probation(), resident(), aside()}) {
       S3FifoHandle* cur = Next(queue);
       while (cur != queue) {
         S3FifoHandle* next = Next(cur);
@@ -494,7 +496,7 @@ void S3FifoCacheShard::EraseUnRefEntries() {
             cur->state.compare_exchange_strong(s, 0,
                                                std::memory_order_acquire)) {
           assert(s & S3FifoHandle::kInCache);
-          FIFO_Remove(cur);
+          FIFO_Remove(cur, (s & S3FifoHandle::kInProbation) != 0);
           RemoveFromTable(cur);
           assert(usage_.Get() >= cur->SlotCharge());
           usage_ -= cur->SlotCharge();
@@ -578,9 +580,19 @@ void S3FifoCacheShard::ApplyToSomeEntries(
   }
 }
 
-void S3FifoCacheShard::TEST_GetFIFOList(S3FifoHandle** fifo) {
+void S3FifoCacheShard::TEST_PromoteToResident(const Slice& key) {
   DMutexLock l(mutex_);
-  *fifo = Slot(kFifoSlot);
+  S3FifoHandle* h = FindInTable(key, ComputeHash(key, hash_seed_));
+  assert(h != nullptr && h->InProbation());
+  FIFO_Remove(h, /*in_probation=*/true);
+  h->state.fetch_and(static_cast<uint16_t>(~S3FifoHandle::kInProbation),
+                     std::memory_order_relaxed);
+  FIFO_Append(resident(), h);
+}
+
+void S3FifoCacheShard::TEST_GetProbationList(S3FifoHandle** fifo) {
+  DMutexLock l(mutex_);
+  *fifo = probation();
 }
 
 S3FifoCacheShard::Stats S3FifoCacheShard::GetStats() {
@@ -633,18 +645,22 @@ bool S3FifoCacheShard::TEST_FreeListMatchesTable() {
   return listed == unoccupied;
 }
 
-size_t S3FifoCacheShard::TEST_GetFIFOSize() {
+size_t S3FifoCacheShard::TEST_GetProbationSize() {
   DMutexLock l(mutex_);
   size_t size = 0;
-  for (S3FifoHandle* h = Next(fifo()); h != fifo(); h = Next(h)) {
+  for (S3FifoHandle* h = Next(probation()); h != probation(); h = Next(h)) {
     size++;
   }
   return size;
 }
 
-void S3FifoCacheShard::FIFO_Remove(S3FifoHandle* e) {
+void S3FifoCacheShard::FIFO_Remove(S3FifoHandle* e, bool /*in_probation*/) {
   assert(e->next != kNoLink);
   assert(e->prev != kNoLink);
+  if (e == resident_hand_) {
+    S3FifoHandle* next = ResidentNext(e);
+    resident_hand_ = next == e ? resident() : next;
+  }
   Next(e)->prev = e->prev;
   Prev(e)->next = e->next;
   e->prev = e->next = kNoLink;
@@ -652,21 +668,30 @@ void S3FifoCacheShard::FIFO_Remove(S3FifoHandle* e) {
   // Queue membership does not affect usage_.
 }
 
-void S3FifoCacheShard::FIFO_Append(S3FifoHandle* e) { LinkAtTail(fifo(), e); }
+void S3FifoCacheShard::FIFO_Append(S3FifoHandle* queue, S3FifoHandle* e) {
+  assert(e->InProbation() == (queue == probation()));
+  LinkAtTail(queue, e);
+}
 
 void S3FifoCacheShard::LinkAtTail(S3FifoHandle* queue, S3FifoHandle* e) {
   assert(e->next == kNoLink);
   assert(e->prev == kNoLink);
-  // Append to tail: queue->prev is newest and queue->next is oldest.
+  // Append to tail. For probation and aside queue->prev is newest and
+  // queue->next is oldest. For resident the tail is just before the hand,
+  // which is the dummy head itself when resident is empty.
+  S3FifoHandle* before = queue == resident() ? resident_hand_ : queue;
   const uint16_t idx = IndexOf(e);
-  e->next = IndexOf(queue);
-  e->prev = queue->prev;
+  e->next = IndexOf(before);
+  e->prev = before->prev;
   Prev(e)->next = idx;
-  queue->prev = idx;
+  before->prev = idx;
+  if (queue == resident() && resident_hand_ == resident()) {
+    resident_hand_ = e;
+  }
 }
 
 void S3FifoCacheShard::MoveToTail(S3FifoHandle* e, S3FifoHandle* queue) {
-  FIFO_Remove(e);
+  FIFO_Remove(e, /*in_probation=*/false);
   LinkAtTail(queue, e);
 }
 
@@ -690,11 +715,11 @@ void S3FifoCacheShard::ReturnUnpinnedAside() {
     TEST_SYNC_POINT("S3FifoCacheShard::EvictionVisit");
     S3FifoHandle* e = Next(aside());
     // A Lookup may pin e right after this check; it is then a pinned entry
-    // in the queue, as after any other race with a hit.
+    // in its queue, as after any other race with a hit.
     if (e->HasRefs()) {
       SetAside(e);
     } else {
-      MoveToTail(e, fifo());
+      MoveToTail(e, e->InProbation() ? probation() : resident());
     }
   }
 }
@@ -712,13 +737,18 @@ bool S3FifoCacheShard::ReturnUnpinnedAsideChunk(S3FifoHandle* last) {
     if (e->HasRefs()) {
       SetAside(e);
     } else {
-      MoveToTail(e, fifo());
+      MoveToTail(e, e->InProbation() ? probation() : resident());
     }
     if (at_last) {
       return true;
     }
   }
   return false;
+}
+
+S3FifoHandle* S3FifoCacheShard::ResidentNext(S3FifoHandle* e) {
+  S3FifoHandle* next = Next(e);
+  return next == resident() ? Next(next) : next;
 }
 
 void S3FifoCacheShard::EvictFromFIFO(size_t charge,
@@ -734,7 +764,7 @@ void S3FifoCacheShard::EvictFromFIFO(size_t charge,
 void S3FifoCacheShard::EvictNeed(EvictionData* data,
                                  autovector<S3FifoHandle*>* deleted) {
   ReturnUnpinnedAside();
-  EvictFromQueue(data, deleted);
+  EvictFromQueues(data, deleted);
   // Eviction returns only kAsideChecksPerEviction aside entries per call,
   // so after a burst of pins is released most of the shard may wait on the
   // aside list. When it falls short, return them kAsideReturnChunk at a
@@ -751,11 +781,20 @@ void S3FifoCacheShard::EvictNeed(EvictionData* data,
     bool walked = false;
     while (!walked && !data->Done()) {
       walked = ReturnUnpinnedAsideChunk(last);
-      EvictFromQueue(data, deleted);
+      EvictFromQueues(data, deleted);
     }
     if (!walked) {
       aside_unpinned_.store(true, std::memory_order_relaxed);
     }
+  }
+}
+
+void S3FifoCacheShard::EvictFromQueues(EvictionData* data,
+                                       autovector<S3FifoHandle*>* deleted) {
+  // Probation drains first, then resident second-chance.
+  EvictFromProbation(data, deleted);
+  if (!data->Done()) {
+    EvictFromResident(data, deleted);
   }
 }
 
@@ -769,36 +808,128 @@ void S3FifoCacheShard::EvictClaimed(S3FifoHandle* e, EvictionData* data,
   deleted->push_back(e);
 }
 
-void S3FifoCacheShard::EvictFromQueue(EvictionData* data,
-                                      autovector<S3FifoHandle*>* deleted) {
-  // Each step consumes the head: evict it, or move it to the tail (or aside)
-  // if pinned. The pass ends after the entry that was newest when it began,
-  // so it visits each entry at most once and an all-pinned shard terminates
-  // having evicted nothing. Eviction claims the entry with a CAS that
-  // requires refs == 0, so a concurrent Lookup either pins it first (and it
-  // moves to the tail as pinned) or misses. The pinned move never touches
+bool S3FifoCacheShard::EvictFromProbation(EvictionData* data,
+                                          autovector<S3FifoHandle*>* deleted) {
+  // Each step consumes the head: promote, evict, or move a pinned entry to
+  // the tail (or aside). The pass ends after the entry that was newest when it
+  // began, so it visits at most the initial number of entries and never
+  // revisits a moved pin. Promotion frees nothing; the pass continues. Moves
+  // touch only links and the probation charge: usage_ is unchanged. Promotion
+  // and eviction claim the entry with a CAS that requires refs == 0, so a
+  // concurrent Lookup either pins it first (and it moves to the tail as pinned)
+  // or loses the race: after an eviction it misses; after a promotion it
+  // retries and hits the now-resident entry. The pinned move never touches
   // state.
+  bool promoted = false;
   size_t rotated = 0;
-  S3FifoHandle* const last = Prev(fifo());
-  bool at_last = Next(fifo()) == fifo();
+  S3FifoHandle* const last = Prev(probation());
+  bool at_last = Next(probation()) == probation();
   while (!at_last && !data->Done()) {
     TEST_SYNC_POINT("S3FifoCacheShard::EvictionVisit");
-    S3FifoHandle* cur = Next(fifo());
+    S3FifoHandle* cur = Next(probation());
     at_last = cur == last;
     uint16_t s = cur->state.load(std::memory_order_relaxed);
     assert(s & S3FifoHandle::kInCache);
+    assert(s & S3FifoHandle::kInProbation);
+    const bool promote =
+        cur->freq.load(std::memory_order_relaxed) >= kPromoteThreshold;
+    // Acquire pairs with the seq_cst decrement in Release, so the last
+    // holder's reads of the value happen before an evicted entry is freed.
     if ((s & S3FifoHandle::kRefMask) != 0 ||
-        !cur->state.compare_exchange_strong(s, 0, std::memory_order_acquire)) {
+        !cur->state.compare_exchange_strong(
+            s,
+            promote ? static_cast<uint16_t>(s & ~S3FifoHandle::kInProbation)
+                    : uint16_t{0},
+            std::memory_order_acquire)) {
       if (rotated++ < kPinnedRotationsPerPass) {
-        MoveToTail(cur, fifo());
+        MoveToTail(cur, probation());
         ++stats_.pinned_rotations;
       } else {
         SetAside(cur);
         ++stats_.set_aside;
       }
     } else {
-      FIFO_Remove(cur);
-      EvictClaimed(cur, data, deleted);
+      if (promote) {
+        FIFO_Remove(cur, /*in_probation=*/true);
+        FIFO_Append(resident(), cur);
+        cur->freq.store(0, std::memory_order_relaxed);
+        promoted = true;
+      } else {
+        if (cur->freq.load(std::memory_order_relaxed) == 0) {
+          ++stats_.evicted_without_hit;
+        }
+        FIFO_Remove(cur, /*in_probation=*/true);
+        EvictClaimed(cur, data, deleted);
+      }
+    }
+  }
+  return promoted;
+}
+
+void S3FifoCacheShard::EvictFromResident(EvictionData* data,
+                                         autovector<S3FifoHandle*>* deleted) {
+  // Every step rotates (advances the hand past), evicts or sets aside the
+  // head; a pass ends when the hand cycles back to its marker. The marker
+  // is re-anchored by breaking out on every eviction. An eviction claims the
+  // head with a CAS that requires refs == 0; losing it to a concurrent Lookup
+  // is the same as meeting a pinned head.
+  int idle_passes = 0;
+  // Pinned entries passed in this call since the last idle pass. A pass that
+  // evicts or re-anchors ends early and does not reset it, so it bounds the
+  // pinned entries passed per call until an idle pass; when evicting passes
+  // carry the hand around resident more than once, it counts the same pinned
+  // entry again.
+  size_t rotated = 0;
+  while (!data->Done() && Next(resident()) != resident() &&
+         idle_passes < kMaxResidentIdlePasses) {
+    S3FifoHandle* start = resident_hand_;
+    bool evicted_this_pass = false;
+    bool reanchored = false;
+    do {
+      TEST_SYNC_POINT("S3FifoCacheShard::EvictionVisit");
+      // The entry at the hand (unrelated to S3FifoHandle::head): the oldest in
+      // clock order, which this step rotates past, evicts or sets aside.
+      S3FifoHandle* head = resident_hand_;
+      uint16_t s = head->state.load(std::memory_order_relaxed);
+      const uint8_t freq = head->freq.load(std::memory_order_relaxed);
+      if ((s & S3FifoHandle::kRefMask) == 0 && freq > 0) {
+        // Recently hit: spend one hit and rotate.
+        head->freq.store(freq - 1, std::memory_order_relaxed);
+        resident_hand_ = ResidentNext(head);
+        continue;
+      }
+      // Acquire pairs with the seq_cst decrement in Release, so the last
+      // holder's reads of the value happen before it is freed.
+      if ((s & S3FifoHandle::kRefMask) == 0 &&
+          head->state.compare_exchange_strong(s, 0,
+                                              std::memory_order_acquire)) {
+        assert(s == S3FifoHandle::kInCache);
+        FIFO_Remove(head, /*in_probation=*/false);
+        EvictClaimed(head, data, deleted);
+        evicted_this_pass = true;
+        idle_passes = 0;
+        break;
+      }
+      // Pinned, or the claim lost to a concurrent Lookup.
+      if (rotated++ < kPinnedRotationsPerPass) {
+        resident_hand_ = ResidentNext(head);
+        ++stats_.pinned_rotations;
+        continue;
+      }
+      // FIFO_Remove moves the hand past head. Setting the marker aside
+      // re-anchors the pass, as an eviction does, without counting it idle:
+      // every such step removes an entry.
+      SetAside(head);
+      ++stats_.set_aside;
+      if (head == start) {
+        reanchored = true;
+        break;
+      }
+    } while (!data->Done() && Next(resident()) != resident() &&
+             resident_hand_ != start);
+    if (!evicted_this_pass && !reanchored) {
+      ++idle_passes;
+      rotated = 0;
     }
   }
 }
@@ -808,8 +939,10 @@ void S3FifoCacheShard::NotifyEvicted(
   autovector<S3FifoHandle*> slots;
   UniqueId64x2 buf;
   for (S3FifoHandle* entry : evicted_handles) {
-    // was_hit is always false: FIFO keeps no hit state (frequency tracking
-    // is out of scope), so eviction callbacks cannot distinguish hits.
+    // was_hit stays false: resident freq decays and promotion resets it, so
+    // freq does not record ever-hit for every victim (probation victims at
+    // freq 0 were never hit; see Stats::evicted_without_hit). Sticky hit
+    // tracking waits for a consumer.
     // A callback returning true took ownership of obj.
     if (!eviction_callback_ ||
         !eviction_callback_(KeyOf(entry, &buf), entry, false)) {
@@ -1073,12 +1206,12 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
     // Step 1: reclaim retired slots.
     scan = MaybeReclaim(&heap_keys);
 
-    // Free the space following strict FIFO policy until enough space
-    // is freed or no unpinned entry remains. An entry that can never fit is
-    // refused (strict) or dropped (no handle) below, so evicting for it would
-    // only empty the shard; so is a slotless entry without a handle. A
-    // slotless entry with a handle evicts, also under strict_capacity_limit,
-    // as CreateStandalone evicts before checking that its entry fits.
+    // Free space by the eviction policy until enough space is freed or no
+    // unpinned entry remains. An entry that can never fit is refused (strict)
+    // or dropped (no handle) below, so evicting for it would only empty the
+    // shard; so is a slotless entry without a handle. A slotless entry with a
+    // handle evicts, also under strict_capacity_limit, as CreateStandalone
+    // evicts before checking that its entry fits.
     // Step 2: evict by the policy for the charge.
     const bool skip_eviction =
         handle == nullptr ? slotless || NeverFits(total_charge)
@@ -1110,8 +1243,9 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
       // Under strict_capacity_limit the table only grows when the growth
       // also fits, so an admitted insert never ends above capacity; without
       // it, usage ends above capacity only when eviction cannot free enough
-      // (every remaining entry pinned), or when an overwrite finds no free slot
-      // and the table grows past capacity.
+      // (every remaining entry pinned, or every resident entry re-hit faster
+      // than the clock sweeps; see kMaxResidentIdlePasses), or when an
+      // overwrite finds no free slot and the table grows past capacity.
       S3FifoHandle* old = FindInTable(key, hash);
       // A slotless entry skips the table: growth, the occupancy eviction
       // and the slot itself.
@@ -1201,10 +1335,12 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
         e->helper_index = helper_index;
         e->SetSlotCharge(static_cast<uint32_t>(total_charge));
         e->next = e->prev = kNoLink;
+        e->freq.store(0, std::memory_order_relaxed);
         // The final state, set before the chain publishes e to Lookup.
         // Release: GetPinnedUsage reads the charge after an acquire load
         // of state, without the chain.
         e->state.store(static_cast<uint16_t>(S3FifoHandle::kInCache |
+                                             S3FifoHandle::kInProbation |
                                              (handle != nullptr ? 1 : 0)),
                        std::memory_order_release);
         LinkIntoChain(e);
@@ -1216,7 +1352,7 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
           }
         }
         usage_ += total_charge;
-        FIFO_Append(e);
+        FIFO_Append(probation(), e);
         if (handle != nullptr) {
           *handle = e;
         }
@@ -1314,7 +1450,7 @@ S3FifoHandle* S3FifoCacheShard::Lookup(const Slice& key, HashCref hash,
   if (e != nullptr) {
     s = e->state.load(std::memory_order_relaxed);
     do {
-      // At the 15-bit ref cap, one more ref would carry into kInCache: miss
+      // At the 14-bit ref cap, one more ref would carry into kInCache: miss
       // instead, as for an entry being removed.
       if ((s & S3FifoHandle::kInCache) == 0 ||
           (s & S3FifoHandle::kRefMask) == S3FifoHandle::kRefMask) {
@@ -1335,13 +1471,17 @@ S3FifoHandle* S3FifoCacheShard::Lookup(const Slice& key, HashCref hash,
     return nullptr;
   }
   TEST_SYNC_POINT_CALLBACK("S3FifoCacheShard::Lookup:AfterRef", e);
-  // A hit moves nothing.
+  // Credit the hit, saturating at kMaxFrequency.
+  const uint8_t freq = e->freq.load(std::memory_order_relaxed);
+  if (freq < kMaxFrequency) {
+    e->freq.store(freq + 1, std::memory_order_relaxed);
+  }
   return e;
 }
 
 bool S3FifoCacheShard::Ref(S3FifoHandle* e) {
   // To create another reference - entry must be already externally referenced.
-  // Refused at the 15-bit ref cap, where one more would carry into kInCache.
+  // Refused at the 14-bit ref cap, where one more would carry into kInCache.
   uint16_t s = e->state.load(std::memory_order_relaxed);
   do {
     assert((s & S3FifoHandle::kRefMask) > 0);
@@ -1414,9 +1554,9 @@ bool S3FifoCacheShard::ReleaseLocked(S3FifoHandle* e, bool erase_if_last_ref) {
         }
         return false;
       }
-      // The FIFO queue may still hold pinned entries, so unlike LRU there
+      // The queues may still hold pinned entries, so unlike LRU there
       // is no emptiness assertion here.
-      FIFO_Remove(e);
+      FIFO_Remove(e, (s & S3FifoHandle::kInProbation) != 0);
       RemoveFromTable(e);
     } else {
       // Detached (erased/overwritten) or standalone.
@@ -1441,7 +1581,8 @@ bool S3FifoCacheShard::Detach(S3FifoHandle* e) {
   const uint16_t s =
       e->state.fetch_and(S3FifoHandle::kRefMask, std::memory_order_acq_rel);
   assert(s & S3FifoHandle::kInCache);
-  FIFO_Remove(e);
+  const bool in_probation = (s & S3FifoHandle::kInProbation) != 0;
+  FIFO_Remove(e, in_probation);
   RemoveFromTable(e);
   if ((s & S3FifoHandle::kRefMask) == 0) {
     assert(usage_.Get() >= e->SlotCharge());
@@ -1698,6 +1839,7 @@ S3FifoCacheShard::Stats S3FifoCache::GetStats() {
     total.occupancy_evictions += s.occupancy_evictions;
     total.pinned_rotations += s.pinned_rotations;
     total.set_aside += s.set_aside;
+    total.evicted_without_hit += s.evicted_without_hit;
     total.table_full_standalone += s.table_full_standalone;
     total.helper_overflow_standalone += s.helper_overflow_standalone;
     total.large_charge_standalone += s.large_charge_standalone;
@@ -1728,9 +1870,9 @@ bool S3FifoCache::ReservationFailed() {
          }) != 0;
 }
 
-size_t S3FifoCache::TEST_GetFIFOSize() {
+size_t S3FifoCache::TEST_GetProbationSize() {
   return SumOverShards(
-      [](S3FifoCacheShard& cs) { return cs.TEST_GetFIFOSize(); });
+      [](S3FifoCacheShard& cs) { return cs.TEST_GetProbationSize(); });
 }
 
 }  // namespace s3fifo_cache
