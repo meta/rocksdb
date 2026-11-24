@@ -15,6 +15,7 @@
 #include <cstdlib>
 
 #include "cache/secondary_cache_adapter.h"
+#include "memory/throw_if_alloc_failed.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics_impl.h"
 #include "port/lang.h"
@@ -529,8 +530,8 @@ LRUHandle* LRUCacheShard::CreateHandle(const Slice& key, uint32_t hash,
   // Allocate the memory here outside of the mutex.
   // If the cache is full, we'll have to release it.
   // It shouldn't happen very often though.
-  LRUHandle* e =
-      static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
+  LRUHandle* e = static_cast<LRUHandle*>(
+      ThrowIfAllocFailed(malloc(sizeof(LRUHandle) - 1 + key.size())));
 
   e->value = value;
   e->m_flags = 0;

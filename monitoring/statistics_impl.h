@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "memory/throw_if_alloc_failed.h"
 #include "monitoring/histogram.h"
 #include "port/likely.h"
 #include "port/port.h"
@@ -92,8 +93,12 @@ class StatisticsImpl : public Statistics {
                   INTERNAL_HISTOGRAM_ENUM_MAX * sizeof(HistogramImpl)) %
                      CACHE_LINE_SIZE)] ROCKSDB_FIELD_UNUSED;
 #endif
-    void* operator new(size_t s) { return port::cacheline_aligned_alloc(s); }
-    void* operator new[](size_t s) { return port::cacheline_aligned_alloc(s); }
+    void* operator new(size_t s) {
+      return ThrowIfAllocFailed(port::cacheline_aligned_alloc(s));
+    }
+    void* operator new[](size_t s) {
+      return ThrowIfAllocFailed(port::cacheline_aligned_alloc(s));
+    }
     void operator delete(void* p) { port::cacheline_aligned_free(p); }
     void operator delete[](void* p) { port::cacheline_aligned_free(p); }
   };

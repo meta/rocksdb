@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <string>
 
+#include "memory/throw_if_alloc_failed.h"
 #include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/advanced_cache.h"
@@ -139,8 +140,9 @@ class ShardedCache : public ShardedCacheBase {
 
   explicit ShardedCache(const ShardedCacheOptions& opts)
       : ShardedCacheBase(opts),
-        shards_(static_cast<CacheShard*>(port::cacheline_aligned_alloc(
-            sizeof(CacheShard) * GetNumShards()))),
+        shards_(static_cast<CacheShard*>(
+            ThrowIfAllocFailed(port::cacheline_aligned_alloc(
+                sizeof(CacheShard) * GetNumShards())))),
         destroy_shards_in_dtor_(false) {}
 
   virtual ~ShardedCache() {
