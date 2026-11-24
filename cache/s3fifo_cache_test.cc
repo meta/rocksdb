@@ -25,6 +25,7 @@
 #include <system_error>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "port/port.h"
@@ -2788,6 +2789,389 @@ TEST_F(S3FifoCacheTest, SecondaryCacheWrapped) {
   if (h != nullptr) {
     cache->Release(h);
   }
+}
+
+// A probation victim re-inserted lands in resident, so the same
+// pressure that evicted it once no longer does. Resident holds only a, so
+// probation stays over budget and every eviction draws from probation.
+TEST_F(S3FifoCacheTest, GhostReadmitsProbationVictimToResident) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("a"));
+  InsertN("c", 99);
+  EXPECT_EQ(100, cache_->GetUsage());
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  // Evicts c0; a goes to resident.
+  EXPECT_OK(Insert("a"));
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(InProbationForTest("a"));
+  // A full probation's worth of cold inserts: in probation, a would go.
+  InsertN("d", 100);
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_EQ(100, cache_->GetUsage());
+}
+
+// A resident victim is not remembered and re-enters probation, while a
+// probation victim from the same run is readmitted to resident.
+TEST_F(S3FifoCacheTest, GhostIgnoresResidentVictims) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("big", /*charge*/ 87));
+  HitNTimes("big", 2);
+  EXPECT_OK(Insert("a"));
+  HitNTimes("a", 2);
+  InsertN("p", 12);
+  EXPECT_EQ(100, cache_->GetUsage());
+  // Promotes big and a, evicts p0 from probation.
+  EXPECT_OK(Insert("t"));
+  EXPECT_FALSE(ContainsForTest("p0"));
+  EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+  HitNTimes("big", 1);
+  // Probation at budget: resident first. big spends its hit; a is evicted.
+  EXPECT_OK(Insert("u"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_OK(Insert("a"));
+  EXPECT_TRUE(InProbationForTest("a"));
+  EXPECT_OK(Insert("p0"));
+  EXPECT_TRUE(ContainsForTest("p0"));
+  EXPECT_FALSE(InProbationForTest("p0"));
+}
+
+// Readmission consumes the ghost. After a is readmitted and then
+// evicted from resident, a third insert goes to probation.
+TEST_F(S3FifoCacheTest, GhostForgetsReadmittedKey) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("big", /*charge*/ 87));
+  HitNTimes("big", 2);
+  EXPECT_OK(Insert("a"));
+  InsertN("p", 12);
+  EXPECT_EQ(100, cache_->GetUsage());
+  // Promotes big, evicts a from probation.
+  EXPECT_OK(Insert("t"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  // Evicts p0; a is readmitted to resident.
+  EXPECT_OK(Insert("a"));
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(InProbationForTest("a"));
+  EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+  HitNTimes("big", 1);
+  // Probation at budget: resident first. big spends its hit; a is evicted.
+  EXPECT_OK(Insert("u"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_OK(Insert("a"));
+  EXPECT_TRUE(InProbationForTest("a"));
+}
+
+// A record left stale by readmission must not drop a newer record of the same
+// key when it reaches the head of the ghost queue.
+TEST_F(S3FifoCacheTest, GhostStaleRecordKeepsNewerRecord) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a"));
+  InsertN("c", 9);
+  // Evicts a. Ghost: [a].
+  EXPECT_OK(Insert("x"));
+  // Evicts c0, then readmits a. Ghost: [stale a, c0].
+  EXPECT_OK(Insert("a"));
+  EXPECT_FALSE(InProbationForTest("a"));
+  Erase("a");
+  Erase("x");
+  for (int i = 1; i < 9; i++) {
+    Erase("c" + std::to_string(i));
+  }
+  EXPECT_EQ(0, cache_->GetUsage());
+  EXPECT_OK(Insert("a"));
+  // e9 evicts a from probation. Ghost: [stale a, c0, a].
+  InsertN("e", 10);
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_EQ(3, cache_->TEST_GetGhostSize());
+  for (int i = 3; i < 10; i++) {
+    Erase("e" + std::to_string(i));
+  }
+  // Evicts e0 with 3 entries in the table, dropping the stale record; the
+  // trim after SetCapacity then drops c0 for the 2 entries left.
+  cache_->SetCapacity(2);
+  EXPECT_EQ(2, cache_->TEST_GetGhostSize());
+  cache_->SetCapacity(10);
+  EXPECT_OK(Insert("a"));
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(InProbationForTest("a"));
+}
+
+// Under a long unique-key workload the ghost queue holds exactly as
+// many keys as the shard holds entries, and follows the shard when it
+// shrinks.
+TEST_F(S3FifoCacheTest, GhostBoundedByOccupancy) {
+  NewCache(/*capacity*/ 100);
+  InsertN("k", 10000);
+  EXPECT_EQ(100, cache_->GetOccupancyCount());
+  EXPECT_EQ(100, cache_->TEST_GetGhostSize());
+  cache_->SetCapacity(50);
+  InsertN("j", 10000);
+  EXPECT_EQ(50, cache_->GetOccupancyCount());
+  EXPECT_EQ(50, cache_->TEST_GetGhostSize());
+}
+
+// The ghost queue keeps its bound (no more ghosts than entries in the table)
+// after SetCapacity lowers capacity, even when the shrink evicts nothing,
+// not only when the next victim is recorded.
+TEST_F(S3FifoCacheTest, GhostBoundHoldsAfterCapacityShrink) {
+  NewCache(/*capacity*/ 10);
+  InsertN("a", 10);
+  // Evicts a0..a5 from probation; their keys go to the ghost.
+  InsertN("b", 6);
+  ASSERT_EQ(6, cache_->TEST_GetGhostSize());
+  // Erasing adds no victims, so the ghost keeps its six keys.
+  for (int i = 6; i < 10; ++i) {
+    Erase("a" + std::to_string(i));
+  }
+  for (int i = 0; i < 4; ++i) {
+    Erase("b" + std::to_string(i));
+  }
+  ASSERT_EQ(2, cache_->GetOccupancyCount());
+  ASSERT_EQ(6, cache_->TEST_GetGhostSize());
+  // Usage 2 fits capacity 3, so nothing is evicted and no ghost recorded;
+  // the trim alone brings the ghost within the bound.
+  cache_->SetCapacity(3);
+  EXPECT_EQ(2, cache_->GetOccupancyCount());
+  EXPECT_LE(cache_->TEST_GetGhostSize(), 2);
+}
+
+// The ghost ring keeps the newest records across growth and a wrap of the
+// ring: after 100 probation victims with room for 40, the newest victim is
+// readmitted to resident and one dropped earlier is not.
+TEST_F(S3FifoCacheTest, GhostRingWrapsKeepingNewestRecords) {
+  NewCache(/*capacity*/ 40);
+  InsertN("k", 40);
+  InsertN("m", 100);
+  // Victims k0..k39 then m0..m59; the ghost remembers m20..m59.
+  EXPECT_EQ(40, cache_->TEST_GetGhostSize());
+  EXPECT_OK(Insert("m59"));
+  EXPECT_TRUE(ContainsForTest("m59"));
+  EXPECT_FALSE(InProbationForTest("m59"));
+  EXPECT_OK(Insert("m19"));
+  EXPECT_TRUE(InProbationForTest("m19"));
+}
+
+// The ghost is keyed on 32 bits of the key's hash (GhostHash), so a different
+// key with a remembered hash is readmitted to resident, at freq 0.
+TEST_F(S3FifoCacheTest, GhostHashCollisionAdmitsToResident) {
+  NewCache(/*capacity*/ 10);
+  constexpr UniqueId64x2 kHash = {12345, 0};
+  auto insert_with_hash = [&](const std::string& key) {
+    return cache_->Insert(key, kHash, nullptr, &kNoopCacheItemHelper, 1,
+                          nullptr, Cache::Priority::LOW);
+  };
+  EXPECT_OK(insert_with_hash("a"));
+  InsertN("c", 9);
+  // Evicts a, remembering kHash.
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_OK(insert_with_hash("b"));
+  EXPECT_TRUE(ContainsForTest("b"));
+  EXPECT_FALSE(InProbationForTest("b"));
+}
+
+// A placeholder insert (zero charge, kNoopCacheItemHelper), as
+// CacheWithSecondaryAdapter uses to record recent use, neither takes nor
+// leaves a ghost: readmission credit waits for the real entry.
+TEST_F(S3FifoCacheTest, GhostIgnoresPlaceholderInserts) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a"));
+  InsertN("c", 9);
+  // Evicts a, remembering it.
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_OK(Insert("a", /*charge*/ 0));
+  EXPECT_TRUE(InProbationForTest("a"));
+  Erase("a");
+  EXPECT_OK(Insert("a"));
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(InProbationForTest("a"));
+}
+
+// Under kFullChargeCacheMetadata a key that is not 16 bytes is charged as
+// metadata, so a placeholder's total charge is not 0. Insert and probation
+// eviction must still both treat it as a placeholder: it neither takes nor
+// leaves a ghost.
+TEST_F(S3FifoCacheTest, GhostIgnoresPlaceholderWithChargedHeapKey) {
+  NewCache(/*capacity*/ 8192, /*strict*/ false, kFullChargeCacheMetadata);
+  int filler = 0;
+  // Inserts charge-100 entries until key is evicted.
+  auto fill_until_evicted = [&](const std::string& key) {
+    for (int i = 0; i < 1000 && ContainsForTest(key); ++i) {
+      EXPECT_OK(Insert("f" + std::to_string(filler++), /*charge*/ 100));
+    }
+    ASSERT_FALSE(ContainsForTest(key));
+  };
+  // Insert side: a remembered key inserted as a placeholder stays in
+  // probation and leaves the ghost for the real entry.
+  EXPECT_OK(Insert("a", /*charge*/ 100));
+  fill_until_evicted("a");
+  EXPECT_OK(Insert("a", /*charge*/ 0));
+  EXPECT_TRUE(InProbationForTest("a"));
+  Erase("a");
+  EXPECT_OK(Insert("a", /*charge*/ 100));
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(InProbationForTest("a"));
+  // Eviction side: a placeholder evicted from probation leaves no ghost, so
+  // the real entry starts in probation.
+  EXPECT_OK(Insert("p", /*charge*/ 0));
+  fill_until_evicted("p");
+  EXPECT_OK(Insert("p", /*charge*/ 100));
+  EXPECT_TRUE(InProbationForTest("p"));
+}
+
+// End to end through the Cache interface: a key read once per scan longer
+// than the cache misses forever without the ghost queue. With it, the
+// second miss lands in resident and every later read hits despite scans.
+TEST_F(S3FifoCacheTest, GhostKeepsSlowReuseKeyAcrossScans) {
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 100, /*num_shard_bits*/ 0, /*strict_capacity_limit*/ false,
+      kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  auto access = [&](const std::string& key) {
+    Cache::Handle* h = cache->Lookup(key);
+    if (h != nullptr) {
+      cache->Release(h);
+      return true;
+    }
+    EXPECT_OK(cache->Insert(key, nullptr, &kNoopCacheItemHelper, 1));
+    return false;
+  };
+  int hits = 0;
+  int scanned = 0;
+  for (int round = 0; round < 5; round++) {
+    if (access("hot")) {
+      hits++;
+    }
+    for (int i = 0; i < 150; i++) {
+      EXPECT_FALSE(access("s" + std::to_string(scanned++)));
+    }
+  }
+  // Misses in rounds 0 and 1, hits in rounds 2 to 4.
+  EXPECT_EQ(3, hits);
+}
+
+// The ghost index (open addressing, backward-shift deletion) agrees with a
+// map under random sets, erases and resizes, including overwrites and
+// clusters, with every position it reports the last one set for its hash.
+TEST(S3FifoGhostIndexTest, MatchesReferenceMap) {
+  using s3fifo_cache::S3FifoGhostIndex;
+  Random64 rnd(301);
+  for (uint32_t universe : {uint32_t{40}, uint32_t{0}}) {
+    S3FifoGhostIndex index;
+    std::unordered_map<uint32_t, uint32_t> ref;
+    size_t max_entries = 16;
+    index.Reset(max_entries);
+    for (int op = 0; op < 200000; op++) {
+      const uint32_t hash = universe
+                                ? static_cast<uint32_t>(rnd.Uniform(universe))
+                                : static_cast<uint32_t>(rnd.Next());
+      const uint64_t kind = rnd.Uniform(10);
+      if (kind < 5) {
+        if (ref.size() < max_entries || ref.count(hash) > 0) {
+          const uint32_t pos = static_cast<uint32_t>(rnd.Uniform(1u << 20));
+          index.Set(hash, pos);
+          ref[hash] = pos;
+        }
+      } else if (kind < 8) {
+        EXPECT_EQ(ref.erase(hash) > 0, index.Erase(hash));
+      } else if (kind < 9) {
+        const size_t i = index.Find(hash);
+        auto it = ref.find(hash);
+        ASSERT_EQ(it != ref.end(), i != S3FifoGhostIndex::kNotFound);
+        if (i != S3FifoGhostIndex::kNotFound) {
+          EXPECT_EQ(it->second, index.PosAt(i));
+          if (rnd.OneIn(2)) {
+            index.EraseAt(i);
+            ref.erase(it);
+          }
+        }
+      } else if (max_entries < 1024 && rnd.OneIn(500)) {
+        // Grow, remapping every position as a ring doubling does.
+        max_entries *= 2;
+        index.Resize(max_entries, [](uint32_t pos) { return pos ^ 1u; });
+        for (auto& kv : ref) {
+          kv.second ^= 1u;
+        }
+      }
+      ASSERT_EQ(ref.size(), index.size());
+    }
+    for (const auto& kv : ref) {
+      const size_t i = index.Find(kv.first);
+      ASSERT_NE(S3FifoGhostIndex::kNotFound, i);
+      EXPECT_EQ(kv.second, index.PosAt(i));
+    }
+  }
+}
+
+// Erasing from the middle of a cluster keeps every entry behind it, from
+// the same home and from the next one, findable.
+TEST(S3FifoGhostIndexTest, EraseKeepsClusterFindable) {
+  using s3fifo_cache::S3FifoGhostIndex;
+  S3FifoGhostIndex index;
+  index.Reset(16);
+  std::vector<uint32_t> same_home;
+  std::vector<uint32_t> next_home;
+  const size_t home = index.TEST_Home(0);
+  for (uint32_t h = 1; same_home.size() < 4 || next_home.size() < 2; h++) {
+    if (index.TEST_Home(h) == home && same_home.size() < 4) {
+      same_home.push_back(h);
+    } else if (index.TEST_Home(h) == home + 1 && next_home.size() < 2) {
+      next_home.push_back(h);
+    }
+  }
+  uint32_t pos = 0;
+  for (uint32_t h : same_home) {
+    index.Set(h, pos++);
+  }
+  for (uint32_t h : next_home) {
+    index.Set(h, pos++);
+  }
+  EXPECT_TRUE(index.Erase(same_home[1]));
+  EXPECT_TRUE(index.Erase(same_home[0]));
+  EXPECT_EQ(S3FifoGhostIndex::kNotFound, index.Find(same_home[0]));
+  EXPECT_EQ(S3FifoGhostIndex::kNotFound, index.Find(same_home[1]));
+  pos = 0;
+  for (uint32_t h : same_home) {
+    if (h != same_home[0] && h != same_home[1]) {
+      ASSERT_NE(S3FifoGhostIndex::kNotFound, index.Find(h));
+      EXPECT_EQ(pos, index.PosAt(index.Find(h)));
+    }
+    pos++;
+  }
+  for (uint32_t h : next_home) {
+    ASSERT_NE(S3FifoGhostIndex::kNotFound, index.Find(h));
+    EXPECT_EQ(pos++, index.PosAt(index.Find(h)));
+  }
+  EXPECT_EQ(4u, index.size());
+}
+
+// The ghost ring can grow after its head has wrapped, once a raised capacity
+// lets the shard, and so the ghost bound, grow. Index entries must move with
+// their records: keys trimmed after the growth are forgotten, and the newest
+// victim is still remembered.
+TEST_F(S3FifoCacheTest, GhostRingGrowthAfterWrapKeepsPositions) {
+  NewCache(/*capacity*/ 20);
+  InsertN("a", 20);
+  // Victims a0..a19 and b0..b39; the ghost remembers b20..b39, and its head
+  // (sequence 40) has wrapped the 32-record ring (position 8).
+  InsertN("b", 60);
+  ASSERT_EQ(20, cache_->TEST_GetGhostSize());
+  cache_->SetCapacity(200);
+  InsertN("c", 180);
+  // Victims b40..b59 and c0..c179 grow the ghost to 200 records (the ring
+  // doubles three times, first with its head at sequence 40), and the trim
+  // then drops b20..b39.
+  InsertN("d", 200);
+  ASSERT_EQ(200, cache_->TEST_GetGhostSize());
+  EXPECT_OK(Insert("b30"));
+  EXPECT_TRUE(InProbationForTest("b30"));
+  EXPECT_OK(Insert("c179"));
+  EXPECT_TRUE(ContainsForTest("c179"));
+  EXPECT_FALSE(InProbationForTest("c179"));
 }
 
 // Values that detect use after free and double free: the deleter marks the
