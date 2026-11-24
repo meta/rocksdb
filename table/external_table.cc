@@ -1146,14 +1146,7 @@ class ExternalTableFactoryAdapter : public TableFactory {
           "External table does not support user-defined timestamps");
     }
     std::unique_ptr<ExternalTableReaderBase<Mode>> reader;
-    FileOptions fopts(topts.env_options);
-    fopts.io_options.io_activity = ro.io_activity;
-    // Files opened by external readers lack MANIFEST checksum metadata.
-    fopts.file_checksum_func_name = kNoFileChecksumFuncName;
-    ExternalTableOptions ext_topts(
-        topts.prefix_extractor, topts.ioptions.user_comparator,
-        &topts.internal_comparator, topts.ioptions.fs, fopts,
-        topts.column_family_name, &topts);
+    const ExternalTableOptions ext_topts(ro, topts);
     const std::string file_name = file->file_name();
     auto status = inner_->NewTableReader(ro, file_name, ext_topts,
                                          std::move(file), file_size, &reader);
@@ -1204,10 +1197,7 @@ class ExternalTableFactoryAdapter : public TableFactory {
   TableBuilder* NewTableBuilder(const TableBuilderOptions& topts,
                                 WritableFileWriter* file) const override {
     std::unique_ptr<ExternalTableBuilderBase> builder;
-    ExternalTableBuilderOptions ext_topts(
-        topts.read_options, topts.write_options,
-        topts.moptions.prefix_extractor, topts.ioptions.user_comparator,
-        topts.column_family_name, topts.reason, topts.ioptions.fs, &topts);
+    const ExternalTableBuilderOptions ext_topts(topts);
     builder.reset(inner_->NewTableBuilder(ext_topts, file->file_name(), file));
     if (builder) {
       return new ExternalTableBuilderAdapter<Mode>(topts, std::move(builder),
@@ -1254,6 +1244,37 @@ std::unique_ptr<TableFactory> NewExternalTableFactoryImpl(
 }
 
 }  // namespace
+
+ExternalTableOptions::ExternalTableOptions(
+    const ReadOptions& read_options, const TableReaderOptions& table_options)
+    : prefix_extractor(table_options.prefix_extractor),
+      comparator(table_options.ioptions.user_comparator),
+      internal_key_comparator(&table_options.internal_comparator),
+      column_family_name(table_options.column_family_name),
+      fs(table_options.ioptions.fs),
+      file_options([&] {
+        FileOptions options(table_options.env_options);
+        options.io_options.io_activity = read_options.io_activity;
+        // Files opened by external readers lack MANIFEST checksum metadata.
+        options.file_checksum_func_name = kNoFileChecksumFuncName;
+        return options;
+      }()),
+      native_args(&table_options) {}
+
+ExternalTableBuilderOptions::ExternalTableBuilderOptions(
+    const TableBuilderOptions& table_options)
+    : read_options(table_options.read_options),
+      write_options(table_options.write_options),
+      prefix_extractor(table_options.moptions.prefix_extractor),
+      comparator(table_options.ioptions.user_comparator),
+      column_family_name(table_options.column_family_name),
+      db_id(table_options.db_id),
+      db_session_id(table_options.db_session_id),
+      reason(table_options.reason),
+      fs(table_options.ioptions.fs),
+      native_args(&table_options),
+      level_at_creation(table_options.level_at_creation),
+      num_levels(table_options.num_levels) {}
 
 std::unique_ptr<TableFactory> NewExternalTableFactory(
     std::shared_ptr<ExternalTableFactory> inner_factory) {

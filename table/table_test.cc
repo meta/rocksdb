@@ -83,6 +83,7 @@
 #include "table/meta_blocks.h"
 #include "table/plain/plain_table_factory.h"
 #include "table/sst_file_writer_collectors.h"
+#include "table/table_builder.h"
 #include "table/unique_id_impl.h"
 #include "test_util/simple_external_table_factory.h"
 #include "test_util/sync_point.h"
@@ -8723,6 +8724,70 @@ TEST(TableFactoryTest, FileIsValidTable) {
       block->FileIsValidTable(IOOptions(), failed, failed.Size(), &matches)
           .IsIOError());
   ASSERT_FALSE(matches);
+}
+
+TEST(TableFactoryTest, ConvertTableReaderOptions) {
+  Options options;
+  options.comparator = ReverseBytewiseComparator();
+  const ImmutableOptions ioptions(options);
+  const InternalKeyComparator internal_comparator(options.comparator);
+  const std::shared_ptr<const SliceTransform> prefix_extractor(
+      NewFixedPrefixTransform(3));
+  EnvOptions env_options;
+  env_options.use_direct_reads = true;
+  TableReaderOptions table_options(ioptions, prefix_extractor, nullptr,
+                                   env_options, internal_comparator, 0);
+  table_options.column_family_name = "external";
+  ReadOptions read_options;
+  read_options.io_activity = Env::IOActivity::kGet;
+
+  const ExternalTableOptions external_options(read_options, table_options);
+  const ExternalTableOptions copied_options(external_options);
+  ASSERT_EQ(external_options.prefix_extractor, prefix_extractor);
+  ASSERT_EQ(external_options.comparator, ReverseBytewiseComparator());
+  ASSERT_EQ(external_options.internal_key_comparator, &internal_comparator);
+  ASSERT_EQ(external_options.column_family_name, "external");
+  ASSERT_EQ(external_options.fs, FileSystem::Default());
+  ASSERT_NE(&external_options.file_options, &copied_options.file_options);
+  ASSERT_TRUE(external_options.file_options.use_direct_reads);
+  ASSERT_EQ(external_options.file_options.io_options.io_activity,
+            Env::IOActivity::kGet);
+  ASSERT_EQ(external_options.file_options.file_checksum_func_name,
+            kNoFileChecksumFuncName);
+  ASSERT_EQ(external_options.native_args, &table_options);
+}
+
+TEST(TableFactoryTest, ConvertTableBuilderOptions) {
+  Options options;
+  options.comparator = ReverseBytewiseComparator();
+  options.prefix_extractor.reset(NewFixedPrefixTransform(3));
+  options.num_levels = 5;
+  const ImmutableOptions ioptions(options);
+  const MutableCFOptions moptions(options);
+  const ReadOptions read_options;
+  const WriteOptions write_options;
+  const InternalKeyComparator internal_comparator(options.comparator);
+  const std::string column_family_name = "external";
+  const TableBuilderOptions table_options(
+      ioptions, moptions, read_options, write_options, internal_comparator,
+      nullptr, kNoCompression, options.compression_opts, /*column_family_id=*/1,
+      column_family_name, /*level=*/2, /*newest_key_time=*/0,
+      /*is_bottommost=*/false, TableFileCreationReason::kCompaction,
+      /*oldest_key_time=*/0, "db-id", "session-id");
+
+  const ExternalTableBuilderOptions external_options(table_options);
+  ASSERT_EQ(&external_options.read_options, &read_options);
+  ASSERT_EQ(&external_options.write_options, &write_options);
+  ASSERT_EQ(external_options.prefix_extractor, options.prefix_extractor);
+  ASSERT_EQ(external_options.comparator, ReverseBytewiseComparator());
+  ASSERT_EQ(external_options.column_family_name, "external");
+  ASSERT_EQ(external_options.db_id, "db-id");
+  ASSERT_EQ(external_options.db_session_id, "session-id");
+  ASSERT_EQ(external_options.reason, TableFileCreationReason::kCompaction);
+  ASSERT_EQ(external_options.level_at_creation, 2);
+  ASSERT_EQ(external_options.num_levels, 5);
+  ASSERT_EQ(external_options.fs, FileSystem::Default());
+  ASSERT_EQ(external_options.native_args, &table_options);
 }
 
 TEST_F(ExternalTableTest, BootstrapConfig) {

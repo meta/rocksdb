@@ -39,6 +39,9 @@ class CoroExternalTableReaderBase;
 
 class ExternalTableBuilderBase;
 
+struct TableReaderOptions;
+struct TableBuilderOptions;
+
 template <ExternalTableMode Mode>
 class ExternalTableFactoryBase;
 
@@ -464,9 +467,13 @@ struct ExternalTableOptions {
   const CompareInterface* internal_key_comparator;
   std::string column_family_name;
   const std::shared_ptr<FileSystem>& fs;
-  const FileOptions& file_options;
+  const FileOptions file_options;
   // Opaque implementation context valid only during NewTableReader().
   const void* native_args;
+
+  // Converts the options passed to TableFactory::NewTableReader().
+  ExternalTableOptions(const ReadOptions& read_options,
+                       const TableReaderOptions& table_options);
 
   ExternalTableOptions(
       const std::shared_ptr<const SliceTransform>& _prefix_extractor,
@@ -499,12 +506,20 @@ struct ExternalTableBuilderOptions {
   const std::shared_ptr<const SliceTransform>& prefix_extractor;
   const Comparator* comparator;
   const std::string& column_family_name;
+  // Database and session IDs may be empty when unavailable.
   const std::string db_id;
   const std::string db_session_id;
   const TableFileCreationReason reason;
   const std::shared_ptr<FileSystem>& fs;
   // Opaque implementation context valid only during NewTableBuilder().
   const void* native_args;
+  // LSM creation level and configured level count. -1 means unknown.
+  int level_at_creation = -1;
+  int num_levels = -1;
+
+  // Converts the options passed to TableFactory::NewTableBuilder().
+  explicit ExternalTableBuilderOptions(
+      const TableBuilderOptions& table_options);
 
   ExternalTableBuilderOptions(
       const ReadOptions& _read_options, const WriteOptions& _write_options,
