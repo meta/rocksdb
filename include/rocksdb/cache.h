@@ -502,9 +502,10 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 // num_shard_bits is 20 or more; Cache::CreateFromString("s3fifo_cache://..."),
 // whose num_shard_bits must be -1 or 0 to 19, then returns InvalidArgument.
 // num_shard_bits = -1 keeps shards in [4 MiB, 128 MiB] (fits 4 KiB entries);
-// set it for smaller entries or a later SetCapacity raise. GetPinnedUsage scans
-// all tables, O(homes), under the caller's lock (the DB mutex for
-// rocksdb.block-cache-pinned-usage). Details: cache/s3fifo_cache.h.
+// set it for smaller entries or a later SetCapacity raise, else keep the
+// default (hits take no lock, so more shards only spread inserts).
+// GetPinnedUsage scans all tables, O(homes), under the caller's lock (the DB
+// mutex for rocksdb.block-cache-pinned-usage). Details: cache/s3fifo_cache.h.
 struct S3FifoCacheOptions : public ShardedCacheOptions {
   // Whether to use adaptive mutexes for cache shards. Note that adaptive
   // mutexes need to be supported by the platform in order for this to have any

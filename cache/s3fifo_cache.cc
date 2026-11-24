@@ -3,6 +3,24 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+// S3FifoCache implements S3-FIFO, from "FIFO Queues are All You Need for Cache
+// Eviction" (SOSP '23): https://jasony.me/publication/sosp23-s3fifo.pdf
+//
+// The policy (probation, resident and ghost queues; the 12% probation
+// budget; the differences from the paper) is described at S3FifoCacheShard in
+// s3fifo_cache.h.
+//
+// Expectation: entries read once, and scans, leave through probation without
+// touching resident, so hot entries survive. This should mean fewer misses than
+// LRU on skewed and scan-heavy workloads. Hits stay cheap: Lookup, Ref and a
+// Release that neither erases nor frees the entry take no lock (a Lookup costs
+// an epoch announcement with a seq_cst fence, a freq increment and a refcount
+// CAS on the entry's slot), except that a probation pin or unpin by a thread
+// without a ReaderSlot takes the shard mutex; inserts, erases, eviction and a
+// Release that erases or frees the entry take it too. So the shard count only
+// spreads inserts and erases; S3FifoCacheOptions in include/rocksdb/cache.h
+// says how to choose it.
+
 #include "cache/s3fifo_cache.h"
 
 #include <algorithm>
