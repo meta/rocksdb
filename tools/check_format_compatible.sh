@@ -580,7 +580,7 @@ do
   then
     rm -rf ${ext_test_dir:?}/${checkout_ref}_ingest
     echo "== Use $current_checkout_name to ingest extern SST file from $checkout_ref"
-    ingest_external_sst $ext_test_dir/${checkout_ref}_ingest $current_ext_test_dir
+    ingest_external_sst $ext_test_dir/${checkout_ref}_ingest $ext_test_dir/$checkout_ref
     compare_db $ext_test_dir/${checkout_ref}_ingest ${current_ext_test_dir}_ingest db_dump.txt 1 1
   fi
 
