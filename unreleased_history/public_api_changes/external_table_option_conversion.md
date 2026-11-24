@@ -1,0 +1,1 @@
+Added public constructors for converting the options passed to `TableFactory` into `ExternalTableOptions` and `ExternalTableBuilderOptions`. `ExternalTableOptions` now owns its `FileOptions`. External table builders now receive the LSM level at creation, configured level count, and database and session IDs when available.
