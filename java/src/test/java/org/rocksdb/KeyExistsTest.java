@@ -7,10 +7,13 @@ package org.rocksdb;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
 import org.junit.*;
 import org.junit.rules.ExpectedException;
 import org.junit.rules.TemporaryFolder;
@@ -21,6 +24,7 @@ public class KeyExistsTest {
       new RocksNativeLibraryResource();
 
   @Rule public TemporaryFolder dbFolder = new TemporaryFolder();
+  @Rule public TemporaryFolder dbFolder2 = new TemporaryFolder();
 
   @Rule public ExpectedException exceptionRule = ExpectedException.none();
 
@@ -44,6 +48,64 @@ public class KeyExistsTest {
       columnFamilyHandle.close();
     }
     db.close();
+  }
+
+  @Test
+  public void keyExistAfterDbOpen() throws RocksDBException {
+    try (RocksDB db2 = RocksDB.open(dbFolder2.getRoot().getAbsolutePath())) {
+      db2.put("key".getBytes(UTF_8), "value".getBytes(UTF_8));
+      assertThat(db2.keyExists("key".getBytes(UTF_8))).isTrue();
+      assertThat(db2.keyExists("key2".getBytes(UTF_8))).isFalse();
+      assertThat(db2.keyMayExist("key".getBytes(UTF_8), null)).isTrue();
+    }
+    try (RocksDB db2 = RocksDB.open(dbFolder2.getRoot().getAbsolutePath())) {
+      assertThat(db2.keyMayExist("key".getBytes(UTF_8), null)).isTrue();
+      assertThat(db2.keyExists("key".getBytes(UTF_8))).isTrue();
+      assertThat(db2.keyExists("key2".getBytes(UTF_8))).isFalse();
+    }
+    try (RocksDB db2 = RocksDB.open(dbFolder2.getRoot().getAbsolutePath())) {
+      assertThat(db2.keyMayExist("key".getBytes(UTF_8), null)).isTrue();
+    }
+    try (RocksDB db2 = RocksDB.open(dbFolder2.getRoot().getAbsolutePath())) {
+      assertThat(db2.keyExists("key".getBytes(UTF_8))).isTrue();
+    }
+    try (RocksDB db2 = RocksDB.open(dbFolder2.getRoot().getAbsolutePath())) {
+      assertThat(db2.keyExists("key2".getBytes(UTF_8))).isFalse();
+    }
+  }
+
+  @Test
+  public void keyExistInTtlDb() throws RocksDBException, IOException {
+    final byte[] KNOWN_KEY = "random_key".getBytes(UTF_8);
+    final long PSEUDO_RANDOM_SEED = 15875551233124l;
+
+    try (Options options = new Options().setCreateIfMissing(true);
+        TtlDB db2 = TtlDB.open(options, dbFolder2.getRoot().getAbsolutePath(), 86400, false);
+        WriteOptions writeOptions = new WriteOptions()) {
+      writeOptions.setDisableWAL(true);
+      db2.put(KNOWN_KEY, "value".getBytes(UTF_8));
+
+      ByteBuffer key = ByteBuffer.allocateDirect(16);
+      ByteBuffer value = ByteBuffer.allocateDirect(16);
+      Random r = new Random(PSEUDO_RANDOM_SEED);
+      for (int i = 0; i < 1000; i++) {
+        key.clear();
+        key.putLong(r.nextLong());
+        key.putLong(r.nextLong());
+        key.flip();
+
+        value.clear();
+        value.putLong(r.nextLong());
+        value.putLong(r.nextLong());
+        value.flip();
+        db2.put(writeOptions, key, value);
+      }
+      db2.compactRange();
+    }
+    try (Options options = new Options();
+        TtlDB db2 = TtlDB.open(options, dbFolder2.getRoot().getAbsolutePath(), 86400, true);) {
+      assertThat(db2.keyExists(KNOWN_KEY)).isTrue();
+    }
   }
 
   @Test
