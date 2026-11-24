@@ -33,20 +33,20 @@ namespace s3fifo_cache {
 
 class S3FifoHelperRegistry;
 
-// S3FifoCache: an opt-in block cache. This file evicts with plain FIFO; the
-// S3-FIFO policy (Yang et al., "FIFO Queues are All You Need for Cache
-// Eviction", SOSP '23) is built on top of it in later changes.
+// S3FifoCache: an opt-in block cache with S3-FIFO eviction (Yang et al., "FIFO
+// Queues are All You Need for Cache Eviction", SOSP '23).
 //
 // Classes. S3FifoCache is the public Cache: as ShardedCache<S3FifoCacheShard>
 // it hashes the key, picks a shard from the upper hash bits and forwards the
 // call, keeping almost no state of its own. S3FifoCacheShard is one
-// independent small cache (its table, FIFO queue, mutex and slot
+// independent small cache (its table, queues, mutex and slot
 // reclamation); all the logic is there. S3FifoHandle is one entry, stored in
 // one 42-byte slot of its shard's table (three slots per 128-byte group); a
 // Cache::Handle* points to it.
 //
-// Eviction: each shard evicts its oldest unpinned entry first. A Lookup does
-// not change an entry's position.
+// Eviction: each shard has two queues, probation and resident; see the policy
+// overview at S3FifoCacheShard. A Lookup only increments the entry's freq and
+// never moves it.
 //
 // Locking: Lookup, Ref and a Release that neither erases nor frees take no
 // lock, and neither do the usage and occupancy getters. Insert, Erase,
@@ -78,7 +78,7 @@ class S3FifoHelperRegistry;
 // served from memory, that raises tail latency.
 //
 // Where entries live: most entries are in a slot of their shard's table and
-// in the shard's FIFO queue. Three kinds are outside the queue:
+// in one of the shard's two queues. Three kinds are outside the queues:
 // - an entry set aside because it stayed pinned: still in the table, on the
 //   aside list, a list of pinned entries removed from their queue so
 //   eviction stops re-walking them (see aside_slot_);
@@ -90,32 +90,33 @@ class S3FifoHelperRegistry;
 //
 // Slot reuse: a lock-free Lookup may still read a slot whose entry was
 // removed, so the slot is reused only after epoch reclamation. See
-// S3FifoCacheShard for the table, reclamation and the aside list.
+// S3FifoCacheShard for the policy, the table, reclamation and the aside list.
 //
 // S3FifoHandle can be in these states:
 // 1. Referenced externally AND in the slot table.
-//    The entry stays in the FIFO queue. An eviction scan that meets it
-//    moves it to the tail, so later scans do not re-walk it. In a mostly
-//    pinned shard the scan sets it aside instead, until it is unpinned (see
-//    aside_slot_).
+//    The entry stays in its queue. A probation scan that meets it moves it
+//    to the probation tail so later scans do not re-walk it; resident
+//    rotates under pressure (see EvictFromFIFO). In a mostly pinned shard
+//    the scan sets it aside instead, until it is unpinned (see aside_slot_).
 //    (refs >= 1 && in_cache == true)
 // 2. Not referenced externally AND in the slot table.
-//    In the FIFO queue, or still on the aside list until an eviction
-//    returns it to the queue; evictable once in the queue.
+//    In one of the queues, or still on the aside list until an eviction
+//    returns it to its queue; evictable once in a queue.
 //    (refs == 0 && in_cache == true)
 // 3. Referenced externally AND not in the slot table.
-//    The entry is in neither the queue nor the slot table. It is freed
+//    The entry is in neither queue nor the slot table. It is freed
 //    when refs drops to 0.
 //    (refs >= 1 && in_cache == false)
-// Unlike LRU, Lookup and Release never reorder the queue; only an eviction
-// scan moves a pinned entry it meets to the tail. While refs > 0, public
-// properties like value and helper must not change.
+// While refs > 0, public properties like value and helper must not change.
 //
-// Lookup, Ref and most Releases run without the shard lock, so refs and the
-// in-cache bit share one atomic word (state). The bit changes only under the
-// shard lock, in the same atomic operation that checks refs. Eviction claims an
-// entry with a CAS that requires refs == 0 and clears state to 0, so no Lookup
-// can pin it afterwards.
+// Lookup, Ref and most Releases run without the shard lock, so refs and the two
+// membership bits share one atomic word (state). The bits change only
+// under the shard lock, in the same atomic operation that checks refs, so
+// every lock-free 0 <-> 1 ref change sees, in its own CAS snapshot, the queue
+// its entry is in. Eviction claims an entry with a CAS that requires refs == 0
+// and clears state to 0, so no Lookup can pin it afterwards. Promotion uses the
+// same refs == 0 CAS but clears only kInProbation: a Lookup may pin the entry
+// right after, and then pins a resident entry.
 //
 // Layout. A slot is 42 bytes, three to a 128-byte group (S3FifoSlotGroup), so
 // the table costs 128/3 bytes per slot, about 71 bytes per entry at its 3/5
@@ -126,11 +127,14 @@ class S3FifoHelperRegistry;
 //   a 64-byte line at any of the three positions (slot 1 starts at byte 42
 //   and its bytes 0-21 end at byte 63). For a 16-byte key, KeyMatches reads
 //   flags only after the hash matches, so a miss stays on that line. A hit
-//   also reads flags and the value: for slot 1 those are on the group's
-//   second line.
+//   also reads flags, reads and writes freq and reads the value: for slot 1
+//   those are on the group's second line.
 // - The 2-byte atomics sit at even offsets, and every slot starts at an even
 //   offset, so none straddles a line.
-// - aside keeps a byte of its own; the last byte (offset 41) is padding.
+// - freq and aside each keep a byte of their own: Lookup writes freq with a
+//   plain store, which would clobber anything else sharing its byte, and
+//   aside is read lock-free by Release, so it cannot share the non-atomic
+//   flags byte.
 // - The helper is an index into the cache's S3FifoHelperRegistry, the charge
 //   32 bits, and slot indexes 16 bits (so a shard holds at most 65532 homes,
 //   see S3FifoCacheShard::kMaxLength). An entry the slot cannot describe (a
@@ -147,13 +151,20 @@ struct S3FifoHandle : public Cache::Handle {
   // [1] = a HeapKey copy of its bytes (kHeapKey). Read through GetHash.
   char key_data[16];
 
-  // External refs (the cache itself is not counted) in the low 15 bits, plus
-  // kInCache.
+  // External refs (the cache itself is not counted) in the low 14 bits, plus
+  // kInCache and kInProbation. kInProbation must stay in this word: Lookup and
+  // Release read it in the same atomic value as their 0 <-> 1 ref change,
+  // and promotion clears it in the same CAS that checks refs.
   std::atomic<uint16_t> state{0};
-  static constexpr uint16_t kRefMask = (uint16_t{1} << 15) - 1;
+  static constexpr uint16_t kRefMask = (uint16_t{1} << 14) - 1;
 
   // Whether this entry is referenced by the hash table.
-  static constexpr uint16_t kInCache = uint16_t{1} << 15;
+  static constexpr uint16_t kInCache = uint16_t{1} << 14;
+
+  // Whether this entry belongs to probation: linked in the probation queue, or
+  // set aside from it (see aside_slot_). Clear for resident entries, set aside
+  // or not, and for entries in neither.
+  static constexpr uint16_t kInProbation = uint16_t{1} << 15;
 
   // First entry of the chain of home (slot index - kFirstSlot), the home whose
   // slot this is; 0 when that chain is empty (slot 0 is a queue head and never
@@ -200,6 +211,13 @@ struct S3FifoHandle : public Cache::Handle {
   // shard lock; read by a lock-free last Release, which then flags the
   // shard (see S3FifoCacheShard::aside_unpinned_).
   std::atomic<uint8_t> aside{0};
+
+  // Saturating access counter, range 0..kMaxFrequency (see the policy
+  // overview at S3FifoCacheShard). Incremented by Lookup only (never by Ref);
+  // promotion and the resident clock read it at eviction time. Reset to 0 on
+  // promotion to resident. Lock-free hits and the locked clock may race on it;
+  // a lost update only shifts one decision.
+  std::atomic<uint8_t> freq{0};
 
   struct HeapKey {
     size_t size;
@@ -249,6 +267,9 @@ struct S3FifoHandle : public Cache::Handle {
   }
   bool InCache() const {
     return (state.load(std::memory_order_relaxed) & kInCache) != 0;
+  }
+  bool InProbation() const {
+    return (state.load(std::memory_order_relaxed) & kInProbation) != 0;
   }
   bool IsStandalone() const { return (flags & kStandalone) != 0; }
   bool HasHeapKey() const { return (flags & kHeapKey) != 0; }
@@ -386,6 +407,32 @@ const Cache::CacheItemHelper* S3FifoHandle::GetHelper(
 
 // A single shard of S3FifoCache.
 //
+// Eviction policy (S3-FIFO). Each shard has two queues, which the paper calls
+// small and main and this code calls probation and resident.
+// 1. Insert: a new entry goes to the probation tail.
+// 2. Hit: a Lookup increments the entry's freq, saturating at kMaxFrequency
+//    (3). It never moves the entry, so a hit takes no lock.
+// 3. Probation eviction: the probation head with freq >= kPromoteThreshold (2)
+//    moves to resident, with freq reset to 0. Otherwise it is evicted.
+// 4. Resident eviction (CLOCK): resident is a ring whose hand
+//    (resident_hand_) points at its oldest entry. The hand passes an entry
+//    with freq > 0, decrementing it, and evicts an entry at 0. A promoted
+//    entry is linked just before the hand, so the hand reaches it last.
+// 5. Queue choice: probation evicts first; resident evicts only when one pass
+//    over probation did not free enough.
+// A pinned entry is never evicted: probation moves it to its tail, the
+// resident hand passes it, and after kPinnedRotationsPerPass such moves (per
+// probation pass; per resident call until an idle pass, see
+// kPinnedRotationsPerPass) the next ones go to the aside list (see
+// aside_slot_).
+//
+// Differences from the paper:
+// - Probation always evicts first, whatever its size.
+// - There is no ghost queue: an evicted key is forgotten.
+// - When kMaxResidentIdlePasses passes over resident evict nothing (every
+//   entry pinned or hot), eviction stops instead of evicting a hot entry.
+// - Pinned entries rotate or go to the aside list.
+//
 // Table. The design follows AutoHyperClockCache (cache/clock_cache.h):
 // chained hashing whose chain entries live in the slot table (coalesced, with
 // one chain per home, so chains never merge), over 42-byte slots (three per
@@ -400,7 +447,7 @@ const Cache::CacheItemHelper* S3FifoHandle::GetHelper(
 //   head and chain_next. The chain walk to an entry in its home's slot reads
 //   one cache line; to an entry elsewhere, two. A hit on a slot at group
 //   position 1 also touches the group's second line (see S3FifoHandle).
-// - Slot 0 is the dummy head of the FIFO queue (next: oldest, prev: newest);
+// - Slots 0 and 1 are the dummy heads of the probation and resident queues;
 //   slot kFirstSlot + max_length_ is the dummy head of the aside list.
 // - Growth (linear hashing): the table starts with kInitialLength homes and,
 //   before an insert, adds homes one at a time while the entries in the
@@ -449,22 +496,24 @@ const Cache::CacheItemHelper* S3FifoHandle::GetHelper(
 // Example. Starting from 4 homes, A, B, D and C are inserted in that order.
 // By the low bits of their hashes, A and B belong to home 0 (B's third bit
 // is 1), D to home 1 and C to home 3. B finds home 0's slot taken by A and
-// lands in slot 2. Before D, the table grows to 5 homes: home 0 splits into
+// lands in slot 3. Before D, the table grows to 5 homes: home 0 splits into
 // homes 0 and 4, moving B to home 4 without moving its slot. D finds home 1's
-// slot taken by B and lands in slot 5. Inserting C grows the table twice, to
+// slot taken by B and lands in slot 6. Inserting C grows the table twice, to
 // 7 homes, and C takes its home's slot. The result:
 //
 //   slot  home part (head)   entry part
-//    0    FIFO queue head
-//    1    home 0 -> slot 1   A
-//    2    home 1 -> slot 5   B (a home-4 entry)
-//    3    home 2 -> none     free
-//    4    home 3 -> slot 4   C
-//    5    home 4 -> slot 2   D (a home-1 entry)
-//    6    home 5 -> none     free
-//    7    home 6 -> none     free
+//    0    probation queue head
+//    1    resident queue head
+//    2    home 0 -> slot 2   A
+//    3    home 1 -> slot 6   B (a home-4 entry)
+//    4    home 2 -> none     free
+//    5    home 3 -> slot 5   C
+//    6    home 4 -> slot 3   D (a home-1 entry)
+//    7    home 5 -> none     free
+//    8    home 6 -> none     free
 //
-//   FIFO queue: A -> B -> D -> C, in insertion order, unrelated to the slots.
+//   Probation queue: A -> B -> D -> C, in insertion order, unrelated to the
+//   slots.
 class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
  public:
   // NOTE: the eviction_callback ptr is saved, as it is assumed to be kept
@@ -516,18 +565,22 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // Set once by S3FifoCache before use; standalone shards in tests use 0.
   void SetHashSeed(uint32_t seed) { hash_seed_ = seed; }
 
-  // Sets the capacity and evicts, by the policy, until usage fits or nothing
-  // unpinned remains. The slot table cannot grow past its reservation,
-  // made at construction for max(capacity, max_capacity): raising capacity
-  // beyond what it holds does not grow it, so once the table is full new
-  // keys are also evicted by occupancy, as in HyperClockCache.
+  // Sets the capacity and evicts, by the policy, until usage fits, nothing
+  // unpinned remains, or the resident clock gives up with hot unpinned entries
+  // left (see kMaxResidentIdlePasses), so usage can stay above the new
+  // capacity. The slot table cannot grow past its reservation, made at
+  // construction for max(capacity, max_capacity): raising capacity beyond what
+  // it holds does not grow it, so once the table is full new keys are also
+  // evicted by occupancy, as in HyperClockCache.
   void SetCapacity(size_t capacity);
 
   // Set the flag to reject insertion if the cache is full.
   void SetStrictCapacityLimit(bool strict_capacity_limit);
 
   // Like Cache methods, but with an extra "hash" parameter.
-  // priority is ignored: FIFO has no priority pools.
+  // priority is deliberately ignored: placement is inferred from access
+  // frequency (freq), not declared by the caller, so HIGH entries must earn
+  // residency through re-access like any other entry.
   Status Insert(const Slice& key, HashCref hash, Cache::ObjectPtr value,
                 const Cache::CacheItemHelper* helper, size_t charge,
                 S3FifoHandle** handle, Cache::Priority priority);
@@ -540,7 +593,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // helper, create_context, priority and stats are ignored: with no secondary
   // cache configured this is a primary-only lookup. Secondary promotion is
   // handled by CacheWithSecondaryAdapter above the shard, as with LRU.
-  // A hit moves nothing.
+  // A hit increments freq, saturating at kMaxFrequency.
   S3FifoHandle* Lookup(const Slice& key, HashCref hash,
                        const Cache::CacheItemHelper* helper,
                        Cache::CreateContext* create_context,
@@ -585,14 +638,21 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   const S3FifoHelperRegistry& helpers() const { return *helpers_; }
 
  public:  // other function definitions
-  // The FIFO queue. Walk it with TEST_Next.
-  void TEST_GetFIFOList(S3FifoHandle** fifo);
+  // Test-only: moves a probation entry to the resident tail without the
+  // promotion-threshold check, so tests can build exact resident layouts
+  // that pressure-driven promotion cannot assemble without disturbing the
+  // entry under test. The entry must be unpinned.
+  void TEST_PromoteToResident(const Slice& key);
+
+  // Probation list only; resident entries are not visible here, nor entries
+  // set aside. Walk it with TEST_Next.
+  void TEST_GetProbationList(S3FifoHandle** fifo);
   S3FifoHandle* TEST_Next(const S3FifoHandle* h) const { return Next(h); }
-  // The slot index of h, counted from slot 0 (the FIFO queue head).
+  // The slot index of h, counted from slot 0 (the probation queue head).
   size_t TEST_IndexOf(const S3FifoHandle* h) const { return IndexOf(h); }
 
-  // Number of entries in the FIFO queue, for unit tests. Takes mutex_.
-  size_t TEST_GetFIFOSize();
+  // Number of entries in the probation queue, for unit tests. Takes mutex_.
+  size_t TEST_GetProbationSize();
 
   // Times the free list was rebuilt from the table (RebuildFreeSlots), for
   // unit tests. Takes mutex_.
@@ -611,15 +671,16 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // it.
   DMutex& TEST_GetMutex() const { return mutex_; }
 
-  // Eviction and table counters, for tests and debugging. The first six
+  // Eviction and table counters, for tests and debugging. The first seven
   // count since construction; the last two are taken now.
   struct Stats {
     // Entries evicted only to keep the table's load factor once it is at
     // its reservation (new keys evicted by occupancy, not charge).
     uint64_t occupancy_evictions = 0;
 
-    // Pinned queue heads an eviction pass moved to the tail, including heads
-    // whose claim CAS lost to a concurrent Lookup.
+    // Pinned entries an eviction pass rotated past instead of evicting: moved
+    // to the probation tail, or passed (not moved) by the resident hand.
+    // Includes entries whose claim CAS lost to a concurrent Lookup.
     uint64_t pinned_rotations = 0;
 
     // Pinned entries an eviction pass moved to the aside list.
@@ -637,6 +698,11 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
     // Entries handed out outside the table because their total charge does
     // not fit a slot's 32 bits.
     uint64_t large_charge_standalone = 0;
+
+    // Probation entries evicted with freq 0, i.e. never hit since insertion
+    // (placeholders included: zero-charge kNoopCacheItemHelper entries).
+    // Resident victims are not counted.
+    uint64_t evicted_without_hit = 0;
 
     // Entries on the aside list.
     size_t aside_entries = 0;
@@ -685,17 +751,18 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // Slot indexes are 16 bits and kNoLink is 0xFFFF, so every slot index,
   // up to the aside head at kFirstSlot + max_length_, must be below it.
   static constexpr uint16_t kNoLink = 0xFFFF;
-  // 65532 keeps the aside head (kFirstSlot + kMaxLength) below kNoLink
-  // (checked by the static_assert below), with room for a second queue head.
-  static constexpr size_t kMaxLength = 65532;
+  // 65532. The literal 2 is kFirstSlot, declared in the private section below,
+  // where a static_assert checks that the two agree.
+  static constexpr size_t kMaxLength = size_t{kNoLink} - 1 - 2 /*kFirstSlot*/;
 
  private:
   friend class S3FifoCache;
 
-  // Slot 0 is the queue dummy head; homes start at kFirstSlot.
-  static constexpr uint16_t kFifoSlot = 0;
-  static constexpr uint16_t kFirstSlot = 1;
-  static_assert(kFirstSlot + kMaxLength < kNoLink,
+  // Slots 0 and 1 are the queue dummy heads; homes start at kFirstSlot.
+  static constexpr uint16_t kProbationSlot = 0;
+  static constexpr uint16_t kResidentSlot = 1;
+  static constexpr uint16_t kFirstSlot = 2;
+  static_assert(kMaxLength == size_t{kNoLink} - 1 - kFirstSlot,
                 "the aside head, the highest slot index, is below kNoLink");
 
   // Homes the table starts with and the load factor it grows at: more
@@ -731,9 +798,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   }
   S3FifoHandle* Next(const S3FifoHandle* h) const { return Slot(h->next); }
   S3FifoHandle* Prev(const S3FifoHandle* h) const { return Slot(h->prev); }
-  // The FIFO queue: oldest at the head, newest at the tail. It contains all
-  // in-cache items, pinned and unpinned, except those set aside.
-  S3FifoHandle* fifo() const { return Slot(kFifoSlot); }
+  S3FifoHandle* probation() const { return Slot(kProbationSlot); }
+  S3FifoHandle* resident() const { return Slot(kResidentSlot); }
   S3FifoHandle* aside() const { return Slot(aside_slot_); }
 
   // Home index of hash for the given linear-hashing length info.
@@ -796,7 +862,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   bool TableAboveInitialLength() const {
     return used_length_ > std::min(kInitialLength, max_length_);
   }
-  // Insert an item into the hash table and append it to the FIFO queue.
+  // Insert an item into the hash table and append it to probation.
   // Older unpinned items are evicted as necessary. Frees heap_key on a
   // non-OK status.
   Status InsertItem(const Slice& key, HashCref hash,
@@ -810,22 +876,24 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
       const Cache::CacheItemHelper* helper, size_t total_charge);
   static void FreeStandalone(S3FifoHandle* h);
 
-  // Unlinks e from the queue or the aside list.
-  void FIFO_Remove(S3FifoHandle* e);
+  // Unlinks e from its queue or the aside list.
+  void FIFO_Remove(S3FifoHandle* e, bool in_probation);
 
-  // Links e at the tail of the FIFO queue; neither function touches state.
-  void FIFO_Append(S3FifoHandle* e);
+  // Links e at the tail of queue. Appending to probation requires
+  // kInProbation already set; FIFO_Remove and FIFO_Append do not touch state.
+  void FIFO_Append(S3FifoHandle* queue, S3FifoHandle* e);
 
-  // FIFO_Append for either list: the FIFO queue or the aside list.
+  // FIFO_Append, also for the aside list.
   void LinkAtTail(S3FifoHandle* queue, S3FifoHandle* e);
 
-  // Moves a linked entry to the tail of queue (the FIFO queue or aside)
-  // without changing any charge.
+  // Moves a linked entry to the tail of queue (probation, resident or
+  // aside) without changing any charge: an entry set aside stays charged
+  // to its queue.
   void MoveToTail(S3FifoHandle* e, S3FifoHandle* queue);
 
   // Checks up to kAsideChecksPerEviction entries at the head of the aside
-  // list: an unpinned one returns to the tail of the FIFO queue, a pinned
-  // one to the aside tail.
+  // list: an unpinned one returns to the tail of its queue, a pinned one to
+  // the aside tail.
   void ReturnUnpinnedAside();
 
   // Visits up to kAsideReturnChunk entries at the head of the aside list,
@@ -841,18 +909,46 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // the lock is held, as "Under mutex_" does elsewhere).
   bool ReleaseLocked(S3FifoHandle* e, bool erase_if_last_ref);
 
-  // Erase or overwrite: clears kInCache in one step, unlinks e from the
-  // queue and the table. Returns true when no ref held it, so the
+  // Erase or overwrite: clears both bits of e in one step, unlinks it from
+  // its queue and the table. Returns true when no ref held it, so the
   // caller frees it; otherwise it stays charged until its last Release.
   bool Detach(S3FifoHandle* e);
 
   // Under mutex_: removes a claimed or detached entry from the table.
   void RemoveFromTable(S3FifoHandle* e);
 
-  // Pinned entries one pass over the queue rotates (moves to the tail)
-  // before it sets the next ones aside. A pass meets each pinned entry once,
-  // and this is far more than a shard normally has pinned at once, so only
-  // a mostly pinned shard sets entries aside.
+  // The resident entry after e in clock order, skipping the dummy head.
+  S3FifoHandle* ResidentNext(S3FifoHandle* e);
+
+  // Frequency counter range and promotion threshold (policy steps 2 and 3). A
+  // Lookup saturates at kMaxFrequency; a probation head at or above
+  // kPromoteThreshold is promoted, below it is evicted.
+  static constexpr uint8_t kMaxFrequency = 3;
+  static constexpr uint8_t kPromoteThreshold = 2;
+
+  // Resident clock bound (policy step 4): EvictFromResident gives up after this
+  // many consecutive passes over resident that evict nothing (3 to drain a
+  // saturated counter, 1 to reap). That many idle passes mean every remaining
+  // entry is pinned, or is hit (lock-free, refilling its counter) faster than
+  // the hand sweeps. Eviction then stops, since probation runs first (see
+  // EvictFromQueues) and has already fallen short: the insert is admitted over
+  // capacity (non-strict, with a handle), dropped (no handle) or refused
+  // (strict, with a handle), and a SetCapacity cut can leave usage above
+  // capacity. A shard whose every entry is that hot keeps them rather than
+  // evict one for a new key, which measured faster and with a higher hit ratio
+  // than evicting.
+  static constexpr int kMaxResidentIdlePasses = 4;
+
+  // Pinned entries an eviction pass rotates (moves to the probation tail, or
+  // passes with the resident hand) before it sets the next ones aside:
+  // counted per call in probation, where a call meets each pinned entry at most
+  // once; in resident, counted per call until a pass evicts nothing (an idle
+  // pass resets the count). This is far more than a shard normally has pinned
+  // at once, so normally only a mostly pinned shard sets entries aside. But a
+  // call whose evicting passes carry the hand around resident more than once
+  // (e.g. a large SetCapacity cut) can pass the same pinned entry again and
+  // count it again, and so set entries aside in a shard that is not mostly
+  // pinned.
   static constexpr size_t kPinnedRotationsPerPass = 64;
   // Aside entries each eviction checks first (ReturnUnpinnedAside): a small
   // constant cost per eviction that slowly cycles the list. A burst of
@@ -864,11 +960,17 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // need is met, instead of relinking the whole list first.
   static constexpr size_t kAsideReturnChunk = 64;
 
-  // Free some space following strict FIFO policy until enough space
-  // to hold (usage_ + charge) is freed or no unpinned entry remains.
-  // Pinned entries the scan meets move to the tail, so long-lived pins
-  // are not re-walked by every eviction. Terminates after a single pass
-  // even if everything is pinned.
+  // Evicts until usage_ + charge fits capacity_, by policy steps 3-5 (see the
+  // policy overview at S3FifoCacheShard): one pass over probation, then the
+  // resident clock. It also stops when no unpinned entry remains, or when the
+  // resident clock gives up (kMaxResidentIdlePasses) with hot unpinned entries
+  // left, so usage can stay above capacity. Pinned resident entries are passed
+  // without decrementing freq. Promotion touches only links: usage_ is
+  // unchanged by a move between queues. The probation pass consumes its head
+  // each step, so it ends after at most the initial number of entries; the
+  // resident scan stops after kMaxResidentIdlePasses consecutive passes that
+  // evict nothing. An all-pinned shard terminates having evicted nothing.
+  // The name predates the two queues: it evicts from both.
   // This function is not thread safe - it needs to be executed while
   // holding the mutex_.
   void EvictFromFIFO(size_t charge, autovector<S3FifoHandle*>* deleted);
@@ -887,23 +989,40 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   };
 
   // One eviction attempt for data: up to kAsideChecksPerEviction aside checks,
-  // then one EvictFromQueue pass. If that falls short and an aside entry may
+  // then one EvictFromQueues round. If that falls short and an aside entry may
   // have been unpinned, aside entries are returned kAsideReturnChunk at a time,
-  // with a pass after each chunk, until data is Done or every aside entry
+  // with a round after each chunk, until data is Done or every aside entry
   // present at the start was visited. May return with data not Done.
   void EvictNeed(EvictionData* data, autovector<S3FifoHandle*>* deleted);
+
+  // One round: the probation pass, then the resident pass if data is not Done.
+  void EvictFromQueues(EvictionData* data, autovector<S3FifoHandle*>* deleted);
 
   // Under mutex_: takes a claimed entry out of the table and the usage, and
   // records it in data and deleted.
   void EvictClaimed(S3FifoHandle* e, EvictionData* data,
                     autovector<S3FifoHandle*>* deleted);
 
-  // One sweep over the queue from the head: unpinned entries are evicted,
-  // pinned entries move to the tail, so long-lived pins are not re-walked
+  // Policy step 3: one sweep over probation from the head. Unpinned entries
+  // at or above kPromoteThreshold move to resident just before the hand
+  // (counter reset), unpinned entries below it are evicted, and pinned
+  // entries move to the probation tail, so long-lived pins are not re-walked
   // by every eviction, or aside once the pass has rotated
-  // kPinnedRotationsPerPass of them. Stops once data is Done. Not thread
+  // kPinnedRotationsPerPass of them.
+  // Stops once data is Done. Returns whether it promoted anything. Not
+  // thread safe - call with mutex_ held.
+  bool EvictFromProbation(EvictionData* data,
+                          autovector<S3FifoHandle*>* deleted);
+
+  // Policy step 4, the resident clock: the hand passes an entry with
+  // freq > 0, decrementing it, and evicts one at 0; it passes pinned entries
+  // without decrementing until this call has passed kPinnedRotationsPerPass of
+  // them since its last idle pass (see kPinnedRotationsPerPass), then sets the
+  // next ones aside. Passing an entry only advances the hand: no relinking.
+  // Stops once data is Done or the idle-pass bound is hit. Not thread
   // safe - call with mutex_ held.
-  void EvictFromQueue(EvictionData* data, autovector<S3FifoHandle*>* deleted);
+  void EvictFromResident(EvictionData* data,
+                         autovector<S3FifoHandle*>* deleted);
 
   // Runs the eviction callback (or deleter) for evicted entries, overwritten
   // entries no longer referenced, and a handle-less insert dropped instead of
@@ -1002,7 +1121,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   };
 
   // Layout. Lookup and a Release that neither erases nor frees run without
-  // mutex_ and write only the slot (state) and the caller's ThreadReader;
+  // mutex_ and write only the slot (state, freq) and the caller's ThreadReader;
   // the last Release of an aside entry also sets aside_unpinned_, and
   // pending_ and scan_result_ are written without mutex_ too. What hits read
   // sits on lines that no hit writes:
@@ -1075,10 +1194,24 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // overwrite while pinned, or standalone.
   LockedSize detached_pinned_usage_;
 
-  // Aside list: pinned entries an eviction pass met after rotating
-  // kPinnedRotationsPerPass others, so that a mostly pinned shard is not
-  // re-walked by every insert. An aside entry is still in the table and
-  // charged as before; ReturnUnpinnedAside relinks it into the FIFO queue
+  // Resident is a clock: its oldest entry is resident_hand_ and its newest
+  // the entry linked just before the hand, so a second chance advances the
+  // hand instead of relinking the entry. New resident entries are linked
+  // just before the hand, and the hand moves past an entry that leaves, so
+  // the order is the FIFO-reinsertion order. The resident dummy head when
+  // resident is empty.
+  // New entries enter probation. Eviction drains probation first: a head
+  // with enough frequency is promoted to resident, any other is evicted,
+  // and resident is evicted only when probation cannot free enough.
+  // Probation has no size bound, so a burst of promotions can leave it
+  // holding only the newest entries.
+  S3FifoHandle* resident_hand_;
+
+  // Aside list: pinned entries an eviction met after kPinnedRotationsPerPass
+  // rotations (per probation pass; per resident call until an idle pass, see
+  // kPinnedRotationsPerPass), so that a mostly pinned shard is not re-walked by
+  // every insert. An aside entry is still in the table and charged to its queue
+  // (kInProbation unchanged); ReturnUnpinnedAside relinks it into its queue
   // once it is unpinned. Its dummy head is slot kFirstSlot + max_length_, just
   // past the last home the table can grow to.
   uint16_t aside_slot_;
@@ -1135,9 +1268,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 
 // S3FifoCache, the public Cache. The S3FifoCacheOptions comment in
 // include/rocksdb/cache.h is the short user contract; this is its detail.
-// - A Lookup neither promotes an entry nor protects it from a scan (see
-//   Eviction at the top of this file).
-// - Unlike LRUCache: an entry holds at most 32767 references (kRefMask); beyond
+// - Unlike LRUCache: an entry holds at most 16383 references (kRefMask); beyond
 //   that Lookup misses and Ref returns false. It cannot be the primary cache of
 //   NewTieredCache.
 // - Entries the table cannot hold are not cached: slotless ones (see Layout at
@@ -1156,8 +1287,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 //   under strict_capacity_limit it is accepted only if it fits, as
 //   CreateStandalone(allow_uncharged=false) admits entries, and no insert takes
 //   usage above capacity (usage can still exceed it after a SetCapacity cut
-//   that pinned entries survive, or when the limit is turned on over capacity).
-//   Without a handle it is dropped, strict or not.
+//   that pinned or hot entries survive, or when the limit is turned on over
+//   capacity). Without a handle it is dropped, strict or not.
 // - Not charged to capacity: process-wide, one cache line per thread for the
 //   most threads that have used an S3FifoCache at the same time, kept for the
 //   life of the process (ThreadReader, see s3fifo_cache.cc).
@@ -1213,8 +1344,8 @@ class S3FifoCache final : public ShardedCache<S3FifoCacheShard> {
   // The shards' GetStats, summed.
   S3FifoCacheShard::Stats GetStats();
 
-  // Number of entries in the FIFO queues of all shards, for unit tests.
-  size_t TEST_GetFIFOSize();
+  // Number of entries in the probation queues of all shards, for unit tests.
+  size_t TEST_GetProbationSize();
 
  private:
   // Shared with the shards, which may outlive this object's members: the
