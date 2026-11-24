@@ -166,15 +166,16 @@ class S3FifoCacheTest : public testing::Test {
 
   // Drives resident second-chance laps around "k" and returns the number of
   // resident evictions before "k" itself is evicted. Everything travels the
-  // public path: fillers reach resident through pressure promotion (hit
-  // twice, then an over-budget probation sweep promotes them while a cold
-  // sacrificial covers the eviction). Resident holds exactly 10 entries
-  // whenever round pressure is applied, so k is visited once per 9
-  // evictions: counter n means exactly 9n evictions before k. Capacity is
-  // 11 so a refill (filler plus sacrificial) stages without pressure,
-  // while each round still draws from resident first with a single
-  // trigger in probation at (not over) the budget of 1. Rounds are capped
-  // so a broken termination bound fails instead of hanging.
+  // public path. Fillers reach resident through pressure promotion: they are
+  // hit twice, then an over-budget probation sweep promotes them while a
+  // cold sacrificial entry covers the eviction. Resident holds exactly 10
+  // entries whenever a round applies pressure, so the hand visits k once per
+  // 9 evictions, and a counter of n means exactly 9n evictions before k.
+  // Capacity is 11, so a refill (filler plus sacrificial) stages without
+  // pressure. Each round's trigger has charge 2 and probation is empty, so
+  // the probation pass frees nothing and resident covers exactly one
+  // charge-1 eviction. Rounds are capped, so a broken termination bound
+  // fails instead of hanging.
   int CountEvictionsBeforeK(int hits) {
     NewCache(/*capacity*/ 11);
     EXPECT_OK(Insert("k"));
@@ -192,17 +193,12 @@ class S3FifoCacheTest : public testing::Test {
     int evicted = 0;
     int next_filler = 9;
     for (int round = 0; round < 40; round++) {
-      // Two triggers: the first lands without pressure, the second applies
-      // it with probation at (not over) budget, so resident goes first.
       std::string l = "l" + std::to_string(round);
-      EXPECT_OK(Insert(l));
-      std::string m = "m" + std::to_string(round);
-      EXPECT_OK(Insert(m));
+      EXPECT_OK(Insert(l, /*charge*/ 2));
       if (!ContainsForTest("k")) {
         break;
       }
       Erase(l);
-      Erase(m);
       evicted++;
       // Restore resident to 10 without disturbing it: the sweep promotes
       // the filler and spends the sacrificial.
@@ -2077,22 +2073,23 @@ TEST_F(S3FifoCacheTest, ProbationUnderBudgetDrawsFromResident) {
   NewCache(/*capacity*/ 100);
   EXPECT_OK(Insert("r"));
   HitNTimes("r", 2);
-  for (int i = 0; i < 87; i++) {
+  for (int i = 0; i < 88; i++) {
     std::string y = "y" + std::to_string(i);
     EXPECT_OK(Insert(y));
     HitNTimes(y, 2);
   }
   EXPECT_OK(Insert("s"));
-  for (int i = 0; i < 11; i++) {
+  for (int i = 0; i < 10; i++) {
     EXPECT_OK(Insert("p" + std::to_string(i)));
   }
-  // Total is 100; the sweep promotes r and y0..y86 and evicts s.
+  // Total is 100; the sweep promotes r and y0..y87 and evicts s.
   EXPECT_EQ(100, cache_->GetUsage());
   EXPECT_OK(Insert("t"));
   EXPECT_TRUE(ContainsForTest("r"));
   EXPECT_FALSE(ContainsForTest("s"));
-  // Probation holds p0..p10 plus t: 12, at (not over) the budget.
-  EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+  // Probation holds p0..p9 plus t: 11, so x lands it at (not over) the
+  // budget.
+  EXPECT_EQ(11, cache_->TEST_GetProbationUsage());
   EXPECT_EQ(100, cache_->GetUsage());
   EXPECT_OK(Insert("x"));
   EXPECT_FALSE(ContainsForTest("r"));
@@ -2100,10 +2097,10 @@ TEST_F(S3FifoCacheTest, ProbationUnderBudgetDrawsFromResident) {
   EXPECT_TRUE(ContainsForTest("x"));
 }
 
-// The queue choice reads the current probation charge, before the incoming
-// entry is accounted: probation exactly at budget draws from resident even
-// when the incoming entry would push it over.
-TEST_F(S3FifoCacheTest, ProbationBudgetBoundaryUsesCurrentUsage) {
+// The queue choice counts the probation-bound incoming charge: probation at
+// budget draws from probation when the incoming entry would push it over,
+// and from resident when it lands exactly at budget.
+TEST_F(S3FifoCacheTest, ProbationBudgetCountsIncomingCharge) {
   NewCache(/*capacity*/ 100);
   EXPECT_OK(Insert("big", /*charge*/ 88));
   HitNTimes("big", 2);
@@ -2118,9 +2115,24 @@ TEST_F(S3FifoCacheTest, ProbationBudgetBoundaryUsesCurrentUsage) {
   // Probation holds p1..p11 plus t: 12, exactly at budget.
   EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
   EXPECT_EQ(100, cache_->GetUsage());
-  // Incoming charge 5 would push probation to 17 if counted; the choice
-  // ignores it and draws from resident.
+  // Incoming charge 5 pushes probation to 17: probation pays, p1..p5 go.
   EXPECT_OK(Insert("x", /*charge*/ 5));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_FALSE(ContainsForTest("p5"));
+  EXPECT_TRUE(ContainsForTest("p6"));
+  EXPECT_TRUE(ContainsForTest("x"));
+  EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(100, cache_->GetUsage());
+
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("big", /*charge*/ 89));
+  HitNTimes("big", 2);
+  InsertN("p", 11);
+  // Promotes big, evicts p0: probation holds 11.
+  EXPECT_OK(Insert("t"));
+  EXPECT_EQ(11, cache_->TEST_GetProbationUsage());
+  // 11 + 1 lands exactly at budget: resident pays.
+  EXPECT_OK(Insert("x"));
   EXPECT_FALSE(ContainsForTest("big"));
   EXPECT_TRUE(ContainsForTest("p1"));
   EXPECT_TRUE(ContainsForTest("x"));
@@ -2594,7 +2606,9 @@ TEST_F(S3FifoCacheTest, SingleEntryExceedsProbationBudget) {
 
 // With probation fully pinned, eviction terminates: with resident empty it
 // evicts nothing; with resident entries it evicts from resident, which goes
-// first since pinned probation charge does not count toward the budget.
+// first since pinned probation charge does not count toward the budget, or
+// second when the incoming charge alone puts probation over the budget (its
+// pass frees nothing).
 TEST_F(S3FifoCacheTest, FullyPinnedProbationOverBudgetTerminates) {
   NewCache(/*capacity*/ 100);
   for (int i = 0; i < 100; i++) {
@@ -2654,6 +2668,47 @@ TEST_F(S3FifoCacheTest, FullyPinnedProbationOverBudgetTerminates) {
   EXPECT_EQ(set_aside, cache_->GetStats().set_aside);
   for (S3FifoHandle* h : pinned2) {
     cache_->Release(h, true, false);
+  }
+
+  // Probation fully pinned again, but the incoming entry's charge (13) is
+  // over the budget of 12 by itself, so probation goes first: its pass
+  // rotates 64 pinned entries, sets the other 23 aside and frees nothing,
+  // and resident covers by evicting r.
+  NewCache(/*capacity*/ 100);
+  EXPECT_EQ(12, cache_->TEST_GetProbationBudget());
+  EXPECT_OK(Insert("r", /*charge*/ 13));
+  HitNTimes("r", 2);
+  for (int i = 0; i < 87; i++) {
+    EXPECT_OK(Insert("p" + std::to_string(i)));
+  }
+  EXPECT_EQ(100, cache_->GetUsage());
+  EXPECT_OK(Insert("t"));
+  // Resident is empty, so probation goes first: promotes r, evicts p0.
+  EXPECT_FALSE(InProbationForTest("r"));
+  EXPECT_TRUE(ContainsForTest("r"));
+  EXPECT_FALSE(ContainsForTest("p0"));
+  std::vector<S3FifoHandle*> pinned3;
+  for (int i = 1; i < 87; i++) {
+    S3FifoHandle* h = Lookup("p" + std::to_string(i));
+    ASSERT_NE(nullptr, h);
+    pinned3.push_back(h);
+  }
+  ht = Lookup("t");
+  ASSERT_NE(nullptr, ht);
+  pinned3.push_back(ht);
+  EXPECT_EQ(87, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(0, cache_->TEST_GetProbationUnpinnedUsage());
+  const uint64_t rotations3 = cache_->GetStats().pinned_rotations;
+  const uint64_t set_aside3 = cache_->GetStats().set_aside;
+  EXPECT_OK(Insert("x", /*charge*/ 13));
+  EXPECT_EQ(rotations3 + 64, cache_->GetStats().pinned_rotations);
+  EXPECT_EQ(set_aside3 + 23, cache_->GetStats().set_aside);
+  EXPECT_FALSE(ContainsForTest("r"));
+  EXPECT_TRUE(ContainsForTest("x"));
+  EXPECT_TRUE(ContainsForTest("p1"));
+  EXPECT_EQ(100, cache_->GetUsage());
+  for (S3FifoHandle* h : pinned3) {
+    EXPECT_FALSE(cache_->Release(h, true, false));
   }
 }
 
@@ -2815,18 +2870,19 @@ TEST_F(S3FifoCacheTest, GhostReadmitsProbationVictimToResident) {
 // probation victim from the same run is readmitted to resident.
 TEST_F(S3FifoCacheTest, GhostIgnoresResidentVictims) {
   NewCache(/*capacity*/ 100);
-  EXPECT_OK(Insert("big", /*charge*/ 87));
+  EXPECT_OK(Insert("big", /*charge*/ 88));
   HitNTimes("big", 2);
   EXPECT_OK(Insert("a"));
   HitNTimes("a", 2);
-  InsertN("p", 12);
+  InsertN("p", 11);
   EXPECT_EQ(100, cache_->GetUsage());
   // Promotes big and a, evicts p0 from probation.
   EXPECT_OK(Insert("t"));
   EXPECT_FALSE(ContainsForTest("p0"));
-  EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+  EXPECT_EQ(11, cache_->TEST_GetProbationUsage());
   HitNTimes("big", 1);
-  // Probation at budget: resident first. big spends its hit; a is evicted.
+  // u lands probation at budget: resident first. big spends its hit; a is
+  // evicted.
   EXPECT_OK(Insert("u"));
   EXPECT_FALSE(ContainsForTest("a"));
   EXPECT_TRUE(ContainsForTest("big"));
@@ -2855,8 +2911,10 @@ TEST_F(S3FifoCacheTest, GhostForgetsReadmittedKey) {
   EXPECT_FALSE(InProbationForTest("a"));
   EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
   HitNTimes("big", 1);
-  // Probation at budget: resident first. big spends its hit; a is evicted.
-  EXPECT_OK(Insert("u"));
+  // p0 is readmitted to resident, so it does not count against the budget:
+  // resident first. big spends its hit; a is evicted.
+  EXPECT_OK(Insert("p0"));
+  EXPECT_FALSE(InProbationForTest("p0"));
   EXPECT_FALSE(ContainsForTest("a"));
   EXPECT_TRUE(ContainsForTest("big"));
   EXPECT_OK(Insert("a"));
@@ -2888,8 +2946,8 @@ TEST_F(S3FifoCacheTest, GhostStaleRecordKeepsNewerRecord) {
   for (int i = 3; i < 10; i++) {
     Erase("e" + std::to_string(i));
   }
-  // Evicts e0 with 3 entries in the table, dropping the stale record; the
-  // trim after SetCapacity then drops c0 for the 2 entries left.
+  // Evicts e0 with 3 entries in the table: the count bound drops the stale
+  // record, then the charge bound of 2 drops c0.
   cache_->SetCapacity(2);
   EXPECT_EQ(2, cache_->TEST_GetGhostSize());
   cache_->SetCapacity(10);
@@ -2912,9 +2970,10 @@ TEST_F(S3FifoCacheTest, GhostBoundedByOccupancy) {
   EXPECT_EQ(50, cache_->TEST_GetGhostSize());
 }
 
-// The ghost queue keeps its bound (no more ghosts than entries in the table)
-// after SetCapacity lowers capacity, even when the shrink evicts nothing,
-// not only when the next victim is recorded.
+// The ghost queue keeps its bound after SetCapacity lowers capacity, even
+// when the shrink evicts nothing, not only when the next victim is recorded.
+// Only the count bound (no more ghosts than entries in the table) binds
+// here: it allows 2 records, the charge bound 3.
 TEST_F(S3FifoCacheTest, GhostBoundHoldsAfterCapacityShrink) {
   NewCache(/*capacity*/ 10);
   InsertN("a", 10);
@@ -3172,6 +3231,266 @@ TEST_F(S3FifoCacheTest, GhostRingGrowthAfterWrapKeepsPositions) {
   EXPECT_OK(Insert("c179"));
   EXPECT_TRUE(ContainsForTest("c179"));
   EXPECT_FALSE(InProbationForTest("c179"));
+}
+
+// An entry larger than the whole probation budget inserts when the
+// shard has room, takes its room from probation first and from resident
+// only for the remainder, then waits in probation over budget and is
+// decided on its turn. If the queue choice ignored the incoming charge,
+// resident would pay for all 20.
+TEST_F(S3FifoCacheTest, OversizedEntryPaidByProbationFirst) {
+  for (bool strict : {false, true}) {
+    NewCache(/*capacity*/ 100, strict);
+    for (int i = 0; i < 8; i++) {
+      std::string r = "r" + std::to_string(i);
+      EXPECT_OK(Insert(r, /*charge*/ 11));
+      HitNTimes(r, 2);
+    }
+    InsertN("p", 12);
+    // Promotes r0..r7, evicts p0: probation holds 12, at budget.
+    EXPECT_OK(Insert("t"));
+    EXPECT_EQ(12, cache_->TEST_GetProbationUsage());
+    S3FifoHandle* h = nullptr;
+    EXPECT_OK(Insert("x", /*charge*/ 20, &h));
+    ASSERT_NE(nullptr, h);
+    EXPECT_FALSE(cache_->Release(h, true, false));
+    // Probation's 12 went first; resident covered the other 8 with r0.
+    EXPECT_FALSE(ContainsForTest("p11"));
+    EXPECT_FALSE(ContainsForTest("t"));
+    EXPECT_FALSE(ContainsForTest("r0"));
+    EXPECT_TRUE(ContainsForTest("r1"));
+    EXPECT_EQ(20, cache_->TEST_GetProbationUsage());
+    EXPECT_EQ(97, cache_->GetUsage());
+    // Over budget and cold at the head: x is the next victim.
+    EXPECT_OK(Insert("y", /*charge*/ 4));
+    EXPECT_FALSE(ContainsForTest("x"));
+    for (int i = 1; i < 8; i++) {
+      EXPECT_TRUE(ContainsForTest("r" + std::to_string(i)));
+    }
+    EXPECT_EQ(81, cache_->GetUsage());
+  }
+}
+
+// The promotion rule under mixed charges on a shard whose budget rounds to
+// zero: every probation-bound insert is over budget, so eviction is
+// probation-first and probation still sorts twice-hit from once-hit entries.
+TEST_F(S3FifoCacheTest, ZeroBudgetMixedChargesKeepPromotion) {
+  NewCache(/*capacity*/ 8);
+  EXPECT_EQ(0, cache_->TEST_GetProbationBudget());
+  EXPECT_OK(Insert("a", /*charge*/ 1));
+  HitNTimes("a", 2);
+  EXPECT_OK(Insert("b", /*charge*/ 3));
+  HitNTimes("b", 1);
+  EXPECT_OK(Insert("c", /*charge*/ 4));
+  // Promotes a, evicts b.
+  EXPECT_OK(Insert("d", /*charge*/ 2));
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(InProbationForTest("a"));
+  EXPECT_FALSE(ContainsForTest("b"));
+  EXPECT_EQ(7, cache_->GetUsage());
+  EXPECT_OK(Insert("e", /*charge*/ 1));
+  // Needs 5: c and d go from probation, resident a is untouched.
+  EXPECT_OK(Insert("f", /*charge*/ 5));
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(ContainsForTest("c"));
+  EXPECT_FALSE(ContainsForTest("d"));
+  EXPECT_TRUE(ContainsForTest("f"));
+  EXPECT_EQ(7, cache_->GetUsage());
+}
+
+// Readmission under mixed charges: an oversized probation victim is
+// remembered and readmitted, then survives a mixed-charge cold stream.
+TEST_F(S3FifoCacheTest, GhostReadmitsOversizedVictim) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("a", /*charge*/ 20));
+  InsertN("c", 80);
+  EXPECT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_OK(Insert("a", /*charge*/ 20));
+  EXPECT_FALSE(InProbationForTest("a"));
+  for (int i = 0; i < 200; i++) {
+    EXPECT_OK(Insert("d" + std::to_string(i), (i % 2) ? 15 : 1));
+    ASSERT_LE(cache_->GetUsage(), 100);
+  }
+  EXPECT_TRUE(ContainsForTest("a"));
+}
+
+// The ghost queue is bounded by charge (one shard's worth of victims)
+// and by record count (the table size), whichever is tighter.
+TEST_F(S3FifoCacheTest, GhostBoundedByChargeAndCount) {
+  // Many small resident entries, large victims: the charge bound binds.
+  // An occupancy-only bound (881 records) would keep all 49 victims here.
+  NewCache(/*capacity*/ 1000);
+  for (int i = 0; i < 880; i++) {
+    std::string r = "r" + std::to_string(i);
+    EXPECT_OK(Insert(r));
+    HitNTimes(r, 2);
+  }
+  for (int i = 0; i < 50; i++) {
+    EXPECT_OK(Insert("L" + std::to_string(i), /*charge*/ 100));
+  }
+  EXPECT_EQ(881, cache_->GetOccupancyCount());
+  EXPECT_EQ(10, cache_->TEST_GetGhostSize());
+  // L0 is 49 large victims back, far beyond one shard of charge: not
+  // readmitted. L45 is within it: readmitted.
+  EXPECT_OK(Insert("L0", /*charge*/ 100));
+  EXPECT_TRUE(InProbationForTest("L0"));
+  EXPECT_OK(Insert("L45", /*charge*/ 100));
+  EXPECT_TRUE(ContainsForTest("L45"));
+  EXPECT_FALSE(InProbationForTest("L45"));
+
+  // One large resident entry, small victims: the count bound binds. A
+  // charge-only bound would keep 100 records here.
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("big", /*charge*/ 80));
+  HitNTimes("big", 2);
+  InsertN("c", 1000);
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_EQ(21, cache_->GetOccupancyCount());
+  EXPECT_EQ(21, cache_->TEST_GetGhostSize());
+}
+
+// A victim with the largest charge a slot holds (UINT32_MAX; anything larger
+// is standalone and never a victim) is remembered at that charge, so it
+// still fits the charge bound next to another such victim and is readmitted
+// to resident.
+TEST_F(S3FifoCacheTest, GhostKeepsMaxSlotChargeVictim) {
+  if (sizeof(size_t) < 8) {
+    ROCKSDB_GTEST_BYPASS("charges over 4 GiB need a 64-bit size_t");
+    return;
+  }
+  constexpr size_t kMaxSlotCharge = std::numeric_limits<uint32_t>::max();
+  // Raised by SetCapacity, which reserves nothing, so the test does not
+  // map a large table (Windows commits the whole reservation).
+  NewCache(/*capacity*/ 1 << 20);
+  cache_->SetCapacity(2 * kMaxSlotCharge);
+  EXPECT_OK(Insert("r"));
+  HitNTimes("r", 2);
+  EXPECT_OK(Insert("big", kMaxSlotCharge));
+  // Promotes r and evicts big, remembering it.
+  EXPECT_OK(Insert("filler", kMaxSlotCharge));
+  EXPECT_FALSE(ContainsForTest("big"));
+  EXPECT_EQ(1, cache_->TEST_GetGhostSize());
+  // Evicts filler, remembering it too: the two records stay within capacity,
+  // so big is still remembered.
+  EXPECT_OK(Insert("big", kMaxSlotCharge));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_FALSE(InProbationForTest("big"));
+}
+
+// A victim with the largest charge a slot holds (UINT32_MAX) counts in full
+// toward the ghost's charge bound: two of them exceed a 6 GiB capacity, so
+// the older is dropped and is not readmitted to resident.
+TEST_F(S3FifoCacheTest, GhostChargeBoundCountsMaxSlotCharge) {
+  if (sizeof(size_t) < 8) {
+    ROCKSDB_GTEST_BYPASS("charges over 4 GiB need a 64-bit size_t");
+    return;
+  }
+  constexpr size_t kGiB = size_t{1} << 30;
+  constexpr size_t kMaxSlotCharge = std::numeric_limits<uint32_t>::max();
+  NewCache(/*capacity*/ 1 << 20);
+  cache_->SetCapacity(6 * kGiB);
+  // Small hot entries keep occupancy, the ghost's count bound, above its
+  // record count, so only the charge bound drops records.
+  for (int i = 0; i < 3; ++i) {
+    const std::string key = "r" + std::to_string(i);
+    EXPECT_OK(Insert(key));
+    HitNTimes(key, 2);
+  }
+  EXPECT_OK(Insert("a", kMaxSlotCharge));
+  // Evicts a, remembering it.
+  EXPECT_OK(Insert("b", kMaxSlotCharge));
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_EQ(1, cache_->TEST_GetGhostSize());
+  // Evicts b. a and b together are over capacity, so a is dropped.
+  EXPECT_OK(Insert("c", kMaxSlotCharge));
+  EXPECT_EQ(1, cache_->TEST_GetGhostSize());
+  EXPECT_OK(Insert("a", kMaxSlotCharge));
+  EXPECT_TRUE(InProbationForTest("a"));
+}
+
+// Under a workload whose charges span 4 to 20000 (beyond three orders
+// of magnitude; the largest exceeds the probation budget of 12000):
+// usage never exceeds capacity after any operation, matches the sum of
+// in-cache charges exactly, and every insert succeeds, including strict
+// inserts with a handle, since nothing stays pinned.
+TEST_F(S3FifoCacheTest, MixedChargeWorkloadRespectsCapacity) {
+  const size_t kCapacity = 100000;
+  const size_t kCharges[] = {4, 40, 400, 4000, 20000};
+  for (bool strict : {false, true}) {
+    NewCache(kCapacity, strict);
+    Random rnd(301);
+    for (int op = 0; op < 20000; op++) {
+      int k = static_cast<int>(rnd.Uniform(2000));
+      std::string key = "k" + std::to_string(k);
+      size_t charge = kCharges[k % 5];
+      uint32_t action = rnd.Uniform(10);
+      if (action < 7) {
+        if (!LookupBool(key)) {
+          S3FifoHandle* h = nullptr;
+          ASSERT_OK(Insert(key, charge, strict ? &h : nullptr));
+          if (strict) {
+            ASSERT_NE(nullptr, h);
+            EXPECT_FALSE(cache_->Release(h, true, false));
+          }
+        }
+      } else if (action < 9) {
+        ASSERT_OK(Insert(key, charge));
+      } else {
+        Erase(key);
+      }
+      ASSERT_LE(cache_->GetUsage(), kCapacity);
+      if (op % 1000 == 0) {
+        size_t sum = 0;
+        size_t state = 0;
+        while (state != SIZE_MAX) {
+          cache_->ApplyToSomeEntries(
+              [&](const Slice& /*k*/, Cache::ObjectPtr /*value*/, size_t c,
+                  const Cache::CacheItemHelper* /*helper*/) { sum += c; },
+              /*average_entries_per_lock*/ 1000, &state);
+        }
+        ASSERT_EQ(sum, cache_->GetUsage());
+      }
+    }
+    EXPECT_EQ(0, cache_->GetPinnedUsage());
+  }
+}
+
+// Pathological alternation of tiny (4) and huge (20000, over the budget of
+// 12000) cold entries around one hot entry of each size: no loop, no
+// capacity violation, and neither size class is starved. Both hot entries
+// hit on every round after the first, and every cold entry of either size
+// is admitted.
+TEST_F(S3FifoCacheTest, AlternatingTinyAndHugeNoStarvation) {
+  const size_t kCapacity = 100000;
+  NewCache(kCapacity);
+  int tiny_hits = 0;
+  int huge_hits = 0;
+  const int kRounds = 1000;
+  for (int round = 0; round < kRounds; round++) {
+    if (LookupBool("hot_tiny")) {
+      tiny_hits++;
+    } else {
+      ASSERT_OK(Insert("hot_tiny", /*charge*/ 4));
+    }
+    ASSERT_LE(cache_->GetUsage(), kCapacity);
+    if (LookupBool("hot_huge")) {
+      huge_hits++;
+    } else {
+      ASSERT_OK(Insert("hot_huge", /*charge*/ 20000));
+    }
+    ASSERT_LE(cache_->GetUsage(), kCapacity);
+    std::string tiny = "t" + std::to_string(round);
+    ASSERT_OK(Insert(tiny, /*charge*/ 4));
+    ASSERT_LE(cache_->GetUsage(), kCapacity);
+    ASSERT_TRUE(ContainsForTest(tiny));
+    std::string huge = "h" + std::to_string(round);
+    ASSERT_OK(Insert(huge, /*charge*/ 20000));
+    ASSERT_LE(cache_->GetUsage(), kCapacity);
+    ASSERT_TRUE(ContainsForTest(huge));
+  }
+  EXPECT_EQ(kRounds - 1, tiny_hits);
+  EXPECT_EQ(kRounds - 1, huge_hits);
 }
 
 // Values that detect use after free and double free: the deleter marks the
