@@ -359,23 +359,33 @@ static void TestTxnDBBatchedMultiGet(void) {
     rocksdb_transactiondb_release_snapshot(db, snapshot);
     // A timestamp on a non-timestamped column family must return an error,
     // rather than being reported as a missing key.
+    rocksdb_transaction_destroy(txn);
     rocksdb_readoptions_set_timestamp(ro, "timestamp", 9);
-    for (int slices = 0; slices <= 1; ++slices) {
-      const char* keys[1] = {"a"};
-      const size_t sizes[1] = {1};
-      const rocksdb_slice_t key_slices[1] = {{"a", 1}};
-      rocksdb_pinnableslice_t* values[1];
-      char* errs[1];
-      if (slices) {
-        rocksdb_transactiondb_batched_multi_get_cf_slice(
-            db, ro, cf, 1, key_slices, values, errs, true);
-      } else {
-        rocksdb_transactiondb_batched_multi_get_cf(db, ro, cf, 1, keys, sizes,
-                                                   values, errs, true);
+    txn = rocksdb_transaction_begin(db, wo, to, NULL);
+    for (int use_txn = 0; use_txn <= 1; ++use_txn) {
+      for (int slices = 0; slices <= 1; ++slices) {
+        const char* keys[1] = {"a"};
+        const size_t sizes[1] = {1};
+        const rocksdb_slice_t key_slices[1] = {{"a", 1}};
+        rocksdb_pinnableslice_t* values[1];
+        char* errs[1];
+        if (use_txn && slices) {
+          rocksdb_transaction_batched_multi_get_for_update_cf_slice(
+              txn, ro, cf, 1, key_slices, values, errs, true);
+        } else if (use_txn) {
+          rocksdb_transaction_batched_multi_get_for_update_cf(
+              txn, ro, cf, 1, keys, sizes, values, errs, true);
+        } else if (slices) {
+          rocksdb_transactiondb_batched_multi_get_cf_slice(
+              db, ro, cf, 1, key_slices, values, errs, true);
+        } else {
+          rocksdb_transactiondb_batched_multi_get_cf(db, ro, cf, 1, keys, sizes,
+                                                     values, errs, true);
+        }
+        CheckCondition(values[0] == NULL);
+        CheckCondition(errs[0] != NULL);
+        rocksdb_free(errs[0]);
       }
-      CheckCondition(values[0] == NULL);
-      CheckCondition(errs[0] != NULL);
-      rocksdb_free(errs[0]);
     }
     rocksdb_readoptions_set_timestamp(ro, NULL, 0);
     rocksdb_transaction_destroy(txn);

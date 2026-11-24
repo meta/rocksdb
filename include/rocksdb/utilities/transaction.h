@@ -481,13 +481,27 @@ class Transaction {
   // or validation failure sets all statuses; acquired locks remain held.
   // A null column_family selects the default column family.
   //
+  // Keys are locked one at a time in input order, whether or not sorted_input
+  // is set. To reduce lock waits and deadlocks between transactions that lock
+  // overlapping keys, pass keys in a consistent order, such as sorted by the
+  // column family's comparator.
+  //
   // Results preserve input order. keys, values, and statuses each have num_keys
   // entries. sorted_input requires keys sorted by the column family's
   // comparator; otherwise the result is undefined. Call Reset() on each value
   // when finished to release pinned resources. io_activity must be kUnknown or
-  // kMultiGet. For timestamped column families, the read timestamp and
-  // validation requirements are the same as GetForUpdate. The default
-  // implementation returns NotSupported for every key.
+  // kMultiGet.
+  //
+  // Timestamps: for a column family without timestamps,
+  // ReadOptions::timestamp must be unset. For a column family with timestamps
+  // (WRITE_COMMITTED only), if TransactionDBOptions::enable_udt_validation is
+  // true, SetReadTimestampForValidation() must have been called and the read
+  // uses that timestamp; if false, it must not have been called and the read
+  // uses kMaxTxnTimestamp. ReadOptions::timestamp, if set, must equal that
+  // timestamp. Otherwise every key gets InvalidArgument, and no key is locked
+  // or tracked.
+  //
+  // The default implementation returns NotSupported for every key.
   virtual void MultiGetForUpdate(const ReadOptions& /*options*/,
                                  ColumnFamilyHandle* /*column_family*/,
                                  size_t num_keys, const Slice* /*keys*/,

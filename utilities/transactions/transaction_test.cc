@@ -216,6 +216,23 @@ TEST_P(TransactionTest, BatchedMultiGetForUpdateValidation) {
   for (const Status& status : statuses) {
     ASSERT_EQ(status.code(), Status::Code::kInvalidArgument);
   }
+  // A timestamp on a column family without timestamps fails for every key,
+  // including with a null column family.
+  read_options.io_activity = Env::IOActivity::kUnknown;
+  std::string ts_buf(sizeof(uint64_t), '\0');
+  Slice ts(ts_buf);
+  read_options.timestamp = &ts;
+  ColumnFamilyHandle* const cfs[] = {db->DefaultColumnFamily(), nullptr};
+  for (ColumnFamilyHandle* cf : cfs) {
+    statuses.fill(Status::OK());
+    txn->MultiGetForUpdate(read_options, cf, keys.size(), keys.data(),
+                           values.data(), statuses.data(), false);
+    for (const Status& status : statuses) {
+      ASSERT_EQ(status.code(), Status::Code::kInvalidArgument);
+    }
+  }
+  read_options.timestamp = nullptr;
+  // Neither failure above took a lock.
   std::unique_ptr<Transaction> other(db->BeginTransaction(WriteOptions()));
   ASSERT_OK(other->Put("a", "other"));
   ASSERT_OK(other->Rollback());

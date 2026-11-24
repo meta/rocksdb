@@ -5185,13 +5185,13 @@ class Benchmark {
           (method == &Benchmark::MultiReadRandom ||
            method == &Benchmark::MultiReadWhileWriting) &&
           ((!FLAGS_transaction_db && !FLAGS_optimistic_transaction_db) ||
-           !FLAGS_multiread_batched || multiread_entity_ ||
+           FLAGS_readonly || !FLAGS_multiread_batched || multiread_entity_ ||
            multiread_entity_lazy_ || FLAGS_read_with_metadata ||
            user_timestamp_size_ > 0)) {
         fprintf(stderr,
                 "multiread_for_update requires transaction_db or "
                 "optimistic_transaction_db, and multiread_batched, without "
-                "entities, metadata, or timestamps\n");
+                "readonly, entities, metadata, or timestamps\n");
         ErrorExit();
       }
 
@@ -6571,10 +6571,6 @@ class Benchmark {
     options.read_triggered_compaction_threshold =
         FLAGS_read_triggered_compaction_threshold;
 
-    if (FLAGS_readonly && FLAGS_multiread_for_update) {
-      fprintf(stderr, "Cannot use readonly flag with multiread_for_update\n");
-      db_bench_exit(1);
-    }
     if (FLAGS_readonly && FLAGS_transaction_db) {
       fprintf(stderr, "Cannot use readonly flag with transaction_db\n");
       db_bench_exit(1);

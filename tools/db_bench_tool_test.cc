@@ -222,22 +222,50 @@ TEST_F(DBBenchTest, MultiReadForUpdateLockFailures) {
 
 TEST_F(DBBenchTest, MultiReadForUpdateReadOnly) {
   GFLAGS_NAMESPACE::FlagSaver flag_saver;
+  // Opening the DB below starts Env thread-pool threads. The default "fast"
+  // death-test style forks without exec, so the child's exit() would try to
+  // join pool threads that do not exist in it.
+  const std::string saved_style = ::testing::GTEST_FLAG(death_test_style);
+  ::testing::GTEST_FLAG(death_test_style) = "threadsafe";
+  const std::string options_file = test_path_ + "/OPTIONS_readonly";
   {
-    Options options;
-    options.create_if_missing = true;
+    Options options = GetDefaultOptions();
+    ASSERT_OK(PersistRocksDBOptions(WriteOptions(), DBOptions(options),
+                                    {"default"}, {ColumnFamilyOptions(options)},
+                                    options_file,
+                                    options.env->GetFileSystem().get()));
     std::unique_ptr<DB> db;
     ASSERT_OK(DB::Open(options, db_path_, &db));
   }
 
-  ResetArgs();
-  AppendArgs({"./db_bench", "--benchmarks=multireadrandom", "--num=2",
-              "--reads=2", "--threads=1", "--batch_size=2", "--readonly=true",
-              "--transaction_db=false", "--optimistic_transaction_db=true",
-              "--num_multi_db=1", "--multiread_batched=true",
-              "--multiread_for_update=true", "--compression_type=none",
-              "--db=" + db_path_});
-  ASSERT_EXIT(db_bench_tool(argc(), argv()), testing::ExitedWithCode(1),
-              "Cannot use readonly flag with multiread_for_update");
+  // The check must also apply when options come from an options file, which
+  // skips flag-based option initialization.
+  for (bool use_options_file : {false, true}) {
+    SCOPED_TRACE(use_options_file);
+    for (bool optimistic : {false, true}) {
+      SCOPED_TRACE(optimistic);
+      ResetArgs();
+      AppendArgs(
+          {"./db_bench", "--benchmarks=multireadrandom", "--num=2", "--reads=2",
+           "--threads=1", "--batch_size=2", "--readonly=true",
+           std::string("--transaction_db=") + (optimistic ? "false" : "true"),
+           std::string("--optimistic_transaction_db=") +
+               (optimistic ? "true" : "false"),
+           "--num_multi_db=1", "--multiread_batched=true",
+           "--multiread_for_update=true", "--compression_type=none",
+           "--db=" + db_path_,
+           "--options_file=" + (use_options_file ? options_file : "")});
+      // Without an options file, the existing readonly and transaction_db
+      // check fires first.
+      const char* expected =
+          !use_options_file && !optimistic
+              ? "Cannot use readonly flag with transaction_db"
+              : "multiread_for_update requires";
+      ASSERT_EXIT(db_bench_tool(argc(), argv()), testing::ExitedWithCode(1),
+                  expected);
+    }
+  }
+  ::testing::GTEST_FLAG(death_test_style) = saved_style;
 }
 
 TEST_F(DBBenchTest, MultiReadForUpdateOptimistic) {

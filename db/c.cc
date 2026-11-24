@@ -13619,15 +13619,10 @@ void rocksdb_transaction_batched_multi_get_for_update_cf_slice(
     rocksdb_column_family_handle_t* column_family, size_t num_keys,
     const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
     char** errs, const bool sorted_input) {
-  if (num_keys == 0) {
-    return;
-  }
-  std::vector<Slice> keys(num_keys);
-  for (size_t i = 0; i < num_keys; ++i) {
-    keys[i] = Slice(keys_list[i].data, keys_list[i].size);
-  }
+  // Cast rocksdb_slice_t* to Slice* - they have identical memory layout
   TransactionBatchedMultiGetForUpdate(txn, options, column_family, num_keys,
-                                      keys.data(), values, errs, sorted_input);
+                                      reinterpret_cast<const Slice*>(keys_list),
+                                      values, errs, sorted_input);
 }
 
 void rocksdb_transactiondb_batched_multi_get_cf(

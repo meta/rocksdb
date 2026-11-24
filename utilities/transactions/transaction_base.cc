@@ -480,11 +480,23 @@ void TransactionBaseImpl::MultiGetForUpdate(const ReadOptions& read_options,
   if (num_keys == 0) {
     return;
   }
+  column_family = column_family ? column_family : db_->DefaultColumnFamily();
+  const size_t ts_sz = column_family->GetComparator()->timestamp_size();
   Status s;
   if (read_options.io_activity != Env::IOActivity::kUnknown &&
       read_options.io_activity != Env::IOActivity::kMultiGet) {
     s = Status::InvalidArgument(
         "MultiGetForUpdate requires io_activity kUnknown or kMultiGet");
+  } else if (read_options.timestamp == nullptr && ts_sz > 0) {
+    s = Status::InvalidArgument(
+        "MultiGetForUpdate requires a read timestamp for column family " +
+        column_family->GetName());
+  } else if (read_options.timestamp != nullptr &&
+             read_options.timestamp->size() != ts_sz) {
+    // Also covers a timestamp on a column family without timestamps.
+    s = Status::InvalidArgument(
+        "MultiGetForUpdate timestamp size does not match column family " +
+        column_family->GetName());
   } else {
     for (size_t i = 0; i < num_keys; ++i) {
       s = TryLock(column_family, keys[i], true /* read_only */,

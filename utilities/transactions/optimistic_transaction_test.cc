@@ -114,6 +114,32 @@ TEST_P(OptimisticTransactionTest, BatchedMultiGetForUpdate) {
   }
 }
 
+TEST_P(OptimisticTransactionTest, BatchedMultiGetForUpdateTimestamp) {
+  ASSERT_OK(txn_db->Put(WriteOptions(), "b", "db"));
+  std::string ts_buf(sizeof(uint64_t), '\0');
+  Slice ts(ts_buf);
+  ReadOptions read_options;
+  read_options.timestamp = &ts;
+  const std::vector<Slice> keys{"b", "missing"};
+  ColumnFamilyHandle* const cfs[] = {txn_db->DefaultColumnFamily(), nullptr};
+  for (ColumnFamilyHandle* cf : cfs) {
+    SCOPED_TRACE(cf == nullptr);
+    std::unique_ptr<Transaction> txn(txn_db->BeginTransaction(WriteOptions()));
+    std::vector<PinnableSlice> values(keys.size());
+    std::vector<Status> statuses(keys.size());
+    txn->MultiGetForUpdate(read_options, cf, keys.size(), keys.data(),
+                           values.data(), statuses.data(), false);
+    for (const Status& status : statuses) {
+      ASSERT_EQ(status.code(), Status::Code::kInvalidArgument);
+    }
+    // The failure did not track the keys, so a concurrent write does not
+    // conflict.
+    ASSERT_OK(txn_db->Put(WriteOptions(), "missing", "changed"));
+    ASSERT_OK(txn->Commit());
+    ASSERT_OK(txn_db->Delete(WriteOptions(), "missing"));
+  }
+}
+
 TEST_P(OptimisticTransactionTest, SuccessTest) {
   WriteOptions write_options;
   ReadOptions read_options;
