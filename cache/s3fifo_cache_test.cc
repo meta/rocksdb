@@ -24,12 +24,16 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
 
+#include "cache/lru_cache.h"
 #include "port/port.h"
 #include "rocksdb/cache.h"
+#include "rocksdb/convenience.h"
+#include "rocksdb/table.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/random.h"
@@ -3493,6 +3497,362 @@ TEST_F(S3FifoCacheTest, AlternatingTinyAndHugeNoStarvation) {
   EXPECT_EQ(kRounds - 1, huge_hits);
 }
 
+#ifndef NDEBUG
+// A slot-table reservation that fails at construction is reported by
+// Cache::CreateFromString as InvalidArgument, with no cache, instead of
+// aborting.
+TEST_F(S3FifoCacheTest, CreateFromStringReportsReservationFailure) {
+  SyncPoint::GetInstance()->SetCallBack(
+      "S3FifoCacheShard::S3FifoCacheShard:Reserved",
+      [](void* arg) { *static_cast<S3FifoHandle**>(arg) = nullptr; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ConfigOptions config_options;
+  std::shared_ptr<Cache> cache;
+  const Status s = Cache::CreateFromString(
+      config_options, "s3fifo_cache://capacity=1M;num_shard_bits=2", &cache);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  EXPECT_EQ(nullptr, cache);
+}
+#endif  // NDEBUG
+
+// Every exposed scalar option survives serialize -> parse, both into
+// S3FifoCacheOptions and through Cache::CreateFromString into the cache.
+TEST_F(S3FifoCacheTest, CreateFromStringRoundTripsScalarOptions) {
+  ConfigOptions config_options;
+  S3FifoCacheOptions a = TestS3FifoOptions(
+      /*capacity*/ 12345, /*num_shard_bits*/ 3,
+      /*strict_capacity_limit*/ true, kDontChargeCacheMetadata);
+  a.use_adaptive_mutex = !kDefaultToAdaptiveMutex;
+  a.hash_seed = 42;
+  a.max_capacity = 54321;
+  S3FifoCacheOptions b = TestS3FifoOptions(
+      /*capacity*/ size_t{1} << 30, /*num_shard_bits*/ 0,
+      /*strict_capacity_limit*/ false, kFullChargeCacheMetadata);
+  b.hash_seed = ShardedCacheOptions::kQuasiRandomHashSeed;
+  for (const S3FifoCacheOptions& opts : {a, b}) {
+    std::string str;
+    ASSERT_OK(OptionTypeInfo::SerializeType(
+        config_options, S3FifoCacheOptionsTypeInfo(), &opts, &str));
+    EXPECT_EQ(std::string::npos, str.find("memory_allocator"));
+    EXPECT_EQ(std::string::npos, str.find("secondary_cache"));
+
+    S3FifoCacheOptions parsed;
+    ASSERT_OK(OptionTypeInfo::ParseStruct(config_options, "s3fifo_cache",
+                                          &S3FifoCacheOptionsTypeInfo(),
+                                          "s3fifo_cache", str, &parsed));
+    EXPECT_EQ(opts.capacity, parsed.capacity);
+    EXPECT_EQ(opts.num_shard_bits, parsed.num_shard_bits);
+    EXPECT_EQ(opts.strict_capacity_limit, parsed.strict_capacity_limit);
+    EXPECT_EQ(opts.metadata_charge_policy, parsed.metadata_charge_policy);
+    EXPECT_EQ(opts.hash_seed, parsed.hash_seed);
+    EXPECT_EQ(opts.use_adaptive_mutex, parsed.use_adaptive_mutex);
+    EXPECT_EQ(opts.max_capacity, parsed.max_capacity);
+
+    std::shared_ptr<Cache> cache;
+    ASSERT_OK(Cache::CreateFromString(config_options, "s3fifo_cache://" + str,
+                                      &cache));
+    auto* fifo = dynamic_cast<S3FifoCache*>(cache.get());
+    ASSERT_NE(nullptr, fifo);
+    EXPECT_EQ(opts.capacity, fifo->GetCapacity());
+    EXPECT_EQ(opts.num_shard_bits, fifo->GetNumShardBits());
+    EXPECT_EQ(opts.strict_capacity_limit, fifo->HasStrictCapacityLimit());
+    if (opts.hash_seed >= 0) {
+      EXPECT_EQ(static_cast<uint32_t>(opts.hash_seed), fifo->GetHashSeed());
+    }
+    ASSERT_OK(cache->Insert("k", nullptr, &kNoopCacheItemHelper, 1));
+    EXPECT_EQ(opts.metadata_charge_policy == kDontChargeCacheMetadata,
+              cache->GetUsage() == 1);
+  }
+}
+
+// Spaces inside the braces are trimmed as in the LRU form, so a s3fifo_cache://
+// value written that way builds a S3FifoCache instead of falling through to the
+// object registry, which returns OK and leaves the caller's cache unchanged.
+TEST_F(S3FifoCacheTest, CreateFromStringTrimsSpacesInsideBraces) {
+  ConfigOptions config_options;
+  for (const char* value :
+       {"{ s3fifo_cache://capacity=1M}", "{s3fifo_cache://capacity=1M }",
+        "{  s3fifo_cache://capacity=1M; num_shard_bits=2 }",
+        " s3fifo_cache://capacity=1M", " {s3fifo_cache://capacity=1M} "}) {
+    std::shared_ptr<Cache> cache;
+    ASSERT_OK(Cache::CreateFromString(config_options, value, &cache)) << value;
+    ASSERT_NE(nullptr, cache) << value;
+    EXPECT_STREQ("S3FifoCache", cache->Name()) << value;
+    EXPECT_EQ(size_t{1} << 20, cache->GetCapacity()) << value;
+  }
+}
+
+// Invalid configuration fails with InvalidArgument naming the field, and
+// leaves the output untouched.
+TEST_F(S3FifoCacheTest, CreateFromStringRejectsInvalidOptions) {
+  ConfigOptions config_options;
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"s3fifo_cache://", "capacity"},
+      {"s3fifo_cache://num_shard_bits=2", "capacity"},
+      {"s3fifo_cache://capacity=0", "capacity"},
+      {"s3fifo_cache://capacity=1M;num_shard_bits=20", "num_shard_bits"},
+      {"s3fifo_cache://capacity=1M;num_shard_bits=25", "num_shard_bits"},
+      {"s3fifo_cache://capacity=1M;num_shard_bits=-2", "num_shard_bits"},
+      {"s3fifo_cache://capacity=1M;num_shard_bits=-100", "num_shard_bits"},
+      {"s3fifo_cache://capacity=abc", "capacity"},
+      {"s3fifo_cache://capacity=1M;num_shard_bits=x", "num_shard_bits"},
+      {"s3fifo_cache://capacity=1M;strict_capacity_limit=maybe",
+       "strict_capacity_limit"},
+      {"s3fifo_cache://capacity=1M;metadata_charge_policy=kSometimes",
+       "metadata_charge_policy"},
+      {"s3fifo_cache://capacity=1M;hash_seed=seed", "hash_seed"},
+      {"s3fifo_cache://capacity=1M;use_adaptive_mutex=2", "use_adaptive_mutex"},
+      {"s3fifo_cache://capacity=1M;max_capacity=abc", "max_capacity"},
+      {"s3fifo_cache://capacity=1M;high_pri_pool_ratio=0.5",
+       "high_pri_pool_ratio"},
+      {"s3fifo_cache://capacity=1M;probation_ratio=0.2", "probation_ratio"},
+      {"s3fifo_cache://capacity=1M;memory_allocator=jemalloc",
+       "memory_allocator"},
+      {"s3fifo_cache://capacity=1M;"
+       "secondary_cache=compressed_secondary_cache://capacity=1M",
+       "secondary_cache"},
+  };
+  for (const auto& [value, field] : cases) {
+    std::shared_ptr<Cache> sentinel = NewLRUCache(1);
+    std::shared_ptr<Cache> cache = sentinel;
+    Status s = Cache::CreateFromString(config_options, value, &cache);
+    EXPECT_TRUE(s.IsInvalidArgument()) << value << " -> " << s.ToString();
+    EXPECT_NE(std::string::npos, s.ToString().find(field))
+        << value << " -> " << s.ToString();
+    EXPECT_EQ(sentinel, cache) << value;
+  }
+  // -1 (pick automatically) and 0 are the lowest accepted shard bits.
+  for (const char* value : {"s3fifo_cache://capacity=1M;num_shard_bits=-1",
+                            "s3fifo_cache://capacity=1M;num_shard_bits=0"}) {
+    std::shared_ptr<Cache> cache;
+    ASSERT_OK(Cache::CreateFromString(config_options, value, &cache)) << value;
+    ASSERT_NE(nullptr, cache) << value;
+  }
+}
+
+// No capacity trips the 32 TiB reservation check in Cache::CreateFromString:
+// kMaxLength caps each shard's reservation (at 2.7 MiB), so even huge
+// capacities stay far below it, at up to 2^19 shards (checked
+// arithmetically); 16-shard caches at the cap build.
+TEST_F(S3FifoCacheTest, CreateFromStringReservationIsCapped) {
+  const size_t kCappedShardBytes =
+      S3FifoCacheShard::ReservationBytes(SIZE_MAX, 0);
+  // kFirstSlot + homes + the aside head, rounded up to whole groups.
+  EXPECT_EQ(
+      (2 + S3FifoCacheShard::kMaxLength + 1 + 2) / 3 * sizeof(S3FifoSlotGroup),
+      kCappedShardBytes);
+  EXPECT_LT(kCappedShardBytes, size_t{2800} << 10);
+  // The most shards a string accepts: well under 32 TiB.
+  S3FifoCacheOptions opts;
+  opts.capacity = 1 << 20;
+  opts.max_capacity = SIZE_MAX;
+  opts.num_shard_bits = 19;
+  EXPECT_LT(S3FifoCacheReservationBytes(opts), uint64_t{1} << 45);
+  // A 32-bit size_t: a max_capacity of SIZE_MAX leaves each of the 2^19
+  // shards at the 2048-home floor, not at the cap, and a 1 PiB capacity does
+  // not fit.
+  if constexpr (sizeof(size_t) > 4) {
+    // Each of those shards at the cap.
+    EXPECT_EQ(uint64_t{kCappedShardBytes} << 19,
+              S3FifoCacheReservationBytes(opts));
+    // Huge capacities build a capped table: 16 shards at the cap reserve
+    // about 43 MiB, which every platform can afford.
+    ConfigOptions config_options;
+    for (const char* value :
+         {"s3fifo_cache://capacity=1M;max_capacity=-1;num_shard_bits=4",
+          "s3fifo_cache://capacity=1125899906842624;num_shard_bits=4"}) {
+      std::shared_ptr<Cache> cache;
+      ASSERT_OK(Cache::CreateFromString(config_options, value, &cache))
+          << value;
+      ASSERT_NE(nullptr, cache) << value;
+      EXPECT_NE(std::string::npos, cache->GetPrintableOptions().find(
+                                       "reserved_homes_per_shard: 65532\n"))
+          << value;
+    }
+  }
+}
+
+// The s3fifo_cache:// path shards as MakeSharedCache does: num_shard_bits
+// left at -1 follows S3FifoCache::DefaultShardBits, an explicit one wins, and
+// S3FifoCacheReservationBytes matches the reservation the cache makes.
+TEST_F(S3FifoCacheTest, CreateFromStringUsesDefaultShardBits) {
+  constexpr size_t kMiB = size_t{1} << 20;
+  // {string, capacity, explicit num_shard_bits or -1, expected bits}
+  std::vector<std::tuple<std::string, size_t, int, int>> cases = {
+      {"s3fifo_cache://capacity=1M", 1 * kMiB, -1, 0},
+      {"s3fifo_cache://capacity=32M", 32 * kMiB, -1, 3},
+      {"s3fifo_cache://capacity=256M", 256 * kMiB, -1, 6},
+      {"s3fifo_cache://capacity=32M;num_shard_bits=1", 32 * kMiB, 1, 1},
+      {"s3fifo_cache://capacity=1M;num_shard_bits=5", 1 * kMiB, 5, 5},
+  };
+  // 128 capped shards reserve ~341 MiB, committed up front on Windows.
+#if !defined(OS_WIN)
+  if (sizeof(size_t) == 8) {
+    cases.emplace_back("s3fifo_cache://capacity=16G", size_t{16} << 30, -1, 7);
+  }
+#endif  // !OS_WIN
+  ConfigOptions config_options;
+  for (const auto& [value, capacity, explicit_bits, bits] : cases) {
+    SCOPED_TRACE(value);
+    S3FifoCacheOptions opts;
+    opts.capacity = capacity;
+    opts.num_shard_bits = explicit_bits;
+    EXPECT_EQ((uint64_t{1} << bits) *
+                  S3FifoCacheShard::ReservationBytes(capacity >> bits, 0),
+              S3FifoCacheReservationBytes(opts));
+    std::shared_ptr<Cache> cache;
+    ASSERT_OK(Cache::CreateFromString(config_options, value, &cache));
+    ASSERT_NE(nullptr, cache);
+    EXPECT_EQ(bits, static_cast<S3FifoCache*>(cache.get())->GetNumShardBits());
+  }
+}
+
+// A block_cache= string builds the selected S3FifoCache, not a fallback:
+// the incoming-charge queue choice and the ghost's charge bound hold.
+TEST_F(S3FifoCacheTest, CreateFromStringPreservesSelectedBehavior) {
+  auto make = [](size_t capacity) {
+    BlockBasedTableOptions table_opts;
+    EXPECT_OK(GetBlockBasedTableOptionsFromString(
+        ConfigOptions(), BlockBasedTableOptions(),
+        "block_cache={s3fifo_cache://capacity=" + std::to_string(capacity) +
+            ";num_shard_bits=0;metadata_charge_policy=kDontChargeCacheMetadata"
+            "}",
+        &table_opts));
+    EXPECT_STREQ("S3FifoCache", table_opts.block_cache->Name());
+    EXPECT_NE(nullptr,
+              dynamic_cast<S3FifoCache*>(table_opts.block_cache.get()));
+    return table_opts.block_cache;
+  };
+  auto shard = [](const std::shared_ptr<Cache>& cache) -> S3FifoCacheShard& {
+    return static_cast<S3FifoCache*>(cache.get())->GetShard(kNullUniqueId64x2);
+  };
+  auto insert = [](const std::shared_ptr<Cache>& cache, const std::string& key,
+                   size_t charge = 1) {
+    ASSERT_OK(cache->Insert(key, nullptr, &kNoopCacheItemHelper, charge));
+  };
+  auto hit2 = [](const std::shared_ptr<Cache>& cache, const std::string& key) {
+    for (int i = 0; i < 2; i++) {
+      Cache::Handle* h = cache->Lookup(key);
+      ASSERT_NE(nullptr, h);
+      cache->Release(h);
+    }
+  };
+  auto contains = [](const std::shared_ptr<Cache>& cache,
+                     const std::string& key) {
+    bool found = false;
+    cache->ApplyToAllEntries(
+        [&](const Slice& k, Cache::ObjectPtr, size_t,
+            const Cache::CacheItemHelper*) { found |= k.ToString() == key; },
+        {});
+    return found;
+  };
+  auto in_probation = [&](const std::shared_ptr<Cache>& cache,
+                          const std::string& key) {
+    S3FifoHandle* fifo;
+    shard(cache).TEST_GetProbationList(&fifo);
+    for (S3FifoHandle* h = shard(cache).TEST_Next(fifo); h != fifo;
+         h = shard(cache).TEST_Next(h)) {
+      if (h->key().ToString() == key) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Probation at budget, incoming charge 5: probation pays. Ignoring the
+  // incoming charge would draw from resident and evict big.
+  std::shared_ptr<Cache> cache = make(100);
+  insert(cache, "big", 88);
+  hit2(cache, "big");
+  for (int i = 0; i < 12; i++) {
+    insert(cache, "p" + std::to_string(i));
+  }
+  insert(cache, "t");
+  EXPECT_EQ(12, shard(cache).TEST_GetProbationUsage());
+  EXPECT_EQ(100, cache->GetUsage());
+  insert(cache, "x", 5);
+  EXPECT_TRUE(contains(cache, "big"));
+  EXPECT_FALSE(contains(cache, "p5"));
+  EXPECT_TRUE(contains(cache, "p6"));
+  EXPECT_TRUE(contains(cache, "x"));
+  EXPECT_EQ(12, shard(cache).TEST_GetProbationUsage());
+
+  // Large victims behind many small residents: the charge bound keeps 10
+  // ghosts where a count-only (881-record) bound would keep all 49.
+  cache = make(1000);
+  for (int i = 0; i < 880; i++) {
+    std::string r = "r" + std::to_string(i);
+    insert(cache, r);
+    hit2(cache, r);
+  }
+  for (int i = 0; i < 50; i++) {
+    insert(cache, "L" + std::to_string(i), 100);
+  }
+  EXPECT_EQ(881, cache->GetOccupancyCount());
+  EXPECT_EQ(10, shard(cache).TEST_GetGhostSize());
+  insert(cache, "L0", 100);
+  EXPECT_TRUE(in_probation(cache, "L0"));
+  insert(cache, "L45", 100);
+  EXPECT_TRUE(contains(cache, "L45"));
+  EXPECT_FALSE(in_probation(cache, "L45"));
+}
+
+// Strings that worked before never reach the s3fifo_cache:// branch: each
+// builds the same LRUCache as the direct factory, and other URIs still go
+// to the object registry.
+TEST_F(S3FifoCacheTest, CreateFromStringLeavesExistingStringsUnchanged) {
+  ConfigOptions config_options;
+  LRUCacheOptions full(/*capacity*/ 1 << 20, /*num_shard_bits*/ 4,
+                       /*strict_capacity_limit*/ true,
+                       /*high_pri_pool_ratio*/ 0.25);
+  full.low_pri_pool_ratio = 0.125;
+  const std::string full_str =
+      "capacity=1M;num_shard_bits=4;strict_capacity_limit=true;"
+      "high_pri_pool_ratio=0.25;low_pri_pool_ratio=0.125";
+  const std::vector<std::pair<std::string, std::shared_ptr<Cache>>> cases = {
+      {"1M", NewLRUCache(1 << 20)},
+      {"capacity=2M", NewLRUCache(2 << 20)},
+      {full_str, full.MakeSharedCache()},
+      {"{" + full_str + "}", full.MakeSharedCache()},
+  };
+  for (const auto& [value, expected] : cases) {
+    std::shared_ptr<Cache> direct;
+    ASSERT_OK(Cache::CreateFromString(config_options, value, &direct));
+    BlockBasedTableOptions table_opts;
+    ASSERT_OK(GetBlockBasedTableOptionsFromString(
+        config_options, BlockBasedTableOptions(),
+        "block_cache=" +
+            (value.find(';') == std::string::npos || value[0] == '{'
+                 ? value
+                 : "{" + value + "}"),
+        &table_opts));
+    for (const std::shared_ptr<Cache>& actual :
+         {direct, table_opts.block_cache}) {
+      auto* lru = dynamic_cast<LRUCache*>(actual.get());
+      auto* want = static_cast<LRUCache*>(expected.get());
+      ASSERT_NE(nullptr, lru) << value;
+      EXPECT_STREQ("LRUCache", lru->Name());
+      EXPECT_EQ(want->GetCapacity(), lru->GetCapacity()) << value;
+      EXPECT_EQ(want->GetNumShardBits(), lru->GetNumShardBits()) << value;
+      EXPECT_EQ(want->HasStrictCapacityLimit(), lru->HasStrictCapacityLimit());
+      EXPECT_EQ(want->GetHashSeed(), lru->GetHashSeed()) << value;
+      EXPECT_EQ(want->GetHighPriPoolRatio(), lru->GetHighPriPoolRatio());
+      EXPECT_EQ(want->GetShard(0).GetLowPriPoolRatio(),
+                lru->GetShard(0).GetLowPriPoolRatio());
+    }
+  }
+
+  for (const char* uri : {"foo://bar", "my_s3fifo_cache://capacity=1"}) {
+    std::shared_ptr<Cache> sentinel = NewLRUCache(1);
+    std::shared_ptr<Cache> cache = sentinel;
+    Status s = Cache::CreateFromString(config_options, uri, &cache);
+    EXPECT_FALSE(s.IsInvalidArgument()) << s.ToString();
+    EXPECT_EQ(sentinel, cache);
+  }
+}
+
 // Values that detect use after free and double free: the deleter marks the
 // value dead before freeing it, and holders check that what they read is
 // alive and belongs to the key they looked up. LiveValues() counts the
@@ -5639,6 +5999,9 @@ TEST_F(S3FifoCacheTest, TableCappedAt16BitSlotIndexes) {
   // gets them all; one worth 65533, just above it, gets the cap (65532).
   EXPECT_EQ(65531, S3FifoCacheShard::MaxLengthFor(65531 * 64));
   EXPECT_EQ(65532, S3FifoCacheShard::MaxLengthFor(65533 * 64));
+  // kFirstSlot + kMaxLength + 1 slots, in whole 128-byte groups.
+  EXPECT_EQ(21845 * 128, S3FifoCacheShard::ReservationBytes(SIZE_MAX, 0));
+  EXPECT_EQ(21845 * 128, S3FifoCacheShard::ReservationBytes(1 << 20, SIZE_MAX));
 
   NewCache(/*capacity*/ 64 << 20);
   std::string printable;
