@@ -4374,6 +4374,11 @@ TEST_F(DBRangeDelTest, SeekForPrevTest) {
 // to move to needs neither.
 class DBRangeDelSentinelTest : public DBRangeDelTest {
  protected:
+  ~DBRangeDelSentinelTest() override {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
   // Two L1 files without range tombstones, holding prefixes
   // {p000, p002, p004} and {p010, p012}.
   void OpenWithTwoFileLevel() {
@@ -4444,6 +4449,60 @@ TEST_F(DBRangeDelSentinelTest, NoSentinelWhenUpperBoundEndsBeforeNextFile) {
   ASSERT_EQ(0, sentinels_);
 }
 
+TEST_F(DBRangeDelSentinelTest, UpperBoundCheckNotRepeatedAtFileEnd) {
+  class CountingComparator : public Comparator {
+   public:
+    const char* Name() const override { return "CountingComparator"; }
+    int Compare(const Slice& a, const Slice& b) const override {
+      if (a == "p010:a" && b == "p005") {
+        next_file_bound_checks++;
+      }
+      return BytewiseComparator()->Compare(a, b);
+    }
+    void FindShortestSeparator(std::string* start,
+                               const Slice& limit) const override {
+      BytewiseComparator()->FindShortestSeparator(start, limit);
+    }
+    void FindShortSuccessor(std::string* key) const override {
+      BytewiseComparator()->FindShortSuccessor(key);
+    }
+    mutable std::atomic<int> next_file_bound_checks{0};
+  } cmp;
+
+  Options options = PrefixFilterOptions(CurrentOptions());
+  options.comparator = &cmp;
+  DestroyAndReopen(options);
+  for (const char* key : {"p000:a", "p002:a", "p004:a"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  for (const char* key : {"p010:a", "p012:a"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,2", FilesPerLevel());
+
+  CountSentinels();
+  Slice upper_bound("p005");
+  ReadOptions read_options;
+  read_options.total_order_seek = true;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p004");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("p004:a", iter->key());
+  cmp.next_file_bound_checks = 0;
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+  EXPECT_EQ(1, cmp.next_file_bound_checks.load());
+  iter.reset();
+  Close();
+}
+
 TEST_F(DBRangeDelSentinelTest, TombstoneInFileOutlivesPrefixRunningOut) {
   DestroyAndReopen(PrefixFilterOptions(CurrentOptions()));
   ASSERT_OK(Put("p001:b", "v"));
@@ -4493,6 +4552,161 @@ TEST_F(DBRangeDelSentinelTest, TombstoneInNextFileAppliesAfterNext) {
 
   ASSERT_EQ(std::vector<std::string>({"a1", "a2", "c1"}),
             ScanAllKeys(db_.get(), ReadOptions(), /*forward=*/true));
+}
+
+TEST_F(DBRangeDelSentinelTest, NoSentinelWhenSingleFileLevelRunsOut) {
+  DestroyAndReopen(PrefixFilterOptions(CurrentOptions()));
+  for (const char* key : {"p000:a", "p002:a", "p004:a"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,1", FilesPerLevel());
+  CountSentinels();
+  ReadOptions read_options;
+  read_options.prefix_same_as_start = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p001");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+}
+
+TEST_F(DBRangeDelSentinelTest, NoSentinelWhenMidFileReachesUpperBound) {
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  CountSentinels();
+  Slice upper_bound("p003");
+  ReadOptions read_options;
+  read_options.total_order_seek = true;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p002");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("p002:a", iter->key());
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+}
+
+TEST_F(DBRangeDelSentinelTest, TombstoneInFileOutlivesMidFileUpperBound) {
+  DestroyAndReopen(PrefixFilterOptions(CurrentOptions()));
+  ASSERT_OK(Put("p001:b", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  // L1 file 0 holds [p001, p002) and p004:a, so seeking p001 with upper bound
+  // p003 stops mid-file on kOutOfBound while the tombstone must still cover
+  // p001:b in L2.
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "p001",
+                             "p002"));
+  ASSERT_OK(Put("p000:a", "v"));
+  ASSERT_OK(Put("p004:a", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(Put("p010:a", "v"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,2,1", FilesPerLevel());
+
+  Slice upper_bound("p003");
+  ReadOptions read_options;
+  read_options.total_order_seek = true;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p001");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
+TEST_F(DBRangeDelSentinelTest, NoSentinelWhenMultiScanRangeEndsInFile) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  BlockBasedTableOptions table_options;
+  // Put each key in its own data block so MultiScan has distinct block ranges
+  // within each file.
+  table_options.block_size = 1;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+  for (const char* key : {"p000:a", "p002:a", "p004:a"}) {
+    ASSERT_OK(Put(key, std::string(64, 'v')));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  for (const char* key : {"p010:a", "p012:a", "p014:a"}) {
+    ASSERT_OK(Put(key, std::string(64, 'v')));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,2", FilesPerLevel());
+
+  CountSentinels();
+  std::atomic<int> dropped{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelIterator::SetFileIterator:DeleteIterator", [&](void* old_iter) {
+        if (old_iter != nullptr) {
+          dropped++;
+        }
+      });
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("p000"), Slice("p001"));
+  scan_opts.insert(Slice("p004"), Slice("p005"));
+  scan_opts.insert(Slice("p010"), Slice("p011"));
+  scan_opts.insert(Slice("p014"), Slice("p015"));
+  Slice upper_bound("p001");
+  ReadOptions read_options;
+  read_options.total_order_seek = true;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Prepare(scan_opts);
+  ASSERT_OK(iter->status());
+
+  // First range in file 0 ends mid-file with kOutOfBound: no sentinel is
+  // emitted and file 0's prepared iterator stays for the second range.
+  iter->Seek("p000");
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("p000:a", iter->key());
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+  ASSERT_EQ(0, dropped.load());
+
+  // Second (last) range in file 0.
+  upper_bound = "p005";
+  iter->Seek("p004");
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("p004:a", iter->key());
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+
+  // First range in file 1 (last file) ends mid-file with kOutOfBound:
+  // file 1's prepared iterator must stay alive for the second range.
+  upper_bound = "p011";
+  iter->Seek("p010");
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("p010:a", iter->key());
+  const int drops_in_last_file = dropped.load();
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
+  ASSERT_EQ(drops_in_last_file, dropped.load());
+
+  upper_bound = "p015";
+  iter->Seek("p014");
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("p014:a", iter->key());
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(0, sentinels_);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -3856,7 +3856,9 @@ TEST_F(DBBloomFilterLevelSeekTest, AutoPrefixModeFilteredSeekReadsNoIndex) {
 
 // A filtered seek leaves an empty stand-in as the level's file iterator, so
 // the next positioning call into the file finds the stand-in and builds the
-// file's iterator from the stand-in's table reader.
+// file's iterator from the stand-in's table reader. The memtable keys p003:m
+// and p011:m also provide valid positions for testing Prev() back into a
+// filtered file.
 TEST_F(DBBloomFilterLevelSeekTest, PositioningIntoFileOfFilteredSeek) {
   ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
   ASSERT_OK(Put("p003:m", "v"));
@@ -3982,8 +3984,68 @@ TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekInLastFileKeepsStandIn) {
 }
 
 // A file iterator whose filter rules out a seek once the iterator is built
-// stays at the file too, so the next seek into the file reuses it.
+// stays at the file too, so the next seek into the file reuses it -- both in
+// non-last files, in the last file of a level, and in a single-file level.
 TEST_F(DBBloomFilterLevelSeekTest, ReseekAfterPrefixRunsOutReusesFileIterator) {
+  std::atomic<int> dropped{0};
+  auto count_drops = [&]() {
+    dropped = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelIterator::SetFileIterator:DeleteIterator", [&](void* old_iter) {
+          if (old_iter != nullptr) {
+            dropped++;
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  };
+  auto check_reseek = [&](const char* hit1, const char* miss, const char* hit2,
+                          const char* expected1, const char* expected2) {
+    dropped = 0;
+    ReadOptions read_options;
+    read_options.prefix_same_as_start = true;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    iter->Seek(hit1);
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), expected1);
+    const uint64_t seeks_filtered = SeeksFiltered();
+    iter->Seek(miss);
+    ASSERT_OK(iter->status());
+    ASSERT_FALSE(iter->Valid());
+    EXPECT_EQ(SeeksFiltered(), seeks_filtered + 1);
+    iter->Seek(hit2);
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), expected2);
+    EXPECT_EQ(dropped.load(), 0);
+  };
+
+  // Non-last and last file of a two-file level.
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  count_drops();
+  check_reseek("p002", "p001", "p004", "p002:a", "p004:a");
+  check_reseek("p010", "p011", "p012", "p010:a", "p012:a");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Single-file level.
+  DestroyAndReopen(options_);
+  for (const char* key : {"p000:a", "p002:a", "p004:a"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,1", FilesPerLevel());
+  count_drops();
+  check_reseek("p002", "p001", "p004", "p002:a", "p004:a");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// With auto_prefix_mode, a built file iterator whose prefix filter rules out
+// a bounded seek also stays at the file for reuse, matching stand-ins.
+TEST_F(DBBloomFilterLevelSeekTest,
+       AutoPrefixModeReseekAfterFilterMissReusesFileIterator) {
   ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
   std::atomic<int> dropped{0};
   SyncPoint::GetInstance()->SetCallBack(
@@ -3993,18 +4055,25 @@ TEST_F(DBBloomFilterLevelSeekTest, ReseekAfterPrefixRunsOutReusesFileIterator) {
         }
       });
   SyncPoint::GetInstance()->EnableProcessing();
+  Slice upper_bound("p005");
   ReadOptions read_options;
-  read_options.prefix_same_as_start = true;
+  read_options.total_order_seek = true;
+  read_options.auto_prefix_mode = true;
+  read_options.iterate_upper_bound = &upper_bound;
   std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
   iter->Seek("p002");
   ASSERT_OK(iter->status());
   ASSERT_TRUE(iter->Valid());
   EXPECT_EQ(iter->key(), "p002:a");
+
   const uint64_t seeks_filtered = SeeksFiltered();
+  upper_bound = "p002";
   iter->Seek("p001");
   ASSERT_OK(iter->status());
   ASSERT_FALSE(iter->Valid());
   EXPECT_EQ(SeeksFiltered(), seeks_filtered + 1);
+
+  upper_bound = "p005";
   iter->Seek("p004");
   ASSERT_OK(iter->status());
   ASSERT_TRUE(iter->Valid());
