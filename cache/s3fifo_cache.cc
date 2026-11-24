@@ -454,6 +454,10 @@ S3FifoCacheShard::S3FifoCacheShard(
       resident_hand_(nullptr),
       aside_slot_(SlotIndexAt(max_length_)),
       aside_unpinned_(false),
+      ghost_ring_length_(0),
+      ghost_head_seq_(0),
+      ghost_size_(0),
+      ghost_records_(0),
       mutex_(use_adaptive_mutex),
       allocator_(allocator),
       eviction_callback_(*eviction_callback),
@@ -664,6 +668,11 @@ size_t S3FifoCacheShard::ProbationBudget() const {
   }
   return base / 100 * kProbationPercent +
          (base % 100) * kProbationPercent / 100;
+}
+
+size_t S3FifoCacheShard::TEST_GetGhostSize() const {
+  DMutexLock l(mutex_);
+  return ghost_size_;
 }
 
 void S3FifoCacheShard::TEST_GetProbationList(S3FifoHandle** fifo) {
@@ -886,6 +895,16 @@ size_t S3FifoCacheShard::ProbationUnpinnedUsage() {
   return pinned >= probation_usage_ ? 0 : probation_usage_ - pinned;
 }
 
+bool S3FifoCacheShard::IsPlaceholder(const Cache::CacheItemHelper* helper,
+                                     size_t charge) {
+  return helper == &kNoopCacheItemHelper && charge == 0;
+}
+
+bool S3FifoCacheShard::IsPlaceholder(const S3FifoHandle* e) const {
+  return IsPlaceholder(e->GetHelper(*helpers_),
+                       e->GetCharge(metadata_charge_policy_));
+}
+
 bool S3FifoCacheShard::ReturnUnpinnedAsideChunk(S3FifoHandle* last) {
   // Consumes the aside head each step, as ReturnUnpinnedAside does, so a
   // pinned entry moves to the aside tail behind last and is not revisited.
@@ -1043,6 +1062,9 @@ bool S3FifoCacheShard::EvictFromProbation(EvictionData* data,
           ++stats_.evicted_without_hit;
         }
         FIFO_Remove(cur, /*in_probation=*/true);
+        if (!IsPlaceholder(cur)) {
+          GhostRecord(GhostHash(cur->GetHash()));
+        }
         EvictClaimed(cur, data, deleted);
       }
     }
@@ -1116,6 +1138,55 @@ void S3FifoCacheShard::EvictFromResident(EvictionData* data,
       rotated = 0;
     }
   }
+}
+
+void S3FifoCacheShard::GhostRecord(uint32_t hash) {
+  ++ghost_records_;
+  if (ghost_size_ == ghost_ring_length_) {
+    // Double the ring, keeping each record at its sequence number. It starts
+    // at 16 records (64 bytes), small for tiny shards; doubling reaches any
+    // bound in a few steps.
+    const size_t new_length =
+        ghost_ring_length_ == 0 ? size_t{16} : ghost_ring_length_ * 2;
+    std::unique_ptr<uint32_t[]> new_ring(new uint32_t[new_length]);
+    for (uint64_t seq = ghost_head_seq_; seq < ghost_head_seq_ + ghost_size_;
+         ++seq) {
+      new_ring[seq & (new_length - 1)] =
+          ghost_ring_[seq & (ghost_ring_length_ - 1)];
+    }
+    // Every index entry names a live record; move it with its record.
+    const uint64_t head = ghost_head_seq_;
+    const size_t old_mask = ghost_ring_length_ - 1;
+    ghost_index_.Resize(new_length, [&](uint32_t pos) {
+      const uint64_t seq = head + ((pos - head) & old_mask);
+      return static_cast<uint32_t>(seq & (new_length - 1));
+    });
+    ghost_ring_ = std::move(new_ring);
+    ghost_ring_length_ = new_length;
+  }
+  const uint64_t seq = ghost_head_seq_ + ghost_size_;
+  const uint32_t pos = static_cast<uint32_t>(seq & (ghost_ring_length_ - 1));
+  ghost_index_.Set(hash, pos);
+  ghost_ring_[pos] = hash;
+  ++ghost_size_;
+  GhostTrim();
+}
+
+void S3FifoCacheShard::GhostTrim() {
+  while (ghost_size_ > occupancy_.Get()) {
+    const uint32_t pos =
+        static_cast<uint32_t>(ghost_head_seq_ & (ghost_ring_length_ - 1));
+    const size_t i = ghost_index_.Find(ghost_ring_[pos]);
+    if (i != S3FifoGhostIndex::kNotFound && ghost_index_.PosAt(i) == pos) {
+      ghost_index_.EraseAt(i);
+    }
+    --ghost_size_;
+    ++ghost_head_seq_;
+  }
+}
+
+bool S3FifoCacheShard::GhostTake(uint32_t hash) {
+  return ghost_index_.Erase(hash);
 }
 
 void S3FifoCacheShard::NotifyEvicted(
@@ -1380,6 +1451,7 @@ void S3FifoCacheShard::SetCapacity(size_t capacity) {
     // The probation budget is derived at each use (see ProbationBudget), so
     // it already tracks the new capacity when eviction below runs.
     EvictFromFIFO(0, &last_reference_list);
+    GhostTrim();
   }
 
   NotifyEvicted(last_reference_list);
@@ -1446,6 +1518,10 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
   Status s = Status::OK();
   autovector<S3FifoHandle*> last_reference_list;
   std::vector<S3FifoHandle::HeapKey*> heap_keys;
+  // total_charge includes the heap key's metadata charge, as an entry's does
+  // (see S3FifoHandle::GetCharge).
+  const bool placeholder = IsPlaceholder(
+      helper, total_charge - HeapKeyCharge(heap_key, metadata_charge_policy_));
   // A slot holds a one-byte helper index and a 32-bit charge. An entry that
   // needs more is slotless: inserted with a handle it is standalone
   // (S3FifoStandaloneHandle), except that under strict_capacity_limit it is
@@ -1472,7 +1548,13 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
     // or dropped (no handle) below, so evicting for it would only empty the
     // shard; so is a slotless entry without a handle. A slotless entry with a
     // handle evicts, also under strict_capacity_limit, as CreateStandalone
-    // evicts before checking that its entry fits.
+    // evicts before checking that its entry fits. A placeholder never uses the
+    // ghost (see ghost_index_).
+    const size_t ghost = placeholder || slotless
+                             ? S3FifoGhostIndex::kNotFound
+                             : ghost_index_.Find(GhostHash(hash));
+    const bool remembered = ghost != S3FifoGhostIndex::kNotFound;
+    const uint64_t ghost_records_before = ghost_records_;
     // Step 2: evict by the policy for the charge.
     const bool skip_eviction =
         handle == nullptr ? slotless || NeverFits(total_charge)
@@ -1589,6 +1671,17 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
       }
       // Step 7: fill and publish the entry; detach an overwritten one.
       if (e != nullptr) {
+        // One ghost probe: the index from above is still valid unless
+        // eviction recorded a ghost since.
+        bool to_resident = false;
+        if (remembered) {
+          if (ghost_records_ == ghost_records_before) {
+            ghost_index_.EraseAt(ghost);
+            to_resident = true;
+          } else {
+            to_resident = GhostTake(GhostHash(hash));
+          }
+        }
         SetKey(e, hash, heap_key, S3FifoHandle::kOccupied);
         e->set_value(value);
         e->helper_index = helper_index;
@@ -1598,11 +1691,12 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
         // The final state, set before the chain publishes e to Lookup.
         // Release: GetPinnedUsage reads the charge after an acquire load
         // of state, without the chain.
-        e->state.store(static_cast<uint16_t>(S3FifoHandle::kInCache |
-                                             S3FifoHandle::kInProbation |
-                                             (handle != nullptr ? 1 : 0)),
+        e->state.store(static_cast<uint16_t>(
+                           S3FifoHandle::kInCache |
+                           (to_resident ? 0 : S3FifoHandle::kInProbation) |
+                           (handle != nullptr ? 1 : 0)),
                        std::memory_order_release);
-        if (handle != nullptr) {
+        if (handle != nullptr && !to_resident) {
           // Where the lock-free Release that usually ends this pin credits
           // its unpin, so the two cancel in one place. Credited to the
           // shared counter instead, the pin would stay visible to other
@@ -1629,7 +1723,7 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
           }
         }
         usage_ += total_charge;
-        FIFO_Append(probation(), e);
+        FIFO_Append(to_resident ? resident() : probation(), e);
         if (handle != nullptr) {
           *handle = e;
         }

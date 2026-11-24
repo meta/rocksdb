@@ -482,7 +482,8 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 // S3FifoCache - A sharded cache with S3-FIFO eviction (SOSP '23): new entries
 // enter a probation queue; one hit at least twice before reaching its head
 // moves to a resident queue. Probation evicts first while its unpinned charge
-// exceeds 12% of capacity. Lookup, Ref and most Releases take no lock.
+// exceeds 12% of capacity. Keys recently evicted from probation are remembered;
+// re-inserted, they go to resident. Lookup, Ref and most Releases take no lock.
 // Cache::Priority is ignored; pinned entries are never evicted. Unlike
 // LRUCache, a Release never evicts for being over capacity, an entry holds at
 // most 16383 references (then Lookup misses and Ref returns false), and it
@@ -493,13 +494,14 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 // only if it fits, else MemoryLimit), else dropped.
 // Memory: about 71 bytes of metadata per entry (charged against capacity under
 // kFullChargeCacheMetadata) plus up to about 2.7 MiB of address space reserved
-// per shard (committed up front on Windows); per-thread state is not charged.
-// MakeSharedCache returns nullptr if a reservation fails (e.g. past
-// vm.max_map_count) or num_shard_bits is 20 or more. num_shard_bits = -1 keeps
-// shards in [4 MiB, 128 MiB] (fits 4 KiB entries); set it for smaller entries
-// or a later SetCapacity raise. GetPinnedUsage scans all tables, O(homes),
-// under the caller's lock (the DB mutex for rocksdb.block-cache-pinned-usage).
-// Only MakeSharedCache builds it. Details: cache/s3fifo_cache.h.
+// per shard (committed up front on Windows); per-thread state and remembered
+// keys (up to about 40 bytes per entry) are not charged. MakeSharedCache
+// returns nullptr if a reservation fails (e.g. past vm.max_map_count) or
+// num_shard_bits is 20 or more. num_shard_bits = -1 keeps shards in [4 MiB,
+// 128 MiB] (fits 4 KiB entries); set it for smaller entries or a later
+// SetCapacity raise. GetPinnedUsage scans all tables, O(homes), under the
+// caller's lock (the DB mutex for rocksdb.block-cache-pinned-usage). Only
+// MakeSharedCache builds it. Details: cache/s3fifo_cache.h.
 struct S3FifoCacheOptions : public ShardedCacheOptions {
   // Whether to use adaptive mutexes for cache shards. Note that adaptive
   // mutexes need to be supported by the platform in order for this to have any
