@@ -1,0 +1,4402 @@
+//  Copyright (c) Meta Platforms, Inc. and affiliates.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
+
+#include "cache/s3fifo_cache.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
+#include <fstream>
+#include <future>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <string>
+#include <system_error>
+#include <thread>
+#include <type_traits>
+#include <vector>
+
+#include "port/port.h"
+#include "rocksdb/cache.h"
+#include "test_util/sync_point.h"
+#include "test_util/testharness.h"
+#include "util/random.h"
+
+namespace ROCKSDB_NAMESPACE {
+
+namespace {
+// Secondary-compatible helper whose create callback must never fire: the
+// shard performs primary-only lookup and ignores promotion parameters.
+Status DummyCreate(const Slice& /*data*/, CompressionType /*type*/,
+                   CacheTier /*source*/, Cache::CreateContext* /*context*/,
+                   MemoryAllocator* /*allocator*/,
+                   Cache::ObjectPtr* /*out_obj*/, size_t* /*out_charge*/) {
+  ADD_FAILURE() << "CreateCallback must not be called without secondary cache";
+  return Status::NotSupported();
+}
+size_t DummySize(Cache::ObjectPtr /*obj*/) { return 0; }
+Status DummySaveTo(Cache::ObjectPtr /*from_obj*/, size_t /*from_offset*/,
+                   size_t /*length*/, char* /*out_buf*/) {
+  return Status::OK();
+}
+// NOTE: no global secondary-compatible helper: its constructor reads the
+// without_secondary_compat pointee, which would be an initialization-order
+// fiasco against kNoopCacheItemHelper from another TU. Tests build it
+// locally instead.
+
+// Starts fn on *t and returns whether it finished within 20 s, waiting on a
+// future rather than spinning. The caller joins *t (after releasing whatever
+// fn may be blocked on).
+bool FinishesWithin20s(const std::function<void()>& fn, port::Thread* t) {
+  auto done = std::make_shared<std::promise<void>>();
+  std::future<void> finished = done->get_future();
+  *t = port::Thread([fn, done] {
+    fn();
+    done->set_value();
+  });
+  return finished.wait_for(std::chrono::seconds(20)) ==
+         std::future_status::ready;
+}
+
+// S3FifoCacheOptions has no positional constructor; tests set the fields.
+S3FifoCacheOptions TestS3FifoOptions(size_t capacity, int num_shard_bits,
+                                     bool strict_capacity_limit,
+                                     CacheMetadataChargePolicy policy) {
+  S3FifoCacheOptions opts;
+  opts.capacity = capacity;
+  opts.num_shard_bits = num_shard_bits;
+  opts.strict_capacity_limit = strict_capacity_limit;
+  opts.metadata_charge_policy = policy;
+  return opts;
+}
+}  // namespace
+
+// Most tests drive a single S3FifoCacheShard, built in place by NewCache
+// and held in cache_ (named for the cache it stands in for); tests of the
+// public Cache interface build their own S3FifoCache.
+class S3FifoCacheTest : public testing::Test {
+ public:
+  S3FifoCacheTest() = default;
+  ~S3FifoCacheTest() override { DeleteCache(); }
+
+  void DeleteCache() {
+    if (cache_ != nullptr) {
+      cache_->~S3FifoCacheShard();
+      port::cacheline_aligned_free(cache_);
+      cache_ = nullptr;
+    }
+  }
+
+  void NewCache(size_t capacity, bool strict_capacity_limit = false,
+                CacheMetadataChargePolicy metadata_charge_policy =
+                    kDontChargeCacheMetadata,
+                size_t max_capacity = 0) {
+    DeleteCache();
+    cache_ = static_cast<S3FifoCacheShard*>(
+        port::cacheline_aligned_alloc(sizeof(S3FifoCacheShard)));
+    new (cache_) S3FifoCacheShard(
+        capacity, strict_capacity_limit, kDefaultToAdaptiveMutex,
+        metadata_charge_policy,
+        /*max_upper_hash_bits*/ 24,
+        /*allocator*/ nullptr, &eviction_callback_, max_capacity);
+  }
+
+  Status Insert(const std::string& key, size_t charge = 1,
+                S3FifoHandle** handle = nullptr,
+                Cache::Priority priority = Cache::Priority::LOW) {
+    return cache_->Insert(key, S3FifoCacheShard::ComputeHash(key, 0),
+                          nullptr /*value*/, &kNoopCacheItemHelper, charge,
+                          handle, priority);
+  }
+
+  S3FifoHandle* Lookup(const std::string& key) {
+    return cache_->Lookup(key, S3FifoCacheShard::ComputeHash(key, 0), nullptr,
+                          nullptr, Cache::Priority::LOW, nullptr);
+  }
+
+  // Whether key is cached: a Lookup whose handle is released at once.
+  bool LookupBool(const std::string& key) {
+    S3FifoHandle* handle = Lookup(key);
+    if (handle) {
+      cache_->Release(handle, true /*useful*/, false /*erase*/);
+      return true;
+    }
+    return false;
+  }
+
+  // Presence probe that performs no Lookup.
+  bool ContainsForTest(const std::string& key) {
+    bool found = false;
+    size_t state = 0;
+    while (state != SIZE_MAX) {
+      cache_->ApplyToSomeEntries(
+          [&](const Slice& k, Cache::ObjectPtr /*value*/, size_t /*charge*/,
+              const Cache::CacheItemHelper* /*helper*/) {
+            if (k.ToString() == key) {
+              found = true;
+            }
+          },
+          /*average_entries_per_lock*/ 1000, &state);
+    }
+    return found;
+  }
+
+  void Erase(const std::string& key) {
+    cache_->Erase(key, S3FifoCacheShard::ComputeHash(key, 0));
+  }
+
+  void InsertN(const std::string& prefix, int n) {
+    for (int i = 0; i < n; i++) {
+      ASSERT_OK(Insert(prefix + std::to_string(i)));
+    }
+  }
+
+  // Keys from oldest to newest. It reads keys with S3FifoHandle::key(), so
+  // it needs keys that are not 16 bytes long.
+  void ValidateFIFOList(const std::vector<std::string>& keys) {
+    S3FifoHandle* fifo;
+    cache_->TEST_GetFIFOList(&fifo);
+    S3FifoHandle* iter = cache_->TEST_Next(fifo);
+    for (const auto& key : keys) {
+      ASSERT_NE(fifo, iter);
+      ASSERT_EQ(key, iter->key().ToString());
+      iter = cache_->TEST_Next(iter);
+    }
+    ASSERT_EQ(fifo, iter);
+  }
+
+  S3FifoCacheShard* cache_ = nullptr;
+  Cache::EvictionCallback eviction_callback_;
+};
+
+// Oldest unpinned entry is evicted first.
+TEST_F(S3FifoCacheTest, FifoOrderEvictsOldest) {
+  NewCache(/*capacity*/ 3);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  ValidateFIFOList({"a", "b", "c"});
+  EXPECT_OK(Insert("d"));
+  EXPECT_FALSE(LookupBool("a"));
+  EXPECT_TRUE(LookupBool("b"));
+  EXPECT_TRUE(LookupBool("c"));
+  EXPECT_TRUE(LookupBool("d"));
+  ValidateFIFOList({"b", "c", "d"});
+  EXPECT_OK(Insert("e"));
+  EXPECT_FALSE(LookupBool("b"));
+  ValidateFIFOList({"c", "d", "e"});
+  EXPECT_EQ(3, cache_->GetUsage());
+  EXPECT_EQ(3, cache_->GetOccupancyCount());
+}
+
+// Unlike LRU, a hit neither reorders nor protects an entry from FIFO
+// eviction.
+TEST_F(S3FifoCacheTest, LookupDoesNotReorder) {
+  NewCache(/*capacity*/ 3);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  EXPECT_TRUE(LookupBool("a"));
+  ValidateFIFOList({"a", "b", "c"});
+  EXPECT_OK(Insert("d"));
+  EXPECT_FALSE(LookupBool("a"));
+  ValidateFIFOList({"b", "c", "d"});
+}
+
+// A pin/release cycle does not change insertion position.
+TEST_F(S3FifoCacheTest, ReleaseDoesNotReorder) {
+  NewCache(/*capacity*/ 3);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  S3FifoHandle* h = Lookup("b");
+  ASSERT_NE(nullptr, h);
+  EXPECT_FALSE(cache_->Release(h, true, false));
+  ValidateFIFOList({"a", "b", "c"});
+  EXPECT_OK(Insert("d"));
+  EXPECT_FALSE(LookupBool("a"));
+  EXPECT_TRUE(LookupBool("b"));
+}
+
+// A pinned entry survives eviction pressure; the next unpinned goes.
+TEST_F(S3FifoCacheTest, PinnedEntriesSurviveEviction) {
+  NewCache(/*capacity*/ 3);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  S3FifoHandle* pinned = Lookup("a");
+  ASSERT_NE(nullptr, pinned);
+  EXPECT_OK(Insert("d"));
+  EXPECT_TRUE(LookupBool("a"));
+  EXPECT_FALSE(LookupBool("b"));
+  EXPECT_TRUE(LookupBool("c"));
+  EXPECT_TRUE(LookupBool("d"));
+  EXPECT_FALSE(cache_->Release(pinned, true, false));
+  // The scan that evicted b moved pinned a behind it.
+  ValidateFIFOList({"c", "a", "d"});
+}
+
+// A pinned entry the eviction scan meets moves to the tail, so the next
+// eviction starts at an unpinned entry instead of re-walking the pins.
+TEST_F(S3FifoCacheTest, PinnedEntriesMoveBehindTheScan) {
+  NewCache(/*capacity*/ 5);
+  S3FifoHandle* p1 = nullptr;
+  S3FifoHandle* p2 = nullptr;
+  EXPECT_OK(Insert("p1", 1, &p1));
+  EXPECT_OK(Insert("p2", 1, &p2));
+  EXPECT_OK(Insert("c0"));
+  EXPECT_OK(Insert("c1"));
+  EXPECT_OK(Insert("c2"));
+  EXPECT_OK(Insert("d"));
+  ValidateFIFOList({"c1", "c2", "p1", "p2", "d"});
+  EXPECT_OK(Insert("e"));
+  ValidateFIFOList({"c2", "p1", "p2", "d", "e"});
+  EXPECT_FALSE(cache_->Release(p1, true, false));
+  EXPECT_FALSE(cache_->Release(p2, true, false));
+}
+
+// Eviction skips over multiple pinned entries and keeps scanning.
+TEST_F(S3FifoCacheTest, EvictionSkipsMultiplePinned) {
+  NewCache(/*capacity*/ 4);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  EXPECT_OK(Insert("d"));
+  S3FifoHandle* pa = Lookup("a");
+  S3FifoHandle* pb = Lookup("b");
+  ASSERT_NE(nullptr, pa);
+  ASSERT_NE(nullptr, pb);
+  EXPECT_OK(Insert("e"));
+  EXPECT_OK(Insert("f"));
+  EXPECT_TRUE(LookupBool("a"));
+  EXPECT_TRUE(LookupBool("b"));
+  EXPECT_FALSE(LookupBool("c"));
+  EXPECT_FALSE(LookupBool("d"));
+  EXPECT_TRUE(LookupBool("e"));
+  EXPECT_TRUE(LookupBool("f"));
+  EXPECT_FALSE(cache_->Release(pa, true, false));
+  EXPECT_FALSE(cache_->Release(pb, true, false));
+  ValidateFIFOList({"a", "b", "e", "f"});
+}
+
+// An all-pinned shard evicts nothing and terminates.
+TEST_F(S3FifoCacheTest, AllPinnedEvictsNothing) {
+  NewCache(/*capacity*/ 2);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  S3FifoHandle* pa = Lookup("a");
+  S3FifoHandle* pb = Lookup("b");
+  ASSERT_NE(nullptr, pa);
+  ASSERT_NE(nullptr, pb);
+  // Non-strict insert without a handle is dropped but returns OK.
+  EXPECT_OK(Insert("c"));
+  EXPECT_FALSE(LookupBool("c"));
+  EXPECT_EQ(2, cache_->GetUsage());
+  EXPECT_EQ(2, cache_->GetOccupancyCount());
+  EXPECT_FALSE(cache_->Release(pa, true, false));
+  EXPECT_FALSE(cache_->Release(pb, true, false));
+  EXPECT_TRUE(LookupBool("a"));
+  EXPECT_TRUE(LookupBool("b"));
+}
+
+// Non-strict insert with a handle over a fully-pinned shard exceeds
+// capacity rather than evicting.
+TEST_F(S3FifoCacheTest, AllPinnedInsertWithHandleExceedsCapacity) {
+  NewCache(/*capacity*/ 2);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  S3FifoHandle* pa = Lookup("a");
+  S3FifoHandle* pb = Lookup("b");
+  S3FifoHandle* pc = nullptr;
+  EXPECT_OK(Insert("c", /*charge*/ 1, &pc));
+  ASSERT_NE(nullptr, pc);
+  EXPECT_EQ(3, cache_->GetUsage());
+  EXPECT_EQ(3, cache_->GetPinnedUsage());
+  // Releasing does not erase, even over capacity (as in HyperClockCache):
+  // the next insert evicts the oldest.
+  EXPECT_FALSE(cache_->Release(pa, true, false));
+  EXPECT_FALSE(cache_->Release(pb, true, false));
+  EXPECT_FALSE(cache_->Release(pc, true, false));
+  EXPECT_EQ(3, cache_->GetUsage());
+  EXPECT_OK(Insert("d"));
+  EXPECT_EQ(2, cache_->GetUsage());
+  EXPECT_FALSE(ContainsForTest("a"));
+  EXPECT_FALSE(ContainsForTest("b"));
+  EXPECT_TRUE(ContainsForTest("c"));
+  EXPECT_TRUE(ContainsForTest("d"));
+}
+
+// Usage and pinned usage stay exact across pin, ref, release, erase.
+TEST_F(S3FifoCacheTest, VariableChargeAccounting) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a", /*charge*/ 3));
+  EXPECT_OK(Insert("b", /*charge*/ 5));
+  EXPECT_EQ(8, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+  S3FifoHandle* h = Lookup("a");
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(3, cache_->GetPinnedUsage());
+  EXPECT_TRUE(cache_->Ref(h));
+  EXPECT_EQ(3, cache_->GetPinnedUsage());
+  EXPECT_FALSE(cache_->Release(h, true, false));
+  EXPECT_EQ(3, cache_->GetPinnedUsage());
+  EXPECT_FALSE(cache_->Release(h, true, false));
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+  EXPECT_EQ(8, cache_->GetUsage());
+  Erase("b");
+  EXPECT_EQ(3, cache_->GetUsage());
+  EXPECT_EQ(1, cache_->GetOccupancyCount());
+}
+
+// A single large oldest entry can cover the whole deficit.
+TEST_F(S3FifoCacheTest, MixedChargesSingleVictim) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a", /*charge*/ 6));
+  EXPECT_OK(Insert("b", /*charge*/ 2));
+  EXPECT_OK(Insert("c", /*charge*/ 2));
+  EXPECT_OK(Insert("d", /*charge*/ 5));
+  EXPECT_FALSE(LookupBool("a"));
+  EXPECT_TRUE(LookupBool("b"));
+  EXPECT_TRUE(LookupBool("c"));
+  EXPECT_TRUE(LookupBool("d"));
+  EXPECT_EQ(9, cache_->GetUsage());
+  ValidateFIFOList({"b", "c", "d"});
+}
+
+// Eviction takes as many oldest entries as needed.
+TEST_F(S3FifoCacheTest, MixedChargesMultiVictim) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a", /*charge*/ 2));
+  EXPECT_OK(Insert("b", /*charge*/ 2));
+  EXPECT_OK(Insert("c", /*charge*/ 2));
+  EXPECT_OK(Insert("d", /*charge*/ 2));
+  EXPECT_OK(Insert("e", /*charge*/ 6));
+  EXPECT_FALSE(LookupBool("a"));
+  EXPECT_FALSE(LookupBool("b"));
+  EXPECT_TRUE(LookupBool("c"));
+  EXPECT_TRUE(LookupBool("d"));
+  EXPECT_TRUE(LookupBool("e"));
+  EXPECT_EQ(10, cache_->GetUsage());
+  ValidateFIFOList({"c", "d", "e"});
+}
+
+// Overwrite reports OkOverwritten and replaces charge.
+TEST_F(S3FifoCacheTest, OverwriteUnpinned) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a", /*charge*/ 2));
+  Status s = Insert("a", /*charge*/ 5);
+  EXPECT_TRUE(s.IsOkOverwritten());
+  EXPECT_EQ(5, cache_->GetUsage());
+  EXPECT_EQ(1, cache_->GetOccupancyCount());
+  S3FifoHandle* h = Lookup("a");
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(5, h->GetCharge(kDontChargeCacheMetadata));
+  EXPECT_FALSE(cache_->Release(h, true, false));
+}
+
+// Overwriting a pinned entry keeps the old charge until release.
+TEST_F(S3FifoCacheTest, OverwritePinnedKeepsOldCharged) {
+  NewCache(/*capacity*/ 10);
+  S3FifoHandle* old = nullptr;
+  EXPECT_OK(Insert("a", /*charge*/ 2, &old));
+  ASSERT_NE(nullptr, old);
+  Status s = Insert("a", /*charge*/ 5);
+  EXPECT_TRUE(s.IsOkOverwritten());
+  EXPECT_EQ(7, cache_->GetUsage());
+  EXPECT_EQ(2, cache_->GetPinnedUsage());
+  EXPECT_EQ(1, cache_->GetOccupancyCount());
+  S3FifoHandle* cur = Lookup("a");
+  ASSERT_NE(nullptr, cur);
+  EXPECT_EQ(5, cur->GetCharge(kDontChargeCacheMetadata));
+  EXPECT_EQ(7, cache_->GetPinnedUsage());
+  EXPECT_TRUE(cache_->Release(old, true, false));
+  EXPECT_EQ(5, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(cur, true, false));
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+// GetStats counts pinned rotations and set-asides, evictions by occupancy and
+// standalone entries for a full table, and reports the aside list and the
+// reclamation backlog.
+TEST_F(S3FifoCacheTest, StatsCountEvictionEvents) {
+  NewCache(/*capacity*/ 200);
+  std::vector<S3FifoHandle*> pinned;
+  for (int i = 0; i < 200; ++i) {
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pinned.push_back(h);
+  }
+  // Rotates p0..p63 and sets p64..p199 aside; x is dropped.
+  ASSERT_OK(Insert("x"));
+  S3FifoCacheShard::Stats stats = cache_->GetStats();
+  EXPECT_EQ(64, stats.pinned_rotations);
+  EXPECT_EQ(136, stats.set_aside);
+  EXPECT_EQ(136, stats.aside_entries);
+  EXPECT_EQ(0, stats.occupancy_evictions);
+  EXPECT_EQ(0, stats.table_full_standalone);
+  for (S3FifoHandle* h : pinned) {
+    EXPECT_FALSE(cache_->Release(h, true, false));
+  }
+
+  // 64 KiB reserves 2048 homes: past about 1228 entries, new keys evict by
+  // occupancy. The evicted slots wait in limbo or on the pending list.
+  NewCache(/*capacity*/ 64 << 10);
+  for (int i = 0; i < 5000; ++i) {
+    ASSERT_OK(Insert("k" + std::to_string(i)));
+  }
+  stats = cache_->GetStats();
+  EXPECT_EQ(5000 - cache_->GetOccupancyCount(), stats.occupancy_evictions);
+  EXPECT_EQ(0, stats.table_full_standalone);
+  EXPECT_LE(stats.limbo_slots, stats.occupancy_evictions);
+
+  // Every slot pinned: the next insert with a handle gets a standalone entry.
+  NewCache(/*capacity*/ 64 << 10);
+  pinned.clear();
+  for (int i = 0; i < 2048; ++i) {
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("q" + std::to_string(i), /*charge*/ 1, &h));
+    pinned.push_back(h);
+  }
+  S3FifoHandle* extra = nullptr;
+  ASSERT_OK(Insert("extra", /*charge*/ 1, &extra));
+  ASSERT_NE(nullptr, extra);
+  EXPECT_TRUE(extra->IsStandalone());
+  EXPECT_EQ(1, cache_->GetStats().table_full_standalone);
+  EXPECT_TRUE(cache_->Release(extra, true, false));
+  for (S3FifoHandle* h : pinned) {
+    cache_->Release(h, true, false);
+  }
+}
+
+// Standalone entries are unfindable but charged.
+TEST_F(S3FifoCacheTest, CreateStandaloneCharged) {
+  NewCache(/*capacity*/ 10);
+  S3FifoHandle* h = cache_->CreateStandalone(
+      "s", kNullUniqueId64x2, nullptr, &kNoopCacheItemHelper, /*charge*/ 4,
+      /*allow_uncharged*/ false);
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(nullptr, Lookup("s"));
+  EXPECT_EQ(4, cache_->GetUsage());
+  EXPECT_EQ(4, cache_->GetPinnedUsage());
+  EXPECT_EQ(0, cache_->GetOccupancyCount());
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(0, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+// Strict + no room + allow_uncharged creates a zero-charge entry.
+TEST_F(S3FifoCacheTest, CreateStandaloneUnchargedAllowed) {
+  NewCache(/*capacity*/ 5, /*strict*/ true);
+  S3FifoHandle* pinned = nullptr;
+  EXPECT_OK(Insert("a", /*charge*/ 5, &pinned));
+  ASSERT_NE(nullptr, pinned);
+  S3FifoHandle* h = cache_->CreateStandalone(
+      "s", kNullUniqueId64x2, nullptr, &kNoopCacheItemHelper, /*charge*/ 3,
+      /*allow_uncharged*/ true);
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(0, h->GetCharge(kDontChargeCacheMetadata));
+  EXPECT_EQ(5, cache_->GetUsage());
+  EXPECT_EQ(5, cache_->GetPinnedUsage());
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(5, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(pinned, true, false));
+  EXPECT_EQ(5, cache_->GetUsage());
+}
+
+// An uncharged standalone entry reports no charge even when its key is kept
+// on the heap and metadata is charged: its total charge is 0, and the heap
+// key's metadata must not be subtracted from it.
+TEST_F(S3FifoCacheTest, CreateStandaloneUnchargedHeapKeyReportsNoCharge) {
+  NewCache(/*capacity*/ 1000, /*strict*/ true, kFullChargeCacheMetadata);
+  // A pinned 16-byte-key entry fills what the table's own charge leaves.
+  S3FifoHandle* pinned = nullptr;
+  ASSERT_OK(Insert("aaaaaaaaaaaaaaaa", /*charge*/ 1000 - cache_->GetUsage(),
+                   &pinned));
+  ASSERT_NE(nullptr, pinned);
+  const size_t usage = cache_->GetUsage();
+  ASSERT_EQ(1000, usage);
+  // A 1-byte key is stored as a heap copy, charged as metadata.
+  S3FifoHandle* h = cache_->CreateStandalone(
+      "s", kNullUniqueId64x2, nullptr, &kNoopCacheItemHelper, /*charge*/ 3,
+      /*allow_uncharged*/ true);
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(0, h->GetCharge(kFullChargeCacheMetadata));
+  EXPECT_EQ(usage, cache_->GetUsage());
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(usage, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(pinned, true, false));
+}
+
+// Strict + no room + !allow_uncharged fails.
+TEST_F(S3FifoCacheTest, CreateStandaloneUnchargedNotAllowed) {
+  NewCache(/*capacity*/ 5, /*strict*/ true);
+  S3FifoHandle* pinned = nullptr;
+  EXPECT_OK(Insert("a", /*charge*/ 5, &pinned));
+  ASSERT_NE(nullptr, pinned);
+  S3FifoHandle* h = cache_->CreateStandalone(
+      "s", kNullUniqueId64x2, nullptr, &kNoopCacheItemHelper, /*charge*/ 3,
+      /*allow_uncharged*/ false);
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(5, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(pinned, true, false));
+}
+
+// Metadata charging adds overhead but preserves logical charge.
+TEST_F(S3FifoCacheTest, FullMetadataCharge) {
+  NewCache(/*capacity*/ 100000, /*strict*/ false, kFullChargeCacheMetadata);
+  EXPECT_OK(Insert("a", /*charge*/ 1));
+  S3FifoHandle* h = Lookup("a");
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(1, h->GetCharge(kFullChargeCacheMetadata));
+  EXPECT_GT(cache_->GetUsage(), 1);
+  EXPECT_EQ(cache_->GetUsage(),
+            cache_->GetPinnedUsage() + S3FifoCacheShard::TableChargeFor(
+                                           cache_->GetTableAddressCount()));
+  EXPECT_FALSE(cache_->Release(h, true, false));
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+  EXPECT_GT(cache_->GetUsage(), 1);
+}
+
+// Under strict_capacity_limit the table only grows when the growth fits, so
+// an admitted insert never leaves usage above capacity.
+TEST_F(S3FifoCacheTest, StrictInsertDefersTableGrowth) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ true, kFullChargeCacheMetadata);
+  std::vector<S3FifoHandle*> handles;
+  auto key = [](int i) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "k%02d", i);
+    return std::string(buf);
+  };
+  size_t entry_charge = 0;
+  // 2 pinned entries: the 3rd takes the 4-home table past its 3/5 load
+  // factor and would grow it by one home.
+  for (int i = 0; i < 2; ++i) {
+    const size_t before = cache_->GetUsage();
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert(key(i), /*charge*/ 1, &h));
+    entry_charge = cache_->GetUsage() - before;
+    handles.push_back(h);
+  }
+  ASSERT_EQ(4, cache_->GetTableAddressCount());
+  const size_t growth =
+      S3FifoCacheShard::TableChargeFor(5) - S3FifoCacheShard::TableChargeFor(4);
+
+  // Room for the 3rd entry but not for the growth: admitted without
+  // growing, so usage lands exactly on capacity.
+  const size_t capacity = cache_->GetUsage() + entry_charge;
+  cache_->SetCapacity(capacity);
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(Insert(key(2), /*charge*/ 1, &h));
+  handles.push_back(h);
+  EXPECT_EQ(4, cache_->GetTableAddressCount());
+  EXPECT_EQ(capacity, cache_->GetUsage());
+
+  // Room for another entry plus the growth: that insert grows the table.
+  cache_->SetCapacity(capacity + entry_charge + growth);
+  ASSERT_OK(Insert(key(3), /*charge*/ 1, &h));
+  handles.push_back(h);
+  EXPECT_EQ(5, cache_->GetTableAddressCount());
+  EXPECT_EQ(capacity + entry_charge + growth, cache_->GetUsage());
+  for (int i = 0; i <= 3; ++i) {
+    EXPECT_TRUE(LookupBool(key(i)));
+  }
+
+  for (S3FifoHandle* p : handles) {
+    EXPECT_FALSE(cache_->Release(p, true, false));
+  }
+}
+
+// Under strict_capacity_limit, a full table whose growth does not fit
+// evicts unpinned entries for the growth instead of turning away every
+// insert: each capacity below keeps admitting new entries, with or without
+// a handle, and stays within capacity.
+TEST_F(S3FifoCacheTest, StrictInsertEvictsForTableGrowth) {
+  for (size_t capacity = 280; capacity <= 1200; capacity += 4) {
+    NewCache(capacity, /*strict*/ true, kFullChargeCacheMetadata);
+    for (int i = 0; i < 64; ++i) {
+      const std::string key = "k" + std::to_string(i);
+      if (i % 2 == 0) {
+        S3FifoHandle* h = nullptr;
+        ASSERT_OK(Insert(key, /*charge*/ 1, &h)) << "capacity " << capacity;
+        EXPECT_FALSE(cache_->Release(h, true, false));
+      } else {
+        ASSERT_OK(Insert(key, /*charge*/ 1));
+        EXPECT_TRUE(ContainsForTest(key)) << "capacity " << capacity;
+      }
+      EXPECT_LE(cache_->GetUsage(), capacity);
+    }
+  }
+}
+
+// max_capacity reserves the slot table for a capacity SetCapacity raises the
+// cache to later, so the table can hold more entries than the construction
+// capacity's reservation (2048 homes, about 1228 entries, for 64 KiB).
+TEST_F(S3FifoCacheTest, MaxCapacityReservesForLaterGrowth) {
+  constexpr int kEntries = 5000;
+  for (size_t max_capacity : {size_t{0}, size_t{1} << 20}) {
+    NewCache(/*capacity*/ 64 << 10, /*strict*/ false, kDontChargeCacheMetadata,
+             max_capacity);
+    cache_->SetCapacity(1 << 20);
+    for (int i = 0; i < kEntries; ++i) {
+      ASSERT_OK(Insert("k" + std::to_string(i)));
+    }
+    if (max_capacity == 0) {
+      EXPECT_LT(cache_->GetOccupancyCount(), 2048);
+    } else {
+      EXPECT_EQ(kEntries, cache_->GetOccupancyCount());
+    }
+  }
+
+  // Through S3FifoCacheOptions, split across shards.
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 64 << 10, /*num_shard_bits*/ 1,
+      /*strict_capacity_limit*/ false, kDontChargeCacheMetadata);
+  opts.max_capacity = 1 << 20;
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  cache->SetCapacity(1 << 20);
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_OK(cache->Insert("k" + std::to_string(i), nullptr,
+                            &kNoopCacheItemHelper, /*charge*/ 1));
+  }
+  size_t entries = 0;
+  cache->ApplyToAllEntries([&](const Slice&, Cache::ObjectPtr, size_t,
+                               const Cache::CacheItemHelper*) { ++entries; },
+                           {});
+  EXPECT_EQ(kEntries, entries);
+
+  // The printed options show each shard's reservation: 512 KiB / 64 with
+  // max_capacity, the 2048-home floor without.
+  EXPECT_NE(std::string::npos, cache->GetPrintableOptions().find(
+                                   "reserved_homes_per_shard: 8192\n"))
+      << cache->GetPrintableOptions();
+  opts.max_capacity = 0;
+  EXPECT_NE(std::string::npos,
+            opts.MakeSharedCache()->GetPrintableOptions().find(
+                "reserved_homes_per_shard: 2048\n"));
+}
+
+// Strict, no handle, no room -> OK but not inserted.
+TEST_F(S3FifoCacheTest, StrictInsertWithoutHandleDropped) {
+  NewCache(/*capacity*/ 3, /*strict*/ true);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  S3FifoHandle* pa = Lookup("a");
+  S3FifoHandle* pb = Lookup("b");
+  S3FifoHandle* pc = Lookup("c");
+  ASSERT_NE(nullptr, pa);
+  ASSERT_NE(nullptr, pb);
+  ASSERT_NE(nullptr, pc);
+  EXPECT_OK(Insert("d"));
+  EXPECT_EQ(nullptr, Lookup("d"));
+  EXPECT_EQ(3, cache_->GetUsage());
+  EXPECT_EQ(3, cache_->GetOccupancyCount());
+  EXPECT_FALSE(cache_->Release(pa, true, false));
+  EXPECT_FALSE(cache_->Release(pb, true, false));
+  EXPECT_FALSE(cache_->Release(pc, true, false));
+}
+
+// Strict, with handle, no room -> MemoryLimit.
+TEST_F(S3FifoCacheTest, StrictInsertWithHandleFails) {
+  NewCache(/*capacity*/ 3, /*strict*/ true);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  S3FifoHandle* pa = Lookup("a");
+  S3FifoHandle* pb = Lookup("b");
+  S3FifoHandle* pc = Lookup("c");
+  ASSERT_NE(nullptr, pa);
+  ASSERT_NE(nullptr, pb);
+  ASSERT_NE(nullptr, pc);
+  S3FifoHandle* pd = nullptr;
+  Status s = Insert("d", /*charge*/ 1, &pd);
+  EXPECT_TRUE(s.IsMemoryLimit());
+  EXPECT_EQ(nullptr, pd);
+  EXPECT_EQ(nullptr, Lookup("d"));
+  EXPECT_EQ(3, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(pa, true, false));
+  EXPECT_FALSE(cache_->Release(pb, true, false));
+  EXPECT_FALSE(cache_->Release(pc, true, false));
+}
+
+// Charges near SIZE_MAX neither wrap a capacity check nor usage: such an
+// entry is refused (or left uncharged where allowed), strict or not, and
+// usage stays exact.
+TEST_F(S3FifoCacheTest, HugeChargesDoNotWrapAccounting) {
+  constexpr size_t kHuge = std::numeric_limits<size_t>::max() - 10;
+  for (bool strict : {true, false}) {
+    NewCache(/*capacity*/ 1000, strict, kFullChargeCacheMetadata);
+    // A pinned entry, so eviction attempts cannot change usage.
+    S3FifoHandle* pinned = nullptr;
+    ASSERT_OK(Insert("p", /*charge*/ 20, &pinned));
+    const size_t usage = cache_->GetUsage();
+
+    S3FifoHandle* h = nullptr;
+    EXPECT_TRUE(Insert("huge", kHuge, &h).IsMemoryLimit());
+    EXPECT_EQ(nullptr, h);
+    EXPECT_EQ(usage, cache_->GetUsage());
+    // Without a handle it is dropped, like any entry that does not fit.
+    EXPECT_OK(Insert("huge2", kHuge));
+    EXPECT_FALSE(ContainsForTest("huge2"));
+    EXPECT_EQ(usage, cache_->GetUsage());
+
+    // A 1-byte key adds heap-key metadata to the charge: the sum saturates.
+    S3FifoHandle* s = cache_->CreateStandalone("s", kNullUniqueId64x2, nullptr,
+                                               &kNoopCacheItemHelper, kHuge,
+                                               /*allow_uncharged*/ true);
+    ASSERT_NE(nullptr, s);
+    EXPECT_EQ(0, s->GetCharge(kFullChargeCacheMetadata));
+    EXPECT_EQ(usage, cache_->GetUsage());
+    EXPECT_TRUE(cache_->Release(s, true, false));
+    EXPECT_EQ(nullptr, cache_->CreateStandalone("t", kNullUniqueId64x2, nullptr,
+                                                &kNoopCacheItemHelper, kHuge,
+                                                /*allow_uncharged*/ false));
+    EXPECT_EQ(usage, cache_->GetUsage());
+    EXPECT_FALSE(cache_->Release(pinned, true, false));
+  }
+}
+
+// Without strict_capacity_limit, an insert with a handle at the growth
+// boundary: usage plus the entry fits in size_t, but a growth step on top
+// would wrap. The table does not grow (a non-strict insert grows on the load
+// factor only when the step fits capacity, and a free slot remains, so the
+// out-of-slots growth is not reached) and usage stays exact. Usage gets near
+// SIZE_MAX through a pinned standalone entry, as a charge that large has no
+// slot.
+TEST_F(S3FifoCacheTest, HugeChargeAtGrowthBoundaryDoesNotWrap) {
+  if (sizeof(size_t) < 8) {
+    // With a 32-bit size_t a charge near SIZE_MAX fits a slot's 32 bits,
+    // so it is not standalone and the test's setup does not hold.
+    ROCKSDB_GTEST_BYPASS("a slotless charge needs a 64-bit size_t");
+    return;
+  }
+  NewCache(/*capacity*/ 1000, /*strict*/ false, kFullChargeCacheMetadata);
+  // Two pinned 16-byte-key entries: the third new key takes the 4-home table
+  // past its load factor and would grow it by one home.
+  S3FifoHandle* a = nullptr;
+  S3FifoHandle* b = nullptr;
+  ASSERT_OK(Insert("aaaaaaaaaaaaaaaa", /*charge*/ 1, &a));
+  ASSERT_OK(Insert("bbbbbbbbbbbbbbbb", /*charge*/ 1, &b));
+  ASSERT_EQ(4, cache_->GetTableAddressCount());
+  const size_t usage = cache_->GetUsage();
+  const size_t charge = std::numeric_limits<size_t>::max() - usage - 10;
+  S3FifoHandle* big = nullptr;
+  ASSERT_OK(Insert("bigbigbigbigbigb", charge, &big));
+  ASSERT_NE(nullptr, big);
+  EXPECT_EQ(4, cache_->GetTableAddressCount());
+  EXPECT_EQ(usage + charge, cache_->GetUsage());
+
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(Insert("cccccccccccccccc", /*charge*/ 1, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(4, cache_->GetTableAddressCount());
+  EXPECT_EQ(usage + charge + 1, cache_->GetUsage());
+  // Released, it stays cached and charged until evicted or erased.
+  EXPECT_FALSE(cache_->Release(h, true, false));
+  EXPECT_EQ(usage + charge + 1, cache_->GetUsage());
+  Erase("cccccccccccccccc");
+  EXPECT_EQ(usage + charge, cache_->GetUsage());
+  EXPECT_TRUE(cache_->Release(big, true, false));
+  EXPECT_EQ(usage, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(a, true, false));
+  EXPECT_FALSE(cache_->Release(b, true, false));
+}
+
+// An entry that can never fit, larger than the capacity left beside the
+// smallest table's own metadata charge, is refused under
+// strict_capacity_limit or dropped without a handle, and nothing is evicted
+// for it first: every earlier unpinned entry stays. The same holds for
+// CreateStandalone under strict_capacity_limit.
+TEST_F(S3FifoCacheTest, OversizedInsertKeepsUnpinnedEntries) {
+  auto expect_kept = [this](size_t usage) {
+    for (int i = 0; i < 3; i++) {
+      EXPECT_TRUE(ContainsForTest("k" + std::to_string(i)));
+    }
+    EXPECT_FALSE(ContainsForTest("big"));
+    EXPECT_EQ(usage, cache_->GetUsage());
+  };
+  for (bool strict : {false, true}) {
+    for (bool with_handle : {false, true}) {
+      if (!strict && with_handle) {
+        // Admitted over capacity, by the Cache contract.
+        continue;
+      }
+      SCOPED_TRACE(std::string(strict ? "strict" : "not strict") +
+                   (with_handle ? ", with handle" : ", without handle"));
+      NewCache(/*capacity*/ 10, strict);
+      InsertN("k", 3);
+      S3FifoHandle* h = nullptr;
+      const Status s = Insert("big", /*charge*/ 11, with_handle ? &h : nullptr);
+      if (with_handle) {
+        EXPECT_TRUE(s.IsMemoryLimit());
+        EXPECT_EQ(nullptr, h);
+      } else {
+        EXPECT_OK(s);
+      }
+      expect_kept(3);
+    }
+  }
+
+  // CreateStandalone under strict_capacity_limit: refused, or left
+  // uncharged, without evicting.
+  for (bool allow_uncharged : {false, true}) {
+    SCOPED_TRACE(allow_uncharged ? "allow_uncharged" : "charged only");
+    NewCache(/*capacity*/ 10, /*strict*/ true);
+    InsertN("k", 3);
+    S3FifoHandle* h = cache_->CreateStandalone(
+        "big", S3FifoCacheShard::ComputeHash("big", 0), nullptr,
+        &kNoopCacheItemHelper, /*charge*/ 11, allow_uncharged);
+    expect_kept(3);
+    if (allow_uncharged) {
+      ASSERT_NE(nullptr, h);
+      EXPECT_EQ(0, h->GetCharge(kDontChargeCacheMetadata));
+      cache_->Release(h, true, false);
+    } else {
+      EXPECT_EQ(nullptr, h);
+    }
+  }
+
+  // Full metadata charge: the entry fits the capacity on its own, but not
+  // beside the 4-home table every shard keeps, so it can never fit.
+  NewCache(/*capacity*/ 1000, /*strict*/ true, kFullChargeCacheMetadata);
+  InsertN("k", 3);
+  const size_t usage = cache_->GetUsage();
+  EXPECT_OK(Insert("big",
+                   /*charge*/ 1000 - S3FifoCacheShard::TableChargeFor(4) + 1));
+  expect_kept(usage);
+}
+
+// Both strict branches on one pinned shard, with mixed charges.
+TEST_F(S3FifoCacheTest, StrictMixedChargesBothBranches) {
+  NewCache(/*capacity*/ 10, /*strict*/ true);
+  S3FifoHandle* pa = nullptr;
+  S3FifoHandle* pb = nullptr;
+  EXPECT_OK(Insert("a", /*charge*/ 6, &pa));
+  EXPECT_OK(Insert("b", /*charge*/ 4, &pb));
+  ASSERT_NE(nullptr, pa);
+  ASSERT_NE(nullptr, pb);
+  EXPECT_OK(Insert("c", /*charge*/ 5));
+  EXPECT_EQ(nullptr, Lookup("c"));
+  S3FifoHandle* pc = nullptr;
+  Status s = Insert("c", /*charge*/ 5, &pc);
+  EXPECT_TRUE(s.IsMemoryLimit());
+  EXPECT_EQ(nullptr, pc);
+  EXPECT_EQ(10, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(pa, true, false));
+  EXPECT_FALSE(cache_->Release(pb, true, false));
+}
+
+// Strict still evicts unpinned entries to make room.
+TEST_F(S3FifoCacheTest, StrictEvictsUnpinned) {
+  NewCache(/*capacity*/ 3, /*strict*/ true);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  S3FifoHandle* pd = nullptr;
+  EXPECT_OK(Insert("d", /*charge*/ 1, &pd));
+  ASSERT_NE(nullptr, pd);
+  EXPECT_FALSE(LookupBool("a"));
+  EXPECT_TRUE(LookupBool("d"));
+  EXPECT_FALSE(cache_->Release(pd, true, false));
+}
+
+// Erase of a pinned entry detaches it; charge drops on last release.
+TEST_F(S3FifoCacheTest, ErasePinnedDetaches) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a", /*charge*/ 3));
+  S3FifoHandle* h = Lookup("a");
+  ASSERT_NE(nullptr, h);
+  Erase("a");
+  EXPECT_EQ(nullptr, Lookup("a"));
+  EXPECT_EQ(3, cache_->GetUsage());
+  EXPECT_EQ(3, cache_->GetPinnedUsage());
+  EXPECT_EQ(0, cache_->GetOccupancyCount());
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(0, cache_->GetUsage());
+}
+
+// Erasing a missing key is a no-op.
+TEST_F(S3FifoCacheTest, EraseMissingIsNoop) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a"));
+  Erase("missing");
+  EXPECT_EQ(1, cache_->GetUsage());
+  EXPECT_TRUE(LookupBool("a"));
+}
+
+// Release with erase_if_last_ref removes an under-capacity entry.
+TEST_F(S3FifoCacheTest, ReleaseEraseIfLastRef) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  S3FifoHandle* h = Lookup("a");
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(cache_->Release(h, true, true /*erase*/));
+  EXPECT_EQ(nullptr, Lookup("a"));
+  EXPECT_EQ(1, cache_->GetUsage());
+  EXPECT_TRUE(LookupBool("b"));
+}
+
+// Shrinking capacity evicts by the eviction policy; growing keeps everything.
+TEST_F(S3FifoCacheTest, SetCapacity) {
+  NewCache(/*capacity*/ 5);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_OK(Insert("c"));
+  EXPECT_OK(Insert("d"));
+  EXPECT_OK(Insert("e"));
+  cache_->SetCapacity(2);
+  EXPECT_FALSE(LookupBool("a"));
+  EXPECT_FALSE(LookupBool("b"));
+  EXPECT_FALSE(LookupBool("c"));
+  EXPECT_TRUE(LookupBool("d"));
+  EXPECT_TRUE(LookupBool("e"));
+  EXPECT_EQ(2, cache_->GetUsage());
+  cache_->SetCapacity(10);
+  EXPECT_EQ(2, cache_->GetUsage());
+  EXPECT_TRUE(LookupBool("d"));
+}
+
+// Toggling the strict limit changes insert behavior.
+TEST_F(S3FifoCacheTest, SetStrictCapacityLimit) {
+  NewCache(/*capacity*/ 1, /*strict*/ false);
+  S3FifoHandle* pa = nullptr;
+  EXPECT_OK(Insert("a", /*charge*/ 1, &pa));
+  ASSERT_NE(nullptr, pa);
+  cache_->SetStrictCapacityLimit(true);
+  S3FifoHandle* pb = nullptr;
+  Status s = Insert("b", /*charge*/ 1, &pb);
+  EXPECT_TRUE(s.IsMemoryLimit());
+  cache_->SetStrictCapacityLimit(false);
+  EXPECT_OK(Insert("b", /*charge*/ 1, &pb));
+  ASSERT_NE(nullptr, pb);
+  EXPECT_EQ(2, cache_->GetUsage());
+  // Over capacity, but a Release does not erase.
+  EXPECT_FALSE(cache_->Release(pa, true, false));
+  EXPECT_FALSE(cache_->Release(pb, true, false));
+  EXPECT_EQ(2, cache_->GetUsage());
+}
+
+// GetOccupancyCount counts the entries in the table (a standalone entry is
+// not one), and GetTableAddressCount, the homes the load factor divides by,
+// is positive.
+TEST_F(S3FifoCacheTest, OccupancyAndTableAddresses) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_EQ(0, cache_->GetOccupancyCount());
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  EXPECT_EQ(2, cache_->GetOccupancyCount());
+  EXPECT_GT(cache_->GetTableAddressCount(), 0);
+  S3FifoHandle* h = cache_->CreateStandalone(
+      "s", kNullUniqueId64x2, nullptr, &kNoopCacheItemHelper, /*charge*/ 1,
+      /*allow_uncharged*/ false);
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(2, cache_->GetOccupancyCount());
+  EXPECT_TRUE(cache_->Release(h, true, false));
+}
+
+// A capacity cut below the grown slot table's own metadata charge evicts
+// every entry; the empty table then shrinks, so the shard keeps caching
+// within the new capacity instead of turning every key away.
+TEST_F(S3FifoCacheTest, SetCapacityBelowTableChargeKeepsCaching) {
+  for (bool strict : {false, true}) {
+    NewCache(/*capacity*/ 1 << 20, strict, kFullChargeCacheMetadata);
+    for (int i = 0; i < 400; ++i) {
+      ASSERT_OK(Insert("k" + std::to_string(i), /*charge*/ 4000));
+    }
+    cache_->SetCapacity(16 << 10);
+    EXPECT_LE(cache_->GetUsage(), size_t{16} << 10);
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("z", /*charge*/ 1000, &h));
+    ASSERT_NE(nullptr, h);
+    EXPECT_FALSE(
+        cache_->Release(h, /*useful*/ true, /*erase_if_last_ref*/ false));
+    EXPECT_TRUE(ContainsForTest("z"));
+    EXPECT_LE(cache_->GetUsage(), size_t{16} << 10);
+  }
+  // An entry pinned through the cut keeps the table in use; once it is
+  // released, the next insert evicts it and shrinks the table.
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  S3FifoHandle* pinned = nullptr;
+  ASSERT_OK(Insert("p", /*charge*/ 4000, &pinned));
+  for (int i = 0; i < 400; ++i) {
+    ASSERT_OK(Insert("k" + std::to_string(i), /*charge*/ 4000));
+  }
+  cache_->SetCapacity(16 << 10);
+  EXPECT_FALSE(
+      cache_->Release(pinned, /*useful*/ true, /*erase_if_last_ref*/ false));
+  ASSERT_OK(Insert("z", /*charge*/ 1000));
+  EXPECT_FALSE(ContainsForTest("p"));
+  EXPECT_TRUE(ContainsForTest("z"));
+  EXPECT_LE(cache_->GetUsage(), size_t{16} << 10);
+}
+
+// A cut that evicts every entry while the table's own charge still fits
+// also shrinks the emptied table, so normal-size entries fit again.
+TEST_F(S3FifoCacheTest, SetCapacityJustAboveTableChargeShrinksTable) {
+  for (bool strict : {false, true}) {
+    NewCache(/*capacity*/ 1 << 20, strict, kFullChargeCacheMetadata);
+    for (int i = 0; i < 400; ++i) {
+      ASSERT_OK(Insert("k" + std::to_string(i), /*charge*/ 4000));
+    }
+    const size_t table_charge =
+        S3FifoCacheShard::TableChargeFor(cache_->GetTableAddressCount());
+    // No entry fits beside the table's charge, so all are evicted, but the
+    // table's charge alone is within the new capacity.
+    cache_->SetCapacity(table_charge + 2000);
+    EXPECT_EQ(0, cache_->GetOccupancyCount());
+    EXPECT_LT(S3FifoCacheShard::TableChargeFor(cache_->GetTableAddressCount()),
+              table_charge);
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("z", /*charge*/ 4000, &h));
+    ASSERT_NE(nullptr, h);
+    EXPECT_FALSE(
+        cache_->Release(h, /*useful*/ true, /*erase_if_last_ref*/ false));
+    EXPECT_TRUE(ContainsForTest("z"));
+  }
+}
+
+// Entries erased while pinned keep their slots but leave the load factor's
+// count. The table grows past them instead of refusing new keys while
+// capacity is free.
+TEST_F(S3FifoCacheTest, ErasedPinnedSlotsDoNotBlockGrowth) {
+  for (bool strict : {false, true}) {
+    NewCache(/*capacity*/ 1 << 20, strict);
+    std::vector<S3FifoHandle*> pinned;
+    for (int i = 0; i < 100; ++i) {
+      S3FifoHandle* h = nullptr;
+      ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+      pinned.push_back(h);
+    }
+    for (int i = 0; i < 100; ++i) {
+      const std::string key = "p" + std::to_string(i);
+      cache_->Erase(key, S3FifoCacheShard::ComputeHash(key, 0));
+    }
+    for (int i = 0; i < 200; ++i) {
+      S3FifoHandle* h = nullptr;
+      ASSERT_OK(
+          Insert("n" + std::to_string(i), /*charge*/ 1, strict ? &h : nullptr));
+      if (h != nullptr) {
+        cache_->Release(h, /*useful*/ true, /*erase_if_last_ref*/ false);
+      }
+    }
+    for (int i = 0; i < 200; ++i) {
+      EXPECT_TRUE(ContainsForTest("n" + std::to_string(i))) << i;
+    }
+    for (S3FifoHandle* h : pinned) {
+      EXPECT_TRUE(
+          cache_->Release(h, /*useful*/ true, /*erase_if_last_ref*/ false));
+    }
+    EXPECT_EQ(0, cache_->GetPinnedUsage());
+  }
+}
+
+// Without strict_capacity_limit, an insert whose table grows also evicts for
+// the growth's metadata charge, so usage stays within capacity.
+TEST_F(S3FifoCacheTest, NonStrictGrowthStaysWithinCapacity) {
+  const size_t kCapacity = 64 << 10;
+  NewCache(kCapacity, /*strict*/ false, kFullChargeCacheMetadata);
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_OK(Insert("big" + std::to_string(i), /*charge*/ 1000));
+  }
+  for (int i = 0; i < 400; ++i) {
+    ASSERT_OK(Insert("small" + std::to_string(i), /*charge*/ 100));
+    EXPECT_LE(cache_->GetUsage(), kCapacity) << i;
+  }
+  // The newest entry survives a hit and release.
+  S3FifoHandle* h = Lookup("small399");
+  ASSERT_NE(nullptr, h);
+  EXPECT_FALSE(
+      cache_->Release(h, /*useful*/ true, /*erase_if_last_ref*/ false));
+  EXPECT_TRUE(ContainsForTest("small399"));
+}
+
+// Steady churn (a full shard where every insert evicts) reuses retired slots
+// without piling up stale free-slot indices, so reclamation never pays for an
+// O(table) rebuild of the free list under the mutex.
+TEST_F(S3FifoCacheTest, SteadyChurnDoesNotRebuildFreeSlots) {
+  for (bool hashed_key : {false, true}) {
+    SCOPED_TRACE(hashed_key ? "16-byte keys" : "heap keys");
+    NewCache(/*capacity*/ 1000);
+    for (int i = 0; i < 200000; ++i) {
+      std::string key = "k" + std::to_string(i);
+      if (hashed_key) {
+        key.resize(16, '_');
+      }
+      ASSERT_OK(Insert(key));
+    }
+    EXPECT_EQ(1000, cache_->GetOccupancyCount());
+    EXPECT_EQ(0, cache_->TEST_GetFreeSlotRebuilds());
+    EXPECT_TRUE(cache_->TEST_FreeListMatchesTable());
+  }
+}
+
+// A last Release never erases an entry because the shard is over capacity
+// (as in HyperClockCache): pinned entries pushed usage over capacity, and a
+// hot entry admitted then, looked up and released again, stays cached. The
+// next insert evicts by the eviction policy instead.
+TEST_F(S3FifoCacheTest, OverCapacityReleaseKeepsHotEntry) {
+  NewCache(/*capacity*/ 10);
+  std::vector<S3FifoHandle*> pins;
+  for (int i = 0; i < 10; ++i) {
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pins.push_back(h);
+  }
+  S3FifoHandle* hot = nullptr;
+  ASSERT_OK(Insert("hot", /*charge*/ 1, &hot));
+  ASSERT_NE(nullptr, hot);
+  EXPECT_EQ(11, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(hot, true, false));
+  EXPECT_TRUE(ContainsForTest("hot"));
+  for (int i = 0; i < 3; ++i) {
+    S3FifoHandle* h = Lookup("hot");
+    ASSERT_NE(nullptr, h);
+    EXPECT_FALSE(cache_->Release(h, true, false));
+  }
+  EXPECT_TRUE(ContainsForTest("hot"));
+  EXPECT_EQ(11, cache_->GetUsage());
+  // Releasing a pin does not erase it either.
+  EXPECT_FALSE(cache_->Release(pins[0], true, false));
+  EXPECT_TRUE(ContainsForTest("p0"));
+  for (size_t i = 1; i < pins.size(); ++i) {
+    EXPECT_FALSE(cache_->Release(pins[i], true, false));
+  }
+  // The next insert evicts the oldest unpinned entries, p0 and p1.
+  ASSERT_OK(Insert("new"));
+  EXPECT_EQ(10, cache_->GetUsage());
+  EXPECT_FALSE(ContainsForTest("p0"));
+  EXPECT_FALSE(ContainsForTest("p1"));
+  EXPECT_TRUE(ContainsForTest("hot"));
+}
+
+#if !defined(MUST_FREE_HEAP_ALLOCATIONS) && !defined(__SANITIZE_THREAD__)
+// A key copy that cannot be allocated fails the insert with MemoryLimit,
+// leaving the value with the caller and nothing cached or charged. (Sanitizer
+// allocators abort on such a request instead of returning nullptr.) See also
+// HeapKeyAllocFailureReturnsMemoryLimit, which fails it through a sync point.
+TEST_F(S3FifoCacheTest, KeyAllocationFailureFailsInsert) {
+  NewCache(/*capacity*/ 100);
+  const char byte = 'k';
+  // malloc refuses this size, so the key bytes are never read.
+  const Slice huge(&byte, std::numeric_limits<size_t>::max() / 2);
+  const UniqueId64x2 hash{{1, 2}};
+  S3FifoHandle* handle = nullptr;
+  Status s =
+      cache_->Insert(huge, hash, /*value*/ nullptr, &kNoopCacheItemHelper,
+                     /*charge*/ 1, &handle, Cache::Priority::LOW);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(nullptr, handle);
+  EXPECT_EQ(0, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetOccupancyCount());
+  EXPECT_EQ(nullptr, cache_->CreateStandalone(huge, hash, /*value*/ nullptr,
+                                              &kNoopCacheItemHelper,
+                                              /*charge*/ 1,
+                                              /*allow_uncharged*/ true));
+}
+#endif  // !MUST_FREE_HEAP_ALLOCATIONS && !__SANITIZE_THREAD__
+
+// Batched iteration visits every entry exactly once.
+TEST_F(S3FifoCacheTest, ApplyToSomeEntriesCoversAll) {
+  NewCache(/*capacity*/ 100);
+  for (int i = 0; i < 10; i++) {
+    EXPECT_OK(Insert("key" + std::to_string(i)));
+  }
+  std::set<std::string> seen;
+  size_t total = 0;
+  size_t state = 0;
+  while (state != SIZE_MAX) {
+    cache_->ApplyToSomeEntries(
+        [&](const Slice& key, Cache::ObjectPtr /*value*/, size_t charge,
+            const Cache::CacheItemHelper* /*helper*/) {
+          EXPECT_EQ(1, charge);
+          seen.insert(key.ToString());
+          total++;
+        },
+        /*average_entries_per_lock*/ 3, &state);
+  }
+  EXPECT_EQ(10, total);
+  EXPECT_EQ(10, seen.size());
+}
+
+// A batch size near SIZE_MAX visits every entry in one call and finishes:
+// the batch end must not wrap below the first slot.
+TEST_F(S3FifoCacheTest, ApplyToSomeEntriesHugeBatchFinishes) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("a"));
+  EXPECT_OK(Insert("b"));
+  for (size_t batch : {SIZE_MAX, SIZE_MAX - 1}) {
+    size_t visited = 0;
+    size_t state = 0;
+    cache_->ApplyToSomeEntries(
+        [&](const Slice&, Cache::ObjectPtr, size_t,
+            const Cache::CacheItemHelper*) { ++visited; },
+        batch, &state);
+    EXPECT_EQ(2, visited);
+    EXPECT_EQ(SIZE_MAX, state);
+  }
+
+  // Through the sharded dispatcher, which calls again until every shard
+  // reports SIZE_MAX.
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 1 << 20, /*num_shard_bits*/ 1,
+      /*strict_capacity_limit*/ false, kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(cache->Insert("k" + std::to_string(i), nullptr,
+                            &kNoopCacheItemHelper, /*charge*/ 1));
+  }
+  Cache::ApplyToAllEntriesOptions all;
+  all.average_entries_per_lock = SIZE_MAX;
+  size_t entries = 0;
+  cache->ApplyToAllEntries([&](const Slice&, Cache::ObjectPtr, size_t,
+                               const Cache::CacheItemHelper*) { ++entries; },
+                           all);
+  EXPECT_EQ(10, entries);
+}
+
+// EraseUnRefEntries drops only unpinned entries.
+TEST_F(S3FifoCacheTest, EraseUnRefEntriesKeepsPinned) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a", /*charge*/ 2));
+  EXPECT_OK(Insert("b", /*charge*/ 3));
+  EXPECT_OK(Insert("c", /*charge*/ 4));
+  S3FifoHandle* h = Lookup("b");
+  ASSERT_NE(nullptr, h);
+  cache_->EraseUnRefEntries();
+  EXPECT_EQ(nullptr, Lookup("a"));
+  EXPECT_EQ(nullptr, Lookup("c"));
+  EXPECT_EQ(3, cache_->GetUsage());
+  EXPECT_EQ(3, cache_->GetPinnedUsage());
+  EXPECT_FALSE(cache_->Release(h, true, false));
+  EXPECT_TRUE(LookupBool("b"));
+  EXPECT_EQ(3, cache_->GetUsage());
+}
+
+// Secondary-cache lookup parameters are ignored without secondary.
+TEST_F(S3FifoCacheTest, LookupIgnoresSecondaryParameters) {
+  NewCache(/*capacity*/ 10);
+  EXPECT_OK(Insert("a"));
+  Cache::CreateContext context;
+  Cache::CacheItemHelper secondary_helper(CacheEntryRole::kMisc, nullptr,
+                                          DummySize, DummySaveTo, DummyCreate,
+                                          &kNoopCacheItemHelper);
+  S3FifoHandle* h = cache_->Lookup("a", S3FifoCacheShard::ComputeHash("a", 0),
+                                   &secondary_helper, &context,
+                                   Cache::Priority::HIGH, nullptr);
+  ASSERT_NE(nullptr, h);
+  EXPECT_FALSE(cache_->Release(h, true, false));
+  EXPECT_EQ(nullptr,
+            cache_->Lookup("missing", kNullUniqueId64x2, &secondary_helper,
+                           &context, Cache::Priority::HIGH, nullptr));
+}
+
+// Priorities do not affect FIFO order.
+TEST_F(S3FifoCacheTest, PriorityIgnored) {
+  NewCache(/*capacity*/ 2);
+  EXPECT_OK(Insert("a", /*charge*/ 1, nullptr, Cache::Priority::HIGH));
+  EXPECT_OK(Insert("b", /*charge*/ 1, nullptr, Cache::Priority::BOTTOM));
+  ValidateFIFOList({"a", "b"});
+  EXPECT_OK(Insert("c", /*charge*/ 1, nullptr, Cache::Priority::HIGH));
+  EXPECT_FALSE(LookupBool("a"));
+  EXPECT_TRUE(LookupBool("b"));
+  EXPECT_TRUE(LookupBool("c"));
+}
+
+// There is no positional constructor (it could not set max_capacity), so
+// positional calls written for this or another cache's options, in the order
+// of ShardedCacheOptions (fifth: metadata charge policy) or
+// HyperClockCacheOptions (second: estimated entry charge), do not compile.
+static_assert(
+    !std::is_constructible_v<S3FifoCacheOptions, size_t, int, bool,
+                             std::nullptr_t, bool, CacheMetadataChargePolicy>);
+static_assert(
+    !std::is_constructible_v<S3FifoCacheOptions, size_t, int, bool,
+                             std::nullptr_t, CacheMetadataChargePolicy>);
+static_assert(
+    !std::is_constructible_v<S3FifoCacheOptions, size_t, size_t, int, bool,
+                             std::nullptr_t, CacheMetadataChargePolicy>);
+
+// Factory builds a working cache behind the Cache interface.
+TEST_F(S3FifoCacheTest, MakeSharedCacheBasic) {
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 10, /*num_shard_bits*/ 0, /*strict_capacity_limit*/ false,
+      kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  EXPECT_STREQ("S3FifoCache", cache->Name());
+  EXPECT_EQ(10, cache->GetCapacity());
+  EXPECT_FALSE(cache->HasStrictCapacityLimit());
+  EXPECT_OK(cache->Insert("k1", reinterpret_cast<Cache::ObjectPtr>(42),
+                          &kNoopCacheItemHelper, /*charge*/ 1));
+  Cache::Handle* h = cache->Lookup("k1");
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(42, reinterpret_cast<uintptr_t>(cache->Value(h)));
+  EXPECT_EQ(1, cache->GetCharge(h));
+  EXPECT_EQ(&kNoopCacheItemHelper, cache->GetCacheItemHelper(h));
+  EXPECT_EQ(1, cache->GetUsage());
+  EXPECT_EQ(1, cache->GetPinnedUsage());
+  cache->Release(h);
+  EXPECT_EQ(0, cache->GetPinnedUsage());
+  cache->Erase("k1");
+  EXPECT_EQ(nullptr, cache->Lookup("k1"));
+  EXPECT_EQ(0, cache->GetUsage());
+}
+
+// FIFO order holds through the sharded Cache interface (1 shard).
+TEST_F(S3FifoCacheTest, CacheInterfaceFifoOrder) {
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 3, /*num_shard_bits*/ 0, /*strict_capacity_limit*/ false,
+      kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  EXPECT_OK(cache->Insert("a", nullptr, &kNoopCacheItemHelper, 1));
+  EXPECT_OK(cache->Insert("b", nullptr, &kNoopCacheItemHelper, 1));
+  EXPECT_OK(cache->Insert("c", nullptr, &kNoopCacheItemHelper, 1));
+  EXPECT_OK(cache->Insert("d", nullptr, &kNoopCacheItemHelper, 1));
+  EXPECT_EQ(nullptr, cache->Lookup("a"));
+  for (const char* k : {"b", "c", "d"}) {
+    Cache::Handle* h = cache->Lookup(k);
+    EXPECT_NE(nullptr, h) << k;
+    if (h) {
+      cache->Release(h);
+    }
+  }
+  EXPECT_EQ(3, cache->GetOccupancyCount());
+  EXPECT_GT(cache->GetTableAddressCount(), 0);
+}
+
+// Strict asymmetry through the Cache interface.
+TEST_F(S3FifoCacheTest, CacheInterfaceStrict) {
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 2, /*num_shard_bits*/ 0, /*strict_capacity_limit*/ true,
+      kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  EXPECT_OK(cache->Insert("a", nullptr, &kNoopCacheItemHelper, 1));
+  EXPECT_OK(cache->Insert("b", nullptr, &kNoopCacheItemHelper, 1));
+  Cache::Handle* pa = cache->Lookup("a");
+  Cache::Handle* pb = cache->Lookup("b");
+  ASSERT_NE(nullptr, pa);
+  ASSERT_NE(nullptr, pb);
+  EXPECT_OK(cache->Insert("c", nullptr, &kNoopCacheItemHelper, 1));
+  EXPECT_EQ(nullptr, cache->Lookup("c"));
+  Cache::Handle* pc = nullptr;
+  Status s = cache->Insert("c", nullptr, &kNoopCacheItemHelper, 1, &pc);
+  EXPECT_TRUE(s.IsMemoryLimit());
+  EXPECT_EQ(nullptr, pc);
+  cache->Release(pa);
+  cache->Release(pb);
+}
+
+// Option validation and defaults.
+TEST_F(S3FifoCacheTest, MakeSharedCacheValidation) {
+  S3FifoCacheOptions bad = TestS3FifoOptions(
+      /*capacity*/ 10, /*num_shard_bits*/ 20, /*strict_capacity_limit*/ false,
+      kDefaultCacheMetadataChargePolicy);
+  EXPECT_EQ(nullptr, bad.MakeSharedCache());
+  // Large enough for the slot table, charged under the default
+  // kFullChargeCacheMetadata.
+  S3FifoCacheOptions dflt = TestS3FifoOptions(
+      /*capacity*/ 1000, /*num_shard_bits*/ -1, /*strict_capacity_limit*/ false,
+      kDefaultCacheMetadataChargePolicy);
+  std::shared_ptr<Cache> cache = dflt.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  EXPECT_OK(cache->Insert("a", nullptr, &kNoopCacheItemHelper, 1));
+  Cache::Handle* h = cache->Lookup("a");
+  EXPECT_NE(nullptr, h);
+  if (h) {
+    cache->Release(h);
+  }
+}
+
+#ifndef NDEBUG
+// A shard whose slot-table reservation fails makes MakeSharedCache return
+// nullptr (instead of aborting the process); the shards already built are
+// destroyed cleanly.
+TEST_F(S3FifoCacheTest, ReservationFailureReturnsNull) {
+  int shards_seen = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "S3FifoCacheShard::S3FifoCacheShard:Reserved", [&](void* arg) {
+        // Fail the third shard's reservation.
+        if (++shards_seen == 3) {
+          *static_cast<S3FifoHandle**>(arg) = nullptr;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 1 << 20, /*num_shard_bits*/ 2,
+      /*strict_capacity_limit*/ false, kDefaultCacheMetadataChargePolicy);
+  EXPECT_EQ(nullptr, opts.MakeSharedCache());
+  EXPECT_EQ(4, shards_seen);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // Without the injected failure the same options work.
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  EXPECT_OK(cache->Insert("a", nullptr, &kNoopCacheItemHelper, 1));
+}
+#endif  // NDEBUG
+
+#ifndef NDEBUG
+// A key that is not 16 bytes is copied to the heap. When that copy cannot be
+// allocated, Insert returns MemoryLimit, clears *handle and leaves the cache
+// unchanged; CreateStandalone returns nullptr. 16-byte keys need no copy and
+// are unaffected. See also KeyAllocationFailureFailsInsert, which fails a
+// real allocation.
+TEST_F(S3FifoCacheTest, HeapKeyAllocFailureReturnsMemoryLimit) {
+  NewCache(/*capacity*/ 100);
+  EXPECT_OK(Insert("a"));
+  const size_t usage = cache_->GetUsage();
+  int failed_allocs = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "S3FifoCacheShard::NewHeapKey:Malloc", [&](void* arg) {
+        auto** hk = static_cast<S3FifoHandle::HeapKey**>(arg);
+        free(*hk);
+        *hk = nullptr;
+        ++failed_allocs;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  S3FifoHandle sentinel;
+  S3FifoHandle* h = &sentinel;
+  EXPECT_TRUE(Insert("b", /*charge*/ 1, &h).IsMemoryLimit());
+  EXPECT_EQ(nullptr, h);
+  EXPECT_TRUE(Insert("c").IsMemoryLimit());
+  EXPECT_EQ(nullptr,
+            cache_->CreateStandalone("s", kNullUniqueId64x2, nullptr,
+                                     &kNoopCacheItemHelper, /*charge*/ 1,
+                                     /*allow_uncharged*/ true));
+  EXPECT_EQ(3, failed_allocs);
+  EXPECT_EQ(usage, cache_->GetUsage());
+  EXPECT_TRUE(ContainsForTest("a"));
+  EXPECT_FALSE(ContainsForTest("b"));
+  EXPECT_FALSE(ContainsForTest("c"));
+  const std::string inline_key(S3FifoCacheShard::kInlineKeySize, 'k');
+  EXPECT_OK(Insert(inline_key));
+  EXPECT_EQ(3, failed_allocs);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_OK(Insert("b"));
+  EXPECT_TRUE(ContainsForTest("b"));
+}
+#endif  // NDEBUG
+
+// ApplyToAllEntries and EraseUnRefEntries through the interface.
+TEST_F(S3FifoCacheTest, CacheInterfaceBulkOps) {
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 100, /*num_shard_bits*/ 0, /*strict_capacity_limit*/ false,
+      kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  for (int i = 0; i < 5; i++) {
+    EXPECT_OK(cache->Insert("k" + std::to_string(i), nullptr,
+                            &kNoopCacheItemHelper, 1));
+  }
+  size_t total = 0;
+  cache->ApplyToAllEntries(
+      [&](const Slice& /*key*/, Cache::ObjectPtr /*value*/, size_t charge,
+          const Cache::CacheItemHelper* /*helper*/) {
+        EXPECT_EQ(1, charge);
+        total++;
+      },
+      {});
+  EXPECT_EQ(5, total);
+  Cache::Handle* pinned = cache->Lookup("k0");
+  ASSERT_NE(nullptr, pinned);
+  cache->EraseUnRefEntries();
+  EXPECT_EQ(1, cache->GetUsage());
+  EXPECT_EQ(nullptr, cache->Lookup("k1"));
+  cache->Release(pinned);
+  Cache::Handle* h = cache->Lookup("k0");
+  EXPECT_NE(nullptr, h);
+  if (h) {
+    cache->Release(h);
+  }
+  EXPECT_EQ(0, cache->GetPinnedUsage());
+  EXPECT_EQ(1, cache->GetUsage());
+}
+
+// Under kFullChargeCacheMetadata an empty shard is already charged for its
+// table, and entries add both their charge and the homes the table grows by.
+TEST_F(S3FifoCacheTest, MetadataChargeIncludesTableAddresses) {
+  NewCache(/*capacity*/ 1 << 20, /*strict_capacity_limit*/ false,
+           kFullChargeCacheMetadata);
+  const size_t empty_usage = cache_->GetUsage();
+  EXPECT_GT(empty_usage, 0);
+  EXPECT_EQ(0, cache_->TEST_GetTableOccupancyCount());
+
+  for (int i = 0; i < 32; ++i) {
+    EXPECT_OK(Insert("k" + std::to_string(i)));
+  }
+
+  EXPECT_EQ(32, cache_->GetOccupancyCount());
+  EXPECT_EQ(32, cache_->TEST_GetTableOccupancyCount());
+  EXPECT_GT(cache_->GetUsage(), empty_usage + 32);
+  EXPECT_GT(cache_->GetTableAddressCount(), 16);
+}
+
+// A batched walk visits every entry exactly once even when inserts between
+// batches grow the table: slots never move, so the next slot index stays a
+// valid resume point.
+TEST_F(S3FifoCacheTest, ApplyToAllEntriesCoversEachKeyOnceAcrossResize) {
+  NewCache(/*capacity*/ 1 << 20);
+  auto insert_hashed = [&](const std::string& key) {
+    EXPECT_OK(cache_->Insert(key, S3FifoCacheShard::ComputeHash(key, 0),
+                             nullptr, &kNoopCacheItemHelper, 1, nullptr,
+                             Cache::Priority::LOW));
+  };
+  for (int i = 0; i < 15; ++i) {
+    insert_hashed("k" + std::to_string(i));
+  }
+  const size_t length_before = cache_->GetTableAddressCount();
+
+  std::multiset<std::string> visited;
+  auto record = [&](const Slice& key, Cache::ObjectPtr /*value*/,
+                    size_t /*charge*/,
+                    const Cache::CacheItemHelper* /*helper*/) {
+    visited.insert(key.ToString());
+  };
+  size_t state = 0;
+  cache_->ApplyToSomeEntries(record, length_before / 2, &state);
+  ASSERT_NE(SIZE_MAX, state);
+  EXPECT_GT(visited.size(), 0);
+  EXPECT_LT(visited.size(), 15);
+
+  // ShardedCache::ApplyToAllEntries releases the shard mutex between calls,
+  // so an insert may grow the table here.
+  for (int i = 15; i < 64; ++i) {
+    insert_hashed("k" + std::to_string(i));
+  }
+  ASSERT_GT(cache_->GetTableAddressCount(), length_before);
+  while (state != SIZE_MAX) {
+    cache_->ApplyToSomeEntries(record, /*average_entries_per_lock*/ 4, &state);
+  }
+
+  for (int i = 0; i < 15; ++i) {
+    EXPECT_EQ(1, visited.count("k" + std::to_string(i)));
+  }
+  for (const std::string& key : visited) {
+    EXPECT_EQ(1, visited.count(key)) << key;
+  }
+}
+
+// Threads mixing inserts (with and without a handle), lookups, erases,
+// SetCapacity, walks and releases (some erasing) leave usage equal to the
+// charge of the entries left and nothing pinned.
+TEST_F(S3FifoCacheTest, ConcurrentOpsKeepUsageConsistent) {
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 1000, /*num_shard_bits*/ 2, /*strict_capacity_limit*/ false,
+      kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+
+  constexpr int kThreads = 4;
+  constexpr int kOpsPerThread = 20000;
+  std::vector<port::Thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&cache, t]() {
+      Random rnd(301 + t);
+      std::vector<Cache::Handle*> held;
+      for (int i = 0; i < kOpsPerThread; ++i) {
+        const std::string key = "k" + std::to_string(rnd.Uniform(400));
+        switch (rnd.Uniform(6)) {
+          case 0: {
+            Cache::Handle* h = nullptr;
+            EXPECT_OK(cache->Insert(key, nullptr, &kNoopCacheItemHelper,
+                                    1 + rnd.Uniform(10),
+                                    rnd.OneIn(2) ? &h : nullptr));
+            if (h != nullptr) {
+              held.push_back(h);
+            }
+            break;
+          }
+          case 1:
+          case 2: {
+            Cache::Handle* h = cache->Lookup(key);
+            if (h != nullptr) {
+              held.push_back(h);
+            }
+            break;
+          }
+          case 3:
+            cache->Erase(key);
+            break;
+          case 4:
+            if (rnd.OneIn(50)) {
+              cache->SetCapacity(rnd.OneIn(2) ? 500 : 1000);
+            }
+            break;
+          default:
+            if (rnd.OneIn(50)) {
+              cache->ApplyToAllEntries(
+                  [](const Slice& /*key*/, Cache::ObjectPtr /*value*/,
+                     size_t /*charge*/,
+                     const Cache::CacheItemHelper* /*helper*/) {},
+                  {});
+            }
+            break;
+        }
+        if (held.size() > 8 || (!held.empty() && rnd.OneIn(3))) {
+          const size_t idx = rnd.Uniform(static_cast<int>(held.size()));
+          cache->Release(held[idx], /*erase_if_last_ref*/ rnd.OneIn(10));
+          held[idx] = held.back();
+          held.pop_back();
+        }
+      }
+      for (Cache::Handle* h : held) {
+        cache->Release(h);
+      }
+    });
+  }
+  for (port::Thread& thread : threads) {
+    thread.join();
+  }
+
+  size_t charge_sum = 0;
+  cache->ApplyToAllEntries(
+      [&](const Slice& /*key*/, Cache::ObjectPtr /*value*/, size_t charge,
+          const Cache::CacheItemHelper* /*helper*/) { charge_sum += charge; },
+      {});
+  EXPECT_EQ(0, cache->GetPinnedUsage());
+  EXPECT_EQ(charge_sum, cache->GetUsage());
+}
+
+// Under kDontChargeCacheMetadata usage is the entries' charge alone, also
+// after the table grows.
+TEST_F(S3FifoCacheTest, UsageStaysPayloadOnlyAcrossResizeWithNoMetadataCharge) {
+  NewCache(/*capacity*/ 1 << 20, /*strict_capacity_limit*/ false,
+           kDontChargeCacheMetadata);
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_OK(Insert("k" + std::to_string(i), /*charge*/ 2));
+  }
+  EXPECT_EQ(200, cache_->GetUsage());
+  for (int i = 100; i < 500; ++i) {
+    EXPECT_OK(Insert("k" + std::to_string(i), /*charge*/ 1));
+  }
+  EXPECT_EQ(600, cache_->GetUsage());
+}
+
+// Values that detect use after free and double free: the deleter marks the
+// value dead before freeing it, and holders check that what they read is
+// alive and belongs to the key they looked up. LiveValues() counts the
+// values not yet deleted, so a leak or a double free leaves it nonzero.
+namespace {
+constexpr uint32_t kLiveMagic = 0x1a7e1a7e;
+constexpr uint32_t kDeadMagic = 0xdeaddead;
+std::atomic<int64_t>& LiveValues() {
+  static std::atomic<int64_t> count{0};
+  return count;
+}
+struct StressValue {
+  explicit StressValue(uint32_t k) : magic(kLiveMagic), key(k) {
+    LiveValues().fetch_add(1);
+  }
+  std::atomic<uint32_t> magic;
+  const uint32_t key;
+};
+void DeleteStressValue(Cache::ObjectPtr obj, MemoryAllocator* /*alloc*/) {
+  auto* value = static_cast<StressValue*>(obj);
+  EXPECT_EQ(kLiveMagic, value->magic.exchange(kDeadMagic));
+  LiveValues().fetch_sub(1);
+  delete value;
+}
+const Cache::CacheItemHelper* StressHelper() {
+  static const Cache::CacheItemHelper helper{CacheEntryRole::kMisc,
+                                             &DeleteStressValue};
+  return &helper;
+}
+// When set (before the stress threads start), StressKey pads keys to 16
+// bytes, so they take the bijective-hash path every block cache key takes
+// instead of a heap copy.
+std::atomic<bool>& StressHashedKeys() {
+  static std::atomic<bool> hashed{false};
+  return hashed;
+}
+std::string StressKey(uint32_t k) {
+  std::string key = "key" + std::to_string(k);
+  if (StressHashedKeys().load(std::memory_order_relaxed)) {
+    key.resize(S3FifoCacheShard::kInlineKeySize, '_');
+  }
+  return key;
+}
+void CheckStressValue(Cache* cache, Cache::Handle* h, uint32_t k) {
+  auto* value = static_cast<StressValue*>(cache->Value(h));
+  ASSERT_EQ(kLiveMagic, value->magic.load());
+  ASSERT_EQ(k, value->key);
+}
+}  // namespace
+
+// Populates the queue, oldest first: a, c0..c7, g.
+void PopulateQueue(S3FifoCacheTest* t) {
+  t->NewCache(/*capacity*/ 10);
+  ASSERT_OK(t->Insert("a"));
+  for (int i = 0; i < 8; i++) {
+    ASSERT_OK(t->Insert("c" + std::to_string(i)));
+  }
+  ASSERT_OK(t->Insert("g"));
+}
+
+// Hits on the oldest and newest entries, Ref, non-erasing Release and a
+// miss.
+void HitLoop(S3FifoCacheTest* t, int rounds) {
+  for (int i = 0; i < rounds; ++i) {
+    for (const char* key : {"a", "g"}) {
+      S3FifoHandle* h = t->Lookup(key);
+      ASSERT_NE(nullptr, h);
+      EXPECT_TRUE(t->cache_->Ref(h));
+      EXPECT_FALSE(t->cache_->Release(h, true, false));
+      EXPECT_FALSE(t->cache_->Release(h, true, false));
+    }
+    EXPECT_EQ(nullptr, t->Lookup("missing"));
+  }
+}
+
+// Lookup (hit or miss), Ref and a Release that does not erase never take
+// the shard lock: another thread completes them while this one holds it,
+// including registering its thread's reader.
+TEST_F(S3FifoCacheTest, HitsNeverTakeShardLock) {
+  PopulateQueue(this);
+  bool completed = false;
+  port::Thread hitter;
+  {
+    DMutexLock l(cache_->TEST_GetMutex());
+    // A hit that takes the lock blocks until this scope ends.
+    completed = FinishesWithin20s([&] { HitLoop(this, 1000); }, &hitter);
+  }
+  hitter.join();
+  EXPECT_TRUE(completed);
+}
+
+// Hits write no byte of the shard object: only the entries and the
+// thread's reader change.
+TEST_F(S3FifoCacheTest, HitsWriteNoShardState) {
+  PopulateQueue(this);
+  HitLoop(this, 1);
+  const std::string before(reinterpret_cast<const char*>(cache_),
+                           sizeof(S3FifoCacheShard));
+  HitLoop(this, 100);
+  const std::string after(reinterpret_cast<const char*>(cache_),
+                          sizeof(S3FifoCacheShard));
+  EXPECT_TRUE(before == after);
+}
+
+// GetUsage, GetOccupancyCount and GetTableAddressCount take no lock: another
+// thread completes them while this one holds the shard mutex. (Blob-cache
+// charging calls GetUsage on every blob insert and lookup.)
+TEST_F(S3FifoCacheTest, GettersTakeNoLock) {
+  PopulateQueue(this);
+  const size_t homes = cache_->GetTableAddressCount();
+  size_t usage = 0;
+  size_t occupancy = 0;
+  size_t addresses = 0;
+  bool completed = false;
+  port::Thread getter;
+  {
+    DMutexLock l(cache_->TEST_GetMutex());
+    // A getter that takes the lock cannot finish until this scope ends.
+    completed = FinishesWithin20s(
+        [&] {
+          usage = cache_->GetUsage();
+          occupancy = cache_->GetOccupancyCount();
+          addresses = cache_->GetTableAddressCount();
+        },
+        &getter);
+  }
+  getter.join();
+  ASSERT_TRUE(completed);
+  EXPECT_EQ(10, usage);
+  EXPECT_EQ(10, occupancy);
+  EXPECT_EQ(homes, addresses);
+}
+
+#ifndef NDEBUG
+// Runs op on another thread, parks it at sync point `point`, runs
+// `meanwhile` here, then lets op finish. Only op's first arrival parks:
+// processing is off before `meanwhile` runs, so `meanwhile` may pass the
+// same point.
+void RunWhileParked(const std::string& point, const std::function<void()>& op,
+                    const std::function<void()>& meanwhile) {
+  std::promise<void> reached;
+  std::promise<void> resume;
+  std::shared_future<void> resumed = resume.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack(point, [&](void*) {
+    reached.set_value();
+    resumed.wait();
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  port::Thread t(op);
+  reached.get_future().wait();
+  SyncPoint::GetInstance()->DisableProcessing();
+  meanwhile();
+  resume.set_value();
+  t.join();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// A Lookup parked on the first entry of a chain while the table grows many
+// steps (each split relinks that chain) finishes in a bounded number of
+// steps, and a hit is on its own key.
+TEST_F(S3FifoCacheTest, LookupRacingSplitsTakesBoundedSteps) {
+  NewCache(/*capacity*/ 1 << 20);
+  // Keys whose hashes agree on the low 8 bits share home 0 until the table
+  // has 256 homes, so they form one chain through every split below.
+  std::vector<std::string> chain;
+  for (int i = 0; chain.size() < 5; ++i) {
+    const std::string key = "c" + std::to_string(i);
+    if ((S3FifoCacheShard::ComputeHash(key, 0)[0] & 0xff) == 0) {
+      chain.push_back(key);
+    }
+  }
+  for (const std::string& key : chain) {
+    ASSERT_OK(Insert(key));
+  }
+  // The oldest key is at the end of its chain (new entries link at the
+  // head), so the Lookup walks the whole chain.
+  const std::string target = chain.front();
+  std::atomic<std::thread::id> lookup_thread{};
+  std::atomic<int> steps{0};
+  std::promise<void> reached;
+  std::promise<void> resume;
+  std::shared_future<void> resumed = resume.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack(
+      "S3FifoCacheShard::Lookup:ChainStep", [&](void*) {
+        if (std::this_thread::get_id() != lookup_thread.load()) {
+          return;
+        }
+        if (steps.fetch_add(1) == 0) {
+          reached.set_value();
+          resumed.wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  S3FifoHandle* found = nullptr;
+  port::Thread t([&] {
+    lookup_thread.store(std::this_thread::get_id());
+    found = Lookup(target);
+  });
+  reached.get_future().wait();
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_OK(Insert("g" + std::to_string(i)));
+  }
+  EXPECT_GT(cache_->GetTableAddressCount(), 200);
+  resume.set_value();
+  t.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_LE(steps.load(), static_cast<int>(cache_->GetOccupancyCount()) + 1);
+  if (found != nullptr) {
+    UniqueId64x2 buf;
+    EXPECT_EQ(target, cache_->KeyOf(found, &buf).ToString());
+    cache_->Release(found, true, false);
+  }
+  EXPECT_TRUE(ContainsForTest(target));
+}
+
+// Reclamation: a Lookup parked after finding its entry keeps that slot
+// from being reused across many reclaim passes, so once the entry is
+// erased the Lookup misses instead of taking a ref on whatever reused the
+// slot. A Lookup parked before reading its home across table growth may
+// miss, but never crashes or loops.
+TEST_F(S3FifoCacheTest, ReclaimWaitsForInFlightLookup) {
+  NewCache(/*capacity*/ 1000);
+  ASSERT_OK(Insert("k"));
+  S3FifoHandle* found = nullptr;
+  RunWhileParked(
+      "S3FifoCacheShard::Lookup:Found", [&] { found = Lookup("k"); },
+      [&] {
+        Erase("k");
+        // Enough locked operations to run reclaim, none of which grows the
+        // table, then an entry with k's hash: it would land in k's slot
+        // were that slot already free.
+        for (int i = 0; i < 100; ++i) {
+          Erase("missing" + std::to_string(i));
+        }
+        ASSERT_OK(cache_->Insert("k2", S3FifoCacheShard::ComputeHash("k", 0),
+                                 nullptr, &kNoopCacheItemHelper, 1, nullptr,
+                                 Cache::Priority::LOW));
+      });
+  EXPECT_EQ(nullptr, found);
+
+  NewCache(/*capacity*/ 1000);
+  ASSERT_OK(Insert("k"));
+  RunWhileParked(
+      "S3FifoCacheShard::Lookup:HomeLoaded",
+      [&] {
+        // Growth may have moved k to another chain, so a miss is allowed.
+        found = Lookup("k");
+        if (found != nullptr) {
+          cache_->Release(found, true, false);
+        }
+      },
+      [&] {
+        const size_t homes = cache_->GetTableAddressCount();
+        InsertN("x", 300);
+        ASSERT_GT(cache_->GetTableAddressCount(), homes);
+      });
+  EXPECT_TRUE(LookupBool("k"));
+}
+
+#endif  // !NDEBUG
+
+// Many threads mix Lookup, Release (some erasing), Insert with and
+// without a handle, overwrite, Erase and SetCapacity on a small cache whose
+// tables grow during the run, while holding some pins for a long time.
+// Every value a holder reads must be alive and its own; at the end every
+// value is deleted exactly once.
+TEST_F(S3FifoCacheTest, ConcurrentStressKeepsLifetimeExact) {
+  // Heap keys, then 16-byte keys (the production path).
+  for (bool hashed_keys : {false, true}) {
+    SCOPED_TRACE(hashed_keys ? "16-byte keys" : "heap keys");
+    StressHashedKeys().store(hashed_keys);
+    {
+      S3FifoCacheOptions opts = TestS3FifoOptions(
+          /*capacity*/ 64 << 10, /*num_shard_bits*/ 1,
+          /*strict_capacity_limit*/ false, kFullChargeCacheMetadata);
+      std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+      ASSERT_NE(nullptr, cache);
+      constexpr int kThreads = 8;
+      std::vector<port::Thread> threads;
+      threads.reserve(kThreads);
+      for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&cache, t] {
+          Random rnd(7 + t);
+          std::vector<std::pair<Cache::Handle*, uint32_t>> held;
+          std::vector<std::pair<Cache::Handle*, uint32_t>> long_held;
+          for (int i = 0; i < 20000; ++i) {
+            const uint32_t k = rnd.Skewed(11);
+            const std::string key = StressKey(k);
+            switch (rnd.Uniform(12)) {
+              case 0:
+              case 1:
+              case 2: {
+                Cache::Handle* h = nullptr;
+                ASSERT_OK(cache->Insert(key, new StressValue(k), StressHelper(),
+                                        64 + rnd.Uniform(2048),
+                                        rnd.OneIn(2) ? &h : nullptr));
+                if (h != nullptr) {
+                  held.emplace_back(h, k);
+                }
+                break;
+              }
+              case 3:
+                cache->Erase(key);
+                break;
+              case 4:
+                if (rnd.OneIn(100)) {
+                  cache->SetCapacity(rnd.OneIn(2) ? (16 << 10) : (64 << 10));
+                }
+                break;
+              default: {
+                Cache::Handle* h = cache->Lookup(key);
+                if (h == nullptr) {
+                  break;
+                }
+                CheckStressValue(cache.get(), h, k);
+                if (rnd.OneIn(50) && long_held.size() < 4) {
+                  long_held.emplace_back(h, k);
+                } else {
+                  held.emplace_back(h, k);
+                }
+                break;
+              }
+            }
+            if (held.size() > 4 || (!held.empty() && rnd.OneIn(2))) {
+              const size_t idx = rnd.Uniform(static_cast<int>(held.size()));
+              CheckStressValue(cache.get(), held[idx].first, held[idx].second);
+              cache->Release(held[idx].first,
+                             /*erase_if_last_ref*/ rnd.OneIn(10));
+              held[idx] = held.back();
+              held.pop_back();
+            }
+            if (!long_held.empty() && rnd.OneIn(2000)) {
+              CheckStressValue(cache.get(), long_held.back().first,
+                               long_held.back().second);
+              cache->Release(long_held.back().first);
+              long_held.pop_back();
+            }
+          }
+          for (auto* list : {&held, &long_held}) {
+            for (const auto& [h, k] : *list) {
+              CheckStressValue(cache.get(), h, k);
+              cache->Release(h);
+            }
+          }
+        });
+      }
+      for (port::Thread& thread : threads) {
+        thread.join();
+      }
+      EXPECT_EQ(0, cache->GetPinnedUsage());
+      size_t charge_sum = 0;
+      cache->ApplyToAllEntries(
+          [&](const Slice& /*key*/, Cache::ObjectPtr value, size_t charge,
+              const Cache::CacheItemHelper* /*helper*/) {
+            EXPECT_EQ(kLiveMagic,
+                      static_cast<StressValue*>(value)->magic.load());
+            charge_sum += charge;
+          },
+          {});
+      EXPECT_LE(charge_sum, cache->GetUsage());
+    }
+    EXPECT_EQ(0, LiveValues().load());
+  }
+  StressHashedKeys().store(false);
+}
+
+// Short-lived threads look up entries while a writer evicts and erases, so
+// readers are created, exit and are adopted while slots are retired and
+// reclaimed. Every value a reader sees must be alive and its own, and every
+// value is deleted exactly once. Meant for ASan.
+TEST_F(S3FifoCacheTest, ThreadChurnLookupsKeepLifetimeExact) {
+  {
+    S3FifoCacheOptions opts = TestS3FifoOptions(
+        /*capacity*/ 32 << 10, /*num_shard_bits*/ 1,
+        /*strict_capacity_limit*/ false, kDefaultCacheMetadataChargePolicy);
+    std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+    ASSERT_NE(nullptr, cache);
+    constexpr uint32_t kKeys = 2000;
+    std::atomic<bool> stop{false};
+    port::Thread writer([&] {
+      Random rnd(11);
+      for (int i = 0; !stop.load(std::memory_order_relaxed); ++i) {
+        const uint32_t k = rnd.Uniform(kKeys);
+        ASSERT_OK(cache->Insert(StressKey(k), new StressValue(k),
+                                StressHelper(), /*charge*/ 64));
+        if (i % 7 == 0) {
+          cache->Erase(StressKey(rnd.Uniform(kKeys)));
+        }
+      }
+    });
+    for (int wave = 0; wave < 200; ++wave) {
+      std::vector<port::Thread> readers;
+      readers.reserve(4);
+      for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&cache, wave, t] {
+          Random rnd(static_cast<uint32_t>(wave * 4 + t));
+          for (int i = 0; i < 200; ++i) {
+            const uint32_t k = rnd.Uniform(kKeys);
+            Cache::Handle* h = cache->Lookup(StressKey(k));
+            if (h != nullptr) {
+              CheckStressValue(cache.get(), h, k);
+              cache->Release(h);
+            }
+          }
+        });
+      }
+      for (port::Thread& r : readers) {
+        r.join();
+      }
+    }
+    stop.store(true);
+    writer.join();
+  }
+  EXPECT_EQ(0, LiveValues().load());
+}
+
+// A thread whose Lookup on shard A is followed by a Lookup on shard B must
+// stay visible to A's reader scan until its first Lookup's reads are done,
+// or A frees slots and heap keys that Lookup still reads. ThreadReader::shard
+// is stored with release and loaded with acquire for this. x86 keeps stores
+// in order, so only a weakly ordered CPU (aarch64) can fail this test; run it
+// there under ASan with --gtest_repeat. Not observed to fail with the
+// orderings relaxed: a smoke test, not a reproducer.
+TEST_F(S3FifoCacheTest, CrossShardLookupPingPong) {
+  {
+    S3FifoCacheOptions opts = TestS3FifoOptions(
+        /*capacity*/ 32 << 10, /*num_shard_bits*/ 1,
+        /*strict_capacity_limit*/ false, kDefaultCacheMetadataChargePolicy);
+    opts.hash_seed = 0;
+    std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+    ASSERT_NE(nullptr, cache);
+    // Heap-stored keys (not 16 bytes long) of each shard.
+    std::vector<uint32_t> keys[2];
+    for (uint32_t k = 0; keys[0].size() < 64 || keys[1].size() < 64; ++k) {
+      const auto hash = S3FifoCacheShard::ComputeHash(StressKey(k), 0);
+      std::vector<uint32_t>& shard_keys =
+          keys[S3FifoCacheShard::HashPieceForSharding(hash) & 1];
+      if (shard_keys.size() < 64) {
+        shard_keys.push_back(k);
+      }
+    }
+    std::atomic<bool> stop{false};
+    // Writers churn both shards, so slots and heap keys are retired and
+    // reclaimed while the readers run.
+    std::vector<port::Thread> writers;
+    writers.reserve(2);
+    for (int w = 0; w < 2; ++w) {
+      writers.emplace_back([&, w] {
+        Random rnd(101 + w);
+        while (!stop.load(std::memory_order_relaxed)) {
+          const uint32_t k = keys[rnd.Uniform(2)][rnd.Uniform(64)];
+          if (rnd.OneIn(4)) {
+            cache->Erase(StressKey(k));
+          } else {
+            ASSERT_OK(cache->Insert(StressKey(k), new StressValue(k),
+                                    StressHelper(), 512 + rnd.Uniform(512)));
+          }
+        }
+      });
+    }
+    // Readers alternate between the two shards on every Lookup.
+    std::vector<port::Thread> readers;
+    readers.reserve(4);
+    for (int r = 0; r < 4; ++r) {
+      readers.emplace_back([&, r] {
+        Random rnd(201 + r);
+        for (int i = 0; i < 100000; ++i) {
+          const uint32_t k = keys[i & 1][rnd.Uniform(64)];
+          Cache::Handle* h = cache->Lookup(StressKey(k));
+          if (h != nullptr) {
+            CheckStressValue(cache.get(), h, k);
+            cache->Release(h);
+          }
+        }
+      });
+    }
+    for (port::Thread& t : readers) {
+      t.join();
+    }
+    stop.store(true);
+    for (port::Thread& t : writers) {
+      t.join();
+    }
+  }
+  EXPECT_EQ(0, LiveValues().load());
+}
+
+// Under strict_capacity_limit, concurrent inserts (with and without a
+// handle), hits and releases never take usage above capacity, even while
+// pins hold most of it.
+TEST_F(S3FifoCacheTest, StrictCapacityHoldsUnderConcurrency) {
+  static constexpr size_t kCapacity = 32 << 10;
+  S3FifoCacheOptions opts = TestS3FifoOptions(kCapacity, /*num_shard_bits*/ 0,
+                                              /*strict_capacity_limit*/ true,
+                                              kFullChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  std::vector<port::Thread> threads;
+  threads.reserve(6);
+  for (int t = 0; t < 6; ++t) {
+    threads.emplace_back([&cache, t] {
+      Random rnd(50 + t);
+      std::vector<Cache::Handle*> held;
+      for (int i = 0; i < 20000; ++i) {
+        const std::string key = "k" + std::to_string(rnd.Skewed(10));
+        if (rnd.OneIn(3)) {
+          Cache::Handle* h = nullptr;
+          Status s = cache->Insert(key, nullptr, &kNoopCacheItemHelper,
+                                   512 + rnd.Uniform(2048),
+                                   rnd.OneIn(2) ? &h : nullptr);
+          EXPECT_TRUE(s.ok() || s.IsMemoryLimit()) << s.ToString();
+          if (h != nullptr) {
+            held.push_back(h);
+          }
+        } else if (Cache::Handle* h = cache->Lookup(key)) {
+          held.push_back(h);
+        }
+        // Up to six pins per thread hold more than the capacity in total,
+        // so inserts keep running into the limit.
+        if (held.size() > 6 || (!held.empty() && rnd.OneIn(4))) {
+          cache->Release(held.front(), rnd.OneIn(10));
+          held.erase(held.begin());
+        }
+        ASSERT_LE(cache->GetUsage(), kCapacity);
+      }
+      for (Cache::Handle* h : held) {
+        cache->Release(h);
+      }
+    });
+  }
+  for (port::Thread& thread : threads) {
+    thread.join();
+  }
+  EXPECT_LE(cache->GetUsage(), kCapacity);
+  EXPECT_EQ(0, cache->GetPinnedUsage());
+}
+
+// Slot table: a 16-byte key is stored as a reversible hash, so it must come
+// back exactly, under a nonzero seed, from ApplyToAllEntries and the
+// eviction callback; other lengths come back from their heap copy.
+TEST_F(S3FifoCacheTest, SlotTableReturnsExactKeys) {
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 1 << 20, /*num_shard_bits*/ 2,
+      /*strict_capacity_limit*/ false, kDefaultCacheMetadataChargePolicy);
+  opts.hash_seed = 12345;
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  std::set<std::string> inserted;
+  for (int i = 0; i < 200; ++i) {
+    char buf[17];
+    snprintf(buf, sizeof(buf), "blockkey%08d", i);
+    inserted.insert(std::string(buf, 16));
+    inserted.insert("k" + std::to_string(i));
+  }
+  for (const std::string& key : inserted) {
+    ASSERT_OK(cache->Insert(key, nullptr, &kNoopCacheItemHelper, 1));
+  }
+  std::set<std::string> listed;
+  cache->ApplyToAllEntries(
+      [&](const Slice& key, Cache::ObjectPtr /*value*/, size_t /*charge*/,
+          const Cache::CacheItemHelper* /*helper*/) {
+        listed.insert(key.ToString());
+      },
+      {});
+  EXPECT_EQ(inserted, listed);
+  for (const std::string& key : inserted) {
+    Cache::Handle* h = cache->Lookup(key);
+    ASSERT_NE(nullptr, h);
+    cache->Release(h);
+  }
+
+  std::set<std::string> evicted;
+  cache->SetEvictionCallback(
+      [&](const Slice& key, Cache::Handle* /*h*/, bool /*was_hit*/) {
+        evicted.insert(key.ToString());
+        return false;
+      });
+  cache->SetCapacity(0);
+  EXPECT_EQ(inserted, evicted);
+}
+
+// Slot table: linear-hashing growth relinks chains as the table grows past
+// its initial size, and every key stays findable through growth and
+// erasure.
+TEST_F(S3FifoCacheTest, SlotTableGrowthKeepsEveryKeyFindable) {
+  NewCache(/*capacity*/ 1 << 20);
+  const size_t initial_homes = cache_->GetTableAddressCount();
+  auto key = [](int i) {
+    if (i % 2 == 0) {
+      char buf[17];
+      snprintf(buf, sizeof(buf), "slotkey%09d", i);
+      return std::string(buf, 16);
+    }
+    return "s" + std::to_string(i);
+  };
+  constexpr int kKeys = 5000;
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Insert(key(i)));
+  }
+  EXPECT_GT(cache_->GetTableAddressCount(), initial_homes);
+  EXPECT_EQ(kKeys, cache_->GetOccupancyCount());
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_TRUE(LookupBool(key(i))) << key(i);
+  }
+  for (int i = 0; i < kKeys; i += 3) {
+    Erase(key(i));
+  }
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_EQ(i % 3 != 0, LookupBool(key(i))) << key(i);
+  }
+}
+
+// Slot table: the table never holds more slots than it reserved. Unpinned
+// entries are evicted by occupancy before it fills; once every slot holds a
+// pinned entry, an insert with a handle gets an entry outside the table,
+// under strict_capacity_limit too since it fits.
+TEST_F(S3FifoCacheTest, FullSlotTableEvictsOrGoesStandalone) {
+  // capacity / 64 is the 2048-home floor of the table, so the table tops
+  // out at 2048 homes while charge never runs out.
+  constexpr int kHomes = 2048;
+  NewCache(/*capacity*/ kHomes * 64);
+  for (int i = 0; i < 3 * kHomes; ++i) {
+    ASSERT_OK(Insert("u" + std::to_string(i)));
+  }
+  EXPECT_EQ(kHomes, cache_->GetTableAddressCount());
+  EXPECT_LE(cache_->GetOccupancyCount(), kHomes * 3 / 5 + 1);
+  EXPECT_GT(cache_->GetOccupancyCount(), 0);
+  cache_->EraseUnRefEntries();
+
+  std::vector<S3FifoHandle*> pins;
+  for (int i = 0; i < kHomes; ++i) {
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pins.push_back(h);
+  }
+  EXPECT_EQ(kHomes, cache_->GetOccupancyCount());
+  S3FifoHandle* outside = nullptr;
+  ASSERT_OK(Insert("outside", /*charge*/ 1, &outside));
+  ASSERT_NE(nullptr, outside);
+  EXPECT_EQ(kHomes, cache_->GetOccupancyCount());
+  EXPECT_FALSE(LookupBool("outside"));
+  EXPECT_EQ(kHomes + 1, cache_->GetPinnedUsage());
+  EXPECT_TRUE(cache_->Release(outside, true, false));
+
+  cache_->SetStrictCapacityLimit(true);
+  S3FifoHandle* strict = nullptr;
+  ASSERT_OK(Insert("strict", /*charge*/ 1, &strict));
+  ASSERT_NE(nullptr, strict);
+  EXPECT_TRUE(strict->IsStandalone());
+  EXPECT_EQ(kHomes, cache_->GetOccupancyCount());
+  EXPECT_FALSE(LookupBool("strict"));
+  EXPECT_EQ(kHomes + 1, cache_->GetPinnedUsage());
+  EXPECT_TRUE(cache_->Release(strict, true, false));
+  for (S3FifoHandle* h : pins) {
+    EXPECT_FALSE(cache_->Release(h, true, false));
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+namespace {
+struct CountedValue {
+  int deletes = 0;
+};
+void DeleteCounted(Cache::ObjectPtr obj, MemoryAllocator* /*alloc*/) {
+  ++static_cast<CountedValue*>(obj)->deletes;
+}
+const Cache::CacheItemHelper* CountedHelper() {
+  static const Cache::CacheItemHelper helper{CacheEntryRole::kMisc,
+                                             &DeleteCounted};
+  return &helper;
+}
+
+Status InsertCounted(S3FifoCacheShard* shard, const std::string& key,
+                     CountedValue* value, S3FifoHandle** handle) {
+  return shard->Insert(key, S3FifoCacheShard::ComputeHash(key, 0), value,
+                       CountedHelper(), /*charge*/ 1, handle,
+                       Cache::Priority::LOW);
+}
+
+std::string QueueHeadKey(S3FifoCacheTest* t) {
+  S3FifoHandle* fifo;
+  t->cache_->TEST_GetFIFOList(&fifo);
+  return t->cache_->TEST_Next(fifo)->key().ToString();
+}
+}  // namespace
+
+// Overwriting a key at max table length: the occupancy eviction, which the
+// overwrite does not need, must not evict the entry being replaced, here
+// the queue head (the next victim). The overwrite replaces it like any
+// other: the new value is visible, occupancy is unchanged, the old value is
+// deleted exactly once.
+TEST_F(S3FifoCacheTest, OverwriteAtMaxLengthKeepsReplacedEntry) {
+  {
+    // 2048 homes, the table's floor; charge never runs out.
+    NewCache(/*capacity*/ 2048 * 64);
+    InsertN("u", 3000);
+    ASSERT_EQ(2048, cache_->GetTableAddressCount());
+    CountedValue old_value;
+    CountedValue new_value;
+    ASSERT_OK(InsertCounted(cache_, "victim", &old_value, nullptr));
+    int filler = 0;
+    while (QueueHeadKey(this) != "victim") {
+      ASSERT_OK(Insert("f" + std::to_string(filler++)));
+    }
+    // The next new entry would run occupancy eviction.
+    const size_t occupancy = cache_->GetOccupancyCount();
+    ASSERT_GT((occupancy + 1) * 5, size_t{2048} * 3);
+
+    Status st = InsertCounted(cache_, "victim", &new_value, nullptr);
+    EXPECT_TRUE(st.IsOkOverwritten()) << st.ToString();
+    EXPECT_EQ(occupancy, cache_->GetOccupancyCount());
+    EXPECT_EQ(1, old_value.deletes);
+    EXPECT_EQ(0, new_value.deletes);
+    S3FifoHandle* h = Lookup("victim");
+    ASSERT_NE(nullptr, h);
+    EXPECT_EQ(&new_value, h->value());
+    EXPECT_FALSE(cache_->Release(h, true, false));
+    DeleteCache();
+    EXPECT_EQ(1, old_value.deletes);
+    EXPECT_EQ(1, new_value.deletes);
+  }
+}
+
+// An overwrite that finds no free slot is still accepted (with a handle, as
+// an entry outside the table; without one, dropped), strict or not when it
+// fits, so the old value must not stay visible.
+TEST_F(S3FifoCacheTest, OverwriteWithoutFreeSlotHidesOldValue) {
+  constexpr int kHomes = 2048;
+  for (int mode = 0; mode < 4; ++mode) {
+    const bool with_handle = (mode & 1) != 0;
+    const bool strict = (mode & 2) != 0;
+    SCOPED_TRACE("with_handle=" + std::to_string(with_handle) +
+                 " strict=" + std::to_string(strict));
+    NewCache(/*capacity*/ kHomes * 64, strict);
+    std::vector<S3FifoHandle*> pins;
+    for (int i = 0; i < kHomes - 1; ++i) {
+      S3FifoHandle* h = nullptr;
+      ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+      pins.push_back(h);
+    }
+    CountedValue old_value;
+    CountedValue new_value;
+    S3FifoHandle* old_handle = nullptr;
+    ASSERT_OK(InsertCounted(cache_, "k", &old_value, &old_handle));
+    ASSERT_EQ(kHomes, cache_->GetOccupancyCount());
+
+    S3FifoHandle* outside = nullptr;
+    Status st = InsertCounted(cache_, "k", &new_value,
+                              with_handle ? &outside : nullptr);
+    EXPECT_TRUE(st.IsOkOverwritten()) << st.ToString();
+    EXPECT_EQ(nullptr, Lookup("k"));
+    EXPECT_EQ(kHomes - 1, cache_->GetOccupancyCount());
+    EXPECT_EQ(0, old_value.deletes);
+    EXPECT_EQ(with_handle ? 0 : 1, new_value.deletes);
+    if (with_handle) {
+      ASSERT_NE(nullptr, outside);
+      EXPECT_TRUE(outside->IsStandalone());
+      EXPECT_EQ(&new_value, outside->value());
+      EXPECT_TRUE(cache_->Release(outside, true, false));
+      EXPECT_EQ(1, new_value.deletes);
+    }
+    EXPECT_TRUE(cache_->Release(old_handle, true, false));
+    EXPECT_EQ(1, old_value.deletes);
+    for (S3FifoHandle* p : pins) {
+      EXPECT_FALSE(cache_->Release(p, true, false));
+    }
+    EXPECT_EQ(0, cache_->GetPinnedUsage());
+  }
+}
+
+// Occupancy eviction is bounded by entries: at max table length, each
+// insert of a zero-charge entry (as CacheWithSecondaryAdapter inserts)
+// evicts exactly one entry, not every zero-charge entry it meets.
+TEST_F(S3FifoCacheTest, OccupancyEvictionFreesOneEntryPerInsert) {
+  NewCache(/*capacity*/ 2048 * 64);
+  size_t evicted = 0;
+  eviction_callback_ = [&](const Slice& /*key*/, Cache::Handle* /*h*/,
+                           bool /*was_hit*/) {
+    ++evicted;
+    return false;
+  };
+  size_t most_per_insert = 0;
+  for (int i = 0; i < 3000; ++i) {
+    const size_t before = evicted;
+    ASSERT_OK(Insert("z" + std::to_string(i), /*charge*/ 0));
+    most_per_insert = std::max(most_per_insert, evicted - before);
+  }
+  EXPECT_EQ(2048, cache_->GetTableAddressCount());
+  EXPECT_EQ(1, most_per_insert);
+  EXPECT_EQ(3000, cache_->GetOccupancyCount() + evicted);
+}
+
+// At max table length every new insert also evicts by occupancy, and
+// overwrites of hot keys race lookups, erases, releases and GetPinnedUsage:
+// every value a holder reads is alive and its own, and every value is
+// deleted exactly once.
+TEST_F(S3FifoCacheTest, ConcurrentMaxLengthOverwritesKeepLifetimeExact) {
+  {
+    // 2048 homes per shard, and about one byte per entry: occupancy, not
+    // charge, bounds the table.
+    S3FifoCacheOptions opts = TestS3FifoOptions(
+        /*capacity*/ 256 << 10, /*num_shard_bits*/ 1,
+        /*strict_capacity_limit*/ false, kDontChargeCacheMetadata);
+    std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+    ASSERT_NE(nullptr, cache);
+    constexpr int kThreads = 8;
+    std::atomic<bool> done{false};
+    // GetPinnedUsage scans the slot table without the shard lock while
+    // entries come and go.
+    port::Thread poller([&] {
+      while (!done.load()) {
+        cache->GetPinnedUsage();
+      }
+    });
+    std::vector<port::Thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+      threads.emplace_back([&cache, t] {
+        Random rnd(500 + t);
+        std::vector<std::pair<Cache::Handle*, uint32_t>> held;
+        for (int i = 0; i < 20000; ++i) {
+          const uint32_t k = rnd.Skewed(13);
+          const std::string key = StressKey(k);
+          const uint32_t op = rnd.Uniform(100);
+          if (op < 30) {
+            Cache::Handle* h = nullptr;
+            ASSERT_OK(cache->Insert(key, new StressValue(k), StressHelper(),
+                                    1 + rnd.Uniform(2),
+                                    rnd.OneIn(2) ? &h : nullptr));
+            if (h != nullptr) {
+              CheckStressValue(cache.get(), h, k);
+              held.emplace_back(h, k);
+            }
+          } else if (op < 35) {
+            cache->Erase(key);
+          } else if (Cache::Handle* h = cache->Lookup(key)) {
+            CheckStressValue(cache.get(), h, k);
+            held.emplace_back(h, k);
+          }
+          if (held.size() > 8 || (!held.empty() && rnd.OneIn(2))) {
+            const size_t idx = rnd.Uniform(static_cast<int>(held.size()));
+            CheckStressValue(cache.get(), held[idx].first, held[idx].second);
+            cache->Release(held[idx].first,
+                           /*erase_if_last_ref*/ rnd.OneIn(10));
+            held[idx] = held.back();
+            held.pop_back();
+          }
+        }
+        for (const auto& [h, k] : held) {
+          CheckStressValue(cache.get(), h, k);
+          cache->Release(h);
+        }
+      });
+    }
+    for (port::Thread& thread : threads) {
+      thread.join();
+    }
+    done.store(true);
+    poller.join();
+    EXPECT_EQ(0, cache->GetPinnedUsage());
+    // Both shards reached max length, so occupancy eviction ran.
+    EXPECT_EQ(2 * 2048, cache->GetTableAddressCount());
+  }
+  EXPECT_EQ(0, LiveValues().load());
+}
+
+// GetPinnedUsage takes no shard lock and is exact for every kind of pin:
+// inserts with a handle and lock-free hits, from two threads, an erased
+// entry still pinned, and a standalone entry.
+TEST_F(S3FifoCacheTest, GetPinnedUsageTakesNoShardLock) {
+  NewCache(/*capacity*/ 1000);
+  ASSERT_OK(Insert("r", /*charge*/ 2));
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_OK(Insert("c" + std::to_string(i)));
+  }
+  std::vector<S3FifoHandle*> held;
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(Insert("p", /*charge*/ 3, &h));
+  held.push_back(h);
+  held.push_back(Lookup("r"));
+  held.push_back(Lookup("c7"));
+  port::Thread([&] {
+    held.push_back(Lookup("r"));
+    held.push_back(Lookup("c6"));
+  }).join();
+  ASSERT_OK(Insert("e", /*charge*/ 5));
+  held.push_back(Lookup("e"));
+  Erase("e");
+  held.push_back(
+      cache_->CreateStandalone("s", S3FifoCacheShard::ComputeHash("s", 0),
+                               nullptr, &kNoopCacheItemHelper,
+                               /*charge*/ 7, /*allow_uncharged*/ false));
+  for (S3FifoHandle* x : held) {
+    ASSERT_NE(nullptr, x);
+  }
+  // p + r (pinned twice, counted once) + c7 + c6 + e + s
+  const size_t expected = 3 + 2 + 1 + 1 + 5 + 7;
+
+  size_t seen = 0;
+  bool completed = false;
+  port::Thread reader;
+  {
+    DMutexLock l(cache_->TEST_GetMutex());
+    completed =
+        FinishesWithin20s([&] { seen = cache_->GetPinnedUsage(); }, &reader);
+  }
+  reader.join();
+  EXPECT_TRUE(completed);
+  EXPECT_EQ(expected, seen);
+  for (S3FifoHandle* x : held) {
+    cache_->Release(x, true, false);
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+#ifndef NDEBUG
+// Counts the entries eviction visits (moves, checks, evicts) during op.
+size_t CountEvictionVisits(const std::function<void()>& op) {
+  std::atomic<size_t> visits{0};
+  SyncPoint::GetInstance()->SetCallBack("S3FifoCacheShard::EvictionVisit",
+                                        [&](void*) { visits.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  op();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  return visits.load();
+}
+
+#endif  // !NDEBUG
+
+// Entries set aside stay in the table, charged to their queue, findable
+// and erasable; once unpinned they return to their queue and are evicted
+// in turn, or removed by EraseUnRefEntries.
+TEST_F(S3FifoCacheTest, AsideEntriesReturnOnceUnpinned) {
+  NewCache(/*capacity*/ 200);
+  std::vector<S3FifoHandle*> pinned;
+  for (int i = 0; i < 200; ++i) {
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pinned.push_back(h);
+  }
+  // Rotates p0..p63 and sets p64..p199 aside; x is dropped.
+  ASSERT_OK(Insert("x"));
+  EXPECT_FALSE(ContainsForTest("x"));
+  ValidateFIFOList([] {
+    std::vector<std::string> keys;
+    keys.reserve(64);
+    for (int i = 0; i < 64; ++i) {
+      keys.push_back("p" + std::to_string(i));
+    }
+    return keys;
+  }());
+  EXPECT_EQ(200, cache_->GetPinnedUsage());
+
+  // Aside entries are found, and erased while pinned.
+  EXPECT_TRUE(LookupBool("p150"));
+  Erase("p160");
+  EXPECT_FALSE(LookupBool("p160"));
+  EXPECT_EQ(200, cache_->GetPinnedUsage());
+  EXPECT_TRUE(cache_->Release(pinned[160], true, false));
+
+  // An unpinned aside entry returns within a bounded number of evictions
+  // and is evicted; the pinned ones stay.
+  EXPECT_FALSE(cache_->Release(pinned[150], true, false));
+  int inserts = 0;
+  while (ContainsForTest("p150") && inserts < 200) {
+    ASSERT_OK(Insert("y" + std::to_string(inserts++)));
+  }
+  EXPECT_FALSE(ContainsForTest("p150"));
+  // 136 aside entries (p64..p199), kAsideChecksPerEviction (2) checked per
+  // insert.
+  EXPECT_LE(inserts, (200 - 64) / 2 + 1);
+  // 198 pinned entries, the insert that evicted p150 and the one before it.
+  EXPECT_EQ(200, cache_->GetOccupancyCount());
+
+  // EraseUnRefEntries removes an unpinned aside entry at once.
+  EXPECT_FALSE(cache_->Release(pinned[151], true, false));
+  cache_->EraseUnRefEntries();
+  EXPECT_FALSE(ContainsForTest("p151"));
+  EXPECT_EQ(197, cache_->GetOccupancyCount());
+  EXPECT_EQ(197, cache_->GetPinnedUsage());
+  for (int i = 0; i < 200; ++i) {
+    if (i != 150 && i != 151 && i != 160) {
+      EXPECT_FALSE(cache_->Release(pinned[i], true, false));
+    }
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+
+// Entries set aside while pinned stay within eviction's reach once
+// released: an eviction that would fall short returns them to the queue, a
+// chunk at a time, until its need is met, so a shrink or a large insert
+// frees them like any other unpinned entry.
+TEST_F(S3FifoCacheTest, ReleasedAsideEntriesAreEvictable) {
+  auto pin_then_release = [&] {
+    std::vector<S3FifoHandle*> pinned;
+    for (int i = 0; i < 200; ++i) {
+      S3FifoHandle* h = nullptr;
+      ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+      pinned.push_back(h);
+    }
+    // Rotates p0..p63 and sets p64..p199 aside; x is dropped.
+    ASSERT_OK(Insert("x"));
+    ASSERT_EQ(136, cache_->TEST_GetAsideSize());
+    for (S3FifoHandle* h : pinned) {
+      EXPECT_FALSE(cache_->Release(h, true, false));
+    }
+    ASSERT_EQ(0, cache_->GetPinnedUsage());
+  };
+
+  // A shrink reaches its target.
+  NewCache(/*capacity*/ 200);
+  pin_then_release();
+  cache_->SetCapacity(100);
+  EXPECT_EQ(100, cache_->GetUsage());
+
+  // A strict insert with a handle that fits once unpinned entries are
+  // evicted succeeds.
+  NewCache(/*capacity*/ 200, /*strict*/ true);
+  pin_then_release();
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(Insert("big", /*charge*/ 100, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_EQ(200, cache_->GetUsage());
+  EXPECT_FALSE(cache_->Release(h, true, false));
+
+  // So does one without a handle, instead of being dropped.
+  NewCache(/*capacity*/ 200);
+  pin_then_release();
+  ASSERT_OK(Insert("big", /*charge*/ 100));
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_EQ(200, cache_->GetUsage());
+}
+
+#ifndef NDEBUG
+// After a burst of pins is released, an eviction that falls short returns
+// unpinned aside entries a chunk at a time and stops once its need is met,
+// instead of walking the whole aside list under the mutex. The entries it
+// did not reach stay within eviction's reach.
+TEST_F(S3FifoCacheTest, AsideReturnIsBounded) {
+  // Reserved for 1 MiB, so 2000 entries stay below the occupancy limit and
+  // only charge decides what is evicted.
+  NewCache(/*capacity*/ 2000, /*strict*/ false, kDontChargeCacheMetadata,
+           /*max_capacity*/ 1 << 20);
+  std::vector<S3FifoHandle*> pinned;
+  for (int i = 0; i < 2000; ++i) {
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pinned.push_back(h);
+  }
+  // Rotates p0..p63 and sets the other 1936 aside; x is dropped.
+  ASSERT_OK(Insert("x"));
+  ASSERT_EQ(1936, cache_->TEST_GetAsideSize());
+  for (S3FifoHandle* h : pinned) {
+    EXPECT_FALSE(cache_->Release(h, true, false));
+  }
+  int visits = 0;
+  SyncPoint::GetInstance()->SetCallBack("S3FifoCacheShard::EvictionVisit",
+                                        [&](void*) { ++visits; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // Needs 100: the queue holds 66 (p0..p63 and two returned), the rest
+  // comes from the aside list.
+  ASSERT_OK(Insert("big", /*charge*/ 100));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(ContainsForTest("big"));
+  EXPECT_EQ(2000, cache_->GetUsage());
+  EXPECT_LT(visits, 300);
+  EXPECT_GT(cache_->TEST_GetAsideSize(), 1000);
+  // The rest of the aside list is still evictable.
+  cache_->SetCapacity(100);
+  EXPECT_EQ(100, cache_->GetUsage());
+}
+
+// The last Release of an entry can race with eviction setting it aside: it
+// checks the aside flag before SetAside sets it, so it does not flag the
+// shard. SetAside then sees the unref itself, and the entry stays within
+// eviction's reach.
+TEST_F(S3FifoCacheTest, AsideEntryReleasedWhileSetAsideIsEvictable) {
+  NewCache(/*capacity*/ 200);
+  std::vector<S3FifoHandle*> pinned;
+  for (int i = 0; i < 200; ++i) {
+    S3FifoHandle* h = nullptr;
+    ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pinned.push_back(h);
+  }
+  // p0..p63 rotate; the tenth entry set aside, p73, is released between
+  // its move and its flag.
+  int set_aside = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "S3FifoCacheShard::SetAside:BeforeFlag", [&](void* arg) {
+        if (++set_aside == 10) {
+          ASSERT_EQ(pinned[73], arg);
+          EXPECT_FALSE(cache_->Release(pinned[73], true, false));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // All other entries are pinned, and the two aside checks ran before
+  // anything was set aside, so only the chunked aside walk (EvictNeed) can
+  // make room for x.
+  ASSERT_OK(Insert("x"));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(ContainsForTest("x"));
+  EXPECT_FALSE(ContainsForTest("p73"));
+  EXPECT_EQ(135, cache_->TEST_GetAsideSize());
+  EXPECT_EQ(199, cache_->GetPinnedUsage());
+  for (int i = 0; i < 200; ++i) {
+    if (i != 73) {
+      EXPECT_FALSE(cache_->Release(pinned[i], true, false));
+    }
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+}
+#endif  // !NDEBUG
+
+// A large cache reserves its slot table (kMaxLength homes in 128-byte
+// groups of three slots) without committing it: the table works, and on Linux
+// the mapping is flagged no-reserve ("nr" in smaps), so it does not count
+// against the commit limit. Linux ignores the flag, and would account the whole
+// reservation, under vm.overcommit_memory=2.
+TEST_F(S3FifoCacheTest, LargeCapacityReservesWithoutCommit) {
+  if (sizeof(size_t) < 8) {
+    ROCKSDB_GTEST_BYPASS("a 16 GiB capacity needs a 64-bit size_t");
+    return;
+  }
+#ifdef OS_WIN
+  ROCKSDB_GTEST_BYPASS("Windows commits the reservation up front");
+#else
+#ifdef OS_LINUX
+  int overcommit_mode = 0;
+  std::ifstream("/proc/sys/vm/overcommit_memory") >> overcommit_mode;
+  if (overcommit_mode == 2) {
+    ROCKSDB_GTEST_BYPASS("strict overcommit accounts the reservation");
+    return;
+  }
+#endif  // OS_LINUX
+  // One 16 GiB shard: a slot table at kMaxLength homes.
+  NewCache(/*capacity*/ size_t{16} << 30);
+  ASSERT_OK(Insert("k"));
+  EXPECT_TRUE(LookupBool("k"));
+#ifdef OS_LINUX
+  S3FifoHandle* fifo;
+  cache_->TEST_GetFIFOList(&fifo);
+  const uintptr_t table = reinterpret_cast<uintptr_t>(fifo);
+  std::ifstream smaps("/proc/self/smaps");
+  std::string line;
+  bool in_table = false;
+  std::string flags;
+  while (std::getline(smaps, line)) {
+    unsigned long long lo = 0;
+    unsigned long long hi = 0;
+    char dash = 0;
+    std::istringstream header(line);
+    if (header >> std::hex >> lo >> dash >> hi && dash == '-') {
+      in_table = lo <= table && table < hi;
+    } else if (in_table && line.rfind("VmFlags:", 0) == 0) {
+      flags = line + " ";
+    }
+  }
+  EXPECT_NE(std::string::npos, flags.find(" nr ")) << flags;
+#endif  // OS_LINUX
+#endif  // OS_WIN
+}
+
+// Inserts prefix0..prefix<n-1> and returns the highest slot index any of
+// them landed in, counted from slot 0 (the FIFO queue head).
+size_t InsertNAndGetHighestSlot(S3FifoCacheTest* t, const std::string& prefix,
+                                int n) {
+  t->InsertN(prefix, n);
+  size_t highest = 0;
+  for (int i = 0; i < n; ++i) {
+    S3FifoHandle* h = t->Lookup(prefix + std::to_string(i));
+    EXPECT_NE(nullptr, h);
+    if (h != nullptr) {
+      highest = std::max(highest, t->cache_->TEST_IndexOf(h));
+      t->cache_->Release(h, true, false);
+    }
+  }
+  return highest;
+}
+
+// EraseUnRefEntries returns an emptied table to its initial homes and their
+// charge, but never below a slot still in use, here a pinned entry erased
+// from the table. Slot 0 is the queue head, so slot i needs i homes. The
+// table grows again afterwards.
+TEST_F(S3FifoCacheTest, EraseUnRefEntriesShrinksEmptyTable) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  const size_t baseline_usage = cache_->GetUsage();
+  const size_t initial_homes = cache_->GetTableAddressCount();
+  const size_t highest = InsertNAndGetHighestSlot(this, "k", 100);
+  const size_t grown = cache_->GetTableAddressCount();
+  ASSERT_GT(highest, initial_homes);
+  std::string pinned_key;
+  for (int i = 0; i < 100 && pinned_key.empty(); ++i) {
+    S3FifoHandle* h = Lookup("k" + std::to_string(i));
+    ASSERT_NE(nullptr, h);
+    if (cache_->TEST_IndexOf(h) == highest) {
+      pinned_key = "k" + std::to_string(i);
+    }
+    cache_->Release(h, true, false);
+  }
+  S3FifoHandle* pinned = Lookup(pinned_key);
+  ASSERT_NE(nullptr, pinned);
+
+  // An entry left in the table: no shrink.
+  cache_->EraseUnRefEntries();
+  EXPECT_EQ(1, cache_->GetOccupancyCount());
+  EXPECT_EQ(grown, cache_->GetTableAddressCount());
+
+  // Erased but pinned: the table is empty but keeps the entry's slot, and
+  // stays fully charged.
+  Erase(pinned_key);
+  cache_->EraseUnRefEntries();
+  EXPECT_EQ(0, cache_->GetOccupancyCount());
+  EXPECT_EQ(highest, cache_->GetTableAddressCount());
+  EXPECT_TRUE(cache_->TEST_FreeListMatchesTable());
+  EXPECT_EQ(cache_->GetUsage(),
+            cache_->GetPinnedUsage() + S3FifoCacheShard::TableChargeFor(
+                                           cache_->GetTableAddressCount()));
+
+  EXPECT_TRUE(cache_->Release(pinned, true, false));
+  cache_->EraseUnRefEntries();
+  EXPECT_EQ(initial_homes, cache_->GetTableAddressCount());
+  EXPECT_EQ(baseline_usage, cache_->GetUsage());
+
+  InsertN("k", 100);
+  EXPECT_EQ(grown, cache_->GetTableAddressCount());
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_TRUE(LookupBool("k" + std::to_string(i)));
+  }
+}
+
+#ifndef NDEBUG
+// A Lookup in flight holds back reclamation of every slot retired since it
+// started, so EraseUnRefEntries shrinks the table only down to the highest
+// of those slots; once the Lookup finishes (missing the erased key), the
+// table returns to its initial homes and charge.
+TEST_F(S3FifoCacheTest, ShrinkKeepsSlotsOfInFlightLookup) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  const size_t baseline_usage = cache_->GetUsage();
+  const size_t initial_homes = cache_->GetTableAddressCount();
+  const size_t highest = InsertNAndGetHighestSlot(this, "k", 100);
+  ASSERT_GT(highest, initial_homes);
+  S3FifoHandle* found = nullptr;
+  RunWhileParked(
+      "S3FifoCacheShard::Lookup:Found", [&] { found = Lookup("k0"); },
+      [&] {
+        cache_->EraseUnRefEntries();
+        EXPECT_EQ(0, cache_->GetOccupancyCount());
+        EXPECT_EQ(highest, cache_->GetTableAddressCount());
+      });
+  EXPECT_EQ(nullptr, found);
+  cache_->EraseUnRefEntries();
+  EXPECT_EQ(initial_homes, cache_->GetTableAddressCount());
+  EXPECT_EQ(baseline_usage, cache_->GetUsage());
+}
+#endif  // !NDEBUG
+
+#ifndef NDEBUG
+// The reader scan that reclamation needs runs after the shard lock is
+// released, so its cost, which grows with the threads in the process,
+// never adds to a lock hold.
+TEST_F(S3FifoCacheTest, ReaderScanRunsOutsideShardLock) {
+  NewCache(/*capacity*/ 1000);
+  bool completed = false;
+  port::Thread locker;
+  RunWhileParked(
+      "S3FifoCacheShard::ScanReaders",
+      [&] {
+        ASSERT_OK(Insert("k"));
+        Erase("k");
+        // Two kReclaimInterval rounds.
+        for (int i = 0; i < 2 * 16; ++i) {
+          Erase("missing" + std::to_string(i));
+        }
+      },
+      [&] {
+        // TEST_GetFIFOSize takes mutex_ (GetUsage does not), so it
+        // blocks if the parked scan holds the lock.
+        completed =
+            FinishesWithin20s([&] { cache_->TEST_GetFIFOSize(); }, &locker);
+      });
+  // The parked scan has resumed, so a blocked locker can finish now.
+  locker.join();
+  EXPECT_TRUE(completed);
+}
+
+// A scan's result frees only the batches stamped before the scan was
+// asked for. Here a scan that found no reader is still pending when a
+// Lookup starts and the entry it stands on is erased; that slot is not
+// reused while the Lookup is in flight, so the Lookup misses instead of
+// taking a ref on the entry that would reuse the slot.
+TEST_F(S3FifoCacheTest, ReaderScanCoversOnlyEarlierBatches) {
+  NewCache(/*capacity*/ 1000);
+  std::atomic<int> scans{0};
+  SyncPoint::GetInstance()->SetCallBack("S3FifoCacheShard::ScanReaders",
+                                        [&](void*) { scans.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto erase_until_scans = [&](int target) {
+    for (int i = 0; scans.load() < target; ++i) {
+      ASSERT_LT(i, 1000);
+      Erase("missing" + std::to_string(i));
+    }
+  };
+  ASSERT_OK(Insert("x"));
+  ASSERT_OK(Insert("b"));
+  Erase("x");
+  // Ends right after a scan that saw no reader; its result is not applied
+  // yet.
+  erase_until_scans(1);
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  S3FifoHandle* found = nullptr;
+  RunWhileParked(
+      "S3FifoCacheShard::Lookup:Found", [&] { found = Lookup("b"); },
+      [&] {
+        Erase("b");
+        SyncPoint::GetInstance()->SetCallBack(
+            "S3FifoCacheShard::ScanReaders",
+            [&](void*) { scans.fetch_add(1); });
+        SyncPoint::GetInstance()->EnableProcessing();
+        // Applies the pending result, then scans twice more with the
+        // Lookup in flight.
+        erase_until_scans(3);
+        SyncPoint::GetInstance()->DisableProcessing();
+        // An entry with b's hash: it would land in b's slot were that slot
+        // already free.
+        ASSERT_OK(cache_->Insert("b2", S3FifoCacheShard::ComputeHash("b", 0),
+                                 nullptr, &kNoopCacheItemHelper, 1, nullptr,
+                                 Cache::Priority::LOW));
+      });
+  EXPECT_EQ(nullptr, found);
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+namespace {
+// Runs a Lookup from its destructor, which runs after the thread's
+// ThreadReaderHolder is destroyed when the object was constructed first.
+struct LookupAtThreadExit {
+  std::function<void()> fn;
+  ~LookupAtThreadExit() {
+    if (fn) {
+      fn();
+    }
+  }
+};
+LookupAtThreadExit& ThreadExitLookup() {
+  thread_local LookupAtThreadExit lookup;
+  return lookup;
+}
+}  // namespace
+
+// A Lookup made after the calling thread released its reader (from a
+// later thread_local destructor) announces itself in a reader no other
+// thread uses, so a thread that adopts the released reader cannot clear
+// the announcement and let the Lookup's slot be reclaimed under it.
+TEST_F(S3FifoCacheTest, LookupAtThreadExitKeepsItsAnnouncement) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  const size_t initial_homes = cache_->GetTableAddressCount();
+  const size_t highest = InsertNAndGetHighestSlot(this, "k", 100);
+  ASSERT_GT(highest, initial_homes);
+  std::string late_key;
+  for (int i = 0; i < 100 && late_key.empty(); ++i) {
+    S3FifoHandle* h = Lookup("k" + std::to_string(i));
+    ASSERT_NE(nullptr, h);
+    if (cache_->TEST_IndexOf(h) == highest) {
+      late_key = "k" + std::to_string(i);
+    }
+    cache_->Release(h, true, false);
+  }
+
+  S3FifoHandle* found = nullptr;
+  std::atomic<bool> armed{false};
+  std::promise<void> reached;
+  std::promise<void> resume;
+  std::shared_future<void> resumed = resume.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack("S3FifoCacheShard::Lookup:Found",
+                                        [&](void*) {
+                                          if (armed.exchange(false)) {
+                                            reached.set_value();
+                                            resumed.wait();
+                                          }
+                                        });
+  SyncPoint::GetInstance()->EnableProcessing();
+  port::Thread exiting([&] {
+    // Constructed before the thread's first Lookup creates its reader, so
+    // destroyed after it.
+    ThreadExitLookup().fn = [&] {
+      armed.store(true);
+      found = Lookup(late_key);
+    };
+    EXPECT_TRUE(LookupBool(late_key));
+  });
+  reached.get_future().wait();
+  // Another thread, likely adopting the released reader, looks up and
+  // finishes; then every entry is erased and the table shrinks, but not
+  // below the slot the exiting thread's Lookup stands on.
+  port::Thread([&] { EXPECT_TRUE(LookupBool("k0")); }).join();
+  cache_->EraseUnRefEntries();
+  EXPECT_EQ(0, cache_->GetOccupancyCount());
+  EXPECT_EQ(highest, cache_->GetTableAddressCount());
+  EXPECT_TRUE(cache_->TEST_FreeListMatchesTable());
+  resume.set_value();
+  exiting.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(nullptr, found);
+  cache_->EraseUnRefEntries();
+  EXPECT_EQ(initial_homes, cache_->GetTableAddressCount());
+}
+#endif  // !NDEBUG
+
+// Lookups, inserts, erases and releases race EraseUnRefEntries and the table
+// shrinks it makes: every value a holder reads is alive and its own, every
+// value is deleted exactly once, and once all pins are released the cache
+// is back to its initial table charge.
+TEST_F(S3FifoCacheTest, ConcurrentShrinkKeepsLifetimeExact) {
+  // Heap keys, then 16-byte keys (the production path).
+  for (bool hashed_keys : {false, true}) {
+    SCOPED_TRACE(hashed_keys ? "16-byte keys" : "heap keys");
+    StressHashedKeys().store(hashed_keys);
+    {
+      S3FifoCacheOptions opts = TestS3FifoOptions(
+          /*capacity*/ 64 << 10, /*num_shard_bits*/ 1,
+          /*strict_capacity_limit*/ false, kFullChargeCacheMetadata);
+      std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+      ASSERT_NE(nullptr, cache);
+      const size_t baseline_usage = cache->GetUsage();
+      constexpr int kThreads = 6;
+      std::vector<port::Thread> threads;
+      threads.reserve(kThreads);
+      for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&cache, t] {
+          Random rnd(300 + t);
+          std::vector<std::pair<Cache::Handle*, uint32_t>> held;
+          for (int i = 0; i < 20000; ++i) {
+            const uint32_t k = rnd.Skewed(9);
+            const std::string key = StressKey(k);
+            const uint32_t op = rnd.Uniform(100);
+            if (op < 25) {
+              Cache::Handle* h = nullptr;
+              ASSERT_OK(cache->Insert(key, new StressValue(k), StressHelper(),
+                                      64 + rnd.Uniform(512),
+                                      rnd.OneIn(2) ? &h : nullptr));
+              if (h != nullptr) {
+                held.emplace_back(h, k);
+              }
+            } else if (op < 30) {
+              cache->Erase(key);
+            } else if (op < 32) {
+              cache->EraseUnRefEntries();
+            } else if (Cache::Handle* h = cache->Lookup(key)) {
+              CheckStressValue(cache.get(), h, k);
+              held.emplace_back(h, k);
+            }
+            if (held.size() > 4 || (!held.empty() && rnd.OneIn(2))) {
+              const size_t idx = rnd.Uniform(static_cast<int>(held.size()));
+              CheckStressValue(cache.get(), held[idx].first, held[idx].second);
+              cache->Release(held[idx].first,
+                             /*erase_if_last_ref*/ rnd.OneIn(10));
+              held[idx] = held.back();
+              held.pop_back();
+            }
+          }
+          for (const auto& [h, k] : held) {
+            CheckStressValue(cache.get(), h, k);
+            cache->Release(h);
+          }
+        });
+      }
+      for (port::Thread& thread : threads) {
+        thread.join();
+      }
+      EXPECT_EQ(0, cache->GetPinnedUsage());
+      cache->EraseUnRefEntries();
+      EXPECT_EQ(baseline_usage, cache->GetUsage());
+    }
+    EXPECT_EQ(0, LiveValues().load());
+  }
+  StressHashedKeys().store(false);
+}
+
+#ifndef NDEBUG
+// The reader scan runs once per ReaderWorkInterval() calls, which grows with
+// the readers in the process, so a process with many threads does not make
+// every insert pay for visiting all of them. The readers it creates outlive
+// it, so later tests in the same process see at least 512 readers (a longer
+// ReaderWorkInterval).
+TEST_F(S3FifoCacheTest, ReaderScanIntervalGrowsWithReaders) {
+  if (sizeof(void*) < 8) {
+    // 512 live threads with default stacks would exhaust a 32-bit address
+    // space.
+    ROCKSDB_GTEST_BYPASS("512 live threads need a 64-bit address space");
+    return;
+  }
+  // Room for a table whose eighth is far above readers / 8.
+  NewCache(/*capacity*/ 1 << 20);
+  // Threads alive at once each take a reader of their own, and the reader
+  // outlives its thread.
+  constexpr int kThreads = 512;
+  bool started_all = true;
+  {
+    // A blocking barrier, so waiting threads use no CPU (a spinning one
+    // starves thread creation under TSan).
+    std::mutex mu;
+    std::condition_variable cv;
+    int arrived = 0;
+    std::vector<port::Thread> threads;
+    threads.reserve(kThreads);
+    try {
+      for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+          EXPECT_EQ(nullptr, Lookup("absent"));
+          std::unique_lock<std::mutex> lock(mu);
+          if (++arrived >= kThreads) {
+            cv.notify_all();
+          } else {
+            cv.wait(lock, [&] { return arrived >= kThreads; });
+          }
+        });
+      }
+    } catch (const std::system_error&) {
+      // Thread creation can fail under a thread, pid or address-space
+      // limit. Release the threads already started (destroying a joinable
+      // thread aborts the process), join them, and skip.
+      started_all = false;
+      std::lock_guard<std::mutex> lock(mu);
+      arrived = kThreads;
+      cv.notify_all();
+    }
+    for (port::Thread& t : threads) {
+      t.join();
+    }
+  }
+  if (!started_all) {
+    ROCKSDB_GTEST_BYPASS("could not start 512 threads");
+    return;
+  }
+  constexpr int kEntries = 8192;
+  constexpr size_t kCharge = 128;
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_OK(Insert("f" + std::to_string(i), kCharge));
+  }
+
+  // Every insert from here evicts one entry and retires its slot. With at
+  // least 512 readers, a scan is asked for at most once per 64 calls,
+  // instead of once per kReclaimInterval (16).
+  std::atomic<int> scans{0};
+  SyncPoint::GetInstance()->SetCallBack("S3FifoCacheShard::ScanReaders",
+                                        [&](void*) { scans.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_OK(Insert("g" + std::to_string(i), kCharge));
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_LE(scans.load(), kEntries / 64 + 2);
+  // Retired slots are still reclaimed: the table holds the newest entries
+  // without having grown past what one shard's worth of entries needs.
+  EXPECT_GE(scans.load(), 1);
+  EXPECT_TRUE(ContainsForTest("g" + std::to_string(kEntries - 1)));
+  EXPECT_EQ(kEntries, cache_->GetOccupancyCount());
+  EXPECT_LT(cache_->GetTableAddressCount(), 2 * kEntries);
+}
+#endif  // !NDEBUG
+
+// Slot layout: 42-byte slots, three to a 128-byte group. At every
+// position the fields a Lookup reads (key, state, head, chain_next) stay in
+// one 64-byte line, and every 2-byte atomic sits at an even offset.
+TEST_F(S3FifoCacheTest, SlotLayoutPacksThreePerGroup) {
+  EXPECT_EQ(42, sizeof(S3FifoHandle));
+  EXPECT_EQ(2, alignof(S3FifoHandle));
+  EXPECT_EQ(128, sizeof(S3FifoSlotGroup));
+  EXPECT_EQ(128, alignof(S3FifoSlotGroup));
+  EXPECT_EQ(3, S3FifoSlotGroup::kSlots);
+  S3FifoSlotGroup group;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(&group);
+  auto offset = [base](const void* p) {
+    return static_cast<size_t>(reinterpret_cast<uintptr_t>(p) - base);
+  };
+  for (size_t r = 0; r < S3FifoSlotGroup::kSlots; ++r) {
+    SCOPED_TRACE("slot " + std::to_string(r));
+    const S3FifoHandle& h = group.s[r];
+    const size_t start = offset(&h);
+    EXPECT_EQ(42 * r, start);
+    EXPECT_EQ(start + 0, offset(h.key_data));
+    EXPECT_EQ(start + 16, offset(&h.state));
+    EXPECT_EQ(start + 18, offset(&h.head));
+    EXPECT_EQ(start + 20, offset(&h.chain_next));
+    EXPECT_EQ(start + 22, offset(h.value_data));
+    EXPECT_EQ(start + 30, offset(h.charge_data));
+    EXPECT_EQ(start + 34, offset(&h.next));
+    EXPECT_EQ(start + 36, offset(&h.prev));
+    EXPECT_EQ(start + 38, offset(&h.helper_index));
+    EXPECT_EQ(start + 39, offset(&h.flags));
+    EXPECT_EQ(start + 40, offset(&h.aside));
+    const size_t lookup_last = offset(&h.chain_next) + sizeof(h.chain_next) - 1;
+    EXPECT_EQ(start / 64, lookup_last / 64);
+    for (const void* atomic16 :
+         {static_cast<const void*>(&h.state), static_cast<const void*>(&h.head),
+          static_cast<const void*>(&h.chain_next)}) {
+      EXPECT_EQ(0, offset(atomic16) % 2);
+    }
+  }
+}
+
+// Slot indexes are 16 bits: a shard holds at most kMaxLength homes, whatever
+// its capacity, with the aside head (the highest slot index) below kNoLink.
+// A shard filled at the cap keeps working: the table stops there, new keys
+// evict by occupancy, and every entry stays reachable.
+TEST_F(S3FifoCacheTest, TableCappedAt16BitSlotIndexes) {
+  EXPECT_EQ(65532, S3FifoCacheShard::kMaxLength);
+  EXPECT_EQ(0xFFFF, S3FifoCacheShard::kNoLink);
+  EXPECT_EQ(S3FifoCacheShard::kMaxLength,
+            S3FifoCacheShard::MaxLengthFor(SIZE_MAX));
+  if constexpr (sizeof(size_t) > 4) {
+    EXPECT_EQ(S3FifoCacheShard::kMaxLength,
+              S3FifoCacheShard::MaxLengthFor(size_t{16} << 30));
+  }
+  // At 64 bytes per home: a capacity worth 65531 homes, just below the cap,
+  // gets them all; one worth 65533, just above it, gets the cap (65532).
+  EXPECT_EQ(65531, S3FifoCacheShard::MaxLengthFor(65531 * 64));
+  EXPECT_EQ(65532, S3FifoCacheShard::MaxLengthFor(65533 * 64));
+
+  NewCache(/*capacity*/ 64 << 20);
+  std::string printable;
+  cache_->AppendPrintableOptions(printable);
+  EXPECT_NE(std::string::npos,
+            printable.find("reserved_homes_per_shard: 65532\n"))
+      << printable;
+  constexpr int kKeys = 50000;
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Insert("k" + std::to_string(i)));
+  }
+  EXPECT_EQ(S3FifoCacheShard::kMaxLength, cache_->GetTableAddressCount());
+  const size_t occupancy = cache_->GetOccupancyCount();
+  EXPECT_LE(occupancy, S3FifoCacheShard::kMaxLength * 3 / 5 + 1);
+  EXPECT_GT(occupancy, S3FifoCacheShard::kMaxLength * 3 / 5 - 64);
+  EXPECT_GT(cache_->GetStats().occupancy_evictions, 0);
+  EXPECT_TRUE(cache_->TEST_FreeListMatchesTable());
+  // Every entry the table holds is found by Lookup, up to the highest slots.
+  size_t found = 0;
+  size_t highest = 0;
+  for (int i = 0; i < kKeys; ++i) {
+    S3FifoHandle* h = Lookup("k" + std::to_string(i));
+    if (h != nullptr) {
+      ++found;
+      highest = std::max(highest, cache_->TEST_IndexOf(h));
+      EXPECT_FALSE(cache_->Release(h, true, false));
+    }
+  }
+  EXPECT_EQ(occupancy, found);
+  EXPECT_GT(highest, size_t{65000});
+  EXPECT_LT(highest, size_t{S3FifoCacheShard::kNoLink} - 1);
+  EXPECT_TRUE(LookupBool("k" + std::to_string(kKeys - 1)));
+  cache_->EraseUnRefEntries();
+  EXPECT_EQ(0, cache_->GetOccupancyCount());
+  EXPECT_EQ(4, cache_->GetTableAddressCount());
+  EXPECT_EQ(0, cache_->GetUsage());
+}
+
+// Refs are 15 bits. At the cap a Lookup misses without taking a ref, and Ref
+// is refused, so the count never carries into kInCache; Release still
+// balances, and the entry is found again once a ref is dropped.
+TEST_F(S3FifoCacheTest, LookupAndRefStopAtRefCap) {
+  constexpr int kRefCap = (1 << 15) - 1;
+  EXPECT_EQ(kRefCap, S3FifoHandle::kRefMask);
+  NewCache(/*capacity*/ 100);
+  S3FifoHandle* first = nullptr;
+  ASSERT_OK(Insert("k", /*charge*/ 1, &first));
+  ASSERT_NE(nullptr, first);
+  std::vector<S3FifoHandle*> held{first};
+  while (held.size() < kRefCap) {
+    S3FifoHandle* h = Lookup("k");
+    ASSERT_NE(nullptr, h);
+    ASSERT_EQ(first, h);
+    held.push_back(h);
+  }
+  S3FifoHandle* over = Lookup("k");
+  EXPECT_EQ(nullptr, over);
+  if (over != nullptr) {
+    held.push_back(over);
+  }
+  const bool ref_over = cache_->Ref(first);
+  EXPECT_FALSE(ref_over);
+  if (ref_over) {
+    held.push_back(first);
+  }
+  EXPECT_EQ(1, cache_->GetPinnedUsage());
+
+  // One ref below the cap, Ref and Lookup work again, up to the cap.
+  EXPECT_FALSE(cache_->Release(held.back(), true, false));
+  held.pop_back();
+  EXPECT_TRUE(cache_->Ref(first));
+  held.push_back(first);
+  EXPECT_FALSE(cache_->Ref(first));
+  EXPECT_FALSE(cache_->Release(held.back(), true, false));
+  held.pop_back();
+  S3FifoHandle* again = Lookup("k");
+  EXPECT_EQ(first, again);
+  if (again != nullptr) {
+    held.push_back(again);
+  }
+  EXPECT_EQ(nullptr, Lookup("k"));
+
+  for (S3FifoHandle* h : held) {
+    EXPECT_FALSE(cache_->Release(h, true, false));
+  }
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+  EXPECT_EQ(1, cache_->GetUsage());
+  EXPECT_TRUE(LookupBool("k"));
+}
+
+// A slot keeps a 32-bit charge. An entry whose total charge is above
+// UINT32_MAX is handed out standalone with its full charge (with a handle;
+// under strict_capacity_limit only if it fits) or dropped (without one), and
+// accounted exactly; one of UINT32_MAX still goes in the table.
+TEST_F(S3FifoCacheTest, ChargeAboveUint32GoesStandalone) {
+  if (sizeof(size_t) < 8) {
+    ROCKSDB_GTEST_BYPASS("charges over 4 GiB need a 64-bit size_t");
+    return;
+  }
+  constexpr size_t kMaxSlotCharge = std::numeric_limits<uint32_t>::max();
+  constexpr size_t kBig = size_t{5} << 30;
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kDontChargeCacheMetadata);
+  cache_->SetCapacity(size_t{64} << 30);
+  auto insert = [this](const std::string& key, CountedValue* value,
+                       size_t charge, S3FifoHandle** handle) {
+    return cache_->Insert(key, S3FifoCacheShard::ComputeHash(key, 0), value,
+                          CountedHelper(), charge, handle,
+                          Cache::Priority::LOW);
+  };
+  auto charge_in_table = [this](const std::string& key) {
+    size_t charge = 0;
+    size_t state = 0;
+    while (state != SIZE_MAX) {
+      cache_->ApplyToSomeEntries(
+          [&](const Slice& k, Cache::ObjectPtr, size_t c,
+              const Cache::CacheItemHelper*) {
+            if (k.ToString() == key) {
+              charge = c;
+            }
+          },
+          /*average_entries_per_lock*/ 1000, &state);
+    }
+    return charge;
+  };
+
+  CountedValue edge;
+  ASSERT_OK(insert("edge", &edge, kMaxSlotCharge, nullptr));
+  EXPECT_EQ(kMaxSlotCharge, charge_in_table("edge"));
+  EXPECT_EQ(kMaxSlotCharge, cache_->GetUsage());
+
+  // With a handle: standalone, charged in full while held.
+  CountedValue big;
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(insert("big", &big, kBig, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(kBig, h->GetCharge(kDontChargeCacheMetadata));
+  EXPECT_EQ(CountedHelper(), h->GetHelper(cache_->helpers()));
+  EXPECT_EQ(kMaxSlotCharge + kBig, cache_->GetUsage());
+  EXPECT_EQ(kBig, cache_->GetPinnedUsage());
+  EXPECT_FALSE(ContainsForTest("big"));
+  EXPECT_EQ(nullptr, Lookup("big"));
+  EXPECT_EQ(1, cache_->GetStats().large_charge_standalone);
+  EXPECT_EQ(0, cache_->GetStats().table_full_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, big.deletes);
+  EXPECT_EQ(kMaxSlotCharge, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+
+  // Without a handle: dropped, like an insert into a full table.
+  CountedValue dropped;
+  ASSERT_OK(insert("dropped", &dropped, kBig, nullptr));
+  EXPECT_EQ(1, dropped.deletes);
+  EXPECT_FALSE(ContainsForTest("dropped"));
+  EXPECT_EQ(kMaxSlotCharge, cache_->GetUsage());
+
+  // Overwriting a key in the table: the old entry goes, the new one is
+  // standalone.
+  CountedValue edge2;
+  S3FifoHandle* h2 = nullptr;
+  Status s = insert("edge", &edge2, kBig, &h2);
+  EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+  ASSERT_NE(nullptr, h2);
+  EXPECT_EQ(1, edge.deletes);
+  EXPECT_FALSE(ContainsForTest("edge"));
+  EXPECT_EQ(kBig, cache_->GetUsage());
+  EXPECT_TRUE(cache_->Release(h2, true, false));
+  EXPECT_EQ(1, edge2.deletes);
+  EXPECT_EQ(0, cache_->GetUsage());
+  EXPECT_EQ(2, cache_->GetStats().large_charge_standalone);
+
+  // Under strict_capacity_limit it fits, so it is standalone too (see
+  // StrictLargeChargeInsertThatFitsGoesStandalone; one that does not fit is
+  // refused, see StrictLargeChargeInsertThatDoesNotFitIsRefused).
+  cache_->SetStrictCapacityLimit(true);
+  CountedValue kept;
+  ASSERT_OK(insert("kept", &kept, 1, nullptr));
+  CountedValue strict_big;
+  S3FifoHandle* h3 = nullptr;
+  ASSERT_OK(insert("strict", &strict_big, kBig, &h3));
+  ASSERT_NE(nullptr, h3);
+  EXPECT_TRUE(h3->IsStandalone());
+  EXPECT_FALSE(ContainsForTest("strict"));
+  EXPECT_TRUE(ContainsForTest("kept"));
+  EXPECT_EQ(1 + kBig, cache_->GetUsage());
+  EXPECT_EQ(3, cache_->GetStats().large_charge_standalone);
+  EXPECT_TRUE(cache_->Release(h3, true, false));
+  EXPECT_EQ(1, strict_big.deletes);
+  EXPECT_EQ(1, cache_->GetUsage());
+  // The values live on this stack frame: free the cache before they go.
+  DeleteCache();
+  EXPECT_EQ(1, kept.deletes);
+}
+
+// Helpers are registered per cache, up to 255 distinct ones, so each slot
+// keeps a one-byte index. Every reader (GetCacheItemHelper, Value,
+// ApplyToAllEntries, the eviction callback, the deleter) gets the entry's own
+// helper back, across shards. An entry with a helper past the 255th is
+// standalone (with a handle) or dropped (without one), and the standalone
+// ones are counted.
+TEST_F(S3FifoCacheTest, HelperRegistryOverflowGoesStandalone) {
+  constexpr int kHelpers = 300;
+  constexpr int kRegistered = 255;
+  std::deque<Cache::CacheItemHelper> helpers;
+  for (int i = 0; i < kHelpers; ++i) {
+    helpers.emplace_back(CacheEntryRole::kMisc, &DeleteCounted);
+  }
+  std::vector<CountedValue> values(kHelpers);
+  auto index_of = [](const Slice& key) {
+    return std::stoi(key.ToString().substr(1));
+  };
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 64 << 20, /*num_shard_bits*/ 2,
+      /*strict_capacity_limit*/ false, kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  auto* fifo = static_cast<S3FifoCache*>(cache.get());
+  std::vector<Cache::Handle*> standalone;
+  for (int i = 0; i < kHelpers; ++i) {
+    Cache::Handle* h = nullptr;
+    ASSERT_OK(cache->Insert("h" + std::to_string(i), &values[i], &helpers[i],
+                            /*charge*/ 1, &h));
+    ASSERT_NE(nullptr, h);
+    EXPECT_EQ(&helpers[i], cache->GetCacheItemHelper(h)) << i;
+    EXPECT_EQ(&values[i], cache->Value(h)) << i;
+    if (i < kRegistered) {
+      cache->Release(h);
+    } else {
+      standalone.push_back(h);
+    }
+  }
+  EXPECT_EQ(kHelpers - kRegistered,
+            fifo->GetStats().helper_overflow_standalone);
+  EXPECT_EQ(0, fifo->GetStats().table_full_standalone);
+
+  int in_table = 0;
+  cache->ApplyToAllEntries(
+      [&](const Slice& key, Cache::ObjectPtr value, size_t,
+          const Cache::CacheItemHelper* helper) {
+        const int i = index_of(key);
+        EXPECT_LT(i, kRegistered);
+        EXPECT_EQ(&helpers[i], helper) << i;
+        EXPECT_EQ(&values[i], value) << i;
+        ++in_table;
+      },
+      {});
+  EXPECT_EQ(kRegistered, in_table);
+  for (int i = 0; i < kHelpers; ++i) {
+    Cache::Handle* h = cache->Lookup("h" + std::to_string(i));
+    if (i < kRegistered) {
+      ASSERT_NE(nullptr, h) << i;
+      EXPECT_EQ(&helpers[i], cache->GetCacheItemHelper(h)) << i;
+      cache->Release(h);
+    } else {
+      EXPECT_EQ(nullptr, h) << i;
+    }
+  }
+  for (Cache::Handle* h : standalone) {
+    EXPECT_TRUE(cache->Release(h));
+  }
+  for (int i = kRegistered; i < kHelpers; ++i) {
+    EXPECT_EQ(1, values[i].deletes) << i;
+  }
+
+  // Without a handle, an unregistered helper's entry is dropped; a
+  // registered helper still finds a slot once the registry is full.
+  CountedValue dropped;
+  ASSERT_OK(cache->Insert("x", &dropped, &helpers[kHelpers - 1], 1));
+  EXPECT_EQ(1, dropped.deletes);
+  EXPECT_EQ(nullptr, cache->Lookup("x"));
+  CountedValue late;
+  ASSERT_OK(cache->Insert("y", &late, &helpers[7], 1));
+  Cache::Handle* y = cache->Lookup("y");
+  ASSERT_NE(nullptr, y);
+  EXPECT_EQ(&helpers[7], cache->GetCacheItemHelper(y));
+  cache->Release(y);
+  // Only entries handed out standalone count; the dropped one does not.
+  EXPECT_EQ(kHelpers - kRegistered,
+            fifo->GetStats().helper_overflow_standalone);
+
+  // Eviction hands each callback its entry's helper, and the deleter of that
+  // helper frees the value.
+  int evicted = 0;
+  cache->SetEvictionCallback(
+      [&](const Slice& key, Cache::Handle* h, bool /*was_hit*/) {
+        const int i = key == "y" ? 7 : index_of(key);
+        EXPECT_EQ(&helpers[i], cache->GetCacheItemHelper(h)) << key.ToString();
+        ++evicted;
+        return false;
+      });
+  cache->SetCapacity(0);
+  EXPECT_EQ(kRegistered + 1, evicted);
+  for (int i = 0; i < kHelpers; ++i) {
+    EXPECT_EQ(1, values[i].deletes) << i;
+  }
+  EXPECT_EQ(1, late.deletes);
+}
+
+namespace {
+Status InsertWithHelper(S3FifoCacheShard* shard, const std::string& key,
+                        CountedValue* value,
+                        const Cache::CacheItemHelper* helper, size_t charge,
+                        S3FifoHandle** handle) {
+  return shard->Insert(key, S3FifoCacheShard::ComputeHash(key, 0), value,
+                       helper, charge, handle, Cache::Priority::LOW);
+}
+
+// Fills the shard's helper registry: one unpinned, charge-1 entry ("r0" to
+// "r254") for each of kMaxHelpers distinct helpers, which must outlive the
+// shard. The next distinct helper is slotless.
+void FillHelperRegistry(S3FifoCacheShard* shard,
+                        std::deque<Cache::CacheItemHelper>* helpers) {
+  for (size_t i = 0; i < s3fifo_cache::S3FifoHelperRegistry::kMaxHelpers; ++i) {
+    helpers->emplace_back(CacheEntryRole::kMisc);
+    const std::string key = "r" + std::to_string(i);
+    ASSERT_OK(shard->Insert(key, S3FifoCacheShard::ComputeHash(key, 0), nullptr,
+                            &helpers->back(), /*charge*/ 1, nullptr,
+                            Cache::Priority::LOW));
+  }
+  ASSERT_EQ(s3fifo_cache::S3FifoHelperRegistry::kMaxHelpers,
+            shard->helpers().size());
+}
+}  // namespace
+
+// Under strict_capacity_limit, an entry with a charge above UINT32_MAX
+// inserted with a handle is handed out standalone when it fits, as
+// CreateStandalone would: charged in full while held, not findable, freed on
+// release. Unpinned entries are evicted for it first, as for CreateStandalone.
+// Without a handle it is still dropped.
+TEST_F(S3FifoCacheTest, StrictLargeChargeInsertThatFitsGoesStandalone) {
+  if (sizeof(size_t) < 8) {
+    ROCKSDB_GTEST_BYPASS("charges over 4 GiB need a 64-bit size_t");
+    return;
+  }
+  constexpr size_t kGiB = size_t{1} << 30;
+  constexpr size_t kBig = 5 * kGiB;
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ true, kDontChargeCacheMetadata);
+  cache_->SetCapacity(64 * kGiB);
+
+  CountedValue kept;
+  ASSERT_OK(
+      InsertWithHelper(cache_, "kept", &kept, CountedHelper(), 1, nullptr));
+  CountedValue big;
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(InsertWithHelper(cache_, "big", &big, CountedHelper(), kBig, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(kBig, h->GetCharge(kDontChargeCacheMetadata));
+  EXPECT_EQ(CountedHelper(), h->GetHelper(cache_->helpers()));
+  EXPECT_EQ(&big, h->value());
+  EXPECT_EQ(1 + kBig, cache_->GetUsage());
+  EXPECT_EQ(kBig, cache_->GetPinnedUsage());
+  EXPECT_FALSE(ContainsForTest("big"));
+  EXPECT_EQ(nullptr, Lookup("big"));
+  EXPECT_TRUE(ContainsForTest("kept"));
+  EXPECT_EQ(1, cache_->GetStats().large_charge_standalone);
+  EXPECT_EQ(0, cache_->GetStats().helper_overflow_standalone);
+  EXPECT_EQ(0, cache_->GetStats().table_full_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, big.deletes);
+  EXPECT_EQ(1, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+
+  // Overwriting a key in the table: the old entry goes, the new one is
+  // standalone.
+  CountedValue big2;
+  h = nullptr;
+  Status s = InsertWithHelper(cache_, "kept", &big2, CountedHelper(), kBig, &h);
+  EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(1, kept.deletes);
+  EXPECT_FALSE(ContainsForTest("kept"));
+  EXPECT_EQ(kBig, cache_->GetUsage());
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, big2.deletes);
+  EXPECT_EQ(0, cache_->GetUsage());
+  EXPECT_EQ(2, cache_->GetStats().large_charge_standalone);
+
+  // Fits only once unpinned entries are evicted: they are, and the entry
+  // fills the capacity exactly.
+  cache_->SetCapacity(kBig + 2 * kGiB);
+  std::vector<CountedValue> small(3);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(InsertWithHelper(cache_, "u" + std::to_string(i), &small[i],
+                               CountedHelper(), kGiB, nullptr));
+  }
+  ASSERT_EQ(3 * kGiB, cache_->GetUsage());
+  CountedValue big3;
+  h = nullptr;
+  ASSERT_OK(InsertWithHelper(cache_, "big3", &big3, CountedHelper(), kBig, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(kBig + 2 * kGiB, cache_->GetUsage());
+  EXPECT_EQ(1, small[0].deletes);
+  EXPECT_TRUE(ContainsForTest("u1"));
+  EXPECT_TRUE(ContainsForTest("u2"));
+  EXPECT_EQ(3, cache_->GetStats().large_charge_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, big3.deletes);
+  EXPECT_EQ(2 * kGiB, cache_->GetUsage());
+
+  // Without a handle: still dropped, uncounted, and nothing is evicted.
+  CountedValue dropped;
+  ASSERT_OK(InsertWithHelper(cache_, "dropped", &dropped, CountedHelper(), kBig,
+                             nullptr));
+  EXPECT_EQ(1, dropped.deletes);
+  EXPECT_FALSE(ContainsForTest("dropped"));
+  EXPECT_TRUE(ContainsForTest("u1"));
+  EXPECT_TRUE(ContainsForTest("u2"));
+  EXPECT_EQ(2 * kGiB, cache_->GetUsage());
+  EXPECT_EQ(3, cache_->GetStats().large_charge_standalone);
+
+  // Without a handle, when it would fit only once unpinned entries are
+  // evicted (room 4 GiB, charge 5 GiB, capacity 6 GiB): still dropped, and
+  // nothing is evicted for it.
+  cache_->SetCapacity(kBig + kGiB);
+  ASSERT_EQ(2 * kGiB, cache_->GetUsage());
+  CountedValue dropped2;
+  ASSERT_OK(InsertWithHelper(cache_, "dropped2", &dropped2, CountedHelper(),
+                             kBig, nullptr));
+  EXPECT_EQ(1, dropped2.deletes);
+  EXPECT_FALSE(ContainsForTest("dropped2"));
+  EXPECT_EQ(0, small[1].deletes);
+  EXPECT_EQ(0, small[2].deletes);
+  EXPECT_TRUE(ContainsForTest("u1"));
+  EXPECT_TRUE(ContainsForTest("u2"));
+  EXPECT_EQ(2 * kGiB, cache_->GetUsage());
+  EXPECT_EQ(3, cache_->GetStats().large_charge_standalone);
+  // The values live on this stack frame: free the cache before they go.
+  DeleteCache();
+  EXPECT_EQ(1, small[1].deletes);
+  EXPECT_EQ(1, small[2].deletes);
+}
+
+// Under strict_capacity_limit, an entry with a charge above UINT32_MAX that
+// does not fit even after eviction is refused (MemoryLimit, no handle, the
+// caller keeps the value), as CreateStandalone refuses it: unpinned entries
+// are evicted for it first, unless it can never fit. A refused overwrite
+// does not detach the old entry; unless pinned, eviction for the insert may
+// still remove it.
+TEST_F(S3FifoCacheTest, StrictLargeChargeInsertThatDoesNotFitIsRefused) {
+  if (sizeof(size_t) < 8) {
+    ROCKSDB_GTEST_BYPASS("charges over 4 GiB need a 64-bit size_t");
+    return;
+  }
+  constexpr size_t kGiB = size_t{1} << 30;
+  constexpr size_t kBig = 5 * kGiB;
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ true, kDontChargeCacheMetadata);
+  cache_->SetCapacity(7 * kGiB);
+
+  CountedValue pinned;
+  S3FifoHandle* p = nullptr;
+  ASSERT_OK(
+      InsertWithHelper(cache_, "p", &pinned, CountedHelper(), 3 * kGiB, &p));
+  CountedValue unpinned;
+  ASSERT_OK(
+      InsertWithHelper(cache_, "u", &unpinned, CountedHelper(), kGiB, nullptr));
+  ASSERT_EQ(4 * kGiB, cache_->GetUsage());
+
+  CountedValue refused;
+  S3FifoHandle* h = nullptr;
+  Status s =
+      InsertWithHelper(cache_, "big", &refused, CountedHelper(), kBig, &h);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(0, refused.deletes);
+  EXPECT_FALSE(ContainsForTest("big"));
+  // "u" was evicted for it; the pinned entry stays.
+  EXPECT_EQ(1, unpinned.deletes);
+  EXPECT_TRUE(ContainsForTest("p"));
+  EXPECT_EQ(3 * kGiB, cache_->GetUsage());
+  EXPECT_EQ(3 * kGiB, cache_->GetPinnedUsage());
+  EXPECT_EQ(0, cache_->GetStats().large_charge_standalone);
+
+  // A refused overwrite does not detach the old entry, here pinned, so
+  // eviction cannot remove it either.
+  CountedValue refused2;
+  h = nullptr;
+  s = InsertWithHelper(cache_, "p", &refused2, CountedHelper(), kBig, &h);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(0, refused2.deletes);
+  EXPECT_EQ(0, pinned.deletes);
+  EXPECT_TRUE(LookupBool("p"));
+  EXPECT_EQ(3 * kGiB, cache_->GetUsage());
+
+  // Larger than the capacity: refused, and nothing is evicted for it.
+  CountedValue unpinned2;
+  ASSERT_OK(InsertWithHelper(cache_, "u2", &unpinned2, CountedHelper(), kGiB,
+                             nullptr));
+  CountedValue never;
+  h = nullptr;
+  s = InsertWithHelper(cache_, "never", &never, CountedHelper(), 8 * kGiB, &h);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(0, never.deletes);
+  EXPECT_TRUE(ContainsForTest("u2"));
+  EXPECT_EQ(4 * kGiB, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetStats().large_charge_standalone);
+
+  EXPECT_FALSE(cache_->Release(p, true, false));
+  DeleteCache();
+  EXPECT_EQ(1, pinned.deletes);
+  EXPECT_EQ(1, unpinned2.deletes);
+}
+
+// Under strict_capacity_limit, an entry whose helper is the 256th distinct
+// one, inserted with a handle, is handed out standalone when it fits (after
+// evicting unpinned entries, as CreateStandalone does), and counted. Without
+// a handle it is still dropped.
+TEST_F(S3FifoCacheTest, StrictHelperOverflowInsertThatFitsGoesStandalone) {
+  NewCache(/*capacity*/ 1000, /*strict*/ true, kDontChargeCacheMetadata);
+  std::deque<Cache::CacheItemHelper> helpers;
+  FillHelperRegistry(cache_, &helpers);
+  ASSERT_EQ(255, cache_->GetUsage());
+  const Cache::CacheItemHelper overflow{CacheEntryRole::kMisc, &DeleteCounted};
+
+  CountedValue v;
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(InsertWithHelper(cache_, "o", &v, &overflow, 100, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(&overflow, h->GetHelper(cache_->helpers()));
+  EXPECT_EQ(100, h->GetCharge(kDontChargeCacheMetadata));
+  EXPECT_EQ(355, cache_->GetUsage());
+  EXPECT_EQ(100, cache_->GetPinnedUsage());
+  EXPECT_FALSE(ContainsForTest("o"));
+  EXPECT_EQ(nullptr, Lookup("o"));
+  EXPECT_TRUE(ContainsForTest("r0"));
+  EXPECT_TRUE(ContainsForTest("r254"));
+  EXPECT_EQ(1, cache_->GetStats().helper_overflow_standalone);
+  EXPECT_EQ(0, cache_->GetStats().large_charge_standalone);
+  EXPECT_EQ(0, cache_->GetStats().table_full_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, v.deletes);
+  EXPECT_EQ(255, cache_->GetUsage());
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+
+  // Fits only once unpinned entries are evicted: they are, and usage stays
+  // within capacity.
+  CountedValue v2;
+  h = nullptr;
+  ASSERT_OK(InsertWithHelper(cache_, "o2", &v2, &overflow, 800, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_LE(cache_->GetUsage(), 1000);
+  EXPECT_LT(cache_->GetUsage(), 255 + 800);
+  EXPECT_FALSE(ContainsForTest("r0"));
+  EXPECT_EQ(2, cache_->GetStats().helper_overflow_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, v2.deletes);
+  EXPECT_EQ(0, cache_->GetPinnedUsage());
+
+  // Without a handle: still dropped, uncounted.
+  const size_t usage = cache_->GetUsage();
+  CountedValue dropped;
+  ASSERT_OK(InsertWithHelper(cache_, "d", &dropped, &overflow, 1, nullptr));
+  EXPECT_EQ(1, dropped.deletes);
+  EXPECT_FALSE(ContainsForTest("d"));
+  EXPECT_EQ(usage, cache_->GetUsage());
+  EXPECT_EQ(2, cache_->GetStats().helper_overflow_standalone);
+
+  // Without a handle, when it would fit only once unpinned entries are
+  // evicted (a charge of the full capacity, with unpinned entries cached):
+  // still dropped, and nothing is evicted for it.
+  ASSERT_GT(usage, 0);
+  const auto resident_count = [&] {
+    size_t n = 0;
+    for (size_t i = 0; i < helpers.size(); ++i) {
+      n += ContainsForTest("r" + std::to_string(i)) ? 1 : 0;
+    }
+    return n;
+  };
+  const size_t resident = resident_count();
+  ASSERT_GT(resident, 0);
+  CountedValue dropped2;
+  ASSERT_OK(
+      InsertWithHelper(cache_, "d2", &dropped2, &overflow, 1000, nullptr));
+  EXPECT_EQ(1, dropped2.deletes);
+  EXPECT_FALSE(ContainsForTest("d2"));
+  EXPECT_EQ(usage, cache_->GetUsage());
+  EXPECT_EQ(resident, resident_count());
+  EXPECT_EQ(2, cache_->GetStats().helper_overflow_standalone);
+  DeleteCache();
+}
+
+// Under strict_capacity_limit, an entry whose helper is the 256th distinct
+// one that does not fit even after eviction is refused (MemoryLimit, no
+// handle, the caller keeps the value), as CreateStandalone refuses it:
+// unpinned entries are evicted for it first, unless it can never fit.
+TEST_F(S3FifoCacheTest, StrictHelperOverflowInsertThatDoesNotFitIsRefused) {
+  NewCache(/*capacity*/ 1000, /*strict*/ true, kDontChargeCacheMetadata);
+  std::deque<Cache::CacheItemHelper> helpers;
+  FillHelperRegistry(cache_, &helpers);
+  const Cache::CacheItemHelper overflow{CacheEntryRole::kMisc, &DeleteCounted};
+
+  // Larger than the capacity: refused, and nothing is evicted for it.
+  CountedValue never;
+  S3FifoHandle* h = nullptr;
+  Status s = InsertWithHelper(cache_, "n", &never, &overflow, 1001, &h);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(0, never.deletes);
+  EXPECT_EQ(255, cache_->GetUsage());
+  EXPECT_TRUE(ContainsForTest("r0"));
+
+  // A pinned entry with a registered helper leaves too little room once the
+  // unpinned entries are evicted.
+  S3FifoHandle* p = nullptr;
+  ASSERT_OK(cache_->Insert("p", S3FifoCacheShard::ComputeHash("p", 0), nullptr,
+                           &helpers[0], 700, &p, Cache::Priority::LOW));
+  CountedValue refused;
+  h = nullptr;
+  s = InsertWithHelper(cache_, "o", &refused, &overflow, 400, &h);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(0, refused.deletes);
+  EXPECT_FALSE(ContainsForTest("o"));
+  EXPECT_FALSE(ContainsForTest("r0"));
+  EXPECT_TRUE(ContainsForTest("p"));
+  EXPECT_EQ(700, cache_->GetUsage());
+  EXPECT_EQ(700, cache_->GetPinnedUsage());
+  EXPECT_EQ(0, cache_->GetStats().helper_overflow_standalone);
+  EXPECT_FALSE(cache_->Release(p, true, false));
+  DeleteCache();
+}
+
+// Without strict_capacity_limit a slotless entry (either cause) inserted with
+// a handle is handed out standalone even past capacity, and one inserted
+// without a handle is dropped.
+TEST_F(S3FifoCacheTest, NonStrictSlotlessInsertGoesStandalonePastCapacity) {
+  NewCache(/*capacity*/ 100, /*strict*/ false, kDontChargeCacheMetadata);
+  std::deque<Cache::CacheItemHelper> helpers;
+  FillHelperRegistry(cache_, &helpers);
+  const Cache::CacheItemHelper overflow{CacheEntryRole::kMisc, &DeleteCounted};
+  CountedValue v;
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(InsertWithHelper(cache_, "o", &v, &overflow, 200, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(200, cache_->GetUsage());
+  EXPECT_EQ(1, cache_->GetStats().helper_overflow_standalone);
+  CountedValue dropped;
+  ASSERT_OK(InsertWithHelper(cache_, "d", &dropped, &overflow, 1, nullptr));
+  EXPECT_EQ(1, dropped.deletes);
+  EXPECT_EQ(1, cache_->GetStats().helper_overflow_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, v.deletes);
+  EXPECT_EQ(0, cache_->GetUsage());
+
+  if (sizeof(size_t) < 8) {
+    return;  // Charges over 4 GiB need a 64-bit size_t.
+  }
+  constexpr size_t kBig = size_t{5} << 30;
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kDontChargeCacheMetadata);
+  CountedValue big;
+  h = nullptr;
+  ASSERT_OK(InsertWithHelper(cache_, "big", &big, CountedHelper(), kBig, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(kBig, cache_->GetUsage());
+  EXPECT_EQ(1, cache_->GetStats().large_charge_standalone);
+  CountedValue dropped2;
+  ASSERT_OK(
+      InsertWithHelper(cache_, "d", &dropped2, CountedHelper(), kBig, nullptr));
+  EXPECT_EQ(1, dropped2.deletes);
+  EXPECT_EQ(1, cache_->GetStats().large_charge_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, big.deletes);
+  EXPECT_EQ(0, cache_->GetUsage());
+}
+
+namespace {
+// A table with no free slot: kTableFullHomes (capacity / 64, the table's
+// floor, so it tops out there) pinned entries of the given charge, one per
+// slot. With every slot pinned, the eviction and growth steps of an insert
+// can free or add none.
+constexpr int kTableFullHomes = 2048;
+constexpr size_t kTableFullCapacity = kTableFullHomes * 64;
+
+void PinEverySlot(S3FifoCacheTest* t, int count, size_t charge,
+                  std::vector<S3FifoHandle*>* pins) {
+  for (int i = 0; i < count; ++i) {
+    S3FifoHandle* h = nullptr;
+    const std::string key = "p" + std::to_string(i);
+    ASSERT_OK(t->cache_->Insert(key, S3FifoCacheShard::ComputeHash(key, 0),
+                                nullptr, &kNoopCacheItemHelper, charge, &h,
+                                Cache::Priority::LOW));
+    ASSERT_NE(nullptr, h);
+    ASSERT_FALSE(h->IsStandalone()) << key;
+    pins->push_back(h);
+  }
+  ASSERT_EQ(kTableFullHomes, t->cache_->GetTableAddressCount());
+}
+
+void ReleaseAll(S3FifoCacheTest* t, const std::vector<S3FifoHandle*>& pins) {
+  for (S3FifoHandle* h : pins) {
+    EXPECT_FALSE(t->cache_->Release(h, true, false));
+  }
+  EXPECT_EQ(0, t->cache_->GetPinnedUsage());
+}
+}  // namespace
+
+// Under strict_capacity_limit, a new key inserted with a handle into a table
+// with no free slot (every slot pinned, the table at its reserved length) is
+// handed out standalone when it fits, as a non-strict one is: charged in full
+// while held, not findable, counted in table_full_standalone, freed on
+// release. It may fill the capacity exactly. Without a handle it is still
+// dropped.
+TEST_F(S3FifoCacheTest, StrictFullSlotTableInsertThatFitsGoesStandalone) {
+  NewCache(kTableFullCapacity, /*strict*/ true, kDontChargeCacheMetadata);
+  std::vector<S3FifoHandle*> pins;
+  PinEverySlot(this, kTableFullHomes, /*charge*/ 1, &pins);
+  ASSERT_EQ(kTableFullHomes, cache_->GetOccupancyCount());
+  ASSERT_EQ(kTableFullHomes, cache_->GetUsage());
+
+  CountedValue v;
+  S3FifoHandle* h = nullptr;
+  Status s = InsertWithHelper(cache_, "outside", &v, CountedHelper(), 100, &h);
+  EXPECT_TRUE(s.ok()) << s.ToString();
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(100, h->GetCharge(kDontChargeCacheMetadata));
+  EXPECT_EQ(CountedHelper(), h->GetHelper(cache_->helpers()));
+  EXPECT_EQ(&v, h->value());
+  EXPECT_EQ(kTableFullHomes + 100, cache_->GetUsage());
+  EXPECT_EQ(kTableFullHomes + 100, cache_->GetPinnedUsage());
+  EXPECT_EQ(kTableFullHomes, cache_->GetOccupancyCount());
+  EXPECT_EQ(kTableFullHomes, cache_->GetTableAddressCount());
+  EXPECT_FALSE(ContainsForTest("outside"));
+  EXPECT_EQ(nullptr, Lookup("outside"));
+  EXPECT_EQ(1, cache_->GetStats().table_full_standalone);
+  EXPECT_EQ(0, cache_->GetStats().helper_overflow_standalone);
+  EXPECT_EQ(0, cache_->GetStats().large_charge_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, v.deletes);
+  EXPECT_EQ(kTableFullHomes, cache_->GetUsage());
+  EXPECT_EQ(kTableFullHomes, cache_->GetPinnedUsage());
+
+  // Fills the capacity exactly: accepted. Then one more unit of charge does
+  // not fit: refused, nothing charged.
+  CountedValue exact;
+  h = nullptr;
+  s = InsertWithHelper(cache_, "exact", &exact, CountedHelper(),
+                       kTableFullCapacity - kTableFullHomes, &h);
+  EXPECT_TRUE(s.ok()) << s.ToString();
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(kTableFullCapacity, cache_->GetUsage());
+  EXPECT_EQ(2, cache_->GetStats().table_full_standalone);
+  CountedValue over;
+  S3FifoHandle* h2 = nullptr;
+  s = InsertWithHelper(cache_, "over", &over, CountedHelper(), 1, &h2);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(nullptr, h2);
+  EXPECT_EQ(0, over.deletes);
+  EXPECT_EQ(kTableFullCapacity, cache_->GetUsage());
+  EXPECT_EQ(2, cache_->GetStats().table_full_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, exact.deletes);
+  EXPECT_EQ(kTableFullHomes, cache_->GetUsage());
+
+  // Without a handle: dropped (OK), uncounted, nothing charged.
+  CountedValue dropped;
+  ASSERT_OK(InsertWithHelper(cache_, "dropped", &dropped, CountedHelper(), 1,
+                             nullptr));
+  EXPECT_EQ(1, dropped.deletes);
+  EXPECT_FALSE(ContainsForTest("dropped"));
+  EXPECT_EQ(kTableFullHomes, cache_->GetUsage());
+  EXPECT_EQ(kTableFullHomes, cache_->GetOccupancyCount());
+  EXPECT_EQ(2, cache_->GetStats().table_full_standalone);
+
+  ReleaseAll(this, pins);
+}
+
+// Under strict_capacity_limit, a new key inserted with a handle into a table
+// with no free slot that does not fit is refused (MemoryLimit, no handle,
+// the caller keeps the value), and nothing is charged or counted. So is one
+// larger than the capacity.
+TEST_F(S3FifoCacheTest, StrictFullSlotTableInsertThatDoesNotFitIsRefused) {
+  NewCache(kTableFullCapacity, /*strict*/ true, kDontChargeCacheMetadata);
+  std::vector<S3FifoHandle*> pins;
+  PinEverySlot(this, kTableFullHomes, /*charge*/ 60, &pins);
+  constexpr size_t kUsage = size_t{kTableFullHomes} * 60;
+  ASSERT_EQ(kUsage, cache_->GetUsage());
+
+  // Room is 8192; 9000 does not fit, and every entry is pinned.
+  for (size_t charge : {size_t{9000}, kTableFullCapacity + 1}) {
+    SCOPED_TRACE("charge=" + std::to_string(charge));
+    CountedValue refused;
+    S3FifoHandle* h = nullptr;
+    Status s = InsertWithHelper(cache_, "refused", &refused, CountedHelper(),
+                                charge, &h);
+    EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+    EXPECT_EQ(nullptr, h);
+    EXPECT_EQ(0, refused.deletes);
+    EXPECT_FALSE(ContainsForTest("refused"));
+    EXPECT_EQ(kUsage, cache_->GetUsage());
+    EXPECT_EQ(kUsage, cache_->GetPinnedUsage());
+    EXPECT_EQ(kTableFullHomes, cache_->GetOccupancyCount());
+    EXPECT_EQ(0, cache_->GetStats().table_full_standalone);
+  }
+
+  ReleaseAll(this, pins);
+}
+
+// Under strict_capacity_limit, an overwrite that finds no free slot and fits
+// is accepted with a handle as a standalone entry: OkOverwritten, the old
+// entry detached (freed at once if unpinned, on its last release if pinned)
+// and no longer findable. Without a handle the new value is dropped and the
+// old one still detached (OkOverwritten).
+TEST_F(S3FifoCacheTest, StrictOverwriteWithoutFreeSlotGoesStandalone) {
+  for (int mode = 0; mode < 4; ++mode) {
+    const bool old_pinned = (mode & 1) != 0;
+    const bool with_handle = (mode & 2) != 0;
+    SCOPED_TRACE("old_pinned=" + std::to_string(old_pinned) +
+                 " with_handle=" + std::to_string(with_handle));
+    NewCache(kTableFullCapacity, /*strict*/ true, kDontChargeCacheMetadata);
+    std::vector<S3FifoHandle*> pins;
+    PinEverySlot(this, kTableFullHomes - 1, /*charge*/ 1, &pins);
+    CountedValue old_value;
+    S3FifoHandle* old_handle = nullptr;
+    ASSERT_OK(InsertWithHelper(cache_, "k", &old_value, CountedHelper(), 1,
+                               old_pinned ? &old_handle : nullptr));
+    ASSERT_EQ(kTableFullHomes, cache_->GetOccupancyCount());
+    ASSERT_EQ(kTableFullHomes, cache_->GetTableAddressCount());
+
+    CountedValue new_value;
+    S3FifoHandle* h = nullptr;
+    Status s = InsertWithHelper(cache_, "k", &new_value, CountedHelper(), 100,
+                                with_handle ? &h : nullptr);
+    EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+    EXPECT_EQ(nullptr, Lookup("k"));
+    EXPECT_EQ(kTableFullHomes - 1, cache_->GetOccupancyCount());
+    EXPECT_EQ(old_pinned ? 0 : 1, old_value.deletes);
+    EXPECT_EQ(with_handle ? 0 : 1, new_value.deletes);
+    EXPECT_EQ(with_handle ? 1 : 0, cache_->GetStats().table_full_standalone);
+    // The pins, the old entry while pinned, and the new one while held.
+    EXPECT_EQ(
+        kTableFullHomes - 1 + (old_pinned ? 1 : 0) + (with_handle ? 100 : 0),
+        cache_->GetUsage());
+    EXPECT_LE(cache_->GetUsage(), kTableFullCapacity);
+    if (with_handle) {
+      ASSERT_NE(nullptr, h);
+      EXPECT_TRUE(h->IsStandalone());
+      EXPECT_EQ(&new_value, h->value());
+      EXPECT_EQ(100, h->GetCharge(kDontChargeCacheMetadata));
+      EXPECT_TRUE(cache_->Release(h, true, false));
+      EXPECT_EQ(1, new_value.deletes);
+    }
+    if (old_pinned) {
+      EXPECT_TRUE(cache_->Release(old_handle, true, false));
+      EXPECT_EQ(1, old_value.deletes);
+    }
+    EXPECT_EQ(kTableFullHomes - 1, cache_->GetUsage());
+    ReleaseAll(this, pins);
+    DeleteCache();
+  }
+}
+
+// Under strict_capacity_limit, a refused overwrite (it does not fit) does
+// not detach the old entry: pinned, it stays cached with its value. Unpinned,
+// eviction for the insert may still remove it, as for any refused strict
+// insert.
+TEST_F(S3FifoCacheTest, StrictOverwriteThatDoesNotFitKeepsOldEntry) {
+  for (bool old_pinned : {true, false}) {
+    SCOPED_TRACE("old_pinned=" + std::to_string(old_pinned));
+    NewCache(kTableFullCapacity, /*strict*/ true, kDontChargeCacheMetadata);
+    std::vector<S3FifoHandle*> pins;
+    PinEverySlot(this, kTableFullHomes - 1, /*charge*/ 60, &pins);
+    constexpr size_t kPinned = size_t{kTableFullHomes - 1} * 60;
+    CountedValue old_value;
+    S3FifoHandle* old_handle = nullptr;
+    ASSERT_OK(InsertWithHelper(cache_, "k", &old_value, CountedHelper(), 1000,
+                               old_pinned ? &old_handle : nullptr));
+    ASSERT_EQ(kTableFullHomes, cache_->GetOccupancyCount());
+    ASSERT_EQ(kPinned + 1000, cache_->GetUsage());
+
+    // 9000 does not fit, even with the old entry's 1000 evicted.
+    CountedValue new_value;
+    S3FifoHandle* h = nullptr;
+    Status s =
+        InsertWithHelper(cache_, "k", &new_value, CountedHelper(), 9000, &h);
+    EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+    EXPECT_EQ(nullptr, h);
+    EXPECT_EQ(0, new_value.deletes);
+    EXPECT_EQ(0, cache_->GetStats().table_full_standalone);
+    if (old_pinned) {
+      EXPECT_EQ(0, old_value.deletes);
+      S3FifoHandle* found = Lookup("k");
+      ASSERT_NE(nullptr, found);
+      EXPECT_EQ(&old_value, found->value());
+      EXPECT_FALSE(cache_->Release(found, true, false));
+      EXPECT_EQ(kPinned + 1000, cache_->GetUsage());
+      EXPECT_FALSE(cache_->Release(old_handle, true, false));
+    } else {
+      // Evicted for the insert, which still did not fit.
+      EXPECT_EQ(1, old_value.deletes);
+      EXPECT_EQ(nullptr, Lookup("k"));
+      EXPECT_EQ(kPinned, cache_->GetUsage());
+    }
+    ReleaseAll(this, pins);
+    DeleteCache();
+  }
+}
+
+// Without strict_capacity_limit, a new key inserted into a table with no
+// free slot: with a handle it is standalone even past capacity;
+// without one it is dropped.
+TEST_F(S3FifoCacheTest,
+       NonStrictFullSlotTableInsertGoesStandalonePastCapacity) {
+  NewCache(kTableFullCapacity, /*strict*/ false, kDontChargeCacheMetadata);
+  std::vector<S3FifoHandle*> pins;
+  PinEverySlot(this, kTableFullHomes, /*charge*/ 60, &pins);
+  constexpr size_t kUsage = size_t{kTableFullHomes} * 60;
+  CountedValue v;
+  S3FifoHandle* h = nullptr;
+  ASSERT_OK(InsertWithHelper(cache_, "outside", &v, CountedHelper(), 9000, &h));
+  ASSERT_NE(nullptr, h);
+  EXPECT_TRUE(h->IsStandalone());
+  EXPECT_EQ(kUsage + 9000, cache_->GetUsage());
+  EXPECT_GT(cache_->GetUsage(), kTableFullCapacity);
+  EXPECT_EQ(nullptr, Lookup("outside"));
+  EXPECT_EQ(1, cache_->GetStats().table_full_standalone);
+  CountedValue dropped;
+  ASSERT_OK(InsertWithHelper(cache_, "dropped", &dropped, CountedHelper(), 1,
+                             nullptr));
+  EXPECT_EQ(1, dropped.deletes);
+  EXPECT_EQ(1, cache_->GetStats().table_full_standalone);
+  EXPECT_TRUE(cache_->Release(h, true, false));
+  EXPECT_EQ(1, v.deletes);
+  EXPECT_EQ(kUsage, cache_->GetUsage());
+  ReleaseAll(this, pins);
+}
+
+// Threads registering the same helpers in different orders, on different
+// shards, agree on every helper's index: each entry reads back its own
+// helper.
+TEST_F(S3FifoCacheTest, ConcurrentHelperRegistration) {
+  constexpr int kHelpers = 200;
+  constexpr int kThreads = 8;
+  std::deque<Cache::CacheItemHelper> helpers;
+  for (int i = 0; i < kHelpers; ++i) {
+    helpers.emplace_back(CacheEntryRole::kMisc);
+  }
+  S3FifoCacheOptions opts = TestS3FifoOptions(
+      /*capacity*/ 64 << 20, /*num_shard_bits*/ 3,
+      /*strict_capacity_limit*/ false, kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  std::vector<port::Thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      Random rnd(static_cast<uint32_t>(t + 1));
+      for (int n = 0; n < 2000; ++n) {
+        const int i = static_cast<int>(rnd.Uniform(kHelpers));
+        const std::string key =
+            "t" + std::to_string(t) + "_" + std::to_string(n);
+        Cache::Handle* h = nullptr;
+        ASSERT_OK(cache->Insert(key, nullptr, &helpers[i], 1, &h));
+        EXPECT_EQ(&helpers[i], cache->GetCacheItemHelper(h));
+        cache->Release(h);
+        Cache::Handle* found = cache->Lookup(key);
+        if (found != nullptr) {
+          EXPECT_EQ(&helpers[i], cache->GetCacheItemHelper(found));
+          cache->Release(found);
+        }
+      }
+    });
+  }
+  for (auto& th : threads) {
+    th.join();
+  }
+  EXPECT_EQ(0, static_cast<S3FifoCache*>(cache.get())
+                   ->GetStats()
+                   .helper_overflow_standalone);
+}
+
+#ifndef NDEBUG
+// A thread whose probe misses a helper that another thread then registers as
+// the 255th, filling the registry, still gets that helper's index (not
+// kFull): seeing the registry full, it probes again.
+TEST_F(S3FifoCacheTest, HelperRegisteredLastIsFoundAfterProbeMiss) {
+  using s3fifo_cache::S3FifoHelperRegistry;
+  constexpr size_t kMax = S3FifoHelperRegistry::kMaxHelpers;
+  std::deque<Cache::CacheItemHelper> helpers;
+  for (size_t i = 0; i < kMax; ++i) {
+    helpers.emplace_back(CacheEntryRole::kMisc);
+  }
+  S3FifoHelperRegistry registry;
+  for (size_t i = 0; i + 1 < kMax; ++i) {
+    ASSERT_EQ(static_cast<int>(i), registry.IndexOf(&helpers[i]));
+  }
+  const Cache::CacheItemHelper* last = &helpers.back();
+  int parked_index = -1;
+  int registered_index = -1;
+  // The parked thread's probe misses last; this thread then registers it.
+  RunWhileParked(
+      "S3FifoHelperRegistry::IndexOf:ProbeMissed",
+      [&] { parked_index = registry.IndexOf(last); },
+      [&] { registered_index = registry.IndexOf(last); });
+  EXPECT_EQ(static_cast<int>(kMax) - 1, registered_index);
+  EXPECT_EQ(kMax, registry.size());
+  EXPECT_EQ(registered_index, parked_index);
+}
+#endif  // NDEBUG
+
+// Left at -1, num_shard_bits keeps every shard within [kMinShardSize,
+// kMaxShardSize]: up to 64 shards while shards stay at least 4 MiB, and more
+// than 64 when needed to keep them at most 128 MiB.
+TEST_F(S3FifoCacheTest, DefaultShardBitsKeepShardsWithinBounds) {
+  constexpr uint64_t kMiB = uint64_t{1} << 20;
+  constexpr uint64_t kGiB = uint64_t{1} << 30;
+  EXPECT_EQ(4 * kMiB, S3FifoCache::kMinShardSize);
+  EXPECT_EQ(128 * kMiB, S3FifoCache::kMaxShardSize);
+  const std::vector<std::pair<uint64_t, int>> cases = {
+      {0, 0},
+      {kMiB, 0},
+      {8 * kMiB - 1, 0},
+      {8 * kMiB, 1},
+      {32 * kMiB, 3},
+      {256 * kMiB - 1, 5},
+      {256 * kMiB, 6},
+      {4 * kGiB - 1, 6},
+      {4 * kGiB, 6},
+      {8 * kGiB, 6},
+      {8 * kGiB + 1, 7},
+      {16 * kGiB, 7},
+      {64 * kGiB, 9},
+      {uint64_t{64} << 40, 19},
+      {std::numeric_limits<uint64_t>::max(), 19},
+  };
+  for (const auto& [capacity, bits] : cases) {
+    if (capacity > std::numeric_limits<size_t>::max()) {
+      continue;  // 32-bit
+    }
+    SCOPED_TRACE("capacity " + std::to_string(capacity));
+    const int got =
+        S3FifoCache::DefaultShardBits(static_cast<size_t>(capacity));
+    EXPECT_EQ(bits, got);
+    // Every shard (capacity / shards, rounded up as the cache splits it)
+    // within the bounds, as far as 64 shards and the 19-bit limit allow.
+    const uint64_t per_shard =
+        (capacity >> got) +
+        ((capacity & ((uint64_t{1} << got) - 1)) != 0 ? 1 : 0);
+    if (capacity >= 2 * S3FifoCache::kMinShardSize) {
+      EXPECT_GE(per_shard, S3FifoCache::kMinShardSize);
+    }
+    if (got < 19) {
+      EXPECT_LE(per_shard, S3FifoCache::kMaxShardSize);
+    }
+  }
+}
+
+// MakeSharedCache shards by DefaultShardBits when num_shard_bits is -1, and
+// an explicit num_shard_bits wins, even past either bound.
+TEST_F(S3FifoCacheTest, MakeSharedCacheUsesDefaultShardBits) {
+  constexpr size_t kMiB = size_t{1} << 20;
+  auto shard_bits = [](size_t capacity, int num_shard_bits) {
+    S3FifoCacheOptions opts;
+    opts.capacity = capacity;
+    opts.num_shard_bits = num_shard_bits;
+    std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+    EXPECT_NE(nullptr, cache);
+    return cache == nullptr
+               ? -1
+               : static_cast<S3FifoCache*>(cache.get())->GetNumShardBits();
+  };
+  EXPECT_EQ(0, shard_bits(1 * kMiB, -1));
+  EXPECT_EQ(3, shard_bits(32 * kMiB, -1));
+  EXPECT_EQ(6, shard_bits(256 * kMiB, -1));
+  EXPECT_EQ(1, shard_bits(32 * kMiB, 1));
+  EXPECT_EQ(5, shard_bits(1 * kMiB, 5));
+  // 128 capped shards reserve ~341 MiB, committed up front on Windows.
+#if !defined(OS_WIN)
+  if (sizeof(size_t) == 8) {
+    // 128 shards of 128 MiB, each reserving its capped table.
+    EXPECT_EQ(7, shard_bits(size_t{16} << 30, -1));
+    EXPECT_EQ(2, shard_bits(size_t{16} << 30, 2));
+  }
+#endif  // !OS_WIN
+}
+
+}  // namespace ROCKSDB_NAMESPACE
+
+int main(int argc, char** argv) {
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
