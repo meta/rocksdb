@@ -20,6 +20,7 @@
 #include "db/db_with_timestamp_test_util.h"
 #include "db/log_reader.h"
 #include "db/manifest_ops.h"
+#include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "db/wide/wide_column_test_util.h"
 #include "db/write_batch_internal.h"
@@ -30,6 +31,7 @@
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
 #include "util/defer.h"
 #include "utilities/fault_injection_fs.h"
 #include "utilities/merge_operators/string_append/stringappend2.h"
@@ -2968,6 +2970,129 @@ TEST_F(DBSecondaryTest, CatchUpKeepsViewWhenNewManifestListsDeletedFiles) {
     VerifySecondaryValue(handle, "foo", "v1");
     VerifySecondaryValue(handle, "bar", "v1");
   }
+}
+
+namespace {
+// See TableCache for the key format.
+std::set<uint64_t> TableCacheFileNumbers(Cache* cache) {
+  std::set<uint64_t> numbers;
+  cache->ApplyToAllEntries(
+      [&numbers](const Slice& key, Cache::ObjectPtr, size_t,
+                 const Cache::CacheItemHelper*) {
+        ASSERT_EQ(sizeof(uint64_t), key.size());
+        uint64_t number = 0;
+        GetUnaligned(reinterpret_cast<const uint64_t*>(key.data()), &number);
+        numbers.insert(number);
+      },
+      {});
+  return numbers;
+}
+
+std::set<uint64_t> LiveTableFileNumbers(DB* db) {
+  std::vector<LiveFileMetaData> files;
+  db->GetLiveFilesMetaData(&files);
+  std::set<uint64_t> numbers;
+  for (const auto& file : files) {
+    numbers.insert(file.file_number);
+  }
+  return numbers;
+}
+}  // anonymous namespace
+
+// Files that one catch-up round adds and deletes never reach a Version, so
+// only VersionBuilder::UnrefFile can evict their table cache entries.
+class DBSecondaryTableCacheTest : public DBSecondaryTestBase {
+ public:
+  DBSecondaryTableCacheTest()
+      : DBSecondaryTestBase("db_secondary_table_cache_test") {}
+
+ protected:
+  // max_open_files=-1 keeps released entries cached. Disabling file deletions
+  // stands in for a catch-up that wins the race against the primary's purge.
+  void OpenPrimaryAndSecondary() {
+    Options options;
+    options.env = env_;
+    options.disable_auto_compactions = true;
+    Reopen(options);
+
+    Options secondary_options;
+    secondary_options.env = env_;
+    secondary_options.max_open_files = -1;
+    secondary_options.verify_sst_unique_id_in_manifest = true;
+    secondary_options.statistics = CreateDBStatistics();
+    OpenSecondary(secondary_options);
+
+    ASSERT_OK(db_->DisableFileDeletions());
+  }
+
+  void FlushTwiceAndCompact(int round, std::set<uint64_t>* deleted) {
+    const std::string value = "v" + std::to_string(round);
+    ASSERT_OK(Put("a", value));
+    ASSERT_OK(Put("c", value));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("b", value));
+    ASSERT_OK(Put("c", value + "c"));
+    ASSERT_OK(Flush());
+
+    const std::set<uint64_t> before = LiveTableFileNumbers(db_.get());
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    const std::set<uint64_t> after = LiveTableFileNumbers(db_.get());
+    for (uint64_t number : before) {
+      if (after.count(number) == 0) {
+        deleted->insert(number);
+      }
+    }
+  }
+
+  void VerifySecondaryRound(int round) {
+    const std::string value = "v" + std::to_string(round);
+    VerifySecondaryValue("a", value);
+    VerifySecondaryValue("b", value);
+    VerifySecondaryValue("c", value + "c");
+  }
+};
+
+TEST_F(DBSecondaryTableCacheTest, FilesAddedAndDeletedInOneCatchUp) {
+  ASSERT_NO_FATAL_FAILURE(OpenPrimaryAndSecondary());
+  std::set<uint64_t> deleted;
+  ASSERT_NO_FATAL_FAILURE(FlushTwiceAndCompact(/*round=*/0, &deleted));
+  ASSERT_EQ(2, deleted.size());
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  // Without the verify-time opens the checks below would pass vacuously.
+  ASSERT_GE(TestGetTickerCount(db_secondary_->GetOptions(), NO_FILE_OPENS),
+            deleted.size() + 1);
+  ASSERT_NO_FATAL_FAILURE(VerifySecondaryRound(/*round=*/0));
+
+  Cache* cache = db_secondary_full()->TEST_table_cache();
+  for (uint64_t number : deleted) {
+    Cache::Handle* handle = TableCache::Lookup(cache, number);
+    EXPECT_EQ(nullptr, handle) << "table cache holds deleted file " << number;
+    if (handle != nullptr) {
+      cache->Release(handle);
+    }
+  }
+  // Also covers the intermediate compaction output the test never names.
+  EXPECT_EQ(LiveTableFileNumbers(db_secondary_.get()),
+            TableCacheFileNumbers(cache));
+}
+
+TEST_F(DBSecondaryTableCacheTest, NoGrowthOverRepeatedCatchUps) {
+  constexpr int kRounds = 5;
+  ASSERT_NO_FATAL_FAILURE(OpenPrimaryAndSecondary());
+  for (int round = 0; round < kRounds; ++round) {
+    SCOPED_TRACE("round " + std::to_string(round));
+    std::set<uint64_t> deleted;
+    ASSERT_NO_FATAL_FAILURE(FlushTwiceAndCompact(round, &deleted));
+    ASSERT_FALSE(deleted.empty());
+    ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+    ASSERT_NO_FATAL_FAILURE(VerifySecondaryRound(round));
+  }
+  EXPECT_EQ(LiveTableFileNumbers(db_secondary_.get()),
+            TableCacheFileNumbers(db_secondary_full()->TEST_table_cache()));
 }
 
 // Makes the MANIFEST files opened while a cap is set appear to end after `cap`
