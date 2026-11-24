@@ -1,6 +1,10 @@
 # Rocksdb Change Log
 > NOTE: Entries for next release do not go here. Follow instructions in `unreleased_history/README.txt`
 
+## 11.15.1 (11/22/2026)
+### Bug Fixes
+* Fixed a compatibility regression in 11.15.0: OPTIONS files saved `read_io_executor_threads=0`, which releases 11.9 through 11.14 reject in a read-write `DB::Open()`, so those releases failed to open such a DB read-write with options loaded from the file (for example with `LoadLatestOptions()`). OPTIONS files written from now on omit `read_io_executor_threads`. Files written by earlier releases still carry their saved value until a release with this fix opens the DB read-write or calls `SetOptions()`.
+
 ## 11.15.0 (11/19/2026)
 ### New Features
 * Added `DBOptions::best_efforts_blob_db_repair`, which opens an integrated BlobDB whose blob files are missing. Unlike `best_efforts_recovery`, it keeps the SST files that reference them, records the missing blob files in the MANIFEST, and makes reads and later compactions treat the lost values as deleted instead of failing. The option is not saved in the OPTIONS file, so it applies only to the open that sets it.
@@ -59,7 +63,6 @@
 * A prefix seek (`prefix_same_as_start`, legacy prefix seek, or `auto_prefix_mode`) into an SST file below L0 now checks the file's prefix filter before creating the file's index and table iterators, so a seek the filter rules out skips that work. Files with range tombstones are not affected.
 * A `prefix_same_as_start` seek on a block-based table no longer copies the seek key's prefix when the prefix filter rules the seek out, and reuses the copy's buffer across seeks instead of allocating one for every prefix longer than the small-string buffer.
 * Greatly reduced cases of redundant reads of SST file metadata blocks for operations like `GetPropertiesOfAllTables()` while files are still being opened under `max_open_files = -1` and `open_files_async = true`.
-
 
 ## 11.14.0 (11/05/2026)
 ### New Features
