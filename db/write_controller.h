@@ -5,9 +5,8 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
 #include "rocksdb/rate_limiter.h"

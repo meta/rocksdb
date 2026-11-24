@@ -21,11 +21,11 @@
 #include <intrin.h>
 #include <malloc.h>
 #include <process.h>
-#include <stdint.h>
-#include <string.h>
 
 #include <cassert>
 #include <condition_variable>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>

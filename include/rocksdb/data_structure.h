@@ -5,9 +5,8 @@
 
 #pragma once
 
-#include <assert.h>
-
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <functional>

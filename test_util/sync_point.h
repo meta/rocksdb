@@ -4,9 +4,8 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
-#include <assert.h>
-
 #include <atomic>
+#include <cassert>
 #include <functional>
 #include <string>
 #include <vector>

@@ -11,14 +11,14 @@
 
 #include "port/win/port_win.h"
 
-#include <assert.h>
 #include <io.h>
 #include <rpc.h>
-#include <stdio.h>
-#include <string.h>
 
+#include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 

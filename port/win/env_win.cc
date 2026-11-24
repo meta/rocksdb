@@ -12,9 +12,8 @@
 #include "port/win/env_win.h"
 
 #include <direct.h>  // _rmdir, _mkdir, _getcwd
-#include <errno.h>
-#include <io.h>   // _access
-#include <rpc.h>  // for uuid generation
+#include <io.h>      // _access
+#include <rpc.h>     // for uuid generation
 #include <shlwapi.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -22,6 +21,7 @@
 #include <winioctl.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <ctime>
 #include <thread>
 

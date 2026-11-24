@@ -17,7 +17,6 @@
 
 #include "rocksdb/slice.h"
 #ifdef OS_WIN
-#include <string.h>
 #endif
 #include <cstring>
 

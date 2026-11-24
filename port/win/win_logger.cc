@@ -15,11 +15,11 @@
 #include "port/win/win_logger.h"
 
 #include <fcntl.h>
-#include <stdio.h>
-#include <time.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <ctime>
 
 #include "monitoring/iostats_context_imp.h"
 #include "port/sys_time.h"

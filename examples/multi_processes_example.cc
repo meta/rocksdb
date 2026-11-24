@@ -28,11 +28,12 @@
 // POSIX-compliant systems.
 #if defined(OS_LINUX)
 #include <dirent.h>
-#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <csignal>
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"

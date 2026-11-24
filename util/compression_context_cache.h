@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <stdint.h>
+#include <cstdint>
 
 #include "rocksdb/rocksdb_namespace.h"
 

@@ -15,9 +15,9 @@
 // multiple threads without any external synchronization.
 
 #pragma once
-#include <stdint.h>
 #include <windows.h>
 
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>

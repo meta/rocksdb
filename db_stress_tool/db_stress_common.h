@@ -23,14 +23,14 @@
 #ifdef GFLAGS
 #pragma once
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <sys/types.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <queue>
 #include <thread>

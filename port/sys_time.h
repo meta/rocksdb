@@ -16,7 +16,7 @@
 
 #if defined(OS_WIN) && (defined(_MSC_VER) || defined(__MINGW32__))
 
-#include <time.h>
+#include <ctime>
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -40,7 +40,8 @@ inline struct tm* LocalTimeR(const time_t* timep, struct tm* result) {
 
 #else
 #include <sys/time.h>
-#include <time.h>
+
+#include <ctime>
 
 namespace ROCKSDB_NAMESPACE {
 

@@ -16,11 +16,10 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #include <any>
 #include <chrono>
 #include <cstdarg>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>

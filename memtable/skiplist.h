@@ -31,8 +31,8 @@
 //
 
 #pragma once
-#include <assert.h>
-#include <stdlib.h>
+#include <cassert>
+#include <cstdlib>
 
 #include "memory/allocator.h"
 #include "port/port.h"

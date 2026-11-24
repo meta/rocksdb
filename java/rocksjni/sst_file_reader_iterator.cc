@@ -7,8 +7,9 @@
 // calling c++ ROCKSDB_NAMESPACE::Iterator methods from Java side.
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
+
+#include <cstdio>
+#include <cstdlib>
 
 #include "include/org_rocksdb_SstFileReaderIterator.h"
 #include "rocksdb/iterator.h"

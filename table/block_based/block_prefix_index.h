@@ -4,7 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
-#include <stdint.h>
+#include <cstdint>
 
 #include "db/dbformat.h"
 #include "rocksdb/status.h"

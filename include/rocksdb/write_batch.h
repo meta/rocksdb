@@ -24,9 +24,8 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>

@@ -6,8 +6,9 @@
 // This file implements the "bridge" between Java and C++.
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
+
+#include <cstdio>
+#include <cstdlib>
 
 #include "include/org_rocksdb_Snapshot.h"
 #include "rocksdb/db.h"

@@ -9,10 +9,10 @@
 #include "rocksdb/iterator.h"
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 #include "include/org_rocksdb_RocksIterator.h"
 #include "rocksjni/portal.h"

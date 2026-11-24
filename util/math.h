@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include <assert.h>
+#include <cassert>
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif

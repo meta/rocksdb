@@ -44,9 +44,9 @@
 #include <endian.h>
 #endif
 #include <pthread.h>
-#include <stdint.h>
-#include <string.h>
 
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 

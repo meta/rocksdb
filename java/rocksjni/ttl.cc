@@ -8,9 +8,9 @@
 // from Java side.
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>

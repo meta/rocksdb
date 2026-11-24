@@ -4,9 +4,8 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #pragma once
-#include <stddef.h>
-#include <stdint.h>
-
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "rocksdb/rocksdb_namespace.h"
