@@ -399,26 +399,39 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   s = CompactionServiceResult::Read(compaction_result_binary,
                                     &compaction_result);
 
-  if (s.ok() && compaction_result.merge_order_mismatch &&
+  // A worker that cannot run the compaction as this primary decided it marks
+  // the result before processing any input. Run such a compaction locally,
+  // whatever Wait() returned.
+  const char* decline_reason = nullptr;
+  Status::Code decline_code = Status::kOk;
+  if (s.ok() && compaction_result.merge_order_mismatch) {
+    decline_reason = "filter order";
+    decline_code = Status::kNotSupported;
+  } else if (s.ok() && compaction_result.per_key_placement_mismatch) {
+    decline_reason = "per-key placement";
+    decline_code = Status::kIncomplete;
+  }
+  if (decline_reason != nullptr &&
       (compaction_status == CompactionServiceJobStatus::kSuccess ||
        compaction_status == CompactionServiceJobStatus::kFailure)) {
-    if (!compaction_result.status.IsNotSupported() ||
+    if (compaction_result.status.code() != decline_code ||
         !compaction_result.output_files.empty() ||
         !compaction_result.blob_file_additions.empty() ||
         !compaction_result.blob_file_garbages.empty() ||
         compaction_result.stats.num_input_records != 0 ||
         compaction_result.merge_before_filter_version != 0) {
       sub_compact->status =
-          Status::Corruption("Invalid remote compaction filter order decline");
+          Status::Corruption(std::string("Invalid remote compaction ") +
+                             decline_reason + " decline");
       db_options_.compaction_service->OnInstallation(
           response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
       return CompactionServiceJobStatus::kFailure;
     }
     ROCKS_LOG_WARN(db_options_.info_log,
-                   "[%s] [JOB %d] Worker declined compaction filter order; "
+                   "[%s] [JOB %d] Worker declined compaction %s; "
                    "falling back to local compaction",
-                   compaction->column_family_data()->GetName().c_str(),
-                   job_id_);
+                   compaction->column_family_data()->GetName().c_str(), job_id_,
+                   decline_reason);
     db_options_.compaction_service->OnInstallation(
         response.scheduled_job_id, CompactionServiceJobStatus::kUseLocal);
     return CompactionServiceJobStatus::kUseLocal;
@@ -1974,6 +1987,9 @@ static std::unordered_map<std::string, OptionTypeInfo> cs_result_type_info = {
     {"merge_order_mismatch",
      {offsetof(struct CompactionServiceResult, merge_order_mismatch),
       OptionType::kBoolean}},
+    {"per_key_placement_mismatch",
+     {offsetof(struct CompactionServiceResult, per_key_placement_mismatch),
+      OptionType::kBoolean}},
     {"status",
      {offsetof(struct CompactionServiceResult, status),
       OptionType::kCustomizable, OptionVerificationType::kNormal,
@@ -2129,6 +2145,7 @@ Status CompactionServiceResult::Read(const std::string& data_str,
   if (format_version == kOptionsString) {
     obj->merge_before_filter_version = 0;
     obj->merge_order_mismatch = false;
+    obj->per_key_placement_mismatch = false;
     obj->blob_file_additions.clear();
     obj->blob_file_garbages.clear();
     obj->blob_compaction_version = 0;

@@ -1,0 +1,1 @@
+Fixed a remote compaction with `preclude_last_level_data_seconds` failing with a background error when the worker's per-key placement differed from the primary's and the `CompactionService` mapped the worker's decline to `kFailure`. The primary now runs such a compaction locally.
