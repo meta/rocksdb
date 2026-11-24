@@ -521,6 +521,17 @@ TEST_P(TransactionTest, InplaceUpdateSupportRequiresWriteCommitted) {
   if (supported) {
     ASSERT_OK(s);
     ASSERT_OK(db->Put(WriteOptions(), cfh, "key", "value"));
+    // Range deletions are rejected for a column family with in-place updates,
+    // even when the caller promises that they cause no conflicts.
+    WriteBatch wb;
+    ASSERT_OK(wb.DeleteRange(cfh, "a", "z"));
+    TransactionDBWriteOptimizations flags;
+    flags.skip_concurrency_control = true;
+    ASSERT_EQ(db->Write(WriteOptions(), flags, &wb).code(),
+              Status::Code::kNotSupported);
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), cfh, "key", &value));
+    ASSERT_EQ("value", value);
     ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
   } else {
     ASSERT_EQ(s.code(), Status::Code::kNotSupported);

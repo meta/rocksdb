@@ -2365,6 +2365,89 @@ TEST_F(ExternalSSTFileBasicTest,
   ASSERT_EQ("old-f", Get("f"));
 }
 
+// Column families with inplace_update_support take no new range deletions, so
+// files with range deletions cannot be ingested into them. Files without range
+// deletions still can.
+TEST_F(ExternalSSTFileBasicTest, IngestRangeDeletionWithInplaceUpdateSupport) {
+  Options options = CurrentOptions();
+  options.inplace_update_support = true;
+  options.allow_concurrent_memtable_write = false;
+  DestroyAndReopen(options);
+
+  SstFileWriter sst_file_writer(EnvOptions(), options);
+  const std::string range_del_file = sst_files_dir_ + "range_del.sst";
+  ASSERT_OK(sst_file_writer.Open(range_del_file));
+  ASSERT_OK(sst_file_writer.Put("a", "new-a"));
+  ASSERT_OK(sst_file_writer.DeleteRange("b", "c"));
+  ASSERT_OK(sst_file_writer.Finish());
+  const std::string point_file = sst_files_dir_ + "point.sst";
+  ASSERT_OK(sst_file_writer.Open(point_file));
+  ASSERT_OK(sst_file_writer.Put("d", "new-d"));
+  ASSERT_OK(sst_file_writer.Finish());
+
+  ASSERT_OK(Put("b", "old-b"));
+  ASSERT_EQ(
+      db_->IngestExternalFile({range_del_file}, IngestExternalFileOptions())
+          .code(),
+      Status::Code::kNotSupported);
+  ASSERT_EQ("NOT_FOUND", Get("a"));
+  ASSERT_EQ("old-b", Get("b"));
+  ASSERT_OK(db_->IngestExternalFile({point_file}, IngestExternalFileOptions()));
+  ASSERT_EQ("new-d", Get("d"));
+
+  // Without in-place updates, the same file is accepted.
+  options.inplace_update_support = false;
+  Reopen(options);
+  ASSERT_OK(
+      db_->IngestExternalFile({range_del_file}, IngestExternalFileOptions()));
+  ASSERT_EQ("new-a", Get("a"));
+  ASSERT_EQ("NOT_FOUND", Get("b"));
+  ASSERT_EQ("new-d", Get("d"));
+}
+
+// With inplace_update_support, atomic_replace_range does not generate a range
+// tombstone file for a partially overlapped file. It fails instead, as for
+// other configurations that cannot use one.
+TEST_F(ExternalSSTFileBasicTest, AtomicReplaceRangeWithInplaceUpdateSupport) {
+  for (bool inplace_update_support : {false, true}) {
+    SCOPED_TRACE(inplace_update_support);
+    Options options = CurrentOptions();
+    options.compaction_style = kCompactionStyleUniversal;
+    options.disable_auto_compactions = true;
+    options.inplace_update_support = inplace_update_support;
+    options.allow_concurrent_memtable_write = false;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "old-a"));
+    ASSERT_OK(Put("c", "old-c"));
+    ASSERT_OK(Flush());
+
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    const std::string replacement_file = sst_files_dir_ + "replacement.sst";
+    ASSERT_OK(sst_file_writer.Open(replacement_file));
+    ASSERT_OK(sst_file_writer.Put("b", "new-b"));
+    ASSERT_OK(sst_file_writer.Finish());
+
+    IngestExternalFileArg arg;
+    arg.column_family = db_->DefaultColumnFamily();
+    arg.external_files = {replacement_file};
+    arg.options.snapshot_consistency = false;
+    // Partially overlaps the existing file with "a" and "c".
+    arg.atomic_replace_range = {{"b", "d"}};
+    Status s = db_->IngestExternalFiles({arg});
+    if (inplace_update_support) {
+      ASSERT_EQ(s.code(), Status::Code::kInvalidArgument);
+      ASSERT_EQ("NOT_FOUND", Get("b"));
+      ASSERT_EQ("old-c", Get("c"));
+    } else {
+      ASSERT_OK(s);
+      ASSERT_EQ("new-b", Get("b"));
+      ASSERT_EQ("NOT_FOUND", Get("c"));
+    }
+    ASSERT_EQ("old-a", Get("a"));
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+  }
+}
+
 // A universal L0->L0 compaction (always the case with num_levels=1) must not
 // pick a file that a concurrent atomic-replace ingestion is deleting while the
 // ingestion has released the DB mutex to write its MANIFEST record.

@@ -3466,8 +3466,9 @@ struct IngestExternalFileArg {
   // factory that supports range deletion, a partial overlap is handled by
   // retaining the overlapping file and adding a range tombstone below the
   // ingested data. This requires allow_global_seqno=true,
-  // allow_db_generated_files=false, and no user-defined timestamps. Other
-  // configurations fail on partial overlap.
+  // allow_db_generated_files=false, no user-defined timestamps, and
+  // inplace_update_support=false. Other configurations fail on partial
+  // overlap.
   //   * fail_if_not_bottommost_level=true rejects partial overlap because the
   //     retained file requires the tombstone and replacement files to be
   //     placed on higher levels.

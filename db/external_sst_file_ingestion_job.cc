@@ -118,6 +118,7 @@ Status CheckExternalFileNotTooOld(const std::string& file_path,
 
 bool ExternalSstFileIngestionJob::SupportsAtomicReplaceRangeTombstone() const {
   return cfd_->is_delete_range_supported() &&
+         !cfd_->ioptions().inplace_update_support &&
          cfd_->ioptions().compaction_style == kCompactionStyleUniversal &&
          ingestion_options_.allow_global_seqno &&
          !ingestion_options_.allow_db_generated_files &&
@@ -164,6 +165,7 @@ Status ExternalSstFileIngestionJob::PrepareAtomicReplaceRangeTombstone(
     const Slice& start, const Slice& limit, uint64_t file_number,
     SuperVersion* super_version) {
   assert(cfd_->is_delete_range_supported());
+  assert(!cfd_->ioptions().inplace_update_support);
   assert(cfd_->ioptions().compaction_style == kCompactionStyleUniversal);
   assert(ingestion_options_.allow_global_seqno);
   assert(!ingestion_options_.allow_db_generated_files);
@@ -283,6 +285,13 @@ Status ExternalSstFileIngestionJob::Prepare(
     if (file_to_ingest.num_entries == 0 &&
         file_to_ingest.num_range_deletions == 0) {
       return Status::InvalidArgument("File contain no entries");
+    }
+
+    if (file_to_ingest.num_range_deletions > 0 &&
+        cfd_->ioptions().inplace_update_support) {
+      return Status::NotSupported(
+          "Files with range deletions cannot be ingested into a column family "
+          "with inplace_update_support");
     }
 
     if (!file_to_ingest.smallest_internal_key.Valid() ||

@@ -137,7 +137,10 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
           active_mem != nullptr && !HasTableFilter(read_options) &&
                   read_options.read_tier == kReadAllTier &&
                   (expect_total_order_inner_iter_ || prefix_same_as_start_) &&
-                  HasFullTimestampVisibility(read_options)
+                  HasFullTimestampVisibility(read_options) &&
+                  // Column families with in-place updates take no range
+                  // tombstones.
+                  !ioptions.inplace_update_support
               ? mutable_cf_options.min_tombstones_for_range_conversion
               : 0),
       expose_blob_index_(expose_blob_index),

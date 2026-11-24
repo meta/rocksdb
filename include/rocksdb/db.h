@@ -708,6 +708,9 @@ class DB {
   // max_open_files to -1 whenever possible.
   // 3) Incompatible with row_cache, will return Status::NotSupported() if
   // row_cache is configured.
+  // 4) Not supported for a column family with inplace_update_support, will
+  // return Status::NotSupported(). A WriteBatch with a range deletion for such
+  // a column family is rejected as a whole in the same way.
   virtual Status DeleteRange(const WriteOptions& options,
                              ColumnFamilyHandle* column_family,
                              const Slice& begin_key, const Slice& end_key);
@@ -2684,6 +2687,8 @@ class DB {
   // for the same key, the point data currently overrides the range deletion
   // regardless which one has the higher user-defined timestamps.
   // For FIFO compaction, SST files will always be ingested into L0.
+  // Files with range deletions cannot be ingested into a column family with
+  // inplace_update_support (Status::NotSupported()).
   //
   // (1) External SST files can be created using SstFileWriter
   // (2) We will try to ingest the files to the lowest possible level

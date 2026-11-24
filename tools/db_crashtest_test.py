@@ -1252,6 +1252,7 @@ class DBCrashTestTest(unittest.TestCase):
             "delrangepercent",
             "min_tombstones_for_range_conversion",
             "test_ingest_standalone_range_deletion_one_in",
+            "ingest_external_file_atomic_replace_one_in",
             "prefixpercent",
             "iterpercent",
             "acquire_snapshot_one_in",
@@ -1294,6 +1295,7 @@ class DBCrashTestTest(unittest.TestCase):
                         "sync_fault_injection": 1,
                         "memtable_verify_per_key_checksum_on_seek": 1,
                         "test_ingest_standalone_range_deletion_one_in": 5,
+                        "ingest_external_file_atomic_replace_one_in": 5,
                         "lazy_entity_read_one_in": 10,
                     }
                 )
@@ -1306,6 +1308,7 @@ class DBCrashTestTest(unittest.TestCase):
             {"delrangepercent": 1},
             {"min_tombstones_for_range_conversion": 2},
             {"test_ingest_standalone_range_deletion_one_in": 5},
+            {"ingest_external_file_atomic_replace_one_in": 5},
             {"allow_concurrent_memtable_write": 1},
             {"test_batches_snapshots": 1},
             {"disable_wal": 1},
@@ -1448,6 +1451,7 @@ class DBCrashTestTest(unittest.TestCase):
                 "enable_blob_direct_write": 0,
                 "ingest_external_file_atomic_replace_one_in": 1,
                 "ingest_external_file_one_in": 1,
+                "inplace_update_support": 0,
                 "manual_wal_flush_one_in": 0,
                 "sync_fault_injection": 0,
                 "test_batches_snapshots": 0,

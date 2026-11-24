@@ -746,6 +746,15 @@ int db_stress_tool(int argc, char** argv) {
         "check_multiget_consistency, check_multiget_entity_consistency must "
         "all be 0 when using compaction filter or inplace update support");
   }
+  if (FLAGS_inplace_update_support &&
+      (FLAGS_delrangepercent > 0 ||
+       FLAGS_test_ingest_standalone_range_deletion_one_in > 0 ||
+       FLAGS_ingest_external_file_atomic_replace_one_in > 0)) {
+    return ReturnValidationError(
+        "delrangepercent, test_ingest_standalone_range_deletion_one_in and "
+        "ingest_external_file_atomic_replace_one_in must all be 0 when using "
+        "inplace update support, which does not support range deletions");
+  }
   if (FLAGS_test_multi_ops_txns) {
     CheckAndSetOptionsForMultiOpsTxnStressTest();
   }
