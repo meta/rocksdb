@@ -554,15 +554,17 @@ class S3FifoGhostIndex {
 //    probation pin by a thread without a ReaderSlot; see Release).
 // 3. Probation eviction: the probation head with freq >= kPromoteThreshold (2)
 //    moves to resident, with freq reset to 0. Otherwise it is evicted and its
-//    key hash is recorded in the ghost queue, which keeps at most as many
-//    hashes as the shard has entries, dropping the oldest. Resident victims
+//    key hash is recorded in the ghost queue. The ghost drops its oldest
+//    hashes while it holds more hashes than the shard has entries, or more
+//    total victim charge than capacity_ (see ghost_ring_). Resident victims
 //    are not recorded.
 // 4. Resident eviction (CLOCK): resident is a ring whose hand
 //    (resident_hand_) points at its oldest entry. The hand passes an entry
 //    with freq > 0, decrementing it, and evicts an entry at 0. A promoted
 //    entry is linked just before the hand, so the hand reaches it last.
-// 5. Queue choice: probation evicts first while its unpinned charge exceeds
-//    its budget, 12% of the charge the shard can hold (kProbationPercent,
+// 5. Queue choice: probation evicts first while its unpinned charge, plus the
+//    incoming charge if the new entry will enter probation, exceeds its
+//    budget, 12% of the charge the shard can hold (kProbationPercent,
 //    ProbationBudget), or when resident is empty; otherwise resident evicts
 //    first. Either way the other queue evicts too if need remains, so the
 //    budget only picks the queue: it is not a fixed split, and eviction can
@@ -581,10 +583,10 @@ class S3FifoGhostIndex {
 // - The budget is 12% instead of 10% (see kProbationPercent).
 // - The budget picks the queue that evicts first instead of fixing the queue
 //   sizes.
-// - The ghost queue is bounded by the shard's entry count, not by the main
-//   queue's size, and holds 32-bit hashes, so a collision can admit a new key
-//   to resident (at freq 0, so it is evicted on its first visit unless hit or
-//   pinned first).
+// - The ghost queue is bounded by the shard's entry count and capacity, not
+//   by the main queue's size, and holds 32-bit hashes, so a collision can admit
+//   a new key to resident (at freq 0, so it is evicted on its first visit
+//   unless hit or pinned first).
 // - When kMaxResidentIdlePasses passes over resident evict nothing (every
 //   entry pinned or hot), eviction stops instead of evicting a hot entry.
 // - Pinned entries rotate or go to the aside list.
@@ -1198,14 +1200,17 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 
   // The probation budget, 12% of the charge the shard can hold (policy step
   // 5; see ProbationBudget). It is not a partition: it only chooses which
-  // queue evicts first (see EvictFromQueues). Eviction can still take
-  // probation below it: when the resident pass falls short (its entries
-  // pinned or hot) or resident is empty, probation evicts too. Probation
-  // shrinks toward it as entries are promoted and as ghost hits go straight
-  // to resident; on a warm shard whose hot set is already resident it can
-  // stay well above it. Shard-internal: not an option. On shards small
-  // enough that the share rounds to zero the budget is zero, so probation is
-  // over budget, and evicts first, whenever it holds unpinned charge.
+  // queue evicts first (see EvictFromQueues), and never caps an insert: an
+  // entry larger than the whole budget enters probation over budget and is
+  // decided on its turn like any other. Eviction can still take probation
+  // below it: when the resident pass falls short (its entries pinned or hot)
+  // or resident is empty, probation evicts too. Probation shrinks toward it
+  // as entries are promoted and as ghost hits go straight to resident; on a
+  // warm shard whose hot set is already resident it can stay well above it.
+  // Shard-internal: not an option. On shards small enough that the share
+  // rounds to zero the budget is zero, so probation evicts first for any
+  // insert, except one that adds no probation charge (zero charge, a ghost hit
+  // or slotless) while probation holds no unpinned charge.
   // Why 12%: S3-FIFO (SOSP '23) sizes its small queue at 10% of the cache.
   // In cache_bench with the full S3-FIFO policy, 12% missed less when the
   // cache already hit above 0.9, and 10% slightly less under cache pressure;
@@ -1227,23 +1232,25 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // remains, or when the resident clock gives up (kMaxResidentIdlePasses) with
   // hot unpinned entries left, so usage can stay above capacity. Total capacity
   // decides whether to evict; the probation budget only selects the queue. When
-  // unpinned probation charge (ProbationUnpinnedUsage) is over budget (or
-  // resident is empty) the probation pass runs first, otherwise the resident
-  // pass runs first; the other queue is tried if need remains, so a pinned
-  // preferred queue falls back instead of stranding evictable entries. The
-  // choice reads the current unpinned probation charge, before the incoming
-  // entry is accounted. An entry that alone exceeds the whole budget is treated
-  // like any other: it waits in probation and is promoted or evicted on its
-  // turn under pressure. Pinned resident entries are passed without
-  // decrementing freq. Promotion touches only links: usage_ is unchanged by a
-  // move between queues. The probation pass consumes its head each step, so it
-  // ends after at most the initial number of entries; the resident scan stops
-  // after kMaxResidentIdlePasses consecutive passes that evict nothing. An
-  // all-pinned shard terminates having evicted nothing.
+  // unpinned probation charge (ProbationUnpinnedUsage) plus probation_charge
+  // (the part of the incoming charge that will be linked into probation, 0 if
+  // none) is over budget, or resident is empty, the probation pass runs first;
+  // otherwise the resident pass runs first. Either way the other queue is tried
+  // if need remains, so a pinned preferred queue falls back instead of
+  // stranding evictable entries. Because probation_charge is counted, a
+  // probation-bound entry that pushes probation over budget is paid for by
+  // probation first; resident covers only the remainder, however large the
+  // entry. Pinned resident entries are passed without decrementing freq.
+  // Promotion touches only links: usage_ is unchanged by a move between queues.
+  // The probation pass consumes its head each step, so it ends after at most
+  // the initial number of entries; the resident scan stops after
+  // kMaxResidentIdlePasses consecutive passes that evict nothing. An all-pinned
+  // shard terminates having evicted nothing.
   // The name predates the two queues: it evicts from both.
   // This function is not thread safe - it needs to be executed while
   // holding the mutex_.
-  void EvictFromFIFO(size_t charge, autovector<S3FifoHandle*>* deleted);
+  void EvictFromFIFO(size_t charge, size_t probation_charge,
+                     autovector<S3FifoHandle*>* deleted);
 
   // What one eviction call must free, and what it has freed so far. Charge
   // and entries are counted separately, so zero-charge entries cannot make
@@ -1263,12 +1270,14 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // have been unpinned, aside entries are returned kAsideReturnChunk at a time,
   // with a round after each chunk, until data is Done or every aside entry
   // present at the start was visited. May return with data not Done.
-  void EvictNeed(EvictionData* data, autovector<S3FifoHandle*>* deleted);
+  void EvictNeed(EvictionData* data, size_t probation_charge,
+                 autovector<S3FifoHandle*>* deleted);
 
   // Picks the queue that evicts first from the probation budget (probation when
   // resident is empty), then runs the probation and resident passes once
   // (resident again after a promoting probation fallback).
-  void EvictFromQueues(EvictionData* data, autovector<S3FifoHandle*>* deleted);
+  void EvictFromQueues(EvictionData* data, size_t probation_charge,
+                       autovector<S3FifoHandle*>* deleted);
 
   // Under mutex_: takes a claimed entry out of the table and the usage, and
   // records it in data and deleted.
@@ -1298,10 +1307,11 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 
   // The 32 bits of an entry's hash the ghost queue remembers.
   static uint32_t GhostHash(HashCref hash) { return Lower32of64(hash[0]); }
-  // Records a probation victim's ghost hash in the ghost queue, dropping
-  // the oldest ghosts beyond the bound. Call before removing the victim
-  // from the table so that a full shard of N entries keeps N ghosts.
-  void GhostRecord(uint32_t hash);
+  // Records a probation victim's ghost hash and charge in the ghost queue,
+  // dropping the oldest ghosts beyond the bound. Call before removing the
+  // victim from the table so that a full shard of N entries keeps N ghosts
+  // while the count bound, not the charge bound, is the one that binds.
+  void GhostRecord(uint32_t hash, size_t charge);
 
   // Forgets a ghost hash: drops it from the index, so its ring record is
   // skipped when trimmed. Returns whether it was remembered.
@@ -1611,10 +1621,13 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // victims are never recorded: they already had their chance. A hash collision
   // only admits one entry to resident at freq 0, where it is evicted on its
   // first visit unless hit or pinned first.
-  // Bound: at most occupancy_ records, oldest dropped first, i.e. reuse is
-  // remembered over about one shard's worth of evictions, and ghost memory
-  // stays proportional to the table it shadows. Not charged to usage_:
-  // about 4 bytes of ring plus one index entry per remembered key.
+  // Bound: records' total charge at most capacity_ and at most occupancy_
+  // records, oldest dropped first. The charge bound remembers about one
+  // shard's worth of probation victims by charge, the unit of the budget,
+  // so large victims cannot be remembered over many shards of traffic. The
+  // record bound keeps ghost memory proportional to the table it shadows
+  // even for tiny or zero charges. Not charged to usage_: 8 bytes of ring
+  // and 16 of index per record of the ring.
   // The bound is enforced when a ghost is recorded and after SetCapacity
   // (GhostTrim). Erasing entries does not trim, so after erases ghost_size_
   // can exceed occupancy_ until one of those runs. EraseUnRefEntries does not
@@ -1630,8 +1643,15 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // number. Records live in a power-of-two ring addressed by sequence
   // number, so the ring and its index allocate nothing once grown to the
   // bound, and growing never moves a record to another sequence number.
-  // Each ring element is one ghost record (a ghost hash).
-  std::unique_ptr<uint32_t[]> ghost_ring_;
+  // A GhostSlot holds one ghost record.
+  struct GhostSlot {
+    // Victim total_charge. It always fits: victims are slot entries, whose
+    // charge is 32 bits, so the clamp in GhostRecord is defensive. Only the
+    // ghost bound reads it.
+    uint32_t charge;
+    uint32_t hash;
+  };
+  std::unique_ptr<GhostSlot[]> ghost_ring_;
 
   // Ring length, 0 or a power of two. Grows to the record bound and never
   // shrinks.
@@ -1642,6 +1662,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   uint64_t ghost_head_seq_;
   size_t ghost_size_;
   S3FifoGhostIndex ghost_index_;
+
+  // Total charge of all records in the ring, stale ones included.
+  size_t ghost_charge_;
 
   // Bumped by every GhostRecord, so InsertItem can tell whether a Find
   // result from ghost_index_ survived its eviction.
@@ -1728,7 +1751,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 //   that pinned or hot entries survive, or when the limit is turned on over
 //   capacity). Without a handle it is dropped, strict or not.
 // - Not charged to capacity: each shard's memory of evicted keys (up to about
-//   40 bytes per key, about one key per cached entry, kept at its peak size;
+//   48 bytes per key, about one key per cached entry, kept at its peak size;
 //   see ghost_ring_); one cache line per thread that has used the shard, for up
 //   to 8192 threads, allocated in blocks of 64 threads (4 KiB with 64-byte
 //   cache lines; building the cache allocates the building thread's block on

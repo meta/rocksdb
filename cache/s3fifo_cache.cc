@@ -457,6 +457,7 @@ S3FifoCacheShard::S3FifoCacheShard(
       ghost_ring_length_(0),
       ghost_head_seq_(0),
       ghost_size_(0),
+      ghost_charge_(0),
       ghost_records_(0),
       mutex_(use_adaptive_mutex),
       allocator_(allocator),
@@ -932,20 +933,20 @@ S3FifoHandle* S3FifoCacheShard::ResidentNext(S3FifoHandle* e) {
   return next == resident() ? Next(next) : next;
 }
 
-void S3FifoCacheShard::EvictFromFIFO(size_t charge,
+void S3FifoCacheShard::EvictFromFIFO(size_t charge, size_t probation_charge,
                                      autovector<S3FifoHandle*>* deleted) {
   if (FitsIn(usage_.Get(), charge, capacity_.Get())) {
     return;
   }
   EvictionData data;
   data.need_charge = Excess(usage_.Get(), charge, capacity_.Get());
-  EvictNeed(&data, deleted);
+  EvictNeed(&data, probation_charge, deleted);
 }
 
-void S3FifoCacheShard::EvictNeed(EvictionData* data,
+void S3FifoCacheShard::EvictNeed(EvictionData* data, size_t probation_charge,
                                  autovector<S3FifoHandle*>* deleted) {
   ReturnUnpinnedAside();
-  EvictFromQueues(data, deleted);
+  EvictFromQueues(data, probation_charge, deleted);
   // Eviction returns only kAsideChecksPerEviction aside entries per call,
   // so after a burst of pins is released most of the shard may wait on the
   // aside list. When it falls short, return them kAsideReturnChunk at a
@@ -962,7 +963,7 @@ void S3FifoCacheShard::EvictNeed(EvictionData* data,
     bool walked = false;
     while (!walked && !data->Done()) {
       walked = ReturnUnpinnedAsideChunk(last);
-      EvictFromQueues(data, deleted);
+      EvictFromQueues(data, probation_charge, deleted);
     }
     if (!walked) {
       aside_unpinned_.store(true, std::memory_order_relaxed);
@@ -971,15 +972,16 @@ void S3FifoCacheShard::EvictNeed(EvictionData* data,
 }
 
 void S3FifoCacheShard::EvictFromQueues(EvictionData* data,
+                                       size_t probation_charge,
                                        autovector<S3FifoHandle*>* deleted) {
-  // The budget selects the queue from the current unpinned probation
-  // charge, before the incoming entry is accounted. Pinned entries are
-  // excluded: they can be neither evicted nor promoted, so counting them
-  // would hold probation over budget for as long as they stay pinned and
-  // the resident clock would never run. Either pass can free nothing (all
-  // pinned), so the other queue is always tried when need remains.
-  const bool probation_first = (Next(resident()) == resident()) ||
-                               (ProbationUnpinnedUsage() > ProbationBudget());
+  // The budget selects the queue from the unpinned probation charge (see
+  // ProbationUnpinnedUsage) as it will be once a probation-bound incoming
+  // entry is linked, so probation pays for its own arrivals. Either pass can
+  // free nothing (all pinned), so the other queue is always tried when need
+  // remains.
+  const bool probation_first =
+      (Next(resident()) == resident()) ||
+      !FitsIn(ProbationUnpinnedUsage(), probation_charge, ProbationBudget());
   if (probation_first) {
     EvictFromProbation(data, deleted);
     if (!data->Done()) {
@@ -1063,7 +1065,7 @@ bool S3FifoCacheShard::EvictFromProbation(EvictionData* data,
         }
         FIFO_Remove(cur, /*in_probation=*/true);
         if (!IsPlaceholder(cur)) {
-          GhostRecord(GhostHash(cur->GetHash()));
+          GhostRecord(GhostHash(cur->GetHash()), cur->SlotCharge());
         }
         EvictClaimed(cur, data, deleted);
       }
@@ -1140,15 +1142,15 @@ void S3FifoCacheShard::EvictFromResident(EvictionData* data,
   }
 }
 
-void S3FifoCacheShard::GhostRecord(uint32_t hash) {
+void S3FifoCacheShard::GhostRecord(uint32_t hash, size_t charge) {
   ++ghost_records_;
   if (ghost_size_ == ghost_ring_length_) {
     // Double the ring, keeping each record at its sequence number. It starts
-    // at 16 records (64 bytes), small for tiny shards; doubling reaches any
+    // at 16 records (128 bytes), small for tiny shards; doubling reaches any
     // bound in a few steps.
     const size_t new_length =
         ghost_ring_length_ == 0 ? size_t{16} : ghost_ring_length_ * 2;
-    std::unique_ptr<uint32_t[]> new_ring(new uint32_t[new_length]);
+    std::unique_ptr<GhostSlot[]> new_ring(new GhostSlot[new_length]);
     for (uint64_t seq = ghost_head_seq_; seq < ghost_head_seq_ + ghost_size_;
          ++seq) {
       new_ring[seq & (new_length - 1)] =
@@ -1167,19 +1169,25 @@ void S3FifoCacheShard::GhostRecord(uint32_t hash) {
   const uint64_t seq = ghost_head_seq_ + ghost_size_;
   const uint32_t pos = static_cast<uint32_t>(seq & (ghost_ring_length_ - 1));
   ghost_index_.Set(hash, pos);
-  ghost_ring_[pos] = hash;
+  const uint32_t slot_charge = static_cast<uint32_t>(
+      std::min<size_t>(charge, std::numeric_limits<uint32_t>::max()));
+  ghost_ring_[pos] = GhostSlot{slot_charge, hash};
   ++ghost_size_;
+  ghost_charge_ += slot_charge;
   GhostTrim();
 }
 
 void S3FifoCacheShard::GhostTrim() {
-  while (ghost_size_ > occupancy_.Get()) {
+  while (ghost_size_ > occupancy_.Get() || ghost_charge_ > capacity_.Get()) {
     const uint32_t pos =
         static_cast<uint32_t>(ghost_head_seq_ & (ghost_ring_length_ - 1));
-    const size_t i = ghost_index_.Find(ghost_ring_[pos]);
+    // The oldest record, at the head of the ring.
+    const GhostSlot& head = ghost_ring_[pos];
+    const size_t i = ghost_index_.Find(head.hash);
     if (i != S3FifoGhostIndex::kNotFound && ghost_index_.PosAt(i) == pos) {
       ghost_index_.EraseAt(i);
     }
+    ghost_charge_ -= head.charge;
     --ghost_size_;
     ++ghost_head_seq_;
   }
@@ -1450,7 +1458,7 @@ void S3FifoCacheShard::SetCapacity(size_t capacity) {
     FoldSlots();
     // The probation budget is derived at each use (see ProbationBudget), so
     // it already tracks the new capacity when eviction below runs.
-    EvictFromFIFO(0, &last_reference_list);
+    EvictFromFIFO(0, 0, &last_reference_list);
     GhostTrim();
   }
 
@@ -1543,24 +1551,25 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
     // Step 1: reclaim retired slots.
     work = MaybeReclaim(&heap_keys);
 
-    // Free space by the eviction policy until enough space is freed or no
-    // unpinned entry remains. An entry that can never fit is refused (strict)
-    // or dropped (no handle) below, so evicting for it would only empty the
-    // shard; so is a slotless entry without a handle. A slotless entry with a
-    // handle evicts, also under strict_capacity_limit, as CreateStandalone
-    // evicts before checking that its entry fits. A placeholder never uses the
-    // ghost (see ghost_index_).
+    // Skip eviction when the entry will be refused or dropped anyway:
+    // handle-less inserts that are slotless or can never fit, and strict
+    // inserts that can never fit. Otherwise evict for it (a strict slotless
+    // insert with a handle too, as CreateStandalone evicts before checking
+    // that its entry fits). A ghost hit, or a slotless entry, does not count
+    // against the probation budget. Placeholders never use the ghost (see
+    // ghost_index_).
     const size_t ghost = placeholder || slotless
                              ? S3FifoGhostIndex::kNotFound
                              : ghost_index_.Find(GhostHash(hash));
     const bool remembered = ghost != S3FifoGhostIndex::kNotFound;
     const uint64_t ghost_records_before = ghost_records_;
+    const size_t probation_charge = remembered || slotless ? 0 : total_charge;
     // Step 2: evict by the policy for the charge.
     const bool skip_eviction =
         handle == nullptr ? slotless || NeverFits(total_charge)
                           : strict_capacity_limit_ && NeverFits(total_charge);
     if (!skip_eviction) {
-      EvictFromFIFO(total_charge, &last_reference_list);
+      EvictFromFIFO(total_charge, probation_charge, &last_reference_list);
     }
 
     // Step 3: shrink a table left empty.
@@ -1605,7 +1614,7 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
           if (!FitsIn(usage_.Get(), needed, capacity_.Get())) {
             EvictionData data;
             data.need_charge = Excess(usage_.Get(), needed, capacity_.Get());
-            EvictNeed(&data, &last_reference_list);
+            EvictNeed(&data, probation_charge, &last_reference_list);
             // No WouldGrowOnNewInsert() recheck: EvictNeed changes neither
             // used_length_ nor max_length_, so GrowOneHome's precondition still
             // holds. Eviction can only lower occupancy_, and then this step
@@ -1636,7 +1645,7 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
           // could pick old itself, which Detach below must find in cache.
           EvictionData data;
           data.need_count = 1;
-          EvictNeed(&data, &last_reference_list);
+          EvictNeed(&data, probation_charge, &last_reference_list);
           stats_.occupancy_evictions += data.freed_count;
         }
         // Step 6: allocate a slot, reclaiming or growing if none is free.
@@ -1658,7 +1667,7 @@ Status S3FifoCacheShard::InsertItem(const Slice& key, HashCref hash,
               !FitsIn(usage_.Get(), needed, capacity_.Get())) {
             EvictionData data;
             data.need_charge = Excess(usage_.Get(), needed, capacity_.Get());
-            EvictNeed(&data, &last_reference_list);
+            EvictNeed(&data, probation_charge, &last_reference_list);
           }
           if (strict_capacity_limit_
                   ? FitsIn(usage_.Get(), needed, capacity_.Get())
@@ -2029,7 +2038,7 @@ S3FifoHandle* S3FifoCacheShard::CreateStandalone(
     DMutexLock l(mutex_);
 
     if (!(strict_capacity_limit_ && NeverFits(e->total_charge))) {
-      EvictFromFIFO(e->total_charge, &last_reference_list);
+      EvictFromFIFO(e->total_charge, 0, &last_reference_list);
     }
 
     // Uncharged or refused when it does not fit under strict_capacity_limit,
