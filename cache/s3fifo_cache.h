@@ -44,8 +44,9 @@ class S3FifoHelperRegistry;
 // one 42-byte slot of its shard's table (three slots per 128-byte group); a
 // Cache::Handle* points to it.
 //
-// Eviction: each shard has two queues, probation and resident; see the policy
-// overview at S3FifoCacheShard. A Lookup only increments the entry's freq and
+// Eviction: each shard has two queues of entries, probation and resident, and
+// a ghost queue of recently evicted key hashes; see the policy overview at
+// S3FifoCacheShard. A Lookup only increments the entry's freq and
 // never moves it.
 //
 // Locking: Lookup, Ref and a Release that neither erases nor frees take no
@@ -410,16 +411,152 @@ const Cache::CacheItemHelper* S3FifoHandle::GetHelper(
   return registry.Get(helper_index);
 }
 
+// Index of the ghost queue: maps a ghost hash to the ring position of its
+// latest record. Open addressing with linear probing and backward-shift
+// deletion, at most half full, so a probe touches about one cache line and
+// nothing is allocated or freed except when the ring grows (Resize): a
+// node-based map would allocate under the shard mutex for every recorded ghost.
+// Measured 2026-10-31 (cache_bench, CMake Release without folly, 1 GiB, 4 KiB
+// values, all-miss at 16 threads on 2 shards, 3 paired runs each, against the
+// same code without the ghost queue): -55% throughput with std::unordered_map
+// (UnorderedMap without USE_FOLLY) as the index (0.938M -> 0.419M ops/s), -5.3%
+// with this one (0.992M -> 0.939M).
+class S3FifoGhostIndex {
+ public:
+  static constexpr size_t kNotFound = std::numeric_limits<size_t>::max();
+
+  // Empties the index and sizes it for up to max_entries entries. Only tests
+  // call it: a shard's index starts with no table and is sized by Resize when
+  // its ghost ring first grows (Find returns kNotFound while size() is 0).
+  void Reset(size_t max_entries) {
+    AllocateFor(max_entries);
+    size_ = 0;
+  }
+  // Sizes the index for up to max_entries entries (at least size()),
+  // keeping every entry with its position mapped through remap.
+  template <typename Remap>
+  void Resize(size_t max_entries, Remap remap) {
+    assert(max_entries >= size_);
+    std::unique_ptr<Entry[]> old = std::move(table_);
+    const size_t old_length = old ? mask_ + 1 : 0;
+    AllocateFor(max_entries);
+    for (size_t i = 0; i < old_length; ++i) {
+      if (old[i].pos != kEmpty) {
+        size_t j = Home(old[i].hash);
+        while (table_[j].pos != kEmpty) {
+          j = (j + 1) & mask_;
+        }
+        table_[j] = Entry{old[i].hash, remap(old[i].pos)};
+      }
+    }
+  }
+  // Index of hash's entry, or kNotFound. Valid until the next Set, Erase,
+  // EraseAt or Resize.
+  size_t Find(uint32_t hash) const {
+    if (size_ == 0) {
+      return kNotFound;
+    }
+    for (size_t i = Home(hash);; i = (i + 1) & mask_) {
+      if (table_[i].pos == kEmpty) {
+        return kNotFound;
+      }
+      if (table_[i].hash == hash) {
+        return i;
+      }
+    }
+  }
+  uint32_t PosAt(size_t i) const {
+    assert(table_[i].pos != kEmpty);
+    return table_[i].pos;
+  }
+  // Sets hash's position, adding the entry if absent.
+  void Set(uint32_t hash, uint32_t pos) {
+    assert(pos != kEmpty);
+    size_t i = Home(hash);
+    while (table_[i].pos != kEmpty && table_[i].hash != hash) {
+      i = (i + 1) & mask_;
+    }
+    if (table_[i].pos == kEmpty) {
+      ++size_;
+      assert(2 * size_ <= mask_ + 1);
+    }
+    table_[i] = Entry{hash, pos};
+  }
+  // Removes the entry at i (from Find), shifting back the entries after it
+  // that would otherwise become unreachable.
+  void EraseAt(size_t i) {
+    assert(table_[i].pos != kEmpty);
+    for (size_t j = (i + 1) & mask_; table_[j].pos != kEmpty;
+         j = (j + 1) & mask_) {
+      // j may fill the hole at i unless its home lies after i, up to j.
+      if (((j - Home(table_[j].hash)) & mask_) >= ((j - i) & mask_)) {
+        table_[i] = table_[j];
+        i = j;
+      }
+    }
+    table_[i].pos = kEmpty;
+    --size_;
+  }
+  bool Erase(uint32_t hash) {
+    const size_t i = Find(hash);
+    if (i == kNotFound) {
+      return false;
+    }
+    EraseAt(i);
+    return true;
+  }
+  size_t size() const { return size_; }
+  size_t TEST_Home(uint32_t hash) const { return Home(hash); }
+
+ private:
+  static constexpr uint32_t kEmpty = std::numeric_limits<uint32_t>::max();
+  struct Entry {
+    uint32_t hash;
+    uint32_t pos;
+  };
+  void AllocateFor(size_t max_entries) {
+    int bits = 1;
+    while ((size_t{1} << bits) < 2 * max_entries) {
+      ++bits;
+    }
+    shift_ = 64 - bits;
+    mask_ = (size_t{1} << bits) - 1;
+    table_.reset(new Entry[mask_ + 1]);
+    for (size_t i = 0; i <= mask_; ++i) {
+      table_[i].pos = kEmpty;
+    }
+  }
+  // Fibonacci hashing: the top bits of the product spread ghost hashes
+  // that differ only in low bits.
+  size_t Home(uint32_t hash) const {
+    return static_cast<size_t>((uint64_t{hash} * 0x9E3779B97F4A7C15U) >>
+                               shift_);
+  }
+  std::unique_ptr<Entry[]> table_;
+  size_t mask_ = 0;
+  // 64 - log2(table size), set by AllocateFor. The initial 64 is never used:
+  // Home runs only once a table is allocated.
+  int shift_ = 64;
+  size_t size_ = 0;
+};
+
 // A single shard of S3FifoCache.
 //
-// Eviction policy (S3-FIFO). Each shard has two queues, which the paper calls
-// small and main and this code calls probation and resident.
-// 1. Insert: a new entry goes to the probation tail.
+// Eviction policy (S3-FIFO). Each shard has three queues, which the paper
+// calls small, main and ghost and this code calls probation, resident and
+// ghost. The ghost queue holds only 32-bit key hashes, no entries.
+// Probation, resident and the aside list together hold every in-cache entry.
+// 1. Insert: a new entry goes to the probation tail. If its key is in the
+//    ghost queue, it goes to resident instead (just before the hand) and the
+//    ghost is consumed.
 // 2. Hit: a Lookup increments the entry's freq, saturating at kMaxFrequency
 //    (3). It never moves the entry, so a hit takes no lock (except a
 //    probation pin by a thread without a ReaderSlot; see Release).
 // 3. Probation eviction: the probation head with freq >= kPromoteThreshold (2)
-//    moves to resident, with freq reset to 0. Otherwise it is evicted.
+//    moves to resident, with freq reset to 0. Otherwise it is evicted and its
+//    key hash is recorded in the ghost queue, which keeps at most as many
+//    hashes as the shard has entries, dropping the oldest. Resident victims
+//    are not recorded.
 // 4. Resident eviction (CLOCK): resident is a ring whose hand
 //    (resident_hand_) points at its oldest entry. The hand passes an entry
 //    with freq > 0, decrementing it, and evicts an entry at 0. A promoted
@@ -444,7 +581,10 @@ const Cache::CacheItemHelper* S3FifoHandle::GetHelper(
 // - The budget is 12% instead of 10% (see kProbationPercent).
 // - The budget picks the queue that evicts first instead of fixing the queue
 //   sizes.
-// - There is no ghost queue: an evicted key is forgotten.
+// - The ghost queue is bounded by the shard's entry count, not by the main
+//   queue's size, and holds 32-bit hashes, so a collision can admit a new key
+//   to resident (at freq 0, so it is evicted on its first visit unless hit or
+//   pinned first).
 // - When kMaxResidentIdlePasses passes over resident evict nothing (every
 //   entry pinned or hot), eviction stops instead of evicting a hot entry.
 // - Pinned entries rotate or go to the aside list.
@@ -675,6 +815,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // mutex_.
   size_t TEST_GetProbationBudget() const;
 
+  // Test-only: records in the ghost queue, an upper bound on the keys it
+  // remembers. Takes mutex_.
+  size_t TEST_GetGhostSize() const;
+
   // Probation list only; resident entries are not visible here, nor entries
   // set aside. Walk it with TEST_Next.
   void TEST_GetProbationList(S3FifoHandle** fifo);
@@ -746,8 +890,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
     uint64_t large_charge_standalone = 0;
 
     // Probation entries evicted with freq 0, i.e. never hit since insertion
-    // (placeholders included: zero-charge kNoopCacheItemHelper entries).
-    // Resident victims are not counted.
+    // (placeholders included: zero-charge kNoopCacheItemHelper entries, see
+    // IsPlaceholder). Resident victims are not counted.
     uint64_t evicted_without_hit = 0;
 
     // Entries on the aside list.
@@ -912,7 +1056,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   bool TableAboveInitialLength() const {
     return used_length_ > std::min(kInitialLength, max_length_);
   }
-  // Insert an item into the hash table and append it to probation.
+  // Insert an item into the slot table and append it to probation, or to
+  // resident if its key is in the ghost queue (consuming the ghost).
   // Older unpinned items are evicted as necessary. Frees heap_key on a
   // non-OK status.
   Status InsertItem(const Slice& key, HashCref hash,
@@ -1001,6 +1146,15 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // The resident entry after e in clock order, skipping the dummy head.
   S3FifoHandle* ResidentNext(S3FifoHandle* e);
 
+  // Whether an entry with this helper and charge (metadata excluded) is a
+  // placeholder: a zero-charge kNoopCacheItemHelper entry, as
+  // CacheWithSecondaryAdapter inserts to record recent use of a key. Insert
+  // and eviction both decide through it, so they agree under any metadata
+  // charge policy.
+  static bool IsPlaceholder(const Cache::CacheItemHelper* helper,
+                            size_t charge);
+  bool IsPlaceholder(const S3FifoHandle* e) const;
+
   // Frequency counter range and promotion threshold (policy steps 2 and 3). A
   // Lookup saturates at kMaxFrequency; a probation head at or above
   // kPromoteThreshold is promoted, below it is evicted.
@@ -1043,14 +1197,15 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   static constexpr size_t kAsideReturnChunk = 64;
 
   // The probation budget, 12% of the charge the shard can hold (policy step
-  // 5; see ProbationBudget). It only chooses which queue evicts first (see
-  // EvictFromQueues). Eviction can still take probation below it: when the
-  // resident pass falls short (its entries pinned or hot) or resident is
-  // empty, probation evicts too. On a warm shard whose hot set is already
-  // resident, probation can stay well above it. Shard-internal: not an
-  // option. On shards small enough that the share rounds to zero the budget
-  // is zero, so probation is over budget, and evicts first, whenever it holds
-  // unpinned charge.
+  // 5; see ProbationBudget). It is not a partition: it only chooses which
+  // queue evicts first (see EvictFromQueues). Eviction can still take
+  // probation below it: when the resident pass falls short (its entries
+  // pinned or hot) or resident is empty, probation evicts too. Probation
+  // shrinks toward it as entries are promoted and as ghost hits go straight
+  // to resident; on a warm shard whose hot set is already resident it can
+  // stay well above it. Shard-internal: not an option. On shards small
+  // enough that the share rounds to zero the budget is zero, so probation is
+  // over budget, and evicts first, whenever it holds unpinned charge.
   // Why 12%: S3-FIFO (SOSP '23) sizes its small queue at 10% of the cache.
   // In cache_bench with the full S3-FIFO policy, 12% missed less when the
   // cache already hit above 0.9, and 10% slightly less under cache pressure;
@@ -1122,10 +1277,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 
   // Policy step 3: one sweep over probation from the head. Unpinned entries
   // at or above kPromoteThreshold move to resident just before the hand
-  // (counter reset), unpinned entries below it are evicted, and pinned
-  // entries move to the probation tail, so long-lived pins are not re-walked
-  // by every eviction, or aside once the pass has rotated
-  // kPinnedRotationsPerPass of them.
+  // (counter reset), unpinned entries below it are evicted and their keys
+  // recorded in the ghost queue, and pinned entries move to the probation
+  // tail, so long-lived pins are not re-walked by every eviction, or aside
+  // once the pass has rotated kPinnedRotationsPerPass of them.
   // Stops once data is Done. Returns whether it promoted anything. Not
   // thread safe - call with mutex_ held.
   bool EvictFromProbation(EvictionData* data,
@@ -1140,6 +1295,23 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // safe - call with mutex_ held.
   void EvictFromResident(EvictionData* data,
                          autovector<S3FifoHandle*>* deleted);
+
+  // The 32 bits of an entry's hash the ghost queue remembers.
+  static uint32_t GhostHash(HashCref hash) { return Lower32of64(hash[0]); }
+  // Records a probation victim's ghost hash in the ghost queue, dropping
+  // the oldest ghosts beyond the bound. Call before removing the victim
+  // from the table so that a full shard of N entries keeps N ghosts.
+  void GhostRecord(uint32_t hash);
+
+  // Forgets a ghost hash: drops it from the index, so its ring record is
+  // skipped when trimmed. Returns whether it was remembered.
+  bool GhostTake(uint32_t hash);
+
+  // Drops the oldest ghosts while the queue is over its bound. Called when a
+  // ghost is recorded and after SetCapacity, which can lower the bound.
+  // Erasing entries leaves the ghost as is: it adds no victims, and the
+  // ghost stays within the table's past size.
+  void GhostTrim();
 
   // Runs the eviction callback (or deleter) for evicted entries, overwritten
   // entries no longer referenced, and a handle-less insert dropped instead of
@@ -1412,9 +1584,6 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // just before the hand, and the hand moves past an entry that leaves, so
   // the order is the FIFO-reinsertion order. The resident dummy head when
   // resident is empty.
-  // New entries enter probation; probation victims with enough frequency
-  // are promoted to resident. The 12% budget (kProbationPercent) decides
-  // which of the two queues evicts, not how much each holds.
   S3FifoHandle* resident_hand_;
 
   // Aside list: pinned entries an eviction met after kPinnedRotationsPerPass
@@ -1434,6 +1603,49 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // EvictNeed's acquire exchange pairs with; the other stores are made under
   // mutex_ and are relaxed.
   std::atomic<bool> aside_unpinned_;
+
+  // Ghost queue (policy steps 1 and 3): ghost hashes (GhostHash) of keys
+  // recently evicted from probation, no values. Re-inserting a remembered key
+  // goes straight to resident, so an entry whose reuse distance exceeds
+  // probation but not the whole shard is still recognised as reused. Resident
+  // victims are never recorded: they already had their chance. A hash collision
+  // only admits one entry to resident at freq 0, where it is evicted on its
+  // first visit unless hit or pinned first.
+  // Bound: at most occupancy_ records, oldest dropped first, i.e. reuse is
+  // remembered over about one shard's worth of evictions, and ghost memory
+  // stays proportional to the table it shadows. Not charged to usage_:
+  // about 4 bytes of ring plus one index entry per remembered key.
+  // The bound is enforced when a ghost is recorded and after SetCapacity
+  // (GhostTrim). Erasing entries does not trim, so after erases ghost_size_
+  // can exceed occupancy_ until one of those runs. EraseUnRefEntries does not
+  // clear the ghost either, so a key evicted before the cache was cleared can
+  // still go straight to resident.
+  // Placeholder inserts (zero charge, kNoopCacheItemHelper, as
+  // CacheWithSecondaryAdapter uses to record recent use) neither take nor
+  // leave a ghost, so readmission credit reaches the real entry.
+  // ghost_index_ maps a hash to the ring position of its latest record, so
+  // a stale record (consumed by readmission, or superseded) is skipped when
+  // it reaches the head; stale records still count toward the bound. Every
+  // index entry points at a live record, so a position names one sequence
+  // number. Records live in a power-of-two ring addressed by sequence
+  // number, so the ring and its index allocate nothing once grown to the
+  // bound, and growing never moves a record to another sequence number.
+  // Each ring element is one ghost record (a ghost hash).
+  std::unique_ptr<uint32_t[]> ghost_ring_;
+
+  // Ring length, 0 or a power of two. Grows to the record bound and never
+  // shrinks.
+  size_t ghost_ring_length_;
+
+  // Sequence number of the oldest record; records are ghost_head_seq_ up to
+  // ghost_head_seq_ + ghost_size_.
+  uint64_t ghost_head_seq_;
+  size_t ghost_size_;
+  S3FifoGhostIndex ghost_index_;
+
+  // Bumped by every GhostRecord, so InsertItem can tell whether a Find
+  // result from ghost_index_ survived its eviction.
+  uint64_t ghost_records_;
 
   // We don't count mutex_ as the cache's internal state so semantically we
   // don't mind mutex_ invoking the non-const actions.
@@ -1515,12 +1727,14 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 //   usage above capacity (usage can still exceed it after a SetCapacity cut
 //   that pinned or hot entries survive, or when the limit is turned on over
 //   capacity). Without a handle it is dropped, strict or not.
-// - Not charged to capacity: one cache line per thread that has used the shard,
-//   for up to 8192 threads, allocated in blocks of 64 threads (4 KiB with
-//   64-byte cache lines; building the cache allocates the building thread's
-//   block on every shard, so even one thread costs 4 KiB per shard); and
-//   process-wide, one cache line per thread for the most threads that have used
-//   an S3FifoCache at the same time, kept for the life of the process
+// - Not charged to capacity: each shard's memory of evicted keys (up to about
+//   40 bytes per key, about one key per cached entry, kept at its peak size;
+//   see ghost_ring_); one cache line per thread that has used the shard, for up
+//   to 8192 threads, allocated in blocks of 64 threads (4 KiB with 64-byte
+//   cache lines; building the cache allocates the building thread's block on
+//   every shard, so even one thread costs 4 KiB per shard); and process-wide,
+//   one cache line per thread for the most threads that have used an
+//   S3FifoCache at the same time, kept for the life of the process
 //   (ThreadReader, see s3fifo_cache.cc).
 // - Reservation (see Reservation at S3FifoCacheShard): at least 2048 homes
 //   (about 86 KiB) and at most about 2.7 MiB per shard, e.g. about 171 MiB for
