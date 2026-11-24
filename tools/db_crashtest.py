@@ -1007,6 +1007,15 @@ def apply_liveness_remote_defaults(params, args):
     # default_params.
     if getattr(args, "compact_range_one_in", None) is None:
         params["compact_range_one_in"] = lambda: random.choice([20000, 1000000])
+    # A very low periodic_compaction_seconds makes compaction rewrite young files in
+    # a loop, and on a remote DB deleting the obsolete files blocks flushes until
+    # the liveness watchdog aborts. At 1800, each file is rewritten at most about
+    # every half hour. An offpeak window would mark files just rewritten as due
+    # again, so daily_offpeak_time_utc is cleared too.
+    if getattr(args, "periodic_compaction_seconds", None) is None:
+        params["periodic_compaction_seconds"] = lambda: random.choice([0, 1800])
+    if getattr(args, "daily_offpeak_time_utc", None) is None:
+        params["daily_offpeak_time_utc"] = ""
 
 
 simple_default_params = {
