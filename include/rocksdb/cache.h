@@ -481,7 +481,8 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 // EXPERIMENTAL: the API is subject to change.
 // S3FifoCache - A sharded cache with S3-FIFO eviction (SOSP '23): new entries
 // enter a probation queue; one hit at least twice before reaching its head
-// moves to a resident queue. Lookup, Ref and most Releases take no lock.
+// moves to a resident queue. Probation evicts first while its unpinned charge
+// exceeds 12% of capacity. Lookup, Ref and most Releases take no lock.
 // Cache::Priority is ignored; pinned entries are never evicted. Unlike
 // LRUCache, a Release never evicts for being over capacity, an entry holds at
 // most 16383 references (then Lookup misses and Ref returns false), and it

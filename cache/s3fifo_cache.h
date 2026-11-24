@@ -50,7 +50,10 @@ class S3FifoHelperRegistry;
 //
 // Locking: Lookup, Ref and a Release that neither erases nor frees take no
 // lock, and neither do the usage and occupancy getters. Insert, Erase,
-// eviction, SetCapacity and the bulk operations take the shard mutex.
+// eviction, SetCapacity and the bulk operations take the shard mutex. A
+// pin or unpin of a probation entry also updates the calling thread's
+// ReaderSlot; a thread with no ReaderSlot (reader index 8192 or more, or a
+// thread that is exiting; see ReaderSlot) takes the mutex for it instead.
 //
 // Shard size. A shard is one independent cache with its own mutex, slot
 // table and queues; a key's hash picks its shard. Each shard should be
@@ -112,11 +115,12 @@ class S3FifoHelperRegistry;
 // Lookup, Ref and most Releases run without the shard lock, so refs and the two
 // membership bits share one atomic word (state). The bits change only
 // under the shard lock, in the same atomic operation that checks refs, so
-// every lock-free 0 <-> 1 ref change sees, in its own CAS snapshot, the queue
-// its entry is in. Eviction claims an entry with a CAS that requires refs == 0
-// and clears state to 0, so no Lookup can pin it afterwards. Promotion uses the
-// same refs == 0 CAS but clears only kInProbation: a Lookup may pin the entry
-// right after, and then pins a resident entry.
+// every lock-free 0 <-> 1 ref change sees, in its own CAS snapshot, the
+// queue it must be credited to. Eviction claims an entry with a CAS that
+// requires refs == 0 and clears state to 0, so no Lookup can pin it afterwards.
+// Promotion uses the same refs == 0 CAS but clears only kInProbation: a Lookup
+// may pin the entry right after, and its CAS snapshot then shows a resident
+// entry, so nothing is credited to probation.
 //
 // Layout. A slot is 42 bytes, three to a 128-byte group (S3FifoSlotGroup), so
 // the table costs 128/3 bytes per slot, about 71 bytes per entry at its 3/5
@@ -127,8 +131,9 @@ class S3FifoHelperRegistry;
 //   a 64-byte line at any of the three positions (slot 1 starts at byte 42
 //   and its bytes 0-21 end at byte 63). For a 16-byte key, KeyMatches reads
 //   flags only after the hash matches, so a miss stays on that line. A hit
-//   also reads flags, reads and writes freq and reads the value: for slot 1
-//   those are on the group's second line.
+//   also reads flags, reads and writes freq and reads the value (and the
+//   charge, on a probation pin): for slot 1 those are on the group's second
+//   line.
 // - The 2-byte atomics sit at even offsets, and every slot starts at an even
 //   offset, so none straddles a line.
 // - freq and aside each keep a byte of their own: Lookup writes freq with a
@@ -411,15 +416,24 @@ const Cache::CacheItemHelper* S3FifoHandle::GetHelper(
 // small and main and this code calls probation and resident.
 // 1. Insert: a new entry goes to the probation tail.
 // 2. Hit: a Lookup increments the entry's freq, saturating at kMaxFrequency
-//    (3). It never moves the entry, so a hit takes no lock.
+//    (3). It never moves the entry, so a hit takes no lock (except a
+//    probation pin by a thread without a ReaderSlot; see Release).
 // 3. Probation eviction: the probation head with freq >= kPromoteThreshold (2)
 //    moves to resident, with freq reset to 0. Otherwise it is evicted.
 // 4. Resident eviction (CLOCK): resident is a ring whose hand
 //    (resident_hand_) points at its oldest entry. The hand passes an entry
 //    with freq > 0, decrementing it, and evicts an entry at 0. A promoted
 //    entry is linked just before the hand, so the hand reaches it last.
-// 5. Queue choice: probation evicts first; resident evicts only when one pass
-//    over probation did not free enough.
+// 5. Queue choice: probation evicts first while its unpinned charge exceeds
+//    its budget, 12% of the charge the shard can hold (kProbationPercent,
+//    ProbationBudget), or when resident is empty; otherwise resident evicts
+//    first. Either way the other queue evicts too if need remains, so the
+//    budget only picks the queue: it is not a fixed split, and eviction can
+//    take probation below it. Only unpinned probation charge counts (see
+//    ProbationUnpinnedUsage). At the occupancy limit (the table at its
+//    reservation and full to its load factor), the budget is 12% of the
+//    charge in the table, if that is smaller than capacity_, since occupancy,
+//    not capacity, is what evicts there.
 // A pinned entry is never evicted: probation moves it to its tail, the
 // resident hand passes it, and after kPinnedRotationsPerPass such moves (per
 // probation pass; per resident call until an idle pass, see
@@ -427,7 +441,9 @@ const Cache::CacheItemHelper* S3FifoHandle::GetHelper(
 // aside_slot_).
 //
 // Differences from the paper:
-// - Probation always evicts first, whatever its size.
+// - The budget is 12% instead of 10% (see kProbationPercent).
+// - The budget picks the queue that evicts first instead of fixing the queue
+//   sizes.
 // - There is no ghost queue: an evicted key is forgotten.
 // - When kMaxResidentIdlePasses passes over resident evict nothing (every
 //   entry pinned or hot), eviction stops instead of evicting a hot entry.
@@ -599,13 +615,15 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
                        Cache::CreateContext* create_context,
                        Cache::Priority priority, Statistics* stats);
 
-  // Lookup takes no lock. Release and Ref take none either, unless Release
-  // drops the last ref of an entry it must erase (erase_if_last_ref) or free
-  // (detached or standalone). Being over capacity never makes a Release
-  // erase, as in HyperClockCache: the next insert evicts. Inserts,
-  // erases, eviction, SetCapacity and the bulk operations take mutex_; the
-  // getters (GetUsage, GetPinnedUsage, GetOccupancyCount,
-  // GetTableAddressCount) do not.
+  // Lookup and Release take no lock, except that a probation 0 <-> 1 ref
+  // change by a thread without a ReaderSlot (an exiting thread, or past the
+  // 8192nd reader) credits it under mutex_. Ref takes none either, and
+  // neither does Release unless it drops the last ref of an entry it must
+  // erase (erase_if_last_ref) or free (detached or standalone). Being over
+  // capacity never makes a Release erase, as in HyperClockCache: the next
+  // insert evicts. Inserts, erases, eviction, SetCapacity and the bulk
+  // operations take mutex_; the getters (GetUsage, GetPinnedUsage,
+  // GetOccupancyCount, GetTableAddressCount) do not.
   bool Release(S3FifoHandle* handle, bool useful, bool erase_if_last_ref);
   bool Ref(S3FifoHandle* handle);
   void Erase(const Slice& key, HashCref hash);
@@ -638,11 +656,24 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   const S3FifoHelperRegistry& helpers() const { return *helpers_; }
 
  public:  // other function definitions
-  // Test-only: moves a probation entry to the resident tail without the
-  // promotion-threshold check, so tests can build exact resident layouts
-  // that pressure-driven promotion cannot assemble without disturbing the
-  // entry under test. The entry must be unpinned.
-  void TEST_PromoteToResident(const Slice& key);
+  // Test-only: charge of entries in probation, including probation entries set
+  // aside. Takes mutex_.
+  size_t TEST_GetProbationUsage() const;
+
+  // Test-only: charge of probation entries with no external reference, the
+  // quantity the budget is compared with. Folds every ReaderSlot first, as
+  // SetCapacity does. Takes mutex_.
+  size_t TEST_GetProbationUnpinnedUsage();
+
+  // Test-only: every ReaderSlot's pinned probation charge as of the last fold
+  // applied, without folding. A fold reads each slot's probation_pinned into
+  // folded_slot_values_ and folded_slot_sum_ (see FoldSlots and
+  // FoldReaderSlots). Takes mutex_.
+  size_t TEST_GetFoldedSlotSum() const;
+
+  // Test-only: current probation budget derived from capacity. Takes
+  // mutex_.
+  size_t TEST_GetProbationBudget() const;
 
   // Probation list only; resident entries are not visible here, nor entries
   // set aside. Walk it with TEST_Next.
@@ -667,9 +698,24 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // Entries on the aside list, for unit tests.
   size_t TEST_GetAsideSize();
 
-  // Test-only: lets a test hold the shard lock to show that hits never take
-  // it.
+  // Test-only: lets a test hold the shard lock to show that hits on a thread
+  // with a ReaderSlot do not take it.
   DMutex& TEST_GetMutex() const { return mutex_; }
+
+  // Readers [0, ReaderSlotCount()) get a ReaderSlot in every shard (see
+  // kReaderSlotChunks); readers past it get none.
+  static constexpr size_t ReaderSlotCount() {
+    return kReaderSlotChunks * kReaderSlotsPerChunk;
+  }
+
+  // Test-only: the calling thread's ThreadReader index, giving the thread a
+  // reader if it has none yet; UINT32_MAX once the thread is exiting.
+  static uint32_t TEST_ThreadReaderIndex();
+
+  // Test-only: sets the index below which a thread's first use prefers to
+  // reuse a free ThreadReader (ReaderSlotCount() unless a test lowers it, so
+  // that a few threads stand in for thousands); returns the previous one.
+  static size_t TEST_SetPreferredReaders(size_t bound);
 
   // Eviction and table counters, for tests and debugging. The first seven
   // count since construction; the last two are taken now.
@@ -835,6 +881,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // Under mutex_: whether inserting one more entry would grow the table.
   bool WouldGrowOnNewInsert() const;
 
+  // Under mutex_: whether the table is as large as it gets and full to its
+  // load factor, so a new key also evicts one entry by occupancy.
+  bool AtOccupancyLimit() const;
+
   // Under mutex_: once no entry is in the table, returns it to its initial
   // homes (and their charge), or to the fewest that still cover every slot
   // in use. Heap keys of reclaimed slots go to heap_keys, as in Reclaim.
@@ -876,14 +926,16 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
       const Cache::CacheItemHelper* helper, size_t total_charge);
   static void FreeStandalone(S3FifoHandle* h);
 
-  // Unlinks e from its queue or the aside list.
+  // Unlinks e from its queue or the aside list. in_probation says whether
+  // to remove e's charge from probation_usage_, since the caller may
+  // already have cleared kInProbation when claiming e.
   void FIFO_Remove(S3FifoHandle* e, bool in_probation);
 
   // Links e at the tail of queue. Appending to probation requires
   // kInProbation already set; FIFO_Remove and FIFO_Append do not touch state.
   void FIFO_Append(S3FifoHandle* queue, S3FifoHandle* e);
 
-  // FIFO_Append, also for the aside list.
+  // FIFO_Append without the probation charge, also for the aside list.
   void LinkAtTail(S3FifoHandle* queue, S3FifoHandle* e);
 
   // Moves a linked entry to the tail of queue (probation, resident or
@@ -903,6 +955,35 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 
   // Moves a linked, pinned entry to the aside tail.
   void SetAside(S3FifoHandle* e);
+
+  // Unpinned probation charge, the quantity the budget is compared with:
+  // probation_usage_ minus the charge pinned in probation, which is
+  // probation_pinned_usage_ plus the ReaderSlots' shares. Other threads'
+  // shares come from the last fold applied, the caller's own share is read
+  // live. So it is exact after a locked fold at quiescence (FoldSlots with no
+  // ref change in flight; the periodic FoldReaderSlots reads the slots without
+  // mutex_ and applies that reading later), and for ref changes made by the
+  // calling thread; another thread's lock-free ref changes reach it within
+  // about ReaderWorkInterval() inserts or erases (then the fold's walk). A
+  // stale value only reorders which queue pays for an eviction. Pinned charge
+  // is excluded because a pinned entry can be neither evicted nor promoted:
+  // long-lived pins (cache reservations, pinned index and filter blocks) must
+  // not hold probation over budget and stop the resident clock.
+  size_t ProbationUnpinnedUsage();
+
+  // Locked fold: adds each ReaderSlot's probation_pinned change since the last
+  // fold to folded_slot_sum_. The values folded are kept in
+  // folded_slot_values_, so the owners' lines are only read. Needs mutex_; for
+  // the cold paths only (SetCapacity, test getters). The periodic fold is
+  // FoldReaderSlots.
+  void FoldSlots();
+
+  // Periodic unlocked fold, run by the insert or erase whose MaybeReclaim set
+  // work.fold: reads every ReaderSlot into fold_values_ and fold_sum_ without
+  // mutex_ (the walk grows with the threads in the process, so, like
+  // ScanReaders, it is kept out of the lock), then takes mutex_ only to swap
+  // them into folded_slot_values_ and folded_slot_sum_.
+  void FoldReaderSlots();
 
   // Release of the last ref when it must erase or free: Release's locked path.
   // Takes mutex_ itself, so the caller must not hold it (the name does not mean
@@ -930,13 +1011,14 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // many consecutive passes over resident that evict nothing (3 to drain a
   // saturated counter, 1 to reap). That many idle passes mean every remaining
   // entry is pinned, or is hit (lock-free, refilling its counter) faster than
-  // the hand sweeps. Eviction then stops, since probation runs first (see
-  // EvictFromQueues) and has already fallen short: the insert is admitted over
-  // capacity (non-strict, with a handle), dropped (no handle) or refused
-  // (strict, with a handle), and a SetCapacity cut can leave usage above
-  // capacity. A shard whose every entry is that hot keeps them rather than
-  // evict one for a new key, which measured faster and with a higher hit ratio
-  // than evicting.
+  // the hand sweeps. Only this resident pass stops: the probation pass runs
+  // too, before or after it (see EvictFromQueues), and, when resident went
+  // first, resident runs again if the probation fallback promoted anything. If
+  // together they free too little, the insert is admitted over capacity
+  // (non-strict, with a handle), dropped (no handle) or refused (strict, with a
+  // handle), and a SetCapacity cut can leave usage above capacity. A shard
+  // whose every entry is that hot keeps them rather than evict one for a new
+  // key, which measured faster and with a higher hit ratio than evicting.
   static constexpr int kMaxResidentIdlePasses = 4;
 
   // Pinned entries an eviction pass rotates (moves to the probation tail, or
@@ -960,16 +1042,49 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // need is met, instead of relinking the whole list first.
   static constexpr size_t kAsideReturnChunk = 64;
 
+  // The probation budget, 12% of the charge the shard can hold (policy step
+  // 5; see ProbationBudget). It only chooses which queue evicts first (see
+  // EvictFromQueues). Eviction can still take probation below it: when the
+  // resident pass falls short (its entries pinned or hot) or resident is
+  // empty, probation evicts too. On a warm shard whose hot set is already
+  // resident, probation can stay well above it. Shard-internal: not an
+  // option. On shards small enough that the share rounds to zero the budget
+  // is zero, so probation is over budget, and evicts first, whenever it holds
+  // unpinned charge.
+  // Why 12%: S3-FIFO (SOSP '23) sizes its small queue at 10% of the cache.
+  // In cache_bench with the full S3-FIFO policy, 12% missed less when the
+  // cache already hit above 0.9, and 10% slightly less under cache pressure;
+  // the two differed by at most 0.003 in hit ratio.
+  static constexpr size_t kProbationPercent = 12;
+
+  // Probation budget: floor(base * 12 / 100) computed as
+  // base/100*12 + (base%100)*12/100, which is exact without overflowing on
+  // large capacities. base is capacity_, except at the occupancy limit,
+  // where the table rather than capacity_ bounds what the shard holds: there
+  // it is the charge in the table, if smaller. A budget of 12% of capacity_
+  // would then never be reached and would send every eviction to resident
+  // first, draining the hot set. Evaluated at each use, so SetCapacity can
+  // never leave a stale bound behind.
+  size_t ProbationBudget() const;
+
   // Evicts until usage_ + charge fits capacity_, by policy steps 3-5 (see the
-  // policy overview at S3FifoCacheShard): one pass over probation, then the
-  // resident clock. It also stops when no unpinned entry remains, or when the
-  // resident clock gives up (kMaxResidentIdlePasses) with hot unpinned entries
-  // left, so usage can stay above capacity. Pinned resident entries are passed
-  // without decrementing freq. Promotion touches only links: usage_ is
-  // unchanged by a move between queues. The probation pass consumes its head
-  // each step, so it ends after at most the initial number of entries; the
-  // resident scan stops after kMaxResidentIdlePasses consecutive passes that
-  // evict nothing. An all-pinned shard terminates having evicted nothing.
+  // policy overview at S3FifoCacheShard). It also stops when no unpinned entry
+  // remains, or when the resident clock gives up (kMaxResidentIdlePasses) with
+  // hot unpinned entries left, so usage can stay above capacity. Total capacity
+  // decides whether to evict; the probation budget only selects the queue. When
+  // unpinned probation charge (ProbationUnpinnedUsage) is over budget (or
+  // resident is empty) the probation pass runs first, otherwise the resident
+  // pass runs first; the other queue is tried if need remains, so a pinned
+  // preferred queue falls back instead of stranding evictable entries. The
+  // choice reads the current unpinned probation charge, before the incoming
+  // entry is accounted. An entry that alone exceeds the whole budget is treated
+  // like any other: it waits in probation and is promoted or evicted on its
+  // turn under pressure. Pinned resident entries are passed without
+  // decrementing freq. Promotion touches only links: usage_ is unchanged by a
+  // move between queues. The probation pass consumes its head each step, so it
+  // ends after at most the initial number of entries; the resident scan stops
+  // after kMaxResidentIdlePasses consecutive passes that evict nothing. An
+  // all-pinned shard terminates having evicted nothing.
   // The name predates the two queues: it evicts from both.
   // This function is not thread safe - it needs to be executed while
   // holding the mutex_.
@@ -995,7 +1110,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // present at the start was visited. May return with data not Done.
   void EvictNeed(EvictionData* data, autovector<S3FifoHandle*>* deleted);
 
-  // One round: the probation pass, then the resident pass if data is not Done.
+  // Picks the queue that evicts first from the probation budget (probation when
+  // resident is empty), then runs the probation and resident passes once
+  // (resident again after a promoting probation fallback).
   void EvictFromQueues(EvictionData* data, autovector<S3FifoHandle*>* deleted);
 
   // Under mutex_: takes a claimed entry out of the table and the usage, and
@@ -1037,6 +1154,53 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // there (then a seq_cst fence) before reading the table, and clears it after.
   // Values are not deferred: deleters and eviction callbacks run as soon as an
   // entry leaves the cache.
+  //
+  // ReaderSlot: per (ThreadReader, shard), the net charge the reader's
+  // threads pinned in probation through lock-free 0 <-> 1 ref changes and
+  // inserts with a handle; it wraps as size_t (a thread may unpin what
+  // another pinned). Only the reader's current owner writes it, and only on
+  // a probation ref change or such an insert. A reader
+  // outlives its thread and passes to a later one together with its slots,
+  // so no slot is ever read through freed thread-local state.
+  struct ALIGN_AS(CACHE_LINE_SIZE) ReaderSlot {
+    std::atomic<size_t> probation_pinned{0};
+
+    // The owning reader's index, the slot's position in folded_slot_values_.
+    uint32_t index = 0;
+
+    void AddProbationPinned(size_t delta) {
+      probation_pinned.store(
+          probation_pinned.load(std::memory_order_relaxed) + delta,
+          std::memory_order_relaxed);
+    }
+  };
+
+  // Slots for readers [0, kReaderSlotChunks * kReaderSlotsPerChunk), 8192,
+  // far more threads than a process normally runs at once (readers are
+  // reused after their threads exit), at one cache line per slot only for
+  // chunks in use. A reader past that, or an exiting thread, gets no slot and
+  // credits its probation ref changes under mutex_ instead. A thread's first
+  // use reuses a free reader below 8192 before a higher one
+  // (AcquireThreadReader in s3fifo_cache.cc), so it gets a reader past that
+  // only when none below is free: while more than 8192 threads hold readers
+  // at once, or while readers below are kept by threads whose first use came
+  // from a pthread key destructor (see MySlot). It keeps that reader until it
+  // exits, even if a lower one is freed meanwhile.
+  static constexpr size_t kReaderSlotsPerChunk = 64;
+  static constexpr size_t kReaderSlotChunks = 128;
+
+  // The calling thread's slot, allocating its chunk without mutex_ on first
+  // use; nullptr when the thread has none (see above). Any first S3FifoCache
+  // call that needs a reader (a Lookup, or one that reaches MySlot) gives the
+  // thread its reader (OwnThreadReader); one made from a pthread key destructor
+  // keeps it, and its slot index, for the life of the process, so churn of such
+  // threads pushes later threads past the slots.
+  ReaderSlot* MySlot();
+
+  // Credits a lock-free probation ref change of the calling thread: to its
+  // ReaderSlot, or to probation_pinned_usage_ under mutex_ if it has none.
+  void CreditProbationPin(size_t delta);
+
   // Queues retired slots chained through next, values already released,
   // for StampPending. Safe without mutex_.
   void Retire(S3FifoHandle* first, S3FifoHandle* last);
@@ -1051,16 +1215,29 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
     uint16_t first;
   };
 
+  // Reader work MaybeReclaim hands to its caller, to run once it has
+  // released mutex_.
+  struct ReaderWork {
+    // Scan the readers' announcements (ScanReaders).
+    bool scan = false;
+
+    // Read the ReaderSlots for the periodic fold (FoldReaderSlots).
+    bool fold = false;
+  };
+
   // Called by each insert and erase. Every kReclaimInterval calls, stamps
   // queued slots and applies the last reader scan; once per
-  // ReaderWorkInterval() calls it also asks for a new scan. Returns whether the
-  // caller must scan the readers (ScanReaders) once it has released mutex_: the
-  // scan's cost grows with the threads in the process, so this regular scan is
+  // ReaderWorkInterval() calls it also asks for a new scan and a new fold.
+  // Returns the reader work the caller must run once it has released mutex_:
+  // both walks grow with the threads in the process, so these regular walks are
   // kept out of the lock. Reclaim, on an insert that finds no free slot, and
   // ShrinkTableIfEmpty still scan under mutex_. Needs mutex_. Heap keys of
   // reclaimed slots are added to heap_keys, for the caller to free after
   // releasing mutex_.
-  bool MaybeReclaim(std::vector<S3FifoHandle::HeapKey*>* heap_keys);
+  ReaderWork MaybeReclaim(std::vector<S3FifoHandle::HeapKey*>* heap_keys);
+
+  // Runs the reader work MaybeReclaim returned. Without mutex_.
+  void RunReaderWork(const ReaderWork& work);
 
   // Stamps queued slots, scans the readers and frees every batch it can,
   // all under mutex_, for the rare callers that need the slots now.
@@ -1121,9 +1298,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   };
 
   // Layout. Lookup and a Release that neither erases nor frees run without
-  // mutex_ and write only the slot (state, freq) and the caller's ThreadReader;
-  // the last Release of an aside entry also sets aside_unpinned_, and
-  // pending_ and scan_result_ are written without mutex_ too. What hits read
+  // mutex_ and write only the slot (state, freq), the caller's ThreadReader
+  // and, on a probation ref change, the caller's ReaderSlot; the last Release
+  // of an aside entry also sets aside_unpinned_, and pending_, scan_result_,
+  // fold_sum_ and fold_values_ are written without mutex_ too. What hits read
   // sits on lines that no hit writes:
   // 1. Rarely written: by SetCapacity, SetStrictCapacityLimit, a growth or
   //    shrink step and an epoch advance (inside some inserts, erases,
@@ -1190,6 +1368,40 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // Under mutex_.
   Stats stats_;
 
+  // Charge of entries that belong to probation (kInProbation), including those
+  // on the aside list. Changed only when an entry joins or leaves probation
+  // (FIFO_Append to probation, FIFO_Remove with in_probation); MoveToTail and
+  // SetAside leave it unchanged. Promotion moves charge out of this counter
+  // while usage_ stays unchanged.
+  size_t probation_usage_;
+
+  // The part of the charge pinned in probation that changed under mutex_
+  // (erasing a pinned entry, a locked Release, and the ref changes and
+  // inserts with a handle of a thread without a ReaderSlot); the other
+  // lock-free ref changes and inserts with a handle go to the ReaderSlots.
+  // Wraps as size_t. The budget excludes pinned charge (see
+  // ProbationUnpinnedUsage).
+  size_t probation_pinned_usage_;
+
+  // folded_* are the applied values; fold_* (below) are the in-flight
+  // scratch copy.
+  // Sum of the ReaderSlots' probation_pinned as of the last fold. Wraps as
+  // size_t.
+  size_t folded_slot_sum_;
+
+  // Each ReaderSlot's probation_pinned at the last fold, by reader index.
+  std::vector<size_t> folded_slot_values_;
+
+  // A periodic fold was handed to a caller and is not applied yet. Under
+  // mutex_.
+  bool fold_in_flight_;
+
+  // The periodic fold's reading: written only by the caller it was handed
+  // to (fold_in_flight_ makes that caller the only one), without mutex_,
+  // then swapped in by that caller under mutex_.
+  size_t fold_sum_;
+  std::vector<size_t> fold_values_;
+
   // Charge of referenced entries outside the table: detached by Erase or
   // overwrite while pinned, or standalone.
   LockedSize detached_pinned_usage_;
@@ -1200,11 +1412,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // just before the hand, and the hand moves past an entry that leaves, so
   // the order is the FIFO-reinsertion order. The resident dummy head when
   // resident is empty.
-  // New entries enter probation. Eviction drains probation first: a head
-  // with enough frequency is promoted to resident, any other is evicted,
-  // and resident is evicted only when probation cannot free enough.
-  // Probation has no size bound, so a burst of promotions can leave it
-  // holding only the newest entries.
+  // New entries enter probation; probation victims with enough frequency
+  // are promoted to resident. The 12% budget (kProbationPercent) decides
+  // which of the two queues evicts, not how much each holds.
   S3FifoHandle* resident_hand_;
 
   // Aside list: pinned entries an eviction met after kPinnedRotationsPerPass
@@ -1264,10 +1474,26 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // is due. Under mutex_.
   size_t reader_ticks_;
   bool scan_due_;
+
+  // ReaderSlot chunks, allocated on first use without mutex_ and freed with
+  // the shard. Read on probation ref changes, written only when a chunk is
+  // installed, so kept off the lines a hit reads.
+  ALIGN_AS(CACHE_LINE_SIZE)
+  std::array<std::atomic<ReaderSlot*>, kReaderSlotChunks> reader_slot_chunks_{};
 };
 
 // S3FifoCache, the public Cache. The S3FifoCacheOptions comment in
 // include/rocksdb/cache.h is the short user contract; this is its detail.
+// - The probation budget, 12% of capacity (kProbationPercent), is fixed, not
+//   configurable.
+// - Lock exception: an exiting thread, or a thread beyond the 8192 that each
+//   shard keeps a ReaderSlot for, takes the shard mutex to pin or unpin a
+//   probation entry. A thread lands beyond 8192 only if no place below is
+//   free at its first use (an exited thread's place is reused, places below
+//   8192 first): it is a process's 8193rd or later concurrent thread that uses
+//   S3FifoCache, or places below 8192 are kept by threads whose first use came
+//   from a pthread key destructor. It takes the lock for those pins for as
+//   long as it runs (see kReaderSlotsPerChunk).
 // - Unlike LRUCache: an entry holds at most 16383 references (kRefMask); beyond
 //   that Lookup misses and Ref returns false. It cannot be the primary cache of
 //   NewTieredCache.
@@ -1289,9 +1515,13 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 //   usage above capacity (usage can still exceed it after a SetCapacity cut
 //   that pinned or hot entries survive, or when the limit is turned on over
 //   capacity). Without a handle it is dropped, strict or not.
-// - Not charged to capacity: process-wide, one cache line per thread for the
-//   most threads that have used an S3FifoCache at the same time, kept for the
-//   life of the process (ThreadReader, see s3fifo_cache.cc).
+// - Not charged to capacity: one cache line per thread that has used the shard,
+//   for up to 8192 threads, allocated in blocks of 64 threads (4 KiB with
+//   64-byte cache lines; building the cache allocates the building thread's
+//   block on every shard, so even one thread costs 4 KiB per shard); and
+//   process-wide, one cache line per thread for the most threads that have used
+//   an S3FifoCache at the same time, kept for the life of the process
+//   (ThreadReader, see s3fifo_cache.cc).
 // - Reservation (see Reservation at S3FifoCacheShard): at least 2048 homes
 //   (about 86 KiB) and at most about 2.7 MiB per shard, e.g. about 171 MiB for
 //   the 64 shards the default num_shard_bits gives caches of 256 MiB to 8 GiB.
