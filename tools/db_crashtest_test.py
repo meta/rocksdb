@@ -2128,6 +2128,41 @@ class DBCrashTestTest(unittest.TestCase):
         self.assertEqual(17, params["duration"])
         self.assertEqual(7, params["liveness_no_progress_timeout_sec"])
 
+    def test_liveness_remote_db_limits_periodic_compaction(self):
+        db_crashtest = self.load_db_crashtest()
+        db_crashtest.is_remote_db = True
+
+        params = db_crashtest.gen_cmd_params(self.build_mode_args())
+        self.assertEqual(
+            {0, 1800},
+            {params["periodic_compaction_seconds"]() for _ in range(100)},
+        )
+        self.assertEqual("", params["daily_offpeak_time_utc"])
+
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args(
+                periodic_compaction_seconds=1, daily_offpeak_time_utc="04:00-08:00"
+            )
+        )
+        self.assertEqual(1, params["periodic_compaction_seconds"])
+        self.assertEqual("04:00-08:00", params["daily_offpeak_time_utc"])
+
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args(periodic_compaction_seconds=1800)
+        )
+        self.assertEqual(1800, params["periodic_compaction_seconds"])
+        self.assertEqual("", params["daily_offpeak_time_utc"])
+
+        params = db_crashtest.gen_cmd_params(
+            self.build_mode_args(daily_offpeak_time_utc="04:00-08:00")
+        )
+        self.assertEqual("04:00-08:00", params["daily_offpeak_time_utc"])
+
+        db_crashtest.is_remote_db = False
+        params = db_crashtest.gen_cmd_params(self.build_mode_args())
+        for key in ["periodic_compaction_seconds", "daily_offpeak_time_utc"]:
+            self.assertIs(db_crashtest.default_params[key], params[key])
+
     def test_liveness_wrapper_timeout_is_successful_end_of_run(self):
         db_crashtest = self.load_db_crashtest()
         execute_calls = []
