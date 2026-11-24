@@ -431,10 +431,6 @@ TEST_P(CacheTest, EntriesArePinned) {
 }
 
 TEST_P(CacheTest, EvictionPolicy) {
-  if (GetParam() == kS3Fifo) {
-    ROCKSDB_GTEST_BYPASS("Plain S3FifoCache ignores lookups by design.");
-    return;
-  }
   Insert(100, 101);
   Insert(200, 201);
   // Frequently used entry must be kept around
@@ -447,6 +443,12 @@ TEST_P(CacheTest, EvictionPolicy) {
 }
 
 TEST_P(CacheTest, ExternalRefPinsEntries) {
+  if (GetParam() == kS3Fifo) {
+    ROCKSDB_GTEST_BYPASS(
+        "S3FifoCache promotes an entry hit twice to resident, where insertions "
+        "of keys never looked up do not evict it.");
+    return;
+  }
   Insert(100, 101);
   Cache::Handle* h = cache_->Lookup(EncodeKey(100));
   ASSERT_TRUE(cache_->Ref(h));

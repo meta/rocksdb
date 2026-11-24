@@ -479,16 +479,17 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
 };
 
 // EXPERIMENTAL: the API is subject to change.
-// S3FifoCache - A sharded cache that evicts each shard's oldest unpinned entry
-// first (FIFO). Lookup, Ref and most Releases take no lock. Cache::Priority is
-// ignored; pinned entries are never evicted. Unlike LRUCache, a Release never
-// evicts for being over capacity, an entry holds at most 32767 references (then
-// Lookup misses and Ref returns false), and it cannot be the primary of
-// NewTieredCache. An entry the table cannot hold (a charge of 4 GiB or more,
-// the 256th and later distinct CacheItemHelpers of a cache, or any entry while
-// every slot of its shard's table is taken) is not cached: with a handle it is
-// handed out uncached (under strict_capacity_limit only if it fits, else
-// MemoryLimit), else dropped.
+// S3FifoCache - A sharded cache with S3-FIFO eviction (SOSP '23): new entries
+// enter a probation queue; one hit at least twice before reaching its head
+// moves to a resident queue. Lookup, Ref and most Releases take no lock.
+// Cache::Priority is ignored; pinned entries are never evicted. Unlike
+// LRUCache, a Release never evicts for being over capacity, an entry holds at
+// most 16383 references (then Lookup misses and Ref returns false), and it
+// cannot be the primary of NewTieredCache. An entry the table cannot hold (a
+// charge of 4 GiB or more, the 256th and later distinct CacheItemHelpers of a
+// cache, or any entry while every slot of its shard's table is taken) is not
+// cached: with a handle it is handed out uncached (under strict_capacity_limit
+// only if it fits, else MemoryLimit), else dropped.
 // Memory: about 71 bytes of metadata per entry (charged against capacity under
 // kFullChargeCacheMetadata) plus up to about 2.7 MiB of address space reserved
 // per shard (committed up front on Windows); per-thread state is not charged.
