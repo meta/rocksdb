@@ -405,7 +405,7 @@ DEFINE_SYNC_AND_ASYNC(void, Version::MultiGet)
   // objects, which is expensive
   autovector<GetContext, 16> get_ctx;
   // Size the spill-over once; regrowing it moves the GetContexts built so far.
-  get_ctx.reserve(range->KeysLeft());
+  get_ctx.reserve(static_cast<size_t>(range->KeysLeft()));
   VersionBlobFetcher blob_fetcher(this, read_options);
   for (auto iter = range->begin(); iter != range->end(); ++iter) {
     assert(iter->s->ok() || iter->s->IsMergeInProgress());
