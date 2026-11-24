@@ -231,6 +231,11 @@ size_t Excess(size_t used, size_t add, size_t cap) {
   return used >= cap ? SaturatingAdd(used - cap, add) : add - (cap - used);
 }
 
+// max_capacity split over the shards, rounded up.
+size_t PerShardMaxCapacity(size_t max_capacity, size_t num_shards) {
+  return max_capacity / num_shards + (max_capacity % num_shards != 0 ? 1 : 0);
+}
+
 }  // namespace
 
 uint8_t S3FifoHelperRegistry::Probe(const Cache::CacheItemHelper* helper,
@@ -437,11 +442,8 @@ S3FifoCacheShard::S3FifoCacheShard(
       length_info_(0),
       slots_base_(nullptr),
       usage_(0),
-      // kFirstSlot + homes + 1 slots, in whole groups of three.
       slots_(MemMapping::AllocateLazyZeroedNoReserve(
-          (kFirstSlot + MaxLengthFor(std::max(capacity, max_capacity)) + 1 +
-           S3FifoSlotGroup::kSlots - 1) /
-          S3FifoSlotGroup::kSlots * sizeof(S3FifoSlotGroup))),
+          ReservationBytes(capacity, max_capacity))),
       used_length_(0),
       max_length_(MaxLengthFor(std::max(capacity, max_capacity))),
       occupancy_(0),
@@ -2182,8 +2184,8 @@ S3FifoCache::S3FifoCache(const S3FifoCacheOptions& opts)
     : ShardedCache(opts), helpers_(std::make_shared<S3FifoHelperRegistry>()) {
   size_t per_shard = GetPerShardCapacity();
   const size_t num_shards = GetNumShards();
-  const size_t per_shard_max = opts.max_capacity / num_shards +
-                               (opts.max_capacity % num_shards != 0 ? 1 : 0);
+  const size_t per_shard_max =
+      PerShardMaxCapacity(opts.max_capacity, num_shards);
   MemoryAllocator* alloc = memory_allocator();
   const int max_upper_hash_bits = 32 - opts.num_shard_bits;
   InitShards([&](S3FifoCacheShard* cs) {
@@ -2271,6 +2273,54 @@ size_t S3FifoCache::TEST_GetProbationSize() {
 }
 
 }  // namespace s3fifo_cache
+
+const std::unordered_map<std::string, OptionTypeInfo>&
+S3FifoCacheOptionsTypeInfo() {
+  static const std::unordered_map<std::string, CacheMetadataChargePolicy>
+      metadata_charge_policy_string_map = {
+          {"kDontChargeCacheMetadata", kDontChargeCacheMetadata},
+          {"kFullChargeCacheMetadata", kFullChargeCacheMetadata},
+      };
+  static const std::unordered_map<std::string, OptionTypeInfo> type_info = {
+      {"capacity",
+       {offsetof(struct S3FifoCacheOptions, capacity), OptionType::kSizeT,
+        OptionVerificationType::kNormal}},
+      {"num_shard_bits",
+       {offsetof(struct S3FifoCacheOptions, num_shard_bits), OptionType::kInt,
+        OptionVerificationType::kNormal}},
+      {"strict_capacity_limit",
+       {offsetof(struct S3FifoCacheOptions, strict_capacity_limit),
+        OptionType::kBoolean, OptionVerificationType::kNormal}},
+      {"metadata_charge_policy",
+       OptionTypeInfo::Enum<CacheMetadataChargePolicy>(
+           offsetof(struct S3FifoCacheOptions, metadata_charge_policy),
+           &metadata_charge_policy_string_map)},
+      {"hash_seed",
+       {offsetof(struct S3FifoCacheOptions, hash_seed), OptionType::kInt32T,
+        OptionVerificationType::kNormal}},
+      {"use_adaptive_mutex",
+       {offsetof(struct S3FifoCacheOptions, use_adaptive_mutex),
+        OptionType::kBoolean, OptionVerificationType::kNormal}},
+      {"max_capacity",
+       {offsetof(struct S3FifoCacheOptions, max_capacity), OptionType::kSizeT,
+        OptionVerificationType::kNormal}},
+  };
+  return type_info;
+}
+
+uint64_t S3FifoCacheReservationBytes(const S3FifoCacheOptions& opts) {
+  assert(opts.num_shard_bits < 20);
+  const int num_shard_bits = opts.num_shard_bits < 0
+                                 ? S3FifoCache::DefaultShardBits(opts.capacity)
+                                 : opts.num_shard_bits;
+  const size_t num_shards = size_t{1} << num_shard_bits;
+  // Capacity is split as ShardedCacheBase::ComputePerShardCapacity does.
+  const size_t per_shard = (opts.capacity + (num_shards - 1)) / num_shards;
+  return uint64_t{num_shards} *
+         S3FifoCacheShard::ReservationBytes(
+             per_shard,
+             s3fifo_cache::PerShardMaxCapacity(opts.max_capacity, num_shards));
+}
 
 std::shared_ptr<Cache> S3FifoCacheOptions::MakeSharedCache() const {
   if (num_shard_bits >= 20) {
