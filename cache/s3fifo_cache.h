@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,7 @@
 #include "port/likely.h"
 #include "port/mmap.h"
 #include "port/port.h"
+#include "rocksdb/utilities/options_type.h"
 #include "table/unique_id_impl.h"
 #include "util/autovector.h"
 #include "util/distributed_mutex.h"
@@ -915,6 +917,16 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
   // construction, so no lock is needed.
   void AppendPrintableOptions(std::string& str) const;
 
+  // Address space a shard with this capacity and max_capacity reserves for
+  // its slot table at construction: kFirstSlot + homes + 1 slots, in whole
+  // groups.
+  static size_t ReservationBytes(size_t capacity, size_t max_capacity) {
+    const size_t slots =
+        kFirstSlot + MaxLengthFor(std::max(capacity, max_capacity)) + 1;
+    return (slots + S3FifoSlotGroup::kSlots - 1) / S3FifoSlotGroup::kSlots *
+           sizeof(S3FifoSlotGroup);
+  }
+
   // Metadata charge of a table of `homes` homes: 128/3 bytes per home, the
   // share of a 128-byte group, rounded up for the whole table.
   static size_t TableChargeFor(size_t homes) {
@@ -1781,8 +1793,16 @@ class ALIGN_AS(CACHE_LINE_SIZE) S3FifoCacheShard final : public CacheShardBase {
 //   of 20 or more.
 // - GetPinnedUsage takes no shard lock, so it runs under whatever locks its
 //   caller holds; see S3FifoCacheShard::GetPinnedUsage for its cost.
-// - Opt-in: reached only by constructing it (MakeSharedCache); no option string
-//   or tool selects it, and it is not the default block cache.
+// - Opt-in, not the default block cache. Besides MakeSharedCache,
+//   Cache::CreateFromString accepts "s3fifo_cache://capacity=<n>;..." with the
+//   scalar fields of S3FifoCacheOptions (e.g.
+//   block_cache={s3fifo_cache://capacity=1G;num_shard_bits=6});
+//   memory_allocator and secondary_cache can only be set in C++, and
+//   num_shard_bits must be -1 (automatic) or 0 to 19. A string whose
+//   reservation fails (e.g. past vm.max_map_count, above) is rejected with
+//   InvalidArgument ("could not reserve address space for slot tables"). The
+//   65532-home cap bounds the whole reservation at about 1.33 TiB even at the
+//   most shards (2^19), so no capacity is rejected for its size alone.
 class S3FifoCache final : public ShardedCache<S3FifoCacheShard> {
  public:
   explicit S3FifoCache(const S3FifoCacheOptions& opts);
@@ -1826,5 +1846,14 @@ using S3FifoCache = s3fifo_cache::S3FifoCache;
 using S3FifoHandle = s3fifo_cache::S3FifoHandle;
 using S3FifoCacheShard = s3fifo_cache::S3FifoCacheShard;
 using S3FifoSlotGroup = s3fifo_cache::S3FifoSlotGroup;
+
+// The s3fifo_cache:// option fields. Built on first use, so it is ready even
+// when called during another translation unit's static initialization.
+const std::unordered_map<std::string, OptionTypeInfo>&
+S3FifoCacheOptionsTypeInfo();
+
+// Address space S3FifoCacheOptions::MakeSharedCache reserves for the slot
+// tables of all shards. Requires num_shard_bits < 20.
+uint64_t S3FifoCacheReservationBytes(const S3FifoCacheOptions& opts);
 
 }  // namespace ROCKSDB_NAMESPACE
