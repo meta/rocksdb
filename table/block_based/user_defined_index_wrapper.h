@@ -101,7 +101,18 @@ class IndexFactoryIteratorWrapper : public InternalIteratorBase<IndexValue> {
     UpdateValidAndKey();
   }
 
-  Slice key() const override { return Slice(*ikey_.const_rep()); }
+  // Builds the internal key on first use: a point lookup reads only value(),
+  // and a fresh iterator per lookup would allocate for it every time.
+  Slice key() const override {
+    if (ikey_stale_) {
+      ikey_.Set(result_.key, 0, ValueType::kTypeValue);
+      ikey_stale_ = false;
+    }
+    return Slice(*ikey_.const_rep());
+  }
+
+  // The separator itself, so no internal key needs building.
+  Slice user_key() const override { return result_.key; }
 
   IndexValue value() const override { return cached_value_; }
 
@@ -111,6 +122,8 @@ class IndexFactoryIteratorWrapper : public InternalIteratorBase<IndexValue> {
     if (scan_opts) {
       udi_iter_->Prepare(scan_opts->GetScanRanges().data(),
                          scan_opts->GetScanRanges().size());
+    } else {
+      udi_iter_->Prepare(nullptr, 0);
     }
   }
 
@@ -119,27 +132,19 @@ class IndexFactoryIteratorWrapper : public InternalIteratorBase<IndexValue> {
   }
 
  private:
-  // Refresh valid_, ikey_, and cached_value_ from result_ after every UDI
-  // positioning operation.
+  // Refresh valid_ and cached_value_ from result_ after every UDI positioning
+  // operation, and mark ikey_ for key() to rebuild.
   void UpdateValidAndKey() {
     if (status_.ok()) {
       // kUnknown and kOutOfBound both mean no valid position.
       valid_ = result_.bound_check_result == IterBoundCheck::kInbound;
       if (valid_) {
-        SetInternalKeyFromUDIResult();
+        ikey_stale_ = true;
+        CacheCurrentValue();
       }
     } else {
       valid_ = false;
     }
-  }
-
-  // Build the internal-key form of the current separator. UDI returns
-  // user keys; the index iterator contract requires internal keys.
-  // seq=0 / kTypeValue gives the correct upper-bound semantics for a
-  // separator: any data key with the same user key compares less.
-  void SetInternalKeyFromUDIResult() {
-    ikey_.Set(result_.key, 0, ValueType::kTypeValue);
-    CacheCurrentValue();
   }
 
   // Cache so repeated value() calls (multiple per block in
@@ -152,10 +157,16 @@ class IndexFactoryIteratorWrapper : public InternalIteratorBase<IndexValue> {
 
   std::unique_ptr<IndexFactoryIterator> udi_iter_;
   IterateResult result_;
-  InternalKey ikey_;
+  // The internal-key form of the current separator, built by key(). UDI
+  // returns user keys; the index iterator contract requires internal keys.
+  // seq=0 / kTypeValue gives the correct upper-bound semantics for a
+  // separator: any data key with the same user key compares less.
+  mutable InternalKey ikey_;
   IndexValue cached_value_;
   Status status_;
   bool valid_;
+  // Whether ikey_ is older than result_.key.
+  mutable bool ikey_stale_ = false;
 };
 
 class IndexFactoryReaderWrapper : public BlockBasedTable::IndexReader {

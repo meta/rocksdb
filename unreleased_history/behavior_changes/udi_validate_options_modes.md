@@ -1,0 +1,1 @@
+A custom index factory's `ValidateOptions()` no longer runs in `index_mode=kStandardOnly`, which ignores the factory. In the other modes, `DB::Open()` and `CreateColumnFamily()` now reject `TrieIndexFactory` with a non-bytewise comparator.

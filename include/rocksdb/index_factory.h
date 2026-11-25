@@ -265,9 +265,14 @@ class IndexFactoryIterator {
   virtual ~IndexFactoryIterator() = default;
 
   // Hint for upcoming scan ranges. Implementations may use this for
-  // prefetching or bounding.
-  // @param scan_opts  Array of scan range descriptors.
-  // @param num_opts   Number of elements in scan_opts.
+  // prefetching or bounding. The ranges are sorted and do not overlap.
+  // @param scan_opts  Array of scan range descriptors. May be null when
+  //                   num_opts is 0.
+  // @param num_opts   Number of elements in scan_opts. 0 discards the ranges
+  //                   of an earlier Prepare(), so the iterator is unbounded
+  //                   again.
+  // The caller keeps the keys pointed to by scan_opts alive until the ranges
+  // are discarded or replaced by another Prepare().
   virtual void Prepare(const ScanOptions scan_opts[], size_t num_opts) = 0;
 
   // Context for Seek, carrying the packed sequence+type tag of the
@@ -352,6 +357,13 @@ struct IndexFactoryOptions {
 //
 // Extends Customizable for string-based construction (CreateFromString),
 // options serialization, and Name()-based identification.
+//
+// A factory can override ValidateOptions() to reject options it does not
+// support. BlockBasedTableFactory calls it in every index mode except
+// kStandardOnly, which ignores the factory. It runs when DB::Open() and
+// CreateColumnFamily() validate the options, but not for SetOptions() or
+// SstFileWriter, so a factory that cannot build with an option should also
+// fail NewBuilder().
 // ---------------------------------------------------------------------------
 class IndexFactory : public Customizable {
  public:
@@ -359,7 +371,7 @@ class IndexFactory : public Customizable {
 
   static const char* Type() { return "UserDefinedIndexFactory"; }
 
-  // Create an IndexFactory from a string identifier (e.g., "trie").
+  // Create an IndexFactory from a string identifier (e.g., "trie_index").
   static Status CreateFromString(const ConfigOptions& config_options,
                                  const std::string& value,
                                  std::shared_ptr<IndexFactory>* factory);

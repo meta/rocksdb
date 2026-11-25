@@ -1991,8 +1991,9 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
       // ticked already or returned.
       RecordTick(rep_->ioptions.statistics.get(),
                  SST_USER_DEFINED_INDEX_LOAD_FAIL_COUNT);
-      if (!custom_index_required &&
-          (s.IsCorruption() || s.IsNotSupported() || s.IsInvalidArgument())) {
+      const bool unusable_block =
+          s.IsCorruption() || s.IsNotSupported() || s.IsInvalidArgument();
+      if (!custom_index_required && unusable_block) {
         ROCKS_LOG_ERROR(rep_->ioptions.logger,
                         "Failed to load the UDI block %s in file %s, falling "
                         "back to the standard index; %s",
@@ -2002,6 +2003,18 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
         rep_->udi_block.Reset();
         s = Status::OK();
       } else {
+        if (unusable_block) {
+          // Whether another index_mode can read this SST is decided here, not
+          // by the factory, so the way out is added to its error here too.
+          s = Status::CopyAppendMessage(
+              s, "; ",
+              requires_custom_reader
+                  ? "this SST has no standard index to fall back to, so only "
+                    "a release whose factory reads this block can open it"
+                  : "index_mode=kStandardDefault reads this SST through its "
+                    "standard index, and a compaction in that mode rewrites "
+                    "the custom index block");
+        }
         ROCKS_LOG_ERROR(rep_->ioptions.logger,
                         "Failed to load the UDI block %s in file %s; the "
                         "configured index_mode has no usable fallback; %s",
