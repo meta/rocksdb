@@ -26,7 +26,7 @@ JniCallback::JniCallback(JNIEnv* env, jobject jcallback_obj) {
   // across multiple method calls, so we create a global ref
   assert(jcallback_obj != nullptr);
   m_jcallback_obj = env->NewGlobalRef(jcallback_obj);
-  if (jcallback_obj == nullptr) {
+  if (m_jcallback_obj == nullptr) {
     // exception thrown: OutOfMemoryError
     return;
   }
