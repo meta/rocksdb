@@ -951,6 +951,16 @@ static rocksdb_t* CheckCompaction(rocksdb_t* db, rocksdb_options_t* options,
   // Reenable compaction
   rocksdb_enable_manual_compaction(db);
 
+  // Abort all compactions
+  rocksdb_abort_all_compactions(db);
+  rocksdb_compact_range(db, NULL, 0, NULL, 0);
+  // should not filter anything while compactions are aborted
+  CheckGet(db, roptions, "foo", "foovalue");
+  CheckGet(db, roptions, "bar", "barvalue");
+  CheckGet(db, roptions, "baz", "bazvalue");
+  // Resume compactions
+  rocksdb_resume_all_compactions(db);
+
   // Force compaction
   rocksdb_compact_range(db, NULL, 0, NULL, 0);
   rocksdb_wait_for_compact_options_t* wco;

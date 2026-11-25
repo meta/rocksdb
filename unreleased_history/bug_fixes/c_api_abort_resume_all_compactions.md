@@ -1,0 +1,1 @@
+The C API header now declares `rocksdb_abort_all_compactions()` and `rocksdb_resume_all_compactions()`. Both were already defined in `db/c.cc` but were missing from `include/rocksdb/c.h`, so C callers had no prototype and Windows DLL builds did not export them.
