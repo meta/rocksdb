@@ -773,6 +773,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/rocks_callback_object.cc                      \
   java/rocksjni/rocksjni.cc                                   \
   java/rocksjni/rocksdb_exception_test.cc                     \
+  java/rocksjni/sim_cache.cc                                  \
   java/rocksjni/slice.cc                                      \
   java/rocksjni/snapshot.cc                                   \
   java/rocksjni/sst_file_manager.cc                           \
