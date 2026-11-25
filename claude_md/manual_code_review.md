@@ -8,8 +8,7 @@ the full CI review *methodology* but drops the multi-agent orchestration and the
 CI-only file-persistence machinery, to approximate the heavyweight result at a
 fraction of the cost.
 
-**Scope: LOCAL manual review only. This file is NOT used by CI.** CI uses
-`claude_md/ci_review_prompt.md`.
+**Scope: LOCAL manual review only.**
 
 ## How to use
 
