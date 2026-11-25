@@ -1065,4 +1065,64 @@ public class WriteBatchWithIndexTest {
       }
     }
   }
+
+  @Test
+  public void wideColumnBatch() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final WriteBatchWithIndex wbwi = new WriteBatchWithIndex(false);
+        final WriteOptions wOpt = new WriteOptions();
+        final ColumnFamilyHandle cf = db.getDefaultColumnFamily()) {
+      WideColumn<byte[]> column = new WideColumn<>("name".getBytes(UTF_8), "value".getBytes(UTF_8));
+      List<WideColumn<byte[]>> columns = new ArrayList<>();
+      columns.add(column);
+      wbwi.putEntity(cf, "key".getBytes(UTF_8), 0, 3, columns);
+
+      db.write(wOpt, wbwi);
+
+      List<WideColumn<byte[]>> results = new ArrayList<>();
+
+      db.getEntity("key".getBytes(UTF_8), results);
+
+      assertThat(results).isNotEmpty();
+      WideColumn<byte[]> result = results.get(0);
+      assertThat(result.getName()).isEqualTo("name".getBytes(UTF_8));
+      assertThat(result.getValue()).isEqualTo("value".getBytes(UTF_8));
+    }
+  }
+
+  @Test
+  public void wideColumnBatchDirect() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final WriteBatchWithIndex wbwi = new WriteBatchWithIndex(false);
+        final WriteOptions wOpt = new WriteOptions();
+        final ColumnFamilyHandle cf = db.getDefaultColumnFamily()) {
+      ByteBuffer key = ByteBuffer.allocateDirect(10);
+      key.put("key".getBytes(UTF_8));
+      key.flip();
+
+      ByteBuffer name = ByteBuffer.allocateDirect(10);
+      name.put("name".getBytes(UTF_8));
+      name.flip();
+
+      ByteBuffer value = ByteBuffer.allocateDirect(10);
+      value.put("value".getBytes(UTF_8));
+      value.flip();
+
+      WideColumn<ByteBuffer> column = new WideColumn<>(name, value);
+      List<WideColumn<ByteBuffer>> columns = new ArrayList<>(1);
+      columns.add(column);
+
+      wbwi.putEntity(cf, key, columns);
+      db.write(wOpt, wbwi);
+
+      List<WideColumn<byte[]>> results = new ArrayList<>();
+
+      db.getEntity("key".getBytes(UTF_8), results);
+
+      assertThat(results).isNotEmpty();
+      WideColumn<byte[]> result = results.get(0);
+      assertThat(result.getName()).isEqualTo("name".getBytes(UTF_8));
+      assertThat(result.getValue()).isEqualTo("value".getBytes(UTF_8));
+    }
+  }
 }

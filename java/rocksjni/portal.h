@@ -9526,5 +9526,161 @@ class BlockBasedTableOptionsJni
   }
 };
 
+class WideColumnJni {
+ public:
+  static void convertWideColumnsDirect(
+      std::function<void(ROCKSDB_NAMESPACE::Slice&,
+                         ROCKSDB_NAMESPACE::WideColumns&)>
+          op,
+      JNIEnv* env, jobject jKey, jint jKeyOffset, jint jKeyLen,
+      jobjectArray jNames, jintArray jNamesOffset, jintArray jNamesLen,
+      jobjectArray jValues, jintArray jvaluesOffset, jintArray jValuesLen) {
+    auto jKeyAddress = env->GetDirectBufferAddress(jKey);
+    if (jKeyAddress == nullptr) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(
+          env,
+          "Invalid key argument (argument is not a valid direct ByteBuffer)");
+      return;
+    }
+
+    auto key = reinterpret_cast<char*>(jKeyAddress) + jKeyOffset;
+    ROCKSDB_NAMESPACE::Slice key_slice(key, static_cast<size_t>(jKeyLen));
+
+    const auto columns_len = static_cast<int>(env->GetArrayLength(jNames));
+
+    auto namesOffset = std::make_unique<jint[]>(columns_len);
+    env->GetIntArrayRegion(jNamesOffset, 0, columns_len, namesOffset.get());
+    if (env->ExceptionCheck()) {
+      return;
+    }
+    auto namesLength = std::make_unique<jint[]>(columns_len);
+    env->GetIntArrayRegion(jNamesLen, 0, columns_len, namesLength.get());
+    if (env->ExceptionCheck()) {
+      return;
+    }
+
+    auto valuesOffset = std::make_unique<jint[]>(columns_len);
+    env->GetIntArrayRegion(jvaluesOffset, 0, columns_len, valuesOffset.get());
+    if (env->ExceptionCheck()) {
+      return;
+    }
+
+    auto valuesLenght = std::make_unique<jint[]>(columns_len);
+    env->GetIntArrayRegion(jValuesLen, 0, columns_len, valuesLenght.get());
+    if (env->ExceptionCheck()) {
+      return;
+    }
+
+    ROCKSDB_NAMESPACE::WideColumns columns;
+    columns.reserve(columns_len);
+
+    for (int i = 0; i < columns_len; i++) {
+      auto jname = env->GetObjectArrayElement(jNames, i);
+      if (env->ExceptionCheck()) {
+        return;
+      }
+      auto _name = env->GetDirectBufferAddress(jname);
+      env->DeleteLocalRef(jname);
+      if (_name == nullptr) {
+        ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(
+            env,
+            "Invalid \"name\" argument (argument is not a valid direct "
+            "ByteBuffer)");
+        return;
+      }
+      auto name = reinterpret_cast<char*>(_name) + namesOffset[i];
+      ROCKSDB_NAMESPACE::Slice nameSlice(name, namesLength[i]);
+
+      auto j_value = env->GetObjectArrayElement(jValues, i);
+      if (env->ExceptionCheck()) {
+        return;
+      }
+      auto _value = env->GetDirectBufferAddress(j_value);
+      env->DeleteLocalRef(j_value);
+      if (_value == nullptr) {
+        ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(
+            env,
+            "Invalid \"value\" argument (argument is not a valid direct "
+            "ByteBuffer)");
+        return;
+      }
+      auto value = reinterpret_cast<char*>(_value) + valuesOffset[i];
+      ROCKSDB_NAMESPACE::Slice valueSlice(value, valuesLenght[i]);
+
+      columns.push_back(ROCKSDB_NAMESPACE::WideColumn(nameSlice, valueSlice));
+    }
+
+    op(key_slice, columns);
+    return;
+  }
+
+  static void convertWideColumns(
+      std::function<void(ROCKSDB_NAMESPACE::Slice&,
+                         ROCKSDB_NAMESPACE::WideColumns&)>
+          op,
+      JNIEnv* env, jbyteArray jkey, jint keyOffset, jint keyLen,
+      jobjectArray jnames, jobjectArray jvalues) {
+    auto key = std::make_unique<jbyte[]>(keyLen);
+
+    env->GetByteArrayRegion(jkey, keyOffset, keyLen, key.get());
+    if (env->ExceptionCheck()) {
+      return;
+    }
+    ROCKSDB_NAMESPACE::Slice key_slice(reinterpret_cast<char*>(key.get()),
+                                       keyLen);
+
+    const auto column_len = env->GetArrayLength(jnames);
+    rocksdb::WideColumns columns;
+    columns.reserve(column_len);
+
+    std::vector<std::unique_ptr<jbyte[]>> names_vec;
+    names_vec.reserve(column_len);
+
+    std::vector<std::unique_ptr<jbyte[]>> values_vec;
+    values_vec.reserve(column_len);
+
+    for (int i = 0; i < column_len; i++) {
+      auto jname =
+          static_cast<jbyteArray>(env->GetObjectArrayElement(jnames, i));
+      if (env->ExceptionCheck()) {
+        return;
+      }
+      auto jname_len = env->GetArrayLength(jname);
+      auto name = std::make_unique<jbyte[]>(jname_len);
+      env->GetByteArrayRegion(jname, 0, jname_len, name.get());
+      env->DeleteLocalRef(jname);
+      if (env->ExceptionCheck()) {
+        return;
+      }
+      ROCKSDB_NAMESPACE::Slice name_slice(reinterpret_cast<char*>(name.get()),
+                                          jname_len);
+      names_vec.push_back(std::move(name));
+
+      auto j_value =
+          static_cast<jbyteArray>(env->GetObjectArrayElement(jvalues, i));
+      if (env->ExceptionCheck()) {
+        return;
+      }
+      auto jvalue_len = env->GetArrayLength(j_value);
+      auto value = std::make_unique<jbyte[]>(jvalue_len);
+      env->GetByteArrayRegion(j_value, 0, jvalue_len, value.get());
+      env->DeleteLocalRef(j_value);
+      if (env->ExceptionCheck()) {
+        return;
+      }
+      ROCKSDB_NAMESPACE::Slice value_slice(reinterpret_cast<char*>(value.get()),
+                                           jvalue_len);
+      names_vec.push_back(std::move(value));
+
+      columns.emplace_back(
+          ROCKSDB_NAMESPACE::WideColumn(name_slice, value_slice));
+    }
+
+    op(key_slice, columns);
+
+    return;
+  }
+};
+
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // JAVA_ROCKSJNI_PORTAL_H_
