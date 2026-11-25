@@ -121,7 +121,7 @@ public class RocksDB extends RocksObject {
       for (final String path : paths) {
         try {
           System.load(path + "/" +
-              Environment.getJniLibraryFileName("rocksdbjni"));
+              Environment.getJniLibraryFileName("rocksdb"));
           success = true;
           break;
         } catch (final UnsatisfiedLinkError e) {
