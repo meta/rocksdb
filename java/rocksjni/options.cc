@@ -3873,6 +3873,29 @@ jint Java_org_rocksdb_Options_blobFileStartingLevel(JNIEnv*, jclass,
 
 /*
  * Class:     org_rocksdb_Options
+ * Method:    setMemtableProtectionBytesPerKey
+ * Signature: (JI)V
+ */
+void Java_org_rocksdb_Options_setMemtableProtectionBytesPerKey(
+    JNIEnv*, jclass, jlong jhandle, jint jmemtable_protection_bytes_per_key) {
+  auto* opts = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
+  opts->memtable_protection_bytes_per_key =
+      static_cast<uint32_t>(jmemtable_protection_bytes_per_key);
+}
+
+/*
+ * Class:     org_rocksdb_Options
+ * Method:    memtableProtectionBytesPerKey
+ * Signature: (J)I
+ */
+jint Java_org_rocksdb_Options_memtableProtectionBytesPerKey(JNIEnv*, jclass,
+                                                            jlong jhandle) {
+  auto* opts = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
+  return static_cast<jint>(opts->memtable_protection_bytes_per_key);
+}
+
+/*
+ * Class:     org_rocksdb_Options
  * Method:    setPrepopulateBlobCache
  * Signature: (JB)V
  */
@@ -5828,6 +5851,31 @@ jint Java_org_rocksdb_ColumnFamilyOptions_blobFileStartingLevel(JNIEnv*, jclass,
   auto* opts =
       reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle);
   return static_cast<jint>(opts->blob_file_starting_level);
+}
+
+/*
+ * Class:     org_rocksdb_ColumnFamilyOptions
+ * Method:    setMemtableProtectionBytesPerKey
+ * Signature: (JI)V
+ */
+void Java_org_rocksdb_ColumnFamilyOptions_setMemtableProtectionBytesPerKey(
+    JNIEnv*, jclass, jlong jhandle, jint jmemtable_protection_bytes_per_key) {
+  auto* opts =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle);
+  opts->memtable_protection_bytes_per_key =
+      static_cast<uint32_t>(jmemtable_protection_bytes_per_key);
+}
+
+/*
+ * Class:     org_rocksdb_ColumnFamilyOptions
+ * Method:    memtableProtectionBytesPerKey
+ * Signature: (J)I
+ */
+jint Java_org_rocksdb_ColumnFamilyOptions_memtableProtectionBytesPerKey(
+    JNIEnv*, jclass, jlong jhandle) {
+  auto* opts =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle);
+  return static_cast<jint>(opts->memtable_protection_bytes_per_key);
 }
 
 /*
@@ -8125,6 +8173,30 @@ void Java_org_rocksdb_WriteOptions_setMemtableInsertHintPerBatch(
   reinterpret_cast<ROCKSDB_NAMESPACE::WriteOptions*>(jhandle)
       ->memtable_insert_hint_per_batch =
       static_cast<bool>(jmemtable_insert_hint_per_batch);
+}
+
+/*
+ * Class:     org_rocksdb_WriteOptions
+ * Method:    setProtectionBytesPerKey
+ * Signature: (JJ)V
+ */
+void Java_org_rocksdb_WriteOptions_setProtectionBytesPerKey(
+    JNIEnv*, jclass, jlong jhandle, jlong jprotection_bytes_per_key) {
+  reinterpret_cast<ROCKSDB_NAMESPACE::WriteOptions*>(jhandle)
+      ->protection_bytes_per_key =
+      static_cast<size_t>(jprotection_bytes_per_key);
+}
+
+/*
+ * Class:     org_rocksdb_WriteOptions
+ * Method:    protectionBytesPerKey
+ * Signature: (J)J
+ */
+jlong Java_org_rocksdb_WriteOptions_protectionBytesPerKey(JNIEnv*, jclass,
+                                                          jlong jhandle) {
+  return static_cast<jlong>(
+      reinterpret_cast<ROCKSDB_NAMESPACE::WriteOptions*>(jhandle)
+          ->protection_bytes_per_key);
 }
 
 /////////////////////////////////////////////////////////////////////

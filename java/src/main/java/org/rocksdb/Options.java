@@ -2141,6 +2141,17 @@ public class Options extends RocksObject
     return PrepopulateBlobCache.getPrepopulateBlobCache(prepopulateBlobCache(nativeHandle_));
   }
 
+  @Override
+  public Options setMemtableProtectionBytesPerKey(final int memtableProtectionBytesPerKey) {
+    setMemtableProtectionBytesPerKey(nativeHandle_, memtableProtectionBytesPerKey);
+    return this;
+  }
+
+  @Override
+  public int memtableProtectionBytesPerKey() {
+    return memtableProtectionBytesPerKey(nativeHandle_);
+  }
+
   //
   // END options for blobs (integrated BlobDB)
   //
@@ -2560,6 +2571,9 @@ public class Options extends RocksObject
   private static native void setBlobFileStartingLevel(
       final long nativeHandle_, final int blobFileStartingLevel);
   private static native int blobFileStartingLevel(final long nativeHandle_);
+  private static native void setMemtableProtectionBytesPerKey(
+      final long nativeHandle_, final int memtableProtectionBytesPerKey);
+  private static native int memtableProtectionBytesPerKey(final long nativeHandle_);
   private static native void setPrepopulateBlobCache(
       final long nativeHandle_, final byte prepopulateBlobCache);
   private static native byte prepopulateBlobCache(final long nativeHandle_);

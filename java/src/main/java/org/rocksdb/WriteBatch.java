@@ -42,6 +42,18 @@ public class WriteBatch extends AbstractWriteBatch {
   }
 
   /**
+   * Constructs a WriteBatch instance with a given size and per-KV checksum protection.
+   * <p>
+   * Supported values: 0, 8
+   *
+   * @param reserved_bytes reserved size for WriteBatch
+   * @param protectionBytesPerKey number of checksum bytes per key-value
+   */
+  public WriteBatch(final int reserved_bytes, final long protectionBytesPerKey) {
+    super(newWriteBatch(reserved_bytes, protectionBytesPerKey));
+  }
+
+  /**
    * Constructs a WriteBatch instance from a serialized representation
    * as returned by {@link #data()}.
    *
@@ -371,6 +383,8 @@ public class WriteBatch extends AbstractWriteBatch {
   private static native void setMaxBytesJni(final long nativeHandle, final long maxBytes);
 
   private static native long newWriteBatch(final int reserved_bytes);
+  private static native long newWriteBatch(
+      final int reserved_bytes, final long protectionBytesPerKey);
   private static native long newWriteBatch(final byte[] serialized, final int serializedLength);
   private static native void iterate(final long handle, final long handlerHandle)
       throws RocksDBException;

@@ -498,6 +498,49 @@ public class WriteBatchTest {
     }
   }
 
+  @Test
+  public void constructorWithProtectionBytesPerKey() throws RocksDBException {
+    // Test constructor with protectionBytesPerKey parameter
+    try (final WriteBatch batch = new WriteBatch(1024, 8)) {
+      assertThat(batch.count()).isEqualTo(0);
+
+      // Add some operations
+      batch.put("key1".getBytes(UTF_8), "value1".getBytes(UTF_8));
+      batch.put("key2".getBytes(UTF_8), "value2".getBytes(UTF_8));
+      assertThat(batch.count()).isEqualTo(2);
+    }
+
+    // Test with 0 (disabled)
+    try (final WriteBatch batch = new WriteBatch(512, 0)) {
+      assertThat(batch.count()).isEqualTo(0);
+      batch.put("key".getBytes(UTF_8), "value".getBytes(UTF_8));
+      assertThat(batch.count()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void checksumIntegrationTest() throws RocksDBException {
+    // Integration test: use WriteOptions.protectionBytesPerKey with WriteBatch
+    try (final Options options = new Options().setCreateIfMissing(true);
+        final WriteOptions writeOptions = new WriteOptions();
+        final WriteBatch batch = new WriteBatch(1024, 8)) {
+      // Set protection in WriteOptions
+      writeOptions.setProtectionBytesPerKey(8);
+      assertThat(writeOptions.protectionBytesPerKey()).isEqualTo(8);
+
+      final String dbPath = dbFolder.getRoot().getAbsolutePath();
+      try (final RocksDB db = RocksDB.open(options, dbPath)) {
+        // Write with checksums
+        batch.put("protected_key".getBytes(UTF_8), "protected_value".getBytes(UTF_8));
+        db.write(writeOptions, batch);
+
+        // Verify data was written
+        final byte[] value = db.get("protected_key".getBytes(UTF_8));
+        assertThat(new String(value, UTF_8)).isEqualTo("protected_value");
+      }
+    }
+  }
+
   private static native byte[] getContents(final long writeBatchHandle);
 }
 

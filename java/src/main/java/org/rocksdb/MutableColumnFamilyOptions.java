@@ -141,7 +141,8 @@ public class MutableColumnFamilyOptions extends AbstractMutableOptions {
     max_sequential_skip_in_iterations(ValueType.LONG),
     paranoid_file_checks(ValueType.BOOLEAN),
     report_bg_io_stats(ValueType.BOOLEAN),
-    compression(ValueType.ENUM);
+    compression(ValueType.ENUM),
+    memtable_protection_bytes_per_key(ValueType.INT);
 
     private final ValueType valueType;
     MiscOption(final ValueType valueType) {
@@ -642,6 +643,17 @@ public class MutableColumnFamilyOptions extends AbstractMutableOptions {
     @Override
     public PrepopulateBlobCache prepopulateBlobCache() {
       return getEnum(BlobOption.prepopulate_blob_cache);
+    }
+
+    @Override
+    public MutableColumnFamilyOptionsBuilder setMemtableProtectionBytesPerKey(
+        final int memtableProtectionBytesPerKey) {
+      return setInt(MiscOption.memtable_protection_bytes_per_key, memtableProtectionBytesPerKey);
+    }
+
+    @Override
+    public int memtableProtectionBytesPerKey() {
+      return getInt(MiscOption.memtable_protection_bytes_per_key);
     }
   }
 }
