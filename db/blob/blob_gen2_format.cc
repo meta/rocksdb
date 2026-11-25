@@ -8,7 +8,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "file/random_access_file_reader.h"
@@ -16,6 +19,8 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "table/format.h"
+#include "test_util/sync_point.h"
+#include "util/autovector.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
@@ -206,87 +211,261 @@ struct Gen2ReadSlot {
   Status* status = nullptr;
 };
 
-// Issues a single MultiRead for the records described by `slots` and copies
-// each result into its buf, setting *slots[i].status. Shared by the
-// whole-record and range batch readers; per-record format checks (compression
-// marker / checksum) are done by the whole-record caller afterwards from the
-// (now populated) buf.
+// The inline size of the slot and physical read lists in MultiReadGen2. A call
+// with more entries reserves each list once on the heap, so this size only
+// decides when a call allocates. 32 is an estimate of a common call size: it
+// equals MultiGetContext::MAX_BATCH_SIZE, so a call from one MultiGet batch
+// with one read per key fits. It is not a limit: one
+// LazyWideColumnsBatch::MultiResolve call can pass any number of reads.
+constexpr size_t kGen2ReadInlineSize = 32;
+
+// Reads the byte ranges in `slots` from `file`. Each slot gets its bytes in buf
+// and its result in *status. The whole-record and the range batch readers below
+// share this helper. One call reads one batch: the reads of one SST and one
+// read kind (see the batch readers in blob_gen2_format.h).
+//
+// Background: FSRandomAccessFile::MultiRead requires that the requests of one
+// call do not overlap. The slots can still overlap. The same range can appear
+// twice (for example, a MultiGetEntityLazy call with the same key twice), and
+// two range reads of one value can partly overlap. So the helper works in these
+// steps:
+// 1. Sort the slots by (offset, length). Then overlapping slots are next to
+//    each other, and one pass over the slots finds them.
+// 2. Merge. A "physical read" is one request to RandomAccessFileReader::
+//    MultiRead. Walk the sorted slots and add each slot to the current physical
+//    read when the slot starts before the end of that read. Otherwise the slot
+//    starts a new physical read. The slots of one physical read are its
+//    members. Exact duplicates are members of the same physical read, so they
+//    share one file read. Slots with a gap between them stay in separate
+//    physical reads, so the bytes in the gap are not read. Slots that only
+//    touch also stay separate, so a slot that shares no bytes can still read
+//    straight into its own buf.
+// 3. Choose where each physical read puts its bytes. When one member covers
+//    the whole physical read, the read goes straight into that member's buf.
+//    This is the case for a physical read with one member, for exact
+//    duplicates, and for nested ranges whose longest range starts at the
+//    physical read's offset. Otherwise (members that only partly overlap), the
+//    read goes into a scratch buffer of the merged size. With direct I/O, the
+//    reader reads into its own aligned buffer instead. It aligns the physical
+//    reads to the alignment that the file requires, and may merge them,
+//    before it calls the file system.
+// 4. Issue all physical reads in one MultiRead call. The call is made only when
+//    at least one slot needs bytes and preparing the I/O options succeeds.
+// 5. Route results. Each member gets the status of its physical read. Each
+//    member that read OK copies its own slice of the returned bytes into its
+//    buf, unless the slice is already there. The covering member's buf is a
+//    source of these copies and is never written by them.
+//
+// For example, slots A and B both read file bytes [0, 100) and slot C reads
+// [50, 150). They merge into one physical read of [0, 150):
+//
+//   offset    0         50        100       150
+//   A         [-------------------)
+//   B         [-------------------)
+//   C                   [-------------------)
+//   read      [-----------------------------)
+//
+// No member covers [0, 150), so the read goes into scratch. A and B copy bytes
+// [0, 100) of it, and C copies [50, 150). If C read [20, 30) instead, the
+// physical read would be [0, 100). A covers it, so the read would go into A's
+// buf, and B and C would copy their slices from A's buf.
+//
+// Results:
+// - If preparing the I/O options or the MultiRead call fails as a whole, every
+//   slot that needed a read gets that error.
+// - If one physical read fails, all of its members get its error.
+// - If a physical read returns fewer bytes than asked, a member whose range
+//   lies fully inside the returned bytes gets OK and its bytes. Any other
+//   member gets Corruption ("Incomplete blob record read").
+// - An empty slot gets OK without I/O. A slot whose end offset does not fit in
+//   uint64_t gets Corruption, because the merge step computes end offsets.
+// The whole-record caller checks each record buffer on its own afterwards.
+//
+// Memory: scratch is allocated only without direct I/O, and only for physical
+// reads that no member covers. These reads share one allocation per call. Its
+// size is at most the total length of their members, because a merged span is
+// never longer than the ranges it covers put together. In a valid file, two
+// different records never share bytes, so whole records never partly overlap
+// and whole-record reads never use scratch. Their bytes then go only into the
+// caller's buffers, which can come from the blob cache's memory allocator (for
+// example, one that keeps blob bytes out of core dumps). The range callers
+// allocate their buffers without that allocator, so scratch for range reads
+// does not bypass it. An mmap read can return bytes from the file mapping even
+// when the helper gives it a buffer. The members then copy from the returned
+// bytes, as in step 5.
 void MultiReadGen2(const ReadOptions& read_options,
                    RandomAccessFileReader* file,
-                   std::vector<Gen2ReadSlot>& slots) {
+                   autovector<Gen2ReadSlot, kGen2ReadInlineSize>& slots) {
   assert(file != nullptr);
   assert(!slots.empty());
 
-  // RandomAccessFileReader::MultiRead requires the requests sorted ascending by
-  // file offset -- it asserts this, and in direct-I/O mode it aligns and merges
-  // only consecutive requests, so unsorted input reads the wrong bytes. The
-  // callers group records by SST but not by offset, so sort here. Each slot
-  // carries its own output buf/status pointer, so sorting does not disturb
-  // result routing.
+  // Step 1.
   std::sort(slots.begin(), slots.end(),
             [](const Gen2ReadSlot& a, const Gen2ReadSlot& b) {
-              return a.offset < b.offset;
+              return std::make_pair(a.offset, a.len) <
+                     std::make_pair(b.offset, b.len);
             });
 
-  const size_t num = slots.size();
+  // Empty slots and slots whose end offset overflows get their status in step
+  // 2 and are never members.
+  const auto needs_read = [](const Gen2ReadSlot& slot) {
+    return slot.len > 0 &&
+           slot.offset <= std::numeric_limits<uint64_t>::max() - slot.len;
+  };
+
+  // Step 2. A physical read covers the sorted slots [first_slot, end_slot).
+  // The slots in that index range that need a read are its members.
+  // first_slot is always a member.
+  struct PhysicalRead {
+    uint64_t offset = 0;
+    uint64_t end_offset = 0;
+    size_t first_slot = 0;
+    size_t end_slot = 0;
+    // The member that starts at `offset` and is the longest. It covers the
+    // whole physical read when it also ends at `end_offset`.
+    size_t longest_first_slot = 0;
+  };
+  autovector<PhysicalRead, kGen2ReadInlineSize> physical_reads;
+  physical_reads.reserve(slots.size());
+  for (size_t i = 0; i < slots.size(); ++i) {
+    Gen2ReadSlot& slot = slots[i];
+    if (slot.len == 0) {
+      *slot.status = Status::OK();
+      continue;
+    }
+    if (!needs_read(slot)) {
+      *slot.status = Status::Corruption("Blob read range overflow in " +
+                                        file->file_name() + " at offset " +
+                                        std::to_string(slot.offset));
+      continue;
+    }
+    const uint64_t end_offset = slot.offset + slot.len;
+    if (!physical_reads.empty() &&
+        slot.offset < physical_reads.back().end_offset) {
+      PhysicalRead& read = physical_reads.back();
+      read.end_offset = std::max(read.end_offset, end_offset);
+      read.end_slot = i + 1;
+      if (slot.offset == read.offset) {
+        // The sort order makes this slot the longest so far at this offset.
+        read.longest_first_slot = i;
+      }
+    } else {
+      physical_reads.push_back(
+          PhysicalRead{slot.offset, end_offset, i, i + 1, i});
+    }
+  }
+  if (physical_reads.empty()) {
+    return;
+  }
+
+  // Step 3. Direct I/O reads into the reader's aligned buffer, so it needs
+  // neither caller buffers nor scratch.
+  const bool direct_io = file->use_direct_io();
+  // A physical read covers only slots that overlap, so its span is at most the
+  // sum of its members' lengths. All member buffers exist at the same time, so
+  // the span fits in size_t, also where size_t has 32 bits.
+  const auto span_of = [](const PhysicalRead& read) {
+    const uint64_t span = read.end_offset - read.offset;
+    assert(span <= std::numeric_limits<size_t>::max());
+    return static_cast<size_t>(span);
+  };
+  const auto covering_buf = [&](const PhysicalRead& read) -> char* {
+    const Gen2ReadSlot& longest = slots[read.longest_first_slot];
+    return longest.offset + longest.len == read.end_offset ? longest.buf
+                                                           : nullptr;
+  };
+  size_t scratch_size = 0;
+  if (!direct_io) {
+    for (const PhysicalRead& read : physical_reads) {
+      if (covering_buf(read) == nullptr) {
+        scratch_size += span_of(read);
+      }
+    }
+  }
+  std::unique_ptr<char[]> scratch;
+  if (scratch_size > 0) {
+    scratch.reset(new char[scratch_size]);
+  }
+  // MultiRead takes the requests as one array, so they go into a vector. An
+  // autovector keeps one array only up to its inline size.
   std::vector<FSReadRequest> read_reqs;
-  read_reqs.reserve(num);
-  for (size_t i = 0; i < num; ++i) {
+  read_reqs.reserve(physical_reads.size());
+  char* next_scratch = scratch.get();
+  for (const PhysicalRead& read : physical_reads) {
     FSReadRequest read_req{};
-    read_req.offset = slots[i].offset;
-    read_req.len = slots[i].len;
+    read_req.offset = read.offset;
+    read_req.len = span_of(read);
+    if (direct_io) {
+      read_req.scratch = nullptr;
+    } else if (char* buf = covering_buf(read)) {
+      read_req.scratch = buf;
+    } else {
+      // The reader changes the first byte of each buffer before the read, so
+      // that a file system that reports success without writing the buffer
+      // fails the checks. Changing the byte reads it, so it must be set.
+      next_scratch[0] = 0;
+      read_req.scratch = next_scratch;
+      next_scratch += read_req.len;
+    }
     read_reqs.emplace_back(std::move(read_req));
   }
 
+  // Step 4.
   AlignedBuffer direct_io_buffer;
-  const bool direct_io = file->use_direct_io();
-  if (direct_io) {
-    for (size_t i = 0; i < num; ++i) {
-      read_reqs[i].scratch = nullptr;
-    }
-  } else {
-    for (size_t i = 0; i < num; ++i) {
-      read_reqs[i].scratch = slots[i].buf;
-    }
-  }
-
   IOOptions opts;
   IODebugContext dbg;
   Status s = file->PrepareIOOptions(read_options, opts, &dbg);
   if (s.ok()) {
     AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
+    TEST_SYNC_POINT_CALLBACK("MultiReadGen2:Requests", &read_reqs);
     s = file->MultiRead(opts, read_reqs.data(), read_reqs.size(),
                         &direct_io_context, &dbg);
   }
   if (!s.ok()) {
-    // Batch read failed; s is written to every slot's status below, so these
-    // per-request FS statuses carry nothing extra.
-    for (auto& read_req : read_reqs) {
+    // The call failed as a whole. s goes to every member below, so the
+    // per-request statuses carry nothing extra.
+    for (FSReadRequest& read_req : read_reqs) {
       read_req.status.PermitUncheckedError();
     }
-    for (size_t i = 0; i < num; ++i) {
-      *slots[i].status = s;
+    for (const PhysicalRead& read : physical_reads) {
+      for (size_t i = read.first_slot; i < read.end_slot; ++i) {
+        if (needs_read(slots[i])) {
+          *slots[i].status = s;
+        }
+      }
     }
     return;
   }
 
-  for (size_t i = 0; i < num; ++i) {
-    FSReadRequest& read_req = read_reqs[i];
-    if (read_req.status.ok() && read_req.result.size() != read_req.len) {
-      read_req.status = IOStatus::Corruption(
-          "Incomplete blob record read from " + file->file_name() +
-          " at offset " + std::to_string(read_req.offset) + ": expected " +
-          std::to_string(read_req.len) + " bytes, got " +
-          std::to_string(read_req.result.size()));
-    }
-    *slots[i].status = read_req.status;
-    if (!slots[i].status->ok()) {
-      continue;
-    }
-    // With mmap/direct reads the data lands outside the caller's buf; copy it
-    // in so the caller can rely on buf owning the bytes.
-    if (read_req.result.data() != slots[i].buf) {
-      memcpy(slots[i].buf, read_req.result.data(), read_req.len);
+  // Step 5.
+  for (size_t r = 0; r < physical_reads.size(); ++r) {
+    const PhysicalRead& read = physical_reads[r];
+    const FSReadRequest& read_req = read_reqs[r];
+    const bool read_ok = read_req.status.ok();
+    const uint64_t returned_end = read.offset + read_req.result.size();
+    for (size_t i = read.first_slot; i < read.end_slot; ++i) {
+      Gen2ReadSlot& slot = slots[i];
+      if (!needs_read(slot)) {
+        continue;
+      }
+      if (!read_ok) {
+        *slot.status = read_req.status;
+        continue;
+      }
+      if (slot.offset + slot.len > returned_end) {
+        const uint64_t got =
+            returned_end > slot.offset ? returned_end - slot.offset : 0;
+        *slot.status = Status::Corruption(
+            "Incomplete blob record read from " + file->file_name() +
+            " at offset " + std::to_string(slot.offset) + ": expected " +
+            std::to_string(slot.len) + " bytes, got " + std::to_string(got));
+        continue;
+      }
+      *slot.status = Status::OK();
+      const char* data = read_req.result.data() + (slot.offset - read.offset);
+      if (data != slot.buf) {
+        memcpy(slot.buf, data, slot.len);
+      }
     }
   }
 }
@@ -302,7 +481,7 @@ void ReadAndVerifySimpleGen2BlobRecords(const ReadOptions& read_options,
   assert(file != nullptr);
   assert(num_records > 0);
 
-  std::vector<Gen2ReadSlot> slots;
+  autovector<Gen2ReadSlot, kGen2ReadInlineSize> slots;
   slots.reserve(num_records);
   for (size_t i = 0; i < num_records; ++i) {
     assert(reqs[i].buf != nullptr);
@@ -359,7 +538,7 @@ void ReadSimpleGen2BlobRanges(const ReadOptions& read_options,
   assert(file != nullptr);
   assert(num_records > 0);
 
-  std::vector<Gen2ReadSlot> slots;
+  autovector<Gen2ReadSlot, kGen2ReadInlineSize> slots;
   slots.reserve(num_records);
   for (size_t i = 0; i < num_records; ++i) {
     assert(reqs[i].buf != nullptr);

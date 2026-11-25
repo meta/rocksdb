@@ -7,15 +7,22 @@
 // (DB::GetEntityLazy / LazyWideColumns / DB::MultiGetEntityLazy /
 // LazyWideColumnsBatch).
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "db/blob/blob_gen2_format.h"
 #include "db/db_test_util.h"
 #include "db/wide/wide_column_test_util.h"
+#include "file/random_access_file_reader.h"
 #include "monitoring/thread_status_util.h"
 #include "port/stack_trace.h"
 #include "rocksdb/cache.h"
@@ -23,6 +30,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/lazy_wide_columns.h"
+#include "rocksdb/memory_allocator.h"
 #include "rocksdb/sst_file_writer.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/utilities/transaction_db.h"
@@ -90,10 +98,59 @@ class BlobReadIOActivityFS : public FileSystemWrapper {
     blob_read_count_.store(0);
     blob_multiread_count_.store(0);
     sst_multiread_count_.store(0);
+    sst_multiread_overlap_count_.store(0);
+    std::lock_guard<std::mutex> lock(sst_multiread_requests_mutex_);
+    sst_multiread_requests_.clear();
+    sst_multiread_scratches_.clear();
   }
   uint64_t blob_read_count() const { return blob_read_count_.load(); }
   uint64_t blob_multiread_count() const { return blob_multiread_count_.load(); }
   uint64_t sst_multiread_count() const { return sst_multiread_count_.load(); }
+
+  // The number of SST MultiRead requests that overlap an earlier request of the
+  // same call, after sorting each call's requests by offset.
+  uint64_t sst_multiread_overlap_count() const {
+    return sst_multiread_overlap_count_.load();
+  }
+
+  // The (offset, length) requests of each SST MultiRead call since the last
+  // ResetBlobReadCounts, one inner list per call, in the order given.
+  std::vector<std::vector<std::pair<uint64_t, size_t>>> sst_multiread_requests()
+      const {
+    std::lock_guard<std::mutex> lock(sst_multiread_requests_mutex_);
+    return sst_multiread_requests_;
+  }
+
+  // The scratch pointer of each request in sst_multiread_requests(), in the
+  // same layout. It shows which buffer each request reads into.
+  std::vector<std::vector<const char*>> sst_multiread_scratches() const {
+    std::lock_guard<std::mutex> lock(sst_multiread_requests_mutex_);
+    return sst_multiread_scratches_;
+  }
+
+  // When set, each SST MultiRead call passes its requests to `hook` before it
+  // reads. Set it only while no read runs.
+  void SetSstMultiReadHook(
+      std::function<void(const FSReadRequest*, size_t)> hook) {
+    std::lock_guard<std::mutex> lock(sst_multiread_requests_mutex_);
+    sst_multiread_hook_ = std::move(hook);
+  }
+
+  // When set, every SST MultiRead returns an IOError without reading.
+  void SetFailSstMultiRead(bool fail) { fail_sst_multiread_.store(fail); }
+
+  // After each SST MultiRead, the request at `index` in the call gets an
+  // IOError of its own, so one request fails while the call succeeds. A
+  // negative index turns this off.
+  void SetFailSstReadRequest(int index) { fail_sst_read_request_.store(index); }
+
+  // After each SST MultiRead, the request at `index` in the call returns
+  // `missing_bytes` fewer bytes than asked, as a short read does. A negative
+  // index turns this off.
+  void SetShortSstReadRequest(int index, size_t missing_bytes) {
+    short_sst_read_missing_bytes_.store(missing_bytes);
+    short_sst_read_request_.store(index);
+  }
 
  private:
   class RecordingFile : public FSRandomAccessFileOwnerWrapper {
@@ -124,6 +181,54 @@ class BlobReadIOActivityFS : public FileSystemWrapper {
         fs_->blob_multiread_count_.fetch_add(1);
       } else {
         fs_->sst_multiread_count_.fetch_add(1);
+        // FSRandomAccessFile::MultiRead requires requests that do not overlap.
+        // The file system in this test can handle overlaps, so count them
+        // instead, to catch a caller that breaks the rule.
+        std::vector<std::pair<uint64_t, size_t>> ranges;
+        std::vector<const char*> scratches;
+        for (size_t i = 0; i < num_reqs; ++i) {
+          ranges.emplace_back(reqs[i].offset, reqs[i].len);
+          scratches.push_back(reqs[i].scratch);
+        }
+        {
+          std::lock_guard<std::mutex> lock(fs_->sst_multiread_requests_mutex_);
+          fs_->sst_multiread_requests_.push_back(ranges);
+          fs_->sst_multiread_scratches_.push_back(scratches);
+          if (fs_->sst_multiread_hook_) {
+            fs_->sst_multiread_hook_(reqs, num_reqs);
+          }
+        }
+        std::sort(ranges.begin(), ranges.end());
+        // A request can overlap any earlier request, not only the one just
+        // before it, so compare with the largest end offset so far.
+        uint64_t max_end = 0;
+        for (size_t i = 0; i < ranges.size(); ++i) {
+          if (i > 0 && ranges[i].first < max_end) {
+            fs_->sst_multiread_overlap_count_.fetch_add(1);
+          }
+          max_end = std::max(max_end, ranges[i].first + ranges[i].second);
+        }
+        if (fs_->fail_sst_multiread_.load()) {
+          return IOStatus::IOError("Injected SST MultiRead error");
+        }
+        IOStatus s = FSRandomAccessFileOwnerWrapper::MultiRead(reqs, num_reqs,
+                                                               options, dbg);
+        if (!s.ok()) {
+          return s;
+        }
+        const int fail_index = fs_->fail_sst_read_request_.load();
+        if (fail_index >= 0 && static_cast<size_t>(fail_index) < num_reqs) {
+          reqs[fail_index].status =
+              IOStatus::IOError("Injected SST read request error");
+        }
+        const int short_index = fs_->short_sst_read_request_.load();
+        if (short_index >= 0 && static_cast<size_t>(short_index) < num_reqs) {
+          Slice& result = reqs[short_index].result;
+          const size_t missing = std::min(
+              result.size(), fs_->short_sst_read_missing_bytes_.load());
+          result = Slice(result.data(), result.size() - missing);
+        }
+        return s;
       }
       return FSRandomAccessFileOwnerWrapper::MultiRead(reqs, num_reqs, options,
                                                        dbg);
@@ -139,6 +244,56 @@ class BlobReadIOActivityFS : public FileSystemWrapper {
   std::atomic<uint64_t> blob_read_count_{0};
   std::atomic<uint64_t> blob_multiread_count_{0};
   std::atomic<uint64_t> sst_multiread_count_{0};
+  std::atomic<uint64_t> sst_multiread_overlap_count_{0};
+  std::atomic<bool> fail_sst_multiread_{false};
+  std::atomic<int> fail_sst_read_request_{-1};
+  std::atomic<int> short_sst_read_request_{-1};
+  std::atomic<size_t> short_sst_read_missing_bytes_{0};
+  mutable std::mutex sst_multiread_requests_mutex_;
+  std::vector<std::vector<std::pair<uint64_t, size_t>>> sst_multiread_requests_;
+  std::vector<std::vector<const char*>> sst_multiread_scratches_;
+  std::function<void(const FSReadRequest*, size_t)> sst_multiread_hook_;
+};
+
+// A blob cache memory allocator that zero-fills each block and remembers the
+// blocks that are allocated now. A test uses it to check that a read buffer
+// belongs to the allocator.
+class TrackingMemoryAllocator : public MemoryAllocator {
+ public:
+  static const char* kClassName() { return "TrackingMemoryAllocator"; }
+  const char* Name() const override { return kClassName(); }
+
+  void* Allocate(size_t size) override {
+    char* block = new char[size];
+    memset(block, 0, size);
+    std::lock_guard<std::mutex> lock(mutex_);
+    blocks_[block] = size;
+    return block;
+  }
+
+  void Deallocate(void* p) override {
+    char* block = static_cast<char*>(p);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      blocks_.erase(block);
+    }
+    delete[] block;
+  }
+
+  // True when [p, p + len) lies inside one block that is allocated now.
+  bool Owns(const char* p, size_t len) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = blocks_.upper_bound(p);
+    if (it == blocks_.begin()) {
+      return false;
+    }
+    --it;
+    return p + len <= it->first + it->second;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::map<const char*, size_t> blocks_;
 };
 }  // namespace
 
@@ -190,6 +345,67 @@ class DBLazyEntityTest : public DBTestBase {
     return options.statistics->getTickerCount(BLOB_DB_LAZY_PARTIAL_BYTES_SAVED);
   }
 
+  // Opens a DB with `options` on `fs`, ingests the embedded values "ek0"
+  // (2000 bytes) and "ek1" (3000 bytes), and resolves the whole "data" column
+  // of the entities of "ek0", "ek0" and "ek1" in one MultiResolve call. "ek0"
+  // twice gives two entities that point to the same embedded record. Checks
+  // every value, and that the SST reads were one MultiRead call with two
+  // requests: the duplicate shares one of them. The statistics and the read
+  // counts of `fs` are reset before MultiResolve. Returns the number of reads.
+  size_t ResolveDuplicateEmbeddedRecord(Options& options,
+                                        BlobReadIOActivityFS* fs) {
+    DestroyAndReopen(options);
+    const std::string value0(2000, 'a');
+    const std::string value1(3000, 'b');
+    IngestEmbeddedEntities(
+        options, {{"ek0", WideColumns{{kDefaultWideColumnName, "inline"},
+                                      {"data", value0}}},
+                  {"ek1", WideColumns{{kDefaultWideColumnName, "inline"},
+                                      {"data", value1}}}});
+
+    const std::array<Slice, 3> key_slices{Slice("ek0"), Slice("ek0"),
+                                          Slice("ek1")};
+    const std::array<const std::string*, 3> expected{&value0, &value0, &value1};
+    LazyWideColumnsBatch batch;
+    std::array<Status, 3> get_statuses;
+    db_->MultiGetEntityLazy(ReadOptions(), db_->DefaultColumnFamily(),
+                            key_slices.size(), key_slices.data(), &batch,
+                            get_statuses.data());
+    for (const Status& s : get_statuses) {
+      EXPECT_OK(s);
+    }
+    EXPECT_EQ(batch.size(), key_slices.size());
+    if (batch.size() != key_slices.size()) {
+      return 0;
+    }
+
+    fs->ResetBlobReadCounts();
+    EXPECT_OK(options.statistics->Reset());
+
+    std::array<PinnableSlice, 3> results;
+    std::array<Status, 3> statuses;
+    std::array<LazyColumnReadRequest, 3> reads;
+    for (size_t i = 0; i < reads.size(); ++i) {
+      reads[i].column = &batch[i][1];  // embedded "data" column
+      reads[i].result = &results[i];
+      reads[i].status = &statuses[i];
+    }
+    EXPECT_OK(batch.MultiResolve(reads.size(), reads.data()));
+
+    for (size_t i = 0; i < reads.size(); ++i) {
+      SCOPED_TRACE("read " + std::to_string(i));
+      EXPECT_OK(statuses[i]);
+      EXPECT_EQ(results[i], *expected[i]);
+    }
+    EXPECT_EQ(fs->sst_multiread_overlap_count(), 0U);
+    const auto calls = fs->sst_multiread_requests();
+    EXPECT_EQ(calls.size(), 1U);
+    if (!calls.empty()) {
+      EXPECT_EQ(calls[0].size(), 2U);
+    }
+    return reads.size();
+  }
+
   // Warms the blob-file reader for a column with a 1-byte partial read: opening
   // the blob file reads its header + footer, a one-time cost. Tests that assert
   // an exact BLOB_DB_BLOB_FILE_BYTES_READ delta call this and then reset stats,
@@ -198,6 +414,18 @@ class DBLazyEntityTest : public DBTestBase {
     PinnableSlice warm;
     ASSERT_OK(lazy.ResolveColumnRange(lazy[column_index], /*offset=*/0,
                                       /*length=*/1, &warm));
+  }
+
+  // Returns a value where each byte depends on its position, so a read from a
+  // wrong offset returns different bytes. The pattern repeats every 251 bytes.
+  // 251 is a prime, so the pattern does not repeat at the power-of-two
+  // distances that block and page sizes use.
+  static std::string PositionDependentValue(size_t size) {
+    std::string value(size, '\0');
+    for (size_t i = 0; i < size; ++i) {
+      value[i] = static_cast<char>(i % 251);
+    }
+    return value;
   }
 
   // Writes an SST containing a single embedded (same-file blob) wide-column
@@ -1309,6 +1537,508 @@ TEST_F(DBLazyEntityTest, BatchCoalescesEmbeddedReadsOutOfOrder) {
   }
   // Still one coalesced MultiRead over the SST despite the unsorted input.
   ASSERT_EQ(fs->sst_multiread_count(), 1U);
+}
+
+// Tests of batched embedded range reads that check the requests each SST
+// MultiRead call gets. FSRandomAccessFile::MultiRead requires requests that do
+// not overlap, so MultiReadGen2 merges overlapping ranges into one request and
+// sends all requests of a group in one call. Each test reads ranges of one
+// embedded value of kValueSize bytes. The value bytes depend on their position,
+// so a slice taken from a wrong place in a merged read gives wrong bytes.
+class DBLazyEntityEmbeddedMultiReadTest : public DBLazyEntityTest {
+ public:
+  ~DBLazyEntityEmbeddedMultiReadTest() override {
+    // The batch pins DB state, so release it before the DB closes, and close
+    // the DB before recording_env_ and fs_ go away.
+    batch_.Reset();
+    Close();
+  }
+
+ protected:
+  // Large enough for the ranges of the tests below, which end at or before
+  // offset 4000.
+  static constexpr size_t kValueSize = 4000;
+
+  // Opens a DB on the recording file system, ingests one entity whose "data"
+  // column is an embedded value, loads it into batch_ and resets the counters.
+  // With `use_direct_reads`, the SST is read with direct I/O.
+  void OpenAndLoadEntity(bool use_direct_reads) {
+    fs_ = std::make_shared<BlobReadIOActivityFS>(FileSystem::Default());
+    recording_env_ = NewCompositeEnv(fs_);
+    options_ = GetLazyTestOptions();
+    options_.env = recording_env_.get();
+    options_.use_direct_reads = use_direct_reads;
+    DestroyAndReopen(options_);
+
+    value_ = PositionDependentValue(kValueSize);
+    IngestEmbeddedEntity(
+        options_, "entity",
+        WideColumns{{kDefaultWideColumnName, "inline"}, {"data", value_}});
+
+    const std::array<Slice, 1> key_slices{Slice("entity")};
+    std::array<Status, 1> get_statuses;
+    db_->MultiGetEntityLazy(ReadOptions(), db_->DefaultColumnFamily(),
+                            key_slices.size(), key_slices.data(), &batch_,
+                            get_statuses.data());
+    ASSERT_OK(get_statuses[0]);
+    ASSERT_EQ(batch_.size(), 1U);
+
+    fs_->ResetBlobReadCounts();
+    ASSERT_OK(options_.statistics->Reset());
+  }
+
+  // Reads the (offset, length) `ranges` of the "data" column in one
+  // MultiResolve call. Fills results_ and statuses_ and returns the dispatch
+  // status.
+  Status ResolveRanges(const std::vector<std::pair<uint64_t, size_t>>& ranges) {
+    results_ = std::vector<PinnableSlice>(ranges.size());
+    statuses_ = std::vector<Status>(ranges.size());
+    std::vector<LazyColumnReadRequest> reads(ranges.size());
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      reads[i].column = &batch_[0][1];  // embedded "data" column
+      reads[i].offset = ranges[i].first;
+      reads[i].length = ranges[i].second;
+      reads[i].result = &results_[i];
+      reads[i].status = &statuses_[i];
+    }
+    return batch_.MultiResolve(reads.size(), reads.data());
+  }
+
+  // Checks that every range read OK and got its bytes of the value.
+  void ExpectAllRangesRead(
+      const std::vector<std::pair<uint64_t, size_t>>& ranges) {
+    ASSERT_EQ(statuses_.size(), ranges.size());
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      SCOPED_TRACE("range " + std::to_string(i));
+      ASSERT_OK(statuses_[i]);
+      ASSERT_EQ(results_[i], value_.substr(ranges[i].first, ranges[i].second));
+    }
+  }
+
+  // Checks that the SST reads were one MultiRead call with requests of these
+  // (offset, length) pairs. The offsets are relative to the first request,
+  // because the file offset of the value depends on the SST layout.
+  void ExpectOneCall(
+      const std::vector<std::pair<uint64_t, size_t>>& relative_requests) {
+    const auto calls = fs_->sst_multiread_requests();
+    ASSERT_EQ(calls.size(), 1U);
+    ASSERT_EQ(fs_->sst_multiread_overlap_count(), 0U);
+    const auto& requests = calls[0];
+    ASSERT_EQ(requests.size(), relative_requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+      SCOPED_TRACE("request " + std::to_string(i));
+      ASSERT_EQ(requests[i].first - requests[0].first,
+                relative_requests[i].first);
+      ASSERT_EQ(requests[i].second, relative_requests[i].second);
+    }
+  }
+
+  // Opens the DB's only SST file for direct calls of the batch readers, which
+  // MultiResolve cannot reach for some inputs (for example, empty ranges).
+  // Also sets sst_name_.
+  std::unique_ptr<RandomAccessFileReader> OpenSstReader() {
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    EXPECT_EQ(files.size(), 1U);
+    sst_name_ = files[0].directory + "/" + files[0].relative_filename;
+    std::unique_ptr<FSRandomAccessFile> file;
+    EXPECT_OK(fs_->NewRandomAccessFile(sst_name_, FileOptions(), &file,
+                                       /*dbg=*/nullptr));
+    return std::make_unique<RandomAccessFileReader>(std::move(file), sst_name_);
+  }
+
+  std::shared_ptr<BlobReadIOActivityFS> fs_;
+  // The Env on fs_. DBTestBase::env_ stays the Env of the base fixture.
+  std::unique_ptr<Env> recording_env_;
+  Options options_;
+  std::string sst_name_;
+  std::string value_;
+  LazyWideColumnsBatch batch_;
+  std::vector<PinnableSlice> results_;
+  std::vector<Status> statuses_;
+};
+
+// An exact duplicate, a partial overlap and two disjoint ranges of one value:
+// - [0, 100) twice and [50, 150) merge into one request [0, 150).
+// - [1000, 1200) and [3000, 3010) overlap nothing, so each is its own request.
+// All three requests go in one MultiRead call.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, OverlappingRangesMergeIntoOneRead) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+
+  const std::vector<std::pair<uint64_t, size_t>> ranges{
+      {0, 100}, {0, 100}, {50, 100}, {1000, 200}, {3000, 10}};
+  ASSERT_OK(ResolveRanges(ranges));
+
+  ASSERT_NO_FATAL_FAILURE(ExpectAllRangesRead(ranges));
+  ASSERT_NO_FATAL_FAILURE(ExpectOneCall({{0, 150}, {1000, 200}, {3000, 10}}));
+  // Read statistics count each range, so the ranges that share a read count
+  // too.
+  ASSERT_EQ(LazyReadCount(options_), ranges.size());
+  ASSERT_EQ(BlobBytesRead(options_), 100 + 100 + 100 + 200 + 10);
+}
+
+// Buffered reads of 128 distinct prefixes [0, 1), [0, 2), ..., [0, 128) of one
+// value. They are more than the 32 entries that the lists in MultiReadGen2 hold
+// without a heap allocation, and they all overlap, so they merge into one
+// request [0, 128). The test also reads [1000, 1010), which overlaps nothing,
+// to check that the merged request and an unrelated request share the call.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, StrictPrefixesShareOneRead) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+
+  constexpr size_t kNumPrefixes = 128;
+  std::vector<std::pair<uint64_t, size_t>> ranges;
+  ranges.reserve(kNumPrefixes + 1);
+  for (size_t length = 1; length <= kNumPrefixes; ++length) {
+    ranges.emplace_back(0, length);
+  }
+  ranges.emplace_back(1000, 10);
+  ASSERT_OK(ResolveRanges(ranges));
+
+  ASSERT_NO_FATAL_FAILURE(ExpectAllRangesRead(ranges));
+  ASSERT_NO_FATAL_FAILURE(ExpectOneCall({{0, kNumPrefixes}, {1000, 10}}));
+}
+
+// Ranges that do not overlap go to one MultiRead, however many there are. This
+// test reads 40 ranges of one value, more than the 32 entries that the lists in
+// MultiReadGen2 hold without a heap allocation.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, ManyDisjointRangesUseOneMultiRead) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+
+  // Range i, for i = 0, 1, ..., 39, is [i * 50, i * 50 + 20). The ranges start
+  // 50 bytes apart and are 20 bytes long, so a 30-byte gap separates each
+  // range from the next, and no two ranges overlap or touch.
+  constexpr size_t kNumRanges = 40;
+  std::vector<std::pair<uint64_t, size_t>> ranges;
+  ranges.reserve(kNumRanges);
+  for (size_t i = 0; i < kNumRanges; ++i) {
+    ranges.emplace_back(i * 50, 20);
+  }
+  ASSERT_OK(ResolveRanges(ranges));
+
+  ASSERT_NO_FATAL_FAILURE(ExpectAllRangesRead(ranges));
+  ASSERT_NO_FATAL_FAILURE(ExpectOneCall(ranges));
+}
+
+// Direct I/O. The reader reads aligned pages into its own buffer, so each
+// range copies its slice from there, also from a merged read. The ranges merge
+// into five reads: [0, 150) (from [0, 100) twice, [50, 150) and [20, 30)),
+// [1000, 1200) (from [1000, 1200) and [1100, 1150)), [2000, 2064) (from 64
+// prefixes), [3000, 3010) and [3990, 4000). All of them go in one MultiRead
+// call. The reader aligns and merges them before the file system sees them, so
+// the test checks the five reads at the MultiReadGen2:Requests sync point, and
+// that the file system gets one call with no overlapping request.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, DirectReadsCopyMergedSlices) {
+  if (!IsDirectIOSupported()) {
+    ROCKSDB_GTEST_BYPASS("Direct I/O not supported");
+    return;
+  }
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/true));
+
+  std::vector<std::pair<uint64_t, size_t>> ranges{
+      {0, 100},    {0, 100},   {50, 100},  {20, 10},
+      {1000, 200}, {1100, 50}, {3000, 10}, {3990, 10}};
+  for (size_t length = 1; length <= 64; ++length) {
+    ranges.emplace_back(2000, length);
+  }
+  std::vector<std::pair<uint64_t, size_t>> reads;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MultiReadGen2:Requests", [&](void* arg) {
+        for (const FSReadRequest& req :
+             *static_cast<std::vector<FSReadRequest>*>(arg)) {
+          reads.emplace_back(req.offset, req.len);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer clear_sync_point([]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(ResolveRanges(ranges));
+
+  ASSERT_NO_FATAL_FAILURE(ExpectAllRangesRead(ranges));
+  // The offsets are relative to the first read, as in ExpectOneCall.
+  const std::vector<std::pair<uint64_t, size_t>> expected_reads{
+      {0, 150}, {1000, 200}, {2000, 64}, {3000, 10}, {3990, 10}};
+  ASSERT_EQ(reads.size(), expected_reads.size());
+  for (size_t i = 0; i < reads.size(); ++i) {
+    SCOPED_TRACE("read " + std::to_string(i));
+    ASSERT_EQ(reads[i].first - reads[0].first, expected_reads[i].first);
+    ASSERT_EQ(reads[i].second, expected_reads[i].second);
+  }
+  ASSERT_EQ(fs_->sst_multiread_requests().size(), 1U);
+  ASSERT_EQ(fs_->sst_multiread_overlap_count(), 0U);
+}
+
+// Buffered reads. When one range of a merged request covers the whole request,
+// the request reads straight into that range's buffer, and the other ranges
+// copy from it. Only partial overlaps need a scratch buffer. The requests are:
+// - [0, 40) from the nested prefixes [0, 1), [0, 2), ..., [0, 40). [0, 40)
+//   covers the request.
+// - [500, 600) from [500, 600) twice and [520, 530). Either copy of [500, 600)
+//   covers the request.
+// - [1000, 1010), a range of its own.
+// - [2000, 2150) from [2000, 2100) and [2050, 2150). No range covers it, so it
+//   reads into scratch.
+// Each range result keeps the buffer it was read into, so the test compares
+// the scratch pointer of each request with the result buffers.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, CoveringRangeReadsIntoItsBuffer) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+
+  std::vector<std::pair<uint64_t, size_t>> ranges{
+      {500, 100}, {520, 10}, {500, 100}, {1000, 10}, {2000, 100}, {2050, 100}};
+  constexpr size_t kNumPrefixes = 40;
+  for (size_t length = 1; length <= kNumPrefixes; ++length) {
+    ranges.emplace_back(0, length);
+  }
+  ASSERT_OK(ResolveRanges(ranges));
+
+  ASSERT_NO_FATAL_FAILURE(ExpectAllRangesRead(ranges));
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectOneCall({{0, kNumPrefixes}, {500, 100}, {1000, 10}, {2000, 150}}));
+  const auto scratches = fs_->sst_multiread_scratches()[0];
+  ASSERT_EQ(scratches[0], results_.back().data());  // [0, 40)
+  ASSERT_TRUE(scratches[1] == results_[0].data() ||
+              scratches[1] == results_[2].data());  // [500, 600)
+  ASSERT_EQ(scratches[2], results_[3].data());      // [1000, 1010)
+  for (const PinnableSlice& result : results_) {
+    ASSERT_NE(scratches[3], result.data());  // [2000, 2150)
+  }
+}
+
+// A batch of only empty ranges needs no bytes, so ReadSimpleGen2BlobRanges
+// gives each range OK and makes no MultiRead call. MultiResolve answers empty
+// ranges before it reaches this reader, so the test calls the reader directly
+// on the SST file.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, AllEmptyRangesMakeNoCall) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+  const std::unique_ptr<RandomAccessFileReader> reader = OpenSstReader();
+
+  // Two empty ranges, at payload offsets 0 and 50, of a 100-byte payload at
+  // file offset 0. The values are examples: no byte is read.
+  char buf[1];
+  std::array<Status, 2> statuses{Status::Incomplete(), Status::Incomplete()};
+  std::array<SimpleGen2RangeReadRequest, 2> reqs;
+  for (size_t i = 0; i < reqs.size(); ++i) {
+    reqs[i].payload_size = 100;
+    reqs[i].range_offset = i * 50;
+    reqs[i].range_length = 0;
+    reqs[i].buf = buf;
+    reqs[i].status = &statuses[i];
+  }
+  ReadSimpleGen2BlobRanges(ReadOptions(), reader.get(), reqs.size(),
+                           reqs.data());
+
+  for (const Status& s : statuses) {
+    ASSERT_OK(s);
+  }
+  ASSERT_TRUE(fs_->sst_multiread_requests().empty());
+}
+
+// An empty range whose offset lies inside a merged read needs no bytes, so it
+// gets OK even when that read fails. The test reads [0, 100), an empty range
+// at offset 50, [50, 150) and [500, 510) of a 1000-byte payload at file offset
+// 0 of the SST. The values are examples. The empty range sorts between [0, 100)
+// and [50, 150), inside the index range of their merged read [0, 150).
+// [500, 510) is a second read, so the batch always uses MultiRead. MultiResolve
+// answers empty ranges before it reaches this reader, so the test calls the
+// reader directly.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, EmptyRangeInsideMergedReadGetsOK) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+  const std::unique_ptr<RandomAccessFileReader> reader = OpenSstReader();
+  std::string file_bytes;
+  ASSERT_OK(ReadFileToString(env_, sst_name_, &file_bytes));
+  ASSERT_GE(file_bytes.size(), 510U);
+
+  for (const bool fail_read : {false, true}) {
+    SCOPED_TRACE(fail_read ? "failed read" : "good read");
+    fs_->ResetBlobReadCounts();
+    const std::array<std::pair<uint64_t, size_t>, 4> ranges{
+        {{0, 100}, {50, 0}, {50, 100}, {500, 10}}};
+    std::array<std::string, 4> bufs{std::string(100, 'x'), std::string(1, 'x'),
+                                    std::string(100, 'x'),
+                                    std::string(10, 'x')};
+    std::array<Status, 4> statuses;
+    std::array<SimpleGen2RangeReadRequest, 4> reqs;
+    for (size_t i = 0; i < reqs.size(); ++i) {
+      reqs[i].payload_size = 1000;
+      reqs[i].range_offset = ranges[i].first;
+      reqs[i].range_length = ranges[i].second;
+      reqs[i].buf = bufs[i].data();
+      reqs[i].status = &statuses[i];
+    }
+    fs_->SetFailSstReadRequest(fail_read ? 0 : -1);
+    ReadSimpleGen2BlobRanges(ReadOptions(), reader.get(), reqs.size(),
+                             reqs.data());
+    fs_->SetFailSstReadRequest(-1);
+
+    ASSERT_NO_FATAL_FAILURE(ExpectOneCall({{0, 150}, {500, 10}}));
+    ASSERT_OK(statuses[1]);
+    ASSERT_EQ(bufs[1], "x");  // no byte written
+    ASSERT_OK(statuses[3]);
+    ASSERT_EQ(bufs[3], file_bytes.substr(500, 10));
+    for (size_t i : {0, 2}) {
+      SCOPED_TRACE("range " + std::to_string(i));
+      if (fail_read) {
+        ASSERT_EQ(statuses[i].code(), Status::kIOError)
+            << statuses[i].ToString();
+      } else {
+        ASSERT_OK(statuses[i]);
+        ASSERT_EQ(bufs[i], file_bytes.substr(ranges[i].first, 100));
+      }
+    }
+  }
+}
+
+// A range whose end offset does not fit in 64 bits gets Corruption that names
+// the file and the offset, and the other ranges of the batch still read. The
+// test calls the reader directly, because a valid blob index cannot give such
+// an offset. The two other ranges are two reads, so the batch always uses
+// MultiRead.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, RangeEndOverflowGetsCorruption) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+  const std::unique_ptr<RandomAccessFileReader> reader = OpenSstReader();
+
+  // Range 0: a 100-byte payload at file offset UINT64_MAX - 50, so the range
+  // end passes UINT64_MAX. Ranges 1 and 2: [0, 10) and [100, 110) of a 200-byte
+  // payload at file offset 0.
+  constexpr uint64_t kOverflowOffset =
+      std::numeric_limits<uint64_t>::max() - 50;
+  std::array<std::string, 3> bufs{std::string(100, 'x'), std::string(10, 'x'),
+                                  std::string(10, 'x')};
+  std::array<Status, 3> statuses;
+  std::array<SimpleGen2RangeReadRequest, 3> reqs;
+  reqs[0].record_offset = kOverflowOffset;
+  reqs[0].payload_size = 100;
+  reqs[0].range_length = 100;
+  reqs[1].payload_size = 200;
+  reqs[1].range_length = 10;
+  reqs[2].payload_size = 200;
+  reqs[2].range_offset = 100;
+  reqs[2].range_length = 10;
+  for (size_t i = 0; i < reqs.size(); ++i) {
+    reqs[i].buf = bufs[i].data();
+    reqs[i].status = &statuses[i];
+  }
+  ReadSimpleGen2BlobRanges(ReadOptions(), reader.get(), reqs.size(),
+                           reqs.data());
+
+  ASSERT_EQ(statuses[0].code(), Status::kCorruption) << statuses[0].ToString();
+  ASSERT_EQ(statuses[0].ToString(), "Corruption: Blob read range overflow in " +
+                                        sst_name_ + " at offset " +
+                                        std::to_string(kOverflowOffset));
+  ASSERT_OK(statuses[1]);
+  ASSERT_OK(statuses[2]);
+  ASSERT_NO_FATAL_FAILURE(ExpectOneCall({{0, 10}, {100, 10}}));
+}
+
+// Errors. [0, 100) twice and [50, 150) merge into one request, and
+// [1000, 1100) is a second request in the same call.
+// - When only the merged request fails, all three of its ranges get the error,
+//   and [1000, 1100) keeps its bytes.
+// - When the whole call fails, every range gets the error.
+// In both cases the dispatch status of MultiResolve is OK, because the errors
+// are per-read results.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest, MergedReadErrorGoesToAllMembers) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+
+  const std::vector<std::pair<uint64_t, size_t>> ranges{
+      {0, 100}, {0, 100}, {50, 100}, {1000, 100}};
+
+  fs_->SetFailSstReadRequest(0);
+  ASSERT_OK(ResolveRanges(ranges));
+  fs_->SetFailSstReadRequest(-1);
+  for (size_t i = 0; i < 3; ++i) {
+    SCOPED_TRACE("range " + std::to_string(i));
+    ASSERT_EQ(statuses_[i].code(), Status::kIOError) << statuses_[i].ToString();
+  }
+  ASSERT_OK(statuses_[3]);
+  ASSERT_EQ(results_[3], value_.substr(1000, 100));
+  ASSERT_NO_FATAL_FAILURE(ExpectOneCall({{0, 150}, {1000, 100}}));
+
+  fs_->ResetBlobReadCounts();
+  fs_->SetFailSstMultiRead(true);
+  ASSERT_OK(ResolveRanges(ranges));
+  fs_->SetFailSstMultiRead(false);
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    SCOPED_TRACE("range " + std::to_string(i));
+    ASSERT_EQ(statuses_[i].code(), Status::kIOError) << statuses_[i].ToString();
+  }
+  ASSERT_NO_FATAL_FAILURE(ExpectOneCall({{0, 150}, {1000, 100}}));
+}
+
+// Short read. [0, 100) twice, [20, 30) and [50, 150) merge into one request
+// [0, 150), and [1000, 1100) is a second request. The merged request returns
+// 40 bytes less than asked, so only [0, 110) arrives:
+// - [0, 100) twice and [20, 30) lie inside the returned bytes and get OK.
+// - [50, 150) reaches past the end and gets Corruption.
+// - [1000, 1100) is not affected.
+TEST_F(DBLazyEntityEmbeddedMultiReadTest,
+       ShortMergedReadFailsOnlyMembersPastEnd) {
+  ASSERT_NO_FATAL_FAILURE(OpenAndLoadEntity(/*use_direct_reads=*/false));
+
+  const std::vector<std::pair<uint64_t, size_t>> ranges{
+      {0, 100}, {0, 100}, {20, 10}, {50, 100}, {1000, 100}};
+  fs_->SetShortSstReadRequest(0, /*missing_bytes=*/40);
+  ASSERT_OK(ResolveRanges(ranges));
+  fs_->SetShortSstReadRequest(-1, 0);
+
+  for (size_t i : std::vector<size_t>{0, 1, 2, 4}) {
+    SCOPED_TRACE("range " + std::to_string(i));
+    ASSERT_OK(statuses_[i]);
+    ASSERT_EQ(results_[i], value_.substr(ranges[i].first, ranges[i].second));
+  }
+  ASSERT_EQ(statuses_[3].code(), Status::kCorruption)
+      << statuses_[3].ToString();
+  ASSERT_NO_FATAL_FAILURE(ExpectOneCall({{0, 150}, {1000, 100}}));
+}
+
+// Whole embedded reads: two entities of the same key point to the same record.
+// The two requests for that record share one file read, so the MultiRead gets
+// no duplicate.
+TEST_F(DBLazyEntityTest, BatchEmbeddedDuplicateRecordReadOnce) {
+  auto fs = std::make_shared<BlobReadIOActivityFS>(FileSystem::Default());
+  std::unique_ptr<Env> env(NewCompositeEnv(fs));
+  Defer close_db_on_exit([this]() { Close(); });
+
+  Options options = GetLazyTestOptions();
+  options.env = env.get();
+  const size_t num_reads = ResolveDuplicateEmbeddedRecord(options, fs.get());
+  // Read statistics count each request, so the duplicate counts too.
+  ASSERT_EQ(LazyReadCount(options), num_reads);
+}
+
+// Whole embedded reads fill the blob cache through its memory allocator (for
+// example, one that keeps blob bytes out of core dumps). The duplicate record
+// must also be read into a buffer from that allocator, not into a plain heap
+// buffer. The test allocator zero-fills its blocks, so the read buffers are
+// initialized before the read. A hook checks, during the MultiRead call, that
+// each request reads into a block of the allocator.
+TEST_F(DBLazyEntityTest, BatchEmbeddedDuplicateRecordUsesCacheAllocator) {
+  auto fs = std::make_shared<BlobReadIOActivityFS>(FileSystem::Default());
+  std::unique_ptr<Env> env(NewCompositeEnv(fs));
+  Defer close_db_on_exit([this]() { Close(); });
+
+  auto allocator = std::make_shared<TrackingMemoryAllocator>();
+  Options options = GetLazyTestOptions();
+  options.env = env.get();
+  LRUCacheOptions co;
+  co.capacity = 8 << 20;  // 8 MB, room for both values
+  co.memory_allocator = allocator;
+  options.blob_cache = NewLRUCache(co);
+
+  size_t num_checked = 0;
+  // The hook uses the locals above, so clear it before they go away, also on
+  // an early return.
+  Defer clear_hook([&fs]() { fs->SetSstMultiReadHook(nullptr); });
+  fs->SetSstMultiReadHook([&](const FSReadRequest* reqs, size_t num_reqs) {
+    for (size_t i = 0; i < num_reqs; ++i) {
+      EXPECT_TRUE(allocator->Owns(reqs[i].scratch, reqs[i].len))
+          << "request " << i;
+      ++num_checked;
+    }
+  });
+  ASSERT_NO_FATAL_FAILURE(ResolveDuplicateEmbeddedRecord(options, fs.get()));
+  ASSERT_EQ(num_checked, 2U);
 }
 
 // A single batch MultiResolve mixing an inline column (served immediately), a
