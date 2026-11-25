@@ -414,13 +414,6 @@ class ClockCacheTest : public testing::Test {
     return Insert(TestHashedKey(key), priority);
   }
 
-  Status InsertWithLen(char key, size_t len) {
-    std::string skey(len, key);
-    return shard_->Insert(skey, TestHashedKey(key), nullptr /*value*/,
-                          &kNoopCacheItemHelper, 1 /*charge*/,
-                          nullptr /*handle*/, Cache::Priority::LOW);
-  }
-
   bool Lookup(const Slice& key, const UniqueId64x2& hashed_key,
               bool useful = true) {
     auto handle = shard_->Lookup(key, hashed_key);
@@ -479,21 +472,12 @@ TYPED_TEST(ClockCacheTest, Misc) {
   // so lots of `this->`
   auto& shard = *this->shard_;
 
-  // Key size stuff
-  EXPECT_OK(this->InsertWithLen('a', 16));
-  EXPECT_NOK(this->InsertWithLen('b', 15));
-  EXPECT_OK(this->InsertWithLen('b', 16));
-  EXPECT_NOK(this->InsertWithLen('c', 17));
-  EXPECT_NOK(this->InsertWithLen('d', 1000));
-  EXPECT_NOK(this->InsertWithLen('e', 11));
-  EXPECT_NOK(this->InsertWithLen('f', 0));
+  EXPECT_OK(this->Insert('a'));
+  EXPECT_OK(this->Insert('b'));
 
   // Some of this is motivated by code coverage
-  std::string wrong_size_key(15, 'x');
-  EXPECT_FALSE(this->Lookup(wrong_size_key, this->TestHashedKey('x')));
   EXPECT_FALSE(shard.Ref(nullptr));
   EXPECT_FALSE(shard.Release(nullptr));
-  shard.Erase(wrong_size_key, this->TestHashedKey('x'));  // no-op
 }
 
 TYPED_TEST(ClockCacheTest, Limits) {
