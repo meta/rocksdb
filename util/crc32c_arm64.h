@@ -12,7 +12,6 @@
 #if defined(__aarch64__) || defined(__AARCH64__)
 
 #ifdef __ARM_FEATURE_CRC32
-#define HAVE_ARM64_CRC
 #include <arm_acle.h>
 #define crc32c_u8(crc, v) __crc32cb(crc, v)
 #define crc32c_u16(crc, v) __crc32ch(crc, v)
@@ -40,10 +39,9 @@ uint32_t crc32c_arm64(uint32_t crc, unsigned char const* data, size_t len);
 uint32_t crc32c_runtime_check(void);
 bool crc32c_pmull_runtime_check(void);
 
-#ifdef __ARM_FEATURE_CRYPTO
-#define HAVE_ARM64_CRYPTO
+#ifdef __ARM_FEATURE_AES
 #include <arm_neon.h>
-#endif  // __ARM_FEATURE_CRYPTO
+#endif  // __ARM_FEATURE_AES
 #endif  // __ARM_FEATURE_CRC32
 
 #endif  // defined(__aarch64__) || defined(__AARCH64__)
