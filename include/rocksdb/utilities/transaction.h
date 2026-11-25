@@ -475,6 +475,43 @@ class Transaction {
       const ReadOptions& options, const std::vector<Slice>& keys,
       std::vector<std::string>* values) = 0;
 
+  // Batched MultiGetForUpdate for a single column family, with PinnableSlice
+  // results. Tracks keys for conflict validation and acquires exclusive locks
+  // for pessimistic transactions before reading, including missing keys. A lock
+  // or validation failure sets all statuses; acquired locks remain held.
+  // A null column_family selects the default column family.
+  //
+  // Keys are locked one at a time in input order, whether or not sorted_input
+  // is set. To reduce lock waits and deadlocks between transactions that lock
+  // overlapping keys, pass keys in a consistent order, such as sorted by the
+  // column family's comparator.
+  //
+  // Results preserve input order. keys, values, and statuses each have num_keys
+  // entries. sorted_input requires keys sorted by the column family's
+  // comparator; otherwise the result is undefined. Call Reset() on each value
+  // when finished to release pinned resources. io_activity must be kUnknown or
+  // kMultiGet.
+  //
+  // Timestamps: for a column family without timestamps,
+  // ReadOptions::timestamp must be unset. For a column family with timestamps
+  // (WRITE_COMMITTED only), if TransactionDBOptions::enable_udt_validation is
+  // true, SetReadTimestampForValidation() must have been called and the read
+  // uses that timestamp; if false, it must not have been called and the read
+  // uses kMaxTxnTimestamp. ReadOptions::timestamp, if set, must equal that
+  // timestamp. Otherwise every key gets InvalidArgument, and no key is locked
+  // or tracked.
+  //
+  // The default implementation returns NotSupported for every key.
+  virtual void MultiGetForUpdate(const ReadOptions& /*options*/,
+                                 ColumnFamilyHandle* /*column_family*/,
+                                 size_t num_keys, const Slice* /*keys*/,
+                                 PinnableSlice* /*values*/, Status* statuses,
+                                 bool /*sorted_input*/) {
+    for (size_t i = 0; i < num_keys; ++i) {
+      statuses[i] = Status::NotSupported("Batched MultiGetForUpdate");
+    }
+  }
+
   // Returns an iterator that will iterate on all keys in the default
   // column family including both keys in the DB and uncommitted keys in this
   // transaction.

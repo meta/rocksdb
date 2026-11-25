@@ -268,6 +268,12 @@ class WriteCommittedTxn : public PessimisticTransaction {
                       PinnableSlice* pinnable_val, bool exclusive,
                       const bool do_validate) override;
 
+  using TransactionBaseImpl::MultiGetForUpdate;
+  void MultiGetForUpdate(const ReadOptions& read_options,
+                         ColumnFamilyHandle* column_family, size_t num_keys,
+                         const Slice* keys, PinnableSlice* values,
+                         Status* statuses, bool sorted_input) override;
+
   Status GetEntityForUpdate(const ReadOptions& read_options,
                             ColumnFamilyHandle* column_family, const Slice& key,
                             PinnableWideColumns* columns, bool exclusive,
@@ -339,6 +345,10 @@ class WriteCommittedTxn : public PessimisticTransaction {
   TxnTimestamp GetCommitTimestamp() const override { return commit_timestamp_; }
 
  private:
+  Status ValidateReadTimestamp(const ReadOptions& read_options,
+                               ColumnFamilyHandle* column_family,
+                               bool do_validate);
+
   template <typename TValue>
   Status GetForUpdateImpl(const ReadOptions& read_options,
                           ColumnFamilyHandle* column_family, const Slice& key,

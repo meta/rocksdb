@@ -8372,8 +8372,9 @@ void rocksdb_transaction_multi_get_for_update(
   for (size_t i = 0; i < num_keys; i++) {
     keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  // Note: GetForUpdate only has vector-based API, no array-based PinnableSlice
-  // variant
+  // This wrapper uses the vector-based MultiGetForUpdate, which copies values
+  // into std::string. rocksdb_transaction_batched_multi_get_for_update_cf()
+  // uses the batched PinnableSlice overload for one column family.
   std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<Status> statuses =
@@ -8443,8 +8444,9 @@ void rocksdb_transaction_multi_get_for_update_cf(
     keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
     cfs[i] = column_families[i]->rep;
   }
-  // Note: GetForUpdate only has vector-based API, no array-based PinnableSlice
-  // variant
+  // MultiGetForUpdate has no multi-column-family batched PinnableSlice
+  // variant, so this uses the vector-based API, which copies values into
+  // std::string.
   std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<Status> statuses =
@@ -8608,6 +8610,57 @@ void rocksdb_transactiondb_multi_get_cf(
       }
     }
   }
+}
+
+static void TransactionBatchedMultiGetForUpdate(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const Slice* keys, rocksdb_pinnableslice_t** values, char** errs,
+    bool sorted_input) {
+  std::vector<PinnableSlice> value_slices(num_keys);
+  std::vector<Status> statuses(num_keys);
+  txn->rep->MultiGetForUpdate(options->rep, column_family->rep, num_keys, keys,
+                              value_slices.data(), statuses.data(),
+                              sorted_input);
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new rocksdb_pinnableslice_t;
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      errs[i] = statuses[i].IsNotFound()
+                    ? nullptr
+                    : strdup(statuses[i].ToString().c_str());
+    }
+  }
+}
+
+void rocksdb_transaction_batched_multi_get_for_update_cf(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    rocksdb_pinnableslice_t** values, char** errs, const bool sorted_input) {
+  if (num_keys == 0) {
+    return;
+  }
+  std::vector<Slice> keys(num_keys);
+  for (size_t i = 0; i < num_keys; ++i) {
+    keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
+  }
+  TransactionBatchedMultiGetForUpdate(txn, options, column_family, num_keys,
+                                      keys.data(), values, errs, sorted_input);
+}
+
+void rocksdb_transaction_batched_multi_get_for_update_cf_slice(
+    rocksdb_transaction_t* txn, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input) {
+  // Cast rocksdb_slice_t* to Slice* - they have identical memory layout
+  TransactionBatchedMultiGetForUpdate(txn, options, column_family, num_keys,
+                                      reinterpret_cast<const Slice*>(keys_list),
+                                      values, errs, sorted_input);
 }
 
 void rocksdb_transactiondb_batched_multi_get_cf(

@@ -1,0 +1,1 @@
+Added a batched `Transaction::MultiGetForUpdate()` overload for one column family with `PinnableSlice` values, with C API `rocksdb_transaction_batched_multi_get_for_update_cf()` and db_bench `--multiread_for_update`.
