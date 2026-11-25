@@ -3658,6 +3658,62 @@ int main(int argc, char** argv) {
     rocksdb_destroy_db(options, dbname, &err);
   }
 
+  StartPhase("capped_prefix");
+  {
+    // Unlike rocksdb_slicetransform_create_fixed_prefix, a capped-prefix
+    // transform is InDomain for every key, including ones shorter than the
+    // cap -- exercise it with a key shorter than the cap ("ba", 2 bytes,
+    // cap 3) alongside longer keys sharing its leading bytes. Uses its own
+    // fresh options (default skiplist memtable + block-based table, not the
+    // shared `options` variable's hash_skip_list_rep/plain_table_factory
+    // left over from the "prefix" phase above) so entries aren't partitioned
+    // into separate prefix buckets and iteration order is plain bytewise,
+    // isolating the extractor itself.
+    rocksdb_options_t* capped_options = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(capped_options, 1);
+    rocksdb_options_set_prefix_extractor(
+        capped_options, rocksdb_slicetransform_create_capped_prefix(3));
+
+    db = rocksdb_open(capped_options, dbname, &err);
+    CheckNoError(err);
+
+    rocksdb_put(db, woptions, "ba", 2, "bar", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "bar1", 4, "bar", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "bar2", 4, "bar", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "foo1", 4, "foo", 3, &err);
+    CheckNoError(err);
+
+    CheckGet(db, roptions, "ba", "bar");
+
+    rocksdb_iterator_t* iter = rocksdb_create_iterator(db, roptions);
+    CheckCondition(!rocksdb_iter_valid(iter));
+
+    rocksdb_iter_seek(iter, "ba", 2);
+    rocksdb_iter_get_error(iter, &err);
+    CheckNoError(err);
+    CheckCondition(rocksdb_iter_valid(iter));
+    CheckIter(iter, "ba", "bar");
+    rocksdb_iter_next(iter);
+    CheckIter(iter, "bar1", "bar");
+    rocksdb_iter_next(iter);
+    CheckIter(iter, "bar2", "bar");
+    rocksdb_iter_next(iter);
+    CheckIter(iter, "foo1", "foo");
+    rocksdb_iter_next(iter);
+    CheckCondition(!rocksdb_iter_valid(iter));
+    rocksdb_iter_get_error(iter, &err);
+    CheckNoError(err);
+    rocksdb_iter_destroy(iter);
+
+    rocksdb_close(db);
+    rocksdb_destroy_db(capped_options, dbname, &err);
+    CheckNoError(err);
+    rocksdb_options_destroy(capped_options);
+  }
+
   // Check memory usage stats
   StartPhase("approximate_memory_usage");
   {
