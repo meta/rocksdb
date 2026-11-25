@@ -185,6 +185,10 @@ class PointLockManager : public LockManager {
   // to avoid acquiring a mutex in order to look up a LockMap
   std::unique_ptr<ThreadLocalPtr> lock_maps_cache_;
 
+  // Incremented by RemoveColumnFamily(). A thread discards its
+  // lock_maps_cache_ entry when it was filled under an older version.
+  std::atomic<uint64_t> lock_maps_version_{0};
+
   // Thread local variable for KeyLockWaiter. As one thread could only need one
   // KeyLockWaiter.
   // Lazy init on first time usage

@@ -430,11 +430,14 @@ void LockMapStripe::ReleaseLastLockHolder(
 }
 
 namespace {
+struct LockMapsCache {
+  uint64_t version = 0;
+  UnorderedMap<uint32_t, std::shared_ptr<LockMap>> lock_maps;
+};
+
 void UnrefLockMapsCache(void* ptr) {
   // Called when a thread exits or a ThreadLocalPtr gets destroyed.
-  auto lock_maps_cache =
-      static_cast<UnorderedMap<uint32_t, std::shared_ptr<LockMap>>*>(ptr);
-  delete lock_maps_cache;
+  delete static_cast<LockMapsCache*>(ptr);
 }
 void UnrefKeyLockWaiter(void* ptr) {
   auto key_lock_waiter = static_cast<KeyLockWaiter*>(ptr);
@@ -494,14 +497,8 @@ void PointLockManager::RemoveColumnFamily(const ColumnFamilyHandle* cf) {
     }
 
     lock_maps_.erase(lock_maps_iter);
+    lock_maps_version_.fetch_add(1);
   }  // lock_map_mutex_
-
-  // Clear all thread-local caches
-  autovector<void*> local_caches;
-  lock_maps_cache_->Scrape(&local_caches, nullptr);
-  for (auto cache : local_caches) {
-    delete static_cast<LockMaps*>(cache);
-  }
 }
 
 // Look up the LockMap std::shared_ptr for a given column_family_id.
@@ -510,14 +507,17 @@ void PointLockManager::RemoveColumnFamily(const ColumnFamilyHandle* cf) {
 std::shared_ptr<LockMap> PointLockManager::GetLockMap(
     ColumnFamilyId column_family_id) {
   // First check thread-local cache
-  if (lock_maps_cache_->Get() == nullptr) {
-    lock_maps_cache_->Reset(new LockMaps());
+  const uint64_t version = lock_maps_version_.load();
+  auto lock_maps_cache = static_cast<LockMapsCache*>(lock_maps_cache_->Get());
+  if (lock_maps_cache == nullptr || lock_maps_cache->version != version) {
+    auto new_cache = new LockMapsCache{version, {}};
+    lock_maps_cache_->Reset(new_cache);
+    delete lock_maps_cache;
+    lock_maps_cache = new_cache;
   }
 
-  auto lock_maps_cache = static_cast<LockMaps*>(lock_maps_cache_->Get());
-
-  auto lock_map_iter = lock_maps_cache->find(column_family_id);
-  if (lock_map_iter != lock_maps_cache->end()) {
+  auto lock_map_iter = lock_maps_cache->lock_maps.find(column_family_id);
+  if (lock_map_iter != lock_maps_cache->lock_maps.end()) {
     // Found lock map for this column family.
     return lock_map_iter->second;
   }
@@ -531,7 +531,7 @@ std::shared_ptr<LockMap> PointLockManager::GetLockMap(
   } else {
     // Found lock map.  Store in thread-local cache and return.
     std::shared_ptr<LockMap>& lock_map = lock_map_iter->second;
-    lock_maps_cache->insert({column_family_id, lock_map});
+    lock_maps_cache->lock_maps.insert({column_family_id, lock_map});
 
     return lock_map;
   }

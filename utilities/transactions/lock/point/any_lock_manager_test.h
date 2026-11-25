@@ -60,6 +60,30 @@ TEST_P(AnyLockManagerTest, ReentrantSharedLock) {
   delete txn;
 }
 
+TEST_P(AnyLockManagerTest, LockWhileDroppingOtherColumnFamilies) {
+  MockColumnFamilyHandle cf(1);
+  locker_->AddColumnFamily(&cf);
+
+  std::atomic<bool> done{false};
+  port::Thread dropper([&] {
+    for (ColumnFamilyId id = 2; !done.load(); ++id) {
+      MockColumnFamilyHandle dropped_cf(id);
+      locker_->AddColumnFamily(&dropped_cf);
+      locker_->RemoveColumnFamily(&dropped_cf);
+    }
+  });
+
+  auto txn = NewTxn();
+  for (int i = 0; i < 1000; ++i) {
+    const std::string key = std::to_string(i);
+    EXPECT_OK(locker_->TryLock(txn, 1, key, env_, true));
+    locker_->UnLock(txn, 1, key, env_);
+  }
+  delete txn;
+  done.store(true);
+  dropper.join();
+}
+
 TEST_P(AnyLockManagerTest, LockUpgrade) {
   // Tests that a txn can upgrade from a shared lock to an exclusive lock.
   MockColumnFamilyHandle cf(1);
