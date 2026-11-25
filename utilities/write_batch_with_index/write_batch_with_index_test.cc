@@ -11,14 +11,39 @@
 
 #include <db/db_test_util.h>
 
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <functional>
+#include <initializer_list>
+#include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "db/column_family.h"
+#include "db/dbformat.h"
+#include "db/lookup_key.h"
+#include "db/merge_context.h"
+#include "db/version_set.h"
+#include "memory/arena.h"
 #include "memtable/wbwi_memtable.h"
+#include "options/cf_options.h"
 #include "port/stack_trace.h"
+#include "rocksdb/db.h"
+#include "rocksdb/env.h"
+#include "rocksdb/merge_operator.h"
+#include "rocksdb/snapshot.h"
+#include "rocksdb/types.h"
+#include "table/internal_iterator.h"
+#include "table/multiget_context.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/autovector.h"
+#include "util/coding.h"
 #include "util/random.h"
 #include "util/string_util.h"
 #include "utilities/merge_operators.h"
