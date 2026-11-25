@@ -64,7 +64,7 @@ structure from Dietzfelbinger and
 Walzer](https://arxiv.org/pdf/1907.04750.pdf). It has very good space
 usage for required CPU time (~30% space savings for 3-4x CPU) and,
 with some engineering, Bloom-like configurability. The complications
-were managable for use in RocksDB:
+were manageable for use in RocksDB:
 * Ribbon space efficiency does not naturally scale to very large
   number of keys in a single filter (whole SST file or partition), but
   with the current 128-bit Ribbon implementation in RocksDB, even 100

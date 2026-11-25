@@ -20,7 +20,7 @@ function platform() {
   elif [[ -f "/etc/dpkg/dpkg.cfg" ]]; then
     eval $__resultvar="ubuntu"
   else
-    fatal "Unknwon operating system"
+    fatal "Unknown operating system"
   fi
 }
 platform OS

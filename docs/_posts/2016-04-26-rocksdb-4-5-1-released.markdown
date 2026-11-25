@@ -11,7 +11,7 @@ redirect_from:
 
 ### Bug Fixes
 
-  *  Fix failures caused by the destorying order of singleton objects.
+  *  Fix failures caused by the destroying order of singleton objects.
 
 <br/>
 
