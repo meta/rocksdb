@@ -6,7 +6,6 @@
 package org.rocksdb;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -78,25 +77,12 @@ public class TransactionDB extends RocksDB
       final List<ColumnFamilyDescriptor> columnFamilyDescriptors,
       final List<ColumnFamilyHandle> columnFamilyHandles)
       throws RocksDBException {
-    int defaultColumnFamilyIndex = -1;
-    final byte[][] cfNames = new byte[columnFamilyDescriptors.size()][];
-    final long[] cfOptionHandles = new long[columnFamilyDescriptors.size()];
-    for (int i = 0; i < columnFamilyDescriptors.size(); i++) {
-      final ColumnFamilyDescriptor cfDescriptor = columnFamilyDescriptors
-          .get(i);
-      cfNames[i] = cfDescriptor.getName();
-      cfOptionHandles[i] = cfDescriptor.getOptions().nativeHandle_;
-      if (Arrays.equals(cfDescriptor.getName(), RocksDB.DEFAULT_COLUMN_FAMILY)) {
-        defaultColumnFamilyIndex = i;
-      }
-    }
-    if (defaultColumnFamilyIndex < 0) {
-      throw new IllegalArgumentException(
-          "You must provide the default column family in your columnFamilyDescriptors");
-    }
+    final long[] cfDescriptorHandles = ColumnFamilyDescriptor.toCfdHandles(columnFamilyDescriptors);
+    final int defaultColumnFamilyIndex =
+        ColumnFamilyDescriptor.defaultColumnFamilyIndex(columnFamilyDescriptors);
 
-    final long[] handles = open(dbOptions.nativeHandle_,
-        transactionDbOptions.nativeHandle_, path, cfNames, cfOptionHandles);
+    final long[] handles = open(
+        dbOptions.nativeHandle_, transactionDbOptions.nativeHandle_, path, cfDescriptorHandles);
     final TransactionDB tdb = new TransactionDB(handles[0]);
 
     // when non-default Options is used, keeping an Options reference
@@ -405,7 +391,7 @@ public class TransactionDB extends RocksDB
       throws RocksDBException;
   private static native long[] open(final long dbOptionsHandle,
       final long transactionDbOptionsHandle, final String path,
-      final byte[][] columnFamilyNames, final long[] columnFamilyOptions);
+      final long[] columnFamilyDescriptors);
   private static native void closeDatabase(final long handle) throws RocksDBException;
   private static native long beginTransaction(final long handle, final long writeOptionsHandle);
   private static native long beginTransaction(

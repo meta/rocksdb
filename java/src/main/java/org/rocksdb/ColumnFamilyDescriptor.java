@@ -6,12 +6,15 @@
 package org.rocksdb;
 
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * <p>Describes a column family with a
  * name and respective Options.</p>
  */
-public class ColumnFamilyDescriptor {
+public class ColumnFamilyDescriptor extends RocksObject {
+  private final ColumnFamilyOptions columnFamilyOptions;
+  private final boolean implicitlyCreatedColumnFamilyOptions;
 
   /**
    * <p>Creates a new Column Family using a name and default
@@ -20,24 +23,65 @@ public class ColumnFamilyDescriptor {
    * @param columnFamilyName name of column family.
    * @since 3.10.0
    */
-  public ColumnFamilyDescriptor(final byte[] columnFamilyName) {
-    this(columnFamilyName, new ColumnFamilyOptions());
+  public ColumnFamilyDescriptor(final byte[] columnFamilyName) throws RocksDBException {
+    this(columnFamilyName, new ColumnFamilyOptions(), true);
+  }
+
+  public static long[] toCfdHandles(List<ColumnFamilyDescriptor> columnFamilyDescriptors) {
+    final long[] cfDescriptorHandles = new long[columnFamilyDescriptors.size()];
+    for (int i = 0; i < columnFamilyDescriptors.size(); i++) {
+      final ColumnFamilyDescriptor cfDescriptor = // NOPMD - CloseResource
+          columnFamilyDescriptors.get(i);
+      cfDescriptorHandles[i] = cfDescriptor.nativeHandle_;
+    }
+    return cfDescriptorHandles;
+  }
+
+  public static int defaultColumnFamilyIndex(List<ColumnFamilyDescriptor> columnFamilyDescriptors) {
+    int defaultColumnFamilyIndex = -1;
+    for (int i = 0; i < columnFamilyDescriptors.size(); i++) {
+      if (Arrays.equals(columnFamilyDescriptors.get(i).getName(), RocksDB.DEFAULT_COLUMN_FAMILY)) {
+        defaultColumnFamilyIndex = i;
+        break;
+      }
+    }
+    if (defaultColumnFamilyIndex < 0) {
+      throw new IllegalArgumentException(
+          "You must provide the default column family in your columnFamilyDescriptors");
+    }
+    return defaultColumnFamilyIndex;
   }
 
   /**
    * <p>Creates a new Column Family using a name and custom
-   * options.</p>
+   * options. This constructor make copy of ColumnFamilyOptions.</p>
    *
    * @param columnFamilyName name of column family.
-   * @param columnFamilyOptions options to be used with
-   *     column family.
+   * @param columnFamilyOptions options to be used with column family.
    * @since 3.10.0
    */
-  @SuppressWarnings("PMD.ArrayIsStoredDirectly")
-  public ColumnFamilyDescriptor(
-      final byte[] columnFamilyName, final ColumnFamilyOptions columnFamilyOptions) {
-    columnFamilyName_ = columnFamilyName;
-    columnFamilyOptions_ = columnFamilyOptions;
+  public ColumnFamilyDescriptor(final byte[] columnFamilyName,
+      final ColumnFamilyOptions columnFamilyOptions) throws RocksDBException {
+    this(columnFamilyName, columnFamilyOptions, false);
+  }
+
+  private ColumnFamilyDescriptor(final byte[] columnFamilyName,
+      final ColumnFamilyOptions columnFamilyOptions,
+      final boolean implicitlyCreatedColumnFamilyOptions) throws RocksDBException {
+    super(createNativeInstance(columnFamilyName, columnFamilyOptions));
+    this.columnFamilyOptions = columnFamilyOptions;
+    this.implicitlyCreatedColumnFamilyOptions = implicitlyCreatedColumnFamilyOptions;
+  }
+
+  private static long createNativeInstance(final byte[] columnFamilyName,
+      final ColumnFamilyOptions columnFamilyOptions) throws RocksDBException {
+    final long instance =
+        createNativeDescriptor(columnFamilyName, columnFamilyOptions.nativeHandle_);
+    if (instance == 0) {
+      throw new RocksDBException("Can't create instance of ColumnFamilyDescriptor");
+    } else {
+      return instance;
+    }
   }
 
   /**
@@ -46,9 +90,8 @@ public class ColumnFamilyDescriptor {
    * @return column family name.
    * @since 3.10.0
    */
-  @SuppressWarnings("PMD.MethodReturnsInternalArray")
   public byte[] getName() {
-    return columnFamilyName_;
+    return getName(nativeHandle_);
   }
 
   /**
@@ -57,9 +100,8 @@ public class ColumnFamilyDescriptor {
    * @return Options instance assigned to this instance.
    */
   public ColumnFamilyOptions getOptions() {
-    return columnFamilyOptions_;
+    return columnFamilyOptions;
   }
-
   @Override
   public boolean equals(final Object o) {
     if (this == o) {
@@ -69,18 +111,26 @@ public class ColumnFamilyDescriptor {
       return false;
     }
 
-    final ColumnFamilyDescriptor that = (ColumnFamilyDescriptor) o;
-    return Arrays.equals(columnFamilyName_, that.columnFamilyName_)
-            && columnFamilyOptions_.nativeHandle_ == that.columnFamilyOptions_.nativeHandle_;
+    final ColumnFamilyDescriptor that = (ColumnFamilyDescriptor) o; // NOPMD - CloseResource
+    return nativeHandle_ == that.getNativeHandle();
   }
 
   @Override
   public int hashCode() {
-    int result = (int) (columnFamilyOptions_.nativeHandle_ ^ (columnFamilyOptions_.nativeHandle_ >>> 32));
-    result = 31 * result + Arrays.hashCode(columnFamilyName_);
-    return result;
+    return 31 * ((int) (nativeHandle_ ^ (nativeHandle_ >>> 32)));
   }
-
-  private final byte[] columnFamilyName_;
-  private final ColumnFamilyOptions columnFamilyOptions_;
+  @Override
+  protected void disposeInternal(final long handle) {
+    try {
+      if (implicitlyCreatedColumnFamilyOptions) {
+        columnFamilyOptions.close();
+      }
+    } finally {
+      disposeJni(handle);
+    }
+  }
+  private static native void disposeJni(final long nativeHandle);
+  private static native long createNativeDescriptor(
+      final byte[] columnFamilyName, final long columnFamilyOptions);
+  private static native byte[] getName(final long nativeHandle);
 }

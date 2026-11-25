@@ -40,6 +40,9 @@ public class PerfLevelTest {
 
   @After
   public void after() {
+    for (ColumnFamilyDescriptor cfDescriptor : cfDescriptors) {
+      cfDescriptor.close();
+    }
     for (final ColumnFamilyHandle columnFamilyHandle : columnFamilyHandleList) {
       columnFamilyHandle.close();
     }
