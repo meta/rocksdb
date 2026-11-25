@@ -463,9 +463,10 @@ class ClockCacheTest : public testing::Test {
   }
 
   Shard* shard_ = nullptr;
+  // Called by the shard for each entry it evicts
+  Cache::EvictionCallback eviction_callback_;
 
  private:
-  Cache::EvictionCallback eviction_callback_;
   uint32_t hash_seed_ = 0;
 };
 
@@ -692,6 +693,78 @@ TYPED_TEST(ClockCacheTest, ClockEvictionTest) {
     EXPECT_TRUE(this->Lookup('s', /*use*/ false));
     EXPECT_TRUE(this->Lookup('t', /*use*/ false));
   }
+}
+
+// With strict_capacity_limit, an insert into a shard over capacity (here
+// after SetCapacity lowered it with entries held) evicts the excess as well
+// as its own charge, and usage keeps the charges of the entries still in the
+// cache until that eviction is done. The eviction callback erases a held
+// entry from inside the insert's eviction, which must take its charge off
+// usage that still has it.
+TYPED_TEST(ClockCacheTest, StrictInsertOverCapacityKeepsUsageWhileEvicting) {
+  using HandleImpl = typename ClockCacheTest<TypeParam>::Shard::HandleImpl;
+  auto insert = [this](int k, size_t charge, HandleImpl** h) {
+    UniqueId64x2 hkey = this->CheapHash(k);
+    return this->shard_->Insert(this->TestKey(hkey), hkey, nullptr /*value*/,
+                                &kNoopCacheItemHelper, charge, h,
+                                Cache::Priority::LOW);
+  };
+  this->NewShard(200, /*strict_capacity_limit*/ true);
+  auto& shard = *this->shard_;
+  HandleImpl* p = nullptr;
+  HandleImpl* q = nullptr;
+  ASSERT_OK(insert(1, 150, &p));
+  ASSERT_OK(insert(2, 30, &q));
+  shard.SetCapacity(100);
+  ASSERT_EQ(shard.GetUsage(), 180U);
+  // q stays in the cache, unreferenced; p is still held
+  shard.Release(q, /*useful*/ false, /*erase_if_last_ref*/ false);
+
+  bool erased_in_callback = false;
+  size_t usage_in_callback = 0;
+  this->eviction_callback_ = [&](const Slice& /*key*/, Cache::Handle* /*h*/,
+                                 bool /*was_hit*/) {
+    if (p != nullptr) {
+      erased_in_callback =
+          shard.Release(p, /*useful*/ false, /*erase_if_last_ref*/ true);
+      p = nullptr;
+      usage_in_callback = shard.GetUsage();
+    }
+    return false;
+  };
+  // Needs 90 evicted (80 over capacity plus its own 10), but only q (30) is
+  // evictable when the eviction starts.
+  HandleImpl* x = nullptr;
+  Status s = insert(3, 10, &x);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(x, nullptr);
+  EXPECT_TRUE(erased_in_callback);
+  // Only p's charge is off: q's comes off when the insert finishes evicting
+  EXPECT_EQ(usage_in_callback, 30U);
+  EXPECT_EQ(shard.GetUsage(), 0U);
+  this->eviction_callback_ = {};
+
+  // An insert over capacity that evicts enough leaves usage at the charges
+  // of what is left.
+  this->NewShard(300, /*strict_capacity_limit*/ true);
+  auto& shard2 = *this->shard_;
+  ASSERT_OK(insert(1, 150, &p));
+  for (int k = 2; k <= 4; ++k) {
+    ASSERT_OK(insert(k, 30, nullptr));
+  }
+  shard2.SetCapacity(190);
+  ASSERT_EQ(shard2.GetUsage(), 240U);
+  ASSERT_OK(insert(5, 10, &x));
+  ASSERT_NE(x, nullptr);
+  size_t left = 0;
+  for (int k = 2; k <= 4; ++k) {
+    left += this->Lookup(this->CheapHash(k)) ? 1 : 0;
+  }
+  // Needed 60 evicted, so at most one of the three stays
+  EXPECT_LE(left, 1U);
+  EXPECT_EQ(shard2.GetUsage(), 150U + 10U + 30U * left);
+  shard2.Release(x, /*useful*/ false, /*erase_if_last_ref*/ false);
+  shard2.Release(p, /*useful*/ false, /*erase_if_last_ref*/ false);
 }
 
 TYPED_TEST(ClockCacheTest, ClockEvictionEffortCapTest) {
