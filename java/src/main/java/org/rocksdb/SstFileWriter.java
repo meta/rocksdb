@@ -151,6 +151,20 @@ public class SstFileWriter extends RocksObject {
   }
 
   /**
+   * Add a Delete key with value to currently opened file.
+   *
+   * @param key the specified key to be inserted.
+   *
+   * @throws RocksDBException thrown if error happens in underlying
+   *    native library.
+   */
+  public void delete(final ByteBuffer key) throws RocksDBException {
+    assert key.isDirect();
+    deleteDirect(nativeHandle_, key, key.position(), key.remaining());
+    key.position(key.limit());
+  }
+
+  /**
    * Add a deletion key to currently opened file.
    *
    * @param key the specified key to be deleted.
@@ -226,6 +240,9 @@ public class SstFileWriter extends RocksObject {
       throws RocksDBException;
 
   private static native void delete(final long handle, final byte[] key) throws RocksDBException;
+
+  private static native void deleteDirect(long handle, ByteBuffer key, int keyOffset, int keyLength)
+      throws RocksDBException;
 
   private static native void finish(final long handle) throws RocksDBException;
 
