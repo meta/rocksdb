@@ -5,12 +5,14 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/env.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"

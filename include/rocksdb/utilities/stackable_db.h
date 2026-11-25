@@ -4,11 +4,23 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "rocksdb/attribute_groups.h"
 #include "rocksdb/db.h"
+#include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/status.h"
+#include "rocksdb/types.h"
+#include "rocksdb/wal_iterator.h"
+#include "rocksdb/wide_columns.h"
 
 #ifdef _WIN32
 // Windows API macro interference

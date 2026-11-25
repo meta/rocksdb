@@ -5,8 +5,10 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {

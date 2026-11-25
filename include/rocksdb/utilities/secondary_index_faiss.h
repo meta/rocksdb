@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -13,6 +14,7 @@
 
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/utilities/secondary_index.h"
 
 namespace faiss {

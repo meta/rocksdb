@@ -15,6 +15,7 @@
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "rocksdb/wide_columns.h"
 
 namespace ROCKSDB_NAMESPACE {
 

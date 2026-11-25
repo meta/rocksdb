@@ -9,6 +9,8 @@
 #include <string>
 
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/utilities/secondary_index.h"
 
 namespace ROCKSDB_NAMESPACE {

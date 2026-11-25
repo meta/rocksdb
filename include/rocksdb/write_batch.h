@@ -25,18 +25,22 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 
+#include "rocksdb/attribute_groups.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "rocksdb/wide_columns.h"
 #include "rocksdb/write_batch_base.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Slice;
 class ColumnFamilyHandle;
 struct SavePoints;
 struct SliceParts;

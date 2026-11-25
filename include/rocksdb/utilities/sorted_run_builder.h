@@ -5,11 +5,15 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "rocksdb/compression_type.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 
@@ -17,6 +21,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class Comparator;
 class Iterator;
+class TableFactory;
 class WriteBatch;
 
 struct SortedRunBuilderOptions {

@@ -13,6 +13,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -20,6 +21,7 @@
 #include <mutex>
 
 #include "rocksdb/cache.h"
+#include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
 class CacheReservationManager;
