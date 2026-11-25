@@ -2034,6 +2034,9 @@ inlineskiplist_test: $(OBJ_DIR)/memtable/inlineskiplist_test.o $(TEST_LIBRARY) $
 skiplist_test: $(OBJ_DIR)/memtable/skiplist_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+trie_rep_test: $(OBJ_DIR)/plugin/trie/trie_rep_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 write_buffer_manager_test: $(OBJ_DIR)/memtable/write_buffer_manager_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

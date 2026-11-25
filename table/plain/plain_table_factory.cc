@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "db/dbformat.h"
+#include "plugin/trie/trie_rep.h"
 #include "port/port.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/utilities/customizable_util.h"
@@ -235,6 +236,20 @@ static int RegisterBuiltinMemTableRepFactory(ObjectLibrary& library,
         }
         return guard->get();
       });
+  {
+    // The trie rep takes no size parameter, so register it by class name and
+    // nickname only (no ":#" suffix).
+    auto trie_pattern =
+        ObjectLibrary::PatternEntry(TrieRepFactory::kClassName(), true);
+    trie_pattern.AnotherName(TrieRepFactory::kNickName());
+    library.AddFactory<MemTableRepFactory>(
+        trie_pattern, [](const std::string& /*uri*/,
+                         std::unique_ptr<MemTableRepFactory>* guard,
+                         std::string* /*errmsg*/) {
+          guard->reset(NewTrieRepFactory());
+          return guard->get();
+        });
+  }
   library.AddFactory<MemTableRepFactory>(
       "cuckoo",
       [](const std::string& /*uri*/,

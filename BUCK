@@ -187,6 +187,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "options/options.cc",
         "options/options_helper.cc",
         "options/options_parser.cc",
+        "plugin/trie/trie_rep.cc",
         "port/mmap.cc",
         "port/port_posix.cc",
         "port/stack_trace.cc",
@@ -5791,6 +5792,12 @@ cpp_unittest_wrapper(name="trie_index_db_test",
 
 cpp_unittest_wrapper(name="trie_index_test",
             srcs=["utilities/trie_index/trie_index_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="trie_rep_test",
+            srcs=["plugin/trie/trie_rep_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
