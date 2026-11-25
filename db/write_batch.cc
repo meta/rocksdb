@@ -100,6 +100,18 @@ enum ContentFlags : uint32_t {
 constexpr size_t kMaxWriteBatchKeySize =
     size_t{std::numeric_limits<uint32_t>::max()} - kNumInternalBytes;
 
+Status CheckSlicePartsSize(const SliceParts& parts, size_t limit,
+                           const char* name) {
+  size_t total_bytes = 0;
+  for (int i = 0; i < parts.num_parts; ++i) {
+    if (parts.parts[i].size() > limit - total_bytes) {
+      return Status::InvalidArgument(std::string(name) + " is too large");
+    }
+    total_bytes += parts.parts[i].size();
+  }
+  return Status::OK();
+}
+
 struct BatchContentClassifier : public WriteBatch::Handler {
   uint32_t content_flags = 0;
 
@@ -1021,22 +1033,12 @@ Status WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice& key,
 
 Status WriteBatchInternal::CheckSlicePartsLength(const SliceParts& key,
                                                  const SliceParts& value) {
-  size_t total_key_bytes = 0;
-  for (int i = 0; i < key.num_parts; ++i) {
-    total_key_bytes += key.parts[i].size();
+  Status s = CheckSlicePartsSize(key, kMaxWriteBatchKeySize, "key");
+  if (!s.ok()) {
+    return s;
   }
-  if (total_key_bytes > kMaxWriteBatchKeySize) {
-    return Status::InvalidArgument("key is too large");
-  }
-
-  size_t total_value_bytes = 0;
-  for (int i = 0; i < value.num_parts; ++i) {
-    total_value_bytes += value.parts[i].size();
-  }
-  if (total_value_bytes > size_t{std::numeric_limits<uint32_t>::max()}) {
-    return Status::InvalidArgument("value is too large");
-  }
-  return Status::OK();
+  return CheckSlicePartsSize(
+      value, size_t{std::numeric_limits<uint32_t>::max()}, "value");
 }
 
 Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
@@ -1654,7 +1656,10 @@ Status WriteBatch::DeleteRange(ColumnFamilyHandle* column_family,
 Status WriteBatchInternal::DeleteRange(WriteBatch* b, uint32_t column_family_id,
                                        const SliceParts& begin_key,
                                        const SliceParts& end_key) {
-  Status s = CheckSlicePartsLength(begin_key, end_key);
+  Status s = CheckSlicePartsSize(begin_key, kMaxWriteBatchKeySize, "begin key");
+  if (s.ok()) {
+    s = CheckSlicePartsSize(end_key, kMaxWriteBatchKeySize, "end key");
+  }
   if (!s.ok()) {
     return s;
   }
