@@ -371,6 +371,10 @@ LIB_SOURCES_ASM =
 LIB_SOURCES_C =
 endif
 
+LIB_SOURCES_ARM64_ASM = \
+  util/crc32_iscsi_sve2.S \
+  util/crc32_iscsi_crc_ext.S
+
 WITH_FAISS_LIB_SOURCES = \
   utilities/secondary_index/faiss_ivf_index.cc                  \
 
