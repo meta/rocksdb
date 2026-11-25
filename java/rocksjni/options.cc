@@ -2409,6 +2409,28 @@ jboolean Java_org_rocksdb_Options_manualWalFlush(JNIEnv*, jclass,
 
 /*
  * Class:     org_rocksdb_Options
+ * Method:    setWalCompression
+ * Signature: (JI)V
+ */
+void Java_org_rocksdb_Options_setWalCompression(JNIEnv*, jclass, jlong jhandle,
+                                                jint jwal_compression) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
+  opt->wal_compression =
+      static_cast<ROCKSDB_NAMESPACE::CompressionType>(jwal_compression);
+}
+
+/*
+ * Class:     org_rocksdb_Options
+ * Method:    walCompression
+ * Signature: (J)I
+ */
+jint Java_org_rocksdb_Options_walCompression(JNIEnv*, jclass, jlong jhandle) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle);
+  return opt->wal_compression;
+}
+
+/*
+ * Class:     org_rocksdb_Options
  * Method:    setAtomicFlush
  * Signature: (JZ)V
  */
@@ -7716,6 +7738,29 @@ jboolean Java_org_rocksdb_DBOptions_manualWalFlush(JNIEnv*, jclass,
                                                    jlong jhandle) {
   auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
   return static_cast<jboolean>(opt->manual_wal_flush);
+}
+
+/*
+ * Class:     org_rocksdb_DBOptions
+ * Method:    setWalCompression
+ * Signature: (JI)V
+ */
+void Java_org_rocksdb_DBOptions_setWalCompression(JNIEnv*, jclass,
+                                                  jlong jhandle,
+                                                  jint jwal_compression) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
+  opt->wal_compression =
+      static_cast<ROCKSDB_NAMESPACE::CompressionType>(jwal_compression);
+}
+
+/*
+ * Class:     org_rocksdb_DBOptions
+ * Method:    walCompression
+ * Signature: (J)I
+ */
+jint Java_org_rocksdb_DBOptions_walCompression(JNIEnv*, jclass, jlong jhandle) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::DBOptions*>(jhandle);
+  return opt->wal_compression;
 }
 
 /*

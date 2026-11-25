@@ -711,6 +711,17 @@ public class DBOptionsTest {
   }
 
   @Test
+  public void walCompression() {
+    try (final DBOptions opt = new DBOptions()) {
+      assertThat(opt.walCompression()).isEqualTo(CompressionType.NO_COMPRESSION);
+      for (CompressionType compressionType : CompressionType.values()) {
+        opt.setWalCompression(compressionType);
+        assertThat(opt.walCompression()).isEqualTo(compressionType);
+      }
+    }
+  }
+
+  @Test
   public void atomicFlush() {
     try (final DBOptions opt = new DBOptions()) {
       assertThat(opt.atomicFlush()).isFalse();
