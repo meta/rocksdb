@@ -147,6 +147,7 @@ OPTION_STRUCTS_GROUP = OutputGroup(
                 "CompressionType",
                 "CacheTier",
                 "Temperature",
+                "PartitionWALUsage",
             ),
             setter_name_overrides=(
                 ("compaction_readahead_size", "rocksdb_options_compaction_readahead_size"),
