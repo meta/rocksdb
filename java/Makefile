@@ -81,6 +81,7 @@ NATIVE_JAVA_CLASSES = \
 	org.rocksdb.WalIterator\
 	org.rocksdb.TtlDB\
 	org.rocksdb.VectorMemTableConfig\
+	org.rocksdb.WaitForCompactOptions\
 	org.rocksdb.Snapshot\
 	org.rocksdb.StringAppendOperator\
 	org.rocksdb.UInt64AddOperator\
