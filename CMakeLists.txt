@@ -1335,6 +1335,10 @@ if(ROCKSDB_BUILD_SHARED)
         COMPILE_FLAGS "/Fd${CMAKE_CFG_INTDIR}/${ROCKSDB_STATIC_LIB}.pdb")
       set_target_properties(${ROCKSDB_SHARED_LIB} PROPERTIES
         COMPILE_FLAGS "/Fd${CMAKE_CFG_INTDIR}/${ROCKSDB_SHARED_LIB}.pdb")
+      if (MSVC_VERSION GREATER 1900)
+        set_target_properties(${ROCKSDB_SHARED_LIB} PROPERTIES
+          LINK_FLAGS "/guard:cf")
+      endif()
     endif()
   else()
     set_target_properties(${ROCKSDB_SHARED_LIB} PROPERTIES
