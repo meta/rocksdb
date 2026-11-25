@@ -113,6 +113,7 @@ jlongArray Java_org_rocksdb_TransactionDB_open__JJLjava_lang_String_2_3_3B_3J(
   ROCKSDB_NAMESPACE::TransactionDB* tdb = nullptr;
   const ROCKSDB_NAMESPACE::Status s = ROCKSDB_NAMESPACE::TransactionDB::Open(
       *db_options, *txn_db_options, db_path, column_families, &handles, &tdb);
+  env->ReleaseStringUTFChars(jdb_path, db_path);
 
   // check if open operation was successful
   if (s.ok()) {
