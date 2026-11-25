@@ -879,6 +879,9 @@ enum Histograms : uint32_t {
   // Time spent opening the secondary DB inside DB::OpenAndCompact().
   OPEN_AND_COMPACT_DB_OPEN_MICROS,
 
+  // Time spent waiting in the compaction queue before compaction starts
+  COMPACTION_QUEUE_WAIT_TIME,
+
   HISTOGRAM_ENUM_MAX
 };
 
