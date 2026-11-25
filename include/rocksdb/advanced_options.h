@@ -1045,6 +1045,9 @@ struct AdvancedColumnFamilyOptions {
   //  and a typical setting is the last level is cold tier which is likely not
   //  size constrained, the size amp is going to be only for non-last levels.
   //
+  // Recent data is not kept out of the last level while `enable_blob_files` is
+  // set or the column family still has blob files.
+  //
   // Default: 0 (disable the feature)
   //
   // Dynamically changeable through the SetOptions() API
