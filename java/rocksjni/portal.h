@@ -7402,6 +7402,51 @@ class PriorityJni {
   }
 };
 
+// The portal class for org.rocksdb.IOPriority
+class IOPriorityJni {
+ public:
+  // Returns the equivalent org.rocksdb.IOPriority for the provided
+  // C++ ROCKSDB_NAMESPACE::Env::IOPriority enum
+  static jbyte toJavaIOPriority(
+      const ROCKSDB_NAMESPACE::Env::IOPriority& io_priority) {
+    switch (io_priority) {
+      case ROCKSDB_NAMESPACE::Env::IOPriority::IO_LOW:
+        return 0x0;
+      case ROCKSDB_NAMESPACE::Env::IOPriority::IO_MID:
+        return 0x1;
+      case ROCKSDB_NAMESPACE::Env::IOPriority::IO_HIGH:
+        return 0x2;
+      case ROCKSDB_NAMESPACE::Env::IOPriority::IO_USER:
+        return 0x3;
+      case ROCKSDB_NAMESPACE::Env::IOPriority::IO_TOTAL:
+        return 0x4;
+      default:
+        return 0x7F;  // undefined
+    }
+  }
+
+  // Returns the equivalent C++ ROCKSDB_NAMESPACE::Env::IOPriority enum for the
+  // provided Java org.rocksdb.IOPriority
+  static ROCKSDB_NAMESPACE::Env::IOPriority toCppIOPriority(
+      jbyte jio_priority) {
+    switch (jio_priority) {
+      case 0x0:
+        return ROCKSDB_NAMESPACE::Env::IOPriority::IO_LOW;
+      case 0x1:
+        return ROCKSDB_NAMESPACE::Env::IOPriority::IO_MID;
+      case 0x2:
+        return ROCKSDB_NAMESPACE::Env::IOPriority::IO_HIGH;
+      case 0x3:
+        return ROCKSDB_NAMESPACE::Env::IOPriority::IO_USER;
+      case 0x4:
+        return ROCKSDB_NAMESPACE::Env::IOPriority::IO_TOTAL;
+      default:
+        // undefined/default
+        return ROCKSDB_NAMESPACE::Env::IOPriority::IO_TOTAL;
+    }
+  }
+};
+
 // The portal class for org.rocksdb.ThreadType
 class ThreadTypeJni {
  public:
