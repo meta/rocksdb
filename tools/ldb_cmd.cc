@@ -3040,6 +3040,20 @@ class InMemoryHandler : public WriteBatch::Handler {
     return Status::OK();
   }
 
+  Status TimedPutCF(uint32_t cf, const Slice& key, const Slice& value,
+                    uint64_t write_time) override {
+    row_ << "TIMED_PUT(" << cf << ", " << write_time << ") : ";
+    commonPutMerge(cf, key, value);
+    return Status::OK();
+  }
+
+  Status PutBlobIndexCF(uint32_t cf, const Slice& key,
+                        const Slice& value) override {
+    row_ << "PUT_BLOB_INDEX(" << cf << ") : ";
+    commonPutMerge(cf, key, value);
+    return Status::OK();
+  }
+
   Status MergeCF(uint32_t cf, const Slice& key, const Slice& value) override {
     row_ << "MERGE(" << cf << ") : ";
     commonPutMerge(cf, key, value);
@@ -3069,6 +3083,11 @@ class InMemoryHandler : public WriteBatch::Handler {
     row_ << PrintKey(cf, begin_key) << " ";
     row_ << PrintKey(cf, end_key) << " ";
     return Status::OK();
+  }
+
+  void LogData(const Slice& blob) override {
+    row_ << "LOG_DATA : ";
+    row_ << LDBCommand::StringToHex(blob.ToString()) << " ";
   }
 
   Status MarkBeginPrepare(bool unprepare) override {
