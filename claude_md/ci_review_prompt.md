@@ -1,5 +1,12 @@
 # Code Review Workflow — CI Prompt
 
+> **History:** This prompt was written for GitHub Actions workflows that
+> posted AI reviews on pull requests. Those workflows have been removed; find
+> them with `git log --diff-filter=D -- .github/workflows/claude-review.yml`.
+> The prompt is still used for local reviews through
+> `claude_md/manual_code_review.md`, which overrides the CI-specific
+> instructions below (PR comment output, `review-findings.md`, turn limits).
+
 ## Purpose
 Thorough multi-agent code review for RocksDB commits following CLAUDE.md guidelines,
 with structured codebase exploration, inter-agent debate, and verification.
