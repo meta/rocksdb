@@ -1,0 +1,1 @@
+Fixed a bug where `MultiScan` with `MultiScanArgs::use_async_io = true` could return keys deleted by `DeleteRange` when range tombstones were stored in an SST file whose iterator was pre-created during `Prepare()`.
