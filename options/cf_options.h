@@ -60,6 +60,11 @@ struct ImmutableCFOptions {
 
   bool level_compaction_dynamic_level_bytes;
 
+  bool experimental_enable_sst_view_compaction;
+  uint64_t experimental_sst_view_min_bytes_saved;
+  double experimental_sst_view_min_reuse_ratio;
+  uint64_t experimental_sst_view_max_retained_dead_bytes;
+
   int num_levels;
 
   bool optimize_filters_for_hits;
