@@ -1212,6 +1212,9 @@ check-c-api-gen:
 	# must have exactly one definition (guards against dropped wrappers that
 	# would break downstream language bindings at link time).
 	$(PYTHON) tools/c_api_gen/check_api_completeness.py
+	# Unit tests for the generators (the clang-dependent cases are skipped when
+	# CLANG_CXX is not available).
+	CLANG_CXX="$(CLANG_CXX)" $(PYTHON) tools/c_api_gen/c_api_gen_test.py
 	# Backward-compatibility: no public C function may be removed or have its
 	# signature changed vs the baseline. Skipped if the baseline ref is not
 	# resolvable locally (CI passes an explicit ref), unless CHECK_C_API_GEN_STRICT.
