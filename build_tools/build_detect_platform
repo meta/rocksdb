@@ -666,6 +666,22 @@ EOF
             COMMON_FLAGS="$COMMON_FLAGS -DROCKSDB_IOURING_PRESENT"
         fi
     fi
+
+    if ! test $ROCKSDB_DISABLE_SVE; then
+        if test -n "`echo $TARGET_ARCHITECTURE | grep -e ^arm64 -e ^aarch64`"; then
+            $CXX $PLATFORM_CXXFLAGS -march=armv8.2-a+sve -x c++ - -o test.o 2>/dev/null <<EOF
+              #include <arm_sve.h>
+              int main() {
+                svfloat64_t a;
+                (void)a;
+                return 0;
+              }
+EOF
+            if [ "$?" = 0 ]; then
+                HAVE_ARMV8_SVE=1
+            fi
+        fi
+    fi
 fi
 
 # TODO(tec): Fix -Wshorten-64-to-32 errors on FreeBSD and enable the warning.
@@ -872,4 +888,7 @@ if test -n "$USE_FOLLY"; then
 fi
 if test -n "$PPC_LIBC_IS_GNU"; then
   echo "PPC_LIBC_IS_GNU=$PPC_LIBC_IS_GNU" >> "$OUTPUT"
+fi
+if test -n "$HAVE_ARMV8_SVE"; then
+  echo "HAVE_ARMV8_SVE=$HAVE_ARMV8_SVE" >> "$OUTPUT"
 fi
