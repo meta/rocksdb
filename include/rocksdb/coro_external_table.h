@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <coroutine>
+#include <cstddef>
 #include <utility>
 #include <vector>
 
@@ -12,6 +14,10 @@
 #include "folly/coro/Nothrow.h"
 #include "folly/coro/Task.h"
 #include "rocksdb/external_table.h"
+#include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 

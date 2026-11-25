@@ -6,15 +6,25 @@
 #pragma once
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "rocksdb/advanced_iterator.h"
+#include "rocksdb/comparator.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/iterator_base.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "rocksdb/table.h"
+#include "rocksdb/table_properties.h"
+#include "rocksdb/types.h"
 #include "rocksdb/utilities/types_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -38,6 +48,7 @@ template <ExternalTableMode Mode>
 class CoroExternalTableReaderBase;
 
 class ExternalTableBuilderBase;
+class SliceTransform;
 
 struct TableReaderOptions;
 struct TableBuilderOptions;

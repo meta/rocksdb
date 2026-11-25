@@ -5,18 +5,24 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "rocksdb/compression_type.h"
+#include "rocksdb/configurable.h"
 #include "rocksdb/db.h"
+#include "rocksdb/env.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
+#include "rocksdb/types.h"
 
 namespace ROCKSDB_NAMESPACE {
-class Env;
-class Logger;
+class MemTableRepFactory;
 class ObjectRegistry;
 
 struct ColumnFamilyOptions;

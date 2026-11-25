@@ -8,14 +8,18 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-class Slice;
 
 // The general interface for comparing two Slices are defined for both of
 // Comparator and some internal data structures.

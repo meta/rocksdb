@@ -5,9 +5,15 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+#include <string>
 #include <utility>
 
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/table_reader_caller.h"
 #include "rocksdb/trace_reader_writer.h"

@@ -9,12 +9,16 @@
 #pragma once
 
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {

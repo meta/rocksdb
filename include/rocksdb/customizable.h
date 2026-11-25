@@ -8,7 +8,11 @@
 
 #pragma once
 
+#include <string>
+#include <unordered_map>
+
 #include "rocksdb/configurable.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
