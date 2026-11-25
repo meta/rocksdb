@@ -4,7 +4,11 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -12,13 +16,17 @@
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
 #include "memtable/skiplist.h"
+#include "options/cf_options.h"
 #include "options/db_options.h"
 #include "port/port.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
+#include "rocksdb/wide_columns.h"
+#include "rocksdb/write_batch.h"
 
 namespace ROCKSDB_NAMESPACE {
 
