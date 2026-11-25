@@ -111,6 +111,25 @@ public abstract class AbstractWriteBatch extends RocksObject
   }
 
   @Override
+  public void deleteRange(ByteBuffer beginKey, ByteBuffer endKey) throws RocksDBException {
+    assert beginKey.isDirect() && endKey.isDirect();
+    deleteRangeDirect(nativeHandle_, beginKey, beginKey.position(), beginKey.remaining(), endKey, endKey.position(),
+        endKey.remaining(), 0);
+    beginKey.position(beginKey.limit());
+    endKey.position(endKey.limit());
+  }
+
+  @Override
+  public void deleteRange(ColumnFamilyHandle columnFamilyHandle, ByteBuffer beginKey, ByteBuffer endKey)
+      throws RocksDBException {
+    assert beginKey.isDirect() && endKey.isDirect();
+    deleteRangeDirect(nativeHandle_, beginKey, beginKey.position(), beginKey.remaining(), endKey, endKey.position(),
+        endKey.remaining(), columnFamilyHandle.nativeHandle_);
+    beginKey.position(beginKey.limit());
+    endKey.position(endKey.limit());
+  }
+
+  @Override
   public void putLogData(final byte[] blob) throws RocksDBException {
     putLogData(nativeHandle_, blob, blob.length);
   }
@@ -185,6 +204,10 @@ public abstract class AbstractWriteBatch extends RocksObject
 
   abstract void deleteRange(final long handle, final byte[] beginKey, final int beginKeyLen,
       final byte[] endKey, final int endKeyLen, final long cfHandle) throws RocksDBException;
+
+  abstract void deleteRangeDirect(final long handle, final ByteBuffer beginKey, final int beginKeyOffset,
+      final int beginKeyLength, final ByteBuffer endKey, final int endKeyOffset, final int endKeyValue,
+      final long cfHandle);
 
   abstract void putLogData(final long handle, final byte[] blob,
       final int blobLen) throws RocksDBException;

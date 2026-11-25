@@ -1129,6 +1129,38 @@ void Java_org_rocksdb_RocksDB_deleteRange__JJ_3BII_3BIIJ(
 
 /*
  * Class:     org_rocksdb_RocksDB
+ * Method:    deleteRangeDirect
+ * Signature: (JJLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIJ)V
+ */
+void Java_org_rocksdb_RocksDB_deleteRangeDirect(
+        JNIEnv* env, jclass /*jdb*/, jlong jdb_handle, jlong jwrite_options_handle,
+        jobject jbegin_key, jint jbegin_key_off, jint jbegin_key_len, jobject jend_key, jint jend_key_off,
+        jint jend_key_len, jlong jcf_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto* write_options =
+          reinterpret_cast<ROCKSDB_NAMESPACE::WriteOptions*>(jwrite_options_handle);
+  auto* cf_handle =
+          reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(jcf_handle);
+  auto deleteRange = [&env, &db, &cf_handle, &write_options](
+          ROCKSDB_NAMESPACE::Slice& beginKey,
+          ROCKSDB_NAMESPACE::Slice& endKey) {
+      ROCKSDB_NAMESPACE::Status s;
+      if (cf_handle == nullptr) {
+        s = db->DeleteRange(*write_options, beginKey, endKey);
+      } else {
+        s = db->DeleteRange(*write_options, cf_handle, beginKey, endKey);
+      }
+      if (s.ok()) {
+        return;
+      }
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  };
+  ROCKSDB_NAMESPACE::JniUtil::kv_op_direct(deleteRange, env, jbegin_key, jbegin_key_off, jbegin_key_len,
+                                           jend_key, jend_key_off, jend_key_len);
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
  * Method:    clipColumnFamily
  * Signature: (JJ[BII[BII)V
  */
