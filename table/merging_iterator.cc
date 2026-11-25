@@ -27,8 +27,9 @@ namespace ROCKSDB_NAMESPACE {
 // for example. Level j is in active_ if its current range tombstone has its
 // start_key popped from minHeap_ and its end_key in minHeap_. If the top of
 // minHeap_ is a point key from level L, we can determine if the point key is
-// covered by any range tombstone by checking if there is an l <= L in active_.
-// The case of l == L also involves checking range tombstone's sequence number.
+// covered by any range tombstone by checking if there is an l <= L in active_
+// whose tombstone sequence number is greater than the point key sequence
+// number.
 //
 // The following (non-exhaustive) list of invariants are maintained by
 // MergingIterator during forward scanning. After each InternalIterator API,
@@ -61,6 +62,7 @@ class MergingIterator : public InternalIterator {
         prefix_seek_mode_(prefix_seek_mode),
         direction_(kForward),
         comparator_(comparator),
+        range_del_read_seqno_(kMaxSequenceNumber),
         current_(nullptr),
         minHeap_(MinHeapItemComparator(comparator_)),
         pinned_iters_mgr_(nullptr),
@@ -143,6 +145,7 @@ class MergingIterator : public InternalIterator {
   }
 
   void SetRangeDelReadSeqno(SequenceNumber read_seqno) override {
+    range_del_read_seqno_ = read_seqno;
     for (auto& child : children_) {
       // This should only be needed for LevelIterator (iterators from L1+).
       child.iter.SetRangeDelReadSeqno(read_seqno);
@@ -152,6 +155,36 @@ class MergingIterator : public InternalIterator {
         child->SetRangeDelReadSeqno(read_seqno);
       }
     }
+  }
+
+  bool RangeTombstoneCoversPointKey(size_t level,
+                                    const ParsedInternalKey& pik) const {
+    assert(range_tombstone_iters_[level]);
+    assert(range_tombstone_iters_[level]->Valid());
+    assert(comparator_->Compare(range_tombstone_iters_[level]->start_key(),
+                                pik) <= 0);
+    assert(comparator_->Compare(pik, range_tombstone_iters_[level]->end_key()) <
+           0);
+    return pik.sequence < range_tombstone_iters_[level]->seq();
+  }
+
+  std::set<size_t>::const_iterator FindActiveRangeTombstoneCoveringPointKey(
+      const ParsedInternalKey& pik, size_t max_level) const {
+    for (auto i = active_.begin(); i != active_.end() && *i <= max_level; ++i) {
+      if (RangeTombstoneCoversPointKey(*i, pik)) {
+        return i;
+      }
+    }
+    return active_.end();
+  }
+
+  bool CanUseLevelOrderRangeTombstoneSkip(size_t level) const {
+    assert(range_tombstone_iters_[level]);
+    assert(range_tombstone_iters_[level]->Valid());
+    // Read-path range conversion materializes tombstones at the iterator read
+    // sequence. Such a tombstone can be in a newer iterator level without being
+    // newer than every lower-level point key.
+    return range_tombstone_iters_[level]->seq() != range_del_read_seqno_;
   }
 
   bool Valid() const override { return current_ != nullptr && status_.ok(); }
@@ -613,6 +646,7 @@ class MergingIterator : public InternalIterator {
   enum Direction : uint8_t { kForward, kReverse };
   Direction direction_;
   const InternalKeyComparator* comparator_;
+  SequenceNumber range_del_read_seqno_;
   // HeapItem for all child point iterators.
   // Invariant(children_): children_[i] is in minHeap_ iff
   // children_[i].iter.Valid(), and at most one children_[i] is in minHeap_.
@@ -767,10 +801,11 @@ class MergingIterator : public InternalIterator {
 //  - range_tombstone_iters_[i]->Valid()
 //  - range_tombstone_iters_[i]->start_key().user_key <= k1.user_key
 //  - k2 = range_tombstone_iters_[i]->end_key()
-// We assume that range_tombstone_iters_[i]->start_key() has a higher sequence
-// number compared to any key from levels > i that has the same user key. So no
-// point key from levels > i in range [k1, k2) is visible. So
-// children_[i].iter.key() <= LevelNextVisible(i, target).
+// CanUseLevelOrderRangeTombstoneSkip(i) ensures the range tombstone is not a
+// read-sequence tombstone. For other range tombstones, level order implies the
+// tombstone has a higher sequence number than any key from levels > i with the
+// same user key. So no point key from levels > i in range [k1, k2) is visible.
+// Thus children_[i].iter.key() <= LevelNextVisible(i, target).
 //
 // Post-condition (**) target < pinned_heap_item_[i].tombstone_pik for i >=
 // starting_level if range_tombstone_iters_[i].Valid(). This follows from that
@@ -869,9 +904,9 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
               level, comparator_->Compare(range_tombstone_iter->start_key(),
                                           pik) > 0 /* start_key */);
           // current_search_key < end_key guaranteed by the SeekInternalKey()
-          // and Valid() calls above. Here we only need to compare user_key
-          // since if target.user_key ==
-          // range_tombstone_iter->start_key().user_key and target <
+          // and Valid() calls above. When level-order tombstone skipping is
+          // allowed, we only need to compare user_key since if target.user_key
+          // == range_tombstone_iter->start_key().user_key and target <
           // range_tombstone_iter->start_key(), no older level would have any
           // key in range [target, range_tombstone_iter->start_key()], so no
           // keys in range [target, range_tombstone_iter->end_key()) from older
@@ -880,7 +915,8 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
           //
           // TODO: range_tombstone_iter->Seek() finds the max covering
           //  sequence number, can make it cheaper by not looking for max.
-          if (comparator_->user_comparator()->Compare(
+          if (CanUseLevelOrderRangeTombstoneSkip(level) &&
+              comparator_->user_comparator()->Compare(
                   range_tombstone_iter->start_key().user_key,
                   current_search_key.GetUserKey()) <= 0) {
             range_tombstone_reseek = true;
@@ -1038,45 +1074,27 @@ bool MergingIterator::SkipNextDeleted() {
   ParsedInternalKey pik;
   ParseInternalKey(current->iter.key(), &pik, false).PermitUncheckedError();
   if (!active_.empty()) {
-    auto i = *active_.begin();
-    if (i < current->level) {
-      // range tombstone is from a newer level, definitely covers
-      assert(comparator_->Compare(range_tombstone_iters_[i]->start_key(),
-                                  pik) <= 0);
-      assert(comparator_->Compare(pik, range_tombstone_iters_[i]->end_key()) <
-             0);
+    auto covering_iter =
+        FindActiveRangeTombstoneCoveringPointKey(pik, current->level);
+    if (covering_iter == active_.end()) {
+      return false /* current key not deleted */;
+    }
+    auto i = *covering_iter;
+    if (i < current->level && CanUseLevelOrderRangeTombstoneSkip(i)) {
       std::string target;
       AppendInternalKey(&target, range_tombstone_iters_[i]->end_key());
       SeekImpl(target, current->level, true);
       return true /* current key deleted */;
-    } else if (i == current->level) {
-      // range tombstone is from the same level as current, check sequence
-      // number. By `active_` we know current key is between start key and end
-      // key.
-      assert(comparator_->Compare(range_tombstone_iters_[i]->start_key(),
-                                  pik) <= 0);
-      assert(comparator_->Compare(pik, range_tombstone_iters_[i]->end_key()) <
-             0);
-      if (pik.sequence < range_tombstone_iters_[current->level]->seq()) {
-        // covered by range tombstone
-        current->iter.Next();
-        // Invariant (children_)
-        if (current->iter.Valid()) {
-          minHeap_.replace_top(current);
-        } else {
-          considerStatus(current->iter.status());
-          minHeap_.pop();
-        }
-        return true /* current key deleted */;
-      } else {
-        return false /* current key not deleted */;
-      }
     } else {
-      return false /* current key not deleted */;
-      // range tombstone from an older sorted run with current key < end key.
-      // current key is not deleted and the older sorted run will have its range
-      // tombstone updated when the range tombstone's end key are popped from
-      // minHeap_.
+      current->iter.Next();
+      // Invariant (children_)
+      if (current->iter.Valid()) {
+        minHeap_.replace_top(current);
+      } else {
+        considerStatus(current->iter.status());
+        minHeap_.pop();
+      }
+      return true /* current key deleted */;
     }
   }
   // we can reach here only if active_ is empty
@@ -1149,9 +1167,8 @@ void MergingIterator::SeekForPrevImpl(const Slice& target,
               level, comparator_->Compare(range_tombstone_iter->end_key(),
                                           pik) <= 0 /* end_key */);
           // start key <= current_search_key guaranteed by the Seek() call above
-          // Only interested in user key coverage since older sorted runs must
-          // have smaller sequence numbers than this tombstone.
-          if (comparator_->user_comparator()->Compare(
+          if (CanUseLevelOrderRangeTombstoneSkip(level) &&
+              comparator_->user_comparator()->Compare(
                   current_search_key.GetUserKey(),
                   range_tombstone_iter->end_key().user_key) < 0) {
             range_tombstone_reseek = true;
@@ -1252,13 +1269,13 @@ bool MergingIterator::SkipPrevDeleted() {
   ParsedInternalKey pik;
   ParseInternalKey(current->iter.key(), &pik, false).PermitUncheckedError();
   if (!active_.empty()) {
-    auto i = *active_.begin();
-    if (i < current->level) {
-      // range tombstone is from a newer level, definitely covers
-      assert(comparator_->Compare(range_tombstone_iters_[i]->start_key(),
-                                  pik) <= 0);
-      assert(comparator_->Compare(pik, range_tombstone_iters_[i]->end_key()) <
-             0);
+    auto covering_iter =
+        FindActiveRangeTombstoneCoveringPointKey(pik, current->level);
+    if (covering_iter == active_.end()) {
+      return false /* current key not deleted */;
+    }
+    auto i = *covering_iter;
+    if (i < current->level && CanUseLevelOrderRangeTombstoneSkip(i)) {
       std::string target;
       AppendInternalKey(&target, range_tombstone_iters_[i]->start_key());
       // This is different from SkipNextDeleted() which does reseek at sorted
@@ -1270,26 +1287,15 @@ bool MergingIterator::SkipPrevDeleted() {
       // which might still be the same user key.
       SeekForPrevImpl(target, i + 1, true);
       return true /* current key deleted */;
-    } else if (i == current->level) {
-      // By `active_` we know current key is between start key and end key.
-      assert(comparator_->Compare(range_tombstone_iters_[i]->start_key(),
-                                  pik) <= 0);
-      assert(comparator_->Compare(pik, range_tombstone_iters_[i]->end_key()) <
-             0);
-      if (pik.sequence < range_tombstone_iters_[current->level]->seq()) {
-        current->iter.Prev();
-        if (current->iter.Valid()) {
-          maxHeap_->replace_top(current);
-        } else {
-          considerStatus(current->iter.status());
-          maxHeap_->pop();
-        }
-        return true /* current key deleted */;
-      } else {
-        return false /* current key not deleted */;
-      }
     } else {
-      return false /* current key not deleted */;
+      current->iter.Prev();
+      if (current->iter.Valid()) {
+        maxHeap_->replace_top(current);
+      } else {
+        considerStatus(current->iter.status());
+        maxHeap_->pop();
+      }
+      return true /* current key deleted */;
     }
   }
 
