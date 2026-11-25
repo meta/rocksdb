@@ -1106,36 +1106,20 @@ Status GetDBOptionsFromString(const ConfigOptions& config_options,
                              new_options);
 }
 
-Status GetOptionsFromString(const Options& base_options,
-                            const std::string& opts_str, Options* new_options) {
-  ConfigOptions config_options(base_options);
-  config_options.input_strings_escaped = false;
-  config_options.ignore_unknown_options = false;
-
-  return GetOptionsFromString(config_options, base_options, opts_str,
-                              new_options);
-}
-
-Status GetOptionsFromString(const ConfigOptions& config_options,
-                            const Options& base_options,
-                            const std::string& opts_str, Options* new_options) {
-  ColumnFamilyOptions new_cf_options;
-  std::unordered_map<std::string, std::string> unused_opts;
-  std::unordered_map<std::string, std::string> opts_map;
-
+Status GetOptionsFromMap(
+    const ConfigOptions& config_options, const Options& base_options,
+    const std::unordered_map<std::string, std::string>& opts_map,
+    Options* new_options) {
   assert(new_options);
   *new_options = base_options;
-  Status s = StringToMap(opts_str, &opts_map);
-  if (!s.ok()) {
-    return s;
-  }
   auto config = DBOptionsAsConfigurable(base_options);
-  s = config->ConfigureFromMap(config_options, opts_map, &unused_opts);
-
+  std::unordered_map<std::string, std::string> unused_opts;
+  Status s = config->ConfigureFromMap(config_options, opts_map, &unused_opts);
   if (s.ok()) {
     DBOptions* new_db_options =
         config->GetOptions<DBOptions>(OptionsHelper::kDBOptionsName);
     if (!unused_opts.empty()) {
+      ColumnFamilyOptions new_cf_options;
       s = GetColumnFamilyOptionsFromMap(config_options, base_options,
                                         unused_opts, &new_cf_options);
       if (s.ok()) {
@@ -1151,6 +1135,28 @@ Status GetOptionsFromString(const ConfigOptions& config_options,
   } else {
     return Status::InvalidArgument(s.getState());
   }
+}
+
+Status GetOptionsFromString(const Options& base_options,
+                            const std::string& opts_str, Options* new_options) {
+  ConfigOptions config_options(base_options);
+  config_options.input_strings_escaped = false;
+  config_options.ignore_unknown_options = false;
+
+  return GetOptionsFromString(config_options, base_options, opts_str,
+                              new_options);
+}
+
+Status GetOptionsFromString(const ConfigOptions& config_options,
+                            const Options& base_options,
+                            const std::string& opts_str, Options* new_options) {
+  std::unordered_map<std::string, std::string> opts_map;
+  Status s = StringToMap(opts_str, &opts_map);
+  if (!s.ok()) {
+    *new_options = base_options;
+    return s;
+  }
+  return GetOptionsFromMap(config_options, base_options, opts_map, new_options);
 }
 
 std::unordered_map<std::string, EncodingType>
