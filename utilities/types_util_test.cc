@@ -6,10 +6,16 @@
 
 #include "rocksdb/utilities/types_util.h"
 
+#include <gtest/gtest.h>
+
+#include <initializer_list>
+#include <optional>
+
 #include "db/dbformat.h"
 #include "port/stack_trace.h"
 #include "rocksdb/types.h"
 #include "test_util/testharness.h"
+#include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
