@@ -465,6 +465,180 @@ TEST_P(WriteCommittedTxnWithTsTest, RecoverFromWal) {
   }
 }
 
+// Regression test for https://github.com/facebook/rocksdb/issues/15473 with
+// user-defined timestamps: a prepared transaction wrote to a column family
+// with user-defined timestamps, the column family was dropped, and the
+// transaction was committed with ignore_missing_column_families=true.
+// Replaying the commit marker from the WAL used to dereference a null
+// ColumnFamilyData for the dropped column family while assigning the commit
+// timestamp. A second transaction is left prepared across the reopen so that
+// rebuilding and committing a prepared transaction with a dropped column
+// family is covered with user-defined timestamps as well.
+TEST_P(WriteCommittedTxnWithTsTest, RecoverFromWalWithDroppedColumnFamily) {
+  ASSERT_OK(ReOpenNoDelete());
+
+  ColumnFamilyOptions cf_opts;
+  cf_opts.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  const std::string test_cf_name = "test_cf";
+  ColumnFamilyHandle* cfh = nullptr;
+  assert(db);
+  ASSERT_OK(db->CreateColumnFamily(cf_opts, test_cf_name, &cfh));
+  delete cfh;
+  cfh = nullptr;
+
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  cf_descs.emplace_back(kDefaultColumnFamilyName, options);
+  cf_descs.emplace_back(test_cf_name, cf_opts);
+  options.avoid_flush_during_shutdown = true;
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  WriteOptions write_opts;
+  write_opts.sync = true;
+  write_opts.ignore_missing_column_families = true;
+
+  std::unique_ptr<Transaction> txn0(NewTxn(write_opts, TransactionOptions()));
+  assert(txn0);
+  ASSERT_OK(txn0->Put(handles_[1], "foo", "foo_value"));
+  ASSERT_OK(txn0->Put("bar", "bar_value"));
+  ASSERT_OK(txn0->SetName("txn0"));
+  ASSERT_OK(txn0->Prepare());
+
+  std::unique_ptr<Transaction> txn1(NewTxn(write_opts, TransactionOptions()));
+  assert(txn1);
+  ASSERT_OK(txn1->Put(handles_[1], "baz", "baz_value"));
+  ASSERT_OK(txn1->Put("qux", "qux_value"));
+  ASSERT_OK(txn1->SetName("txn1"));
+  ASSERT_OK(txn1->Prepare());
+
+  ASSERT_OK(db->DropColumnFamily(handles_[1]));
+  delete handles_[1];
+  handles_.pop_back();
+  cf_descs.pop_back();
+
+  // Committed after the drop: the write to the dropped column family is
+  // ignored, the write to the default column family is applied.
+  ASSERT_OK(txn0->SetCommitTimestamp(/*ts=*/23));
+  ASSERT_OK(txn0->Commit());
+  txn0.reset();
+
+  // txn1 stays prepared.
+  txn1.reset();
+
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), handles_[0], "bar", &value));
+  ASSERT_EQ("bar_value", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), handles_[0], "foo", &value).IsNotFound());
+
+  std::vector<Transaction*> prepared_trans;
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(1u, prepared_trans.size());
+  Transaction* recovered_txn1 = db->GetTransactionByName("txn1");
+  ASSERT_NE(nullptr, recovered_txn1);
+  // Both writes were rebuilt; the one to the dropped column family is not
+  // indexed and is ignored at commit with ignore_missing_column_families.
+  ASSERT_EQ(2u, recovered_txn1->GetWriteBatch()->GetWriteBatch()->Count());
+  recovered_txn1->GetWriteOptions()->ignore_missing_column_families = true;
+  ASSERT_OK(recovered_txn1->SetCommitTimestamp(/*ts=*/24));
+  ASSERT_OK(recovered_txn1->Commit());
+  delete recovered_txn1;
+
+  ASSERT_OK(db->Get(ReadOptions(), handles_[0], "qux", &value));
+  ASSERT_EQ("qux_value", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), handles_[0], "baz", &value).IsNotFound());
+  prepared_trans.clear();
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(0u, prepared_trans.size());
+
+  // The commit marker of the recovered transaction is replayed as well.
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  ASSERT_OK(db->Get(ReadOptions(), handles_[0], "bar", &value));
+  ASSERT_EQ("bar_value", value);
+  ASSERT_OK(db->Get(ReadOptions(), handles_[0], "qux", &value));
+  ASSERT_EQ("qux_value", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), handles_[0], "foo", &value).IsNotFound());
+  ASSERT_TRUE(db->Get(ReadOptions(), handles_[0], "baz", &value).IsNotFound());
+  prepared_trans.clear();
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(0u, prepared_trans.size());
+}
+
+// Same as above with the roles reversed: the default column family has
+// user-defined timestamps and the dropped column family does not. A rebuilt
+// transaction knows no comparator for the dropped column family, so its
+// entries must not be treated as keys of the default column family when the
+// commit timestamp is assigned (the key is shorter than a timestamp).
+TEST_P(WriteCommittedTxnWithTsTest,
+       RecoverFromWalWithDroppedColumnFamilyWithoutTimestamp) {
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  ASSERT_OK(ReOpen());
+
+  const std::string test_cf_name = "test_cf";
+  ColumnFamilyOptions cf_options;
+  ColumnFamilyHandle* cfh = nullptr;
+  assert(db);
+  ASSERT_OK(db->CreateColumnFamily(cf_options, test_cf_name, &cfh));
+  delete cfh;
+  cfh = nullptr;
+
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  cf_descs.emplace_back(kDefaultColumnFamilyName, options);
+  cf_descs.emplace_back(test_cf_name, Options(DBOptions(), cf_options));
+  options.avoid_flush_during_shutdown = true;
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  WriteOptions write_opts;
+  write_opts.sync = true;
+  write_opts.ignore_missing_column_families = true;
+
+  std::unique_ptr<Transaction> txn1(NewTxn(write_opts, TransactionOptions()));
+  assert(txn1);
+  ASSERT_OK(txn1->Put(handles_[1], "k1", "v"));
+  ASSERT_OK(txn1->Put(handles_[0], "kept1", "kept1_value"));
+  ASSERT_OK(txn1->SetName("txn1"));
+  ASSERT_OK(txn1->Prepare());
+
+  ASSERT_OK(db->DropColumnFamily(handles_[1]));
+  delete handles_[1];
+  handles_.pop_back();
+  cf_descs.pop_back();
+
+  // txn1 stays prepared across the reopen.
+  txn1.reset();
+
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  std::string value;
+  Transaction* recovered_txn1 = db->GetTransactionByName("txn1");
+  ASSERT_NE(nullptr, recovered_txn1);
+  ASSERT_EQ(2u, recovered_txn1->GetWriteBatch()->GetWriteBatch()->Count());
+  recovered_txn1->GetWriteOptions()->ignore_missing_column_families = true;
+  ASSERT_OK(recovered_txn1->SetCommitTimestamp(/*ts=*/5));
+  ASSERT_OK(recovered_txn1->Commit());
+  delete recovered_txn1;
+
+  ASSERT_OK(GetFromDb(ReadOptions(), handles_[0], "kept1", /*ts=*/5, &value));
+  ASSERT_EQ("kept1_value", value);
+  ASSERT_TRUE(GetFromDb(ReadOptions(), handles_[0], "k1", /*ts=*/5, &value)
+                  .IsNotFound());
+  std::vector<Transaction*> prepared_trans;
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(0u, prepared_trans.size());
+
+  // The commit marker of the recovered transaction is replayed as well.
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  ASSERT_OK(GetFromDb(ReadOptions(), handles_[0], "kept1", /*ts=*/5, &value));
+  ASSERT_EQ("kept1_value", value);
+  ASSERT_TRUE(GetFromDb(ReadOptions(), handles_[0], "k1", /*ts=*/5, &value)
+                  .IsNotFound());
+  prepared_trans.clear();
+  db->GetAllPreparedTransactions(&prepared_trans);
+  ASSERT_EQ(0u, prepared_trans.size());
+}
+
 TEST_P(WriteCommittedTxnWithTsTest, EnabledUDTDisabledRecoverFromWal) {
   // This feature is not compatible with UDT in memtable only.
   options.allow_concurrent_memtable_write = false;

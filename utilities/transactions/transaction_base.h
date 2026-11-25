@@ -7,6 +7,7 @@
 
 #include <stack>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "db/write_batch_internal.h"
@@ -454,6 +455,12 @@ class TransactionBaseImpl : public Transaction {
   // Extra data to be persisted with the commit. Note this is only used when
   // prepare phase is not skipped.
   WriteBatch commit_time_batch_;
+
+  // Column families that no longer existed when this transaction was rebuilt
+  // from the WAL (see RebuildFromWriteBatch). Their writes are kept in
+  // write_batch_ with their original column family id but are not indexed
+  // and have no comparator here.
+  std::unordered_set<uint32_t> dropped_cfs_in_rebuilt_batch_;
 
   // If true, future Put/PutEntity/Merge/Delete operations will be indexed in
   // the WriteBatchWithIndex. If false, future Put/PutEntity/Merge/Delete
