@@ -11,14 +11,18 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "rocksdb/compression_type.h"
 #include "rocksdb/data_structure.h"
 #include "rocksdb/memory_allocator.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 

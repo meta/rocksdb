@@ -16,17 +16,23 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/functor_wrapper.h"
 #include "rocksdb/port_defs.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/thread_status.h"
 #include "rocksdb/types.h"
@@ -52,7 +58,6 @@ class FileLock;
 class Logger;
 class RandomAccessFile;
 class SequentialFile;
-class Slice;
 struct DataVerificationInfo;
 class WritableFile;
 class RandomRWFile;

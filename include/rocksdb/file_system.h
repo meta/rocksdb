@@ -17,24 +17,33 @@
 #pragma once
 
 #include <any>
+#include <cassert>
 #include <chrono>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/table.h"
 #include "rocksdb/thread_status.h"
+#include "rocksdb/types.h"
 
 namespace folly {
 class IOExecutor;
@@ -49,7 +58,6 @@ class FSRandomRWFile;
 class FSSequentialFile;
 class FSWritableFile;
 class Logger;
-class Slice;
 struct ImmutableDBOptions;
 struct MutableDBOptions;
 class RateLimiter;

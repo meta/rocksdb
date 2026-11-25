@@ -5,16 +5,28 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <string>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #include "rocksdb/data_structure.h"
 #include "rocksdb/db.h"
+#include "rocksdb/file_checksum.h"
+#include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "rocksdb/table_properties.h"
 
 namespace ROCKSDB_NAMESPACE {
+class FileSystem;
+
 namespace experimental {
 
 // Supported only for Leveled compaction

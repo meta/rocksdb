@@ -10,13 +10,13 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/wide_columns.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-class Slice;
 
 // Implementations may keep internal state, but SelectPartition() runs on the
 // write hot path and may be called concurrently from multiple writer threads,

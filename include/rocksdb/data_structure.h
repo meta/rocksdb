@@ -10,8 +10,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <set>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #include "rocksdb/comparator.h"
 #include "rocksdb/rocksdb_namespace.h"
