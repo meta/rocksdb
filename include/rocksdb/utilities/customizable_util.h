@@ -14,10 +14,12 @@
 
 #pragma once
 #include <memory>
+#include <string>
 #include <unordered_map>
 
 #include "rocksdb/convenience.h"
 #include "rocksdb/customizable.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 #include "rocksdb/utilities/object_registry.h"
 

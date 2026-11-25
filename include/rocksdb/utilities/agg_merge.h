@@ -5,11 +5,14 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "rocksdb/merge_operator.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 // The feature is still in development so the encoding format is subject

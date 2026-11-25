@@ -5,15 +5,20 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstddef>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {

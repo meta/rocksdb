@@ -6,8 +6,13 @@
 #pragma once
 
 #include <cassert>
+#include <cstddef>
+#include <string>
 
+#include "folly/coro/Task.h"
+#include "rocksdb/attribute_groups.h"
 #include "rocksdb/coro_db.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/utilities/stackable_db.h"
 
 namespace ROCKSDB_NAMESPACE {

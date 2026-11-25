@@ -19,10 +19,16 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
+#include <cstdint>
 #include <iostream>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "rocksdb/env.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 

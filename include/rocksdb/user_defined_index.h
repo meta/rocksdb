@@ -23,6 +23,7 @@
 #pragma once
 
 #include "rocksdb/index_factory.h"
+#include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
 
