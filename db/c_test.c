@@ -5826,6 +5826,16 @@ int main(int argc, char** argv) {
 
     // begin a transaction
     txn = rocksdb_transaction_begin(txn_db, woptions, txn_options, NULL);
+    {
+      rocksdb_writebatch_wi_t* txn_wi =
+          rocksdb_transaction_get_writebatch_wi(txn);
+      CheckCondition(rocksdb_writebatch_wi_count(txn_wi) == 0);
+      rocksdb_free(txn_wi);
+
+      txn_wi = rocksdb_transaction_get_writebatch_wi(txn);
+      CheckCondition(rocksdb_writebatch_wi_count(txn_wi) == 0);
+      rocksdb_writebatch_wi_destroy(txn_wi);
+    }
     // put
     rocksdb_transaction_put(txn, "foo", 3, "hello", 5, &err);
     CheckNoError(err);
