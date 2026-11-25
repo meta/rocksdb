@@ -5,12 +5,15 @@
 
 package org.rocksdb;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-
-import static org.assertj.core.api.Assertions.assertThat;
 
 public class BuiltinComparatorTest {
 
@@ -127,6 +130,37 @@ public class BuiltinComparatorTest {
             "abc3".getBytes());
         assertThat(rocksIterator.value()).isEqualTo(
             "abc3".getBytes());
+      }
+    }
+  }
+
+  @Test
+  public void builtinU64TimestampComparators() throws Exception {
+    final byte[] first = "a".getBytes(UTF_8);
+    final byte[] second = "b".getBytes(UTF_8);
+    final byte[] timestamp =
+        ByteBuffer.allocate(Long.BYTES).order(ByteOrder.LITTLE_ENDIAN).putLong(10).array();
+    for (final BuiltinComparator comparator :
+        new BuiltinComparator[] {BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64_TS,
+            BuiltinComparator.REVERSE_BYTEWISE_COMPARATOR_WITH_U64_TS}) {
+      try (final Options options = new Options().setCreateIfMissing(true).setComparator(comparator);
+          final RocksDB db = RocksDB.open(options, dbFolder.newFolder().getAbsolutePath());
+          final WriteOptions write = new WriteOptions(); final Slice ts = new Slice(timestamp);
+          final ReadOptions read = new ReadOptions().setTimestamp(ts)) {
+        db.put(write, second, timestamp, second);
+        db.put(write, first, timestamp, first);
+        final boolean forward = comparator == BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64_TS;
+        try (final RocksIterator iterator = db.newIterator(read)) {
+          iterator.seekToFirst();
+          assertThat(iterator.isValid()).isTrue();
+          assertThat(iterator.key()).isEqualTo(forward ? first : second);
+          iterator.next();
+          assertThat(iterator.isValid()).isTrue();
+          assertThat(iterator.key()).isEqualTo(forward ? second : first);
+          iterator.next();
+          assertThat(iterator.isValid()).isFalse();
+          iterator.status();
+        }
       }
     }
   }
