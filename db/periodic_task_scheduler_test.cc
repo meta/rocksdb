@@ -98,6 +98,8 @@ TEST_F(PeriodicTaskSchedulerTest, Basic) {
   ASSERT_EQ(3, dump_st_counter);
   ASSERT_EQ(3, pst_st_counter);
   ASSERT_EQ(3, flush_info_log_counter);
+  const int trigger_compaction_count_before_disable =
+      trigger_compaction_counter;
 
   // Disable scheduler with SetOption
   ASSERT_OK(dbfull()->SetDBOptions(
@@ -111,6 +113,8 @@ TEST_F(PeriodicTaskSchedulerTest, Basic) {
   ASSERT_EQ(3, dump_st_counter);
   ASSERT_EQ(3, pst_st_counter);
   ASSERT_EQ(4, flush_info_log_counter);
+  ASSERT_EQ(trigger_compaction_count_before_disable,
+            trigger_compaction_counter);
 
   ASSERT_EQ(2u, scheduler.TEST_GetValidTaskNum());
 
@@ -127,19 +131,16 @@ TEST_F(PeriodicTaskSchedulerTest, Basic) {
   ASSERT_EQ(3, pst_st_counter);
   ASSERT_EQ(5, flush_info_log_counter);
 
-  // With the new ComputeTriggerCompactionPeriod() logic, since
-  // stats_dump_period_sec = stats_persist_period_sec = kPeriodSec, the trigger
-  // compaction period is also kPeriodSec. Unlike other periodic tasks,
-  // kTriggerCompaction uses run_immediately=false, so it doesn't fire on
-  // initial registration. It fires after each period elapses.
-  // By now we've had: initial 9s + 10s + 10s + 10s + 10s = 49s elapsed.
-  // kTriggerCompaction fires at t=10, 20, 30, 40 = 4 times.
-  ASSERT_EQ(4, trigger_compaction_counter);
+  // Disabling the stats tasks also lengthens the compaction trigger period.
+  // Re-enabling the dump task shortens it again, starting a new schedule.
+  ASSERT_GT(trigger_compaction_counter,
+            trigger_compaction_count_before_disable);
+  const int trigger_compaction_count = trigger_compaction_counter;
 
-  // Sleep one more period and verify it increments
+  // Sleep one more period and verify the new schedule keeps running.
   dbfull()->TEST_WaitForPeriodicTaskRun(
       [&] { mock_clock_->MockSleepForSeconds(static_cast<int>(kPeriodSec)); });
-  ASSERT_EQ(5, trigger_compaction_counter);
+  ASSERT_GT(trigger_compaction_counter, trigger_compaction_count);
 
   Close();
 }
@@ -320,6 +321,98 @@ TEST_F(PeriodicTaskSchedulerTest, TriggerCompactionPeriodComputation) {
     options.max_compaction_trigger_wakeup_seconds = 3600;  // 1 hour
     test_period(options, 300);  // stats_dump wins (smaller)
   }
+}
+
+TEST_F(PeriodicTaskSchedulerTest, TriggerCompactionPeriodFollowsOptionChanges) {
+  Close();
+  uint64_t trigger_compaction_period = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "PeriodicTaskScheduler::Register:TaskRegistered", [&](void* arg) {
+        auto* task_info =
+            static_cast<std::pair<PeriodicTaskType, uint64_t>*>(arg);
+        if (task_info->first == PeriodicTaskType::kTriggerCompaction) {
+          trigger_compaction_period = task_info->second;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options;
+  options.create_if_missing = true;
+  options.env = mock_env_.get();
+  options.stats_dump_period_sec = 0;
+  options.stats_persist_period_sec = 0;
+  Reopen(options);
+  ASSERT_EQ(12 * 60 * 60, trigger_compaction_period);
+
+  ASSERT_OK(dbfull()->SetOptions({{"ttl", "100"}}));
+  ASSERT_EQ(20, trigger_compaction_period);
+  ASSERT_OK(dbfull()->SetOptions({{"ttl", "0"}}));
+  ASSERT_EQ(12 * 60 * 60, trigger_compaction_period);
+
+  ASSERT_OK(dbfull()->SetDBOptions(
+      {{"max_compaction_trigger_wakeup_seconds", "30"}}));
+  ASSERT_EQ(30, trigger_compaction_period);
+  ASSERT_OK(dbfull()->SetDBOptions({{"stats_dump_period_sec", "10"}}));
+  ASSERT_EQ(10, trigger_compaction_period);
+  ASSERT_OK(dbfull()->SetDBOptions({{"stats_dump_period_sec", "0"}}));
+  ASSERT_EQ(30, trigger_compaction_period);
+
+  ColumnFamilyOptions cf_options;
+  cf_options.ttl = 50;
+  ColumnFamilyHandle* cf_handle = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(cf_options, "ttl_cf", &cf_handle));
+  ASSERT_EQ(10, trigger_compaction_period);
+  ASSERT_OK(
+      db_->SetOptions(cf_handle, {{"periodic_compaction_seconds", "20"}}));
+  ASSERT_EQ(4, trigger_compaction_period);
+  ASSERT_OK(db_->SetOptions(cf_handle, {{"periodic_compaction_seconds", "0"}}));
+  ASSERT_EQ(10, trigger_compaction_period);
+  ASSERT_OK(db_->DropColumnFamily(cf_handle));
+  ASSERT_EQ(30, trigger_compaction_period);
+  delete cf_handle;
+  Close();
+}
+
+TEST_F(PeriodicTaskSchedulerTest, TriggerCompactionPeriodAfterPartialUpdate) {
+  Close();
+  uint64_t trigger_compaction_period = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "PeriodicTaskScheduler::Register:TaskRegistered", [&](void* arg) {
+        auto* task_info =
+            static_cast<std::pair<PeriodicTaskType, uint64_t>*>(arg);
+        if (task_info->first == PeriodicTaskType::kTriggerCompaction) {
+          trigger_compaction_period = task_info->second;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options;
+  options.create_if_missing = true;
+  options.env = mock_env_.get();
+  options.stats_dump_period_sec = 0;
+  options.stats_persist_period_sec = 0;
+  Reopen(options);
+  ASSERT_EQ(12 * 60 * 60, trigger_compaction_period);
+
+  ColumnFamilyHandle* cf_handle = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(options, "other_cf", &cf_handle));
+  std::unordered_map<ColumnFamilyHandle*,
+                     std::unordered_map<std::string, std::string>>
+      cf_options;
+  cf_options.emplace(db_->DefaultColumnFamily(),
+                     std::unordered_map<std::string, std::string>{});
+  cf_options.emplace(cf_handle, std::unordered_map<std::string, std::string>{});
+  // Assign by iteration order so the valid change is applied before the
+  // invalid one, regardless of how the handles hash on this platform.
+  auto it = cf_options.begin();
+  it->second = {{"ttl", "100"}};
+  (++it)->second = {{"unknown_option", "1"}};
+  ASSERT_NOK(db_->SetOptions(cf_options));
+  ASSERT_EQ(20, trigger_compaction_period);
+
+  ASSERT_OK(db_->DropColumnFamily(cf_handle));
+  delete cf_handle;
+  Close();
 }
 
 // Test that TriggerPeriodicCompaction() properly considers CFs for compaction
