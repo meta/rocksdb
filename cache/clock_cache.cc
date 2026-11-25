@@ -1534,7 +1534,7 @@ class LoadVarianceStats {
 template <class Table>
 void BaseHyperClockCache<Table>::ReportProblems(
     const std::shared_ptr<Logger>& info_log) const {
-  if (info_log->GetInfoLogLevel() <= InfoLogLevel::DEBUG_LEVEL) {
+  if (info_log && info_log->GetInfoLogLevel() <= InfoLogLevel::DEBUG_LEVEL) {
     LoadVarianceStats slot_stats;
     uint64_t eviction_effort_exceeded_count = 0;
     this->ForEachShard([&](const BaseHyperClockCache<Table>::Shard* shard) {
@@ -3568,7 +3568,7 @@ void AutoHyperClockCache::ReportProblems(
     const std::shared_ptr<Logger>& info_log) const {
   BaseHyperClockCache::ReportProblems(info_log);
 
-  if (info_log->GetInfoLogLevel() <= InfoLogLevel::DEBUG_LEVEL) {
+  if (info_log && info_log->GetInfoLogLevel() <= InfoLogLevel::DEBUG_LEVEL) {
     LoadVarianceStats head_stats;
     size_t entry_at_home_count = 0;
     uint64_t yield_count = 0;
