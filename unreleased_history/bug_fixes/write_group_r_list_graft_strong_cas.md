@@ -1,0 +1,1 @@
+Fixed a crash in `WriteThread::EnterAsBatchGroupLeader` on aarch64 builds without LSE atomics, where a spurious `compare_exchange_weak` failure while re-linking writers that could not join the write group walked past the end of the writer queue.

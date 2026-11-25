@@ -559,7 +559,8 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
     rb->link_older = we;
     re->link_newer = nullptr;
     we->link_newer = rb;
-    if (!newest_writer_.compare_exchange_weak(w, re)) {
+    // Strong: the walk below assumes a failure means newer writers arrived.
+    if (!newest_writer_.compare_exchange_strong(w, re)) {
       while (w->link_older != newest_writer) {
         w = w->link_older;
       }
