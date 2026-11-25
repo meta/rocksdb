@@ -373,7 +373,9 @@ enum Tickers : uint32_t {
   BLOB_DB_WRITE_BLOB_TTL,
   // # of bytes written to blob file.
   BLOB_DB_BLOB_FILE_BYTES_WRITTEN,
-  // # of bytes read from blob file.
+  // # of bytes read from blob files and embedded blobs. Requests of one batched
+  // read that overlap can share one file read, but each of them still counts
+  // its own bytes.
   BLOB_DB_BLOB_FILE_BYTES_READ,
   // # of times a blob files being synced.
   BLOB_DB_BLOB_FILE_SYNCED,
@@ -666,11 +668,14 @@ enum Tickers : uint32_t {
   // result (attributed via Env::IOActivity::kLazyResolve). Cache hits, which do
   // no storage read, are not counted.
   //
-  // Number of storage reads issued by lazy resolution (both whole-column and
-  // partial byte-range reads).
+  // Number of blob reads that lazy resolution resolved from storage (both
+  // whole-column and partial byte-range reads). Each read request counts once.
+  // Requests of one batch that overlap can share one file read, but each of
+  // them still counts, so this can be larger than the number of file reads.
   BLOB_DB_LAZY_READ_COUNT,
-  // Bytes actually read from storage by those reads (on-disk record bytes for
-  // whole-column reads; the requested sub-range length for partial reads).
+  // Bytes of those reads, counted per read request in the same way (on-disk
+  // record bytes for whole-column reads; the requested sub-range length for
+  // partial reads).
   BLOB_DB_LAZY_READ_BYTES,
   // Of the above, the number that were actual partial (byte-range) reads: only
   // a requested sub-range of an uncompressed blob's value was read (skipping

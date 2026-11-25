@@ -118,13 +118,23 @@ struct SimpleGen2RangeReadRequest {
 };
 
 // Batch counterpart of ReadAndVerifySimpleGen2BlobRecord: reads `num_records`
-// whole records from `file` in a single MultiRead, then per record verifies the
-// compression marker and (when read_options.verify_checksums) the
-// context-modified checksum, copying the record into reqs[i].buf. Per-record
-// outcome is written to *reqs[i].status; on success reqs[i].buf[0,
+// whole records from `file` into reqs[i].buf. The records form one batch. For
+// example, LazyWideColumnsBatch::MultiResolve groups its embedded reads by SST,
+// and the table reader of each SST makes one batch of whole records and one
+// batch of byte ranges (see ReadSimpleGen2BlobRanges). A batch is read with one
+// MultiRead call, which is made when preparing the I/O options succeeds.
+// FSRandomAccessFile::MultiRead requires requests that do not overlap, so:
+// - Requests that overlap, including exact duplicates (same offset and size),
+//   share one file read. Each of them gets the status of that read and, on
+//   success, a copy of its own bytes. Callers count read statistics per
+//   request, so a request that shares a read still counts as a read.
+// - Then each request that read OK is checked on its own: first its compression
+//   marker, then, when read_options.verify_checksums is set, its
+//   context-modified checksum.
+// Per-record outcome is written to *reqs[i].status; on success reqs[i].buf[0,
 // payload_size) holds the verified payload (the trailer sits unused at the
-// tail). Requests may be given in any order; they are sorted internally, as
-// RandomAccessFileReader::MultiRead requires ascending offsets.
+// tail). Requests may be given in any order. The comment above MultiReadGen2 in
+// blob_gen2_format.cc describes the merge, the buffers and the error rules.
 void ReadAndVerifySimpleGen2BlobRecords(const ReadOptions& read_options,
                                         RandomAccessFileReader* file,
                                         ChecksumType checksum_type,
@@ -133,11 +143,14 @@ void ReadAndVerifySimpleGen2BlobRecords(const ReadOptions& read_options,
                                         SimpleGen2RecordReadRequest* reqs);
 
 // Batch counterpart of ReadSimpleGen2BlobRange: reads the requested sub-range
-// of `num_records` *uncompressed* payloads from `file` in a single MultiRead
-// (no trailer read, no checksum). Per-record outcome is in *reqs[i].status; on
-// success reqs[i].buf[0, range_length) holds the requested bytes. Requests may
-// be given in any order; they are sorted internally, as
-// RandomAccessFileReader::MultiRead requires ascending offsets.
+// of `num_records` *uncompressed* payloads from `file`, with no trailer read
+// and no checksum check. The requests form one batch of byte ranges, as
+// described at ReadAndVerifySimpleGen2BlobRecords. A valid empty range gets OK
+// without I/O. The batch is read with one MultiRead call, which is made only
+// when at least one range needs bytes and preparing the I/O options succeeds.
+// Requests that overlap share one file read, and each gets a copy of its own
+// bytes. Per-record outcome is in *reqs[i].status; on success reqs[i].buf[0,
+// range_length) holds the requested bytes. Requests may be given in any order.
 void ReadSimpleGen2BlobRanges(const ReadOptions& read_options,
                               RandomAccessFileReader* file, size_t num_records,
                               SimpleGen2RangeReadRequest* reqs);

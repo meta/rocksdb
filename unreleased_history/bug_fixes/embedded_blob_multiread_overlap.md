@@ -1,0 +1,1 @@
+Fixed batched reads of embedded blobs (`SstFileWriter::OpenWithEmbeddedBlobs()`), for example from `LazyWideColumnsBatch::MultiResolve()`, which could have sent duplicate or partly overlapping byte ranges in one `FSRandomAccessFile::MultiRead()` call, against the `MultiRead()` contract.
