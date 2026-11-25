@@ -227,6 +227,12 @@ bool RandomAccessCacheFile::OpenImpl(const bool enable_direct_reads) {
 bool RandomAccessCacheFile::Read(const LBA& lba, Slice* key, Slice* val,
                                  char* scratch) {
   ReadLock _(&rwlock_);
+  return ReadNoLock(lba, key, val, scratch);
+}
+
+bool RandomAccessCacheFile::ReadNoLock(const LBA& lba, Slice* key, Slice* val,
+                                     char* scratch) {
+  rwlock_.AssertHeld();
 
   assert(lba.cache_id_ == cache_id_);
 
@@ -246,6 +252,7 @@ bool RandomAccessCacheFile::Read(const LBA& lba, Slice* key, Slice* val,
   assert(result.data() == scratch);
 
   return ParseRec(lba, key, val, scratch);
+
 }
 
 bool RandomAccessCacheFile::ParseRec(const LBA& lba, Slice* key, Slice* val,
