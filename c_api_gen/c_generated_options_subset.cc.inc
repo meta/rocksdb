@@ -64,25 +64,3 @@ rocksdb_options_get_bottommost_compression_options_use_zstd_dict_trainer(
     rocksdb_options_t* opt) {
   return opt->rep.bottommost_compression_opts.use_zstd_dict_trainer;
 }
-
-void rocksdb_options_set_use_fsync(rocksdb_options_t* opt, int use_fsync) {
-  opt->rep.use_fsync = use_fsync;
-}
-
-int rocksdb_options_get_use_fsync(rocksdb_options_t* opt) {
-  return opt->rep.use_fsync;
-}
-
-void rocksdb_options_set_disable_auto_compactions(rocksdb_options_t* opt,
-                                                  int disable) {
-  opt->rep.disable_auto_compactions = disable;
-}
-
-void rocksdb_options_set_optimize_filters_for_hits(rocksdb_options_t* opt,
-                                                   int v) {
-  opt->rep.optimize_filters_for_hits = v;
-}
-
-void rocksdb_options_set_report_bg_io_stats(rocksdb_options_t* opt, int v) {
-  opt->rep.report_bg_io_stats = v;
-}
