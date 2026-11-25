@@ -1,0 +1,1 @@
+RocksJava exposes the built-in forward and reverse bytewise comparators with unsigned 64-bit timestamps, along with timestamped `RocksDB.put` and `RocksDB.delete` overloads for the default and named column families. These writes can be read using `ReadOptions.setTimestamp()`.

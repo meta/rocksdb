@@ -138,7 +138,9 @@ public class BuiltinComparatorTest {
     assertThat(
         BuiltinComparator.REVERSE_BYTEWISE_COMPARATOR.ordinal())
         .isEqualTo(1);
-    assertThat(BuiltinComparator.values().length).isEqualTo(2);
+    assertThat(BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64_TS.ordinal()).isEqualTo(2);
+    assertThat(BuiltinComparator.REVERSE_BYTEWISE_COMPARATOR_WITH_U64_TS.ordinal()).isEqualTo(3);
+    assertThat(BuiltinComparator.values().length).isEqualTo(4);
     assertThat(BuiltinComparator.valueOf("BYTEWISE_COMPARATOR")).
         isEqualTo(BuiltinComparator.BYTEWISE_COMPARATOR);
   }

@@ -1149,6 +1149,38 @@ public class RocksDB extends RocksObject {
   }
 
   /**
+   * Writes a version in the default column family. Timestamps are opaque bytes
+   * interpreted by its comparator; U64 timestamps use eight little-endian bytes.
+   * Writes of the same key must have nondecreasing timestamps.
+   *
+   * @param writeOpts write policy
+   * @param key logical key without a timestamp suffix
+   * @param timestamp version timestamp
+   * @param value value copied by this call
+   * @throws RocksDBException if the native write fails, including invalid timestamps
+   */
+  public void put(final WriteOptions writeOpts, final byte[] key, final byte[] timestamp,
+      final byte[] value) throws RocksDBException {
+    put(0, writeOpts, key, timestamp, value);
+  }
+
+  /**
+   * Writes a timestamped version to the specified column family.
+   *
+   * @param columnFamilyHandle target column family, including the default handle
+   * @param writeOpts write policy
+   * @param key logical key
+   * @param timestamp bytes matching the comparator's format and length
+   * @param value value copied by this call
+   * @throws RocksDBException if the native write fails
+   * @see #put(WriteOptions, byte[], byte[], byte[])
+   */
+  public void put(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpts,
+      final byte[] key, final byte[] timestamp, final byte[] value) throws RocksDBException {
+    put(Objects.requireNonNull(columnFamilyHandle).nativeHandle_, writeOpts, key, timestamp, value);
+  }
+
+  /**
    * Delete the database entry (if any) for "key".  Returns OK on
    * success, and a non-OK status on error.  It is not an error if "key"
    * did not exist in the database.
@@ -1298,6 +1330,36 @@ public class RocksDB extends RocksObject {
       final int len)  throws RocksDBException {
     delete(nativeHandle_, writeOpt.nativeHandle_, key, offset, len,
         columnFamilyHandle.nativeHandle_);
+  }
+
+  /**
+   * Writes a timestamped deletion in the default column family. Older reads can
+   * still see versions preceding the deletion. Writes of the same key, including
+   * puts and deletes, must have nondecreasing timestamps.
+   *
+   * @param writeOpts write policy
+   * @param key logical key
+   * @param timestamp deletion timestamp
+   * @throws RocksDBException if the native deletion fails
+   */
+  public void delete(final WriteOptions writeOpts, final byte[] key, final byte[] timestamp)
+      throws RocksDBException {
+    delete(0, writeOpts, key, timestamp);
+  }
+
+  /**
+   * Writes a timestamped deletion to the specified column family. Writes of the
+   * same key, including puts and deletes, must have nondecreasing timestamps.
+   *
+   * @param columnFamilyHandle target column family
+   * @param writeOpts write policy
+   * @param key logical key
+   * @param timestamp bytes matching the comparator's format and length
+   * @throws RocksDBException if the native deletion fails
+   */
+  public void delete(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpts,
+      final byte[] key, final byte[] timestamp) throws RocksDBException {
+    delete(Objects.requireNonNull(columnFamilyHandle).nativeHandle_, writeOpts, key, timestamp);
   }
 
   /**
@@ -4910,6 +4972,23 @@ public class RocksDB extends RocksObject {
     }
   }
 
+  private void put(final long cfHandle, final WriteOptions writeOpts, final byte[] key,
+      final byte[] timestamp, final byte[] value) throws RocksDBException {
+    Objects.requireNonNull(writeOpts);
+    Objects.requireNonNull(key);
+    Objects.requireNonNull(timestamp);
+    Objects.requireNonNull(value);
+    putWithTimestamp(nativeHandle_, cfHandle, writeOpts.nativeHandle_, key, timestamp, value);
+  }
+
+  private void delete(final long cfHandle, final WriteOptions writeOpts, final byte[] key,
+      final byte[] timestamp) throws RocksDBException {
+    Objects.requireNonNull(writeOpts);
+    Objects.requireNonNull(key);
+    Objects.requireNonNull(timestamp);
+    deleteWithTimestamp(nativeHandle_, cfHandle, writeOpts.nativeHandle_, key, timestamp);
+  }
+
   // native methods
   private static native long open(final long optionsHandle, final String path)
       throws RocksDBException;
@@ -4992,6 +5071,9 @@ public class RocksDB extends RocksObject {
   private static native void put(final long handle, final long writeOptHandle, final byte[] key,
       final int keyOffset, final int keyLength, final byte[] value, final int valueOffset,
       final int valueLength, final long cfHandle) throws RocksDBException;
+  private static native void putWithTimestamp(final long handle, final long cfHandle,
+      final long writeOptHandle, final byte[] key, final byte[] timestamp, final byte[] value)
+      throws RocksDBException;
   private static native void delete(final long handle, final byte[] key, final int keyOffset,
       final int keyLength) throws RocksDBException;
   private static native void delete(final long handle, final byte[] key, final int keyOffset,
@@ -5000,6 +5082,8 @@ public class RocksDB extends RocksObject {
       final int keyOffset, final int keyLength) throws RocksDBException;
   private static native void delete(final long handle, final long writeOptHandle, final byte[] key,
       final int keyOffset, final int keyLength, final long cfHandle) throws RocksDBException;
+  private static native void deleteWithTimestamp(final long handle, final long cfHandle,
+      final long writeOptHandle, final byte[] key, final byte[] timestamp) throws RocksDBException;
   private static native void singleDelete(final long handle, final byte[] key, final int keyLen)
       throws RocksDBException;
   private static native void singleDelete(final long handle, final byte[] key, final int keyLen,

@@ -722,6 +722,37 @@ void Java_org_rocksdb_RocksDB_put__JJ_3BII_3BIIJ(
 
 /*
  * Class:     org_rocksdb_RocksDB
+ * Method:    putWithTimestamp
+ * Signature: (JJJ[B[B[B)V
+ */
+void Java_org_rocksdb_RocksDB_putWithTimestamp(
+    JNIEnv* env, jclass, jlong jdb_handle, jlong jcf_handle,
+    jlong jwrite_options_handle, jbyteArray jkey, jbyteArray jtimestamp,
+    jbyteArray jval) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto* cf = jcf_handle == 0
+                 ? db->DefaultColumnFamily()
+                 : reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(
+                       jcf_handle);
+  auto* write_options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::WriteOptions*>(jwrite_options_handle);
+  try {
+    ROCKSDB_NAMESPACE::JByteArraySlice key(env, jkey, 0,
+                                           env->GetArrayLength(jkey));
+    ROCKSDB_NAMESPACE::JByteArraySlice ts(env, jtimestamp, 0,
+                                          env->GetArrayLength(jtimestamp));
+    ROCKSDB_NAMESPACE::JByteArraySlice value(env, jval, 0,
+                                             env->GetArrayLength(jval));
+    ROCKSDB_NAMESPACE::KVException::ThrowOnError(
+        env,
+        db->Put(*write_options, cf, key.slice(), ts.slice(), value.slice()));
+  } catch (ROCKSDB_NAMESPACE::KVException&) {
+    return;
+  }
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
  * Method:    putDirect
  * Signature: (JJLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;IIJ)V
  */
@@ -788,6 +819,33 @@ bool rocksdb_delete_helper(JNIEnv* env, ROCKSDB_NAMESPACE::DB* db,
 
   ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
   return false;
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
+ * Method:    deleteWithTimestamp
+ * Signature: (JJJ[B[B)V
+ */
+void Java_org_rocksdb_RocksDB_deleteWithTimestamp(
+    JNIEnv* env, jclass, jlong jdb_handle, jlong jcf_handle,
+    jlong jwrite_options_handle, jbyteArray jkey, jbyteArray jtimestamp) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto* cf = jcf_handle == 0
+                 ? db->DefaultColumnFamily()
+                 : reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(
+                       jcf_handle);
+  auto* write_options =
+      reinterpret_cast<ROCKSDB_NAMESPACE::WriteOptions*>(jwrite_options_handle);
+  try {
+    ROCKSDB_NAMESPACE::JByteArraySlice key(env, jkey, 0,
+                                           env->GetArrayLength(jkey));
+    ROCKSDB_NAMESPACE::JByteArraySlice ts(env, jtimestamp, 0,
+                                          env->GetArrayLength(jtimestamp));
+    ROCKSDB_NAMESPACE::KVException::ThrowOnError(
+        env, db->Delete(*write_options, cf, key.slice(), ts.slice()));
+  } catch (ROCKSDB_NAMESPACE::KVException&) {
+    return;
+  }
 }
 
 /*

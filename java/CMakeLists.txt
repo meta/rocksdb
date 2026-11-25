@@ -400,6 +400,7 @@ set(JAVA_TEST_CLASSES
   src/test/java/org/rocksdb/StatsCallbackMock.java
   src/test/java/org/rocksdb/TableFilterTest.java
   src/test/java/org/rocksdb/TimedEnvTest.java
+  src/test/java/org/rocksdb/TimestampedWriteTest.java
   src/test/java/org/rocksdb/TransactionDBOptionsTest.java
   src/test/java/org/rocksdb/TransactionDBTest.java
   src/test/java/org/rocksdb/TransactionOptionsTest.java
@@ -518,6 +519,7 @@ set(JAVA_TEST_RUNNING_CLASSES
   org.rocksdb.StatisticsTest
   org.rocksdb.TableFilterTest
   org.rocksdb.TimedEnvTest
+  org.rocksdb.TimestampedWriteTest
   org.rocksdb.TransactionDBOptionsTest
   org.rocksdb.TransactionDBTest
   org.rocksdb.TransactionOptionsTest
