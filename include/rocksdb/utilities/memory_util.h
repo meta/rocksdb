@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -13,6 +14,8 @@
 
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 

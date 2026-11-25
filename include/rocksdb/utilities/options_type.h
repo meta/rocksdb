@@ -14,12 +14,21 @@
 
 #pragma once
 
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "rocksdb/convenience.h"
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {

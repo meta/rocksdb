@@ -5,16 +5,27 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstdint>
+#include <memory>
 #include <set>
+#include <string>
+#include <vector>
 
+#include "rocksdb/advanced_cache.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/secondary_cache.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/table.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class DB;
 
 // The classes and functions in this header file is used for dumping out the
 // blocks in a block cache, storing or transfering the blocks to another

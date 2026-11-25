@@ -9,11 +9,13 @@
 
 #pragma once
 
+#include <cassert>
 #include <climits>
 #include <cstdint>
 #include <forward_list>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,6 +24,7 @@
 #include "rocksdb/io_status.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 #include "rocksdb/utilities/checkpoint.h"
 
