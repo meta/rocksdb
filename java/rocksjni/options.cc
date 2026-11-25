@@ -1752,6 +1752,7 @@ static void rocksdb_set_event_listeners_helper(
             ptr_jlistener_array[i]);
     listener_sptr_vec.push_back(listener_sptr);
   }
+  env->ReleaseLongArrayElements(jlistener_array, ptr_jlistener_array, JNI_ABORT);
 }
 
 /*
