@@ -10,6 +10,7 @@ package org.rocksdb;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.DELETE;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.DELETE_RANGE;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.LOG;
@@ -19,6 +20,7 @@ import static org.rocksdb.util.CapturingWriteBatchHandler.Action.SINGLE_DELETE;
 
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
@@ -346,6 +348,39 @@ public class WriteBatchTest {
 
       batch.put("k1".getBytes(), "v1".getBytes());
     }
+  }
+
+  @Test
+  public void putAndDeleteDirect_overMaxBytes() throws RocksDBException {
+    try (final Options options = new Options().setCreateIfMissing(true);
+        final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath());
+        final ColumnFamilyHandle newCf =
+            db.createColumnFamily(new ColumnFamilyDescriptor("new_cf".getBytes(UTF_8)));
+        final WriteBatch batch = new WriteBatch()) {
+      batch.setMaxBytes(1);
+
+      assertMemoryLimit(() -> batch.put(directBuffer("k1"), directBuffer("v1")));
+      assertMemoryLimit(() -> batch.put(newCf, directBuffer("k1"), directBuffer("v1")));
+      assertMemoryLimit(() -> batch.delete(directBuffer("k1")));
+      assertMemoryLimit(() -> batch.delete(newCf, directBuffer("k1")));
+
+      // the rejected writes must not have been added to the batch
+      assertThat(batch.count()).isZero();
+    }
+  }
+
+  private static ByteBuffer directBuffer(final String s) {
+    final byte[] bytes = s.getBytes(UTF_8);
+    final ByteBuffer buffer = ByteBuffer.allocateDirect(bytes.length);
+    buffer.put(bytes).flip();
+    return buffer;
+  }
+
+  private static void assertMemoryLimit(final ThrowingCallable writeOp) {
+    final Throwable thrown = catchThrowable(writeOp);
+    assertThat(thrown).isInstanceOf(RocksDBException.class);
+    assertThat(((RocksDBException) thrown).getStatus().getSubCode())
+        .isEqualTo(Status.SubCode.MemoryLimit);
   }
 
   @Test

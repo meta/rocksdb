@@ -212,12 +212,16 @@ void Java_org_rocksdb_WriteBatch_putDirectJni(JNIEnv* env, jclass /*jobj*/,
   assert(wb != nullptr);
   auto* cf_handle =
       reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(jcf_handle);
-  auto put = [&wb, &cf_handle](ROCKSDB_NAMESPACE::Slice& key,
-                               ROCKSDB_NAMESPACE::Slice& value) {
+  auto put = [&env, &wb, &cf_handle](ROCKSDB_NAMESPACE::Slice& key,
+                                     ROCKSDB_NAMESPACE::Slice& value) {
+    ROCKSDB_NAMESPACE::Status s;
     if (cf_handle == nullptr) {
-      wb->Put(key, value);
+      s = wb->Put(key, value);
     } else {
-      wb->Put(cf_handle, key, value);
+      s = wb->Put(cf_handle, key, value);
+    }
+    if (!s.ok()) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
     }
   };
   ROCKSDB_NAMESPACE::JniUtil::kv_op_direct(
@@ -375,11 +379,15 @@ void Java_org_rocksdb_WriteBatch_deleteDirectJni(JNIEnv* env, jclass /*jobj*/,
   assert(wb != nullptr);
   auto* cf_handle =
       reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(jcf_handle);
-  auto remove = [&wb, &cf_handle](ROCKSDB_NAMESPACE::Slice& key) {
+  auto remove = [&env, &wb, &cf_handle](ROCKSDB_NAMESPACE::Slice& key) {
+    ROCKSDB_NAMESPACE::Status s;
     if (cf_handle == nullptr) {
-      wb->Delete(key);
+      s = wb->Delete(key);
     } else {
-      wb->Delete(cf_handle, key);
+      s = wb->Delete(cf_handle, key);
+    }
+    if (!s.ok()) {
+      ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
     }
   };
   ROCKSDB_NAMESPACE::JniUtil::k_op_direct(remove, env, jkey, jkey_offset,
