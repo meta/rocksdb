@@ -987,6 +987,45 @@ TEST(LineFileReaderTest, LineFileReaderTest) {
   }
 }
 
+TEST(LineFileReaderTest, FinalLineWithoutTrailingNewline) {
+  const std::vector<std::string> inputs = {
+      "abc", "a\nb", "a\n", "", std::string(8192, 'x'),
+      std::string(16384, 'x'), std::string(8193, 'x')};
+
+  std::unique_ptr<Env> mem_env(MockEnv::Create(Env::Default()));
+  std::shared_ptr<FileSystem> fs = mem_env->GetFileSystem();
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const std::string& input = inputs[i];
+    const std::string filename = "line_file_reader_test_" + std::to_string(i);
+    {
+      std::unique_ptr<FSWritableFile> file;
+      ASSERT_OK(fs->NewWritableFile(filename, FileOptions(), &file,
+                                     /*dbg*/ nullptr));
+      ASSERT_OK(file->Append(input, IOOptions(), /*dbg*/ nullptr));
+    }
+
+    std::unique_ptr<LineFileReader> reader;
+    ASSERT_OK(LineFileReader::Create(fs, filename, FileOptions(), &reader,
+                                     nullptr /* dbg */,
+                                     nullptr /* rate_limiter */));
+    std::string line;
+    if (input.empty()) {
+      ASSERT_FALSE(reader->ReadLine(&line, Env::IO_TOTAL));
+      ASSERT_TRUE(line.empty());
+    } else {
+      ASSERT_TRUE(reader->ReadLine(&line, Env::IO_TOTAL));
+      const size_t delimiter = input.find('\n');
+      ASSERT_EQ(line, input.substr(0, delimiter));
+      if (delimiter != std::string::npos && delimiter + 1 < input.size()) {
+        ASSERT_TRUE(reader->ReadLine(&line, Env::IO_TOTAL));
+        ASSERT_EQ(line, input.substr(delimiter + 1));
+      }
+      ASSERT_FALSE(reader->ReadLine(&line, Env::IO_TOTAL));
+    }
+    ASSERT_OK(reader->GetStatus());
+  }
+}
+
 class IOErrorEventListener : public EventListener {
  public:
   IOErrorEventListener() { notify_error_.store(0); }
