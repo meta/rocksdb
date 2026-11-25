@@ -55,6 +55,195 @@
       "c_type": "size_t",
       "field_cxx_type": "uint64_t",
       "reason": "Shipped as `size_t block_size`; the field is uint64_t but the C parameter type must stay `size_t` for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_compactoptions_get_bottommost_level_compaction",
+      "role": "getter",
+      "c_type": "unsigned char",
+      "field_cxx_type": "BottommostLevelCompaction",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_compactoptions_get_max_subcompactions",
+      "role": "getter",
+      "c_type": "int",
+      "field_cxx_type": "uint32_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_compactoptions_get_target_path_id",
+      "role": "getter",
+      "c_type": "int",
+      "field_cxx_type": "uint32_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_compactoptions_set_bottommost_level_compaction",
+      "role": "setter",
+      "c_type": "unsigned char",
+      "field_cxx_type": "BottommostLevelCompaction",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_compactoptions_set_max_subcompactions",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "uint32_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_compactoptions_set_target_path_id",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "uint32_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_get_hard_pending_compaction_bytes_limit",
+      "role": "getter",
+      "c_type": "size_t",
+      "field_cxx_type": "uint64_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_get_max_manifest_file_size",
+      "role": "getter",
+      "c_type": "size_t",
+      "field_cxx_type": "uint64_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_get_soft_pending_compaction_bytes_limit",
+      "role": "getter",
+      "c_type": "size_t",
+      "field_cxx_type": "uint64_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_get_use_fsync",
+      "role": "getter",
+      "c_type": "int",
+      "field_cxx_type": "bool",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_get_writable_file_max_buffer_size",
+      "role": "getter",
+      "c_type": "uint64_t",
+      "field_cxx_type": "size_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_set_disable_auto_compactions",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "bool",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_set_hard_pending_compaction_bytes_limit",
+      "role": "setter",
+      "c_type": "size_t",
+      "field_cxx_type": "uint64_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_set_max_manifest_file_size",
+      "role": "setter",
+      "c_type": "size_t",
+      "field_cxx_type": "uint64_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_set_optimize_filters_for_hits",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "bool",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_set_report_bg_io_stats",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "bool",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_set_soft_pending_compaction_bytes_limit",
+      "role": "setter",
+      "c_type": "size_t",
+      "field_cxx_type": "uint64_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_set_use_fsync",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "bool",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_options_set_writable_file_max_buffer_size",
+      "role": "setter",
+      "c_type": "uint64_t",
+      "field_cxx_type": "size_t",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_universal_compaction_options_get_max_merge_width",
+      "role": "getter",
+      "c_type": "int",
+      "field_cxx_type": "unsigned int",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_universal_compaction_options_get_max_size_amplification_percent",
+      "role": "getter",
+      "c_type": "int",
+      "field_cxx_type": "unsigned int",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_universal_compaction_options_get_min_merge_width",
+      "role": "getter",
+      "c_type": "int",
+      "field_cxx_type": "unsigned int",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_universal_compaction_options_get_size_ratio",
+      "role": "getter",
+      "c_type": "int",
+      "field_cxx_type": "unsigned int",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_universal_compaction_options_set_max_merge_width",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "unsigned int",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_universal_compaction_options_set_max_size_amplification_percent",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "unsigned int",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_universal_compaction_options_set_min_merge_width",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "unsigned int",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
+    },
+    {
+      "function": "rocksdb_universal_compaction_options_set_size_ratio",
+      "role": "setter",
+      "c_type": "int",
+      "field_cxx_type": "unsigned int",
+      "reason": "Shipped hand-written with this C type before the field was generated; pinned for ABI compatibility."
     }
   ]
 }

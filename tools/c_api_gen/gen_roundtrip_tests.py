@@ -19,7 +19,9 @@ the getter returns it, and destroys the object.
 Because the generated setters/getters are direct field assignments, a sentinel
 round-trips reliably:
   - string getters (``const char*`` + ``size_t*``) -> set "test", compare bytes
-  - everything else -> set 1 then 0 and assert the getter returns each.
+  - malloc()ed string getters (``char*``) -> set "test", strcmp, free
+  - scalars -> set 1 then 0 and assert the getter returns each.
+Pairs of any other shape (a pointer or handle on either side) are left out.
 
 1 and 0 are used (rather than a larger sentinel) because a bool field whose C
 getter has the legacy ``int`` shape -- indistinguishable from a real scalar by
@@ -49,7 +51,16 @@ DECL_RE = re.compile(
 
 
 class Pair:
-    __slots__ = ("prefix", "field", "receiver", "getter", "setter", "ret", "is_string")
+    __slots__ = (
+        "prefix",
+        "field",
+        "receiver",
+        "getter",
+        "setter",
+        "ret",
+        "value_type",
+        "is_string",
+    )
 
     def __init__(self, prefix: str, field: str, receiver: str) -> None:
         self.prefix = prefix
@@ -58,7 +69,19 @@ class Pair:
         self.getter: str | None = None
         self.setter: str | None = None
         self.ret: str | None = None
+        self.value_type: str | None = None
         self.is_string = False
+
+    def kind(self) -> str | None:
+        """How the pair round-trips: "string", "strdup", "scalar", or None
+        when a sentinel value cannot express it."""
+        if self.is_string:
+            return "string"
+        if self.ret == "char*" and self.value_type == "const char*":
+            return "strdup"
+        if "*" in (self.ret or "") or "*" in (self.value_type or ""):
+            return None
+        return "scalar"
 
 
 def _params(param_str: str) -> list[str]:
@@ -80,9 +103,14 @@ def _split_role(name: str) -> tuple[str, str, str] | None:
 
 
 def collect_pairs() -> list[Pair]:
+    return pairs_from_texts(
+        inc.read_text() for inc in sorted(GENERATED_ROOT.glob("*.h.inc"))
+    )
+
+
+def pairs_from_texts(texts) -> list[Pair]:
     pairs: dict[tuple[str, str], Pair] = {}
-    for inc in sorted(GENERATED_ROOT.glob("*.h.inc")):
-        text = inc.read_text()
+    for text in texts:
         for m in DECL_RE.finditer(text):
             ret = " ".join(m.group(1).split())
             name = m.group(2)
@@ -101,6 +129,7 @@ def collect_pairs() -> list[Pair]:
                 # Only simple scalar/string setters: (receiver, value).
                 if len(params) == 2:
                     pair.setter = name
+                    pair.value_type = _first_param_type(params[1])
             else:  # get
                 if len(params) == 1 and ret != "void":
                     pair.getter = name
@@ -109,7 +138,7 @@ def collect_pairs() -> list[Pair]:
                     pair.getter = name
                     pair.ret = ret
                     pair.is_string = True
-    return [p for p in pairs.values() if p.getter and p.setter]
+    return [p for p in pairs.values() if p.getter and p.setter and p.kind()]
 
 
 def parameterless_creators(header_text: str) -> set[str]:
@@ -161,37 +190,9 @@ def emit() -> str:
 
     test_fns: list[str] = []
     for prefix in sorted(by_prefix):
-        pairs = sorted(by_prefix[prefix], key=lambda p: p.field)
-        receiver = pairs[0].receiver
         fn = f"rocksdb_roundtrip_test_{prefix}"
         test_fns.append(fn)
-        lines.append(f"static void {fn}(void) {{")
-        lines.append(f"  {receiver} obj = {prefix}_create();")
-        for pair in pairs:
-            if pair.is_string:
-                lines.append(f'  {pair.setter}(obj, "test");')
-                lines.append("  {")
-                lines.append("    size_t rt_len = 0;")
-                lines.append(f"    const char* rt_v = {pair.getter}(obj, &rt_len);")
-                lines.append(
-                    "    CheckCondition(rt_len == 4 && rt_v != NULL && "
-                    'memcmp(rt_v, "test", 4) == 0);'
-                )
-                lines.append("  }")
-            else:
-                # Use 1 and 0 (both directions). These round-trip through any
-                # numeric/enum field AND through bool fields -- a larger value
-                # would be collapsed to 1 by a bool field whose C getter is the
-                # legacy `int` shape (e.g. rocksdb_options_get_use_fsync), so we
-                # cannot tell bool from a plain scalar by the C signature alone.
-                for value in ("1", "0"):
-                    lines.append(f"  {pair.setter}(obj, {value});")
-                    lines.append(
-                        f"  CheckCondition({pair.getter}(obj) == {value});"
-                    )
-        lines.append(f"  {prefix}_destroy(obj);")
-        lines.append("}")
-        lines.append("")
+        lines += emit_test(fn, prefix, by_prefix[prefix])
 
     lines.append("static void rocksdb_run_generated_roundtrip_tests(void) {")
     for fn in test_fns:
@@ -199,6 +200,46 @@ def emit() -> str:
     lines.append("}")
     lines.append("")
     return "\n".join(lines)
+
+
+def emit_test(fn: str, prefix: str, pairs: list[Pair]) -> list[str]:
+    pairs = sorted(pairs, key=lambda p: p.field)
+    receiver = pairs[0].receiver
+    lines = [f"static void {fn}(void) {{", f"  {receiver} obj = {prefix}_create();"]
+    for pair in pairs:
+        kind = pair.kind()
+        if kind == "string":
+            lines.append(f'  {pair.setter}(obj, "test");')
+            lines.append("  {")
+            lines.append("    size_t rt_len = 0;")
+            lines.append(f"    const char* rt_v = {pair.getter}(obj, &rt_len);")
+            lines.append(
+                "    CheckCondition(rt_len == 4 && rt_v != NULL && "
+                'memcmp(rt_v, "test", 4) == 0);'
+            )
+            lines.append("  }")
+        elif kind == "strdup":
+            lines.append(f'  {pair.setter}(obj, "test");')
+            lines.append("  {")
+            lines.append(f"    char* rt_v = {pair.getter}(obj);")
+            lines.append(
+                '    CheckCondition(rt_v != NULL && strcmp(rt_v, "test") == 0);'
+            )
+            lines.append("    rocksdb_free(rt_v);")
+            lines.append("  }")
+        else:
+            # Use 1 and 0 (both directions). These round-trip through any
+            # numeric/enum field AND through bool fields -- a larger value
+            # would be collapsed to 1 by a bool field whose C getter is the
+            # legacy `int` shape (e.g. rocksdb_options_get_use_fsync), so we
+            # cannot tell bool from a plain scalar by the C signature alone.
+            for value in ("1", "0"):
+                lines.append(f"  {pair.setter}(obj, {value});")
+                lines.append(f"  CheckCondition({pair.getter}(obj) == {value});")
+    lines.append(f"  {prefix}_destroy(obj);")
+    lines.append("}")
+    lines.append("")
+    return lines
 
 
 def main() -> int:
