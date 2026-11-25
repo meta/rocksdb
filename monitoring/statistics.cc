@@ -349,6 +349,7 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
      "rocksdb.remote.compact.blob.result.declined.count"},
     {BLOB_DB_DROPPED_BLOB_READ_COUNT, "rocksdb.blobdb.dropped.blob.read.count"},
+    {WAL_ITERATOR_TAIL_ROTATIONS, "rocksdb.wal.iterator.tail.rotations"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

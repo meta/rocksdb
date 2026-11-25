@@ -260,6 +260,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.wal_compression = immutable_db_options.wal_compression;
   options.background_close_inactive_wals =
       immutable_db_options.background_close_inactive_wals;
+  options.wal_iterator_tail_rotations =
+      immutable_db_options.wal_iterator_tail_rotations;
   options.atomic_flush = immutable_db_options.atomic_flush;
   options.avoid_unnecessary_blocking_io =
       immutable_db_options.avoid_unnecessary_blocking_io;

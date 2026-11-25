@@ -691,6 +691,10 @@ enum Tickers : uint32_t {
   // hide. An iterator can count an entry again when it moves back to it.
   BLOB_DB_DROPPED_BLOB_READ_COUNT,
 
+  // WAL rotations crossed beyond an iterator's initial file snapshot before
+  // delivering another contiguous batch.
+  WAL_ITERATOR_TAIL_ROTATIONS,
+
   TICKER_ENUM_MAX
 };
 

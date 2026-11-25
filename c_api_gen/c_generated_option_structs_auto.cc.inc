@@ -713,6 +713,16 @@ unsigned char rocksdb_options_get_background_close_inactive_wals(
   return opt->rep.background_close_inactive_wals;
 }
 
+void rocksdb_options_set_wal_iterator_tail_rotations(rocksdb_options_t* opt,
+                                                     unsigned char v) {
+  opt->rep.wal_iterator_tail_rotations = v;
+}
+
+unsigned char rocksdb_options_get_wal_iterator_tail_rotations(
+    rocksdb_options_t* opt) {
+  return opt->rep.wal_iterator_tail_rotations;
+}
+
 void rocksdb_options_set_atomic_flush(rocksdb_options_t* opt, unsigned char v) {
   opt->rep.atomic_flush = v;
 }
