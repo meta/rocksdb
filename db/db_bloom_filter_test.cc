@@ -3854,13 +3854,11 @@ TEST_F(DBBloomFilterLevelSeekTest, AutoPrefixModeFilteredSeekReadsNoIndex) {
   EXPECT_EQ(SeeksFiltered(), 1);
 }
 
-// A filtered seek leaves an empty stand-in as the level's file iterator, and
-// the file's boundary sentinel in the merging iterator's heap. When no other
-// key sorts before the sentinel, the merging iterator skips it within the same
-// seek, which moves the level iterator off the file and drops the stand-in.
-// Here memtable keys sort before the sentinels, so the next positioning call
-// into the file finds the stand-in and builds the file's iterator from the
-// stand-in's table reader.
+// A filtered seek leaves an empty stand-in as the level's file iterator, so
+// the next positioning call into the file finds the stand-in and builds the
+// file's iterator from the stand-in's table reader. The memtable keys p003:m
+// and p011:m also provide valid positions for testing Prev() back into a
+// filtered file.
 TEST_F(DBBloomFilterLevelSeekTest, PositioningIntoFileOfFilteredSeek) {
   ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
   ASSERT_OK(Put("p003:m", "v"));
@@ -3962,6 +3960,127 @@ TEST_F(DBBloomFilterLevelSeekTest, PositioningIntoFileOfFilteredSeek) {
     EXPECT_EQ(iter->key(), "p010:a");
     EXPECT_EQ(retries_.load(), 6);
   }
+}
+
+// The level iterator keeps the stand-in when a filtered seek leaves no file to
+// move on to, here because the file is the last one, even when no other key
+// keeps the merging iterator from moving past the file.
+TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekInLastFileKeepsStandIn) {
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  CountRetriesOfFilteredFiles();
+  ReadOptions read_options;
+  read_options.prefix_same_as_start = true;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p011");
+  ASSERT_OK(iter->status());
+  ASSERT_FALSE(iter->Valid());
+  iter->Seek("p012");
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "p012:a");
+  EXPECT_EQ(retries_.load(), 1);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// A file iterator whose filter rules out a seek once the iterator is built
+// stays at the file too, so the next seek into the file reuses it -- both in
+// non-last files, in the last file of a level, and in a single-file level.
+TEST_F(DBBloomFilterLevelSeekTest, ReseekAfterPrefixRunsOutReusesFileIterator) {
+  std::atomic<int> dropped{0};
+  auto count_drops = [&]() {
+    dropped = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "LevelIterator::SetFileIterator:DeleteIterator", [&](void* old_iter) {
+          if (old_iter != nullptr) {
+            dropped++;
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  };
+  auto check_reseek = [&](const char* hit1, const char* miss, const char* hit2,
+                          const char* expected1, const char* expected2) {
+    dropped = 0;
+    ReadOptions read_options;
+    read_options.prefix_same_as_start = true;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    iter->Seek(hit1);
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), expected1);
+    const uint64_t seeks_filtered = SeeksFiltered();
+    iter->Seek(miss);
+    ASSERT_OK(iter->status());
+    ASSERT_FALSE(iter->Valid());
+    EXPECT_EQ(SeeksFiltered(), seeks_filtered + 1);
+    iter->Seek(hit2);
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    EXPECT_EQ(iter->key(), expected2);
+    EXPECT_EQ(dropped.load(), 0);
+  };
+
+  // Non-last and last file of a two-file level.
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  count_drops();
+  check_reseek("p002", "p001", "p004", "p002:a", "p004:a");
+  check_reseek("p010", "p011", "p012", "p010:a", "p012:a");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Single-file level.
+  DestroyAndReopen(options_);
+  for (const char* key : {"p000:a", "p002:a", "p004:a"}) {
+    ASSERT_OK(Put(key, "v"));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_EQ("0,1", FilesPerLevel());
+  count_drops();
+  check_reseek("p002", "p001", "p004", "p002:a", "p004:a");
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// With auto_prefix_mode, a built file iterator whose prefix filter rules out
+// a bounded seek also stays at the file for reuse, matching stand-ins.
+TEST_F(DBBloomFilterLevelSeekTest,
+       AutoPrefixModeReseekAfterFilterMissReusesFileIterator) {
+  ASSERT_NO_FATAL_FAILURE(OpenWithTwoFileLevel());
+  std::atomic<int> dropped{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "LevelIterator::SetFileIterator:DeleteIterator", [&](void* old_iter) {
+        if (old_iter != nullptr) {
+          dropped++;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Slice upper_bound("p005");
+  ReadOptions read_options;
+  read_options.total_order_seek = true;
+  read_options.auto_prefix_mode = true;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->Seek("p002");
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "p002:a");
+
+  const uint64_t seeks_filtered = SeeksFiltered();
+  upper_bound = "p002";
+  iter->Seek("p001");
+  ASSERT_OK(iter->status());
+  ASSERT_FALSE(iter->Valid());
+  EXPECT_EQ(SeeksFiltered(), seeks_filtered + 1);
+
+  upper_bound = "p005";
+  iter->Seek("p004");
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  EXPECT_EQ(iter->key(), "p004:a");
+  EXPECT_EQ(dropped.load(), 0);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 // The stand-in for a file whose table reader is not pinned holds the file's
@@ -4079,10 +4198,8 @@ TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekStandInsAreNotPinned) {
     read_options.prefix_same_as_start = true;
     read_options.pin_data = true;
     std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
-    // Each seek is ruled out by the filter of the file it lands in. With the
-    // memtable empty, the merging iterator then skips that file's boundary
-    // sentinel within the same seek, which moves the level iterator off the
-    // file and drops the stand-in.
+    // Each seek is ruled out by the filter of the file it lands in, and drops
+    // the stand-in that the seek before it left in the other file.
     constexpr int kSeeks = 100;
     for (int i = 0; i < kSeeks; i++) {
       iter->Seek(i % 2 == 0 ? "p001" : "p011");
@@ -4091,10 +4208,10 @@ TEST_F(DBBloomFilterLevelSeekTest, FilteredSeekStandInsAreNotPinned) {
     }
     EXPECT_EQ(SeeksFiltered() - seeks_filtered, kSeeks);
     EXPECT_EQ(pinned.load(), 0);
-    EXPECT_EQ(dropped.load(), kSeeks);
+    EXPECT_EQ(dropped.load(), kSeeks - 1);
     // Only with a finite max_open_files do the stand-ins hold a handle.
     EXPECT_EQ(dropped_with_cleanups.load(),
-              mode == Mode::kTableCacheHandles ? kSeeks : 0);
+              mode == Mode::kTableCacheHandles ? kSeeks - 1 : 0);
   }
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();

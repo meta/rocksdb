@@ -1,0 +1,1 @@
+Reduce CPU overhead of forward prefix seeks and bounded scans by skipping unnecessary internal file-boundary sentinels when a file has no range tombstones and no next file is reachable, and by retaining the file iterator or filter stand-in across consecutive prefix seeks into the same file.
