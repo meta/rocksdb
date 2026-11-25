@@ -5,6 +5,7 @@
 
 #include "db/wide/wide_column_serialization.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 
@@ -291,10 +292,16 @@ Status WideColumnSerialization::SerializeV2(
 
 Status WideColumnSerialization::DeserializeV1(
     Slice& input, uint32_t num_columns, std::vector<WideColumn>& columns) {
-  columns.reserve(num_columns);
+  // num_columns comes from the entity, so a corrupt entity can claim far more
+  // columns than it holds. Each V1 column takes at least 2 bytes (a name length
+  // and a value size), so the input cannot hold more than input.size() / 2
+  // columns. Reserve no more than that, so that a bogus count does not make
+  // the decoder allocate memory for it.
+  const size_t max_columns = std::min<size_t>(num_columns, input.size() / 2);
+  columns.reserve(max_columns);
 
   autovector<uint32_t, 16> column_value_sizes;
-  column_value_sizes.reserve(num_columns);
+  column_value_sizes.reserve(max_columns);
 
   for (uint32_t i = 0; i < num_columns; ++i) {
     Slice name;
@@ -325,7 +332,11 @@ Status WideColumnSerialization::DeserializeV1(
   for (uint32_t i = 0; i < num_columns; ++i) {
     const uint32_t value_size = column_value_sizes[i];
 
-    if (pos + value_size > data.size()) {
+    // pos only grows by value sizes that passed this check, so pos <=
+    // data.size(), and the subtraction cannot underflow. Comparing value_size
+    // with the remaining size cannot wrap, also on a 32-bit platform.
+    assert(pos <= data.size());
+    if (value_size > data.size() - pos) {
       return Status::Corruption("Error decoding wide column value payload");
     }
 
@@ -375,9 +386,11 @@ Status WideColumnSerialization::DeserializeV2Impl(
   }
   input.remove_prefix(num_columns);
 
-  // Validate that sections 4-6 fit in the remaining input
-  const size_t metadata_size =
-      name_sizes_bytes + value_sizes_bytes + names_bytes;
+  // Validate that sections 4-6 fit in the remaining input. Add the three
+  // uint32 sizes in uint64_t: a corrupt entity can hold sizes whose 32-bit sum
+  // wraps to a small number and passes this check.
+  const uint64_t metadata_size =
+      uint64_t{name_sizes_bytes} + value_sizes_bytes + names_bytes;
   if (input.size() < metadata_size) {
     return Status::Corruption("Error decoding wide column sections");
   }
@@ -390,7 +403,11 @@ Status WideColumnSerialization::DeserializeV2Impl(
   const char* s5_limit = s5 + value_sizes_bytes;
   const char* s6 = s5_limit;          // section 6: names
   const char* s7 = s6 + names_bytes;  // section 7: values
-  const char* input_end = input.data() + input.size();
+  // Bounds checks below compare sizes, not pointers, so that a corrupt size
+  // never forms a pointer past the end of the input. The section check above
+  // makes sure that this subtraction does not underflow.
+  const size_t total_values_bytes =
+      input.size() - name_sizes_bytes - value_sizes_bytes - names_bytes;
 
   columns.reserve(num_columns);
   size_t name_pos = 0;
@@ -414,7 +431,7 @@ Status WideColumnSerialization::DeserializeV2Impl(
     s5 = s5_next;
 
     // Read name from section 6
-    if (name_pos + ns > names_bytes) {
+    if (ns > names_bytes - name_pos) {
       return Status::Corruption("Error decoding wide column name");
     }
     Slice name(s6 + name_pos, ns);
@@ -427,7 +444,7 @@ Status WideColumnSerialization::DeserializeV2Impl(
     }
 
     // Read value from section 7
-    if (s7 + value_pos + vs > input_end) {
+    if (vs > total_values_bytes - value_pos) {
       return Status::Corruption("Error decoding wide column value payload");
     }
 
@@ -439,7 +456,6 @@ Status WideColumnSerialization::DeserializeV2Impl(
   // Validate that the consumed bytes match the declared section sizes. Because
   // a V2 entity's values section is defined to extend to the end of `input`,
   // this also rejects any trailing bytes after the entity.
-  const size_t total_values_bytes = static_cast<size_t>(input_end - s7);
   if (s4 != s4_limit || s5 != s5_limit || name_pos != names_bytes ||
       value_pos != total_values_bytes) {
     return Status::Corruption("Wide column section size mismatch");
@@ -651,8 +667,10 @@ Status WideColumnSerialization::ForEachBlobFileNumber(
   input_ref.remove_prefix(names_bytes);
 
   // Now input_ref points to VALUES section. Walk through value sizes
-  // and decode only blob column values.
-  size_t value_pos = 0;
+  // and decode only blob column values. value_pos adds up the value sizes of
+  // all earlier columns. It is a uint64_t, so the sum of up to 2^32 uint32
+  // sizes cannot wrap, also on a 32-bit platform.
+  uint64_t value_pos = 0;
   for (uint32_t i = 0; i < num_columns; ++i) {
     uint32_t vs = 0;
     const char* vs_next = GetVarint32Ptr(vs_ptr, vs_limit, &vs);
@@ -662,7 +680,10 @@ Status WideColumnSerialization::ForEachBlobFileNumber(
     vs_ptr = vs_next;
 
     if (static_cast<uint8_t>(type_bytes[i]) == kTypeBlobIndex) {
-      if (value_pos + vs > input_ref.size()) {
+      // Only blob columns are checked, so value_pos can already be past the
+      // end of the values. Check that first. Then compare vs with the
+      // remaining size, which cannot underflow.
+      if (value_pos > input_ref.size() || vs > input_ref.size() - value_pos) {
         return Status::Corruption("Error decoding wide column blob index");
       }
       Slice blob_slice(input_ref.data() + value_pos, vs);

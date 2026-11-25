@@ -350,57 +350,209 @@ TEST_F(WideColumnSerializationTest, DeserializeV2OutOfOrder) {
 }
 
 TEST_F(WideColumnSerializationTest, DeserializeV2RejectsRecursiveType) {
-  // Manually construct a V2 entity where one column has type
-  // kTypeWideColumnEntity, which would create recursive nesting.
-  // Deserialization must reject this.
-  std::string buf;
+  // A column of type kTypeWideColumnEntity would nest one entity inside
+  // another, so the decoder rejects it. This test builds the same two-column V2
+  // entity twice: once with kTypeWideColumnEntity as the second column type,
+  // and once with kTypeValue. The kTypeValue control must decode, which shows
+  // that the layout is valid and that the type byte alone causes the error.
+  auto make_entity = [](ValueType second_type) {
+    std::string buf;
+    PutVarint32(&buf, WideColumnSerialization::kVersion2);
+    PutVarint32(&buf, 2);  // num_columns
 
-  PutVarint32(&buf, WideColumnSerialization::kVersion2);
+    // Section 2: SKIP INFO
+    PutVarint32(&buf, 2);  // name_sizes_bytes (varint(1) + varint(1))
+    PutVarint32(&buf, 2);  // value_sizes_bytes (varint(3) + varint(5))
+    PutVarint32(&buf, 2);  // names_bytes ("a" + "b")
 
-  constexpr uint32_t num_columns = 2;
-  PutVarint32(&buf, num_columns);
+    // Section 3: COLUMN TYPES
+    buf.push_back(static_cast<char>(kTypeValue));
+    buf.push_back(static_cast<char>(second_type));
 
-  // Section 2: COLUMN TYPES -- first column inline, second recursive
-  buf.push_back(static_cast<char>(kTypeValue));
-  buf.push_back(static_cast<char>(kTypeWideColumnEntity));
+    // Section 4: NAME SIZES
+    PutVarint32(&buf, 1);
+    PutVarint32(&buf, 1);
+    // Section 5: VALUE SIZES
+    PutVarint32(&buf, 3);
+    PutVarint32(&buf, 5);
+    // Section 6: NAMES
+    buf.append("ab");
+    // Section 7: VALUES
+    buf.append("xyz12345");
+    return buf;
+  };
 
-  // Section 3: SKIP INFO
-  PutVarint32(&buf, 2);  // name_sizes_bytes (varint(1) + varint(1))
-  PutVarint32(&buf, 2);  // value_sizes_bytes (varint(3) + varint(5))
-  PutVarint32(&buf, 2);  // names_bytes ("a" + "b")
-
-  // Section 4: NAME SIZES
-  PutVarint32(&buf, 1);  // "a"
-  PutVarint32(&buf, 1);  // "b"
-
-  // Section 5: VALUE SIZES
-  PutVarint32(&buf, 3);
-  PutVarint32(&buf, 5);
-
-  // Section 6: NAMES
-  buf.append("ab");
-
-  // Section 7: VALUES (8 bytes of placeholder data)
-  buf.append(8, 'x');
-
-  // Deserialize should reject with Corruption
   {
-    Slice input(buf);
-    std::vector<WideColumn> columns;
-    std::vector<std::pair<size_t, BlobIndex>> blob_columns;
-    const Status s =
-        WideColumnSerialization::Deserialize(input, columns, &blob_columns);
-    ASSERT_TRUE(s.IsCorruption());
-    ASSERT_TRUE(std::strstr(s.getState(), "Unsupported wide column ValueType"));
-  }
+    const std::string buf = make_entity(kTypeWideColumnEntity);
 
-  // Deserialize (V1-only API) should also reject
-  {
-    Slice input(buf);
     WideColumns columns;
-    const Status s = WideColumnSerialization::DeserializeSimple(input, columns);
+    std::vector<std::pair<size_t, BlobIndex>> blob_columns;
+    Status s =
+        WideColumnSerialization::Deserialize(buf, columns, &blob_columns);
     ASSERT_TRUE(s.IsCorruption());
+    ASSERT_STREQ(s.getState(), "Unsupported wide column ValueType");
+
+    WideColumns simple_columns;
+    s = WideColumnSerialization::DeserializeSimple(buf, simple_columns);
+    ASSERT_TRUE(s.IsCorruption());
+    ASSERT_STREQ(s.getState(), "Unsupported wide column ValueType");
+
+    bool has_blob_columns = true;
+    s = WideColumnSerialization::HasBlobColumns(buf, has_blob_columns);
+    ASSERT_TRUE(s.IsCorruption());
+    ASSERT_STREQ(s.getState(), "Unsupported wide column ValueType");
   }
+
+  {
+    const std::string buf = make_entity(kTypeValue);
+    const WideColumns expected{{"a", "xyz"}, {"b", "12345"}};
+
+    WideColumns columns;
+    std::vector<std::pair<size_t, BlobIndex>> blob_columns;
+    ASSERT_OK(
+        WideColumnSerialization::Deserialize(buf, columns, &blob_columns));
+    ASSERT_EQ(columns, expected);
+    ASSERT_TRUE(blob_columns.empty());
+
+    WideColumns simple_columns;
+    ASSERT_OK(WideColumnSerialization::DeserializeSimple(buf, simple_columns));
+    ASSERT_EQ(simple_columns, expected);
+
+    bool has_blob_columns = true;
+    ASSERT_OK(WideColumnSerialization::HasBlobColumns(buf, has_blob_columns));
+    ASSERT_FALSE(has_blob_columns);
+  }
+}
+
+TEST_F(WideColumnSerializationTest, DeserializeV2RejectsWrappedSectionSizes) {
+  // A V2 entity stores the byte sizes of sections 4 to 6 as three uint32
+  // varints. A corrupt entity can hold sizes whose sum is larger than
+  // UINT32_MAX, so the decoder adds them in uint64_t. A uint32 sum would wrap
+  // to a small number, pass the size check, and make the decoder read far past
+  // the end of the input.
+  std::string buf;
+  PutVarint32(&buf, WideColumnSerialization::kVersion2);
+  PutVarint32(&buf, 1);  // num_columns
+
+  // SKIP INFO. The sum is 0xFFFFFFF0 + 0x11 + 0 = 2^32 + 1, so a 32-bit sum
+  // wraps to 1.
+  PutVarint32(&buf, 0xFFFFFFF0);  // name_sizes_bytes
+  PutVarint32(&buf, 0x11);        // value_sizes_bytes
+  PutVarint32(&buf, 0);           // names_bytes
+
+  // COLUMN TYPES
+  buf.push_back(static_cast<char>(kTypeValue));
+
+  // Only a few bytes follow. They are far fewer than the declared section
+  // sizes. The first byte is a valid name size varint (5).
+  PutVarint32(&buf, 5);
+  buf.append(4, 'x');
+
+  Slice input(buf);
+  std::vector<WideColumn> columns;
+  std::vector<std::pair<size_t, BlobIndex>> blob_columns;
+  const Status s =
+      WideColumnSerialization::Deserialize(input, columns, &blob_columns);
+  ASSERT_EQ(s.code(), Status::Code::kCorruption) << s.ToString();
+  ASSERT_TRUE(std::strstr(s.getState(), "sections")) << s.ToString();
+}
+
+TEST_F(WideColumnSerializationTest, DeserializeV2RejectsNameOverrun) {
+  // Two columns, "a" and "b", whose names are declared as 1 byte each, while
+  // the NAMES section holds only 1 byte. The second name runs past the end of
+  // the NAMES section, so the decoder must report it.
+  std::string buf;
+  PutVarint32(&buf, WideColumnSerialization::kVersion2);
+  PutVarint32(&buf, 2);  // num_columns
+  PutVarint32(&buf, 2);  // name_sizes_bytes
+  PutVarint32(&buf, 2);  // value_sizes_bytes
+  PutVarint32(&buf, 1);  // names_bytes
+  buf.push_back(static_cast<char>(kTypeValue));
+  buf.push_back(static_cast<char>(kTypeValue));
+  PutVarint32(&buf, 1);  // NAME SIZES: "a"
+  PutVarint32(&buf, 1);  // NAME SIZES: second name, past the section
+  PutVarint32(&buf, 0);  // VALUE SIZES
+  PutVarint32(&buf, 2);  // VALUE SIZES
+  buf.append("a");       // NAMES
+  buf.append("zz");      // VALUES
+
+  WideColumns columns;
+  const Status s = WideColumnSerialization::DeserializeSimple(buf, columns);
+  ASSERT_EQ(s.ToString(), "Corruption: Error decoding wide column name");
+}
+
+TEST_F(WideColumnSerializationTest, DeserializeV2RejectsValueOverrun) {
+  // One column whose value size is larger than the 2-byte VALUES section. 3 is
+  // just past the end. UINT32_MAX is the largest size a varint32 can hold.
+  for (const uint32_t value_size : {3u, std::numeric_limits<uint32_t>::max()}) {
+    SCOPED_TRACE("value_size=" + std::to_string(value_size));
+    std::string value_sizes;
+    PutVarint32(&value_sizes, value_size);
+
+    std::string buf;
+    PutVarint32(&buf, WideColumnSerialization::kVersion2);
+    PutVarint32(&buf, 1);  // num_columns
+    PutVarint32(&buf, 1);  // name_sizes_bytes
+    PutVarint32(&buf, static_cast<uint32_t>(value_sizes.size()));
+    PutVarint32(&buf, 0);  // names_bytes
+    buf.push_back(static_cast<char>(kTypeValue));
+    PutVarint32(&buf, 0);  // NAME SIZES: default column
+    buf.append(value_sizes);
+    buf.append("ab");  // VALUES
+
+    WideColumns columns;
+    const Status s = WideColumnSerialization::DeserializeSimple(buf, columns);
+    ASSERT_EQ(s.ToString(),
+              "Corruption: Error decoding wide column value payload");
+  }
+}
+
+TEST_F(WideColumnSerializationTest, DeserializeV1LimitsReserveToInputSize) {
+  // A corrupt V1 entity can claim far more columns than it holds. Each V1
+  // column takes at least 2 bytes, so the decoder reserves at most
+  // input.size() / 2 entries. Here 4 bytes follow the column count: one
+  // column "a" with a value size of 1 (3 bytes), and one more byte, which is
+  // too short for a second column. So at most 2 entries are reserved.
+  for (const uint32_t num_columns :
+       {uint32_t{1} << 20, std::numeric_limits<uint32_t>::max()}) {
+    SCOPED_TRACE("num_columns=" + std::to_string(num_columns));
+    std::string buf;
+    PutVarint32(&buf, WideColumnSerialization::kVersion1);
+    PutVarint32(&buf, num_columns);
+    PutLengthPrefixedSlice(&buf, "a");
+    PutVarint32(&buf, 1);  // value size
+    buf.push_back('x');
+
+    WideColumns columns;
+    const Status s = WideColumnSerialization::DeserializeSimple(buf, columns);
+    ASSERT_EQ(s.ToString(), "Corruption: Error decoding wide column name");
+    ASSERT_LE(columns.capacity(), 2U);
+  }
+}
+
+TEST_F(WideColumnSerializationTest,
+       ForEachBlobFileNumberRejectsBlobPastValues) {
+  // ForEachBlobFileNumber() checks only blob columns. Here the first column
+  // is a plain value whose declared size (100) is larger than the whole
+  // 2-byte VALUES section, so the blob column after it starts past the end.
+  std::string buf;
+  PutVarint32(&buf, WideColumnSerialization::kVersion2);
+  PutVarint32(&buf, 2);  // num_columns
+  PutVarint32(&buf, 2);  // name_sizes_bytes
+  PutVarint32(&buf, 2);  // value_sizes_bytes
+  PutVarint32(&buf, 1);  // names_bytes
+  buf.push_back(static_cast<char>(kTypeValue));
+  buf.push_back(static_cast<char>(kTypeBlobIndex));
+  PutVarint32(&buf, 0);    // NAME SIZES: default column
+  PutVarint32(&buf, 1);    // NAME SIZES: "b"
+  PutVarint32(&buf, 100);  // VALUE SIZES: past the end of VALUES
+  PutVarint32(&buf, 1);    // VALUE SIZES: the blob column
+  buf.append("b");         // NAMES
+  buf.append("xy");        // VALUES
+
+  const Status s = WideColumnSerialization::ForEachBlobFileNumber(
+      buf, [](const BlobIndex&) { return Status::OK(); });
+  ASSERT_EQ(s.ToString(), "Corruption: Error decoding wide column blob index");
 }
 
 TEST_F(WideColumnSerializationTest, FastPathsRejectUnsupportedColumnType) {
