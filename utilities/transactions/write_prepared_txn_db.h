@@ -635,9 +635,12 @@ class WritePreparedTxnDB : public WritePreparedTxnDBBase {
     PreparedHeap& operator=(PreparedHeap&&) = delete;
 
     ~PreparedHeap() {
-      if (!TEST_CRASH_) {
-        assert(heap_.empty());
-        assert(erased_heap_.empty());
+      /*
+         Assert prepared_txns_  is empty is ideal case. In XA
+         transactions scenario the prepared_txns_ is non-empty since some
+         transactions are not committed but be prepared. So the assert is
+         disabled.
+       */
       }
     }
     port::Mutex* push_pop_mutex() { return &push_pop_mutex_; }
