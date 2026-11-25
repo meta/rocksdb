@@ -39,13 +39,19 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "rocksdb/advanced_iterator.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/index_factory.h"
+#include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/types.h"
 #include "utilities/trie_index/louds_trie.h"
 
