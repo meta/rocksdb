@@ -166,7 +166,7 @@ Status TableCache::GetTableReader(
       }
     }
     if (!sequential_mode && ioptions_.advise_random_on_open) {
-      file->Hint(FSRandomAccessFile::kRandom);
+      file->Hint(Env::AccessPattern::kRandom);
     }
     if (ioptions_.default_temperature != Temperature::kUnknown &&
         file_temperature == Temperature::kUnknown) {
