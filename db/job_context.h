@@ -16,6 +16,7 @@
 #include "db/column_family.h"
 #include "db/log_writer.h"
 #include "db/version_set.h"
+#include "file/file_io_listener.h"
 #include "util/autovector.h"
 #include "util/hash_containers.h"
 
@@ -91,6 +92,7 @@ struct SuperVersionContext {
     // notify listeners on changed write stall conditions
     for (auto& notif : write_stall_notifications) {
       for (auto& listener : notif.immutable_options->listeners) {
+        const ScopedEventListenerCallback callback_scope(listener.get());
         listener->OnStallConditionsChanged(notif.write_stall_info);
       }
     }

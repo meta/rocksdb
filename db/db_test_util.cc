@@ -137,6 +137,7 @@ DBTestBase::~DBTestBase() {
   // (e.g. NewDirectory), so env_ must outlive it.
   last_options_.sst_file_manager.reset();
   delete env_;
+  delete encrypted_env_;
 }
 
 bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {

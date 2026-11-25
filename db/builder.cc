@@ -302,7 +302,9 @@ Status BuildTable(
       //  Generate a rolling 64-bit hash of the key and values
       //  Note :
       //  Here "key" integrates 'sequence_number'+'kType'+'user key'.
-      s = output_validator.Add(key_after_flush, value_after_flush);
+      s = tboptions.require_strict_key_order
+              ? output_validator.AddStrict(key_after_flush, value_after_flush)
+              : output_validator.Add(key_after_flush, value_after_flush);
       if (!s.ok()) {
         break;
       }

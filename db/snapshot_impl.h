@@ -25,6 +25,9 @@ namespace ROCKSDB_NAMESPACE {
 class SnapshotList;
 class ShardedSnapshotList;
 
+enum class SnapshotKind : uint8_t { kUser, kJob };
+enum class SnapshotCheck : uint8_t { kAll, kUser };
+
 // Each SnapshotImpl corresponds to a particular sequence number and is linked
 // into one of the DB's per-shard doubly-linked snapshot lists.
 class SnapshotImpl : public Snapshot {
@@ -60,6 +63,7 @@ class SnapshotImpl : public Snapshot {
 
   // Will this snapshot be used by a Transaction to do write-conflict checking?
   bool is_write_conflict_boundary_ = false;
+  SnapshotKind kind_ = SnapshotKind::kUser;
 };
 
 class SnapshotList {
@@ -93,7 +97,7 @@ class SnapshotList {
   }
 
   SnapshotImpl* New(SnapshotImpl* s, SequenceNumber seq, uint64_t unix_time,
-                    bool is_write_conflict_boundary,
+                    bool is_write_conflict_boundary, SnapshotKind kind,
                     uint64_t ts = std::numeric_limits<uint64_t>::max()) {
     if (!empty()) {
       assert(newest()->number_ <= seq);
@@ -102,6 +106,7 @@ class SnapshotList {
     s->unix_time_ = unix_time;
     s->timestamp_ = ts;
     s->is_write_conflict_boundary_ = is_write_conflict_boundary;
+    s->kind_ = kind;
     s->list_ = this;
     s->next_ = &list_;
     s->prev_ = list_.prev_;
@@ -194,6 +199,7 @@ class SnapshotList {
 
  private:
   // Dummy head of doubly-linked list of snapshots
+  friend class ShardedSnapshotList;
   SnapshotImpl list_;
   uint64_t count_;
 };
@@ -240,7 +246,7 @@ class ShardedSnapshotList {
                    ShouldCreateFn should_create_fn,
                    AfterCreateFn after_create_fn, uint64_t unix_time,
                    bool is_write_conflict_boundary, uint64_t ts,
-                   bool db_mutex_held) {
+                   bool db_mutex_held, SnapshotKind kind) {
     const int core = port::PhysicalCoreID();
     const uint32_t shard_key =
         core < 0 ? FallbackShard() : static_cast<uint32_t>(core);
@@ -261,7 +267,7 @@ class ShardedSnapshotList {
       return NewResult::kNotCreated;
     }
     s->shard_ = idx;
-    shard.list.New(s, seq, unix_time, is_write_conflict_boundary, ts);
+    shard.list.New(s, seq, unix_time, is_write_conflict_boundary, kind, ts);
     after_create_fn(seq);
     return NewResult::kSuccess;
   }
@@ -333,7 +339,11 @@ class ShardedSnapshotList {
   // ingestion, which can already hold many per-column-family locks. A
   // concurrent release can make a true result conservative; the DB mutex
   // prevents a creator that bypasses the gate from being missed.
-  bool AnySnapshotWhileNewBlocked() const;
+  // An operation-owned pin may be excluded; other snapshots at the same
+  // sequence number still count. Job pins can be excluded from admission
+  // checks while remaining in GetAll() and oldest-snapshot GC accounting.
+  bool AnySnapshotWhileNewBlocked(const Snapshot* excluded,
+                                  SnapshotCheck check) const;
   uint64_t count() const;
   // Returns 0 when empty. Snapshot timestamps are read before taking a shard
   // lock, so the result is approximate when creations are concurrent or the

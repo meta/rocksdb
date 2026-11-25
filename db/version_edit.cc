@@ -229,6 +229,10 @@ bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
 bool VersionEdit::EncodeTo(std::string* dst,
                            std::optional<size_t> ts_sz) const {
   assert(!IsNoManifestWriteDummy());
+  if (requires_source_priority_for_equal_sequences_) {
+    PutVarint32(dst, kRequireSourcePriorityForEqualSequences);
+    PutVarint32(dst, 1);
+  }
   if (has_db_id_) {
     PutVarint32(dst, kDbId);
     PutLengthPrefixedSlice(dst, db_id_);
@@ -728,6 +732,15 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
     }
 #endif
     switch (tag) {
+      case kRequireSourcePriorityForEqualSequences: {
+        uint32_t required;
+        if (!GetVarint32(&input, &required) || required != 1) {
+          msg = "source priority requirement";
+        } else {
+          requires_source_priority_for_equal_sequences_ = true;
+        }
+        break;
+      }
       case kDbId:
         if (GetLengthPrefixedSlice(&input, &str)) {
           db_id_ = str.ToString();
@@ -1108,6 +1121,9 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
 std::string VersionEdit::DebugString(bool hex_key) const {
   std::string r;
   r.append("VersionEdit {");
+  if (requires_source_priority_for_equal_sequences_) {
+    r.append("\n  RequireSourcePriorityForEqualSequences: true");
+  }
   if (has_db_id_) {
     r.append("\n  DB ID: ");
     r.append(db_id_);
@@ -1276,6 +1292,9 @@ std::string VersionEdit::DebugString(bool hex_key) const {
 std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
   JSONWriter jw;
   jw << "EditNumber" << edit_num;
+  if (requires_source_priority_for_equal_sequences_) {
+    jw << "RequireSourcePriorityForEqualSequences" << true;
+  }
 
   if (has_db_id_) {
     jw << "DB ID" << db_id_;

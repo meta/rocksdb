@@ -13,6 +13,7 @@
 
 #include "db/internal_stats.h"
 #include "db/table_cache.h"
+#include "file/file_io_listener.h"
 #include "port/port.h"
 #include "test_util/sync_point.h"
 
@@ -32,7 +33,9 @@ Status LoadTableHandlersHelper(
   std::atomic<size_t> next_file_meta_idx(0);
   std::atomic<bool> has_error(false);
   Status ret;
+  const auto listener_context = ScopedDeferredFileIOListeners::CaptureContext();
   std::function<void()> load_handlers_func([&]() {
+    ScopedDeferredFileIOListeners::ScopedContext scope(listener_context);
     while (true) {
       size_t file_idx = next_file_meta_idx.fetch_add(1);
 

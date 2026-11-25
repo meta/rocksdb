@@ -617,10 +617,26 @@ struct BackgroundJobPressure {
 // Otherwise, callback functions should not run for an extended period of
 // time before the function returns, because this will slow RocksDB.
 //
-// [Threading] All EventListener callback will be called using the
-// actual thread that involves in that specific event.   For example, it
+// [Threading] Callbacks normally run on the thread involved in the event.
+// For example, it
 // is the RocksDB background flush thread that does the actual flush to
 // call EventListener::OnFlushCompleted().
+// File I/O notifications associated with ApplyLsmEdit may be deferred to
+// the committing thread until installation releases its locks and snapshot
+// fence. Their operation timestamps and other event metadata are preserved.
+// They are delivered before OnExternalFileIngested for that edit.
+// If deferred notification storage runs out of memory, OnIOError reports
+// MemoryLimit after installation locks are released, with an empty file path
+// for the unavailable payload. This does not change the installation result.
+// LSM edit commits sharing listeners are serialized through I/O callback
+// delivery. Reentrant LSM edit commits whose listener lease depends on the
+// current callback or committing thread return NotSupported, including partial
+// listener-set overlap and background flush/compaction lifecycle callbacks.
+// Lifecycle callbacks remain synchronous. A lifecycle callback with no
+// dependency on an active listener lease may initiate another LSM edit.
+// Nested calls from callbacks or edit scopes return NotSupported if a requested
+// listener is already leased; they may proceed when all requested leases are
+// free.
 //
 // [Locking] All EventListener callbacks are designed to be called without
 // the current thread holding any DB mutex. This is to prevent potential

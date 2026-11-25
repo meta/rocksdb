@@ -39,6 +39,7 @@ class InternalStats;
 
 InternalIterator* NewCompactionMergingIterator(
     const InternalKeyComparator* comparator, InternalIterator** children, int n,
+    bool source_priority_for_equal_sequences,
     std::vector<std::pair<std::unique_ptr<TruncatedRangeDelIterator>,
                           std::unique_ptr<TruncatedRangeDelIterator>**>>&
         range_tombstone_iters,
