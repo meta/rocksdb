@@ -4783,6 +4783,9 @@ TEST_F(DBBloomFilterTest, FixedWidthSegments) {
   auto extractor4b0b = MakeSharedCappedKeySegmentsExtractor({4, 0});
   auto extractor4b0b4b = MakeSharedCappedKeySegmentsExtractor({4, 0, 4});
   auto extractor1b3b0b4b = MakeSharedCappedKeySegmentsExtractor({1, 3, 0, 4});
+  // More than 6 segments uses a different implementation
+  auto extractor1b2b0b1b1b1b1b =
+      MakeSharedCappedKeySegmentsExtractor({1, 2, 0, 1, 1, 1, 1});
 
   ASSERT_EQ(extractor_none->GetId(), "CappedKeySegmentsExtractor");
   ASSERT_EQ(extractor0b->GetId(), "CappedKeySegmentsExtractor0b");
@@ -4791,6 +4794,8 @@ TEST_F(DBBloomFilterTest, FixedWidthSegments) {
   ASSERT_EQ(extractor4b0b->GetId(), "CappedKeySegmentsExtractor4b0b");
   ASSERT_EQ(extractor4b0b4b->GetId(), "CappedKeySegmentsExtractor4b0b4b");
   ASSERT_EQ(extractor1b3b0b4b->GetId(), "CappedKeySegmentsExtractor1b3b0b4b");
+  ASSERT_EQ(extractor1b2b0b1b1b1b1b->GetId(),
+            "CappedKeySegmentsExtractor1b2b0b1b1b1b1b");
 
   using V = std::vector<int>;
   ASSERT_EQ(V({}), ExtractedSizes(*extractor_none, {}));
@@ -4826,6 +4831,15 @@ TEST_F(DBBloomFilterTest, FixedWidthSegments) {
 
   ASSERT_EQ(V({4, 0, 4}), ExtractedSizes(*extractor4b0b4b, "blah12345"));
   ASSERT_EQ(V({1, 3, 0, 4}), ExtractedSizes(*extractor1b3b0b4b, "blah12345"));
+
+  ASSERT_EQ(V({0, 0, 0, 0, 0, 0, 0}),
+            ExtractedSizes(*extractor1b2b0b1b1b1b1b, {}));
+  ASSERT_EQ(V({1, 2, 0, 1, 0, 0, 0}),
+            ExtractedSizes(*extractor1b2b0b1b1b1b1b, "blah"));
+  ASSERT_EQ(V({1, 2, 0, 1, 1, 1, 1}),
+            ExtractedSizes(*extractor1b2b0b1b1b1b1b, "blah123"));
+  ASSERT_EQ(V({1, 2, 0, 1, 1, 1, 1}),
+            ExtractedSizes(*extractor1b2b0b1b1b1b1b, "blah12345"));
 
   // Filter config for second and fourth segment
   auto filter1 =
