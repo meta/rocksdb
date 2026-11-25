@@ -9,7 +9,7 @@ package org.rocksdb;
  * CassandraValueMergeOperator is a merge operator that merges two cassandra wide column
  * values.
  */
-public class CassandraValueMergeOperator extends MergeOperator {
+public class CassandraValueMergeOperator extends InBuiltMergeOperator {
   public CassandraValueMergeOperator(final int gcGracePeriodInSeconds) {
     super(newSharedCassandraValueMergeOperator(gcGracePeriodInSeconds, 0));
   }
