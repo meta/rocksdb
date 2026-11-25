@@ -3465,7 +3465,19 @@ Status DBImpl::EnableAutoCompaction(
   return SetOptions(column_family_handles,
                     {{"disable_auto_compactions", "false"}});
 }
+Status DBImpl::EnableIntraL0Compaction(
+    const std::vector<ColumnFamilyHandle*>& column_family_handles) {
+  Status s;
+  for (auto cf_ptr : column_family_handles) {
+    Status status =
+        this->SetOptions(cf_ptr, {{"disable_intra_l0_compaction", "false"}});
+    if (!status.ok()) {
+      s = status;
+    }
+  }
 
+  return s;
+}
 // NOTE: Calling DisableManualCompaction() may overwrite the
 // user-provided canceled variable in CompactRangeOptions
 void DBImpl::DisableManualCompaction() {
