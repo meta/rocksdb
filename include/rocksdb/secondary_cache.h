@@ -4,13 +4,20 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "rocksdb/advanced_cache.h"
+#include "rocksdb/advanced_options.h"
+#include "rocksdb/compression_type.h"
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"

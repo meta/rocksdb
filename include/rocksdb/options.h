@@ -8,8 +8,12 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -19,6 +23,7 @@
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/customizable.h"
@@ -26,7 +31,11 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/listener.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/sst_partitioner.h"
+#include "rocksdb/status.h"
+#include "rocksdb/table_properties.h"
 #include "rocksdb/types.h"
 #include "rocksdb/universal_compaction.h"
 #include "rocksdb/version.h"
@@ -38,7 +47,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-class Cache;
 class CompactionFilter;
 class CompactionFilterFactory;
 class Comparator;
@@ -53,7 +61,6 @@ class Snapshot;
 class MemTableRepFactory;
 class RateLimiter;
 class ReadScopedBlockBufferProvider;
-class Slice;
 class Statistics;
 class InternalKeyComparator;
 class WalFilter;

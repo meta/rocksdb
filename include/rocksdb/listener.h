@@ -7,6 +7,8 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -16,8 +18,10 @@
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/compaction_job_stats.h"
 #include "rocksdb/compression_type.h"
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/types.h"

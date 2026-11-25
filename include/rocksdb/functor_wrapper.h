@@ -5,8 +5,10 @@
 
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <memory>
+#include <tuple>
 #include <utility>
 
 #include "rocksdb/rocksdb_namespace.h"

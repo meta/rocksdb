@@ -5,9 +5,13 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
+#include <string>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {

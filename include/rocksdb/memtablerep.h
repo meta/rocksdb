@@ -39,15 +39,20 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 

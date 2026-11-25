@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <deque>
 #include <memory>
 #include <string>
@@ -12,8 +13,11 @@
 #include <variant>
 #include <vector>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/wide_columns.h"
 
 namespace ROCKSDB_NAMESPACE {

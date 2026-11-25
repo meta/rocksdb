@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -12,6 +14,8 @@
 #include <vector>
 
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/types.h"
 
 namespace ROCKSDB_NAMESPACE {
