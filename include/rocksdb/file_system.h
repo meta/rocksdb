@@ -17,6 +17,7 @@
 #pragma once
 
 #include <any>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -33,6 +34,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
 #include "rocksdb/options.h"
+#include "rocksdb/read_source.h"
 #include "rocksdb/table.h"
 #include "rocksdb/thread_status.h"
 
@@ -326,6 +328,9 @@ struct IODebugContext {
   // Arbitrary structure containing cost information about the IO request
   std::any cost_info;
 
+  // Independent of cost_info so filesystem-specific cost payloads can coexist.
+  std::shared_ptr<std::atomic<uint8_t>> read_source_state;
+
   // FileSystem implementations can use this mutex to synchronize concurrent
   // reads/writes as needed (e.g. to update the counters or cost_info field)
   std::shared_mutex mutex;
@@ -339,6 +344,7 @@ struct IODebugContext {
         msg(other.msg),
         trace_data(other.trace_data),
         cost_info(other.cost_info),
+        read_source_state(other.read_source_state),
         _request_id(other.request_id ? *other.request_id : "") {
     request_id = other.request_id ? &_request_id : nullptr;
   }
@@ -351,6 +357,7 @@ struct IODebugContext {
       msg = other.msg;
       trace_data = other.trace_data;
       cost_info = other.cost_info;
+      read_source_state = other.read_source_state;
       _request_id = other.request_id ? *other.request_id : "";
       request_id = other.request_id ? &_request_id : nullptr;
     }

@@ -96,17 +96,18 @@ void FilePrefetchBuffer::PrepareBufferForRead(
 Status FilePrefetchBuffer::Read(BufferInfo* buf, const IOOptions& opts,
                                 RandomAccessFileReader* reader,
                                 uint64_t read_len, uint64_t aligned_useful_len,
-                                uint64_t start_offset, bool use_fs_buffer) {
+                                uint64_t start_offset, bool use_fs_buffer,
+                                IODebugContext* dbg) {
   Slice result;
   Status s;
   char* to_buf = nullptr;
   if (use_fs_buffer) {
     s = FSBufferDirectRead(reader, buf, opts, start_offset + aligned_useful_len,
-                           read_len, result);
+                           read_len, result, dbg);
   } else {
     to_buf = buf->buffer_.BufferStart() + aligned_useful_len;
     s = reader->Read(start_offset + aligned_useful_len, read_len, opts, &result,
-                     to_buf, /*dbg=*/nullptr);
+                     to_buf, dbg);
   }
 
 #ifndef NDEBUG
@@ -142,7 +143,8 @@ Status FilePrefetchBuffer::Read(BufferInfo* buf, const IOOptions& opts,
 
 Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
                                      RandomAccessFileReader* reader,
-                                     uint64_t read_len, uint64_t start_offset) {
+                                     uint64_t read_len, uint64_t start_offset,
+                                     IODebugContext* dbg) {
   TEST_SYNC_POINT("FilePrefetchBuffer::ReadAsync");
   // callback for async read request.
   auto fp = std::bind(&FilePrefetchBuffer::PrefetchAsyncCallback, this,
@@ -154,10 +156,14 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
   req.result = result;
   req.scratch = buf->buffer_.BufferStart();
   buf->async_req_len_ = req.len;
+  buf->async_debug_context_ =
+      dbg != nullptr && dbg->read_source_state != nullptr
+          ? std::make_shared<IODebugContext>(*dbg)
+          : nullptr;
 
   Status s = reader->ReadAsync(req, opts, fp, buf, &(buf->io_handle_),
                                &(buf->del_fn_), /*aligned_buf=*/nullptr,
-                               /*dbg=*/nullptr);
+                               buf->async_debug_context_.get());
   req.status.PermitUncheckedError();
   if (s.ok()) {
     if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
@@ -169,7 +175,8 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
     // Fall back to synchronous read so the buffer is populated inline
     // and callers proceed transparently.
     s = reader->Read(start_offset, read_len, opts, &result,
-                     buf->buffer_.BufferStart(), /*dbg=*/nullptr);
+                     buf->buffer_.BufferStart(),
+                     buf->async_debug_context_.get());
     if (s.ok()) {
       buf->buffer_.Size(buf->CurrentSize() + result.size());
       if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
@@ -182,7 +189,8 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
 
 Status FilePrefetchBuffer::Prefetch(const IOOptions& opts,
                                     RandomAccessFileReader* reader,
-                                    uint64_t offset, size_t n) {
+                                    uint64_t offset, size_t n,
+                                    IODebugContext* dbg) {
   if (!enable_ || reader == nullptr) {
     return Status::OK();
   }
@@ -219,7 +227,7 @@ Status FilePrefetchBuffer::Prefetch(const IOOptions& opts,
   Status s;
   if (read_len > 0) {
     s = Read(buf, opts, reader, read_len, aligned_useful_len, rounddown_offset,
-             use_fs_buffer);
+             use_fs_buffer, dbg);
   }
 
   if (usage_ == FilePrefetchBufferUsage::kTableOpenPrefetchTail && s.ok()) {
@@ -524,7 +532,7 @@ void FilePrefetchBuffer::HandleOverlappingSyncData(uint64_t offset,
 Status FilePrefetchBuffer::HandleOverlappingAsyncData(
     const IOOptions& opts, RandomAccessFileReader* reader, uint64_t offset,
     size_t length, size_t readahead_size, bool& copy_to_overlap_buffer,
-    uint64_t& tmp_offset, size_t& tmp_length) {
+    uint64_t& tmp_offset, size_t& tmp_length, IODebugContext* dbg) {
   // No Overlapping of data between 2 buffers.
   if (IsBufferQueueEmpty() || NumBuffersAllocated() == 1) {
     return Status::OK();
@@ -600,7 +608,7 @@ Status FilePrefetchBuffer::HandleOverlappingAsyncData(
                           /*length=*/0, readahead_size, start_offset,
                           end_offset, read_len, aligned_useful_len);
       if (read_len > 0) {
-        s = ReadAsync(new_buf, opts, reader, read_len, start_offset);
+        s = ReadAsync(new_buf, opts, reader, read_len, start_offset, dbg);
         if (!s.ok()) {
           DestroyAndClearIOHandle(new_buf);
           FreeLastBuffer();
@@ -630,7 +638,8 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
                                             RandomAccessFileReader* reader,
                                             uint64_t offset, size_t length,
                                             size_t readahead_size,
-                                            bool& copy_to_overlap_buffer) {
+                                            bool& copy_to_overlap_buffer,
+                                            IODebugContext* dbg) {
   if (!enable_) {
     return Status::OK();
   }
@@ -652,8 +661,8 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
 
   // Handle overlapping data over two buffers (async prefetching case).
   s = HandleOverlappingAsyncData(opts, reader, offset, length, readahead_size,
-                                 copy_to_overlap_buffer, tmp_offset,
-                                 tmp_length);
+                                 copy_to_overlap_buffer, tmp_offset, tmp_length,
+                                 dbg);
   if (!s.ok()) {
     return s;
   }
@@ -769,8 +778,8 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
 
   // Prefetch in remaining buffer only if readahead_size > 0.
   if (readahead_size > 0) {
-    s = PrefetchRemBuffers(opts, reader, end_offset1, alignment,
-                           readahead_size);
+    s = PrefetchRemBuffers(opts, reader, end_offset1, alignment, readahead_size,
+                           dbg);
     if (!s.ok()) {
       return s;
     }
@@ -778,7 +787,7 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
 
   if (read_len1 > 0) {
     s = Read(buf, opts, reader, read_len1, aligned_useful_len1, start_offset1,
-             use_fs_buffer);
+             use_fs_buffer, dbg);
     if (!s.ok()) {
       AbortAllIOs();
       FreeAllBuffers();
@@ -798,9 +807,10 @@ bool FilePrefetchBuffer::TryReadFromCache(const IOOptions& opts,
                                           RandomAccessFileReader* reader,
                                           uint64_t offset, size_t n,
                                           Slice* result, Status* status,
-                                          bool for_compaction) {
+                                          bool for_compaction,
+                                          IODebugContext* dbg) {
   bool ret = TryReadFromCacheUntracked(opts, reader, offset, n, result, status,
-                                       for_compaction);
+                                       for_compaction, dbg);
   if (usage_ == FilePrefetchBufferUsage::kTableOpenPrefetchTail && enable_) {
     if (ret) {
       RecordTick(stats_, TABLE_OPEN_PREFETCH_TAIL_HIT);
@@ -813,7 +823,8 @@ bool FilePrefetchBuffer::TryReadFromCache(const IOOptions& opts,
 
 bool FilePrefetchBuffer::TryReadFromCacheUntracked(
     const IOOptions& opts, RandomAccessFileReader* reader, uint64_t offset,
-    size_t n, Slice* result, Status* status, bool for_compaction) {
+    size_t n, Slice* result, Status* status, bool for_compaction,
+    IODebugContext* dbg) {
   // We disallow async IO for compaction reads since they are performed in
   // the background anyways and are less latency sensitive compared to
   // user-initiated reads
@@ -882,7 +893,7 @@ bool FilePrefetchBuffer::TryReadFromCacheUntracked(
       s = PrefetchInternal(
           opts, reader, offset, n,
           (num_buffers_ > 1 ? readahead_size_ / 2 : readahead_size_),
-          copy_to_overlap_buffer);
+          copy_to_overlap_buffer, dbg);
       explicit_prefetch_submitted_ = false;
       if (!s.ok()) {
         if (status) {
@@ -952,7 +963,7 @@ void FilePrefetchBuffer::PrefetchAsyncCallback(FSReadRequest& req,
 Status FilePrefetchBuffer::PrefetchAsync(const IOOptions& opts,
                                          RandomAccessFileReader* reader,
                                          uint64_t offset, size_t n,
-                                         Slice* result) {
+                                         Slice* result, IODebugContext* dbg) {
   assert(reader != nullptr);
   if (!enable_) {
     return Status::NotSupported();
@@ -1066,7 +1077,7 @@ Status FilePrefetchBuffer::PrefetchAsync(const IOOptions& opts,
     }
 
     if (read_len1 > 0) {
-      s = ReadAsync(buf, opts, reader, read_len1, start_offset1);
+      s = ReadAsync(buf, opts, reader, read_len1, start_offset1, dbg);
       if (!s.ok()) {
         DestroyAndClearIOHandle(buf);
         FreeLastBuffer();
@@ -1078,8 +1089,8 @@ Status FilePrefetchBuffer::PrefetchAsync(const IOOptions& opts,
   }
 
   if (is_eligible_for_prefetching) {
-    s = PrefetchRemBuffers(opts, reader, end_offset1, alignment,
-                           readahead_size);
+    s = PrefetchRemBuffers(opts, reader, end_offset1, alignment, readahead_size,
+                           dbg);
     if (!s.ok()) {
       return s;
     }
@@ -1088,11 +1099,9 @@ Status FilePrefetchBuffer::PrefetchAsync(const IOOptions& opts,
   return (data_found ? Status::OK() : Status::TryAgain());
 }
 
-Status FilePrefetchBuffer::PrefetchRemBuffers(const IOOptions& opts,
-                                              RandomAccessFileReader* reader,
-                                              uint64_t end_offset1,
-                                              size_t alignment,
-                                              size_t readahead_size) {
+Status FilePrefetchBuffer::PrefetchRemBuffers(
+    const IOOptions& opts, RandomAccessFileReader* reader, uint64_t end_offset1,
+    size_t alignment, size_t readahead_size, IODebugContext* dbg) {
   Status s;
   while (NumBuffersAllocated() < num_buffers_) {
     BufferInfo* prev_buf = GetLastBuffer();
@@ -1112,7 +1121,7 @@ Status FilePrefetchBuffer::PrefetchRemBuffers(const IOOptions& opts,
 
     if (read_len2 > 0) {
       TEST_SYNC_POINT("FilePrefetchBuffer::PrefetchAsync:ExtraPrefetching");
-      s = ReadAsync(new_buf, opts, reader, read_len2, start_offset2);
+      s = ReadAsync(new_buf, opts, reader, read_len2, start_offset2, dbg);
       if (!s.ok()) {
         DestroyAndClearIOHandle(new_buf);
         FreeLastBuffer();
