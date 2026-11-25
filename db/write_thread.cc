@@ -344,7 +344,7 @@ void WriteThread::BeginWriteStall() {
       SetState(w, STATE_COMPLETED);
       // Only update `link_newer` if it's already set.
       // `CreateMissingNewerLinks()` will update the nullptr `link_newer` later,
-      // which assumes the the first non-nullptr `link_newer` is the last
+      // which assumes the first non-nullptr `link_newer` is the last
       // nullptr link in the writer list.
       // If `link_newer` is set here, `CreateMissingNewerLinks()` may stop
       // updating the whole list when it sees the first non nullptr link.

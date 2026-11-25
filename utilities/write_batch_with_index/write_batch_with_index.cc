@@ -85,7 +85,7 @@ struct WriteBatchWithIndex::Rep {
     AddOrUpdateIndexWithCfId(0, key, type, last_entry_offset);
   }
 
-  // Add a new index entry pointing to the the entry at `last_entry_offset`
+  // Add a new index entry pointing to the entry at `last_entry_offset`
   // in the write batch. `most_recent_entry_update_count` will be used to
   // initialize the update count of the new index entry.
   void AddNewEntry(uint32_t column_family_id, WriteType type,
