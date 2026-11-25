@@ -279,8 +279,8 @@ class ReadOnlyMemTable {
 
   virtual uint64_t GetDataSize() const = 0;
 
-  // Returns the sequence number of the first element that was inserted
-  // into the memtable.
+  // Returns the smallest sequence number of any element inserted into the
+  // memtable, or 0 if the memtable is empty.
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable (unless this Memtable is immutable).
   virtual SequenceNumber GetFirstSequenceNumber() = 0;
@@ -290,10 +290,9 @@ class ReadOnlyMemTable {
   // operations on the same MemTable (unless this Memtable is immutable).
   virtual bool IsEmpty() const = 0;
 
-  // Returns the sequence number that is guaranteed to be smaller than or equal
-  // to the sequence number of any key that could be inserted into this
-  // memtable. It can then be assumed that any write with a larger(or equal)
-  // sequence number will be present in this memtable or a later memtable.
+  // Returns a lower bound on the sequence numbers that may be present in the
+  // memtable. This can be smaller than the first sequence number, and does not
+  // necessarily correspond to an entry in the memtable.
   //
   // If the earliest sequence number could not be determined,
   // kMaxSequenceNumber will be returned.
@@ -815,8 +814,8 @@ class MemTable final : public ReadOnlyMemTable {
     return first_seqno_.load(std::memory_order_relaxed);
   }
 
-  // Returns the sequence number of the first element that was inserted
-  // into the memtable.
+  // Sets the smallest sequence number of any element inserted into the
+  // memtable.
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable (unless this Memtable is immutable).
   void SetFirstSequenceNumber(SequenceNumber first_seqno) {
@@ -828,10 +827,9 @@ class MemTable final : public ReadOnlyMemTable {
     return earliest_seqno_.load(std::memory_order_relaxed);
   }
 
-  // Sets the sequence number that is guaranteed to be smaller than or equal
-  // to the sequence number of any key that could be inserted into this
-  // memtable. It can then be assumed that any write with a larger(or equal)
-  // sequence number will be present in this memtable or a later memtable.
+  // Sets the lower bound on the sequence numbers that may be present in the
+  // memtable. This can be smaller than the first sequence number, and does not
+  // necessarily correspond to an entry in the memtable.
   // Used only for MemPurge operation
   void SetEarliestSequenceNumber(SequenceNumber earliest_seqno) {
     return earliest_seqno_.store(earliest_seqno, std::memory_order_relaxed);
