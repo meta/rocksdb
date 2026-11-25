@@ -1,0 +1,1 @@
+Fixed `BlockBasedTableOptions::super_block_alignment_size` validation to reject values that are nonzero and at or below `block_size`, as documented. Previously, such values were silently accepted but could not achieve the option's purpose while still modifying file layout.
