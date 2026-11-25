@@ -195,7 +195,7 @@ DEFINE_SYNC_AND_ASYNC(IOStatus, BlockFetcher::ReadBlockContents)() {
     slice_.size_ = block_size_;
     decomp_args_.compressed_data = slice_;
     io_status_ = status_to_io_status(DecompressSerializedBlock(
-        decomp_args_, *decompressor_, contents_, ioptions_, memory_allocator_,
+        decomp_args_, decompressor_, contents_, ioptions_, memory_allocator_,
         block_buffer_provider_));
 #ifndef NDEBUG
     num_heap_buf_memcpy_++;

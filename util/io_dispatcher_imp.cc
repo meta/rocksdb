@@ -183,7 +183,7 @@ static Status CreateAndPinBlockFromBuffer(
     // When a provider is configured, decompression allocates provider-backed
     // output and writes the uncompressed block directly into it.
     s = DecompressSerializedBlock(block_data, block.size(), compression_type,
-                                  *decompressor, &tmp_contents, rep->ioptions,
+                                  decompressor, &tmp_contents, rep->ioptions,
                                   GetMemoryAllocator(rep->table_options),
                                   block_buffer_provider);
   }
