@@ -979,6 +979,59 @@ TEST_F(WideColumnSerializationTest, DeserializeRejectsTrailingData) {
   }
 }
 
+TEST_F(WideColumnSerializationTest, DeserializeV2SkipInfoOverflow) {
+  // A V2 entity declares the byte size of its NAME SIZES, VALUE SIZES and NAMES
+  // sections up front, and the parser checks the sum of the three against the
+  // remaining input before deriving a pointer to each section. Skip info whose
+  // sizes sum to 2^32 or more must be rejected, otherwise those pointers land
+  // past the end of the entity: the first case below puts the VALUE SIZES
+  // pointer exactly one byte past it (read by the per-column varint decode),
+  // the other two put it gigabytes out.
+  struct TestCase {
+    uint32_t name_sizes_bytes;
+    uint32_t value_sizes_bytes;
+    uint32_t names_bytes;
+    size_t trailing_bytes;
+  };
+  constexpr TestCase kCases[] = {
+      {1, 0x80000000, 0x80000000, 1},
+      {0x80000000, 0x80000000, 0, 2},
+      {0xfffffff0, 0x10, 0, 2},
+  };
+
+  for (const auto& test_case : kCases) {
+    SCOPED_TRACE(
+        "name_sizes_bytes=" + std::to_string(test_case.name_sizes_bytes) +
+        " value_sizes_bytes=" + std::to_string(test_case.value_sizes_bytes) +
+        " names_bytes=" + std::to_string(test_case.names_bytes));
+
+    std::string buf;
+    PutVarint32(&buf, WideColumnSerialization::kVersion2);
+    PutVarint32(&buf, 1);  // num_columns
+
+    // Section 2: SKIP INFO
+    PutVarint32(&buf, test_case.name_sizes_bytes);
+    PutVarint32(&buf, test_case.value_sizes_bytes);
+    PutVarint32(&buf, test_case.names_bytes);
+
+    // Section 3: COLUMN TYPES
+    buf.push_back(static_cast<char>(kTypeValue));
+
+    // Sections 4-7 are nowhere near the declared sizes.
+    buf.append(test_case.trailing_bytes, '\0');
+
+    // Deserialize from an exactly sized allocation, so that a read past the
+    // entity is an out-of-bounds read rather than a read of spare capacity.
+    const std::vector<char> entity(buf.begin(), buf.end());
+
+    std::vector<WideColumn> columns;
+    std::vector<std::pair<size_t, BlobIndex>> blob_columns;
+    ASSERT_TRUE(WideColumnSerialization::Deserialize(
+                    Slice(entity.data(), entity.size()), columns, &blob_columns)
+                    .IsCorruption());
+  }
+}
+
 namespace {
 
 size_t ExpectedPayloadSize(const WideColumns& columns) {
