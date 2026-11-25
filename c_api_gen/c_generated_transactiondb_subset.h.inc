@@ -60,3 +60,6 @@ extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_flush(
 extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_flush_cf(
     rocksdb_transactiondb_t* txn_db, const rocksdb_flushoptions_t* options,
     rocksdb_column_family_handle_t* column_family, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_transactiondb_resume(
+    rocksdb_transactiondb_t* txn_db, char** errptr);
