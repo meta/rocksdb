@@ -10,8 +10,7 @@
 // File names used by DB code
 
 #pragma once
-#include <stdint.h>
-
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>

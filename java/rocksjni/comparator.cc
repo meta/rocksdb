@@ -7,9 +7,9 @@
 // ROCKSDB_NAMESPACE::Comparator.
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 

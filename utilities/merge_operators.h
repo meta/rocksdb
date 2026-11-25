@@ -4,8 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 #pragma once
-#include <stdio.h>
-
+#include <cstdio>
 #include <memory>
 #include <string>
 

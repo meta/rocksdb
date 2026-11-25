@@ -8,7 +8,7 @@
 
 #include "rocksjni/jnicallback.h"
 
-#include <assert.h>
+#include <cassert>
 
 #include "rocksjni/portal.h"
 

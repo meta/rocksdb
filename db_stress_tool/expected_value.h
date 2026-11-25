@@ -7,11 +7,10 @@
 
 #pragma once
 
-#include <stdint.h>
-#include <stdio.h>
-
 #include <atomic>
 #include <cassert>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
 
 #include "rocksdb/rocksdb_namespace.h"

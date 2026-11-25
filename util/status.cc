@@ -11,7 +11,6 @@
 
 #include <cstdio>
 #ifdef OS_WIN
-#include <string.h>
 #endif
 #include <cstring>
 

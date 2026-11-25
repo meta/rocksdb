@@ -8,9 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
-#include <stdint.h>
-
 #include <algorithm>
+#include <cstdint>
 #include <random>
 
 #include "rocksdb/rocksdb_namespace.h"

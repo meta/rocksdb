@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include <stddef.h>
+#include <cstddef>
 
 #include "rocksdb/compression_type.h"
 #include "rocksdb/rocksdb_namespace.h"

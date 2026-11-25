@@ -10,7 +10,7 @@
 
 #include "db/compaction/compaction_outputs.h"
 
-#include <inttypes.h>
+#include <cinttypes>
 
 #include "db/builder.h"
 #include "logging/logging.h"

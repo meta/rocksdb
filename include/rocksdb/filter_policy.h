@@ -19,9 +19,8 @@
 
 #pragma once
 
-#include <stdlib.h>
-
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>

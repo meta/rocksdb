@@ -10,7 +10,7 @@
   is under the MIT license.
 */
 #pragma once
-#include <stdint.h>
+#include <cstdint>
 
 #include "rocksdb/slice.h"
 

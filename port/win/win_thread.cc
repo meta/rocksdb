@@ -16,10 +16,10 @@
 
 #include "port/win/win_thread.h"
 
-#include <assert.h>
 #include <process.h>  // __beginthreadex
 #include <windows.h>
 
+#include <cassert>
 #include <stdexcept>
 #include <system_error>
 #include <thread>

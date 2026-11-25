@@ -5,9 +5,8 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 
 #include "util/autovector.h"

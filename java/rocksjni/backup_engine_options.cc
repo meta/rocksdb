@@ -8,9 +8,9 @@
 // ROCKSDB_NAMESPACE::BackupEngineOptions methods from Java side.
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 

@@ -8,9 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
-#include <stdio.h>
-
 #include <array>
+#include <cstdio>
 #include <memory>
 #include <optional>
 #include <string>

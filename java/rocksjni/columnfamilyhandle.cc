@@ -7,8 +7,9 @@
 // ROCKSDB_NAMESPACE::ColumnFamilyHandle.
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
+
+#include <cstdio>
+#include <cstdlib>
 
 #include "include/org_rocksdb_ColumnFamilyHandle.h"
 #include "rocksjni/portal.h"

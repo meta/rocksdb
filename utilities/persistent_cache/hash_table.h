@@ -5,8 +5,7 @@
 //
 #pragma once
 
-#include <assert.h>
-
+#include <cassert>
 #include <list>
 #include <vector>
 

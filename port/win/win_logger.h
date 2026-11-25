@@ -12,10 +12,10 @@
 
 #pragma once
 
-#include <stdint.h>
 #include <windows.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
 #include "rocksdb/env.h"

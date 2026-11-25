@@ -3,9 +3,8 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#include <assert.h>
-
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <functional>
 #include <mutex>

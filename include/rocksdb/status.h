@@ -17,8 +17,8 @@
 #pragma once
 
 #ifdef ROCKSDB_ASSERT_STATUS_CHECKED
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #endif
 
 #include <memory>

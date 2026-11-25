@@ -11,9 +11,8 @@
 
 #pragma once
 
-#include <time.h>
-
 #include <atomic>
+#include <ctime>
 #include <memory>
 
 #include "file/writable_file_writer.h"

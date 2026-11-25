@@ -9,9 +9,9 @@
 #include "rocksdb/slice.h"
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "include/org_rocksdb_AbstractSlice.h"

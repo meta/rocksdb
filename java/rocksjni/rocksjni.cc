@@ -7,10 +7,10 @@
 // calling c++ ROCKSDB_NAMESPACE::DB methods from Java side.
 
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>

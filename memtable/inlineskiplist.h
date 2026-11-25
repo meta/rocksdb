@@ -41,9 +41,8 @@
 //
 
 #pragma once
-#include <assert.h>
-#include <stdlib.h>
-
+#include <cassert>
+#include <cstdlib>
 #include <functional>
 #include <type_traits>
 
