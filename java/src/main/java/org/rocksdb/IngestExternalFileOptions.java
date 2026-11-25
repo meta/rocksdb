@@ -51,6 +51,32 @@ public class IngestExternalFileOptions extends RocksObject {
   }
 
   /**
+   * Returns true if ingestion will fall back to copying when hard linking
+   * fails.
+   *
+   * @return true if ingestion will fall back to copying when hard linking
+   *     fails.
+   */
+  public boolean failedMoveFallBackToCopy() {
+    return failedMoveFallBackToCopy(nativeHandle_);
+  }
+
+  /**
+   * If set to true, ingestion falls back to copying when hard linking fails.
+   * This applies when {@link #moveFiles()} is true.
+   *
+   * @param failedMoveFallBackToCopy true if ingestion should fall back to
+   *     copying when hard linking fails.
+   *
+   * @return the reference to the current IngestExternalFileOptions.
+   */
+  public IngestExternalFileOptions setFailedMoveFallBackToCopy(
+      final boolean failedMoveFallBackToCopy) {
+    setFailedMoveFallBackToCopy(nativeHandle_, failedMoveFallBackToCopy);
+    return this;
+  }
+
+  /**
    * If set to false, an ingested file keys could appear in existing snapshots
    * that where created before the file was ingested.
    *
@@ -205,6 +231,9 @@ public class IngestExternalFileOptions extends RocksObject {
 
   private static native boolean moveFiles(final long handle);
   private static native void setMoveFiles(final long handle, final boolean move_files);
+  private static native boolean failedMoveFallBackToCopy(final long handle);
+  private static native void setFailedMoveFallBackToCopy(
+      final long handle, final boolean failedMoveFallBackToCopy);
   private static native boolean snapshotConsistency(final long handle);
   private static native void setSnapshotConsistency(
       final long handle, final boolean snapshotConsistency);

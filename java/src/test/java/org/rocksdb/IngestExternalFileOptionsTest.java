@@ -56,6 +56,16 @@ public class IngestExternalFileOptionsTest {
   }
 
   @Test
+  public void failedMoveFallBackToCopy() {
+    try (final IngestExternalFileOptions options =
+        new IngestExternalFileOptions()) {
+      assertThat(options.failedMoveFallBackToCopy()).isTrue();
+      options.setFailedMoveFallBackToCopy(false);
+      assertThat(options.failedMoveFallBackToCopy()).isFalse();
+    }
+  }
+
+  @Test
   public void snapshotConsistency() {
     try (final IngestExternalFileOptions options =
         new IngestExternalFileOptions()) {
