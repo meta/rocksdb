@@ -82,6 +82,8 @@ class BlockBasedTableFactory : public TableFactory {
 
   bool IsDeleteRangeSupported() const override { return true; }
 
+  bool IsRecordCountSupported() const override { return true; }
+
   std::unique_ptr<TableFactory> Clone() const override {
     return std::make_unique<BlockBasedTableFactory>(*this);
   }

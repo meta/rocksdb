@@ -174,6 +174,8 @@ class PlainTableFactory : public TableFactory {
   std::string GetPrintableOptions() const override;
   static const char kValueTypeSeqId0 = char(~0);
 
+  bool IsRecordCountSupported() const override { return true; }
+
   std::unique_ptr<TableFactory> Clone() const override {
     return std::make_unique<PlainTableFactory>(*this);
   }
