@@ -145,6 +145,12 @@ class ReadOnlyMemTable {
   virtual void UniqueRandomSample(const uint64_t& target_sample_size,
                                   std::unordered_set<const char*>* entries) = 0;
 
+  // EXPERIMENTAL. True if this memtable's rep stores entry keys in its own
+  // structure instead of in the encoded entry (see MemTableRep::OwnsKeys()).
+  // Code that parses encoded entries (for example MemPurge sampling) must skip
+  // such memtables.
+  virtual bool OwnsKeys() const { return false; }
+
   // Return an iterator that yields the contents of the memtable.
   //
   // The caller must ensure that the underlying MemTable remains live
@@ -592,6 +598,9 @@ class MemTable final : public ReadOnlyMemTable {
                    const char* prefix_len_key2) const override;
     int operator()(const char* prefix_len_key,
                    const DecodedType& key) const override;
+    const Comparator* user_comparator() const override {
+      return comparator.user_comparator();
+    }
   };
 
   // earliest_seq should be the current SequenceNumber in the db such that any
@@ -652,8 +661,13 @@ class MemTable final : public ReadOnlyMemTable {
                           std::unordered_set<const char*>* entries) override {
     // TODO(bjlemaire): at the moment, only supported by skiplistrep.
     // Extend it to all other memtable representations.
+    // Callers parse encoded entries; MemPurge makes a rep that owns keys
+    // fall back to the skip list (see MemTable::MemTable).
+    assert(!table_owns_keys_);
     table_->UniqueRandomSample(NumEntries(), target_sample_size, entries);
   }
+
+  bool OwnsKeys() const override { return table_owns_keys_; }
 
   // This method heuristically determines if the memtable should continue to
   // host more data.
@@ -936,6 +950,12 @@ class MemTable final : public ReadOnlyMemTable {
                                     uint32_t protection_bytes_per_key,
                                     bool allow_data_in_errors = false);
 
+  // Same, for an entry whose key is stored apart from its value part (see
+  // MemTableRep::EntryView).
+  static Status VerifyEntryChecksum(const MemTableRep::EntryView& entry,
+                                    uint32_t protection_bytes_per_key,
+                                    bool allow_data_in_errors);
+
   // Validate the checksum of the key/value pair.
   Status ValidateKey(const char* key, bool allow_data_in_errors);
 
@@ -952,6 +972,10 @@ class MemTable final : public ReadOnlyMemTable {
   AllocTracker mem_tracker_;
   ConcurrentArena arena_;
   std::unique_ptr<MemTableRep> table_;
+  // True when table_ owns its keys (table_->OwnsKeys()). MemTable then
+  // allocates entries with AllocateWithKey() and reads them through
+  // MemTableRep::EntryView.
+  bool table_owns_keys_ = false;
   std::unique_ptr<MemTableRep> range_del_table_;
   // This is OK to be relaxed access because consistency between table_ and
   // range_del_table_ is provided by explicit multi-versioning with sequence

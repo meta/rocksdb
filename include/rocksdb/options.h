@@ -2698,6 +2698,11 @@ struct ReadOptions {
   // BlockBasedTableOptions::use_delta_encoding = false,
   // Iterator's property "rocksdb.iterator.is-key-pinned" is guaranteed to
   // return 1.
+  // EXPERIMENTAL exception: a memtable rep that owns its keys (see
+  // MemTableRep::OwnsKeys()) may rebuild a key when its iterator moves, so
+  // is-key-pinned can be 0 for such a memtable even with pin_data and
+  // use_delta_encoding = false; keys from it must be copied before the next
+  // iterator move.
   bool pin_data = false;
 
   // For iterators, RocksDB does auto-readahead on noticing more than two

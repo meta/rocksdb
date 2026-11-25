@@ -1,0 +1,1 @@
+Added an experimental opt-in `MemTableRep` key-ownership interface (`OwnsKeys()`, `AllocateWithKey()`, `GetEntries()`, `EntryView`, `Iterator::entry()`, `Iterator::IsKeyPinned()`) that lets a rep store entry keys in its own structure instead of in the encoded entry, plus `MemTableRep::KeyComparator::user_comparator()` so a rep can inspect the user comparator.
