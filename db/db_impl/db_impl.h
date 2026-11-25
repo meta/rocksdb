@@ -2330,8 +2330,11 @@ class DBImpl : public DB
 
   void InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap();
 
-  // Return true to proceed with current WAL record whose content is stored in
-  // `batch`. Return false to skip current WAL record.
+  // `status` must be OK on entry. Return true to apply the record in `batch`;
+  // `status` stays OK. Return false to skip it; `status` may then hold an
+  // error. NotSupported always fails the recovery. A Corruption from
+  // `kCorruptedRecord` is handled by `wal_recovery_mode` in
+  // `HandleNonOkStatusOrOldLogRecord()`.
   bool InvokeWalFilterIfNeededOnWalRecord(uint64_t wal_number,
                                           const std::string& wal_fname,
                                           log::Reader::Reporter& reporter,
@@ -2795,6 +2798,10 @@ class DBImpl : public DB
 
   void SetupLogFileProcessing(uint64_t wal_number);
 
+  // On success, `reader` is set to read the WAL. If the WAL file cannot be
+  // opened, returns that error and leaves `reader` unset. The caller,
+  // `ProcessLogFile()`, uses `MaybeIgnoreError()` to decide whether to fail
+  // the recovery or skip this WAL.
   Status InitializeLogReader(uint64_t wal_number, bool is_retry,
                              std::string& fname,
 
