@@ -106,7 +106,7 @@ class MockFileSystem : public FileSystem {
                            IODebugContext* /*dbg*/) override;
   IOStatus IsDirectory(const std::string& /*path*/,
                        const IOOptions& /*options*/, bool* /*is_dir*/,
-                       IODebugContext* /*dgb*/) override {
+                       IODebugContext* /*dbg*/) override {
     return IOStatus::NotSupported("IsDirectory");
   }
 
