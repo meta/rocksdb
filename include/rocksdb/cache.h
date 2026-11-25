@@ -478,6 +478,48 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
   std::shared_ptr<Cache> MakeSharedCache() const;
 };
 
+// EXPERIMENTAL: the API is subject to change.
+// S3FifoCache - A sharded cache with S3-FIFO eviction (SOSP '23): new entries
+// enter a probation queue; one hit at least twice before reaching its head
+// moves to a resident queue. Lookup, Ref and most Releases take no lock.
+// Cache::Priority is ignored; pinned entries are never evicted. Unlike
+// LRUCache, a Release never evicts for being over capacity, an entry holds at
+// most 16383 references (then Lookup misses and Ref returns false), and it
+// cannot be the primary of NewTieredCache. An entry the table cannot hold (a
+// charge of 4 GiB or more, the 256th and later distinct CacheItemHelpers of a
+// cache, or any entry while every slot of its shard's table is taken) is not
+// cached: with a handle it is handed out uncached (under strict_capacity_limit
+// only if it fits, else MemoryLimit), else dropped.
+// Memory: about 71 bytes of metadata per entry (charged against capacity under
+// kFullChargeCacheMetadata) plus up to about 2.7 MiB of address space reserved
+// per shard (committed up front on Windows); per-thread state is not charged.
+// MakeSharedCache returns nullptr if a reservation fails (e.g. past
+// vm.max_map_count) or num_shard_bits is 20 or more. num_shard_bits = -1 keeps
+// shards in [4 MiB, 128 MiB] (fits 4 KiB entries); set it for smaller entries
+// or a later SetCapacity raise. GetPinnedUsage scans all tables, O(homes),
+// under the caller's lock (the DB mutex for rocksdb.block-cache-pinned-usage).
+// Only MakeSharedCache builds it. Details: cache/s3fifo_cache.h.
+struct S3FifoCacheOptions : public ShardedCacheOptions {
+  // Whether to use adaptive mutexes for cache shards. Note that adaptive
+  // mutexes need to be supported by the platform in order for this to have any
+  // effect. The default value is true if RocksDB is compiled with
+  // -DROCKSDB_DEFAULT_TO_ADAPTIVE_MUTEX, false otherwise.
+  bool use_adaptive_mutex = kDefaultToAdaptiveMutex;
+
+  // The largest capacity SetCapacity may raise this cache to, when larger than
+  // capacity, so that the slot tables are reserved for it; 0 (the default)
+  // reserves for capacity. It matters only for shards under 4 MiB (see
+  // cache/s3fifo_cache.h).
+  size_t max_capacity = 0;
+
+  // No positional constructor: set the fields (capacity, max_capacity, ...)
+  // by name.
+  S3FifoCacheOptions() {}
+
+  // Construct an instance of S3FifoCache using these options
+  std::shared_ptr<Cache> MakeSharedCache() const;
+};
+
 // DEPRECATED - The old Clock Cache implementation had an unresolved bug and
 // has been removed. The new HyperClockCache requires an additional
 // configuration parameter that is not provided by this API. This function

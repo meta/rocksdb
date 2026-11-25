@@ -1526,8 +1526,8 @@ TEST_P(BasicSecondaryCacheTest, FullCapacityTest) {
       ASSERT_EQ(secondary_cache->num_lookups(), 1u);
 
       // Releasing k2's handle first, k2 is evicted from primary iff k1
-      // promotion was charged to the cache (except HCC doesn't erase in
-      // Release() over capacity)
+      // promotion was charged to the cache (except HCC and S3FifoCache don't
+      // erase in Release() over capacity)
       // FIXME: Insert to secondary from Release disabled
       cache->Release(handle2);
       cache->Release(handle1);
@@ -1535,7 +1535,7 @@ TEST_P(BasicSecondaryCacheTest, FullCapacityTest) {
           k2.AsSlice(),
           GetHelper(CacheEntryRole::kDataBlock, /*secondary_compatible=*/false),
           /*context*/ this, Cache::Priority::LOW);
-      if (strict_capacity_limit || IsHyperClock()) {
+      if (strict_capacity_limit || !ReleaseErasesOverCapacity()) {
         ASSERT_NE(handle2, nullptr);
         cache->Release(handle2);
         ASSERT_EQ(secondary_cache->num_inserts(), 1u);
@@ -1566,7 +1566,7 @@ TEST_P(BasicSecondaryCacheTest, FullCapacityTest) {
 // intend to add support for demotion in Release, but that currently causes too
 // much unit test churn.
 TEST_P(DBSecondaryCacheTest, TestSecondaryCacheCorrectness1) {
-  if (IsHyperClock()) {
+  if (!ReleaseErasesOverCapacity()) {
     // See CORRECTION above
     ROCKSDB_GTEST_BYPASS("Test depends on LRUCache-specific behaviors");
     return;
@@ -1852,7 +1852,7 @@ TEST_P(DBSecondaryCacheTest, SecondaryCacheIntensiveTesting) {
 // if we try to insert block_1 to the block cache, it will always fails. Only
 // block_2 will be successfully inserted into the block cache.
 TEST_P(DBSecondaryCacheTest, SecondaryCacheFailureTest) {
-  if (IsHyperClock()) {
+  if (!ReleaseErasesOverCapacity()) {
     ROCKSDB_GTEST_BYPASS("Test depends on LRUCache-specific behaviors");
     return;
   }
@@ -2520,7 +2520,7 @@ TEST_P(DBSecondaryCacheTest, TestSecondaryCacheOptionBasic) {
 // with new options, which set the lowest_used_cache_tier to
 // kNonVolatileBlockTier. So secondary cache will be used.
 TEST_P(DBSecondaryCacheTest, TestSecondaryCacheOptionChange) {
-  if (IsHyperClock()) {
+  if (!ReleaseErasesOverCapacity()) {
     ROCKSDB_GTEST_BYPASS("Test depends on LRUCache-specific behaviors");
     return;
   }
@@ -2615,7 +2615,7 @@ TEST_P(DBSecondaryCacheTest, TestSecondaryCacheOptionChange) {
 // Two DB test. We create 2 DBs sharing the same block cache and secondary
 // cache. We disable the secondary cache option for DB2.
 TEST_P(DBSecondaryCacheTest, TestSecondaryCacheOptionTwoDB) {
-  if (IsHyperClock()) {
+  if (!ReleaseErasesOverCapacity()) {
     ROCKSDB_GTEST_BYPASS("Test depends on LRUCache-specific behaviors");
     return;
   }
