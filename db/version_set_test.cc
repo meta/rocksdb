@@ -1235,8 +1235,9 @@ class VersionSetTestBase {
     assert(column_families != nullptr);
     assert(last_seqno != nullptr);
     assert(log_writer != nullptr);
-    ASSERT_OK(
-        SetIdentityFile(WriteOptions(), env_, dbname_, Temperature::kUnknown));
+    ASSERT_OK(SetIdentityFile(WriteOptions(), env_, dbname_,
+                              Temperature::kUnknown,
+                              /*atomic_replace_on_close=*/false));
     VersionEdit new_db;
     if (imm_db_options_.write_dbid_to_manifest) {
       std::string db_id;
@@ -1376,7 +1377,8 @@ class VersionSetTestBase {
     // Make "CURRENT" file point to the new manifest file.
     ASSERT_OK(SetCurrentFile(WriteOptions(), fs_.get(), dbname_, 1,
                              Temperature::kUnknown,
-                             /* dir_contains_current_file */ nullptr));
+                             /* dir_contains_current_file */ nullptr,
+                             /*atomic_replace_on_close=*/false));
   }
 
   // Create DB with 3 column families.
@@ -3357,7 +3359,8 @@ TEST_F(VersionSetAtomicGroupTest,
   ASSERT_GE(new_manifest_size, old_manifest_end);
   ASSERT_OK(SetCurrentFile(WriteOptions(), fs_.get(), dbname_,
                            kNewManifestFileNumber, Temperature::kUnknown,
-                           /*dir_contains_current_file=*/nullptr));
+                           /*dir_contains_current_file=*/nullptr,
+                           /*atomic_replace_on_close=*/false));
 
   InstrumentedMutex mu;
   std::unordered_set<ColumnFamilyData*> cfds_changed;
@@ -4179,7 +4182,8 @@ class VersionSetTestEmptyDb
     VersionEdit new_db;
     if (imm_db_options_.write_dbid_to_manifest) {
       ASSERT_OK(SetIdentityFile(WriteOptions(), env_, dbname_,
-                                Temperature::kUnknown));
+                                Temperature::kUnknown,
+                                /*atomic_replace_on_close=*/false));
       std::string db_id;
       ASSERT_OK(ReadFileToString(env_, IdentityFileName(dbname_), &db_id));
       // Strip trailing newline if present (old GenerateUniqueId format)
@@ -4500,8 +4504,9 @@ class VersionSetTestMissingFiles : public VersionSetTestBase,
     assert(column_families != nullptr);
     assert(last_seqno != nullptr);
     assert(log_writer != nullptr);
-    ASSERT_OK(
-        SetIdentityFile(WriteOptions(), env_, dbname_, Temperature::kUnknown));
+    ASSERT_OK(SetIdentityFile(WriteOptions(), env_, dbname_,
+                              Temperature::kUnknown,
+                              /*atomic_replace_on_close=*/false));
     const std::string manifest = DescriptorFileName(dbname_, 1);
     const auto& fs = env_->GetFileSystem();
     std::unique_ptr<WritableFileWriter> file_writer;

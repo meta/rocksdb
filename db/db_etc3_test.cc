@@ -3,16 +3,20 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
 #include <mutex>
 #include <set>
 
 #include "db/db_test_util.h"
+#include "file/file_util.h"
 #include "file/filename.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/experimental.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/sst_file_writer.h"
+#include "rocksdb/utilities/checkpoint.h"
+#include "rocksdb/utilities/options_util.h"
 #include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -21,6 +25,36 @@ class DBEtc3Test : public DBTestBase {
  public:
   DBEtc3Test() : DBTestBase("db_etc3_test", /*env_do_fsync=*/true) {}
 };
+
+namespace {
+// Setup of the AtomicReplaceOnClose* tests: a test::AtomicReplaceOnCloseFS on
+// top of the test file system, an Env on that file system, and options that
+// use the Env. The test opens the DB itself, for example with
+// DestroyAndReopen(setup.options). The destructor closes the DB before the
+// Env is destroyed, also when an assertion fails. It also points last_options_
+// back to env_, because DestroyAndReopen() in a later loop iteration or test
+// destroys the DB with last_options_.
+struct AtomicReplaceOnCloseSetup {
+  AtomicReplaceOnCloseSetup(DBTestBase* _db_test, bool set_bit)
+      : db_test(_db_test),
+        fs(std::make_shared<test::AtomicReplaceOnCloseFS>(
+            db_test->env_->GetFileSystem())),
+        env(NewCompositeEnv(fs)),
+        options(db_test->CurrentOptions()) {
+    fs->SetBitInSupportedOps(set_bit);
+    options.env = env.get();
+  }
+  ~AtomicReplaceOnCloseSetup() {
+    db_test->Close();
+    db_test->last_options_.env = db_test->env_;
+  }
+
+  DBTestBase* const db_test;
+  std::shared_ptr<test::AtomicReplaceOnCloseFS> fs;
+  std::unique_ptr<Env> env;
+  Options options;
+};
+}  // namespace
 
 namespace {
 // The configuration in which RocksDB 11.10 through 11.13 could write a common
@@ -1577,6 +1611,319 @@ TEST_F(DBOwnershipTest, Repair) {
   EXPECT_EQ(from_wal.db_ownership_start_time, from_wal.file_creation_time);
   expected.origin = DataFileProvenance::Origin::kFlush;
   EXPECT_EQ(Decode(from_wal), expected);
+}
+
+// Returns the events of `fs` for writing CURRENT and IDENTITY: renames to
+// them, new MANIFEST files, temp files other than OPTIONS temp files, the
+// publish and the directory sync of CURRENT and IDENTITY, and the directory
+// syncs that name no file.
+std::vector<std::string> TakeCurrentAndIdentityEvents(
+    test::AtomicReplaceOnCloseFS* fs) {
+  std::vector<std::string> events;
+  for (const std::string& event : fs->TakeEvents()) {
+    const Slice e(event);
+    if (e.ends_with(" CURRENT") || e.ends_with(" IDENTITY") ||
+        event == "dirsync" ||
+        (e.starts_with("create ") && !e.starts_with("create OPTIONS-"))) {
+      events.push_back(event);
+    }
+  }
+  return events;
+}
+
+// With kAtomicReplaceOnClose, creating a DB, rolling the MANIFEST and
+// rewriting a missing IDENTITY at open write CURRENT and IDENTITY directly,
+// with no temp file and no rename, and each write is followed by its
+// directory sync. Each direct write of CURRENT also comes after a directory
+// sync that follows the creation of its MANIFEST, so the MANIFEST entry is
+// durable before CURRENT is. Without the bit, the same steps use temp files
+// and renames, with no directory sync between the MANIFEST and the rename.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseWritesCurrentAndIdentityDirectly) {
+  for (bool set_bit : {true, false}) {
+    SCOPED_TRACE("set_bit=" + std::to_string(set_bit));
+    AtomicReplaceOnCloseSetup setup(this, set_bit);
+    auto& fs = setup.fs;
+    Options& options = setup.options;
+    // Write a new MANIFEST, and so a new CURRENT, on each MANIFEST write.
+    options.max_manifest_file_size = 0;
+    options.max_manifest_space_amp_pct = 0;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", "value"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(env_->DeleteFile(IdentityFileName(dbname_)));
+    Reopen(options);
+    ASSERT_EQ("value", Get("key"));
+    ASSERT_OK(env_->FileExists(IdentityFileName(dbname_)));
+
+    const std::vector<std::string> events =
+        TakeCurrentAndIdentityEvents(fs.get());
+    // Whether a directory sync that names no file came after the newest
+    // MANIFEST was created.
+    bool dir_synced_after_manifest = false;
+    size_t current_writes = 0;
+    for (size_t i = 0; i < events.size(); ++i) {
+      SCOPED_TRACE(events[i]);
+      const Slice event(events[i]);
+      if (event.starts_with("create MANIFEST-")) {
+        dir_synced_after_manifest = false;
+      } else if (events[i] == "dirsync") {
+        dir_synced_after_manifest = true;
+      } else if (!set_bit) {
+        ASSERT_FALSE(event.starts_with("publish "));
+        if (event.starts_with("rename ") && event.ends_with(" CURRENT")) {
+          ASSERT_FALSE(dir_synced_after_manifest);
+          ++current_writes;
+        }
+      } else {
+        // Only direct writes, each followed by its directory sync.
+        ASSERT_TRUE(events[i] == "publish CURRENT" ||
+                    events[i] == "publish IDENTITY");
+        const std::string name = events[i].substr(events[i].find(' ') + 1);
+        ASSERT_LT(i + 1, events.size());
+        ASSERT_EQ("dirsync " + name, events[i + 1]);
+        ++i;
+        if (name == "CURRENT") {
+          ASSERT_TRUE(dir_synced_after_manifest);
+          ++current_writes;
+        }
+      }
+    }
+    // NewDB, the flush and the reopen each write CURRENT.
+    ASSERT_GE(current_writes, size_t{3});
+  }
+}
+
+// With kAtomicReplaceOnClose, a failure while writing CURRENT for a new
+// MANIFEST fails the flush. The failing step is one step of the CURRENT
+// write, or the directory sync before it ("dirsync before"). A failure before
+// CURRENT is published keeps the old CURRENT. A Close() that publishes
+// CURRENT and then fails leaves CURRENT naming the new MANIFEST, which
+// RocksDB keeps. Either way the DB reopens with all its data.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseCurrentWriteFailure) {
+  for (const char* step_name : {"dirsync before", "open", "append", "sync",
+                                "close", "close after publish"}) {
+    const std::string step = step_name;
+    SCOPED_TRACE(step);
+    const bool published = step == "close after publish";
+    AtomicReplaceOnCloseSetup setup(this, /*set_bit=*/true);
+    auto& fs = setup.fs;
+    Options& options = setup.options;
+    options.max_manifest_file_size = 0;
+    options.max_manifest_space_amp_pct = 0;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key1", "value1"));
+    ASSERT_OK(Flush());
+    std::string current_before;
+    ASSERT_OK(
+        ReadFileToString(env_, CurrentFileName(dbname_), &current_before));
+
+    ASSERT_OK(Put("key2", "value2"));
+    if (step == "dirsync before") {
+      // The new MANIFEST is synced, and the next directory sync is the one
+      // before CURRENT is written.
+      SyncPoint::GetInstance()->SetCallBack(
+          "VersionSet::ProcessManifestWrites:AfterSyncManifest",
+          [&](void* /*arg*/) { fs->FailNextDirSyncWithoutName(); });
+      SyncPoint::GetInstance()->EnableProcessing();
+    } else {
+      fs->SetFailure("CURRENT", step);
+    }
+    ASSERT_NOK(Flush());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    fs->SetFailure("", "");
+    std::string current_after;
+    ASSERT_OK(ReadFileToString(env_, CurrentFileName(dbname_), &current_after));
+    ASSERT_EQ(published, current_before != current_after);
+    // CURRENT names a MANIFEST that exists.
+    ASSERT_TRUE(Slice(current_after).ends_with("\n"));
+    ASSERT_OK(env_->FileExists(
+        dbname_ + "/" + current_after.substr(0, current_after.size() - 1)));
+
+    Reopen(options);
+    ASSERT_EQ("value1", Get("key1"));
+    ASSERT_EQ("value2", Get("key2"));
+  }
+}
+
+// With kAtomicReplaceOnClose, SetCurrentFile() syncs the DB directory before
+// it publishes CURRENT also when the caller passes no directory handle, as
+// VersionSet::ReduceNumberOfLevels() does. Without a handle, no directory
+// sync follows the write.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseSetCurrentFileWithoutDirectory) {
+  auto fs =
+      std::make_shared<test::AtomicReplaceOnCloseFS>(env_->GetFileSystem());
+  const std::string dir = dbname_ + "_set_current_file";
+  ASSERT_OK(DestroyDir(env_, dir));
+  ASSERT_OK(env_->CreateDirIfMissing(dir));
+  Defer destroy_dir([&]() { EXPECT_OK(DestroyDir(env_, dir)); });
+  ASSERT_OK(SetCurrentFile(WriteOptions(), fs.get(), dir,
+                           /*descriptor_number=*/7, Temperature::kUnknown,
+                           /*dir_contains_current_file=*/nullptr,
+                           /*atomic_replace_on_close=*/true));
+  const std::vector<std::string> expected = {"dirsync", "publish CURRENT"};
+  ASSERT_EQ(expected, fs->TakeEvents());
+  std::string current;
+  ASSERT_OK(ReadFileToString(env_, CurrentFileName(dir), &current));
+  ASSERT_EQ("MANIFEST-000007\n", current);
+}
+
+// Returns the sorted names of the OPTIONS files (OPTIONS-<number>, without
+// temp files) in `dbname`.
+std::vector<std::string> ListOptionsFiles(Env* env, const std::string& dbname) {
+  std::vector<std::string> children;
+  EXPECT_OK(env->GetChildren(dbname, &children));
+  std::vector<std::string> options_files;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kOptionsFile) {
+      options_files.push_back(child);
+    }
+  }
+  std::sort(options_files.begin(), options_files.end());
+  return options_files;
+}
+
+// With kAtomicReplaceOnClose, a checkpoint CURRENT appears only at Close().
+// When that Close() fails, CreateCheckpoint() fails and leaves no checkpoint.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseCheckpointCurrentCloseFailure) {
+  AtomicReplaceOnCloseSetup setup(this, /*set_bit=*/true);
+  auto& fs = setup.fs;
+  DestroyAndReopen(setup.options);
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Flush());
+
+  const std::string checkpoint_dir =
+      test::PerThreadDBPath(env_, "atomic_replace_checkpoint");
+  ASSERT_OK(DestroyDir(env_, checkpoint_dir));
+  Checkpoint* checkpoint_ptr = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint_ptr));
+  std::unique_ptr<Checkpoint> checkpoint(checkpoint_ptr);
+
+  fs->SetFailure("CURRENT", "close");
+  const Status s = checkpoint->CreateCheckpoint(checkpoint_dir);
+  fs->SetFailure("", "");
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+  ASSERT_EQ(Status::Code::kNotFound, env_->FileExists(checkpoint_dir).code());
+
+  ASSERT_OK(checkpoint->CreateCheckpoint(checkpoint_dir));
+  ASSERT_OK(env_->FileExists(CurrentFileName(checkpoint_dir)));
+  ASSERT_OK(DestroyDir(env_, checkpoint_dir));
+}
+
+// With kAtomicReplaceOnClose, DB open and SetOptions() write OPTIONS files
+// directly, with no temp file and no rename, each followed by its directory
+// sync, and the new file is the live OPTIONS file. Without the bit, the same
+// steps use temp files and renames.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseWritesOptionsDirectly) {
+  for (bool set_bit : {true, false}) {
+    SCOPED_TRACE("set_bit=" + std::to_string(set_bit));
+    AtomicReplaceOnCloseSetup setup(this, set_bit);
+    auto& fs = setup.fs;
+    Options& options = setup.options;
+    DestroyAndReopen(options);
+    ASSERT_OK(db_->SetOptions({{"write_buffer_size", "1048576"}}));
+
+    // The events for OPTIONS files: temp files, renames, publishes and
+    // directory syncs.
+    std::vector<std::string> events;
+    for (const std::string& event : fs->TakeEvents()) {
+      if (event.find(" OPTIONS-") != std::string::npos) {
+        events.push_back(event);
+      }
+    }
+    size_t temp_steps = 0;
+    size_t publishes = 0;
+    for (size_t i = 0; i < events.size(); ++i) {
+      SCOPED_TRACE(events[i]);
+      const Slice event(events[i]);
+      if (event.starts_with("create ") || event.starts_with("rename ")) {
+        ++temp_steps;
+      } else if (set_bit && event.starts_with("publish ")) {
+        // Each direct write is followed by its directory sync.
+        const std::string name = events[i].substr(events[i].find(' ') + 1);
+        ASSERT_LT(i + 1, events.size());
+        ASSERT_EQ("dirsync " + name, events[i + 1]);
+        ++publishes;
+      }
+    }
+    if (set_bit) {
+      ASSERT_EQ(size_t{0}, temp_steps);
+      // DB open and SetOptions() each write an OPTIONS file.
+      ASSERT_GE(publishes, size_t{2});
+    } else {
+      ASSERT_GT(temp_steps, size_t{0});
+    }
+
+    // The live OPTIONS file is the latest one and has the new value.
+    const std::vector<std::string> options_files =
+        ListOptionsFiles(env_, dbname_);
+    ASSERT_FALSE(options_files.empty());
+    std::vector<std::string> live_files;
+    uint64_t manifest_size = 0;
+    ASSERT_OK(db_->GetLiveFiles(live_files, &manifest_size,
+                                /*flush_memtable=*/false));
+    ASSERT_NE(std::find(live_files.begin(), live_files.end(),
+                        "/" + options_files.back()),
+              live_files.end());
+    DBOptions db_options;
+    std::vector<ColumnFamilyDescriptor> cf_descs;
+    ConfigOptions config_options;
+    config_options.env = env_;
+    ASSERT_OK(
+        LoadLatestOptions(config_options, dbname_, &db_options, &cf_descs));
+    ASSERT_EQ(size_t{1048576}, cf_descs[0].options.write_buffer_size);
+  }
+}
+
+// With kAtomicReplaceOnClose, a failure at any step of writing an OPTIONS
+// file, including the directory sync after the write and the verify that
+// reads it back, fails SetOptions() and leaves the OPTIONS files as they were.
+// After a "close after publish" failure, a failed directory sync or a failed
+// verify, the file is already published, so PersistOptionsFile() deletes it.
+// The next SetOptions() succeeds.
+TEST_F(DBEtc3Test, AtomicReplaceOnCloseOptionsWriteFailure) {
+  AtomicReplaceOnCloseSetup setup(this, /*set_bit=*/true);
+  auto& fs = setup.fs;
+  DestroyAndReopen(setup.options);
+
+  size_t write_buffer_size = 1 << 20;
+  for (const char* step : {"open", "append", "sync", "close",
+                           "close after publish", "dir sync", "read"}) {
+    SCOPED_TRACE(step);
+    const std::vector<std::string> files_before =
+        ListOptionsFiles(env_, dbname_);
+    write_buffer_size += 1024;
+    fs->SetFailure("OPTIONS-", step);
+    const Status s = db_->SetOptions(
+        {{"write_buffer_size", std::to_string(write_buffer_size)}});
+    fs->SetFailure("", "");
+    ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+    ASSERT_EQ(files_before, ListOptionsFiles(env_, dbname_));
+    // The DB still uses the previous OPTIONS file and lists no OPTIONS file
+    // that is missing on disk.
+    std::vector<std::string> live_files;
+    uint64_t manifest_size = 0;
+    ASSERT_OK(db_->GetLiveFiles(live_files, &manifest_size,
+                                /*flush_memtable=*/false));
+    for (const std::string& live_file : live_files) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(live_file.substr(1), &number, &type) &&
+          type == kOptionsFile) {
+        ASSERT_EQ("/" + files_before.back(), live_file);
+      }
+    }
+    ASSERT_NE(std::find(live_files.begin(), live_files.end(),
+                        "/" + files_before.back()),
+              live_files.end());
+
+    write_buffer_size += 1024;
+    ASSERT_OK(db_->SetOptions(
+        {{"write_buffer_size", std::to_string(write_buffer_size)}}));
+    ASSERT_NE(files_before, ListOptionsFiles(env_, dbname_));
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

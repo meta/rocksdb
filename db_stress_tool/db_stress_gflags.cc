@@ -1532,6 +1532,14 @@ DEFINE_int32(write_fault_one_in, 0,
 DEFINE_bool(exclude_wal_from_write_fault_injection, false,
             "If true, we won't inject write fault when writing to WAL file");
 
+DEFINE_bool(atomic_replace_on_close, false,
+            "If true, the DB runs on a FaultInjectionTestFS in atomic-replace "
+            "mode: the file system sets FSSupportedOps::kAtomicReplaceOnClose "
+            "and keeps its contract for CURRENT, IDENTITY and OPTIONS files, "
+            "so RocksDB writes these files directly instead of through a temp "
+            "file and a rename. See "
+            "FaultInjectionTestFS::SetAtomicReplaceOnClose().");
+
 DEFINE_bool(file_scope_wal_write_faults, false,
             "If true, injected write faults on WAL files have file scope so "
             "the file-scoped WAL recovery protocol is exercised. Other fault "

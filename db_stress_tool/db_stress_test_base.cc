@@ -614,7 +614,7 @@ bool NeedsFaultInjection() {
          FLAGS_metadata_read_fault_one_in ||
          FLAGS_metadata_write_fault_one_in || FLAGS_read_fault_one_in ||
          FLAGS_write_fault_one_in || FLAGS_sync_fault_injection ||
-         FLAGS_test_cf_lifecycle;
+         FLAGS_test_cf_lifecycle || FLAGS_atomic_replace_on_close;
 }
 
 // Resolves --read_index. The auto value (-1) reads through the trie when it is
@@ -1387,6 +1387,8 @@ StressTest::StressTest(int db_index, const std::string& db_path,
         FLAGS_file_scope_wal_write_faults);
     db_fault_injection_fs_->SetInjectWriteFaultsOnlyOnWAL(
         FLAGS_file_scope_wal_write_faults);
+    db_fault_injection_fs_->SetAtomicReplaceOnClose(
+        FLAGS_atomic_replace_on_close);
     // Normally bypass filesystem fault injection during DB open. Lifecycle
     // testing keeps the fresh MANIFEST behind the wrapper while injection
     // remains disabled until the target setup after open. Other modes

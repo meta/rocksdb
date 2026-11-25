@@ -53,6 +53,7 @@ DECLARE_int32(read_fault_one_in);
 DECLARE_int32(write_fault_one_in);
 DECLARE_bool(exclude_wal_from_write_fault_injection);
 DECLARE_bool(file_scope_wal_write_faults);
+DECLARE_bool(atomic_replace_on_close);
 DECLARE_int32(open_metadata_read_fault_one_in);
 DECLARE_int32(open_metadata_write_fault_one_in);
 DECLARE_int32(open_write_fault_one_in);
