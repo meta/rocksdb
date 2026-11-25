@@ -287,6 +287,24 @@ TEST_F(DBOptionsTest, CloseDropsDeferredOwnedLoggerRecord) {
   ASSERT_EQ(context->threshold_us->load(), 100000);
 }
 
+TEST_F(DBOptionsTest, NegativeNumLevelsDoesNotCrashOnOpen) {
+  // Regression for a crash on DB::Open with a negative num_levels. DB::Open
+  // validates the raw, unsanitized ColumnFamilyOptions, which builds a
+  // MutableCFOptions whose RefreshDerivedOptions resized a vector to
+  // num_levels. A negative value converted to a huge size_t and threw
+  // std::length_error (std::terminate) instead of being clamped the way
+  // num_levels == 0 is. After the fix, DB::Open succeeds and the value is
+  // clamped the same way (to 2 under level compaction), matching num_levels == 0
+  // and CreateColumnFamily.
+  Destroy(last_options_);
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.num_levels = -1;
+  Status s = TryReopen(options);
+  ASSERT_OK(s);
+  ASSERT_EQ(db_->GetOptions().num_levels, 2);
+}
+
 TEST_F(DBOptionsTest, ImmutableTrackAndVerifyWalsInManifest) {
   Options options;
   options.env = env_;

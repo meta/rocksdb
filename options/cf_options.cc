@@ -1224,7 +1224,13 @@ size_t MaxFileSizeForL0MetaPin(const MutableCFOptions& cf_options) {
 
 void MutableCFOptions::RefreshDerivedOptions(int num_levels,
                                              CompactionStyle compaction_style) {
-  max_file_size.resize(num_levels);
+  // num_levels can be <= 0 here: DB::Open validates the raw, unsanitized
+  // ColumnFamilyOptions (building a MutableCFOptions) before SanitizeOptions
+  // clamps num_levels to >= 1. A negative value would convert to a huge size_t
+  // and make resize() throw std::length_error (terminating the process), so
+  // treat it as empty. The loop below already skips when num_levels <= 0, and
+  // the real column family is later built with sanitized options.
+  max_file_size.resize(num_levels < 0 ? 0 : static_cast<size_t>(num_levels));
   for (int i = 0; i < num_levels; ++i) {
     if (i == 0 && compaction_style == kCompactionStyleUniversal) {
       max_file_size[i] = ULLONG_MAX;
