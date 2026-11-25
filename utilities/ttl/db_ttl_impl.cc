@@ -6,12 +6,14 @@
 #include "utilities/ttl/db_ttl_impl.h"
 
 #include <array>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #include "db/db_impl/db_impl_metadata.h"
 #include "db/write_batch_internal.h"
-#include "file/filename.h"
 #include "logging/logging.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
@@ -20,8 +22,8 @@
 #include "rocksdb/utilities/db_ttl.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
+#include "rocksdb/write_batch.h"
 #include "table/multiget_context.h"
-#include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
 

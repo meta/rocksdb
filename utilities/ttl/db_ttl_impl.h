@@ -5,16 +5,28 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/db.h"
+#include "rocksdb/iterator.h"
 #include "rocksdb/merge_operator.h"
+#include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/utilities/db_ttl.h"
+#include "rocksdb/utilities/stackable_db.h"
+#include "util/coding_lean.h"
+#include "util/coro_utils.h"
 #include "utilities/compaction_filters/layered_compaction_filter_base.h"
 
 #if USE_COROUTINES
