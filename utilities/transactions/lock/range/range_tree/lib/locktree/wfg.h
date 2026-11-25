@@ -106,7 +106,7 @@ class wfg {
 
     static void free(node *n);
   };
-  ENSURE_POD(node);
+  static_assert(std::is_trivially_default_constructible_v<node>);
 
   toku::omt<node *> m_nodes;
 
@@ -119,6 +119,5 @@ class wfg {
 
   static int find_by_txnid(node *const &node_a, const TXNID &txnid_b);
 };
-ENSURE_POD(wfg);
 
 } /* namespace toku */
