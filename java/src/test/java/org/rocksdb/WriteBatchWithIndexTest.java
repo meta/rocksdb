@@ -11,11 +11,13 @@ package org.rocksdb;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
@@ -889,6 +891,71 @@ public class WriteBatchWithIndexTest {
 
       assertThat(wbwi.getFromBatch(dbOptions, k2)).isNull();
     }
+  }
+
+  @Test
+  public void putAndDeleteDirect() throws RocksDBException {
+    final byte[] k1 = "k1".getBytes(UTF_8);
+    final byte[] k2 = "k2".getBytes(UTF_8);
+
+    try (final Options options = new Options().setCreateIfMissing(true);
+        final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath());
+        final ColumnFamilyHandle newCf =
+            db.createColumnFamily(new ColumnFamilyDescriptor("new_cf".getBytes(UTF_8)));
+        final WriteBatchWithIndex wbwi = new WriteBatchWithIndex(true);
+        final DBOptions dbOptions = new DBOptions()) {
+      wbwi.put(directBuffer("k1"), directBuffer("v1"));
+      wbwi.put(directBuffer("k2"), directBuffer("v2"));
+      wbwi.put(newCf, directBuffer("k1"), directBuffer("v1-cf"));
+      wbwi.put(newCf, directBuffer("k2"), directBuffer("v2-cf"));
+
+      assertThat(wbwi.getFromBatch(dbOptions, k1)).isEqualTo("v1".getBytes(UTF_8));
+      assertThat(wbwi.getFromBatch(dbOptions, k2)).isEqualTo("v2".getBytes(UTF_8));
+      assertThat(wbwi.getFromBatch(newCf, dbOptions, k1)).isEqualTo("v1-cf".getBytes(UTF_8));
+      assertThat(wbwi.getFromBatch(newCf, dbOptions, k2)).isEqualTo("v2-cf".getBytes(UTF_8));
+
+      wbwi.delete(directBuffer("k1"));
+      wbwi.delete(newCf, directBuffer("k2"));
+
+      // each delete only affects its own column family
+      assertThat(wbwi.getFromBatch(dbOptions, k1)).isNull();
+      assertThat(wbwi.getFromBatch(dbOptions, k2)).isEqualTo("v2".getBytes(UTF_8));
+      assertThat(wbwi.getFromBatch(newCf, dbOptions, k1)).isEqualTo("v1-cf".getBytes(UTF_8));
+      assertThat(wbwi.getFromBatch(newCf, dbOptions, k2)).isNull();
+    }
+  }
+
+  @Test
+  public void putAndDeleteDirect_overMaxBytes() throws RocksDBException {
+    try (final Options options = new Options().setCreateIfMissing(true);
+        final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath());
+        final ColumnFamilyHandle newCf =
+            db.createColumnFamily(new ColumnFamilyDescriptor("new_cf".getBytes(UTF_8)));
+        final WriteBatchWithIndex wbwi = new WriteBatchWithIndex(true)) {
+      wbwi.setMaxBytes(1);
+
+      assertMemoryLimit(() -> wbwi.put(directBuffer("k1"), directBuffer("v1")));
+      assertMemoryLimit(() -> wbwi.put(newCf, directBuffer("k1"), directBuffer("v1")));
+      assertMemoryLimit(() -> wbwi.delete(directBuffer("k1")));
+      assertMemoryLimit(() -> wbwi.delete(newCf, directBuffer("k1")));
+
+      // the rejected writes must not have been added to the batch
+      assertThat(wbwi.count()).isZero();
+    }
+  }
+
+  private static ByteBuffer directBuffer(final String s) {
+    final byte[] bytes = s.getBytes(UTF_8);
+    final ByteBuffer buffer = ByteBuffer.allocateDirect(bytes.length);
+    buffer.put(bytes).flip();
+    return buffer;
+  }
+
+  private static void assertMemoryLimit(final ThrowingCallable writeOp) {
+    final Throwable thrown = catchThrowable(writeOp);
+    assertThat(thrown).isInstanceOf(RocksDBException.class);
+    assertThat(((RocksDBException) thrown).getStatus().getSubCode())
+        .isEqualTo(Status.SubCode.MemoryLimit);
   }
 
   @Test
