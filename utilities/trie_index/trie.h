@@ -73,7 +73,9 @@
 //      separator 7 spans 4, the entries are {3, 1} and {7, 4}, and separator
 //      7's blocks start at block 7 + 1 = 8.
 //    Tag table: u64 count, then count entries of {u64 block_index, u64 tag}
-//      for every block with a nonzero tag, in block order. It ends the index.
+//      for every block with a nonzero tag, in block order. The tags of
+//      consecutive blocks that share a separator do not ascend, which lets
+//      Seek binary search them. It ends the index.
 //
 //  Column (linear frame of reference, groups of 64 values):
 //    u64 count, then per group {u64 base, u32 slope, u32 layout}, then the
@@ -107,7 +109,9 @@
 //    u8 (drop << 4 | add) when drop < 15 and add < 15, otherwise 0xFF
 //    followed by varint32 drop and varint32 add; then `add` suffix bytes.
 //    The separator is the previous one minus its last `drop` bytes, plus the
-//    suffix.
+//    suffix. drop is as small as it can be: the suffix is not empty and does
+//    not start with the byte it replaces. Seek relies on that to pass over a
+//    separator without comparing its bytes.
 
 #pragma once
 
@@ -143,6 +147,7 @@ class TrieBuilder {
   // Consecutive equal separators describe one user key spanning several
   // blocks. tag is 0 when the block can be found by user key alone,
   // otherwise the packed sequence number and type of the block's last key.
+  // The tags of consecutive blocks with equal separators must not ascend.
   void AddBlock(const Slice& separator, const TrieBlockHandle& handle,
                 uint64_t tag);
 
@@ -153,8 +158,8 @@ class TrieBuilder {
   uint64_t NumBlocks() const { return handles_.size(); }
   Slice LastSeparator() const;
 
-  // Serializes the index into *output. Fails if separators or offsets were
-  // added out of order, or a column value or the trie does not fit the
+  // Serializes the index into *output. Fails if separators, tags or offsets
+  // were added out of order, or a column value or the trie does not fit the
   // format.
   Status Finish(std::string* output);
 
@@ -205,7 +210,10 @@ class TrieBuilder {
   std::vector<TrieBlockHandle> handles_;
   // Every block with a nonzero tag.
   std::vector<Tag> tags_;
+  // Tag of the block added last, 0 when it has none.
+  uint64_t last_tag_ = 0;
   bool out_of_order_ = false;
+  bool tags_ascend_ = false;
 };
 
 // Read-only view of a serialized trie index. Init() validates the header,

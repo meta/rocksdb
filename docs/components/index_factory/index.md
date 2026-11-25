@@ -123,8 +123,11 @@ before reading any index or data block:
 
 After that, a custom block that is present but unusable is treated like a
 missing one: in `kStandardDefault` the reader logs an ERROR, drops the block,
-and serves the file from its standard index. Every other mode propagates the
-error. Only `Corruption` / `NotSupported` / `InvalidArgument` qualify for the
+and serves the file from its standard index. The other modes that load the
+block (`kStandardRequired`, `kCustomDefault`, `kCustomOnly`) propagate the
+error, to which the table reader adds whether another mode can read the file:
+`kStandardDefault` when the file has a standard index, none for a stub file.
+Only `Corruption` / `NotSupported` / `InvalidArgument` qualify for the
 fallback; an `IOError` or a block-cache limit is transient or environmental and
 propagates so the normal table-cache retry can re-attempt the open rather than
 baking a degraded reader into a long-lived `Rep`.
@@ -193,6 +196,15 @@ reopened, e.g. by reopening the DB.
 `kCustomOnly` is effectively a one-way door. Those SSTs have no usable standard
 index, so before dropping the factory you must move to `kCustomDefault` and
 compact every file, with the factory still attached.
+
+The same applies when a factory stops reading the blocks an older release of it
+wrote, as the built-in trie did when its format changed. Files that carry a
+standard index fall back to it in `kStandardDefault`, each one counted by
+`SST_USER_DEFINED_INDEX_LOAD_FAIL_COUNT` when it is opened, and compacting
+there rewrites them. Opening the DB in `kStandardRequired` with
+`max_open_files = -1` fails while any such file is left, so it confirms the
+rewrite is complete. Stub files have nothing to fall back to: rewrite them in
+another mode with the release that wrote them.
 
 ### Gotchas
 

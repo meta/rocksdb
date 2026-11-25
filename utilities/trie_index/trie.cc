@@ -406,6 +406,8 @@ void TrieBuilder::AddBlock(const Slice& separator,
     separator_ends_.push_back(separator_bytes_.size());
   } else {
     out_of_order_ |= cmp < 0;
+    // TrieIterator::ApplyTag() binary searches the tags of one separator.
+    tags_ascend_ |= last_tag_ != 0 && tag > last_tag_;
     if (!runs_.empty() && runs_.back().separator_index == num_separators - 1) {
       runs_.back().extra_blocks++;
     } else {
@@ -415,12 +417,17 @@ void TrieBuilder::AddBlock(const Slice& separator,
   if (tag != 0) {
     tags_.push_back({handles_.size(), tag});
   }
+  last_tag_ = tag;
   handles_.push_back(handle);
 }
 
 Status TrieBuilder::Finish(std::string* output) {
   if (out_of_order_) {
     return Status::InvalidArgument("Trie index: separators out of order");
+  }
+  if (tags_ascend_) {
+    return Status::InvalidArgument(
+        "Trie index: tags of one separator out of order");
   }
   if (bucket_size_ == 0) {
     return Status::InvalidArgument("Trie index: bucket size must be > 0");
@@ -903,10 +910,11 @@ Status Trie::Parse(const Slice& data) {
   }
   const uint32_t version = DecodeFixed32(p + kVersionPos);
   if (version != kVersion) {
-    return Status::NotSupported(
-        "Trie index: format version " + std::to_string(version) +
-        " is not readable by this release; open with "
-        "index_mode=kStandardDefault and compact to rewrite the trie");
+    return Status::NotSupported("Trie index: format version " +
+                                std::to_string(version) +
+                                " is not readable by this release, which "
+                                "reads version " +
+                                std::to_string(kVersion));
   }
   if (data.size() < kTrieHeaderSize) {
     return Corrupt("too short");
@@ -1418,20 +1426,33 @@ Status TrieIterator::ApplyTag(uint64_t tag) {
     return EnterBlock(run_begin_);
   }
   // First tagged block at or after the current one.
-  uint64_t lo = Trie::SideTableLowerBound(index_->tags_, num_tags, run_begin_);
-  // A block without a tag sorts after every tag of its separator.
-  if (lo == num_tags || index_->TagBlock(lo) != run_begin_) {
+  const uint64_t first =
+      Trie::SideTableLowerBound(index_->tags_, num_tags, run_begin_);
+  // A block without a tag sorts after every tag of its separator. The first
+  // block is the answer for the newest version, the usual target.
+  if (first == num_tags || index_->TagBlock(first) != run_begin_ ||
+      tag >= index_->TagValue(first)) {
     return EnterBlock(run_begin_);
   }
-  for (uint64_t b = run_begin_; b < run_end_; b++) {
-    uint64_t block_tag = 0;
-    if (lo < num_tags && index_->TagBlock(lo) == b) {
-      block_tag = index_->TagValue(lo);
-      lo++;
+  // The blocks to skip are those with a tag greater than `tag`. They come
+  // first, as the tags of one separator descend, and tag entries are in block
+  // order, so block run_begin_ + k has a tag exactly when entry first + k is
+  // its own. Binary search for the number of blocks to skip: a Seek below
+  // every version of a user key must not visit all of its blocks.
+  const uint64_t run_len = run_end_ - run_begin_;
+  uint64_t skip = 1;
+  uint64_t end = std::min(run_len, num_tags - first);
+  while (skip < end) {
+    const uint64_t mid = skip + (end - skip) / 2;
+    if (index_->TagBlock(first + mid) == run_begin_ + mid &&
+        index_->TagValue(first + mid) > tag) {
+      skip = mid + 1;
+    } else {
+      end = mid;
     }
-    if (block_tag == 0 || tag >= block_tag) {
-      return EnterBlock(b);
-    }
+  }
+  if (skip < run_len) {
+    return EnterBlock(run_begin_ + skip);
   }
   // Every block of this separator precedes the target.
   return NextSeparator();

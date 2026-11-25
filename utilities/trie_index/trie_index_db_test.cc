@@ -4999,8 +4999,13 @@ TEST_F(TrieIndexDBTest, OtherTrieVersionFallsBackOrFails) {
   for (IndexMode mode :
        {IndexMode::kStandardRequired, IndexMode::kCustomDefault}) {
     SCOPED_TRACE(static_cast<int>(mode));
-    ASSERT_EQ(OpenDBImpl(/*block_size=*/128, mode).code(),
-              Status::Code::kNotSupported);
+    const Status s = OpenDBImpl(/*block_size=*/128, mode);
+    ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+    // The SST has a standard index, so the error names the mode that reads
+    // through it.
+    ASSERT_NE(s.ToString().find("index_mode=kStandardDefault"),
+              std::string::npos)
+        << s.ToString();
   }
 
   ASSERT_OK(DestroyDB(dbname_, options_));
@@ -5014,8 +5019,14 @@ TEST_F(TrieIndexDBTest, OtherTrieVersionFallsBackOrFails) {
   trie_factory_ = std::make_shared<TrieIndexFactory>();
   for (IndexMode mode : {IndexMode::kStandardDefault, IndexMode::kCustomOnly}) {
     SCOPED_TRACE(static_cast<int>(mode));
-    ASSERT_EQ(OpenDBImpl(/*block_size=*/128, mode).code(),
-              Status::Code::kNotSupported);
+    const Status s = OpenDBImpl(/*block_size=*/128, mode);
+    ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+    // No index_mode reads this SST, so the error must not send the user to
+    // one. It says why there is no fallback instead.
+    ASSERT_EQ(s.ToString().find("kStandardDefault"), std::string::npos)
+        << s.ToString();
+    ASSERT_NE(s.ToString().find("no standard index"), std::string::npos)
+        << s.ToString();
   }
   // kStandardOnly does not load the trie, so it rejects the stub.
   ASSERT_EQ(OpenDBImpl(/*block_size=*/128, IndexMode::kStandardOnly).code(),

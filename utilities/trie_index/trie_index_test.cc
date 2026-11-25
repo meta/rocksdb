@@ -245,6 +245,12 @@ TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsSerializedTrie) {
       {"sparse", {}},
       {"dense_shared_prefix", {}, 4},
       {"random", {}},
+      // Each key twice, so one block ends and the next starts with it, and
+      // consecutive keys differ by one in the last byte, which
+      // FindShortestSeparator() cannot shorten. So the block after each pair
+      // repeats the pair's separator, and gets a tag for it that nothing in
+      // its own keys predicts.
+      {"unshortened_duplicates", {}},
   };
   for (int i = 1; i < 256; ++i) {
     cases[5].keys.emplace_back(1, static_cast<char>(i));
@@ -252,6 +258,10 @@ TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsSerializedTrie) {
   }
   for (int i = 1; i <= 64; ++i) {
     cases[7].keys.emplace_back(32 + i, static_cast<char>(i));
+  }
+  for (int i = 1; i <= 200; ++i) {
+    const std::string key = std::string(8, 'p') + static_cast<char>(i);
+    cases[10].keys.insert(cases[10].keys.end(), 2, key);
   }
   Random random(301);
   for (int i = 0; i < 4096; ++i) {
@@ -271,19 +281,45 @@ TEST_F(TrieIndexFactoryTest, EstimatedSizeBoundsSerializedTrie) {
     }
   }
 
-  // Blocks of varying size and spacing, one of them huge, as with block
-  // alignment padding and a very large value.
-  std::vector<IndexFactoryBuilder::BlockHandle> irregular;
-  uint64_t offset = 0;
-  for (size_t i = 0; i < cases[9].keys.size(); ++i) {
+  // Blocks of varying size and spacing, as with block alignment padding,
+  // which make Finish() store every size. With a very large value among
+  // them, and without: the huge block alone widens the bound on the offsets
+  // by more than the sizes take.
+  for (bool huge_block : {true, false}) {
+    SCOPED_TRACE(huge_block);
+    std::vector<IndexFactoryBuilder::BlockHandle> irregular;
+    uint64_t offset = 0;
+    for (size_t i = 0; i < cases[9].keys.size(); ++i) {
+      const uint64_t size = huge_block && i == 1000 ? uint64_t{1} << 30
+                                                    : 1 + random.Uniform(8000);
+      irregular.push_back({offset, size});
+      offset += size + random.Uniform(4096);
+    }
+    for (bool parallel : {false, true}) {
+      SCOPED_TRACE(parallel);
+      AssertSerializedSizeBound(cases[9].keys, irregular, parallel, 0);
+    }
+  }
+
+  // Unequal gaps between blocks of about 2^49 bytes, under keys that differ
+  // only in their last bytes. The stored sizes then take more than the slack
+  // in every other term of the bound, so the bound holds only if it counts
+  // them.
+  std::vector<std::string> short_suffix_keys;
+  std::vector<IndexFactoryBuilder::BlockHandle> huge_blocks;
+  uint64_t huge_offset = 0;
+  for (int i = 0; i < 4096; ++i) {
+    char key[16];
+    snprintf(key, sizeof(key), "k%05d", i);
+    short_suffix_keys.emplace_back(key);
     const uint64_t size =
-        i == 1000 ? uint64_t{1} << 30 : 1 + random.Uniform(8000);
-    irregular.push_back({offset, size});
-    offset += size + random.Uniform(4096);
+        (uint64_t{1} << 49) + (uint64_t{random.Uniform(1 << 30)} << 19);
+    huge_blocks.push_back({huge_offset, size});
+    huge_offset += size + random.Uniform(4096);
   }
   for (bool parallel : {false, true}) {
     SCOPED_TRACE(parallel);
-    AssertSerializedSizeBound(cases[9].keys, irregular, parallel, 0);
+    AssertSerializedSizeBound(short_suffix_keys, huge_blocks, parallel, 0);
   }
 }
 
@@ -2267,8 +2303,10 @@ TEST_F(TrieIndexFactoryTest, TagsRandomized) {
         // FindShortestSeparator produces a distinct separator.
         key_counter += 2 + rnd.Uniform(10);
         std::string next_key = make_key(key_counter);
+        // High enough that the same-key boundaries after it, each lowering
+        // the sequence number by at most 100, never take it below zero.
         SequenceNumber next_seq =
-            static_cast<SequenceNumber>(1 + rnd.Uniform(10000));
+            static_cast<SequenceNumber>(5000 + rnd.Uniform(10000));
         blocks.push_back(
             {current_key, next_key, offset, 500, block_seq, next_seq});
         current_key = next_key;
@@ -4024,6 +4062,43 @@ class TrieTest : public testing::Test {
     return index.Trie::NumBlocks();
   }
 
+  // Sections of a serialized index, in the order of the header's offsets.
+  enum Section : size_t {
+    kTrie,
+    kBucketTable,
+    kBucketData,
+    kOffsetTable,
+    kSizeTable,
+    kRunTable,
+    kTagTable,
+    kEnd,
+  };
+
+  // Where a section starts. 0 for the size table when sizes are derived.
+  static uint64_t SectionOffset(const std::string& data, Section section) {
+    return DecodeFixed64(&data[56 + 8 * section]);
+  }
+
+  // Returns data with the bytes of a section replaced by contents, and the
+  // offsets of the sections after it moved to match.
+  static std::string ReplaceSection(std::string data, Section section,
+                                    const std::string& contents) {
+    const uint64_t begin = SectionOffset(data, section);
+    uint64_t end = 0;
+    for (size_t next = section + 1; end == 0; next++) {
+      end = SectionOffset(data, static_cast<Section>(next));
+    }
+    data.replace(begin, end - begin, contents);
+    for (size_t later = section + 1; later <= kEnd; later++) {
+      char* pos = &data[56 + 8 * later];
+      const uint64_t offset = DecodeFixed64(pos);
+      if (offset != 0) {
+        EncodeFixed64(pos, offset - (end - begin) + contents.size());
+      }
+    }
+    return data;
+  }
+
   // Serializes blocks with the given bucket size, failing the test on error.
   static std::string Build(const std::vector<Block>& blocks,
                            uint32_t bucket_size) {
@@ -4416,6 +4491,37 @@ TEST_F(TrieTest, RejectsOtherVersions) {
   }
 }
 
+// A block as the 11.15 release wrote it (format version 1, a different
+// layout), for data blocks ending in "apple", "banana" and "cherry". It
+// starts with the same magic and has the version in the same place, so it is
+// reported as an unsupported version rather than as corrupt.
+TEST_F(TrieTest, RejectsBlockWrittenByVersion1Release) {
+  std::string data;
+  ASSERT_TRUE(
+      Slice("4549525401000000030000000000000000000000060000000000000000000000"
+            "0000000000000000010000000000000001000000000000000000000000000000"
+            "0000000000000000000000000000000000000000000000000000000000000000"
+            "0000000000000000000000000000000000000000000000000000000000000000"
+            "0700000000000000626368657272790007000000000000000500000000000000"
+            "3E00000000000000000000000000000000000000000000000000000000000000"
+            "070000000000000006000000000000007D000000000000000000000000000000"
+            "0000000000000000000000000000000006000000000000000100000000000000"
+            "0200000000000000000000000000000000000000000000000000000000000000"
+            "0500000000000000020000000300000004000000050000000600000000000000"
+            "0300000004000000050000000600000007000000000000000000000000000000"
+            "0000000069000000D20000000000000064000000640000006400000000000000"
+            "0000000000000000000000000000000000000000000000000108000000000000"
+            "01000000010000000100000000000000")
+          .DecodeHex(&data));
+  ASSERT_EQ(data.size(), 432u);
+  Trie index;
+  const Status s = index.Init(data);
+  ASSERT_EQ(s.code(), Status::Code::kNotSupported);
+  ASSERT_NE(s.ToString().find("format version 1 "), std::string::npos)
+      << s.ToString();
+  ASSERT_EQ(NumBlocks(index), 0u);
+}
+
 // Init() rejects a max_separator_len that the separator bytes stored in the
 // index cannot reach.
 TEST_F(TrieTest, RejectsMaxSeparatorLenBeyondContent) {
@@ -4556,6 +4662,82 @@ TEST_F(TrieTest, SeparatorsOutOfOrder) {
   ASSERT_EQ(builder.Finish(&data).code(), Status::Code::kInvalidArgument);
 }
 
+// Seek searches the blocks of one separator by tag, which only works when
+// their tags descend, so Finish() rejects tags that ascend. Equal tags and
+// blocks without a tag do not mislead the search.
+TEST_F(TrieTest, AscendingTagsOfOneSeparatorAreRejected) {
+  const uint64_t older = PackSequenceAndType(5, kTypeValue);
+  const uint64_t newer = PackSequenceAndType(7, kTypeValue);
+  struct Case {
+    std::vector<uint64_t> tags;
+    Status::Code expected;
+  };
+  const std::vector<Case> cases = {
+      {{newer, older}, Status::Code::kOk},
+      {{newer, newer}, Status::Code::kOk},
+      {{newer, 0}, Status::Code::kOk},
+      {{0, newer}, Status::Code::kOk},
+      {{older, 0, newer}, Status::Code::kOk},
+      {{older, newer}, Status::Code::kInvalidArgument},
+      {{newer, older, newer}, Status::Code::kInvalidArgument},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE("num_tags=" + std::to_string(c.tags.size()) +
+                 " first=" + std::to_string(c.tags[0]) +
+                 " second=" + std::to_string(c.tags[1]));
+    TrieBuilder builder(8);
+    uint64_t offset = 0;
+    for (uint64_t tag : c.tags) {
+      builder.AddBlock("a", {offset, 10}, tag);
+      offset += 15;
+    }
+    // A later separator starts over: its first tag may be the largest.
+    builder.AddBlock("b", {offset, 10}, newer + 1);
+    std::string data;
+    ASSERT_EQ(builder.Finish(&data).code(), c.expected);
+  }
+}
+
+// One separator shared by many blocks. Seek finds the first block whose tag
+// is at most the target's wherever that block is in the run, takes a block
+// without a tag when every tag is larger, and otherwise moves to the next
+// separator, whose own tag must not be taken for one of the run's.
+TEST_F(TrieTest, SeekWithinLongRun) {
+  for (const bool last_untagged : {false, true}) {
+    for (const bool tagged_successor : {false, true}) {
+      for (const uint64_t run : {1, 2, 3, 4, 5, 63, 64, 65, 1000}) {
+        SCOPED_TRACE("run=" + std::to_string(run) +
+                     " last_untagged=" + std::to_string(last_untagged) +
+                     " tagged_successor=" + std::to_string(tagged_successor));
+        std::vector<Block> blocks = {{"a", {0, 10}, 0}};
+        std::vector<uint64_t> tags = BasicSeekTags();
+        tags.push_back(0);
+        uint64_t offset = 15;
+        for (uint64_t j = 0; j < run; j++) {
+          // Sequence numbers 3 * run, ..., 6, 3 leave room to seek between.
+          const uint64_t tag = PackSequenceAndType(3 * (run - j), kTypeValue);
+          const bool tagged = !(last_untagged && j + 1 == run);
+          blocks.push_back({"b", {offset, 10}, tagged ? tag : 0});
+          offset += 15;
+          tags.push_back(tag);
+          tags.push_back(PackSequenceAndType(3 * (run - j) + 1, kTypeValue));
+          tags.push_back(PackSequenceAndType(3 * (run - j) - 1, kTypeValue));
+        }
+        // Larger than every tag of the run, so a search that read it as the
+        // run's would skip the run's last block.
+        blocks.push_back(
+            {"c",
+             {offset, 10},
+             tagged_successor ? PackSequenceAndType(10 * run, kTypeValue) : 0});
+        for (uint32_t bucket_size : {1u, 8u}) {
+          ASSERT_NO_FATAL_FAILURE(
+              Verify(blocks, bucket_size, {"a", "b", "c"}, tags));
+        }
+      }
+    }
+  }
+}
+
 // A block much larger than the others widens only the residuals of its own
 // group of 64 offsets.
 TEST_F(TrieTest, OutlierBlockWidensOnlyItsGroup) {
@@ -4615,6 +4797,146 @@ TEST_F(TrieTest, DecreasingOffsets) {
   ASSERT_OK(it.Seek(keys[64], kSeekTag));
   ASSERT_EQ(it.key(), keys[64]);
   ASSERT_EQ(it.Prev().code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
+}
+
+// Init() rejects each of these, which a well-formed index never has. Every
+// case passes the other checks, so only the one named in it can reject it.
+TEST_F(TrieTest, RejectsMalformedFields) {
+  const std::string one_block = Build({{"a", {0, 10}, 0}}, 8);
+  // Buckets "a" and "b" under a root with two labels, and buckets "a" and "c".
+  const std::string two_buckets =
+      Build({{"a", {0, 10}, 0}, {"b", {15, 10}, 0}}, 1);
+  const std::string buckets_a_c =
+      Build({{"a", {0, 10}, 0}, {"c", {15, 10}, 0}}, 1);
+  // Separator 0 spans 2 blocks and separator 1 spans 3: run table entries
+  // {0, 1} and {1, 3}.
+  const std::string two_runs = Build({{"a", {0, 10}, 0},
+                                      {"a", {15, 10}, 0},
+                                      {"b", {30, 10}, 0},
+                                      {"b", {45, 10}, 0},
+                                      {"b", {60, 10}, 0}},
+                                     8);
+
+  struct Case {
+    const char* name;
+    std::string valid;
+    std::string malformed;
+  };
+  std::vector<Case> cases;
+
+  {
+    // The header's flags are reserved, for a later version to use.
+    for (uint32_t flags : {uint32_t{1}, uint32_t{1} << 31}) {
+      std::string data = one_block;
+      EncodeFixed32(&data[8], flags);
+      cases.push_back({"nonzero flags", one_block, data});
+    }
+  }
+  {
+    // 2^64 - 1 blocks, so that the offset table's num_blocks + 1 values wrap
+    // around to none, which an empty column matches. The run table accounts
+    // for every block: the one separator has 2^64 - 2 blocks after its first.
+    std::string data = one_block;
+    EncodeFixed64(&data[16], std::numeric_limits<uint64_t>::max());
+    data = ReplaceSection(data, kOffsetTable, std::string(16, '\0'));
+    std::string runs;
+    PutFixed64(&runs, 1);
+    PutFixed64(&runs, 0);
+    PutFixed64(&runs, std::numeric_limits<uint64_t>::max() - 1);
+    data = ReplaceSection(data, kRunTable, runs);
+    cases.push_back({"block count that wraps around", one_block, data});
+  }
+  {
+    // The root's labels 'a' and 'b', swapped.
+    std::string data = two_buckets;
+    const size_t labels = data.find("ab", SectionOffset(data, kTrie));
+    ASSERT_LT(labels, SectionOffset(data, kBucketTable));
+    ASSERT_EQ(data.find("ab", labels + 1), std::string::npos);
+    std::swap(data[labels], data[labels + 1]);
+    cases.push_back({"descending labels", two_buckets, data});
+  }
+  {
+    // max_separator_len 0, although the root has children one byte down.
+    std::string data = two_buckets;
+    EncodeFixed32(&data[36], 0);
+    cases.push_back({"children past max_separator_len", two_buckets, data});
+  }
+  {
+    // A trie of one terminal leaf, for bucket 0 of 2: header (leaf, terminal),
+    // empty path, bucket id.
+    std::string data =
+        ReplaceSection(two_buckets, kTrie, std::string("\x04\x00\x00", 3));
+    EncodeFixed32(&data[44], 0);  // trie_root
+    cases.push_back({"fewer terminals than buckets", two_buckets, data});
+  }
+  {
+    // Leaves for buckets 0 and 1 with a leaf that is not terminal between
+    // them, under a sparse root at position 8 with labels 'a', 'b' and 'c' and
+    // 1-byte pointers back to positions 0, 3 and 5.
+    const std::string trie(
+        "\x04\x00\x00"
+        "\x00\x00"
+        "\x04\x00\x01"
+        "\x01\x00\x02"
+        "abc"
+        "\x08\x05\x03",
+        17);
+    std::string data = ReplaceSection(buckets_a_c, kTrie, trie);
+    EncodeFixed32(&data[44], 8);  // trie_root
+    cases.push_back({"leaf without a bucket", buckets_a_c, data});
+  }
+  {
+    // An offset table of 2 values with 60-bit residuals: count, one group
+    // {base, slope, layout = width 60 from word 0}, the 2 words they take,
+    // padding. Reading one takes more than an 8-byte load.
+    std::string column;
+    PutFixed64(&column, 2);
+    PutFixed64(&column, 0);
+    PutFixed32(&column, 0);
+    PutFixed32(&column, 60);
+    column.append(2 * 8 + 8, '\0');
+    cases.push_back({"column residuals wider than 56 bits", one_block,
+                     ReplaceSection(one_block, kOffsetTable, column)});
+  }
+  {
+    // The first run's cumulative count, which is 1, raised to the second
+    // run's 3, as if the second run had no extra block. The total still
+    // matches the header's block count.
+    std::string data = two_runs;
+    const uint64_t first_run = SectionOffset(data, kRunTable) + 8;
+    ASSERT_EQ(DecodeFixed64(&data[first_run + 8]), 1u);
+    ASSERT_EQ(DecodeFixed64(&data[first_run + 24]), 3u);
+    EncodeFixed64(&data[first_run + 8], 3);
+    cases.push_back({"run without an extra block", two_runs, data});
+  }
+
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    Trie index;
+    ASSERT_OK(index.Init(c.valid));
+    ASSERT_EQ(index.Init(c.malformed).code(), Status::Code::kCorruption);
+  }
+}
+
+// max_separator_len bounds every separator, not only the bucket heads that
+// Init() walks. The iterator rejects a longer one when it decodes it.
+TEST_F(TrieTest, SeparatorLongerThanHeaderAllowsFailsOnRead) {
+  // One bucket: the head "a", which is also the shared prefix, then
+  // "abcdefgh", which adds 7 bytes to it.
+  std::string data = Build({{"a", {0, 10}, 0}, {"abcdefgh", {15, 10}, 0}}, 8);
+  ASSERT_EQ(DecodeFixed32(&data[36]), 8u);
+  EncodeFixed32(&data[36], 4);  // max_separator_len
+  Trie index;
+  ASSERT_OK(index.Init(data));
+  TrieIterator it(&index);
+  ASSERT_OK(it.SeekToFirst());
+  ASSERT_EQ(it.key(), "a");
+  ASSERT_EQ(it.Next().code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
+  ASSERT_EQ(it.Seek("abc", kSeekTag).code(), Status::Code::kCorruption);
+  ASSERT_FALSE(it.Valid());
+  ASSERT_EQ(it.SeekToLast().code(), Status::Code::kCorruption);
   ASSERT_FALSE(it.Valid());
 }
 
@@ -4697,7 +5019,7 @@ TEST_F(TrieTest, MalformedBucketEntryFailsOnRead) {
   std::string data = Build(blocks, 8);
   // The first entry after bucket 0's head, located by the header's third
   // section offset. It now drops 15 bytes from a 1-byte suffix.
-  const uint64_t bucket_data = DecodeFixed64(&data[56 + 8 * 2]);
+  const uint64_t bucket_data = SectionOffset(data, kBucketData);
   data[bucket_data] = '\xF0';
   Trie index;
   ASSERT_OK(index.Init(data));
@@ -4723,7 +5045,7 @@ TEST_F(TrieTest, BadBucketPositionFailsOnRead) {
   std::string data = Build(blocks, 8);
   // The base of the only group of the bucket table, located by the header's
   // second section offset.
-  const uint64_t bucket_table = DecodeFixed64(&data[56 + 8]);
+  const uint64_t bucket_table = SectionOffset(data, kBucketTable);
   EncodeFixed64(&data[bucket_table + 8], uint64_t{1} << 40);
   Trie index;
   ASSERT_OK(index.Init(data));
@@ -4747,7 +5069,7 @@ TEST_F(TrieTest, MalformedBucketEntryFailsOnPrev) {
   }
   // Buckets {k0, k1} and {k2, k3}. Break k1, the only entry of bucket 0.
   std::string data = Build(blocks, 2);
-  const uint64_t bucket_data = DecodeFixed64(&data[56 + 8 * 2]);
+  const uint64_t bucket_data = SectionOffset(data, kBucketData);
   data[bucket_data] = '\xF0';
   Trie index;
   ASSERT_OK(index.Init(data));
@@ -4773,7 +5095,7 @@ TEST_F(TrieTest, MalformedBucketEntryFailsOnCachedPrev) {
   // bucket 0 takes 2 bytes. k3's now adds 3 bytes, which run past bucket 0
   // into bucket 1, and k7long keeps that length within max_separator_len.
   std::string data = Build(blocks, 4);
-  const uint64_t bucket_data = DecodeFixed64(&data[56 + 8 * 2]);
+  const uint64_t bucket_data = SectionOffset(data, kBucketData);
   ASSERT_EQ(data[bucket_data + 4], '\x11');
   data[bucket_data + 4] = '\x13';
   Trie index;
@@ -5035,7 +5357,7 @@ TEST_F(TrieTest, ThreeBytePointersAndBucketIds) {
     }
     std::string data = Build(blocks, /*bucket_size=*/1);
     const uint64_t trie_off = DecodeFixed64(&data[56]);
-    const uint64_t bucket_table_off = DecodeFixed64(&data[56 + 8]);
+    const uint64_t bucket_table_off = SectionOffset(data, kBucketTable);
     ASSERT_GT(bucket_table_off - trie_off, 65535u);
     Trie index;
     ASSERT_OK(index.Init(data));
