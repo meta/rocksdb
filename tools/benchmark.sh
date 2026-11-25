@@ -721,7 +721,7 @@ function run_manual_compaction_worker {
        --sync=0 \
        $extra_params \
        --threads=$num_threads \
-       --compaction_measure_io_stats=$1 \
+       --report_bg_io_stats=$1 \
        --compaction_style=$2 \
        --subcompactions=$3 \
        --memtablerep=vector \
@@ -739,7 +739,7 @@ function run_manual_compaction_worker {
   fi
   eval $cmd
 
-  summarize_result $log_file_namefillrandom_output_file man_compact_fillrandom_$3 fillrandom
+  summarize_result $log_file_name man_compact_fillrandom_$3 fillrandom
 
   echo "Compacting with $3 subcompactions specified ..."
 
@@ -755,7 +755,7 @@ function run_manual_compaction_worker {
        --sync=0 \
        $extra_params \
        --threads=$num_threads \
-       --compaction_measure_io_stats=$1 \
+       --report_bg_io_stats=$1 \
        --compaction_style=$2 \
        --subcompactions=$3 \
        --max_background_compactions=$4 \
