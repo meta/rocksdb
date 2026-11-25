@@ -772,7 +772,7 @@ inline WinWritableImpl::WinWritableImpl(WinFileData* file_data,
       reservedsize_(0) {
   // Query current position in case ReopenWritableFile is called
   // This position is only important for buffered writes
-  // for unbuffered writes we explicitely specify the position.
+  // for unbuffered writes we explicitly specify the position.
   LARGE_INTEGER zero_move;
   zero_move.QuadPart = 0;  // Do not move
   LARGE_INTEGER pos;
