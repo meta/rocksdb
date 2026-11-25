@@ -10,19 +10,20 @@
 #include "rocksdb/comparator.h"
 
 #include <algorithm>
+#include <compare>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <type_traits>
+#include <unordered_map>
 
 #include "db/dbformat.h"
 #include "port/lang.h"
-#include "port/port.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/slice.h"
-#include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/object_registry.h"
-#include "util/coding.h"
+#include "util/coding_lean.h"
 
 namespace ROCKSDB_NAMESPACE {
 

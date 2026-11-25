@@ -9,8 +9,11 @@
 
 #include "util/coding.h"
 
+#include <algorithm>
 #include <initializer_list>
+#include <vector>
 
+#include "gtest/gtest.h"
 #include "test_util/testharness.h"
 #include "util/prefix_varint.h"
 

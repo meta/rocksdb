@@ -12,6 +12,7 @@
 #include "util/crc32c.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 

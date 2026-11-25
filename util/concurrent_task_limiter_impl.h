@@ -9,10 +9,13 @@
 
 #pragma once
 #include <atomic>
+#include <cstdint>
 #include <memory>
+#include <string>
 
 #include "rocksdb/concurrent_task_limiter.h"
 #include "rocksdb/env.h"
+#include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
 

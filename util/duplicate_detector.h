@@ -5,10 +5,21 @@
 
 #pragma once
 
+#include <cassert>
+#include <cinttypes>
 #include <cstdint>
+#include <map>
+#include <set>
+#include <stdexcept>
+#include <utility>
 
 #include "db/db_impl/db_impl.h"
 #include "logging/logging.h"
+#include "options/db_options.h"
+#include "rocksdb/db.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/types.h"
 #include "util/set_comparator.h"
 
 namespace ROCKSDB_NAMESPACE {

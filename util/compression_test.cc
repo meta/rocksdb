@@ -5,18 +5,62 @@
 //
 // Testing various compression features
 
-#include <atomic>
-#include <cstdlib>
-#include <memory>
+#include "util/compression.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <initializer_list>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "db/compaction/compaction.h"
+#include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
+#include "gtest/gtest.h"
+#include "options/options_helper.h"
 #include "port/stack_trace.h"
+#include "rocksdb/advanced_compression.h"
+#include "rocksdb/cache.h"
+#include "rocksdb/compression_type.h"
+#include "rocksdb/convenience.h"
+#include "rocksdb/db.h"
+#include "rocksdb/filter_policy.h"
 #include "rocksdb/flush_block_policy.h"
+#include "rocksdb/io_status.h"
+#include "rocksdb/iterator.h"
+#include "rocksdb/listener.h"
+#include "rocksdb/memtablerep.h"
+#include "rocksdb/metadata.h"
+#include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/statistics.h"
+#include "rocksdb/status.h"
+#include "rocksdb/table.h"
+#include "rocksdb/table_properties.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "table/block_based/block_builder.h"
 #include "table/block_based/data_block_footer.h"
+#include "table/format.h"
+#include "table/mock_table.h"
+#include "test_util/sync_point.h"
+#include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/aligned_buffer.h"
+#include "util/atomic.h"
 #include "util/auto_tune_compressor.h"
 #include "util/coding.h"
 #include "util/random.h"

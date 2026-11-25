@@ -7,12 +7,15 @@
 
 #include <cassert>
 #include <cstddef>
+#include <iterator>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "port/likely.h"
 #include "port/port.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "util/math.h"
 #include "util/random.h"
 

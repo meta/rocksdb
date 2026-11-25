@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -17,6 +18,7 @@
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/env.h"
+#include "rocksdb/system_clock.h"
 #include "util/atomic.h"
 
 namespace ROCKSDB_NAMESPACE {

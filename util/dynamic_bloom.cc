@@ -6,11 +6,11 @@
 #include "dynamic_bloom.h"
 
 #include <algorithm>
+#include <cassert>
+#include <cstring>
 
 #include "memory/allocator.h"
-#include "port/port.h"
 #include "rocksdb/slice.h"
-#include "util/hash.h"
 
 namespace ROCKSDB_NAMESPACE {
 
