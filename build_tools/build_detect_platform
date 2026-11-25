@@ -684,7 +684,9 @@ if [ "$PORTABLE" == "" ] || [ "$PORTABLE" == 0 ]; then
   if test -n "`echo $TARGET_ARCHITECTURE | grep ^ppc64`"; then
     # Tune for this POWER processor, treating '+' models as base models
     POWER=`LD_SHOW_AUXV=1 /bin/true | grep AT_PLATFORM | grep -E -o power[0-9]+`
-    COMMON_FLAGS="$COMMON_FLAGS -mcpu=$POWER -mtune=$POWER "
+    if [ -n "$POWER" ]; then
+      COMMON_FLAGS="$COMMON_FLAGS -mcpu=$POWER -mtune=$POWER "
+    fi
   elif test -n "`echo $TARGET_ARCHITECTURE | grep -e^arm -e^aarch64`"; then
     # TODO: Handle this with approprite options.
     COMMON_FLAGS="$COMMON_FLAGS"
@@ -711,7 +713,10 @@ if [ "$PORTABLE" == "" ] || [ "$PORTABLE" == 0 ]; then
 else
   # PORTABLE specified
   if [ "$PORTABLE" == 1 ]; then
-    if test -n "`echo $TARGET_ARCHITECTURE | grep ^s390x`"; then
+    if test -n "`echo $TARGET_ARCHITECTURE | grep ^ppc64`"; then
+      # For portable powerPC builds, use generic power8
+      COMMON_FLAGS="$COMMON_FLAGS -mcpu=power8 -mtune=power8 "
+    elif test -n "`echo $TARGET_ARCHITECTURE | grep ^s390x`"; then
       COMMON_FLAGS="$COMMON_FLAGS -march=z196 "
     elif test -n "`echo $TARGET_ARCHITECTURE | grep ^riscv64`"; then
       COMMON_FLAGS="$COMMON_FLAGS -march=rv64gc"
