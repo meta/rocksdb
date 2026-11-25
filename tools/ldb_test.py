@@ -143,21 +143,21 @@ class LDBTestCase(unittest.TestCase):
 
         self.assertRunOK(
             "scan --from=x1 --to=z",
-            "x1 ==> y1\nx2 ==> y2\nx4 ==> cv1\nx5 ==> cn1:cv1 cn2:cv2",
+            "x1 ==> y1\nx2 ==> y2\nx4 ==> cv1\nx5 ==> @cn1:cv1 cn2:cv2",
         )
         self.assertRunOK("put x3 y3", "OK")
 
         self.assertRunOK(
             "scan --from=x1 --to=z",
-            "x1 ==> y1\nx2 ==> y2\nx3 ==> y3\nx4 ==> cv1\nx5 ==> cn1:cv1 cn2:cv2",
+            "x1 ==> y1\nx2 ==> y2\nx3 ==> y3\nx4 ==> cv1\nx5 ==> @cn1:cv1 cn2:cv2",
         )
         self.assertRunOK(
             "scan",
-            "x1 ==> y1\nx2 ==> y2\nx3 ==> y3\nx4 ==> cv1\nx5 ==> cn1:cv1 cn2:cv2",
+            "x1 ==> y1\nx2 ==> y2\nx3 ==> y3\nx4 ==> cv1\nx5 ==> @cn1:cv1 cn2:cv2",
         )
         self.assertRunOK(
             "scan --from=x",
-            "x1 ==> y1\nx2 ==> y2\nx3 ==> y3\nx4 ==> cv1\nx5 ==> cn1:cv1 cn2:cv2",
+            "x1 ==> y1\nx2 ==> y2\nx3 ==> y3\nx4 ==> cv1\nx5 ==> @cn1:cv1 cn2:cv2",
         )
 
         self.assertRunOK("scan --to=x2", "x1 ==> y1")
@@ -807,6 +807,56 @@ class LDBTestCase(unittest.TestCase):
         )
         blob_files = self.getBlobFiles(loadedDbPath)
         self.assertTrue(len(blob_files) >= 1)
+
+    def testDumpLoadWideColumns(self):
+        print("Running testDumpLoadWideColumns...")
+        self.assertRunOK("put --create_if_missing k1 plainvalue", "OK")
+        self.assertRunOK("put_entity k2 :defaultcol colA:valA colB:valB", "OK")
+        self.assertRunOK("put_entity k3 colX:1 colY:2", "OK")
+        # A plain value that starts with the entity marker must be escaped
+        self.assertRunOK("put k4 @plainvalue", "OK")
+        origDbPath = os.path.join(self.TMP_DIR, self.DB_NAME)
+
+        expected = {
+            "k1": ":plainvalue",
+            "k2": ":defaultcol colA:valA colB:valB",
+            "k3": "colX:1 colY:2",
+            "k4": ":@plainvalue",
+        }
+
+        for hexMode in (False, True):
+            suffix = "-hex" if hexMode else "-text"
+            hexParam = " --hex" if hexMode else ""
+            dumpFilePath = os.path.join(self.TMP_DIR, "wc_dump" + suffix)
+            loadedDbPath = os.path.join(self.TMP_DIR, "wc_loaded" + suffix)
+
+            self.assertTrue(
+                self.dumpDb("--db=%s%s" % (origDbPath, hexParam), dumpFilePath)
+            )
+            self.assertTrue(
+                self.loadDb(
+                    "--db=%s --create_if_missing%s" % (loadedDbPath, hexParam),
+                    dumpFilePath,
+                )
+            )
+
+            for key, expectedOutput in expected.items():
+                self.assertRunOKFull(
+                    "get_entity --db=%s %s" % (loadedDbPath, key), expectedOutput
+                )
+
+        # A malformed hex value must be reported and skipped instead of
+        # terminating the process
+        badDumpFilePath = os.path.join(self.TMP_DIR, "wc_dump_bad_hex")
+        badDbPath = os.path.join(self.TMP_DIR, "wc_loaded_bad_hex")
+        with open(badDumpFilePath, "w") as badDumpFile:
+            badDumpFile.write("0x6B31 ==> 0xZZ\n0x6B32 ==> 0x706C61696E\n")
+        self.assertTrue(
+            self.loadDb(
+                "--db=%s --hex --create_if_missing" % badDbPath, badDumpFilePath
+            )
+        )
+        self.assertRunOKFull("scan --db=%s" % badDbPath, "k2 ==> plain")
 
     def testIDumpBasics(self):
         print("Running testIDumpBasics...")
