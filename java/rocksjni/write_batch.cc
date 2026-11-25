@@ -156,9 +156,10 @@ void Java_org_rocksdb_WriteBatch_setMaxBytesJni(JNIEnv* /*env*/,
  * Method:    put
  * Signature: (J[BI[BI)V
  */
-void Java_org_rocksdb_WriteBatch_putJni__J_3BI_3BI(
-    JNIEnv* env, jclass, jlong jwb_handle, jbyteArray jkey, jint jkey_len,
-    jbyteArray jentry_value, jint jentry_value_len) {
+void Java_org_rocksdb_WriteBatch_putJni__J_3BII_3BII(
+    JNIEnv* env, jclass, jlong jwb_handle, jbyteArray jkey, jint jkey_offset,
+    jint jkey_len, jbyteArray jentry_value, jint jvalue_offset,
+    jint jentry_value_len) {
   auto* wb = reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatch*>(jwb_handle);
   assert(wb != nullptr);
   auto put = [&wb](ROCKSDB_NAMESPACE::Slice key,
@@ -166,7 +167,8 @@ void Java_org_rocksdb_WriteBatch_putJni__J_3BI_3BI(
     return wb->Put(key, value);
   };
   std::unique_ptr<ROCKSDB_NAMESPACE::Status> status =
-      ROCKSDB_NAMESPACE::JniUtil::kv_op(put, env, jkey, jkey_len, jentry_value,
+      ROCKSDB_NAMESPACE::JniUtil::kv_op(put, env, jkey, jkey_offset, jkey_len,
+                                        jentry_value, jvalue_offset,
                                         jentry_value_len);
   if (status != nullptr && !status->ok()) {
     ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, status);
@@ -178,9 +180,10 @@ void Java_org_rocksdb_WriteBatch_putJni__J_3BI_3BI(
  * Method:    put
  * Signature: (J[BI[BIJ)V
  */
-void Java_org_rocksdb_WriteBatch_putJni__J_3BI_3BIJ(
-    JNIEnv* env, jclass, jlong jwb_handle, jbyteArray jkey, jint jkey_len,
-    jbyteArray jentry_value, jint jentry_value_len, jlong jcf_handle) {
+void Java_org_rocksdb_WriteBatch_putJni__J_3BII_3BIIJ(
+    JNIEnv* env, jclass, jlong jwb_handle, jbyteArray jkey, jint jkey_offset,
+    jint jkey_len, jbyteArray jentry_value, jint jvalue_offset,
+    jint jentry_value_len, jlong jcf_handle) {
   auto* wb = reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatch*>(jwb_handle);
   assert(wb != nullptr);
   auto* cf_handle =
@@ -191,7 +194,8 @@ void Java_org_rocksdb_WriteBatch_putJni__J_3BI_3BIJ(
     return wb->Put(cf_handle, key, value);
   };
   std::unique_ptr<ROCKSDB_NAMESPACE::Status> status =
-      ROCKSDB_NAMESPACE::JniUtil::kv_op(put, env, jkey, jkey_len, jentry_value,
+      ROCKSDB_NAMESPACE::JniUtil::kv_op(put, env, jkey, jkey_offset, jkey_len,
+                                        jentry_value, jvalue_offset,
                                         jentry_value_len);
   if (status != nullptr && !status->ok()) {
     ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, status);

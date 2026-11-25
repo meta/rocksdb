@@ -158,6 +158,7 @@ public class KeyExistsTest {
     boolean exists = db.keyExists(buff);
     assertThat(exists).isTrue();
     db.delete(key);
+    buff.flip();
     exists = db.keyExists(buff);
     assertThat(exists).isFalse();
   }
@@ -180,6 +181,8 @@ public class KeyExistsTest {
     assertThat(db.keyExists(columnFamilyHandleList.get(0), key1Buff)).isTrue();
     assertThat(db.keyExists(columnFamilyHandleList.get(0), key2Buff)).isFalse();
 
+    key1Buff.flip();
+    key2Buff.flip();
     assertThat(db.keyExists(columnFamilyHandleList.get(1), key1Buff)).isFalse();
     assertThat(db.keyExists(columnFamilyHandleList.get(1), key2Buff)).isTrue();
   }
@@ -203,6 +206,8 @@ public class KeyExistsTest {
       assertThat(db.keyExists(columnFamilyHandleList.get(0), readOptions, key1Buff)).isTrue();
       assertThat(db.keyExists(columnFamilyHandleList.get(0), readOptions, key2Buff)).isFalse();
 
+      key1Buff.flip();
+      key2Buff.flip();
       assertThat(db.keyExists(columnFamilyHandleList.get(1), readOptions, key1Buff)).isFalse();
       assertThat(db.keyExists(columnFamilyHandleList.get(1), readOptions, key2Buff)).isTrue();
     }

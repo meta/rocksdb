@@ -10,6 +10,7 @@ package org.rocksdb;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.DELETE;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.DELETE_RANGE;
 import static org.rocksdb.util.CapturingWriteBatchHandler.Action.LOG;
@@ -479,6 +480,55 @@ public class WriteBatchTest {
   public void getWriteBatch() {
     try (final WriteBatch batch = new WriteBatch()) {
       assertThat(batch.getWriteBatch()).isEqualTo(batch);
+    }
+  }
+
+  @Test
+  public void byteBuffers() throws RocksDBException {
+    try (final Options options = new Options().setCreateIfMissing(true);
+        final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath())) {
+      try (WriteBatch writeBatch = new WriteBatch()) {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        writeBatch.put(key, value);
+      }
+      try (WriteBatch writeBatch = new WriteBatch()) {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        writeBatch.put(db.getDefaultColumnFamily(), key, value);
+      }
+
+      try (WriteBatch writeBatch = new WriteBatch()) {
+        byte[] keyByffer = new byte[16];
+        byte[] valueByffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyByffer, 2, 6).slice();
+        ByteBuffer value = ByteBuffer.wrap(valueByffer, 2, 6).slice();
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        writeBatch.put(key, value);
+      }
+      try (WriteBatch writeBatch = new WriteBatch()) {
+        byte[] keyByffer = new byte[16];
+        byte[] valueByffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyByffer, 2, 6).slice();
+        ByteBuffer value = ByteBuffer.wrap(valueByffer, 2, 6).slice();
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        writeBatch.put(db.getDefaultColumnFamily(), key, value);
+      }
+      try (WriteBatch writeBatch = new WriteBatch()) {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        ByteBuffer value = ByteBuffer.allocate(16);
+        key.put("key".getBytes(UTF_8)).flip();
+        value.put("value".getBytes(UTF_8)).flip();
+        assertThatThrownBy(() -> writeBatch.put(db.getDefaultColumnFamily(), key, value))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
     }
   }
 

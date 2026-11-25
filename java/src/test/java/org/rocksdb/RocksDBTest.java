@@ -4,16 +4,16 @@
 //  (found in the LICENSE.Apache file in the root directory).
 package org.rocksdb;
 
-import org.junit.*;
-import org.junit.rules.ExpectedException;
-import org.junit.rules.TemporaryFolder;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.fail;
 
 import java.nio.ByteBuffer;
 import java.util.*;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.Assert.fail;
+import org.junit.*;
+import org.junit.rules.ExpectedException;
+import org.junit.rules.TemporaryFolder;
 
 public class RocksDBTest {
 
@@ -622,6 +622,366 @@ public class RocksDBTest {
       assertThat(db.get("key2".getBytes())).isNull();
       assertThat(db.get("key3".getBytes())).isNull();
       assertThat(db.get("key4".getBytes())).isEqualTo("xyz".getBytes());
+    }
+  }
+
+  @Test
+  public void deleteByteBuffer() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final WriteOptions writeOptions = new WriteOptions();) {
+      db.put("key1".getBytes(), "value".getBytes());
+      db.put("key2".getBytes(), "12345678".getBytes());
+      db.put("key3".getBytes(), "abcdefg".getBytes());
+      db.put("key4".getBytes(), "xyz".getBytes());
+
+      {
+        ByteBuffer key1 = ByteBuffer.allocateDirect(16);
+        key1.put("key1".getBytes()).flip();
+        db.delete(db.getDefaultColumnFamily(), writeOptions, key1);
+      }
+      {
+        ByteBuffer key2 = ByteBuffer.allocateDirect(16);
+        key2.put("key2".getBytes()).flip();
+        db.delete(writeOptions, key2);
+      }
+      {
+        byte[] key3Buffer = new byte[16];
+        ByteBuffer key3 = ByteBuffer.wrap(key3Buffer, 2, 6).slice();
+        key3.put("key3".getBytes()).flip();
+        db.delete(db.getDefaultColumnFamily(), writeOptions, key3);
+      }
+      {
+        byte[] key4Buffer = new byte[16];
+        ByteBuffer key4 = ByteBuffer.wrap(key4Buffer, 2, 6).slice();
+        key4.put("key4".getBytes()).flip();
+        db.delete(writeOptions, key4);
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key".getBytes()).flip();
+
+        assertThatThrownBy(() -> db.delete(writeOptions, key.asReadOnlyBuffer()))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+
+        assertThatThrownBy(
+            () -> db.delete(db.getDefaultColumnFamily(), writeOptions, key.asReadOnlyBuffer()))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
+
+      try (RocksIterator i = db.newIterator()) {
+        i.seekToFirst();
+        assertThat(i.isValid()).as("Database must be empty").isFalse();
+      }
+    }
+  }
+
+  @Test
+  public void getWithByteBuffer() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final ReadOptions readOptions = new ReadOptions()) {
+      db.put("key1".getBytes(), "value".getBytes());
+
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes()).flip();
+
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+
+        int result = db.get(db.getDefaultColumnFamily(), readOptions, key, value);
+        assertThat(key.position()).isEqualTo(4);
+        assertThat(result).isEqualTo(5);
+        assertThat(value.position()).isEqualTo(5);
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes()).flip();
+
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+
+        int result = db.get(readOptions, key, value);
+        assertThat(result).isEqualTo(5);
+        assertThat(value.limit()).isEqualTo(5);
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key1".getBytes()).flip();
+
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+
+        int result = db.get(db.getDefaultColumnFamily(), readOptions, key, value);
+        assertThat(result).isEqualTo(5);
+        assertThat(value.position()).isEqualTo(5);
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key1".getBytes()).flip();
+
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+
+        int result = db.get(readOptions, key, value);
+        assertThat(result).isEqualTo(5);
+        assertThat(value.limit()).isEqualTo(5);
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes()).flip();
+
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+
+        assertThatThrownBy(() -> db.get(db.getDefaultColumnFamily(), readOptions, key, value))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes()).flip();
+
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+
+        assertThatThrownBy(() -> db.get(readOptions, key, value))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
+    }
+  }
+
+  @Test
+  public void keyExistByteBuffer() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final ReadOptions readOptions = new ReadOptions()) {
+      db.put("key1".getBytes(), "value".getBytes());
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes()).flip();
+        assertThat(db.keyExists(db.getDefaultColumnFamily(), readOptions, key)).isTrue();
+        assertThat(key.position()).isEqualTo(key.limit());
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key1".getBytes()).flip();
+        assertThat(db.keyExists(db.getDefaultColumnFamily(), readOptions, key)).isTrue();
+        assertThat(key.position()).isEqualTo(key.limit());
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key1".getBytes()).flip();
+        assertThatThrownBy(
+            () -> db.keyExists(db.getDefaultColumnFamily(), readOptions, key.asReadOnlyBuffer()))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
+    }
+  }
+
+  @Test
+  public void keyMayExistByteBuffer() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final ReadOptions readOptions = new ReadOptions()) {
+      db.put("key1".getBytes(), "value".getBytes());
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes()).flip();
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        value.position(2);
+        value.mark();
+        KeyMayExist result = db.keyMayExist(db.getDefaultColumnFamily(), readOptions, key, value);
+
+        assertThat(result.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
+        assertThat(result.valueLength).isEqualTo(5);
+
+        assertThat(key.position()).isEqualTo(key.limit());
+
+        assertThat(value.position()).isEqualTo(7);
+        value.limit(value.position());
+        value.reset();
+        assertThat(UTF_8.decode(value).toString()).isEqualTo("value");
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes()).flip();
+        boolean result = db.keyMayExist(db.getDefaultColumnFamily(), readOptions, key);
+        assertThat(result).isTrue();
+        assertThat(key.position()).isEqualTo(key.limit());
+      }
+
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key1".getBytes()).flip();
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+        KeyMayExist result = db.keyMayExist(db.getDefaultColumnFamily(), readOptions, key, value);
+
+        assertThat(result.exists).isEqualTo(KeyMayExist.KeyMayExistEnum.kExistsWithValue);
+        assertThat(result.valueLength).isEqualTo(5);
+
+        assertThat(key.position()).isEqualTo(key.limit());
+        assertThat(value.position()).isEqualTo(5);
+
+        value.flip();
+        assertThat(UTF_8.decode(value).toString()).isEqualTo("value");
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key1".getBytes()).flip();
+
+        boolean result = db.keyMayExist(db.getDefaultColumnFamily(), readOptions, key);
+        assertThat(result).isTrue();
+        assertThat(key.position()).isEqualTo(key.limit());
+      }
+    }
+  }
+
+  @Test
+  public void mergeByteBuffer() throws RocksDBException {
+    try (final StringAppendOperator stringAppendOperator = new StringAppendOperator();
+        final Options opt =
+            new Options().setCreateIfMissing(true).setMergeOperator(stringAppendOperator);
+        final WriteOptions wOpt = new WriteOptions();
+        final RocksDB db = RocksDB.open(opt, dbFolder.getRoot().getAbsolutePath())) {
+      db.put("key1".getBytes(UTF_8), "value".getBytes());
+      db.put("key2".getBytes(UTF_8), "value".getBytes());
+      db.put("key3".getBytes(UTF_8), "value".getBytes());
+      db.put("key4".getBytes(UTF_8), "value".getBytes());
+
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes(UTF_8)).flip();
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        value.put("value2".getBytes(UTF_8)).flip();
+        db.merge(db.getDefaultColumnFamily(), wOpt, key, value);
+        byte[] ret = db.get("key1".getBytes(UTF_8));
+        assertThat(ret).isEqualTo("value,value2".getBytes(UTF_8));
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key2".getBytes(UTF_8)).flip();
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        value.put("value2".getBytes(UTF_8)).flip();
+        db.merge(wOpt, key, value);
+        byte[] ret = db.get("key2".getBytes(UTF_8));
+        assertThat(ret).isEqualTo("value,value2".getBytes(UTF_8));
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key3".getBytes()).flip();
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+        value.put("value2".getBytes(UTF_8)).flip();
+        db.merge(db.getDefaultColumnFamily(), wOpt, key, value);
+        byte[] ret = db.get("key3".getBytes(UTF_8));
+        assertThat(ret).isEqualTo("value,value2".getBytes(UTF_8));
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key4".getBytes()).flip();
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+        value.put("value2".getBytes(UTF_8)).flip();
+        db.merge(wOpt, key, value);
+        byte[] ret = db.get("key4".getBytes(UTF_8));
+        assertThat(ret).isEqualTo("value,value2".getBytes(UTF_8));
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocate(16);
+        key.put("key1".getBytes(UTF_8)).flip();
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        value.put("value2".getBytes(UTF_8)).flip();
+        assertThatThrownBy(() -> db.merge(db.getDefaultColumnFamily(), wOpt, key, value))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocate(16);
+        key.put("key1".getBytes(UTF_8)).flip();
+        ByteBuffer value = ByteBuffer.allocate(16);
+        value.put("value2".getBytes(UTF_8)).flip();
+        assertThatThrownBy(
+            () -> db.merge(db.getDefaultColumnFamily(), wOpt, key.asReadOnlyBuffer(), value))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
+    }
+  }
+
+  @Test
+  public void putByteBuffer() throws RocksDBException {
+    try (final Options opt = new Options().setCreateIfMissing(true);
+        final WriteOptions wOpt = new WriteOptions();
+        final RocksDB db = RocksDB.open(opt, dbFolder.getRoot().getAbsolutePath())) {
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key1".getBytes(UTF_8)).flip();
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        value.put("value1".getBytes(UTF_8)).flip();
+        db.put(db.getDefaultColumnFamily(), wOpt, key, value);
+        byte[] ret = db.get("key1".getBytes(UTF_8));
+        assertThat(ret).isEqualTo("value1".getBytes(UTF_8));
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocateDirect(16);
+        key.put("key2".getBytes(UTF_8)).flip();
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        value.put("value2".getBytes(UTF_8)).flip();
+        db.put(wOpt, key, value);
+        byte[] ret = db.get("key2".getBytes(UTF_8));
+        assertThat(ret).isEqualTo("value2".getBytes(UTF_8));
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key3".getBytes(UTF_8)).flip();
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+        value.put("value3".getBytes(UTF_8)).flip();
+        db.put(db.getDefaultColumnFamily(), wOpt, key, value);
+        byte[] ret = db.get("key3".getBytes(UTF_8));
+        assertThat(ret).isEqualTo("value3".getBytes(UTF_8));
+      }
+      {
+        byte[] keyBuffer = new byte[16];
+        ByteBuffer key = ByteBuffer.wrap(keyBuffer, 2, 6).slice();
+        key.put("key4".getBytes(UTF_8)).flip();
+        byte[] valueBuffer = new byte[16];
+        ByteBuffer value = ByteBuffer.wrap(valueBuffer, 2, 6).slice();
+        value.put("value4".getBytes(UTF_8)).flip();
+        db.put(wOpt, key, value);
+        byte[] ret = db.get("key4".getBytes(UTF_8));
+        assertThat(ret).isEqualTo("value4".getBytes(UTF_8));
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocate(16);
+        key.put("key1".getBytes(UTF_8)).flip();
+        ByteBuffer value = ByteBuffer.allocateDirect(16);
+        value.put("value1".getBytes(UTF_8)).flip();
+        assertThatThrownBy(() -> db.put(db.getDefaultColumnFamily(), wOpt, key, value))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
+      {
+        ByteBuffer key = ByteBuffer.allocate(16);
+        key.put("key1".getBytes(UTF_8)).flip();
+        ByteBuffer value = ByteBuffer.allocate(16);
+        value.put("value1".getBytes(UTF_8)).flip();
+        assertThatThrownBy(
+            () -> db.put(db.getDefaultColumnFamily(), wOpt, key.asReadOnlyBuffer(), value))
+            .isInstanceOf(RocksDBException.class)
+            .hasMessage(RocksDB.BB_ALL_DIRECT_OR_INDIRECT);
+      }
     }
   }
 
