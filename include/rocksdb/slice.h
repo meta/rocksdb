@@ -27,6 +27,7 @@
 #include <string_view>
 
 #include "rocksdb/cleanable.h"
+#include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
 

@@ -5,12 +5,14 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "rocksdb/file_system.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 

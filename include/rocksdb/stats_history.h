@@ -8,9 +8,11 @@
 
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
 
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 

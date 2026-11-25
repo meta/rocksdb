@@ -21,13 +21,16 @@
 #include <cstdlib>
 #endif
 
+#include <cassert>
 #include <memory>
 #include <string>
+#include <utility>
 
 #ifdef ROCKSDB_ASSERT_STATUS_CHECKED
 #include "port/stack_trace.h"
 #endif
 
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 
 namespace ROCKSDB_NAMESPACE {
