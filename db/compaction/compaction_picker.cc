@@ -221,8 +221,10 @@ void CompactionPicker::GetRange(const CompactionInputFiles& inputs,
       }
     }
   } else {
-    *smallest = inputs[0]->smallest;
-    *largest = inputs[inputs.size() - 1]->largest;
+    if (inputs.size() > 0) {
+      *smallest = inputs[0]->smallest;
+      *largest = inputs[inputs.size() - 1]->largest;
+    }
   }
 }
 
