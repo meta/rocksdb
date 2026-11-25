@@ -64,6 +64,9 @@
 namespace ROCKSDB_NAMESPACE {
 namespace test {
 
+// Return a name of the DB for this test, based on the test case/name
+std::string GetTestNameForDB(const std::string& suggested = "");
+
 // Return the directory to use for temporary storage.
 std::string TmpDir(Env* env = Env::Default());
 
