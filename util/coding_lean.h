@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include "port/port.h"  // for port::kLittleEndian
+#include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
 

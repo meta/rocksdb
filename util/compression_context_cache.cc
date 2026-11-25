@@ -10,7 +10,11 @@
 #include "util/compression_context_cache.h"
 
 #include <atomic>
+#include <cassert>
+#include <cstddef>
+#include <utility>
 
+#include "port/port.h"
 #include "util/compression.h"
 #include "util/core_local.h"
 

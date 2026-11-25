@@ -7,10 +7,15 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 
+#include "port/port.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "table/multiget_context.h"
 #include "util/atomic.h"
+#include "util/fastrange.h"
 #include "util/hash.h"
 
 namespace ROCKSDB_NAMESPACE {

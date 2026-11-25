@@ -10,10 +10,21 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
 
 #include "memory/memory_allocator_impl.h"
 #include "rocksdb/advanced_compression.h"
+#include "rocksdb/cache.h"
+#include "rocksdb/compression_type.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "table/block_based/block_type.h"
 #include "util/aligned_buffer.h"
 #include "util/coding.h"

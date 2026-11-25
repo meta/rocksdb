@@ -17,10 +17,13 @@
 
 #pragma once
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <type_traits>
 
 #include "port/port.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "util/cast_util.h"
 #include "util/coding_lean.h"

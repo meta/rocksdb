@@ -5,9 +5,10 @@
 
 #include "util/defer.h"
 
-#include "port/port.h"
+#include <string>
+
+#include "gtest/gtest.h"
 #include "port/stack_trace.h"
-#include "test_util/testharness.h"
 
 namespace ROCKSDB_NAMESPACE {
 

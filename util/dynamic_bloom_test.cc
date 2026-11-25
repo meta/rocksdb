@@ -15,7 +15,9 @@ int main() {
 #include <atomic>
 #include <cinttypes>
 #include <functional>
+#include <initializer_list>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 

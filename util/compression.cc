@@ -9,7 +9,14 @@
 #include <bzlib.h>
 #endif  // BZIP2
 
+#include <algorithm>
+#include <initializer_list>
 #include <limits>
+#include <mutex>
+#include <type_traits>
+#include <unordered_map>
+#include <variant>
+#include <vector>
 
 #ifdef LZ4
 #include <lz4.h>
@@ -31,6 +38,9 @@
 #include "options/options_helper.h"
 #include "port/likely.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/customizable.h"
+#include "rocksdb/memory_allocator.h"
+#include "rocksdb/options.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
