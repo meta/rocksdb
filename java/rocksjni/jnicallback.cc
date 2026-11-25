@@ -13,7 +13,8 @@
 #include "rocksjni/portal.h"
 
 namespace ROCKSDB_NAMESPACE {
-JniCallback::JniCallback(JNIEnv* env, jobject jcallback_obj) {
+JniCallback::JniCallback(JNIEnv* env, jobject jcallback_obj)
+    : m_jvm(nullptr), m_jcallback_obj(nullptr) {
   // Note: jcallback_obj may be accessed by multiple threads,
   // so we ref the jvm not the env
   const jint rs = env->GetJavaVM(&m_jvm);
@@ -26,7 +27,7 @@ JniCallback::JniCallback(JNIEnv* env, jobject jcallback_obj) {
   // across multiple method calls, so we create a global ref
   assert(jcallback_obj != nullptr);
   m_jcallback_obj = env->NewGlobalRef(jcallback_obj);
-  if (jcallback_obj == nullptr) {
+  if (m_jcallback_obj == nullptr) {
     // exception thrown: OutOfMemoryError
     return;
   }
@@ -41,6 +42,12 @@ void JniCallback::releaseJniEnv(jboolean& attached) const {
 }
 
 JniCallback::~JniCallback() {
+  if (m_jvm == nullptr) {
+    // construction failed before the JavaVM was obtained,
+    // so there is nothing to release
+    return;
+  }
+
   jboolean attached_thread = JNI_FALSE;
   JNIEnv* env = getJniEnv(&attached_thread);
   assert(env != nullptr);
