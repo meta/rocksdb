@@ -1233,22 +1233,45 @@ IOStatus PosixRandomAccessFile::ReadAsync(
   }
 
 #if defined(ROCKSDB_IOURING_PRESENT)
-  // io_uring_queue_init.
+  // Attempt to get (or lazily create) the per-thread io_uring ring.
+  int io_uring_init_err = 0;
   struct io_uring* iu = nullptr;
   if (thread_local_async_read_io_urings_) {
     iu = static_cast<struct io_uring*>(
         thread_local_async_read_io_urings_->Get());
     if (iu == nullptr) {
-      iu = CreateIOUring();
+      iu = CreateIOUring(&io_uring_init_err);
       if (iu != nullptr) {
         thread_local_async_read_io_urings_->Reset(iu);
       }
     }
   }
 
-  // Init failed, platform doesn't support io_uring.
+  // io_uring ring unavailable.  Return a descriptive error so callers can
+  // distinguish resource-exhaustion (ENOMEM) from "not supported by kernel"
+  // (ENOSYS/EPERM).
   if (iu == nullptr) {
-    return IOStatus::NotSupported("ReadAsync: failed to init io_uring");
+    if (io_uring_init_err == ENOMEM) {
+      return IOStatus::IOError(
+          "ReadAsync: io_uring_queue_init failed with ENOMEM — memlock limit "
+          "exhausted. Raise RLIMIT_MEMLOCK or reduce concurrent io_uring "
+          "usage. See CreateIOUring log for details.");
+    } else if (io_uring_init_err == ENOSYS || io_uring_init_err == EPERM) {
+      return IOStatus::NotSupported(
+          "ReadAsync: io_uring not available on this system (errno=" +
+          std::to_string(io_uring_init_err) + ": " +
+          errnoStr(io_uring_init_err) + ")");
+    } else if (io_uring_init_err != 0) {
+      return IOStatus::IOError(
+          "ReadAsync: io_uring_queue_init failed (errno=" +
+          std::to_string(io_uring_init_err) + ": " +
+          errnoStr(io_uring_init_err) + ")");
+    } else {
+      // thread_local_async_read_io_urings_ was null — io_uring disabled at
+      // file-open time.
+      return IOStatus::NotSupported(
+          "ReadAsync: io_uring not enabled for this file");
+    }
   }
 
   *io_handle = nullptr;
