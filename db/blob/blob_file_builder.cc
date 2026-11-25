@@ -71,12 +71,15 @@ BlobFileBuilder::BlobFileBuilder(
       blob_file_size_(mutable_cf_options->blob_file_size),
       blob_file_writable_file_max_buffer_size_(
           mutable_cf_options->blob_file_writable_file_max_buffer_size),
-      blob_compression_type_(mutable_cf_options->blob_compression_type),
-      // TODO with schema change: support custom compression manager and options
-      // such as max_compressed_bytes_per_kb
-      // NOTE: returns nullptr for kNoCompression
+      // TODO with schema change: support custom compression managers and
+      // per-blob compression decisions.
       blob_compressor_(GetBuiltinV2CompressionManager()->GetCompressor(
-          mutable_cf_options->blob_compression_opts, blob_compression_type_)),
+          mutable_cf_options->blob_compression_opts,
+          mutable_cf_options->blob_compression_type)),
+      // The file header and blob indexes must match the stored bytes.
+      blob_compression_type_(blob_compressor_
+                                 ? mutable_cf_options->blob_compression_type
+                                 : kNoCompression),
       blob_compressor_wa_(blob_compressor_
                               ? blob_compressor_->ObtainWorkingArea()
                               : Compressor::ManagedWorkingArea{}),
