@@ -732,6 +732,134 @@ TEST_F(DBFlushTest, StatisticsGarbageRangeDeletes) {
   Close();
 }
 
+TEST_F(DBFlushTest, StatisticsGarbageWithBlobFiles) {
+  constexpr uint64_t min_blob_size = 8;
+
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.create_if_missing = true;
+  options.compression = kNoCompression;
+  options.enable_blob_files = true;
+  options.min_blob_size = min_blob_size;
+  options.blob_compression_type = kNoCompression;
+  options.disable_auto_compactions = true;
+  options.write_buffer_size = 64 << 20;
+
+  DestroyAndReopen(options);
+
+  constexpr size_t NUM_KEYS = 100;
+  constexpr size_t RAND_VALUES_LENGTH = 1024;
+  static_assert(RAND_VALUES_LENGTH >= min_blob_size,
+                "values too short to be extracted into a blob file");
+
+  // The values are large enough to be extracted into a blob file, so the table
+  // file only holds a blob reference for each of them. The memtable garbage
+  // statistics must nevertheless account for the size of the values, since the
+  // values are not garbage: they were written out, just to a different file.
+  uint64_t EXPECTED_MEMTABLE_PAYLOAD_BYTES_AT_FLUSH = 0;
+  uint64_t EXPECTED_MEMTABLE_GARBAGE_BYTES_AT_FLUSH = 0;
+
+  Random rnd(301);
+
+  // Returns the blob files of the default column family, ordered by blob file
+  // number, so that the test can confirm the values really were extracted.
+  auto get_blob_files = [&]() -> VersionStorageInfo::BlobFiles {
+    VersionSet* const versions = dbfull()->GetVersionSet();
+    EXPECT_NE(versions, nullptr);
+
+    ColumnFamilyData* const cfd = versions->GetColumnFamilySet()->GetDefault();
+    EXPECT_NE(cfd, nullptr);
+
+    Version* const current = cfd->current();
+    EXPECT_NE(current, nullptr);
+
+    const VersionStorageInfo* const storage_info = current->storage_info();
+    EXPECT_NE(storage_info, nullptr);
+
+    return storage_info->GetBlobFiles();
+  };
+
+  // First flush: every key is distinct, so this flush produces no garbage at
+  // all.
+  for (size_t i = 0; i < NUM_KEYS; i++) {
+    const std::string key = "key" + std::to_string(i);
+    const std::string value = rnd.RandomString(RAND_VALUES_LENGTH);
+    ASSERT_OK(Put(key, value));
+    EXPECTED_MEMTABLE_PAYLOAD_BYTES_AT_FLUSH +=
+        key.size() + value.size() + sizeof(uint64_t);
+  }
+
+  ASSERT_OK(Flush());
+
+  {
+    const VersionStorageInfo::BlobFiles blob_files = get_blob_files();
+    ASSERT_EQ(blob_files.size(), 1);
+    ASSERT_EQ(blob_files.back()->GetTotalBlobCount(), NUM_KEYS);
+  }
+
+  EXPECT_EQ(TestGetTickerCount(options, MEMTABLE_PAYLOAD_BYTES_AT_FLUSH),
+            EXPECTED_MEMTABLE_PAYLOAD_BYTES_AT_FLUSH);
+  EXPECT_EQ(TestGetTickerCount(options, MEMTABLE_GARBAGE_BYTES_AT_FLUSH),
+            EXPECTED_MEMTABLE_GARBAGE_BYTES_AT_FLUSH);
+
+  // Second flush: every key is written twice, so the first value of each key
+  // is garbage, while the second one is extracted into the blob file.
+  for (size_t i = 0; i < NUM_KEYS; i++) {
+    const std::string key = "key" + std::to_string(i);
+    const std::string obsolete_value = rnd.RandomString(RAND_VALUES_LENGTH);
+    const std::string value = rnd.RandomString(RAND_VALUES_LENGTH);
+    ASSERT_OK(Put(key, obsolete_value));
+    ASSERT_OK(Put(key, value));
+    EXPECTED_MEMTABLE_PAYLOAD_BYTES_AT_FLUSH +=
+        key.size() + obsolete_value.size() + sizeof(uint64_t) + key.size() +
+        value.size() + sizeof(uint64_t);
+    EXPECTED_MEMTABLE_GARBAGE_BYTES_AT_FLUSH +=
+        key.size() + obsolete_value.size() + sizeof(uint64_t);
+  }
+
+  ASSERT_OK(Flush());
+
+  {
+    const VersionStorageInfo::BlobFiles blob_files = get_blob_files();
+    ASSERT_EQ(blob_files.size(), 2);
+    ASSERT_EQ(blob_files.back()->GetTotalBlobCount(), NUM_KEYS);
+  }
+
+  EXPECT_EQ(TestGetTickerCount(options, MEMTABLE_PAYLOAD_BYTES_AT_FLUSH),
+            EXPECTED_MEMTABLE_PAYLOAD_BYTES_AT_FLUSH);
+  EXPECT_EQ(TestGetTickerCount(options, MEMTABLE_GARBAGE_BYTES_AT_FLUSH),
+            EXPECTED_MEMTABLE_GARBAGE_BYTES_AT_FLUSH);
+
+  // Third flush: wide-column entities with one column large enough to be
+  // extracted. The keys are distinct again, so this flush adds no garbage
+  // either. The serialized size of an entity is not spelled out here, so only
+  // the garbage counter is checked.
+  const uint64_t garbage_bytes_before_entities =
+      TestGetTickerCount(options, MEMTABLE_GARBAGE_BYTES_AT_FLUSH);
+
+  for (size_t i = 0; i < NUM_KEYS; i++) {
+    const std::string key = "entity" + std::to_string(i);
+    const std::string value = rnd.RandomString(RAND_VALUES_LENGTH);
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), key,
+                             WideColumns{{"large", value}, {"small", "tiny"}}));
+  }
+
+  ASSERT_OK(Flush());
+
+  {
+    const VersionStorageInfo::BlobFiles blob_files = get_blob_files();
+    ASSERT_EQ(blob_files.size(), 3);
+    // Only the large column of each entity is extracted.
+    ASSERT_EQ(blob_files.back()->GetTotalBlobCount(), NUM_KEYS);
+  }
+
+  EXPECT_EQ(TestGetTickerCount(options, MEMTABLE_GARBAGE_BYTES_AT_FLUSH),
+            garbage_bytes_before_entities);
+
+  Close();
+}
+
 // This simple Listener can only handle one flush at a time.
 class TestFlushListener : public EventListener {
  public:
