@@ -138,12 +138,17 @@ static inline tokutime_t toku_time_now(void) {
   asm volatile("stckf %0" : "=Q"(result) : : "cc");
   return result;
 #elif defined(__riscv) && __riscv_xlen == 32
+  // Use rdtime, not rdcycle. Since Linux 6.6 the default
+  // kernel.perf_user_access=1 makes a direct user-mode rdcycle trap with
+  // SIGILL; the time CSR is always readable from user mode and ticks at a
+  // constant rate, which is all toku_time_now() callers need (they only
+  // subtract two readings).
   uint32_t cycles_lo, cycles_hi0, cycles_hi1;
   // Implemented in assembly because Clang insisted on branching.
   asm volatile(
-      "rdcycleh %0\n"
-      "rdcycle %1\n"
-      "rdcycleh %2\n"
+      "rdtimeh %0\n"
+      "rdtime %1\n"
+      "rdtimeh %2\n"
       "sub %0, %0, %2\n"
       "seqz %0, %0\n"
       "sub %0, zero, %0\n"
@@ -151,8 +156,9 @@ static inline tokutime_t toku_time_now(void) {
       : "=r"(cycles_hi0), "=r"(cycles_lo), "=r"(cycles_hi1));
   return (static_cast<uint64_t>(cycles_hi1) << 32) | cycles_lo;
 #elif defined(__riscv) && __riscv_xlen == 64
+  // rdtime, not rdcycle: see the 32-bit case above.
   uint64_t cycles;
-  asm volatile("rdcycle %0" : "=r"(cycles));
+  asm volatile("rdtime %0" : "=r"(cycles));
   return cycles;
 #elif defined(__loongarch64)
   unsigned long result;
