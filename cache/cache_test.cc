@@ -180,7 +180,8 @@ TEST_P(CacheTest, UsageTest) {
   auto precise_cache = NewCache(kCapacity, 0, false, kFullChargeCacheMetadata);
   ASSERT_EQ(0, cache->GetUsage());
   size_t baseline_meta_usage = precise_cache->GetUsage();
-  if (!IsHyperClock()) {
+  // S3FifoCache charges its slot table.
+  if (!IsHyperClock() && GetParam() != kS3Fifo) {
     ASSERT_EQ(0, baseline_meta_usage);
   }
 
@@ -210,7 +211,8 @@ TEST_P(CacheTest, UsageTest) {
   ASSERT_EQ(0, cache->GetUsage());
   if (GetParam() != kAutoHyperClock) {
     // NOTE: AutoHyperClockCache meta usage grows in proportion to lifetime
-    // max number of entries.
+    // max number of entries. S3FifoCache shrinks its table back to the initial
+    // size once EraseUnRefEntries leaves it empty.
     ASSERT_EQ(baseline_meta_usage, precise_cache->GetUsage());
   }
 
@@ -249,7 +251,8 @@ TEST_P(CacheTest, PinnedUsageTest) {
   auto cache = NewCache(kCapacity, 8, false, kDontChargeCacheMetadata);
   auto precise_cache = NewCache(kCapacity, 8, false, kFullChargeCacheMetadata);
   size_t baseline_meta_usage = precise_cache->GetUsage();
-  if (!IsHyperClock()) {
+  // S3FifoCache charges its slot table.
+  if (!IsHyperClock() && GetParam() != kS3Fifo) {
     ASSERT_EQ(0, baseline_meta_usage);
   }
 
@@ -440,6 +443,12 @@ TEST_P(CacheTest, EvictionPolicy) {
 }
 
 TEST_P(CacheTest, ExternalRefPinsEntries) {
+  if (GetParam() == kS3Fifo) {
+    ROCKSDB_GTEST_BYPASS(
+        "S3FifoCache promotes an entry hit twice to resident, where insertions "
+        "of keys never looked up do not evict it.");
+    return;
+  }
   Insert(100, 101);
   Cache::Handle* h = cache_->Lookup(EncodeKey(100));
   ASSERT_TRUE(cache_->Ref(h));
@@ -778,7 +787,7 @@ TEST_P(CacheTest, OverCapacity) {
     cache.Release(handles[i]);
   }
 
-  if (IsHyperClock()) {
+  if (IsHyperClock() || GetParam() == kS3Fifo) {
     // Make sure eviction is triggered.
     ASSERT_OK(cache.Insert(EncodeKey(-1), nullptr, 1, handles.data()));
 
@@ -915,6 +924,20 @@ TEST_P(CacheTest, ApplyToHandleTest) {
 TEST_P(CacheTest, DefaultShardBits) {
   // Prevent excessive allocation (to save time & space)
   estimated_value_size_ = 100000;
+  if (GetParam() == kS3Fifo) {
+    // S3FifoCache keeps each shard within [4 MiB, 128 MiB] instead (see
+    // S3FifoCache::DefaultShardBits).
+    std::shared_ptr<Cache> cache = NewCache(32U << 20);
+    ASSERT_EQ(3,
+              dynamic_cast<ShardedCacheBase*>(cache.get())->GetNumShardBits());
+    cache = NewCache((8U << 20) - 1);
+    ASSERT_EQ(0,
+              dynamic_cast<ShardedCacheBase*>(cache.get())->GetNumShardBits());
+    cache = NewCache(3U * 1024U * 1024U * 1024U);
+    ASSERT_EQ(6,
+              dynamic_cast<ShardedCacheBase*>(cache.get())->GetNumShardBits());
+    return;
+  }
   // Implementations use different minimum shard sizes
   size_t min_shard_size = (IsHyperClock() ? 32U * 1024U : 512U) * 1024U;
 
