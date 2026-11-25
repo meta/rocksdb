@@ -25,7 +25,7 @@ public class Environment {
   private static Boolean MUSL_LIBC = null;
 
   public static boolean isAarch64() {
-    return ARCH.contains("aarch64");
+    return ARCH.contains("aarch64") || ARCH.contains("arm64");
   }
 
   public static boolean isPowerPC() {
@@ -204,6 +204,9 @@ public class Environment {
     } else if (isAix() && is64Bit()) {
       return String.format("%sjni-aix64", name);
     } else if (isWindows() && is64Bit()) {
+      if (isAarch64()) {
+        return String.format("%sjni-win-arm64", name);
+      }
       return String.format("%sjni-win64", name);
     } else if (isOpenBSD()) {
       return String.format("%sjni-openbsd%s", name, is64Bit() ? "64" : "32");
