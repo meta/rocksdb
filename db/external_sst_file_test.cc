@@ -715,6 +715,68 @@ TEST_F(ExternalSSTFileTest,
   ASSERT_EQ("new-d", Get("d"));
 }
 
+TEST_F(ExternalSSTFileTest,
+       AtomicReplaceRangeDetectsFragmentedMemtableTombstones) {
+  for (CompactionStyle style :
+       {kCompactionStyleLevel, kCompactionStyleUniversal}) {
+    SCOPED_TRACE(style);
+    for (bool overlapping : {false, true}) {
+      SCOPED_TRACE(overlapping);
+      Options options = CurrentOptions();
+      options.compaction_style = style;
+      options.disable_auto_compactions = true;
+      DestroyAndReopen(options);
+
+      ColumnFamilyHandle* cf = db_->DefaultColumnFamily();
+      if (overlapping) {
+        ASSERT_OK(db_->DeleteRange(WriteOptions(), cf, "c", "g"));
+      }
+      ASSERT_OK(db_->DeleteRange(WriteOptions(), cf, "e", "g"));
+
+      std::string file_path;
+      ASSERT_OK(GenerateExternalFileOnly(
+          options, {{"b", "new-b"}, {"d", "new-d"}}, &file_path));
+      IngestExternalFileArg arg;
+      arg.column_family = cf;
+      arg.external_files = {file_path};
+      arg.options.snapshot_consistency = false;
+      arg.options.allow_blocking_flush = false;
+      arg.atomic_replace_range = {{"a", "e"}};
+
+      Status status = db_->IngestExternalFiles({arg});
+      if (overlapping) {
+        // [c, e) overlaps the replacement range even though the last
+        // fragment, [e, g), starts at its exclusive limit.
+        ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+        ASSERT_EQ("NOT_FOUND", Get("b"));
+        ASSERT_EQ("NOT_FOUND", Get("d"));
+
+        arg.options.allow_blocking_flush = true;
+        status = db_->IngestExternalFiles({arg});
+        if (style == kCompactionStyleLevel) {
+          ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+        } else {
+          // Flushing exposes a partial SST overlap that was not present
+          // during preparation. Retry so its replacement tombstone is prepared.
+          ASSERT_TRUE(status.IsTryAgain()) << status.ToString();
+          ASSERT_OK(db_->IngestExternalFiles({arg}));
+          ASSERT_EQ("new-b", Get("b"));
+          ASSERT_EQ("new-d", Get("d"));
+          ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+          Reopen(options);
+          ASSERT_EQ("new-b", Get("b"));
+          ASSERT_EQ("new-d", Get("d"));
+        }
+      } else {
+        // A tombstone starting at the exclusive limit does not need a flush.
+        ASSERT_OK(status);
+        ASSERT_EQ("new-b", Get("b"));
+        ASSERT_EQ("new-d", Get("d"));
+      }
+    }
+  }
+}
+
 TEST_F(ExternalSSTFileTest, ParallelFileOpenWithFileOpeningThreads) {
   // Ingest many non-overlapping files with file_opening_threads > 1 so commit
   // opens table readers with multiple threads. max_open_files == -1 makes
