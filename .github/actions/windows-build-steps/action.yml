@@ -128,7 +128,7 @@ runs:
       if ("${{ inputs.run-java }}" -eq "true") {
         echo ======================== Test RocksJava ========================
         cd build\java
-        & ctest -C Debug -j 16
+        & ctest -C Debug -j 16 --rerun-failed --output-on-failure
         if(!$?) { Exit $LASTEXITCODE }
       } else {
         echo "Skipping Java tests"
