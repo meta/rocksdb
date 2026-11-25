@@ -2016,6 +2016,11 @@ DEFINE_bool(multiscan_reverse, false,
 DEFINE_bool(multiscan_use_async_io, false,
             "If set, enable async_io for MultiScan operations.");
 
+DEFINE_bool(multiscan_allow_unsorted_or_overlapping_ranges, false,
+            "If set with use_multiscan, reverse caller range order and add "
+            "duplicate overlapping ranges while opting into non-canonical "
+            "MultiScan Prepare behavior.");
+
 DEFINE_bool(read_scoped_block_buffer_provider, false,
             "If set, configure ReadOptions::read_scoped_block_buffer_provider "
             "with a stress-test provider for supported scan reads.");

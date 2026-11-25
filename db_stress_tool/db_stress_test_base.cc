@@ -3348,6 +3348,8 @@ Status StressTest::TestMultiScan(ThreadState* thread,
   MultiScanArgs scan_opts(options_.comparator);
   const bool reverse_multiscan = FLAGS_multiscan_reverse;
   scan_opts.reverse = reverse_multiscan;
+  scan_opts.allow_unsorted_or_overlapping_ranges =
+      FLAGS_multiscan_allow_unsorted_or_overlapping_ranges;
   scan_opts.use_async_io =
       FLAGS_multiscan_use_async_io &&
       CheckFSFeatureSupport(options_.env->GetFileSystem().get(),
@@ -3370,10 +3372,18 @@ Status StressTest::TestMultiScan(ThreadState* thread,
     ro.iterate_lower_bound = &lb;
   }
   ro.iterate_upper_bound = &ub;
-  for (size_t i = 0; i < num_scans * 2; i += 2) {
-    assert(rand_keys[i] <= rand_keys[i + 1]);
-    start_key_strs.emplace_back(Key(rand_keys[i]));
-    end_key_strs.emplace_back(Key(rand_keys[i + 1]));
+  for (size_t scan_index = 0; scan_index < num_scans; ++scan_index) {
+    size_t source_index = scan_index;
+    if (FLAGS_multiscan_allow_unsorted_or_overlapping_ranges) {
+      source_index = num_scans - scan_index - 1;
+      if (scan_index >= 2 && scan_index % 3 == 2) {
+        source_index = num_scans - 1;
+      }
+    }
+    const size_t key_index = source_index * 2;
+    assert(rand_keys[key_index] <= rand_keys[key_index + 1]);
+    start_key_strs.emplace_back(Key(rand_keys[key_index]));
+    end_key_strs.emplace_back(Key(rand_keys[key_index + 1]));
     scan_opts.insert(Slice(start_key_strs.back()), Slice(end_key_strs.back()));
   }
 
@@ -3382,7 +3392,8 @@ Status StressTest::TestMultiScan(ThreadState* thread,
     std::ostringstream start_oss;
     start_oss << "action=start cf=" << rand_column_families[0]
               << " range_count=" << num_scans
-              << " reverse=" << reverse_multiscan
+              << " reverse=" << reverse_multiscan << " allow_noncanonical="
+              << scan_opts.allow_unsorted_or_overlapping_ranges
               << " multiscan_async_io=" << scan_opts.use_async_io
               << " prefetch_memory_limit="
               << FLAGS_multiscan_max_prefetch_memory_bytes << " read_options={"

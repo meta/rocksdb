@@ -2249,8 +2249,8 @@ DEFINE_bool(
 
 DEFINE_uint64(io_dispatcher_max_prefetch_memory_bytes, 0,
               "Maximum memory (in bytes) for IODispatcher prefetching across "
-              "all ReadSets. When this limit is reached, SubmitJob() blocks "
-              "until memory is released. 0 means unlimited.");
+              "all ReadSets. SubmitJob() remains non-blocking; blocks that "
+              "cannot be admitted are read on demand. 0 means unlimited.");
 
 DEFINE_uint64(
     multiscan_max_prefetch_size,
@@ -2272,6 +2272,10 @@ DEFINE_uint64(multiscan_rolling_prefetch_window_size, 0,
 DEFINE_bool(use_multiscan, true,
             "If true, multiscanrandom uses MultiScan API. If false, uses "
             "normal iterators (Seek + Next) for each range.");
+
+DEFINE_bool(multiscan_allow_unsorted_or_overlapping_ranges, false,
+            "Generate multiscanrandom ranges in caller order without sorting "
+            "or removing overlaps, and opt MultiScan into accepting them.");
 
 DEFINE_bool(openandcompact_allow_resumption, false,
             "Whether to keep existing progress and enable resume compaction in "
@@ -4990,6 +4994,9 @@ class Benchmark {
                 FLAGS_multiscan_use_async_io ? "true" : "false");
         fprintf(stderr, "use_multiscan = %s\n",
                 FLAGS_use_multiscan ? "true" : "false");
+        fprintf(stderr, "multiscan_allow_unsorted_or_overlapping_ranges = %s\n",
+                FLAGS_multiscan_allow_unsorted_or_overlapping_ranges ? "true"
+                                                                     : "false");
         fprintf(stderr, "reverse_iterator = %s\n",
                 FLAGS_reverse_iterator ? "true" : "false");
         method = &Benchmark::MultiScanRandom;
@@ -9119,7 +9126,7 @@ class Benchmark {
       int64_t batch_size =
           1 + static_cast<int64_t>(thread->rand.Uniform(kMaxBatchSize));
 
-      // Generate sorted non-overlapping ranges with random sizes
+      // Generate caller ranges; legacy mode canonicalizes them below.
       struct RangeSpec {
         uint64_t start;
         uint64_t size;
@@ -9135,33 +9142,33 @@ class Benchmark {
         ranges[i].start = thread->rand.Uniform(max_start + 1);
       }
 
-      // Sort by start key
-      std::sort(ranges.begin(), ranges.end(),
-                [](const RangeSpec& a, const RangeSpec& b) {
-                  return a.start < b.start;
-                });
+      std::vector<RangeSpec> canonical_ranges;
+      const std::vector<RangeSpec>* scan_ranges = &ranges;
+      if (!FLAGS_multiscan_allow_unsorted_or_overlapping_ranges) {
+        std::sort(ranges.begin(), ranges.end(),
+                  [](const RangeSpec& a, const RangeSpec& b) {
+                    return a.start < b.start;
+                  });
 
-      // Remove overlaps: trim or skip ranges that overlap with the previous
-      std::vector<RangeSpec> non_overlapping;
-      non_overlapping.reserve(batch_size);
-      for (auto& r : ranges) {
-        if (non_overlapping.empty()) {
-          non_overlapping.push_back(r);
-        } else {
-          uint64_t prev_end =
-              non_overlapping.back().start + non_overlapping.back().size;
-          if (r.start >= prev_end) {
-            non_overlapping.push_back(r);
-          } else if (r.start + r.size > prev_end) {
-            uint64_t new_start = prev_end;
-            uint64_t new_size = r.start + r.size - new_start;
-            non_overlapping.push_back({new_start, new_size});
+        canonical_ranges.reserve(batch_size);
+        for (const RangeSpec& range : ranges) {
+          if (canonical_ranges.empty()) {
+            canonical_ranges.push_back(range);
+          } else {
+            const uint64_t previous_end =
+                canonical_ranges.back().start + canonical_ranges.back().size;
+            if (range.start >= previous_end) {
+              canonical_ranges.push_back(range);
+            } else if (range.start + range.size > previous_end) {
+              const uint64_t new_size = range.start + range.size - previous_end;
+              canonical_ranges.push_back({previous_end, new_size});
+            }
           }
-          // else: fully contained, skip
         }
+        scan_ranges = &canonical_ranges;
       }
 
-      if (non_overlapping.empty()) {
+      if (scan_ranges->empty()) {
         continue;
       }
 
@@ -9178,12 +9185,14 @@ class Benchmark {
         opts.rolling_prefetch_window_size =
             FLAGS_multiscan_rolling_prefetch_window_size;
         opts.reverse = FLAGS_reverse_iterator;
+        opts.allow_unsorted_or_overlapping_ranges =
+            FLAGS_multiscan_allow_unsorted_or_overlapping_ranges;
         if (io_dispatcher) {
           opts.io_dispatcher = io_dispatcher;
         }
-        opts.reserve(non_overlapping.size());
+        opts.reserve(scan_ranges->size());
 
-        for (auto& r : non_overlapping) {
+        for (const RangeSpec& range : *scan_ranges) {
           std::unique_ptr<const char[]> skey_guard;
           Slice skey = AllocateKey(&skey_guard);
           guards.push_back(std::move(skey_guard));
@@ -9191,8 +9200,8 @@ class Benchmark {
           Slice ekey = AllocateKey(&ekey_guard);
           guards.push_back(std::move(ekey_guard));
 
-          GenerateKeyFromInt(r.start, FLAGS_num, &skey);
-          GenerateKeyFromInt(r.start + r.size, FLAGS_num, &ekey);
+          GenerateKeyFromInt(range.start, FLAGS_num, &skey);
+          GenerateKeyFromInt(range.start + range.size, FLAGS_num, &ekey);
           opts.insert(skey, ekey);
         }
 
@@ -9240,13 +9249,14 @@ class Benchmark {
           }
         };
         if (FLAGS_reverse_iterator) {
-          for (auto it = non_overlapping.rbegin();
-               it != non_overlapping.rend() && iter->status().ok(); ++it) {
+          for (std::vector<RangeSpec>::const_reverse_iterator it =
+                   scan_ranges->rbegin();
+               it != scan_ranges->rend() && iter->status().ok(); ++it) {
             scan_range(*it);
           }
         } else {
-          for (auto& r : non_overlapping) {
-            scan_range(r);
+          for (const RangeSpec& range : *scan_ranges) {
+            scan_range(range);
             if (!iter->status().ok()) {
               break;
             }

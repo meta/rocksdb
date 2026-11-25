@@ -27,6 +27,7 @@ namespace {
 struct PrefetchGroup {
   std::vector<size_t> block_indices;
   size_t total_bytes = 0;
+  size_t logical_priority = 0;
   size_t rolling_window_index = std::numeric_limits<size_t>::max();
 };
 
@@ -50,6 +51,10 @@ std::vector<PrefetchGroup> CoalesceBlocks(
   for (const size_t block_index : block_indices) {
     const size_t block_size =
         BlockBasedTable::BlockSizeWithTrailer(block_handles[block_index]);
+    const size_t logical_priority =
+        job->logical_block_priorities.empty()
+            ? 0
+            : job->logical_block_priorities[block_index];
     if (max_group_bytes > 0 && block_size > max_group_bytes &&
         !include_oversized_blocks) {
       continue;
@@ -63,7 +68,9 @@ std::vector<PrefetchGroup> CoalesceBlocks(
           last_handle.offset() +
           BlockBasedTable::BlockSizeWithTrailer(last_handle);
       const uint64_t current_start = block_handles[block_index].offset();
-      if (current_start > last_end + coalesce_threshold) {
+      if (logical_priority != groups.back().logical_priority ||
+          current_start < last_handle.offset() ||
+          current_start > last_end + coalesce_threshold) {
         start_new_group = true;
       } else if (max_group_bytes > 0) {
         if (group_limit == PrefetchGroupLimit::kTotalBlockBytes) {
@@ -79,6 +86,9 @@ std::vector<PrefetchGroup> CoalesceBlocks(
     }
     if (start_new_group) {
       groups.emplace_back();
+    }
+    if (groups.back().block_indices.empty()) {
+      groups.back().logical_priority = logical_priority;
     }
     groups.back().block_indices.push_back(block_index);
     groups.back().total_bytes += block_size;
@@ -108,6 +118,11 @@ class DefaultPrefetchCoordinator {
   size_t MaxBytes() const { return max_bytes_; }
 
  private:
+  struct PendingScheduler {
+    std::weak_ptr<DefaultPrefetchScheduler> scheduler;
+    bool has_logical_priorities = false;
+  };
+
   void TryDispatchPending();
 
   const size_t max_bytes_;
@@ -115,7 +130,8 @@ class DefaultPrefetchCoordinator {
   std::atomic<size_t> bytes_in_use_{0};
   std::atomic<bool> has_pending_{false};
   port::Mutex queue_mutex_;
-  std::deque<std::weak_ptr<DefaultPrefetchScheduler>> pending_;
+  std::deque<PendingScheduler> pending_;
+  size_t pending_with_logical_priorities_ = 0;
 };
 
 class DefaultPrefetchScheduler final
@@ -144,8 +160,14 @@ class DefaultPrefetchScheduler final
     }
   }
   DispatchProgress TryDispatchAvailable();
+  size_t NextLogicalPriority();
+  bool HasLogicalPriorities() const {
+    return !job_->logical_block_priorities.empty();
+  }
 
  private:
+  void SortBlocksByOffset(std::vector<size_t>* block_indices);
+
   std::weak_ptr<PrefetchDispatchTarget> target_;
   std::weak_ptr<DefaultPrefetchCoordinator> coordinator_;
   std::weak_ptr<ReadSet> read_set_;
@@ -267,35 +289,110 @@ void DefaultPrefetchCoordinator::Release(size_t bytes) {
 void DefaultPrefetchCoordinator::Enqueue(
     const std::shared_ptr<DefaultPrefetchScheduler>& scheduler) {
   MutexLock lock(&queue_mutex_);
-  pending_.push_back(scheduler);
+  const bool has_logical_priorities = scheduler->HasLogicalPriorities();
+  pending_.push_back({scheduler, has_logical_priorities});
+  pending_with_logical_priorities_ += has_logical_priorities ? 1 : 0;
   has_pending_.store(true, std::memory_order_release);
 }
 
 void DefaultPrefetchCoordinator::TryDispatchPending() {
   while (true) {
-    std::weak_ptr<DefaultPrefetchScheduler> pending;
+    std::shared_ptr<DefaultPrefetchScheduler> scheduler;
     {
       MutexLock lock(&queue_mutex_);
       if (pending_.empty()) {
         has_pending_.store(false, std::memory_order_release);
         return;
       }
-      pending = std::move(pending_.front());
-      pending_.pop_front();
+      if (pending_with_logical_priorities_ == 0) {
+        while (!pending_.empty() && !scheduler) {
+          scheduler = pending_.front().scheduler.lock();
+          pending_.pop_front();
+        }
+      } else {
+        while (true) {
+          for (std::deque<PendingScheduler>::iterator it = pending_.begin();
+               it != pending_.end();) {
+            if (!it->scheduler.lock()) {
+              if (it->has_logical_priorities) {
+                --pending_with_logical_priorities_;
+              }
+              it = pending_.erase(it);
+            } else {
+              ++it;
+            }
+          }
+
+          size_t best_index = std::numeric_limits<size_t>::max();
+          size_t best_priority = std::numeric_limits<size_t>::max();
+          bool retry_selection = false;
+          for (size_t index = 0; index < pending_.size(); ++index) {
+            const std::shared_ptr<DefaultPrefetchScheduler> candidate =
+                pending_[index].scheduler.lock();
+            if (!candidate) {
+              retry_selection = true;
+              break;
+            }
+            const size_t priority = pending_[index].has_logical_priorities
+                                        ? candidate->NextLogicalPriority()
+                                        : 0;
+            if (best_index == std::numeric_limits<size_t>::max() ||
+                priority < best_priority) {
+              best_index = index;
+              best_priority = priority;
+              scheduler = candidate;
+            }
+          }
+          if (retry_selection) {
+            scheduler.reset();
+            continue;
+          }
+          if (best_index != std::numeric_limits<size_t>::max()) {
+            if (pending_[best_index].has_logical_priorities) {
+              --pending_with_logical_priorities_;
+            }
+            pending_.erase(pending_.begin() + best_index);
+          }
+          break;
+        }
+      }
+      if (!scheduler) {
+        has_pending_.store(false, std::memory_order_release);
+        return;
+      }
     }
-    const auto scheduler = pending.lock();
-    if (!scheduler) {
-      continue;
-    }
-    const auto progress = scheduler->TryDispatchAvailable();
+    const DefaultPrefetchScheduler::DispatchProgress progress =
+        scheduler->TryDispatchAvailable();
     if (progress.pending) {
       MutexLock lock(&queue_mutex_);
-      pending_.push_front(scheduler);
+      const bool has_logical_priorities = scheduler->HasLogicalPriorities();
+      pending_.push_front({scheduler, has_logical_priorities});
+      pending_with_logical_priorities_ += has_logical_priorities ? 1 : 0;
       if (!progress.dispatched) {
         return;
       }
     }
   }
+}
+
+size_t DefaultPrefetchScheduler::NextLogicalPriority() {
+  TEST_SYNC_POINT("DefaultPrefetchScheduler::NextLogicalPriority");
+  MutexLock lock(&mutex_);
+  return groups_.empty() ? std::numeric_limits<size_t>::max()
+                         : groups_.front().logical_priority;
+}
+
+void DefaultPrefetchScheduler::SortBlocksByOffset(
+    std::vector<size_t>* block_indices) {
+  if (job_->job_options.block_handles_are_sorted) {
+    return;
+  }
+  TEST_SYNC_POINT("DefaultPrefetchScheduler::SortBlocksByOffset");
+  std::sort(block_indices->begin(), block_indices->end(),
+            [this](size_t a, size_t b) {
+              return job_->block_handles[a].offset() <
+                     job_->block_handles[b].offset();
+            });
 }
 
 Status DefaultPrefetchScheduler::Start(
@@ -307,17 +404,23 @@ Status DefaultPrefetchScheduler::Start(
     return Status::OK();
   }
 
-  auto groups = CoalesceBlocks(job_, block_indices, coordinator->MaxBytes(),
-                               /*include_oversized_blocks=*/false,
-                               PrefetchGroupLimit::kTotalBlockBytes);
+  std::vector<PrefetchGroup> groups = CoalesceBlocks(
+      job_, block_indices, coordinator->MaxBytes(),
+      /*include_oversized_blocks=*/false, PrefetchGroupLimit::kTotalBlockBytes);
   std::vector<size_t> blocks_to_dispatch;
-  for (auto& group : groups) {
-    if (coordinator->TryAcquire(group.total_bytes)) {
+  // Logical priorities form a strict admission sequence. Canonical jobs retain
+  // the legacy policy of trying later groups when an earlier group does not
+  // fit the remaining budget.
+  const bool preserve_logical_admission_order = HasLogicalPriorities();
+  bool admission_blocked = false;
+  for (PrefetchGroup& group : groups) {
+    if (!admission_blocked && coordinator->TryAcquire(group.total_bytes)) {
       blocks_to_dispatch.insert(blocks_to_dispatch.end(),
                                 group.block_indices.begin(),
                                 group.block_indices.end());
       continue;
     }
+    admission_blocked = preserve_logical_admission_order;
     pending_blocks_.insert(group.block_indices.begin(),
                            group.block_indices.end());
     groups_.push_back(std::move(group));
@@ -325,6 +428,7 @@ Status DefaultPrefetchScheduler::Start(
 
   Status status;
   if (!blocks_to_dispatch.empty()) {
+    SortBlocksByOffset(&blocks_to_dispatch);
     status = target->DispatchPrefetch(read_set, job_, blocks_to_dispatch,
                                       /*require_async_io=*/false);
   }
@@ -383,6 +487,7 @@ DefaultPrefetchScheduler::TryDispatchAvailable() {
   }
 
   if (!blocks_to_dispatch.empty()) {
+    SortBlocksByOffset(&blocks_to_dispatch);
     Status status = target->DispatchPrefetch(read_set, job_, blocks_to_dispatch,
                                              /*require_async_io=*/false);
     status.PermitUncheckedError();

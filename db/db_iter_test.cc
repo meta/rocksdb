@@ -218,11 +218,13 @@ class TestIterator : public InternalIterator {
   bool IsKeyPinned() const override { return true; }
   bool IsValuePinned() const override { return true; }
 
-  void Prepare(const MultiScanArgs* /*scan_opts*/) override {
+  void Prepare(const MultiScanArgs* scan_opts) override {
     ++prepare_call_count_;
+    prepared_with_scan_opts_ = scan_opts != nullptr;
   }
 
   size_t prepare_call_count() const { return prepare_call_count_; }
+  bool prepared_with_scan_opts() const { return prepared_with_scan_opts_; }
 
  private:
   bool initialized_;
@@ -231,6 +233,7 @@ class TestIterator : public InternalIterator {
   size_t iter_;
   size_t steps_ = 0;
   size_t prepare_call_count_ = 0;
+  bool prepared_with_scan_opts_ = false;
 
   InternalKeyComparator cmp;
   std::vector<std::pair<std::string, std::string>> data_;
@@ -273,6 +276,7 @@ TEST_F(DBIteratorTest, PrepareForwardsValidatedScanRanges) {
   db_iter->Prepare(scan_opts);
   ASSERT_OK(db_iter->status());
   EXPECT_EQ(internal_iter->prepare_call_count(), 1);
+  EXPECT_TRUE(internal_iter->prepared_with_scan_opts());
 }
 
 TEST_F(DBIteratorTest, PrepareDoesNotForwardInvalidScanRanges) {
@@ -297,6 +301,32 @@ TEST_F(DBIteratorTest, PrepareDoesNotForwardInvalidScanRanges) {
   db_iter->Prepare(scan_opts);
   EXPECT_TRUE(db_iter->status().IsInvalidArgument());
   EXPECT_EQ(internal_iter->prepare_call_count(), 0);
+}
+
+TEST_F(DBIteratorTest, PrepareForwardsBoundedArbitraryScanRanges) {
+  Options options;
+  ImmutableOptions ioptions = ImmutableOptions(options);
+  MutableCFOptions mutable_cf_options = MutableCFOptions(options);
+  TestIterator* internal_iter = new TestIterator(BytewiseComparator());
+  internal_iter->AddPut("a", "val_a");
+  internal_iter->AddPut("b", "val_b");
+  internal_iter->Finish();
+
+  ReadOptions ro;
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
+      env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
+      internal_iter, nullptr /* version */, 10 /* sequence */,
+      nullptr /* read_callback */, /*active_mem=*/nullptr));
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.allow_unsorted_or_overlapping_ranges = true;
+  scan_opts.insert("b", "d");
+  scan_opts.insert("a", "c");
+
+  db_iter->Prepare(scan_opts);
+  ASSERT_OK(db_iter->status());
+  EXPECT_EQ(internal_iter->prepare_call_count(), 1);
+  EXPECT_TRUE(internal_iter->prepared_with_scan_opts());
 }
 
 TEST_F(DBIteratorTest, DBIteratorPrevNext) {
