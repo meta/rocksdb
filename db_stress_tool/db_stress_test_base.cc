@@ -1584,6 +1584,24 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
       opts.secondary_cache = std::move(secondary_cache);
       block_cache = NewLRUCache(opts);
     }
+  } else if (cache_type == "s3fifo_cache" && !tiered) {
+    S3FifoCacheOptions opts;
+    opts.capacity = cache_size;
+    opts.num_shard_bits = num_shard_bits;
+    opts.metadata_charge_policy =
+        static_cast<CacheMetadataChargePolicy>(FLAGS_metadata_charge_policy);
+    opts.hash_seed = BitwiseAnd(FLAGS_seed, INT32_MAX);
+    opts.secondary_cache = std::move(secondary_cache);
+    block_cache = opts.MakeSharedCache();
+    if (block_cache == nullptr) {
+      // num_shard_bits is 20 or more, or a shard could not reserve address
+      // space for its slot table. Without this check the DB would silently
+      // get the default block cache.
+      fprintf(stderr,
+              "S3FifoCache: invalid --cache_numshardbits (must be at most 19) "
+              "or could not reserve address space for slot tables.\n");
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
   } else {
     fprintf(stderr, "Cache type not supported.");
     exit(1);  // NOLINT(concurrency-mt-unsafe)

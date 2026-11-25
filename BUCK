@@ -19,6 +19,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "cache/clock_cache.cc",
         "cache/compressed_secondary_cache.cc",
         "cache/lru_cache.cc",
+        "cache/s3fifo_cache.cc",
         "cache/secondary_cache.cc",
         "cache/secondary_cache_adapter.cc",
         "cache/sharded_cache.cc",
@@ -5640,6 +5641,12 @@ cpp_unittest_wrapper(name="repeatable_thread_test",
 
 cpp_unittest_wrapper(name="ribbon_test",
             srcs=["util/ribbon_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="s3fifo_cache_test",
+            srcs=["cache/s3fifo_cache_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
