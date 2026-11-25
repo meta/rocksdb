@@ -552,6 +552,50 @@ TEST_F(PeriodicTaskSchedulerTest, MultiEnv) {
   Close();
 }
 
+TEST_F(PeriodicTaskSchedulerTest, PersistStatsResetUnderflowGuard) {
+  Options options;
+  options.stats_persist_period_sec = 1;
+  options.create_if_missing = true;
+  options.env = mock_env_.get();
+  options.statistics = CreateDBStatistics();
+
+  Reopen(options);
+
+  // Perform some initial operations to increase ticker counters
+  ASSERT_OK(Put("k1", "v1"));
+  ASSERT_OK(Flush());
+
+  // Run initial persist
+  dbfull()->TEST_WaitForPeriodicTaskRun(
+      [&] { mock_clock_->MockSleepForSeconds(1); });
+
+  // Reset statistics so counters go back to 0
+  ASSERT_OK(options.statistics->Reset());
+
+  // Perform a small operation
+  ASSERT_OK(Put("k2", "v2"));
+
+  // Persist again after reset
+  dbfull()->TEST_WaitForPeriodicTaskRun(
+      [&] { mock_clock_->MockSleepForSeconds(1); });
+
+  // Verify that in-memory stats history contains no wrapped 2^64 deltas
+  std::map<std::string, uint64_t> stats_map;
+  std::unique_ptr<StatsHistoryIterator> stats_iter;
+  Status s = dbfull()->GetStatsHistory(0, UINT64_MAX, &stats_iter);
+  if (s.ok() && stats_iter) {
+    for (; stats_iter->Valid(); stats_iter->Next()) {
+      auto slice = stats_iter->GetStatsMap();
+      for (const auto& pair : slice) {
+        // Delta should be realistic, never wrapped around near 2^64 (1.8e19)
+        ASSERT_LT(pair.second, uint64_t{1000000000ULL});
+      }
+    }
+  }
+
+  Close();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
