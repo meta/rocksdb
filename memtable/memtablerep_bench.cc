@@ -416,7 +416,7 @@ class Benchmark {
 
   virtual ~Benchmark() {}
   virtual void Run() {
-    std::cout << "Number of threads: " << num_threads_ << std::endl;
+    std::cout << "Number of threads: " << num_threads_ << '\n';
     std::vector<port::Thread> threads;
     uint64_t bytes_written = 0;
     uint64_t bytes_read = 0;
@@ -425,26 +425,23 @@ class Benchmark {
     RunThreads(&threads, &bytes_written, &bytes_read, true, &read_hits);
     auto elapsed_time = static_cast<double>(timer.ElapsedNanos() / 1000);
     std::cout << "Elapsed time: " << static_cast<int>(elapsed_time) << " us"
-              << std::endl;
+              << '\n';
 
     if (bytes_written > 0) {
       auto MiB_written = static_cast<double>(bytes_written) / (1 << 20);
       auto write_throughput = MiB_written / (elapsed_time / 1000000);
-      std::cout << "Total bytes written: " << MiB_written << " MiB"
-                << std::endl;
-      std::cout << "Write throughput: " << write_throughput << " MiB/s"
-                << std::endl;
+      std::cout << "Total bytes written: " << MiB_written << " MiB" << '\n';
+      std::cout << "Write throughput: " << write_throughput << " MiB/s" << '\n';
       auto us_per_op = elapsed_time / num_write_ops_per_thread_;
-      std::cout << "write us/op: " << us_per_op << std::endl;
+      std::cout << "write us/op: " << us_per_op << '\n';
     }
     if (bytes_read > 0) {
       auto MiB_read = static_cast<double>(bytes_read) / (1 << 20);
       auto read_throughput = MiB_read / (elapsed_time / 1000000);
-      std::cout << "Total bytes read: " << MiB_read << " MiB" << std::endl;
-      std::cout << "Read throughput: " << read_throughput << " MiB/s"
-                << std::endl;
+      std::cout << "Total bytes read: " << MiB_read << " MiB" << '\n';
+      std::cout << "Read throughput: " << read_throughput << " MiB/s" << '\n';
       auto us_per_op = elapsed_time / num_read_ops_per_thread_;
-      std::cout << "read us/op: " << us_per_op << std::endl;
+      std::cout << "read us/op: " << us_per_op << '\n';
     }
   }
 
@@ -498,7 +495,7 @@ class ReadBenchmark : public Benchmark {
     }
     std::cout << "read hit%: "
               << (static_cast<double>(*read_hits) / FLAGS_num_operations) * 100
-              << std::endl;
+              << '\n';
   }
 };
 
@@ -676,7 +673,7 @@ int main(int argc, char** argv) {
           memtablerep.get(), key_gen.get(), &sequence));
     } else {
       std::cout << "WARNING: skipping unknown benchmark '" << name.ToString()
-                << std::endl;
+                << '\n';
       continue;
     }
     std::cout << "Running " << name.ToString() << std::endl;
