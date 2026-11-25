@@ -1477,6 +1477,10 @@ class FSWritableFile {
     return IOStatus::OK();
   }
 
+  enum AccessPattern { kNormal, kSequential, kRandom, kWillNeed, kDontNeed };
+
+  virtual void Hint(AccessPattern /*pattern*/) {}
+
   // If you're adding methods here, remember to add them to
   // WritableFileWrapper too.
 
@@ -2101,6 +2105,10 @@ class FSWritableFileWrapper : public FSWritableFile {
   IOStatus Allocate(uint64_t offset, uint64_t len, const IOOptions& options,
                     IODebugContext* dbg) override {
     return target_->Allocate(offset, len, options, dbg);
+  }
+
+  void Hint(FSWritableFile::AccessPattern pattern) override {
+    target_->Hint(pattern);
   }
 
  private:
