@@ -7,8 +7,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 
 namespace ROCKSDB_NAMESPACE {

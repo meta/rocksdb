@@ -18,15 +18,22 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
+#include "rocksdb/advanced_options.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/cleanable.h"
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {

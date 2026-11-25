@@ -4,13 +4,17 @@
 // Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/types.h"
 

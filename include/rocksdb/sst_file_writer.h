@@ -5,12 +5,17 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
 #include "advanced_options.h"
+#include "rocksdb/compression_type.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/types.h"
 #include "rocksdb/wide_columns.h"

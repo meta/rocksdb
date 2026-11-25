@@ -5,9 +5,15 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/types.h"
 

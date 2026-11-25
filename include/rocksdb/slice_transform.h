@@ -13,15 +13,18 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Slice;
 struct ConfigOptions;
 
 // A SliceTransform is a generic pluggable way of transforming one string

@@ -10,7 +10,9 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <string>
 
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/port_defs.h"
 #include "rocksdb/rocksdb_namespace.h"
