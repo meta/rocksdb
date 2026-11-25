@@ -675,6 +675,26 @@ TEST(BitFieldsTest, BitFields) {
     ASSERT_EQ(after.Get<Field5>(), 0U);
   }
   {
+    // An additive transform applied to a value that isn't atomic, with the
+    // same overflow/underflow detection
+    auto transform = Field1::PlusTransformPromiseNoOverflow(10000U) +
+                     Field4::MinusTransformPromiseNoUnderflow(3U);
+    MyState value =
+        MyState{}.With<Field1>(45U).With<Field2>(true).With<Field4>(3U);
+    transform.ApplyTo(value);
+    ASSERT_EQ(value.Get<Field1>(), 10045U);
+    ASSERT_EQ(value.Get<Field2>(), true);
+    ASSERT_EQ(value.Get<Field3>(), false);
+    ASSERT_EQ(value.Get<Field4>(), 0U);
+
+    MyState field4_max = MyState{}.With<Field4>(31U);
+    ASSERT_TESTABLE_FAILURE(
+        Field4::PlusTransformPromiseNoOverflow(1U).ApplyTo(field4_max));
+    MyState field1_zero = MyState{}.With<Field1>(0U);
+    ASSERT_TESTABLE_FAILURE(
+        Field1::MinusTransformPromiseNoUnderflow(1U).ApplyTo(field1_zero));
+  }
+  {
     BitFieldsAtomic<MyState> acqrel{state};
     ASSERT_EQ(state, acqrel.Load());
     acqrel.Store(state2);
