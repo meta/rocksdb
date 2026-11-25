@@ -5407,6 +5407,9 @@ Status DBImpl::CreateColumnFamilyWithPreparedOptions(
           is_snapshot_supported_.store(false, std::memory_order_relaxed);
         });
       }
+      if (cfd->ioptions().inplace_update_support) {
+        has_inplace_update_support_cf_.store(true, std::memory_order_relaxed);
+      }
 
       cfd->set_initialized();
 
@@ -5579,6 +5582,7 @@ Status DBImpl::DropColumnFamilyWithOptionsFile(
   }
 
   bool cf_support_snapshot = cfd->mem()->IsSnapshotSupported();
+  const bool cf_inplace_update_support = cfd->ioptions().inplace_update_support;
   Status s;
   VersionEdit edit;
   edit.DropColumnFamily();
@@ -5626,17 +5630,26 @@ Status DBImpl::DropColumnFamilyWithOptionsFile(
       preserve_info.Combine(moptions);
     }
 
-    if (!cf_support_snapshot) {
-      // Dropped Column Family doesn't support snapshot. Need to recalculate
-      // is_snapshot_supported_.
+    if (!cf_support_snapshot || cf_inplace_update_support) {
+      // Dropped Column Family doesn't support snapshot or has in-place updates.
+      // Need to recalculate is_snapshot_supported_ and
+      // has_inplace_update_support_cf_.
       bool new_is_snapshot_supported = true;
+      bool new_has_inplace_update_support_cf = false;
       for (auto c : *versions_->GetColumnFamilySet()) {
-        if (!c->IsDropped() && !c->mem()->IsSnapshotSupported()) {
+        if (c->IsDropped()) {
+          continue;
+        }
+        if (!c->mem()->IsSnapshotSupported()) {
           new_is_snapshot_supported = false;
-          break;
+        }
+        if (c->ioptions().inplace_update_support) {
+          new_has_inplace_update_support_cf = true;
         }
       }
       is_snapshot_supported_ = new_is_snapshot_supported;
+      has_inplace_update_support_cf_.store(new_has_inplace_update_support_cf,
+                                           std::memory_order_relaxed);
     }
     bg_cv_.SignalAll();
   }

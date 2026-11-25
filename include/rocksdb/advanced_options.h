@@ -341,6 +341,17 @@ struct AdvancedColumnFamilyOptions {
   // It is intended to work or be compatible with a limited set of features:
   // (1) Non-snapshot Get()
   //
+  // Range deletions are not supported, because an in-place update keeps the
+  // sequence number of the entry it overwrites, so a range tombstone written
+  // between the two writes would hide the new value. With this option,
+  // DeleteRange(), a WriteBatch with a range deletion for this column family,
+  // and ingestion of files with range deletions return
+  // Status::NotSupported(); atomic_replace_range does not add a range
+  // tombstone (see IngestExternalFileArg::atomic_replace_range); and
+  // min_tombstones_for_range_conversion has no effect. Range tombstones
+  // written before this option was enabled are not detected, and can still
+  // hide in-place updates while they are in the memtable.
+  //
   // If inplace_callback function is not set,
   //   Put(key, new_value) will update inplace the existing_value iff
   //   * key exists in current memtable
@@ -1465,6 +1476,8 @@ struct AdvancedColumnFamilyOptions {
   // Read-write iterators using ReadOptions::table_filter are rejected while
   // this option is enabled, see more details in ReadOptions::table_filter
   // comments.
+  //
+  // This option has no effect for a column family with inplace_update_support.
   //
   // Set to 0 to disable.
   //

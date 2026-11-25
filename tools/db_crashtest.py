@@ -1475,6 +1475,7 @@ _INPLACE_UPDATE_INCOMPATIBLE_RUN_PARAMS = (
     "compact_range_one_in",
     "delrangepercent",
     "disable_wal",
+    "ingest_external_file_atomic_replace_one_in",
     "iterpercent",
     "lazy_entity_read_one_in",
     "manual_wal_flush_one_in",
@@ -1545,6 +1546,9 @@ def finalize_and_sanitize(src_params):
         dest_params["delpercent"] += dest_params["delrangepercent"]
         dest_params["delrangepercent"] = 0
         dest_params["min_tombstones_for_range_conversion"] = 0
+        # RocksDB does not add an atomic_replace_range tombstone with
+        # inplace_update_support, so a partial overlap fails the ingestion.
+        dest_params["ingest_external_file_atomic_replace_one_in"] = 0
         # Iterators and seek-time key checksum verification can see an entry
         # while it is being updated in place.
         dest_params["readpercent"] += dest_params["prefixpercent"]

@@ -6,6 +6,7 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <algorithm>
 #include <cinttypes>
 #include <optional>
 #include <unordered_map>
@@ -888,6 +889,51 @@ Status DBImpl::SyncBlobDirectWriteManagers(
   return Status::OK();
 }
 
+Status DBImpl::CheckRangeDeletionsSupported(const WriteBatch& batch) {
+  assert(batch.HasDeleteRange());
+  if (immutable_db_options_.row_cache) {
+    return Status::NotSupported(
+        "DeleteRange is not compatible with row cache.");
+  }
+  TEST_SYNC_POINT("DBImpl::CheckRangeDeletionsSupported:FindColumnFamilies");
+  autovector<uint32_t> range_del_cf_ids;
+  Slice input = WriteBatchInternal::Contents(&batch);
+  input.remove_prefix(WriteBatchInternal::kHeader);
+  while (!input.empty()) {
+    char tag = 0;
+    uint32_t cf_id = 0;
+    Slice key;
+    Slice value;
+    Slice blob;
+    Slice xid;
+    uint64_t unix_write_time = 0;
+    Status s = ReadRecordFromWriteBatch(&input, &tag, &cf_id, &key, &value,
+                                        &blob, &xid, &unix_write_time);
+    if (!s.ok()) {
+      return s;
+    }
+    if ((tag == kTypeRangeDeletion || tag == kTypeColumnFamilyRangeDeletion) &&
+        std::find(range_del_cf_ids.begin(), range_del_cf_ids.end(), cf_id) ==
+            range_del_cf_ids.end()) {
+      range_del_cf_ids.push_back(cf_id);
+    }
+  }
+  InstrumentedMutexLock l(&mutex_);
+  for (uint32_t cf_id : range_del_cf_ids) {
+    ColumnFamilyData* cfd =
+        versions_->GetColumnFamilySet()->GetColumnFamily(cf_id);
+    // A missing column family is handled at memtable insert, as for any
+    // other write to it.
+    if (cfd != nullptr && cfd->ioptions().inplace_update_support) {
+      return Status::NotSupported(
+          "DeleteRange is not compatible with inplace_update_support (column "
+          "family " +
+          cfd->GetName() + ")");
+    }
+  }
+  return Status::OK();
+}
+
 Status DBImpl::WriteImpl(
     const WriteOptions& write_options, WriteBatch* my_batch,
     WriteCallback* callback, UserWriteCallback* user_write_cb,
@@ -991,9 +1037,13 @@ Status DBImpl::WriteImpl(
     return Status::NotSupported(
         "seq_per_batch currently does not honor post_memtable_callback");
   }
-  if (my_batch->HasDeleteRange() && immutable_db_options_.row_cache) {
-    return Status::NotSupported(
-        "DeleteRange is not compatible with row cache.");
+  if ((immutable_db_options_.row_cache != nullptr ||
+       has_inplace_update_support_cf_.load(std::memory_order_relaxed)) &&
+      my_batch->HasDeleteRange()) {
+    Status s = CheckRangeDeletionsSupported(*my_batch);
+    if (!s.ok()) {
+      return s;
+    }
   }
   // Whether the WBWI is from transaction commit or a direct write
   // (IngestWriteBatchWithIndex())

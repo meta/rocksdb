@@ -2980,6 +2980,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       if (!cfd->mem()->IsSnapshotSupported()) {
         impl->is_snapshot_supported_ = false;
       }
+      if (cfd->ioptions().inplace_update_support) {
+        impl->has_inplace_update_support_cf_ = true;
+      }
       if (cfd->ioptions().merge_operator != nullptr &&
           !cfd->mem()->IsMergeOperatorSupported()) {
         s = Status::InvalidArgument(

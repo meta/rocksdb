@@ -2083,6 +2083,14 @@ class DBImpl : public DB
       bool skip_blob_direct_write_transform = false,
       const DeferredPutEntityBatch* deferred_put_entities = nullptr);
 
+  // Returns NotSupported if `batch`, which must contain a range deletion,
+  // cannot be written because the DB has a row cache or because a range
+  // deletion is for a column family with `inplace_update_support`. Writes call
+  // this before the WAL write, and only when the DB has a row cache or
+  // `has_inplace_update_support_cf_` is set: a range deletion rejected at
+  // memtable insert would leave the DB with a background error.
+  Status CheckRangeDeletionsSupported(const WriteBatch& batch);
+
   // Per-WriteImpl state that keeps BDW column families pinned through
   // referenced SuperVersions until the transformed write either commits or
   // rolls back.
@@ -4041,6 +4049,9 @@ class DBImpl : public DB
 
   // Written with mutex_ held. Read without mutex_ when creating a snapshot.
   std::atomic<bool> is_snapshot_supported_{true};
+  // Whether a column family that is not dropped has inplace_update_support.
+  // Written with mutex_ held. Read without mutex_ on every write.
+  std::atomic<bool> has_inplace_update_support_cf_{false};
 
   std::map<uint64_t, std::map<std::string, uint64_t>> stats_history_;
 

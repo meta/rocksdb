@@ -1,0 +1,1 @@
+Column families with `inplace_update_support` now reject range deletions with `Status::NotSupported`: `DeleteRange()`, a `WriteBatch` with a range deletion for such a column family, and ingestion of files with range deletions. `min_tombstones_for_range_conversion` has no effect for them. Previously, a range tombstone could hide a later in-place update of a key it covered.
