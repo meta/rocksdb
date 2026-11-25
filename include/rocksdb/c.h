@@ -460,6 +460,8 @@ extern ROCKSDB_LIBRARY_API void rocksdb_flush_wal(rocksdb_t* db,
                                                   unsigned char sync,
                                                   char** errptr);
 
+extern ROCKSDB_LIBRARY_API void rocksdb_resume(rocksdb_t* db, char** errptr);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_pause_background_work(rocksdb_t* db,
                                                               char** errptr);
 
