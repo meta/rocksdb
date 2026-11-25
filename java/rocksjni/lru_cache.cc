@@ -16,22 +16,30 @@
 /*
  * Class:     org_rocksdb_LRUCache
  * Method:    newLRUCache
- * Signature: (JIZD)J
+ * Signature: (JIZDDJ)J
  */
-jlong Java_org_rocksdb_LRUCache_newLRUCache(JNIEnv* /*env*/, jclass /*jcls*/,
-                                            jlong jcapacity,
-                                            jint jnum_shard_bits,
-                                            jboolean jstrict_capacity_limit,
-                                            jdouble jhigh_pri_pool_ratio,
-                                            jdouble jlow_pri_pool_ratio) {
-  auto* sptr_lru_cache = new std::shared_ptr<ROCKSDB_NAMESPACE::Cache>(
-      ROCKSDB_NAMESPACE::NewLRUCache(
-          static_cast<size_t>(jcapacity), static_cast<int>(jnum_shard_bits),
-          static_cast<bool>(jstrict_capacity_limit),
-          static_cast<double>(jhigh_pri_pool_ratio),
-          nullptr /* memory_allocator */, rocksdb::kDefaultToAdaptiveMutex,
-          rocksdb::kDefaultCacheMetadataChargePolicy,
-          static_cast<double>(jlow_pri_pool_ratio)));
+jlong Java_org_rocksdb_LRUCache_newLRUCache(
+    JNIEnv* /*env*/, jclass /*jcls*/, jlong jcapacity, jint jnum_shard_bits,
+    jboolean jstrict_capacity_limit, jdouble jhigh_pri_pool_ratio,
+    jdouble jlow_pri_pool_ratio, jlong jsecondary_cache_handle) {
+  std::shared_ptr<ROCKSDB_NAMESPACE::SecondaryCache> secondary_cache;
+  if (jsecondary_cache_handle != 0) {
+    auto* secondary_cache_ptr =
+        reinterpret_cast<std::shared_ptr<ROCKSDB_NAMESPACE::SecondaryCache>*>(
+            jsecondary_cache_handle);
+    secondary_cache = *secondary_cache_ptr;
+  }
+
+  auto opts = ROCKSDB_NAMESPACE::LRUCacheOptions();
+  opts.capacity = static_cast<size_t>(jcapacity);
+  opts.num_shard_bits = static_cast<int>(jnum_shard_bits);
+  opts.strict_capacity_limit = static_cast<bool>(jstrict_capacity_limit);
+  opts.high_pri_pool_ratio = static_cast<double>(jhigh_pri_pool_ratio);
+  opts.low_pri_pool_ratio = static_cast<double>(jlow_pri_pool_ratio);
+  opts.secondary_cache = secondary_cache;
+
+  auto* sptr_lru_cache =
+      new std::shared_ptr<ROCKSDB_NAMESPACE::Cache>(opts.MakeSharedCache());
   return GET_CPLUSPLUS_POINTER(sptr_lru_cache);
 }
 

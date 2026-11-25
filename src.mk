@@ -770,6 +770,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/cassandra_compactionfilterjni.cc              \
   java/rocksjni/cassandra_value_operator.cc                   \
   java/rocksjni/restorejni.cc                                 \
+  java/rocksjni/secondary_cache.cc                            \
   java/rocksjni/rocks_callback_object.cc                      \
   java/rocksjni/rocksjni.cc                                   \
   java/rocksjni/rocksdb_exception_test.cc                     \
