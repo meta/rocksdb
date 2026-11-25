@@ -232,6 +232,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/ReusedSynchronisationType.java
   src/main/java/org/rocksdb/RocksCallbackObject.java
   src/main/java/org/rocksdb/RocksDB.java
+  src/main/java/org/rocksdb/RocksDBAddr.java
   src/main/java/org/rocksdb/RocksDBException.java
   src/main/java/org/rocksdb/RocksEnv.java
   src/main/java/org/rocksdb/RocksIterator.java
@@ -291,6 +292,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/WalIterator.java
   src/main/java/org/rocksdb/WalProcessingOption.java
   src/main/java/org/rocksdb/WriteBatch.java
+  src/main/java/org/rocksdb/WriteBatchAddr.java
   src/main/java/org/rocksdb/WriteBatchInterface.java
   src/main/java/org/rocksdb/WriteBatchWithIndex.java
   src/main/java/org/rocksdb/WriteBufferManager.java
@@ -312,6 +314,7 @@ set(JAVA_MAIN_CLASSES
   src/test/java/org/rocksdb/WriteBatchTest.java
   src/test/java/org/rocksdb/test/TestableEventListener.java
   src/test/java/org/rocksdb/util/CapturingWriteBatchHandler.java
+  src/test/java/org/rocksdb/util/DirectByteBufferAddress.java
   src/test/java/org/rocksdb/util/WriteBatchGetter.java
 )
 
@@ -892,6 +895,10 @@ add_custom_target(rocksdbjava ALL
 
 enable_testing()
 get_target_property(ROCKSDBJNI_CLASSES_TEST_JAR_FILE rocksdbjni_test_classes JAR_FILE)
+# The DirectByteBufferAddress test utility reads the private java.nio.Buffer.address field
+if(${Java_VERSION_MAJOR} VERSION_GREATER_EQUAL "9")
+  list(APPEND JVMARGS --add-opens java.base/java.nio=ALL-UNNAMED)
+endif()
 foreach (CLAZZ ${JAVA_TEST_RUNNING_CLASSES})
   if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
     add_test(

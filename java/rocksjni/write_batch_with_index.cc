@@ -158,6 +158,40 @@ void Java_org_rocksdb_WriteBatchWithIndex_putDirectJni(
 
 /*
  * Class:     org_rocksdb_WriteBatchWithIndex
+ * Method:    putAddrJni
+ * Signature: (JJIJIJ)V
+ */
+void Java_org_rocksdb_WriteBatchWithIndex_putAddrJni(
+    JNIEnv* env, jclass /*jcls*/, jlong jwb_handle, jlong jkey_addr,
+    jint jkey_len, jlong jval_addr, jint jval_len, jlong jcf_handle) {
+  auto* wb =
+      reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatchWithIndex*>(jwb_handle);
+  assert(wb != nullptr);
+  auto* cf_handle =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(jcf_handle);
+
+  ROCKSDB_NAMESPACE::Slice key_slice;
+  ROCKSDB_NAMESPACE::Slice value_slice;
+  if (!ROCKSDB_NAMESPACE::JniUtil::kv_create_slices_from_direct_addr(
+          env, jkey_addr, jkey_len, jval_addr, jval_len, &key_slice,
+          &value_slice)) {
+    // exception thrown: RocksDBException
+    return;
+  }
+
+  ROCKSDB_NAMESPACE::Status s;
+  if (cf_handle == nullptr) {
+    s = wb->Put(key_slice, value_slice);
+  } else {
+    s = wb->Put(cf_handle, key_slice, value_slice);
+  }
+  if (!s.ok()) {
+    ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  }
+}
+
+/*
+ * Class:     org_rocksdb_WriteBatchWithIndex
  * Method:    merge
  * Signature: (J[BI[BI)V
  */
@@ -318,6 +352,38 @@ void Java_org_rocksdb_WriteBatchWithIndex_deleteDirectJni(
   };
   ROCKSDB_NAMESPACE::JniUtil::k_op_direct(remove, env, jkey, jkey_offset,
                                           jkey_len);
+}
+
+/*
+ * Class:     org_rocksdb_WriteBatchWithIndex
+ * Method:    deleteAddrJni
+ * Signature: (JJIJ)V
+ */
+void Java_org_rocksdb_WriteBatchWithIndex_deleteAddrJni(
+    JNIEnv* env, jclass /*jcls*/, jlong jwb_handle, jlong jkey_addr,
+    jint jkey_len, jlong jcf_handle) {
+  auto* wb =
+      reinterpret_cast<ROCKSDB_NAMESPACE::WriteBatchWithIndex*>(jwb_handle);
+  assert(wb != nullptr);
+  auto* cf_handle =
+      reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(jcf_handle);
+
+  ROCKSDB_NAMESPACE::Slice key_slice;
+  if (!ROCKSDB_NAMESPACE::JniUtil::k_create_slice_from_direct_addr(
+          env, jkey_addr, jkey_len, &key_slice)) {
+    // exception thrown: RocksDBException
+    return;
+  }
+
+  ROCKSDB_NAMESPACE::Status s;
+  if (cf_handle == nullptr) {
+    s = wb->Delete(key_slice);
+  } else {
+    s = wb->Delete(cf_handle, key_slice);
+  }
+  if (!s.ok()) {
+    ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  }
 }
 
 /*

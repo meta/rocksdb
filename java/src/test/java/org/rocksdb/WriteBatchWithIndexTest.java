@@ -11,6 +11,8 @@ package org.rocksdb;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.rocksdb.util.DirectByteBufferAddress.address;
+import static org.rocksdb.util.DirectByteBufferAddress.directBuffer;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -101,6 +103,32 @@ public class WriteBatchWithIndexTest {
         assertThat(it.key()).isEqualTo(k3);
         assertThat(it.value()).isEqualTo(v3Other);
       }
+    }
+  }
+
+  @Test
+  public void putDeleteWithAddress() throws RocksDBException {
+    try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
+        final ColumnFamilyHandle cf =
+            db.createColumnFamily(new ColumnFamilyDescriptor("cf".getBytes(UTF_8)));
+        final DBOptions dbOptions = new DBOptions();
+        final WriteBatchWithIndex wbwi = new WriteBatchWithIndex(true)) {
+      final WriteBatchAddr addrBatch = new WriteBatchAddr(wbwi) {};
+      final ByteBuffer key1 = directBuffer("k1");
+      final ByteBuffer key2 = directBuffer("k2");
+      final ByteBuffer value = directBuffer("v");
+      addrBatch.put(address(key1), key1.remaining(), address(value), value.remaining());
+      addrBatch.put(address(key2), key2.remaining(), address(value), value.remaining());
+      addrBatch.delete(address(key1), key1.remaining());
+      addrBatch.put(cf, address(key1), key1.remaining(), address(value), value.remaining());
+      addrBatch.put(cf, address(key2), key2.remaining(), address(value), value.remaining());
+      addrBatch.delete(cf, address(key2), key2.remaining());
+
+      assertThat(wbwi.getFromBatch(dbOptions, "k1".getBytes(UTF_8))).isNull();
+      assertThat(wbwi.getFromBatch(dbOptions, "k2".getBytes(UTF_8))).isEqualTo("v".getBytes(UTF_8));
+      assertThat(wbwi.getFromBatch(cf, dbOptions, "k1".getBytes(UTF_8)))
+          .isEqualTo("v".getBytes(UTF_8));
+      assertThat(wbwi.getFromBatch(cf, dbOptions, "k2".getBytes(UTF_8))).isNull();
     }
   }
 
