@@ -42,6 +42,7 @@ class WithCacheType : public TestCreateContext {
   };
 
   static constexpr auto kLRU = "lru";
+  static constexpr auto kS3Fifo = "s3fifo";
   static constexpr auto kFixedHyperClock = "fixed_hyper_clock";
   static constexpr auto kAutoHyperClock = "auto_hyper_clock";
 
@@ -56,6 +57,13 @@ class WithCacheType : public TestCreateContext {
 
   bool IsHyperClock() const { return IsHyperClock(Type()); }
 
+  // Whether the last Release of an entry erases it while the cache is over
+  // capacity, as LRUCache does. HyperClockCache and S3FifoCache leave it
+  // cached; the next insert evicts.
+  bool ReleaseErasesOverCapacity() const {
+    return !IsHyperClock() && Type() != kS3Fifo;
+  }
+
   std::shared_ptr<Cache> NewCache(
       size_t capacity,
       const std::function<void(ShardedCacheOptions&)>& modify_opts_fn = {}) {
@@ -68,6 +76,15 @@ class WithCacheType : public TestCreateContext {
         modify_opts_fn(lru_opts);
       }
       return lru_opts.MakeSharedCache();
+    }
+    if (type == kS3Fifo) {
+      S3FifoCacheOptions fifo_opts;
+      fifo_opts.capacity = capacity;
+      fifo_opts.hash_seed = 0;  // deterministic tests
+      if (modify_opts_fn) {
+        modify_opts_fn(fifo_opts);
+      }
+      return fifo_opts.MakeSharedCache();
     }
     if (IsHyperClock(type)) {
       HyperClockCacheOptions hc_opts{
@@ -119,12 +136,14 @@ class WithCacheTypeParam : public WithCacheType,
 };
 
 constexpr auto kLRU = WithCacheType::kLRU;
+constexpr auto kS3Fifo = WithCacheType::kS3Fifo;
 constexpr auto kFixedHyperClock = WithCacheType::kFixedHyperClock;
 constexpr auto kAutoHyperClock = WithCacheType::kAutoHyperClock;
 
+// kS3Fifo is last so that the other types keep their instance indexes.
 inline auto GetTestingCacheTypes() {
   return testing::Values(std::string(kLRU), std::string(kFixedHyperClock),
-                         std::string(kAutoHyperClock));
+                         std::string(kAutoHyperClock), std::string(kS3Fifo));
 }
 
 }  // namespace secondary_cache_test_util

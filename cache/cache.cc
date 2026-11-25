@@ -10,6 +10,7 @@
 #include "rocksdb/cache.h"
 
 #include "cache/lru_cache.h"
+#include "cache/s3fifo_cache.h"
 #include "rocksdb/secondary_cache.h"
 #include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/options_type.h"
@@ -89,6 +90,10 @@ static Status NoopCreate(const Slice& /*data*/, CompressionType /*type*/,
 
 static Cache::CacheItemHelper kBasicCacheItemHelper(CacheEntryRole::kMisc,
                                                     &NoopDelete);
+
+// The most address space a s3fifo_cache:// string may make S3FifoCache reserve:
+// a quarter of the 47-bit x86-64 user address space (32 TiB).
+constexpr uint64_t kMaxS3FifoReservation = uint64_t{1} << 45;
 }  // namespace
 
 const Cache::CacheItemHelper kSliceCacheItemHelper{
@@ -127,6 +132,11 @@ Status Cache::CreateFromString(const ConfigOptions& config_options,
                                std::shared_ptr<Cache>* result) {
   Status status;
   std::shared_ptr<Cache> cache;
+  // The s3fifo_cache:// form is trimmed inside and outside the braces like
+  // the LRU form, so " { s3fifo_cache://...} " is not silently passed to the
+  // object registry instead.
+  const std::string trimmed =
+      trim(OptionTypeInfo::StripOuterBraces(trim(value)));
   if (StartsWith(value, "null")) {
     cache = nullptr;
   } else if (value.find("://") == std::string::npos) {
@@ -143,6 +153,41 @@ Status Cache::CreateFromString(const ConfigOptions& config_options,
     }
     if (status.ok()) {
       result->swap(cache);
+    }
+  } else if (StartsWith(trimmed, "s3fifo_cache://")) {
+    S3FifoCacheOptions cache_opts;
+    status = OptionTypeInfo::ParseStruct(
+        config_options, "s3fifo_cache", &S3FifoCacheOptionsTypeInfo(),
+        "s3fifo_cache", trimmed.substr(std::strlen("s3fifo_cache://")),
+        &cache_opts);
+    if (status.ok() && cache_opts.capacity == 0) {
+      status = Status::InvalidArgument("s3fifo_cache.capacity",
+                                       "must be set and non-zero");
+    } else if (status.ok() && (cache_opts.num_shard_bits < -1 ||
+                               cache_opts.num_shard_bits >= 20)) {
+      status = Status::InvalidArgument("s3fifo_cache.num_shard_bits",
+                                       "must be -1 (automatic) or 0 to 19");
+    } else if (status.ok() && S3FifoCacheReservationBytes(cache_opts) >
+                                  kMaxS3FifoReservation) {
+      // Rejected before trying: a reservation this large would likely fail.
+      // Unreachable while kMaxLength caps a shard's table at 2.7 MiB (at most
+      // about 1.33 TiB at 2^19 shards); kept so that a larger cap cannot let
+      // a string ask for an unbounded reservation.
+      status = Status::InvalidArgument(
+          cache_opts.max_capacity > cache_opts.capacity
+              ? "s3fifo_cache.max_capacity"
+              : "s3fifo_cache.capacity",
+          "slot tables would reserve more than 32 TiB of address space");
+    }
+    if (status.ok()) {
+      cache = cache_opts.MakeSharedCache();
+      if (cache == nullptr) {
+        // A shard could not reserve its slot table.
+        status = Status::InvalidArgument(
+            "s3fifo_cache", "could not reserve address space for slot tables");
+      } else {
+        result->swap(cache);
+      }
     }
   } else {
     status = LoadSharedObject<Cache>(config_options, value, result);
