@@ -38,7 +38,7 @@ public enum LoggerType {
    *     value is provided.
    */
   static LoggerType getLoggerType(final byte value) {
-    for (final LoggerType loggerType : LoggerType.values()) {
+    for (final LoggerType loggerType : values()) {
       if (loggerType.getValue() == value) {
         return loggerType;
       }

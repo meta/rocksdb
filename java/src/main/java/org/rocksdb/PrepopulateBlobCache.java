@@ -34,14 +34,14 @@ public enum PrepopulateBlobCache {
    */
   public static PrepopulateBlobCache getPrepopulateBlobCache(String libraryName) {
     if (libraryName != null) {
-      for (PrepopulateBlobCache prepopulateBlobCache : PrepopulateBlobCache.values()) {
+      for (PrepopulateBlobCache prepopulateBlobCache : values()) {
         if (prepopulateBlobCache.getLibraryName() != null
             && prepopulateBlobCache.getLibraryName().equals(libraryName)) {
           return prepopulateBlobCache;
         }
       }
     }
-    return PrepopulateBlobCache.PREPOPULATE_BLOB_DISABLE;
+    return PREPOPULATE_BLOB_DISABLE;
   }
 
   /**
@@ -56,7 +56,7 @@ public enum PrepopulateBlobCache {
    *   provided byteIdentifier
    */
   public static PrepopulateBlobCache getPrepopulateBlobCache(byte byteIdentifier) {
-    for (final PrepopulateBlobCache prepopulateBlobCache : PrepopulateBlobCache.values()) {
+    for (final PrepopulateBlobCache prepopulateBlobCache : values()) {
       if (prepopulateBlobCache.getValue() == byteIdentifier) {
         return prepopulateBlobCache;
       }
@@ -76,7 +76,7 @@ public enum PrepopulateBlobCache {
    * @return PrepopulateBlobCache instance (optional)
    */
   static PrepopulateBlobCache getFromInternal(final String internalName) {
-    for (final PrepopulateBlobCache prepopulateBlobCache : PrepopulateBlobCache.values()) {
+    for (final PrepopulateBlobCache prepopulateBlobCache : values()) {
       if (prepopulateBlobCache.internalName_.equals(internalName)) {
         return prepopulateBlobCache;
       }

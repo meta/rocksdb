@@ -40,7 +40,7 @@ public enum RateLimiterMode {
    *     cannot be found
    */
   public static RateLimiterMode getRateLimiterMode(final byte byteIdentifier) {
-    for (final RateLimiterMode rateLimiterMode : RateLimiterMode.values()) {
+    for (final RateLimiterMode rateLimiterMode : values()) {
       if (rateLimiterMode.getValue() == byteIdentifier) {
         return rateLimiterMode;
       }

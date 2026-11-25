@@ -39,7 +39,7 @@ public enum ReadTier {
    *     value is provided.
    */
   public static ReadTier getReadTier(final byte value) {
-    for (final ReadTier readTier : ReadTier.values()) {
+    for (final ReadTier readTier : values()) {
       if (readTier.getValue() == value){
         return readTier;
       }
