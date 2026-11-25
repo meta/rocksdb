@@ -14,20 +14,34 @@
 // DB path including CompactionIterator, memtable flush, and the UDI builder
 // wrapper's ValueType mapping and kTypeValuePreferredSeqno handling.
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "port/port.h"
+#include "rocksdb/advanced_options.h"
+#include "rocksdb/compression_type.h"
 #include "rocksdb/db.h"
+#include "rocksdb/env.h"
 #include "rocksdb/experimental.h"
+#include "rocksdb/iterator.h"
+#include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
+#include "rocksdb/snapshot.h"
 #include "rocksdb/sst_file_writer.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
+#include "rocksdb/table_properties.h"
 #include "rocksdb/utilities/transaction.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/wide_columns.h"

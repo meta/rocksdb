@@ -8,12 +8,13 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <memory>
+#include <utility>
 
 #include "db/dbformat.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "util/cast_util.h"
-#include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace trie_index {
