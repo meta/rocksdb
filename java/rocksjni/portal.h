@@ -6423,6 +6423,8 @@ class PerfLevelTypeJni {
         return 0x1;
       case ROCKSDB_NAMESPACE::PerfLevel::kEnableCount:
         return 0x2;
+      case ROCKSDB_NAMESPACE::PerfLevel::kEnableWait:
+        return 0x7;
       case ROCKSDB_NAMESPACE::PerfLevel::kEnableTimeExceptForMutex:
         return 0x3;
       case ROCKSDB_NAMESPACE::PerfLevel::kEnableTimeAndCPUTimeExceptForMutex:
@@ -6431,9 +6433,8 @@ class PerfLevelTypeJni {
         return 0x5;
       case ROCKSDB_NAMESPACE::PerfLevel::kOutOfBounds:
         return 0x6;
-      default:
-        return 0x6;
     }
+    return 0x6;
   }
 
   static ROCKSDB_NAMESPACE::PerfLevel toCppPerfLevelType(const jbyte level) {
@@ -6453,6 +6454,8 @@ class PerfLevelTypeJni {
         return ROCKSDB_NAMESPACE::PerfLevel::kEnableTime;
       case 0x6:
         return ROCKSDB_NAMESPACE::PerfLevel::kOutOfBounds;
+      case 0x7:
+        return ROCKSDB_NAMESPACE::PerfLevel::kEnableWait;
       default:
         return ROCKSDB_NAMESPACE::PerfLevel::kOutOfBounds;
     }
