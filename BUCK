@@ -278,6 +278,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "util/coro_stats_util.cc",
         "util/crc32c.cc",
         "util/crc32c_arm64.cc",
+        "util/crc32c_riscv.cc",
         "util/data_structure.cc",
         "util/dynamic_bloom.cc",
         "util/file_checksum_helper.cc",
