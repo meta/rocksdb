@@ -68,6 +68,9 @@ public class NativeLibraryLoader {
     try {
       // try dynamic library
       System.loadLibrary(sharedLibraryName);
+      if (DEBUG_LOADING) {
+        System.out.println("Loaded shared dynamic library: " + sharedLibraryName);
+      }
       return;
     } catch (final UnsatisfiedLinkError ule) {
       // ignore - try from static library
@@ -79,6 +82,9 @@ public class NativeLibraryLoader {
     try {
       // try static library
       System.loadLibrary(jniLibraryName);
+      if (DEBUG_LOADING) {
+        System.out.println("Loaded shared static library: " + jniLibraryName);
+      }
       return;
     } catch (final UnsatisfiedLinkError ule) {
       // ignore - then try static library fallback or from jar
@@ -91,6 +97,9 @@ public class NativeLibraryLoader {
       try {
         // try static library fallback
         System.loadLibrary(fallbackJniLibraryName);
+        if (DEBUG_LOADING) {
+          System.out.println("Loaded static library fallback: " + fallbackJniLibraryName);
+        }
         return;
       } catch (final UnsatisfiedLinkError ule) {
         // ignore - then try from jar
