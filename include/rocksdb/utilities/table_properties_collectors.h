@@ -5,11 +5,17 @@
 
 #pragma once
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/table_properties.h"
+#include "rocksdb/types.h"
 
 namespace ROCKSDB_NAMESPACE {
 

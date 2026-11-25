@@ -5,18 +5,31 @@
 
 #pragma once
 
+#include <atomic>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "rocksdb/attribute_groups.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
+#include "rocksdb/env.h"
+#include "rocksdb/iterator.h"
+#include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "rocksdb/wide_columns.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Iterator;
+class Snapshot;
 class TransactionDB;
+class WriteBatch;
 class WriteBatchWithIndex;
 
 using TransactionName = std::string;

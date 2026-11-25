@@ -5,13 +5,17 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstddef>
 #include <forward_list>
 #include <iterator>
 #include <ostream>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
+#include "rocksdb/cleanable.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"

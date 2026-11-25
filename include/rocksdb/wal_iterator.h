@@ -10,9 +10,13 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 #include "rocksdb/types.h"
 #include "rocksdb/write_batch.h"
