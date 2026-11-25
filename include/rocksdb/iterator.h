@@ -18,10 +18,14 @@
 
 #pragma once
 
+#include <cassert>
 #include <string>
 
 #include "rocksdb/iterator_base.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "rocksdb/wide_columns.h"
 
 namespace ROCKSDB_NAMESPACE {

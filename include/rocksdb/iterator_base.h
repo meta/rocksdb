@@ -6,6 +6,7 @@
 #pragma once
 
 #include "rocksdb/cleanable.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 

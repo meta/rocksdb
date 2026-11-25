@@ -9,7 +9,12 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+
 #include "rocksdb/env.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 

@@ -7,11 +7,15 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "rocksdb/env.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"

@@ -13,8 +13,12 @@
 
 #pragma once
 
+#include <cassert>
+#include <memory>
 #include <string>
+#include <utility>
 
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #ifdef OS_WIN
 #endif

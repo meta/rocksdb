@@ -19,6 +19,7 @@
 
 #include "rocksdb/advanced_iterator.h"
 #include "rocksdb/comparator.h"
+#include "rocksdb/configurable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
