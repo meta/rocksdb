@@ -2441,6 +2441,10 @@ TEST_F(BackupEngineTest, NonEmptySharedDirChecksFileExistsAndReusesFiles) {
 TEST_F(BackupEngineTest, FileDeletionsResumeBeforeTableFilesAreCopied) {
   const int keys_iteration = 5000;
   engine_options_->schema_version = 2;
+  // Keep the table files in the DB directory at backup start equal to the
+  // ones the backup lists: an automatic compaction still running then has an
+  // output file on disk that is not in the listed Version.
+  options_.disable_auto_compactions = true;
 
   for (const auto& sopt : kAllShareOptions) {
     for (const bool with_exclude_callback : {false, true}) {
