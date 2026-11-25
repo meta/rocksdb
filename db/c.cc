@@ -8678,7 +8678,12 @@ rocksdb_slicetransform_t* rocksdb_slicetransform_create(
                        size_t* dst_length),
     unsigned char (*in_domain)(void*, const char* key, size_t length),
     const char* (*name)(void*)) {
-  rocksdb_slicetransform_t* result = new rocksdb_slicetransform_t;
+  struct AllKeysInDomainSliceTransform : public rocksdb_slicetransform_t {
+    bool InDomain(const Slice& /*src*/) const override { return true; }
+  };
+  rocksdb_slicetransform_t* result = in_domain == nullptr
+                                         ? new AllKeysInDomainSliceTransform
+                                         : new rocksdb_slicetransform_t;
   result->state_ = state;
   result->destructor_ = destructor;
   result->transform_ = transform;
