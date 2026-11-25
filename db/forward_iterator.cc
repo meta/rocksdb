@@ -692,6 +692,10 @@ bool ForwardIterator::IsValuePinned() const {
          current_->IsValuePinned();
 }
 
+const Version* ForwardIterator::current_version() const {
+  return sv_ != nullptr ? sv_->current : nullptr;
+}
+
 void ForwardIterator::RebuildIterators(bool refresh_sv) {
   // The iterator can outlive its column family: the user can drop the column
   // family and destroy its handle. Then a SuperVersion can hold the last

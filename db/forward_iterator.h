@@ -83,6 +83,7 @@ class ForwardIterator : public InternalIterator {
   void SetPinnedItersMgr(PinnedIteratorsManager* pinned_iters_mgr) override;
   bool IsKeyPinned() const override;
   bool IsValuePinned() const override;
+  const Version* current_version() const override;
 
   bool TEST_CheckDeletedIters(int* deleted_iters, int* num_iters);
 
