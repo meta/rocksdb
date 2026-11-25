@@ -54,7 +54,7 @@
 #       The REMOTE_USER_AT_HOST should follow the format user-id@host.name
 #   DB_PATH: the path where the rocksdb database will be created during the
 #       regression test.  Default:  $TEST_PATH/db
-#   WAL_PATH: the path where the rocksdb WAL will be outputed.
+#   WAL_PATH: the path where the rocksdb WAL will be outputted.
 #       Default:  $TEST_PATH/wal
 #   OPTIONS_FILE:  If specified, then the regression test will use the specified
 #       file to initialize the RocksDB options in its benchmarks.  Note that
@@ -83,7 +83,7 @@
 #       STATS_INTERVAL_SECONDS seconds.  Default 1.
 #   STATS_INTERVAL_SECONDS:  If STATS_PER_INTERVAL is set to 1, then statistics
 #       will be reported for every STATS_INTERVAL_SECONDS.  Default 60.
-#   MAX_BACKGROUND_FLUSHES:  The maxinum number of concurrent flushes in
+#   MAX_BACKGROUND_FLUSHES:  The maximum number of concurrent flushes in
 #       db_bench.  Default: 4.
 #   MAX_BACKGROUND_COMPACTIONS:  The maximum number of concurrent compactions
 #       in db_bench.  Default: 16.
