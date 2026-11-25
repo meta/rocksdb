@@ -116,6 +116,43 @@ void CheckKeyValueTsWithIterator(
   }
 }
 
+
+TEST_P(WriteCommittedTxnWithTsTest,
+       DisableIndexingWithNonTimestampedColumnFamily) {
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  ASSERT_OK(ReOpen());
+
+  ColumnFamilyOptions cf_options;
+  const std::string test_cf_name = "non_timestamped_cf";
+  ColumnFamilyHandle* cfh = nullptr;
+
+  ASSERT_OK(db->CreateColumnFamily(cf_options, test_cf_name, &cfh));
+  delete cfh;
+
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  cf_descs.emplace_back(kDefaultColumnFamilyName, options);
+  cf_descs.emplace_back(test_cf_name, cf_options);
+  ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
+
+  std::unique_ptr<Transaction> txn(
+      NewTxn(WriteOptions(), TransactionOptions()));
+  ASSERT_NE(txn, nullptr);
+
+  txn->DisableIndexing();
+
+  const std::string key = "0123456789abcdef";
+  ASSERT_OK(txn->Put(handles_[1], key, "value"));
+  ASSERT_OK(txn->Put(handles_[0], "timestamped_key", "timestamped_value"));
+
+  ASSERT_OK(txn->SetCommitTimestamp(5));
+  ASSERT_OK(txn->Commit());
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), handles_[1], key, &value));
+  ASSERT_EQ(value, "value");
+}
+
+
 // This is an incorrect usage of this API, supporting this should be removed
 // after MyRocks remove this pattern in a refactor.
 TEST_P(WriteCommittedTxnWithTsTest, WritesBypassTransactionAPIs) {
