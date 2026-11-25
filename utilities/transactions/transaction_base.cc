@@ -5,7 +5,10 @@
 
 #include "utilities/transactions/transaction_base.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <functional>
+#include <numeric>
 
 #include "db/attribute_group_iterator_impl.h"
 #include "db/coalescing_iterator.h"
@@ -423,9 +426,8 @@ void TransactionBaseImpl::MultiGet(const ReadOptions& _read_options,
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kMultiGet;
   }
-  write_batch_.MultiGetFromBatchAndDB(db_, read_options, column_family,
-                                      num_keys, keys, values, statuses,
-                                      sorted_input);
+  MultiGetImpl(read_options, column_family, num_keys, keys, values, statuses,
+               sorted_input);
 }
 
 void TransactionBaseImpl::MultiGetEntity(const ReadOptions& read_options,
@@ -461,11 +463,48 @@ std::vector<Status> TransactionBaseImpl::MultiGetForUpdate(
     }
   }
 
-  // TODO(agiardullo): optimize multiget?
+  // Read the locked keys with one batched MultiGetImpl() call per column
+  // family. Group keys by column family by stably sorting their indexes (the
+  // sort is skipped when keys are already grouped, e.g. all in one column
+  // family), then scatter the results back into the caller's key order.
+  const auto cf_less = [&column_family](size_t a, size_t b) {
+    return std::less<ColumnFamilyHandle*>()(column_family[a], column_family[b]);
+  };
+  std::vector<size_t> order(num_keys);
+  std::iota(order.begin(), order.end(), size_t{0});
+  if (!std::is_sorted(order.begin(), order.end(), cf_less)) {
+    std::stable_sort(order.begin(), order.end(), cf_less);
+  }
+
+  std::vector<Slice> grouped_keys;
+  std::vector<PinnableSlice> grouped_values;
+  std::vector<Status> grouped_statuses(num_keys);
+  grouped_keys.reserve(num_keys);
+  grouped_values.reserve(num_keys);
+  for (size_t i : order) {
+    grouped_keys.push_back(keys[i]);
+    grouped_values.emplace_back(&(*values)[i]);
+  }
+
+  for (size_t begin = 0; begin < num_keys;) {
+    ColumnFamilyHandle* const cf = column_family[order[begin]];
+    size_t end = begin + 1;
+    while (end < num_keys && column_family[order[end]] == cf) {
+      ++end;
+    }
+    MultiGetImpl(read_options, cf, end - begin, &grouped_keys[begin],
+                 &grouped_values[begin], &grouped_statuses[begin],
+                 false /* sorted_input */);
+    begin = end;
+  }
+
   std::vector<Status> stat_list(num_keys);
-  for (size_t i = 0; i < num_keys; ++i) {
-    stat_list[i] =
-        GetImpl(read_options, column_family[i], keys[i], &(*values)[i]);
+  for (size_t j = 0; j < num_keys; ++j) {
+    const size_t i = order[j];
+    stat_list[i] = std::move(grouped_statuses[j]);
+    if (stat_list[i].ok() && grouped_values[j].IsPinned()) {
+      (*values)[i].assign(grouped_values[j].data(), grouped_values[j].size());
+    }  // else value is already assigned
   }
 
   return stat_list;
