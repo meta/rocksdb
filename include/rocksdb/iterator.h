@@ -65,6 +65,9 @@ class Iterator : public IteratorBase {
   //      - Iterator created with ReadOptions::pin_data = true
   //      - DB tables were created with
   //        BlockBasedTableOptions::use_delta_encoding = false.
+  //   EXPERIMENTAL exception: a memtable rep that owns its keys (see
+  //   MemTableRep::OwnsKeys()) may rebuild a key when its iterator moves, so
+  //   this can return "0" for such a memtable even under the conditions above.
   // Property "rocksdb.iterator.is-value-pinned":
   //   If returning "1", this means that the Slice returned by value() is valid
   //   as long as the iterator is not deleted.

@@ -53,6 +53,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class Arena;
 class Allocator;
+class Comparator;
 class LookupKey;
 class SliceTransform;
 class Logger;
@@ -84,6 +85,12 @@ class MemTableRep {
     virtual int operator()(const char* prefix_len_key,
                            const Slice& key) const = 0;
 
+    // The user-key comparator this key comparator wraps, or nullptr if the
+    // subclass does not expose one. A MemTableRep can use it to check that it
+    // was given a comparator it supports (for example the default bytewise
+    // comparator without user timestamps).
+    virtual const Comparator* user_comparator() const { return nullptr; }
+
     KeyComparator() = default;
     KeyComparator(const KeyComparator&) = default;
     KeyComparator& operator=(const KeyComparator&) = default;
@@ -93,6 +100,53 @@ class MemTableRep {
   };
 
   explicit MemTableRep(Allocator* allocator) : allocator_(allocator) {}
+
+  // EXPERIMENTAL. A memtable entry as seen by readers of a rep that stores
+  // entry keys itself (see OwnsKeys()).
+  struct EntryView {
+    // User key followed by the 8-byte packed sequence number and type. May
+    // point into a buffer owned by the rep or one of its iterators; see
+    // Iterator::IsKeyPinned() and GetEntries().
+    Slice internal_key;
+    // varint32 value length, the value, then the entry's checksum bytes.
+    // Points into the allocator's memory, valid for the rep's lifetime.
+    const char* value_part = nullptr;
+  };
+
+  // EXPERIMENTAL. Returns true if this rep keeps entry keys in its own
+  // structure instead of in the encoded entry. The memtable then allocates
+  // entries with AllocateWithKey() and reads them through GetEntries() and
+  // Iterator::entry(); Iterator::key() only identifies an entry.
+  //
+  // MemTable falls back to a skip list (so a key-owning rep is never used) when
+  // any of these is configured: in-place updates, paranoid memory checks,
+  // per-key checksum verification on seek, MemPurge
+  // (experimental_mempurge_threshold > 0, re-checked at flush time because it
+  // is mutable), or a user comparator with timestamps. Key-owning reps also
+  // require single-writer inserts (allow_concurrent_memtable_write == false),
+  // and their iterators may report keys as not pinned
+  // (Iterator::IsKeyPinned() == false), so ReadOptions::pin_data does not pin
+  // memtable keys.
+  //
+  // Write-time protection (memtable_protection_bytes_per_key) covers the
+  // caller's key and the value bytes the memtable copies, not the key and
+  // sequence/type the rep ultimately stores; corruption of the rep's stored key
+  // is detected on read only, and only when memtable_protection_bytes_per_key
+  // > 0.
+  virtual bool OwnsKeys() const { return false; }
+
+  // EXPERIMENTAL. For reps that own keys: takes the entry's key (user key
+  // and packed sequence number and type) and returns a handle plus a buffer
+  // of value_part_len bytes for the value part (see EntryView), which the
+  // caller fills before passing the handle to an Insert*() call. At most one
+  // allocated handle may be pending insertion at a time.
+  virtual KeyHandle AllocateWithKey(const Slice& /*user_key*/,
+                                    uint64_t /*packed_seq_type*/,
+                                    size_t /*value_part_len*/,
+                                    char** /*value_part*/) {
+    assert(false);
+    return nullptr;
+  }
 
   // Allocate a buf of len size for storing key. The idea is that a
   // specific memtable representation knows its underlying data structure
@@ -209,6 +263,14 @@ class MemTableRep {
   virtual void Get(const LookupKey& k, void* callback_args,
                    bool (*callback_func)(void* arg, const char* entry));
 
+  // EXPERIMENTAL. For reps that own keys: like Get(), passing each entry as
+  // an EntryView whose internal_key is valid only during the callback. The
+  // default implementation iterates through Iterator::entry(); a rep may
+  // override it with a faster path.
+  virtual void GetEntries(const LookupKey& k, void* callback_args,
+                          bool (*callback_func)(void* arg,
+                                                const EntryView& entry));
+
   // Same as Get() but performs data integrity validation.
   virtual Status GetAndValidate(
       const LookupKey& /* k */, void* /* callback_args */,
@@ -275,6 +337,21 @@ class MemTableRep {
     // Returns the key at the current position.
     // REQUIRES: Valid()
     virtual const char* key() const = 0;
+
+    // EXPERIMENTAL. Returns the entry at the current position. The default
+    // decodes key() as an encoded entry; reps that own keys override it.
+    // REQUIRES: Valid()
+    virtual EntryView entry() const {
+      const Slice internal_key = GetLengthPrefixedSlice(key());
+      return {internal_key, internal_key.data() + internal_key.size()};
+    }
+
+    // EXPERIMENTAL. Whether entry().internal_key stays valid after the
+    // iterator moves (otherwise only until the next positioning call).
+    // Defaults to false, the safe answer for a key-owning rep that rebuilds
+    // keys on each move; only key-owning reps are asked (see MemTableIterator),
+    // so encoded-entry reps are unaffected.
+    virtual bool IsKeyPinned() const { return false; }
 
     // Advances to the next position.
     // REQUIRES: Valid()
@@ -396,6 +473,16 @@ class MemTableRepFactory : public Customizable {
   // Return true if the current MemTableRep supports concurrent inserts
   // Default: false
   virtual bool IsInsertConcurrentlySupported() const { return false; }
+
+  // EXPERIMENTAL. Return true if reps created by this factory store entry keys
+  // in their own structure rather than in the encoded entry (see
+  // MemTableRep::OwnsKeys()). The memtable reads this before constructing a rep
+  // so it can fall back to a skip list, without first building and discarding a
+  // key-owning rep, when a column-family option requires the encoded-entry
+  // layout. A factory that returns true must create reps whose OwnsKeys()
+  // returns true.
+  // Default: false
+  virtual bool OwnsKeys() const { return false; }
 
   // Return true if the current MemTableRep supports detecting duplicate
   // <key,seq> at insertion time. If true, then MemTableRep::Insert* returns

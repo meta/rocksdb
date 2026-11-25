@@ -260,9 +260,21 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
     prev_cpu_read_nanos = IOSTATS(cpu_read_nanos);
   }
   Status mempurge_s = Status::NotFound("No MemPurge.");
+  // experimental_mempurge_threshold is mutable and read at flush time, so a
+  // memtable created while it was 0 can reach this path after SetOptions()
+  // raised it. MemPurge samples and parses encoded entries, which a key-owning
+  // rep does not provide, so skip MemPurge when any memtable owns its keys.
+  bool any_memtable_owns_keys = false;
+  for (const ReadOnlyMemTable* m : mems_) {
+    if (m->OwnsKeys()) {
+      any_memtable_owns_keys = true;
+      break;
+    }
+  }
   if ((mempurge_threshold > 0.0) &&
       (flush_reason_ == FlushReason::kWriteBufferFull) && (!mems_.empty()) &&
-      MemPurgeDecider(mempurge_threshold) && !(db_options_.atomic_flush)) {
+      !any_memtable_owns_keys && MemPurgeDecider(mempurge_threshold) &&
+      !(db_options_.atomic_flush)) {
     cfd_->SetMempurgeUsed();
     mempurge_s = MemPurge();
     if (!mempurge_s.ok()) {
