@@ -36,6 +36,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/slice.h"
 #include "strsafe.h"
+#include "test_util/sync_point.h"
 #include "util/string_util.h"
 
 // Undefine the functions  windows might use (again)...
@@ -245,6 +246,8 @@ IOStatus WinFileSystem::NewSequentialFile(
 
   if (options.use_direct_reads && !options.use_mmap_reads) {
     fileFlags |= FILE_FLAG_NO_BUFFERING;
+    TEST_SYNC_POINT_CALLBACK("NewSequentialFile:FILE_FLAG_NO_BUFFERING",
+                             &fileFlags);
   }
 
   {
@@ -278,8 +281,17 @@ IOStatus WinFileSystem::NewRandomAccessFile(
 
   if (options.use_direct_reads && !options.use_mmap_reads) {
     fileFlags |= FILE_FLAG_NO_BUFFERING;
+    TEST_SYNC_POINT_CALLBACK("NewRandomAccessFile:FILE_FLAG_NO_BUFFERING",
+                             &fileFlags);
   } else {
     fileFlags |= FILE_FLAG_RANDOM_ACCESS;
+  }
+
+  // Open in async mode which makes Windows allow more parallelism even
+  // if we need to do sync I/O on top of it. This is directly related to
+  // PositionedReadInternal() implementation
+  if (!options.use_mmap_reads) {
+    fileFlags |= FILE_FLAG_OVERLAPPED;
   }
 
   /// Shared access is necessary for corruption test to pass
@@ -350,7 +362,8 @@ IOStatus WinFileSystem::NewRandomAccessFile(
       fileGuard.release();
     }
   } else {
-    result->reset(new WinRandomAccessFile(fname, hFile, page_size_, options));
+    result->reset(
+        new WinRandomAccessFileAsyncIo(fname, hFile, page_size_, options));
     fileGuard.release();
   }
   return s;
@@ -370,6 +383,8 @@ IOStatus WinFileSystem::OpenWritableFile(
 
   if (local_options.use_direct_writes && !local_options.use_mmap_writes) {
     fileFlags = FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH;
+    TEST_SYNC_POINT_CALLBACK("NewWritableFile:FILE_FLAG_NO_BUFFERING",
+                             &fileFlags);
   }
 
   // Desired access. We are want to write only here but if we want to memory
@@ -469,6 +484,8 @@ IOStatus WinFileSystem::NewRandomRWFile(const std::string& fname,
 
   if (options.use_direct_reads && options.use_direct_writes) {
     file_flags |= FILE_FLAG_NO_BUFFERING;
+    TEST_SYNC_POINT_CALLBACK("NewRandomRWFile:FILE_FLAG_NO_BUFFERING",
+                             &file_flags);
   }
 
   /// Shared access is necessary for corruption test to pass
@@ -1168,6 +1185,108 @@ FileOptions WinFileSystem::OptimizeForManifestRead(
   optimized.use_mmap_writes = false;
   optimized.use_direct_reads = false;
   return optimized;
+}
+
+void WinFileSystem::SupportedOps(int64_t& supported_ops) {
+  supported_ops = 0;
+  supported_ops |= (1 << FSSupportedOps::kAsyncIO);
+}
+
+IOStatus WinFileSystem::Poll(std::vector<void*>& io_handles,
+                             size_t /*min_completions*/) {
+  for (size_t i = 0; i < io_handles.size(); i++) {
+    auto win_handle = static_cast<Win_IOHandle*>(io_handles[i]);
+
+    if (win_handle->is_finished) {
+      continue;
+    }
+
+    FSReadRequest req;
+    req.scratch = win_handle->scratch;
+    req.offset = win_handle->offset;
+    req.len = win_handle->len;
+    DWORD bytes_read = 0;
+    if (FALSE != GetOverlappedResult(win_handle->file_data->GetFileHandle(),
+                                     &win_handle->overlapped, &bytes_read,
+                                     TRUE)) {
+      TEST_SYNC_POINT_CALLBACK(
+          "UpdateResults::io_uring_result",
+          &bytes_read);  // For testing compatibility with io_uring only
+      req.result = Slice(req.scratch, bytes_read);
+      req.status = IOStatus::OK();
+    } else {
+      auto err = GetLastError();
+      if (ERROR_HANDLE_EOF != err) {
+        req.result = Slice(req.scratch, 0);
+        req.status = IOErrorFromWindowsError(
+            "GetOverlappedResult failed: " + win_handle->file_data->GetName(),
+            err);
+      } else {  // EOF
+        req.result = Slice(req.scratch, 0);
+        req.status = IOStatus::OK();
+      }
+    }
+
+    win_handle->is_finished = true;
+    win_handle->cb(req, win_handle->cb_arg);
+
+    if (win_handle->overlapped.hEvent != NULL) {
+      CloseHandle(win_handle->overlapped.hEvent);
+      win_handle->overlapped.hEvent = NULL;
+    }
+  }
+  return IOStatus::OK();
+}
+
+IOStatus WinFileSystem::AbortIO(std::vector<void*>& io_handles) {
+  // On error, returns early without firing callbacks for remaining handles.
+  // Matches the Posix io_uring AbortIO behavior; real errors here indicate a
+  // broken FS state where the caller will have larger problems than a hung
+  // prefetch.
+  for (size_t i = 0; i < io_handles.size(); i++) {
+    auto win_handle = static_cast<Win_IOHandle*>(io_handles[i]);
+    if (win_handle->is_finished) {
+      continue;
+    }
+
+    if (win_handle->overlapped.hEvent == NULL) {
+      return IOStatus::InvalidArgument(
+          "AbortIO: Overlapped event is NULL for: " +
+          win_handle->file_data->GetName());
+    }
+
+    if (FALSE == CancelIoEx(win_handle->file_data->GetFileHandle(),
+                            &win_handle->overlapped)) {
+      auto err = GetLastError();
+      // If this CancelIoEx cannot find a request to cancel, GetLastError
+      // returns ERROR_NOT_FOUND
+      if (err != ERROR_NOT_FOUND) {
+        return IOErrorFromWindowsError(
+            "CancelIoEx failed: " + win_handle->file_data->GetName(), err);
+      }
+    } else {
+      // CancelIoEx succeeded
+      // Wait for the operation to complete
+      DWORD bytes_read = 0;
+      if (!GetOverlappedResult(win_handle->file_data->GetFileHandle(),
+                               &win_handle->overlapped, &bytes_read, TRUE)) {
+        if (GetLastError() != ERROR_OPERATION_ABORTED) {
+          return IOErrorFromWindowsError(
+              "AbortIO failed: " + win_handle->file_data->GetName(),
+              GetLastError());
+        }
+      }
+    }
+
+    win_handle->is_finished = true;
+    FSReadRequest req;
+    req.status = IOStatus::Aborted();
+    win_handle->cb(req, win_handle->cb_arg);
+
+    CloseHandle(win_handle->overlapped.hEvent);
+    win_handle->overlapped.hEvent = NULL;
+  }
+  return IOStatus::OK();
 }
 
 // Returns true iff the named directory exists and is a directory.
