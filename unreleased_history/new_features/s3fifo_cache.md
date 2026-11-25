@@ -1,0 +1,1 @@
+Added experimental `S3FifoCache`, an opt-in sharded block cache with S3-FIFO eviction, created with `S3FifoCacheOptions::MakeSharedCache()` or `s3fifo_cache://` in a `block_cache` options string (C++ only; no C or Java bindings).
