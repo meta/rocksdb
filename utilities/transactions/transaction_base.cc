@@ -6,6 +6,7 @@
 #include "utilities/transactions/transaction_base.h"
 
 #include <cinttypes>
+#include <map>
 
 #include "db/attribute_group_iterator_impl.h"
 #include "db/coalescing_iterator.h"
@@ -423,9 +424,8 @@ void TransactionBaseImpl::MultiGet(const ReadOptions& _read_options,
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kMultiGet;
   }
-  write_batch_.MultiGetFromBatchAndDB(db_, read_options, column_family,
-                                      num_keys, keys, values, statuses,
-                                      sorted_input);
+  MultiGetImpl(read_options, column_family, num_keys, keys, values, statuses,
+               sorted_input);
 }
 
 void TransactionBaseImpl::MultiGetEntity(const ReadOptions& read_options,
@@ -461,11 +461,36 @@ std::vector<Status> TransactionBaseImpl::MultiGetForUpdate(
     }
   }
 
-  // TODO(agiardullo): optimize multiget?
+  // Read the locked keys with one batched read per column family. The batched
+  // path below is single-CF, so group the keys by column family first. The
+  // per-key results are scattered back to the caller's original key order.
   std::vector<Status> stat_list(num_keys);
+  std::map<ColumnFamilyHandle*, std::vector<size_t>> cf_to_indexes;
   for (size_t i = 0; i < num_keys; ++i) {
-    stat_list[i] =
-        GetImpl(read_options, column_family[i], keys[i], &(*values)[i]);
+    cf_to_indexes[column_family[i]].push_back(i);
+  }
+  for (const auto& cf_and_indexes : cf_to_indexes) {
+    const std::vector<size_t>& indexes = cf_and_indexes.second;
+    const size_t group_size = indexes.size();
+    std::vector<Slice> group_keys;
+    std::vector<PinnableSlice> group_values;
+    std::vector<Status> group_statuses(group_size);
+    group_keys.reserve(group_size);
+    group_values.reserve(group_size);
+    for (size_t i : indexes) {
+      group_keys.push_back(keys[i]);
+      group_values.emplace_back(&(*values)[i]);
+    }
+    MultiGetImpl(read_options, cf_and_indexes.first, group_size,
+                 group_keys.data(), group_values.data(),
+                 group_statuses.data(), false /* sorted_input */);
+    for (size_t j = 0; j < group_size; ++j) {
+      const size_t i = indexes[j];
+      stat_list[i] = group_statuses[j];
+      if (stat_list[i].ok() && group_values[j].IsPinned()) {
+        (*values)[i].assign(group_values[j].data(), group_values[j].size());
+      }
+    }
   }
 
   return stat_list;
