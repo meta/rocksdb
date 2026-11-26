@@ -179,6 +179,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// For how the MANIFEST adds relocation files and routes reads to them, see the
+// overview in db/blob/blob_relocation_manifest.h.
+
 // Table property that holds the encoded BlobRelocationDirectory.
 inline constexpr char kBlobRelocationDirectoryPropertyName[] =
     "rocksdb.blob.relocation-directory";
