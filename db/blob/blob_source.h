@@ -179,6 +179,9 @@ class BlobSource {
   // - A blob file never changes after it is written, and the DB never reuses
   //   a file number. So (origin, original offset) names the same bytes for the
   //   life of the DB.
+  // - Outside tests, a relocation file is marked lost only when the open
+  //   replays a loss record, so no entry of this session can belong to a lost
+  //   file.
   Status GetIndirectBlobFromCache(const BlobIndex& blob_index,
                                   uint64_t range_offset, size_t range_length,
                                   PinnableSlice* value) const;
