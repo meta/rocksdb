@@ -64,6 +64,12 @@ bool GetFixed32(Slice* input, uint32_t* value);
 bool GetFixed16(Slice* input, uint16_t* value);
 bool GetVarint32(Slice* input, uint32_t* value);
 bool GetVarint64(Slice* input, uint64_t* value);
+// Like GetVarint32/64, but each value has exactly one accepted encoding. They
+// reject overlong (non-minimal) encodings, and a last byte with bits above the
+// 32-bit or 64-bit range, which GetVarint32/64 drop. On failure `input` may be
+// partly consumed; callers treat that as corruption.
+bool GetCanonicalVarint32(Slice* input, uint32_t* value);
+bool GetCanonicalVarint64(Slice* input, uint64_t* value);
 bool GetVarsignedint64(Slice* input, int64_t* value);
 bool GetLengthPrefixedSlice(Slice* input, Slice* result);
 // This function assumes data is well-formed.
@@ -295,6 +301,29 @@ inline bool GetVarint64(Slice* input, uint64_t* value) {
     *input = Slice(q, static_cast<size_t>(limit - q));
     return true;
   }
+}
+
+// The last byte of a varint holds the top bits of the value. The decoder drops
+// the bits of that byte that are above the type width, so for example a 10th
+// byte of 0x01 and of 0x03 give the same uint64_t. A canonical last byte holds
+// exactly the top bits, so it equals the value shifted right by 7 bits per
+// earlier byte. `end` points just past the last byte.
+inline bool IsCanonicalVarintEnd(const char* end, size_t length,
+                                 uint64_t value) {
+  return length == static_cast<size_t>(VarintLength(value)) &&
+         static_cast<unsigned char>(end[-1]) == (value >> (7 * (length - 1)));
+}
+
+inline bool GetCanonicalVarint32(Slice* input, uint32_t* value) {
+  const size_t before = input->size();
+  return GetVarint32(input, value) &&
+         IsCanonicalVarintEnd(input->data(), before - input->size(), *value);
+}
+
+inline bool GetCanonicalVarint64(Slice* input, uint64_t* value) {
+  const size_t before = input->size();
+  return GetVarint64(input, value) &&
+         IsCanonicalVarintEnd(input->data(), before - input->size(), *value);
 }
 
 inline bool GetVarsignedint64(Slice* input, int64_t* value) {

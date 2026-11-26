@@ -135,8 +135,14 @@ Status BlobDumpTool::DumpBlobLogHeader(uint64_t* offset,
                       std::to_string((int)header.compression) + ")";
   }
   fprintf(stdout, "  Compression      : %s\n", compression_str.c_str());
-  fprintf(stdout, "  Expiration range : %s\n",
-          GetString(header.expiration_range).c_str());
+  if (header.version == kVersion2) {
+    // A version 2 header has no expiration range. Its first expiration-range
+    // field holds the file's own number instead (see blob_log_format.h).
+    fprintf(stdout, "  File number      : %" PRIu64 "\n", header.file_number);
+  } else {
+    fprintf(stdout, "  Expiration range : %s\n",
+            GetString(header.expiration_range).c_str());
+  }
   *offset = BlobLogHeader::kSize;
   *compression = header.compression;
   return s;
