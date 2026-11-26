@@ -1920,6 +1920,27 @@ class VersionSet {
   // LogAndApply() returns before the batch starts: when there are no edits,
   // when every column family is dropped, or when pre_cb fails. They must not
   // call user code or do I/O.
+  //
+  // pre_cb (precondition callback): a caller sets it when its edits are valid
+  // only if some state is unchanged when the call is committed. For example,
+  // indirect blob GC checks that its input is still installable. When pre_cb
+  // is set, the call gets no group commit with other calls. An earlier leader
+  // does not take the writers of this call into its batch, and the batch of
+  // this call does not take the writers of a later call.
+  //
+  // pre_cb runs once, under the DB mutex, when the call reaches the head of
+  // the MANIFEST writer queue. If it fails, the call returns its error and
+  // changes nothing. The batch can release the DB mutex later (to apply edits,
+  // finalize blob files or write the MANIFEST), and pre_cb does not run
+  // again. So pre_cb may depend only on state that changes through
+  // LogAndApply() (for example, which Version is current, the files it lists,
+  // and column family drops), which stays frozen while the call is at the
+  // queue head, or on state that the caller owns. Per-file state that changes
+  // under the DB mutex outside LogAndApply(), such as
+  // FileMetaData::being_compacted, is not frozen. If pre_cb also reads state
+  // that can change in other ways, the caller must make sure that such a change
+  // after pre_cb ran cannot make its edits unsafe, and say why at the call
+  // site.
   virtual Status LogAndApply(
       const autovector<ColumnFamilyData*>& cfds,
       const ReadOptions& read_options, const WriteOptions& write_options,
@@ -1931,6 +1952,25 @@ class VersionSet {
       const std::function<Status()>& pre_cb = {},
       int max_file_opening_threads = 1,
       const MutableCFOptionsPublication* options_publication = nullptr);
+
+  // Like LogAndApply() with one column family, one edit and a pre_cb, but the
+  // edit is applied to its VersionBuilder without the DB mutex. A caller uses
+  // this for an edit that is large enough that applying it under the DB mutex
+  // would stall other threads (for example, an indirect blob GC install with
+  // one change per route). The DB mutex is released only when the call leads
+  // its batch and the batch writes a MANIFEST record. pre_cb must be set, and
+  // the pre_cb contract of LogAndApply() applies: it runs once, before the
+  // unlocked apply. The apply is safe without the DB mutex because the edit
+  // and the builder belong to the caller, and the call stays at the head of
+  // the MANIFEST writer queue, so no other Version is installed meanwhile (see
+  // VersionSet::LogAndApplyHelper()). It is not virtual: a secondary instance
+  // (ReactiveVersionSet) runs no background jobs, so it never calls it.
+  Status LogAndApplyWithUnlockedApply(ColumnFamilyData* column_family_data,
+                                      const ReadOptions& read_options,
+                                      const WriteOptions& write_options,
+                                      VersionEdit* edit, InstrumentedMutex* mu,
+                                      FSDirectory* dir_contains_current_file,
+                                      const std::function<Status()>& pre_cb);
 
   void WakeUpWaitingManifestWriters();
 
@@ -1977,8 +2017,11 @@ class VersionSet {
   // Freeing relocation state
   //
   // Why: the relocation state of a fenced Version (mainly its file table) can
-  // be large, and freeing it under the DB mutex can stall writers. Versions,
-  // builders and file reference counts still change only under the DB mutex.
+  // be large, and freeing it under the DB mutex can stall writers. Versions and
+  // file reference counts still change only under the DB mutex. A builder
+  // also changes only under the DB mutex, except in the unlocked apply of
+  // LogAndApplyWithUnlockedApply(), where the builder belongs to the head of
+  // the MANIFEST writer queue.
   // Holders are std::shared_ptr<void> because they hold different types (a
   // Version's BlobRelocationState, a state whose files were released, or a
   // builder's change maps), and the free step only needs to drop the last
@@ -2925,14 +2968,15 @@ class VersionSet {
       bool new_descriptor_log, const ColumnFamilyOptions* new_cf_options,
       bool new_cf_options_are_sanitized,
       const std::vector<std::function<void(const Status&)>>& manifest_wcbs,
-      const std::function<Status()>& pre_cb, int max_file_opening_threads,
+      const std::function<Status()>& pre_cb, bool apply_unlocked,
+      int max_file_opening_threads,
       const MutableCFOptionsPublication* options_publication);
 
   void LogAndApplyCFHelper(VersionEdit* edit,
                            SequenceNumber* max_last_sequence);
   Status LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b,
                            VersionEdit* edit, SequenceNumber* max_last_sequence,
-                           InstrumentedMutex* mu);
+                           InstrumentedMutex* mu, bool apply_unlocked);
   // The "no re-add" rule. File numbers are never reused. So an edit that adds
   // back a relocation file, a route, or a blob file that an earlier edit of the
   // same MANIFEST deleted (or removed by blob file retirement) is a writer bug.
