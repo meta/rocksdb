@@ -284,6 +284,16 @@ Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options);
 Status CheckCFPathsSupported(const DBOptions& db_options,
                              const ColumnFamilyOptions& cf_options);
 
+// Returns NotSupported when `has_blob_indirection` is true and `style` is
+// kCompactionStyleFIFO, because blob indirection does not support FIFO
+// compaction. ColumnFamilyData::ValidateOptions() calls it for one CF.
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection);
+// Runs the check above for each CF of an open request. Read-only and secondary
+// opens call it, because they do not call ValidateOptions().
+Status CheckBlobIndirectionCompactionStyle(
+    const std::vector<ColumnFamilyDescriptor>& column_families);
+
 ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                                       bool read_only,
                                       const ColumnFamilyOptions& src);
@@ -377,6 +387,10 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
+
+  // Test-only, not public API. Until the indirect blob GC stack is complete,
+  // ValidateOptions rejects enable_blob_indirection unless a test allows it.
+  static void TEST_SetAllowBlobIndirection(bool allow);
 
   // DBImpl::SetOptions() must change the options of all its column families or
   // none, so it changes them in two steps: prepare every column family, then
