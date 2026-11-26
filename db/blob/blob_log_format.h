@@ -10,6 +10,7 @@
 #include <memory>
 #include <utility>
 
+#include "db/blob/blob_constants.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -18,7 +19,13 @@
 namespace ROCKSDB_NAMESPACE {
 
 constexpr uint32_t kMagicNumber = 2395959;  // 0x00248f37
+// Version 1: the base blob file format.
 constexpr uint32_t kVersion1 = 1;
+// Version 2: written for the blob files of blob indirection
+// (enable_blob_indirection). Like version 1, but the file has no TTL, and the
+// header stores the file's own number (see the header format below). The
+// footer is the same as in version 1.
+constexpr uint32_t kVersion2 = 2;
 
 using ExpirationRange = std::pair<uint64_t, uint64_t>;
 
@@ -35,8 +42,17 @@ using ExpirationRange = std::pair<uint64_t, uint64_t>;
 // List of flags:
 //   has_ttl: Whether the file contain TTL data.
 //
-// Expiration range in the header is a rough range based on
+// Version 1: the expiration range in the header is a rough range based on
 // blob_db_options.ttl_range_secs.
+// Version 2: the file has no TTL, and the flags byte is 0. The first
+// expiration-range field holds the file's own number (not 0), and the second
+// one holds 0. A reader compares the number with the number in the file name,
+// so a blob file that was copied or renamed to another number fails to open.
+// Only blob indirection writes version 2, so a tool can tell from the version
+// alone, without the MANIFEST, that the file belongs to blob indirection.
+//
+// DecodeFrom() returns Corruption for an unknown version and, in version 2, for
+// a nonzero flags byte, file number 0 or a nonzero second field.
 
 // clang-format on
 
@@ -55,9 +71,11 @@ struct BlobLogHeader {
   uint32_t column_family_id = 0;
   CompressionType compression = kNoCompression;
   bool has_ttl = false;
+  // Version 2 only: the file's own number.
+  uint64_t file_number = kInvalidBlobFileNumber;
   ExpirationRange expiration_range;
 
-  void EncodeTo(std::string* dst);
+  void EncodeTo(std::string* dst) const;
 
   Status DecodeFrom(Slice slice);
 };
@@ -139,7 +157,15 @@ struct BlobLogRecord {
 
   uint64_t record_size() const { return kHeaderSize + key_size + value_size; }
 
+  // The base signature: EncodeHeaderTo(dst, /*value_crc32c=*/nullptr).
   void EncodeHeaderTo(std::string* dst);
+
+  // Encodes the record header into `dst`. The header ends with the record CRC
+  // (blob_crc), which covers the key and the value. `value_crc32c` is optional:
+  // when it is not null, it must be the CRC32C of `value`, already computed by
+  // the caller. The record CRC then combines it with the key CRC and does not
+  // read the value again.
+  void EncodeHeaderTo(std::string* dst, const uint32_t* value_crc32c);
 
   Status DecodeHeaderFrom(Slice src);
 
