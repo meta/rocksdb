@@ -29,6 +29,7 @@
 #include "test_util/sync_point.h"
 #include "trace_replay/io_tracer.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -43,27 +44,27 @@ BlobFileBuilder::BlobFileBuilder(
     BlobFileCompletionCallback* blob_callback,
     BlobFileCreationReason creation_reason, std::string blob_output_path,
     std::vector<std::string>* output_file_paths,
-    std::vector<BlobFileAddition>* blob_file_additions)
+    std::vector<BlobFileAddition>* blob_file_additions, BlobSource* blob_source)
     : BlobFileBuilder([versions]() { return versions->NewFileNumber(); }, fs,
                       immutable_options, mutable_cf_options, file_options,
                       write_options, std::move(db_id), std::move(db_session_id),
                       job_id, column_family_id, column_family_name, write_hint,
                       io_tracer, blob_callback, creation_reason,
                       std::move(blob_output_path), output_file_paths,
-                      blob_file_additions) {}
+                      blob_file_additions, blob_source) {}
 
 BlobFileBuilder::BlobFileBuilder(
     std::function<uint64_t()> file_number_generator, FileSystem* fs,
     const ImmutableOptions* immutable_options,
     const MutableCFOptions* mutable_cf_options, const FileOptions* file_options,
-    const WriteOptions* write_options, std::string db_id,
-    std::string db_session_id, int job_id, uint32_t column_family_id,
+    const WriteOptions* write_options, std::string /*db_id*/,
+    std::string /*db_session_id*/, int job_id, uint32_t column_family_id,
     const std::string& column_family_name, Env::WriteLifeTimeHint write_hint,
     const std::shared_ptr<IOTracer>& io_tracer,
     BlobFileCompletionCallback* blob_callback,
     BlobFileCreationReason creation_reason, std::string blob_output_path,
     std::vector<std::string>* output_file_paths,
-    std::vector<BlobFileAddition>* blob_file_additions)
+    std::vector<BlobFileAddition>* blob_file_additions, BlobSource* blob_source)
     : file_number_generator_(std::move(file_number_generator)),
       fs_(fs),
       immutable_options_(immutable_options),
@@ -81,10 +82,9 @@ BlobFileBuilder::BlobFileBuilder(
                               ? blob_compressor_->ObtainWorkingArea()
                               : Compressor::ManagedWorkingArea{}),
       prepopulate_blob_cache_(mutable_cf_options->prepopulate_blob_cache),
+      enable_blob_indirection_(mutable_cf_options->enable_blob_indirection),
       file_options_(file_options),
       write_options_(write_options),
-      db_id_(std::move(db_id)),
-      db_session_id_(std::move(db_session_id)),
       job_id_(job_id),
       column_family_id_(column_family_id),
       column_family_name_(column_family_name),
@@ -95,6 +95,7 @@ BlobFileBuilder::BlobFileBuilder(
       blob_output_path_(std::move(blob_output_path)),
       output_file_paths_(output_file_paths),
       blob_file_additions_(blob_file_additions),
+      blob_source_(blob_source),
       blob_count_(0),
       blob_bytes_(0) {
   assert(file_number_generator_);
@@ -144,9 +145,23 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
   uint64_t blob_file_number = 0;
   uint64_t blob_offset = 0;
 
+  // The logical CRC and the stored CRC are defined under "Checksums" in
+  // db/blob/blob_index.h.
+  //
+  // With indirection, the CRC32C of the stored (maybe compressed) bytes is
+  // computed once and used three times:
+  //   - The blob log record CRC covers the key and the stored bytes. It is
+  //     made by combining the key's CRC with this CRC.
+  //   - The stored CRC in the BlobIndex is this CRC extended with the
+  //     compression byte.
+  //   - For an uncompressed value, this CRC is also the logical CRC (the
+  //     value of BlobIndex::stable_checksum()).
+  const uint32_t stored_bytes_crc =
+      enable_blob_indirection_ ? crc32c::Value(blob.data(), blob.size()) : 0;
   {
-    const Status s =
-        WriteBlobToFile(key, blob, &blob_file_number, &blob_offset);
+    const Status s = WriteBlobToFile(
+        key, blob, enable_blob_indirection_ ? &stored_bytes_crc : nullptr,
+        &blob_file_number, &blob_offset);
     if (!s.ok()) {
       return s;
     }
@@ -159,9 +174,19 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
     }
   }
 
+  const StableBlobFingerprint fingerprint{
+      blob.size(), blob_compression_type_,
+      !enable_blob_indirection_ ? 0
+      : blob_compression_type_ == kNoCompression
+          ? stored_bytes_crc
+          : crc32c::Value(value.data(), value.size()),
+      enable_blob_indirection_ ? BlobIndex::ExtendChecksumWithCompression(
+                                     stored_bytes_crc, blob_compression_type_)
+                               : 0};
   {
-    const Status s =
-        PutBlobIntoCacheIfNeeded(value, blob_file_number, blob_offset);
+    const Status s = PutBlobIntoCacheIfNeeded(
+        value, blob_file_number, blob_offset,
+        enable_blob_indirection_ ? &fingerprint : nullptr);
     if (!s.ok()) {
       ROCKS_LOG_WARN(immutable_options_->info_log,
                      "Failed to pre-populate the blob into blob cache: %s",
@@ -169,8 +194,18 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
     }
   }
 
-  BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset, blob.size(),
-                        blob_compression_type_);
+  if (enable_blob_indirection_) {
+    BlobIndex::EncodeUnflattenedIndirectBlob(
+        blob_index, {.origin_file_number = blob_file_number,
+                     .original_value_offset = blob_offset,
+                     .stored_value_size = blob.size(),
+                     .compression = blob_compression_type_,
+                     .stable_checksum = fingerprint.stable_checksum,
+                     .stored_checksum = fingerprint.stored_checksum});
+  } else {
+    BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset,
+                          blob.size(), blob_compression_type_);
+  }
 
   return Status::OK();
 }
@@ -259,6 +294,12 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
 
   BlobLogHeader header(column_family_id_, blob_compression_type_, has_ttl,
                        expiration_range);
+  // A blob file of blob indirection gets a version 2 header, which records the
+  // file's own number (see db/blob/blob_log_format.h).
+  if (enable_blob_indirection_) {
+    header.version = kVersion2;
+    header.file_number = blob_file_number;
+  }
 
   {
     Status s = blob_log_writer->WriteHeader(*write_options_, header);
@@ -308,6 +349,7 @@ Status BlobFileBuilder::CompressBlobIfNeeded(
 }
 
 Status BlobFileBuilder::WriteBlobToFile(const Slice& key, const Slice& blob,
+                                        const uint32_t* value_crc32c,
                                         uint64_t* blob_file_number,
                                         uint64_t* blob_offset) {
   assert(IsBlobFileOpen());
@@ -316,8 +358,12 @@ Status BlobFileBuilder::WriteBlobToFile(const Slice& key, const Slice& blob,
 
   uint64_t key_offset = 0;
 
-  Status s =
-      writer_->AddRecord(*write_options_, key, blob, &key_offset, blob_offset);
+  Status s = value_crc32c != nullptr
+                 ? writer_->AddRecordWithValueCrc(*write_options_, key, blob,
+                                                  *value_crc32c, &key_offset,
+                                                  blob_offset)
+                 : writer_->AddRecord(*write_options_, key, blob, &key_offset,
+                                      blob_offset);
 
   TEST_SYNC_POINT_CALLBACK("BlobFileBuilder::WriteBlobToFile:AddRecord", &s);
 
@@ -413,37 +459,17 @@ void BlobFileBuilder::Abandon(const Status& s) {
   blob_bytes_ = 0;
 }
 
-Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(const Slice& blob,
-                                                 uint64_t blob_file_number,
-                                                 uint64_t blob_offset) const {
-  Status s = Status::OK();
-
-  BlobSource::SharedCacheInterface blob_cache{immutable_options_->blob_cache};
-  auto statistics = immutable_options_->statistics.get();
-  bool warm_cache =
+Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(
+    const Slice& blob, uint64_t blob_file_number, uint64_t blob_offset,
+    const StableBlobFingerprint* fingerprint) const {
+  const bool warm_cache =
       prepopulate_blob_cache_ == PrepopulateBlobCache::kFlushOnly &&
       creation_reason_ == BlobFileCreationReason::kFlush;
-
-  if (blob_cache && warm_cache) {
-    const OffsetableCacheKey base_cache_key(db_id_, db_session_id_,
-                                            blob_file_number);
-    const CacheKey cache_key = base_cache_key.WithOffset(blob_offset);
-    const Slice key = cache_key.AsSlice();
-
-    const Cache::Priority priority = Cache::Priority::BOTTOM;
-
-    s = blob_cache.InsertSaved(key, blob, nullptr /*context*/, priority,
-                               immutable_options_->lowest_used_cache_tier);
-
-    if (s.ok()) {
-      RecordTick(statistics, BLOB_DB_CACHE_ADD);
-      RecordTick(statistics, BLOB_DB_CACHE_BYTES_WRITE, blob.size());
-    } else {
-      RecordTick(statistics, BLOB_DB_CACHE_ADD_FAILURES);
-    }
+  if (blob_source_ == nullptr || !warm_cache) {
+    return Status::OK();
   }
-
-  return s;
+  return blob_source_->PrepopulateFlushBlob(blob, blob_file_number, blob_offset,
+                                            fingerprint);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -5,6 +5,7 @@
 
 #include "db/blob/blob_source.h"
 
+#include <array>
 #include <cassert>
 #include <string>
 #include <vector>
@@ -14,17 +15,43 @@
 #include "db/blob/blob_contents.h"
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_gen2_format.h"
+#include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/same_file_blob_reader.h"
+#include "db/version_edit.h"
 #include "file/random_access_file_reader.h"
+#include "logging/logging.h"
 #include "memory/memory_allocator_impl.h"
 #include "monitoring/statistics_impl.h"
 #include "options/cf_options.h"
 #include "table/get_context.h"
 #include "table/multiget_context.h"
+#include "util/coding.h"
+#include "util/crc32c.h"
+#include "util/math.h"
+#include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
+
+Status ValidateIndirectBlobIndexForRead(const BlobIndex& blob_index,
+                                        bool is_relocation_file) {
+  if (!blob_index.IsIndirect()) {
+    return Status::InvalidArgument("Expected indirect blob index");
+  }
+  Status status = blob_index.Validate();
+  if (!status.ok()) {
+    return status;
+  }
+  if (!CompressionTypeSupported(blob_index.compression()) ||
+      (is_relocation_file &&
+       blob_index.size() > kMaxSimpleGen2BlobPayloadSize)) {
+    return Status::Corruption(
+        "Indirect blob size or compression is not supported");
+  }
+  return Status::OK();
+}
 
 Status AppendBlobRefreshRetryFailure(const Status& stale_status,
                                      const Status& retry_status) {
@@ -37,6 +64,92 @@ Status AppendBlobRefreshRetryFailure(const Status& stale_status,
       stale_status, "; refresh retry failed: ", retry_status.ToString());
 }
 
+// Start and length of the file read for a whole value at `value_offset` in a
+// blob log file. With checksum verification the read also covers the record
+// header in front of the value.
+std::pair<uint64_t, uint64_t> WholeBlobReadExtent(
+    const ReadOptions& read_options, size_t user_key_size,
+    uint64_t value_offset, uint64_t value_size) {
+  const uint64_t adjustment =
+      read_options.verify_checksums
+          ? BlobLogRecord::CalculateAdjustmentForRecordHeader(user_key_size)
+          : 0;
+  return {value_offset >= adjustment ? value_offset - adjustment : 0,
+          value_size > std::numeric_limits<uint64_t>::max() - adjustment
+              ? std::numeric_limits<uint64_t>::max()
+              : value_size + adjustment};
+}
+
+constexpr size_t kMaxIndirectBatch = MultiGetContext::MAX_BATCH_SIZE;
+
+// One planned file read: its (start, length) and the index of its request.
+struct PlannedRead {
+  uint64_t start = 0;
+  uint64_t length = 0;
+  size_t request = 0;
+  // A copy shares the source's record check, which includes the user key, so
+  // only reads for the same user key are duplicates.
+  Slice user_key;
+};
+using PlannedReads = autovector<PlannedRead, kMaxIndirectBatch>;
+using ReadBatch = autovector<size_t, kMaxIndirectBatch>;
+using ReadBatches = autovector<ReadBatch, 2>;
+// An exact duplicate read: its request, the request whose result it copies,
+// and its length.
+struct DuplicateRead {
+  size_t request = 0;
+  size_t source = 0;
+  uint64_t length = 0;
+};
+using DuplicateReads = autovector<DuplicateRead, kMaxIndirectBatch>;
+
+// Sorts `reads` by (start, length, user key) and splits them into the fewest
+// batches whose reads do not overlap, because FileSystem::MultiRead requires
+// non-overlapping requests. When no reads overlap (the usual case) there is one
+// batch. The sort puts equal reads next to each other, so an exact duplicate of
+// the previous read (same start, length and user key) is not read again; it
+// goes to `duplicates`. Batches hold request indexes.
+void PlanReadBatches(PlannedReads* reads, ReadBatches* batches,
+                     DuplicateReads* duplicates) {
+  std::sort(reads->begin(), reads->end(),
+            [](const PlannedRead& lhs, const PlannedRead& rhs) {
+              if (lhs.start != rhs.start || lhs.length != rhs.length) {
+                return std::make_pair(lhs.start, lhs.length) <
+                       std::make_pair(rhs.start, rhs.length);
+              }
+              return lhs.user_key.compare(rhs.user_key) < 0;
+            });
+  autovector<uint64_t, 2> batch_ends;
+  const PlannedRead* previous = nullptr;
+  for (const PlannedRead& read : *reads) {
+    if (previous != nullptr && previous->start == read.start &&
+        previous->length == read.length &&
+        previous->user_key == read.user_key) {
+      duplicates->push_back({read.request, previous->request, read.length});
+      continue;
+    }
+    previous = &read;
+    const uint64_t end =
+        read.length > std::numeric_limits<uint64_t>::max() - read.start
+            ? std::numeric_limits<uint64_t>::max()
+            : read.start + read.length;
+    size_t batch = batch_ends.size();
+    for (size_t i = 0; i < batch_ends.size(); ++i) {
+      if (batch_ends[i] <= read.start) {
+        batch = i;
+        break;
+      }
+    }
+    if (batch == batch_ends.size()) {
+      batches->emplace_back();
+      batch_ends.push_back(end);
+    } else {
+      batch_ends[batch] = end;
+    }
+    (*batches)[batch].push_back(read.request);
+  }
+}
+
 // Runs read(reader) against the blob-file reader for `file_number`. On a
 // Corruption -- which a stale cached reader (e.g. the physical file was
 // replaced) can surface -- evicts the cached reader, reopens it uncached,
@@ -47,11 +160,15 @@ Status AppendBlobRefreshRetryFailure(const Status& stale_status,
 // `read` is invoked with a BlobFileReader* and returns a Status; because it may
 // run twice, it must re-initialize any output it populates on each call (and is
 // taken by const reference rather than forwarded, since it is not moved-from).
-template <typename ReadFn>
+//
+// `check(reader)` runs first on the cached reader. A metadata error it returns
+// (for example a compression mismatch) is returned as is, without the evict and
+// retry.
+template <typename CheckFn, typename ReadFn>
 Status ReadBlobWithReaderRetry(BlobFileCache* blob_file_cache,
                                const ReadOptions& read_options,
                                const BlobFileOpenInfo& blob_file,
-                               const ReadFn& read) {
+                               const CheckFn& check, const ReadFn& read) {
   CacheHandleGuard<BlobFileReader> blob_file_reader;
   Status s = blob_file_cache->GetBlobFileReader(read_options, blob_file,
                                                 &blob_file_reader);
@@ -60,6 +177,10 @@ Status ReadBlobWithReaderRetry(BlobFileCache* blob_file_cache,
   }
   assert(blob_file_reader.GetValue());
 
+  s = check(blob_file_reader.GetValue());
+  if (!s.ok()) {
+    return s;
+  }
   s = read(blob_file_reader.GetValue());
   if (!s.IsCorruption()) {
     return s;
@@ -87,6 +208,70 @@ Status ReadBlobWithReaderRetry(BlobFileCache* blob_file_cache,
       ->RefreshBlobFileReader(blob_file, &fresh_reader, &ignored_reader)
       .PermitUncheckedError();
   return s;
+}
+
+template <typename ReadFn>
+Status ReadBlobWithReaderRetry(BlobFileCache* blob_file_cache,
+                               const ReadOptions& read_options,
+                               const BlobFileOpenInfo& blob_file,
+                               const ReadFn& read) {
+  return ReadBlobWithReaderRetry(
+      blob_file_cache, read_options, blob_file,
+      [](BlobFileReader*) { return Status::OK(); }, read);
+}
+
+// Reads `requests` in the batches planned from `reads` (see PlanReadBatches)
+// with read_batch(batch_reads, &bytes_read). Each value goes to
+// *value_of(request); an exact duplicate gets its own copy, allocated from
+// `allocator`, and is reported to on_duplicate(request). read_batch records the
+// read statistics of the requests it reads. A duplicate shares the read of its
+// source, but it is still counted as a read with its own bytes, as
+// include/rocksdb/statistics.h says for BLOB_DB_BLOB_FILE_BYTES_READ, so this
+// function records it in `statistics` and the perf context when it gets a
+// value. Returns the bytes of the requests that got a value, duplicates
+// included.
+template <typename Request, typename ReadBatchFn, typename ValueFn,
+          typename DuplicateFn>
+uint64_t ReadInPlannedBatches(autovector<Request, kMaxIndirectBatch>* requests,
+                              PlannedReads* reads, MemoryAllocator* allocator,
+                              Statistics* statistics,
+                              const ReadBatchFn& read_batch,
+                              const ValueFn& value_of,
+                              const DuplicateFn& on_duplicate) {
+  ReadBatches batches;
+  DuplicateReads duplicates;
+  PlanReadBatches(reads, &batches, &duplicates);
+  uint64_t total_bytes_read = 0;
+  for (const ReadBatch& batch : batches) {
+    autovector<std::pair<Request*, std::unique_ptr<BlobContents>>> batch_reads;
+    for (size_t request : batch) {
+      batch_reads.emplace_back(&(*requests)[request],
+                               std::unique_ptr<BlobContents>());
+    }
+    uint64_t batch_bytes_read = 0;
+    read_batch(batch_reads, &batch_bytes_read);
+    total_bytes_read += batch_bytes_read;
+    for (size_t i = 0; i < batch.size(); ++i) {
+      if ((*requests)[batch[i]].status->ok()) {
+        *value_of(batch[i]) = std::move(batch_reads[i].second);
+      }
+    }
+  }
+  for (const DuplicateRead& duplicate : duplicates) {
+    on_duplicate(duplicate.request);
+    *(*requests)[duplicate.request].status =
+        *(*requests)[duplicate.source].status;
+    if ((*requests)[duplicate.source].status->ok()) {
+      const Slice value = (*value_of(duplicate.source))->data();
+      *value_of(duplicate.request) = std::make_unique<BlobContents>(
+          AllocateAndCopyBlock(value, allocator), value.size());
+      RecordTick(statistics, BLOB_DB_BLOB_FILE_BYTES_READ, duplicate.length);
+      PERF_COUNTER_ADD(blob_read_count, 1);
+      PERF_COUNTER_ADD(blob_read_byte, duplicate.length);
+      total_bytes_read += duplicate.length;
+    }
+  }
+  return total_bytes_read;
 }
 
 // Records lazy wide-column read metrics for one actual storage read issued
@@ -134,7 +319,136 @@ void PinCacheHitSubRange(CacheHandleGuard<BlobContents>* blob_handle,
   blob_handle->TransferTo(value);
 }
 
+namespace {
+// Returns the domain (1, 2 or 3) of the stable cache keys of this DB and
+// session. A stable key must never equal a physical blob cache key (the key of
+// a physical file and offset) of the same DB and session.
+//
+// Why: stable keys live in the blob cache next to physical blob keys and
+// embedded blob keys. When the blob cache is also the block cache, they also
+// live next to SST block keys and cache reservation keys. A collision would
+// return the bytes of another value. SST block keys and embedded blob keys are
+// built the same way as physical blob keys: OffsetableCacheKey with a real file
+// number. For keys of this DB and session, this proof applies to all of them
+// ("physical key" below). Keys of another session differ as for any other cache
+// key (see the end of this comment). For the key layout, see OffsetableCacheKey
+// in cache/cache_key.h.
+//
+// Stable keys and physical blob keys are both built by OffsetableCacheKey from
+// an internal id `id`, where id[0] = session_lower and id[1] = H ^ file
+// number. H depends only on db_id and the session.
+//
+// Terms:
+// - First word: the first 64 bits of the cache key. OffsetableCacheKey sets it
+//   to DownwardInvolution(id[0]) ^ ReverseBits(id[1]). The offset changes only
+//   the second word.
+// - P: the low two bits of a physical key's first word. ReverseBits moves the
+//   top two bits of id[1] to the low two bits. File numbers are at most
+//   kFileNumberMask (62 bits), so they never set those top two bits, and P is
+//   the same for every file of this DB and session.
+// - Domain (1, 2 or 3): a value that the stable key xors into the top two bits
+//   of id[1], like a file number that no real file can have. The low two bits
+//   of a stable first word are then P ^ domain.
+//
+// OffsetableCacheKey swaps a zero first word with the second word,
+// ReverseBits(session_lower). So when P is 0, a physical first word can also
+// have the low bits of that swapped word. One fixed domain is therefore not
+// enough. The loop picks the first domain whose stable low bits are not 0 and,
+// when P is 0, also differ from the low bits of the swapped word. At most one
+// of the three domains is rejected: the domain equal to P when P != 0, or the
+// domain that gives the swapped word's low bits when P == 0. The choice depends
+// only on db_id and the session, not on the origin. A stable first word is
+// never 0, so it is never swapped, and distinct origins give distinct first
+// words. Reserved keys (CacheKey::CreateUnique*) have a first word of 0, so a
+// stable key never equals one either. Keys of different sessions differ as for
+// any other cache key.
+uint64_t ChooseStableKeyDomain(const UniqueId64x2& id) {
+  const uint64_t physical_low_bits =
+      (DownwardInvolution(id[0]) ^ ReverseBits(id[1])) & 3;
+  const uint64_t swapped_low_bits = ReverseBits(id[0]) & 3;
+  for (uint64_t domain = 1; domain <= 3; ++domain) {
+    const uint64_t stable_low_bits = physical_low_bits ^ domain;
+    if (stable_low_bits != 0 &&
+        (physical_low_bits != 0 || stable_low_bits != swapped_low_bits)) {
+      return domain;
+    }
+  }
+  assert(false);
+  return 1;
+}
 }  // namespace
+
+CacheKey GetStableBlobCacheKey(const std::string& db_id,
+                               const std::string& db_session_id,
+                               uint64_t origin_file_number,
+                               uint64_t original_value_offset) {
+  static_assert(kFileNumberMask == 0x3fffffffffffffffULL);
+  static_assert(BlobIndex::kMaxFileNumber == kFileNumberMask);
+  assert(origin_file_number != 0 && origin_file_number <= kFileNumberMask);
+  OffsetableCacheKey physical_base(db_id, db_session_id, origin_file_number);
+  UniqueId64x2 id = physical_base.ToInternalUniqueId();
+  id[1] ^= ReverseBits(ChooseStableKeyDomain(id));
+  return OffsetableCacheKey::FromInternalUniqueId(&id).WithOffset(
+      original_value_offset);
+}
+
+// Applies the configured blob-cache memory charging policy, so reads and flush
+// prepopulation are accounted against the block cache when charging is enabled.
+std::shared_ptr<Cache> GetBlobCacheWithReservation(
+    const ImmutableOptions& immutable_options,
+    const MutableCFOptions& mutable_cf_options) {
+  std::shared_ptr<Cache> blob_cache = immutable_options.blob_cache;
+  const BlockBasedTableOptions* const bbto =
+      mutable_cf_options.table_factory->GetOptions<BlockBasedTableOptions>();
+  if (blob_cache && bbto &&
+      bbto->cache_usage_options.options_overrides.at(CacheEntryRole::kBlobCache)
+              .charged == CacheEntryRoleOptions::Decision::kEnabled) {
+    blob_cache = std::make_shared<ChargedCache>(blob_cache, bbto->block_cache);
+  }
+  return blob_cache;
+}
+
+}  // namespace
+
+CacheKey TEST_GetStableBlobCacheKey(const std::string& db_id,
+                                    const std::string& db_session_id,
+                                    uint64_t origin_file_number,
+                                    uint64_t original_value_offset) {
+  return GetStableBlobCacheKey(db_id, db_session_id, origin_file_number,
+                               original_value_offset);
+}
+
+StableBlobCacheKeyBuilder::StableBlobCacheKeyBuilder(
+    const std::string& db_id, const std::string& db_session_id) {
+  UniqueId64x2 id;
+  Status s = GetSstInternalUniqueId(db_id, db_session_id, /*file_number=*/0,
+                                    &id, /*force=*/true);
+  assert(s.ok());
+  s.PermitUncheckedError();
+  session_lower_ = id[0];
+  db_hash_ = id[1];
+  if (session_lower_ == 0) {
+    slow_db_id_ = db_id;
+    slow_db_session_id_ = db_session_id;
+    use_slow_path_ = true;
+    return;
+  }
+  // The domain depends only on db_id and the session: file numbers are at most
+  // kFileNumberMask, so they do not change the top two bits of id[1].
+  domain_bits_ = ReverseBits(ChooseStableKeyDomain(id));
+}
+
+CacheKey StableBlobCacheKeyBuilder::Get(uint64_t origin_file_number,
+                                        uint64_t original_value_offset) const {
+  assert(origin_file_number != 0 && origin_file_number <= kFileNumberMask);
+  if (use_slow_path_) {
+    return GetStableBlobCacheKey(slow_db_id_, slow_db_session_id_,
+                                 origin_file_number, original_value_offset);
+  }
+  UniqueId64x2 id{session_lower_, db_hash_ ^ origin_file_number ^ domain_bits_};
+  return OffsetableCacheKey::FromInternalUniqueId(&id).WithOffset(
+      original_value_offset);
+}
 
 BlobSource::BlobSource(const ImmutableOptions& immutable_options,
                        const MutableCFOptions& mutable_cf_options,
@@ -144,17 +458,39 @@ BlobSource::BlobSource(const ImmutableOptions& immutable_options,
     : db_id_(db_id),
       db_session_id_(db_session_id),
       statistics_(immutable_options.statistics.get()),
+      clock_(immutable_options.clock),
       blob_file_cache_(blob_file_cache),
-      blob_cache_(immutable_options.blob_cache),
-      lowest_used_cache_tier_(immutable_options.lowest_used_cache_tier) {
-  auto bbto =
-      mutable_cf_options.table_factory->GetOptions<BlockBasedTableOptions>();
-  if (bbto &&
-      bbto->cache_usage_options.options_overrides.at(CacheEntryRole::kBlobCache)
-              .charged == CacheEntryRoleOptions::Decision::kEnabled) {
-    blob_cache_ = SharedCacheInterface{std::make_shared<ChargedCache>(
-        immutable_options.blob_cache, bbto->block_cache)};
-  }
+      blob_cache_storage_(
+          GetBlobCacheWithReservation(immutable_options, mutable_cf_options)),
+      blob_cache_(blob_cache_storage_),
+      stable_blob_cache_(blob_cache_storage_),
+      simple_gen2_decompressor_(
+          GetBuiltinV2CompressionManager()->GetDecompressor()),
+      lowest_used_cache_tier_(immutable_options.lowest_used_cache_tier) {}
+
+void BlobSource::InitStableCacheState() const {
+  std::call_once(stable_key_builder_once_, [this]() {
+    stable_key_builder_ =
+        std::make_unique<StableBlobCacheKeyBuilder>(db_id_, db_session_id_);
+    stable_cache_admission_mutex_ =
+        std::make_unique<Striped<CacheAlignedWrapper<port::Mutex>>>(
+            kNumberOfAdmissionMutexStripes);
+  });
+}
+
+CacheKey BlobSource::StableCacheKey(uint64_t origin_file_number,
+                                    uint64_t original_value_offset) const {
+  assert(stable_blob_cache_);
+  InitStableCacheState();
+  CacheKey key =
+      stable_key_builder_->Get(origin_file_number, original_value_offset);
+  // The builder's key must equal the slow path's key for the current db_id and
+  // session id.
+  assert(key.AsSlice() == GetStableBlobCacheKey(db_id_, db_session_id_,
+                                                origin_file_number,
+                                                original_value_offset)
+                              .AsSlice());
+  return key;
 }
 
 BlobSource::~BlobSource() = default;
@@ -221,6 +557,141 @@ Status BlobSource::PutBlobIntoCache(
   return s;
 }
 
+Status BlobSource::GetStableBlobFromCache(
+    const Slice& cache_key, CacheHandleGuard<StableBlobContents>* cached_blob,
+    bool record_statistics, bool primary_only) const {
+  assert(stable_blob_cache_);
+  assert(cached_blob != nullptr);
+  assert(cached_blob->IsEmpty());
+
+  StableTypedHandle* const cache_handle =
+      primary_only
+          ? stable_blob_cache_.Lookup(cache_key)
+          : stable_blob_cache_.LookupFull(cache_key, nullptr /* context */,
+                                          Cache::Priority::BOTTOM, statistics_,
+                                          lowest_used_cache_tier_);
+  if (cache_handle == nullptr) {
+    if (record_statistics) {
+      RecordTick(statistics_, BLOB_DB_CACHE_MISS);
+    }
+    return Status::NotFound("Stable blob not found in cache");
+  }
+
+  *cached_blob = CacheHandleGuard<StableBlobContents>(stable_blob_cache_.get(),
+                                                      cache_handle);
+  const StableBlobContents* const contents = cached_blob->GetValue();
+  assert(contents != nullptr);
+  // Every entry in the cache is valid: primary entries are built only from
+  // checked values, and a promotion that fails its checks never enters the
+  // cache (see the cache item helper of StableBlobContents).
+  assert(contents->validation_status().ok());
+  if (record_statistics) {
+    PERF_COUNTER_ADD(blob_cache_hit_count, 1);
+    PERF_COUNTER_ADD(blob_cache_read_byte, contents->size());
+    RecordTick(statistics_, BLOB_DB_CACHE_HIT);
+    RecordTick(statistics_, BLOB_DB_CACHE_BYTES_READ, contents->size());
+  }
+  return Status::OK();
+}
+
+Status BlobSource::PutStableBlobIntoCache(
+    const Slice& cache_key, const BlobIndex& blob_index,
+    std::unique_ptr<BlobContents>* logical_value,
+    CacheHandleGuard<StableBlobContents>* cached_blob) const {
+  assert(stable_blob_cache_);
+  assert(blob_index.IsIndirect());
+  assert(logical_value != nullptr && *logical_value != nullptr);
+  assert(cached_blob != nullptr);
+  assert(cached_blob->IsEmpty());
+
+  // FinishIndirectBlobRead has checked the logical CRC. The entry adopts the
+  // read buffer, so there is no copy, and it is built outside the lock.
+  const size_t value_size = (*logical_value)->size();
+  std::unique_ptr<StableBlobContents> contents;
+  Status status = StableBlobContents::CreateWithVerifiedAllocation(
+      (*logical_value)->ReleaseAllocation(), value_size,
+      blob_index.fingerprint(), &contents);
+  logical_value->reset();
+  if (!status.ok()) {
+    return status;
+  }
+
+  // This lock is taken only on a miss, after a file read. Between the check
+  // for an existing entry and the insert, it keeps a second read of the same
+  // value from inserting another entry, so readers keep using the first one.
+  // The first lookup already checked the secondary cache, so this lookup checks
+  // only the primary cache.
+  InitStableCacheState();
+  MutexLock admission_lock(&stable_cache_admission_mutex_->Get(cache_key));
+  status = GetStableBlobFromCache(cache_key, cached_blob,
+                                  /*record_statistics=*/false,
+                                  /*primary_only=*/true);
+  if (status.ok() || !status.IsNotFound()) {
+    return status;
+  }
+
+  return InsertStableBlob(cache_key, &contents, cached_blob);
+}
+
+Status BlobSource::InsertStableBlob(
+    const Slice& cache_key, std::unique_ptr<StableBlobContents>* contents,
+    CacheHandleGuard<StableBlobContents>* cached_blob) const {
+  assert(contents != nullptr && *contents != nullptr);
+  const size_t value_size = (*contents)->size();
+  StableTypedHandle* cache_handle = nullptr;
+  const Status status = stable_blob_cache_.InsertFull(
+      cache_key, contents->get(), (*contents)->ApproximateMemoryUsage(),
+      &cache_handle, Cache::Priority::BOTTOM, lowest_used_cache_tier_);
+  if (!status.ok()) {
+    RecordTick(statistics_, BLOB_DB_CACHE_ADD_FAILURES);
+    return status;
+  }
+
+  [[maybe_unused]] StableBlobContents* const released = contents->release();
+  assert(cache_handle != nullptr);
+  CacheHandleGuard<StableBlobContents> guard(stable_blob_cache_.get(),
+                                             cache_handle);
+  if (cached_blob != nullptr) {
+    *cached_blob = std::move(guard);
+  }
+  RecordTick(statistics_, BLOB_DB_CACHE_ADD);
+  RecordTick(statistics_, BLOB_DB_CACHE_BYTES_WRITE, value_size);
+  return Status::OK();
+}
+
+Status BlobSource::PrepopulateFlushBlob(
+    const Slice& value, uint64_t blob_file_number, uint64_t blob_offset,
+    const StableBlobFingerprint* fingerprint) const {
+  if (!blob_cache_) {
+    return Status::OK();
+  }
+  if (fingerprint == nullptr) {
+    const CacheKey cache_key =
+        GetCacheKey(blob_file_number, /*file_size=*/0, blob_offset);
+    const Status s = blob_cache_.InsertSaved(
+        cache_key.AsSlice(), value, nullptr /*context*/,
+        Cache::Priority::BOTTOM, lowest_used_cache_tier_);
+    if (s.ok()) {
+      RecordTick(statistics_, BLOB_DB_CACHE_ADD);
+      RecordTick(statistics_, BLOB_DB_CACHE_BYTES_WRITE, value.size());
+    } else {
+      RecordTick(statistics_, BLOB_DB_CACHE_ADD_FAILURES);
+    }
+    return s;
+  }
+  std::unique_ptr<StableBlobContents> contents;
+  Status s = StableBlobContents::CreateWithVerifiedValue(
+      value, *fingerprint, stable_blob_cache_.get()->memory_allocator(),
+      &contents);
+  if (!s.ok()) {
+    RecordTick(statistics_, BLOB_DB_CACHE_ADD_FAILURES);
+    return s;
+  }
+  const CacheKey cache_key = StableCacheKey(blob_file_number, blob_offset);
+  return InsertStableBlob(cache_key.AsSlice(), &contents,
+                          /*cached_blob=*/nullptr);
+}
+
 BlobSource::TypedHandle* BlobSource::GetEntryFromCache(const Slice& key) const {
   return blob_cache_.LookupFull(key, nullptr /* context */,
                                 Cache::Priority::BOTTOM, statistics_,
@@ -262,6 +733,112 @@ void BlobSource::PinOwnedBlob(std::unique_ptr<BlobContents>* owned_blob,
         delete static_cast<BlobContents*>(arg1);
       },
       blob, nullptr);
+}
+
+Status BlobSource::PinStableCacheHit(
+    CacheHandleGuard<StableBlobContents>* cached_blob, uint64_t range_offset,
+    size_t range_length, PinnableSlice* value) {
+  const size_t logical_size = cached_blob->GetValue()->size();
+  if (range_length != kWholeBlobLength &&
+      (range_offset > logical_size ||
+       range_length > logical_size - static_cast<size_t>(range_offset))) {
+    return Status::InvalidArgument("Stable blob range is out of bounds");
+  }
+  PinStableCachedBlob(cached_blob, range_offset, range_length, value);
+  return Status::OK();
+}
+
+Status BlobSource::GetIndirectBlobFromCache(const BlobIndex& blob_index,
+                                            uint64_t range_offset,
+                                            size_t range_length,
+                                            PinnableSlice* value) const {
+  assert(value != nullptr);
+  assert(blob_index.IsIndirect());
+  value->Reset();
+  if (range_length != kWholeBlobLength &&
+      blob_index.compression() != kNoCompression) {
+    // A range of a compressed value is not supported, also on a cache hit (see
+    // GetIndirectBlob()). Checking here means that no caller can miss it.
+    return Status::Corruption("Cannot range-read a compressed blob");
+  }
+  if (!stable_blob_cache_) {
+    return Status::NotFound("No stable blob cache");
+  }
+  const CacheKey stable_key = StableCacheKey(
+      blob_index.origin_file_number(), blob_index.original_value_offset());
+  CacheHandleGuard<StableBlobContents> cached_blob;
+  const Status status = GetStableBlobFromCache(
+      stable_key.AsSlice(), &cached_blob,
+      /*record_statistics=*/true, /*primary_only=*/false);
+  if (!status.ok()) {
+    return status;
+  }
+  return PinStableCacheHit(&cached_blob, range_offset, range_length, value);
+}
+
+void BlobSource::PinStableCachedBlob(
+    CacheHandleGuard<StableBlobContents>* cached_blob, uint64_t range_offset,
+    size_t range_length, PinnableSlice* value) {
+  assert(cached_blob != nullptr);
+  assert(cached_blob->GetValue() != nullptr);
+  assert(value != nullptr);
+
+  const Slice full = cached_blob->GetValue()->data();
+  Slice selected = full;
+  if (range_length != kWholeBlobLength) {
+    assert(range_offset <= full.size());
+    assert(range_length <= full.size() - range_offset);
+    selected =
+        Slice(full.data() + static_cast<size_t>(range_offset), range_length);
+  }
+  value->Reset();
+  value->PinSlice(selected, static_cast<Cleanable*>(nullptr));
+  cached_blob->TransferTo(value);
+}
+
+Status BlobSource::FinishIndirectBlobRead(
+    const ReadOptions& read_options, const BlobIndex& blob_index,
+    const CacheKey* stable_cache_key, bool materialized_whole,
+    std::unique_ptr<BlobContents>* physical_value,
+    const std::optional<uint32_t>& value_crc32c, PinnableSlice* result) const {
+  assert(blob_index.IsIndirect());
+  assert(physical_value != nullptr && *physical_value != nullptr);
+  assert(result != nullptr);
+  if (!materialized_whole) {
+    PinOwnedBlob(physical_value, result);
+    return Status::OK();
+  }
+  const bool fill_stable_cache =
+      stable_cache_key != nullptr && read_options.fill_cache;
+  const Slice value = (*physical_value)->data();
+  if (read_options.verify_checksums || fill_stable_cache) {
+    // The reader may have computed the CRC while it checked the record.
+    const uint32_t checksum = value_crc32c.has_value()
+                                  ? *value_crc32c
+                                  : crc32c::Value(value.data(), value.size());
+    if (checksum != blob_index.stable_checksum()) {
+      return Status::Corruption(
+          "Stable blob checksum mismatch",
+          "generation " + std::to_string(blob_index.generation_file_number()) +
+              ", origin " + std::to_string(blob_index.origin_file_number()) +
+              ", original offset " +
+              std::to_string(blob_index.original_value_offset()));
+    }
+  }
+
+  if (fill_stable_cache) {
+    CacheHandleGuard<StableBlobContents> cached_blob;
+    Status status = PutStableBlobIntoCache(
+        stable_cache_key->AsSlice(), blob_index, physical_value, &cached_blob);
+    if (!status.ok()) {
+      return status;
+    }
+    PinStableCachedBlob(&cached_blob, /*range_offset=*/0, kWholeBlobLength,
+                        result);
+    return Status::OK();
+  }
+  PinOwnedBlob(physical_value, result);
+  return Status::OK();
 }
 
 Status BlobSource::InsertEntryIntoCache(const Slice& key, BlobContents* value,
@@ -465,6 +1042,507 @@ Status BlobSource::GetBlobRange(const ReadOptions& read_options,
   return s;
 }
 
+Status BlobSource::GetIndirectBlob(
+    const ReadOptions& read_options, const Slice& user_key,
+    const BlobIndex& blob_index, const BlobPhysicalFile& file,
+    const MutableCFOptions& mutable_cf_options, uint64_t range_offset,
+    size_t range_length, FilePrefetchBuffer* prefetch_buffer,
+    PinnableSlice* value, uint64_t* bytes_read, bool cache_checked) {
+  assert(value != nullptr);
+  value->Reset();
+  if (bytes_read != nullptr) {
+    *bytes_read = 0;
+  }
+  if (range_length != kWholeBlobLength &&
+      blob_index.compression() != kNoCompression) {
+    // As in base RocksDB, a range of a compressed value is not supported, also
+    // when the stable cache holds the value: a byte range cannot be
+    // decompressed alone. Callers read the whole value and slice it.
+    return Status::Corruption("Cannot range-read a compressed blob");
+  }
+  Status status;
+  if (!cache_checked) {
+    status =
+        GetIndirectBlobFromCache(blob_index, range_offset, range_length, value);
+    if (!status.IsNotFound()) {
+      return status;
+    }
+  }
+  status = ValidateIndirectBlobIndexForRead(blob_index, file.is_relocation);
+  if (!status.ok()) {
+    return status;
+  }
+  if (range_length != kWholeBlobLength &&
+      (range_offset > blob_index.size() ||
+       static_cast<uint64_t>(range_length) >
+           blob_index.size() - range_offset)) {
+    return Status::InvalidArgument("Stable blob range is out of bounds");
+  }
+  if (file.open_info.file_number == 0 || file.file_size == 0) {
+    return Status::Corruption("Invalid indirect blob physical file");
+  }
+
+  // The stable cache key is derived only when there is a stable cache. It is
+  // used to fill the cache after the read.
+  CacheKey stable_key;
+  if (stable_blob_cache_) {
+    stable_key = StableCacheKey(blob_index.origin_file_number(),
+                                blob_index.original_value_offset());
+  }
+  if (read_options.read_tier == kBlockCacheTier) {
+    return Status::Incomplete("Cannot read indirect blob: no disk I/O allowed");
+  }
+
+  const bool materialize_whole = range_length == kWholeBlobLength;
+  // A value that will be cached ends up in a buffer from the cache's allocator,
+  // so the cache entry can adopt the buffer without another copy. A relocation
+  // record is read directly into that buffer. A normal blob file value is read
+  // into a local buffer and copied (or decompressed) into it once, as in base.
+  MemoryAllocator* const allocator =
+      stable_blob_cache_ && read_options.fill_cache
+          ? stable_blob_cache_.get()->memory_allocator()
+          : nullptr;
+  // The reader computes the value CRC while it checks the record, when it can
+  // (whole uncompressed values).
+  std::optional<uint32_t> value_crc32c;
+  std::optional<uint32_t>* const value_crc32c_out =
+      materialize_whole && blob_index.compression() == kNoCompression
+          ? &value_crc32c
+          : nullptr;
+  std::unique_ptr<BlobContents> physical_value;
+  uint64_t physical_bytes_read = 0;
+  if (file.is_relocation) {
+    CacheHandleGuard<BlobFileReader> reader;
+    status = blob_file_cache_->GetRelocationFileReader(
+        read_options, file, mutable_cf_options, &reader);
+    if (!status.ok()) {
+      return status;
+    }
+    SameFileBlobStandaloneRead output;
+    RelocationBlobReadRequest request;
+    request.blob_index = &blob_index;
+    request.range_offset = materialize_whole ? 0 : range_offset;
+    request.range_length = materialize_whole ? kWholeBlobLength : range_length;
+    request.status = &status;
+    request.output = &output;
+    reader.GetValue()->relocation()->MultiGetBlob(read_options, allocator,
+                                                  /*num_reads=*/1, &request,
+                                                  &physical_bytes_read);
+    physical_value = std::move(output.contents);
+    if (value_crc32c_out != nullptr) {
+      value_crc32c = output.gen2.payload_crc32c;
+    }
+  } else {
+    status = ReadBlobWithReaderRetry(
+        blob_file_cache_, read_options, file.open_info,
+        [&](BlobFileReader* reader) {
+          // A metadata error: an evict and reopen cannot fix it.
+          return reader->GetCompressionType() == blob_index.compression()
+                     ? Status::OK()
+                     : Status::Corruption(
+                           "Compression type mismatch when reading indirect "
+                           "blob");
+        },
+        [&](BlobFileReader* reader) {
+          physical_value.reset();
+          value_crc32c.reset();
+          physical_bytes_read = 0;
+          if (materialize_whole) {
+            return reader->GetBlob(read_options, user_key,
+                                   blob_index.original_value_offset(),
+                                   blob_index.size(), blob_index.compression(),
+                                   prefetch_buffer, allocator, &physical_value,
+                                   &physical_bytes_read, value_crc32c_out);
+          }
+          return reader->GetBlobRange(
+              read_options, user_key, blob_index.original_value_offset(),
+              blob_index.size(), range_offset, range_length,
+              /*allocator=*/nullptr, &physical_value, &physical_bytes_read);
+        });
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  if (bytes_read != nullptr) {
+    *bytes_read = physical_bytes_read;
+  }
+  // BlobFileReader records these for blob log files. The relocation reader
+  // reads through the table reader, which does not record them, so BlobSource
+  // records them here.
+  if (file.is_relocation) {
+    RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, physical_bytes_read);
+    PERF_COUNTER_ADD(blob_read_count, 1);
+    PERF_COUNTER_ADD(blob_read_byte, physical_bytes_read);
+  }
+  // BlobFileReader and the relocation table reader do not record lazy-read
+  // statistics, so BlobSource records them here. A stable cache hit returns
+  // earlier, so it is not counted.
+  if (read_options.io_activity == Env::IOActivity::kLazyResolve) {
+    RecordLazyRead(statistics_, physical_bytes_read);
+    if (!materialize_whole) {
+      RecordLazyPartialRead(statistics_, physical_bytes_read,
+                            blob_index.size());
+    }
+  }
+
+  return FinishIndirectBlobRead(
+      read_options, blob_index, stable_blob_cache_ ? &stable_key : nullptr,
+      materialize_whole, &physical_value, value_crc32c, value);
+}
+
+void BlobSource::MultiGetIndirectBlobFromOneFile(
+    const ReadOptions& read_options, const BlobPhysicalFile& file,
+    const MutableCFOptions& mutable_cf_options, size_t num_requests,
+    IndirectBlobReadRequest* requests, uint64_t* bytes_read) {
+  if (bytes_read != nullptr) {
+    *bytes_read = 0;
+  }
+  if (num_requests == 0) {
+    return;
+  }
+  assert(requests != nullptr);
+  if (file.open_info.file_number == 0 || file.file_size == 0) {
+    for (size_t i = 0; i < num_requests; ++i) {
+      assert(requests[i].status != nullptr);
+      *requests[i].status =
+          Status::Corruption("Invalid indirect blob physical file");
+    }
+    return;
+  }
+  // One caller, Version::MultiGetBlob, does not limit the number of requests
+  // per file. The fixed-size arrays below hold at most kMaxIndirectBatch
+  // (MultiGetContext::MAX_BATCH_SIZE, 32) requests, so a larger call is split
+  // into chunks of that size. A chunk cannot overflow the uint64_t byte counts
+  // below: a relocation value is at most kMaxSimpleGen2BlobPayloadSize (about
+  // 4 GiB), and a normal blob file read must fit inside the file.
+  if (num_requests > kMaxIndirectBatch) {
+    uint64_t total_bytes_read = 0;
+    for (size_t begin = 0; begin < num_requests; begin += kMaxIndirectBatch) {
+      const size_t count = std::min(num_requests - begin, kMaxIndirectBatch);
+      uint64_t chunk_bytes_read = 0;
+      MultiGetIndirectBlobFromOneFile(read_options, file, mutable_cf_options,
+                                      count, requests + begin,
+                                      &chunk_bytes_read);
+      total_bytes_read += chunk_bytes_read;
+    }
+    if (bytes_read != nullptr) {
+      *bytes_read = total_bytes_read;
+    }
+    return;
+  }
+
+  // A request that needs a file read, with its physical result.
+  struct Pending {
+    size_t request = 0;
+    // Whole value, else an uncompressed range read alone.
+    bool whole = false;
+    // Set only with a stable cache.
+    CacheKey stable_key;
+    // The read outputs:
+    // - out.contents: the physical value.
+    // - out.gen2.payload_crc32c: set by the reader when it computed the value
+    //   CRC while checking the record.
+    SameFileBlobStandaloneRead out;
+  };
+  autovector<Pending, kMaxIndirectBatch> pending;
+  const bool no_io = read_options.read_tier == kBlockCacheTier;
+  for (size_t i = 0; i < num_requests; ++i) {
+    IndirectBlobReadRequest& request = requests[i];
+    assert(request.blob_index != nullptr);
+    assert(request.result != nullptr);
+    assert(request.status != nullptr);
+    const BlobIndex& blob_index = *request.blob_index;
+    request.result->Reset();
+    if (request.range_length != kWholeBlobLength &&
+        blob_index.compression() != kNoCompression) {
+      // A range of a compressed value is not supported (see GetIndirectBlob()).
+      *request.status =
+          Status::Corruption("Cannot range-read a compressed blob");
+      continue;
+    }
+    if (!request.cache_checked) {
+      *request.status =
+          GetIndirectBlobFromCache(blob_index, request.range_offset,
+                                   request.range_length, request.result);
+      if (!request.status->IsNotFound()) {
+        continue;
+      }
+    }
+    *request.status =
+        ValidateIndirectBlobIndexForRead(blob_index, file.is_relocation);
+    if (!request.status->ok()) {
+      continue;
+    }
+    CacheKey stable_key;
+    if (stable_blob_cache_) {
+      stable_key = StableCacheKey(blob_index.origin_file_number(),
+                                  blob_index.original_value_offset());
+    }
+    const bool whole = request.range_length == kWholeBlobLength;
+    if (!whole && (request.range_offset > blob_index.size() ||
+                   static_cast<uint64_t>(request.range_length) >
+                       blob_index.size() - request.range_offset)) {
+      *request.status =
+          Status::InvalidArgument("Stable blob range is out of bounds");
+      continue;
+    }
+    if (no_io) {
+      *request.status =
+          Status::Incomplete("Cannot read indirect blob: no disk I/O allowed");
+      continue;
+    }
+    *request.status = Status::OK();
+    pending.emplace_back();
+    pending.back().request = i;
+    pending.back().whole = whole;
+    pending.back().stable_key = stable_key;
+  }
+  if (pending.empty()) {
+    return;
+  }
+
+  // A value that will be cached ends up in a buffer from the cache's allocator,
+  // so the cache entry can adopt the buffer without another copy. A relocation
+  // record is read directly into that buffer. A normal blob file value is read
+  // into a local buffer and copied (or decompressed) into it once, as in base.
+  MemoryAllocator* const allocator =
+      stable_blob_cache_ && read_options.fill_cache
+          ? stable_blob_cache_.get()->memory_allocator()
+          : nullptr;
+  const auto value_crc32c_out = [requests](Pending& p) {
+    return p.whole && requests[p.request].blob_index->compression() ==
+                          kNoCompression
+               ? &p.out.gen2.payload_crc32c
+               : nullptr;
+  };
+  uint64_t physical_bytes_read = 0;
+  if (file.is_relocation) {
+    CacheHandleGuard<BlobFileReader> reader;
+    Status open_status = blob_file_cache_->GetRelocationFileReader(
+        read_options, file, mutable_cf_options, &reader);
+    if (!open_status.ok()) {
+      for (const Pending& p : pending) {
+        *requests[p.request].status = open_status;
+      }
+      return;
+    }
+    // At most kMaxIndirectBatch requests, kept contiguous for the reader.
+    std::array<RelocationBlobReadRequest, kMaxIndirectBatch>
+        relocation_requests;
+    size_t relocation_count = 0;
+    for (Pending& p : pending) {
+      const IndirectBlobReadRequest& request = requests[p.request];
+      RelocationBlobReadRequest& relocation_request =
+          relocation_requests[relocation_count++];
+      relocation_request.blob_index = request.blob_index;
+      relocation_request.range_offset = p.whole ? 0 : request.range_offset;
+      relocation_request.range_length =
+          p.whole ? kWholeBlobLength : request.range_length;
+      relocation_request.status = request.status;
+      relocation_request.output = &p.out;
+    }
+    reader.GetValue()->relocation()->MultiGetBlob(
+        read_options, allocator, relocation_count, relocation_requests.data(),
+        &physical_bytes_read);
+    RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, physical_bytes_read);
+    PERF_COUNTER_ADD(blob_read_byte, physical_bytes_read);
+  } else {
+    CacheHandleGuard<BlobFileReader> reader;
+    Status open_status = blob_file_cache_->GetBlobFileReader(
+        read_options, file.open_info, &reader);
+    if (!open_status.ok()) {
+      for (const Pending& p : pending) {
+        *requests[p.request].status = open_status;
+      }
+      return;
+    }
+    // Requests and their planned reads; *_owner maps a request to its index in
+    // `pending`.
+    autovector<BlobReadRequest, kMaxIndirectBatch> whole_requests;
+    autovector<BlobRangeReadRequest, kMaxIndirectBatch> range_requests;
+    autovector<size_t, kMaxIndirectBatch> whole_owner;
+    autovector<size_t, kMaxIndirectBatch> range_owner;
+    PlannedReads whole_reads;
+    PlannedReads range_reads;
+    for (size_t position = 0; position < pending.size(); ++position) {
+      Pending& p = pending[position];
+      IndirectBlobReadRequest& request = requests[p.request];
+      const BlobIndex& blob_index = *request.blob_index;
+      if (reader.GetValue()->GetCompressionType() != blob_index.compression()) {
+        *request.status = Status::Corruption(
+            "Compression type mismatch when reading indirect blob");
+        continue;
+      }
+      if (blob_index.size() > std::numeric_limits<size_t>::max()) {
+        *request.status = Status::Corruption("Indirect blob size is too large");
+        continue;
+      }
+      const uint64_t offset = blob_index.original_value_offset();
+      if (p.whole) {
+        whole_requests.emplace_back(
+            request.user_key, offset, static_cast<size_t>(blob_index.size()),
+            blob_index.compression(), /*result=*/nullptr, request.status);
+        if (read_options.verify_checksums) {
+          whole_requests.back().value_crc32c = value_crc32c_out(p);
+        }
+        const std::pair<uint64_t, uint64_t> extent = WholeBlobReadExtent(
+            read_options, request.user_key.size(), offset, blob_index.size());
+        whole_reads.push_back({extent.first, extent.second,
+                               whole_requests.size() - 1, request.user_key});
+        whole_owner.push_back(position);
+      } else {
+        range_requests.emplace_back(request.user_key, offset, blob_index.size(),
+                                    request.range_offset, request.range_length,
+                                    /*result=*/nullptr, request.status);
+        range_reads.push_back({offset + request.range_offset,
+                               request.range_length, range_requests.size() - 1,
+                               request.user_key});
+        range_owner.push_back(position);
+      }
+    }
+    physical_bytes_read += ReadInPlannedBatches(
+        &whole_requests, &whole_reads, allocator, statistics_,
+        [&](autovector<std::pair<BlobReadRequest*,
+                                 std::unique_ptr<BlobContents>>>& batch_reads,
+            uint64_t* batch_bytes_read) {
+          reader.GetValue()->MultiGetBlob(read_options, allocator, batch_reads,
+                                          batch_bytes_read);
+        },
+        [&](size_t request) {
+          return &pending[whole_owner[request]].out.contents;
+        },
+        [&](size_t request) {
+          Pending& p = pending[whole_owner[request]];
+          // The copy has no CRC from the reader; FinishIndirectBlobRead
+          // computes the value CRC again.
+          p.out.gen2.payload_crc32c.reset();
+        });
+    physical_bytes_read += ReadInPlannedBatches(
+        &range_requests, &range_reads, /*allocator=*/nullptr, statistics_,
+        [&](autovector<std::pair<BlobRangeReadRequest*,
+                                 std::unique_ptr<BlobContents>>>& batch_reads,
+            uint64_t* batch_bytes_read) {
+          reader.GetValue()->MultiGetBlobRange(read_options, batch_reads,
+                                               batch_bytes_read);
+        },
+        [&](size_t request) {
+          return &pending[range_owner[request]].out.contents;
+        },
+        [](size_t /*request*/) {});
+    // A Corruption of a whole read may come from a stale cached reader (for
+    // example, the file was replaced). Like MultiGetBlobFromOneFile, those
+    // reads are retried once with a newly opened reader. Range reads are not
+    // retried, like MultiGetBlobRangeFromOneFile.
+    autovector<size_t, kMaxIndirectBatch> stale;
+    for (size_t r = 0; r < whole_requests.size(); ++r) {
+      if (whole_requests[r].status->IsCorruption()) {
+        stale.push_back(r);
+      }
+    }
+    if (!stale.empty()) {
+      reader.Reset();
+      blob_file_cache_->Evict(file.open_info.file_number);
+      std::unique_ptr<BlobFileReader> fresh_reader;
+      const Status reopen_status = blob_file_cache_->OpenBlobFileReaderUncached(
+          read_options, file.open_info, &fresh_reader,
+          /*allow_footer_skip_retry=*/false);
+      if (!reopen_status.ok()) {
+        for (size_t r : stale) {
+          *whole_requests[r].status = AppendBlobRefreshRetryFailure(
+              *whole_requests[r].status, reopen_status);
+        }
+      } else {
+        autovector<BlobReadRequest, kMaxIndirectBatch> retry_requests;
+        autovector<Status, kMaxIndirectBatch> stale_statuses;
+        PlannedReads retry_reads;
+        for (size_t r : stale) {
+          BlobReadRequest& request = whole_requests[r];
+          stale_statuses.push_back(*request.status);
+          // Only a failed retry reads the stale status.
+          stale_statuses.back().PermitUncheckedError();
+          *request.status = Status::OK();
+          pending[whole_owner[r]].out.gen2.payload_crc32c.reset();
+          retry_requests.push_back(request);
+          const std::pair<uint64_t, uint64_t> extent =
+              WholeBlobReadExtent(read_options, request.user_key->size(),
+                                  request.offset, request.len);
+          retry_reads.push_back({extent.first, extent.second,
+                                 retry_requests.size() - 1, *request.user_key});
+        }
+        physical_bytes_read += ReadInPlannedBatches(
+            &retry_requests, &retry_reads, allocator, statistics_,
+            [&](autovector<
+                    std::pair<BlobReadRequest*, std::unique_ptr<BlobContents>>>&
+                    batch_reads,
+                uint64_t* batch_bytes_read) {
+              fresh_reader->MultiGetBlob(read_options, allocator, batch_reads,
+                                         batch_bytes_read);
+            },
+            [&](size_t k) {
+              return &pending[whole_owner[stale[k]]].out.contents;
+            },
+            [&](size_t k) {
+              pending[whole_owner[stale[k]]].out.gen2.payload_crc32c.reset();
+            });
+        bool install_fresh_reader = false;
+        for (size_t k = 0; k < stale.size(); ++k) {
+          Status* const status = retry_requests[k].status;
+          if (status->ok()) {
+            install_fresh_reader = true;
+          } else {
+            *status = AppendBlobRefreshRetryFailure(stale_statuses[k], *status);
+          }
+        }
+        if (install_fresh_reader) {
+          CacheHandleGuard<BlobFileReader> ignored_reader;
+          blob_file_cache_
+              ->RefreshBlobFileReader(file.open_info, &fresh_reader,
+                                      &ignored_reader)
+              .PermitUncheckedError();
+        }
+      }
+    }
+  }
+
+  size_t successful_reads = 0;
+  for (Pending& p : pending) {
+    IndirectBlobReadRequest& request = requests[p.request];
+    if (!request.status->ok()) {
+      continue;
+    }
+    ++successful_reads;
+    if (read_options.io_activity == Env::IOActivity::kLazyResolve) {
+      // For a relocation file this is an estimate: the range length for an
+      // uncompressed range read, else the record size (value plus
+      // kSimpleGen2BlobTrailerSize, 5 bytes). It does not count the index and
+      // data block reads.
+      const BlobIndex& blob_index = *request.blob_index;
+      const uint64_t read_size =
+          !p.whole ? request.range_length
+          : file.is_relocation
+              ? blob_index.size() + kSimpleGen2BlobTrailerSize
+              : WholeBlobReadExtent(read_options, request.user_key.size(),
+                                    blob_index.original_value_offset(),
+                                    blob_index.size())
+                    .second;
+      RecordLazyRead(statistics_, read_size);
+      if (!p.whole) {
+        RecordLazyPartialRead(statistics_, read_size, blob_index.size());
+      }
+    }
+    *request.status = FinishIndirectBlobRead(
+        read_options, *request.blob_index,
+        stable_blob_cache_ ? &p.stable_key : nullptr, p.whole, &p.out.contents,
+        p.out.gen2.payload_crc32c, request.result);
+  }
+  if (file.is_relocation) {
+    PERF_COUNTER_ADD(blob_read_count, successful_reads);
+  }
+  if (bytes_read != nullptr) {
+    *bytes_read = physical_bytes_read;
+  }
+}
+
 Status BlobSource::GetSimpleGen2Blob(
     const ReadOptions& read_options, const OffsetableCacheKey& base_cache_key,
     RandomAccessFileReader* file, uint64_t record_offset, uint64_t payload_size,
@@ -511,8 +1589,9 @@ Status BlobSource::GetSimpleGen2Blob(
 
   // Cache miss (or no cache configured). Read the record into a buffer
   // allocated from the blob cache's memory allocator when we intend to insert
-  // it, exposing the uncompressed payload as BlobContents (the trailer just
-  // sits unused at the tail of the buffer).
+  // it. An uncompressed payload is exposed as BlobContents in place (the
+  // trailer sits unused at the tail of the buffer); a compressed payload is
+  // decompressed into a new buffer.
   MemoryAllocator* const allocator = (blob_cache_ && read_options.fill_cache)
                                          ? blob_cache_.get()->memory_allocator()
                                          : nullptr;
@@ -527,8 +1606,19 @@ Status BlobSource::GetSimpleGen2Blob(
     return s;
   }
 
-  std::unique_ptr<BlobContents> blob_contents(
-      new BlobContents(std::move(buf), static_cast<size_t>(payload_size)));
+  std::unique_ptr<BlobContents> blob_contents;
+  if (expected_compression == kNoCompression) {
+    blob_contents.reset(
+        new BlobContents(std::move(buf), static_cast<size_t>(payload_size)));
+  } else {
+    s = UncompressBlobContentsIfNeeded(
+        Slice(buf.get(), static_cast<size_t>(payload_size)),
+        expected_compression, simple_gen2_decompressor_.get(), allocator,
+        clock_, statistics_, &blob_contents);
+    if (!s.ok()) {
+      return s;
+    }
+  }
 
   // Record the per-read statistics (mirrors BlobFileReader::GetBlob).
   RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, record_size);
@@ -712,8 +1802,19 @@ void BlobSource::MultiGetSimpleGen2Blob(
       continue;
     }
     const uint64_t record_size = pending[k].record_size;
-    std::unique_ptr<BlobContents> blob_contents(new BlobContents(
-        std::move(pending[k].buf), static_cast<size_t>(req.payload_size)));
+    std::unique_ptr<BlobContents> blob_contents;
+    if (req.expected_compression == kNoCompression) {
+      blob_contents.reset(new BlobContents(
+          std::move(pending[k].buf), static_cast<size_t>(req.payload_size)));
+    } else {
+      *req.status = UncompressBlobContentsIfNeeded(
+          Slice(pending[k].buf.get(), static_cast<size_t>(req.payload_size)),
+          req.expected_compression, simple_gen2_decompressor_.get(), allocator,
+          clock_, statistics_, &blob_contents);
+      if (!req.status->ok()) {
+        continue;
+      }
+    }
 
     RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, record_size);
     PERF_COUNTER_ADD(blob_read_count, 1);

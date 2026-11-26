@@ -13,10 +13,13 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -1016,6 +1019,89 @@ class TargetCacheChargeTrackingCache : public CacheWrapper {
   bool last_peak_tracked_;
   std::deque<std::size_t> cache_charge_peaks_;
   std::size_t cache_charge_increments_sum_;
+};
+
+// Background: VersionSet::LogAndApply() puts its writers in the MANIFEST
+// writer queue. The writer at the head of the queue processes a batch of the
+// writers queued behind it. Some tests need a known batch layout. This helper
+// gives one: it blocks the first MANIFEST write that starts after Install(),
+// so that the next callers queue in a known order, and it counts every
+// LogAndApply() caller that reaches the queue, including the first one. When
+// the test releases the first write, the next queued caller leads a batch with
+// the writers behind it.
+//
+// Usage:
+// 1. Call Install(), then enable sync point processing.
+// 2. Start a caller that writes the MANIFEST, then call
+//    WaitForFirstWriteBlocked().
+// 3. Start the other callers one at a time. After each one, call
+//    WaitForQueuedCallers() with the total number of callers started so far,
+//    including the first one.
+// 4. Call ReleaseFirstWrite().
+// The sync point callbacks use this object, so clear them before it is
+// destroyed.
+class ManifestWriteBlocker {
+ public:
+  // Sets the callbacks of the sync points
+  // VersionSet::LogAndApply:BeforeWriterWaiting and
+  // VersionSet::LogAndApply:WriteManifestStart.
+  void Install() {
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionSet::LogAndApply:BeforeWriterWaiting", [this](void*) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          ++queued_callers_;
+          changed_.notify_all();
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionSet::LogAndApply:WriteManifestStart", [this](void*) {
+          std::unique_lock<std::mutex> lock(mutex_);
+          ++manifest_writes_;
+          if (first_write_blocked_) {
+            return;
+          }
+          first_write_blocked_ = true;
+          changed_.notify_all();
+          changed_.wait(lock, [this] { return release_first_write_; });
+        });
+  }
+
+  // The Wait functions return false when the event does not happen within
+  // 50 seconds, so that a test fails at its line instead of hanging. Use them
+  // in ASSERT_TRUE().
+  bool WaitForFirstWriteBlocked() {
+    return WaitFor([this] { return first_write_blocked_; });
+  }
+
+  // Waits until `count` LogAndApply() callers in total, including the first
+  // one, have reached the queue since Install().
+  bool WaitForQueuedCallers(int count) {
+    return WaitFor([this, count] { return queued_callers_ >= count; });
+  }
+
+  void ReleaseFirstWrite() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_first_write_ = true;
+    changed_.notify_all();
+  }
+
+  // Returns the number of MANIFEST writes that started since Install().
+  int manifest_writes() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return manifest_writes_;
+  }
+
+ private:
+  bool WaitFor(const std::function<bool()>& done) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, std::chrono::seconds(50), done);
+  }
+
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  int queued_callers_ = 0;
+  int manifest_writes_ = 0;
+  bool first_write_blocked_ = false;
+  bool release_first_write_ = false;
 };
 
 class DBTestBase : public testing::Test {
