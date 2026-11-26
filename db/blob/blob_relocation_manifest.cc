@@ -22,6 +22,7 @@
 #include "db/blob/blob_read_request.h"
 #include "port/lang.h"
 #include "util/coding.h"
+#include "util/hash.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -323,6 +324,51 @@ size_t BlobFileTable::ApproximateMemoryUsage() const {
   return bytes;
 }
 
+namespace {
+
+// Each relocation file and each route has its own 128-bit digest: Hash2x64 of
+// an encoding that starts with a type tag (1 = file, 2 = route).
+// BlobRelocationState adds the digest of an item when the item is set and
+// subtracts it when the item is replaced or deleted. Sums do not depend on
+// order, so the state fingerprint does not depend on the order of edits.
+// AddDigest() adds the digest of `encoded` when `add` is true, else subtracts
+// it.
+void AddDigest(const std::string& encoded, bool add, uint64_t* high,
+               uint64_t* low) {
+  uint64_t digest_high = 0;
+  uint64_t digest_low = 0;
+  Hash2x64(encoded.data(), encoded.size(), &digest_high, &digest_low);
+  if (add) {
+    *high += digest_high;
+    *low += digest_low;
+  } else {
+    *high -= digest_high;
+    *low -= digest_low;
+  }
+}
+
+std::string EncodeFileForDigest(const BlobRelocationFileMetaData& file) {
+  std::string encoded;
+  PutFixed32(&encoded, 1U /* relocation file */);
+  PutFixed64(&encoded, file.GetFileNumber());
+  PutFixed64(&encoded, file.GetFileSize());
+  PutLengthPrefixedSlice(&encoded, file.GetChecksumMethod());
+  PutLengthPrefixedSlice(&encoded, file.GetChecksumValue());
+  PutFixed32(&encoded, file.GetDirectoryDigest());
+  PutFixed32(&encoded, file.IsMarkedLost() ? 1U : 0U);
+  return encoded;
+}
+
+std::string EncodeRouteForDigest(uint64_t source, uint64_t target) {
+  std::string encoded;
+  PutFixed32(&encoded, 2U /* route */);
+  PutFixed64(&encoded, source);
+  PutFixed64(&encoded, target);
+  return encoded;
+}
+
+}  // namespace
+
 // BlobRelocationState
 
 const BlobRelocationState::Files& BlobRelocationState::files() const {
@@ -383,6 +429,56 @@ void BlobRelocationState::Seal() {
   table_.Apply(ops);
 }
 
+size_t BlobRelocationState::IncrementalRetentionBytes(
+    const BlobRelocationState& base,
+    const std::vector<uint64_t>& changed_files) const {
+  // A census change log entry that holds this state is charged the result.
+  //
+  // Counted:
+  // - The BlobRelocationState object itself (sizeof(*this)).
+  // - The files vectors of both states, when this state has its own copy.
+  // - The metadata of each changed relocation file, old and new. No other
+  //   reservation charges this metadata, and an earlier change log entry can
+  //   still hold the old one. Each object counts as its size plus 8 pointers
+  //   (an estimate of the allocation overhead) plus its checksum strings.
+  //
+  // Not counted: the file table. Its shards and top arrays are charged by
+  // ownership to the file metadata reservation (see
+  // BlobFileTable::SetCacheReservationManager()). Each shard is charged once
+  // and released when its last holder frees it, so the table stays charged
+  // while any entry or Version holds it. Counting it per entry would charge the
+  // table copy of every flush again.
+  size_t bytes = sizeof(*this);
+  const auto add = [&bytes](size_t count, size_t item_bytes) {
+    if (item_bytes != 0 &&
+        count > (std::numeric_limits<size_t>::max() - bytes) / item_bytes) {
+      bytes = std::numeric_limits<size_t>::max();
+    } else {
+      bytes += count * item_bytes;
+    }
+  };
+  if (files_ != base.files_) {
+    add(files().capacity() + base.files().capacity(),
+        sizeof(std::shared_ptr<BlobRelocationFileMetaData>));
+  }
+  for (uint64_t file_number : changed_files) {
+    const BlobRelocationFileMetaData* const old_file =
+        base.PeekFile(file_number);
+    const BlobRelocationFileMetaData* const new_file = PeekFile(file_number);
+    if (old_file == new_file) {
+      continue;
+    }
+    for (const BlobRelocationFileMetaData* file : {old_file, new_file}) {
+      if (file != nullptr) {
+        add(1, sizeof(BlobRelocationFileMetaData) + 8 * sizeof(void*));
+        add(file->GetChecksumMethod().capacity(), 1);
+        add(file->GetChecksumValue().capacity(), 1);
+      }
+    }
+  }
+  return bytes;
+}
+
 std::shared_ptr<BlobRelocationFileMetaData> BlobRelocationState::FindFile(
     uint64_t file_number) const {
   const BlobRelocationFileMetaData* file = PeekFile(file_number);
@@ -423,6 +519,18 @@ void BlobRelocationState::SetFile(
   assert(file != nullptr);
   const uint64_t file_number = file->GetFileNumber();
   const BlobRelocationFileMetaData* previous = PeekFile(file_number);
+  if (previous != nullptr) {
+    AddDigest(EncodeFileForDigest(*previous), /*add=*/false, &digest_high_,
+              &digest_low_);
+    if (previous->IsMarkedLost()) {
+      --lost_file_count_;
+    }
+  }
+  AddDigest(EncodeFileForDigest(*file), /*add=*/true, &digest_high_,
+            &digest_low_);
+  if (file->IsMarkedLost()) {
+    ++lost_file_count_;
+  }
   if (previous != nullptr && !aggregate_overflow_) {
     physical_file_bytes_ -= previous->GetFileSize();
     record_bytes_ -= previous->GetTotalRecordBytes();
@@ -442,7 +550,7 @@ void BlobRelocationState::SetFile(
     Lookup(file_number, &route_count);
   }
   Stage(file_number,
-        BlobFileTable::RelocationFileValue(file.get(), /*lost=*/false),
+        BlobFileTable::RelocationFileValue(file.get(), file->IsMarkedLost()),
         route_count);
   Files& files = MutableFiles();
   const auto it = std::lower_bound(
@@ -460,6 +568,11 @@ void BlobRelocationState::DeleteFile(uint64_t file_number) {
   const BlobRelocationFileMetaData* file = PeekFile(file_number);
   if (file == nullptr) {
     return;
+  }
+  AddDigest(EncodeFileForDigest(*file), /*add=*/false, &digest_high_,
+            &digest_low_);
+  if (file->IsMarkedLost()) {
+    --lost_file_count_;
   }
   if (!aggregate_overflow_) {
     physical_file_bytes_ -= file->GetFileSize();
@@ -498,9 +611,13 @@ void BlobRelocationState::SetRoute(const BlobRelocationRoute& route) {
   }
   if (previous != kInvalidBlobFileNumber) {
     AdjustRouteCount(previous, -1);
+    AddDigest(EncodeRouteForDigest(source, previous), /*add=*/false,
+              &digest_high_, &digest_low_);
   } else {
     ++route_count_;
   }
+  AddDigest(EncodeRouteForDigest(source, target), /*add=*/true, &digest_high_,
+            &digest_low_);
   Stage(source, BlobFileTable::RouteValue(target), /*count=*/0);
   AdjustRouteCount(target, 1);
 }
@@ -510,6 +627,8 @@ void BlobRelocationState::DeleteRoute(uint64_t old_file_number) {
   if (target == kInvalidBlobFileNumber) {
     return;
   }
+  AddDigest(EncodeRouteForDigest(old_file_number, target), /*add=*/false,
+            &digest_high_, &digest_low_);
   Stage(old_file_number, 0, /*count=*/0);
   --route_count_;
   AdjustRouteCount(target, -1);
@@ -525,6 +644,19 @@ void BlobRelocationState::DeleteBlobFile(uint64_t file_number) {
   if (BlobFileTable::IsBlobFile(Lookup(file_number))) {
     Stage(file_number, 0, /*count=*/0);
   }
+}
+
+void BlobRelocationState::ComputeFingerprint(uint32_t format_version,
+                                             uint64_t* high,
+                                             uint64_t* low) const {
+  std::string encoded;
+  PutFixed32(&encoded, 3U /* fingerprint encoding version */);
+  PutFixed32(&encoded, format_version);
+  PutFixed64(&encoded, files().size());
+  PutFixed64(&encoded, route_count_);
+  PutFixed64(&encoded, digest_high_);
+  PutFixed64(&encoded, digest_low_);
+  Hash2x64(encoded.data(), encoded.size(), high, low);
 }
 
 // BlobRelocationFileAddition

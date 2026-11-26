@@ -22,6 +22,7 @@ enum class PeriodicTaskType : uint8_t {
   kFlushInfoLog,
   kRecordSeqnoTime,
   kTriggerCompaction,
+  kBlobReferenceCensus,
   kMax,
 };
 

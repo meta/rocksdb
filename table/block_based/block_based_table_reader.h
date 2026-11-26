@@ -515,6 +515,11 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
 
   std::shared_ptr<const TableProperties> GetTableProperties() const override;
 
+  Status ReadBlobReferenceGroups(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const std::function<Status(size_t buffer_bytes)>& before_allocation,
+      std::vector<BlobReferenceGroup>* groups) const override;
+
   const SeqnoToTimeMapping& GetSeqnoToTimeMapping() const;
 
   size_t ApproximateMemoryUsage() const override;

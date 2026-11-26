@@ -160,10 +160,13 @@
 // - Blob file retirement (kBlobFileRetirement): removes a live indirect-origin
 //   blob file that GC has collected. A file with live values also gets its
 //   route in the same edit.
-// - Accepted loss (kBlobPhysicalFileLoss): records that a relocation file is
-//   lost. It never names a normal or indirect-origin blob file; a missing one
-//   uses the base dropped-file record (kDroppedBlobFile). VersionEdit decodes
-//   the record, but VersionBuilder fails on it with NotSupported.
+// - Accepted loss (kBlobPhysicalFileLoss): records that the bytes of a live
+//   relocation file are gone. It never names a normal or indirect-origin blob
+//   file; a missing one uses the base dropped-file record (kDroppedBlobFile).
+//   VersionBuilder keeps the file in the Version and marks it lost, and reads
+//   of its values return NotFound. Only tests create a loss.
+//   WriteCurrentStateToManifest() writes the record again for each file that
+//   is marked lost.
 // - The DB-global fence stays set even after the last fenced column family is
 //   dropped.
 //
@@ -172,8 +175,8 @@
 // New file numbers come from one DB-wide counter, so two column families do
 // not get the same file number. Nothing checks this across column families.
 // These checks keep a wrong MANIFEST record from deleting or misreading a file:
-// - Per column family: VersionBuilder applies relocation, route and retirement
-//   records to the state of the edit's own column family. It rejects a
+// - Per column family: VersionBuilder applies relocation, route, retirement and
+//   loss records to the state of the edit's own column family. It rejects a
 //   relocation file whose number is already an SST, a blob file, a route or a
 //   different relocation file there (an identical repeated record, as at
 //   replay, is accepted); a new SST whose number is a relocation file there; a
@@ -181,8 +184,9 @@
 //   route an earlier edit of the same VersionBuilder, or the same edit,
 //   deleted; a new blob file whose number is a relocation file there; a
 //   route whose target is not a live relocation file there; a relocation file
-//   deletion that names no live relocation file there; and a route deletion
-//   that names no route there.
+//   deletion that names no live relocation file there; a route deletion that
+//   names no route there; and a loss record that names no live relocation
+//   file there.
 // - Purge: the obsolete file purge is DB-wide. A .blob file stays while any
 //   column family's Version lists it as a blob file or a relocation file
 //   (Version::RemoveLiveFiles() for a normal purge, Version::AddLiveFiles()
@@ -355,11 +359,29 @@ class BlobRelocationFileMetaData {
   uint32_t GetDirectoryDigest() const { return addition_.GetDirectoryDigest(); }
   const BlobRelocationFileAddition& GetAddition() const { return addition_; }
 
+  // An accepted loss is recorded per Version, not on the physical file: older
+  // Versions without the loss can still read the file. This returns a copy of
+  // `backing` that is marked lost. The copy keeps `backing` alive, so the file
+  // still has exactly one owner object, whose release makes the file obsolete.
+  // A Version with the loss never reads the file, even if a copy of the file
+  // appears on disk again later.
+  static std::shared_ptr<BlobRelocationFileMetaData> CreateMarkedLost(
+      std::shared_ptr<BlobRelocationFileMetaData> backing) {
+    std::shared_ptr<BlobRelocationFileMetaData> marked =
+        Create(backing->GetAddition());
+    marked->lost_ = true;
+    marked->backing_metadata_ = std::move(backing);
+    return marked;
+  }
+  bool IsMarkedLost() const { return lost_; }
+
  private:
   explicit BlobRelocationFileMetaData(BlobRelocationFileAddition addition)
       : addition_(std::move(addition)) {}
 
   BlobRelocationFileAddition addition_;
+  std::shared_ptr<BlobRelocationFileMetaData> backing_metadata_;
+  bool lost_ = false;
 };
 
 // A route: sends reads of an old file number (a reference's generation number)
@@ -451,11 +473,8 @@ class BlobRelocationRouteDeletion {
 //     kMaxBlobRelocationFileNumber (2^62 - 1), so the target always fits.
 //   - live blob file: the BlobFileMetaData pointer, low 3 bits 0.
 //   - live relocation file: the BlobRelocationFileMetaData pointer, with bit 1
-//     (value 2) set. Bit 2 (value 4) marks a relocation file whose loss was
-//     accepted (kBlobPhysicalFileLoss). VersionBuilder rejects every such
-//     record with NotSupported, so only tests set the bit. The bit exists so
-//     that a later change can apply accepted-loss records without a change to
-//     the file table's tagged value layout.
+//     (value 2) set. Bit 2 (value 4) marks a relocation file that a loss
+//     record (kBlobPhysicalFileLoss) names.
 //
 // Ownership: the table does not own the metadata. The Version's blob file and
 // relocation file vectors own it, and they always hold the same files as the
@@ -691,6 +710,9 @@ class BlobRelocationState {
         route_count_(base.route_count_),
         physical_file_bytes_(base.physical_file_bytes_),
         record_bytes_(base.record_bytes_),
+        lost_file_count_(base.lost_file_count_),
+        digest_high_(base.digest_high_),
+        digest_low_(base.digest_low_),
         aggregate_overflow_(base.aggregate_overflow_),
         validated_(base.validated()) {
     assert(base.pending_.empty());
@@ -723,6 +745,8 @@ class BlobRelocationState {
   // True once one of the two totals above would overflow. The totals then stop
   // changing, and Version validation fails with Corruption.
   bool AggregateOverflow() const { return aggregate_overflow_; }
+  // True when at least one relocation file is marked lost (an accepted loss).
+  bool HasLostFiles() const { return lost_file_count_ != 0; }
   std::shared_ptr<BlobRelocationFileMetaData> FindFile(
       uint64_t file_number) const;
   // Like FindFile(), without copying the shared pointer (read path).
@@ -759,6 +783,21 @@ class BlobRelocationState {
     table_.SetCacheReservationManager(std::move(manager));
   }
   bool sealed() const { return pending_.empty(); }
+  // Computes a 128-bit fingerprint of the relocation files and routes in O(1).
+  // SetFile(), DeleteFile(), SetRoute() and DeleteRoute() keep two running
+  // digest sums up to date, so the result does not depend on the order of the
+  // changes. The fingerprint also covers `format_version` and the file and
+  // route counts.
+  void ComputeFingerprint(uint32_t format_version, uint64_t* high,
+                          uint64_t* low) const;
+  // Returns an estimate, meant as an upper bound, of the memory that this state
+  // keeps alive beyond `base` and that no other reservation charges.
+  // `changed_files` lists the relocation files that can differ between the two
+  // states. The file table is not counted (the reason is in
+  // IncrementalRetentionBytes() in blob_relocation_manifest.cc).
+  size_t IncrementalRetentionBytes(
+      const BlobRelocationState& base,
+      const std::vector<uint64_t>& changed_files) const;
 
   // True when this state was fully checked, or when VersionBuilder checked
   // every change on top of a checked base
@@ -791,6 +830,10 @@ class BlobRelocationState {
   size_t route_count_ = 0;
   uint64_t physical_file_bytes_ = 0;
   uint64_t record_bytes_ = 0;
+  size_t lost_file_count_ = 0;
+  // Sums of the digests of every relocation file and route.
+  uint64_t digest_high_ = 0;
+  uint64_t digest_low_ = 0;
   bool aggregate_overflow_ = false;
   mutable std::atomic<bool> validated_{false};
 };
