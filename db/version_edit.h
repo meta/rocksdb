@@ -436,16 +436,18 @@ struct FileMetaData {
   // reference, its generation number). See "Coarse SST" in
   // db/blob/blob_reference_metadata.h.
   uint64_t oldest_coarse_indirect_origin_file_number = kInvalidBlobFileNumber;
-  // Marks an SST that has no descriptor and no coarse frontier, in a CF with
-  // the format fence, so that recovery accepts the SST. Such an SST was created
-  // before the format was activated. VersionBuilder sets it in memory for such
-  // an SST. A MANIFEST snapshot sets it for every SST of a fenced CF that has
-  // no descriptor and no coarse frontier, and writes it as an unignorable
-  // NewFile field. Edits that copy the file metadata (AddExistingFile()) carry
-  // it. Why the snapshot writes it: in a snapshot the format fence comes before
-  // (or in the same edit as) the SSTs of the CF, so replay checks every SST as
-  // one added after the fence. The marker lets replay accept an SST that has no
-  // descriptor and no coarse frontier.
+  // Marks an SST in a CF with the format fence that has no descriptor and no
+  // coarse frontier, so that recovery accepts the SST. There are two cases: an
+  // SST created before the format was activated, and an SST whose coarse
+  // classification has frontier 0 (it has no indirect references; see
+  // ExtractBlobReferenceClassificationFromTableProperties()). VersionBuilder
+  // sets it in memory for such an SST. A MANIFEST snapshot sets it for every
+  // SST of a fenced CF that has no descriptor and no coarse frontier, and
+  // writes it as an unignorable NewFile field. Edits that copy the file
+  // metadata (AddExistingFile()) carry it. Why the snapshot writes it: in a
+  // snapshot the format fence comes before (or in the same edit as) the SSTs of
+  // the CF, so replay checks every SST as one added after the fence. The marker
+  // lets replay accept an SST that has no descriptor and no coarse frontier.
   bool blob_reference_legacy_metadata = false;
 
   // Skips prefetching index and filter blocks into block cache on file open,

@@ -339,6 +339,13 @@ void LevelCompactionBuilder::SetupInitialFiles() {
 }
 
 bool LevelCompactionBuilder::SetupOtherL0FilesIfNeeded() {
+  // An L0 trivial move takes L0 files with disjoint key ranges and already
+  // keeps whole epoch runs (see TryPickL0TrivialMove()), so it skips
+  // ExpandExactL0Inputs().
+  if (start_level_ == 0 && !is_l0_trivial_move_ &&
+      !vstorage_->ExpandExactL0Inputs(&start_level_inputs_.files)) {
+    return false;
+  }
   if (start_level_ == 0 && output_level_ != 0 && !is_l0_trivial_move_) {
     return compaction_picker_->GetOverlappingL0Files(
         vstorage_, &start_level_inputs_, output_level_, &parent_index_);
@@ -682,6 +689,14 @@ bool LevelCompactionBuilder::TryPickL0TrivialMove() {
       CompactionInputFiles output_level_inputs;
       output_level_inputs.level = output_level_;
       FileMetaData* file = *it;
+      // A coarse file must be rewritten when it leaves L0, so the move stops
+      // before it. Files picked so far still move. The coarse file waits for a
+      // normal compaction. The ticker counts this stop before the move checks
+      // below (see COMPACTION_COARSE_L0_TRIVIAL_MOVE_BLOCKED).
+      if (Compaction::MustRewriteCoarseL0File(*file)) {
+        RecordTick(ioptions_.stats, COMPACTION_COARSE_L0_TRIVIAL_MOVE_BLOCKED);
+        break;
+      }
       if (it == level_files.rbegin()) {
         my_smallest = file->smallest;
         my_largest = file->largest;
@@ -703,6 +718,23 @@ bool LevelCompactionBuilder::TryPickL0TrivialMove() {
         start_level_inputs_.files.push_back(file);
       } else {
         break;
+      }
+    }
+    // The files of an epoch run (see VersionStorageInfo::ExpandExactL0Inputs())
+    // must move together. The loop visits files oldest first, from the back
+    // of level_files (which is newest first). cut_epoch is the epoch of the
+    // next newer file, where the loop stopped. If the newest picked files have
+    // that epoch, the loop cut their run: drop them. This also drops a group
+    // whose run has no exact file. That is safe, because it only makes the
+    // trivial move smaller.
+    if (vstorage_->HasBlobIndirectionFormat() &&
+        start_level_inputs_.size() < level_files.size()) {
+      const uint64_t cut_epoch =
+          level_files[level_files.size() - start_level_inputs_.size() - 1]
+              ->epoch_number;
+      while (!start_level_inputs_.empty() &&
+             start_level_inputs_.files.back()->epoch_number == cut_epoch) {
+        start_level_inputs_.files.pop_back();
       }
     }
   }
@@ -928,18 +960,35 @@ bool LevelCompactionBuilder::PickIntraL0Compaction() {
   start_level_inputs_.clear();
   const std::vector<FileMetaData*>& level_files =
       vstorage_->LevelFiles(0 /* level */);
-  if (level_files.size() <
-          static_cast<size_t>(
-              mutable_cf_options_.level0_file_num_compaction_trigger + 2) ||
+  // The trigger counts sorted runs: an exact epoch run counts once (see
+  // VersionStorageInfo::NumL0SortedRuns()).
+  if (level_files.empty() ||
+      vstorage_->NumL0SortedRuns() <
+          mutable_cf_options_.level0_file_num_compaction_trigger + 2 ||
       level_files[0]->being_compacted) {
     // If L0 isn't accumulating much files beyond the regular trigger, don't
     // resort to L0->L0 compaction yet.
     return false;
   }
-  return PickCostBasedIntraL0Compaction(
-      level_files, kMinFilesForIntraL0Compaction,
-      std::numeric_limits<uint64_t>::max(),
-      mutable_cf_options_.max_compaction_bytes, &start_level_inputs_);
+  if (!PickCostBasedIntraL0Compaction(
+          level_files, kMinFilesForIntraL0Compaction,
+          std::numeric_limits<uint64_t>::max(),
+          mutable_cf_options_.max_compaction_bytes, &start_level_inputs_)) {
+    return false;
+  }
+  // The minimum also counts sorted runs, so that one exact epoch run is never
+  // picked alone and rewritten into itself. It counts the whole runs that
+  // SetupOtherL0FilesIfNeeded() expands the pick to.
+  if (vstorage_->HasBlobIndirectionFormat()) {
+    std::vector<FileMetaData*> expanded = start_level_inputs_.files;
+    if (!vstorage_->ExpandExactL0Inputs(&expanded) ||
+        vstorage_->CountL0SortedRuns(expanded) <
+            kMinFilesForIntraL0Compaction) {
+      start_level_inputs_.clear();
+      return false;
+    }
+  }
+  return true;
 }
 
 bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
@@ -950,9 +999,12 @@ bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
   }
   const std::vector<FileMetaData*>& l0_files =
       vstorage_->LevelFiles(/*level=*/0);
+  // The minimum counts sorted runs: an exact epoch run counts once (see
+  // VersionStorageInfo::NumL0SortedRuns()). Counting its files would pick the
+  // same run again after each compaction that the reference cap cuts.
   size_t min_num_file =
       std::max(2, mutable_cf_options_.level0_file_num_compaction_trigger);
-  if (l0_files.size() < min_num_file) {
+  if (static_cast<size_t>(vstorage_->NumL0SortedRuns()) < min_num_file) {
     return false;
   }
   uint64_t l0_size = 0;
@@ -988,7 +1040,7 @@ bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
     }
     start_level_inputs_.files.push_back(file);
   }
-  if (start_level_inputs_.files.size() < min_num_file) {
+  if (vstorage_->CountL0SortedRuns(start_level_inputs_.files) < min_num_file) {
     start_level_inputs_.clear();
     return false;
   }

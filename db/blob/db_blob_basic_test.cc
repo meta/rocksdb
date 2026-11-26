@@ -41,6 +41,7 @@
 #include "options/cf_options.h"
 #include "port/stack_trace.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/experimental.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/lazy_wide_columns.h"
 #include "rocksdb/trace_reader_writer.h"
@@ -426,6 +427,7 @@ class DBBlobBasicTest : public DBTestBase {
       EXPECT_OK(Put(Key(i), std::string(10 + i % 23, 'v')));
     }
     EXPECT_OK(Flush());
+    EXPECT_OK(BuildExactSstAtLevel1());
     return options;
   }
 
@@ -463,6 +465,180 @@ class DBBlobBasicTest : public DBTestBase {
         Slice(contents.data() + handle.offset(), handle.size()), descriptor,
         &index));
     return index;
+  }
+
+  // Compacts each L0 SST alone into `level`, so SSTs with separate key ranges
+  // stay separate. When `level` is 1 or higher, each output has exact metadata.
+  void CompactEachL0FileTo(int level) {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    for (const auto& file : metadata.levels[0].files) {
+      ASSERT_OK(db_->CompactFiles(CompactionOptions(), {file.name}, level));
+    }
+  }
+
+  Status BuildExactSstAtLevel1() {
+    CompactRangeOptions compact_options;
+    compact_options.change_level = true;
+    compact_options.target_level = 1;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    compact_options.blob_garbage_collection_policy =
+        BlobGarbageCollectionPolicy::kDisable;
+    return db_->CompactRange(compact_options, nullptr, nullptr);
+  }
+
+  // Flush output is always coarse. This helper uses the FlushJob test hook to
+  // make one flush write exact reference metadata, for tests that need an exact
+  // SST.
+  Status FlushInjectedBlobIndexesWithExactMetadata() {
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack("FlushJob::WriteLevel0Table:TableBuilderOptions",
+                            [](void* arg) {
+                              static_cast<TableBuilderOptions*>(arg)
+                                  ->collect_blob_reference_metadata = true;
+                            });
+    sync_point->EnableProcessing();
+    const Defer cleanup([sync_point] {
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+    return Flush();
+  }
+
+  // Checks that Get() and MultiGet() find a live key next to a reference cap
+  // cut inside a range tombstone.
+  //
+  // Setup: the cap cuts one compaction to L0 into two exact L0 files with one
+  // epoch number (an epoch run). The cut is inside the range tombstone
+  // [Key(4090), Key(4100)), so both files keep the whole tombstone, and the
+  // left file ends with the exclusive sentinel
+  // <Key(4095), kMaxSequenceNumber, kTypeRangeDeletion>. Key(4095) is the "cut
+  // key": the first key of the right file. If Get() reads the file that does
+  // not hold the key first, that file's untruncated tombstone must not end the
+  // search: the key is live and newer than the tombstone.
+  //
+  // How the compaction to L0 is made:
+  //  - universal: num_levels = 1, so CompactRange() writes L0;
+  //  - leveled: CompactFiles() with output level 0 (an intra-L0 compaction).
+  //    L1 and deeper are empty, so the compaction is bottommost and its output
+  //    gets exact reference metadata, which the cap needs.
+  //
+  // Each case writes one more key (the "newer key") after the live key. The
+  // output file that holds the newer key has the larger largest seqno, and L0
+  // reads the files of one epoch in order of largest seqno, larger first. So
+  // the newer key decides which file Get() reads first.
+  //  - live key 4095 (the cut key), newer key 10 on the left: the left file is
+  //    read first, and the lookup is at its sentinel;
+  //  - live key 4092, newer key 4500 on the right: the right file is read
+  //    first, and the key is live in the left file.
+  //
+  // Each case runs with 2 L0 files and with 4 L0 files (two newer flushes of
+  // one key each). With at most 3 L0 files and no other level, FilePicker
+  // asks every L0 file. With more than 3, it skips files whose user key range
+  // does not hold the key, but it still asks the left file about the cut key,
+  // because the left file's largest user key is the cut key. With 4 files, the
+  // case with live key 4092 skips the right file, so only the cut-key case
+  // reaches the check.
+  void CheckPointLookupAcrossRangeTombstoneCut(CompactionStyle style) {
+    constexpr int kKeys = 5000;
+    // Keys 0 to 4094 are 4095 references, and one of them (the live key or the
+    // newer key) has a second version under the snapshot, so the left file
+    // reaches the cap of 4096 references just before Key(4095).
+    constexpr int kCut = 4095;
+    struct Case {
+      int live_key;
+      int newer_key;
+    };
+    for (const int extra_l0_files : {0, 2}) {
+      for (const Case& c : {Case{kCut, 10}, Case{4092, 4500}}) {
+        SCOPED_TRACE("live_key=" + std::to_string(c.live_key) +
+                     " extra_l0_files=" + std::to_string(extra_l0_files));
+        Options options = GetDefaultOptions();
+        options.create_if_missing = true;
+        options.enable_blob_files = options.enable_blob_indirection = true;
+        options.enable_blob_garbage_collection = false;
+        options.disable_auto_compactions = true;
+        options.min_blob_size = 0;
+        options.compaction_style = style;
+        if (style == kCompactionStyleUniversal) {
+          options.num_levels = 1;
+        }
+        options.target_file_size_base = 1ULL << 30;
+        options.blob_indirection_max_references_per_sst = 4096;
+        DestroyAndReopen(options);
+        for (int i = 0; i < kKeys; ++i) {
+          ASSERT_OK(Put(Key(i), "old" + std::to_string(i)));
+        }
+        // Keeps the tombstone and the covered versions in the bottommost
+        // compaction below.
+        const Snapshot* const snapshot = db_->GetSnapshot();
+        ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                   Key(4090), Key(4100)));
+        ASSERT_OK(Put(Key(c.live_key), "live"));
+        ASSERT_OK(Put(Key(c.newer_key), "newer"));
+        ASSERT_OK(Flush());
+        if (style == kCompactionStyleUniversal) {
+          ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+        } else {
+          std::vector<LiveFileMetaData> flushed;
+          db_->GetLiveFilesMetaData(&flushed);
+          ASSERT_EQ(flushed.size(), 1U);
+          ASSERT_EQ(flushed[0].level, 0);
+          ASSERT_OK(db_->CompactFiles(CompactionOptions(), {flushed[0].name},
+                                      /*output_level=*/0));
+        }
+
+        ColumnFamilyData* const cfd =
+            dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+        {
+          const std::vector<FileMetaData*>& files =
+              cfd->current()->storage_info()->LevelFiles(0);
+          ASSERT_EQ(files.size(), 2U);
+          ASSERT_EQ(files[0]->epoch_number, files[1]->epoch_number);
+          // Both outputs have exact reference metadata.
+          for (const FileMetaData* file : files) {
+            ASSERT_FALSE(file->blob_reference_descriptor.empty());
+          }
+        }
+        for (int i = 0; i < extra_l0_files; ++i) {
+          ASSERT_OK(Put(Key(i), "extra"));
+          ASSERT_OK(Flush());
+        }
+        std::vector<LiveFileMetaData> files;
+        db_->GetLiveFilesMetaData(&files);
+        ASSERT_EQ(files.size(), 2U + extra_l0_files);
+        for (const LiveFileMetaData& file : files) {
+          ASSERT_EQ(file.level, 0);
+        }
+
+        EXPECT_EQ(Get(Key(c.live_key)), "live");
+        // One MultiGet batch with the live key and one covered key on each
+        // side of the cut.
+        const std::string live_key = Key(c.live_key);
+        const std::string covered_left = Key(4091);
+        const std::string covered_right = Key(4097);
+        const std::vector<Slice> keys{covered_left, live_key, covered_right};
+        std::vector<std::string> values;
+        const std::vector<Status> statuses =
+            db_->MultiGet(ReadOptions(), keys, &values);
+        ASSERT_EQ(statuses.size(), 3U);
+        EXPECT_TRUE(statuses[0].IsNotFound()) << statuses[0].ToString();
+        EXPECT_OK(statuses[1]);
+        EXPECT_EQ(values[1], "live");
+        EXPECT_TRUE(statuses[2].IsNotFound()) << statuses[2].ToString();
+        // Covered keys on both sides of the cut stay deleted.
+        for (int i = 4090; i < 4100; ++i) {
+          if (i != c.live_key) {
+            ASSERT_EQ(Get(Key(i)), "NOT_FOUND") << i;
+          }
+        }
+        // The snapshot still sees the old values.
+        ASSERT_EQ(Get(Key(4093), snapshot), "old4093");
+        ASSERT_EQ(Get(Key(kCut), snapshot), "old" + std::to_string(kCut));
+        db_->ReleaseSnapshot(snapshot);
+      }
+    }
   }
 
   Status ApplyVersionEdit(VersionEdit* edit, bool new_descriptor_log) {
@@ -579,6 +755,1045 @@ class BlobFileChecksumCapturingFS : public FileSystemWrapper {
   std::string file_checksum_func_name_;
   int capture_count_ = 0;
 };
+
+TEST_F(DBBlobBasicTest, ExactReferenceBudgetKeepsCompleteL0Histories) {
+  // A user key's history is all its kept versions, including deletions and
+  // inline versions with no references. Compaction never splits a history.
+  // a_references is the reference count of the only version of key A.
+  // b_references gives the reference count of each kept version of key B,
+  // oldest first. The test sets the cap to 4 with the sync point
+  // BlockBasedTableBuilder::BlobReferenceLimit (below the option's minimum of
+  // 4096). B starts a new output only when A already filled the output; `split`
+  // says that this happens. B's history then stays in one output, also past the
+  // cap.
+  struct Scenario {
+    int a_references;
+    std::vector<int> b_references;
+    int deletion;  // 0: none, 1: point deletion, 2: range deletion
+    bool split;
+  };
+  const std::vector<Scenario> scenarios{{4, {3}, 1, true},
+                                        {2, {4, 1}, 0, false},
+                                        {4, {3, 0, 2}, 0, true},
+                                        {4, {4, 3}, 0, true},
+                                        {4, {3}, 2, true}};
+  const std::string blob(4096, 'v');
+  const std::array<const char*, 4> names{{"a", "b", "c", "d"}};
+  const auto columns_for = [&](int references) {
+    WideColumns columns;
+    if (references == 0) {
+      columns.emplace_back("a", "inline");
+    } else {
+      for (int i = 0; i < references; ++i) {
+        columns.emplace_back(names[i], blob);
+      }
+    }
+    return columns;
+  };
+  for (size_t scenario_index = 0; scenario_index < scenarios.size();
+       ++scenario_index) {
+    SCOPED_TRACE(scenario_index);
+    const Scenario& scenario = scenarios[scenario_index];
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = false;
+    options.disable_auto_compactions = true;
+    options.min_blob_size = 1024;
+    options.target_file_size_base = 1ULL << 30;
+    DestroyAndReopen(options);
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "A",
+                             columns_for(scenario.a_references)));
+    std::vector<const Snapshot*> snapshots;
+    const Defer release_snapshots([&] {
+      for (const Snapshot* snapshot : snapshots) {
+        db_->ReleaseSnapshot(snapshot);
+      }
+    });
+    uint64_t b_references = 0;
+    for (int references : scenario.b_references) {
+      ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "B",
+                               columns_for(references)));
+      snapshots.push_back(db_->GetSnapshot());
+      ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+      b_references += references;
+    }
+    if (scenario.deletion != 0) {
+      if (scenario.deletion == 1) {
+        ASSERT_OK(Delete("B"));
+      } else {
+        ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                   "B", "C"));
+      }
+      ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+    }
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    std::vector<std::string> inputs;
+    for (const auto& file : metadata.levels[0].files) {
+      inputs.push_back(file.name);
+    }
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "BlockBasedTableBuilder::BlobReferenceLimit",
+        [](void* arg) { *static_cast<uint64_t*>(arg) = 4; });
+    sync_point->EnableProcessing();
+    const Defer cleanup([sync_point] {
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, 0));
+    TablePropertiesCollection properties;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+    std::multiset<uint64_t> counts;
+    for (const auto& entry : properties) {
+      BlobReferenceMetadataDescriptor descriptor;
+      ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(
+          entry.second->user_collected_properties.at(
+              kBlobReferenceDescriptorPropertyName),
+          &descriptor));
+      counts.insert(descriptor.reference_count);
+    }
+    const uint64_t a_references = scenario.a_references;
+    const std::multiset<uint64_t> expected =
+        scenario.split ? std::multiset<uint64_t>{a_references, b_references}
+                       : std::multiset<uint64_t>{a_references + b_references};
+    ASSERT_EQ(counts, expected);
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+      ReadOptions read;
+      read.snapshot = snapshots[i];
+      PinnableWideColumns result;
+      ASSERT_OK(db_->GetEntity(read, db_->DefaultColumnFamily(), "B", &result));
+      ASSERT_EQ(result.columns(), columns_for(scenario.b_references[i]));
+    }
+    PinnableWideColumns result;
+    const Status read_status =
+        db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "B", &result);
+    if (scenario.deletion != 0) {
+      ASSERT_TRUE(read_status.IsNotFound());
+    } else {
+      ASSERT_OK(read_status);
+      ASSERT_EQ(result.columns(), columns_for(scenario.b_references.back()));
+    }
+  }
+}
+
+// Keeps the table_file_creation lines of the event log.
+class TableFileCreationEventLogger : public Logger {
+ public:
+  using Logger::Logv;
+  void Logv(const char* format, va_list ap) override {
+    char buffer[16384];
+    vsnprintf(buffer, sizeof(buffer), format, ap);
+    if (strstr(buffer, "\"table_file_creation\"") != nullptr) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      lines_.emplace_back(buffer);
+    }
+  }
+  std::vector<std::string> lines() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return lines_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::string> lines_;
+};
+
+TEST_F(DBBlobBasicTest, BlobReferenceOptionCutsCompactionOutputs) {
+  // 5000 user keys with two kept versions each (10000 references) and a cap of
+  // 4096 references: three outputs, two cut by the cap, never inside a user
+  // key's history.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  options.target_file_size_base = 1ULL << 30;
+  options.blob_indirection_max_references_per_sst = 4096;
+  options.statistics = CreateDBStatistics();
+  auto logger = std::make_shared<TableFileCreationEventLogger>();
+  options.info_log = logger;
+  DestroyAndReopen(options);
+  constexpr int kKeys = 5000;
+  const auto key_of = [](int i) {
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "key%05d", i);
+    return std::string(buffer);
+  };
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Put(key_of(i), "old" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  const Snapshot* const snapshot = db_->GetSnapshot();
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Put(key_of(i), "new" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(options.statistics->Reset());
+  // One compaction of both L0 files into L1.
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const auto& file : metadata.levels[0].files) {
+    inputs.push_back(file.name);
+  }
+  ASSERT_EQ(inputs.size(), 2U);
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/1));
+
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_TRUE(metadata.levels[0].files.empty());
+  ASSERT_EQ(metadata.levels[1].files.size(), 3U);
+  // Files are sorted by key; no user key spans two files.
+  const auto& files = metadata.levels[1].files;
+  for (size_t i = 1; i < files.size(); ++i) {
+    ASSERT_LT(files[i - 1].largestkey, files[i].smallestkey);
+  }
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  uint64_t total = 0;
+  for (const auto& entry : properties) {
+    BlobReferenceMetadataDescriptor descriptor;
+    ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(
+        entry.second->user_collected_properties.at(
+            kBlobReferenceDescriptorPropertyName),
+        &descriptor));
+    ASSERT_LE(descriptor.reference_count, 4096U);
+    ASSERT_EQ(descriptor.reference_count % 2, 0U);
+    total += descriptor.reference_count;
+  }
+  ASSERT_EQ(total, 2U * kKeys);
+  ASSERT_EQ(options.statistics->getTickerCount(
+                COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS),
+            2U);
+  HistogramData histogram;
+  options.statistics->histogramData(COMPACTION_OUTPUT_BLOB_REFERENCES,
+                                    &histogram);
+  ASSERT_EQ(histogram.count, 3U);
+  ASSERT_EQ(histogram.sum, 2U * kKeys);
+
+  // The table_file_creation event of each compaction output has
+  // "blob_references". The events of the two outputs that the cap closed also
+  // have "close_reason": "blob_reference_limit".
+  int creations = 0;
+  int cut_by_limit = 0;
+  for (const std::string& line : logger->lines()) {
+    if (line.find("\"reason\"") != std::string::npos ||
+        line.find("\"blob_references\": ") == std::string::npos) {
+      continue;
+    }
+    if (line.find("\"column_family_name\": \"default\"") == std::string::npos) {
+      continue;
+    }
+    ++creations;
+    cut_by_limit += line.find("\"close_reason\": \"blob_reference_limit\"") !=
+                    std::string::npos;
+  }
+  // Two flushes write no blob_references field; three compaction outputs do.
+  ASSERT_EQ(creations, 3);
+  ASSERT_EQ(cut_by_limit, 2);
+
+  for (int i = 0; i < kKeys; i += 997) {
+    ASSERT_EQ(Get(key_of(i)), "new" + std::to_string(i));
+    ASSERT_EQ(Get(key_of(i), snapshot), "old" + std::to_string(i));
+  }
+  db_->ReleaseSnapshot(snapshot);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceOptionCutsLevel0Outputs) {
+  // Universal compaction with one level. The test hook makes both flushed L0
+  // files exact. A compaction to L0 that the cap cuts then makes three exact L0
+  // outputs with one epoch number. A later compaction of one of them takes all
+  // three. Reads and the census are still correct after reopen.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 1;
+  options.target_file_size_base = 1ULL << 30;
+  options.blob_indirection_max_references_per_sst = 4096;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  constexpr int kKeys = 5000;
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Put(Key(i), "old" + std::to_string(i)));
+  }
+  // A compaction to L0 makes exact output only from exact L0 inputs, or when
+  // the compaction is bottommost. The compactions below are bottommost (there
+  // is only one level), but the test also makes the flushes exact (see
+  // FlushInjectedBlobIndexesWithExactMetadata()), so the outputs are exact also
+  // by the exact-input rule.
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  const Snapshot* const snapshot = db_->GetSnapshot();
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Put(Key(i), "new" + std::to_string(i)));
+  }
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto l0_names = [&]() {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    std::vector<std::string> names;
+    for (const auto& file : metadata.levels[0].files) {
+      names.push_back(file.name);
+    }
+    return names;
+  };
+  std::vector<std::string> inputs = l0_names();
+  ASSERT_EQ(inputs.size(), 2U);
+  ASSERT_OK(options.statistics->Reset());
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/0));
+  ASSERT_EQ(options.statistics->getTickerCount(
+                COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS),
+            2U);
+  std::vector<std::string> outputs = l0_names();
+  ASSERT_EQ(outputs.size(), 3U);
+  {
+    const auto& files = cfd->current()->storage_info()->LevelFiles(0);
+    ASSERT_EQ(files.size(), 3U);
+    for (const FileMetaData* file : files) {
+      EXPECT_FALSE(file->blob_reference_descriptor.empty());
+      EXPECT_EQ(file->epoch_number, files.front()->epoch_number);
+    }
+  }
+  // Compacting one of the outputs takes its epoch siblings too.
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), {outputs[1]},
+                              /*output_level=*/0));
+  const std::vector<std::string> after = l0_names();
+  for (const std::string& name : outputs) {
+    EXPECT_EQ(std::find(after.begin(), after.end(), name), after.end()) << name;
+  }
+  ASSERT_EQ(after.size(), 3U);
+
+  // The snapshot belongs to this DB object, so release it before the reopen.
+  db_->ReleaseSnapshot(snapshot);
+  Reopen(options);
+  for (int i = 0; i < kKeys; i += 499) {
+    ASSERT_EQ(Get(Key(i)), "new" + std::to_string(i));
+  }
+  ExpectCensusMatchesVersion();
+}
+
+TEST_F(DBBlobBasicTest, CoarseL0TrivialMoveBlockedTicker) {
+  // A coarse L0 file must be rewritten with exact blob reference metadata when
+  // it leaves L0, so the leveled L0 trivial move stops before it and ticks
+  // COMPACTION_COARSE_L0_TRIVIAL_MOVE_BLOCKED. Without blob indirection, L0
+  // files are not coarse: the same workload makes trivial moves and the ticker
+  // stays 0.
+  for (const bool indirection : {false, true}) {
+    SCOPED_TRACE(indirection);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.statistics = CreateDBStatistics();
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = indirection;
+    options.min_blob_size = 0;
+    options.level0_file_num_compaction_trigger = 4;
+    DestroyAndReopen(options);
+    // The L0 trivial move needs a non-empty output level, so the first key
+    // range is compacted out of L0 first.
+    ASSERT_OK(Put(Key(0), std::string(512, 'v')));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+    std::atomic<int> trivial_moves{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BackgroundCompaction:TrivialMove",
+        [&](void*) { ++trivial_moves; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    // Four L0 files with disjoint key ranges after Key(0) reach the compaction
+    // trigger, and none of them overlaps the output level.
+    constexpr int kFiles = 4;
+    constexpr int kKeysPerFile = 10;
+    for (int file = 0; file < kFiles; ++file) {
+      for (int i = 0; i < kKeysPerFile; ++i) {
+        ASSERT_OK(Put(Key(1 + file * kKeysPerFile + i), std::string(512, 'v')));
+      }
+      ASSERT_OK(Flush());
+    }
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    const uint64_t blocked = options.statistics->getTickerCount(
+        COMPACTION_COARSE_L0_TRIVIAL_MOVE_BLOCKED);
+    if (indirection) {
+      EXPECT_GT(blocked, 0U);
+      EXPECT_EQ(trivial_moves.load(), 0);
+    } else {
+      EXPECT_EQ(blocked, 0U);
+      EXPECT_GT(trivial_moves.load(), 0);
+    }
+    for (int key = 0; key <= kFiles * kKeysPerFile; ++key) {
+      ASSERT_EQ(Get(Key(key)), std::string(512, 'v'));
+    }
+  }
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGcStatsCoarseKeys) {
+  // The keys coarse-sst-count and lowest-coarse-frontier of
+  // rocksdb.indirect-blob-gc-stats show the coarse SSTs of the current
+  // Version. A coarse SST records only its oldest indirect-origin blob file
+  // number (its frontier), and blob files at or above the lowest frontier
+  // cannot be collected. The keys are:
+  // - 0 and 0 without blob indirection,
+  // - the number of coarse flushes and the oldest blob file number after
+  //   plain flushes,
+  // - 0 and 0 after a full compaction, which writes exact SSTs, and after a
+  //   flush that writes exact metadata.
+  const auto coarse_keys = [&]() {
+    std::map<std::string, std::string> values;
+    EXPECT_TRUE(
+        db_->GetMapProperty(DB::Properties::kIndirectBlobGcStats, &values));
+    EXPECT_EQ(values.count("coarse-sst-count"), 1U);
+    EXPECT_EQ(values.count("lowest-coarse-frontier"), 1U);
+    return std::make_pair(values["coarse-sst-count"],
+                          values["lowest-coarse-frontier"]);
+  };
+  const auto zero = std::make_pair(std::string("0"), std::string("0"));
+  for (const bool indirection : {false, true}) {
+    SCOPED_TRACE(indirection);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = indirection;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    ASSERT_EQ(coarse_keys(), zero);
+    ASSERT_OK(Put("a", "value_a"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("b", "value_b"));
+    ASSERT_OK(Flush());
+    if (!indirection) {
+      ASSERT_EQ(coarse_keys(), zero);
+      continue;
+    }
+    const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+    ASSERT_EQ(blob_files.size(), 2U);
+    // GetBlobFileNumbers() is sorted, so the oldest blob file comes first.
+    ASSERT_EQ(
+        coarse_keys(),
+        std::make_pair(std::string("2"), std::to_string(blob_files.front())));
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_EQ(coarse_keys(), zero);
+    ASSERT_OK(Put("c", "value_c"));
+    ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+    ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+    ASSERT_EQ(coarse_keys(), zero);
+  }
+}
+
+namespace {
+// Counts compactions as they start. `intra_l0` counts the ones that read L0
+// and write L0.
+class CompactionBeginCounter : public EventListener {
+ public:
+  void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& info) override {
+    ++compactions;
+    if (info.base_input_level == 0 && info.output_level == 0) {
+      ++intra_l0;
+    }
+  }
+  std::atomic<int> compactions{0};
+  std::atomic<int> intra_l0{0};
+};
+
+// Sets the blob reference cap of every exact SST to `cap` references with the
+// sync point BlockBasedTableBuilder::BlobReferenceLimit. The option
+// blob_indirection_max_references_per_sst does not accept values below 4096,
+// and a small cap keeps the tests small. The caller must disable sync point
+// processing and clear the callbacks.
+void SetBlobReferenceCapForTest(uint64_t cap) {
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "BlockBasedTableBuilder::BlobReferenceLimit",
+      [cap](void* arg) { *static_cast<uint64_t*>(arg) = cap; });
+  sync_point->EnableProcessing();
+}
+}  // namespace
+
+// Background for the next three tests. With blob indirection, the reference
+// cap can cut one exact compaction output to L0 into several L0 files. These
+// files have one epoch number and do not overlap, so together they are one
+// sorted run (an "exact epoch run"). The L0 compaction score, the L0
+// compaction triggers and the L0 write stall triggers must count such a run
+// as one sorted run, not as one run per file.
+
+TEST_F(DBBlobBasicTest, UniversalOneLevelExactEpochRunSettles) {
+  // Universal compaction with num_levels = 1 and a compaction trigger of 4.
+  // Four flushes of 20 new keys each hold 80 blob references. Their full
+  // compaction is bottommost, so its output is exact, and the cap of 16
+  // references cuts it into 5 L0 files with one epoch number. The 5 files are
+  // one sorted run, so the compaction score drops below 1 and no other
+  // compaction starts. If each file counted as a sorted run, 5 runs would
+  // reach the trigger again after every compaction, and the DB would compact
+  // the same data forever with no writes. The wait has a timeout, so that
+  // case fails and does not hang.
+  constexpr int kTrigger = 4;
+  constexpr uint64_t kCap = 16;
+  constexpr int kFlushes = 4;
+  constexpr int kKeysPerFlush = 20;
+  constexpr int kOutputs = kFlushes * kKeysPerFlush / static_cast<int>(kCap);
+  auto counter = std::make_shared<CompactionBeginCounter>();
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 1;
+  options.level0_file_num_compaction_trigger = kTrigger;
+  options.target_file_size_base = 1ULL << 30;
+  // The flushes below must not start a compaction. SetOptions() turns
+  // automatic compactions on after the last flush.
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+  options.listeners.push_back(counter);
+  DestroyAndReopen(options);
+  for (int flush = 0; flush < kFlushes; ++flush) {
+    for (int i = 0; i < kKeysPerFlush; ++i) {
+      const int key = flush * kKeysPerFlush + i;
+      ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_EQ(NumTableFilesAtLevel(0), kFlushes);
+
+  SetBlobReferenceCapForTest(kCap);
+  const Defer cleanup([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(options.statistics->Reset());
+  ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+  // Without the run counting, the DB compacts the same run again and again,
+  // so the wait times out and the test fails. A passing test returns as soon
+  // as the one compaction ends. The timeout is 50 seconds, the longest that
+  // fits in the 60-second unit test limit, so a loaded host does not fail it.
+  WaitForCompactOptions wait_options;
+  wait_options.timeout = std::chrono::seconds(50);
+  const Status wait_status = dbfull()->WaitForCompact(wait_options);
+  // Exactly one compaction: the full compaction that makes the run.
+  EXPECT_EQ(counter->compactions.load(), 1);
+  ASSERT_OK(wait_status);
+  ASSERT_EQ(options.statistics->getTickerCount(
+                COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS),
+            static_cast<uint64_t>(kOutputs - 1));
+  ASSERT_EQ(NumTableFilesAtLevel(0), kOutputs);
+  ASSERT_GE(kOutputs, kTrigger);
+  uint64_t pending = 1;
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kCompactionPending, &pending));
+  ASSERT_EQ(pending, 0U);
+  for (int key = 0; key < kFlushes * kKeysPerFlush; key += 7) {
+    ASSERT_EQ(Get(Key(key)), "value" + std::to_string(key));
+  }
+}
+
+TEST_F(DBBlobBasicTest, LeveledSizeBasedIntraL0ExactEpochRunSettles) {
+  // Leveled compaction picks a size-based intra-L0 compaction (L0 to L0) when
+  // L0 has at least max(2, trigger) sorted runs (the files of one exact epoch
+  // run count as one run; see VersionStorageInfo::NumL0SortedRuns()) and Lbase
+  // is more than 20 times larger than L0 (PickSizeBasedIntraL0Compaction).
+  //
+  // Setup:
+  //  - Lbase holds 2000 inline values of 1000 bytes each, with keys "a..."
+  //    and one more key "zz".
+  //  - L0 holds four flushes of 20 blob values each, with keys "z...". These
+  //    keys are inside the key range of Lbase, so the L0 trivial move to
+  //    Lbase cannot take the L0 files.
+  //  - A compaction to L0 is not bottommost while a lower level has files, so
+  //    the test makes the last flush exact
+  //    (FlushInjectedBlobIndexesWithExactMetadata()). A compaction to L0 with
+  //    an exact input writes exact output.
+  //
+  // The cap of 16 references cuts the output of the intra-L0 compaction into
+  // 5 L0 files with one epoch number. The 5 files are one sorted run, so they
+  // do not reach the trigger of 4, and no other compaction starts. If each
+  // file counted, the picker would pick the same run again and again with no
+  // writes. The wait has a timeout, so that case fails and does not hang.
+  constexpr int kTrigger = 4;
+  constexpr uint64_t kCap = 16;
+  constexpr int kFlushes = 4;
+  constexpr int kKeysPerFlush = 20;
+  constexpr int kOutputs = kFlushes * kKeysPerFlush / static_cast<int>(kCap);
+  constexpr int kBaseKeys = 2000;
+  constexpr int kBaseValueSize = 1000;
+  auto counter = std::make_shared<CompactionBeginCounter>();
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  // Lbase values stay inline, so Lbase is large. SetOptions() below sends the
+  // L0 values to blob files.
+  options.min_blob_size = 1 << 20;
+  options.level0_file_num_compaction_trigger = kTrigger;
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+  options.listeners.push_back(counter);
+  DestroyAndReopen(options);
+  Random rnd(301);
+  for (int i = 0; i < kBaseKeys; ++i) {
+    ASSERT_OK(Put("a" + Key(i), rnd.RandomString(kBaseValueSize)));
+  }
+  ASSERT_OK(Put("zz", "last"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+
+  ASSERT_OK(db_->SetOptions({{"min_blob_size", "0"}}));
+  for (int flush = 0; flush < kFlushes; ++flush) {
+    for (int i = 0; i < kKeysPerFlush; ++i) {
+      const int key = flush * kKeysPerFlush + i;
+      ASSERT_OK(Put("z" + Key(key), "value" + std::to_string(key)));
+    }
+    if (flush == kFlushes - 1) {
+      ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+    } else {
+      ASSERT_OK(Flush());
+    }
+  }
+  ASSERT_EQ(NumTableFilesAtLevel(0), kFlushes);
+
+  SetBlobReferenceCapForTest(kCap);
+  const Defer cleanup([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(options.statistics->Reset());
+  const int compactions_before = counter->compactions.load();
+  ASSERT_EQ(counter->intra_l0.load(), 0);
+  ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+  // See UniversalOneLevelExactEpochRunSettles for why the timeout is 50 s.
+  WaitForCompactOptions wait_options;
+  wait_options.timeout = std::chrono::seconds(50);
+  const Status wait_status = dbfull()->WaitForCompact(wait_options);
+  // Exactly one compaction: the intra-L0 compaction that makes the run.
+  EXPECT_EQ(counter->intra_l0.load(), 1);
+  EXPECT_EQ(counter->compactions.load() - compactions_before, 1);
+  ASSERT_OK(wait_status);
+  ASSERT_EQ(options.statistics->getTickerCount(
+                COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS),
+            static_cast<uint64_t>(kOutputs - 1));
+  ASSERT_EQ(NumTableFilesAtLevel(0), kOutputs);
+  ASSERT_GE(kOutputs, kTrigger);
+  for (int key = 0; key < kFlushes * kKeysPerFlush; key += 7) {
+    ASSERT_EQ(Get("z" + Key(key)), "value" + std::to_string(key));
+  }
+}
+
+TEST_F(DBBlobBasicTest, WriteStallCountsExactEpochRunAsOneRun) {
+  // L0 write stall triggers and the L0 part of the pending compaction bytes
+  // estimate count sorted runs. The compaction trigger is 4, the slowdown
+  // trigger is 8 and the stop trigger is 12, and L0 holds 10 files.
+  //  - With blob indirection, the 10 files are one exact epoch run: the cap of
+  //    16 references cuts one compaction to L0 of 160 references into 10
+  //    files. This is one sorted run, so writes neither slow down nor stop,
+  //    and the estimate has no L0 part.
+  //  - Without blob indirection, 10 flushes make 10 sorted runs, so writes
+  //    slow down and the estimate counts L0. This shows that 10 files do reach
+  //    both triggers.
+  // Write stall conditions apply only with automatic compactions on. All LOW
+  // pool threads are busy while SetOptions() turns them on, so no compaction
+  // can change L0 before the checks.
+  constexpr uint64_t kCap = 16;
+  constexpr int kFiles = 10;
+  constexpr int kKeysPerFile = static_cast<int>(kCap);
+  for (const bool indirection : {false, true}) {
+    SCOPED_TRACE(indirection);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = indirection;
+    options.enable_blob_garbage_collection = false;
+    options.min_blob_size = 0;
+    options.target_file_size_base = 1ULL << 30;
+    options.level0_file_num_compaction_trigger = 4;
+    options.level0_slowdown_writes_trigger = 8;
+    options.level0_stop_writes_trigger = 12;
+    options.disable_auto_compactions = true;
+    options.statistics = CreateDBStatistics();
+    DestroyAndReopen(options);
+    if (indirection) {
+      for (int key = 0; key < kFiles * kKeysPerFile; ++key) {
+        ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+      }
+      ASSERT_OK(Flush());
+      // No lower level holds these keys, so the compaction to L0 is
+      // bottommost and its output is exact, which the cap needs.
+      ColumnFamilyMetaData metadata;
+      db_->GetColumnFamilyMetaData(&metadata);
+      ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+      SetBlobReferenceCapForTest(kCap);
+      const Status compact_status = db_->CompactFiles(
+          CompactionOptions(), {metadata.levels[0].files[0].name},
+          /*output_level=*/0);
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      ASSERT_OK(compact_status);
+      ASSERT_EQ(options.statistics->getTickerCount(
+                    COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS),
+                static_cast<uint64_t>(kFiles - 1));
+      ColumnFamilyData* const cfd =
+          dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+      const std::vector<FileMetaData*>& files =
+          cfd->current()->storage_info()->LevelFiles(0);
+      ASSERT_EQ(files.size(), static_cast<size_t>(kFiles));
+      for (const FileMetaData* file : files) {
+        ASSERT_EQ(file->epoch_number, files.front()->epoch_number);
+      }
+    } else {
+      for (int file = 0; file < kFiles; ++file) {
+        for (int i = 0; i < kKeysPerFile; ++i) {
+          const int key = file * kKeysPerFile + i;
+          ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+        }
+        ASSERT_OK(Flush());
+      }
+    }
+    // NumTableFilesAtLevel() reads rocksdb.num-files-at-level0, which counts
+    // files, not sorted runs.
+    ASSERT_EQ(NumTableFilesAtLevel(0), kFiles);
+
+    const int low_threads = env_->GetBackgroundThreads(Env::Priority::LOW);
+    std::vector<test::SleepingBackgroundTask> sleeping_tasks(low_threads);
+    for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+      env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask, &task,
+                     Env::Priority::LOW);
+      task.WaitUntilSleeping();
+    }
+    const Defer wake([&sleeping_tasks] {
+      for (test::SleepingBackgroundTask& task : sleeping_tasks) {
+        task.WakeUp();
+        task.WaitUntilDone();
+      }
+    });
+    ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+    uint64_t delayed_write_rate = 0;
+    uint64_t write_stopped = 0;
+    ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kActualDelayedWriteRate,
+                                    &delayed_write_rate));
+    ASSERT_TRUE(
+        db_->GetIntProperty(DB::Properties::kIsWriteStopped, &write_stopped));
+    // The pending compaction bytes estimate counts L0 only when L0 reaches the
+    // compaction trigger of 4 sorted runs (or max_bytes_for_level_base, which
+    // these small files do not reach). No other level holds data, so the
+    // estimate is 0 when L0 does not count.
+    uint64_t pending_bytes = 0;
+    ASSERT_TRUE(db_->GetIntProperty(
+        DB::Properties::kEstimatePendingCompactionBytes, &pending_bytes));
+    EXPECT_EQ(write_stopped, 0U);
+    if (indirection) {
+      EXPECT_EQ(delayed_write_rate, 0U);
+      EXPECT_EQ(pending_bytes, 0U);
+    } else {
+      EXPECT_GT(delayed_write_rate, 0U);
+      EXPECT_GT(pending_bytes, 0U);
+    }
+  }
+}
+
+namespace {
+// Records the write stall flags of FlushJobInfo that OnFlushBegin and
+// OnFlushCompleted receive. Each entry is the pair (triggered_writes_slowdown,
+// triggered_writes_stop).
+class FlushStallFlagsRecorder : public EventListener {
+ public:
+  void OnFlushBegin(DB* /*db*/, const FlushJobInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    begin.emplace_back(info.triggered_writes_slowdown,
+                       info.triggered_writes_stop);
+  }
+  void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    completed.emplace_back(info.triggered_writes_slowdown,
+                           info.triggered_writes_stop);
+  }
+  std::mutex mutex;
+  std::vector<std::pair<bool, bool>> begin;
+  std::vector<std::pair<bool, bool>> completed;
+};
+}  // namespace
+
+TEST_F(DBBlobBasicTest, FlushInfoStallFlagsCountExactEpochRunAsOneRun) {
+  // FlushJobInfo::triggered_writes_slowdown and triggered_writes_stop must use
+  // the same L0 count as the write stall decision: sorted runs, where an exact
+  // epoch run counts once. The setup is the one of
+  // WriteStallCountsExactEpochRunAsOneRun: the slowdown trigger is 8, the stop
+  // trigger is 12, and L0 holds 10 files. Then one more flush runs, and a
+  // listener records the flags. OnFlushBegin sees L0 before the new file is
+  // added (10 files), and OnFlushCompleted sees it after (11 files).
+  //  - With blob indirection, the 10 files are one exact epoch run, so L0 holds
+  //    1 sorted run, and then 2. Both are below the slowdown trigger, so all
+  //    flags are false.
+  //  - Without blob indirection, the 10 files are 10 sorted runs, and then 11.
+  //    Both reach the slowdown trigger but not the stop trigger.
+  // Automatic compactions stay off, so no compaction changes L0 and writes do
+  // not stall.
+  constexpr uint64_t kCap = 16;
+  constexpr int kFiles = 10;
+  constexpr int kKeysPerFile = static_cast<int>(kCap);
+  for (const bool indirection : {false, true}) {
+    SCOPED_TRACE(indirection);
+    auto recorder = std::make_shared<FlushStallFlagsRecorder>();
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = indirection;
+    options.enable_blob_garbage_collection = false;
+    options.min_blob_size = 0;
+    options.target_file_size_base = 1ULL << 30;
+    options.level0_file_num_compaction_trigger = 4;
+    options.level0_slowdown_writes_trigger = 8;
+    options.level0_stop_writes_trigger = 12;
+    options.disable_auto_compactions = true;
+    options.listeners.push_back(recorder);
+    DestroyAndReopen(options);
+    if (indirection) {
+      for (int key = 0; key < kFiles * kKeysPerFile; ++key) {
+        ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+      }
+      ASSERT_OK(Flush());
+      // No lower level holds these keys, so the compaction to L0 is
+      // bottommost and its output is exact, which the cap needs.
+      ColumnFamilyMetaData metadata;
+      db_->GetColumnFamilyMetaData(&metadata);
+      ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+      SetBlobReferenceCapForTest(kCap);
+      const Status compact_status = db_->CompactFiles(
+          CompactionOptions(), {metadata.levels[0].files[0].name},
+          /*output_level=*/0);
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      ASSERT_OK(compact_status);
+      ColumnFamilyData* const cfd =
+          dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+      const std::vector<FileMetaData*>& files =
+          cfd->current()->storage_info()->LevelFiles(0);
+      ASSERT_EQ(files.size(), static_cast<size_t>(kFiles));
+      for (const FileMetaData* file : files) {
+        ASSERT_EQ(file->epoch_number, files.front()->epoch_number);
+      }
+    } else {
+      for (int file = 0; file < kFiles; ++file) {
+        for (int i = 0; i < kKeysPerFile; ++i) {
+          const int key = file * kKeysPerFile + i;
+          ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+        }
+        ASSERT_OK(Flush());
+      }
+    }
+    ASSERT_EQ(NumTableFilesAtLevel(0), kFiles);
+    // Flush() can return before the flush job calls OnFlushCompleted, so wait
+    // for the setup flushes before the recorder is cleared.
+    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+    {
+      std::lock_guard<std::mutex> lock(recorder->mutex);
+      recorder->begin.clear();
+      recorder->completed.clear();
+    }
+    ASSERT_OK(Put("zz", "last"));
+    ASSERT_OK(Flush());
+    // Flush() can return before the flush job calls OnFlushCompleted, so wait
+    // until the background work is done.
+    ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+    ASSERT_EQ(NumTableFilesAtLevel(0), kFiles + 1);
+
+    std::lock_guard<std::mutex> lock(recorder->mutex);
+    ASSERT_EQ(recorder->begin.size(), 1U);
+    ASSERT_EQ(recorder->completed.size(), 1U);
+    const bool expect_slowdown = !indirection;
+    EXPECT_EQ(recorder->begin[0].first, expect_slowdown);
+    EXPECT_FALSE(recorder->begin[0].second);
+    EXPECT_EQ(recorder->completed[0].first, expect_slowdown);
+    EXPECT_FALSE(recorder->completed[0].second);
+  }
+}
+
+// The L0 key range check of TableCache::RangeTombstonesMayCoverUserKey() is
+// needed only where the reference cap can cut an L0 output into an epoch run,
+// which needs the blob indirection format fence. In a column family without
+// the fence, Get() and MultiGet() over L0 files with range tombstones never
+// call it; with the fence they do. The test also runs an async MultiGet()
+// (async_io with optimize_multiget_for_io). In a build with coroutines, it
+// takes the path that filters each file first (TableCache::MultiGetFilter());
+// in other builds it takes the same path as the sync MultiGet().
+TEST_F(DBBlobBasicTest, L0RangeTombstoneCheckRunsOnlyWithFormatFence) {
+  for (const bool fenced : {false, true}) {
+    SCOPED_TRACE(fenced ? "fenced" : "no fence");
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = fenced;
+    // Values stay inline; only the range tombstones matter here.
+    options.min_blob_size = 1 << 20;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("k0", "v0"));
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "k1",
+                               "k3"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("k2", "v2"));
+    ASSERT_OK(Flush());
+    ASSERT_EQ(NumTableFilesAtLevel(0), 2);
+    ASSERT_EQ(dbfull()
+                  ->GetVersionSet()
+                  ->GetColumnFamilySet()
+                  ->GetDefault()
+                  ->current()
+                  ->storage_info()
+                  ->HasBlobIndirectionFormat(),
+              fenced);
+
+    std::atomic<int> checks{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "TableCache::RangeTombstonesMayCoverUserKey", [&](void*) { ++checks; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_EQ(Get("k0"), "v0");
+    ASSERT_EQ(Get("k2"), "v2");
+    std::vector<Slice> keys{"k0", "k1", "k2"};
+    std::vector<std::string> values;
+    const std::vector<Status> statuses =
+        db_->MultiGet(ReadOptions(), keys, &values);
+    ReadOptions async_read_options;
+    async_read_options.async_io = true;
+    async_read_options.optimize_multiget_for_io = true;
+    std::vector<PinnableSlice> async_values(keys.size());
+    std::vector<Status> async_statuses(keys.size());
+    db_->MultiGet(async_read_options, db_->DefaultColumnFamily(), keys.size(),
+                  keys.data(), async_values.data(), async_statuses.data());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_OK(statuses[0]);
+    ASSERT_EQ(values[0], "v0");
+    ASSERT_TRUE(statuses[1].IsNotFound());
+    ASSERT_OK(statuses[2]);
+    ASSERT_EQ(values[2], "v2");
+    ASSERT_OK(async_statuses[0]);
+    ASSERT_EQ(async_values[0], "v0");
+    ASSERT_TRUE(async_statuses[1].IsNotFound());
+    ASSERT_OK(async_statuses[2]);
+    ASSERT_EQ(async_values[2], "v2");
+    if (fenced) {
+      EXPECT_GT(checks.load(), 0);
+    } else {
+      EXPECT_EQ(checks.load(), 0);
+    }
+  }
+}
+
+TEST_F(DBBlobBasicTest, PointLookupAcrossRangeTombstoneCutInLevel0Run) {
+  CheckPointLookupAcrossRangeTombstoneCut(kCompactionStyleUniversal);
+}
+
+TEST_F(DBBlobBasicTest, PointLookupAcrossRangeTombstoneCutInLeveledIntraL0) {
+  CheckPointLookupAcrossRangeTombstoneCut(kCompactionStyleLevel);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceOptionCutsEachPlacementTarget) {
+  // Per-key placement, turned on by a sync point: versions newer than the
+  // snapshot go to the proximal level (L5), and older versions go to the last
+  // level (L6). Each of the two output levels counts its own references against
+  // the cap, and no user key spans two files of one level.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 7;
+  options.last_level_temperature = Temperature::kCold;
+  options.target_file_size_base = 1ULL << 30;
+  options.blob_indirection_max_references_per_sst = 4096;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  constexpr int kKeys = 5000;
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Put(Key(i), "old" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  const Snapshot* const snapshot = db_->GetSnapshot();
+  const SequenceNumber split = snapshot->GetSequenceNumber();
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Put(Key(i), "new" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint::GetInstance()->SetCallBack(
+      "Compaction::SupportsPerKeyPlacement:Enabled",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::PrepareTimes():preclude_last_level_min_seqno",
+      [&](void* arg) { *static_cast<SequenceNumber*>(arg) = split; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Defer cleanup([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(options.statistics->Reset());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_TRUE(metadata.levels[0].files.empty());
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  for (int level : {5, 6}) {
+    SCOPED_TRACE(level);
+    const auto& files = metadata.levels[level].files;
+    // Each level gets 5000 references, so the cap cuts it once: one file has
+    // 4096 references and the other has the rest.
+    ASSERT_EQ(files.size(), 2U);
+    ASSERT_LT(files[0].largestkey, files[1].smallestkey);
+    std::multiset<uint64_t> counts;
+    for (const auto& file : files) {
+      const auto found = properties.find(file.db_path + file.name);
+      ASSERT_NE(found, properties.end()) << file.name;
+      BlobReferenceMetadataDescriptor descriptor;
+      ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(
+          found->second->user_collected_properties.at(
+              kBlobReferenceDescriptorPropertyName),
+          &descriptor));
+      counts.insert(descriptor.reference_count);
+    }
+    ASSERT_EQ(counts, (std::multiset<uint64_t>{4096, kKeys - 4096}));
+  }
+  ASSERT_EQ(options.statistics->getTickerCount(
+                COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS),
+            2U);
+  for (int i = 0; i < kKeys; i += 499) {
+    ASSERT_EQ(Get(Key(i)), "new" + std::to_string(i));
+    ASSERT_EQ(Get(Key(i), snapshot), "old" + std::to_string(i));
+  }
+  db_->ReleaseSnapshot(snapshot);
+}
+
+TEST_F(DBBlobBasicTest, BlobReferenceOptionRange) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = options.enable_blob_indirection = true;
+  options.blob_indirection_max_references_per_sst = 4095;
+  ASSERT_TRUE(TryReopen(options).IsInvalidArgument());
+  options.blob_indirection_max_references_per_sst =
+      kMaxBlobIndirectionMaxReferencesPerSst + 1;
+  ASSERT_TRUE(TryReopen(options).IsInvalidArgument());
+  options.blob_indirection_max_references_per_sst =
+      kMaxBlobIndirectionMaxReferencesPerSst;
+  Reopen(options);
+  ASSERT_TRUE(
+      db_->SetOptions({{"blob_indirection_max_references_per_sst", "4095"}})
+          .IsInvalidArgument());
+  ASSERT_OK(
+      db_->SetOptions({{"blob_indirection_max_references_per_sst", "4096"}}));
+  ASSERT_EQ(dbfull()->GetOptions().blob_indirection_max_references_per_sst,
+            4096U);
+}
 
 TEST_F(DBBlobBasicTest, BlobReferenceCensusShutdownAfterDispatch) {
   Options options = GetDefaultOptions();
@@ -1146,6 +2361,12 @@ TEST_F(DBBlobBasicTest, BlobIndirectionWritesExactSstMetadata) {
   ASSERT_EQ(Get("key1"), "blob_value_1");
   ASSERT_EQ(Get("key2"), "blob_value_2");
 
+  const FileMetaData* const coarse = storage->LevelFiles(0).front();
+  ASSERT_TRUE(coarse->blob_reference_descriptor.empty());
+  ASSERT_EQ(coarse->oldest_coarse_indirect_origin_file_number,
+            storage->GetBlobFiles().front()->GetBlobFileNumber());
+  ASSERT_OK(BuildExactSstAtLevel1());
+
   TablePropertiesCollection properties;
   ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
   ASSERT_EQ(properties.size(), 1);
@@ -1174,6 +2395,7 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsAndTracksInstalledSsts) {
   ASSERT_OK(Put("key1", "blob_value_1"));
   ASSERT_OK(Put("key2", "blob_value_2"));
   ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
 
   ColumnFamilyData* cfd =
       dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
@@ -1195,7 +2417,12 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsAndTracksInstalledSsts) {
   ASSERT_OK(Flush());
   census = GetCensusSnapshot(cfd);
   ASSERT_NE(census, nullptr);
-  ASSERT_EQ(census->SstFileNumbers().size(), 2);
+  ASSERT_EQ(census->SstFileNumbers().size(), 1);
+  ASSERT_OK(BuildExactSstAtLevel1());
+  census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->SstFileNumbers().size(), 1);
+  ASSERT_EQ(census->generation_count(), 2);
 
   ASSERT_OK(Delete("key1"));
   ASSERT_OK(Delete("key2"));
@@ -1252,6 +2479,60 @@ TEST_F(DBBlobBasicTest, SetOptionsOnFencedColumnFamilyPublishesAtomically) {
   ASSERT_TRUE(cfd->GetLatestMutableCFOptions().disable_auto_compactions);
   ASSERT_TRUE(cfd->current()->GetMutableCFOptions().disable_auto_compactions);
   ASSERT_TRUE(cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
+}
+
+TEST_F(DBBlobBasicTest, SequentialL0FilesDoNotStall) {
+  // Sequential inserts make L0 files with disjoint key ranges. Run twice:
+  // - Coarse L0 files (plain Flush()) are never trivially moved, so the level
+  //   picker must make a normal L0 pick each time instead of picking nothing.
+  // - Exact L0 files (made exact by the test hook) are trivially moved.
+  // In both runs L0 stays below the compaction trigger.
+  for (const bool exact : {false, true}) {
+    SCOPED_TRACE(exact);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.min_blob_size = 0;
+    options.level0_file_num_compaction_trigger = 4;
+    DestroyAndReopen(options);
+    std::atomic<int> trivial_moves{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::BackgroundCompaction:TrivialMove",
+        [&](void*) { ++trivial_moves; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    constexpr int kFiles = 12;
+    constexpr int kKeysPerFile = 20;
+    for (int file = 0; file < kFiles; ++file) {
+      for (int i = 0; i < kKeysPerFile; ++i) {
+        ASSERT_OK(Put(Key(file * kKeysPerFile + i), std::string(512, 'v')));
+      }
+      if (exact) {
+        // The helper turns sync point processing off and clears all callbacks
+        // when it returns, so register the callback again.
+        ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+        SyncPoint::GetInstance()->SetCallBack(
+            "DBImpl::BackgroundCompaction:TrivialMove",
+            [&](void*) { ++trivial_moves; });
+        SyncPoint::GetInstance()->EnableProcessing();
+      } else {
+        ASSERT_OK(Flush());
+      }
+    }
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_LT(NumTableFilesAtLevel(0),
+              options.level0_file_num_compaction_trigger);
+    if (exact) {
+      EXPECT_GT(trivial_moves.load(), 0);
+    } else {
+      EXPECT_EQ(trivial_moves.load(), 0);
+    }
+    for (int key = 0; key < kFiles * kKeysPerFile; ++key) {
+      ASSERT_EQ(Get(Key(key)), std::string(512, 'v'));
+    }
+  }
 }
 
 TEST_F(DBBlobBasicTest, BlobReferenceCensusCatchesDeletionDuringInitialScan) {
@@ -1328,10 +2609,16 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusReplaysLegacySnapshotMarker) {
       dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
   const auto census = GetCensusSnapshot(cfd);
   ASSERT_NE(census, nullptr);
-  ASSERT_EQ(census->SstFileNumbers().size(), 1);
-  ASSERT_EQ(census->generation_count(), 1);
+  ASSERT_EQ(census->SstFileNumbers().size(), 0);
+  ASSERT_EQ(census->generation_count(), 0);
   ASSERT_EQ(Get("legacy"), "legacy_blob_value");
   ASSERT_EQ(Get("feature"), "feature_blob_value");
+  ASSERT_OK(BuildExactSstAtLevel1());
+  const auto exact_census = GetCensusSnapshot(cfd);
+  ASSERT_NE(exact_census, nullptr);
+  ASSERT_EQ(exact_census->SstFileNumbers().size(), 1);
+  // Legacy direct references do not add generation numbers to the census.
+  ASSERT_EQ(exact_census->generation_count(), 1);
 }
 
 TEST_F(DBBlobBasicTest,
@@ -1342,8 +2629,10 @@ TEST_F(DBBlobBasicTest,
   options.min_blob_size = 0;
   Reopen(options);
 
+  // Flush output is coarse, so both flushes use the test hook to write exact
+  // metadata. The census rebuild then has two SSTs to read.
   ASSERT_OK(Put("first", "first_blob_value"));
-  ASSERT_OK(Flush());
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
   ColumnFamilyData* cfd =
       dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
   ASSERT_NE(GetCensusSnapshot(cfd), nullptr);
@@ -1357,6 +2646,11 @@ TEST_F(DBBlobBasicTest,
         *static_cast<Status*>(argument) =
             Status::IOError("injected census-only read failure");
       });
+  sync_point->SetCallBack("FlushJob::WriteLevel0Table:TableBuilderOptions",
+                          [](void* arg) {
+                            static_cast<TableBuilderOptions*>(arg)
+                                ->collect_blob_reference_metadata = true;
+                          });
   // A rebuild reads the reference index of every SST again.
   std::atomic<int> rebuild_reads{0};
   sync_point->SetCallBack("DBImpl::BuildBlobReferenceCensus:ReadSst",
@@ -1510,17 +2804,23 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusAppliesCompactionRemovedGroups) {
   ASSERT_OK(Put("a", "blob_a"));
   ASSERT_OK(Flush());
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  // Flush output is coarse. Compacting each L0 file to L1 rewrites it with
+  // exact metadata.
   ASSERT_OK(Put("b", "blob_b"));
   ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(CompactEachL0FileTo(1));
   ASSERT_OK(Put("c", "blob_c"));
   ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(CompactEachL0FileTo(1));
   ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
 
   ColumnFamilyMetaData metadata;
   db_->GetColumnFamilyMetaData(&metadata);
   std::vector<std::string> inputs;
-  for (const auto& file : metadata.levels[0].files) {
-    inputs.push_back(file.name);
+  for (const auto& file : metadata.levels[1].files) {
+    if (file.smallestkey != "a") {
+      inputs.push_back(file.name);
+    }
   }
   ASSERT_EQ(inputs.size(), 2U);
   const size_t charge_before = cache->GetCacheCharge();
@@ -1530,7 +2830,7 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusAppliesCompactionRemovedGroups) {
   });
   CensusEventCounter counter;
   counter.Start();
-  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/1));
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/2));
   ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
   EXPECT_EQ(counter.rebuilds.load(), 0);
   EXPECT_EQ(counter.reads.load(), 0);
@@ -1541,6 +2841,621 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusAppliesCompactionRemovedGroups) {
   ASSERT_EQ(Get("a"), "blob_a");
   ASSERT_EQ(Get("b"), "blob_b");
   ASSERT_EQ(Get("c"), "blob_c");
+}
+
+TEST_F(DBBlobBasicTest, CoarseL0FilesStayInL0) {
+  // A coarse L0 file pins every generation number at or above its frontier, so
+  // it must be rewritten with exact metadata when it leaves L0. Under leveled
+  // compaction, PromoteL0 returns NotSupported and CompactRange rewrites the
+  // file instead of moving it. Under universal compaction, only an automatic
+  // pick can be a trivial move (a manual CompactRange never is), so the test
+  // turns on auto compaction with allow_trivial_move. The picker then picks
+  // the two L0 files, whose key ranges do not overlap, as a trivial move, and
+  // the coarse check in Compaction::IsTrivialMove() makes it a rewrite.
+  for (const bool universal : {false, true}) {
+    SCOPED_TRACE(universal);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    if (universal) {
+      options.compaction_style = kCompactionStyleUniversal;
+      options.compaction_options_universal.allow_trivial_move = true;
+      options.num_levels = 4;
+      options.level0_file_num_compaction_trigger = 2;
+    }
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("a", "value_a"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("b", "value_b"));
+    ASSERT_OK(Flush());
+    const auto files_by_level = [&]() {
+      ColumnFamilyMetaData metadata;
+      db_->GetColumnFamilyMetaData(&metadata);
+      return metadata;
+    };
+    ASSERT_EQ(files_by_level().levels[0].files.size(), 2U);
+    if (!universal) {
+      const Status status =
+          experimental::PromoteL0(db_.get(), db_->DefaultColumnFamily(), 1);
+      ASSERT_TRUE(status.IsNotSupported()) << status.ToString();
+      ASSERT_EQ(files_by_level().levels[0].files.size(), 2U);
+      ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    } else {
+      // Two L0 files reach the trigger, so the automatic pick takes both.
+      ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "false"}}));
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+      ASSERT_EQ(files_by_level().levels[0].files.size(), 0U);
+    }
+    const VersionStorageInfo* const storage = dbfull()
+                                                  ->GetVersionSet()
+                                                  ->GetColumnFamilySet()
+                                                  ->GetDefault()
+                                                  ->current()
+                                                  ->storage_info();
+    size_t files = 0;
+    for (int level = 1; level < storage->num_levels(); ++level) {
+      for (const FileMetaData* file : storage->LevelFiles(level)) {
+        EXPECT_EQ(file->oldest_coarse_indirect_origin_file_number, 0U);
+        EXPECT_FALSE(file->blob_reference_descriptor.empty());
+        ++files;
+      }
+    }
+    EXPECT_GT(files, 0U);
+    ASSERT_EQ(Get("a"), "value_a");
+    ASSERT_EQ(Get("b"), "value_b");
+  }
+}
+
+namespace {
+// Turns on blob indirection with universal compaction and one level, so every
+// compaction writes to L0. Auto compaction and blob GC are off, so the test
+// decides when compactions run. Every value goes to a blob file
+// (min_blob_size = 0).
+Options UniversalOneLevelIndirectionOptions(Options options) {
+  options.create_if_missing = true;
+  options.enable_blob_files = options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 1;
+  return options;
+}
+
+// Runs a full (bottommost) compaction with a reference cap of `cap` references
+// per output SST. The option blob_indirection_max_references_per_sst has a
+// minimum of 4096, so the cap is set with the sync point
+// BlockBasedTableBuilder::BlobReferenceLimit, which lets a test cut outputs
+// after a few keys.
+Status FullCompactionWithReferenceCap(DB* db, uint64_t cap) {
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "BlockBasedTableBuilder::BlobReferenceLimit",
+      [cap](void* arg) { *static_cast<uint64_t*>(arg) = cap; });
+  sync_point->EnableProcessing();
+  const Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  CompactRangeOptions full;
+  full.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  return db->CompactRange(full, nullptr, nullptr);
+}
+}  // namespace
+
+TEST_F(DBBlobBasicTest,
+       UniversalOneLevelReadTriggeredCompactionSkipsOneExactRun) {
+  // With universal compaction and one level, a full compaction with the
+  // reference cap leaves the whole DB as one exact epoch run of several files,
+  // which is one sorted run. Hot reads on one run file mark it for a
+  // read-triggered compaction. Compacting the run alone into L0 would only
+  // rewrite it, and the new files, cut again by the cap, could be picked again
+  // after more reads. So no read-triggered compaction may run. A reference
+  // cap of 4 references per SST cuts the 16 keys into a run of 4 files. The
+  // cap stays on for every compaction of the test, as a real cap would cut a
+  // large run.
+  Options options = UniversalOneLevelIndirectionOptions(GetDefaultOptions());
+  // With this trigger, size-ratio and size-amplification picks need at least
+  // 8 sorted runs, so with one run only a read-triggered pick can run.
+  options.level0_file_num_compaction_trigger = 8;
+  options.read_triggered_compaction_threshold = 0.001;
+  DestroyAndReopen(options);
+  for (int key = 0; key < 16; ++key) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  SetBlobReferenceCapForTest(/*cap=*/4);
+  std::atomic<int> read_triggered{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "UniversalCompactionBuilder::PickCompaction:Return", [&](void* arg) {
+        const auto* compaction = static_cast<Compaction*>(arg);
+        if (compaction != nullptr && compaction->compaction_reason() ==
+                                         CompactionReason::kReadTriggered) {
+          read_triggered.fetch_add(1);
+        }
+      });
+  const Defer cleanup([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  CompactRangeOptions full;
+  full.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(full, nullptr, nullptr));
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto run_files = [cfd]() {
+    std::vector<uint64_t> numbers;
+    for (const FileMetaData* file :
+         cfd->current()->storage_info()->LevelFiles(0)) {
+      numbers.push_back(file->fd.GetNumber());
+    }
+    return numbers;
+  };
+  const std::vector<uint64_t> run = run_files();
+  ASSERT_EQ(run.size(), 4U);
+  ASSERT_EQ(cfd->current()->storage_info()->NumL0SortedRuns(), 1);
+  for (int round = 0; round < 2; ++round) {
+    SCOPED_TRACE("round " + std::to_string(round));
+    // Mark the newest run file as hot, then let auto compaction pick.
+    cfd->current()
+        ->storage_info()
+        ->LevelFiles(0)
+        .front()
+        ->stats.num_collapsible_entry_reads_sampled.store(1 << 20);
+    ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "true"}}));
+    ASSERT_EQ(read_triggered.load(), 0);
+    ASSERT_EQ(run_files(), run);
+  }
+  for (int key = 0; key < 16; ++key) {
+    ASSERT_EQ(Get(Key(key)), "value" + std::to_string(key));
+  }
+}
+
+TEST_F(DBBlobBasicTest,
+       UniversalOneLevelDeleteTriggeredCompactionTakesWholeExactRun) {
+  // Background: with universal compaction and one level, a compaction with the
+  // reference cap can write an exact epoch run, which is several exact L0
+  // files with one epoch number. Their key ranges do not overlap, but their L0
+  // order (newest largest sequence number first) can differ from their key
+  // order. The run is one sorted run. With num_levels = 1, the
+  // delete-triggered pick never starts at the last (oldest) sorted run. It
+  // starts at the first sorted run with a file that CompactOnDeletionCollector
+  // marked, and takes every older sorted run. If it took only part of a run,
+  // its output would get the run's epoch number and could overlap a run file
+  // that it left out. The Version would then reject the install and set a
+  // background error.
+  //
+  // The test builds a run of three files above one older L0 file X (keys
+  // 20..23), so the run is not the last sorted run. In L0 order the run files
+  // are: file N (keys 4..7), file M (keys 8..11, with deletions of keys 9 and
+  // 10, so it is marked) and file O (keys 0..3). A compaction of only M and O
+  // would keep keys 0..3, 8 and 11, so its output would cover keys 0..11 and
+  // overlap N. The test checks that the delete-triggered compaction takes all
+  // three run files and X, sets no background error, and leaves no two L0
+  // files of one epoch with overlapping key ranges.
+  Options options = UniversalOneLevelIndirectionOptions(GetDefaultOptions());
+  // The collector marks an SST when a window of 4 entries has 2 deletions.
+  // Only file M (and the flushed SST that the run comes from) has deletions.
+  options.table_properties_collector_factories.emplace_back(
+      NewCompactOnDeletionCollectorFactory(/*sliding_window_size=*/4,
+                                           /*deletion_trigger=*/2));
+  // Size-ratio and size-amplification picks need at least 8 sorted runs, and
+  // the DB has 2, so only the delete-triggered pick runs.
+  options.level0_file_num_compaction_trigger = 8;
+  DestroyAndReopen(options);
+  // File X is the oldest L0 file.
+  for (int key = 20; key < 24; ++key) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+  const uint64_t file_x = [this]() {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    return metadata.levels[0].files[0].file_number;
+  }();
+  // Keys 0..3 (file O) and 8..11 (file M) are written first. Keys 9 and 10 are
+  // then deleted, while a snapshot keeps the old values, so the compaction
+  // below keeps both the values and the deletions. Keys 4..7 (file N) are
+  // written last. The largest sequence numbers then order the files N, M, O.
+  for (const int key : {0, 1, 2, 3, 8, 9, 10, 11}) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  const Snapshot* snapshot = db_->GetSnapshot();
+  for (const int key : {9, 10}) {
+    ASSERT_OK(Delete(Key(key)));
+  }
+  for (int key = 4; key < 8; ++key) {
+    ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+  }
+  // The compaction of only the new SST to L0 is not bottommost, because file X
+  // is older. A compaction to L0 writes exact output when an input is exact,
+  // so this flush writes exact metadata.
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+  std::string flushed;
+  {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    ASSERT_EQ(metadata.levels[0].files.size(), 2U);
+    for (const auto& file : metadata.levels[0].files) {
+      if (file.file_number != file_x) {
+        flushed = file.name;
+      }
+    }
+  }
+  // Each run file has 4 references (a deletion has none), so a cap of 4 cuts
+  // the output at keys 4 and 8.
+  SetBlobReferenceCapForTest(/*cap=*/4);
+  Status status =
+      db_->CompactFiles(CompactionOptions(), {flushed}, /*output_level=*/0);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  db_->ReleaseSnapshot(snapshot);
+  ASSERT_OK(status);
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto storage = [cfd]() { return cfd->current()->storage_info(); };
+  std::vector<uint64_t> run;
+  {
+    const std::vector<FileMetaData*>& files = storage()->LevelFiles(0);
+    ASSERT_EQ(files.size(), 4U);
+    for (size_t i = 0; i < 3; ++i) {
+      ASSERT_FALSE(files[i]->blob_reference_descriptor.empty());
+      ASSERT_EQ(files[i]->epoch_number, files.front()->epoch_number);
+      run.push_back(files[i]->fd.GetNumber());
+    }
+    ASSERT_EQ(files[0]->smallest.user_key(), Key(4));
+    ASSERT_EQ(files[1]->smallest.user_key(), Key(8));
+    ASSERT_EQ(files[2]->smallest.user_key(), Key(0));
+    ASSERT_FALSE(files[0]->marked_for_compaction);
+    ASSERT_TRUE(files[1]->marked_for_compaction);
+    ASSERT_FALSE(files[2]->marked_for_compaction);
+    ASSERT_EQ(files[3]->fd.GetNumber(), file_x);
+    ASSERT_LT(files[3]->epoch_number, files[0]->epoch_number);
+    ASSERT_FALSE(files[3]->marked_for_compaction);
+  }
+
+  // Turning on auto compaction schedules the delete-triggered compaction.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"}}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  const std::vector<FileMetaData*>& files = storage()->LevelFiles(0);
+  ASSERT_FALSE(files.empty());
+  for (const FileMetaData* file : files) {
+    EXPECT_EQ(std::find(run.begin(), run.end(), file->fd.GetNumber()),
+              run.end())
+        << file->fd.GetNumber();
+    // The pick takes every sorted run older than the run, so X is gone too.
+    EXPECT_NE(file->fd.GetNumber(), file_x);
+  }
+  const Comparator* const ucmp = BytewiseComparator();
+  for (size_t i = 0; i < files.size(); ++i) {
+    for (size_t j = i + 1; j < files.size(); ++j) {
+      if (files[i]->epoch_number != files[j]->epoch_number) {
+        continue;
+      }
+      EXPECT_TRUE(ucmp->Compare(files[i]->largest.user_key(),
+                                files[j]->smallest.user_key()) < 0 ||
+                  ucmp->Compare(files[j]->largest.user_key(),
+                                files[i]->smallest.user_key()) < 0)
+          << files[i]->fd.GetNumber() << " " << files[j]->fd.GetNumber();
+    }
+  }
+  for (int key = 0; key < 24; ++key) {
+    if (key >= 12 && key < 20) {
+      continue;
+    }
+    const bool deleted = key == 9 || key == 10;
+    ASSERT_EQ(Get(Key(key)),
+              deleted ? "NOT_FOUND" : "value" + std::to_string(key));
+  }
+  ExpectCensusMatchesVersion();
+}
+
+TEST_F(DBBlobBasicTest, UniversalOneLevelFullCompactionWritesExactOutput) {
+  // Background: a flush writes a coarse SST. A coarse SST records only its
+  // oldest indirect-origin blob file number (its frontier). The Version pins
+  // every indirect-origin blob file at or above the oldest frontier, so
+  // indirect blob GC cannot collect those files. With universal compaction and
+  // num_levels = 1, no compaction writes to L1 or deeper. So a bottommost
+  // compaction must write exact output, or the data stays coarse for ever.
+  //
+  // The test flushes three coarse SSTs with three blob files and runs a full
+  // compaction. It checks that every output SST is exact, that the Version has
+  // no coarse frontier, and that no blob file is pinned.
+  DestroyAndReopen(UniversalOneLevelIndirectionOptions(GetDefaultOptions()));
+  constexpr int kFlushes = 3;
+  constexpr int kKeysPerFlush = 4;
+  for (int flush = 0; flush < kFlushes; ++flush) {
+    for (int i = 0; i < kKeysPerFlush; ++i) {
+      const int key = flush * kKeysPerFlush + i;
+      ASSERT_OK(Put(Key(key), "value" + std::to_string(key)));
+    }
+    ASSERT_OK(Flush());
+  }
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto storage = [cfd]() { return cfd->current()->storage_info(); };
+  ASSERT_EQ(storage()->LevelFiles(0).size(), static_cast<size_t>(kFlushes));
+  ASSERT_EQ(CountExactSsts(), 0U);
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), static_cast<size_t>(kFlushes));
+  // GetBlobFileNumbers() is sorted, so the oldest blob file comes first.
+  ASSERT_EQ(storage()->OldestCoarseIndirectOriginFileNumber(),
+            blob_files.front());
+  for (uint64_t blob_file : blob_files) {
+    ASSERT_TRUE(storage()->IsCoarseIndirectOriginBlobPinned(blob_file))
+        << blob_file;
+  }
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  const std::vector<FileMetaData*>& files = storage()->LevelFiles(0);
+  ASSERT_FALSE(files.empty());
+  for (const FileMetaData* file : files) {
+    EXPECT_FALSE(file->blob_reference_descriptor.empty());
+    EXPECT_EQ(file->oldest_coarse_indirect_origin_file_number,
+              kInvalidBlobFileNumber);
+  }
+  ASSERT_EQ(CountExactSsts(), files.size());
+  ASSERT_EQ(storage()->OldestCoarseIndirectOriginFileNumber(),
+            kInvalidBlobFileNumber);
+  // Every value is still live, so the compaction keeps all three blob files.
+  ASSERT_EQ(GetBlobFileNumbers(), blob_files);
+  for (uint64_t blob_file : blob_files) {
+    ASSERT_FALSE(storage()->IsCoarseIndirectOriginBlobPinned(blob_file))
+        << blob_file;
+  }
+  for (int key = 0; key < kFlushes * kKeysPerFlush; ++key) {
+    ASSERT_EQ(Get(Key(key)), "value" + std::to_string(key));
+  }
+  ExpectCensusMatchesVersion();
+}
+
+TEST_F(DBBlobBasicTest, UniversalOneLevelPartialCompactionKeepsNewerL0Coarse) {
+  // Universal compaction with one level: an exact epoch run (several exact L0
+  // files with one epoch number, written by one compaction) sits at the bottom
+  // of L0, and newer coarse flushes sit above it. The test checks three
+  // things:
+  //   1. A compaction of only the newer coarse files is not bottommost (their
+  //      keys also exist in the older run) and has no exact input, so its
+  //      output stays coarse. The exact run is not touched.
+  //   2. A compaction that names one file of the exact run takes all files of
+  //      the run (VersionStorageInfo::ExpandExactL0Inputs()), so no run is
+  //      split.
+  //   3. A later full compaction makes every SST exact again and removes the
+  //      coarse frontier.
+  DestroyAndReopen(UniversalOneLevelIndirectionOptions(GetDefaultOptions()));
+  constexpr int kKeys = 12;
+  for (int key = 0; key < kKeys; ++key) {
+    ASSERT_OK(Put(Key(key), "old" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto storage = [cfd]() { return cfd->current()->storage_info(); };
+  const auto l0_numbers = [&]() {
+    std::vector<uint64_t> numbers;
+    for (const FileMetaData* file : storage()->LevelFiles(0)) {
+      numbers.push_back(file->fd.GetNumber());
+    }
+    return numbers;
+  };
+  const auto table_names = [](const std::vector<uint64_t>& numbers) {
+    std::vector<std::string> names;
+    for (uint64_t number : numbers) {
+      names.push_back(MakeTableFileName(number));
+    }
+    return names;
+  };
+  CompactRangeOptions full;
+  full.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+
+  // The full compaction runs with a reference cap of 4. The 12 keys have one
+  // reference each, so the cap cuts the output into three exact L0 files with
+  // one epoch number.
+  ASSERT_OK(FullCompactionWithReferenceCap(db_.get(), /*cap=*/4));
+  const std::vector<uint64_t> run = l0_numbers();
+  ASSERT_EQ(run.size(), 3U);
+  for (const FileMetaData* file : storage()->LevelFiles(0)) {
+    ASSERT_FALSE(file->blob_reference_descriptor.empty());
+    ASSERT_EQ(file->epoch_number,
+              storage()->LevelFiles(0).front()->epoch_number);
+  }
+  ASSERT_EQ(storage()->OldestCoarseIndirectOriginFileNumber(),
+            kInvalidBlobFileNumber);
+  const uint64_t run_blob_file = GetBlobFileNumbers().back();
+
+  // Two coarse flushes overwrite keys at both ends and in the middle of the
+  // run's key range.
+  for (const int key : {0, 5, 11}) {
+    ASSERT_OK(Put(Key(key), "mid" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  for (const int key : {0, 6, 11}) {
+    ASSERT_OK(Put(Key(key), "new" + std::to_string(key)));
+  }
+  ASSERT_OK(Flush());
+  std::vector<uint64_t> l0 = l0_numbers();
+  ASSERT_EQ(l0.size(), 5U);
+  // L0 is newest first: the two flushes, then the run.
+  const std::vector<uint64_t> newer(l0.begin(), l0.begin() + 2);
+  ASSERT_EQ(std::vector<uint64_t>(l0.begin() + 2, l0.end()), run);
+  ASSERT_EQ(CountExactSsts(), run.size());
+  const uint64_t frontier = storage()->OldestCoarseIndirectOriginFileNumber();
+  ASSERT_GT(frontier, run_blob_file);
+  ASSERT_FALSE(storage()->IsCoarseIndirectOriginBlobPinned(run_blob_file));
+
+  // Step 1: compact only the two newer coarse files.
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), table_names(newer),
+                              /*output_level=*/0));
+  l0 = l0_numbers();
+  ASSERT_EQ(l0.size(), 4U);
+  ASSERT_EQ(std::vector<uint64_t>(l0.begin() + 1, l0.end()), run);
+  const FileMetaData* const coarse = storage()->LevelFiles(0).front();
+  ASSERT_TRUE(coarse->blob_reference_descriptor.empty());
+  ASSERT_EQ(coarse->oldest_coarse_indirect_origin_file_number, frontier);
+  ASSERT_EQ(CountExactSsts(), run.size());
+  ASSERT_EQ(storage()->OldestCoarseIndirectOriginFileNumber(), frontier);
+  ASSERT_TRUE(storage()->IsCoarseIndirectOriginBlobPinned(frontier));
+  ASSERT_FALSE(storage()->IsCoarseIndirectOriginBlobPinned(run_blob_file));
+  const uint64_t coarse_number = coarse->fd.GetNumber();
+
+  // Step 2: name only the middle file of the run. The compaction takes all
+  // three run files and none of the newer coarse file. Its output is
+  // bottommost (nothing older is left in L0), so it is exact.
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), table_names({run[1]}),
+                              /*output_level=*/0));
+  l0 = l0_numbers();
+  ASSERT_EQ(l0.front(), coarse_number);
+  for (uint64_t number : run) {
+    EXPECT_EQ(std::find(l0.begin(), l0.end(), number), l0.end()) << number;
+  }
+  ASSERT_EQ(CountExactSsts(), l0.size() - 1);
+  ASSERT_EQ(storage()->OldestCoarseIndirectOriginFileNumber(), frontier);
+
+  // Step 3: a full compaction makes every SST exact again.
+  ASSERT_OK(db_->CompactRange(full, nullptr, nullptr));
+  ASSERT_FALSE(storage()->LevelFiles(0).empty());
+  ASSERT_EQ(CountExactSsts(), storage()->LevelFiles(0).size());
+  ASSERT_EQ(storage()->OldestCoarseIndirectOriginFileNumber(),
+            kInvalidBlobFileNumber);
+  for (uint64_t blob_file : GetBlobFileNumbers()) {
+    ASSERT_FALSE(storage()->IsCoarseIndirectOriginBlobPinned(blob_file))
+        << blob_file;
+  }
+  for (int key = 0; key < kKeys; ++key) {
+    std::string expected = "old" + std::to_string(key);
+    if (key == 0 || key == 6 || key == 11) {
+      expected = "new" + std::to_string(key);
+    } else if (key == 5) {
+      expected = "mid" + std::to_string(key);
+    }
+    ASSERT_EQ(Get(Key(key)), expected);
+  }
+  ExpectCensusMatchesVersion();
+}
+
+TEST_F(DBBlobBasicTest, CompactFilesBelowL1TakesL1FilesOfWholeExactRun) {
+  // Background: CompactFiles() takes all files of an exact epoch run (several
+  // exact L0 files with one epoch number; see
+  // VersionStorageInfo::ExpandExactL0Inputs()), also when the caller names
+  // only one of them. A run file that the caller did not name can widen the
+  // key range of the L0 inputs. For an output level below L1, the files of the
+  // levels in between that overlap the wider range must be inputs too.
+  // Otherwise the output, which holds the newer L0 data, is written below an
+  // older L1 file, and reads return the older value.
+  //
+  // Example layout (the key numbers are examples; L0 is listed newest first):
+  //
+  //   L0: file A (keys 12..15), file B (keys 0..3)  <- one exact epoch run
+  //   L1: file F (key 15, older value)
+  //   L2: empty
+  //
+  // The test names only file B and compacts it to L2. The run adds file A,
+  // which overlaps file F, so file F must be an input too. Then Get() of key
+  // 15 returns the L0 value.
+  //
+  // The test runs twice, without and with
+  // CompactionOptions::allow_trivial_move. Files A and B do not overlap, so
+  // without file F as an input, CompactFiles() could also move them to L2
+  // without a rewrite, below file F. With file F as an input, the compaction
+  // reads two levels, so it is not a trivial move.
+  for (const bool allow_trivial_move : {false, true}) {
+    SCOPED_TRACE("allow_trivial_move=" + std::to_string(allow_trivial_move));
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = false;
+    options.disable_auto_compactions = true;
+    options.min_blob_size = 0;
+    options.num_levels = 3;
+    DestroyAndReopen(options);
+
+    // File F: key 15 with the older value, compacted from L0 to L1.
+    ASSERT_OK(Put(Key(15), "l1_15"));
+    ASSERT_OK(Flush());
+    {
+      ColumnFamilyMetaData metadata;
+      db_->GetColumnFamilyMetaData(&metadata);
+      ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+      ASSERT_OK(db_->CompactFiles(CompactionOptions(),
+                                  {metadata.levels[0].files[0].name},
+                                  /*output_level=*/1));
+    }
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+    ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+
+    // Keys 0..3 are written before keys 12..15, so the file with keys 12..15
+    // gets the larger largest sequence number and comes first in L0.
+    // SanitizeCompactionInputFilesForAllLevels() takes the L0 files from the
+    // first named file to the oldest file. B must be the oldest file, so that
+    // naming B leaves out A.
+    for (const int key : {0, 1, 2, 3, 12, 13, 14, 15}) {
+      ASSERT_OK(Put(Key(key), "l0_" + std::to_string(key)));
+    }
+    // The flushed file is exact, so the compaction to L0 also writes exact
+    // output (see Compaction::CollectExactBlobReferences()). The cap of 4
+    // references cuts the output into file B (keys 0..3) and file A (keys
+    // 12..15). Both files get one epoch number, so they form one exact epoch
+    // run.
+    ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+    std::string flushed;
+    {
+      ColumnFamilyMetaData metadata;
+      db_->GetColumnFamilyMetaData(&metadata);
+      ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+      flushed = metadata.levels[0].files[0].name;
+    }
+    SetBlobReferenceCapForTest(/*cap=*/4);
+    Status status =
+        db_->CompactFiles(CompactionOptions(), {flushed}, /*output_level=*/0);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_OK(status);
+
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    std::string file_b;
+    {
+      const std::vector<FileMetaData*>& files =
+          cfd->current()->storage_info()->LevelFiles(0);
+      ASSERT_EQ(files.size(), 2U);
+      for (const FileMetaData* file : files) {
+        ASSERT_FALSE(file->blob_reference_descriptor.empty());
+        ASSERT_EQ(file->epoch_number, files.front()->epoch_number);
+      }
+      ASSERT_EQ(files[0]->smallest.user_key(), Key(12));
+      ASSERT_EQ(files[1]->smallest.user_key(), Key(0));
+      file_b = MakeTableFileName(files[1]->fd.GetNumber());
+    }
+
+    // Name only file B. SanitizeCompactionInputFilesForAllLevels() takes the L0
+    // files from B to the oldest file, which is only B. So its range is keys
+    // 0..3, and no L1 file overlaps it.
+    CompactionOptions compact_options;
+    compact_options.allow_trivial_move = allow_trivial_move;
+    ASSERT_OK(db_->CompactFiles(compact_options, {file_b}, /*output_level=*/2));
+    EXPECT_EQ(NumTableFilesAtLevel(0), 0);
+    // File F overlaps file A, so it must be an input.
+    EXPECT_EQ(NumTableFilesAtLevel(1), 0);
+    EXPECT_GT(NumTableFilesAtLevel(2), 0);
+    for (const int key : {0, 1, 2, 3, 12, 13, 14, 15}) {
+      EXPECT_EQ(Get(Key(key)), "l0_" + std::to_string(key)) << key;
+    }
+    ExpectCensusMatchesVersion();
+  }
 }
 
 TEST_F(DBBlobBasicTest, BlobReferenceCensusSkipsTrivialMove) {
@@ -1555,8 +3470,10 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusSkipsTrivialMove) {
   DestroyAndReopen(options);
   ASSERT_OK(Put("a", "blob_a"));
   ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(CompactEachL0FileTo(/*level=*/1));
   ASSERT_OK(Put("b", "blob_b"));
   ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(CompactEachL0FileTo(/*level=*/1));
   ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
   std::atomic<int> changed_files{0};
   SyncPoint::GetInstance()->SetCallBack(
@@ -1590,6 +3507,13 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsForSstWithoutSummary) {
   ASSERT_EQ(census->missing_summary_rebuild_count(), 0U);
 
   CensusEventCounter counter;
+  // Make the flush exact with the test hook (see
+  // FlushInjectedBlobIndexesWithExactMetadata()).
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::WriteLevel0Table:TableBuilderOptions", [](void* arg) {
+        static_cast<TableBuilderOptions*>(arg)
+            ->collect_blob_reference_metadata = true;
+      });
   SyncPoint::GetInstance()->SetCallBack(
       "BuildTable:BlobReferenceSummary", [](void* arg) {
         static_cast<FileMetaData*>(arg)->blob_reference_summary.reset();
@@ -2385,9 +4309,10 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusRebuildsAfterFileDeletion) {
   DestroyAndReopen(options);
   ASSERT_OK(Put("a", "blob_a"));
   ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(CompactEachL0FileTo(/*level=*/1));
   ASSERT_OK(Put("m", "blob_m"));
   ASSERT_OK(Flush());
-  MoveFilesToLevel(/*level=*/1);
+  ASSERT_NO_FATAL_FAILURE(CompactEachL0FileTo(/*level=*/1));
   ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
   CensusEventCounter counter;
   counter.Start();
@@ -2535,12 +4460,22 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusOverflowRestartsBuildOnce) {
   options.env->SetBackgroundThreads(2, Env::Priority::LOW);
   DestroyAndReopen(options);
   ASSERT_OK(Put("a", "blob_a"));
-  ASSERT_OK(Flush());
+  // Write an exact SST, so the census build at reopen has a file to read and
+  // waits before reading it.
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
   Close();
 
   SyncPoint* const sync_point = SyncPoint::GetInstance();
   sync_point->SetCallBack("BlobReferenceCensus::AppendChange:Limit",
                           [](void* arg) { *static_cast<size_t*>(arg) = 1; });
+  // Make the flushes exact with the test hook (see
+  // FlushInjectedBlobIndexesWithExactMetadata()), so that each flush adds
+  // census changes.
+  sync_point->SetCallBack("FlushJob::WriteLevel0Table:TableBuilderOptions",
+                          [](void* arg) {
+                            static_cast<TableBuilderOptions*>(arg)
+                                ->collect_blob_reference_metadata = true;
+                          });
   sync_point->LoadDependency(
       {{"DBBlobBasicTest::FlushedDuringBuild",
         "DBImpl::BuildBlobReferenceCensus:BeforeReadFile"}});
@@ -2764,7 +4699,8 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusFullCompactionInstallsByDelta) {
   DestroyAndReopen(options);
   // Every SST covers the whole key range, so the compaction is not a series
   // of trivial moves. A first compaction writes exact SSTs below L0, so the
-  // full compaction below has exact inputs.
+  // full compaction below has exact inputs even when flushes write coarse
+  // SSTs.
   for (int i = 0; i < 6; ++i) {
     ASSERT_OK(Put("key0", "blob_value" + std::to_string(i)));
     ASSERT_OK(Put("key3", "blob_value" + std::to_string(i)));
@@ -2814,14 +4750,13 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusFullCompactionWithConcurrentFlush) {
   options.min_blob_size = 0;
   options.disable_auto_compactions = true;
   DestroyAndReopen(options);
-  // A first compaction writes exact SSTs below L0, so the full compaction below
-  // has exact inputs.
-  for (int i = 0; i < 5; ++i) {
+  // Make an exact SST in L1 and a coarse flushed SST in L0 that overlaps it.
+  for (int i = 0; i < 3; ++i) {
     ASSERT_OK(Put("key0", "blob_value" + std::to_string(i)));
     ASSERT_OK(Put("key3", "blob_value" + std::to_string(i)));
     ASSERT_OK(Flush());
-    if (i == 2) {
-      ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    if (i == 1) {
+      ASSERT_OK(BuildExactSstAtLevel1());
     }
   }
   ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
@@ -2850,8 +4785,8 @@ TEST_F(DBBlobBasicTest, BlobReferenceCensusFullCompactionWithConcurrentFlush) {
   ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
   EXPECT_EQ(counter.rebuilds.load(), 0);
   EXPECT_EQ(removals_without_groups.load(), 0);
-  ASSERT_EQ(Get("key0"), "blob_value4");
-  ASSERT_EQ(Get("key3"), "blob_value4");
+  ASSERT_EQ(Get("key0"), "blob_value2");
+  ASSERT_EQ(Get("key3"), "blob_value2");
   ASSERT_EQ(Get("key5"), "blob_flushed");
 }
 
@@ -2865,18 +4800,19 @@ TEST_F(DBBlobBasicTest, BlobReferenceMetadataSurvivesTrivialMove) {
 
   ASSERT_OK(Put("key", "blob_value"));
   ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
   ColumnFamilyData* cfd =
       dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
-  const auto& l0_files = cfd->current()->storage_info()->LevelFiles(0);
-  ASSERT_EQ(l0_files.size(), 1);
-  const uint64_t file_number = l0_files.front()->fd.GetNumber();
-  ASSERT_FALSE(l0_files.front()->blob_reference_descriptor.empty());
-
-  MoveFilesToLevel(/*level=*/1);
   const auto& l1_files = cfd->current()->storage_info()->LevelFiles(1);
   ASSERT_EQ(l1_files.size(), 1);
-  ASSERT_EQ(l1_files.front()->fd.GetNumber(), file_number);
+  const uint64_t file_number = l1_files.front()->fd.GetNumber();
   ASSERT_FALSE(l1_files.front()->blob_reference_descriptor.empty());
+
+  MoveFilesToLevel(/*level=*/2);
+  const auto& l2_files = cfd->current()->storage_info()->LevelFiles(2);
+  ASSERT_EQ(l2_files.size(), 1);
+  ASSERT_EQ(l2_files.front()->fd.GetNumber(), file_number);
+  ASSERT_FALSE(l2_files.front()->blob_reference_descriptor.empty());
 
   Reopen(options);
   dbfull()->TEST_WaitForBlobReferenceCensus();
@@ -2913,14 +4849,20 @@ TEST_F(DBBlobBasicTest, BlobReferenceMetadataSurvivesWalRecoveryFlush) {
     for (const FileMetaData* file :
          cfd->current()->storage_info()->LevelFiles(level)) {
       ++file_count;
-      ASSERT_FALSE(file->blob_reference_descriptor.empty());
+      ASSERT_TRUE(file->blob_reference_descriptor.empty());
+      ASSERT_NE(file->oldest_coarse_indirect_origin_file_number,
+                kInvalidBlobFileNumber);
       ASSERT_FALSE(file->blob_reference_legacy_metadata);
     }
   }
   ASSERT_GE(file_count, 2);
   const auto census = GetCensusSnapshot(cfd);
   ASSERT_NE(census, nullptr);
-  ASSERT_EQ(census->SstFileNumbers().size(), file_count);
+  ASSERT_EQ(census->SstFileNumbers().size(), 0U);
+  ASSERT_OK(BuildExactSstAtLevel1());
+  const auto exact_census = GetCensusSnapshot(cfd);
+  ASSERT_NE(exact_census, nullptr);
+  ASSERT_EQ(exact_census->SstFileNumbers().size(), 1U);
 }
 
 TEST_F(DBBlobBasicTest, BlobIndirectionReadsCompressedUnflattenedIndexes) {
@@ -3046,7 +4988,9 @@ TEST_F(DBBlobBasicTest, FlattenedReferenceReadChecksOriginInReader) {
   // relocation file does not hold.
   ASSERT_GT(origin_file_number, 1U);
   put_flattened("outside", origin_file_number - 1);
-  ASSERT_OK(Flush());
+  // A coarse SST cannot hold a flattened reference, so the flush writes exact
+  // metadata (see FlushInjectedBlobIndexesWithExactMetadata()).
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
   ASSERT_EQ(Get("flattened"), expected);
   PinnableSlice result;
   const Status status =
@@ -3229,6 +5173,7 @@ TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
   const std::string expected = "relocated-value";
   ASSERT_OK(Put(key, expected));
   ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
 
   VersionSet* version_set = dbfull()->GetVersionSet();
   ColumnFamilyData* cfd = version_set->GetColumnFamilySet()->GetDefault();
@@ -3239,8 +5184,9 @@ TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
   const uint64_t original_value_offset =
       BlobLogHeader::kSize + BlobLogRecord::kHeaderSize + key.size();
 
-  // `routed_generation` is an old file number that is not a live file. A
-  // reference with that generation is read through its route.
+  // An old blob file G that indirect blob GC already collected into relocation
+  // file R: a reference to G (generation == origin == G, so flush output can
+  // hold it) is read through route[G].
   dbfull()->TEST_LockMutex();
   const uint64_t routed_generation = version_set->NewFileNumber();
   const uint64_t relocation_file_number = version_set->NewFileNumber();
@@ -3257,7 +5203,8 @@ TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
   BlobRelocationFileMetadata metadata;
   uint64_t relocation_file_size = 0;
   const std::vector<RelocationTestRecord> records{
-      {origin_file_number, original_value_offset, expected, kNoCompression}};
+      {origin_file_number, original_value_offset, expected, kNoCompression},
+      {routed_generation, original_value_offset, expected, kNoCompression}};
   WriteRelocationFileForDBTest(
       immutable_options, mutable_options, table_options, cfd->GetID(),
       relocation_file_number, records, &metadata, &relocation_file_size);
@@ -3279,7 +5226,7 @@ TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
         crc32c::Value(expected.data(), expected.size());
     BlobIndex::EncodeIndirectBlob(
         &blob_index, routed_generation,
-        {.origin_file_number = origin_file_number,
+        {.origin_file_number = routed_generation,
          .original_value_offset = original_value_offset,
          .stored_value_size = expected.size(),
          .compression = kNoCompression,
@@ -4500,6 +6447,7 @@ TEST_F(DBBlobBasicTest, BlobIndirectionWritesCompleteEmptySstMetadata) {
   Reopen(options);
   ASSERT_OK(Put("key", "inline"));
   ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
   ASSERT_TRUE(dbfull()
                   ->GetVersionSet()
                   ->GetColumnFamilySet()
@@ -4567,7 +6515,8 @@ TEST_F(DBBlobBasicTest, BlobIndirectionCanBeEnabledDynamically) {
   ASSERT_EQ(properties.size(), 1);
   const auto& user_properties =
       properties.begin()->second->user_collected_properties;
-  EXPECT_EQ(user_properties.count(kBlobReferenceDescriptorPropertyName), 1);
+  EXPECT_EQ(user_properties.count(kBlobReferenceDescriptorPropertyName), 0);
+  EXPECT_EQ(user_properties.count(kBlobReferenceClassificationPropertyName), 1);
 
   // Reopen with the option off (only SetOptions() turned it on). The per-CF
   // format fence is permanent, so it stays set, and the blob file stays an
@@ -4867,6 +6816,7 @@ TEST_F(DBBlobBasicTest, BlobIndirectionTracksAllWideColumnBlobReferences) {
   ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "key",
                            &result));
   ASSERT_EQ(result.columns(), columns);
+  ASSERT_OK(BuildExactSstAtLevel1());
 
   TablePropertiesCollection properties;
   ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
@@ -4886,9 +6836,10 @@ TEST_F(DBBlobBasicTest, BlobIndirectionTracksAllWideColumnBlobReferences) {
 
 TEST_F(DBBlobBasicTest, WideColumnReferencedBlobBytesWithAndWithoutCollector) {
   // With the option on, the table builder walks an entity once for both the
-  // referenced_blob_bytes property and the reference collector. The property
-  // must be the same as with the option off, where only the property walk
-  // runs.
+  // referenced_blob_bytes property and the reference work: the coarse
+  // classification of a flush output, or the reference collector of a
+  // compaction output with exact metadata. The property must be the same as
+  // with the option off, where only the property walk runs.
   const std::string key = "key";
   const std::string default_blob = "default_blob";
   const std::string secondary_blob = "secondary_blob";
@@ -4898,6 +6849,18 @@ TEST_F(DBBlobBasicTest, WideColumnReferencedBlobBytesWithAndWithoutCollector) {
   const uint64_t expected =
       default_blob.size() + secondary_blob.size() +
       2 * BlobLogRecord::CalculateAdjustmentForRecordHeader(key.size());
+  const auto check_single_table = [&](bool indirection, bool exact) {
+    TablePropertiesCollection properties;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+    ASSERT_EQ(properties.size(), 1);
+    const auto& table_properties = *properties.begin()->second;
+    const auto& user_properties = table_properties.user_collected_properties;
+    ASSERT_EQ(user_properties.count(kBlobReferenceDescriptorPropertyName),
+              indirection && exact ? 1 : 0);
+    ASSERT_EQ(user_properties.count(kBlobReferenceClassificationPropertyName),
+              indirection && !exact ? 1 : 0);
+    ASSERT_EQ(table_properties.referenced_blob_bytes, expected);
+  };
   for (bool indirection : {false, true}) {
     SCOPED_TRACE(indirection);
     Options options = GetDefaultOptions();
@@ -4908,16 +6871,15 @@ TEST_F(DBBlobBasicTest, WideColumnReferencedBlobBytesWithAndWithoutCollector) {
     DestroyAndReopen(options);
     ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), key,
                              columns));
+    // The flush output is coarse: it records only the classification.
     ASSERT_OK(Flush());
-
-    TablePropertiesCollection properties;
-    ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
-    ASSERT_EQ(properties.size(), 1);
-    const auto& table_properties = *properties.begin()->second;
-    ASSERT_EQ(table_properties.user_collected_properties.count(
-                  kBlobReferenceDescriptorPropertyName),
-              indirection ? 1 : 0);
-    ASSERT_EQ(table_properties.referenced_blob_bytes, expected);
+    check_single_table(indirection, /*exact=*/false);
+    // A full compaction to L1 rewrites the SST with exact metadata.
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    check_single_table(indirection, /*exact=*/true);
   }
 }
 
@@ -5064,11 +7026,11 @@ TEST_F(DBBlobBasicTest, BlobIndirectionFenceRejectsNonBlockBasedTableFactory) {
   ASSERT_EQ(Get(1, "other_key2"), "other_value2");
 }
 
-TEST_F(DBBlobBasicTest, BlobIndirectionFlushesWhenMetadataCannotBeCharged) {
+TEST_F(DBBlobBasicTest, BlobIndirectionCompactsWhenMetadataCannotBeCharged) {
   // A block cache of capacity 1 with strict_capacity_limit rejects every
-  // charge of the blob reference buffers. The flush still succeeds, with the
-  // buffers uncharged, and sets no background error, so later writes and
-  // flushes work.
+  // charge of the blob reference buffers. A flush writes coarse metadata, so
+  // the compaction below is the first job that collects exact metadata. It
+  // still succeeds, with the buffers uncharged, and sets no background error.
   LRUCacheOptions cache_options;
   cache_options.capacity = 1;
   cache_options.num_shard_bits = 0;
@@ -5090,28 +7052,31 @@ TEST_F(DBBlobBasicTest, BlobIndirectionFlushesWhenMetadataCannotBeCharged) {
   SyncPoint::GetInstance()->EnableProcessing();
   ASSERT_OK(Put("key", "blob_value"));
   ASSERT_OK(Flush());
-  ASSERT_OK(dbfull()->TEST_GetBGError());
-  ASSERT_OK(Put("key2", "blob_value2"));
-  ASSERT_OK(Flush());
+  // A flush collects no references, so it makes no charge.
+  ASSERT_EQ(failed_charges.load(std::memory_order_relaxed), 0);
+  ASSERT_OK(BuildExactSstAtLevel1());
   ASSERT_OK(dbfull()->TEST_GetBGError());
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
-  // The collector ran and its charges failed, and each SST still has the
-  // exact reference metadata.
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(files.size(), 1U);
+  ASSERT_EQ(files[0].level, 1);
+  // The compaction's collector ran and its charges failed, and the L1 SST
+  // still has the exact reference metadata.
   ASSERT_GT(failed_charges.load(std::memory_order_relaxed), 0);
   TablePropertiesCollection properties;
   ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
-  ASSERT_EQ(properties.size(), 2);
-  for (const auto& [file_name, table_properties] : properties) {
-    SCOPED_TRACE(file_name);
-    const auto descriptor_it = table_properties->user_collected_properties.find(
-        kBlobReferenceDescriptorPropertyName);
-    ASSERT_NE(descriptor_it, table_properties->user_collected_properties.end());
-    BlobReferenceMetadataDescriptor descriptor;
-    ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(descriptor_it->second,
-                                                          &descriptor));
-    EXPECT_EQ(descriptor.reference_count, 1);
-  }
+  ASSERT_EQ(properties.size(), 1U);
+  const auto& user_properties =
+      properties.begin()->second->user_collected_properties;
+  const auto descriptor_it =
+      user_properties.find(kBlobReferenceDescriptorPropertyName);
+  ASSERT_NE(descriptor_it, user_properties.end());
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(descriptor_it->second,
+                                                        &descriptor));
+  EXPECT_EQ(descriptor.reference_count, 1);
   // A read that tries to add a block to this full cache fails, so read
   // without filling the cache.
   ReadOptions read_options;
@@ -5119,8 +7084,6 @@ TEST_F(DBBlobBasicTest, BlobIndirectionFlushesWhenMetadataCannotBeCharged) {
   std::string value;
   ASSERT_OK(db_->Get(read_options, "key", &value));
   ASSERT_EQ(value, "blob_value");
-  ASSERT_OK(db_->Get(read_options, "key2", &value));
-  ASSERT_EQ(value, "blob_value2");
 }
 
 TEST_F(DBBlobBasicTest, BlobReferenceSummaryReadGoesOnWhenCacheIsFull) {
@@ -5128,8 +7091,10 @@ TEST_F(DBBlobBasicTest, BlobReferenceSummaryReadGoesOnWhenCacheIsFull) {
   // that reads its input summaries) charges the summary to the
   // kBlobReferenceMetadataBuildingBuffer manager of the table factory. When
   // the block cache is full, the read still succeeds, with the summary
-  // uncharged. The flush runs with room in the cache. Then the cache shrinks
-  // to 1 byte with strict_capacity_limit, so every new charge fails.
+  // uncharged. A flush writes coarse metadata, which has no summary, so a
+  // compaction writes the exact SST whose summary the test reads. Both run
+  // with room in the cache. Then the cache shrinks to 1 byte with
+  // strict_capacity_limit, so every new charge fails.
   LRUCacheOptions cache_options;
   cache_options.capacity = 64 << 20;
   cache_options.num_shard_bits = 0;
@@ -5145,6 +7110,7 @@ TEST_F(DBBlobBasicTest, BlobReferenceSummaryReadGoesOnWhenCacheIsFull) {
   Reopen(options);
   ASSERT_OK(Put("key", "blob_value"));
   ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
   dbfull()->TEST_WaitForBlobReferenceCensus();
 
   std::atomic<int> uncharged_reads{0};
@@ -9061,6 +11027,55 @@ TEST_F(DBBlobWithTimestampTest, HistoryCompactionPreservesHealthyBlobKey) {
   ASSERT_EQ(value, "healthy");
 }
 
+TEST_F(DBBlobWithTimestampTest, ExactReferenceBudgetGroupsAllTimestamps) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  options.target_file_size_base = 1ULL << 30;
+  TestComparator comparator(Timestamp(0, 0).size());
+  options.comparator = &comparator;
+  DestroyAndReopen(options);
+  const std::string value(4096, 'v');
+  // The test sets the cap to 2 with the sync point
+  // BlockBasedTableBuilder::BlobReferenceLimit. Key A has two timestamped
+  // versions, so it fills the first output. B starts a new output and keeps all
+  // three of its timestamps there, past the cap.
+  ASSERT_OK(db_->Put(WriteOptions(), "A", Timestamp(1, 0), value));
+  ASSERT_OK(db_->Put(WriteOptions(), "A", Timestamp(2, 0), value));
+  for (int i = 1; i <= 3; ++i) {
+    ASSERT_OK(db_->Put(WriteOptions(), "B", Timestamp(i, 0), value));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("BlockBasedTableBuilder::BlobReferenceLimit",
+                          [](void* arg) { *static_cast<uint64_t*>(arg) = 2; });
+  sync_point->EnableProcessing();
+  const Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  CompactRangeOptions compact;
+  compact.change_level = true;
+  compact.target_level = 1;
+  compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 2U);
+  for (int i = 1; i <= 3; ++i) {
+    const std::string timestamp = Timestamp(i, 0);
+    const Slice read_timestamp(timestamp);
+    ReadOptions read;
+    read.timestamp = &read_timestamp;
+    std::string result;
+    ASSERT_OK(db_->Get(read, "B", &result));
+    ASSERT_EQ(result, value);
+  }
+}
+
 TEST_F(DBBlobWithTimestampTest, GetBlob) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;
@@ -10478,6 +12493,135 @@ TEST_F(DBBlobBasicTest, GetApproximateSizesConservesMixedMetadataBudget) {
   ASSERT_GT(distribution_change, physical_blob_size / 100);
 }
 
+TEST_F(DBBlobBasicTest,
+       ExactReferenceBudgetCutsEachOutputWithoutSplittingEntities) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  const WideColumns columns{
+      {"a", "value_a"}, {"b", "value_b"}, {"c", "value_c"}};
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(),
+                             "key" + std::to_string(i), columns));
+  }
+  ASSERT_OK(Flush());
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  // Each entity fills the output, so the next key starts a new one.
+  sync_point->SetCallBack("BlockBasedTableBuilder::BlobReferenceLimit",
+                          [](void* arg) { *static_cast<uint64_t*>(arg) = 3; });
+  sync_point->EnableProcessing();
+  const Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto& files = cfd->current()->storage_info()->LevelFiles(1);
+  ASSERT_EQ(files.size(), 3U);
+  for (const FileMetaData* file : files) {
+    BlobReferenceMetadataDescriptor descriptor;
+    ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(
+        file->blob_reference_descriptor, &descriptor));
+    ASSERT_EQ(descriptor.reference_count, 3U);
+    ASSERT_EQ(file->num_entries, 1U);
+  }
+  for (int i = 0; i < 3; ++i) {
+    PinnableWideColumns result;
+    ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(),
+                             "key" + std::to_string(i), &result));
+    ASSERT_EQ(result.columns(), columns);
+  }
+}
+TEST_F(DBBlobBasicTest, ExactReferenceBudgetKeepsOneOversizedEntity) {
+  // The limit is soft: one entity with more references than the limit stays
+  // whole in one output.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  const WideColumns columns{
+      {"a", "value_a"}, {"b", "value_b"}, {"c", "value_c"}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "key",
+                           columns));
+  ASSERT_OK(Flush());
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("BlockBasedTableBuilder::BlobReferenceLimit",
+                          [](void* arg) { *static_cast<uint64_t*>(arg) = 2; });
+  sync_point->EnableProcessing();
+  const Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto& files = cfd->current()->storage_info()->LevelFiles(1);
+  ASSERT_EQ(files.size(), 1U);
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(
+      files.front()->blob_reference_descriptor, &descriptor));
+  ASSERT_EQ(descriptor.reference_count, 3U);
+  PinnableWideColumns result;
+  ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "key",
+                           &result));
+  ASSERT_EQ(result.columns(), columns);
+}
+
+TEST_F(DBBlobBasicTest, CoarseIntraL0CompactionUsesAgeBasedBlobGc) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.blob_garbage_collection_age_cutoff = 1.0;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  // A bottommost compaction writes exact output. An exact L1 SST with the same
+  // key makes the L0 to L0 compaction below not bottommost, so its output is
+  // coarse.
+  ASSERT_OK(Put("key", "low"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  // Background jobs can install a new Version. The test reads cfd->current()
+  // without the DB mutex, so it waits until no background job runs before each
+  // read.
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  // The blob file of the L0 SST is the newest one.
+  const uint64_t original_blob = cfd->current()
+                                     ->storage_info()
+                                     ->GetBlobFiles()
+                                     .back()
+                                     ->GetBlobFileNumber();
+  const FileMetaData* const sst =
+      cfd->current()->storage_info()->LevelFiles(0).front();
+  const std::string input = TableFileName(
+      cfd->ioptions().cf_paths, sst->fd.GetNumber(), sst->fd.GetPathId());
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), {input}, 0));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_EQ(storage->LevelFiles(0).size(), 1U);
+  ASSERT_TRUE(
+      storage->LevelFiles(0).front()->blob_reference_descriptor.empty());
+  ASSERT_GT(
+      storage->LevelFiles(0).front()->oldest_coarse_indirect_origin_file_number,
+      original_blob);
+  ASSERT_TRUE(storage->GetBlobRelocationFiles().empty());
+  ASSERT_EQ(Get("key"), "blob_value");
+}
+
 namespace {
 
 // The keys that "rocksdb.indirect-blob-gc-stats" reports from the census diff
@@ -10887,7 +13031,8 @@ TEST_F(DBBlobBasicTest, CensusSignalsReportFailedBuild) {
   ASSERT_OK(Put("key", std::string(4096, 'v')));
   ASSERT_OK(Flush());
   // A forced compaction writes an SST with exact reference metadata, which
-  // the census build at open reads.
+  // the census build at open reads (a flush can write a coarse SST, which the
+  // build does not read).
   CompactRangeOptions compact_options;
   compact_options.bottommost_level_compaction =
       BottommostLevelCompaction::kForce;
@@ -11355,6 +13500,14 @@ TEST_F(DBBlobBasicTest, CensusBuildsAndInstallsWhenCacheIsFull) {
     SyncPoint* const sync_point = SyncPoint::GetInstance();
     sync_point->SetCallBack("DBImpl::CheckBlobReferenceCensus:Force",
                             [](void* arg) { *static_cast<bool*>(arg) = true; });
+    // A flush writes coarse metadata, which has no summary for the census
+    // build to read. The FlushJob test hook makes each flush write exact
+    // metadata, so the census build reads two summaries.
+    sync_point->SetCallBack("FlushJob::WriteLevel0Table:TableBuilderOptions",
+                            [](void* arg) {
+                              static_cast<TableBuilderOptions*>(arg)
+                                  ->collect_blob_reference_metadata = true;
+                            });
     sync_point->EnableProcessing();
     auto cleanup = Defer([sync_point] {
       sync_point->DisableProcessing();
