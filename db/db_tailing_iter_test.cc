@@ -14,6 +14,7 @@
 #include "db/db_test_util.h"
 #include "db/forward_iterator.h"
 #include "port/stack_trace.h"
+#include "rocksdb/lazy_wide_columns.h"
 
 namespace {
 static bool enable_io_uring = true;
@@ -31,6 +32,162 @@ class DBTestTailingIterator : public DBTestBase,
 
 INSTANTIATE_TEST_CASE_P(DBTestTailingIterator, DBTestTailingIterator,
                         ::testing::Bool());
+
+TEST_P(DBTestTailingIterator, DroppedColumnFamilyPinsLazyBlobFiles) {
+  // A tailing iterator of a dropped column family whose handle is destroyed
+  // keeps reading: the SST and blob files that it opens lazily stay live
+  // and readable. The base fix "Fix use-after-free in
+  // ForwardIterator::RebuildIterators on a dropped column family"
+  // (ForwardIterator keeps its current SuperVersion when it rebuilds its child
+  // iterators) makes this pass. This test covers the lazy blob file case, which
+  // the base test does not.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  CreateAndReopenWithCF({"dropped"}, options);
+  const std::string value(1024, 'v');
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_OK(Put(1, Key(i), value));
+  }
+  ASSERT_OK(Flush(1));
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 1;
+  ASSERT_OK(db_->CompactRange(compact_options, handles_[1], nullptr, nullptr));
+  ASSERT_GT(NumTableFilesAtLevel(1, 1), 0);
+
+  ReadOptions read_options;
+  read_options.tailing = true;
+  read_options.async_io = GetParam();
+  std::unique_ptr<Iterator> single(db_->NewIterator(read_options, handles_[1]));
+  std::vector<Iterator*> multiple;
+  ASSERT_OK(db_->NewIterators(read_options, {handles_[1]}, &multiple));
+  ASSERT_EQ(multiple.size(), 1U);
+  std::unique_ptr<Iterator> batch(multiple[0]);
+  const uint32_t cf_id = handles_[1]->GetID();
+  const auto is_linked = [&] {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    for (ColumnFamilyData* cfd :
+         *dbfull()->GetVersionSet()->GetColumnFamilySet()) {
+      if (cfd->GetID() == cf_id) {
+        return true;
+      }
+    }
+    return false;
+  };
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handles_[1]));
+  handles_.pop_back();
+
+  // Neither iterator has done a seek yet. So their level iterators open the SST
+  // and blob files later, after this full purge has scanned the files.
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_TRUE(is_linked());
+  for (Iterator* iter : {single.get(), batch.get()}) {
+    iter->SeekToFirst();
+    for (int i = 0; i < 64; ++i) {
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key().ToString(), Key(i));
+      ASSERT_EQ(iter->value().ToString(), value);
+      iter->Next();
+    }
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+  single.reset();
+  batch.reset();
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_FALSE(is_linked());
+}
+
+TEST_P(DBTestTailingIterator, DroppedColumnFamilyOutlivedBySuperVersionPins) {
+  // A GetEntityLazy result and a pinned GetMergeOperands result each hold a
+  // SuperVersion, and a SuperVersion holds a column family reference. That
+  // reference alone must keep a dropped column family alive, with its files
+  // live, until the last result is released. An ordinary iterator is released
+  // first.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  options.max_open_files = -1;  // Required by GetEntityLazy.
+  CreateAndReopenWithCF({"dropped"}, options);
+  const std::string value(1024, 'v');
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_OK(Put(1, Key(i), value));
+  }
+  ASSERT_OK(db_->PutEntity(WriteOptions(), handles_[1], "entity",
+                           {{kDefaultWideColumnName, value}}));
+  // Large operands, so GetMergeOperands pins the SuperVersion.
+  const std::string operand_a(20000, 'a');
+  const std::string operand_b(20000, 'b');
+  ASSERT_OK(db_->Merge(WriteOptions(), handles_[1], "merge", operand_a));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(db_->Merge(WriteOptions(), handles_[1], "merge", operand_b));
+  ASSERT_OK(Flush(1));
+
+  ReadOptions read_options;
+  read_options.async_io = GetParam();
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options, handles_[1]));
+  auto lazy = std::make_unique<LazyWideColumns>();
+  ASSERT_OK(
+      db_->GetEntityLazy(read_options, handles_[1], "entity", lazy.get()));
+  ASSERT_EQ(lazy->size(), 1U);
+  std::vector<PinnableSlice> operands(2);
+  GetMergeOperandsOptions merge_options;
+  merge_options.expected_max_number_of_operands = 2;
+  int num_operands = 0;
+  ASSERT_OK(db_->GetMergeOperands(read_options, handles_[1], "merge",
+                                  operands.data(), &merge_options,
+                                  &num_operands));
+  ASSERT_EQ(num_operands, 2);
+
+  const uint32_t cf_id = handles_[1]->GetID();
+  const auto is_linked = [&] {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    for (ColumnFamilyData* cfd :
+         *dbfull()->GetVersionSet()->GetColumnFamilySet()) {
+      if (cfd->GetID() == cf_id) {
+        return true;
+      }
+    }
+    return false;
+  };
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  ASSERT_OK(db_->DestroyColumnFamilyHandle(handles_[1]));
+  handles_.pop_back();
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_TRUE(is_linked());
+
+  // Release the iterator and the results one by one. The column family stays in
+  // the column family list until the last one is released.
+  iter->SeekToFirst();
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->value().ToString(), value);
+    iter->Next();
+  }
+  ASSERT_OK(iter->status());
+  iter.reset();
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_TRUE(is_linked());
+
+  PinnableSlice resolved;
+  ASSERT_OK(lazy->ResolveColumn((*lazy)[0], &resolved));
+  ASSERT_EQ(resolved.ToString(), value);
+  resolved.Reset();
+  lazy.reset();
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_TRUE(is_linked());
+
+  ASSERT_EQ(operands[0].ToString(), operand_a);
+  ASSERT_EQ(operands[1].ToString(), operand_b);
+  operands.clear();
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_FALSE(is_linked());
+}
 
 TEST_P(DBTestTailingIterator, TailingIteratorSingle) {
   ReadOptions read_options;

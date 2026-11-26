@@ -53,6 +53,38 @@ class VersionBuilder {
   // Save the current Version to the provided `vstorage`.
   Status SaveTo(VersionStorageInfo* vstorage) const;
 
+  // Saving a Version can also be done in two steps, so that step 2 (the blob
+  // files and the consistency check) can run with the DB mutex released (see
+  // VersionSet::ProcessManifestWrites()). Step 1 saves the SST metadata and
+  // the compact cursors. The caller must hold the DB mutex, because this step
+  // increments FileMetaData reference counts, which are not atomic.
+  Status SaveTableFilesTo(VersionStorageInfo* vstorage) const;
+
+  // Step 2, after SaveTableFilesTo(), does two things: it saves the blob file
+  // metadata and the list of dropped blob files (see
+  // VersionStorageInfo::GetDroppedBlobFiles()), and then it checks the
+  // consistency of the whole new Version, SST files and blob files. When
+  // force_consistency_checks is on (the default) or in debug builds, the check
+  // walks every SST. We expect, without a measurement, that this check is the
+  // main cost of this step. This step is different from
+  // VersionStorageInfo::PrepareForVersionAppend(), which builds derived data
+  // such as file indexes. VersionSet::AppendVersion() marks the
+  // VersionStorageInfo as finalized later.
+  //
+  // Step 2 does not need the DB mutex, because no other thread changes the
+  // state it reads. The builder and the new Version are not shared yet. The
+  // parts of the base Version that this step reads (its blob file list and
+  // its dropped blob file list, and the file numbers, keys, sequence numbers,
+  // epoch numbers and oldest blob file numbers of its SSTs) do not change
+  // while the base Version is referenced. So the caller must keep the base
+  // Version of the builder referenced until this returns.
+  //
+  // The step copies shared_ptr<BlobFileMetaData> (the reference count is
+  // atomic) and creates new BlobFileMetaData objects for the blob files that
+  // the edits add or change. It does not touch FileMetaData reference
+  // counts.
+  Status SaveBlobFilesAndCheckTo(VersionStorageInfo* vstorage) const;
+
   // Load table handlers for newly added files in the builder. This does not
   // load any files in the base storage.
   Status LoadTableHandlers(InternalStats* internal_stats, int max_threads,
@@ -127,6 +159,7 @@ class BaseReferencedVersionBuilder {
       bool allow_incomplete_valid_version = false);
   ~BaseReferencedVersionBuilder();
   VersionBuilder* version_builder() const { return version_builder_.get(); }
+  Version* base_version() const { return version_; }
 
  private:
   std::unique_ptr<VersionBuilder> version_builder_;
