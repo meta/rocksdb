@@ -164,6 +164,7 @@ struct MutableCFOptions {
         preserve_internal_time_seconds(options.preserve_internal_time_seconds),
         verify_output_flags(options.verify_output_flags),
         enable_blob_files(options.enable_blob_files),
+        enable_blob_indirection(options.enable_blob_indirection),
         min_blob_size(options.min_blob_size),
         blob_file_size(options.blob_file_size),
         blob_file_writable_file_max_buffer_size(
@@ -242,6 +243,7 @@ struct MutableCFOptions {
         preserve_internal_time_seconds(0),
         verify_output_flags(VerifyOutputFlags::kVerifyNone),
         enable_blob_files(false),
+        enable_blob_indirection(false),
         min_blob_size(0),
         blob_file_size(0),
         blob_file_writable_file_max_buffer_size(0),
@@ -350,6 +352,7 @@ struct MutableCFOptions {
 
   // Blob file related options
   bool enable_blob_files;
+  bool enable_blob_indirection;
   uint64_t min_blob_size;
   uint64_t blob_file_size;
   uint64_t blob_file_writable_file_max_buffer_size;

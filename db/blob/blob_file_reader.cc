@@ -58,7 +58,7 @@ Status BlobFileReader::Create(
   {
     const Status s =
         ReadHeader(file_reader.get(), read_options, column_family_id,
-                   statistics, &compression_type);
+                   blob_file_number, statistics, &compression_type);
     if (!s.ok()) {
       return s;
     }
@@ -160,6 +160,7 @@ Status BlobFileReader::OpenFile(
 Status BlobFileReader::ReadHeader(const RandomAccessFileReader* file_reader,
                                   const ReadOptions& read_options,
                                   uint32_t column_family_id,
+                                  uint64_t blob_file_number,
                                   Statistics* statistics,
                                   CompressionType* compression_type) {
   assert(file_reader);
@@ -203,6 +204,9 @@ Status BlobFileReader::ReadHeader(const RandomAccessFileReader* file_reader,
 
   if (header.column_family_id != column_family_id) {
     return Status::Corruption("Column family ID mismatch");
+  }
+  if (header.version == kVersion2 && header.file_number != blob_file_number) {
+    return Status::Corruption("Blob file number mismatch");
   }
 
   *compression_type = header.compression;
