@@ -653,6 +653,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    pin_blob_relocation_location_blocks),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"blob_indirection_max_references_per_sst",
+         {offsetof(struct MutableCFOptions,
+                   blob_indirection_max_references_per_sst),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"min_blob_size",
          {offsetof(struct MutableCFOptions, min_blob_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -1390,6 +1395,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  enable_blob_indirection ? "true" : "false");
   ROCKS_LOG_INFO(log, "      pin_blob_relocation_location_blocks: %s",
                  pin_blob_relocation_location_blocks ? "true" : "false");
+  ROCKS_LOG_INFO(log, "  blob_indirection_max_references_per_sst: %" PRIu64,
+                 blob_indirection_max_references_per_sst);
   ROCKS_LOG_INFO(log, "                            min_blob_size: %" PRIu64,
                  min_blob_size);
   ROCKS_LOG_INFO(log, "                           blob_file_size: %" PRIu64,

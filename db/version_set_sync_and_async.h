@@ -87,6 +87,8 @@ DEFINE_SYNC_AND_ASYNC(void, Version::Get)
     *status =
         CO_AWAIT(table_cache_->Get, read_options, *internal_comparator(),
                  *f->file_metadata, ikey, &get_context, mutable_cf_options_,
+                 /*check_l0_range=*/fp.GetHitFileLevel() == 0 &&
+                     storage_info_.HasBlobIndirectionFormat(),
                  cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
                  IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
                                  fp.IsHitFileLastInLevel()),
@@ -247,6 +249,8 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
 #endif
   s = CO_AWAIT(table_cache_->MultiGet, read_options, *internal_comparator(),
                *f->file_metadata, &file_range, mutable_cf_options_,
+               /*check_l0_range=*/hit_file_level == 0 &&
+                   storage_info_.HasBlobIndirectionFormat(),
                cfd_->internal_stats()->GetFileReadHist(hit_file_level),
                skip_filters, skip_range_deletions, hit_file_level,
                table_handle);
@@ -522,6 +526,8 @@ DEFINE_SYNC_AND_ASYNC(void, Version::MultiGet)
             Status status = table_cache_->MultiGetFilter(
                 read_options, *internal_comparator(), *f->file_metadata,
                 mutable_cf_options_,
+                /*check_l0_range=*/fp.GetHitFileLevel() == 0 &&
+                    storage_info_.HasBlobIndirectionFormat(),
                 cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
                 fp.GetHitFileLevel(), &file_range, &table_handle);
             skip_range_deletions = true;

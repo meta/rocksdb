@@ -1990,17 +1990,17 @@ class DB {
     // full, so their memory went on uncharged, also those of installs after the
     // census is ready; it counts attempts, not bytes, and a later successful
     // charge can charge that memory again; a compaction only logs its
-    // uncharged input summary reads), census-bytes (an
-    // estimate of the census memory that stays: the worker state and the
-    // change log; rocksdb.block-cache-entry-stats has the exact total of the
-    // census cache role, including short-lived copies), route-count,
-    // relocation-file-count, relocation-file-bytes, relocation-garbage-bytes,
-    // tracked-files (the files in the census candidate heap, which GC may pick,
-    // including files below the garbage threshold; suppressed files and files
-    // pinned by the coarse frontier are not counted),
-    // garbage-bytes-collectable, garbage-bytes-suppressed, coarse-pinned-files,
-    // coarse-pinned-bytes, coarse-pinned-garbage-bytes. Every *-micros key is a
-    // duration, never a timestamp.
+    // uncharged input summary reads), census-bytes (an estimate of the
+    // census memory that stays: the worker state and the change log;
+    // rocksdb.block-cache-entry-stats has the exact total of the census cache
+    // role, including short-lived copies), route-count, relocation-file-count,
+    // relocation-file-bytes, relocation-garbage-bytes, tracked-files (the files
+    // in the census candidate heap, which GC may pick, including files below
+    // the garbage threshold; suppressed files and files pinned by the coarse
+    // frontier are not counted), garbage-bytes-collectable,
+    // garbage-bytes-suppressed, coarse-pinned-files, coarse-pinned-bytes,
+    // coarse-pinned-garbage-bytes, coarse-sst-count, lowest-coarse-frontier.
+    // Every *-micros key is a duration, never a timestamp.
     static const std::string kIndirectBlobGcStats;
 
     // "rocksdb.blob-reference-census-unready-micros" - returns how long the

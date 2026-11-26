@@ -486,6 +486,9 @@ Status SstFileDumper::PrimeCompression(CompressionType compress_type,
       compress_type, compress_opt,
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       column_family_name, unknown_level, kUnknownNewestKeyTime);
+  // The table built here only measures sizes and is thrown away, so it does
+  // not collect exact blob reference metadata.
+  tb_opts.collect_blob_reference_metadata = false;
 
   std::unique_ptr<Env> env(NewMemEnv(options_.env));
   std::unique_ptr<WritableFileWriter> dest_writer;
@@ -740,6 +743,9 @@ Status SstFileDumper::ShowCompressionSize(
       &block_based_table_factories, compress_type, compress_opt,
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       column_family_name, unknown_level, kUnknownNewestKeyTime);
+  // The table built here only measures sizes and is thrown away, so it does
+  // not collect exact blob reference metadata.
+  tb_opts.collect_blob_reference_metadata = false;
   TableProperties props;
   std::chrono::microseconds write_time;
   std::chrono::microseconds read_time;
