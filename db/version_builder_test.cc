@@ -1080,6 +1080,77 @@ TEST_F(VersionBuilderTest, IndirectOriginBlobFileRequiresFormatFence) {
   UnrefFilesInVersion(&output);
 }
 
+TEST_F(VersionBuilderTest, FencedL0EpochRunRejectsNonNeighborOverlap) {
+  // An L0 epoch run is a set of L0 files with one epoch number. The L0 order
+  // puts the files of one epoch in largest-seqno order, not key order, and the
+  // neighbor check compares only files next to each other. In this example,
+  // the file numbers, keys and seqnos are only examples. Epoch 9 has three
+  // files, newest first:
+  //   file 11  keys [a..c]  largest seqno 300
+  //   file 12  keys [m..p]  largest seqno 200
+  //   file 13  keys [b..d]  largest seqno 100
+  // Files 11 and 13 overlap, but they are not neighbors. With the format fence,
+  // the Version must be rejected. Without the fence the check is skipped, as
+  // in base RocksDB. A run whose files do not overlap installs with the fence.
+  UpdateVersionStorageInfo();
+  EnvOptions env_options;
+  struct RunFile {
+    uint64_t file_number;
+    const char* smallest;
+    const char* largest;
+    SequenceNumber largest_seqno;
+  };
+  const auto try_install = [&](bool fenced, const std::vector<RunFile>& files) {
+    VersionEdit edit;
+    if (fenced) {
+      edit.SetBlobIndirectionFormatVersion(
+          kBlobIndirectionManifestFormatVersion);
+    }
+    for (const RunFile& file : files) {
+      edit.AddFile(/*level=*/0, file.file_number, /*file_path_id=*/0,
+                   /*file_size=*/100, GetInternalKey(file.smallest),
+                   GetInternalKey(file.largest), /*smallest_seqno=*/50,
+                   file.largest_seqno, /*marked_for_compaction=*/false,
+                   Temperature::kUnknown, kInvalidBlobFileNumber,
+                   kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+                   /*epoch_number=*/9, kUnknownFileChecksum,
+                   kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
+                   /*user_defined_timestamps_persisted=*/true);
+      if (fenced) {
+        edit.GetMutableNewFiles().back().second.blob_reference_legacy_metadata =
+            true;
+      }
+    }
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    Status status = builder.Apply(&edit);
+    if (!status.ok()) {
+      return status;
+    }
+    VersionStorageInfo output(
+        &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+        /*force_consistency_checks=*/true, EpochNumberRequirement::kMustPresent,
+        /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+        OffpeakTimeOption(options_.daily_offpeak_time_utc),
+        PeriodicCompactionPhaseParams{});
+    status = builder.SaveTo(&output);
+    UnrefFilesInVersion(&output);
+    return status;
+  };
+  const std::vector<RunFile> overlapping = {
+      {11, "a", "c", 300}, {12, "m", "p", 200}, {13, "b", "d", 100}};
+  const Status rejected = try_install(/*fenced=*/true, overlapping);
+  ASSERT_EQ(rejected.code(), Status::Code::kCorruption) << rejected.ToString();
+  ASSERT_NE(rejected.ToString().find(
+                "L0 files of same epoch number but overlapping range #11"),
+            std::string::npos)
+      << rejected.ToString();
+  ASSERT_OK(try_install(/*fenced=*/false, overlapping));
+  ASSERT_OK(try_install(
+      /*fenced=*/true,
+      {{11, "a", "c", 300}, {12, "m", "p", 200}, {13, "e", "g", 100}}));
+}
+
 TEST_F(VersionBuilderTest, PhysicalFileLossRejectsNormalBlobFile) {
   // A loss record names only a relocation file. A missing normal or
   // indirect-origin blob file uses the base dropped-file record instead

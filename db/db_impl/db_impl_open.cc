@@ -2284,6 +2284,9 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           dbname_ /* db_name */);
       Version* version = cfd->current();
       version->Ref();
+      tboptions.track_blob_reference_classification =
+          UsesBlobIndirection(mutable_cf_options_copy, version->storage_info());
+      tboptions.collect_blob_reference_metadata = false;
       TableProperties temp_table_proerties;
       s = BuildTable(
           dbname_, versions_.get(), immutable_db_options_, tboptions,

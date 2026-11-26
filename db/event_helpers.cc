@@ -76,7 +76,8 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
     uint64_t oldest_blob_file_number, const TableProperties& table_properties,
     TableFileCreationReason reason, const Status& s,
     const std::string& file_checksum,
-    const std::string& file_checksum_func_name) {
+    const std::string& file_checksum_func_name,
+    const TableFileBlobReferenceInfo* blob_references) {
   if (!event_logger && listeners.empty()) {
     s.PermitUncheckedError();
     return;
@@ -169,6 +170,13 @@ void EventHelpers::LogAndNotifyTableFileCreationFinished(
 
     if (oldest_blob_file_number != kInvalidBlobFileNumber) {
       jwriter << "oldest_blob_file_number" << oldest_blob_file_number;
+    }
+
+    if (blob_references != nullptr) {
+      jwriter << "blob_references" << blob_references->count;
+      if (blob_references->closed_by_limit) {
+        jwriter << "close_reason" << "blob_reference_limit";
+      }
     }
 
     jwriter << "status" << s.ToString();

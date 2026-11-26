@@ -104,6 +104,8 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
       enable_blob_indirection(options.enable_blob_indirection),
       pin_blob_relocation_location_blocks(
           options.pin_blob_relocation_location_blocks),
+      blob_indirection_max_references_per_sst(
+          options.blob_indirection_max_references_per_sst),
       min_blob_size(options.min_blob_size),
       blob_file_size(options.blob_file_size),
       blob_file_writable_file_max_buffer_size(
@@ -450,6 +452,9 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    enable_blob_indirection ? "true" : "false");
   ROCKS_LOG_HEADER(log, "    Options.pin_blob_relocation_location_blocks: %s",
                    pin_blob_relocation_location_blocks ? "true" : "false");
+  ROCKS_LOG_HEADER(log,
+                   "Options.blob_indirection_max_references_per_sst: %" PRIu64,
+                   blob_indirection_max_references_per_sst);
   ROCKS_LOG_HEADER(log,
                    "                          Options.min_blob_size: %" PRIu64,
                    min_blob_size);
