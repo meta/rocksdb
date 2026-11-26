@@ -1844,8 +1844,35 @@ struct DBOptions {
   // every SST file's oldest referenced blob file is newer. Blob garbage
   // collection that relocates the older blobs ends this sooner. RocksDB
   // versions without this option ignore the records and drop them when they
-  // write a new MANIFEST. A blob file that is missing but not recorded causes
-  // Corruption; only this option records dropped blob files.
+  // write a new MANIFEST. A normal blob file that is missing but not recorded
+  // causes Corruption when it is read; only this option records dropped blob
+  // files. A missing relocation file fails the open instead (see below).
+  //
+  // Column families with blob indirection (enable_blob_indirection, see
+  // advanced_options.h) also have relocation files, which indirect blob GC
+  // writes when it moves live values. This option handles them differently:
+  // * A missing or corrupt relocation file is not dropped. It is marked lost:
+  //   its values read as deleted, the same as values in a dropped blob file,
+  //   and it stays in the MANIFEST until no SST file references it. Indirect
+  //   blob GC then removes it without reading it.
+  // * While a column family has a lost relocation file, every compaction of
+  //   that column family repairs the references it reads, runs locally
+  //   (bypassing DBOptions::compaction_service), and writes the exact list of
+  //   blob references of each output. Nothing schedules the compactions that
+  //   remove the last references. So after an open that marks relocation
+  //   files lost, run CompactRange() on that column family with
+  //   CompactRangeOptions::bottommost_level_compaction set to
+  //   BottommostLevelCompaction::kForce. With the default setting and no
+  //   compaction filter, level-style CompactRange() does not rewrite the
+  //   bottommost level by itself, so SST files there can keep their
+  //   references to the lost file.
+  // * The open fails with Corruption instead of losing values that a
+  //   relocation file on disk still holds: when it would fall back to a point
+  //   in time before an indirect blob GC edit, and when it would recover from
+  //   an older MANIFEST file and drop or lose blob files of such a column
+  //   family.
+  // Without this option, a normal open fails with NotFound when a relocation
+  // file that is not marked lost is missing.
   //
   // Requires enable_blob_files on at least one column family passed to
   // DB::Open. A read-only DB applies the same recovery in memory but cannot
@@ -3161,6 +3188,11 @@ struct CompactRangeOptions {
   // Repair runs locally and bypasses DBOptions::compaction_service, which does
   // not currently support this repair policy. FIFO compaction returns
   // NotSupported.
+  // A column family that may hold blob indirection references (the option
+  // enable_blob_indirection is on, or the column family already has the blob
+  // indirection format) returns NotSupported, because routes can still serve
+  // values whose original blob file is gone. Use
+  // DBOptions::best_efforts_blob_db_repair for such a column family.
   // Default: false
   bool skip_missing_blob_files = false;
 

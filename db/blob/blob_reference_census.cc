@@ -167,7 +167,10 @@ void BlobGcCandidateHeap::Remove(Candidate* candidate) {
 }
 
 uint64_t BlobGcCandidateHeap::RelocationGarbage(const Candidate& candidate) {
-  return candidate.is_indirect_origin
+  // A lost relocation file is left out of the relocation byte totals
+  // (BlobRelocationState::PhysicalFileBytes()), so its garbage is left out
+  // too.
+  return candidate.is_indirect_origin || candidate.is_lost
              ? 0
              : candidate.total_bytes -
                    std::min(candidate.live_bytes, candidate.total_bytes);
@@ -192,6 +195,13 @@ void BlobGcCandidateHeap::AdjustRelocationGarbage(uint64_t before,
 }
 
 void BlobGcCandidateHeap::AccountTotals(const Candidate& candidate, bool add) {
+  // A lost relocation file that still has references stays out of the heap
+  // (see Activate()). GC cannot copy from it, so its garbage is in no group.
+  // When no reference remains, it counts as collectable: the empty-file
+  // cleanup removes it.
+  if (candidate.is_lost && candidate.live_bytes != 0) {
+    return;
+  }
   const uint64_t garbage =
       candidate.total_bytes -
       std::min(candidate.live_bytes, candidate.total_bytes);

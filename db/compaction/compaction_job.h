@@ -439,19 +439,17 @@ class CompactionJob {
   //
   // Checks at install:
   //   1. Before the run, ValidateBlobRelocationInputGenerations() checks each
-  //      number in the job's own input Version. A number that cannot be read
-  //      there (for example, a lost file) fails the job with Corruption. A
-  //      dropped origin (best_efforts_blob_db_repair) passes: the compaction
-  //      turns its references into deletions (MissingBlobRepairIterator), so
-  //      the output never writes it. An input SST whose reference summary
-  //      cannot be read (for example, a corrupt reference metadata block) is
-  //      skipped with a WARN line, as at the start of the job, because
-  //      compacting that SST is the way to repair it. The skip gives up check
-  //      1 for that input. Check 2 still rejects an output number that
-  //      resolves to no file or to a normal blob file that is not an indirect
-  //      origin. It accepts a number that resolves to a relocation file marked
-  //      lost. This loses no value: a value in a lost file cannot be read
-  //      before the compaction either.
+  //      number in the job's own input Version. A number that cannot be
+  //      resolved there fails the job with Corruption. A lost file and a
+  //      dropped origin pass: the compaction turns their references into
+  //      deletions (MissingBlobRepairIterator), so the output never writes
+  //      them. An input SST whose reference summary cannot be read (for
+  //      example, a corrupt reference metadata block) is skipped with a WARN
+  //      line, as at the start of the job, because compacting that SST is the
+  //      way to repair it. The skip gives up check 1 for that input. Check 2
+  //      still rejects an output number that resolves to no file or to a
+  //      normal blob file that is not an indirect origin, and check 3 rejects
+  //      a number that resolves to a relocation file marked lost.
   //   2. After the run, PrepareBlobRelocationOutputDependencies() records the
   //      physical file that each output number resolves to in the input
   //      Version (the output dependencies). It fails the job with Corruption
@@ -464,9 +462,9 @@ class CompactionJob {
   //      dependency whose file metadata object changed, it checks every
   //      number. For an unchanged file, it checks only the routed numbers
   //      (kept numbers whose route leads to that file). If a number cannot be
-  //      read, the install fails with Corruption. This should never happen:
-  //      the check guards the invariants above, so that a future bug fails
-  //      loudly instead of losing data.
+  //      read, or the file is a lost relocation file, the install fails with
+  //      Corruption. This should never happen: the check guards the invariants
+  //      above, so that a future bug fails loudly instead of losing data.
   //
   // Coarse L0 inputs have no reference list. Until the install, a coarse
   // input is still in the current Version, and its coarse frontier (the oldest
@@ -535,9 +533,8 @@ class CompactionJob {
   // Errors: it returns Corruption, or the status of the step that failed: the
   // file open, the descriptor decode, the metadata read, the build of the
   // allowed generation numbers (an input summary read or its memory charge),
-  // or a group check (for example NotFound for a relocation file marked lost).
-  // The caller then deletes the imported files and runs the compaction
-  // locally.
+  // or a group check. The caller then deletes the imported files and runs the
+  // compaction locally.
   //
   // Output: on success it sets `*table_properties` to the table properties
   // stored in the file, and sets `meta->blob_reference_descriptor` and

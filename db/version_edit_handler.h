@@ -368,6 +368,11 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
   Status OnAtomicGroupReplayEnd() override;
   void CheckIterationResult(const log::Reader& reader, Status* s) override;
 
+  // Under best_efforts_blob_db_repair, fails when the chosen point leaves out a
+  // blob file that a later indirect blob GC edit removed on purpose (see the
+  // comment in the definition).
+  Status CheckRepairFallbackAgainstGc();
+
   ColumnFamilyData* DestroyCfAndCleanup(const VersionEdit& edit) override;
   // `MaybeCreateVersionBeforeApplyEdit(..., false)` creates a version upon a
   // negative edge trigger (transition from valid to invalid).

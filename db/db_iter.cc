@@ -144,6 +144,7 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       allow_unprepared_value_(read_options.allow_unprepared_value),
       arena_mode_(arena_mode) {
   RecordTick(statistics_, NO_ITERATOR_CREATED);
+  has_blob_value_loss_ = blob_state_->reader.blob_fetcher().HasBlobValueLoss();
   if (pin_thru_lifetime_) {
     pinned_iters_mgr_.StartPinning();
   }
@@ -218,9 +219,43 @@ bool DBIter::ParseKey(ParsedInternalKey* ikey) {
     valid_ = false;
     ROCKS_LOG_ERROR(logger_, "In DBIter: %s", status_.getState());
     return false;
-  } else {
-    return true;
   }
+  // Without a lost file in the Version of the blob fetcher, the loss fields
+  // are never set, so they need no reset.
+  if (UNLIKELY(has_blob_value_loss_)) {
+    current_entry_lost_ = false;
+    current_entry_repaired_entity_.clear();
+    if (ikey->type == kTypeBlobIndex || ikey->type == kTypeWideColumnEntity) {
+      // The loss check reads the value (the BlobIndex or the entity). With
+      // allow_unprepared_value, the value may not be loaded yet, so load it
+      // here. This runs only when the Version of the blob fetcher has a lost
+      // file.
+      if (!PrepareValueInternal()) {
+        return false;
+      }
+      bool lost = false;
+      // A partially lost entity keeps its other columns; CurrentValue() returns
+      // it without the lost ones.
+      s = blob_state_->reader.blob_fetcher().IsBlobValueLost(
+          ikey->type, iter_.value(), &lost, &current_entry_repaired_entity_);
+      if (!s.ok()) {
+        status_ = s;
+        valid_ = false;
+        return false;
+      }
+      if (lost) {
+        // Every forward, reverse and merge traversal must see the same point
+        // deletion boundary, even when value materialization is deferred.
+        ikey->type =
+            timestamp_size_ == 0 ? kTypeDeletion : kTypeDeletionWithTimestamp;
+        current_entry_lost_ = true;
+      }
+      if (lost || !current_entry_repaired_entity_.empty()) {
+        RecordTick(statistics_, BLOB_DB_LOST_BLOB_READ_COUNT);
+      }
+    }
+  }
+  return true;
 }
 
 void DBIter::Next() {
@@ -326,8 +361,12 @@ bool DBIter::SetValueAndColumnsFromBlob(const Slice& user_key,
 
 bool DBIter::CheckDeletedByDroppedBlobFiles(ValueType type) {
   assert(!dropped_blob_files_.empty());
+  // ParseKey() may have removed the lost columns of an entity: the columns
+  // whose values are in a relocation file marked lost. The check uses the
+  // remaining columns, so an entity whose other columns are all in dropped
+  // blob files reads as deleted.
   return VersionStorageInfo::CheckDroppedBlobReferences(
-             dropped_blob_files_, type, iter_.value(),
+             dropped_blob_files_, type, CurrentValue(),
              /*remaining_columns=*/nullptr) ==
          VersionStorageInfo::DroppedBlobRead::kDeleted;
 }
@@ -650,10 +689,22 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
               // Skip if outside seek prefix -- the top-of-loop check
               // flushed any pending run, but we must also avoid starting
               // a new run outside the prefix.
-              if (min_tombstones_for_range_conversion_ > 0 &&
-                  PrefixCheck(user_key_without_ts)) {
-                TrackContiguousTombstone(ikey_.user_key,
-                                         /*always_update_first_key=*/false);
+              if (min_tombstones_for_range_conversion_ > 0) {
+                if (current_entry_lost_) {
+                  // A lost blob value is a virtual deletion that keeps its
+                  // Put identity. Like a live key, it ends a run and never
+                  // becomes part of a real range tombstone. This is a
+                  // conservative choice, not needed for correctness: the lost
+                  // key already reads as deleted at the iterator's sequence
+                  // number and later, so a range tombstone over it would
+                  // change no read. A later change can treat lost keys like
+                  // other deletions and remove current_entry_lost_,
+                  // current_key_deleted_by_loss_ and these branches.
+                  FlushPendingTombstoneRun(ikey_.user_key);
+                } else if (PrefixCheck(user_key_without_ts)) {
+                  TrackContiguousTombstone(ikey_.user_key,
+                                           /*always_update_first_key=*/false);
+                }
               }
             }
             break;
@@ -678,7 +729,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
                 return false;
               }
             } else if (ikey_.type == kTypeWideColumnEntity) {
-              if (!SetValueAndColumnsFromEntity(iter_.value())) {
+              if (!SetValueAndColumnsFromEntity(SaveCurrentValue())) {
                 return false;
               }
             } else {
@@ -923,7 +974,7 @@ bool DBIter::MergeValuesNewToOld() {
 
       return true;
     } else if (kTypeWideColumnEntity == ikey.type) {
-      if (!MergeWithWideColumnBaseValue(iter_.value(), ikey.user_key)) {
+      if (!MergeWithWideColumnBaseValue(CurrentValue(), ikey.user_key)) {
         return false;
       }
 
@@ -1138,7 +1189,19 @@ void DBIter::PrevInternal() {
     // would use a stale value.
     if (min_tombstones_for_range_conversion_ > 0 &&
         range_tomb_end_key_.Size() > 0 && timestamp_lb_ == nullptr) {
-      if (!valid_ && found_visible && PrefixCheck(saved_key_without_ts)) {
+      if (!valid_ && found_visible && current_key_deleted_by_loss_) {
+        // Reverse iteration visits keys from large to small. A lost key ends
+        // the current run, like a live key (a conservative choice; see the
+        // forward case in FindNextUserEntryInternal()). The next run holds
+        // smaller keys.
+        // Its exclusive end key is set to this lost key, so that run never
+        // covers it.
+        FlushPendingTombstoneRun(range_tomb_end_key_.GetUserKey(),
+                                 /*check_prefix_match=*/true);
+        range_tomb_end_key_.SetUserKey(saved_key_.GetUserKey(),
+                                       true /* copy */);
+      } else if (!valid_ && found_visible &&
+                 PrefixCheck(saved_key_without_ts)) {
         // Key was deleted and is within the seek prefix -- track it.
         TrackContiguousTombstone(saved_key_.GetUserKey(),
                                  /*always_update_first_key=*/true);
@@ -1204,6 +1267,8 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
   // blob files. Only that entry decides the result, so older entries that it
   // hides are not counted in BLOB_DB_DROPPED_BLOB_READ_COUNT.
   bool last_not_merge_dropped = false;
+  bool last_key_entry_lost = false;
+  current_key_deleted_by_loss_ = false;
 
   // If false, it indicates that we have not seen any valid entry, even though
   // last_key_entry_type is initialized to kTypeDeletion.
@@ -1286,6 +1351,7 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
     ikey_ = ikey;
     valid_entry_seen = true;
     last_key_entry_type = ikey.type;
+    last_key_entry_lost = current_entry_lost_;
     switch (last_key_entry_type) {
       case kTypeValue:
       case kTypeValuePreferredSeqno:
@@ -1296,7 +1362,7 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
           if (last_key_entry_type == kTypeValuePreferredSeqno) {
             pinned_value_ = ParsePackedValueForValue(iter_.value());
           } else {
-            pinned_value_ = iter_.value();
+            pinned_value_ = SaveCurrentValue();
           }
         } else {
           valid_ = false;
@@ -1378,6 +1444,7 @@ bool DBIter::FindValueForCurrentKey(bool& found_visible) {
     case kTypeDeletion:
     case kTypeDeletionWithTimestamp:
     case kTypeSingleDeletion:
+      current_key_deleted_by_loss_ = last_key_entry_lost;
       if (timestamp_lb_ == nullptr) {
         valid_ = false;
       } else {
@@ -1528,6 +1595,7 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
 
   if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion ||
       kTypeDeletionWithTimestamp == ikey.type) {
+    current_key_deleted_by_loss_ = current_entry_lost_;
     if (timestamp_lb_ == nullptr) {
       valid_ = false;
     } else {
@@ -1550,7 +1618,7 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
     if (ikey.type == kTypeValuePreferredSeqno) {
       pinned_value_ = ParsePackedValueForValue(iter_.value());
     } else {
-      pinned_value_ = iter_.value();
+      pinned_value_ = SaveCurrentValue();
     }
     if (ikey.type == kTypeBlobIndex) {
       if (!SetValueAndColumnsFromBlob(ikey.user_key, pinned_value_)) {
@@ -1643,7 +1711,7 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
 
       return true;
     } else if (ikey.type == kTypeWideColumnEntity) {
-      if (!MergeWithWideColumnBaseValue(iter_.value(),
+      if (!MergeWithWideColumnBaseValue(CurrentValue(),
                                         saved_key_.GetUserKey())) {
         return false;
       }

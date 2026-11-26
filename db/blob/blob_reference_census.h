@@ -576,8 +576,10 @@ class BlobGcCandidateHeap {
 
   // Totals over the physical files, for monitoring. Each file counts in one
   // group: suppressed (Suppress()), else pinned by the coarse frontier, else
-  // collectable. Garbage is total bytes minus live bytes. The heap keeps them
-  // up to date at each change, so reading them is O(1).
+  // collectable. A lost relocation file that still has live bytes counts in no
+  // group, because GC cannot collect from it. Garbage is total bytes minus live
+  // bytes. The heap keeps them up to date at each change, so reading them is
+  // O(1).
   struct Totals {
     uint64_t candidate_count = 0;
     uint64_t collectable_garbage_bytes = 0;

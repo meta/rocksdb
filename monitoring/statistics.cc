@@ -383,6 +383,7 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
      "rocksdb.indirect.blob.gc.bytes.reclaimed"},
     {REMOTE_COMPACT_COARSE_FALLBACK_COUNT,
      "rocksdb.remote.compact.coarse.fallback.count"},
+    {BLOB_DB_LOST_BLOB_READ_COUNT, "rocksdb.blobdb.lost.blob.read.count"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

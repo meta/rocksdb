@@ -466,6 +466,63 @@ IOStatus Directories::SetDirectories(FileSystem* fs, const std::string& dbname,
   return IOStatus::OK();
 }
 
+Status DBImpl::CheckRelocationFilesExist(
+    UnorderedMap<std::string, UnorderedSet<uint64_t>>*
+        blob_file_numbers_by_path) {
+  mutex_.AssertHeld();
+  assert(blob_file_numbers_by_path != nullptr);
+  // Startup has not exposed any CF or started its background jobs, so a
+  // directory listing can run outside the DB mutex.
+  Status s;
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    const std::string path =
+        NormalizePath(cfd->ioptions().cf_paths.front().path);
+    for (const std::shared_ptr<BlobRelocationFileMetaData>& file :
+         cfd->current()->storage_info()->GetBlobRelocationFiles()) {
+      if (file->IsMarkedLost()) {
+        continue;
+      }
+      auto listed = blob_file_numbers_by_path->find(path);
+      if (listed == blob_file_numbers_by_path->end()) {
+        TEST_SYNC_POINT("DBImpl::CheckRelocationFilesExist:ListDirectory");
+        std::vector<std::string> children;
+        mutex_.Unlock();
+        s = env_->GetChildren(path, &children);
+        mutex_.Lock();
+        if (!s.ok()) {
+          return s;
+        }
+        UnorderedSet<uint64_t>& numbers = (*blob_file_numbers_by_path)[path];
+        for (const std::string& child : children) {
+          uint64_t number = 0;
+          FileType type;
+          if (ParseFileName(child, &number, &type) && type == kBlobFile) {
+            numbers.insert(number);
+          }
+        }
+        listed = blob_file_numbers_by_path->find(path);
+      }
+      if (listed->second.count(file->GetFileNumber()) == 0) {
+        s.PermitUncheckedError();
+        return Status::NotFound(
+            "Blob relocation file " +
+            BlobFileName(cfd->ioptions().cf_paths.front().path,
+                         file->GetFileNumber()) +
+            " (#" + std::to_string(file->GetFileNumber()) + ", CF " +
+            cfd->GetName() +
+            ") is missing. Restore the file to open the DB, or open once with "
+            "best_efforts_blob_db_repair to accept the loss of its values. "
+            "That open reads the lost values as deleted and does not replay "
+            "the WAL, so writes that are only in the WAL are not applied");
+      }
+    }
+  }
+  return s;
+}
+
 Status DBImpl::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families, bool read_only,
     bool error_if_wal_file_exists, bool error_if_data_exists_in_wals,
@@ -644,6 +701,18 @@ Status DBImpl::Recover(
   if (!s.ok()) {
     return s;
   }
+  if (read_only && !immutable_db_options_.UsesBestEffortsRecoveryPath()) {
+    // A read-only open lists no directory otherwise: list each needed path
+    // once. A read-write open checks after MaybeUpdateNextFileNumber() below,
+    // with its listing. Both run after complete replay, so they check only the
+    // relocation files of the current Versions, not the files that a later
+    // MANIFEST record removed.
+    UnorderedMap<std::string, UnorderedSet<uint64_t>> listing;
+    s = CheckRelocationFilesExist(&listing);
+    if (!s.ok()) {
+      return s;
+    }
+  }
   if (!read_only) {
     for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
       if (cfd == nullptr || cfd->IsDropped()) {
@@ -771,6 +840,15 @@ Status DBImpl::Recover(
   ROCKS_LOG_INFO(immutable_db_options_.info_log, "DB ID: %s\n", db_id_.c_str());
   if (s.ok() && !read_only) {
     s = MaybeUpdateNextFileNumber(recovery_ctx);
+  }
+  if (s.ok() && !read_only &&
+      !immutable_db_options_.UsesBestEffortsRecoveryPath()) {
+    // Reuses the directory listing of MaybeUpdateNextFileNumber(), so no
+    // FileExists call per relocation file.
+    UnorderedMap<std::string, UnorderedSet<uint64_t>> listing;
+    s = CheckRelocationFilesExist(
+        recovery_ctx != nullptr ? &recovery_ctx->blob_file_numbers_by_path_
+                                : &listing);
   }
   if (s.ok() && !read_only) {
     OptionsFileSelection selection;
@@ -3545,9 +3623,9 @@ Status DBImpl::BuildBlobReferenceCensus(
       for (const std::shared_ptr<BlobFileMetaData>& file :
            starting_version->storage_info()->GetBlobFiles()) {
         if (file->IsIndirectOrigin()) {
-          physical_files.push_back({file->GetBlobFileNumber(),
-                                    file->GetTotalBlobBytes(),
-                                    /*is_indirect_origin=*/true});
+          physical_files.push_back(
+              {file->GetBlobFileNumber(), file->GetTotalBlobBytes(),
+               /*is_indirect_origin=*/true, /*is_lost=*/false});
         }
       }
       status = census.SetWorkerPhysicalFiles(token, physical_files);
