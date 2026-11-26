@@ -5,6 +5,7 @@
 
 #include "db/version_builder.h"
 
+#include <atomic>
 #include <cstring>
 #include <iomanip>
 #include <memory>
@@ -508,6 +509,64 @@ TEST_F(VersionBuilderTest, ApplyMultipleAndSaveTo) {
   ASSERT_EQ(500U, new_vstorage.NumLevelBytes(2));
 
   UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, ApplyChecksBaseConsistencyOnce) {
+  // The base Version does not change during a builder's life. So once the check
+  // passes, the builder does not check it again, even when it applies many
+  // edits.
+  Add(2, 1U, "150", "200", 100U);
+  UpdateVersionStorageInfo();
+  std::atomic<int> base_checks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::Apply:CheckBaseConsistency",
+      [&](void*) { ++base_checks; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, &ioptions_,
+                                 /*table_cache=*/nullptr, &vstorage_,
+                                 /*version_set=*/nullptr);
+  for (uint64_t i = 0; i < 5; ++i) {
+    VersionEdit edit;
+    const std::string smallest = std::to_string(300 + 100 * i);
+    const std::string largest = std::to_string(350 + 100 * i);
+    edit.AddFile(2, 10 + i, 0, 100U, GetInternalKey(smallest.c_str()),
+                 GetInternalKey(largest.c_str()), 200, 200, false,
+                 Temperature::kUnknown, kInvalidBlobFileNumber,
+                 kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+                 kUnknownEpochNumber, kUnknownFileChecksum,
+                 kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
+                 /* user_defined_timestamps_persisted */ true);
+    ASSERT_OK(version_builder.Apply(&edit));
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(base_checks.load(), 1);
+
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, nullptr, false,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(version_builder.SaveTo(&new_vstorage));
+  UpdateVersionStorageInfo(&new_vstorage);
+  EXPECT_EQ(new_vstorage.NumLevelFiles(2), 6);
+  UnrefFilesInVersion(&new_vstorage);
+}
+
+TEST_F(VersionBuilderTest, ApplyReportsInconsistentBaseOnEveryApply) {
+  // Overlapping L1 files make the base inconsistent. Every Apply reports it,
+  // because a failed check is not remembered as passed.
+  Add(1, 1U, "100", "300", 100U);
+  Add(1, 2U, "200", "400", 100U);
+  EnvOptions env_options;
+  VersionBuilder version_builder(env_options, &ioptions_,
+                                 /*table_cache=*/nullptr, &vstorage_,
+                                 /*version_set=*/nullptr);
+  VersionEdit edit;
+  ASSERT_EQ(version_builder.Apply(&edit).code(), Status::kCorruption);
+  ASSERT_EQ(version_builder.Apply(&edit).code(), Status::kCorruption);
 }
 
 TEST_F(VersionBuilderTest, ApplyDeleteAndSaveTo) {
