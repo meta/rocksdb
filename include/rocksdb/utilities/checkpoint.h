@@ -127,6 +127,9 @@ class CheckpointEngineBase {
   // Exports all live SST files of the given column family into destination_dir,
   // returning their metadata in *out_metadata. Returns NotSupported if any SST
   // file references blob files (see Checkpoint::ExportColumnFamily).
+  // It also returns NotSupported for a column family that uses blob
+  // indirection (see Checkpoint::ExportColumnFamily). Full checkpoints are
+  // supported.
   virtual IOStatus ExportColumnFamily(
       DB* source_db, ColumnFamilyHandle* handle,
       const std::string& destination_dir,
@@ -196,8 +199,15 @@ class Checkpoint {
   // - export_dir should not already exist and will be created by this API.
   // - Always triggers a flush.
   // - Blob files are not exported. Returns NotSupported, and leaves no export
-  //   files behind, if any SST file of the column family references blob
-  //   files.
+  //   files behind, if any SST file of the column family references blob files.
+  //   It also returns NotSupported for a column family that uses blob
+  //   indirection: enable_blob_indirection is on, a pending flush or compaction
+  //   writes blob indirection output, or the column family used blob
+  //   indirection in the past. Turning the option off does not lift this limit.
+  //   The export does not carry the blob indirection state that such a column
+  //   family needs. This state is relocation files (see enable_blob_indirection
+  //   in advanced_options.h) and routes. A route is a MANIFEST record that
+  //   points an old blob file to the file that now holds its values.
   virtual Status ExportColumnFamily(ColumnFamilyHandle* handle,
                                     const std::string& export_dir,
                                     ExportImportFilesMetaData** metadata);

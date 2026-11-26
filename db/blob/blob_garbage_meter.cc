@@ -5,19 +5,29 @@
 
 #include "db/blob/blob_garbage_meter.h"
 
+#include <limits>
+
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
+#include "port/likely.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 Status BlobGarbageMeter::ProcessInFlow(const Slice& key, const Slice& value) {
-  return ProcessFlow(key, value, /*is_inflow=*/true);
+  return ProcessFlow(key, value, /*is_inflow=*/true,
+                     /*decoded_blob_index=*/nullptr);
 }
 
 Status BlobGarbageMeter::ProcessOutFlow(const Slice& key, const Slice& value) {
-  return ProcessFlow(key, value, /*is_inflow=*/false);
+  return ProcessFlow(key, value, /*is_inflow=*/false,
+                     /*decoded_blob_index=*/nullptr);
+}
+
+Status BlobGarbageMeter::ProcessOutFlow(const Slice& key, const Slice& value,
+                                        const BlobIndex* decoded_blob_index) {
+  return ProcessFlow(key, value, /*is_inflow=*/false, decoded_blob_index);
 }
 
 Status BlobGarbageMeter::GetBlobReferenceDetails(const ParsedInternalKey& ikey,
@@ -32,6 +42,14 @@ Status BlobGarbageMeter::GetBlobReferenceDetails(const ParsedInternalKey& ikey,
   if (blob_index.IsInlined() || blob_index.HasTTL()) {
     return Status::Corruption("Unexpected TTL/inlined blob index");
   }
+  // An unflattened indirect reference still points to a record in a normal
+  // blob file, so it counts in that file's garbage accounting. A flattened
+  // reference points to a relocation file. The census tracks the live bytes of
+  // a relocation file, so the garbage meter skips the reference.
+  if (blob_index.IsIndirect() &&
+      blob_index.generation_file_number() != blob_index.origin_file_number()) {
+    return Status::OK();
+  }
   if (blob_index.IsSameFile()) {
     return Status::OK();
   }
@@ -44,10 +62,10 @@ Status BlobGarbageMeter::GetBlobReferenceDetails(const ParsedInternalKey& ikey,
   return Status::OK();
 }
 
-Status BlobGarbageMeter::ParseBlobIndexReference(const ParsedInternalKey& ikey,
-                                                 const Slice& value,
-                                                 uint64_t* blob_file_number,
-                                                 uint64_t* bytes) {
+Status BlobGarbageMeter::ParseBlobIndexReference(
+    const ParsedInternalKey& ikey, const Slice& value,
+    const BlobIndex* decoded_blob_index, uint64_t* blob_file_number,
+    uint64_t* bytes) {
   assert(blob_file_number);
   assert(*blob_file_number == kInvalidBlobFileNumber);
   assert(bytes);
@@ -55,6 +73,11 @@ Status BlobGarbageMeter::ParseBlobIndexReference(const ParsedInternalKey& ikey,
 
   if (ikey.type != kTypeBlobIndex) {
     return Status::OK();
+  }
+
+  if (decoded_blob_index != nullptr) {
+    return GetBlobReferenceDetails(ikey, *decoded_blob_index, blob_file_number,
+                                   bytes);
   }
 
   BlobIndex blob_index;
@@ -86,7 +109,8 @@ void BlobGarbageMeter::AddFlow(uint64_t blob_file_number, uint64_t bytes,
 }
 
 Status BlobGarbageMeter::ProcessFlow(const Slice& key, const Slice& value,
-                                     bool is_inflow) {
+                                     bool is_inflow,
+                                     const BlobIndex* decoded_blob_index) {
   ParsedInternalKey ikey;
 
   {
@@ -99,8 +123,8 @@ Status BlobGarbageMeter::ProcessFlow(const Slice& key, const Slice& value,
 
   uint64_t blob_file_number = kInvalidBlobFileNumber;
   uint64_t bytes = 0;
-  if (Status s =
-          ParseBlobIndexReference(ikey, value, &blob_file_number, &bytes);
+  if (Status s = ParseBlobIndexReference(ikey, value, decoded_blob_index,
+                                         &blob_file_number, &bytes);
       !s.ok()) {
     return s;
   }

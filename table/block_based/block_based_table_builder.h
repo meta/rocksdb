@@ -16,7 +16,9 @@
 #include <utility>
 #include <vector>
 
+#include "db/blob/blob_gen2_format.h"
 #include "db/version_edit.h"
+#include "port/likely.h"
 #include "rocksdb/flush_block_policy.h"
 #include "rocksdb/listener.h"
 #include "rocksdb/options.h"
@@ -33,6 +35,7 @@ class BlockBuilder;
 class BlockHandle;
 class WritableFile;
 struct BlockBasedTableOptions;
+struct BlobRelocationFileMetadata;
 
 extern const uint64_t kBlockBasedTableMagicNumber;
 
@@ -41,9 +44,14 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Create a builder that will store the contents of the table it is
   // building in *file.  Does not close the file.  It is up to the
   // caller to close the file after calling Finish().
-  BlockBasedTableBuilder(const BlockBasedTableOptions& table_options,
-                         const TableBuilderOptions& table_builder_options,
-                         WritableFileWriter* file);
+  // `blob_reference_cache_res_mgr` charges the block cache for the memory of
+  // the exact blob reference metadata collector. The table factory shares one
+  // manager between all its builders. Null means the memory is not charged.
+  BlockBasedTableBuilder(
+      const BlockBasedTableOptions& table_options,
+      const TableBuilderOptions& table_builder_options,
+      WritableFileWriter* file,
+      std::shared_ptr<CacheReservationManager> blob_reference_cache_res_mgr);
 
   // No copying allowed
   BlockBasedTableBuilder(const BlockBasedTableBuilder&) = delete;
@@ -73,6 +81,58 @@ class BlockBasedTableBuilder : public TableBuilder {
   // compaction's Add() assumptions.
   TableBuilderAddResult TryAdd(const Slice& key, const Slice& value,
                                TableBuilderAddContext* context) override;
+
+  bool BlobReferenceLimitReached() const override;
+
+  // Relocation file building. Indirect blob GC writes the live values it copies
+  // into a relocation file, which is a block-based table (see
+  // db/blob/blob_relocation_file.h). Create the builder with
+  // NewBlobRelocationTableBuilder, which also starts the file.
+
+  // Starts a relocation file and writes its 8-byte prefix
+  // (kBlobRelocationFilePrefix). Also turns off compression sampling. Requires
+  // a fresh builder (nothing added yet) created with embedded blob support
+  // (TableBuilderOptions::embedded_blob_options set, as
+  // NewBlobRelocationTableBuilder does), a persisted file identity
+  // (orig_file_number and db_session_id) and the bytewise comparator without
+  // timestamps; otherwise InvalidArgument. The builder must not buffer data
+  // blocks for dictionary sampling (NewBlobRelocationTableBuilder sets
+  // TableBuilderOptions::ignore_data_block_dictionary).
+  Status StartBlobRelocationFile();
+
+  // Registers an old file number that may be routed to this file. The file
+  // stores this served-file list in its directory (see
+  // db/blob/blob_relocation_file.h). `file_number` must be smaller than this
+  // file's number; otherwise InvalidArgument. Duplicate calls are allowed and
+  // removed in Finish().
+  Status AddBlobRelocationServedFile(uint64_t file_number);
+
+  // Adds one stored blob payload under its stable identity (origin, original
+  // offset). The payload is already compressed with `compression` and is
+  // written as is. `origin_file_number` must be smaller than this file's
+  // number, and calls must be in strictly increasing (origin, original offset)
+  // order. A payload above kMaxSimpleGen2BlobPayloadSize or an unsupported
+  // compression type is also rejected. All these cases return InvalidArgument.
+  Status AddBlobRelocation(uint64_t origin_file_number,
+                           uint64_t original_value_offset,
+                           const Slice& stored_payload,
+                           CompressionType compression);
+
+  // Streaming counterpart, with the same checks. The source verifies the exact
+  // stored bytes with the stored CRC. If the source fails, the caller must
+  // abandon the whole output and must not publish it.
+  Status AddBlobRelocation(uint64_t origin_file_number,
+                           uint64_t original_value_offset,
+                           uint64_t stored_value_size,
+                           CompressionType compression,
+                           uint32_t stored_checksum,
+                           const VerifiedBlobStoredSource& source);
+
+  // Returns the encoded directory and tail size after Finish() succeeds.
+  // Otherwise returns the builder's error status, or InvalidArgument if the
+  // file is not finished yet.
+  Status GetBlobRelocationFileMetadata(
+      BlobRelocationFileMetadata* metadata) const;
 
   // Return non-ok iff some error has been detected.
   Status status() const override;
@@ -121,6 +181,9 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Get table properties
   TableProperties GetTableProperties() const override;
 
+  std::shared_ptr<const BlobReferenceSstSummary> GetBlobReferenceSstSummary()
+      const override;
+
   // Get file checksum
   std::string GetFileChecksum() const override;
 
@@ -139,6 +202,23 @@ class BlockBasedTableBuilder : public TableBuilder {
 
  private:
   bool ok() const;
+
+  // Add() with the caller's decode of a kTypeBlobIndex `value`, or nullptr
+  // (see TableBuilderAddContext::decoded_blob_index).
+  void AddImpl(const Slice& key, const Slice& value,
+               const BlobIndex* decoded_blob_index);
+
+  // Feeds the blob references of one entry to the reference collector, or
+  // records the coarse classification. For a wide-column entity it also counts
+  // the referenced_blob_bytes property, so the entity is walked once. Returns
+  // false, with the builder status set, on an error. AddImpl() calls it only
+  // when the SST collects references or tracks the classification, and only
+  // for kTypeBlobIndex and kTypeWideColumnEntity entries.
+  // ROCKSDB_NOINLINE keeps it out of AddImpl(), so the base path stays small.
+  ROCKSDB_NOINLINE bool AddBlobReferences(const Slice& entry_ikey,
+                                          const Slice& entry_value,
+                                          ValueType value_type,
+                                          const BlobIndex* value_blob_index);
 
   // Transition state from buffered to unbuffered if the conditions are met. See
   // `Rep::State` API comment for details of the states.
@@ -162,6 +242,8 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WriteBlock(const Slice& block_contents, BlockHandle* handle,
                   BlockType block_type, bool* skip_delta_encoding = nullptr);
   // Directly write data to the file.
+  // The base signatures. They pass warm_cache = true (base behavior: the
+  // block may be added to the block cache when the options ask for it).
   void WriteMaybeCompressedBlock(
       const Slice& block_contents, CompressionType, BlockHandle* handle,
       BlockType block_type, const Slice* uncompressed_block_data = nullptr,
@@ -172,6 +254,20 @@ class BlockBasedTableBuilder : public TableBuilder {
       BlockType block_type, const Slice* uncompressed_block_data = nullptr,
       bool* skip_delta_encoding = nullptr,
       const uint32_t* precomputed_block_contents_crc32c = nullptr);
+
+  // `warm_cache` false keeps the block out of the block cache even when the
+  // options ask to warm it (prepopulate_block_cache). Used for blocks that no
+  // reader looks up in the block cache.
+  void WriteMaybeCompressedBlock(
+      const Slice& block_contents, CompressionType, BlockHandle* handle,
+      BlockType block_type, const Slice* uncompressed_block_data,
+      bool* skip_delta_encoding,
+      const uint32_t* precomputed_block_contents_crc32c, bool warm_cache);
+  IOStatus WriteMaybeCompressedBlockImpl(
+      const Slice& block_contents, CompressionType, BlockHandle* handle,
+      BlockType block_type, const Slice* uncompressed_block_data,
+      bool* skip_delta_encoding,
+      const uint32_t* precomputed_block_contents_crc32c, bool warm_cache);
 
   void SetupCacheKeyPrefix(const TableBuilderOptions& tbo);
 
@@ -193,6 +289,7 @@ class BlockBasedTableBuilder : public TableBuilder {
   void WritePropertiesBlock(MetaIndexBuilder* meta_index_builder);
   void WriteCompressionDictBlock(MetaIndexBuilder* meta_index_builder);
   void WriteRangeDelBlock(MetaIndexBuilder* meta_index_builder);
+  void WriteBlobReferenceMetadata(MetaIndexBuilder* meta_index_builder);
   void WriteFooter(BlockHandle& metaindex_block_handle,
                    BlockHandle& index_block_handle);
 
@@ -215,11 +312,43 @@ class BlockBasedTableBuilder : public TableBuilder {
   // original value should be used as-is).
   Status BuildEmbeddedWideColumnEntity(const Slice& value, bool* rewritten);
 
-  // Appends one uncompressed same-file blob record for `payload` at the current
-  // table offset, advances the offset, lazily allocates and updates the
-  // embedded-blob state (counters), and encodes a same-file BlobIndex into
-  // rep_->embedded_blob_state->blob_index_buf.
-  Status WriteEmbeddedBlobRecord(const Slice& payload);
+  // Appends one same-file blob record at the current table offset and advances
+  // the offset. `payload` is already in stored form, compressed with
+  // `compression`, and is written as is. Also updates the embedded-blob
+  // counters and encodes a same-file BlobIndex into
+  // rep_->embedded_blob_state->blob_index_buf. When non-null, `record_offset`
+  // receives the file offset where the record starts.
+  Status WriteEmbeddedBlobRecord(const Slice& payload,
+                                 CompressionType compression,
+                                 uint64_t* record_offset);
+
+  // Checks one value for both AddBlobRelocation() overloads: the file must be
+  // started and healthy, the stored size must be 1 to
+  // kMaxSimpleGen2BlobPayloadSize bytes, the compression type must be
+  // supported, and the origin must be older than this file. Returns the
+  // builder's error if the builder has already failed, and InvalidArgument
+  // for the other cases. An origin that is not older also fails the builder,
+  // because the reader would reject the finished file.
+  Status CheckBlobRelocationValue(uint64_t origin_file_number,
+                                  uint64_t stored_value_size,
+                                  CompressionType compression);
+
+  // Relocation files: a location entry covers a group of values of one origin
+  // (see db/blob/blob_relocation_file.h). Before a record of
+  // `origin_file_number` is written, this writes the open group's location
+  // entry if the record starts a new group. The location entry is added only
+  // after the group's records, so a data block is never written between the
+  // records of one group.
+  void PrepareBlobRelocationGroup(uint64_t origin_file_number);
+
+  // Adds a written record to the open group, and writes the group's location
+  // entry when the group is full.
+  void AddToBlobRelocationGroup(uint64_t origin_file_number,
+                                uint64_t original_value_offset,
+                                uint64_t stored_value_size,
+                                uint64_t record_offset);
+  // Writes the location entry of the open group, if any.
+  void FinishBlobRelocationGroup();
 
   struct Rep;
   class BlockBasedTablePropertiesCollectorFactory;
@@ -262,5 +391,61 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Stop worker threads for parallel compression
   void StopParallelCompression(bool abort);
 };
+
+// The identity and the size target of one relocation file, for
+// NewBlobRelocationTableBuilder(). Callers set the fields by name, so values of
+// the same type (db_id and db_session_id, file_number and target_file_size)
+// cannot be swapped by mistake. The strings are copied.
+// NewBlobRelocationTableBuilder() runs once per relocation file, so the copies
+// cost little.
+struct BlobRelocationTableFileInfo {
+  uint32_t column_family_id = 0;
+  std::string column_family_name;
+  TableFileCreationReason reason = TableFileCreationReason::kMisc;
+  std::string db_id;
+  std::string db_session_id;
+  std::string db_name;
+  uint64_t file_number = 0;
+  // The file size that the caller aims for; 0 means no target.
+  uint64_t target_file_size = 0;
+};
+
+// Creates the builder of relocation file `file_info.file_number` of column
+// family `file_info.column_family_id`, writing to `file`, and starts the file
+// (StartBlobRelocationFile). Settings of the builder:
+// - Table options: MakeBlobRelocationTableOptions(`table_options`).
+// - Other settings: from `mutable_cf_options`, with blob indirection and the
+//   prefix extractor turned off.
+// - Data blocks: they hold only location entries (see
+//   db/blob/blob_relocation_file.h). They use the column family's
+//   bottommost_compression if it is set, else its compression. Bottommost comes
+//   first because a relocation file holds values that indirect blob GC moved
+//   out of old files, and such long-lived data is like bottommost data (a
+//   design choice). The builder writes each value itself, outside the data
+//   blocks, already in stored form, as an embedded blob record; values are
+//   never recompressed.
+// - No parallel compression: it writes data blocks to the file from other
+//   threads, while the builder writes the records from the calling thread.
+// - No dictionary: dictionary sampling holds the data blocks in memory until
+//   the sampling ends. Location blocks are small, so a dictionary is not worth
+//   that memory (a design choice). The builder sets max_dict_bytes and
+//   zstd_max_train_bytes to 0. It also sets
+//   TableBuilderOptions::ignore_data_block_dictionary, so the builder ignores
+//   the dictionary guidance of a custom compression manager (dictionary
+//   sampling or a pre-defined dictionary) and never buffers data blocks. Such a
+//   manager works for normal SSTs, so it must not make the relocation file fail
+//   to start. A compressor that brings its own dictionary can still use it.
+//
+// `comparator` must use the bytewise comparator and outlive the builder. If
+// starting the file fails, the builder is abandoned and `*builder` is reset, so
+// the caller only needs to return the status.
+Status NewBlobRelocationTableBuilder(
+    const ImmutableOptions& ioptions,
+    const MutableCFOptions& mutable_cf_options,
+    const BlockBasedTableOptions& table_options,
+    const ReadOptions& read_options, const WriteOptions& write_options,
+    const InternalKeyComparator& comparator,
+    const BlobRelocationTableFileInfo& file_info, WritableFileWriter* file,
+    std::unique_ptr<BlockBasedTableBuilder>* builder);
 
 }  // namespace ROCKSDB_NAMESPACE

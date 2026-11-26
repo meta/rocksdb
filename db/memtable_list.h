@@ -316,6 +316,16 @@ class MemTableList {
   // completely flushed and logged.
   int NumFlushed() const;
 
+  // Records that a flush picked this memtable with enable_blob_indirection on.
+  // Such a flush can set the format fence when it installs its output, even if
+  // SetOptions has turned the option off. The count stays until the memtable
+  // is installed or rolled back, not until the FlushJob is destroyed.
+  // REQUIRES: DB mutex held.
+  void BeginBlobIndirectionActivation(ReadOnlyMemTable* memtable);
+  bool HasPendingBlobIndirectionActivation() const {
+    return pending_blob_indirection_activations_ != 0;
+  }
+
   // Flush-completion listener notification accounting. All require the DB
   // mutex to be held (this class is not internally synchronized). See
   // num_pending_flush_notifications_ for details.
@@ -561,6 +571,8 @@ class MemTableList {
   // DB mutex held
   void InstallNewVersion();
 
+  void EndBlobIndirectionActivation(ReadOnlyMemTable* memtable);
+
   // DB mutex held
   // Called after writing to MANIFEST
   void RemoveMemTablesOrRestoreFlags(const Status& s, ColumnFamilyData* cfd,
@@ -603,6 +615,7 @@ class MemTableList {
   // FlushOptions::listener_wait, so that Flush(wait=true) does not return
   // before the callbacks complete. Guarded by the DB mutex.
   int num_pending_flush_notifications_ = 0;
+  size_t pending_blob_indirection_activations_ = 0;
 };
 
 // Installs memtable atomic flush results.

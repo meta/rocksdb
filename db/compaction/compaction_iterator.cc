@@ -135,8 +135,8 @@ CompactionIterator::CompactionIterator(
     BlobFileBuilder* blob_file_builder, bool allow_data_in_errors,
     bool enforce_single_del_contracts,
     const std::atomic<bool>& manual_compaction_canceled,
-    bool must_count_input_entries, const Compaction* compaction,
-    const CompactionFilter* compaction_filter,
+    bool must_count_input_entries, bool allow_blob_index_flattening,
+    const Compaction* compaction, const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
@@ -150,9 +150,10 @@ CompactionIterator::CompactionIterator(
           allow_data_in_errors, enforce_single_del_contracts,
           manual_compaction_canceled,
           compaction ? std::make_unique<RealCompaction>(compaction) : nullptr,
-          must_count_input_entries, compaction_filter, shutting_down, info_log,
-          full_history_ts_low, preserve_seqno_min, input_version,
-          blob_read_io_activity, blob_gc_cutoff_file_number) {}
+          must_count_input_entries, allow_blob_index_flattening,
+          compaction_filter, shutting_down, info_log, full_history_ts_low,
+          preserve_seqno_min, input_version, blob_read_io_activity,
+          blob_gc_cutoff_file_number) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
@@ -166,7 +167,7 @@ CompactionIterator::CompactionIterator(
     bool enforce_single_del_contracts,
     const std::atomic<bool>& manual_compaction_canceled,
     std::unique_ptr<CompactionProxy> compaction, bool must_count_input_entries,
-    const CompactionFilter* compaction_filter,
+    bool allow_blob_index_flattening, const CompactionFilter* compaction_filter,
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
@@ -183,6 +184,7 @@ CompactionIterator::CompactionIterator(
       env_(env),
       clock_(env_->GetSystemClock().get()),
       report_detailed_time_(report_detailed_time),
+      check_large_values_(blob_file_builder != nullptr),
       range_del_agg_(range_del_agg),
       blob_file_builder_(blob_file_builder),
       compaction_(std::move(compaction)),
@@ -217,11 +219,19 @@ CompactionIterator::CompactionIterator(
                                               blob_read_io_activity)),
       prefetch_buffers_(
           CreatePrefetchBufferCollectionIfNeeded(compaction_.get())),
+      allow_blob_index_flattening_(allow_blob_index_flattening),
+      coarse_blob_output_(
+          compaction_ != nullptr && compaction_->real_compaction() != nullptr &&
+          compaction_->real_compaction()->output_level() == 0 &&
+          !compaction_->real_compaction()->CollectExactBlobReferences()),
       current_key_committed_(false),
       cmp_with_history_ts_low_(0),
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
       preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)) {
   assert(snapshots_ != nullptr);
+  input_has_blob_indirection_format_ =
+      compaction_ != nullptr && compaction_->input_version() != nullptr &&
+      compaction_->input_version()->storage_info()->HasBlobIndirectionFormat();
   if (compaction_filter_ &&
       merge_order_ == CompactionFilter::MergeOrder::kMergeBeforeFilter &&
       (snapshot_checker_ != nullptr || timestamp_size_ != 0 ||
@@ -298,6 +308,7 @@ void CompactionIterator::SeekToFirstWithoutPreparingOutput() {
   if (!status_.ok()) {
     return;
   }
+  has_output_blob_index_ = false;
   NextFromInput();
 }
 
@@ -313,6 +324,7 @@ void CompactionIterator::NextImpl() {
     return;
   }
   output_prepared_ = false;
+  has_output_blob_index_ = false;
   // If there is a merge output, return it before continuing to process the
   // input.
   if (merge_out_iter_.Valid()) {
@@ -1696,8 +1708,42 @@ bool CompactionIterator::DeletionIsObsolete() {
                                                     &level_ptrs_);
 }
 
+bool CompactionIterator::DeclineSstOnlyBlobOutput(const Slice& value) {
+  // Tests count the calls: there must be none when the policy is not set.
+  TEST_SYNC_POINT("CompactionIterator::DeclineSstOnlyBlobOutput");
+  if (!sst_only_min_blob_size_.has_value() || value.empty() ||
+      value.size() < *sst_only_min_blob_size_) {
+    return false;
+  }
+  status_ = Status::TryAgain("SST-only compaction requires blob-file output");
+  validity_info_.Invalidate();
+  return true;
+}
+
+void CompactionIterator::DeclineSstOnlyColumnOutput() {
+  for (const WideColumn& column : entity_columns_) {
+    if (DeclineSstOnlyBlobOutput(column.value())) {
+      return;
+    }
+  }
+}
+
+void CompactionIterator::DeclineSstOnlyFetchedBlobOutput(
+    const std::vector<std::pair<size_t, PinnableSlice>>& fetched_blob_values) {
+  for (const auto& fetched : fetched_blob_values) {
+    if (DeclineSstOnlyBlobOutput(fetched.second)) {
+      return;
+    }
+  }
+}
+
 bool CompactionIterator::ExtractLargeValueIfNeededImpl() {
-  if (!blob_file_builder_) {
+  if (!check_large_values_) {
+    return false;
+  }
+  if (UNLIKELY(blob_file_builder_ == nullptr)) {
+    // The SST-only blob output policy is set.
+    DeclineSstOnlyBlobOutput(value_);
     return false;
   }
 
@@ -1757,15 +1803,42 @@ void CompactionIterator::GarbageCollectBlobIfNeeded() {
       }
     }
 
-    if (blob_index.file_number() >=
-        blob_garbage_collection_cutoff_file_number_) {
+    // With compaction-time blob GC on, this table says which values compaction
+    // rewrites into a new blob file or an inline value. "Coarse L0 output" is
+    // L0 output without exact reference metadata (coarse_blob_output_). The
+    // first matching row wins:
+    //
+    //   Value      Output                         Rewritten
+    //   ---------  -----------------------------  -------------------------
+    //   indirect   coarse L0 output               if below the age cutoff
+    //   indirect   enable_blob_indirection on     never
+    //   indirect   enable_blob_indirection off    always
+    //   direct     any                            if below the age cutoff
+    //
+    // The age cutoff is the compaction-time blob GC age cutoff file number
+    // (blob_garbage_collection_cutoff_file_number_). It is compared with
+    // BlobIndex::file_number(), which is the generation number for an indirect
+    // value. With enable_blob_indirection on, exact output keeps the stable
+    // identity, so indirect blob GC can collect the value later. With it off,
+    // indirect data goes away over time, so reads never depend on the current
+    // option value. The job's input Version keeps the files of these values
+    // alive while compaction rewrites them. A rewrite reads the value through
+    // the input Version, so it does not need a ready census.
+    // FetchBlobsNeedingGC() uses the same rule for wide-column entities.
+    if (blob_index.IsIndirect() && !coarse_blob_output_) {
+      if (compaction_->enable_blob_indirection()) {
+        return;
+      }
+    } else if (blob_index.file_number() >=
+               blob_garbage_collection_cutoff_file_number_) {
       return;
     }
 
     FilePrefetchBuffer* prefetch_buffer =
-        prefetch_buffers_ ? prefetch_buffers_->GetOrCreatePrefetchBuffer(
-                                blob_index.file_number())
-                          : nullptr;
+        prefetch_buffers_ != nullptr && !blob_index.IsIndirect()
+            ? prefetch_buffers_->GetOrCreatePrefetchBuffer(
+                  blob_index.file_number())
+            : nullptr;
 
     uint64_t bytes_read = 0;
 
@@ -1830,6 +1903,110 @@ void CompactionIterator::GarbageCollectBlobIfNeeded() {
   }
 }
 
+bool CompactionIterator::FlattenBlobIndexIfNeeded(BlobIndex* blob_index) {
+  if (!allow_blob_index_flattening_ || coarse_blob_output_ ||
+      blob_index == nullptr || !blob_index->IsIndirect() ||
+      compaction_ == nullptr || !compaction_->enable_blob_indirection()) {
+    return false;
+  }
+  const Version* const input_version = compaction_->input_version();
+  if (input_version == nullptr ||
+      !input_version->storage_info()->HasBlobIndirectionFormat()) {
+    return false;
+  }
+  const VersionStorageInfo* const storage = input_version->storage_info();
+  if (input_route_state_ == InputRouteState::kUnknown) {
+    input_route_state_ = storage->GetBlobRelocationRouteCount() == 0
+                             ? InputRouteState::kNoRoutes
+                             : InputRouteState::kHasRoutes;
+  }
+  if (input_route_state_ == InputRouteState::kNoRoutes) {
+    return false;
+  }
+  // Routes are one hop: the target of route[generation] holds the value, and
+  // a target never has a route of its own.
+  const uint64_t generation = blob_index->generation_file_number();
+  if (generation != last_route_generation_) {
+    last_route_generation_ = generation;
+    last_route_target_ = storage->GetBlobRelocationRouteTarget(generation);
+  }
+  const uint64_t target = last_route_target_;
+  if (target == kInvalidBlobFileNumber) {
+    return false;
+  }
+  Status status = blob_index->SetGenerationFileNumber(target);
+  if (!status.ok()) {
+    status_ = std::move(status);
+    validity_info_.Invalidate();
+    return false;
+  }
+  has_flattened_blob_index_ = true;
+  // Tests read the target through a const pointer. The copy keeps the
+  // callback from changing `target`.
+  [[maybe_unused]] uint64_t flattened_target = target;
+  TEST_SYNC_POINT_CALLBACK(
+      "CompactionIterator::FlattenBlobIndexIfNeeded:Target", &flattened_target);
+  return true;
+}
+
+void CompactionIterator::FlattenBlobIfNeeded() {
+  assert(ikey_.type == kTypeBlobIndex);
+  const Version* const input_version =
+      compaction_ != nullptr ? compaction_->input_version() : nullptr;
+  if (input_version == nullptr ||
+      !input_version->storage_info()->HasBlobIndirectionFormat()) {
+    return;
+  }
+  BlobIndex blob_index;
+  Status status = blob_index.DecodeFrom(value_);
+  if (!status.ok()) {
+    status_ = std::move(status);
+    validity_info_.Invalidate();
+    return;
+  }
+  if (FlattenBlobIndexIfNeeded(&blob_index)) {
+    blob_index.EncodeTo(&blob_index_);
+    value_ = blob_index_;
+  }
+  if (status_.ok()) {
+    output_blob_index_ = blob_index;
+    has_output_blob_index_ = true;
+  }
+}
+
+bool CompactionIterator::FlattenBlobIndexesIfNeeded(
+    std::vector<std::pair<size_t, BlobIndex>>* blob_columns) {
+  assert(blob_columns != nullptr);
+  bool changed = false;
+  for (auto& blob_column : *blob_columns) {
+    changed = FlattenBlobIndexIfNeeded(&blob_column.second) || changed;
+    if (!status_.ok()) {
+      return false;
+    }
+  }
+  return changed;
+}
+
+void CompactionIterator::FlattenEntityBlobIndexesIfNeeded() {
+  if (!FlattenBlobIndexesIfNeeded(&entity_blob_columns_)) {
+    return;
+  }
+  entity_wide_columns_.clear();
+  entity_wide_columns_.reserve(entity_columns_.size());
+  for (const WideColumn& column : entity_columns_) {
+    entity_wide_columns_.emplace_back(column.name(), column.value());
+  }
+  rewritten_entity_.clear();
+  Status status = WideColumnSerialization::SerializeV2(
+      entity_wide_columns_, entity_blob_columns_, rewritten_entity_);
+  if (!status.ok()) {
+    status_ = std::move(status);
+    validity_info_.Invalidate();
+    return;
+  }
+  value_ = rewritten_entity_;
+}
+
 // Wide-column entity compaction flow after InvokeFilterIfNeeded():
 //   1. PrepareOutput() is the only caller of the helper block below.
 //   2. PrepareOutput() ensures entity_columns_/entity_blob_columns_ describe
@@ -1843,13 +2020,15 @@ void CompactionIterator::GarbageCollectBlobIfNeeded() {
 //        - entity already containing blob references:
 //            GarbageCollectEntityBlobsIfNeeded()
 //          This is the blob-GC path. It only fetches / relocates references
-//          that fall below the current GC cutoff.
+//          that fall below the current GC cutoff. It also flattens the blob
+//          columns (see FlattenEntityBlobIndexesIfNeeded()), even when blob GC
+//          is off.
 // Both helpers leave value_ unchanged when no rewrite is needed.
 void CompactionIterator::ExtractLargeColumnValuesIfNeeded() {
   assert(ikey_.type == kTypeWideColumnEntity);
 
   // Check if blob extraction is enabled
-  if (!blob_file_builder_) {
+  if (!check_large_values_) {
     return;
   }
 
@@ -1881,6 +2060,12 @@ void CompactionIterator::ExtractLargeColumnValuesIfNeeded() {
   // serialization, and the benefit is marginal since full rewrites happen
   // naturally during blob GC.
   if (UNLIKELY(!entity_blob_columns_.empty())) {
+    return;
+  }
+
+  if (UNLIKELY(blob_file_builder_ == nullptr)) {
+    // The SST-only blob output policy is set.
+    DeclineSstOnlyColumnOutput();
     return;
   }
 
@@ -1960,17 +2145,23 @@ bool CompactionIterator::FetchBlobsNeedingGC(
       continue;
     }
 
-    // Check if this blob file needs garbage collection
-    if (blob_index.file_number() >=
-        blob_garbage_collection_cutoff_file_number_) {
+    // Check if this blob file needs garbage collection (same rule as
+    // GarbageCollectBlobIfNeeded()).
+    if (blob_index.IsIndirect() && !coarse_blob_output_) {
+      if (compaction_->enable_blob_indirection()) {
+        continue;
+      }
+    } else if (blob_index.file_number() >=
+               blob_garbage_collection_cutoff_file_number_) {
       continue;
     }
 
     // This blob needs to be relocated - fetch its value
     FilePrefetchBuffer* prefetch_buffer =
-        prefetch_buffers_ ? prefetch_buffers_->GetOrCreatePrefetchBuffer(
-                                blob_index.file_number())
-                          : nullptr;
+        prefetch_buffers_ != nullptr && !blob_index.IsIndirect()
+            ? prefetch_buffers_->GetOrCreatePrefetchBuffer(
+                  blob_index.file_number())
+            : nullptr;
 
     uint64_t bytes_read = 0;
     assert(blob_fetcher_);
@@ -1998,38 +2189,44 @@ CompactionIterator::RelocateBlobValues(
     const std::vector<std::pair<size_t, PinnableSlice>>& fetched_blob_values) {
   std::vector<std::pair<size_t, BlobIndex>> new_blob_columns;
 
-  if (blob_file_builder_) {
-    for (const auto& fv : fetched_blob_values) {
-      const size_t col_idx = fv.first;
-      const Slice col_value(fv.second);
+  if (!check_large_values_) {
+    return new_blob_columns;
+  }
+  if (UNLIKELY(blob_file_builder_ == nullptr)) {
+    // The SST-only blob output policy is set.
+    DeclineSstOnlyFetchedBlobOutput(fetched_blob_values);
+    return new_blob_columns;
+  }
+  for (const auto& fv : fetched_blob_values) {
+    const size_t col_idx = fv.first;
+    const Slice col_value(fv.second);
 
-      std::string temp_blob_index;
-      Status status =
-          blob_file_builder_->Add(user_key(), col_value, &temp_blob_index);
+    std::string temp_blob_index;
+    Status status =
+        blob_file_builder_->Add(user_key(), col_value, &temp_blob_index);
+    if (!status.ok()) {
+      status_ = status;
+      validity_info_.Invalidate();
+      new_blob_columns.clear();
+      break;
+    }
+
+    if (!temp_blob_index.empty()) {
+      BlobIndex blob_idx;
+      status = blob_idx.DecodeFrom(temp_blob_index);
       if (!status.ok()) {
         status_ = status;
         validity_info_.Invalidate();
         new_blob_columns.clear();
         break;
       }
+      new_blob_columns.emplace_back(col_idx, blob_idx);
 
-      if (!temp_blob_index.empty()) {
-        BlobIndex blob_idx;
-        status = blob_idx.DecodeFrom(temp_blob_index);
-        if (!status.ok()) {
-          status_ = status;
-          validity_info_.Invalidate();
-          new_blob_columns.clear();
-          break;
-        }
-        new_blob_columns.emplace_back(col_idx, blob_idx);
-
-        // Track relocation stats here (after successful relocation)
-        ++iter_stats_.num_blobs_relocated;
-        iter_stats_.total_blob_bytes_relocated += col_value.size();
-      }
-      // If temp_blob_index is empty, the value will be inlined
+      // Track relocation stats here (after successful relocation)
+      ++iter_stats_.num_blobs_relocated;
+      iter_stats_.total_blob_bytes_relocated += col_value.size();
     }
+    // If temp_blob_index is empty, the value will be inlined
   }
 
   return new_blob_columns;
@@ -2061,6 +2258,11 @@ void CompactionIterator::SerializeEntityAfterGC(
   // Add newly relocated blobs
   for (const auto& nb : new_blob_columns) {
     final_blob_columns.push_back(nb);
+  }
+
+  FlattenBlobIndexesIfNeeded(&final_blob_columns);
+  if (!status_.ok()) {
+    return;
   }
 
   // Build WideColumns for serialization, replacing fetched blob values
@@ -2113,7 +2315,7 @@ void CompactionIterator::SerializeEntityAfterGC(
 void CompactionIterator::GarbageCollectEntityBlobsIfNeeded() {
   assert(ikey_.type == kTypeWideColumnEntity);
 
-  if (!compaction_ || !compaction_->enable_blob_garbage_collection()) {
+  if (!compaction_) {
     return;
   }
 
@@ -2142,13 +2344,21 @@ void CompactionIterator::GarbageCollectEntityBlobsIfNeeded() {
     return;
   }
 
+  if (!compaction_->enable_blob_garbage_collection()) {
+    FlattenEntityBlobIndexesIfNeeded();
+    return;
+  }
+
   // Fetch blobs that need GC
   std::vector<std::pair<size_t, PinnableSlice>> fetched_blob_values;
   if (!FetchBlobsNeedingGC(entity_columns_, entity_blob_columns_,
                            &fetched_blob_values)) {
     // Either no blobs needed GC (status_ is OK) or an error occurred
-    // (status_ is already set by FetchBlobsNeedingGC). In both cases,
-    // we return without modifying the entity.
+    // (status_ is already set by FetchBlobsNeedingGC). With OK, the blob
+    // columns can still be flattened below.
+    if (status_.ok()) {
+      FlattenEntityBlobIndexesIfNeeded();
+    }
     return;
   }
 
@@ -2190,12 +2400,17 @@ Status CompactionIterator::OutputHasExternalBlobReferences(
 }
 
 void CompactionIterator::PrepareOutput() {
+  has_output_blob_index_ = false;
   if (Valid()) {
     if (LIKELY(!is_range_del_)) {
       if (ikey_.type == kTypeValue) {
         ExtractLargeValueIfNeeded();
       } else if (ikey_.type == kTypeBlobIndex) {
         GarbageCollectBlobIfNeeded();
+        if (input_has_blob_indirection_format_ && Valid() &&
+            ikey_.type == kTypeBlobIndex) {
+          FlattenBlobIfNeeded();
+        }
       } else if (ikey_.type == kTypeWideColumnEntity) {
         // If entity was already deserialized (e.g., by InvokeFilterIfNeeded)
         // and the filter returned kKeep, skip redundant re-deserialization.

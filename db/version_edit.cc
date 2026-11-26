@@ -10,9 +10,11 @@
 #include "db/version_edit.h"
 
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/version_set.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/event_logger.h"
+#include "port/likely.h"
 #include "rocksdb/slice.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
@@ -21,7 +23,38 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+static_assert(kMaxBlobRelocationFileNumber == kFileNumberMask,
+              "Relocation file numbers use the file number limit");
+
 namespace {
+// For DebugString() / DebugJSON(): the blob reference metadata kind of an SST
+// written with blob indirection (see db/blob/blob_reference_metadata.h), or an
+// empty string for an SST without it. Examples: "exact (3 references, 300
+// stored value bytes)", "coarse (frontier 12)", "legacy". The frontier is the
+// oldest indirect-origin file number a coarse SST may reference (see
+// "Coarse SST" in db/blob/blob_reference_metadata.h).
+std::string BlobReferenceMetadataToString(const FileMetaData& f) {
+  if (!f.blob_reference_descriptor.empty()) {
+    BlobReferenceMetadataDescriptor descriptor;
+    const Status s = BlobReferenceMetadataDescriptor::DecodeFrom(
+        f.blob_reference_descriptor, &descriptor);
+    if (!s.ok()) {
+      return "exact (cannot decode the descriptor: " + s.ToString() + ")";
+    }
+    return "exact (" + std::to_string(descriptor.reference_count) +
+           " references, " + std::to_string(descriptor.stored_value_bytes) +
+           " stored value bytes)";
+  }
+  if (f.oldest_coarse_indirect_origin_file_number != kInvalidBlobFileNumber) {
+    return "coarse (frontier " +
+           std::to_string(f.oldest_coarse_indirect_origin_file_number) + ")";
+  }
+  if (f.blob_reference_legacy_metadata) {
+    return "legacy";
+  }
+  return std::string();
+}
+
 // For DebugString() / DebugJSON(), e.g. "ingestion+moved+raw:0x1103" (the raw
 // value shows reserved bits that aren't decoded).
 std::string DataFileProvenanceToString(uint32_t encoded) {
@@ -137,6 +170,14 @@ uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
 Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
                                       SequenceNumber seqno,
                                       ValueType value_type) {
+  return UpdateBoundaries(key, value, seqno, value_type,
+                          /*decoded_blob_index=*/nullptr);
+}
+
+Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
+                                      SequenceNumber seqno,
+                                      ValueType value_type,
+                                      const BlobIndex* decoded_blob_index) {
   // Helper: update oldest_blob_file_number from a single BlobIndex.
   auto update_oldest_blob = [&](const BlobIndex& blob_index) -> Status {
     if (!blob_index.IsInlined() && !blob_index.HasTTL()) {
@@ -170,13 +211,20 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
   };
 
   if (value_type == kTypeBlobIndex) {
-    BlobIndex blob_index;
-    if (Status s = blob_index.DecodeFrom(value); !s.ok()) {
-      return s;
-    }
-
-    if (Status s = update_oldest_blob(blob_index); !s.ok()) {
-      return s;
+    if (decoded_blob_index != nullptr) {
+      if (Status s = update_oldest_blob(*decoded_blob_index); !s.ok()) {
+        return s;
+      }
+    } else {
+      // Built only when the caller passed no decode, so a key with a decode
+      // does not build a BlobIndex.
+      BlobIndex own_blob_index;
+      if (Status s = own_blob_index.DecodeFrom(value); !s.ok()) {
+        return s;
+      }
+      if (Status s = update_oldest_blob(own_blob_index); !s.ok()) {
+        return s;
+      }
     }
   } else if (value_type == kTypeWideColumnEntity) {
     if (Status s = WideColumnSerialization::ForEachBlobFileNumber(
@@ -196,6 +244,120 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
   return Status::OK();
 }
 
+namespace {
+
+// The route-aware form of FileMetaData::UpdateBoundaries(), used only for
+// compaction output when the input Version has the indirection format. It is
+// a separate function, kept out of line, so that the per-key code of the plain
+// form above stays as small as in base for every other compaction and flush.
+ROCKSDB_NOINLINE Status UpdateFileMetaDataBoundariesWithRoutes(
+    FileMetaData* meta, const Slice& key, const Slice& value,
+    SequenceNumber seqno, ValueType value_type,
+    const VersionStorageInfo& blob_relocation_storage,
+    const BlobIndex* decoded_blob_index) {
+  assert(meta != nullptr);
+  // Helper: update oldest_blob_file_number from a single BlobIndex.
+  auto update_oldest_blob = [&](const BlobIndex& blob_index) -> Status {
+    if (!blob_index.IsInlined() && !blob_index.HasTTL()) {
+      // See the INTEGRITY TRIPWIRE in FileMetaData::UpdateBoundaries() above.
+      if (blob_index.file_number() == kInvalidBlobFileNumber) {
+        return Status::Corruption("Invalid blob file number");
+      }
+
+      uint64_t normal_blob_file_number = blob_index.file_number();
+      if (blob_index.IsIndirect()) {
+        // A flattened reference points to a relocation file. A routed
+        // generation number names a file that indirect blob GC collected, and
+        // the route target, a relocation file, holds its value. Neither keeps a
+        // normal blob file alive.
+        // This runs once per output reference, so skip the route lookup when
+        // the Version has no routes.
+        const uint64_t generation = blob_index.generation_file_number();
+        // A generation number at or above the current oldest cannot lower it,
+        // so the route lookup below is not needed.
+        if (meta->oldest_blob_file_number != kInvalidBlobFileNumber &&
+            generation >= meta->oldest_blob_file_number) {
+          return Status::OK();
+        }
+        if (generation != blob_index.origin_file_number() ||
+            (blob_relocation_storage.GetBlobRelocationRouteCount() != 0 &&
+             blob_relocation_storage.GetBlobRelocationRouteTarget(generation) !=
+                 kInvalidBlobFileNumber)) {
+          return Status::OK();
+        }
+        normal_blob_file_number = generation;
+      }
+
+      if (meta->oldest_blob_file_number == kInvalidBlobFileNumber ||
+          meta->oldest_blob_file_number > normal_blob_file_number) {
+        meta->oldest_blob_file_number = normal_blob_file_number;
+      }
+    }
+    return Status::OK();
+  };
+
+  if (value_type == kTypeBlobIndex) {
+    if (decoded_blob_index != nullptr) {
+      if (Status s = update_oldest_blob(*decoded_blob_index); !s.ok()) {
+        return s;
+      }
+    } else {
+      // Built only when the caller passed no decode, so a key with a decode
+      // does not build a BlobIndex.
+      BlobIndex own_blob_index;
+      if (Status s = own_blob_index.DecodeFrom(value); !s.ok()) {
+        return s;
+      }
+      if (Status s = update_oldest_blob(own_blob_index); !s.ok()) {
+        return s;
+      }
+    }
+  } else if (value_type == kTypeWideColumnEntity) {
+    if (Status s = WideColumnSerialization::ForEachBlobFileNumber(
+            value, update_oldest_blob);
+        !s.ok()) {
+      return s;
+    }
+  }
+
+  if (meta->smallest.size() == 0) {
+    meta->smallest.DecodeFrom(key);
+  }
+  meta->largest.DecodeFrom(key);
+  meta->fd.smallest_seqno = std::min(meta->fd.smallest_seqno, seqno);
+  meta->fd.largest_seqno = std::max(meta->fd.largest_seqno, seqno);
+
+  return Status::OK();
+}
+
+}  // namespace
+
+Status FileMetaData::UpdateBoundaries(
+    const Slice& key, const Slice& value, SequenceNumber seqno,
+    ValueType value_type, const VersionStorageInfo& blob_relocation_storage) {
+  return UpdateFileMetaDataBoundariesWithRoutes(
+      this, key, value, seqno, value_type, blob_relocation_storage,
+      /*decoded_blob_index=*/nullptr);
+}
+
+Status FileMetaData::UpdateBoundaries(
+    const Slice& key, const Slice& value, SequenceNumber seqno,
+    ValueType value_type, const VersionStorageInfo& blob_relocation_storage,
+    const BlobIndex* decoded_blob_index) {
+  return UpdateFileMetaDataBoundariesWithRoutes(
+      this, key, value, seqno, value_type, blob_relocation_storage,
+      decoded_blob_index);
+}
+
+size_t FileMetaData::BlobReferenceSummaryMemoryUsage() const {
+  // Only new files in a VersionEdit hold a summary; Version files drop it. The
+  // summary can be shared by several owners, so this may count it more than
+  // once.
+  return blob_reference_summary != nullptr
+             ? blob_reference_summary->MemoryUsage()
+             : 0;
+}
+
 void VersionEdit::Clear() { *this = VersionEdit(); }
 
 void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
@@ -212,6 +374,24 @@ void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
   FileMetaData& added = new_files_.back().second;
   added.db_ownership_start_time = f.db_ownership_start_time;
   added.data_file_provenance = f.data_file_provenance | provenance_flags_to_set;
+  added.blob_reference_descriptor = f.blob_reference_descriptor;
+  added.blob_reference_legacy_metadata = f.blob_reference_legacy_metadata;
+  added.oldest_coarse_indirect_origin_file_number =
+      f.oldest_coarse_indirect_origin_file_number;
+}
+
+void VersionEdit::MarkBlobReferenceOutputsPredatingIndirectionLegacy() {
+  for (auto& addition : new_files_) {
+    FileMetaData& file = addition.second;
+    if (file.blob_reference_output_predates_indirection &&
+        file.blob_reference_descriptor.empty()) {
+      // No producer flags a coarse output: flush, compaction and the FIFO copy
+      // set the flag only without a coarse frontier, and ingestion has none.
+      assert(file.oldest_coarse_indirect_origin_file_number ==
+             kInvalidBlobFileNumber);
+      file.blob_reference_legacy_metadata = true;
+    }
+  }
 }
 
 bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
@@ -229,6 +409,10 @@ bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
 bool VersionEdit::EncodeTo(std::string* dst,
                            std::optional<size_t> ts_sz) const {
   assert(!IsNoManifestWriteDummy());
+  if (has_blob_indirection_format_version_ &&
+      has_db_blob_indirection_format_version_) {
+    return false;
+  }
   if (has_db_id_) {
     PutVarint32(dst, kDbId);
     PutLengthPrefixedSlice(dst, db_id_);
@@ -290,6 +474,50 @@ bool VersionEdit::EncodeTo(std::string* dst,
   for (const auto& blob_file_garbage : blob_file_garbages_) {
     PutVarint32(dst, kBlobFileGarbage);
     blob_file_garbage.EncodeTo(dst);
+  }
+
+  if (has_blob_indirection_format_version_) {
+    PutVarint32(dst, kBlobIndirectionFormatVersion);
+    PutVarint32(dst, blob_indirection_format_version_);
+  }
+  if (has_db_blob_indirection_format_version_) {
+    PutVarint32(dst, kDbBlobIndirectionFormatVersion);
+    PutVarint32(dst, db_blob_indirection_format_version_);
+  }
+
+  for (const BlobRelocationFileAddition& addition :
+       blob_relocation_file_additions_) {
+    PutVarint32(dst, kBlobRelocationFileAddition);
+    std::string encoded;
+    addition.EncodeTo(&encoded);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+  for (uint64_t file_number : blob_relocation_file_deletions_) {
+    PutVarint32Varint64(dst, kBlobRelocationFileDeletion, file_number);
+  }
+  for (uint64_t file_number : blob_physical_file_losses_) {
+    if (file_number == kInvalidBlobFileNumber) {
+      return false;
+    }
+    PutVarint32Varint64(dst, kBlobPhysicalFileLoss, file_number);
+  }
+  for (uint64_t file_number : blob_file_retirements_) {
+    if (file_number == kInvalidBlobFileNumber) {
+      return false;
+    }
+    PutVarint32Varint64(dst, kBlobFileRetirement, file_number);
+  }
+  for (const BlobRelocationRoute& route : blob_relocation_routes_) {
+    PutVarint32(dst, kBlobRelocationRoute);
+    std::string encoded;
+    route.EncodeTo(&encoded);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+  for (uint64_t source : blob_relocation_route_deletions_) {
+    PutVarint32(dst, kBlobRelocationRouteDeletion);
+    std::string encoded;
+    BlobRelocationRouteDeletion(source).EncodeTo(&encoded);
+    PutLengthPrefixedSlice(dst, encoded);
   }
 
   for (const auto& wal_addition : wal_additions_) {
@@ -515,6 +743,20 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint32(&varint_data_file_provenance, f.data_file_provenance);
     PutLengthPrefixedSlice(dst, Slice(varint_data_file_provenance));
   }
+  if (!f.blob_reference_descriptor.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kBlobReferenceDescriptor);
+    PutLengthPrefixedSlice(dst, Slice(f.blob_reference_descriptor));
+  }
+  if (f.blob_reference_legacy_metadata) {
+    PutVarint32(dst, NewFileCustomTag::kBlobReferenceLegacyMetadata);
+    PutLengthPrefixedSlice(dst, Slice());
+  }
+  if (f.oldest_coarse_indirect_origin_file_number != kInvalidBlobFileNumber) {
+    PutVarint32(dst, kOldestCoarseIndirectOriginFileNumber);
+    std::string encoded;
+    PutVarint64(&encoded, f.oldest_coarse_indirect_origin_file_number);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -671,6 +913,45 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
         case kDataFileProvenance:
           if (!GetVarint32(&field, &f.data_file_provenance)) {
             return "invalid data file provenance";
+          }
+          break;
+        case kBlobReferenceDescriptor: {
+          if (!f.blob_reference_descriptor.empty() ||
+              f.blob_reference_legacy_metadata ||
+              f.oldest_coarse_indirect_origin_file_number !=
+                  kInvalidBlobFileNumber) {
+            return "duplicate blob reference metadata";
+          }
+          BlobReferenceMetadataDescriptor descriptor;
+          Status status =
+              BlobReferenceMetadataDescriptor::DecodeFrom(field, &descriptor);
+          if (!status.ok()) {
+            return "invalid blob reference descriptor";
+          }
+          f.blob_reference_descriptor = field.ToString();
+          break;
+        }
+        case kBlobReferenceLegacyMetadata:
+          if (!field.empty() || !f.blob_reference_descriptor.empty() ||
+              f.blob_reference_legacy_metadata ||
+              f.oldest_coarse_indirect_origin_file_number !=
+                  kInvalidBlobFileNumber) {
+            return "invalid legacy blob reference metadata";
+          }
+          f.blob_reference_legacy_metadata = true;
+          break;
+        case kOldestCoarseIndirectOriginFileNumber:
+          if (f.blob_reference_legacy_metadata ||
+              !f.blob_reference_descriptor.empty() ||
+              f.oldest_coarse_indirect_origin_file_number !=
+                  kInvalidBlobFileNumber ||
+              !GetVarint64(&field,
+                           &f.oldest_coarse_indirect_origin_file_number) ||
+              !field.empty() ||
+              f.oldest_coarse_indirect_origin_file_number ==
+                  kInvalidBlobFileNumber ||
+              f.oldest_coarse_indirect_origin_file_number > kFileNumberMask) {
+            return "invalid coarse blob reference metadata";
           }
           break;
         default:
@@ -910,6 +1191,125 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         }
 
         AddBlobFileGarbage(std::move(blob_file_garbage));
+        break;
+      }
+
+      case kBlobIndirectionFormatVersion: {
+        uint32_t format_version = 0;
+        if (has_blob_indirection_format_version_ ||
+            has_db_blob_indirection_format_version_ ||
+            !GetVarint32(&input, &format_version)) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob indirection format fence");
+        }
+        if (format_version == 0) {
+          return Status::Corruption("VersionEdit",
+                                    "Invalid blob indirection format fence");
+        }
+        if (format_version != kBlobIndirectionManifestFormatVersion) {
+          return Status::NotSupported(
+              "Unknown blob indirection manifest format");
+        }
+        SetBlobIndirectionFormatVersion(format_version);
+        break;
+      }
+
+      case kDbBlobIndirectionFormatVersion: {
+        uint32_t format_version = 0;
+        if (has_db_blob_indirection_format_version_ ||
+            has_blob_indirection_format_version_ ||
+            !GetVarint32(&input, &format_version)) {
+          return Status::Corruption(
+              "VersionEdit",
+              "Malformed DB-global blob indirection format fence");
+        }
+        if (format_version == 0) {
+          return Status::Corruption(
+              "VersionEdit", "Invalid DB-global blob indirection format fence");
+        }
+        if (format_version != kBlobIndirectionManifestFormatVersion) {
+          return Status::NotSupported(
+              "Unknown DB-global blob indirection manifest format");
+        }
+        SetDbBlobIndirectionFormatVersion(format_version);
+        break;
+      }
+
+      case kBlobRelocationFileAddition: {
+        Slice encoded;
+        if (!GetLengthPrefixedSlice(&input, &encoded)) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation file addition");
+        }
+        BlobRelocationFileAddition addition;
+        Status status = addition.DecodeFrom(&encoded);
+        if (!status.ok()) {
+          return status;
+        }
+        AddBlobRelocationFile(std::move(addition));
+        break;
+      }
+
+      case kBlobRelocationFileDeletion: {
+        uint64_t file_number = kInvalidBlobFileNumber;
+        if (!GetVarint64(&input, &file_number) ||
+            file_number == kInvalidBlobFileNumber) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation file deletion");
+        }
+        DeleteBlobRelocationFile(file_number);
+        break;
+      }
+
+      case kBlobRelocationRoute: {
+        Slice encoded;
+        if (!GetLengthPrefixedSlice(&input, &encoded)) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation route");
+        }
+        BlobRelocationRoute route;
+        Status status = route.DecodeFrom(&encoded);
+        if (!status.ok()) {
+          return status;
+        }
+        SetBlobRelocationRoute(std::move(route));
+        break;
+      }
+
+      case kBlobRelocationRouteDeletion: {
+        Slice encoded;
+        if (!GetLengthPrefixedSlice(&input, &encoded)) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation route deletion");
+        }
+        BlobRelocationRouteDeletion deletion;
+        Status status = deletion.DecodeFrom(&encoded);
+        if (!status.ok()) {
+          return status;
+        }
+        DeleteBlobRelocationRoute(deletion.GetOldFileNumber());
+        break;
+      }
+
+      case kBlobPhysicalFileLoss: {
+        uint64_t file_number = 0;
+        if (!GetVarint64(&input, &file_number) ||
+            file_number == kInvalidBlobFileNumber) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation loss");
+        }
+        MarkBlobPhysicalFileLost(file_number);
+        break;
+      }
+
+      case kBlobFileRetirement: {
+        uint64_t file_number = 0;
+        if (!GetVarint64(&input, &file_number) ||
+            file_number == kInvalidBlobFileNumber) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob file retirement");
+        }
+        RetireBlobFile(file_number);
         break;
       }
 
@@ -1213,6 +1613,11 @@ std::string VersionEdit::DebugString(bool hex_key) const {
       r.append(" file_open_metadata_size: ");
       AppendNumberTo(&r, f.file_open_metadata.size());
     }
+    const std::string blob_references = BlobReferenceMetadataToString(f);
+    if (!blob_references.empty()) {
+      r.append(" blob_references: ");
+      r.append(blob_references);
+    }
   }
 
   for (const auto& blob_file_addition : blob_file_additions_) {
@@ -1223,6 +1628,39 @@ std::string VersionEdit::DebugString(bool hex_key) const {
   for (const auto& blob_file_garbage : blob_file_garbages_) {
     r.append("\n  BlobFileGarbage: ");
     r.append(blob_file_garbage.DebugString());
+  }
+  if (has_blob_indirection_format_version_) {
+    r.append("\n  BlobIndirectionFormatVersion: ");
+    AppendNumberTo(&r, blob_indirection_format_version_);
+  }
+  if (has_db_blob_indirection_format_version_) {
+    r.append("\n  DbBlobIndirectionFormatVersion: ");
+    AppendNumberTo(&r, db_blob_indirection_format_version_);
+  }
+  for (const BlobRelocationFileAddition& addition :
+       blob_relocation_file_additions_) {
+    r.append("\n  BlobRelocationFileAddition: ");
+    r.append(addition.DebugString());
+  }
+  for (uint64_t file_number : blob_relocation_file_deletions_) {
+    r.append("\n  BlobRelocationFileDeletion: ");
+    AppendNumberTo(&r, file_number);
+  }
+  for (uint64_t file_number : blob_physical_file_losses_) {
+    r.append("\n  BlobPhysicalFileLoss: ");
+    AppendNumberTo(&r, file_number);
+  }
+  for (uint64_t file_number : blob_file_retirements_) {
+    r.append("\n  BlobFileRetirement: ");
+    AppendNumberTo(&r, file_number);
+  }
+  for (const BlobRelocationRoute& route : blob_relocation_routes_) {
+    r.append("\n  BlobRelocationRoute: ");
+    r.append(route.DebugString());
+  }
+  for (uint64_t old_file_number : blob_relocation_route_deletions_) {
+    r.append("\n  BlobRelocationRouteDeletion: old=");
+    AppendNumberTo(&r, old_file_number);
   }
 
   for (const auto& wal_addition : wal_additions_) {
@@ -1358,6 +1796,10 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       if (!f.file_open_metadata.empty()) {
         jw << "FileOpenMetadataSize" << f.file_open_metadata.size();
       }
+      const std::string blob_references = BlobReferenceMetadataToString(f);
+      if (!blob_references.empty()) {
+        jw << "BlobReferences" << blob_references;
+      }
       jw.EndArrayedObject();
     }
 
@@ -1389,6 +1831,77 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       jw.EndArrayedObject();
     }
 
+    jw.EndArray();
+  }
+
+  if (has_blob_indirection_format_version_) {
+    jw << "BlobIndirectionFormatVersion" << blob_indirection_format_version_;
+  }
+  if (has_db_blob_indirection_format_version_) {
+    jw << "DbBlobIndirectionFormatVersion"
+       << db_blob_indirection_format_version_;
+  }
+
+  if (!blob_relocation_file_additions_.empty()) {
+    jw << "BlobRelocationFileAdditions";
+    jw.StartArray();
+    for (const BlobRelocationFileAddition& addition :
+         blob_relocation_file_additions_) {
+      jw.StartArrayedObject();
+      jw << "FileNumber" << addition.GetFileNumber();
+      jw << "FileSize" << addition.GetFileSize();
+      jw.EndArrayedObject();
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_relocation_file_deletions_.empty()) {
+    jw << "BlobRelocationFileDeletions";
+    jw.StartArray();
+    for (uint64_t file_number : blob_relocation_file_deletions_) {
+      jw << file_number;
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_relocation_routes_.empty()) {
+    jw << "BlobRelocationRoutes";
+    jw.StartArray();
+    for (const BlobRelocationRoute& route : blob_relocation_routes_) {
+      jw.StartArrayedObject();
+      jw << "Old" << route.GetOldFileNumber();
+      jw << "Target" << route.GetTargetFileNumber();
+      jw.EndArrayedObject();
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_relocation_route_deletions_.empty()) {
+    jw << "BlobRelocationRouteDeletions";
+    jw.StartArray();
+    for (uint64_t old_file_number : blob_relocation_route_deletions_) {
+      jw.StartArrayedObject();
+      jw << "Old" << old_file_number;
+      jw.EndArrayedObject();
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_physical_file_losses_.empty()) {
+    jw << "BlobPhysicalFileLosses";
+    jw.StartArray();
+    for (uint64_t file_number : blob_physical_file_losses_) {
+      jw << file_number;
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_file_retirements_.empty()) {
+    jw << "BlobFileRetirements";
+    jw.StartArray();
+    for (uint64_t file_number : blob_file_retirements_) {
+      jw << file_number;
+    }
     jw.EndArray();
   }
 

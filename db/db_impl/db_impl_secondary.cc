@@ -1069,6 +1069,8 @@ Status DBImplSecondary::NewIteratorsImpl(
 }
 
 Status DBImplSecondary::TryCatchUpWithPrimary() {
+  TEST_SYNC_POINT("DBImplSecondary::TryCatchUpWithPrimary:BeforeCatchUpLock");
+  std::lock_guard<std::mutex> catch_up_lock(catch_up_mutex_);
   assert(versions_.get() != nullptr);
   Status s;
   // read the manifest and apply new changes to the secondary instance
@@ -1240,6 +1242,10 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool recover_wal, bool trust_manifest_recovery) {
   *dbptr = nullptr;
+  Status style_status = CheckBlobIndirectionCompactionStyle(column_families);
+  if (!style_status.ok()) {
+    return style_status;
+  }
   // Only normal DB::OpenAsSecondary recovery can defer SST opening.
   // `recover_wal` excludes OpenAndCompact even when no snapshot floor is
   // supplied, `open_files_async` is the explicit opt-in, and trust-MANIFEST
@@ -1873,6 +1879,7 @@ Status DBImplSecondary::HandleInvalidOrNoCompactionProgress(
 Status DBImplSecondary::CompactWithoutInstallation(
     const OpenAndCompactOptions& options, ColumnFamilyHandle* cfh,
     const CompactionServiceInput& input, CompactionServiceResult* result) {
+  assert(result);
   if (options.canceled && options.canceled->load(std::memory_order_acquire)) {
     return Status::Incomplete(Status::SubCode::kManualCompactionPaused);
   }
@@ -1918,8 +1925,11 @@ Status DBImplSecondary::CompactWithoutInstallation(
       !!(mutable_cf_options.verify_output_flags &
          VerifyOutputFlags::kVerifyIteration);
 
-  bool allow_resumption =
-      options.allow_resumption && !output_hash_verification_enabled;
+  const bool feature_aware_compaction =
+      input.blob_indirection_protocol_version != 0;
+  bool allow_resumption = options.allow_resumption &&
+                          !output_hash_verification_enabled &&
+                          !feature_aware_compaction;
 
   if (options.allow_resumption && output_hash_verification_enabled) {
     ROCKS_LOG_WARN(immutable_db_options_.info_log,
@@ -1927,6 +1937,12 @@ Status DBImplSecondary::CompactWithoutInstallation(
                    "incompatibility with output hash verification "
                    "(paranoid_file_checks=true or verify_output_flags "
                    "containing kVerifyIteration)");
+  }
+  if (options.allow_resumption && feature_aware_compaction) {
+    ROCKS_LOG_WARN(
+        immutable_db_options_.info_log,
+        "Resume compaction configured but disabled because the "
+        "progress format does not persist the blob indirection contract");
   }
 
   mutex_.Unlock();
@@ -1947,6 +1963,59 @@ Status DBImplSecondary::CompactWithoutInstallation(
   }
 
   auto* version = cfd->current();
+  assert(version);
+
+  if (input.blob_indirection_protocol_version != 0) {
+    const VersionStorageInfo* input_vstorage = version->storage_info();
+    // Worker check of the feature-aware remote compaction contract (see the
+    // CompactionServiceInput fields in db/compaction/compaction_job.h). The
+    // worker runs the job only when all of these checks pass:
+    //   1. The protocol version is
+    //      kBlobIndirectionCompactionServiceProtocolVersion.
+    //   2. This worker's Version has the per-CF format fence
+    //      (VersionStorageInfo::HasBlobIndirectionFormat()).
+    //   3. This worker's options fingerprint equals the request's. The
+    //      fingerprint also covers this binary's format versions, so a worker
+    //      with other versions declines.
+    //   4. The relocation state fingerprint of this worker's Version equals the
+    //      request's, so the worker sees the same relocation files and routes
+    //      as the primary's input Version.
+    // A job that passes may not create blob files
+    // (CompactionServiceCompactionJob::AllowBlobFileCreation()). When a value
+    // needs new blob file output, the job ends with TryAgain (see the end of
+    // this function). Resumable progress is off for these jobs (see
+    // allow_resumption above).
+    const char* failed_check = nullptr;
+    if (input.blob_indirection_protocol_version !=
+        kBlobIndirectionCompactionServiceProtocolVersion) {
+      failed_check = "protocol version differs";
+    } else if (!input_vstorage->HasBlobIndirectionFormat()) {
+      failed_check = "worker Version has no blob indirection format fence";
+    } else if (input.blob_indirection_options_fingerprint !=
+               ComputeBlobIndirectionCompactionServiceOptionsFingerprint(
+                   cfd->GetID(), mutable_cf_options.enable_blob_indirection,
+                   mutable_cf_options.enable_blob_garbage_collection,
+                   mutable_cf_options.enable_blob_files,
+                   mutable_cf_options.min_blob_size,
+                   mutable_cf_options.blob_file_starting_level)) {
+      failed_check = "options fingerprint differs";
+    } else if (input.blob_relocation_state_fingerprint_high !=
+                   input_vstorage->GetBlobRelocationStateFingerprintHigh() ||
+               input.blob_relocation_state_fingerprint_low !=
+                   input_vstorage->GetBlobRelocationStateFingerprintLow()) {
+      failed_check = "relocation state fingerprint differs";
+    }
+    if (failed_check != nullptr) {
+      // Decline with TryAgain inside an OK result, the same way as a job that
+      // needs new blob file output (see the end of this function). The result
+      // has no output, and the primary logs the message, counts the decline
+      // and runs the job locally before it imports anything.
+      *result = CompactionServiceResult();
+      result->status = Status::TryAgain(
+          "Remote worker declined the blob indirection contract", failed_check);
+      return Status::OK();
+    }
+  }
 
   ColumnFamilyMetaData cf_meta;
   version->GetColumnFamilyMetaData(&cf_meta);
@@ -2100,6 +2169,14 @@ Status DBImplSecondary::CompactWithoutInstallation(
   }
 
   result->status = s;
+  if (input.blob_indirection_protocol_version != 0 && s.IsTryAgain()) {
+    // A feature-aware worker declines a job that needs new blob file output
+    // (see CompactionIterator::DeclineSstOnlyBlobOutput()). Return OK with the
+    // TryAgain in the result, so a CompactionService that maps a failed call
+    // to kFailure still forwards the result, and the primary runs the job
+    // locally instead of setting a background error.
+    return Status::OK();
+  }
   return s;
 }
 

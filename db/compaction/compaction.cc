@@ -70,8 +70,19 @@ void Compaction::FinalizeInputInfo(Version* _input_version) {
   cfd_ = input_version_->cfd();
 
   cfd_->Ref();
+  if (mutable_cf_options_.enable_blob_indirection) {
+    cfd_->BeginBlobIndirectionCompaction();
+    pending_blob_indirection_activation_ = true;
+  }
   input_version_->Ref();
   edit_.SetColumnFamily(cfd_->GetID());
+}
+
+void Compaction::EndPendingBlobIndirectionActivation() {
+  if (pending_blob_indirection_activation_) {
+    cfd_->EndBlobIndirectionCompaction();
+    pending_blob_indirection_activation_ = false;
+  }
 }
 
 void Compaction::GetBoundaryKeys(
@@ -475,7 +486,21 @@ void Compaction::PopulateProximalLevelOutputRange() {
   }
 }
 
+bool Compaction::MustRewriteCoarseL0File(const FileMetaData& file) {
+  // A coarse file that leaves L0 must be rewritten with exact reference
+  // metadata. Moving it would keep its coarse pin until a later compaction
+  // rewrites it, which can take a long time. An L0 file with frontier 0 (see
+  // "Coarse SST" in db/blob/blob_reference_metadata.h) is not coarse: it has
+  // exact metadata, or it is a legacy SST (only legacy references, or none). It
+  // pins nothing and can move.
+  return file.oldest_coarse_indirect_origin_file_number !=
+         kInvalidBlobFileNumber;
+}
+
 Compaction::~Compaction() {
+  if (pending_blob_indirection_activation_) {
+    cfd_->EndBlobIndirectionCompaction();
+  }
   if (input_version_ != nullptr) {
     input_version_->Unref();
   }
@@ -593,6 +618,14 @@ bool Compaction::IsTrivialMove() const {
     return false;
   }
 
+  if (start_level_ == 0 && output_level_ != 0) {
+    for (const FileMetaData* file : inputs_.front().files) {
+      if (MustRewriteCoarseL0File(*file)) {
+        return false;
+      }
+    }
+  }
+
   // Used in universal compaction, where trivial move can be done if the
   // input files are non overlapping
   if ((mutable_cf_options_.compaction_options_universal.allow_trivial_move) &&
@@ -637,6 +670,23 @@ bool Compaction::IsTrivialMove() const {
   }
 
   return true;
+}
+
+bool Compaction::CollectExactBlobReferences() const {
+  if (!UsesBlobIndirection(mutable_cf_options_, input_vstorage_)) {
+    return false;
+  }
+  if (output_level_ != 0 || bottommost_level_) {
+    return true;
+  }
+  for (const CompactionInputFiles& level : inputs_) {
+    for (const FileMetaData* file : level.files) {
+      if (!file->blob_reference_descriptor.empty()) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 void Compaction::AddInputDeletions(VersionEdit* out_edit) {

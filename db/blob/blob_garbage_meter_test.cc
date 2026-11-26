@@ -134,6 +134,71 @@ TEST(BlobGarbageMeterTest, MeasureGarbage) {
   }
 }
 
+// Compaction passes its own decode of each output BlobIndex to
+// ProcessOutFlow(). The status and the flows must be the same as when the
+// meter decodes the value itself.
+TEST(BlobGarbageMeterTest, OutFlowWithDecodedBlobIndex) {
+  std::string legacy;
+  BlobIndex::EncodeBlob(&legacy, /*file_number=*/4, /*offset=*/1234,
+                        /*size=*/555, kLZ4Compression);
+  std::string ttl;
+  BlobIndex::EncodeBlobTTL(&ttl, /*expiration=*/9876543210,
+                           /*file_number=*/5, /*offset=*/100, /*size=*/200,
+                           kNoCompression);
+  std::string same_file;
+  BlobIndex::EncodeBlob(&same_file, kCurrentFileBlobIndexFileNumber,
+                        /*offset=*/10, /*size=*/20, kNoCompression);
+  std::string unflattened;
+  BlobIndex::EncodeUnflattenedIndirectBlob(&unflattened,
+                                           {.origin_file_number = 20,
+                                            .original_value_offset = 200,
+                                            .stored_value_size = 60,
+                                            .compression = kNoCompression,
+                                            .stable_checksum = 1234,
+                                            .stored_checksum = 0});
+  std::string flattened;
+  BlobIndex::EncodeIndirectBlob(&flattened, /*generation=*/40,
+                                {.origin_file_number = 30,
+                                 .original_value_offset = 300,
+                                 .stored_value_size = 70,
+                                 .compression = kZSTD,
+                                 .stable_checksum = 5678,
+                                 .stored_checksum = 8765});
+
+  const InternalKey key("user_key", /*seq=*/123, kTypeBlobIndex);
+  for (const std::string& value :
+       {legacy, ttl, same_file, unflattened, flattened}) {
+    BlobIndex decoded;
+    ASSERT_OK(decoded.DecodeFrom(value));
+    SCOPED_TRACE(decoded.DebugString(/*output_hex=*/true));
+
+    BlobGarbageMeter self_decoded;
+    BlobGarbageMeter caller_decoded;
+    const Status in_status = self_decoded.ProcessInFlow(key.Encode(), value);
+    ASSERT_EQ(caller_decoded.ProcessInFlow(key.Encode(), value).ToString(),
+              in_status.ToString());
+    const Status out_status = self_decoded.ProcessOutFlow(key.Encode(), value);
+    EXPECT_EQ(
+        caller_decoded.ProcessOutFlow(key.Encode(), value, &decoded).ToString(),
+        out_status.ToString());
+
+    ASSERT_EQ(caller_decoded.flows().size(), self_decoded.flows().size());
+    for (const auto& [file_number, flow] : self_decoded.flows()) {
+      SCOPED_TRACE("blob file " + std::to_string(file_number));
+      const auto other = caller_decoded.flows().find(file_number);
+      ASSERT_NE(other, caller_decoded.flows().end());
+      EXPECT_EQ(other->second.GetInFlow().GetCount(),
+                flow.GetInFlow().GetCount());
+      EXPECT_EQ(other->second.GetInFlow().GetBytes(),
+                flow.GetInFlow().GetBytes());
+      EXPECT_EQ(other->second.GetOutFlow().GetCount(),
+                flow.GetOutFlow().GetCount());
+      EXPECT_EQ(other->second.GetOutFlow().GetBytes(),
+                flow.GetOutFlow().GetBytes());
+    }
+  }
+}
+
 TEST(BlobGarbageMeterTest, PlainValue) {
   constexpr char user_key[] = "user_key";
   constexpr SequenceNumber seq = 123;
@@ -166,6 +231,23 @@ TEST(BlobGarbageMeterTest, SameFileBlobIndex) {
 
   ASSERT_OK(blob_garbage_meter.ProcessInFlow(key_slice, value));
   ASSERT_OK(blob_garbage_meter.ProcessOutFlow(key_slice, value));
+  ASSERT_TRUE(blob_garbage_meter.flows().empty());
+}
+
+TEST(BlobGarbageMeterTest, FlattenedIndirectBlobIndex) {
+  const InternalKey key("user_key", /*seq=*/123, kTypeBlobIndex);
+  std::string value;
+  BlobIndex::EncodeIndirectBlob(&value, 7,
+                                {.origin_file_number = 4,
+                                 .original_value_offset = 123,
+                                 .stored_value_size = 456,
+                                 .compression = kNoCompression,
+                                 .stable_checksum = 789,
+                                 .stored_checksum = 0});
+
+  BlobGarbageMeter blob_garbage_meter;
+  ASSERT_OK(blob_garbage_meter.ProcessInFlow(key.Encode(), value));
+  ASSERT_OK(blob_garbage_meter.ProcessOutFlow(key.Encode(), value));
   ASSERT_TRUE(blob_garbage_meter.flows().empty());
 }
 
