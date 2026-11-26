@@ -96,11 +96,33 @@ class BlobFileCache {
       const MutableCFOptions& mutable_cf_options,
       CacheHandleGuard<BlobFileReader>* blob_file_reader);
 
-  // Opens a blob file reader without inserting it into the cache.
+  // Indirect blob GC opens its relocation inputs with this function, so that a
+  // reader opened with GC's options (no pinned location blocks) never serves
+  // user reads. It opens a reader of relocation file `file` and does not put it
+  // into the cache. It does not use or update the remembered failed opens
+  // (failed_relocation_opens_). BlobRelocationFileReader::Open checks the file
+  // against the identity in `file`. Returns NotSupported if the cache has no
+  // DB session id or the column family's table factory is not block-based.
+  Status OpenRelocationFileReaderUncached(
+      const ReadOptions& read_options, const BlobPhysicalFile& file,
+      const MutableCFOptions& mutable_cf_options,
+      std::unique_ptr<BlobFileReader>* blob_file_reader);
+
+  // The base signature. It passes prefer_direct_reads = false (the file is
+  // opened as configured).
   Status OpenBlobFileReaderUncached(
       const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
       std::unique_ptr<BlobFileReader>* blob_file_reader,
       bool allow_footer_skip_retry = false);
+
+  // Opens a blob file reader without inserting it into the cache. With
+  // `prefer_direct_reads`, the file is opened for direct reads when mmap reads
+  // are off. If that open fails (for example, the file system does not support
+  // direct reads), the file is opened as configured.
+  Status OpenBlobFileReaderUncached(
+      const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+      std::unique_ptr<BlobFileReader>* blob_file_reader,
+      bool allow_footer_skip_retry, bool prefer_direct_reads);
 
   // Makes finalized checksum metadata available to direct-write fallback reads
   // whose pinned Version predates the blob-file addition. Any cached
@@ -187,6 +209,10 @@ class BlobFileCache {
                             const BlobFileOpenInfo& blob_file,
                             bool allow_footer_skip_retry,
                             std::unique_ptr<BlobFileReader>* blob_file_reader);
+  Status OpenRelocationFileReader(
+      const ReadOptions& read_options, const BlobPhysicalFile& file,
+      const MutableCFOptions& mutable_cf_options,
+      std::unique_ptr<BlobFileReader>* blob_file_reader);
 
   using CacheInterface =
       BasicTypedCacheInterface<BlobFileReader, CacheEntryRole::kMisc>;

@@ -464,6 +464,38 @@ class ColumnFamilyData {
   uint32_t blob_reference_census_failures() const {
     return blob_reference_census_failures_;
   }
+  // Indirect blob GC idle time: the DB clock time since which this column
+  // family has had GC candidates and no GC job began, or 0. It measures
+  // whether GC falls behind, so it counts only while the options let a GC job
+  // run (IndirectBlobGcOptionsAllowJob()). While the options allow it, a census
+  // publish with candidates while no GC job runs, and the end of a GC job that
+  // leaves candidates, start it. A GC job start, a census publish without
+  // candidates or with the options off, and a SetOptions() call that turns GC
+  // off clear it.
+  void NoteIndirectBlobGcCandidates(uint64_t now_micros) {
+    uint64_t expected = 0;
+    indirect_blob_gc_candidates_since_micros_.compare_exchange_strong(
+        expected, now_micros, std::memory_order_relaxed);
+  }
+  void ClearIndirectBlobGcCandidates() {
+    indirect_blob_gc_candidates_since_micros_.store(0,
+                                                    std::memory_order_relaxed);
+  }
+  uint64_t IndirectBlobGcCandidatesSinceMicros() const {
+    return indirect_blob_gc_candidates_since_micros_.load(
+        std::memory_order_relaxed);
+  }
+  // True when the latest options let an indirect blob GC job run: blob files,
+  // blob GC and blob indirection are on, and auto compactions are not disabled.
+  // These are the option checks of NeedsCompaction(). The census can exist
+  // while they are off, because it follows the Version format, not the
+  // options. REQUIRES: DB mutex held.
+  bool IndirectBlobGcOptionsAllowJob() const {
+    return !mutable_cf_options_.disable_auto_compactions &&
+           mutable_cf_options_.enable_blob_files &&
+           mutable_cf_options_.enable_blob_garbage_collection &&
+           mutable_cf_options_.enable_blob_indirection;
+  }
 
   // REQUIRES: DB mutex held.
   BlobReferenceCensus* GetOrCreateBlobReferenceCensus();
@@ -867,6 +899,7 @@ class ColumnFamilyData {
   ColumnFamilyData* next_blob_reference_census_ = nullptr;
   uint64_t blob_reference_census_retry_micros_ = 0;
   uint32_t blob_reference_census_failures_ = 0;
+  std::atomic<uint64_t> indirect_blob_gc_candidates_since_micros_{0};
 
   // Read outside the DB mutex by compaction workers (acquire-loaded roughly
   // every 1024 records in ProcessKeyValueCompaction). Given its own cache line

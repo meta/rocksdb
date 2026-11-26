@@ -117,6 +117,9 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
           options.blob_garbage_collection_age_cutoff),
       blob_garbage_collection_force_threshold(
           options.blob_garbage_collection_force_threshold),
+      indirect_blob_gc_read_coalesce_bytes(
+          options.indirect_blob_gc_read_coalesce_bytes),
+      indirect_blob_gc_garbage_ratio(options.indirect_blob_gc_garbage_ratio),
       blob_compaction_readahead_size(options.blob_compaction_readahead_size),
       blob_file_starting_level(options.blob_file_starting_level),
       blob_cache(options.blob_cache),
@@ -455,6 +458,11 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "Options.blob_indirection_max_references_per_sst: %" PRIu64,
                    blob_indirection_max_references_per_sst);
+  ROCKS_LOG_HEADER(log,
+                   "Options.indirect_blob_gc_read_coalesce_bytes: %" PRIu64,
+                   indirect_blob_gc_read_coalesce_bytes);
+  ROCKS_LOG_HEADER(log, "Options.indirect_blob_gc_garbage_ratio: %f",
+                   indirect_blob_gc_garbage_ratio);
   ROCKS_LOG_HEADER(log,
                    "                          Options.min_blob_size: %" PRIu64,
                    min_blob_size);

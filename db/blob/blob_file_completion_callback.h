@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <cassert>
+
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "file/sst_file_manager_impl.h"
@@ -96,6 +98,25 @@ class BlobFileCompletionCallback {
                            creation_reason, Status::OK(), checksum_value,
                            checksum_method, blob_count, blob_bytes);
     return space_limit_reached;
+  }
+
+  // Indirect blob GC calls this for an output file whose creation started
+  // (OnBlobFileCreationStarted()) but that does not get its final blob file
+  // name: the job failed before or during the rename, or the output would not
+  // reclaim bytes. It reports the failed creation to the listeners, so the
+  // start event has a matching finish event. It does not register the file with
+  // the SstFileManager, because the job deletes the file. `status` must not be
+  // OK.
+  void OnBlobFileAbandoned(const std::string& file_name,
+                           const std::string& column_family_name, int job_id,
+                           uint64_t file_number,
+                           BlobFileCreationReason creation_reason,
+                           const Status& status) {
+    assert(!status.ok());
+    NotifyCreationFinished(file_name, column_family_name, job_id, file_number,
+                           creation_reason, status, /*checksum_value=*/"",
+                           /*checksum_method=*/"", /*blob_count=*/0,
+                           /*blob_bytes=*/0);
   }
 
   void SetBGError(const Status& s) {
