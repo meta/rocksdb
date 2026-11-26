@@ -317,7 +317,8 @@ class Repairer {
     //     marked as an indirect origin; or a new SST record whose exact
     //     reference metadata descriptor decodes, or that has a coarse frontier
     //     (the oldest indirect-origin file number a coarse SST may reference).
-    //   - in any SST: an exact reference metadata descriptor that decodes.
+    //   - in any SST: an exact reference metadata descriptor that decodes, or
+    //     a coarse classification that decodes.
     //   - in any blob file: a version 2 header, which only blob indirection
     //     writes (see db/blob/blob_log_format.h).
     // The search is best effort: it skips a file or record that it cannot read.
@@ -406,6 +407,20 @@ class Repairer {
         BlobReferenceMetadataDescriptor decoded;
         status = BlobReferenceMetadataDescriptor::DecodeFrom(descriptor->second,
                                                              &decoded);
+        if (status.ok()) {
+          return UnsupportedBlobIndirectionRepair();
+        }
+      }
+      const UserCollectedProperties::const_iterator classification =
+          collected.find(kBlobReferenceClassificationPropertyName);
+      if (classification != collected.end()) {
+        uint64_t frontier = 0;
+        status = DecodeBlobReferenceClassification(classification->second,
+                                                   &frontier);
+        // Any valid classification, also frontier 0, shows that the DB used
+        // enable_blob_indirection. RepairDB cannot rebuild that state, so it
+        // refuses the DB instead of writing a MANIFEST without the blob
+        // indirection format marker.
         if (status.ok()) {
           return UnsupportedBlobIndirectionRepair();
         }

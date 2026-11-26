@@ -1330,6 +1330,11 @@ struct BlockBasedTableBuilder::Rep {
   std::shared_ptr<CacheReservationManager>
       compression_dict_buffer_cache_res_mgr;
   std::unique_ptr<BlobReferenceMetadataCollector> blob_reference_collector;
+  // The reference cap of this output (blob_indirection_max_references_per_sst).
+  // Set only when blob_reference_collector is set.
+  uint64_t max_blob_references = 0;
+  bool track_blob_reference_classification = false;
+  uint64_t oldest_coarse_indirect_origin_file_number = kInvalidBlobFileNumber;
   std::shared_ptr<const BlobReferenceSstSummary> blob_reference_summary;
   std::unique_ptr<BlobRelocationDirectoryBuilder>
       blob_relocation_directory_builder;
@@ -1875,22 +1880,24 @@ struct BlockBasedTableBuilder::Rep {
       compression_dict_buffer_cache_res_mgr = nullptr;
     }
 
-    // The exact blob reference metadata (db/blob/blob_reference_metadata.h)
-    // records the CF ID and the SST file number, so a reader can check that the
-    // metadata belongs to this SST.
-    // SstFileWriter output has no DB file number, and some outputs have no
-    // known CF. Such outputs get no collector and no exact metadata. Every
-    // other output needs a nonzero SST file number; the collector fails the
-    // build without one.
-    if (tbo.moptions.enable_blob_indirection &&
-        tbo.reason != TableFileCreationReason::kSstFileWriter &&
-        tbo.column_family_id !=
-            TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) {
+    // The caller decides whether this SST gets exact blob reference metadata
+    // (TableBuilderOptions::collect_blob_reference_metadata) or only the coarse
+    // classification (track_blob_reference_classification).
+    track_blob_reference_classification =
+        tbo.track_blob_reference_classification;
+    if (tbo.collect_blob_reference_metadata) {
+      max_blob_references =
+          tbo.moptions.blob_indirection_max_references_per_sst;
       blob_reference_collector =
           std::make_unique<BlobReferenceMetadataCollector>(
               std::move(blob_reference_cache_res_mgr),
-              BlobReferenceSstIdentity{.column_family_id = tbo.column_family_id,
-                                       .sst_file_number = tbo.cur_file_num});
+              BlobReferenceSstIdentity{
+                  .column_family_id = tbo.column_family_id,
+                  .sst_file_number = tbo.cur_file_num,
+                  .route_snapshot_fingerprint_high =
+                      tbo.blob_route_snapshot_fingerprint_high,
+                  .route_snapshot_fingerprint_low =
+                      tbo.blob_route_snapshot_fingerprint_low});
     }
 
     // Common user-key prefix feature (format_version >= 8) for index-like
@@ -2348,9 +2355,10 @@ void BlockBasedTableBuilder::AddImpl(const Slice& ikey, const Slice& value,
         account_blob_index(*value_blob_index);
       }
     } else if (value_type == kTypeWideColumnEntity &&
-               r->blob_reference_collector == nullptr) {
-      // With a collector, AddBlobReferences() below walks the entity once for
-      // both this property and the collector.
+               r->blob_reference_collector == nullptr &&
+               !r->track_blob_reference_classification) {
+      // With a collector or classification tracking, AddBlobReferences() below
+      // walks the entity once for both this property and the reference work.
       Status s = WideColumnSerialization::ForEachBlobFileNumber(
           entry_value, [&](const BlobIndex& blob_index) {
             account_blob_index(blob_index);
@@ -2382,10 +2390,12 @@ void BlockBasedTableBuilder::AddImpl(const Slice& ikey, const Slice& value,
     }
 
     // The reference metadata work runs only for an SST that collects
-    // references, and only for the two value types that can hold a blob
-    // reference. Other entries and other SSTs keep the base Add() path. It is
-    // in an out-of-line helper for the same reason.
-    if (r->blob_reference_collector != nullptr &&
+    // references or tracks the coarse classification, and only for the two
+    // value types that can hold a blob reference. Other entries and other SSTs
+    // keep the base Add() path. It is in an out-of-line helper for the same
+    // reason.
+    if ((r->blob_reference_collector != nullptr ||
+         r->track_blob_reference_classification) &&
         (value_type == kTypeBlobIndex || value_type == kTypeWideColumnEntity)) {
       if (!AddBlobReferences(entry_ikey, entry_value, value_type,
                              value_blob_index)) {
@@ -2445,27 +2455,47 @@ bool BlockBasedTableBuilder::AddBlobReferences(
     const BlobIndex* value_blob_index) {
   Rep* const r = rep_.get();
   auto* const blob_reference_collector = r->blob_reference_collector.get();
-  auto& collector = *blob_reference_collector;
   const uint64_t user_key_size = ExtractUserKey(entry_ikey).size();
   // AddImpl() calls this only for kTypeBlobIndex and kTypeWideColumnEntity
   // entries. MaybeExtractEmbeddedBlobs() changes the key type only of
   // kTypeValue entries, so the key type is still `value_type`.
   assert(ExtractValueType(entry_ikey) == value_type);
+  const auto add_reference = [&](const BlobIndex& blob_index) -> Status {
+    if (blob_reference_collector != nullptr) {
+      return blob_reference_collector->Add(blob_index, user_key_size);
+    }
+    if (blob_index.IsIndirect()) {
+      if (blob_index.generation_file_number() !=
+          blob_index.origin_file_number()) {
+        return Status::Corruption(
+            "Coarse SST cannot contain a flattened blob reference "
+            "(generation number != origin)");
+      }
+      const uint64_t origin = blob_index.origin_file_number();
+      if (r->oldest_coarse_indirect_origin_file_number ==
+              kInvalidBlobFileNumber ||
+          origin < r->oldest_coarse_indirect_origin_file_number) {
+        r->oldest_coarse_indirect_origin_file_number = origin;
+      }
+    }
+    return Status::OK();
+  };
   Status reference_status;
   if (value_type == kTypeBlobIndex) {
     // A blob index that does not decode fails the build. Decoding it
     // again gives the error; this happens only for a corrupt value.
     reference_status = value_blob_index == nullptr
                            ? BlobIndex().DecodeFrom(entry_value)
-                           : collector.Add(*value_blob_index, user_key_size);
+                           : add_reference(*value_blob_index);
   } else if (value_type == kTypeWideColumnEntity) {
     // AddImpl() skips its own walk of the entity when the SST collects
-    // references, so this walk also counts the referenced_blob_bytes property.
+    // references or tracks the classification, so this walk also counts the
+    // referenced_blob_bytes property.
     reference_status = WideColumnSerialization::ForEachBlobIndex(
         entry_value, [&](const BlobIndex& blob_index) {
           AddReferencedBlobBytes(blob_index, user_key_size,
                                  &r->props.referenced_blob_bytes);
-          return collector.Add(blob_index, user_key_size);
+          return add_reference(blob_index);
         });
   }
   if (!reference_status.ok()) {
@@ -2481,6 +2511,18 @@ TableBuilderAddResult BlockBasedTableBuilder::TryAdd(
   context->new_table_reason = TableBuilderNewTableReason::kNone;
   AddImpl(ikey, value, context->decoded_blob_index);
   return TableBuilderAddResult::kAdded;
+}
+
+bool BlockBasedTableBuilder::BlobReferenceLimitReached() const {
+  const BlobReferenceMetadataCollector* const collector =
+      rep_->blob_reference_collector.get();
+  if (collector == nullptr) {
+    return false;
+  }
+  uint64_t limit = rep_->max_blob_references;
+  TEST_SYNC_POINT_CALLBACK("BlockBasedTableBuilder::BlobReferenceLimit",
+                           &limit);
+  return collector->reference_count() >= limit;
 }
 
 void BlockBasedTableBuilder::Flush(const Slice* first_key_in_next_block) {
@@ -4127,7 +4169,24 @@ void BlockBasedTableBuilder::WriteBlobReferenceMetadata(
   // The collector's memory and charge are released when it is destroyed.
   std::unique_ptr<BlobReferenceMetadataCollector> collector =
       std::move(rep_->blob_reference_collector);
-  if (collector == nullptr || !ok()) {
+  if (collector == nullptr) {
+    if (rep_->track_blob_reference_classification && ok()) {
+      std::string encoded;
+      EncodeBlobReferenceClassification(
+          rep_->oldest_coarse_indirect_origin_file_number, &encoded);
+      const bool inserted =
+          rep_->props.user_collected_properties
+              .emplace(kBlobReferenceClassificationPropertyName,
+                       std::move(encoded))
+              .second;
+      if (!inserted) {
+        rep_->SetStatus(
+            Status::Corruption("Duplicate blob reference classification"));
+      }
+    }
+    return;
+  }
+  if (!ok()) {
     return;
   }
 
