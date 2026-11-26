@@ -87,6 +87,22 @@ class InternalIteratorBase : public Cleanable {
     Seek(target);
   }
 
+  // The reverse form of SeekWithHeadMarks(), for SeekForPrev(). It uses
+  // reverse head marks (see "Reverse marks" at MemTableHeadMark). As in the
+  // forward form, the seek can use the marks of every registered memtable,
+  // and *used_mark is set only to a mark of `mark_mem` that moved the seek.
+  // DBIter passes its active memtable only if it can publish, so that it can
+  // extend that mark and clip the converted range (see
+  // DBIter::MaybeInsertRangeTombstone()).
+  virtual void SeekForPrevWithHeadMarks(const Slice& target,
+                                        SequenceNumber /*read_seq*/,
+                                        uint64_t /*read_version*/,
+                                        const ReadOnlyMemTable* /*mark_mem*/,
+                                        const MemTableHeadMark** used_mark) {
+    *used_mark = nullptr;
+    SeekForPrev(target);
+  }
+
   // Position at the first key in the source that at or before target
   // The iterator is Valid() after this call iff the source contains
   // an entry that comes at or before target.
