@@ -7,6 +7,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 
 #include "cache/cache_key.h"
 #include "rocksdb/compression_type.h"
@@ -33,7 +35,10 @@ enum ChecksumType : char;
 // context-modified by the record's absolute file offset (see
 // ChecksumModifierForContext / ComputeBuiltinChecksumWithLastByte in
 // table/format.h) so that an identical payload at a different offset gets a
-// different stored checksum. Payloads are currently uncompressed only.
+// different stored checksum. The payload holds the stored bytes as given by the
+// writer: raw value bytes, or value bytes compressed with the type in the
+// compression marker. The read functions in this file return the stored bytes.
+// The caller decompresses them when the marker is not kNoCompression.
 //
 // This format is deliberately decoupled from any particular file type: the same
 // record shape is read out of SST files (embedded blobs) and is intended to be
@@ -41,6 +46,14 @@ enum ChecksumType : char;
 // the byte source (a RandomAccessFileReader) and the checksum context (checksum
 // type + base context checksum), both passed in by the caller.
 inline constexpr size_t kSimpleGen2BlobTrailerSize = 5;
+// Largest payload size a SimpleGen2Blob record may have. It is UINT32_MAX, the
+// 32-bit value size limit of the table format, or less when size_t cannot hold
+// the payload plus the trailer. Writers and readers reject larger sizes.
+inline constexpr uint64_t kMaxSimpleGen2BlobPayloadSize =
+    std::numeric_limits<size_t>::max() - kSimpleGen2BlobTrailerSize <
+            std::numeric_limits<uint32_t>::max()
+        ? std::numeric_limits<size_t>::max() - kSimpleGen2BlobTrailerSize
+        : std::numeric_limits<uint32_t>::max();
 
 // Cache key for the SimpleGen2Blob record at byte `record_offset` within a file
 // whose base cache key is `base_cache_key`. Delegates to the shared
@@ -63,10 +76,10 @@ inline CacheKey GetSimpleGen2BlobCacheKey(
 // `checksum_type` and `base_context_checksum` are the file's checksum context
 // (e.g. from the SST footer). `expected_compression` is the compression type
 // the caller expects the record to carry (from the blob index); it must match
-// the record's marker, and currently must be kNoCompression.
+// the record's marker.
 //
-// On success, buf[0, payload_size) holds the verified, uncompressed payload
-// (the trailer remains at the tail of `buf` and can be ignored).
+// On success, buf[0, payload_size) holds the verified stored payload. The
+// caller decompresses it when the marker is not kNoCompression.
 Status ReadAndVerifySimpleGen2BlobRecord(
     const ReadOptions& read_options, RandomAccessFileReader* file,
     uint64_t record_offset, size_t payload_size, size_t record_size,
@@ -91,6 +104,17 @@ Status ReadSimpleGen2BlobRange(const ReadOptions& read_options,
                                uint64_t range_offset, size_t range_length,
                                CompressionType expected_compression, char* buf);
 
+// Optional outputs of one batched SimpleGen2 record read. The caller owns one
+// per request and points the request's `extras` at it; the reader only writes
+// it.
+struct SimpleGen2ReadExtras {
+  // Set to the CRC32C of the payload when the record checksum was checked with
+  // kCRC32c and passed. It is computed in the same pass as the check, so the
+  // bytes are not read a second time. For an uncompressed payload this is the
+  // CRC32C of the value. Left unset otherwise.
+  std::optional<uint32_t> payload_crc32c;
+};
+
 // One whole-record request in a batched SimpleGen2Blob read (see
 // ReadAndVerifySimpleGen2BlobRecords). Mirrors the scalar
 // ReadAndVerifySimpleGen2BlobRecord inputs, with the read bytes going into
@@ -103,6 +127,8 @@ struct SimpleGen2RecordReadRequest {
   CompressionType expected_compression = kNoCompression;
   char* buf = nullptr;
   Status* status = nullptr;
+  // Optional outputs; may be null.
+  SimpleGen2ReadExtras* extras = nullptr;
 };
 
 // One sub-range request in a batched SimpleGen2Blob range read (see
@@ -122,7 +148,8 @@ struct SimpleGen2RangeReadRequest {
 // example, LazyWideColumnsBatch::MultiResolve groups its embedded reads by SST,
 // and the table reader of each SST makes one batch of whole records and one
 // batch of byte ranges (see ReadSimpleGen2BlobRanges). A batch is read with one
-// MultiRead call, which is made when preparing the I/O options succeeds.
+// MultiRead call, or with one plain Read when the batch needs a single file
+// read. The read is made when preparing the I/O options succeeds.
 // FSRandomAccessFile::MultiRead requires requests that do not overlap, so:
 // - Requests that overlap, including exact duplicates (same offset and size),
 //   share one file read. Each of them gets the status of that read and, on
@@ -146,9 +173,11 @@ void ReadAndVerifySimpleGen2BlobRecords(const ReadOptions& read_options,
 // of `num_records` *uncompressed* payloads from `file`, with no trailer read
 // and no checksum check. The requests form one batch of byte ranges, as
 // described at ReadAndVerifySimpleGen2BlobRecords. A valid empty range gets OK
-// without I/O. The batch is read with one MultiRead call, which is made only
-// when at least one range needs bytes and preparing the I/O options succeeds.
-// Requests that overlap share one file read, and each gets a copy of its own
+// without I/O. The batch is read with one MultiRead call, or with one plain
+// Read, as in ReadAndVerifySimpleGen2BlobRecords. The read is made only when at
+// least one range needs bytes and preparing the I/O options succeeds. The
+// merging of overlapping requests works as in
+// ReadAndVerifySimpleGen2BlobRecords, and each request gets a copy of its own
 // bytes. Per-record outcome is in *reqs[i].status; on success reqs[i].buf[0,
 // range_length) holds the requested bytes. Requests may be given in any order.
 void ReadSimpleGen2BlobRanges(const ReadOptions& read_options,
@@ -162,8 +191,9 @@ void ReadSimpleGen2BlobRanges(const ReadOptions& read_options,
 // record format lives in one module.
 //
 // `checksum_type` and `base_context_checksum` are the file's checksum context
-// (e.g. from the SST footer). `compression` is the payload's compression type,
-// which currently must be kNoCompression.
+// (e.g. from the SST footer). `payload` is already in stored form, and
+// `compression` is the type it was compressed with (kNoCompression for raw
+// bytes). This function writes it as is and never compresses it.
 IOStatus WriteSimpleGen2BlobRecord(WritableFileWriter* file,
                                    const WriteOptions& write_options,
                                    ChecksumType checksum_type,
