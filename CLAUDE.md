@@ -108,9 +108,34 @@ state). Do not add silent data loss to an existing mode. Accepting data loss
 user action through a dedicated API or option, and must never be triggered
 automatically by an error that could be transient.
 
-**Prefer supporting over rejecting:** When two features interact, prefer making
-the combination work if the change is moderate; reject the combination only
-when support is very large or unsafe, and document why.
+#### Engine invariants and exceptions
+
+**Normal engine invariants are the default contract.** Components should be
+designed and tested against the ordinary RocksDB guarantees. For example,
+ordinary writes and compactions preserve read results through an unreleased
+snapshot of the DB. New components may rely on those guarantees unless their
+required use cases include a feature that explicitly relaxes them.
+
+**Exceptions do not redefine other components' contracts.** Some features
+explicitly relax a guarantee for a specific workload. Examples include
+compaction filters (`include/rocksdb/compaction_filter.h`) and external
+ingestion with `snapshot_consistency=false`, including atomic range replacement
+(`include/rocksdb/options.h`). These examples are not an exhaustive list.
+Applications must satisfy each feature's documented workload assumptions or
+tolerate its documented consequences.
+
+Read [the compatibility guide][engine-invariants] when a design or review
+involves a feature that relaxes an invariant. The guide explains which
+combinations require support and how to preserve the remaining guarantees.
+
+[engine-invariants]: claude_md/engine_invariants_and_exceptions.md
+
+**Prefer supporting over rejecting:** Within the required support scope, prefer
+making a combination work if the change is moderate. Limit or reject support
+when the implementation would be very large or unsafe, and document why. For
+features that relax an invariant, use the guide above to determine the required
+combinations. Apply the Behavioral Compatibility requirements before restricting
+any existing accepted configuration.
 
 ### API Design and Compatibility
 
