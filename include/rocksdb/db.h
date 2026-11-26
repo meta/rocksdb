@@ -1838,7 +1838,9 @@ class DB {
 
     //  "rocksdb.estimate-live-data-size" - returns an estimate of the amount of
     //      live data in bytes. For BlobDB, it also includes the exact value of
-    //      live bytes in the blob files of the version.
+    //      live bytes in the blob files of the version. With blob indirection,
+    //      it also includes the relocation files: their size minus the garbage
+    //      that the reverse reference census found (an estimate).
     static const std::string kEstimateLiveDataSize;
 
     //  "rocksdb.min-log-number-to-keep" - return the minimum log number of the
@@ -1941,25 +1943,30 @@ class DB {
     //      of options.statistics
     static const std::string kOptionsStatistics;
 
-    // "rocksdb.num-blob-files" - returns number of blob files in the current
-    //      version.
+    // "rocksdb.num-blob-files" - returns the number of blob files in the
+    //      current version, including the origin blob files of blob
+    //      indirection. Relocation files are not counted (see
+    //      rocksdb.blob-stats).
     static const std::string kNumBlobFiles;
 
     // "rocksdb.blob-stats" - return the total number and size of all blob
     //      files, and total amount of garbage (bytes) in the blob files in
-    //      the current version.
+    //      the current version. With blob indirection, the sizes include the
+    //      relocation files, and the number of relocation files is shown
+    //      separately.
     static const std::string kBlobStats;
 
     // "rocksdb.total-blob-file-size" - returns the total size of all blob
-    //      files over all versions.
+    //      files over all versions, including relocation files.
     static const std::string kTotalBlobFileSize;
 
     // "rocksdb.live-blob-file-size" - returns the total size of all blob
-    //      files in the current version.
+    //      files in the current version, including relocation files.
     static const std::string kLiveBlobFileSize;
 
     // "rocksdb.live-blob-file-garbage-size" - returns the total amount of
-    // garbage in the blob files in the current version.
+    // garbage in the blob files in the current version. For relocation files,
+    // it is the garbage that the reverse reference census found.
     static const std::string kLiveBlobFileGarbageSize;
 
     //  "rocksdb.blob-cache-capacity" - returns blob cache capacity.
@@ -1972,6 +1979,38 @@ class DB {
     // "rocksdb.blob-cache-pinned-usage" - returns the memory size for the
     //      entries being pinned in blob cache.
     static const std::string kBlobCachePinnedUsage;
+
+    // "rocksdb.indirect-blob-gc-stats" - returns a map of the indirect blob GC
+    // state of the column family. Keys: census-state (ready, building, failed,
+    // or none without blob indirection), census-unready-micros (0 when ready),
+    // census-consecutive-failures, census-builds, census-uncharged-builds (the
+    // builds that went on partly uncharged because the block cache was full),
+    // census-uncharged-charges (the number of census charge attempts and
+    // summary reads of a census build that failed because the block cache was
+    // full, so their memory went on uncharged, also those of installs after the
+    // census is ready; it counts attempts, not bytes, and a later successful
+    // charge can charge that memory again; a compaction only logs its
+    // uncharged input summary reads), census-bytes (an
+    // estimate of the census memory that stays: the worker state and the
+    // change log; rocksdb.block-cache-entry-stats has the exact total of the
+    // census cache role, including short-lived copies), route-count,
+    // relocation-file-count, relocation-file-bytes, relocation-garbage-bytes,
+    // tracked-files (the files in the census candidate heap, which GC may pick,
+    // including files below the garbage threshold; suppressed files and files
+    // pinned by the coarse frontier are not counted),
+    // garbage-bytes-collectable, garbage-bytes-suppressed, coarse-pinned-files,
+    // coarse-pinned-bytes, coarse-pinned-garbage-bytes. Every *-micros key is a
+    // duration, never a timestamp.
+    static const std::string kIndirectBlobGcStats;
+
+    // "rocksdb.blob-reference-census-unready-micros" - returns how long the
+    // blob reference census of the column family has been unready, in
+    // microseconds (a duration, not a timestamp). 0 means that it is ready, or
+    // that the column family does not use blob indirection. While it is
+    // unready, the work that needs the census waits. The LOG warning comes
+    // from the periodic stats dump; with stats_dump_period_sec = 0, use this
+    // property.
+    static const std::string kBlobReferenceCensusUnreadyMicros;
 
     // "rocksdb.blob-indirection-format-version" - returns the blob indirection
     // format version of the column family (the per-CF format fence). 0 means

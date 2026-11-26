@@ -16,6 +16,7 @@
 #include <string>
 
 #include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
@@ -24,6 +25,7 @@
 #include "table/unique_id_impl.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
 #include "util/defer.h"
 #include "util/string_util.h"
 #include "utilities/fault_injection_fs.h"
@@ -206,6 +208,18 @@ class VersionBuilderTest : public testing::Test {
         kUnknownOldestAncestorTime, kUnknownFileCreationTime, epoch_number,
         kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
         0, 0, /* user_defined_timestamps_persisted */ true);
+  }
+
+  void AddBlobReferenceDescriptorToLastFile(VersionEdit* edit) {
+    assert(edit != nullptr);
+    assert(!edit->GetMutableNewFiles().empty());
+    BlobReferenceMetadataDescriptor descriptor;
+    descriptor.column_family_id = edit->GetColumnFamily();
+    descriptor.sst_file_number =
+        edit->GetMutableNewFiles().back().second.fd.GetNumber();
+    descriptor.index_handle = BlockHandle(/*offset=*/10, /*size=*/20);
+    descriptor.EncodeTo(
+        &edit->GetMutableNewFiles().back().second.blob_reference_descriptor);
   }
 
   void UpdateVersionStorageInfo(VersionStorageInfo* vstorage) {
@@ -1046,6 +1060,7 @@ TEST_F(VersionBuilderTest, IndirectOriginBlobFileRequiresFormatFence) {
 
   addition.SetBlobIndirectionFormatVersion(
       kBlobIndirectionManifestFormatVersion);
+  AddBlobReferenceDescriptorToLastFile(&addition);
   VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
                          &vstorage_, /*version_set=*/nullptr);
   ASSERT_OK(builder.Apply(&addition));
@@ -1063,6 +1078,182 @@ TEST_F(VersionBuilderTest, IndirectOriginBlobFileRequiresFormatFence) {
   ASSERT_TRUE(meta->IsIndirectOrigin());
   ASSERT_OK(output.ValidateBlobRelocationState());
   UnrefFilesInVersion(&output);
+}
+
+TEST_F(VersionBuilderTest, PhysicalFileLossRejectsNormalBlobFile) {
+  // A loss record names only a relocation file. A missing normal or
+  // indirect-origin blob file uses the base dropped-file record instead
+  // (best_efforts_blob_db_repair). So a loss record that names a normal or an
+  // indirect-origin blob file in the edit that adds the file is Corruption. A
+  // later loss record that names an indirect-origin blob file (file 100 in this
+  // test) is Corruption too, and a later loss record that names a relocation
+  // file (file 200) is accepted.
+  UpdateVersionStorageInfo();
+  EnvOptions env_options;
+  const auto make_edit = [&](bool is_indirect_origin) {
+    VersionEdit edit;
+    edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+    edit.AddBlobFile(/*blob_file_number=*/100, /*total_blob_count=*/1,
+                     /*total_blob_bytes=*/10, /*checksum_method=*/{},
+                     /*checksum_value=*/{}, is_indirect_origin);
+    AddDummyFileToEdit(
+        &edit, /*table_file_number=*/101,
+        /*blob_file_number=*/is_indirect_origin ? kInvalidBlobFileNumber : 100,
+        /*epoch_number=*/1);
+    if (is_indirect_origin) {
+      AddBlobReferenceDescriptorToLastFile(&edit);
+    } else {
+      edit.GetMutableNewFiles().back().second.blob_reference_legacy_metadata =
+          true;
+    }
+    return edit;
+  };
+  for (const bool is_indirect_origin : {true, false}) {
+    SCOPED_TRACE("is_indirect_origin=" + std::to_string(is_indirect_origin));
+    VersionEdit lost = make_edit(is_indirect_origin);
+    lost.MarkBlobPhysicalFileLost(100);
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    const Status status = builder.Apply(&lost);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    ASSERT_NE(status.ToString().find("names no live target"),
+              std::string::npos);
+  }
+
+  VersionEdit added = make_edit(/*is_indirect_origin=*/true);
+  BlobRelocationFileAddition relocation;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/200,
+                                   /*origin_file_numbers=*/{90}, &relocation));
+  added.AddBlobRelocationFile(relocation);
+  const auto make_later = [](uint64_t lost_file_number) {
+    VersionEdit later;
+    later.SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+    later.MarkBlobPhysicalFileLost(lost_file_number);
+    return later;
+  };
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  ASSERT_OK(builder.Apply(&added));
+  VersionEdit later_origin = make_later(100);
+  const Status status = builder.Apply(&later_origin);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("names no live target"), std::string::npos);
+  VersionEdit later_relocation = make_later(200);
+  ASSERT_OK(builder.Apply(&later_relocation));
+}
+
+TEST_F(VersionBuilderTest, ImplicitNormalBlobPruningReportsPhysicalDeletion) {
+  constexpr uint64_t kBlob = 100;
+  constexpr uint64_t kSst = 101;
+  AddDummyFile(kSst, kBlob, /*epoch_number=*/1);
+  vstorage_.LevelFiles(0).front()->blob_reference_legacy_metadata = true;
+  AddBlob(kBlob, /*total_blob_count=*/1, /*total_blob_bytes=*/100,
+          /*checksum_method=*/{}, /*checksum_value=*/{}, {kSst},
+          /*garbage_blob_count=*/0, /*garbage_blob_bytes=*/0);
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  // A fenced Version's file table holds its blob files.
+  vstorage_.SyncBlobFileTable({}, /*rebuild=*/true, /*cache_res_mgr=*/nullptr);
+  UpdateVersionStorageInfo();
+  VersionEdit edit;
+  edit.DeleteFile(0, kSst);
+  // No BlobFileGarbage or blob file retirement record accompanies this SST
+  // deletion.
+  ASSERT_TRUE(edit.GetBlobFileGarbages().empty());
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  ASSERT_OK(builder.Apply(&edit));
+  VersionStorageInfo output(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/false, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&output));
+  ASSERT_TRUE(output.GetBlobFiles().empty());
+  ASSERT_EQ(output.RemovedBlobFiles(), std::vector<uint64_t>{kBlob});
+  UnrefFilesInVersion(&output);
+}
+
+TEST_F(VersionBuilderTest, FormatFenceRequiresExactSstMetadata) {
+  AddDummyFile(/*table_file_number=*/200,
+               /*blob_file_number=*/kInvalidBlobFileNumber,
+               /*epoch_number=*/2);
+  UpdateVersionStorageInfo();
+  EnvOptions env_options;
+
+  VersionEdit missing;
+  missing.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  AddDummyFileToEdit(&missing, /*table_file_number=*/101,
+                     /*blob_file_number=*/kInvalidBlobFileNumber,
+                     /*epoch_number=*/1);
+  VersionBuilder missing_builder(env_options, &ioptions_,
+                                 /*table_cache=*/nullptr, &vstorage_,
+                                 /*version_set=*/nullptr);
+  ASSERT_TRUE(missing_builder.Apply(&missing).IsCorruption());
+
+  missing.GetMutableNewFiles().back().second.blob_reference_legacy_metadata =
+      true;
+  VersionBuilder legacy_builder(env_options, &ioptions_,
+                                /*table_cache=*/nullptr, &vstorage_,
+                                /*version_set=*/nullptr);
+  ASSERT_OK(legacy_builder.Apply(&missing));
+
+  missing.GetMutableNewFiles().back().second.blob_reference_legacy_metadata =
+      false;
+  AddBlobReferenceDescriptorToLastFile(&missing);
+  VersionBuilder complete_builder(env_options, &ioptions_,
+                                  /*table_cache=*/nullptr, &vstorage_,
+                                  /*version_set=*/nullptr);
+  ASSERT_OK(complete_builder.Apply(&missing));
+
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  VersionEdit legacy_move;
+  legacy_move.DeleteFile(/*level=*/0, /*file=*/200);
+  AddDummyFileToEdit(&legacy_move, /*table_file_number=*/200,
+                     /*blob_file_number=*/kInvalidBlobFileNumber,
+                     /*epoch_number=*/2);
+  VersionBuilder move_builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                              &vstorage_, /*version_set=*/nullptr);
+  ASSERT_OK(move_builder.Apply(&legacy_move));
+
+  // A move without a descriptor is allowed only when the current copy has no
+  // descriptor and no coarse frontier either. Otherwise the move would drop
+  // the exact or coarse metadata of SST 200.
+  VersionEdit with_descriptor;
+  AddDummyFileToEdit(&with_descriptor, /*table_file_number=*/200,
+                     /*blob_file_number=*/kInvalidBlobFileNumber,
+                     /*epoch_number=*/2);
+  AddBlobReferenceDescriptorToLastFile(&with_descriptor);
+  ASSERT_EQ(vstorage_.LevelFiles(0).size(), 1U);
+  vstorage_.LevelFiles(0).front()->blob_reference_descriptor =
+      with_descriptor.GetNewFiles().back().second.blob_reference_descriptor;
+  VersionBuilder exact_move_builder(env_options, &ioptions_,
+                                    /*table_cache=*/nullptr, &vstorage_,
+                                    /*version_set=*/nullptr);
+  const Status status = exact_move_builder.Apply(&legacy_move);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("drops the exact or coarse blob reference"),
+            std::string::npos);
+
+  // The same move of a coarse SST (for example, frontier blob file 300) is
+  // also rejected, because the moved copy would become legacy and stop
+  // pinning the indirect origins from file 300 on.
+  vstorage_.LevelFiles(0).front()->blob_reference_descriptor.clear();
+  vstorage_.LevelFiles(0).front()->oldest_coarse_indirect_origin_file_number =
+      300;
+  VersionBuilder coarse_move_builder(env_options, &ioptions_,
+                                     /*table_cache=*/nullptr, &vstorage_,
+                                     /*version_set=*/nullptr);
+  const Status coarse_status = coarse_move_builder.Apply(&legacy_move);
+  ASSERT_TRUE(coarse_status.IsCorruption()) << coarse_status.ToString();
+  ASSERT_NE(
+      coarse_status.ToString().find("drops the exact or coarse blob reference"),
+      std::string::npos);
 }
 
 TEST_F(VersionBuilderTest, ApplyBlobRelocationStateAtomically) {
@@ -1100,6 +1291,251 @@ TEST_F(VersionBuilderTest, ApplyBlobRelocationStateAtomically) {
             200U);
   ASSERT_EQ(output.GetBlobRelocationRouteTargetCount(200), 1U);
   ASSERT_OK(output.ValidateBlobRelocationState());
+}
+
+TEST_F(VersionBuilderTest, NewVersionKeepsRelocationGarbageUntilCensusPublish) {
+  // The census publishes the garbage of the relocation files for one Version
+  // only. A Version built from it starts with the same value, so the blob
+  // garbage properties do not drop to 0 after every flush or compaction. The
+  // read value never exceeds the record bytes of the current relocation files.
+  // In this example, relocation file 200 serves values of origin file 100, and
+  // the census found 10 bytes of garbage in it.
+  constexpr uint64_t kRelocationFileNumber = 200;
+  constexpr uint64_t kGarbageBytes = 10;
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(kRelocationFileNumber,
+                                   /*origin_file_numbers=*/{100}, &addition));
+  ASSERT_GE(addition.GetTotalRecordBytes(), kGarbageBytes);
+  ASSERT_OK(AddRelocationToBase(addition));
+  UpdateVersionStorageInfo();
+  vstorage_.SetBlobRelocationGarbageBytes(kGarbageBytes);
+  ASSERT_EQ(vstorage_.BlobRelocationGarbageBytesForRead(), kGarbageBytes);
+
+  const auto make_output = [&](VersionStorageInfo* base) {
+    return std::make_unique<VersionStorageInfo>(
+        &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, base,
+        /*force_consistency_checks=*/false,
+        EpochNumberRequirement::kMightMissing,
+        /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+        OffpeakTimeOption(options_.daily_offpeak_time_utc),
+        PeriodicCompactionPhaseParams{});
+  };
+  EnvOptions env_options;
+
+  // An edit that does not change the relocation files keeps the value.
+  std::unique_ptr<VersionStorageInfo> next = make_output(&vstorage_);
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    VersionEdit edit;
+    ASSERT_OK(builder.Apply(&edit));
+    ASSERT_OK(builder.SaveTo(next.get()));
+  }
+  UpdateVersionStorageInfo(next.get());
+  EXPECT_EQ(next->BlobRelocationGarbageBytesForRead(), kGarbageBytes);
+  EXPECT_EQ(next->GetBlobStats().total_garbage_size, kGarbageBytes);
+
+  // An edit that deletes the relocation file leaves no record bytes, so the
+  // copied value reads as 0.
+  std::unique_ptr<VersionStorageInfo> after_delete = make_output(next.get());
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           next.get(), /*version_set=*/nullptr);
+    VersionEdit edit;
+    edit.DeleteBlobRelocationFile(kRelocationFileNumber);
+    ASSERT_OK(builder.Apply(&edit));
+    ASSERT_OK(builder.SaveTo(after_delete.get()));
+  }
+  UpdateVersionStorageInfo(after_delete.get());
+  EXPECT_EQ(after_delete->GetBlobRelocationFileMetaData(kRelocationFileNumber),
+            nullptr);
+  EXPECT_EQ(after_delete->BlobRelocationGarbageBytesForRead(), 0U);
+  EXPECT_EQ(after_delete->GetBlobStats().total_garbage_size, 0U);
+}
+
+TEST_F(VersionBuilderTest, RetiredAnchorRootDoesNotDropNormalBlobFiles) {
+  // SST #101 names indirect origin #100 as its oldest blob file and also holds
+  // values in normal blob file #150, which no SST links. Normal file #160
+  // becomes fully garbage. The blob file retirement of #100 leaves no blob file
+  // with linked SSTs. Both the Version that installs that blob file retirement
+  // and a later Version must keep #150 and drop #160.
+  constexpr uint64_t kSourceFileNumber = 100;
+  constexpr uint64_t kTableFileNumber = 101;
+  constexpr uint64_t kLiveNormalFileNumber = 150;
+  constexpr uint64_t kGarbageNormalFileNumber = 160;
+  constexpr uint64_t kRelocationFileNumber = 200;
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  AddDummyFile(kTableFileNumber, kSourceFileNumber, /*epoch_number=*/1);
+  auto shared = SharedBlobFileMetaData::Create(
+      kSourceFileNumber, /*total_blob_count=*/2,
+      /*total_blob_bytes=*/100, /*checksum_method=*/{},
+      /*checksum_value=*/{}, /*is_indirect_origin=*/true);
+  vstorage_.AddBlobFile(BlobFileMetaData::Create(
+      std::move(shared), BlobFileMetaData::LinkedSsts{kTableFileNumber},
+      /*garbage_blob_count=*/1, /*garbage_blob_bytes=*/40));
+  AddBlob(kLiveNormalFileNumber, /*total_blob_count=*/10,
+          /*total_blob_bytes=*/1000, /*checksum_method=*/{},
+          /*checksum_value=*/{}, BlobFileMetaData::LinkedSsts{},
+          /*garbage_blob_count=*/0, /*garbage_blob_bytes=*/0);
+  AddBlob(kGarbageNormalFileNumber, /*total_blob_count=*/5,
+          /*total_blob_bytes=*/500, /*checksum_method=*/{},
+          /*checksum_value=*/{}, BlobFileMetaData::LinkedSsts{},
+          /*garbage_blob_count=*/4, /*garbage_blob_bytes=*/400);
+  // A fenced Version's file table holds its blob files.
+  vstorage_.SyncBlobFileTable({}, /*rebuild=*/true, /*cache_res_mgr=*/nullptr);
+  UpdateVersionStorageInfo();
+
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(kRelocationFileNumber, {kSourceFileNumber},
+                                   &addition));
+
+  VersionEdit retire;
+  retire.AddBlobRelocationFile(addition);
+  retire.SetBlobRelocationRoute(
+      BlobRelocationRoute(kSourceFileNumber, kRelocationFileNumber));
+  retire.RetireBlobFile(kSourceFileNumber);
+  retire.AddBlobFileGarbage(kGarbageNormalFileNumber,
+                            /*garbage_blob_count=*/1,
+                            /*garbage_blob_bytes=*/100);
+
+  const auto make_output = [&](VersionStorageInfo* base) {
+    return std::make_unique<VersionStorageInfo>(
+        &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, base,
+        /*force_consistency_checks=*/false,
+        EpochNumberRequirement::kMightMissing,
+        /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+        OffpeakTimeOption(options_.daily_offpeak_time_utc),
+        PeriodicCompactionPhaseParams{});
+  };
+
+  EnvOptions env_options;
+  std::unique_ptr<VersionStorageInfo> retired = make_output(&vstorage_);
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           &vstorage_, /*version_set=*/nullptr);
+    ASSERT_OK(builder.Apply(&retire));
+    ASSERT_OK(builder.SaveTo(retired.get()));
+  }
+  UpdateVersionStorageInfo(retired.get());
+
+  // Any later Version is built from a base where nothing links a blob file.
+  std::unique_ptr<VersionStorageInfo> next = make_output(retired.get());
+  {
+    VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                           retired.get(), /*version_set=*/nullptr);
+    VersionEdit unrelated;
+    ASSERT_OK(builder.Apply(&unrelated));
+    ASSERT_OK(builder.SaveTo(next.get()));
+  }
+  UpdateVersionStorageInfo(next.get());
+
+  for (VersionStorageInfo* storage : {retired.get(), next.get()}) {
+    ASSERT_EQ(storage->GetBlobFileMetaData(kSourceFileNumber), nullptr);
+    ASSERT_NE(storage->GetBlobFileMetaData(kLiveNormalFileNumber), nullptr);
+    ASSERT_EQ(storage->GetBlobFileMetaData(kGarbageNormalFileNumber), nullptr);
+  }
+  UnrefFilesInVersion(next.get());
+  UnrefFilesInVersion(retired.get());
+}
+
+TEST_F(VersionBuilderTest,
+       IndirectOriginApproximateGarbageDoesNotAuthorizeRetirement) {
+  constexpr uint64_t kSourceFileNumber = 100;
+  constexpr uint64_t kTableFileNumber = 101;
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  AddDummyFile(kTableFileNumber, kSourceFileNumber, /*epoch_number=*/1);
+  auto shared = SharedBlobFileMetaData::Create(
+      kSourceFileNumber, /*total_blob_count=*/1,
+      /*total_blob_bytes=*/100, /*checksum_method=*/{},
+      /*checksum_value=*/{}, /*is_indirect_origin=*/true);
+  vstorage_.AddBlobFile(BlobFileMetaData::Create(
+      std::move(shared), BlobFileMetaData::LinkedSsts{kTableFileNumber},
+      /*garbage_blob_count=*/0, /*garbage_blob_bytes=*/0));
+  // A fenced Version's file table holds its blob files.
+  vstorage_.SyncBlobFileTable({}, /*rebuild=*/true, /*cache_res_mgr=*/nullptr);
+  UpdateVersionStorageInfo();
+
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
+                         &vstorage_, /*version_set=*/nullptr);
+  VersionEdit approximate;
+  approximate.AddBlobFileGarbage(kSourceFileNumber,
+                                 /*garbage_blob_count=*/1,
+                                 /*garbage_blob_bytes=*/100);
+  ASSERT_OK(builder.Apply(&approximate));
+
+  VersionStorageInfo output(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      /*force_consistency_checks=*/true, EpochNumberRequirement::kMightMissing,
+      /*clock=*/nullptr, /*bottommost_file_compaction_delay=*/0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&output));
+  const std::shared_ptr<BlobFileMetaData> retained =
+      output.GetBlobFileMetaData(kSourceFileNumber);
+  ASSERT_NE(retained, nullptr);
+  EXPECT_TRUE(retained->IsIndirectOrigin());
+  EXPECT_EQ(retained->GetGarbageBlobCount(), 1U);
+  EXPECT_EQ(retained->GetGarbageBlobBytes(), 100U);
+  UnrefFilesInVersion(&output);
+}
+
+TEST_F(VersionBuilderTest, IndirectBlobGCSuppressionAdvancesCandidate) {
+  auto first_shared = SharedBlobFileMetaData::Create(
+      /*blob_file_number=*/100, /*total_blob_count=*/10,
+      /*total_blob_bytes=*/1000, /*checksum_method=*/{},
+      /*checksum_value=*/{}, /*is_indirect_origin=*/true);
+  auto second_shared = SharedBlobFileMetaData::Create(
+      /*blob_file_number=*/200, /*total_blob_count=*/10,
+      /*total_blob_bytes=*/1000, /*checksum_method=*/{},
+      /*checksum_value=*/{}, /*is_indirect_origin=*/true);
+  vstorage_.AddBlobFile(BlobFileMetaData::Create(
+      std::move(first_shared), BlobFileMetaData::LinkedSsts{},
+      /*garbage_blob_count=*/8, /*garbage_blob_bytes=*/800));
+  vstorage_.AddBlobFile(BlobFileMetaData::Create(
+      std::move(second_shared), BlobFileMetaData::LinkedSsts{},
+      /*garbage_blob_count=*/6, /*garbage_blob_bytes=*/600));
+  BlobRelocationFileAddition relocation_addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/300,
+                                   /*origin_file_numbers=*/{50},
+                                   &relocation_addition));
+  vstorage_.AddBlobRelocationFile(
+      BlobRelocationFileMetaData::Create(relocation_addition));
+  vstorage_.AddBlobRelocationRoute(
+      BlobRelocationRoute(/*old_file_number=*/50,
+                          /*target_file_number=*/300));
+
+  vstorage_.SetBlobGcCandidates({100, 200, 300});
+  EXPECT_EQ(vstorage_.BlobPhysicalFileForIndirectBlobGC(), 100U);
+  std::vector<uint64_t> candidates;
+  vstorage_.GetBlobPhysicalFilesForIndirectBlobGC(/*max_files=*/3, &candidates);
+  EXPECT_EQ(candidates, (std::vector<uint64_t>{100, 200, 300}));
+  EXPECT_EQ(vstorage_.GetBlobRelocationRouteTargetCount(300), 1U);
+
+  // A job that tried some candidates and could not finish them defers them.
+  // DeferBlobFilesForIndirectBlobGC() moves them to the end of the list, so the
+  // next job looks at the other candidates first.
+  vstorage_.DeferBlobFilesForIndirectBlobGC({100, 200});
+  vstorage_.GetBlobPhysicalFilesForIndirectBlobGC(/*max_files=*/3, &candidates);
+  EXPECT_EQ(candidates, (std::vector<uint64_t>{300, 100, 200}));
+  vstorage_.SetBlobGcCandidates({100, 200, 300});
+
+  // Suppress a candidate that is not first in the list.
+  // SuppressBlobFileForIndirectBlobGC() removes it and shifts the later
+  // candidates forward, so the list never has holes.
+  vstorage_.SuppressBlobFileForIndirectBlobGC(200);
+  vstorage_.GetBlobPhysicalFilesForIndirectBlobGC(/*max_files=*/3, &candidates);
+  EXPECT_EQ(candidates, (std::vector<uint64_t>{100, 300}));
+  EXPECT_EQ(vstorage_.BlobPhysicalFileForIndirectBlobGC(), 100U);
+
+  vstorage_.SuppressBlobFileForIndirectBlobGC(100);
+  EXPECT_EQ(vstorage_.BlobPhysicalFileForIndirectBlobGC(), 300U);
+
+  vstorage_.SuppressBlobFileForIndirectBlobGC(300);
+  EXPECT_EQ(vstorage_.BlobPhysicalFileForIndirectBlobGC(),
+            kInvalidBlobFileNumber);
 }
 
 TEST_F(VersionBuilderTest, BlobRelocationMetadataPinsPhysicalFile) {
@@ -1370,6 +1806,9 @@ TEST_F(VersionBuilderTest, BlobRelocationFileNumberChecksPerColumnFamily) {
          AddDummyFileToEdit(edit, /*table_file_number=*/200,
                             /*blob_file_number=*/kInvalidBlobFileNumber,
                             /*epoch_number=*/2);
+         // A new SST of a fenced column family needs exact blob reference
+         // metadata.
+         AddBlobReferenceDescriptorToLastFile(edit);
        },
        "Table file conflicts with a blob relocation file"},
       {"new blob file 200 is a relocation file",
@@ -1590,6 +2029,251 @@ TEST_F(VersionBuilderTest, BlobRelocationRouteReplacementAndDeletion) {
   ASSERT_TRUE(replay_builder.Apply(&route_reuse).IsCorruption());
 }
 
+TEST_F(VersionBuilderTest, BlobRelocationUnchangedVersionSharesLiveState) {
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(200, {100}, &addition));
+  ASSERT_OK(AddRelocationToBase(addition));
+  for (uint64_t generation = 1000; generation < 2000; ++generation) {
+    vstorage_.AddBlobRelocationRoute(BlobRelocationRoute(generation, 200));
+  }
+  UpdateVersionStorageInfo();
+  ASSERT_OK(vstorage_.ValidateBlobRelocationState());
+  vstorage_.ComputeBlobRelocationStateFingerprint();
+
+  EnvOptions env_options;
+  VersionBuilder builder(env_options, &ioptions_, nullptr, &vstorage_, nullptr);
+  VersionStorageInfo unchanged(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      false, EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+  ASSERT_OK(builder.SaveTo(&unchanged));
+  ASSERT_EQ(unchanged.GetBlobRelocationState(),
+            vstorage_.GetBlobRelocationState());
+  ASSERT_EQ(unchanged.GetBlobRelocationStateFingerprintHigh(),
+            vstorage_.GetBlobRelocationStateFingerprintHigh());
+
+  VersionEdit deletion;
+  deletion.DeleteBlobRelocationRoute(1000);
+  VersionBuilder changed_builder(env_options, &ioptions_, nullptr, &unchanged,
+                                 nullptr);
+  ASSERT_OK(changed_builder.Apply(&deletion));
+  VersionStorageInfo changed(&icmp_, ucmp_, options_.num_levels,
+                             kCompactionStyleLevel, &unchanged, false,
+                             EpochNumberRequirement::kMightMissing, nullptr, 0,
+                             OffpeakTimeOption(options_.daily_offpeak_time_utc),
+                             PeriodicCompactionPhaseParams{});
+  ASSERT_OK(changed_builder.SaveTo(&changed));
+  ASSERT_NE(changed.GetBlobRelocationState(),
+            unchanged.GetBlobRelocationState());
+  ASSERT_EQ(changed.GetBlobRelocationRouteTarget(1000), kInvalidBlobFileNumber);
+  ASSERT_EQ(unchanged.GetBlobRelocationRouteTarget(1000), 200U);
+  ASSERT_NE(changed.GetBlobRelocationStateFingerprintHigh(),
+            unchanged.GetBlobRelocationStateFingerprintHigh());
+  ASSERT_EQ(changed.GetBlobRelocationRouteTargetCount(200), 999U);
+  ASSERT_EQ(unchanged.GetBlobRelocationRouteTargetCount(200), 1000U);
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationFingerprintIsOrderFree) {
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(200, {100, 101}, &addition));
+  const std::shared_ptr<BlobRelocationFileMetaData> file =
+      BlobRelocationFileMetaData::Create(addition);
+  BlobRelocationState first;
+  first.SetFile(file);
+  first.SetRoute(BlobRelocationRoute(1000, 200));
+  first.SetRoute(BlobRelocationRoute(1065, 200));
+  first.Seal();
+  uint64_t first_high;
+  uint64_t first_low;
+  first.ComputeFingerprint(1, &first_high, &first_low);
+  BlobRelocationState second;
+  second.SetRoute(BlobRelocationRoute(1065, 200));
+  second.SetRoute(BlobRelocationRoute(1000, 300));
+  second.SetFile(file);
+  // Re-pointing, adding and removing a route leave the same final digest.
+  second.SetRoute(BlobRelocationRoute(1000, 200));
+  second.SetRoute(BlobRelocationRoute(1001, 200));
+  second.DeleteRoute(1001);
+  second.Seal();
+  uint64_t second_high;
+  uint64_t second_low;
+  second.ComputeFingerprint(1, &second_high, &second_low);
+  ASSERT_EQ(first_high, second_high);
+  ASSERT_EQ(first_low, second_low);
+  // The digest covers the route target and the loss marker.
+  BlobRelocationState copied(first);
+  copied.SetRoute(BlobRelocationRoute(1065, 300));
+  copied.Seal();
+  uint64_t copied_high;
+  uint64_t copied_low;
+  copied.ComputeFingerprint(1, &copied_high, &copied_low);
+  ASSERT_NE(copied_high, first_high);
+  BlobRelocationState lost(first);
+  lost.SetFile(BlobRelocationFileMetaData::CreateMarkedLost(file));
+  lost.Seal();
+  uint64_t lost_high;
+  uint64_t lost_low;
+  lost.ComputeFingerprint(1, &lost_high, &lost_low);
+  ASSERT_NE(lost_high, first_high);
+  ASSERT_TRUE(lost.HasLostFiles());
+  ASSERT_TRUE(BlobFileTable::IsLost(lost.table().Find(200)));
+  ASSERT_FALSE(BlobFileTable::IsLost(first.table().Find(200)));
+  ASSERT_EQ(first.FindRouteTarget(1000), 200U);
+  ASSERT_EQ(first.RouteCount(200), 2U);
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationFingerprintCoversFileFields) {
+  // Each field of a relocation file that identifies it (size, checksum,
+  // directory digest) changes the fingerprint.
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(200, {100}, &addition));
+  const auto fingerprint = [](const BlobRelocationFileAddition& file) {
+    BlobRelocationState state;
+    state.SetFile(BlobRelocationFileMetaData::Create(file));
+    state.Seal();
+    uint64_t high = 0;
+    uint64_t low = 0;
+    state.ComputeFingerprint(1, &high, &low);
+    return std::make_pair(high, low);
+  };
+  const auto base = fingerprint(BlobRelocationFileAddition(
+      200, addition.GetFileSize(), "crc32c", "aaaa", addition.GetTotalEntries(),
+      addition.GetTotalRecordBytes(), addition.GetDirectoryDigest(),
+      addition.GetTailSize()));
+  EXPECT_NE(base,
+            fingerprint(BlobRelocationFileAddition(
+                200, addition.GetFileSize() + 1, "crc32c", "aaaa",
+                addition.GetTotalEntries(), addition.GetTotalRecordBytes(),
+                addition.GetDirectoryDigest(), addition.GetTailSize())));
+  EXPECT_NE(base,
+            fingerprint(BlobRelocationFileAddition(
+                200, addition.GetFileSize(), "crc32c", "aaab",
+                addition.GetTotalEntries(), addition.GetTotalRecordBytes(),
+                addition.GetDirectoryDigest(), addition.GetTailSize())));
+  EXPECT_NE(base,
+            fingerprint(BlobRelocationFileAddition(
+                200, addition.GetFileSize(), "crc32c", "aaaa",
+                addition.GetTotalEntries(), addition.GetTotalRecordBytes(),
+                addition.GetDirectoryDigest() ^ 1, addition.GetTailSize())));
+}
+
+TEST_F(VersionBuilderTest, BlobRelocationRetentionLeavesTableToItsCharge) {
+  // A census change log entry that holds a newer state is charged only for
+  // memory that no other reservation charges. The file table is charged by
+  // ownership to the file metadata reservation, so a route change on a large
+  // table adds no table bytes to the entry.
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(200, {100}, &addition));
+  BlobRelocationState base;
+  base.SetFile(BlobRelocationFileMetaData::Create(addition));
+  for (uint64_t source = 1000; source < 11000; ++source) {
+    base.SetRoute(BlobRelocationRoute(source, 200));
+  }
+  base.Seal();
+  BlobRelocationState changed(base);
+  changed.DeleteRoute(1000);
+  changed.Seal();
+  ASSERT_GT(changed.table().ApproximateMemoryUsage(), 100000U);
+  EXPECT_LT(changed.IncrementalRetentionBytes(base, /*changed_files=*/{}),
+            1024U);
+
+  // A changed relocation file is counted, old and new side.
+  BlobRelocationFileAddition other;
+  ASSERT_OK(MakeRelocationAddition(300, {150}, &other));
+  BlobRelocationState with_file(base);
+  with_file.SetFile(BlobRelocationFileMetaData::Create(other));
+  with_file.Seal();
+  EXPECT_GT(with_file.IncrementalRetentionBytes(base, {300}),
+            with_file.IncrementalRetentionBytes(base, {}));
+}
+
+TEST_F(VersionBuilderTest, AcceptedLossMarksRelocationFile) {
+  // Relocation file #200 holds the values of old file #100, which is routed
+  // to it.
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeRelocationAddition(200, {100}, &addition));
+  ASSERT_OK(AddRelocationToBase(addition));
+  vstorage_.AddBlobRelocationRoute(BlobRelocationRoute(100, 200));
+  UpdateVersionStorageInfo();
+  ASSERT_OK(vstorage_.ValidateBlobRelocationState());
+  vstorage_.ComputeBlobRelocationStateFingerprint();
+
+  EnvOptions env_options;
+  const auto apply = [&](VersionEdit* edit, VersionStorageInfo* base,
+                         VersionStorageInfo* output) {
+    VersionBuilder builder(env_options, &ioptions_, nullptr, base, nullptr);
+    Status status = builder.Apply(edit);
+    if (status.ok() && output != nullptr) {
+      status = builder.SaveTo(output);
+    }
+    return status;
+  };
+  const auto new_storage = [&](VersionStorageInfo* base) {
+    return std::make_unique<VersionStorageInfo>(
+        &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, base, false,
+        EpochNumberRequirement::kMightMissing, nullptr, 0,
+        OffpeakTimeOption(options_.daily_offpeak_time_utc),
+        PeriodicCompactionPhaseParams{});
+  };
+  {
+    // A loss record is rejected for a duplicate file number, file number 0, an
+    // unknown file, and a file that the same edit deletes.
+    for (const std::vector<uint64_t>& losses :
+         std::vector<std::vector<uint64_t>>{{200, 200}, {0}, {999}}) {
+      VersionEdit edit;
+      for (uint64_t file_number : losses) {
+        edit.MarkBlobPhysicalFileLost(file_number);
+      }
+      ASSERT_TRUE(apply(&edit, &vstorage_, nullptr).IsCorruption());
+    }
+    VersionEdit deleted;
+    deleted.DeleteBlobRelocationRoute(100);
+    deleted.DeleteBlobRelocationFile(200);
+    deleted.MarkBlobPhysicalFileLost(200);
+    ASSERT_TRUE(apply(&deleted, &vstorage_, nullptr).IsCorruption());
+  }
+
+  VersionEdit loss;
+  loss.MarkBlobPhysicalFileLost(200);
+  std::unique_ptr<VersionStorageInfo> lost = new_storage(&vstorage_);
+  ASSERT_OK(apply(&loss, &vstorage_, lost.get()));
+  lost->ComputeBlobRelocationStateFingerprint();
+  ASSERT_TRUE(lost->GetBlobRelocationFileMetaData(200)->IsMarkedLost());
+  ASSERT_TRUE(lost->HasLostBlobRelocationFiles());
+  ASSERT_TRUE(BlobFileTable::IsLost(lost->GetBlobFileTable().Find(200)));
+  ASSERT_NE(lost->GetBlobRelocationStateFingerprintHigh(),
+            vstorage_.GetBlobRelocationStateFingerprintHigh());
+  // A reference whose generation number is the routed old file number and one
+  // flattened to the file are both lost; a reference with another generation
+  // number is not.
+  const auto index_of = [](uint64_t generation, uint64_t origin) {
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(&encoded, generation,
+                                  {.origin_file_number = origin,
+                                   .original_value_offset = 11,
+                                   .stored_value_size = 17,
+                                   .compression = kNoCompression,
+                                   .stable_checksum = 1,
+                                   .stored_checksum = 2});
+    BlobIndex index;
+    EXPECT_OK(index.DecodeFrom(encoded));
+    return index;
+  };
+  ASSERT_TRUE(lost->IsBlobReferenceLost(index_of(100, 100)));
+  ASSERT_TRUE(lost->IsBlobReferenceLost(index_of(200, 100)));
+  ASSERT_FALSE(lost->IsBlobReferenceLost(index_of(150, 150)));
+  UpdateVersionStorageInfo(lost.get());
+
+  // Deleting the lost file (after its route) clears the loss count.
+  VersionEdit deletion;
+  deletion.DeleteBlobRelocationRoute(100);
+  deletion.DeleteBlobRelocationFile(200);
+  std::unique_ptr<VersionStorageInfo> deleted = new_storage(lost.get());
+  ASSERT_OK(apply(&deletion, lost.get(), deleted.get()));
+  ASSERT_FALSE(deleted->HasLostBlobRelocationFiles());
+}
+
 TEST_F(VersionBuilderTest, BlobRelocationStateKeepsFileTotals) {
   // BlobRelocationState keeps two totals over its relocation files: the file
   // sizes and the record bytes from each file's directory. It updates them when
@@ -1624,19 +2308,6 @@ TEST_F(VersionBuilderTest, BlobRelocationStateKeepsFileTotals) {
   state.SetFile(make_file(202, {103}, std::numeric_limits<uint64_t>::max()));
   EXPECT_TRUE(state.AggregateOverflow());
   EXPECT_EQ(state.PhysicalFileBytes(), 1000U);
-}
-
-TEST_F(VersionBuilderTest, AcceptedLossRecordIsRejected) {
-  // The builder does not apply blob physical file loss records (written by
-  // MarkBlobPhysicalFileLost()). It must fail with NotSupported rather than
-  // skip one.
-  UpdateVersionStorageInfo();
-  EnvOptions env_options;
-  VersionBuilder builder(env_options, &ioptions_, /*table_cache=*/nullptr,
-                         &vstorage_, /*version_set=*/nullptr);
-  VersionEdit edit;
-  edit.MarkBlobPhysicalFileLost(/*file_number=*/200);
-  ASSERT_TRUE(builder.Apply(&edit).IsNotSupported());
 }
 
 TEST_F(VersionBuilderTest, BlobRelocationSupportsMaximumFileNumber) {
@@ -1691,46 +2362,6 @@ TEST_F(VersionBuilderTest, BlobRelocationSupportsMaximumFileNumber) {
   ASSERT_OK(deletion_builder.SaveTo(&retired));
   ASSERT_EQ(retired.GetBlobRelocationFileMetaData(kMaxFileNumber), nullptr);
   ASSERT_TRUE(retired.GetBlobRelocationFiles().empty());
-}
-
-TEST_F(VersionBuilderTest, BlobRelocationUnchangedVersionSharesLiveState) {
-  BlobRelocationFileAddition addition;
-  ASSERT_OK(MakeRelocationAddition(200, {100}, &addition));
-  ASSERT_OK(AddRelocationToBase(addition));
-  for (uint64_t generation = 1000; generation < 2000; ++generation) {
-    vstorage_.AddBlobRelocationRoute(BlobRelocationRoute(generation, 200));
-  }
-  UpdateVersionStorageInfo();
-  ASSERT_OK(vstorage_.ValidateBlobRelocationState());
-
-  EnvOptions env_options;
-  VersionBuilder builder(env_options, &ioptions_, nullptr, &vstorage_, nullptr);
-  VersionStorageInfo unchanged(
-      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
-      false, EpochNumberRequirement::kMightMissing, nullptr, 0,
-      OffpeakTimeOption(options_.daily_offpeak_time_utc),
-      PeriodicCompactionPhaseParams{});
-  ASSERT_OK(builder.SaveTo(&unchanged));
-  ASSERT_EQ(unchanged.GetBlobRelocationState(),
-            vstorage_.GetBlobRelocationState());
-
-  VersionEdit deletion;
-  deletion.DeleteBlobRelocationRoute(1000);
-  VersionBuilder changed_builder(env_options, &ioptions_, nullptr, &unchanged,
-                                 nullptr);
-  ASSERT_OK(changed_builder.Apply(&deletion));
-  VersionStorageInfo changed(&icmp_, ucmp_, options_.num_levels,
-                             kCompactionStyleLevel, &unchanged, false,
-                             EpochNumberRequirement::kMightMissing, nullptr, 0,
-                             OffpeakTimeOption(options_.daily_offpeak_time_utc),
-                             PeriodicCompactionPhaseParams{});
-  ASSERT_OK(changed_builder.SaveTo(&changed));
-  ASSERT_NE(changed.GetBlobRelocationState(),
-            unchanged.GetBlobRelocationState());
-  ASSERT_EQ(changed.GetBlobRelocationRouteTarget(1000), kInvalidBlobFileNumber);
-  ASSERT_EQ(unchanged.GetBlobRelocationRouteTarget(1000), 200U);
-  ASSERT_EQ(changed.GetBlobRelocationRouteTargetCount(200), 999U);
-  ASSERT_EQ(unchanged.GetBlobRelocationRouteTargetCount(200), 1000U);
 }
 
 TEST_F(VersionBuilderTest, BlobFileRetirementRemovesCollectedFile) {
@@ -1893,6 +2524,17 @@ TEST_F(VersionBuilderTest, BlobFileRetirementRemovesCollectedFile) {
     relocation_edit.AddBlobRelocationFile(relocation_reuse);
     ASSERT_TRUE(
         relocation_reuse_builder.Apply(&relocation_edit).IsCorruption());
+  }
+  {
+    // Late approximate garbage for the routed file is a no-op.
+    VersionBuilder post_retirement_builder(env_options, &ioptions_,
+                                           /*table_cache=*/nullptr, &output,
+                                           /*version_set=*/nullptr);
+    VersionEdit post_retirement_garbage;
+    post_retirement_garbage.AddBlobFileGarbage(kSourceFileNumber,
+                                               /*garbage_blob_count=*/1,
+                                               /*garbage_blob_bytes=*/60);
+    ASSERT_OK(post_retirement_builder.Apply(&post_retirement_garbage));
   }
   UnrefFilesInVersion(&output);
 }
@@ -3530,6 +4172,44 @@ TEST_P(BlobFileTableTest, ChargesMemoryOnce) {
     }
     ASSERT_EQ(manager->GetTotalMemoryUsed(), table.ApproximateMemoryUsage());
   }
+  ASSERT_EQ(manager->GetTotalMemoryUsed(), 0);
+}
+
+TEST_P(BlobFileTableTest, ChargeStaysUntilLastHolderFrees) {
+  // Each table copy (one per Version, or one held by a census change log entry)
+  // shares unchanged shards. Whichever copy is freed first, every shard that a
+  // remaining copy holds stays charged. When one copy is left, the charge
+  // equals its memory.
+  std::shared_ptr<CacheReservationManager> manager =
+      std::make_shared<ConcurrentCacheReservationManager>(
+          std::make_shared<
+              CacheReservationManagerImpl<CacheEntryRole::kFileMetadata>>(
+              NewLRUCache(64 << 20)));
+  auto first = std::make_unique<BlobFileTable>();
+  first->SetCacheReservationManager(manager);
+  std::vector<BlobFileTable::Op> ops;
+  for (uint64_t key = 1; key <= 5000; ++key) {
+    ops.push_back({key, BlobFileTable::RouteValue(key + 1)});
+  }
+  first->Apply(ops);
+  auto second = std::make_unique<BlobFileTable>(*first);
+  second->Apply({{1, 0}, {2, 0}});
+  auto third = std::make_unique<BlobFileTable>(*second);
+  third->Apply({{3, 0}});
+  // Shared shards are charged once, so the total charge is below the sum of
+  // the memory of the three tables.
+  const size_t all_three = manager->GetTotalMemoryUsed();
+  ASSERT_LT(all_three, first->ApproximateMemoryUsage() +
+                           second->ApproximateMemoryUsage() +
+                           third->ApproximateMemoryUsage());
+  ASSERT_GE(all_three, first->ApproximateMemoryUsage());
+  // Free the middle copy first, then the oldest, out of order.
+  second.reset();
+  ASSERT_GE(manager->GetTotalMemoryUsed(), first->ApproximateMemoryUsage());
+  ASSERT_GE(manager->GetTotalMemoryUsed(), third->ApproximateMemoryUsage());
+  first.reset();
+  ASSERT_EQ(manager->GetTotalMemoryUsed(), third->ApproximateMemoryUsage());
+  third.reset();
   ASSERT_EQ(manager->GetTotalMemoryUsed(), 0);
 }
 

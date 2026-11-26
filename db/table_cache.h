@@ -10,6 +10,7 @@
 // Thread-safe (provides internal synchronization)
 
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -28,6 +29,10 @@
 #include "util/coro_utils.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+struct BlobReferenceGroup;
+struct BlobReferenceSstSummary;
+class CacheReservationManager;
 
 class Env;
 class Arena;
@@ -84,6 +89,32 @@ class TableCache {
   using CacheInterface =
       BasicTypedCacheInterface<TableReader, CacheEntryRole::kMisc>;
   using TypedHandle = CacheInterface::TypedHandle;
+
+  // Holds the table reader that reads the exact blob reference metadata of one
+  // SST (see GetBlobReferenceReader()). The reader is either the SST's reader
+  // in the table cache or an ephemeral reader that this object owns. The
+  // destructor releases the table cache handle or frees the ephemeral reader.
+  // A pinned reader (the SST's reader held by its FileMetaData) has no cache
+  // handle, so the caller must keep `file_meta` alive (for example, hold a
+  // Version that contains it) while it uses the reader.
+  class BlobReferenceReader {
+   public:
+    BlobReferenceReader() = default;
+    ~BlobReferenceReader() { Reset(); }
+    BlobReferenceReader(const BlobReferenceReader&) = delete;
+    BlobReferenceReader& operator=(const BlobReferenceReader&) = delete;
+
+    const TableReader* get() const { return reader_; }
+    const TableReader* operator->() const { return reader_; }
+    void Reset();
+
+   private:
+    friend class TableCache;
+    CacheInterface* cache_ = nullptr;
+    TypedHandle* handle_ = nullptr;
+    std::unique_ptr<TableReader> owned_;
+    const TableReader* reader_ = nullptr;
+  };
 
   // Cache interface for row cache
   using RowCacheInterface =
@@ -273,6 +304,37 @@ class TableCache {
                             HistogramImpl* file_read_hist,
                             bool prefetch_index_and_filter_in_cache);
 
+  // Returns the summary of the exact blob references of an SST. If `file_meta`
+  // already holds a summary (a new output of BuildTable() or compaction), it
+  // returns that summary. Otherwise it reads and validates the groups from
+  // the SST through GetBlobReferenceReader().
+  // Background work calls it, for example the census build and compaction for
+  // its input SSTs. Do not call it in the MANIFEST write path, because its I/O
+  // would delay every queued MANIFEST writer. The memory of a summary read from
+  // the SST is charged through `reservation_manager`. When
+  // `reservation_manager` is null, the table factory's blob reference
+  // reservation manager is used. A full block cache does not fail the read:
+  // the memory above the cache capacity stays uncharged. Such a read adds 1 to
+  // `*uncharged_reads` when it is not null, and the caller reports it (for
+  // example, one WARN line per census build or per compaction). When
+  // `uncharged_reads` is null, the read logs a WARN line itself.
+  Status ReadBlobReferenceSstSummary(
+      const ReadOptions& read_options, const FileOptions& file_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+      std::shared_ptr<const BlobReferenceSstSummary>* summary,
+      const std::shared_ptr<CacheReservationManager>& reservation_manager,
+      std::atomic<uint64_t>* uncharged_reads);
+
+  // Same as above, but reads the groups through `reader`, a table reader that
+  // the caller already has open for the SST.
+  Status ReadBlobReferenceSstSummary(
+      const ReadOptions& read_options, const TableReader& reader,
+      const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+      std::shared_ptr<const BlobReferenceSstSummary>* summary,
+      const std::shared_ptr<CacheReservationManager>& reservation_manager,
+      std::atomic<uint64_t>* uncharged_reads);
+
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
                                const FileMetaData& file_meta,
@@ -331,6 +393,34 @@ class TableCache {
   }
 
  private:
+  // Gets a reader for the exact blob reference metadata of `file_meta`. It
+  // first looks for the SST's reader in the table cache without I/O (the pinned
+  // reader of the SST, or a cache lookup). That reader already read the table
+  // tail, so the caller reads only the blocks it needs. On a miss, it opens an
+  // ephemeral reader (OpenEphemeralBlobReferenceReader()), which is not
+  // inserted into the table cache, so this call never evicts the reader of
+  // another SST. Both kinds read the blob reference blocks with
+  // fill_cache=false, checksum checks and no persistent cache (see
+  // BlockBasedTable::ReadBlobReferenceGroups()). Their other blocks still use
+  // the persistent cache, as base readers do. An ephemeral reader reads no
+  // filter block and does not insert its metadata blocks into the shared block
+  // cache. The caller must keep `file_meta` alive (for example, hold a Version
+  // that contains it) while it uses the reader. Returns InvalidArgument for an
+  // SST without exact blob reference metadata.
+  Status GetBlobReferenceReader(
+      const ReadOptions& read_options, const FileOptions& file_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+      BlobReferenceReader* reader);
+
+  // Opens a reader that is not kept in the table cache. Its open does not
+  // insert metadata blocks into the shared block cache.
+  Status OpenEphemeralBlobReferenceReader(
+      const ReadOptions& read_options, const FileOptions& file_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta, const MutableCFOptions& mutable_cf_options,
+      std::unique_ptr<TableReader>* reader);
+
   // Build a table reader
   Status GetTableReader(const ReadOptions& ro, const FileOptions& file_options,
                         const InternalKeyComparator& internal_comparator,

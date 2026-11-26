@@ -37,6 +37,8 @@ namespace ROCKSDB_NAMESPACE {
 class Version;
 class VersionSet;
 class VersionStorageInfo;
+class BlobReferenceCensus;
+struct BlobReferenceCensusGarbage;
 class MemTable;
 class MemTableListVersion;
 class CompactionPicker;
@@ -438,6 +440,38 @@ class ColumnFamilyData {
 
   InternalStats* internal_stats() { return internal_stats_.get(); }
 
+  // The blob reference census of this CF (see db/blob/blob_reference_census.h).
+  // It is null until the CF first needs it. Two paths create it, both through
+  // GetOrCreateBlobReferenceCensus():
+  // - a Version install (LogAndApply()) for a CF whose current Version has the
+  //   per-CF format fence, or for a CF with enable_blob_indirection when the DB
+  //   has the DB-global format fence after the install. Examples are the
+  //   install that activates the format, and the SetOptions() call that turns
+  //   the option on (it installs new Versions without a MANIFEST record). Both
+  //   fences are described under "MANIFEST records" in
+  //   db/blob/blob_relocation_manifest.h;
+  // - census scheduling for a CF recovered from the MANIFEST with the format
+  //   fence.
+  // Once created, the census lives as long as the CFD.
+  BlobReferenceCensus* blob_reference_census() {
+    return blob_reference_census_.load(std::memory_order_acquire);
+  }
+  const BlobReferenceCensus* blob_reference_census() const {
+    return blob_reference_census_.load(std::memory_order_acquire);
+  }
+  // The number of failed census builds in a row (see
+  // blob_reference_census_failures_). REQUIRES: DB mutex held.
+  uint32_t blob_reference_census_failures() const {
+    return blob_reference_census_failures_;
+  }
+
+  // REQUIRES: DB mutex held.
+  BlobReferenceCensus* GetOrCreateBlobReferenceCensus();
+
+  // REQUIRES: DB mutex held. The caller must destroy the returned state after
+  // it releases the DB mutex.
+  BlobReferenceCensusGarbage CancelBlobReferenceCensus();
+
   MemTableList* imm() { return &imm_; }
   MemTable* mem() { return mem_; }
 
@@ -717,6 +751,7 @@ class ColumnFamilyData {
 
  private:
   friend class ColumnFamilySet;
+  friend class DBImpl;
   ColumnFamilyData(
       uint32_t id, const std::string& name, Version* dummy_versions,
       Cache* table_cache, WriteBufferManager* write_buffer_manager,
@@ -768,6 +803,10 @@ class ColumnFamilyData {
   std::unique_ptr<BlobSource> blob_source_;
   // Per-CF manager for write-path blob direct-write files.
   std::shared_ptr<BlobFilePartitionManager> blob_partition_manager_;
+  // Owns the census. blob_reference_census_ points to the same object, so
+  // readers that do not hold the DB mutex can load it.
+  std::unique_ptr<BlobReferenceCensus> blob_reference_census_storage_;
+  std::atomic<BlobReferenceCensus*> blob_reference_census_{nullptr};
 
   std::unique_ptr<InternalStats> internal_stats_;
 
@@ -811,6 +850,23 @@ class ColumnFamilyData {
   // If true, this ColumnFamily is in DBImpl::compaction_queue_ or its parked
   // compaction set.
   bool queued_for_compaction_;
+
+  // State for the background census worker, protected by the DB mutex. DBImpl
+  // keeps two intrusive lists of CFs, linked by next_blob_reference_census_:
+  // the run queue and the retry list. While queued_for_blob_reference_census_
+  // is true, the CF is in one of the lists or its census is running, and the
+  // census scheduler holds one reference to the CF. A running census worker
+  // releases that reference when it is done, or keeps it when it moves the CF
+  // to the retry list. blob_reference_census_retry_micros_ is the time when the
+  // retry list moves the CF back to the run queue. A CF with no failed build
+  // can move back earlier when its census has new work.
+  // blob_reference_census_failures_ counts failed builds in a row (capped at
+  // 6). After a failure, the retry delay is 1 second, doubled for each failure
+  // in a row, so at most 32 seconds.
+  bool queued_for_blob_reference_census_ = false;
+  ColumnFamilyData* next_blob_reference_census_ = nullptr;
+  uint64_t blob_reference_census_retry_micros_ = 0;
+  uint32_t blob_reference_census_failures_ = 0;
 
   // Read outside the DB mutex by compaction workers (acquire-loaded roughly
   // every 1024 records in ProcessKeyValueCompaction). Given its own cache line

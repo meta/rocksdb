@@ -1694,6 +1694,10 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
     // FindObsoleteFiles(). This is because job_context does not
     // catch all created files if compaction failed.
     FindObsoleteFiles(&job_context, !s.ok());
+    // The compaction has installed its SuperVersion, so the census state that
+    // its LogAndApply batch replaced can be freed now (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()).
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
   }  // release the mutex
 
   // delete unnecessary files if any, this is done outside the mutex
@@ -2062,8 +2066,14 @@ Status DBImpl::CompactFilesImpl(
 Status DBImpl::PauseBackgroundWork() {
   InstrumentedMutexLock guard_lock(&mutex_);
   bg_compaction_paused_++;
+  // The blob reference census job is background work too: it reads SSTs,
+  // stores GC candidates in the current Version and schedules compactions. So
+  // wait for it. ScheduleBlobReferenceCensus() does not start it again while
+  // paused.
   while (CompactionsScheduled() > 0 || remote_compaction_pool_jobs_ > 0 ||
-         bg_flush_scheduled_ > 0 || bg_wbm_flush_scheduled_ > 0) {
+         bg_flush_scheduled_ > 0 || bg_wbm_flush_scheduled_ > 0 ||
+         bg_blob_reference_census_state_ ==
+             BlobReferenceCensusJobState::kScheduled) {
     TEST_SYNC_POINT("DBImpl::PauseBackgroundWork:Wait");
     bg_cv_.Wait();
   }
@@ -2084,6 +2094,9 @@ Status DBImpl::ContinueBackgroundWork() {
   // bg_work_paused_ is always no greater than bg_compaction_paused_
   if (bg_work_paused_ == 0) {
     MaybeScheduleFlushOrCompaction();
+    // Check every column family again and start the census job for those that
+    // need a census run (see ScheduleBlobReferenceCensus()).
+    ScheduleBlobReferenceCensus();
   }
   return Status::OK();
 }
@@ -2331,6 +2344,10 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
 
     InstallSuperVersionAndScheduleWork(cfd, &sv_context,
                                        /*defer_snapshot_refresh=*/false);
+    // Free the census state that the LogAndApply batch replaced (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()). refitting_level_ is
+    // still set, so no other ReFitLevel() starts while the mutex is released.
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
 
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log, "[%s] LogAndApply: %s\n",
                     cfd->GetName().c_str(), status.ToString().data());
@@ -4207,6 +4224,10 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
     out_file_metadata.db_ownership_start_time = copy_time;
     out_file_metadata.data_file_provenance =
         in_file->data_file_provenance | kProvenanceTemperatureChangedByCopy;
+    out_file_metadata.blob_reference_descriptor =
+        in_file->blob_reference_descriptor;
+    out_file_metadata.blob_reference_legacy_metadata =
+        in_file->blob_reference_legacy_metadata;
 
     if (out_table_properties) {
       c->SetOutputTableProperties(out_fname, out_table_properties);
@@ -4873,10 +4894,11 @@ void DBImpl::BackgroundCallWBMFlush() {
   bg_cv_.SignalAll();
 }
 
-Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
-                               LogBuffer* log_buffer, FlushReason* reason,
-                               bool* flush_rescheduled_to_retain_udt,
-                               Env::Priority thread_pri) {
+Status DBImpl::BackgroundFlush(
+    bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
+    FlushReason* reason, bool* flush_rescheduled_to_retain_udt,
+    Env::Priority thread_pri,
+    autovector<BlobReferenceCensusApplyTarget>* census_cfds) {
   mutex_.AssertHeld();
 
   Status status;
@@ -5008,7 +5030,14 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
     *reason = bg_flush_args[0].flush_reason_;
     for (auto& arg : bg_flush_args) {
       ColumnFamilyData* cfd = arg.cfd_;
-      if (cfd->UnrefAndTryDelete()) {
+      if (cfd->blob_reference_census() != nullptr && !cfd->IsDropped()) {
+        // The caller applies the census of `cfd` and then drops this
+        // reference. A dropped column family is released here as before, so
+        // FindObsoleteFiles() in the caller still sees its last reference go.
+        mutex_.AssertHeld();
+        census_cfds->push_back({cfd, cfd->current()->GetVersionNumber()});
+        ++blob_reference_census_pending_applies_;
+      } else if (cfd->UnrefAndTryDelete()) {
         arg.cfd_ = nullptr;
       }
     }
@@ -5043,9 +5072,12 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
         CaptureListenerPendingOutput(**pending_outputs_inserted_elem);
     FlushReason reason;
     bool flush_rescheduled_to_retain_udt = false;
-    Status s =
-        BackgroundFlush(&made_progress, &job_context, &log_buffer, &reason,
-                        &flush_rescheduled_to_retain_udt, thread_pri);
+    // The column families of this flush that have a census, each with a
+    // reference (see ApplyBlobReferenceCensusAfterInstall()).
+    autovector<BlobReferenceCensusApplyTarget> census_cfds;
+    Status s = BackgroundFlush(&made_progress, &job_context, &log_buffer,
+                               &reason, &flush_rescheduled_to_retain_udt,
+                               thread_pri, &census_cfds);
     if (s.IsTryAgain() && flush_rescheduled_to_retain_udt) {
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
       mutex_.Unlock();
@@ -5104,6 +5136,9 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
       mutex_.Lock();
     }
     TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:ContextCleanedUp");
+    // Wakes the waiters of the flush result before the deferred census
+    // cleanup and the census apply (see the function comment).
+    ApplyBlobReferenceCensusAfterInstall(census_cfds);
 
     assert(num_running_flushes_ > 0);
     num_running_flushes_--;
@@ -5160,10 +5195,13 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 : (bg_thread_pri == Env::Priority::BOTTOM
                                        ? bg_bottom_compaction_scheduled_ > 0
                                        : bg_compaction_scheduled_ > 0));
-    Status s = BackgroundCompaction(&made_progress, &job_context, &log_buffer,
-                                    prepicked_compaction, bg_thread_pri,
-                                    separate_remote_pool, &deferred_compactions,
-                                    **pending_outputs_inserted_elem);
+    // The column family of this compaction if it has a census, with a
+    // reference (see ApplyBlobReferenceCensusAfterInstall()).
+    autovector<BlobReferenceCensusApplyTarget> census_cfds;
+    Status s = BackgroundCompaction(
+        &made_progress, &job_context, &log_buffer, prepicked_compaction,
+        bg_thread_pri, separate_remote_pool, &deferred_compactions,
+        **pending_outputs_inserted_elem, &census_cfds);
     TEST_SYNC_POINT("BackgroundCallCompaction:1");
     if (s.IsBusy()) {
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
@@ -5246,6 +5284,9 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
       job_context.Clean();
       mutex_.Lock();
     }
+    // Wakes the waiters of the compaction result before the deferred census
+    // cleanup and the census apply (see the function comment).
+    ApplyBlobReferenceCensusAfterInstall(census_cfds);
 
     assert(num_running_compactions_ > 0);
     num_running_compactions_--;
@@ -5302,7 +5343,8 @@ Status DBImpl::BackgroundCompaction(
     bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
     PrepickedCompaction* prepicked_compaction, Env::Priority thread_pri,
     bool separate_remote_pool, int* deferred_compactions,
-    uint64_t min_output_file_number) {
+    uint64_t min_output_file_number,
+    autovector<BlobReferenceCensusApplyTarget>* census_cfds) {
   ManualCompactionState* manual_compaction =
       prepicked_compaction == nullptr
           ? nullptr
@@ -5348,6 +5390,17 @@ Status DBImpl::BackgroundCompaction(
   ColumnFamilyData* in_flight_cfd = nullptr;
   Defer end_in_flight_compaction([&]() {
     if (in_flight_cfd != nullptr) {
+      if (in_flight_cfd->blob_reference_census() != nullptr &&
+          !in_flight_cfd->IsDropped()) {
+        // The caller applies the census of this column family and then drops
+        // this reference. A dropped column family gets no extra reference, so
+        // the comment above stays true for it.
+        in_flight_cfd->Ref();
+        mutex_.AssertHeld();
+        census_cfds->push_back(
+            {in_flight_cfd, in_flight_cfd->current()->GetVersionNumber()});
+        ++blob_reference_census_pending_applies_;
+      }
       EndInFlightCompaction(in_flight_cfd);
     }
   });
@@ -6380,6 +6433,9 @@ void DBImpl::InstallSuperVersionAndScheduleWork(
   }
   cfd->InstallSuperVersion(sv_context, &mutex_,
                            std::move(new_seqno_to_time_mapping));
+  // Queue the census of this CF if it needs a run, for example when the CF got
+  // the format fence after open. The call is O(1).
+  ScheduleBlobReferenceCensus(cfd);
 
   // Refresh the seqno->time preserve-window bound used to gate bottommost file
   // marking, so a file whose largest seqno is still within the preserve window
