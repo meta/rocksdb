@@ -1838,7 +1838,9 @@ class DB {
 
     //  "rocksdb.estimate-live-data-size" - returns an estimate of the amount of
     //      live data in bytes. For BlobDB, it also includes the exact value of
-    //      live bytes in the blob files of the version.
+    //      live bytes in the blob files of the version. With blob indirection,
+    //      it also includes the relocation files: their size minus the garbage
+    //      that the reverse reference census found (an estimate).
     static const std::string kEstimateLiveDataSize;
 
     //  "rocksdb.min-log-number-to-keep" - return the minimum log number of the
@@ -1941,25 +1943,30 @@ class DB {
     //      of options.statistics
     static const std::string kOptionsStatistics;
 
-    // "rocksdb.num-blob-files" - returns number of blob files in the current
-    //      version.
+    // "rocksdb.num-blob-files" - returns the number of blob files in the
+    //      current version, including the origin blob files of blob
+    //      indirection. Relocation files are not counted (see
+    //      rocksdb.blob-stats).
     static const std::string kNumBlobFiles;
 
     // "rocksdb.blob-stats" - return the total number and size of all blob
     //      files, and total amount of garbage (bytes) in the blob files in
-    //      the current version.
+    //      the current version. With blob indirection, the sizes include the
+    //      relocation files, and the number of relocation files is shown
+    //      separately.
     static const std::string kBlobStats;
 
     // "rocksdb.total-blob-file-size" - returns the total size of all blob
-    //      files over all versions.
+    //      files over all versions, including relocation files.
     static const std::string kTotalBlobFileSize;
 
     // "rocksdb.live-blob-file-size" - returns the total size of all blob
-    //      files in the current version.
+    //      files in the current version, including relocation files.
     static const std::string kLiveBlobFileSize;
 
     // "rocksdb.live-blob-file-garbage-size" - returns the total amount of
-    // garbage in the blob files in the current version.
+    // garbage in the blob files in the current version. For relocation files,
+    // it is the garbage that the reverse reference census found.
     static const std::string kLiveBlobFileGarbageSize;
 
     //  "rocksdb.blob-cache-capacity" - returns blob cache capacity.
@@ -1972,6 +1979,61 @@ class DB {
     // "rocksdb.blob-cache-pinned-usage" - returns the memory size for the
     //      entries being pinned in blob cache.
     static const std::string kBlobCachePinnedUsage;
+
+    // "rocksdb.indirect-blob-gc-idle-micros-with-candidates" - returns how long
+    // the column family has had indirect blob GC candidates while no GC job
+    // began, in microseconds (a duration). A large value means that GC is
+    // starved, for example by LSM compactions. 0 means no candidates, or a GC
+    // job began since the candidates appeared. The LOG warning comes from the
+    // periodic stats dump; with stats_dump_period_sec = 0, use this property.
+    static const std::string kIndirectBlobGcIdleMicrosWithCandidates;
+
+    // "rocksdb.indirect-blob-gc-stats" - returns a map of the indirect blob GC
+    // state of the column family. Keys: census-state (ready, building, failed,
+    // or none without blob indirection), census-unready-micros (0 when ready),
+    // census-consecutive-failures, census-builds, census-uncharged-builds (the
+    // builds that went on partly uncharged because the block cache was full),
+    // census-uncharged-charges (the number of census charge attempts and
+    // summary reads of a census build that failed because the block cache was
+    // full, so their memory went on uncharged, also those of installs after the
+    // census is ready; it counts attempts, not bytes, and a later successful
+    // charge can charge that memory again; a compaction only logs its
+    // uncharged input summary reads), census-bytes (an estimate of the
+    // census memory that stays: the worker state and the change log;
+    // rocksdb.block-cache-entry-stats has the exact total of the census cache
+    // role, including short-lived copies), route-count, relocation-file-count,
+    // relocation-file-bytes, relocation-garbage-bytes, tracked-files (the files
+    // in the census candidate heap, which GC may pick, including files below
+    // the garbage threshold; suppressed files and files pinned by the coarse
+    // frontier are not counted), garbage-bytes-collectable,
+    // garbage-bytes-suppressed, coarse-pinned-files, coarse-pinned-bytes,
+    // coarse-pinned-garbage-bytes, coarse-sst-count, lowest-coarse-frontier,
+    // idle-micros-with-candidates, retirement-pending-micros,
+    // corrupt-input-files (the number of files that GC skips now because it
+    // found corruption in them) and corrupt-input-file-list (at most 8 file
+    // numbers, lowest first, comma separated; the list is partial when the
+    // count is above 8). A corrupt file stays in the list until it changes, the
+    // census is rebuilt, or the coarse frontier rises (relocation files only).
+    // The list also holds a file whose corrupt data made GC set a background
+    // error (with paranoid_checks). Every *-micros key is a duration, never a
+    // timestamp.
+    static const std::string kIndirectBlobGcStats;
+
+    // "rocksdb.blob-reference-census-unready-micros" - returns how long the
+    // blob reference census of the column family has been unready, in
+    // microseconds (a duration, not a timestamp). 0 means that it is ready, or
+    // that the column family does not use blob indirection. While it is
+    // unready, the work that needs the census waits. The LOG warning comes
+    // from the periodic stats dump; with stats_dump_period_sec = 0, use this
+    // property.
+    static const std::string kBlobReferenceCensusUnreadyMicros;
+
+    // "rocksdb.blob-indirection-format-version" - returns the blob indirection
+    // format version of the column family (the per-CF format fence). 0 means
+    // that the column family has no format fence yet (no SST built with
+    // enable_blob_indirection on was installed). A release that does not know
+    // the format cannot open a DB where it is not 0.
+    static const std::string kBlobIndirectionFormatVersion;
   };
 
   // DB implementations export properties about their state via this method.
@@ -2162,9 +2224,33 @@ class DB {
   // SetDBOptions, a valid call that changes no option value returns OK without
   // doing anything. This does not apply to a call that sets an object option
   // such as table_factory or one of its fields. It also does not apply after
-  // an options or column family update fails part way or fails to write the
-  // OPTIONS file. Then SetOptions applies in full, and SetDBOptions writes the
-  // OPTIONS file even if no option value changes.
+  // an earlier call fails after its new options take effect (for example, it
+  // fails to write the OPTIONS file), or after a call that creates or drops
+  // several column families with track_options_file_number_in_manifest stops
+  // part way, or after a failed SetOptions call that parsed a key for a
+  // Customizable option, such as table_factory or one of its fields, even if
+  // that key changed nothing (see the ATOMICITY NOTE). Then SetOptions applies
+  // in full, and SetDBOptions writes the OPTIONS file even if no option value
+  // changes.
+  //
+  // ATOMICITY NOTE: a SetOptions call over several column families is
+  // all-or-nothing for the options. If the options for any of the column
+  // families are invalid, or any of them is dropped, the call fails and no
+  // column family's options change. A failure after the new options take
+  // effect, such as a failed OPTIONS file write, returns an error and keeps
+  // the new options. One exception: a key that sets a field inside a
+  // Customizable option, such as
+  // "table_factory.filter_policy.bloom_before_level" for a Ribbon filter
+  // policy, or a field of a custom prefix extractor or compression manager,
+  // can change the live object in place. The same holds for a mutable field
+  // of a custom object in an option that SetOptions cannot replace, such as
+  // merge_operator ("merge_operator.<field>" or
+  // "merge_operator={<field>=<value>}"), and for a field of a custom object
+  // that a whole table factory value sets, such as
+  // "block_based_table_factory={filter_policy.<id>.<field>=<value>}": the new
+  // factory shares that object with the old one. Such a change takes effect
+  // when the call parses it, for every column family that shares the object,
+  // and a failed call does not undo it.
   //
   // EXAMPLES:
   //  s = db->SetOptions(cfh, {{"ttl", "36000"}});

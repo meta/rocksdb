@@ -10,6 +10,7 @@
 #include "db/version_edit.h"
 
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "rocksdb/advanced_options.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
@@ -67,6 +68,34 @@ static void TestOptionsFileNumberField(const char* field_name,
 }
 
 class VersionEditTest : public testing::Test {};
+
+static Status MakeBlobRelocationFileAddition(
+    uint64_t file_number, uint64_t origin_file_number,
+    BlobRelocationFileAddition* addition) {
+  if (addition == nullptr) {
+    return Status::InvalidArgument("Null relocation addition output");
+  }
+  BlobRelocationDirectoryBuilder builder;
+  Status status = builder.Add(origin_file_number, /*original_value_offset=*/11,
+                              /*stored_value_size=*/17, kNoCompression);
+  if (status.ok()) {
+    status = builder.AddServedFile(origin_file_number);
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  BlobRelocationDirectory directory;
+  status = builder.Finish(&directory);
+  if (!status.ok()) {
+    return status;
+  }
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  *addition = BlobRelocationFileAddition(
+      file_number, /*file_size=*/4096, "crc32c", "checksum",
+      std::move(encoded_directory), /*tail_size=*/1);
+  return addition->Validate();
+}
 
 TEST_F(VersionEditTest, EncodeDecode) {
   static const uint64_t kBig = 1ull << 50;
@@ -442,6 +471,137 @@ TEST_F(VersionEditTest, DroppedBlobFiles) {
   ASSERT_NE(
       decoded.DebugJSON(0).find("\"DroppedBlobFiles\": [5, 1099511627776]"),
       std::string::npos);
+}
+
+TEST_F(VersionEditTest, BlobRelocationStateEncodeDecode) {
+  constexpr uint32_t kColumnFamilyId = 7;
+  constexpr uint64_t kOriginFileNumber = 100;
+  constexpr uint64_t kRelocationFileNumber = 200;
+
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeBlobRelocationFileAddition(kRelocationFileNumber,
+                                           kOriginFileNumber, &addition));
+
+  VersionEdit edit;
+  edit.SetColumnFamily(kColumnFamilyId);
+  edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+  edit.AddBlobRelocationFile(addition);
+  edit.DeleteBlobRelocationFile(/*file_number=*/201);
+  edit.SetBlobRelocationRoute(BlobRelocationRoute(
+      /*source_file_number=*/kOriginFileNumber, kRelocationFileNumber));
+  edit.DeleteBlobRelocationRoute(/*source_file_number=*/101);
+  edit.RetireBlobFile(/*file_number=*/102);
+
+  TestEncodeDecode(edit);
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded, /*ts_sz=*/0));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_TRUE(decoded.HasBlobIndirectionFormatVersion());
+  ASSERT_EQ(decoded.GetBlobIndirectionFormatVersion(),
+            kBlobIndirectionManifestFormatVersion);
+  ASSERT_EQ(decoded.GetBlobRelocationFileAdditions().size(), 1U);
+  ASSERT_EQ(decoded.GetBlobRelocationFileAdditions().front(), addition);
+  ASSERT_EQ(decoded.GetBlobRelocationFileDeletions(),
+            std::vector<uint64_t>{201});
+  ASSERT_EQ(decoded.GetBlobRelocationRoutes().size(), 1U);
+  ASSERT_EQ(decoded.GetBlobRelocationRoutes().front(),
+            BlobRelocationRoute(kOriginFileNumber, kRelocationFileNumber));
+  ASSERT_EQ(decoded.GetBlobRelocationRouteDeletions(),
+            std::vector<uint64_t>{101});
+  ASSERT_EQ(decoded.GetBlobFileRetirements(), std::vector<uint64_t>{102});
+  ASSERT_EQ(decoded.GetFilesToQuarantineIfCommitFail()->size(), 1U);
+  ASSERT_EQ(decoded.GetFilesToQuarantineIfCommitFail()->front(),
+            kRelocationFileNumber);
+}
+
+TEST_F(VersionEditTest, DbBlobIndirectionFormatFenceEncodeDecode) {
+  VersionEdit edit;
+  edit.SetDbBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+  TestEncodeDecode(edit);
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_TRUE(decoded.HasDbBlobIndirectionFormatVersion());
+  ASSERT_EQ(decoded.GetDbBlobIndirectionFormatVersion(),
+            kBlobIndirectionManifestFormatVersion);
+  ASSERT_FALSE(decoded.HasBlobIndirectionFormatVersion());
+}
+
+TEST_F(VersionEditTest, RejectsConflictingBlobIndirectionFormatFences) {
+  std::string encoded;
+  PutVarint32(&encoded, kBlobIndirectionFormatVersion);
+  PutVarint32(&encoded, kBlobIndirectionManifestFormatVersion);
+  PutVarint32(&encoded, kDbBlobIndirectionFormatVersion);
+  PutVarint32(&encoded, kBlobIndirectionManifestFormatVersion);
+  VersionEdit decoded;
+  ASSERT_TRUE(decoded.DecodeFrom(encoded).IsCorruption());
+
+  VersionEdit conflicting;
+  conflicting.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  conflicting.SetDbBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  encoded.clear();
+  ASSERT_FALSE(conflicting.EncodeTo(&encoded));
+}
+
+TEST_F(VersionEditTest, BlobRelocationRecordsRejectTrailingBytes) {
+  // The records carry no version of their own (the format fence covers it),
+  // so an unexpected extra field must fail instead of being skipped.
+  BlobRelocationFileAddition addition;
+  ASSERT_OK(MakeBlobRelocationFileAddition(/*file_number=*/200,
+                                           /*origin_file_number=*/100,
+                                           &addition));
+  std::string encoded_addition;
+  addition.EncodeTo(&encoded_addition);
+  std::string encoded_route;
+  BlobRelocationRoute(/*source_file_number=*/100,
+                      /*physical_file_number=*/200)
+      .EncodeTo(&encoded_route);
+  std::string encoded_route_deletion;
+  BlobRelocationRouteDeletion(/*source_file_number=*/100)
+      .EncodeTo(&encoded_route_deletion);
+  for (const auto& record :
+       {std::make_pair(kBlobRelocationFileAddition, encoded_addition),
+        std::make_pair(kBlobRelocationRoute, encoded_route),
+        std::make_pair(kBlobRelocationRouteDeletion, encoded_route_deletion)}) {
+    SCOPED_TRACE(record.first);
+    std::string encoded_edit;
+    PutVarint32(&encoded_edit, kBlobIndirectionFormatVersion);
+    PutVarint32(&encoded_edit, kBlobIndirectionManifestFormatVersion);
+    PutVarint32(&encoded_edit, record.first);
+    PutLengthPrefixedSlice(&encoded_edit, record.second);
+    VersionEdit decoded;
+    ASSERT_OK(decoded.DecodeFrom(encoded_edit));
+
+    encoded_edit.clear();
+    PutVarint32(&encoded_edit, record.first);
+    PutLengthPrefixedSlice(&encoded_edit, record.second + std::string(1, 1));
+    ASSERT_TRUE(decoded.DecodeFrom(encoded_edit).IsCorruption());
+  }
+}
+
+TEST_F(VersionEditTest, BlobRelocationStateRejectsUnsupportedFormatFence) {
+  for (uint32_t tag :
+       {kBlobIndirectionFormatVersion, kDbBlobIndirectionFormatVersion}) {
+    for (uint32_t format_version :
+         {0U, kBlobIndirectionManifestFormatVersion + 1}) {
+      std::string encoded_edit;
+      PutVarint32(&encoded_edit, tag);
+      PutVarint32(&encoded_edit, format_version);
+      VersionEdit decoded;
+      const Status status = decoded.DecodeFrom(encoded_edit);
+      if (format_version == 0) {
+        ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+      } else {
+        ASSERT_TRUE(status.IsNotSupported()) << status.ToString();
+      }
+    }
+  }
 }
 
 TEST_F(VersionEditTest, AddWalEncodeDecode) {
@@ -867,6 +1027,59 @@ TEST(FileMetaDataTest, UpdateBoundariesBlobIndex) {
     ASSERT_TRUE(meta.UpdateBoundaries(key, blob_index, seq, kTypeBlobIndex)
                     .IsCorruption());
     ASSERT_EQ(meta.oldest_blob_file_number, expected_oldest_blob_file_number);
+  }
+}
+
+// Compaction passes its own decode of each output BlobIndex to
+// UpdateBoundaries(). The status and oldest_blob_file_number must be the same
+// as when UpdateBoundaries() decodes the value itself.
+TEST(FileMetaDataTest, UpdateBoundariesWithDecodedBlobIndex) {
+  std::string legacy;
+  BlobIndex::EncodeBlob(&legacy, /*file_number=*/25, /*offset=*/1000,
+                        /*size=*/100, kNoCompression);
+  std::string ttl;
+  BlobIndex::EncodeBlobTTL(&ttl, /*expiration=*/9876543210,
+                           /*file_number=*/15, /*offset=*/2000, /*size=*/500,
+                           kNoCompression);
+  std::string inlined_ttl;
+  BlobIndex::EncodeInlinedTTL(&inlined_ttl, /*expiration=*/9876543210, "value");
+  std::string invalid_file;
+  BlobIndex::EncodeBlob(&invalid_file, kInvalidBlobFileNumber,
+                        /*offset=*/10000, /*size=*/1000, kNoCompression);
+  std::string unflattened;
+  BlobIndex::EncodeUnflattenedIndirectBlob(&unflattened,
+                                           {.origin_file_number = 20,
+                                            .original_value_offset = 200,
+                                            .stored_value_size = 60,
+                                            .compression = kNoCompression,
+                                            .stable_checksum = 1234,
+                                            .stored_checksum = 0});
+  std::string flattened;
+  BlobIndex::EncodeIndirectBlob(&flattened, /*generation=*/40,
+                                {.origin_file_number = 30,
+                                 .original_value_offset = 300,
+                                 .stored_value_size = 70,
+                                 .compression = kZSTD,
+                                 .stable_checksum = 5678,
+                                 .stored_checksum = 8765});
+
+  for (const std::string& value :
+       {legacy, ttl, inlined_ttl, invalid_file, unflattened, flattened}) {
+    BlobIndex decoded;
+    ASSERT_OK(decoded.DecodeFrom(value));
+    SCOPED_TRACE(decoded.DebugString(/*output_hex=*/true));
+
+    FileMetaData self_decoded;
+    FileMetaData caller_decoded;
+    const Status status = self_decoded.UpdateBoundaries(
+        "foo", value, /*seqno=*/100, kTypeBlobIndex);
+    EXPECT_EQ(caller_decoded
+                  .UpdateBoundaries("foo", value, /*seqno=*/100, kTypeBlobIndex,
+                                    &decoded)
+                  .ToString(),
+              status.ToString());
+    EXPECT_EQ(caller_decoded.oldest_blob_file_number,
+              self_decoded.oldest_blob_file_number);
   }
 }
 
@@ -1501,6 +1714,64 @@ TEST_F(VersionEditTest, TryGetDbOwnershipStartTime) {
   EXPECT_EQ(f.TryGetDbOwnershipStartTime(), 2000u);
   f.db_ownership_start_time = 2500;
   EXPECT_EQ(f.TryGetDbOwnershipStartTime(), 2500u);
+}
+
+TEST_F(VersionEditTest, BlobReferenceDescriptorEncodeDecode) {
+  VersionEdit edit;
+  edit.AddFile(3, 300, 0, 100, InternalKey("foo", 10, kTypeValue),
+               InternalKey("zoo", 20, kTypeValue), 10, 20, false,
+               Temperature::kUnknown, kInvalidBlobFileNumber,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+               300 /* epoch_number */, kUnknownFileChecksum,
+               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
+  BlobReferenceMetadataDescriptor descriptor;
+  descriptor.index_handle = BlockHandle(10, 20);
+  descriptor.column_family_id = 0;
+  descriptor.sst_file_number = 300;
+  descriptor.EncodeTo(
+      &edit.GetMutableNewFiles()[0].second.blob_reference_descriptor);
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded, 0 /* ts_sz */));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_EQ(decoded.GetNewFiles().size(), 1);
+  ASSERT_EQ(decoded.GetNewFiles()[0].second.blob_reference_descriptor,
+            edit.GetNewFiles()[0].second.blob_reference_descriptor);
+  ASSERT_NE(NewFileCustomTag::kBlobReferenceDescriptor &
+                NewFileCustomTag::kCustomTagNonSafeIgnoreMask,
+            0U);
+
+  std::string corrupt = encoded;
+  const std::string& descriptor_bytes =
+      edit.GetNewFiles()[0].second.blob_reference_descriptor;
+  const size_t descriptor_offset = corrupt.find(descriptor_bytes);
+  ASSERT_NE(descriptor_offset, std::string::npos);
+  corrupt[descriptor_offset] ^= 1;
+  ASSERT_TRUE(decoded.DecodeFrom(corrupt).IsCorruption());
+}
+
+TEST_F(VersionEditTest, BlobReferenceLegacyMetadataEncodeDecode) {
+  VersionEdit edit;
+  edit.AddFile(3, 300, 0, 100, InternalKey("foo", 10, kTypeValue),
+               InternalKey("zoo", 20, kTypeValue), 10, 20, false,
+               Temperature::kUnknown, kInvalidBlobFileNumber,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
+               300 /* epoch_number */, kUnknownFileChecksum,
+               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0, true);
+  edit.GetMutableNewFiles()[0].second.blob_reference_legacy_metadata = true;
+
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded, 0 /* ts_sz */));
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_EQ(decoded.GetNewFiles().size(), 1);
+  ASSERT_TRUE(decoded.GetNewFiles()[0].second.blob_reference_legacy_metadata);
+  ASSERT_TRUE(
+      decoded.GetNewFiles()[0].second.blob_reference_descriptor.empty());
+  ASSERT_NE(NewFileCustomTag::kBlobReferenceLegacyMetadata &
+                NewFileCustomTag::kCustomTagNonSafeIgnoreMask,
+            0U);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

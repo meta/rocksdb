@@ -14,7 +14,11 @@
 #include <set>
 #include <unordered_map>
 
+#include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_relocation_file.h"
+#include "db/blob/blob_relocation_manifest.h"
 #include "db/compaction/compaction_job.h"
 #include "db/compaction/compaction_state.h"
 #include "file/file_util.h"
@@ -24,10 +28,30 @@
 #include "options/options_helper.h"
 #include "rocksdb/utilities/options_type.h"
 #include "util/defer.h"
+#include "util/hash.h"
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
 class SubcompactionState;
+
+uint64_t ComputeBlobIndirectionCompactionServiceOptionsFingerprint(
+    uint32_t column_family_id, bool enable_blob_indirection,
+    bool enable_blob_garbage_collection, bool enable_blob_files,
+    uint64_t min_blob_size, int blob_file_starting_level) {
+  std::string encoded;
+  PutFixed32(&encoded, kBlobIndirectionCompactionServiceProtocolVersion);
+  PutFixed32(&encoded, column_family_id);
+  encoded.push_back(enable_blob_indirection ? 1 : 0);
+  encoded.push_back(enable_blob_garbage_collection ? 1 : 0);
+  encoded.push_back(enable_blob_files ? 1 : 0);
+  PutFixed64(&encoded, min_blob_size);
+  PutVarsignedint64(&encoded, blob_file_starting_level);
+  PutFixed32(&encoded, BlobIndex::kIndirectBlobFormatVersion);
+  PutFixed32(&encoded, BlobReferenceMetadataDescriptor::kFormatVersion);
+  PutFixed32(&encoded, kBlobIndirectionManifestFormatVersion);
+  PutFixed32(&encoded, BlobRelocationDirectory::kFormatVersion);
+  return Hash64(encoded.data(), encoded.size());
+}
 
 namespace {
 
@@ -106,7 +130,350 @@ Status ValidateRemoteBlobFile(FileSystem* fs, const FileOptions& file_options,
   return Status::OK();
 }
 
+// Checks a remote result before the primary imports any output. The caller
+// runs the job locally when this returns a non-OK status. For a legacy job, it
+// declines output with feature metadata: an exact descriptor or a
+// classification property on an output SST, or an indirect-origin blob file.
+// For a feature-aware job (its CF has the format fence or has
+// enable_blob_indirection on), it checks the protocol version, the flattening
+// permission, that there are no blob file additions, the output level, and
+// each output's exact descriptor. It also declines an output that has a coarse
+// classification next to its descriptor, because the import would fail on
+// such an output with Corruption instead of running the job locally.
+// `column_family_id` and `allow_blob_index_flattening` are the primary's own
+// values. The worker already checked its values against them through the
+// options fingerprint.
+Status ValidateBlobIndirectionCompactionServiceResult(
+    const CompactionServiceInput& input, const CompactionServiceResult& result,
+    uint32_t column_family_id, bool allow_blob_index_flattening) {
+  if (input.blob_indirection_protocol_version == 0) {
+    // A legacy job is built when the CF has no format fence and
+    // enable_blob_indirection is off. Its worker can still write feature
+    // metadata in two cases:
+    //   1. The worker's OPTIONS file has enable_blob_indirection on, and the
+    //      CF still has no fence. Installing the feature output would fail
+    //      with Corruption, because a Version without the fence rejects exact
+    //      metadata. The local rerun writes legacy output, which installs.
+    //   2. The fence was added after the job was built, and the worker sees
+    //      the fenced MANIFEST. The legacy install path does not check feature
+    //      metadata (the fingerprint, the origins and the allowed generation
+    //      numbers), so the primary declines the result instead of installing
+    //      it unchecked. The local rerun also fails to install: a fenced
+    //      Version rejects a new SST without exact blob reference metadata
+    //      (Corruption).
+    for (const CompactionServiceOutputFile& file : result.output_files) {
+      const auto& properties = file.table_properties.user_collected_properties;
+      if (properties.count(kBlobReferenceDescriptorPropertyName) != 0 ||
+          properties.count(kBlobReferenceClassificationPropertyName) != 0) {
+        return Status::Incomplete(
+            "Legacy remote compaction output has blob indirection metadata");
+      }
+    }
+    for (const BlobFileAddition& addition : result.blob_file_additions) {
+      if (addition.IsIndirectOrigin()) {
+        return Status::Incomplete(
+            "Legacy remote compaction output has an indirect-origin blob file");
+      }
+    }
+    return Status::OK();
+  }
+  // A feature-aware worker never creates blob files. When a value needs new
+  // blob output, the worker declines with TryAgain (see
+  // CompactionIterator::DeclineSstOnlyBlobOutput()). So any blob file addition
+  // breaks the contract.
+  if (result.blob_indirection_protocol_version !=
+          input.blob_indirection_protocol_version ||
+      (result.has_flattened_blob_index && !allow_blob_index_flattening) ||
+      !result.blob_file_additions.empty()) {
+    return Status::Incomplete(
+        "Remote compaction result does not match the blob indirection "
+        "contract");
+  }
+  if (result.output_level != input.output_level) {
+    return Status::Incomplete(
+        "Remote compaction result has the wrong output level");
+  }
+  for (const CompactionServiceOutputFile& file : result.output_files) {
+    uint64_t output_file_number = 0;
+    FileType output_file_type = kTableFile;
+    if (!ParseFileName(file.file_name, &output_file_number,
+                       &output_file_type) ||
+        output_file_type != kTableFile || output_file_number == 0) {
+      return Status::Incomplete(
+          "Remote compaction output has an invalid file identity");
+    }
+    const auto descriptor_property =
+        file.table_properties.user_collected_properties.find(
+            kBlobReferenceDescriptorPropertyName);
+    if (descriptor_property ==
+        file.table_properties.user_collected_properties.end()) {
+      return Status::Incomplete(
+          "Remote compaction output is missing exact blob metadata");
+    }
+    if (file.table_properties.user_collected_properties.count(
+            kBlobReferenceClassificationPropertyName) != 0) {
+      return Status::Incomplete(
+          "Remote compaction output has both exact blob metadata and a coarse "
+          "classification");
+    }
+    BlobReferenceMetadataDescriptor descriptor;
+    Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+        descriptor_property->second, &descriptor);
+    if (!status.ok() || !descriptor.HasSstIdentity() ||
+        descriptor.column_family_id != column_family_id ||
+        descriptor.sst_file_number != output_file_number ||
+        descriptor.route_snapshot_fingerprint_high !=
+            input.blob_relocation_state_fingerprint_high ||
+        descriptor.route_snapshot_fingerprint_low !=
+            input.blob_relocation_state_fingerprint_low) {
+      status.PermitUncheckedError();
+      return Status::Incomplete(
+          "Remote compaction output has invalid exact blob metadata");
+    }
+  }
+  return Status::OK();
+}
+
 }  // namespace
+
+Status CompactionJob::PrepareRemoteAllowedBlobGenerations(
+    const Version& input_version) {
+  if (remote_allowed_blob_generations_ready_) {
+    return Status::OK();
+  }
+  // The generation number of every indirect input group, and its route target
+  // in the input Version when it has one. A feature-aware worker may flatten a
+  // generation number to its route target: the worker declines a job whose
+  // input Version has another relocation state fingerprint, so its targets
+  // are the ones listed here. Sorted and without duplicates. Most
+  // groups of one job share their generation numbers, so the list stays near
+  // the number of distinct numbers. Its memory is charged with the output
+  // dependencies (ReserveBlobRelocationDependencyMemory()).
+  std::vector<uint64_t>& allowed = remote_allowed_blob_generations_;
+  const VersionStorageInfo* const storage = input_version.storage_info();
+  // An unreadable input summary fails here. The caller then runs the
+  // compaction locally, and the local input check skips such an input. That
+  // fallback counts in REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT and logs the
+  // same WARN line as a rejected worker output, although the cause is a local
+  // input. The status in the WARN line names the failed read (see the caller).
+  Status s = ForEachIndirectInputReferenceGroup(
+      UnreadableInputSummary::kFail, [&](const BlobReferenceGroup& group) {
+        const uint64_t generation = group.generation_file_number;
+        const uint64_t target =
+            storage->GetBlobRelocationRouteTarget(generation);
+        for (const uint64_t number : {generation, target}) {
+          if (number == kInvalidBlobFileNumber) {
+            continue;
+          }
+          if (allowed.size() == allowed.capacity()) {
+            std::sort(allowed.begin(), allowed.end());
+            allowed.erase(std::unique(allowed.begin(), allowed.end()),
+                          allowed.end());
+            // Grow while the list is at least half full after it drops the
+            // duplicates. Growing only when it stays full would sort the
+            // whole list on almost every push once the distinct count is just
+            // under the capacity.
+            if (2 * allowed.size() >= allowed.capacity()) {
+              const size_t capacity =
+                  std::max<size_t>(16, 2 * allowed.capacity());
+              Status status = ReserveBlobRelocationDependencyMemory(
+                  (capacity - allowed.capacity()) * sizeof(uint64_t));
+              if (!status.ok()) {
+                return status;
+              }
+              allowed.reserve(capacity);
+            }
+          }
+          allowed.push_back(number);
+        }
+        return Status::OK();
+      });
+  if (!s.ok()) {
+    return s;
+  }
+  std::sort(allowed.begin(), allowed.end());
+  allowed.erase(std::unique(allowed.begin(), allowed.end()), allowed.end());
+  // Coarse input SSTs have no reference groups, so their numbers are not in
+  // the list. A coarse SST references only indirect-origin blob files at or
+  // above its frontier (see "Coarse SST" in db/blob/blob_reference_metadata.h).
+  // Use the frontiers of this job's inputs only: the frontier of the whole
+  // input Version can come from an SST outside the job, which another
+  // compaction can remove while this job runs.
+  for (const CompactionInputFiles& level : *compact_->compaction->inputs()) {
+    for (const FileMetaData* file : level.files) {
+      const uint64_t frontier = file->oldest_coarse_indirect_origin_file_number;
+      if (frontier != kInvalidBlobFileNumber &&
+          (remote_coarse_input_frontier_ == kInvalidBlobFileNumber ||
+           frontier < remote_coarse_input_frontier_)) {
+        remote_coarse_input_frontier_ = frontier;
+      }
+    }
+  }
+  remote_allowed_blob_generations_ready_ = true;
+  return Status::OK();
+}
+
+Status CompactionJob::ValidateRemoteExactBlobMetadata(
+    const CompactionServiceOutputFile& file, const ReadOptions& read_options,
+    ColumnFamilyData* cfd, TableCache* table_cache, Version* input_version,
+    const MutableCFOptions& mutable_cf_options, FileMetaData* meta,
+    std::shared_ptr<const TableProperties>* table_properties,
+    std::atomic<uint64_t>* uncharged_summary_reads) {
+  assert(table_properties != nullptr);
+  // ValidateBlobIndirectionCompactionServiceResult() already checked that the
+  // worker reported a descriptor.
+  const UserCollectedProperties::const_iterator reported_descriptor =
+      file.table_properties.user_collected_properties.find(
+          kBlobReferenceDescriptorPropertyName);
+  if (reported_descriptor ==
+      file.table_properties.user_collected_properties.end()) {
+    return Status::Corruption(
+        "Remote exact blob metadata does not match the output file");
+  }
+
+  // Open one short-lived reader of the output. It serves every step below. It
+  // does not go into the table cache, so the first table cache open of an
+  // installed output is at its output level, as for a local output (this
+  // decides, for example, the L0 metadata pinning). It also does not insert
+  // table metadata into the shared block cache, so a rejected output leaves
+  // nothing there. The open needs a descriptor in `meta`. Step 1 checks that
+  // the reported one equals the stored one.
+  meta->blob_reference_descriptor = reported_descriptor->second;
+  std::unique_ptr<TableReader> metadata_reader;
+  Status s = table_cache->OpenEphemeralBlobReferenceReader(
+      read_options, file_options_, cfd->internal_comparator(), *meta,
+      mutable_cf_options, &metadata_reader);
+  if (!s.ok()) {
+    return s;
+  }
+  std::shared_ptr<const TableProperties> imported_table_properties =
+      metadata_reader->GetTableProperties();
+  if (imported_table_properties == nullptr) {
+    return Status::Corruption("Remote output has no table properties");
+  }
+
+  // 1. The descriptor property that the worker reported must equal the one in
+  //    the output file. The output file must not also have a coarse
+  //    classification: the import reads these stored properties, and it fails
+  //    with Corruption on an SST that has both.
+  const UserCollectedProperties::const_iterator actual_descriptor =
+      imported_table_properties->user_collected_properties.find(
+          kBlobReferenceDescriptorPropertyName);
+  if (actual_descriptor ==
+          imported_table_properties->user_collected_properties.end() ||
+      actual_descriptor->second != reported_descriptor->second) {
+    return Status::Corruption(
+        "Remote exact blob metadata does not match the output file");
+  }
+  if (imported_table_properties->user_collected_properties.count(
+          kBlobReferenceClassificationPropertyName) != 0) {
+    return Status::Corruption(
+        "Remote output has both exact blob metadata and a coarse "
+        "classification");
+  }
+
+  // 2. The table properties must name this column family. The descriptor must
+  //    name the same column family and the file number that the table
+  //    properties record (orig_file_number).
+  BlobReferenceMetadataDescriptor descriptor;
+  s = BlobReferenceMetadataDescriptor::DecodeFrom(actual_descriptor->second,
+                                                  &descriptor);
+  std::pair<uint64_t, uint64_t> actual_table_identity{
+      imported_table_properties->column_family_id,
+      imported_table_properties->orig_file_number};
+  TEST_SYNC_POINT_CALLBACK("CompactionServiceJob::Install:ActualTableIdentity",
+                           &actual_table_identity);
+  if (!s.ok()) {
+    return s;
+  }
+  if (actual_table_identity.first != cfd->GetID() ||
+      descriptor.column_family_id != actual_table_identity.first ||
+      descriptor.sst_file_number != actual_table_identity.second) {
+    return Status::Corruption(
+        "Remote exact blob metadata has mismatched file identity",
+        "actual CF " + std::to_string(actual_table_identity.first) +
+            ", expected CF " + std::to_string(cfd->GetID()) + ", actual file " +
+            std::to_string(actual_table_identity.second) + ", descriptor CF " +
+            std::to_string(descriptor.column_family_id) + ", descriptor file " +
+            std::to_string(descriptor.sst_file_number));
+  }
+
+  // 3. The metadata checksums must pass.
+  s = metadata_reader->VerifyBlobReferenceMetadata(
+      read_options, meta->blob_reference_descriptor);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // 4. Read the reference summary of the output.
+  s = table_cache->ReadBlobReferenceSstSummary(
+      read_options, *metadata_reader, *meta, mutable_cf_options,
+      &meta->blob_reference_summary,
+      /*reservation_manager=*/nullptr, uncharged_summary_reads);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // 5. A valid checksum shows that the metadata is well formed, not that its
+  //    groups are valid. Check the generation number and the origin of every
+  //    indirect group against the captured input Version now. The summary
+  //    holds only indirect groups: it leaves out kDirect groups (legacy
+  //    references, see CopyIndirectBlobReferenceGroups()). The install-time
+  //    check (ValidateBlobRelocationOutputDependencies()) does not check
+  //    origins. When it finds a generation number that cannot be read, it
+  //    fails the install with Corruption, which is a background error. A group
+  //    that fails here only makes the primary run the job locally. This reads
+  //    metadata only and runs without the DB mutex.
+  //
+  //    The worker is a separate process. Accept only a generation number that
+  //    an input reference group holds (the census protects its route), the
+  //    route target of such a number (a live file in the job's input Version,
+  //    which route retirement keeps for a running compaction), or the number
+  //    of a coarse reference from a coarse input SST of this job. A coarse
+  //    reference names a live indirect-origin blob file with no route, at or
+  //    above the lowest frontier of the job's coarse inputs, and its
+  //    generation number is its origin. Any other number, for example a
+  //    routed number that no input holds, could lose its route while the job
+  //    runs. The install check would then fail the install with Corruption.
+  //    Rejecting the number here runs the job locally instead.
+  s = PrepareRemoteAllowedBlobGenerations(*input_version);
+  if (!s.ok()) {
+    return Status::CopyAppendMessage(
+        s, ": ", "cannot list the generation numbers of the local inputs");
+  }
+  const VersionStorageInfo* const storage_info = input_version->storage_info();
+  for (const BlobReferenceGroup& group : meta->blob_reference_summary->groups) {
+    assert(group.encoding_class != BlobReferenceEncodingClass::kDirect);
+    s = input_version->ValidateBlobReferenceGroup(group.generation_file_number,
+                                                  group.origin_file_number);
+    if (!s.ok()) {
+      return s;
+    }
+    const uint64_t generation = group.generation_file_number;
+    if (std::binary_search(remote_allowed_blob_generations_.begin(),
+                           remote_allowed_blob_generations_.end(),
+                           generation)) {
+      continue;
+    }
+    const BlobFileMetaData* const coarse_blob =
+        remote_coarse_input_frontier_ != kInvalidBlobFileNumber &&
+                generation >= remote_coarse_input_frontier_ &&
+                generation == group.origin_file_number &&
+                storage_info->GetBlobRelocationRouteTarget(generation) ==
+                    kInvalidBlobFileNumber &&
+                storage_info->PeekBlobRelocationFileMetaData(generation) ==
+                    nullptr
+            ? storage_info->PeekBlobFileMetaData(generation)
+            : nullptr;
+    if (coarse_blob == nullptr || !coarse_blob->IsIndirectOrigin()) {
+      return Status::Corruption(
+          "Remote output names a generation number that its inputs do not "
+          "hold");
+    }
+  }
+  *table_properties = std::move(imported_table_properties);
+  return Status::OK();
+}
 
 CompactionServiceJobStatus
 CompactionJob::ProcessKeyValueCompactionWithCompactionService(
@@ -116,6 +483,12 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   assert(db_options_.compaction_service);
 
   const Compaction* const compaction = sub_compact->compaction;
+  Version* const input_version = compaction->input_version();
+  ColumnFamilyData* const cfd = compaction->column_family_data();
+  assert(input_version);
+  assert(cfd);
+  TableCache* const table_cache = cfd->table_cache();
+  assert(table_cache);
   CompactionServiceInput compaction_input;
   compaction_input.merge_before_filter =
       merge_order == CompactionFilter::MergeOrder::kMergeBeforeFilter;
@@ -156,8 +529,13 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     }
   }
   const MutableCFOptions& mutable_cf_options = compaction->mutable_cf_options();
-  const VersionStorageInfo* const storage_info =
-      compaction->input_version()->storage_info();
+  const VersionStorageInfo* const storage_info = input_version->storage_info();
+  // A job is feature-aware when its CF has the format fence or has
+  // enable_blob_indirection on. A legacy job keeps the remote BlobDB protocol
+  // unchanged.
+  const bool feature_aware_compaction =
+      storage_info->HasBlobIndirectionFormat() ||
+      mutable_cf_options.enable_blob_indirection;
   if (mutable_cf_options.enable_blob_garbage_collection) {
     const CompactionIterator::RealCompaction compaction_proxy(compaction);
     compaction_input.has_blob_gc_cutoff_file_number = true;
@@ -196,7 +574,9 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   const bool blob_eligible_compaction =
       mutable_cf_options.enable_blob_files &&
       compaction->output_level() >= mutable_cf_options.blob_file_starting_level;
-  if (blob_eligible_compaction) {
+  // A feature-aware worker never creates blob files (it declines instead), so
+  // it needs no reserved blob file numbers.
+  if (blob_eligible_compaction && !feature_aware_compaction) {
     // Estimate output from the actual live blob payload and count, plus raw
     // values that can be converted into blobs. Resumption closes a blob file
     // at each checkpointed output SST boundary, so the physical output-file
@@ -263,6 +643,42 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       static_cast<int>(compaction->GetProximalOutputRangeType());
   compaction_input.keep_in_last_level_through_seqno =
       compaction->GetKeepInLastLevelThroughSeqno();
+
+  if (feature_aware_compaction && !compaction->CollectExactBlobReferences()) {
+    // The output is coarse (output level 0, the compaction is not
+    // bottommost, and no input has exact metadata; for example an intra-L0
+    // compaction above older overlapping data). The primary accepts only
+    // feature-aware output with exact reference metadata, so run the job
+    // locally from the start instead of declining the worker's result.
+    RecordTick(stats_, REMOTE_COMPACT_COARSE_FALLBACK_COUNT);
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [JOB %d] Coarse blob indirection output; running the "
+                   "compaction locally",
+                   compaction->column_family_data()->GetName().c_str(),
+                   job_id_);
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+  if (feature_aware_compaction) {
+    compaction_input.blob_indirection_protocol_version =
+        kBlobIndirectionCompactionServiceProtocolVersion;
+    compaction_input.blob_indirection_options_fingerprint =
+        ComputeBlobIndirectionCompactionServiceOptionsFingerprint(
+            cfd->GetID(), mutable_cf_options.enable_blob_indirection,
+            // The worker rebuilds enable_blob_garbage_collection from the
+            // OPTIONS file. CompactionJob::ShouldUseLocalCompaction() keeps a
+            // feature-aware job with a manual override of it local, so the
+            // Compaction's value is the CF's option. If the OPTIONS file holds
+            // another value, the options fingerprints differ and the worker
+            // declines the job.
+            compaction->enable_blob_garbage_collection(),
+            mutable_cf_options.enable_blob_files,
+            mutable_cf_options.min_blob_size,
+            mutable_cf_options.blob_file_starting_level);
+    compaction_input.blob_relocation_state_fingerprint_high =
+        storage_info->GetBlobRelocationStateFingerprintHigh();
+    compaction_input.blob_relocation_state_fingerprint_low =
+        storage_info->GetBlobRelocationStateFingerprintLow();
+  }
 
   TEST_SYNC_POINT_CALLBACK(
       "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
@@ -437,6 +853,31 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     return CompactionServiceJobStatus::kUseLocal;
   }
 
+  if (s.ok() && compaction_input.blob_indirection_protocol_version != 0 &&
+      compaction_result.status.IsTryAgain()) {
+    // A feature-aware worker declined the job, in one of two cases. The status
+    // message tells them apart:
+    //   - A worker contract check failed, for example because GC changed the
+    //     relocation state after the pick. The message names the check (see
+    //     DBImplSecondary::CompactWithoutInstallation()).
+    //   - The job needs new blob file output, for example for a large value, a
+    //     merge result or legacy blob GC
+    //     (CompactionIterator::DeclineSstOnlyBlobOutput()).
+    // Nothing is imported or written to the MANIFEST yet. The service still
+    // owns the remote staging files. It gets the same kUseLocal notification
+    // as for any other declined result. These declines can be frequent, so
+    // the log line is INFO.
+    RecordTick(stats_, REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT);
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [JOB %d] Remote worker declined the blob indirection "
+                   "job (%s), falling back to local compaction",
+                   cfd->GetName().c_str(), job_id_,
+                   compaction_result.status.ToString().c_str());
+    db_options_.compaction_service->OnInstallation(
+        response.scheduled_job_id, CompactionServiceJobStatus::kUseLocal);
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+
   if (compaction_status == CompactionServiceJobStatus::kFailure) {
     if (s.ok()) {
       if (compaction_result.status.ok()) {
@@ -474,6 +915,23 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
                    "result (%s)",
                    compaction->column_family_data()->GetName().c_str(), job_id_,
                    s.ToString().c_str());
+    compaction_result.status.PermitUncheckedError();
+    db_options_.compaction_service->OnInstallation(
+        response.scheduled_job_id, CompactionServiceJobStatus::kUseLocal);
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+  s = ValidateBlobIndirectionCompactionServiceResult(
+      compaction_input, compaction_result, cfd->GetID(),
+      mutable_cf_options.enable_blob_indirection);
+  if (!s.ok()) {
+    assert(sub_compact->GetMutableCompactionOutputs().empty());
+    assert(sub_compact->GetMutableProximalOutputs().empty());
+    RecordTick(stats_, REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT);
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "[%s] [JOB %d] Remote blob indirection contract validation failed "
+        "(%s), falling back to local compaction",
+        cfd->GetName().c_str(), job_id_, s.ToString().c_str());
     compaction_result.status.PermitUncheckedError();
     db_options_.compaction_service->OnInstallation(
         response.scheduled_job_id, CompactionServiceJobStatus::kUseLocal);
@@ -552,6 +1010,41 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
           kCompactionServiceBlobGCCutoffVersion) {
     return decline_blob_result(
         "worker does not support a primary-provided blob GC cutoff");
+  }
+
+  if (compaction_input.blob_indirection_protocol_version != 0) {
+    // The Version keeps garbage counters (BlobFileMetaData) only for live
+    // normal blob files. Drop the garbage that the worker reports for a file
+    // number with no such counters: a routed generation number (a blob file
+    // that indirect blob GC collected, or a deleted relocation file), or a live
+    // relocation file. Garbage for any other unknown file number is kept, so
+    // the existing remote garbage check declines the result. Example: GC moved
+    // the live values of blob file 10 into relocation file 300, routed 10 to
+    // 300, and wrote the blob file retirement of file 10. A worker flattens a
+    // reference with generation number 10 and origin 10 to generation number
+    // 300 and origin 10. The garbage meter counts the references to file 10
+    // that the worker read, and skips the flattened references that it wrote.
+    // So the worker reports the bytes of those references as garbage of file
+    // 10. Local compaction drops the same garbage
+    // (CompactionJob::InstallCompactionResults()). Dropping this garbage loses
+    // nothing: these files have no garbage counters, and GC finds their live
+    // values from the exact reference metadata of the SSTs.
+    std::vector<BlobFileGarbage>& garbages =
+        compaction_result.blob_file_garbages;
+    garbages.erase(
+        std::remove_if(
+            garbages.begin(), garbages.end(),
+            [storage_info](const BlobFileGarbage& garbage) {
+              const uint64_t file_number = garbage.GetBlobFileNumber();
+              return file_number != kInvalidBlobFileNumber &&
+                     storage_info->GetBlobFileMetaData(file_number) ==
+                         nullptr &&
+                     (storage_info->GetBlobRelocationRouteTarget(file_number) !=
+                          kInvalidBlobFileNumber ||
+                      storage_info->PeekBlobRelocationFileMetaData(
+                          file_number) != nullptr);
+            }),
+        garbages.end());
   }
 
   const VerifyOutputFlags verify_output_flags =
@@ -952,6 +1445,44 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       proximal_outputs.pop_back();
     }
   };
+  // Reject the attempt, not the primary DB: local compaction can read the
+  // original inputs and build a validated output.
+  auto fall_back_after_validation = [&](const std::string& rejected_file,
+                                        const Status& validation_status) {
+    cleanup_installed_sst_files();
+    fs_->DeleteFile(rejected_file, IOOptions(), /*dbg=*/nullptr)
+        .PermitUncheckedError();
+    const Status cleanup_status = cleanup_installed_blob_files();
+    if (!cleanup_status.ok()) {
+      sub_compact->status = cleanup_status;
+      db_options_.compaction_service->OnInstallation(
+          response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
+      return CompactionServiceJobStatus::kFailure;
+    }
+    RecordTick(stats_, REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT);
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "[%s] [JOB %d] Remote output validation failed (%s), "
+                   "falling back to local compaction",
+                   cfd->GetName().c_str(), job_id_,
+                   validation_status.ToString().c_str());
+    db_options_.compaction_service->OnInstallation(
+        response.scheduled_job_id, CompactionServiceJobStatus::kUseLocal);
+    return CompactionServiceJobStatus::kUseLocal;
+  };
+  // A remote output summary read that finds the block cache full goes on
+  // uncharged. The job logs one WARN line for all such reads, not one per
+  // output file.
+  std::atomic<uint64_t> uncharged_summary_reads{0};
+  Defer log_uncharged_summary_reads([&]() {
+    if (uncharged_summary_reads.load(std::memory_order_relaxed) > 0) {
+      ROCKS_LOG_WARN(db_options_.info_log,
+                     "[%s] [JOB %d] Read %" PRIu64
+                     " remote output blob reference summaries without their "
+                     "full block cache charge, because the block cache is full",
+                     cfd->GetName().c_str(), job_id_,
+                     uncharged_summary_reads.load(std::memory_order_relaxed));
+    }
+  });
   for (const auto& file : compaction_result.output_files) {
     uint64_t file_num = versions_->NewFileNumber();
     auto src_file = compaction_result.output_path + "/" + file.file_name;
@@ -1017,14 +1548,48 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     meta.temperature = file.file_temperature;
     meta.tail_size =
         FileMetaData::CalculateTailSize(file_size, file.table_properties);
-    auto cfd = compaction->column_family_data();
+    std::shared_ptr<const TableProperties> imported_table_properties;
+    if (compaction_input.blob_indirection_protocol_version != 0) {
+      ReadOptions read_options(Env::IOActivity::kCompaction);
+      read_options.verify_checksums = true;
+      read_options.rate_limiter_priority = GetRateLimiterPriority();
+      s = ValidateRemoteExactBlobMetadata(
+          file, read_options, cfd, table_cache, input_version,
+          compaction->mutable_cf_options(), &meta, &imported_table_properties,
+          &uncharged_summary_reads);
+      if (!s.ok()) {
+        return fall_back_after_validation(tgt_file, s);
+      }
+    }
+    const TableProperties& final_table_properties =
+        imported_table_properties != nullptr ? *imported_table_properties
+                                             : file.table_properties;
     CompactionOutputs* compaction_outputs =
         sub_compact->Outputs(file.is_proximal_level_output);
     assert(compaction_outputs);
     compaction_outputs->AddOutput(std::move(meta), cfd->internal_comparator(),
                                   false, true, file.paranoid_hash);
-    compaction_outputs->UpdateTableProperties(file.table_properties);
+    s = compaction_outputs->UpdateTableProperties(final_table_properties);
+    if (!s.ok()) {
+      fs_->DeleteFile(tgt_file, IOOptions(), /*dbg=*/nullptr)
+          .PermitUncheckedError();
+      cleanup_installed_sst_files();
+      const Status cleanup_status = cleanup_installed_blob_files();
+      if (!cleanup_status.ok()) {
+        s = cleanup_status;
+      }
+      sub_compact->status = s;
+      db_options_.compaction_service->OnInstallation(
+          response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
+      return CompactionServiceJobStatus::kFailure;
+    }
     installed_sst_files.push_back(tgt_file);
+    if (compaction_input.blob_indirection_protocol_version != 0) {
+      // Record the imported SST as an output path, so that the cleanup of an
+      // aborted compaction (CompactionJob::CleanupAbortedSubcompactions())
+      // deletes it.
+      current_outputs->AddOutputFilePath(tgt_file);
+    }
   }
 
   aggregate_garbage_error = validate_remote_blob_garbage(/*commit=*/true);
@@ -1047,6 +1612,35 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       garbage_meter->AddGarbage(garbage.GetBlobFileNumber(),
                                 garbage.GetGarbageBlobCount(),
                                 garbage.GetGarbageBlobBytes());
+    }
+  }
+  sub_compact->has_flattened_blob_index =
+      compaction_result.has_flattened_blob_index;
+  if (compaction_input.blob_indirection_protocol_version != 0) {
+    // Every output of this job passed the per-file check and is imported, so
+    // record one sample per output in COMPACTION_OUTPUT_BLOB_REFERENCES, as a
+    // local compaction does for its outputs. A rejected job adds no sample;
+    // its local rerun records its own outputs. The sample is the reference
+    // count of the output's descriptor, which counts all references, kDirect
+    // (legacy) references included. The reference summary is not used,
+    // because it leaves out kDirect groups.
+    auto record_reference_count = [this](const CompactionOutputs::Output& out) {
+      // ValidateRemoteExactBlobMetadata() checked and set the descriptor.
+      BlobReferenceMetadataDescriptor descriptor;
+      const Status decode_status = BlobReferenceMetadataDescriptor::DecodeFrom(
+          out.meta.blob_reference_descriptor, &descriptor);
+      assert(decode_status.ok());
+      if (decode_status.ok()) {
+        RecordInHistogram(stats_, COMPACTION_OUTPUT_BLOB_REFERENCES,
+                          descriptor.reference_count);
+      }
+    };
+    for (size_t i = initial_output_count; i < normal_outputs.size(); ++i) {
+      record_reference_count(normal_outputs[i]);
+    }
+    for (size_t i = initial_proximal_output_count; i < proximal_outputs.size();
+         ++i) {
+      record_reference_count(proximal_outputs[i]);
     }
   }
 
@@ -1159,6 +1753,14 @@ void CompactionServiceCompactionJob::RecordCompactionIOStats() {
   compaction_result_->bytes_read += IOSTATS(bytes_read);
   compaction_result_->bytes_written += IOSTATS(bytes_written);
   CompactionJob::RecordCompactionIOStats();
+}
+
+// The worker checked that its options match the request's fingerprint, so
+// its own enable_blob_indirection is the primary's.
+bool CompactionServiceCompactionJob::AllowBlobIndexFlattening() const {
+  return compaction_input_.blob_indirection_protocol_version ==
+             kBlobIndirectionCompactionServiceProtocolVersion &&
+         compact_->compaction->mutable_cf_options().enable_blob_indirection;
 }
 
 CompactionServiceCompactionJob::CompactionServiceCompactionJob(
@@ -1346,6 +1948,10 @@ Status CompactionServiceCompactionJob::Run() {
   compaction_result_->internal_stats = internal_stats_;
   compaction_result_->output_level = compact_->compaction->output_level();
   compaction_result_->output_path = output_path_;
+  compaction_result_->blob_indirection_protocol_version =
+      compaction_input_.blob_indirection_protocol_version;
+  compaction_result_->has_flattened_blob_index =
+      sub_compact->has_flattened_blob_index;
   if (status.ok()) {
     for (const auto& output_file : sub_compact->GetOutputs()) {
       auto& meta = output_file.meta;
@@ -1545,6 +2151,22 @@ static std::unordered_map<std::string, OptionTypeInfo> cs_input_type_info = {
      {offsetof(struct CompactionServiceInput, keep_in_last_level_through_seqno),
       OptionType::kUInt64T, OptionVerificationType::kNormal,
       OptionTypeFlags::kNone}},
+    {"blob_indirection_protocol_version",
+     {offsetof(struct CompactionServiceInput,
+               blob_indirection_protocol_version),
+      OptionType::kUInt32T}},
+    {"blob_indirection_options_fingerprint",
+     {offsetof(struct CompactionServiceInput,
+               blob_indirection_options_fingerprint),
+      OptionType::kUInt64T}},
+    {"blob_relocation_state_fingerprint_high",
+     {offsetof(struct CompactionServiceInput,
+               blob_relocation_state_fingerprint_high),
+      OptionType::kUInt64T}},
+    {"blob_relocation_state_fingerprint_low",
+     {offsetof(struct CompactionServiceInput,
+               blob_relocation_state_fingerprint_low),
+      OptionType::kUInt64T}},
 };
 
 static std::unordered_map<std::string, OptionTypeInfo>
@@ -2082,6 +2704,13 @@ static std::unordered_map<std::string, OptionTypeInfo> cs_result_type_info = {
          "internal_stats", &compaction_internal_stats_type_info,
          offsetof(struct CompactionServiceResult, internal_stats),
          OptionVerificationType::kNormal, OptionTypeFlags::kNone)},
+    {"blob_indirection_protocol_version",
+     {offsetof(struct CompactionServiceResult,
+               blob_indirection_protocol_version),
+      OptionType::kUInt32T}},
+    {"has_flattened_blob_index",
+     {offsetof(struct CompactionServiceResult, has_flattened_blob_index),
+      OptionType::kBoolean}},
 };
 
 Status CompactionServiceInput::Read(const std::string& data_str,

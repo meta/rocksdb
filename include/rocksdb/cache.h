@@ -88,6 +88,21 @@ enum class CacheEntryRole {
   kBlobCache,
   // Readahead (prefetch) buffers' charge to account for their memory usage
   kReadaheadBuffer,
+  // Buffers that record the blob references of an SST while the SST is built,
+  // and the in-memory summary of a new SST until the census adds it (only with
+  // enable_blob_indirection)
+  kBlobReferenceMetadataBuildingBuffer,
+  // Blob reference census: the reverse index from blob files to the SSTs that
+  // reference them, its build state, its queued changes, and the SST summaries
+  // that a compaction reads for the census
+  kBlobReferenceCensus,
+  // Working memory of indirect blob GC. Indirect blob GC is a background job
+  // that copies the live values out of a few blob files with a lot of garbage.
+  // A job charges the live references of its input files, its census snapshot
+  // (a copy of the census entries of the inputs: the SSTs that reference them
+  // and their reference totals), its list of planned SST reads, its SST
+  // readers, and its read buffers
+  kIndirectBlobGcWorkingMemory,
   // Default bucket, for miscellaneous cache entries. Do not use for
   // entries that could potentially add up to large usage.
   kMisc,
