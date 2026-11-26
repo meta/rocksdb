@@ -3219,6 +3219,121 @@ TEST_P(DBAtomicFlushTest, FlushMultipleCFsDropSomeBeforeRequestFlush) {
   Destroy(options);
 }
 
+TEST_P(DBAtomicFlushTest, AllColumnFamiliesDroppedWhileInstallWaits) {
+  // An atomic flush of column family 1 writes its SST and queues its MANIFEST
+  // writer. A drop of that column family is queued ahead of it, so when the
+  // writer reaches the head of the queue every column family of the group is
+  // dropped. LogAndApply() then returns ColumnFamilyDropped without calling
+  // any writer callback, so InstallMemtableAtomicFlushResults() updates the
+  // memtable list itself, once, with that error (the test counts the sync
+  // point
+  // MemTableList::InstallMemtableAtomicFlushResults:PublishWithoutCallback).
+  // The DB stays usable and reopens. (A second drop cannot be queued at the
+  // same time: DropColumnFamily() holds the DB options mutex while it waits.)
+  //
+  // Order of events:
+  // 1. An empty edit W0 blocks inside its MANIFEST write.
+  // 2. The flush switches the memtable (DropColumnFamily() would hold the
+  //    write thread it needs), and its background job waits at its start.
+  // 3. The drop queues behind W0.
+  // 4. The flush job writes its SST and queues its install behind the drop.
+  // 5. W0 finishes, the drop is applied, then the install finds the column
+  //    family dropped.
+  if (!GetParam()) {
+    return;
+  }
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.atomic_flush = true;
+  CreateAndReopenWithCF({"pikachu", "eevee"}, options);
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  for (int cf = 0; cf < 3; ++cf) {
+    ASSERT_OK(Put(cf, "key", "value", write_options));
+  }
+
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  bool flush_job_waiting = false;
+  bool release_flush_job = false;
+  ManifestWriteBlocker manifest_write_blocker;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  manifest_write_blocker.Install();
+  int publishes_without_callback = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTableList::InstallMemtableAtomicFlushResults:PublishWithoutCallback",
+      [&](void* arg) {
+        EXPECT_EQ(static_cast<Status*>(arg)->code(),
+                  Status::Code::kColumnFamilyDropped);
+        ++publishes_without_callback;
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCallFlush:start", [&](void*) {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        flush_job_waiting = true;
+        state_changed.notify_all();
+        state_changed.wait(lock, [&] { return release_flush_job; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ColumnFamilyData* const default_cfd =
+      static_cast<ColumnFamilyHandleImpl*>(handles_[0])->cfd();
+  Status first_status;
+  port::Thread first_writer([&] {
+    VersionEdit edit;
+    edit.SetColumnFamily(default_cfd->GetID());
+    dbfull()->TEST_LockMutex();
+    first_status = dbfull()->GetVersionSet()->LogAndApply(
+        default_cfd, ReadOptions(), WriteOptions(), &edit,
+        dbfull()->TEST_Mutex(), /*dir_contains_current_file=*/nullptr);
+    dbfull()->TEST_UnlockMutex();
+  });
+  ASSERT_TRUE(manifest_write_blocker.WaitForFirstWriteBlocked());
+  Status flush_status;
+  port::Thread flusher([&] {
+    FlushOptions flush_options;
+    flush_options.wait = true;
+    flush_status = dbfull()->Flush(flush_options, handles_[1]);
+  });
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    state_changed.wait(lock, [&] { return flush_job_waiting; });
+  }
+  Status drop_status;
+  port::Thread dropper(
+      [&] { drop_status = dbfull()->DropColumnFamily(handles_[1]); });
+  ASSERT_TRUE(manifest_write_blocker.WaitForQueuedCallers(2));
+  {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    release_flush_job = true;
+    state_changed.notify_all();
+  }
+  ASSERT_TRUE(manifest_write_blocker.WaitForQueuedCallers(3));
+  manifest_write_blocker.ReleaseFirstWrite();
+  first_writer.join();
+  dropper.join();
+  flusher.join();
+  // Flush() returns ColumnFamilyDropped as soon as the drop is applied. The
+  // flush job can still be inside its install at that time. Wait for it, so
+  // that its sync point callbacks run before they are cleared.
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(first_status);
+  ASSERT_OK(drop_status);
+  ASSERT_EQ(flush_status.code(), Status::Code::kColumnFamilyDropped)
+      << flush_status.ToString();
+  EXPECT_EQ(publishes_without_callback, 1);
+  ASSERT_EQ(Get(0, "key"), "value");
+  ASSERT_EQ(Get(2, "key"), "value");
+  ASSERT_OK(dbfull()->DestroyColumnFamilyHandle(handles_[1]));
+  handles_.erase(handles_.begin() + 1);
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "eevee"}, options);
+  ASSERT_EQ(Get(0, "key"), "value");
+}
+
 TEST_P(DBAtomicFlushTest,
        FlushMultipleCFsDropSomeAfterScheduleFlushBeforeFlushJobRun) {
   bool atomic_flush = GetParam();
@@ -3587,6 +3702,97 @@ TEST_P(DBAtomicFlushTest, NoWaitWhenWritesStopped) {
   stalled_writer.join();
 
   SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_P(DBAtomicFlushTest, ListenerWaitWhenAnotherThreadLeadsTheBatch) {
+  // Flush(wait=true, listener_wait=true) waits until the flushed memtables are
+  // removed and no flush-completion notification is pending. An atomic flush
+  // removes its memtables in a LogAndApply writer callback, and another thread
+  // can lead the MANIFEST batch and run that callback. Then the leader holds
+  // the DB mutex when its LogAndApply() returns, and the flush thread has not
+  // run yet. At that point a notification must already be pending, or a
+  // waiter that wakes up next could return before OnFlushCompleted runs.
+  //
+  // Setup: a first LogAndApply call (thread w0) blocks in its MANIFEST write.
+  // A second call (thread y) and the atomic flush queue behind it. When w0
+  // finishes, y leads one batch that holds the flush, and y checks the state
+  // before it releases the DB mutex.
+  if (!GetParam()) {
+    return;
+  }
+  class CountingListener : public EventListener {
+   public:
+    void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& /*info*/) override {
+      completed.fetch_add(1);
+    }
+    std::atomic<int> completed{0};
+  };
+  auto listener = std::make_shared<CountingListener>();
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.atomic_flush = true;
+  options.listeners.push_back(listener);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  ASSERT_OK(Put(1, "key", "value", write_options));
+
+  ManifestWriteBlocker manifest_write_blocker;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  manifest_write_blocker.Install();
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ColumnFamilyData* const default_cfd =
+      static_cast<ColumnFamilyHandleImpl*>(handles_[0])->cfd();
+  ColumnFamilyData* const cfd1 =
+      static_cast<ColumnFamilyHandleImpl*>(handles_[1])->cfd();
+  const auto apply_empty_edit = [&] {
+    VersionEdit edit;
+    edit.SetColumnFamily(default_cfd->GetID());
+    dbfull()->TEST_LockMutex();
+    const Status s = dbfull()->GetVersionSet()->LogAndApply(
+        default_cfd, ReadOptions(), WriteOptions(), &edit,
+        dbfull()->TEST_Mutex(), /*dir_contains_current_file=*/nullptr);
+    return s;
+  };
+  port::Thread w0([&] {
+    EXPECT_OK(apply_empty_edit());
+    dbfull()->TEST_UnlockMutex();
+  });
+  ASSERT_TRUE(manifest_write_blocker.WaitForFirstWriteBlocked());
+  int not_flushed_at_y_return = -1;
+  int pending_at_y_return = -1;
+  port::Thread y([&] {
+    EXPECT_OK(apply_empty_edit());
+    // y still holds the DB mutex of the batch that ran the flush callback.
+    not_flushed_at_y_return = cfd1->imm()->NumNotFlushed();
+    pending_at_y_return = cfd1->imm()->NumPendingFlushNotifications();
+    dbfull()->TEST_UnlockMutex();
+  });
+  ASSERT_TRUE(manifest_write_blocker.WaitForQueuedCallers(2));
+  int completed_at_flush_return = -1;
+  port::Thread flusher([&] {
+    FlushOptions flush_options;
+    flush_options.wait = true;
+    flush_options.listener_wait = true;
+    EXPECT_OK(dbfull()->Flush(flush_options, handles_[1]));
+    completed_at_flush_return = listener->completed.load();
+  });
+  ASSERT_TRUE(manifest_write_blocker.WaitForQueuedCallers(3));
+  manifest_write_blocker.ReleaseFirstWrite();
+  w0.join();
+  y.join();
+  flusher.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // y and the flush shared one batch, so y ran the flush callback.
+  ASSERT_EQ(2, manifest_write_blocker.manifest_writes());
+  ASSERT_EQ(0, not_flushed_at_y_return);
+  EXPECT_GT(pending_at_y_return, 0);
+  EXPECT_EQ(1, completed_at_flush_return);
+  EXPECT_EQ(0, cfd1->imm()->NumPendingFlushNotifications());
 }
 
 INSTANTIATE_TEST_CASE_P(DBFlushDirectIOTest, DBFlushDirectIOTest,
