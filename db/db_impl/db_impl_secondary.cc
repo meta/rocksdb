@@ -1069,6 +1069,8 @@ Status DBImplSecondary::NewIteratorsImpl(
 }
 
 Status DBImplSecondary::TryCatchUpWithPrimary() {
+  TEST_SYNC_POINT("DBImplSecondary::TryCatchUpWithPrimary:BeforeCatchUpLock");
+  std::lock_guard<std::mutex> catch_up_lock(catch_up_mutex_);
   assert(versions_.get() != nullptr);
   Status s;
   // read the manifest and apply new changes to the secondary instance
@@ -1240,6 +1242,10 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool recover_wal, bool trust_manifest_recovery) {
   *dbptr = nullptr;
+  Status style_status = CheckBlobIndirectionCompactionStyle(column_families);
+  if (!style_status.ok()) {
+    return style_status;
+  }
   // Only normal DB::OpenAsSecondary recovery can defer SST opening.
   // `recover_wal` excludes OpenAndCompact even when no snapshot floor is
   // supplied, `open_files_async` is the explicit opt-in, and trust-MANIFEST
