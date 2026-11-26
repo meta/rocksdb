@@ -284,6 +284,16 @@ Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options);
 Status CheckCFPathsSupported(const DBOptions& db_options,
                              const ColumnFamilyOptions& cf_options);
 
+// Returns NotSupported when `has_blob_indirection` is true and `style` is
+// kCompactionStyleFIFO, because blob indirection does not support FIFO
+// compaction. ColumnFamilyData::ValidateOptions() calls it for one CF.
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection);
+// Runs the check above for each CF of an open request. Read-only and secondary
+// opens call it, because they do not call ValidateOptions().
+Status CheckBlobIndirectionCompactionStyle(
+    const std::vector<ColumnFamilyDescriptor>& column_families);
+
 ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                                       bool read_only,
                                       const ColumnFamilyOptions& src);
@@ -377,22 +387,53 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
-  // REQUIRES: DB mutex held
-  Status SetOptions(
+
+  // Runs only when the DB is opened for writing (not read-only), after
+  // MANIFEST recovery. If enable_blob_indirection is on or the CF has the
+  // format fence, it checks that the compaction style is supported. If the CF
+  // has the fence, it also checks that blob direct write is off and that the
+  // table factory can write Block-Based Tables. REQUIRES: DB mutex held.
+  Status ValidateBlobIndirectionOptionsAfterRecovery() const;
+
+  // Test-only, not public API. Until the indirect blob GC stack is complete,
+  // ValidateOptions rejects enable_blob_indirection unless a test allows it.
+  static void TEST_SetAllowBlobIndirection(bool allow);
+
+  // DBImpl::SetOptions() must change the options of all its column families or
+  // none, so it changes them in two steps: prepare every column family, then
+  // publish them all together. This is the prepare step. It applies
+  // `options_map` on top of `*mutable_cf_options`, validates the result, and
+  // stores the result back in `*mutable_cf_options`. It does not change the
+  // options of this column family. REQUIRES: DB mutex held. The caller starts
+  // `*mutable_cf_options` from a copy of the latest options of this column
+  // family. It must make sure that no one changes those options before the
+  // publish step. DBImpl::SetOptions() holds options_mutex_ for this.
+  Status PrepareMutableCFOptions(
       const DBOptions& db_options,
-      const std::unordered_map<std::string, std::string>& options_map);
+      const std::unordered_map<std::string, std::string>& options_map,
+      MutableCFOptions* mutable_cf_options) const;
+
+  // The publish step: makes options from PrepareMutableCFOptions() the latest
+  // options of this column family. LogAndApply() calls it for
+  // DBImpl::SetOptions(). Readers see the new options only after
+  // DBImpl::SetOptions() installs a new SuperVersion. Then
+  // DBImpl::SetOptions() calls MarkOptionsInstalled().
+  // REQUIRES: DB mutex held.
+  void PublishMutableCFOptions(const MutableCFOptions& mutable_cf_options);
+
   // REQUIRES: DB mutex held
-  // Returns true if the column family is not dropped, SetOptions(db_options,
-  // options_map) would succeed without changing any option, and options from
-  // an earlier SetOptions() are not still waiting for MarkOptionsInstalled().
+  // Returns true if the column family is not dropped, applying `options_map`
+  // with PrepareMutableCFOptions() would succeed without changing any option,
+  // and options from an earlier PublishMutableCFOptions() are not still
+  // waiting for MarkOptionsInstalled().
   // Can return false for a request that changes nothing, for example one that
   // sets a table factory field.
   bool SetOptionsIsNoOp(
       const DBOptions& db_options,
       const std::unordered_map<std::string, std::string>& options_map) const;
   // REQUIRES: DB mutex held
-  // Call after the options from SetOptions() are in the current SuperVersion
-  // and every other user of them is updated.
+  // Call after the options from PublishMutableCFOptions() are in the current
+  // SuperVersion and every other user of them is updated.
   void MarkOptionsInstalled() { options_install_pending_ = false; }
 
   InternalStats* internal_stats() { return internal_stats_.get(); }
@@ -716,9 +757,10 @@ class ColumnFamilyData {
   const bool is_delete_range_supported_;
   const bool is_table_builder_supported_;
 
-  // True from a successful SetOptions() until MarkOptionsInstalled(). A
-  // DB::SetOptions() call that fails on a later column family leaves it set
-  // for the column families it already changed.
+  // True from PublishMutableCFOptions() until MarkOptionsInstalled().
+  // DBImpl::SetOptions() installs the options of all the column families it
+  // changes together, inside LogAndApply, after every one of them is prepared.
+  // So it sets this flag for every column family it changes, or for none.
   bool options_install_pending_ = false;
 
   std::unique_ptr<TableCache> table_cache_;

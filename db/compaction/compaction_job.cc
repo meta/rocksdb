@@ -1835,7 +1835,9 @@ void CompactionJob::CreateBlobFileBuilder(
         cfd->GetID(), cfd->GetName(), write_hint_, io_tracer_, blob_callback_,
         BlobFileCreationReason::kCompaction, GetBlobOutputPath(),
         sub_compact->Current().GetOutputFilePathsPtr(),
-        sub_compact->Current().GetBlobFileAdditionsPtr());
+        sub_compact->Current().GetBlobFileAdditionsPtr(),
+        // Compaction output never prepopulates the blob cache (flush only).
+        /*blob_source=*/nullptr);
   } else {
     blob_file_builder = nullptr;
   }
@@ -2765,6 +2767,20 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           const std::unordered_map<uint64_t, BlobFileState>::const_iterator
               blob_file = blob_files.find(blob_file_number);
           if (blob_file == blob_files.end()) {
+            // Skip a generation number that has no BlobFileMetaData garbage
+            // counts: a routed generation number (a blob file removed by blob
+            // file retirement, or a deleted relocation file), or a live
+            // relocation file that a flattened reference uses as its generation
+            // number. Indirect blob GC finds the live values of these files
+            // from the exact reference metadata of SSTs, not from garbage
+            // counts.
+            if (blob_file_number != kInvalidBlobFileNumber &&
+                (storage_info->GetBlobRelocationRouteTarget(blob_file_number) !=
+                     kInvalidBlobFileNumber ||
+                 storage_info->PeekBlobRelocationFileMetaData(
+                     blob_file_number) != nullptr)) {
+              continue;
+            }
             if (blob_file_number != kInvalidBlobFileNumber &&
                 (compaction->skip_missing_blob_files() ||
                  storage_info->IsDroppedBlobFile(blob_file_number))) {
@@ -2820,6 +2836,9 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
       edit->AddBlobFile(blob);
     }
   }
+
+  edit->MaybeSetBlobIndirectionFormatFence(
+      compaction->mutable_cf_options().enable_blob_indirection);
 
   for (const auto& pair : blob_total_garbage) {
     const uint64_t blob_file_number = pair.first;
