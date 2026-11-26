@@ -213,6 +213,49 @@ public class TtlDB extends RocksDB {
   }
 
   /**
+   * This operation is not supported by {@code TtlDB}.
+   *
+   * @throws UnsupportedOperationException always
+   */
+  @Override
+  public void put(
+      final WriteOptions writeOpts, final byte[] key, final byte[] timestamp, final byte[] value) {
+    throw new UnsupportedOperationException("Timestamped writes are not supported by TtlDB.");
+  }
+
+  /**
+   * This operation is not supported by {@code TtlDB}.
+   *
+   * @throws UnsupportedOperationException always
+   */
+  @Override
+  public void put(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpts,
+      final byte[] key, final byte[] timestamp, final byte[] value) {
+    throw new UnsupportedOperationException("Timestamped writes are not supported by TtlDB.");
+  }
+
+  /**
+   * This operation is not supported by {@code TtlDB}.
+   *
+   * @throws UnsupportedOperationException always
+   */
+  @Override
+  public void delete(final WriteOptions writeOpts, final byte[] key, final byte[] timestamp) {
+    throw new UnsupportedOperationException("Timestamped writes are not supported by TtlDB.");
+  }
+
+  /**
+   * This operation is not supported by {@code TtlDB}.
+   *
+   * @throws UnsupportedOperationException always
+   */
+  @Override
+  public void delete(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpts,
+      final byte[] key, final byte[] timestamp) {
+    throw new UnsupportedOperationException("Timestamped writes are not supported by TtlDB.");
+  }
+
+  /**
    * <p>Creates a new ttl based column family with a name defined
    * in given ColumnFamilyDescriptor and allocates a
    * ColumnFamilyHandle within an internal structure.</p>

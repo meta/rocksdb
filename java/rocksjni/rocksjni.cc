@@ -3416,6 +3416,52 @@ jlong Java_org_rocksdb_RocksDB_getLatestSequenceNumber(JNIEnv*, jclass,
 
 /*
  * Class:     org_rocksdb_RocksDB
+ * Method:    increaseFullHistoryTsLow
+ * Signature: (JJ[B)V
+ */
+void Java_org_rocksdb_RocksDB_increaseFullHistoryTsLow(JNIEnv* env, jclass,
+                                                       jlong jdb_handle,
+                                                       jlong jcf_handle,
+                                                       jbyteArray jts_low) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto* cf = jcf_handle == 0
+                 ? db->DefaultColumnFamily()
+                 : reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(
+                       jcf_handle);
+  try {
+    ROCKSDB_NAMESPACE::JByteArraySlice ts_low(env, jts_low, 0,
+                                              env->GetArrayLength(jts_low));
+    ROCKSDB_NAMESPACE::KVException::ThrowOnError(
+        env, db->IncreaseFullHistoryTsLow(cf, ts_low.slice().ToString()));
+  } catch (ROCKSDB_NAMESPACE::KVException&) {
+    return;
+  }
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
+ * Method:    getFullHistoryTsLow
+ * Signature: (JJ)[B
+ */
+jbyteArray Java_org_rocksdb_RocksDB_getFullHistoryTsLow(JNIEnv* env, jclass,
+                                                        jlong jdb_handle,
+                                                        jlong jcf_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto* cf = jcf_handle == 0
+                 ? db->DefaultColumnFamily()
+                 : reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>(
+                       jcf_handle);
+  std::string ts_low;
+  ROCKSDB_NAMESPACE::Status s = db->GetFullHistoryTsLow(cf, &ts_low);
+  if (!s.ok()) {
+    ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+    return nullptr;
+  }
+  return ROCKSDB_NAMESPACE::JniUtil::copyBytes(env, ts_low);
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
  * Method:    disableFileDeletions
  * Signature: (J)V
  */
