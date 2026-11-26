@@ -16,6 +16,7 @@
 #include <string>
 
 #include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_index.h"
 #include "db/blob/blob_reference_metadata.h"
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
@@ -4285,6 +4286,61 @@ TEST_P(BlobFileTableTest, ChargeStaysUntilLastHolderFrees) {
 }
 
 INSTANTIATE_TEST_CASE_P(BlobFileTableTest, BlobFileTableTest, testing::Bool());
+
+TEST_F(VersionBuilderTest, UpdateBoundariesSkipsOnlyRoutedGenerations) {
+  const auto encode = [](uint64_t generation, uint64_t origin) {
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(&encoded, generation,
+                                  {.origin_file_number = origin,
+                                   .original_value_offset = 11,
+                                   .stored_value_size = 17,
+                                   .compression = kNoCompression});
+    return encoded;
+  };
+  const auto oldest_blob_file = [&](const std::string& blob_index) {
+    FileMetaData meta;
+    const InternalKey key("key", /*seq=*/1, kTypeBlobIndex);
+    EXPECT_OK(meta.UpdateBoundaries(key.Encode(), blob_index, /*seqno=*/1,
+                                    kTypeBlobIndex, vstorage_));
+    // Compaction passes its own decode of the value. It must give the same
+    // result.
+    BlobIndex decoded;
+    EXPECT_OK(decoded.DecodeFrom(blob_index));
+    FileMetaData meta_with_decode;
+    EXPECT_OK(meta_with_decode.UpdateBoundaries(key.Encode(), blob_index,
+                                                /*seqno=*/1, kTypeBlobIndex,
+                                                vstorage_, &decoded));
+    EXPECT_EQ(meta_with_decode.oldest_blob_file_number,
+              meta.oldest_blob_file_number);
+    return meta.oldest_blob_file_number;
+  };
+  const std::string unflattened_50 = encode(/*generation=*/50, /*origin=*/50);
+  const std::string unflattened_60 = encode(/*generation=*/60, /*origin=*/60);
+  const std::string flattened = encode(/*generation=*/300, /*origin=*/50);
+
+  // Without routes, an unflattened reference keeps its generation file alive
+  // and a flattened one does not.
+  ASSERT_EQ(vstorage_.GetBlobRelocationRouteCount(), 0U);
+  ASSERT_EQ(oldest_blob_file(unflattened_50), 50U);
+  ASSERT_EQ(oldest_blob_file(unflattened_60), 60U);
+  ASSERT_EQ(oldest_blob_file(flattened), kInvalidBlobFileNumber);
+
+  // Route 50 to relocation file 300. Only the routed generation stops keeping
+  // a normal blob file alive.
+  BlobRelocationFileAddition relocation_addition;
+  ASSERT_OK(MakeRelocationAddition(/*file_number=*/300,
+                                   /*origin_file_numbers=*/{50},
+                                   &relocation_addition));
+  vstorage_.AddBlobRelocationFile(
+      BlobRelocationFileMetaData::Create(relocation_addition));
+  vstorage_.AddBlobRelocationRoute(
+      BlobRelocationRoute(/*old_file_number=*/50,
+                          /*target_file_number=*/300));
+  ASSERT_EQ(vstorage_.GetBlobRelocationRouteCount(), 1U);
+  ASSERT_EQ(oldest_blob_file(unflattened_50), kInvalidBlobFileNumber);
+  ASSERT_EQ(oldest_blob_file(unflattened_60), 60U);
+  ASSERT_EQ(oldest_blob_file(flattened), kInvalidBlobFileNumber);
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 
