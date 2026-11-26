@@ -2046,6 +2046,34 @@ TEST_F(DBOptionsTest, SetOptionsNoManifestWrite) {
   ASSERT_EQ(Get("x"), "x");
 }
 
+TEST_F(DBOptionsTest, SetOptionsForcedManifestRunsPreconditionOnce) {
+  // The pre_cb of SetOptions() prepares the new options from the input map.
+  // It runs once per call. If it ran again, a pointer-valued option such as
+  // prefix_extractor would get a second new object, and the options that
+  // SetOptions() publishes would differ from the options in the new Version.
+  // The test makes the dummy edit a real MANIFEST edit, as in
+  // SetOptionsForcedManifestPublishesPreparedState.
+  auto* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  bool forced_manifest_write = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SetOptions:dummy_edit", [&](void* arg) {
+        static_cast<VersionEdit*>(arg)->Clear();
+        forced_manifest_write = true;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Status status =
+      db_->SetOptions({{"prefix_extractor", "rocksdb.FixedPrefix.4"}});
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(status);
+  ASSERT_TRUE(forced_manifest_write);
+  ASSERT_NE(cfd->GetLatestMutableCFOptions().prefix_extractor, nullptr);
+  ASSERT_EQ(cfd->GetLatestMutableCFOptions().prefix_extractor,
+            cfd->current()->GetMutableCFOptions().prefix_extractor);
+}
+
 TEST_F(DBOptionsTest, SetOptionsForcedManifestPublishesPreparedState) {
   auto* const cfd =
       static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
