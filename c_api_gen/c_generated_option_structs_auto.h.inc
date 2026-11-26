@@ -438,6 +438,13 @@ extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_options_get_enable_blob_indirection(rocksdb_options_t* opt);
 
 extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_pin_blob_relocation_location_blocks(rocksdb_options_t* opt,
+                                                        unsigned char v);
+
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_options_get_pin_blob_relocation_location_blocks(rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
 rocksdb_options_set_blob_file_writable_file_max_buffer_size(
     rocksdb_options_t* opt, uint64_t v);
 
