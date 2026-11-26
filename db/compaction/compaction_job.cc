@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +26,7 @@
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_reference_census.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/blob/missing_blob_repair_iterator.h"
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
@@ -2561,7 +2563,7 @@ Status CompactionJob::FinishCompactionOutputFile(
 
   if (s.ok() && (current_entries > 0 || tp.num_range_deletions > 0)) {
     // Output to event logger and fire events.
-    outputs.UpdateTableProperties();
+    s = outputs.UpdateTableProperties();
     ROCKS_LOG_INFO(db_options_.info_log,
                    "[%s] [JOB %d] Generated table #%" PRIu64 ": %" PRIu64
                    " keys, %" PRIu64 " bytes%s, temperature: %s",
@@ -2574,10 +2576,24 @@ Status CompactionJob::FinishCompactionOutputFile(
   FileDescriptor output_fd;
   uint64_t oldest_blob_file_number = kInvalidBlobFileNumber;
   Status status_for_listener = s;
+  TableFileBlobReferenceInfo blob_references;
+  bool has_blob_references = false;
   if (meta != nullptr) {
     fname = GetTableFileName(meta->fd.GetNumber());
     output_fd = meta->fd;
     oldest_blob_file_number = meta->oldest_blob_file_number;
+    BlobReferenceMetadataDescriptor descriptor;
+    if (s.ok() && !meta->blob_reference_descriptor.empty() &&
+        BlobReferenceMetadataDescriptor::DecodeFrom(
+            meta->blob_reference_descriptor, &descriptor)
+            .ok()) {
+      has_blob_references = true;
+      blob_references.count = descriptor.reference_count;
+      blob_references.closed_by_limit =
+          outputs.CurrentOutputClosedByBlobReferenceLimit();
+      RecordInHistogram(stats_, COMPACTION_OUTPUT_BLOB_REFERENCES,
+                        descriptor.reference_count);
+    }
   } else {
     fname = "(nil)";
     if (s.ok()) {
@@ -2588,7 +2604,8 @@ Status CompactionJob::FinishCompactionOutputFile(
       event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(), fname,
       job_id_, output_fd, oldest_blob_file_number, tp,
       TableFileCreationReason::kCompaction, status_for_listener, file_checksum,
-      file_checksum_func_name);
+      file_checksum_func_name,
+      has_blob_references ? &blob_references : nullptr);
 
   // Report new file to SstFileManagerImpl
   auto sfm =
@@ -3028,7 +3045,8 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
         event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
         fname, job_id_, FileDescriptor(), kInvalidBlobFileNumber,
         TableProperties(), TableFileCreationReason::kCompaction, s,
-        kUnknownFileChecksum, kUnknownFileChecksumFuncName);
+        kUnknownFileChecksum, kUnknownFileChecksumFuncName,
+        /*blob_references=*/nullptr);
     return s;
   }
 
@@ -3133,6 +3151,19 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       sub_compact->compaction->max_output_file_size(), file_number,
       proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/,
       dbname_ /*db_name*/, IsRemoteCompaction() /*is_remote_compaction*/);
+  const Compaction* compaction = sub_compact->compaction;
+  const Version* input_version = compaction->input_version();
+  tboptions.track_blob_reference_classification = UsesBlobIndirection(
+      compaction->mutable_cf_options(),
+      input_version != nullptr ? input_version->storage_info() : nullptr);
+  tboptions.collect_blob_reference_metadata =
+      compaction->CollectExactBlobReferences();
+  if (input_version != nullptr && input_version->storage_info() != nullptr) {
+    tboptions.blob_route_snapshot_fingerprint_high =
+        input_version->storage_info()->GetBlobRelocationStateFingerprintHigh();
+    tboptions.blob_route_snapshot_fingerprint_low =
+        input_version->storage_info()->GetBlobRelocationStateFingerprintLow();
+  }
 
   outputs.NewBuilder(tboptions);
 
@@ -3555,7 +3586,7 @@ Status CompactionJob::ReadOutputFilesTableProperties(
   return s;
 }
 
-void CompactionJob::RestoreCompactionOutputs(
+Status CompactionJob::RestoreCompactionOutputs(
     const ColumnFamilyData* cfd,
     const std::vector<std::shared_ptr<const TableProperties>>&
         output_files_table_properties,
@@ -3579,13 +3610,17 @@ void CompactionJob::RestoreCompactionOutputs(
                                   cfd->internal_comparator(),
                                   enable_output_hash, true /* finished */);
 
-    outputs_to_restore->UpdateTableProperties(
+    const Status status = outputs_to_restore->UpdateTableProperties(
         *output_files_table_properties[i]);
+    if (!status.ok()) {
+      return status;
+    }
   }
 
   outputs_to_restore->SetNumOutputRecords(
       subcompaction_progress_per_level.GetNumProcessedOutputRecords());
   outputs_to_restore->AddRestoredBytesWritten(restored_bytes);
+  return Status::OK();
 }
 
 Status CompactionJob::RestoreBlobCompactionProgress(
@@ -3712,9 +3747,12 @@ Status CompactionJob::MaybeResumeSubcompactionProgressOnInputIterator(
           s.ToString());
     }
 
-    RestoreCompactionOutputs(cfd, output_files_table_properties,
-                             subcompaction_progress_per_level,
-                             sub_compact->Outputs(is_proximal_level));
+    s = RestoreCompactionOutputs(cfd, output_files_table_properties,
+                                 subcompaction_progress_per_level,
+                                 sub_compact->Outputs(is_proximal_level));
+    if (!s.ok()) {
+      return s;
+    }
 
     // Skip past all the used file numbers to avoid creating new output files
     // after resumption that conflict with the existing output files

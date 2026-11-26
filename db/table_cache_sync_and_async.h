@@ -14,8 +14,9 @@ namespace ROCKSDB_NAMESPACE {
 DEFINE_SYNC_AND_ASYNC(Status, TableCache::Get)
 (const ReadOptions& options, const InternalKeyComparator& internal_comparator,
  const FileMetaData& file_meta, const Slice& k, GetContext* get_context,
- const MutableCFOptions& mutable_cf_options, HistogramImpl* file_read_hist,
- bool skip_filters, int level, size_t max_file_size_for_l0_meta_pin) {
+ const MutableCFOptions& mutable_cf_options, bool check_l0_range,
+ HistogramImpl* file_read_hist, bool skip_filters, int level,
+ size_t max_file_size_for_l0_meta_pin) {
   auto& fd = file_meta.fd;
   std::string* row_cache_entry = nullptr;
   bool done = false;
@@ -59,7 +60,11 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::Get)
             t->NewRangeTombstoneIterator(GetInternalKeySeqno(k),
                                          options.timestamp));
         const SequenceNumber covering_seq =
-            latest_range_del_iter != nullptr
+            latest_range_del_iter != nullptr &&
+                    (!check_l0_range ||
+                     RangeTombstonesMayCoverUserKey(
+                         internal_comparator.user_comparator(), file_meta,
+                         ExtractUserKey(k)))
                 ? latest_range_del_iter->MaxCoveringTombstoneSeqnum(
                       ExtractUserKey(k), get_context->read_callback())
                 : 0;
@@ -72,7 +77,14 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::Get)
           !options.ignore_range_deletions) {
         std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
             t->NewRangeTombstoneIterator(options));
-        if (range_del_iter != nullptr) {
+        // RangeTombstonesMayCoverUserKey() runs only for an L0 file with range
+        // tombstones. The check is written out here instead of in a lambda,
+        // because a coroutine frame cannot hold a local of a type with no
+        // linkage (the folly coroutine build fails with -Wsubobject-linkage).
+        if (range_del_iter != nullptr &&
+            (!check_l0_range || RangeTombstonesMayCoverUserKey(
+                                    internal_comparator.user_comparator(),
+                                    file_meta, ExtractUserKey(k)))) {
           SequenceNumber seq =
               range_del_iter->MaxCoveringTombstoneSeqnum(ExtractUserKey(k));
           if (seq > *max_covering_tombstone_seq) {
@@ -120,8 +132,9 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::Get)
 DEFINE_SYNC_AND_ASYNC(Status, TableCache::MultiGet)
 (const ReadOptions& options, const InternalKeyComparator& internal_comparator,
  const FileMetaData& file_meta, const MultiGetContext::Range* mget_range,
- const MutableCFOptions& mutable_cf_options, HistogramImpl* file_read_hist,
- bool skip_filters, bool skip_range_deletions, int level, TypedHandle* handle) {
+ const MutableCFOptions& mutable_cf_options, bool check_l0_range,
+ HistogramImpl* file_read_hist, bool skip_filters, bool skip_range_deletions,
+ int level, TypedHandle* handle) {
   auto& fd = file_meta.fd;
   Status s;
   TEST_SYNC_POINT_CALLBACK("TableCache::MultiGet::BeforeFindTable",
@@ -201,7 +214,9 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::MultiGet)
     }
     if (s.ok() && !skip_range_deletions &&
         (!options.ignore_range_deletions || track_newer_versions)) {
-      UpdateRangeTombstoneSeqnums(options, t, table_range);
+      UpdateRangeTombstoneSeqnums(
+          options, t, internal_comparator.user_comparator(),
+          check_l0_range ? &file_meta : nullptr, table_range);
     }
     if (s.ok()) {
       CO_AWAIT(t->MultiGet, options, &table_range,
