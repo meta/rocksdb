@@ -8,7 +8,9 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <functional>
 #include <memory>
+#include <vector>
 
 #include "db/range_tombstone_fragmenter.h"
 #if USE_COROUTINES
@@ -23,6 +25,8 @@
 #include "util/coro_utils.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+struct BlobReferenceGroup;
 
 class Iterator;
 struct ParsedInternalKey;
@@ -132,6 +136,32 @@ class TableReader {
   virtual void SetupForCompaction() = 0;
 
   virtual std::shared_ptr<const TableProperties> GetTableProperties() const = 0;
+
+  // The blob reference census uses this to learn which blob files an SST
+  // references when it has no summary in memory. It reads the exact blob
+  // reference index block of this SST and sets `*groups` to the groups that are
+  // not kDirect, in key order. The census does not track kDirect references.
+  // Only the index block is read: it holds the totals of every group, so no
+  // data block is needed.
+  // - `expected_descriptor` is the descriptor that the MANIFEST holds for this
+  //   SST. A different descriptor in the table properties is Corruption.
+  // - When set, `before_allocation` gets the size in bytes of the group buffer
+  //   before the buffer is allocated, so the caller can charge the memory
+  //   first. If it returns non-OK, this function returns that status.
+  //
+  // The default returns NotSupported, because enable_blob_indirection requires
+  // a block-based table.
+  virtual Status ReadBlobReferenceGroups(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const std::function<Status(size_t buffer_bytes)>& before_allocation,
+      std::vector<BlobReferenceGroup>* groups) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    (void)before_allocation;
+    (void)groups;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
 
   // Prepare work that can be done before the real Get()
   virtual void Prepare(const Slice& /*target*/) {}
