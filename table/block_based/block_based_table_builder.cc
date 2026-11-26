@@ -2001,7 +2001,8 @@ struct BlockBasedTableBuilder::Rep {
           factory->CreateInternalTblPropColl(
               tbo.column_family_id, tbo.level_at_creation,
               tbo.ioptions.num_levels,
-              tbo.last_level_inclusive_max_seqno_threshold)};
+              tbo.last_level_inclusive_max_seqno_threshold,
+              tbo.is_proximal_level_output)};
       if (collector) {
         table_properties_collectors.emplace_back(std::move(collector));
       }

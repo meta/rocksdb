@@ -198,6 +198,11 @@ class TablePropertiesCollectorFactory : public Customizable {
     // to be placed on the last level. When this is the maximum sequence number,
     // it indicates tiering is disabled.
     SequenceNumber last_level_inclusive_max_seqno_threshold = 0;
+    // True only when per-key placement routed this compaction output to
+    // the proximal level (the level above the last level). This is a
+    // routing property of the output, not of the level itself: ordinary
+    // outputs created on the same level have this set to false.
+    bool is_proximal_level_output = false;
     static const uint32_t kUnknownColumnFamily;
     static const int kUnknownLevelAtCreation = -1;
     static const int kUnknownNumLevels = -1;
@@ -205,12 +210,14 @@ class TablePropertiesCollectorFactory : public Customizable {
     Context() {}
 
     Context(uint32_t _column_family_id, int _level_at_creation, int _num_levels,
-            SequenceNumber _last_level_inclusive_max_seqno_threshold)
+            SequenceNumber _last_level_inclusive_max_seqno_threshold,
+            bool _is_proximal_level_output = false)
         : column_family_id(_column_family_id),
           level_at_creation(_level_at_creation),
           num_levels(_num_levels),
           last_level_inclusive_max_seqno_threshold(
-              _last_level_inclusive_max_seqno_threshold) {}
+              _last_level_inclusive_max_seqno_threshold),
+          is_proximal_level_output(_is_proximal_level_output) {}
   };
 
   ~TablePropertiesCollectorFactory() override = default;

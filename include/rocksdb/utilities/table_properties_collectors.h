@@ -119,6 +119,11 @@ NewCompactOnDeletionCollectorFactory(size_t sliding_window_size,
 //    table property, and not mark any file as need compaction.
 // For a column family that does not enable tiering feature, even if an
 // effective configuration is provided, this collector is still disabled.
+// No collector is created for compaction outputs routed to the proximal
+// level by per-key placement (Context::is_proximal_level_output), because
+// per-key placement writes there only entries that compaction judged not
+// yet eligible for the last level. Ordinary files created on the same
+// level are unaffected and can still be marked.
 class CompactForTieringCollectorFactory
     : public TablePropertiesCollectorFactory {
  public:

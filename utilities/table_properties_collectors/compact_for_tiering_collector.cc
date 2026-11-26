@@ -103,8 +103,18 @@ TablePropertiesCollector*
 CompactForTieringCollectorFactory::CreateTablePropertiesCollector(
     TablePropertiesCollectorFactory::Context context) {
   double compaction_trigger_ratio = GetCompactionTriggerRatio();
+  // The proximal exclusion is keyed on is_proximal_level_output (actual
+  // per-key-placement routing set by CompactionJob), not on the level
+  // number, so ordinary outputs created on the same level keep the
+  // collector and the real seqno threshold below. Proximal outputs are
+  // skipped because their entries are not yet eligible for the last level
+  // by their actual seqnos; judging TimedPut entries by their preferred
+  // (write-time-derived) seqnos while a snapshot prevents that seqno from
+  // being swapped in would re-mark every proximal rewrite and loop until
+  // the snapshot is released.
   if (compaction_trigger_ratio <= 0 ||
       context.level_at_creation == context.num_levels - 1 ||
+      context.is_proximal_level_output ||
       context.last_level_inclusive_max_seqno_threshold == kMaxSequenceNumber) {
     return nullptr;
   }
