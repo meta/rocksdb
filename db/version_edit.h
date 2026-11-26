@@ -156,6 +156,7 @@ enum NewFileCustomTag : uint32_t {
 };
 
 class VersionSet;
+class VersionStorageInfo;
 
 constexpr uint64_t kFileNumberMask = 0x3FFFFFFFFFFFFFFF;
 constexpr uint64_t kUnknownOldestAncestorTime = 0;
@@ -431,10 +432,11 @@ struct FileMetaData {
   // references (its coarse frontier). The SST may reference any indirect origin
   // at or above this number, so indirect blob GC treats all of them as in use
   // ("pinned"). kInvalidBlobFileNumber means the SST is not a coarse SST. This
-  // field is separate from oldest_blob_file_number, which is the lowest blob
-  // file number that any blob reference in the SST names (for an indirect
-  // reference, its generation number). See "Coarse SST" in
-  // db/blob/blob_reference_metadata.h.
+  // field is separate from oldest_blob_file_number, which is the lowest normal
+  // blob file number that the SST keeps alive, through a direct reference or
+  // through an indirect reference whose generation number is its origin and has
+  // no route (see UpdateFileMetaDataBoundaries() in version_edit.cc). See
+  // "Coarse SST" in db/blob/blob_reference_metadata.h.
   uint64_t oldest_coarse_indirect_origin_file_number = kInvalidBlobFileNumber;
   // Marks an SST in a CF with the format fence that has no descriptor and no
   // coarse frontier, so that recovery accepts the SST. There are two cases: an
@@ -499,6 +501,25 @@ struct FileMetaData {
   // of a kTypeBlobIndex `value`. It saves a second decode.
   Status UpdateBoundaries(const Slice& key, const Slice& value,
                           SequenceNumber seqno, ValueType value_type,
+                          const BlobIndex* decoded_blob_index);
+
+  // Like UpdateBoundaries() above, for compaction output when the input
+  // Version has the indirection format. `blob_relocation_storage` is the
+  // storage info of the compaction's pinned input Version. A flattened
+  // reference (generation number != origin), or a reference whose generation
+  // number has a route in `blob_relocation_storage`, does not set
+  // oldest_blob_file_number. Its value is in a relocation file, so it does not
+  // keep a normal blob file alive. Flush, RepairDB and compaction without the
+  // indirection format use the overload above.
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const VersionStorageInfo& blob_relocation_storage);
+
+  // Same as above, with the caller's decode of a kTypeBlobIndex `value` (or
+  // nullptr).
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const VersionStorageInfo& blob_relocation_storage,
                           const BlobIndex* decoded_blob_index);
 
   // Unlike UpdateBoundaries, ranges do not need to be presented in any

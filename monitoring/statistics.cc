@@ -353,6 +353,7 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
      "rocksdb.blobdb.census.restart.overflow.count"},
     {COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS,
      "rocksdb.compaction.output.blob.reference.limit.cuts"},
+    {BLOB_RELOCATION_ROUTES_RETIRED, "rocksdb.blob.relocation.routes.retired"},
     {BLOB_RELOCATION_FILE_OPEN_FAILURES,
      "rocksdb.blob.relocation.file.open.failures"},
     {BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS,
