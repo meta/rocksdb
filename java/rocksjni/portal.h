@@ -6100,6 +6100,8 @@ class HistogramTypeJni {
         return 0x4E;
       case ROCKSDB_NAMESPACE::Histograms::COMPACTION_OUTPUT_BLOB_REFERENCES:
         return 0x4F;
+      case ROCKSDB_NAMESPACE::Histograms::INDIRECT_BLOB_GC_JOB_MICROS:
+        return 0x50;
       case ROCKSDB_NAMESPACE::Histograms::HISTOGRAM_ENUM_MAX:
         // 0x3E is reserved for backwards compatibility on current minor
         // version.
@@ -6284,6 +6286,8 @@ class HistogramTypeJni {
             IO_DISPATCHER_ASYNC_READ_PREFETCH_LEAD_MICROS;
       case 0x4F:
         return ROCKSDB_NAMESPACE::Histograms::COMPACTION_OUTPUT_BLOB_REFERENCES;
+      case 0x50:
+        return ROCKSDB_NAMESPACE::Histograms::INDIRECT_BLOB_GC_JOB_MICROS;
       case 0x3E:
         // 0x3E is reserved for backwards compatibility on current minor
         // version.

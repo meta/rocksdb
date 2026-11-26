@@ -10,14 +10,18 @@
 
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_reference_metadata.h"
+#include "db/blob/blob_relocation_file.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
 #include "file/file_util.h"
+#include "file/writable_file_writer.h"
+#include "options/cf_options.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/wal_iterator.h"
+#include "table/block_based/block_based_table_builder.h"
 #include "table/unique_id_impl.h"
 #include "util/string_util.h"
 
@@ -113,6 +117,45 @@ class RepairTest : public DBTestBase {
       ASSERT_OK(header.DecodeFrom(Slice(bytes.data(), BlobLogHeader::kSize)));
       versions->push_back(header.version);
     }
+  }
+
+  // Writes a relocation file with one value into the DB directory as
+  // <file_number>.blob, and adds it to no MANIFEST. The file is complete: it
+  // starts with kBlobRelocationFilePrefix and its table properties hold a
+  // valid relocation directory (see db/blob/blob_relocation_file.h).
+  void WriteRelocationFile(const Options& options, uint64_t file_number) {
+    Options relocation_options = options;
+    relocation_options.cf_paths.clear();
+    relocation_options.cf_paths.emplace_back(dbname_, /*target_size=*/0);
+    BlockBasedTableOptions table_options;
+    relocation_options.table_factory.reset(
+        NewBlockBasedTableFactory(table_options));
+    const ImmutableOptions immutable_options(relocation_options);
+    const MutableCFOptions mutable_options(relocation_options);
+    const std::string path = BlobFileName(dbname_, file_number);
+    std::unique_ptr<FSWritableFile> file;
+    ASSERT_OK(immutable_options.fs->NewWritableFile(path, FileOptions(), &file,
+                                                    /*dbg=*/nullptr));
+    WritableFileWriter writer(std::move(file), path, FileOptions(),
+                              immutable_options.clock);
+    const InternalKeyComparator comparator(BytewiseComparator());
+    BlobRelocationTableFileInfo file_info;
+    file_info.column_family_id = 0;
+    file_info.column_family_name = kDefaultColumnFamilyName;
+    file_info.db_id = "test-db";
+    file_info.db_session_id = "test-session";
+    file_info.file_number = file_number;
+    std::unique_ptr<BlockBasedTableBuilder> builder;
+    ASSERT_OK(NewBlobRelocationTableBuilder(
+        immutable_options, mutable_options, table_options, ReadOptions(),
+        WriteOptions(), comparator, file_info, &writer, &builder));
+    // One value of blob file 1 at offset 11; blob file 1 is its served file.
+    ASSERT_OK(builder->AddBlobRelocation(/*origin_file_number=*/1,
+                                         /*original_value_offset=*/11,
+                                         "payload", kNoCompression));
+    ASSERT_OK(builder->AddBlobRelocationServedFile(/*file_number=*/1));
+    ASSERT_OK(builder->Finish());
+    ASSERT_OK(writer.Close(IOOptions(), /*dbg=*/nullptr));
   }
 
   // Deletes every file in the DB directory whose type is in `types`.
@@ -334,6 +377,84 @@ TEST_F(RepairTest, RefusesDbWithOnlyClassifiedSst) {
   std::vector<std::string> lost_after;
   ASSERT_OK(lost_files(&lost_after));
   ASSERT_EQ(lost_after, lost_before);
+}
+
+TEST_F(RepairTest, RelocationFileWithoutManifestBlocksRepair) {
+  // Indirect blob GC writes relocation files under the normal blob file name
+  // (<number>.blob). A relocation file is evidence of blob indirection even
+  // when the MANIFEST is lost and no SST holds evidence. RepairDB finds it by
+  // its prefix and by a valid relocation directory in its table properties.
+  // Here the DB never used the feature, the MANIFEST is deleted, and one
+  // relocation file is added. RepairDB must return NotSupported and change,
+  // add or remove no file.
+  Options options = CurrentOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+  Close();
+  ASSERT_NO_FATAL_FAILURE(DeleteDbFiles({kDescriptorFile}));
+  // The file number is an example. It is larger than every file number the DB
+  // used.
+  ASSERT_NO_FATAL_FAILURE(WriteRelocationFile(options, /*file_number=*/1000));
+
+  std::map<std::string, std::string> before;
+  ASSERT_NO_FATAL_FAILURE(SnapshotDbDir(&before));
+  const Status repaired = RepairDB(dbname_, options);
+  ASSERT_TRUE(repaired.IsNotSupported()) << repaired.ToString();
+  std::map<std::string, std::string> after;
+  ASSERT_NO_FATAL_FAILURE(SnapshotDbDir(&after));
+  ASSERT_EQ(before, after);
+}
+
+TEST_F(RepairTest, RelocationPrefixWithoutDirectoryIsNotEvidence) {
+  // A <number>.blob file that starts with kBlobRelocationFilePrefix is not
+  // evidence of blob indirection by the prefix alone. RepairDB also needs a
+  // valid relocation directory in the file's table properties. The test adds
+  // one such file to a DB that never used the feature and lost its MANIFEST.
+  // In each case, RepairDB must run the legacy repair and keep the data:
+  //   kPrefixOnly:  the prefix and a few bytes, so no table properties.
+  //   kTruncated:   a complete relocation file without its last byte, so the
+  //                 table footer and the properties do not read.
+  //   kNoDirectory: a copy of the DB's SST whose first bytes are replaced by
+  //                 the prefix. Its table properties read, but they hold no
+  //                 relocation directory.
+  enum Case { kPrefixOnly, kTruncated, kNoDirectory };
+  for (const Case file_case : {kPrefixOnly, kTruncated, kNoDirectory}) {
+    SCOPED_TRACE("case=" + std::to_string(file_case));
+    Options options = CurrentOptions();
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("key", "value"));
+    ASSERT_OK(Flush());
+    Close();
+    ASSERT_NO_FATAL_FAILURE(DeleteDbFiles({kDescriptorFile}));
+
+    // The file number is an example. It is larger than every file number the
+    // DB used.
+    const std::string path = BlobFileName(dbname_, /*number=*/1000);
+    const std::string prefix(kBlobRelocationFilePrefix,
+                             kBlobRelocationFilePrefixSize);
+    std::string contents;
+    if (file_case == kPrefixOnly) {
+      contents = prefix + "not a table";
+    } else if (file_case == kTruncated) {
+      ASSERT_NO_FATAL_FAILURE(
+          WriteRelocationFile(options, /*file_number=*/1000));
+      ASSERT_OK(ReadFileToString(env_, path, &contents));
+      contents.pop_back();
+    } else {
+      std::unordered_map<std::string, uint64_t> ssts;
+      ASSERT_OK(GetAllDataFiles(kTableFile, &ssts));
+      ASSERT_EQ(ssts.size(), 1U);
+      ASSERT_OK(ReadFileToString(env_, ssts.begin()->first, &contents));
+      ASSERT_GT(contents.size(), prefix.size());
+      contents.replace(0, prefix.size(), prefix);
+    }
+    ASSERT_OK(WriteStringToFile(env_, contents, path, /*should_sync=*/true));
+
+    ASSERT_OK(RepairDB(dbname_, options));
+    Reopen(options);
+    ASSERT_EQ(Get("key"), "value");
+  }
 }
 
 TEST_F(RepairTest, SortRepairedDBL0ByEpochNumber) {

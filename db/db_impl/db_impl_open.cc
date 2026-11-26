@@ -3441,6 +3441,19 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete,
     }
   }
   BlobReferenceCensus& census = *cfd->blob_reference_census();
+  bool mismatch_reported = census.TakeMismatchReport();
+  TEST_SYNC_POINT_CALLBACK(
+      "DBImpl::BuildBlobReferenceCensus:AfterTakeMismatchReport",
+      &mismatch_reported);
+  if (mismatch_reported) {
+    // Indirect blob GC reported a census mismatch. Fail this build.
+    // ReportMismatch() also set RebuildRequested(), so a new build starts at
+    // once from the current Version. This status fails only the build slice. It
+    // is not a background error. Any non-OK status would do: the slice caller
+    // (BGWorkBlobReferenceCensus) normally sees RebuildRequested() and restarts
+    // at once. Corruption names the cause: the census does not match the SSTs.
+    return Status::Corruption("Blob GC found a census mismatch");
+  }
   std::shared_ptr<BlobReferenceCensusBuildContext> context =
       census.GetBuildContext();
   Status status;
@@ -3731,14 +3744,17 @@ Status DBImpl::PublishBlobReferenceCensusWorker(
   // stored below, after the DB mutex is taken.
   const uint64_t candidate_retry_micros = census.RetryWorkerCandidates(
       context->token, immutable_db_options_.clock->NowMicros());
-  const BlobGcCandidateHeap::Selection candidates =
-      census.SelectWorkerCandidates(context->token);
+  BlobGcCandidateHeap::SelectionBytes candidate_bytes{};
+  BlobGcCandidateHeap::Selection candidates =
+      census.SelectWorkerCandidates(context->token, &candidate_bytes);
   const BlobGcCandidateHeap::Selection empty_candidates =
       census.SelectWorkerEmptyCandidates(context->token);
   const uint64_t relocation_garbage =
       census.WorkerRelocationGarbageBytes(context->token);
   const BlobGcCandidateHeap::Totals candidate_totals =
       census.WorkerCandidateTotals(context->token);
+  const BlobGcCandidateHeap::CorruptFileReport corrupt_files =
+      census.WorkerCorruptFileReport(context->token);
   TEST_SYNC_POINT("DBImpl::PublishBlobReferenceCensusWorker:BeforeLockReady");
   TEST_SYNC_POINT("DBImpl::PublishBlobReferenceCensusWorker:BeforeLockWait");
   InstrumentedMutexLock lock(&mutex_);
@@ -3749,8 +3765,25 @@ Status DBImpl::PublishBlobReferenceCensusWorker(
   const BlobReferenceCensus::PublishResult result = census.TryPublishWorker(
       context->token, applied_version, cfd->current()->GetVersionNumber());
   if (result == BlobReferenceCensus::PublishResult::kPublished) {
+    // The census matches cfd->current(), so these are the options that a GC
+    // job at this Version reads for its own garbage ratio check.
+    BlobGcCandidateHeap::CutSelection(
+        cfd->current()->GetMutableCFOptions().indirect_blob_gc_garbage_ratio,
+        candidate_bytes, &candidates);
     census.NoteReady();
     census.SetPublishedTotals(candidate_totals, relocation_garbage);
+    census.SetPublishedCorruptFiles(corrupt_files);
+    if (candidates[0] != kInvalidBlobFileNumber &&
+        cfd->IndirectBlobGcOptionsAllowJob()) {
+      // A running GC job keeps the idle time at 0. The job's end starts it
+      // again if candidates remain.
+      if (!census.HasGcJob()) {
+        cfd->NoteIndirectBlobGcCandidates(
+            immutable_db_options_.clock->NowMicros());
+      }
+    } else {
+      cfd->ClearIndirectBlobGcCandidates();
+    }
     const uint64_t build_start_micros = census.TakeBuildStartMicros();
     if (build_start_micros != 0) {
       const uint64_t now_micros = immutable_db_options_.clock->NowMicros();
@@ -4129,17 +4162,53 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
   // publish fails the build, which then backs off like any other failure.
   const bool restart_after_overflow =
       overflowed && cfd->blob_reference_census()->UseOverflowRestart();
-  // A rebuild install (see BlobReferenceCensusDelta::rebuild) invalidated this
-  // build. The next build starts at once.
-  const bool restart_for_rebuild =
+  // A rebuild install (see BlobReferenceCensusDelta::rebuild) or a census
+  // mismatch report invalidated this build. The next build starts at once,
+  // unless this build failed because of a mismatch report and mismatch reports
+  // requested more than two rebuilds in a row. That rebuild waits instead: 1 s
+  // for the first such wait, doubled for each later one
+  // (TakeMismatchRebuildWaitStep()), at most 32 s (see
+  // BlobReferenceCensus::ReportMismatch()).
+  const bool rebuild_requested =
       !status.ok() && !overflowed &&
       cfd->blob_reference_census()->RebuildRequested();
+  // Take the wait step once: the call also counts the wait, and a GC job can
+  // reset the counts at any time (see
+  // BlobReferenceCensus::NoteCensusCheckMatched()). The ERROR line and the
+  // retry delay below use the same value as this decision. The failed-build
+  // retry delay uses the same 1 s start and the same limit of 6 steps (32 s).
+  constexpr uint64_t kFirstFailureRetryMicros = 1000 * 1000;
+  constexpr uint32_t kMaxCountedFailures = 6;
+  const uint32_t mismatch_rebuild_wait_step =
+      rebuild_requested
+          ? cfd->blob_reference_census()->TakeMismatchRebuildWaitStep()
+          : 0;
+  const bool mismatch_rebuild_waits = mismatch_rebuild_wait_step > 0;
+  const uint32_t mismatch_backoff_step =
+      std::min(mismatch_rebuild_wait_step, kMaxCountedFailures);
+  const uint64_t mismatch_rebuild_delay_micros =
+      mismatch_rebuild_waits
+          ? kFirstFailureRetryMicros << (mismatch_backoff_step - 1)
+          : 0;
+  const bool restart_for_rebuild = rebuild_requested && !mismatch_rebuild_waits;
   // Every failed build logs its status (see "Errors and rebuild" in
   // db/blob/blob_reference_census.h for the retry policy). A build that a
   // rebuild install canceled fails with Aborted. This is a normal restart that
   // needs no action, and DeleteFilesInRange() can cause many of them, so it
-  // logs at INFO. Any other status logs at WARN, or at ERROR for Corruption.
-  if (restart_for_rebuild && status.IsAborted()) {
+  // logs at INFO. A rebuild that must wait for the backoff after repeated
+  // census mismatches logs at ERROR. Any other status logs at WARN, or at
+  // ERROR for Corruption.
+  if (mismatch_rebuild_waits) {
+    ROCKS_LOG_ERROR(
+        db->immutable_db_options_.info_log,
+        "Blob reference census of CF %s: indirect blob GC found census "
+        "mismatches after more than two rebuilds in a row; the next rebuild "
+        "waits %" PRIu64 " s (wait %" PRIu32
+        " in a row; each later wait doubles, at most 32 s; GC waits until the "
+        "census is ready)",
+        cfd->GetName().c_str(), mismatch_rebuild_delay_micros / 1000000,
+        mismatch_rebuild_wait_step);
+  } else if (restart_for_rebuild && status.IsAborted()) {
     ROCKS_LOG_INFO(db->immutable_db_options_.info_log,
                    "Blob reference census of CF %s restarts on the latest "
                    "Version after a rebuild install canceled its build: %s",
@@ -4200,7 +4269,9 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
     //   - Change log overflow (restart_after_overflow): restart at once, one
     //     time only, with the restart limit.
     //   - Other failure, also a second overflow before a publish: retry list,
-    //     after 1 s, doubled after each failure, at most 32 s.
+    //     after 1 s, doubled after each failure, at most 32 s. A mismatch
+    //     rebuild that waits (mismatch_rebuild_waits) doubles its wait with the
+    //     count of such waits instead.
     //   - OK, but an indirect blob GC snapshot is pending (snapshot_paused):
     //     retry list after 1 ms (1000 microseconds).
     //   - OK and waiting for candidates (waiting_for_candidates): retry list at
@@ -4240,14 +4311,18 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
       // The periodic task checks the retry list only once per second, so the
       // 1 ms wait really lasts until the next tick, up to 1 s.
       constexpr uint64_t kSnapshotRetryMicros = 1000;
-      constexpr uint64_t kFirstFailureRetryMicros = 1000 * 1000;
-      constexpr uint32_t kMaxCountedFailures = 6;
       uint64_t delay = kSnapshotRetryMicros;
       if (!status.ok()) {
         cfd->blob_reference_census_failures_ = std::min<uint32_t>(
             cfd->blob_reference_census_failures_ + 1, kMaxCountedFailures);
-        delay = kFirstFailureRetryMicros
-                << (cfd->blob_reference_census_failures_ - 1);
+        // Each mismatch rebuild runs OK slices, and an OK slice sets the
+        // failure count back to 0. So a mismatch rebuild that waits uses the
+        // delay that it computed from the count of mismatch rebuilds that
+        // waited (mismatch_rebuild_delay_micros).
+        delay = mismatch_rebuild_waits
+                    ? mismatch_rebuild_delay_micros
+                    : kFirstFailureRetryMicros
+                          << (cfd->blob_reference_census_failures_ - 1);
         TEST_SYNC_POINT_CALLBACK(
             "DBImpl::BGWorkBlobReferenceCensus:FailureRetryDelay", &delay);
       }
