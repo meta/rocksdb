@@ -44,6 +44,8 @@ class VersionEditHandlerBase {
   virtual Status ApplyVersionEdit(VersionEdit& edit,
                                   ColumnFamilyData** cfd) = 0;
 
+  virtual Status DecodeVersionEdit(const Slice& record, VersionEdit* edit);
+
   virtual Status OnAtomicGroupReplayBegin() { return Status::OK(); }
   virtual Status OnAtomicGroupReplayEnd() { return Status::OK(); }
 
@@ -190,6 +192,22 @@ class VersionEditHandler : public VersionEditHandlerBase {
                                 const BlobFileAddition& /*blob_addition*/) {
     return Status::OK();
   }
+  virtual Status VerifyBlobRelocationFile(
+      ColumnFamilyData* /*cfd*/,
+      const BlobRelocationFileAddition& /*addition*/) {
+    return Status::OK();
+  }
+
+  // Moves out the file numbers of the relocation files deleted and the blob
+  // files removed by blob file retirement in the replayed MANIFEST, and the old
+  // file numbers of the routes deleted there. With reuse_manifest_on_open,
+  // LogAndApply then keeps rejecting an edit that adds them back to the same
+  // MANIFEST (see VersionSet::RejectReaddedBlobRelocationState()).
+  void TakeBlobRelocationDeletions(UnorderedSet<uint64_t>* files,
+                                   UnorderedSet<uint64_t>* routes) {
+    *files = std::move(replay_removed_blob_physical_files_);
+    *routes = std::move(replay_deleted_blob_relocation_routes_);
+  }
 
  protected:
   explicit VersionEditHandler(
@@ -219,12 +237,19 @@ class VersionEditHandler : public VersionEditHandlerBase {
   void CheckColumnFamilyId(const VersionEdit& edit, bool* do_not_open_cf,
                            bool* cf_in_builders) const;
 
+  void ResetReplayBlobRelocationHistory() {
+    replay_removed_blob_physical_files_.clear();
+    replay_deleted_blob_relocation_routes_.clear();
+  }
+
   void CheckIterationResult(const log::Reader& reader, Status* s) override;
 
   ColumnFamilyData* CreateCfAndInit(const ColumnFamilyOptions& cf_options,
                                     const VersionEdit& edit);
 
   virtual ColumnFamilyData* DestroyCfAndCleanup(const VersionEdit& edit);
+
+  virtual void DestroyVersionBuilder(uint32_t column_family_id);
 
   virtual Status MaybeCreateVersionBeforeApplyEdit(const VersionEdit& edit,
                                                    ColumnFamilyData* cfd,
@@ -249,6 +274,11 @@ class VersionEditHandler : public VersionEditHandlerBase {
   // families. In non read only mode, if those column families are not dropped
   // by subsequent manifest records, Recover() will return failure status.
   std::unordered_map<uint32_t, std::string> do_not_open_column_families_;
+  // In the replayed MANIFEST: file numbers of the relocation files deleted and
+  // of the blob files removed by blob file retirement, and old file numbers of
+  // the routes deleted.
+  UnorderedSet<uint64_t> replay_removed_blob_physical_files_;
+  UnorderedSet<uint64_t> replay_deleted_blob_relocation_routes_;
   VersionEditParams version_edit_params_;
   bool no_error_if_files_missing_;
   std::shared_ptr<IOTracer> io_tracer_;
@@ -329,6 +359,9 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
                     const FileMetaData& fmeta) override;
   Status VerifyBlobFile(ColumnFamilyData* cfd, uint64_t blob_file_num,
                         const BlobFileAddition& blob_addition) override;
+  Status VerifyBlobRelocationFile(
+      ColumnFamilyData* cfd,
+      const BlobRelocationFileAddition& addition) override;
 
  protected:
   Status OnAtomicGroupReplayBegin() override;
@@ -355,6 +388,15 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
     return true;
   }
 
+  virtual Status SaveVersionTo(VersionBuilder* builder,
+                               VersionStorageInfo* storage);
+
+  // Drops the Versions of an incomplete AtomicGroup and resets the AtomicGroup
+  // state. Called when a new AtomicGroup starts, and before the replay of a new
+  // MANIFEST. The Versions are freed through DiscardVersions(); ManifestTailer
+  // frees their relocation state without the DB mutex.
+  void ResetAtomicUpdateState();
+
   // A Version built from the MANIFEST records read up to some point in time,
   // together with the column family's log number that those records had put in
   // effect. Keeping the two together is what lets an installed Version report
@@ -364,12 +406,17 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
     uint64_t log_number = 0;
   };
 
-  std::unordered_map<uint32_t, PointInTimeVersion> versions_;
+  using PointInTimeVersions = UnorderedMap<uint32_t, PointInTimeVersion>;
+
+  virtual void DeleteVersion(Version* version);
+  virtual void DiscardVersions(PointInTimeVersions* versions);
+
+  PointInTimeVersions versions_;
 
   // `atomic_update_versions_` is for ensuring all-or-nothing AtomicGroup
   // recoveries.  When `atomic_update_versions_` is nonempty, it serves as a
   // barrier to updating `versions_` until all its values are populated.
-  std::unordered_map<uint32_t, PointInTimeVersion> atomic_update_versions_;
+  PointInTimeVersions atomic_update_versions_;
   // `atomic_update_versions_missing_` counts the null `version`s in
   // `atomic_update_versions_`.
   size_t atomic_update_versions_missing_;
@@ -449,15 +496,7 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
   Status VerifyFile(ColumnFamilyData* cfd, const std::string& fpath, int level,
                     const FileMetaData& fmeta) override;
 
-  void PrepareToReadNewManifest() {
-    initialized_ = false;
-    ResetReadState();
-    cfs_awaiting_from_previous_manifest_ = cfs_awaiting_file_list_;
-    cfs_not_yet_in_manifest_.clear();
-    for (const auto& builder : builders_) {
-      cfs_not_yet_in_manifest_.insert(builder.first);
-    }
-  }
+  void PrepareToReadNewManifest(InstrumentedMutex* db_mutex);
 
   // ReactiveVersionSet::ReadAndApply() calls this before it reads with a new
   // reader that starts at GetLastValidRecordEnd(), after a failed MANIFEST read
@@ -484,12 +523,59 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   std::vector<std::string> GetAndClearIntermediateFiles();
 
+  void SetCatchUpDBMutex(InstrumentedMutex* db_mutex) {
+    assert(db_mutex_ == nullptr);
+    assert(db_mutex != nullptr);
+    db_mutex_ = db_mutex;
+  }
+
+  void ClearCatchUpDBMutex() {
+    assert(db_mutex_ != nullptr);
+    db_mutex_ = nullptr;
+  }
+
+ private:
+  // Runs fn() without the DB mutex during catch-up (a null mutex means
+  // single-threaded recovery). `unlocked_sync_point` fires without the mutex.
+  template <typename Fn>
+  auto RunWithoutDbMutex(const char* unlocked_sync_point, Fn&& fn)
+      -> decltype(fn()) {
+    if (db_mutex_ == nullptr) {
+      return fn();
+    }
+    InstrumentedMutexUnlock unlock(db_mutex_);
+    TEST_SYNC_POINT_CALLBACK(unlocked_sync_point, db_mutex_);
+    (void)unlocked_sync_point;
+    return fn();
+  }
+
  protected:
   Status Initialize() override;
 
   bool MustOpenAllColumnFamilies() const override { return false; }
 
   Status ApplyVersionEdit(VersionEdit& edit, ColumnFamilyData** cfd) override;
+
+  Status DecodeVersionEdit(const Slice& record, VersionEdit* edit) override;
+
+  Status VerifyBlobRelocationFile(
+      ColumnFamilyData* cfd,
+      const BlobRelocationFileAddition& addition) override;
+
+  Status SaveVersionTo(VersionBuilder* builder,
+                       VersionStorageInfo* storage) override;
+
+  void DeleteVersion(Version* version) override;
+  void DiscardVersions(PointInTimeVersions* versions) override;
+  ColumnFamilyData* DestroyCfAndCleanup(const VersionEdit& edit) override;
+  void DestroyVersionBuilder(uint32_t column_family_id) override;
+
+  void ReplaceBuilder(uint32_t column_family_id,
+                      VersionBuilderUPtr replacement);
+  // Destroys `guard` under the DB mutex and frees its staged relocation changes
+  // without it (VersionSet::FreeBlobRelocationState()).
+  void ReleaseBuilderUnderMutex(VersionBuilderUPtr guard,
+                                const char* unlocked_sync_point);
 
   Status OnColumnFamilyAdd(VersionEdit& edit, ColumnFamilyData** cfd) override;
 
@@ -512,9 +598,10 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
   // replay a new MANIFEST, and that have not yet applied the record in it that
   // lists their files.
   std::unordered_set<uint32_t> cfs_awaiting_file_list_;
-  // Column families that were awaiting their file list when the tailer
-  // switched to the current MANIFEST, and that it has not added again.
+  // Column families that were awaiting their file list when the tailer switched
+  // to the current MANIFEST, and that it has not added again.
   std::unordered_set<uint32_t> cfs_awaiting_from_previous_manifest_;
+  InstrumentedMutex* db_mutex_ = nullptr;
   // Column families with a builder that the current MANIFEST has not added
   // again since the tailer switched to it.
   std::unordered_set<uint32_t> cfs_not_yet_in_manifest_;

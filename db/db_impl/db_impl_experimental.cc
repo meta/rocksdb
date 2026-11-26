@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "db/column_family.h"
+#include "db/compaction/compaction.h"
 #include "db/db_impl/db_impl.h"
 #include "db/job_context.h"
 #include "db/version_set.h"
@@ -106,6 +107,20 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
         return status;
       }
 
+      // A coarse file must be rewritten with exact metadata when it leaves L0
+      // (see Compaction::MustRewriteCoarseL0File()).
+      if (Compaction::MustRewriteCoarseL0File(*f)) {
+        ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                       "PromoteL0 FAILED. File %" PRIu64
+                       " has coarse blob reference metadata\n",
+                       f->fd.GetNumber());
+        job_context.Clean();
+        status = Status::NotSupported(
+            "PromoteL0 cannot move an L0 file with coarse blob reference "
+            "metadata");
+        return status;
+      }
+
       if (i == 0) {
         continue;
       }
@@ -147,6 +162,9 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
           cfd, job_context.superversion_contexts.data(),
           /*defer_snapshot_refresh=*/false);
     }
+    // Free the census state that the LogAndApply batch replaced (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()).
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
   }  // lock released here
   LogFlush(immutable_db_options_.info_log);
   job_context.Clean();

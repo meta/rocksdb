@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -20,9 +21,12 @@
 #include <utility>
 #include <vector>
 
+#include "cache/cache_reservation_manager.h"
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
+#include "db/blob/blob_reference_census.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/blob/missing_blob_repair_iterator.h"
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
@@ -56,6 +60,7 @@
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/options_type.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/format.h"
 #include "table/merging_iterator.h"
 #include "table/meta_blocks.h"
@@ -1283,8 +1288,72 @@ void CompactionJob::FinalizeCompactionRun(
                            const_cast<Status*>(&input_status));
 }
 
+void CompactionJob::ReadInputBlobReferenceSummaries() {
+  Compaction* const compaction = compact_->compaction;
+  Version* const input = compaction->input_version();
+  ColumnFamilyData* const cfd = compaction->column_family_data();
+  if (input == nullptr || cfd->blob_reference_census() == nullptr ||
+      !input->storage_info()->HasBlobIndirectionFormat()) {
+    return;
+  }
+  std::shared_ptr<CacheReservationManager> reservation_manager;
+  const BlockBasedTableOptions* const table_options =
+      GetBlockBasedTableWriterOptions(
+          compaction->mutable_cf_options().table_factory.get());
+  if (table_options != nullptr && table_options->block_cache != nullptr &&
+      table_options->cache_usage_options.options_overrides
+              .at(CacheEntryRole::kBlobReferenceCensus)
+              .charged != CacheEntryRoleOptions::Decision::kDisabled) {
+    reservation_manager = std::make_shared<ConcurrentCacheReservationManager>(
+        std::make_shared<
+            CacheReservationManagerImpl<CacheEntryRole::kBlobReferenceCensus>>(
+            table_options->block_cache));
+  }
+  ReadOptions read_options(Env::IOActivity::kCompaction);
+  read_options.fill_cache = false;
+  read_options.rate_limiter_priority = GetRateLimiterPriority();
+  // A summary read that finds the block cache full goes on uncharged. The
+  // compaction logs one WARN line for all such reads, not one per input SST.
+  std::atomic<uint64_t> uncharged_reads{0};
+  auto log_uncharged = Defer([&]() {
+    if (uncharged_reads.load(std::memory_order_relaxed) > 0) {
+      ROCKS_LOG_WARN(db_options_.info_log,
+                     "[%s] [JOB %d] Read %" PRIu64
+                     " input blob reference summaries without their full "
+                     "block cache charge, because the block cache is full",
+                     cfd->GetName().c_str(), job_id_,
+                     uncharged_reads.load(std::memory_order_relaxed));
+    }
+  });
+  for (const CompactionInputFiles& level : *compaction->inputs()) {
+    for (const FileMetaData* file : level.files) {
+      if (file->blob_reference_descriptor.empty()) {
+        continue;
+      }
+      std::shared_ptr<const BlobReferenceSstSummary> summary;
+      Status status = cfd->table_cache()->ReadBlobReferenceSstSummary(
+          read_options, file_options_, cfd->internal_comparator(), *file,
+          compaction->mutable_cf_options(), &summary, reservation_manager,
+          &uncharged_reads);
+      TEST_SYNC_POINT_CALLBACK(
+          "CompactionJob::ReadInputBlobReferenceSummaries:Status", &status);
+      if (!status.ok()) {
+        // Not a compaction failure: the census rebuilds after the install.
+        ROCKS_LOG_WARN(db_options_.info_log,
+                       "[%s] [JOB %d] Cannot read blob reference groups of "
+                       "input #%" PRIu64 ": %s",
+                       cfd->GetName().c_str(), job_id_, file->fd.GetNumber(),
+                       status.ToString().c_str());
+        return;
+      }
+      input_blob_reference_summaries_.push_back(std::move(summary));
+    }
+  }
+}
+
 Status CompactionJob::Run() {
   InitializeCompactionRun();
+  ReadInputBlobReferenceSummaries();
 
   const uint64_t start_micros = db_options_.clock->NowMicros();
 
@@ -1835,7 +1904,9 @@ void CompactionJob::CreateBlobFileBuilder(
         cfd->GetID(), cfd->GetName(), write_hint_, io_tracer_, blob_callback_,
         BlobFileCreationReason::kCompaction, GetBlobOutputPath(),
         sub_compact->Current().GetOutputFilePathsPtr(),
-        sub_compact->Current().GetBlobFileAdditionsPtr());
+        sub_compact->Current().GetBlobFileAdditionsPtr(),
+        // Compaction output never prepopulates the blob cache (flush only).
+        /*blob_source=*/nullptr);
   } else {
     blob_file_builder = nullptr;
   }
@@ -2492,7 +2563,7 @@ Status CompactionJob::FinishCompactionOutputFile(
 
   if (s.ok() && (current_entries > 0 || tp.num_range_deletions > 0)) {
     // Output to event logger and fire events.
-    outputs.UpdateTableProperties();
+    s = outputs.UpdateTableProperties();
     ROCKS_LOG_INFO(db_options_.info_log,
                    "[%s] [JOB %d] Generated table #%" PRIu64 ": %" PRIu64
                    " keys, %" PRIu64 " bytes%s, temperature: %s",
@@ -2505,10 +2576,24 @@ Status CompactionJob::FinishCompactionOutputFile(
   FileDescriptor output_fd;
   uint64_t oldest_blob_file_number = kInvalidBlobFileNumber;
   Status status_for_listener = s;
+  TableFileBlobReferenceInfo blob_references;
+  bool has_blob_references = false;
   if (meta != nullptr) {
     fname = GetTableFileName(meta->fd.GetNumber());
     output_fd = meta->fd;
     oldest_blob_file_number = meta->oldest_blob_file_number;
+    BlobReferenceMetadataDescriptor descriptor;
+    if (s.ok() && !meta->blob_reference_descriptor.empty() &&
+        BlobReferenceMetadataDescriptor::DecodeFrom(
+            meta->blob_reference_descriptor, &descriptor)
+            .ok()) {
+      has_blob_references = true;
+      blob_references.count = descriptor.reference_count;
+      blob_references.closed_by_limit =
+          outputs.CurrentOutputClosedByBlobReferenceLimit();
+      RecordInHistogram(stats_, COMPACTION_OUTPUT_BLOB_REFERENCES,
+                        descriptor.reference_count);
+    }
   } else {
     fname = "(nil)";
     if (s.ok()) {
@@ -2519,7 +2604,8 @@ Status CompactionJob::FinishCompactionOutputFile(
       event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(), fname,
       job_id_, output_fd, oldest_blob_file_number, tp,
       TableFileCreationReason::kCompaction, status_for_listener, file_checksum,
-      file_checksum_func_name);
+      file_checksum_func_name,
+      has_blob_references ? &blob_references : nullptr);
 
   // Report new file to SstFileManagerImpl
   auto sfm =
@@ -2765,6 +2851,20 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           const std::unordered_map<uint64_t, BlobFileState>::const_iterator
               blob_file = blob_files.find(blob_file_number);
           if (blob_file == blob_files.end()) {
+            // Skip a generation number that has no BlobFileMetaData garbage
+            // counts: a routed generation number (a blob file removed by blob
+            // file retirement, or a deleted relocation file), or a live
+            // relocation file that a flattened reference uses as its generation
+            // number. Indirect blob GC finds the live values of these files
+            // from the exact reference metadata of SSTs, not from garbage
+            // counts.
+            if (blob_file_number != kInvalidBlobFileNumber &&
+                (storage_info->GetBlobRelocationRouteTarget(blob_file_number) !=
+                     kInvalidBlobFileNumber ||
+                 storage_info->PeekBlobRelocationFileMetaData(
+                     blob_file_number) != nullptr)) {
+              continue;
+            }
             if (blob_file_number != kInvalidBlobFileNumber &&
                 (compaction->skip_missing_blob_files() ||
                  storage_info->IsDroppedBlobFile(blob_file_number))) {
@@ -2813,6 +2913,8 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
   // Add compaction inputs and outputs only after all blob metadata has been
   // validated across subcompactions.
   compaction->AddInputDeletions(edit);
+  edit->SetBlobReferenceSummariesOfDeletedFiles(
+      std::move(input_blob_reference_summaries_));
   for (const auto& sub_compact : compact_->sub_compact_states) {
     sub_compact.AddOutputsEdit(edit);
 
@@ -2820,6 +2922,9 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
       edit->AddBlobFile(blob);
     }
   }
+
+  edit->MaybeSetBlobIndirectionFormatFence(
+      compaction->mutable_cf_options().enable_blob_indirection);
 
   for (const auto& pair : blob_total_garbage) {
     const uint64_t blob_file_number = pair.first;
@@ -2940,7 +3045,8 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
         event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
         fname, job_id_, FileDescriptor(), kInvalidBlobFileNumber,
         TableProperties(), TableFileCreationReason::kCompaction, s,
-        kUnknownFileChecksum, kUnknownFileChecksumFuncName);
+        kUnknownFileChecksum, kUnknownFileChecksumFuncName,
+        /*blob_references=*/nullptr);
     return s;
   }
 
@@ -3045,6 +3151,19 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       sub_compact->compaction->max_output_file_size(), file_number,
       proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/,
       dbname_ /*db_name*/, IsRemoteCompaction() /*is_remote_compaction*/);
+  const Compaction* compaction = sub_compact->compaction;
+  const Version* input_version = compaction->input_version();
+  tboptions.track_blob_reference_classification = UsesBlobIndirection(
+      compaction->mutable_cf_options(),
+      input_version != nullptr ? input_version->storage_info() : nullptr);
+  tboptions.collect_blob_reference_metadata =
+      compaction->CollectExactBlobReferences();
+  if (input_version != nullptr && input_version->storage_info() != nullptr) {
+    tboptions.blob_route_snapshot_fingerprint_high =
+        input_version->storage_info()->GetBlobRelocationStateFingerprintHigh();
+    tboptions.blob_route_snapshot_fingerprint_low =
+        input_version->storage_info()->GetBlobRelocationStateFingerprintLow();
+  }
 
   outputs.NewBuilder(tboptions);
 
@@ -3467,7 +3586,7 @@ Status CompactionJob::ReadOutputFilesTableProperties(
   return s;
 }
 
-void CompactionJob::RestoreCompactionOutputs(
+Status CompactionJob::RestoreCompactionOutputs(
     const ColumnFamilyData* cfd,
     const std::vector<std::shared_ptr<const TableProperties>>&
         output_files_table_properties,
@@ -3491,13 +3610,17 @@ void CompactionJob::RestoreCompactionOutputs(
                                   cfd->internal_comparator(),
                                   enable_output_hash, true /* finished */);
 
-    outputs_to_restore->UpdateTableProperties(
+    const Status status = outputs_to_restore->UpdateTableProperties(
         *output_files_table_properties[i]);
+    if (!status.ok()) {
+      return status;
+    }
   }
 
   outputs_to_restore->SetNumOutputRecords(
       subcompaction_progress_per_level.GetNumProcessedOutputRecords());
   outputs_to_restore->AddRestoredBytesWritten(restored_bytes);
+  return Status::OK();
 }
 
 Status CompactionJob::RestoreBlobCompactionProgress(
@@ -3624,9 +3747,12 @@ Status CompactionJob::MaybeResumeSubcompactionProgressOnInputIterator(
           s.ToString());
     }
 
-    RestoreCompactionOutputs(cfd, output_files_table_properties,
-                             subcompaction_progress_per_level,
-                             sub_compact->Outputs(is_proximal_level));
+    s = RestoreCompactionOutputs(cfd, output_files_table_properties,
+                                 subcompaction_progress_per_level,
+                                 sub_compact->Outputs(is_proximal_level));
+    if (!s.ok()) {
+      return s;
+    }
 
     // Skip past all the used file numbers to avoid creating new output files
     // after resumption that conflict with the existing output files
