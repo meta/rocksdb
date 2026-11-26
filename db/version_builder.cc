@@ -1629,7 +1629,7 @@ class VersionBuilder::Rep : public MutableScalars {
         // A repeated record (MANIFEST replay or catch-up) must equal the file
         // the builder has. The record holds only small fields (numbers and the
         // file checksum strings), so the compare is cheap enough to run here,
-        // under the DB mutex.
+        // also when the caller holds the DB mutex.
         if (current->GetAddition() != addition) {
           return Status::Corruption(
               "Conflicting blob relocation file addition");
