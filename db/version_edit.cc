@@ -21,6 +21,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+static_assert(kMaxBlobRelocationFileNumber == kFileNumberMask,
+              "Relocation file numbers use the file number limit");
+
 namespace {
 // For DebugString() / DebugJSON(), e.g. "ingestion+moved+raw:0x1103" (the raw
 // value shows reserved bits that aren't decoded).
@@ -244,6 +247,10 @@ bool VersionEdit::ShouldEmitPerColumnFamilyRecoveryEdit(
 bool VersionEdit::EncodeTo(std::string* dst,
                            std::optional<size_t> ts_sz) const {
   assert(!IsNoManifestWriteDummy());
+  if (has_blob_indirection_format_version_ &&
+      has_db_blob_indirection_format_version_) {
+    return false;
+  }
   if (has_db_id_) {
     PutVarint32(dst, kDbId);
     PutLengthPrefixedSlice(dst, db_id_);
@@ -305,6 +312,50 @@ bool VersionEdit::EncodeTo(std::string* dst,
   for (const auto& blob_file_garbage : blob_file_garbages_) {
     PutVarint32(dst, kBlobFileGarbage);
     blob_file_garbage.EncodeTo(dst);
+  }
+
+  if (has_blob_indirection_format_version_) {
+    PutVarint32(dst, kBlobIndirectionFormatVersion);
+    PutVarint32(dst, blob_indirection_format_version_);
+  }
+  if (has_db_blob_indirection_format_version_) {
+    PutVarint32(dst, kDbBlobIndirectionFormatVersion);
+    PutVarint32(dst, db_blob_indirection_format_version_);
+  }
+
+  for (const BlobRelocationFileAddition& addition :
+       blob_relocation_file_additions_) {
+    PutVarint32(dst, kBlobRelocationFileAddition);
+    std::string encoded;
+    addition.EncodeTo(&encoded);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+  for (uint64_t file_number : blob_relocation_file_deletions_) {
+    PutVarint32Varint64(dst, kBlobRelocationFileDeletion, file_number);
+  }
+  for (uint64_t file_number : blob_physical_file_losses_) {
+    if (file_number == kInvalidBlobFileNumber) {
+      return false;
+    }
+    PutVarint32Varint64(dst, kBlobPhysicalFileLoss, file_number);
+  }
+  for (uint64_t file_number : blob_file_retirements_) {
+    if (file_number == kInvalidBlobFileNumber) {
+      return false;
+    }
+    PutVarint32Varint64(dst, kBlobFileRetirement, file_number);
+  }
+  for (const BlobRelocationRoute& route : blob_relocation_routes_) {
+    PutVarint32(dst, kBlobRelocationRoute);
+    std::string encoded;
+    route.EncodeTo(&encoded);
+    PutLengthPrefixedSlice(dst, encoded);
+  }
+  for (uint64_t source : blob_relocation_route_deletions_) {
+    PutVarint32(dst, kBlobRelocationRouteDeletion);
+    std::string encoded;
+    BlobRelocationRouteDeletion(source).EncodeTo(&encoded);
+    PutLengthPrefixedSlice(dst, encoded);
   }
 
   for (const auto& wal_addition : wal_additions_) {
@@ -928,6 +979,125 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         break;
       }
 
+      case kBlobIndirectionFormatVersion: {
+        uint32_t format_version = 0;
+        if (has_blob_indirection_format_version_ ||
+            has_db_blob_indirection_format_version_ ||
+            !GetVarint32(&input, &format_version)) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob indirection format fence");
+        }
+        if (format_version == 0) {
+          return Status::Corruption("VersionEdit",
+                                    "Invalid blob indirection format fence");
+        }
+        if (format_version != kBlobIndirectionManifestFormatVersion) {
+          return Status::NotSupported(
+              "Unknown blob indirection manifest format");
+        }
+        SetBlobIndirectionFormatVersion(format_version);
+        break;
+      }
+
+      case kDbBlobIndirectionFormatVersion: {
+        uint32_t format_version = 0;
+        if (has_db_blob_indirection_format_version_ ||
+            has_blob_indirection_format_version_ ||
+            !GetVarint32(&input, &format_version)) {
+          return Status::Corruption(
+              "VersionEdit",
+              "Malformed DB-global blob indirection format fence");
+        }
+        if (format_version == 0) {
+          return Status::Corruption(
+              "VersionEdit", "Invalid DB-global blob indirection format fence");
+        }
+        if (format_version != kBlobIndirectionManifestFormatVersion) {
+          return Status::NotSupported(
+              "Unknown DB-global blob indirection manifest format");
+        }
+        SetDbBlobIndirectionFormatVersion(format_version);
+        break;
+      }
+
+      case kBlobRelocationFileAddition: {
+        Slice encoded;
+        if (!GetLengthPrefixedSlice(&input, &encoded)) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation file addition");
+        }
+        BlobRelocationFileAddition addition;
+        Status status = addition.DecodeFrom(&encoded);
+        if (!status.ok()) {
+          return status;
+        }
+        AddBlobRelocationFile(std::move(addition));
+        break;
+      }
+
+      case kBlobRelocationFileDeletion: {
+        uint64_t file_number = kInvalidBlobFileNumber;
+        if (!GetVarint64(&input, &file_number) ||
+            file_number == kInvalidBlobFileNumber) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation file deletion");
+        }
+        DeleteBlobRelocationFile(file_number);
+        break;
+      }
+
+      case kBlobRelocationRoute: {
+        Slice encoded;
+        if (!GetLengthPrefixedSlice(&input, &encoded)) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation route");
+        }
+        BlobRelocationRoute route;
+        Status status = route.DecodeFrom(&encoded);
+        if (!status.ok()) {
+          return status;
+        }
+        SetBlobRelocationRoute(std::move(route));
+        break;
+      }
+
+      case kBlobRelocationRouteDeletion: {
+        Slice encoded;
+        if (!GetLengthPrefixedSlice(&input, &encoded)) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation route deletion");
+        }
+        BlobRelocationRouteDeletion deletion;
+        Status status = deletion.DecodeFrom(&encoded);
+        if (!status.ok()) {
+          return status;
+        }
+        DeleteBlobRelocationRoute(deletion.GetOldFileNumber());
+        break;
+      }
+
+      case kBlobPhysicalFileLoss: {
+        uint64_t file_number = 0;
+        if (!GetVarint64(&input, &file_number) ||
+            file_number == kInvalidBlobFileNumber) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob relocation loss");
+        }
+        MarkBlobPhysicalFileLost(file_number);
+        break;
+      }
+
+      case kBlobFileRetirement: {
+        uint64_t file_number = 0;
+        if (!GetVarint64(&input, &file_number) ||
+            file_number == kInvalidBlobFileNumber) {
+          return Status::Corruption("VersionEdit",
+                                    "Malformed blob file retirement");
+        }
+        RetireBlobFile(file_number);
+        break;
+      }
+
       case kWalAddition: {
         WalAddition wal_addition;
         const Status s = wal_addition.DecodeFrom(&input);
@@ -1239,6 +1409,39 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append("\n  BlobFileGarbage: ");
     r.append(blob_file_garbage.DebugString());
   }
+  if (has_blob_indirection_format_version_) {
+    r.append("\n  BlobIndirectionFormatVersion: ");
+    AppendNumberTo(&r, blob_indirection_format_version_);
+  }
+  if (has_db_blob_indirection_format_version_) {
+    r.append("\n  DbBlobIndirectionFormatVersion: ");
+    AppendNumberTo(&r, db_blob_indirection_format_version_);
+  }
+  for (const BlobRelocationFileAddition& addition :
+       blob_relocation_file_additions_) {
+    r.append("\n  BlobRelocationFileAddition: ");
+    r.append(addition.DebugString());
+  }
+  for (uint64_t file_number : blob_relocation_file_deletions_) {
+    r.append("\n  BlobRelocationFileDeletion: ");
+    AppendNumberTo(&r, file_number);
+  }
+  for (uint64_t file_number : blob_physical_file_losses_) {
+    r.append("\n  BlobPhysicalFileLoss: ");
+    AppendNumberTo(&r, file_number);
+  }
+  for (uint64_t file_number : blob_file_retirements_) {
+    r.append("\n  BlobFileRetirement: ");
+    AppendNumberTo(&r, file_number);
+  }
+  for (const BlobRelocationRoute& route : blob_relocation_routes_) {
+    r.append("\n  BlobRelocationRoute: ");
+    r.append(route.DebugString());
+  }
+  for (uint64_t old_file_number : blob_relocation_route_deletions_) {
+    r.append("\n  BlobRelocationRouteDeletion: old=");
+    AppendNumberTo(&r, old_file_number);
+  }
 
   for (const auto& wal_addition : wal_additions_) {
     r.append("\n  WalAddition: ");
@@ -1404,6 +1607,77 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       jw.EndArrayedObject();
     }
 
+    jw.EndArray();
+  }
+
+  if (has_blob_indirection_format_version_) {
+    jw << "BlobIndirectionFormatVersion" << blob_indirection_format_version_;
+  }
+  if (has_db_blob_indirection_format_version_) {
+    jw << "DbBlobIndirectionFormatVersion"
+       << db_blob_indirection_format_version_;
+  }
+
+  if (!blob_relocation_file_additions_.empty()) {
+    jw << "BlobRelocationFileAdditions";
+    jw.StartArray();
+    for (const BlobRelocationFileAddition& addition :
+         blob_relocation_file_additions_) {
+      jw.StartArrayedObject();
+      jw << "FileNumber" << addition.GetFileNumber();
+      jw << "FileSize" << addition.GetFileSize();
+      jw.EndArrayedObject();
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_relocation_file_deletions_.empty()) {
+    jw << "BlobRelocationFileDeletions";
+    jw.StartArray();
+    for (uint64_t file_number : blob_relocation_file_deletions_) {
+      jw << file_number;
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_relocation_routes_.empty()) {
+    jw << "BlobRelocationRoutes";
+    jw.StartArray();
+    for (const BlobRelocationRoute& route : blob_relocation_routes_) {
+      jw.StartArrayedObject();
+      jw << "Old" << route.GetOldFileNumber();
+      jw << "Target" << route.GetTargetFileNumber();
+      jw.EndArrayedObject();
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_relocation_route_deletions_.empty()) {
+    jw << "BlobRelocationRouteDeletions";
+    jw.StartArray();
+    for (uint64_t old_file_number : blob_relocation_route_deletions_) {
+      jw.StartArrayedObject();
+      jw << "Old" << old_file_number;
+      jw.EndArrayedObject();
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_physical_file_losses_.empty()) {
+    jw << "BlobPhysicalFileLosses";
+    jw.StartArray();
+    for (uint64_t file_number : blob_physical_file_losses_) {
+      jw << file_number;
+    }
+    jw.EndArray();
+  }
+
+  if (!blob_file_retirements_.empty()) {
+    jw << "BlobFileRetirements";
+    jw.StartArray();
+    for (uint64_t file_number : blob_file_retirements_) {
+      jw << file_number;
+    }
     jw.EndArray();
   }
 

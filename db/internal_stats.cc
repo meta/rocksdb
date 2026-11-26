@@ -340,6 +340,8 @@ static const std::string live_blob_file_garbage_size =
 static const std::string blob_cache_capacity = "blob-cache-capacity";
 static const std::string blob_cache_usage = "blob-cache-usage";
 static const std::string blob_cache_pinned_usage = "blob-cache-pinned-usage";
+static const std::string blob_indirection_format_version_name =
+    "blob-indirection-format-version";
 
 const std::string DB::Properties::kNumFilesAtLevelPrefix =
     rocksdb_prefix + num_files_at_level_prefix;
@@ -470,6 +472,8 @@ const std::string DB::Properties::kBlobCacheUsage =
     rocksdb_prefix + blob_cache_usage;
 const std::string DB::Properties::kBlobCachePinnedUsage =
     rocksdb_prefix + blob_cache_pinned_usage;
+const std::string DB::Properties::kBlobIndirectionFormatVersion =
+    rocksdb_prefix + blob_indirection_format_version_name;
 
 const std::string InternalStats::kPeriodicCFStats =
     DB::Properties::kCFStats + ".periodic";
@@ -680,6 +684,9 @@ const UnorderedMap<std::string, DBPropertyInfo>
         {DB::Properties::kBlobCachePinnedUsage,
          {false, nullptr, &InternalStats::HandleBlobCachePinnedUsage, nullptr,
           nullptr}},
+        {DB::Properties::kBlobIndirectionFormatVersion,
+         {false, nullptr, &InternalStats::HandleBlobIndirectionFormatVersion,
+          nullptr, nullptr}},
 };
 
 InternalStats::InternalStats(int num_levels, SystemClock* clock,
@@ -1002,6 +1009,17 @@ bool InternalStats::HandleBlobCacheUsage(uint64_t* value, DBImpl* /*db*/,
     return true;
   }
   return false;
+}
+
+bool InternalStats::HandleBlobIndirectionFormatVersion(uint64_t* value,
+                                                       DBImpl* /*db*/,
+                                                       Version* /*version*/) {
+  assert(value);
+  assert(cfd_);
+  const Version* const current = cfd_->current();
+  assert(current);
+  *value = current->storage_info()->GetBlobIndirectionFormatVersion();
+  return true;
 }
 
 bool InternalStats::HandleBlobCachePinnedUsage(uint64_t* value, DBImpl* /*db*/,
