@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "db/blob/blob_reference_metadata.h"
 #include "db/wide/wide_column_serialization.h"
 #include "env/composite_env_wrapper.h"
 #include "file/random_access_file_reader.h"
@@ -431,6 +432,86 @@ TEST_F(SSTDumpToolTest, ListMetaBlocks) {
   Options opts;
   SSTDumpToolTestCase(opts, /*filter=*/true, /*wide_column_one_in=*/0,
                       "--list_meta_blocks");
+}
+
+namespace {
+// Adds fixed user properties to every SST it collects, so a test can write the
+// table properties of a feature without the feature's table builder.
+class FixedPropertiesCollector : public TablePropertiesCollector {
+ public:
+  explicit FixedPropertiesCollector(UserCollectedProperties properties)
+      : properties_(std::move(properties)) {}
+  Status AddUserKey(const Slice& /*key*/, const Slice& /*value*/,
+                    EntryType /*type*/, SequenceNumber /*seq*/,
+                    uint64_t /*file_size*/) override {
+    return Status::OK();
+  }
+  Status Finish(UserCollectedProperties* properties) override {
+    properties->insert(properties_.begin(), properties_.end());
+    return Status::OK();
+  }
+  UserCollectedProperties GetReadableProperties() const override { return {}; }
+  const char* Name() const override { return "FixedPropertiesCollector"; }
+
+ private:
+  const UserCollectedProperties properties_;
+};
+
+class FixedPropertiesCollectorFactory : public TablePropertiesCollectorFactory {
+ public:
+  explicit FixedPropertiesCollectorFactory(UserCollectedProperties properties)
+      : properties_(std::move(properties)) {}
+  TablePropertiesCollector* CreateTablePropertiesCollector(
+      TablePropertiesCollectorFactory::Context /*context*/) override {
+    return new FixedPropertiesCollector(properties_);
+  }
+  const char* Name() const override {
+    return "FixedPropertiesCollectorFactory";
+  }
+
+ private:
+  const UserCollectedProperties properties_;
+};
+}  // namespace
+
+TEST_F(SSTDumpToolTest, ShowBlobReferenceProperties) {
+  // The descriptor values are an example; DecodeFrom() checks only their form,
+  // so the index handle does not need to point to a real block.
+  BlobReferenceMetadataDescriptor descriptor;
+  descriptor.index_handle = BlockHandle(/*offset=*/4096, /*size=*/64);
+  descriptor.reference_count = 3;
+  descriptor.stored_value_bytes = 300;
+  descriptor.column_family_id = 0;
+  descriptor.sst_file_number = 12;
+  std::string encoded_descriptor;
+  descriptor.EncodeTo(&encoded_descriptor);
+
+  Options opts;
+  opts.env = env();
+  opts.table_properties_collector_factories.emplace_back(
+      std::make_shared<FixedPropertiesCollectorFactory>(UserCollectedProperties{
+          {kBlobReferenceDescriptorPropertyName, encoded_descriptor}}));
+  const std::string file_path = MakeFilePath("blob_reference_properties.sst");
+  SstFileWriter writer(EnvOptions(), opts);
+  ASSERT_OK(writer.Open(file_path));
+  ASSERT_OK(writer.Put("key", "value"));
+  ASSERT_OK(writer.Finish());
+
+  char* usage[3];
+  auto cleanup_usage = CleanupUsage{usage};
+  PopulateCommandArgs(file_path, "--show_properties", usage);
+  ROCKSDB_NAMESPACE::SSTDumpTool tool;
+  testing::internal::CaptureStdout();
+  const int result = tool.Run(3, usage, opts);
+  const std::string output = testing::internal::GetCapturedStdout();
+  ASSERT_EQ(result, 0);
+  EXPECT_NE(output.find("Blob reference metadata"), std::string::npos);
+  EXPECT_NE(output.find("exact metadata: 3 references, 300 stored value bytes"),
+            std::string::npos);
+  EXPECT_NE(output.find("SST file number when built: 12"), std::string::npos);
+  EXPECT_NE(output.find("index block: offset 4096, size 64"),
+            std::string::npos);
+  cleanup(opts, file_path);
 }
 
 namespace {
