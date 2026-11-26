@@ -404,12 +404,12 @@ class TableCache {
   // inserted into the table cache, so this call never evicts the reader of
   // another SST. Both kinds read the blob reference blocks with
   // fill_cache=false, checksum checks and no persistent cache (see
-  // BlockBasedTable::ReadBlobReferenceGroups()). Their other blocks still use
-  // the persistent cache, as base readers do. An ephemeral reader reads no
-  // filter block and does not insert its metadata blocks into the shared block
-  // cache. The caller must keep `file_meta` alive (for example, hold a Version
-  // that contains it) while it uses the reader. Returns InvalidArgument for an
-  // SST without exact blob reference metadata.
+  // ReadBlobReferenceMetadataBlock() in block_based_table_reader.cc). Their
+  // other blocks still use the persistent cache, as base readers do. An
+  // ephemeral reader reads no filter block and does not insert its metadata
+  // blocks into the shared block cache. The caller must keep `file_meta` alive
+  // (for example, hold a Version that contains it) while it uses the reader.
+  // Returns InvalidArgument for an SST without exact blob reference metadata.
   Status GetBlobReferenceReader(
       const ReadOptions& read_options, const FileOptions& file_options,
       const InternalKeyComparator& internal_comparator,

@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "db/blob/blob_gen2_format.h"
 #include "db/version_edit.h"
 #include "port/likely.h"
 #include "rocksdb/flush_block_policy.h"
@@ -93,8 +94,10 @@ class BlockBasedTableBuilder : public TableBuilder {
   // a fresh builder (nothing added yet) created with embedded blob support
   // (TableBuilderOptions::embedded_blob_options set, as
   // NewBlobRelocationTableBuilder does), a persisted file identity
-  // (orig_file_number and db_session_id), and the bytewise comparator without
-  // timestamps; otherwise InvalidArgument.
+  // (orig_file_number and db_session_id) and the bytewise comparator without
+  // timestamps; otherwise InvalidArgument. The builder must not buffer data
+  // blocks for dictionary sampling (NewBlobRelocationTableBuilder sets
+  // TableBuilderOptions::ignore_data_block_dictionary).
   Status StartBlobRelocationFile();
 
   // Registers an old file number that may be routed to this file. The file
@@ -114,6 +117,16 @@ class BlockBasedTableBuilder : public TableBuilder {
                            uint64_t original_value_offset,
                            const Slice& stored_payload,
                            CompressionType compression);
+
+  // Streaming counterpart, with the same checks. The source verifies the exact
+  // stored bytes with the stored CRC. If the source fails, the caller must
+  // abandon the whole output and must not publish it.
+  Status AddBlobRelocation(uint64_t origin_file_number,
+                           uint64_t original_value_offset,
+                           uint64_t stored_value_size,
+                           CompressionType compression,
+                           uint32_t stored_checksum,
+                           const VerifiedBlobStoredSource& source);
 
   // Returns the encoded directory and tail size after Finish() succeeds.
   // Otherwise returns the builder's error status, or InvalidArgument if the
@@ -309,6 +322,17 @@ class BlockBasedTableBuilder : public TableBuilder {
                                  CompressionType compression,
                                  uint64_t* record_offset);
 
+  // Checks one value for both AddBlobRelocation() overloads: the file must be
+  // started and healthy, the stored size must be 1 to
+  // kMaxSimpleGen2BlobPayloadSize bytes, the compression type must be
+  // supported, and the origin must be older than this file. Returns the
+  // builder's error if the builder has already failed, and InvalidArgument
+  // for the other cases. An origin that is not older also fails the builder,
+  // because the reader would reject the finished file.
+  Status CheckBlobRelocationValue(uint64_t origin_file_number,
+                                  uint64_t stored_value_size,
+                                  CompressionType compression);
+
   // Relocation files: a location entry covers a group of values of one origin
   // (see db/blob/blob_relocation_file.h). Before a record of
   // `origin_file_number` is written, this writes the open group's location
@@ -392,10 +416,25 @@ struct BlobRelocationTableFileInfo {
 // - Table options: MakeBlobRelocationTableOptions(`table_options`).
 // - Other settings: from `mutable_cf_options`, with blob indirection and the
 //   prefix extractor turned off.
-// - Data blocks: written with kNoCompression. They hold only location entries
-//   (see db/blob/blob_relocation_file.h). The builder writes each value
-//   itself, outside the data blocks, already in stored form, as an embedded
-//   blob record.
+// - Data blocks: they hold only location entries (see
+//   db/blob/blob_relocation_file.h). They use the column family's
+//   bottommost_compression if it is set, else its compression. Bottommost comes
+//   first because a relocation file holds values that indirect blob GC moved
+//   out of old files, and such long-lived data is like bottommost data (a
+//   design choice). The builder writes each value itself, outside the data
+//   blocks, already in stored form, as an embedded blob record; values are
+//   never recompressed.
+// - No parallel compression: it writes data blocks to the file from other
+//   threads, while the builder writes the records from the calling thread.
+// - No dictionary: dictionary sampling holds the data blocks in memory until
+//   the sampling ends. Location blocks are small, so a dictionary is not worth
+//   that memory (a design choice). The builder sets max_dict_bytes and
+//   zstd_max_train_bytes to 0. It also sets
+//   TableBuilderOptions::ignore_data_block_dictionary, so the builder ignores
+//   the dictionary guidance of a custom compression manager (dictionary
+//   sampling or a pre-defined dictionary) and never buffers data blocks. Such a
+//   manager works for normal SSTs, so it must not make the relocation file fail
+//   to start. A compressor that brings its own dictionary can still use it.
 //
 // `comparator` must use the bytewise comparator and outlive the builder. If
 // starting the file fails, the builder is abandoned and `*builder` is reset, so
