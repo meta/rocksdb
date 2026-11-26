@@ -442,7 +442,8 @@ namespace ROCKSDB_NAMESPACE {
 // uncharged_build_count() counts these builds (census-uncharged-builds). A
 // compaction does not count its uncharged input summary reads; it logs one
 // WARN line for them. The GC copies keep a strict charge, because GC is
-// optional work with its own memory budget.
+// optional work with its own memory budget. One exception is the copy of a GC
+// job that only removes files with no live value (see SnapshotSelected()).
 //
 // Errors and rebuild: a change that the census cannot apply as a delta makes
 // it unready, and a new build starts. The GC API waits until the build
@@ -1584,9 +1585,27 @@ class BlobReferenceCensus {
   // `version_number`. Copies the holders of `generation_numbers` only. The copy
   // does not block an install. A non-null `gc_block_cache` is charged for the
   // copy under CacheEntryRole::kIndirectBlobGcWorkingMemory.
+  //
+  // Normally a charge that fails because the block cache is full fails the
+  // copy with MemoryLimit, and the job suppresses its inputs for a while.
+  // `empty_files_only` is true for a job that only removes files with no live
+  // value. Only such a job can remove a relocation file that holds no live
+  // value while normal GC is off (see DBImpl::BackgroundCompaction()). If its
+  // copy also failed on a full cache, a cache that stays full would keep such
+  // files on disk forever. So for this job the copy goes on uncharged, and the
+  // failure is counted in uncharged_charge_count(). This is allowed only when
+  // no SST holds any selected generation number, which is true for the inputs
+  // of such a job. Then the copy holds no SST numbers: only one entry for each
+  // input (at most kIndirectBlobGCMaxInputs, 8) and for each old file routed to
+  // it, routes that the Version already keeps in memory. If an SST does hold a
+  // selected number, the charge stays strict. A non-null `copied_uncharged`
+  // is set to true when this copy went on uncharged, so the job can log it.
+  // Other census charges count in the same counter at the same time, so the
+  // counter alone cannot tell the job whether its own copy went uncharged.
   Status SnapshotSelected(uint64_t token, uint64_t version_number,
                           const std::set<uint64_t>& generation_numbers,
                           const std::shared_ptr<Cache>& gc_block_cache,
+                          bool empty_files_only, bool* copied_uncharged,
                           std::shared_ptr<BlobReferenceCensusState>* state);
 
   // Same copy as SnapshotSelected(), without the GC job checks. Route
@@ -1637,12 +1656,17 @@ class BlobReferenceCensus {
                         BlobReferenceCensusState* state);
   // With a null `uncharged_charges`, a failed charge of `gc_block_cache`
   // fails the copy with MemoryLimit. Otherwise the copy goes on uncharged and
-  // the failure is counted there.
+  // the failure is counted there. With `uncharged_only_without_holders`, it
+  // goes on uncharged only when no SST holds a selected generation number,
+  // and otherwise fails with MemoryLimit. A non-null `copied_uncharged` is
+  // set to true when the copy went on uncharged.
   Status CopyWorkerSnapshot(const WorkerState& worker, uint64_t version_number,
                             const std::set<uint64_t>& generation_numbers,
                             const std::shared_ptr<Cache>& gc_block_cache,
                             std::shared_ptr<BlobReferenceCensusState>* state,
-                            std::atomic<uint64_t>* uncharged_charges) const;
+                            std::atomic<uint64_t>* uncharged_charges,
+                            bool uncharged_only_without_holders,
+                            bool* copied_uncharged) const;
   static size_t SnapshotMemoryBound(const BlobReferenceCensusState& state);
 
   // A reader position in the change log.

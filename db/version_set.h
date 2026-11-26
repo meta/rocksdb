@@ -1655,6 +1655,13 @@ class Version {
 
   void GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta);
 
+  // Appends one BlobMetaData entry for each relocation file of this Version
+  // to `cf_meta`, after its blob files, and counts them in blob_file_count and
+  // blob_file_size. DBImpl::GetColumnFamilyMetaData() and
+  // GetAllColumnFamilyMetaData() call it in the same DB mutex hold as
+  // GetColumnFamilyMetaData().
+  void AppendBlobRelocationFileMetaData(ColumnFamilyMetaData* cf_meta) const;
+
   // Get column family metadata with optional filtering by key range and level.
   void GetColumnFamilyMetaData(const GetColumnFamilyMetaDataOptions& options,
                                ColumnFamilyMetaData* cf_meta);
@@ -1876,8 +1883,8 @@ class AtomicGroupReadBuffer {
 //      SetOptions() edits are dummy edits, and a batch of dummy edits ends at
 //      the caller's last writer. On the test-only MANIFEST path (a test clears
 //      the dummy flag through the sync point DBImpl::SetOptions:dummy_edit),
-//      the grouping rule for prepared options in
-//      VersionSet::ProcessManifestWrites() keeps the call alone in its batch.
+//      rule 4 of VersionSet::ManifestBatchEndsBefore() (the grouping rule for
+//      prepared options) keeps the call alone in its batch.
 //   3. When the call reaches the head of the MANIFEST writer queue, pre_cb
 //      applies the input maps to the entries under the DB mutex
 //      (ColumnFamilyData::PrepareMutableCFOptions()).
@@ -2098,8 +2105,9 @@ class VersionSet {
   //   behind schedules that job, so an install by a caller that is not listed
   //   here usually waits only until the census job runs.
   // - The user-thread installs CompactFiles(), DeleteFilesInRanges(),
-  //   ReFitLevel() (CompactRange() with change_level) and PromoteL0(), and
-  //   also SetOptions(), DropColumnFamily() and DB close.
+  //   ReFitLevel() (CompactRange() with change_level), PromoteL0(), file
+  //   ingestion and import (CreateColumnFamilyWithImport()), and also
+  //   SetOptions(), DropColumnFamily() and DB close.
   // A LogAndApply call that installs no SuperVersion waits for the next of
   // these calls. While background work is paused, the census job and the
   // background jobs do not run, so such an entry can wait until background
@@ -3027,12 +3035,19 @@ class VersionSet {
   // The struct is defined in version_set.cc, which includes the census types.
   struct BlobReferenceCensusInstallBatch;
 
+  // Returns true if an edit of `batch_edits` sets the format fence of a
+  // column family that does not have it yet. REQUIRES: DB mutex held.
+  bool BatchActivatesBlobIndirection(
+      const autovector<VersionEdit*>& batch_edits) const;
+
   // Step 1 (see BlobReferenceCensusInstallBatch). REQUIRES: DB mutex held.
   // `pending_format_version` is the DB-global blob indirection format version
-  // after this batch commits: the current one, or the one this batch
-  // activates. It is 0 only when the DB has no format fence, and then no
-  // column family needs a census.
+  // after this batch commits: the current one, or the one this batch activates.
+  // It is 0 only when the DB has no format fence, and then no column family
+  // needs a census. The function also reserves an install for each column
+  // family whose format fence an edit of `batch_edits` sets.
   void ReserveBlobReferenceCensusInstalls(
+      const autovector<VersionEdit*>& batch_edits,
       const autovector<Version*>& versions, uint32_t pending_format_version,
       BlobReferenceCensusInstallBatch* batch) const;
 
@@ -3050,6 +3065,25 @@ class VersionSet {
   Status BuildBlobReferenceCensusDelta(
       const autovector<VersionEdit*>& batch_edits, Version* version,
       std::shared_ptr<BlobReferenceCensusDelta>* delta) const;
+
+  // What the writers that ProcessManifestWrites() took into its batch hold.
+  // The struct is defined in version_set.cc.
+  struct ManifestBatchState;
+
+  // The batch-end rules of ProcessManifestWrites(). The group commit leader
+  // `first_writer` has taken the writers up to `last_writer` into its batch.
+  // `writers` are the writers of the leader's caller. Returns true if the batch
+  // must end before `next_writer`, the next writer in the queue. If
+  // `last_writer` is the first writer of its caller, the function first adds
+  // that caller's caller_* flags to `*batch`. The rules are numbered in the
+  // function and checked in order.
+  // REQUIRES: DB mutex held.
+  bool ManifestBatchEndsBefore(const ManifestWriter& first_writer,
+                               const ManifestWriter& last_writer,
+                               const std::deque<ManifestWriter>& writers,
+                               const ManifestWriter& next_writer,
+                               bool skip_manifest_write,
+                               ManifestBatchState* batch) const;
 
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
   Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,

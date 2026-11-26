@@ -3334,9 +3334,12 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
   edit->SetBlobReferenceSummariesOfDeletedFiles(
       std::move(input_blob_reference_summaries_));
   bool has_flattened_blob_index = false;
+  const bool output_predates_blob_indirection =
+      !compaction->mutable_cf_options().enable_blob_indirection &&
+      !compaction->input_version()->storage_info()->HasBlobIndirectionFormat();
   for (auto& sub_compact : compact_->sub_compact_states) {
     has_flattened_blob_index |= sub_compact.has_flattened_blob_index;
-    sub_compact.AddOutputsEdit(edit);
+    sub_compact.AddOutputsEdit(edit, output_predates_blob_indirection);
 
     for (const auto& blob : sub_compact.Current().GetBlobFileAdditions()) {
       edit->AddBlobFile(blob);

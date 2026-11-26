@@ -70,8 +70,19 @@ void Compaction::FinalizeInputInfo(Version* _input_version) {
   cfd_ = input_version_->cfd();
 
   cfd_->Ref();
+  if (mutable_cf_options_.enable_blob_indirection) {
+    cfd_->BeginBlobIndirectionCompaction();
+    pending_blob_indirection_activation_ = true;
+  }
   input_version_->Ref();
   edit_.SetColumnFamily(cfd_->GetID());
+}
+
+void Compaction::EndPendingBlobIndirectionActivation() {
+  if (pending_blob_indirection_activation_) {
+    cfd_->EndBlobIndirectionCompaction();
+    pending_blob_indirection_activation_ = false;
+  }
 }
 
 void Compaction::GetBoundaryKeys(
@@ -487,6 +498,9 @@ bool Compaction::MustRewriteCoarseL0File(const FileMetaData& file) {
 }
 
 Compaction::~Compaction() {
+  if (pending_blob_indirection_activation_) {
+    cfd_->EndBlobIndirectionCompaction();
+  }
   if (input_version_ != nullptr) {
     input_version_->Unref();
   }

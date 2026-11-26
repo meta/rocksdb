@@ -2374,6 +2374,7 @@ Status DBImpl::SetOptions(
                   .blob_file_writable_file_max_buffer_size);
         }
         cfd->MarkOptionsInstalled();
+        ScheduleBlobReferenceCensus(cfd);
       }
       // Every SuperVersion is installed, so readers can no longer see a mix of
       // new options and Versions with old SuperVersions. Now free the census
@@ -7546,6 +7547,23 @@ Status DBImpl::GetPreparedFileInfoForExternalSstIngestion(
   return s;
 }
 
+Status DBImpl::GetColumnFamilyMetaDataForExport(
+    ColumnFamilyHandle* column_family, ColumnFamilyMetaData* metadata) {
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  InstrumentedMutexLock lock(&mutex_);
+  if (cfd->MayUseBlobIndirection()) {
+    return Status::NotSupported(
+        "Column-family export does not carry blob indirection "
+        "relocation files and routes");
+  }
+  // The SST metadata is read under the DB mutex. The CF has no format fence
+  // and the option is off, so its Version has no relocation files and needs
+  // no AppendBlobRelocationFileMetaData() call.
+  cfd->current()->GetColumnFamilyMetaData(metadata);
+  return Status::OK();
+}
+
 void DBImpl::GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
                                      ColumnFamilyMetaData* cf_meta) {
   assert(column_family);
@@ -7563,6 +7581,9 @@ void DBImpl::GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
     // should not be big. We still need to keep an eye on it.
     InstrumentedMutexLock l(&mutex_);
     cfd->current()->GetColumnFamilyMetaData(cf_meta);
+    // Relocation files are listed in the same lock hold, with the same work
+    // per file as the blob files above.
+    cfd->current()->AppendBlobRelocationFileMetaData(cf_meta);
   }
 }
 
@@ -7583,10 +7604,12 @@ void DBImpl::GetAllColumnFamilyMetaData(
     std::vector<ColumnFamilyMetaData>* metadata) {
   InstrumentedMutexLock l(&mutex_);
   for (auto cfd : *(versions_->GetColumnFamilySet())) {
-    {
-      metadata->emplace_back();
-      cfd->current()->GetColumnFamilyMetaData(&metadata->back());
-    }
+    metadata->emplace_back();
+    Version* const version = cfd->current();
+    version->GetColumnFamilyMetaData(&metadata->back());
+    // Relocation files are listed in the same lock hold, with the same work
+    // per file as the blob files.
+    version->AppendBlobRelocationFileMetaData(&metadata->back());
   }
 }
 
@@ -8735,6 +8758,16 @@ Status DBImpl::PrepareFileIngestion(
     SuperVersion* super_version =
         ingestion_jobs[i]->GetColumnFamilyData()->GetReferencedSuperVersion(
             this);
+    // Prepare() reads the pending state only for DB-generated files (see
+    // ExternalSstFileIngestionJob::SetBlobIndirectionPendingAtPrepare()), so
+    // other ingestions do not take the DB mutex for it.
+    if (ingestion_jobs[i]->GetIngestionOptions().allow_db_generated_files) {
+      InstrumentedMutexLock l(&mutex_);
+      ingestion_jobs[i]->SetBlobIndirectionPendingAtPrepare(
+          ingestion_jobs[i]
+              ->GetColumnFamilyData()
+              ->HasPendingBlobIndirectionOutput());
+    }
     Status es = ingestion_jobs[i]->Prepare(
         args[i].external_files, args[i].files_checksums,
         args[i].files_checksum_func_names, args[i].file_infos,
@@ -8752,6 +8785,14 @@ Status DBImpl::PrepareFileIngestion(
     SuperVersion* super_version =
         ingestion_jobs[0]->GetColumnFamilyData()->GetReferencedSuperVersion(
             this);
+    // As above, only for DB-generated files.
+    if (ingestion_jobs[0]->GetIngestionOptions().allow_db_generated_files) {
+      InstrumentedMutexLock l(&mutex_);
+      ingestion_jobs[0]->SetBlobIndirectionPendingAtPrepare(
+          ingestion_jobs[0]
+              ->GetColumnFamilyData()
+              ->HasPendingBlobIndirectionOutput());
+    }
     Status es = ingestion_jobs[0]->Prepare(
         args[0].external_files, args[0].files_checksums,
         args[0].files_checksum_func_names, args[0].file_infos,
@@ -9031,10 +9072,46 @@ Status DBImpl::CommitFileIngestionHandles(
       // LogAndApply releases mutex_ while writing the MANIFEST. GetSnapshot()
       // can acquire it then even though snapshot creation remains blocked from
       // the lock-free path.
+      //
+      // The blob indirection publication check
+      // (ExternalSstFileIngestionJob::ValidateBlobIndirectionPublication())
+      // can fail only for a job that holds a DB-generated file that Prepare()
+      // did not scan. So it is the MANIFEST precondition (pre_cb) only for
+      // such an ingestion. Every other ingestion passes no precondition and
+      // can share a MANIFEST batch with other callers.
+      //
+      // pre_cb runs once, at the head of the MANIFEST writer queue (see the
+      // pre_cb contract of VersionSet::LogAndApply()). It passes only if each
+      // column family with such a file has no format fence, has
+      // enable_blob_indirection off in its latest options, and has no pending
+      // activation (ColumnFamilyData::HasPendingBlobIndirectionOutput()). The
+      // fence and the options change only through LogAndApply(), which waits
+      // behind this call. The pending state can change outside the MANIFEST
+      // queue, but a flush or compaction becomes pending only when the latest
+      // options have enable_blob_indirection on, and a flush marks a memtable
+      // only while it is already counted as pending. So none of the three can
+      // change before this ingestion is installed.
+      bool needs_publication_check = false;
+      for (const ExternalSstFileIngestionJob* job : ingestion_jobs) {
+        needs_publication_check |= job->HasUnscannedDbGeneratedFile();
+      }
+      std::function<Status()> publication_check;
+      if (needs_publication_check) {
+        publication_check = [&ingestion_jobs] {
+          TEST_SYNC_POINT("DBImpl::IngestExternalFiles:PublicationCheck");
+          for (const ExternalSstFileIngestionJob* job : ingestion_jobs) {
+            Status precondition = job->ValidateBlobIndirectionPublication();
+            if (!precondition.ok()) {
+              return precondition;
+            }
+          }
+          return Status::OK();
+        };
+      }
       status = versions_->LogAndApply(
           cfds_to_commit, read_options, write_options, edit_lists, &mutex_,
           directories_.GetDbDir(), /*new_descriptor_log=*/false,
-          /*new_cf_options=*/nullptr, manifest_wcbs, /*pre_cb=*/{},
+          /*new_cf_options=*/nullptr, manifest_wcbs, publication_check,
           max_file_opening_threads);
       // It is safe to update VersionSet last seqno here after LogAndApply since
       // LogAndApply persists last sequence number from VersionEdits,
@@ -9139,14 +9216,22 @@ Status DBImpl::CommitFileIngestionHandles(
   // arbitrary-size set of per-CF ingestion locks first so sanitizer lock
   // tracking and production lock hold times remain bounded.
   ingest_read_locks.clear();
-  if (status.ok()) {
+  {
     InstrumentedMutexLock l(&mutex_);
-    uint64_t snapshot_release_count = 0;
-    const SequenceNumber oldest_snapshot =
-        snapshots_.OldestOr([this]() { return GetLastPublishedSequence(); },
-                            &snapshot_release_count);
-    UpdateOldestSnapshotAndScheduleWork(oldest_snapshot, snapshot_release_count,
-                                        /*installed_cfd=*/nullptr);
+    // The ingestion has installed its SuperVersions, so the census state that
+    // its LogAndApply batch replaced can be freed now. This runs after writes
+    // resume, so that freeing a large census does not keep writes stopped (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()).
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
+    if (status.ok()) {
+      uint64_t snapshot_release_count = 0;
+      const SequenceNumber oldest_snapshot =
+          snapshots_.OldestOr([this]() { return GetLastPublishedSequence(); },
+                              &snapshot_release_count);
+      UpdateOldestSnapshotAndScheduleWork(oldest_snapshot,
+                                          snapshot_release_count,
+                                          /*installed_cfd=*/nullptr);
+    }
   }
 
   for (auto& sv_ctx : sv_ctxs) {
@@ -9324,6 +9409,10 @@ Status DBImpl::CreateColumnFamilyWithImport(
   {
     InstrumentedMutexLock l(&mutex_);
     ReleaseFileNumberFromPendingOutputs(pending_output_elem);
+    // The import has installed its SuperVersion, so the census state that its
+    // LogAndApply batches replaced can be freed now (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()).
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
   }
 
   import_job.Cleanup(status);
@@ -9541,23 +9630,35 @@ Status DBImpl::VerifyChecksumInternal(const ReadOptions& read_options,
     }
 
     if (s.ok() && use_file_checksum) {
-      const auto& blob_files = vstorage->GetBlobFiles();
-      for (const auto& meta : blob_files) {
-        assert(meta);
-
-        const uint64_t blob_file_number = meta->GetBlobFileNumber();
-
-        const std::string blob_file_name = BlobFileName(
-            cfd->ioptions().cf_paths.front().path, blob_file_number);
-        s = VerifyFullFileChecksum(meta->GetChecksumValue(),
-                                   meta->GetChecksumMethod(), blob_file_name,
-                                   read_options);
+      const auto verify_blob_file = [&](uint64_t file_number,
+                                        const std::string& checksum,
+                                        const std::string& checksum_method) {
+        const std::string file_name =
+            BlobFileName(cfd->ioptions().cf_paths.front().path, file_number);
+        Status status = VerifyFullFileChecksum(checksum, checksum_method,
+                                               file_name, read_options);
         RecordTick(stats_, VERIFY_CHECKSUM_READ_BYTES,
                    IOSTATS(bytes_read) - prev_bytes_read);
         prev_bytes_read = IOSTATS(bytes_read);
+        return status;
+      };
+      const auto& blob_files = vstorage->GetBlobFiles();
+      for (const auto& meta : blob_files) {
+        assert(meta);
+        s = verify_blob_file(meta->GetBlobFileNumber(),
+                             meta->GetChecksumValue(),
+                             meta->GetChecksumMethod());
         if (!s.ok()) {
           break;
         }
+      }
+      for (const auto& meta : vstorage->GetBlobRelocationFiles()) {
+        if (!s.ok()) {
+          break;
+        }
+        assert(meta != nullptr);
+        s = verify_blob_file(meta->GetFileNumber(), meta->GetChecksumValue(),
+                             meta->GetChecksumMethod());
       }
     }
     if (!s.ok()) {

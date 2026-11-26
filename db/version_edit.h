@@ -439,18 +439,54 @@ struct FileMetaData {
   // "Coarse SST" in db/blob/blob_reference_metadata.h.
   uint64_t oldest_coarse_indirect_origin_file_number = kInvalidBlobFileNumber;
   // Marks an SST in a CF with the format fence that has no descriptor and no
-  // coarse frontier, so that recovery accepts the SST. There are two cases: an
-  // SST created before the format was activated, and an SST whose coarse
+  // coarse frontier, so that recovery accepts the SST. There are three cases:
+  // an SST created before the format was activated, an SST whose coarse
   // classification has frontier 0 (it has no indirect references; see
-  // ExtractBlobReferenceClassificationFromTableProperties()). VersionBuilder
-  // sets it in memory for such an SST. A MANIFEST snapshot sets it for every
-  // SST of a fenced CF that has no descriptor and no coarse frontier, and
-  // writes it as an unignorable NewFile field. Edits that copy the file
-  // metadata (AddExistingFile()) carry it. Why the snapshot writes it: in a
-  // snapshot the format fence comes before (or in the same edit as) the SSTs of
-  // the CF, so replay checks every SST as one added after the fence. The marker
-  // lets replay accept an SST that has no descriptor and no coarse frontier.
+  // ExtractBlobReferenceClassificationFromTableProperties()), and an ingested
+  // SST, which never has a descriptor or a coarse frontier (see
+  // blob_reference_output_predates_indirection). VersionBuilder sets it in
+  // memory for such an SST. A MANIFEST snapshot sets it for every SST of a
+  // fenced CF that has no descriptor and no coarse frontier, and writes it as
+  // an unignorable NewFile field. Edits that copy the file metadata
+  // (AddExistingFile()) carry it. Why the snapshot writes it: in a snapshot the
+  // format fence comes before (or in the same edit as) the SSTs of the CF, so
+  // replay checks every SST as one added after the fence. The marker lets
+  // replay accept an SST that has no descriptor and no coarse frontier.
   bool blob_reference_legacy_metadata = false;
+  // Marks an SST that may have been written before the column family used
+  // enable_blob_indirection (a "predating output").
+  //
+  // Background: in a fenced CF, VersionBuilder (during the MANIFEST write and
+  // during recovery) rejects a new SST that has no exact descriptor, no coarse
+  // frontier and no legacy marker (blob_reference_legacy_metadata), unless the
+  // same edit only moves an SST that is already in the Version to another
+  // level. It accepts a legacy marker only after the fence of the CF was
+  // replayed, or in the edit that sets the fence (see
+  // ValidateBlobReferenceMetadata() in db/version_builder.cc). A predating
+  // output can have none of the three, so the MANIFEST writer adds the legacy
+  // marker.
+  //
+  // Three producers set the flag:
+  // - flush and compaction, when they ran with the option off on an input
+  //   Version without the format fence;
+  // - a file copy, when the input SST has no reference metadata and no coarse
+  //   frontier;
+  // - ingestion, for every file, also into a CF that already has the fence.
+  //
+  // Path to the MANIFEST:
+  // 1. VersionEdit::AddFile() records the flag
+  //    (VersionEdit::HasBlobReferenceOutputPredatingIndirection()).
+  // 2. LogAndApplyImpl() copies it to
+  //    ManifestWriter::has_predating_blob_reference_output.
+  // 3. The MANIFEST queue head in ProcessManifestWrites() calls
+  //    VersionEdit::MarkBlobReferenceOutputsPredatingIndirectionLegacy() when
+  //    the CF already has the fence or the same writer sets it. That call
+  //    marks the SST as legacy if it has no exact descriptor
+  //    (blob_reference_descriptor is empty). If the writer sets the fence, its
+  //    first edit also sets it, so that recovery accepts a legacy SST in an
+  //    earlier edit of the same writer.
+  // The flag is kept in memory only and is never encoded.
+  bool blob_reference_output_predates_indirection = false;
 
   // Skips prefetching index and filter blocks into block cache on file open,
   // not persisted in MANIFEST. NOTE: false does not guarantee prefetching
@@ -1020,6 +1056,8 @@ class VersionEdit {
   void AddFile(int level, const FileMetaData& f) {
     assert(f.fd.smallest_seqno <= f.fd.largest_seqno);
     new_files_.emplace_back(level, f);
+    has_blob_reference_output_predating_indirection_ |=
+        f.blob_reference_output_predates_indirection;
     files_to_quarantine_.push_back(f.fd.GetNumber());
     if (!HasLastSequence() || f.fd.largest_seqno > GetLastSequence()) {
       SetLastSequence(f.fd.largest_seqno);
@@ -1038,6 +1076,12 @@ class VersionEdit {
   const NewFiles& GetNewFiles() const { return new_files_; }
 
   NewFiles& GetMutableNewFiles() { return new_files_; }
+
+  bool HasBlobReferenceOutputPredatingIndirection() const {
+    return has_blob_reference_output_predating_indirection_;
+  }
+
+  void MarkBlobReferenceOutputsPredatingIndirectionLegacy();
 
   // Retrieve all the compact cursors
   using CompactCursors = std::vector<std::pair<int, InternalKey>>;
@@ -1465,6 +1509,7 @@ class VersionEdit {
   // Compaction cursors for round-robin compaction policy
   CompactCursors compact_cursors_;
   NewFiles new_files_;
+  bool has_blob_reference_output_predating_indirection_ = false;
 
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;
