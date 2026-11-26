@@ -605,7 +605,35 @@ class DBIter final : public Iterator {
     contiguous_tombstone_count_ = 0;
     range_tomb_first_key_.Clear();
     range_tomb_end_key_.Clear();
+    head_mark_candidate_ = false;
   }
+
+  // Head marks (see MemTableHeadMark in db/memtable.h). Seeks iter_ to
+  // saved_key_, using marks if use_head_marks_ is true and no scan options
+  // are set. If publish_head_marks_ is true, remembers the seek key and
+  // starts watching for a run of tombstones right after the seek.
+  void SeekInnerIterWithHeadMarks();
+
+  // Publishes a head mark into the active memtable if the run of tombstones
+  // started right after the seek. Called by MaybeInsertRangeTombstone() when a
+  // run of tombstones ends, before the conversion check. The mark is [seek key,
+  // end_key), where the seek key is the Seek() target after iterate_lower_bound
+  // is applied. It can start before the first tombstone, so a later seek also
+  // skips the gap before it. The converted range tombstone instead starts at
+  // the first tombstone of the run, and both end at end_key. An extension keeps
+  // the start of the mark it extends. A new mark needs at least
+  // min_tombstones_for_range_conversion_ tombstones. If a lowered mark of the
+  // active memtable moved the seek and is still current, a shorter run (even
+  // one tombstone) can extend it: the keys after the lowered end are often
+  // covered by an earlier converted range tombstone, which this scan does not
+  // count (see MemTableHeadMark::lowered).
+  // end_key is the same exclusive end as for the conversion. It is the key of
+  // the visible value or merge operand that ends the run, after its value is
+  // prepared, or saved_key_ when the scan stops at a prefix boundary, at the
+  // upper bound or at the end of the data. saved_key_ can have only entries
+  // newer than the read sequence number; the mark does not claim it. A scan
+  // that fails before its run ends publishes no mark.
+  void MaybePublishHeadMark(const Slice& end_key);
 
   // Returns true if there is no prefix constraint (prefix_ not set) or
   // if `key` is in the prefix extractor's domain and its prefix matches.
@@ -791,5 +819,37 @@ class DBIter final : public Iterator {
 
   IterKey range_tomb_first_key_;
   IterKey range_tomb_end_key_;
+
+  // Head marks (see MemTableHeadMark in db/memtable.h). Set in the
+  // constructor. A reader may use marks only if it would see every deletion
+  // that a mark skips: no read callback, no user-defined timestamps, no
+  // table_filter, range deletions not ignored, and a total order or
+  // prefix_same_as_start scan. Publishing also needs the conversion gate
+  // above (min_tombstones_for_range_conversion_ > 0), an active memtable with
+  // head marks enabled, a column family, and a nonzero Version number. Seeks
+  // with scan options never use or publish marks.
+  bool use_head_marks_ = false;
+  bool publish_head_marks_ = false;
+  // Valid if publish_head_marks_.
+  const HeadMarkIngestState* head_mark_ingest_ = nullptr;
+  // How a scan publishes a mark: an eligible Seek() (see
+  // SeekInnerIterWithHeadMarks()) sets this flag and saves its seek key in
+  // head_mark_start_. The first run of tombstones after the seek ends in one
+  // of two ways, and both call MaybeInsertRangeTombstone():
+  // - A visible value, a merge operand or a prefix boundary ends the run, and
+  //   FlushPendingTombstoneRun() calls it.
+  // - The scan reaches the upper bound or the end of the data, and
+  //   FindNextUserEntryInternal() calls it with the last tracked key if a run
+  //   exists and the iterator status is OK.
+  // MaybeInsertRangeTombstone() tries to publish [head_mark_start_, end of
+  // the run) before it checks the conversion threshold. That attempt, Next(),
+  // Prev() and a reset of the tombstone tracking clear the flag, so a scan
+  // tries at most once per seek.
+  bool head_mark_candidate_ = false;
+  // The seek key of the current scan (saved_key_ at the seek), if
+  // publish_head_marks_. A mark that moves the seek does not change it.
+  IterKey head_mark_start_;
+  // The mark of active_mem_ that moved the current seek, or nullptr.
+  const MemTableHeadMark* head_mark_sender_ = nullptr;
 };
 }  // namespace ROCKSDB_NAMESPACE

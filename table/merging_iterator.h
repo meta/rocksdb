@@ -19,6 +19,7 @@ namespace ROCKSDB_NAMESPACE {
 class Arena;
 class ArenaWrappedDBIter;
 class InternalKeyComparator;
+class ReadOnlyMemTable;
 
 template <class TValue>
 class InternalIteratorBase;
@@ -75,6 +76,14 @@ class MergeIteratorBuilder {
       std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr =
           nullptr);
 
+  // Tells the merging iterator that the iterator added last reads memtable
+  // `mem`, whose head marks a seek from DBIter may use (see
+  // MemTableHeadMark). Registers `mem` if head marks are enabled for it, even
+  // if it has no mark yet, because a scan can publish the first mark after
+  // this iterator is built. Does nothing if head marks are disabled for
+  // `mem`.
+  void SetHeadMarkMemTable(const ReadOnlyMemTable* mem);
+
   // Get arena used to build the merging iterator. It is called one a child
   // iterator needs to be allocated.
   Arena* GetArena() { return arena; }
@@ -93,6 +102,9 @@ class MergeIteratorBuilder {
  private:
   MergingIterator* merge_iter;
   InternalIterator* first_iter;
+  // The number of point iterators added. The i-th added one becomes child i
+  // of the merging iterator.
+  size_t num_iters_ = 0;
   bool use_merging_iter;
   Arena* arena;
   // Used to set LevelIterator.range_tombstone_iter_.

@@ -1,0 +1,1 @@
+With `min_tombstones_for_range_conversion` > 0, a forward scan that starts with `Seek()` on a run of point tombstones records a head mark in the active memtable, so later scans from the same key skip the deleted keys of that memtable and older levels in one seek. This helps queue workloads that consume from the head of a key range.

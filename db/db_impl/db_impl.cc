@@ -3338,6 +3338,7 @@ InternalIterator* DBImpl::NewInternalIterator(
       }
       merge_iter_builder.AddPointAndTombstoneIterator(
           mem_iter, std::move(mem_tombstone_iter));
+      merge_iter_builder.SetHeadMarkMemTable(super_version->mem);
     } else {
       merge_iter_builder.AddIterator(mem_iter);
     }
@@ -4296,6 +4297,7 @@ Status DBImpl::MultiCFSnapshot(const ReadOptions& read_options,
     } else {
       node->super_version = GetAndRefSuperVersion(node->cfd);
     }
+    TEST_SYNC_POINT("DBImpl::MultiCFSnapshot::SingleCFAfterRefSV");
     if (check_read_ts) {
       s = FailIfReadCollapsedHistory(node->cfd, node->super_version,
                                      *(read_options.timestamp));
@@ -4326,6 +4328,36 @@ Status DBImpl::MultiCFSnapshot(const ReadOptions& read_options,
       // the snapshot, but the snapshot is earlier than the data overwriting it,
       // so users may see wrong results.
       *snapshot = GetLastPublishedSequence();
+      // See SuperVersionMissesIngestion(). The sequence number is read again
+      // after the new reference, for the reason given above.
+      //
+      // References: the read owns one reference to node->super_version.
+      // Without extra_sv_ref it came from the thread-local slot, which is then
+      // marked kSVInUse. ReplaceSuperVersionMissingIngestion() takes a new
+      // reference under the DB mutex and releases the old one. When the
+      // ingestion installed its SuperVersion, it marked every thread-local
+      // slot kSVObsolete. On success the caller of this function releases the
+      // new reference, and on an error sv_cleanup_func() releases it. Both
+      // call ReturnAndCleanupSuperVersion(), and
+      // ReturnThreadLocalSuperVersion() keeps a reference only in a slot that
+      // is still kSVInUse, so the new reference is released and not cached.
+      // With extra_sv_ref, the reference is independent of the slot and is
+      // released with CleanupSuperVersion().
+      while (SuperVersionMissesIngestion(*node->cfd, *node->super_version)) {
+        node->super_version =
+            ReplaceSuperVersionMissingIngestion(node->cfd, node->super_version);
+        *snapshot = GetLastPublishedSequence();
+        // The read timestamp was checked against the first SuperVersion
+        // above, so the new one gets the same check. On an error, the
+        // cleanup below releases the new SuperVersion.
+        if (check_read_ts) {
+          s = FailIfReadCollapsedHistory(node->cfd, node->super_version,
+                                         *(read_options.timestamp));
+          if (!s.ok()) {
+            break;
+          }
+        }
+      }
     }
   } else {
     // If we end up with the same issue of memtable getting sealed during 2
@@ -4343,18 +4375,25 @@ Status DBImpl::MultiCFSnapshot(const ReadOptions& read_options,
       if (i > 0) {
         sv_cleanup_func();
       }
-      if (read_options.snapshot == nullptr) {
-        *snapshot = GetLastPublishedSequence();
-      } else {
+      if (read_options.snapshot != nullptr) {
         *snapshot =
             static_cast_with_check<const SnapshotImpl>(read_options.snapshot)
                 ->number_;
+      } else if (!acquire_mutex) {
+        *snapshot = GetLastPublishedSequence();
       }
       if (acquire_mutex) {
         TEST_SYNC_POINT("DBImpl::MultiCFSnapshot::LastTry");
         // We're close to max number of retries. For the last retry,
         // acquire the lock so we're sure to succeed
         mutex_.Lock();
+        // Without a snapshot, read the sequence number under the mutex. No
+        // SuperVersion can be installed until the references below are taken,
+        // so a flush cannot drop a version that this sequence number needs.
+        // A sequence number read before the mutex has no such guarantee.
+        if (read_options.snapshot == nullptr) {
+          *snapshot = GetLastPublishedSequence();
+        }
       }
       for (auto cf_iter = cf_list->begin(); cf_iter != cf_list->end();
            ++cf_iter) {
@@ -4397,7 +4436,8 @@ Status DBImpl::MultiCFSnapshot(const ReadOptions& read_options,
         if (!acquire_mutex) {
           SequenceNumber seq =
               node->super_version->mem->GetEarliestSequenceNumber();
-          if (seq > *snapshot) {
+          if (seq > *snapshot ||
+              SuperVersionMissesIngestion(*node->cfd, *node->super_version)) {
             retry = true;
             break;
           }
@@ -5778,36 +5818,67 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
     // Note: no need to consider the special case of
     // last_seq_same_as_publish_seq_==false since NewIterator is overridden in
     // WritePreparedTxnDB
-    result = NewIteratorImpl(read_options, cfh, sv,
-                             (read_options.snapshot != nullptr)
-                                 ? read_options.snapshot->GetSequenceNumber()
-                                 : kMaxSequenceNumber,
+    SequenceNumber snapshot = kMaxSequenceNumber;
+    if (read_options.snapshot != nullptr) {
+      snapshot = read_options.snapshot->GetSequenceNumber();
+    } else {
+      const Status s = ReadIteratorSequence(read_options, cfd, &sv, &snapshot);
+      if (!s.ok()) {
+        CleanupSuperVersion(sv);
+        return NewErrorIterator(s);
+      }
+    }
+    result = NewIteratorImpl(read_options, cfh, sv, snapshot,
                              nullptr /* read_callback */);
   }
   return result;
+}
+
+Status DBImpl::ReadIteratorSequence(const ReadOptions& read_options,
+                                    ColumnFamilyData* cfd, SuperVersion** sv,
+                                    SequenceNumber* snapshot) {
+  TEST_SYNC_POINT("DBImpl::NewIterator:1");
+  TEST_SYNC_POINT("DBImpl::NewIterator:2");
+  // The caller has referenced `*sv`, so the sequence number is read after it
+  // (the pin-first rule at SuperVersionMissesIngestion()).
+  *snapshot = versions_->LastSequence();
+  TEST_SYNC_POINT("DBImpl::NewIterator:3");
+  TEST_SYNC_POINT("DBImpl::NewIterator:4");
+  // A snapshot that the caller passes already existed when the SuperVersion
+  // was referenced, and a snapshot at or above an ingested sequence number
+  // can be created only after the ingestion installs its SuperVersion. So
+  // only a read without a snapshot needs the check (see
+  // SuperVersionMissesIngestion()). The sequence number is read again after
+  // the new reference, by the same rule. The caller checked the
+  // table_filter and the read timestamp against the first SuperVersion, so
+  // each new SuperVersion gets the same checks.
+  const bool check_read_ts =
+      read_options.timestamp && read_options.timestamp->size() > 0;
+  while (SuperVersionMissesIngestion(*cfd, **sv)) {
+    *sv = ReplaceSuperVersionMissingIngestion(cfd, *sv);
+    *snapshot = versions_->LastSequence();
+    Status s = FailIfTableFilterWithRangeConversion(read_options,
+                                                    (*sv)->mutable_cf_options);
+    if (!s.ok()) {
+      return s;
+    }
+    if (check_read_ts) {
+      s = FailIfReadCollapsedHistory(cfd, *sv, *(read_options.timestamp));
+      if (!s.ok()) {
+        return s;
+      }
+    }
+  }
+  return Status::OK();
 }
 
 ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
     const ReadOptions& read_options, ColumnFamilyHandleImpl* cfh,
     SuperVersion* sv, SequenceNumber snapshot, ReadCallback* read_callback,
     bool expose_blob_index, bool allow_refresh) {
-  TEST_SYNC_POINT("DBImpl::NewIterator:1");
-  TEST_SYNC_POINT("DBImpl::NewIterator:2");
-
-  if (snapshot == kMaxSequenceNumber) {
-    // Note that the snapshot is assigned AFTER referencing the super
-    // version because otherwise a flush happening in between may compact away
-    // data for the snapshot, so the reader would see neither data that was be
-    // visible to the snapshot before compaction nor the newer data inserted
-    // afterwards.
-    // Note that the super version might not contain all the data available
-    // to this snapshot, but in that case it can see all the data in the
-    // super version, which is a valid consistent state after the user
-    // calls NewIterator().
-    snapshot = versions_->LastSequence();
-    TEST_SYNC_POINT("DBImpl::NewIterator:3");
-    TEST_SYNC_POINT("DBImpl::NewIterator:4");
-  }
+  // DBImpl::NewIterator() reads the sequence number of a read without a
+  // snapshot with ReadIteratorSequence(); every other caller passes one.
+  assert(snapshot != kMaxSequenceNumber);
 
   // Try to generate a DB iterator tree in continuous memory area to be
   // cache friendly. Here is an example of result:
@@ -6718,6 +6789,19 @@ SuperVersion* DBImpl::GetAndRefSuperVersion(uint32_t column_family_id) {
   return GetAndRefSuperVersion(cfd);
 }
 
+SuperVersion* DBImpl::ReplaceSuperVersionMissingIngestion(ColumnFamilyData* cfd,
+                                                          SuperVersion* sv) {
+  SuperVersion* current;
+  TEST_SYNC_POINT("DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock");
+  {
+    InstrumentedMutexLock l(&mutex_);
+    current = cfd->GetSuperVersion()->Ref();
+  }
+  // CleanupSuperVersion() takes the DB mutex if this is the last reference.
+  CleanupSuperVersion(sv);
+  return current;
+}
+
 void DBImpl::CleanupSuperVersion(SuperVersion* sv) {
   // Release SuperVersion
   if (sv->Unref()) {
@@ -7114,6 +7198,13 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
   std::set<FileMetaData*> deleted_files;
   JobContext job_context(next_job_id_.fetch_add(1), true);
   {
+    // A deleted file can hold a range tombstone that hides an older key in a
+    // lower level, which becomes visible again. The head marks of the
+    // memtables are cleared and the new Version is recorded as for a file
+    // ingestion (see MemTableHeadMark). Like an ingestion, this takes
+    // ingest_sst_lock before the DB mutex and holds it until the new
+    // SuperVersion is installed.
+    ReadLock ingest_rl(&cfd->GetIngestSstLock());
     InstrumentedMutexLock l(&mutex_);
     Version* input_version = cfd->current();
 
@@ -7178,9 +7269,12 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
       return status;
     }
     input_version->Ref();
+    cfd->ClearHeadMarks();
     status = versions_->LogAndApply(cfd, read_options, write_options, &edit,
                                     &mutex_, directories_.GetDbDir());
     if (status.ok()) {
+      cfd->RecordFileChangeForHeadMarks(cfd->current()->GetVersionNumber(),
+                                        /*seqno=*/0);
       InstallSuperVersionAndScheduleWork(
           cfd, job_context.superversion_contexts.data(),
           /*defer_snapshot_refresh=*/false);
@@ -8728,6 +8822,13 @@ Status DBImpl::CommitFileIngestionHandles(
         if (assigned > 0) {
           cfd->mem()->BumpIngestSeqnoBarrier(assigned);
         }
+        // The ingested keys go to older levels, possibly at sequence number
+        // 0, and skip the memtable write path that shortens a mark covering
+        // them. A mark moves the seek in older levels past every key in its
+        // usable range, so it would hide them (see MemTableHeadMark). The
+        // ingest_sst_lock read lock stays held until the ingestion state is
+        // recorded below, so no scan publishes a mark before that.
+        cfd->ClearHeadMarks();
       }
     }
     if (status.ok()) {
@@ -8777,6 +8878,20 @@ Status DBImpl::CommitFileIngestionHandles(
           directories_.GetDbDir(), false /* new_descriptor_log */,
           nullptr /* new_cf_options */, manifest_wcbs, {} /* pre_cb */,
           max_file_opening_threads);
+      // Record the ingestion's Version in the column family before the
+      // sequence numbers below are published. A read uses it to tell if its
+      // SuperVersion has the ingested files, and gets the current
+      // SuperVersion if not (see DBImpl::SuperVersionMissesIngestion()). The
+      // memtable barrier further below has a different user: a scan that
+      // tries to insert a converted range tombstone. Both are recorded for
+      // every successful ingestion, also one that assigns no new sequence
+      // number.
+      if (status.ok()) {
+        for (auto* job : ingestion_jobs) {
+          auto* cfd = job->GetColumnFamilyData();
+          cfd->SetLastIngestVersionNumber(cfd->current()->GetVersionNumber());
+        }
+      }
       // It is safe to update VersionSet last seqno here after LogAndApply since
       // LogAndApply persists last sequence number from VersionEdits,
       // which are from file's largest seqno and not from VersionSet.
@@ -8810,6 +8925,8 @@ Status DBImpl::CommitFileIngestionHandles(
           auto* cfd = job->GetColumnFamilyData();
           cfd->mem()->BumpIngestVersionBarrier(
               cfd->current()->GetVersionNumber());
+          cfd->RecordFileChangeForHeadMarks(cfd->current()->GetVersionNumber(),
+                                            job->MaxAssignedSequenceNumber());
         }
       }
     }

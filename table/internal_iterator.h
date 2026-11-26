@@ -19,6 +19,8 @@
 namespace ROCKSDB_NAMESPACE {
 
 class PinnedIteratorsManager;
+class ReadOnlyMemTable;
+struct MemTableHeadMark;
 
 template <class TValue>
 class InternalIteratorBase : public Cleanable {
@@ -65,6 +67,25 @@ class InternalIteratorBase : public Cleanable {
   // happened during the seek, not any past errors.
   // 'target' contains user timestamp if timestamp is enabled.
   virtual void Seek(const Slice& target) = 0;
+
+  // Same as Seek(), but may also use memtable head marks (see
+  // MemTableHeadMark) to seek over a deleted range. Only DBIter calls it, for
+  // the seek of a user scan. Only marks whose seq is at most `read_seq` and
+  // whose ingest_version is at most `read_version` (the number of the scan's
+  // Version) are used. The seek may use the marks of every memtable that the
+  // merging iterator registered. `mark_mem` only selects which mark is
+  // returned: if a mark of memtable `mark_mem` moved the seek, *used_mark is
+  // set to it, so that DBIter can try to extend it; otherwise *used_mark is
+  // nullptr. A null `mark_mem` still lets marks move the seek. The default
+  // ignores marks.
+  virtual void SeekWithHeadMarks(const Slice& target,
+                                 SequenceNumber /*read_seq*/,
+                                 uint64_t /*read_version*/,
+                                 const ReadOnlyMemTable* /*mark_mem*/,
+                                 const MemTableHeadMark** used_mark) {
+    *used_mark = nullptr;
+    Seek(target);
+  }
 
   // Position at the first key in the source that at or before target
   // The iterator is Valid() after this call iff the source contains

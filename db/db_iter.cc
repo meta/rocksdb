@@ -132,9 +132,20 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       // can hide newer UDT versions unless the read is at max timestamp with no
       // lower timestamp bound. Legacy prefix iterators without
       // prefix_same_as_start do not guarantee complete scans, so conversion
-      // must stay disabled for the iterator lifetime.
+      // must stay disabled for the iterator lifetime. With unordered_write, a
+      // write publishes its sequence number before it inserts into the
+      // memtable. While that insert is pending, a later write can publish a
+      // higher sequence number. An iterator opened at that higher sequence
+      // number can miss the pending key, although its snapshot includes it.
+      // The converted range tombstone gets the read sequence number, and a
+      // range tombstone covers only entries with a smaller sequence number.
+      // Because of the later write, the read sequence number is above the
+      // pending key's, so the range tombstone covers the key: every read at
+      // that sequence number or higher would see the key deleted, also after
+      // the insert finishes.
       min_tombstones_for_range_conversion_(
-          active_mem != nullptr && !HasTableFilter(read_options) &&
+          active_mem != nullptr && !ioptions.unordered_write &&
+                  !HasTableFilter(read_options) &&
                   read_options.read_tier == kReadAllTier &&
                   (expect_total_order_inner_iter_ || prefix_same_as_start_) &&
                   HasFullTimestampVisibility(read_options)
@@ -156,6 +167,16 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
   // prefix_seek_opt_in_only should force total_order_seek whereever the caller
   // is duplicating the original ReadOptions
   assert(!ioptions.prefix_seek_opt_in_only || read_options.total_order_seek);
+  use_head_marks_ = read_callback_ == nullptr && timestamp_size_ == 0 &&
+                    !read_options.ignore_range_deletions &&
+                    !HasTableFilter(read_options) &&
+                    (expect_total_order_inner_iter_ || prefix_same_as_start_);
+  publish_head_marks_ =
+      use_head_marks_ && min_tombstones_for_range_conversion_ > 0 &&
+      active_mem_->HeadMarksEnabled() && cfd != nullptr && version_number_ != 0;
+  if (publish_head_marks_) {
+    head_mark_ingest_ = &cfd->GetHeadMarkIngestState();
+  }
   if (active_mem_) {
     // FIXME: GetEarliestSequenceNumber() may return a seqno that is one smaller
     // than the smallest seqno in the memtable. This violates its comment and
@@ -237,6 +258,7 @@ void DBIter::Next() {
   local_stats_.skip_count_--;
   num_internal_keys_skipped_ = 0;
   iter_step_since_seek_++;
+  head_mark_candidate_ = false;
   bool ok = true;
   if (direction_ == kReverse) {
     is_key_seqnum_zero_ = false;
@@ -1873,7 +1895,46 @@ void DBIter::FlushPendingTombstoneRun(const Slice& end_key,
   ResetContiguousTombstoneTracking();
 }
 
+void DBIter::SeekInnerIterWithHeadMarks() {
+  head_mark_sender_ = nullptr;
+  if (!use_head_marks_ || scan_opts_.has_value()) {
+    iter_.Seek(saved_key_.GetInternalKey());
+    return;
+  }
+  iter_.SeekWithHeadMarks(
+      saved_key_.GetInternalKey(), sequence_, version_number_,
+      publish_head_marks_ ? active_mem_ : nullptr, &head_mark_sender_);
+  if (publish_head_marks_) {
+    head_mark_candidate_ = true;
+    head_mark_start_.SetUserKey(saved_key_.GetUserKey(), true /* copy */);
+  }
+}
+
+void DBIter::MaybePublishHeadMark(const Slice& end_key) {
+  head_mark_candidate_ = false;
+  assert(publish_head_marks_);
+  // The same sequence number rule as for conversion (see
+  // MaybeInsertRangeTombstone()): older levels must hold no entry above
+  // sequence_.
+  if (contiguous_tombstone_count_ == 0 || unbounded_prefix_scan_ ||
+      sequence_ < active_mem_->GetEarliestSequenceNumber()) {
+    return;
+  }
+  const Slice start = head_mark_start_.GetUserKey();
+  if (user_comparator_.Compare(start, end_key) >= 0) {
+    return;
+  }
+  [[maybe_unused]] HeadMarkPublishResult result = active_mem_->PublishHeadMark(
+      start, end_key, sequence_, head_mark_sender_,
+      contiguous_tombstone_count_ >= min_tombstones_for_range_conversion_,
+      version_number_, *head_mark_ingest_, *ingest_sst_lock_);
+  TEST_SYNC_POINT_CALLBACK("DBIter::MaybePublishHeadMark:Result", &result);
+}
+
 void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
+  if (head_mark_candidate_) {
+    MaybePublishHeadMark(end_key);
+  }
   if (contiguous_tombstone_count_ < min_tombstones_for_range_conversion_ ||
       unbounded_prefix_scan_) {
     return;
@@ -2208,7 +2269,7 @@ void DBIter::Seek(const Slice& target) {
     PERF_TIMER_GUARD(seek_internal_seek_time);
 
     SetSavedKeyToSeekTarget(target);
-    iter_.Seek(saved_key_.GetInternalKey());
+    SeekInnerIterWithHeadMarks();
 
     RecordTick(statistics_, NUMBER_DB_SEEK);
   }

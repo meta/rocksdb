@@ -3,13 +3,16 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <future>
 #include <memory>
+#include <set>
 
 #include "db/db_test_util.h"
 #include "db/version_set.h"
 #include "port/stack_trace.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/merge_operators.h"
 
@@ -3331,6 +3334,90 @@ TEST_F(DBRangeDelTest, PrefixSameAsStartUnboundedScanNoRangeConversion) {
                    READ_PATH_RANGE_TOMBSTONES_INSERTED));
 }
 
+TEST_F(DBRangeDelTest, UnorderedWriteRangeConversionKeepsPendingWrite) {
+  // With unordered_write, a write publishes its sequence number before it
+  // inserts into the memtable. In this test, "b1", "b2", "b4" and "b5" are
+  // deleted, and a writer of "b3" is paused after it publishes its sequence
+  // number and before it inserts. The test then writes "d", so a new scan
+  // reads at a sequence number above the one of "b3". The scan does not see
+  // "b3", so it sees the four deletes as one run. A range tombstone over that
+  // run would get the scan's sequence number, so every read at that sequence
+  // number or higher would miss "b3", also after the insert of "b3"
+  // finishes. With unordered_write the scan inserts no converted range
+  // tombstone.
+  Options options = CurrentOptions();
+  options.unordered_write = true;
+  // With a threshold of 2, a conversion of the four deletes would insert
+  // ["b1", "c"), which covers "b3".
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("c", "vc"));
+  for (const char* k : {"b1", "b2", "b4", "b5"}) {
+    ASSERT_OK(Delete(k));
+  }
+
+  // Only the "b3" writer stops in the callback. The test thread's own write
+  // below takes the same code path and must not stop.
+  std::atomic<std::thread::id> paused_writer{};
+  std::promise<void> published;
+  std::promise<void> scan_done;
+  std::shared_future<void> scan_done_future = scan_done.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::WriteImpl:BeforeUnorderedWriteMemtable", [&](void*) {
+        if (std::this_thread::get_id() == paused_writer.load()) {
+          published.set_value();
+          scan_done_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  {
+    port::Thread writer([&] {
+      paused_writer.store(std::this_thread::get_id());
+      ASSERT_OK(Put("b3", "v3"));
+    });
+    // This Defer releases and joins the writer, even when an assertion below
+    // fails.
+    Defer release_writer([&] {
+      scan_done.set_value();
+      writer.join();
+    });
+    // A bounded wait: the test fails instead of hanging if the writer never
+    // reaches the callback.
+    ASSERT_EQ(std::future_status::ready,
+              published.get_future().wait_for(std::chrono::minutes(5)));
+    // Write "d", so the iterator below gets a read sequence number above the
+    // pending "b3" write's. A converted range tombstone would get the scan's
+    // read sequence number, so it would cover the pending write.
+    ASSERT_OK(Put("d", "vd"));
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    std::vector<std::string> keys;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+    ASSERT_OK(iter->status());
+    // "b3" is not in the memtable yet, so the scan cannot see it.
+    ASSERT_EQ((std::vector<std::string>{"a", "c", "d"}), keys);
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // "b3" finished its write, so every new read must see it.
+  ASSERT_EQ("v3", Get("b3"));
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->Seek("b");
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ("b3", iter->key());
+  }
+  ASSERT_EQ(0, options.statistics->getTickerCount(
+                   READ_PATH_RANGE_TOMBSTONES_INSERTED));
+}
+
 TEST_F(DBRangeDelTest, RefreshMemtableIter) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
@@ -4363,6 +4450,1168 @@ TEST_F(DBRangeDelTest, SeekForPrevTest) {
   }
   ASSERT_OK(iter2->status());
   iter2.reset();
+}
+
+namespace {
+// Head mark tests (see MemTableHeadMark in db/memtable.h). The queue keys are
+// "q0000", "q0001", ... A consumer scan starts with Seek("q").
+std::string QKey(int i) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "q%04d", i);
+  return buf;
+}
+
+// A mark of the active memtable, with copies of its keys.
+struct HeadMarkView {
+  std::string start;
+  std::string end;
+  std::string usable_end;
+  bool lowered = false;
+  bool operator==(const HeadMarkView& o) const {
+    return start == o.start && end == o.end && usable_end == o.usable_end &&
+           lowered == o.lowered;
+  }
+};
+
+std::ostream& operator<<(std::ostream& os, const HeadMarkView& m) {
+  return os << "[" << m.start << ", " << m.end
+            << ") usable_end=" << m.usable_end << (m.lowered ? " lowered" : "");
+}
+
+// Counts the seeks that a mark moved and records every publish result.
+class HeadMarkTracker {
+ public:
+  HeadMarkTracker() {
+    SyncPoint::GetInstance()->SetCallBack("MergingIterator::SeekOverHeadMark",
+                                          [this](void*) { ++uses; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBIter::MaybePublishHeadMark:Result", [this](void* arg) {
+          results.push_back(*static_cast<HeadMarkPublishResult*>(arg));
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+  ~HeadMarkTracker() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+  void Reset() {
+    uses = 0;
+    results.clear();
+  }
+  int uses = 0;
+  std::vector<HeadMarkPublishResult> results;
+};
+}  // namespace
+
+class DBHeadMarkTest : public DBRangeDelTest {
+ public:
+  Options HeadMarkOptions() {
+    Options options = CurrentOptions();
+    // A run of 4 tombstones is enough for a mark, so short tests make marks.
+    options.min_tombstones_for_range_conversion = 4;
+    options.disable_auto_compactions = true;
+    options.write_buffer_size = 64 << 20;
+    return options;
+  }
+
+  // Puts "q0000" .. "q<n-1>", then deletes the first `deleted` of them.
+  void MakeQueue(int n, int deleted) {
+    for (int i = 0; i < n; ++i) {
+      ASSERT_OK(Put(QKey(i), "v"));
+    }
+    for (int i = 0; i < deleted; ++i) {
+      ASSERT_OK(Delete(QKey(i)));
+    }
+  }
+
+  std::vector<HeadMarkView> ActiveMarks() {
+    auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
+        db_->DefaultColumnFamily());
+    std::vector<HeadMarkView> views;
+    for (const MemTableHeadMark& m :
+         cfh->cfd()->mem()->MemTable::TEST_HeadMarks()) {
+      views.push_back({m.start.ToString(), m.end.ToString(),
+                       m.usable_end.ToString(), m.lowered});
+    }
+    return views;
+  }
+
+  // The head mark bytes of the active memtable, and their budget.
+  std::pair<size_t, size_t> HeadMarkBytesAndBudget() {
+    const MemTable* mem = static_cast_with_check<ColumnFamilyHandleImpl>(
+                              db_->DefaultColumnFamily())
+                              ->cfd()
+                              ->mem();
+    return {mem->TEST_HeadMarkBytes(), mem->TEST_HeadMarkByteBudget()};
+  }
+
+  // Returns an iterator of the default column family that keeps the Version
+  // from before an ingestion but reads at the ingested file's sequence number
+  // S. The ingested file deletes `deleted`, which must overlap an SST file and
+  // no memtable key, so the file gets a new sequence number and the memtable
+  // is not flushed. An iterator that references its Version before it reads
+  // the sequence number gets the current Version instead (see
+  // DBImpl::SuperVersionMissesIngestion()). Only an in-place
+  // Iterator::Refresh() can still pair the two: one IngestExternalFiles()
+  // call into the column families "other" (handles_[0]) and default pauses
+  // after it has published S and installed the first column family, while
+  // the iterator refreshes in place. Requires CreateColumnFamilies({"other"}).
+  // Do not scan before calling it: a converted range tombstone in the default
+  // memtable makes Refresh() rebuild the tree, which waits for the DB mutex
+  // that the paused ingestion holds, so the test would hang. Returns nullptr
+  // after a test failure, for example if the ingestion fails before it
+  // pauses; every wait is bounded, so the test fails instead of hanging. It
+  // turns sync point processing off at the end, so create a HeadMarkTracker
+  // after calling it.
+  std::unique_ptr<Iterator> IteratorWithOldVersionAtNewSeq(
+      const Options& options, const std::string& deleted) {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    const std::string other_file = dbname_ + "/other.sst";
+    const std::string file = dbname_ + "/ingest.sst";
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      EXPECT_OK(writer.Open(other_file));
+      EXPECT_OK(writer.Put("x", "v"));
+      EXPECT_OK(writer.Finish());
+    }
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      EXPECT_OK(writer.Open(file));
+      EXPECT_OK(writer.Delete(deleted));
+      EXPECT_OK(writer.Finish());
+    }
+    // `paused` gets true when the ingestion pauses, or false if the ingestion
+    // returns without pausing. `once` makes sure only one of them sets it.
+    std::atomic<bool> once{false};
+    std::promise<bool> paused;
+    std::promise<void> refreshed;
+    std::shared_future<void> refreshed_future = refreshed.get_future().share();
+    constexpr char kPause[] =
+        "DBImpl::IngestExternalFiles:InstallSVForFirstCF:0";
+    SyncPoint::GetInstance()->SetCallBack(kPause, [&](void*) {
+      if (!once.exchange(true)) {
+        paused.set_value(true);
+        refreshed_future.wait_for(std::chrono::minutes(5));
+      }
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+    port::Thread ingester([&]() {
+      IngestExternalFileArg other_arg;
+      other_arg.column_family = handles_[0];
+      other_arg.external_files = {other_file};
+      IngestExternalFileArg arg;
+      arg.column_family = db_->DefaultColumnFamily();
+      arg.external_files = {file};
+      EXPECT_OK(db_->IngestExternalFiles({other_arg, arg}));
+      if (!once.exchange(true)) {
+        paused.set_value(false);
+      }
+    });
+    // This Defer releases and joins the ingester, even after a failure.
+    bool released = false;
+    Defer cleanup([&]() {
+      if (!released) {
+        refreshed.set_value();
+      }
+      ingester.join();
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearCallBack(kPause);
+    });
+    std::future<bool> paused_future = paused.get_future();
+    if (paused_future.wait_for(std::chrono::minutes(5)) !=
+            std::future_status::ready ||
+        !paused_future.get()) {
+      ADD_FAILURE() << "The ingestion did not pause";
+      return nullptr;
+    }
+    // The ingestion holds the DB mutex here. The default column family still
+    // has its old SuperVersion, so the refresh keeps the iterator tree and
+    // takes the new sequence number without the mutex.
+    EXPECT_OK(iter->Refresh());
+    released = true;
+    refreshed.set_value();
+    return iter;
+  }
+
+  // Writes the layout of the DeleteFilesInRange() tests. An L2 file holds
+  // "q0", and an L1 file holds the range tombstone ["q", "q1"), which hides
+  // it. "a" and "z" keep the L2 file out of the range that DeleteL1File()
+  // deletes. The memtable holds the queue of MakeQueue(11, 10). "q0" sorts
+  // before "q0000", so the converted range tombstone, which starts at the
+  // first point tombstone q0000, does not cover it, but a mark, which starts
+  // at the seek key "q", does.
+  void MakeKeyHiddenByL1File() {
+    ASSERT_OK(Put("a", "va"));
+    ASSERT_OK(Put("q0", "old"));
+    ASSERT_OK(Put("z", "vz"));
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(2);
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "q",
+                               "q1"));
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(1);
+    MakeQueue(/*n=*/11, /*deleted=*/10);
+  }
+
+  // Deletes the L1 file of MakeKeyHiddenByL1File(), which makes "q0" visible.
+  void DeleteL1File() {
+    const Slice begin("q");
+    const Slice end("q1");
+    ASSERT_OK(DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &begin,
+                                 &end));
+    ASSERT_EQ(1, NumTableFilesAtLevel(2));
+    ASSERT_EQ(0, NumTableFilesAtLevel(1));
+  }
+
+  // Returns the first key at or after `target`, or "" if there is none.
+  std::string SeekFirst(const std::string& target,
+                        const ReadOptions& ro = ReadOptions()) {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    iter->Seek(target);
+    EXPECT_OK(iter->status());
+    return iter->Valid() ? iter->key().ToString() : "";
+  }
+};
+
+TEST_F(DBHeadMarkTest, ScanPublishesMarkAndNextScanUsesIt) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  HeadMarkTracker tracker;
+
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kPublished},
+      tracker.results);
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+  ASSERT_EQ(0, tracker.uses);
+
+  // The next scan seeks over the dead prefix with the mark and finds no run
+  // to publish.
+  tracker.Reset();
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(1, tracker.uses);
+  ASSERT_TRUE(tracker.results.empty());
+  // A seek key inside the mark uses it too.
+  ASSERT_EQ(QKey(10), SeekFirst(QKey(3)));
+  ASSERT_EQ(2, tracker.uses);
+}
+
+TEST_F(DBHeadMarkTest, RunInTheMiddleOfAScanMakesNoMark) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/0);
+  for (int i = 1; i < 11; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  HeadMarkTracker tracker;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->Seek("q");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(QKey(0), iter->key());
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(QKey(11), iter->key());
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(tracker.results.empty());
+  ASSERT_TRUE(ActiveMarks().empty());
+}
+
+TEST_F(DBHeadMarkTest, SeveralQueuesGetSeparateMarks) {
+  DestroyAndReopen(HeadMarkOptions());
+  for (const char* q : {"a", "b"}) {
+    for (int i = 0; i < 10; ++i) {
+      ASSERT_OK(Put(q + std::to_string(i), "v"));
+    }
+    for (int i = 0; i < 6; ++i) {
+      ASSERT_OK(Delete(q + std::to_string(i)));
+    }
+  }
+  ASSERT_EQ("a6", SeekFirst("a"));
+  ASSERT_EQ("b6", SeekFirst("b"));
+  ASSERT_EQ(std::vector<HeadMarkView>(
+                {{"a", "a6", "a6", false}, {"b", "b6", "b6", false}}),
+            ActiveMarks());
+}
+
+TEST_F(DBHeadMarkTest, ScanSentByMarkExtendsIt) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/30, /*deleted=*/10);
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  HeadMarkTracker tracker;
+
+  // Two more deletions are too few for an extension.
+  ASSERT_OK(Delete(QKey(10)));
+  ASSERT_OK(Delete(QKey(11)));
+  ASSERT_EQ(QKey(12), SeekFirst("q"));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kRefusedShort},
+      tracker.results);
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+
+  // Four tombstones after the mark are enough.
+  tracker.Reset();
+  ASSERT_OK(Delete(QKey(12)));
+  ASSERT_OK(Delete(QKey(13)));
+  ASSERT_EQ(QKey(14), SeekFirst("q"));
+  ASSERT_EQ(1, tracker.uses);
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kExtended},
+      tracker.results);
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(14), QKey(14), false}}),
+            ActiveMarks());
+}
+
+TEST_F(DBHeadMarkTest, LatePutLowersMarkAndDeleteRepairsIt) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+
+  // A late item inside the dead prefix lowers the mark, so scans find it.
+  ASSERT_OK(Put(QKey(5), "late"));
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(5), QKey(5), true}}),
+            ActiveMarks());
+  ASSERT_EQ(QKey(5), SeekFirst("q"));
+  // A deletion inside the mark does not change it.
+  ASSERT_OK(Delete(QKey(3)));
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(5), QKey(5), true}}),
+            ActiveMarks());
+
+  // After the consumer deletes the late item, the next scan sees one
+  // tombstone, and the rest of the old prefix is covered by the converted
+  // range tombstone. One tombstone is enough to extend a lowered mark.
+  HeadMarkTracker tracker;
+  ASSERT_OK(Delete(QKey(5)));
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kExtended},
+      tracker.results);
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+}
+
+TEST_F(DBHeadMarkTest, WriterDuringValidationKeepsItsLoweredMark) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  // A late put lands after the claim is stored and before the validation
+  // walk. The writer must see the claim and lower it.
+  bool put_done = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTable::PublishHeadMark:BeforeValidate", [&](void*) {
+        if (!put_done) {
+          put_done = true;
+          ASSERT_OK(Put(QKey(5), "late"));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(put_done);
+  // The scan did not raise usable_end over the writer's mark.
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(5), "q", true}}),
+            ActiveMarks());
+  ASSERT_EQ(QKey(5), SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, ValidationStopsAtNewerLiveEntry) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  // The scan reads at a snapshot. A put inside the run after the snapshot is
+  // invisible to the scan, so the scan claims it, and the walk must stop at
+  // it.
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_OK(Put(QKey(5), "late"));
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ASSERT_EQ(QKey(10), SeekFirst("q", ro));
+  db_->ReleaseSnapshot(snap);
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(5), false}}),
+            ActiveMarks());
+  ASSERT_EQ(QKey(5), SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, RepeatedSeekWithoutProgressAllocatesNothing) {
+  DestroyAndReopen(HeadMarkOptions());
+  // An SST, so that every scan builds the merging iterator.
+  ASSERT_OK(Put("z", "v"));
+  ASSERT_OK(Flush());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_OK(Put(QKey(5), "late"));
+  ReadOptions ro;
+  ro.snapshot = snap;
+  // One iterator for all seeks. It keeps the range tombstones of the moment it
+  // was created (none), so each seek counts the same deletions again.
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  iter->Seek("q");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(QKey(10), iter->key());
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(5), false}}),
+            ActiveMarks());
+
+  // Each seek uses the mark, runs to "q0010" and asks to extend it. The claim
+  // already reaches "q0010", and the walk stops at "q0005" again, so nothing
+  // changes and the memtable allocates nothing.
+  auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
+      db_->DefaultColumnFamily());
+  const size_t mem_before = cfh->cfd()->mem()->ApproximateMemoryUsage();
+  HeadMarkTracker tracker;
+  for (int i = 0; i < 100; ++i) {
+    iter->Seek("q");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(QKey(10), iter->key());
+  }
+  ASSERT_EQ(100, tracker.uses);
+  ASSERT_EQ(mem_before, cfh->cfd()->mem()->ApproximateMemoryUsage());
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(5), false}}),
+            ActiveMarks());
+  ASSERT_OK(iter->status());
+  iter.reset();
+  db_->ReleaseSnapshot(snap);
+  // A newer reader sees the put.
+  ASSERT_EQ(QKey(5), SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, ExtensionInsideClaimChecksOnlyItsRun) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/30, /*deleted=*/20);
+  // Two late puts after the snapshot. The snapshot scan claims ["q",
+  // "q0020"), and its walk stops at the first of them, "q0005".
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_OK(Put(QKey(15), "late"));
+  ASSERT_OK(Put(QKey(5), "late"));
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ASSERT_EQ(QKey(20), SeekFirst("q", ro));
+  db_->ReleaseSnapshot(snap);
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(20), QKey(5), false}}),
+            ActiveMarks());
+
+  // A newer scan is sent by the mark to "q0005", sees "q0005" to "q0014"
+  // deleted and stops at the live "q0015". Its run ends inside the claim, so
+  // the mark may become usable only up to "q0015", never past it. The
+  // snapshot scan converted ["q0000", "q0020") at its sequence number, and a
+  // scan does not count covered tombstones, so "q0006" to "q0014" are deleted
+  // again above it to make the run long enough.
+  for (int i = 5; i < 15; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  ASSERT_EQ(QKey(15), SeekFirst("q"));
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(20), QKey(15), false}}),
+            ActiveMarks());
+  ASSERT_EQ(QKey(15), SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, ValidationWalkCapKeepsCheckedPart) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  // Before the walk, add more than kMaxHeadMarkWalk (16384) newer
+  // deletions inside the claim, and a newer put outside it so that the walk
+  // runs. The walk visits the two entries of "q0000" (the put and its
+  // deletion) and then the new deletions, and stops at the 16385th entry,
+  // which is new deletion 16382 (counting from 0).
+  constexpr int kNewDeletions = 17000;
+  auto key_between = [](int i) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "q0000_%05d", i);
+    return std::string(buf);
+  };
+  bool written = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTable::PublishHeadMark:BeforeValidate", [&](void*) {
+        if (written) {
+          return;
+        }
+        written = true;
+        WriteBatch batch;
+        for (int i = 0; i < kNewDeletions; ++i) {
+          ASSERT_OK(batch.Delete(key_between(i)));
+        }
+        ASSERT_OK(batch.Put("z", "v"));
+        ASSERT_OK(db_->Write(WriteOptions(), &batch));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(written);
+  ASSERT_EQ(
+      std::vector<HeadMarkView>({{"q", QKey(10), key_between(16382), false}}),
+      ActiveMarks());
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, OlderSnapshotDoesNotUseMark) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  const Snapshot* snap = db_->GetSnapshot();
+  // A newer write, so the mark below gets a larger seq than the snapshot.
+  ASSERT_OK(Put("z", "v"));
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(1, ActiveMarks().size());
+
+  HeadMarkTracker tracker;
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ASSERT_EQ(QKey(10), SeekFirst("q", ro));
+  ASSERT_EQ(0, tracker.uses);
+  db_->ReleaseSnapshot(snap);
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(1, tracker.uses);
+}
+
+TEST_F(DBHeadMarkTest, ExcludedReadersDoNotUseMarks) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(1, ActiveMarks().size());
+
+  HeadMarkTracker tracker;
+  ReadOptions ignore_range_deletions;
+  ignore_range_deletions.ignore_range_deletions = true;
+  ASSERT_EQ(QKey(10), SeekFirst("q", ignore_range_deletions));
+  // NewIterator() rejects table_filter while conversion is on, so turn
+  // conversion off first. The memtable keeps its marks.
+  ASSERT_OK(
+      dbfull()->SetOptions({{"min_tombstones_for_range_conversion", "0"}}));
+  ASSERT_EQ(1, ActiveMarks().size());
+  const std::function<bool(const TableProperties&)> keep_all =
+      [](const TableProperties&) { return true; };
+  ReadOptions table_filter;
+  table_filter.table_filter = &keep_all;
+  ASSERT_EQ(QKey(10), SeekFirst("q", table_filter));
+  ASSERT_EQ(0, tracker.uses);
+}
+
+TEST_F(DBHeadMarkTest, IncompleteScanMakesNoMark) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  HeadMarkTracker tracker;
+  ReadOptions ro;
+  ro.max_skippable_internal_keys = 3;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  iter->Seek("q");
+  ASSERT_TRUE(iter->status().IsIncomplete());
+  ASSERT_TRUE(tracker.results.empty());
+  ASSERT_TRUE(ActiveMarks().empty());
+}
+
+TEST_F(DBHeadMarkTest, OverlappingRunIsNotPublished) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  // A run from "p" runs into the mark of "q", so it is not published.
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Delete("p" + std::to_string(i)));
+  }
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(10), SeekFirst("p"));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{
+          HeadMarkPublishResult::kRefusedOverlap},
+      tracker.results);
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+}
+
+TEST_F(DBHeadMarkTest, FullTableDropsNewMarkUntilACellEmpties) {
+  DestroyAndReopen(HeadMarkOptions());
+  // 18 queues "a".."r"; each has 5 dead items and one live item.
+  auto queue = [](int q) { return std::string(1, static_cast<char>('a' + q)); };
+  for (int q = 0; q < 18; ++q) {
+    for (int i = 0; i < 6; ++i) {
+      ASSERT_OK(Put(queue(q) + std::to_string(i), "v"));
+    }
+    for (int i = 0; i < 5; ++i) {
+      ASSERT_OK(Delete(queue(q) + std::to_string(i)));
+    }
+  }
+  HeadMarkTracker tracker;
+  for (int q = 0; q < 17; ++q) {
+    ASSERT_EQ(queue(q) + "5", SeekFirst(queue(q)));
+  }
+  ASSERT_EQ(16, ActiveMarks().size());
+  ASSERT_EQ(HeadMarkPublishResult::kRefusedFull, tracker.results.back());
+
+  // A put at the start of queue "a" lowers its mark to nothing, which frees
+  // its cell for the next new mark. Queue "q" cannot retry yet: its first
+  // scan converted its run, and DBIter does not count covered tombstones, so
+  // queue "q" needs more deletions first. The new mark goes to queue "r".
+  ASSERT_OK(Put("a", "v"));
+  tracker.Reset();
+  ASSERT_EQ("r5", SeekFirst("r"));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kPublished},
+      tracker.results);
+  const std::vector<HeadMarkView> marks = ActiveMarks();
+  ASSERT_EQ(16, marks.size());
+  ASSERT_EQ("b", marks.front().start);
+  ASSERT_EQ("r", marks.back().start);
+}
+
+TEST_F(DBHeadMarkTest, ImmutableMemtableMarkIsUsed) {
+  Options options = HeadMarkOptions();
+  options.max_write_buffer_number = 4;
+  options.min_write_buffer_number_to_merge = 3;
+  DestroyAndReopen(options);
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_TRUE(ActiveMarks().empty());
+
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(1, tracker.uses);
+  // A late put into the new memtable is found: marks only cover their own
+  // memtable and older levels.
+  ASSERT_OK(Put(QKey(5), "late"));
+  ASSERT_EQ(QKey(5), SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, NoPublishIntoImmutableMemtable) {
+  // The iterator's active memtable becomes immutable before the scan. The
+  // memtable list has already counted that memtable's memory, so the scan
+  // must not publish into it.
+  Options options = HeadMarkOptions();
+  options.max_write_buffer_number = 4;
+  options.min_write_buffer_number_to_merge = 3;
+  DestroyAndReopen(options);
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  HeadMarkTracker tracker;
+  iter->Seek("q");
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(QKey(10), iter->key());
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{
+          HeadMarkPublishResult::kRefusedImmutable},
+      tracker.results);
+}
+
+TEST_F(DBHeadMarkTest, MarkEndInNextPrefix) {
+  Options options = PrefixFilterOptions(HeadMarkOptions());
+  DestroyAndReopen(options);
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_OK(Delete("qqqq" + std::to_string(i)));
+  }
+  ASSERT_OK(Put("rrrr0", "v"));
+  // A total order scan publishes a mark that ends in the next prefix.
+  ReadOptions total_order;
+  total_order.total_order_seek = true;
+  ASSERT_EQ("rrrr0", SeekFirst("qqqq", total_order));
+  ASSERT_EQ(std::vector<HeadMarkView>({{"qqqq", "rrrr0", "rrrr0", false}}),
+            ActiveMarks());
+  // A prefix_same_as_start scan uses the mark and still stops at the end of
+  // its prefix.
+  HeadMarkTracker tracker;
+  ReadOptions same_prefix;
+  same_prefix.prefix_same_as_start = true;
+  ASSERT_EQ("", SeekFirst("qqqq", same_prefix));
+  ASSERT_EQ(1, tracker.uses);
+  ASSERT_EQ("rrrr0", SeekFirst("rrrr", same_prefix));
+}
+
+TEST_F(DBHeadMarkTest, IngestionClearsMarks) {
+  // The ingested file holds "q", which is inside the mark ["q", "q0010") but
+  // not in the memtable's key range, so the ingestion does not flush.
+  enum class Mode { kNewSeqno, kSeqnoZero, kIngestBehind };
+  for (Mode mode : {Mode::kNewSeqno, Mode::kSeqnoZero, Mode::kIngestBehind}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    Options options = HeadMarkOptions();
+    options.cf_allow_ingest_behind = mode == Mode::kIngestBehind;
+    DestroyAndReopen(options);
+    MakeQueue(/*n=*/20, /*deleted=*/10);
+    ASSERT_EQ(QKey(10), SeekFirst("q"));
+    ASSERT_EQ(1, ActiveMarks().size());
+
+    const std::string file = dbname_ + "/ingest.sst";
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("q", "ingested"));
+      ASSERT_OK(writer.Finish());
+    }
+    // A snapshot makes the ingestion assign a new seqno. Without it, the file
+    // goes to the last level with seqno 0.
+    const Snapshot* snap =
+        mode == Mode::kNewSeqno ? db_->GetSnapshot() : nullptr;
+    IngestExternalFileOptions ifo;
+    ifo.allow_global_seqno = mode == Mode::kNewSeqno;
+    ifo.ingest_behind = mode == Mode::kIngestBehind;
+    ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+    if (snap != nullptr) {
+      db_->ReleaseSnapshot(snap);
+    }
+    ASSERT_TRUE(ActiveMarks().empty());
+    ASSERT_EQ("q", SeekFirst("q"));
+  }
+}
+
+TEST_F(DBHeadMarkTest, IngestionRefusesStalePublishers) {
+  Options options = HeadMarkOptions();
+  DestroyAndReopen(options);
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  const std::string file = dbname_ + "/ingest.sst";
+  {
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("q", "ingested"));
+    ASSERT_OK(writer.Finish());
+  }
+  // This iterator reads the Version before the ingestion.
+  std::unique_ptr<Iterator> stale(db_->NewIterator(ReadOptions()));
+  // This snapshot is older than the ingested file's seqno.
+  const Snapshot* snap = db_->GetSnapshot();
+  IngestExternalFileOptions ifo;
+  ASSERT_OK(db_->IngestExternalFile({file}, ifo));
+
+  HeadMarkTracker tracker;
+  stale->Seek("q");
+  ASSERT_OK(stale->status());
+  ASSERT_EQ(QKey(10), stale->key());
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ASSERT_EQ(QKey(10), SeekFirst("q", ro));
+  db_->ReleaseSnapshot(snap);
+  ASSERT_EQ(std::vector<HeadMarkPublishResult>(
+                {HeadMarkPublishResult::kRefusedIngest,
+                 HeadMarkPublishResult::kRefusedIngest}),
+            tracker.results);
+  ASSERT_TRUE(ActiveMarks().empty());
+  ASSERT_EQ("q", SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, IngestionDuringRaiseLeavesMarksCleared) {
+  Options options = HeadMarkOptions();
+  DestroyAndReopen(options);
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  const std::string file = dbname_ + "/ingest.sst";
+  {
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("q", "ingested"));
+    ASSERT_OK(writer.Finish());
+  }
+  // The scan has allocated its raised mark but not yet taken the mark mutex.
+  // The ingestion clears the table now, so the raise must find no cell. The
+  // callback runs while the scan holds the memtable's immutable_mutex_ as a
+  // reader. "q" sorts before every memtable key, so the ingestion does not
+  // flush the memtable; a flush would wait for that lock and hang the test.
+  bool ingested = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTable::RaiseHeadMarkUsableEnd:Allocated", [&](void*) {
+        if (ingested) {
+          return;
+        }
+        ingested = true;
+        ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(ingested);
+  ASSERT_TRUE(ActiveMarks().empty());
+  ASSERT_EQ("q", SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, HeadMarkDoesNotChangePinnedVersionAfterIngestion) {
+  // Iterator A keeps the Version from before an ingestion and reads at the
+  // ingested file's sequence number S (see IteratorWithOldVersionAtNewSeq()).
+  // A must not publish a mark from that view, and a mark that a newer scan
+  // publishes at S must not move A's seeks.
+  Options options = HeadMarkOptions();
+  DestroyAndReopen(options);
+  CreateColumnFamilies({"other"}, options);
+  // An SST file holds the live key q0005. The memtable deletes the keys
+  // around it.
+  ASSERT_OK(Put(QKey(5), "old"));
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 10; ++i) {
+    if (i != 5) {
+      ASSERT_OK(Delete(QKey(i)));
+    }
+  }
+  ASSERT_OK(Put(QKey(10), "v"));
+  std::unique_ptr<Iterator> a =
+      IteratorWithOldVersionAtNewSeq(options, /*deleted=*/QKey(5));
+  ASSERT_NE(nullptr, a);
+
+  HeadMarkTracker tracker;
+  // A still sees q0005, and its publish is refused.
+  a->Seek("q");
+  ASSERT_OK(a->status());
+  ASSERT_TRUE(a->Valid());
+  ASSERT_EQ(QKey(5), a->key().ToString());
+  ASSERT_EQ(std::vector<HeadMarkPublishResult>(
+                {HeadMarkPublishResult::kRefusedIngest}),
+            tracker.results);
+  ASSERT_TRUE(ActiveMarks().empty());
+
+  // A new scan sees the ingested delete and publishes ["q", q0010).
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+
+  // A must not use that mark: it would move the seek in the SST file past
+  // q0005.
+  tracker.Reset();
+  a->Seek("q");
+  ASSERT_OK(a->status());
+  ASSERT_TRUE(a->Valid());
+  ASSERT_EQ(QKey(5), a->key().ToString());
+  ASSERT_EQ(0, tracker.uses);
+  // A new scan still uses the mark.
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(1, tracker.uses);
+}
+
+TEST_F(DBHeadMarkTest, RepeatedIngestAndSeekBoundsHeadMarkMemory) {
+  // Every ingestion clears the marks, and the next scan publishes the same
+  // mark again. The memtable arena keeps the old marks until flush. No write
+  // reaches the memtable, so nothing makes it flush. The head mark byte budget
+  // stops the publishes; reads and conversion keep working.
+  Options options = HeadMarkOptions();
+  // One tombstone is a run, so the run of the single delete below makes a
+  // mark on every scan. The converted range tombstone covers only older
+  // entries, so the delete stays visible to the same scan again.
+  options.min_tombstones_for_range_conversion = 1;
+  // A smaller write buffer gives smaller arena blocks, so the test can see
+  // the memory growth.
+  options.write_buffer_size = 4 << 20;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  // A long live key makes each mark copy its end key, which is large.
+  const std::string live = "c" + std::string(4000, 'x');
+  ASSERT_OK(Put(live, "v"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_EQ(live, SeekFirst("a"));
+  ASSERT_EQ(1, options.statistics->getTickerCount(
+                   READ_PATH_RANGE_TOMBSTONES_INSERTED));
+  // The memtable property "rocksdb.cur-size-active-mem-table" is updated only
+  // by writes, so read the arena usage directly.
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
+          ->cfd();
+  const size_t mem_before = cfd->mem()->ApproximateMemoryUsage();
+
+  HeadMarkTracker tracker;
+  constexpr int kRounds = 300;
+  for (int i = 0; i < kRounds; ++i) {
+    // Each file has its own key after the memtable keys, so the ingestion
+    // neither flushes the memtable nor overlaps an earlier file.
+    char key[16];
+    snprintf(key, sizeof(key), "z%04d", i);
+    const std::string file = dbname_ + "/ingest" + std::to_string(i) + ".sst";
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put(key, "ingested"));
+      ASSERT_OK(writer.Finish());
+    }
+    ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+    ASSERT_EQ(live, SeekFirst("a"));
+  }
+  // The first publishes succeed, the later ones run out of budget.
+  ASSERT_EQ(HeadMarkPublishResult::kPublished, tracker.results.front());
+  ASSERT_EQ(HeadMarkPublishResult::kRefusedBudget, tracker.results.back());
+  // Without the budget, the memtable grows by more than 2 MB here.
+  ASSERT_LT(cfd->mem()->ApproximateMemoryUsage(), mem_before + (1 << 20));
+  // The converted range tombstone already covers the run, so no scan
+  // converts again.
+  ASSERT_EQ(1, options.statistics->getTickerCount(
+                   READ_PATH_RANGE_TOMBSTONES_INSERTED));
+  // The memtable was never flushed, which would have made an L0 file.
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+}
+
+TEST_F(DBHeadMarkTest, SeekToEmptyKeyPublishesMark) {
+  // The empty key is a valid seek target, so a mark can start at it. The copy
+  // of the empty start has no bytes.
+  DestroyAndReopen(HeadMarkOptions());
+  MakeQueue(/*n=*/20, /*deleted=*/10);
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(10), SeekFirst(""));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kPublished},
+      tracker.results);
+  ASSERT_EQ(std::vector<HeadMarkView>({{"", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+  tracker.Reset();
+  ASSERT_EQ(QKey(10), SeekFirst(""));
+  ASSERT_EQ(1, tracker.uses);
+}
+
+TEST_F(DBHeadMarkTest, HeadMarkBytesStayWithinBudget) {
+  // A publish or a raise reserves the bytes that it allocates before it
+  // allocates them, and is refused if they do not fit in the budget (see
+  // MemTable::ReserveHeadMarkBytes()). The budget in these cases is
+  // kHeadMarkBaseBudget (64 KB) plus the bytes of the memtable's entries.
+  const std::string kLongPart(100 << 10, ' ');
+  for (bool long_end : {false, true}) {
+    SCOPED_TRACE(long_end ? "long end" : "long start");
+    DestroyAndReopen(HeadMarkOptions());
+    MakeQueue(/*n=*/10, /*deleted=*/10);
+    // The first live key, which is the end of the claim.
+    const std::string live = long_end ? QKey(10) + kLongPart : QKey(10);
+    ASSERT_OK(Put(live, "v"));
+    HeadMarkTracker tracker;
+    if (long_end) {
+      // The new claim copies `live` once, which fits: the memtable's entries
+      // include `live`. The raise after the validation walk needs a second
+      // copy of `live`, which does not fit, so nothing becomes usable.
+      ASSERT_EQ(live, SeekFirst("q"));
+      ASSERT_EQ(
+          std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kPublished},
+          tracker.results);
+      ASSERT_EQ(std::vector<HeadMarkView>({{"q", live, "q", false}}),
+                ActiveMarks());
+    } else {
+      // A seek target longer than the whole budget. ' ' sorts before '0', so
+      // the target sorts before q0000. The new claim would copy the target,
+      // so the publish is refused and stores nothing.
+      ASSERT_EQ(live, SeekFirst("q" + kLongPart));
+      ASSERT_EQ(
+          std::vector<HeadMarkPublishResult>{
+              HeadMarkPublishResult::kRefusedBudget},
+          tracker.results);
+      ASSERT_TRUE(ActiveMarks().empty());
+      ASSERT_EQ(0, HeadMarkBytesAndBudget().first);
+    }
+    const std::pair<size_t, size_t> bytes = HeadMarkBytesAndBudget();
+    ASSERT_LE(bytes.first, bytes.second);
+  }
+}
+
+TEST_F(DBHeadMarkTest, DeleteFilesInRangeClearsMarks) {
+  // DeleteFilesInRange() can remove an SST file whose range tombstone hides an
+  // older key, so the key becomes visible again with no new sequence number.
+  // A mark that a scan published while the key was hidden must not skip it.
+  DestroyAndReopen(HeadMarkOptions());
+  MakeKeyHiddenByL1File();
+  {
+    HeadMarkTracker tracker;
+    ASSERT_EQ(QKey(10), SeekFirst("q"));
+    ASSERT_EQ(
+        std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kPublished},
+        tracker.results);
+  }
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+
+  DeleteL1File();
+  ASSERT_EQ("old", Get("q0"));
+  ASSERT_TRUE(ActiveMarks().empty());
+  // A new scan sees "q0" and stops there.
+  ASSERT_EQ("q0", SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, DeleteFilesInRangeRefusesOlderVersion) {
+  // An iterator created before DeleteFilesInRange() keeps the Version that
+  // has the deleted file, so it does not see "q0". Its publish is refused,
+  // because its mark would make newer readers skip "q0".
+  DestroyAndReopen(HeadMarkOptions());
+  MakeKeyHiddenByL1File();
+  std::unique_ptr<Iterator> old_iter(db_->NewIterator(ReadOptions()));
+  DeleteL1File();
+  {
+    HeadMarkTracker tracker;
+    old_iter->Seek("q");
+    ASSERT_OK(old_iter->status());
+    ASSERT_TRUE(old_iter->Valid());
+    ASSERT_EQ(QKey(10), old_iter->key().ToString());
+    ASSERT_EQ(
+        std::vector<HeadMarkPublishResult>{
+            HeadMarkPublishResult::kRefusedIngest},
+        tracker.results);
+  }
+  ASSERT_TRUE(ActiveMarks().empty());
+  ASSERT_EQ("q0", SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, DeleteFilesInRangeDoesNotWaitForLowering) {
+  // DeleteFilesInRange() clears the marks while it holds the DB mutex. It does
+  // not stop the writers, so a writer can be lowering a mark at the same time,
+  // and a lowering allocates its new mark while it holds head_mark_mu_. The
+  // clear must not wait for that writer.
+  DestroyAndReopen(HeadMarkOptions());
+  MakeKeyHiddenByL1File();
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+
+  // The writer pauses inside its lowering, which holds head_mark_mu_, until
+  // the test releases it. Every wait is bounded, so a hang fails the test.
+  std::promise<void> lowering;
+  std::promise<void> release;
+  std::shared_future<void> release_future = release.get_future().share();
+  std::atomic<bool> once{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTable::LowerHeadMarks:Lower", [&](void*) {
+        if (!once.exchange(true)) {
+          lowering.set_value();
+          release_future.wait_for(std::chrono::minutes(1));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  port::Thread writer([&]() { EXPECT_OK(Put(QKey(5), "v2")); });
+  bool released = false;
+  Defer cleanup([&]() {
+    if (!released) {
+      release.set_value();
+    }
+    if (writer.joinable()) {
+      writer.join();
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_EQ(std::future_status::ready,
+            lowering.get_future().wait_for(std::chrono::minutes(1)));
+
+  std::future<Status> deleted = std::async(std::launch::async, [&]() {
+    const Slice begin("q");
+    const Slice end("q1");
+    return DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &begin,
+                              &end);
+  });
+  // The deletion finishes while the writer still holds head_mark_mu_.
+  const std::future_status deleted_status =
+      deleted.wait_for(std::chrono::seconds(10));
+  released = true;
+  release.set_value();
+  writer.join();
+  ASSERT_EQ(std::future_status::ready, deleted_status);
+  ASSERT_OK(deleted.get());
+  ASSERT_EQ(0, NumTableFilesAtLevel(1));
+
+  // The writer lowered the mark in the cleared table, which no reader sees.
+  ASSERT_TRUE(ActiveMarks().empty());
+  ASSERT_EQ("old", Get("q0"));
+  ASSERT_EQ("v2", Get(QKey(5)));
+  ASSERT_EQ("q0", SeekFirst("q"));
+}
+
+TEST_F(DBHeadMarkTest, FIFOCompactionPublishesNoMark) {
+  // FIFO compaction deletes old SST files without ingest_sst_lock, so marks
+  // are off for it. Ordinary conversion still runs.
+  Options options = HeadMarkOptions();
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  options.max_open_files = -1;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  MakeQueue(/*n=*/11, /*deleted=*/10);
+  {
+    HeadMarkTracker tracker;
+    ASSERT_EQ(QKey(10), SeekFirst("q"));
+    // The scan does not try to publish.
+    ASSERT_TRUE(tracker.results.empty());
+  }
+  ASSERT_TRUE(ActiveMarks().empty());
+  ASSERT_EQ(1, options.statistics->getTickerCount(
+                   READ_PATH_RANGE_TOMBSTONES_INSERTED));
+}
+
+TEST_F(DBHeadMarkTest, IngestionClearsMarksOnlyIfEnabled) {
+  // With conversion off, no memtable has head marks, so the ingestion does
+  // not visit the memtables. After the option is turned on, the next active
+  // memtable has marks enabled, and every later ingestion clears the marks.
+  Options options = HeadMarkOptions();
+  options.min_tombstones_for_range_conversion = 0;
+  DestroyAndReopen(options);
+  int clears = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ColumnFamilyData::ClearHeadMarks:Clear", [&](void*) { ++clears; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  int files = 0;
+  auto ingest = [&]() {
+    const std::string file = dbname_ + "/ingest" + std::to_string(files++);
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("a", "v"));
+    ASSERT_OK(writer.Finish());
+    ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+  };
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  ingest();
+  ASSERT_EQ(0, clears);
+  ASSERT_OK(db_->SetOptions({{"min_tombstones_for_range_conversion", "4"}}));
+  ingest();
+  ASSERT_EQ(0, clears);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  ingest();
+  ASSERT_EQ(1, clears);
+  ASSERT_OK(db_->SetOptions({{"min_tombstones_for_range_conversion", "0"}}));
+  ingest();
+  ASSERT_EQ(2, clears);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBHeadMarkTest, RandomQueueMatchesModel) {
+  // A producer appends items, a consumer deletes the oldest ones, and late
+  // items arrive inside the dead prefix. Every scan from the queue start must
+  // return the oldest live item, with marks published, used and lowered on
+  // the way. Memtable switches and snapshot reads are mixed in.
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  Options options = HeadMarkOptions();
+  // TEST_SwitchMemtable() does not schedule a flush, so allow enough
+  // immutable memtables that a manual Flush() never waits for a stall to end.
+  options.max_write_buffer_number = 64;
+  // Compactions keep the L0 file count below the write stop trigger.
+  options.disable_auto_compactions = false;
+  DestroyAndReopen(options);
+
+  std::set<int> live;
+  int next = 0;
+  HeadMarkTracker tracker;
+  for (int step = 0; step < 20000; ++step) {
+    const uint32_t op = rnd.Uniform(100);
+    if (op < 40) {
+      ASSERT_OK(Put(QKey(next), "v"));
+      live.insert(next++);
+    } else if (op < 75) {
+      if (!live.empty()) {
+        ASSERT_OK(Delete(QKey(*live.begin())));
+        live.erase(live.begin());
+      }
+    } else if (op < 80) {
+      // A late item inside the dead prefix.
+      if (!live.empty() && *live.begin() > 0) {
+        const int k = static_cast<int>(rnd.Uniform(*live.begin()));
+        ASSERT_OK(Put(QKey(k), "late"));
+        live.insert(k);
+      }
+    } else if (op < 81) {
+      ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    } else if (op < 82) {
+      ASSERT_OK(Flush());
+    } else if (op < 85) {
+      const Snapshot* snap = db_->GetSnapshot();
+      const std::string expected = live.empty() ? "" : QKey(*live.begin());
+      // A newer write before the queue range, so the snapshot is older than
+      // the latest sequence number.
+      ASSERT_OK(Put("a", "v"));
+      ReadOptions ro;
+      ro.snapshot = snap;
+      ASSERT_EQ(expected, SeekFirst("q", ro));
+      db_->ReleaseSnapshot(snap);
+    } else {
+      const std::string expected = live.empty() ? "" : QKey(*live.begin());
+      ASSERT_EQ(expected, SeekFirst("q"));
+    }
+  }
+  // The run must have exercised the marks.
+  ASSERT_GT(tracker.uses, 0);
+  ASSERT_FALSE(tracker.results.empty());
 }
 
 }  // namespace ROCKSDB_NAMESPACE
