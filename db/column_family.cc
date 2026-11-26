@@ -20,6 +20,7 @@
 
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -752,6 +753,26 @@ ColumnFamilyData::ColumnFamilyData(
                   bbto->block_cache));
     }
   }
+}
+
+BlobReferenceCensus* ColumnFamilyData::GetOrCreateBlobReferenceCensus() {
+  if (blob_reference_census_storage_ == nullptr) {
+    blob_reference_census_storage_ = std::make_unique<BlobReferenceCensus>();
+    // A new census has no published view yet. Mark it unready now, so that a
+    // census whose first build never starts (the job is not scheduled, or
+    // background work is paused) reports its unready time instead of 0.
+    blob_reference_census_storage_->NoteUnready(ioptions_.clock->NowMicros());
+    blob_reference_census_.store(blob_reference_census_storage_.get(),
+                                 std::memory_order_release);
+  }
+  return blob_reference_census_storage_.get();
+}
+
+BlobReferenceCensusGarbage ColumnFamilyData::CancelBlobReferenceCensus() {
+  if (blob_reference_census_storage_ == nullptr) {
+    return {};
+  }
+  return blob_reference_census_storage_->Cancel();
 }
 
 // DB mutex held
