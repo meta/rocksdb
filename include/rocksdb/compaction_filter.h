@@ -220,28 +220,47 @@ class CompactionFilter : public Customizable {
     // it is converted to a plain key-value with the new value specified.
     kChangeValue,
 
-    // Remove all key-values with key in [key, *skip_until). This range of keys
-    // will be skipped in a way that potentially avoids some IO operations
-    // compared to removing the keys one by one. Note that removal in this case
-    // means dropping the key-value regardless of value type; in other words, in
-    // contrast with kRemove, plain values and entities are not converted to
-    // tombstones.
+    // This decision drops a range of point entries without adding tombstones.
+    // Applications use it to reclaim ranges their retention rules consider
+    // obsolete. The skip can avoid I/O compared with removing keys one by one.
+    // For example, an append-only log can keep a cutoff record number that only
+    // increases. Every version of a record below the cutoff is obsolete to the
+    // application, including versions visible through a RocksDB snapshot.
+    //
+    // Removal:
+    // key is the current user key, and *skip_until is the exclusive upper user
+    // key supplied by the compaction filter. Both include a timestamp if
+    // user-defined timestamps are enabled. The user comparator orders the keys.
+    // Table file creation removes the current entry and drops the remaining
+    // point entries in [key, *skip_until) in its input. Those remaining entries
+    // are not passed to the filter, regardless of value type, snapshot
+    // visibility, or commit state. The skip writes no replacement tombstones.
+    // It does not remove range tombstones or entries outside the input.
+    // Subcompactions process separate key ranges. A skip stops at its
+    // subcompaction's end.
     //
     // *skip_until <= key is treated the same as Decision::kKeep (since the
     // range [key, *skip_until) is empty).
     //
     // Caveats:
-    // * The keys are skipped even if there are snapshots containing them,
-    //   i.e. values removed by kRemoveAndSkipUntil can disappear from a
-    //   snapshot - beware if you're using TransactionDB or DB::GetSnapshot().
-    // * If value for a key was overwritten or merged into (multiple Put()s
-    //   or Merge()s), and `CompactionFilter` skips this key with
-    //   kRemoveAndSkipUntil, it's possible that it will remove only
-    //   the new value, exposing the old value that was supposed to be
-    //   overwritten.
-    // * Doesn't work with PlainTableFactory in prefix mode.
-    // * If you use kRemoveAndSkipUntil for table files created by compaction,
-    //   consider also reducing compaction_readahead_size option.
+    // * Compaction filters do not preserve snapshot contents. See the snapshot
+    //   warning in the CompactionFilter class comment. This limit also applies
+    //   to other decisions that modify or remove entries.
+    // * With TransactionDB using WritePrepared or WriteUnprepared, a skip can
+    //   drop prepared writes before they commit. Their transactions can still
+    //   commit successfully, leaving those writes lost.
+    // * A skip can remove a point tombstone or a newer version of a key. An
+    //   older version outside the input can then become visible. Newer merge
+    //   operands outside the input can apply to that version and produce a
+    //   result the key never held. The application must tolerate these results
+    //   as obsolete data. When returned for a merge operand, this decision also
+    //   discards the operands already collected for that key.
+    // * Use DB::Delete() or DB::DeleteRange() when deletion must preserve
+    //   normal snapshot and version guarantees. This decision reclaims
+    //   storage and does not provide those guarantees.
+    // * This decision does not work with PlainTableFactory in prefix mode.
+    // * For compaction, consider reducing compaction_readahead_size to avoid
+    //   reading blocks that the seek skips.
     kRemoveAndSkipUntil,
 
     // Used internally by the old stacked BlobDB implementation. Returning this
