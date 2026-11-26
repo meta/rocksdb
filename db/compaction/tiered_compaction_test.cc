@@ -11,6 +11,7 @@
 #include "db/db_test_util.h"
 #include "options/cf_options.h"
 #include "port/stack_trace.h"
+#include "rocksdb/filter_policy.h"
 #include "rocksdb/iostats_context.h"
 #include "rocksdb/listener.h"
 #include "rocksdb/utilities/debug.h"
@@ -1343,6 +1344,159 @@ TEST_F(TieredCompactionTest, SequenceBasedTieredStorageLevel) {
   ASSERT_EQ("0,0,0,0,0,1,1", FilesPerLevel());
   ASSERT_GT(GetSstSizeHelper(Temperature::kUnknown), 0);
   ASSERT_GT(GetSstSizeHelper(Temperature::kCold), 0);
+}
+
+TEST_F(TieredCompactionTest, ProximalOutputPassesProximalLevelToTableBuilder) {
+  const int kNumLevels = 3;
+  const int kProximalLevel = kNumLevels - 2;
+  const int kLastLevel = kNumLevels - 1;
+
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleLevel;
+  options.level_compaction_dynamic_level_bytes = true;
+  options.num_levels = kNumLevels;
+  options.disable_auto_compactions = true;
+  options.optimize_filters_for_hits = true;
+  BlockBasedTableOptions bbto;
+  bbto.filter_policy.reset(NewBloomFilterPolicy(10));
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  SetColdTemperature(options);
+  DestroyAndReopen(options);
+
+  // Write cold keys first, then record the seqno cutoff so newer keys route
+  // to the proximal level while older keys go to the bottommost level.
+  ASSERT_OK(Put("k1", "cold1"));
+  ASSERT_OK(Put("k4", "cold4"));
+  ASSERT_OK(Flush());
+  const SequenceNumber hot_min_seqno = dbfull()->GetLatestSequenceNumber();
+
+  ASSERT_OK(Put("k2", "hot2"));
+  ASSERT_OK(Put("k3", "hot3"));
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::PrepareTimes():preclude_last_level_min_seqno",
+      [&](void* arg) { *static_cast<SequenceNumber*>(arg) = hot_min_seqno; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ("0,1,1", FilesPerLevel());
+
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  ASSERT_EQ(2U, live_files.size());
+
+  TablePropertiesCollection props_map;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&props_map));
+
+  int saw_proximal = 0;
+  int saw_last = 0;
+  for (const auto& file : live_files) {
+    const std::string full_path = file.directory + file.name;
+    auto it = props_map.find(full_path);
+    ASSERT_NE(it, props_map.end()) << full_path;
+    const auto& props = *it->second;
+    const LsmInfoAtCreation info =
+        LsmInfoAtCreation::DecodeFrom(props.lsm_info_at_creation);
+    if (file.level == kProximalLevel) {
+      ++saw_proximal;
+      // Only the hot keys k2 and k3 route to the proximal level.
+      EXPECT_EQ("k2", file.smallestkey);
+      EXPECT_EQ("k3", file.largestkey);
+      EXPECT_EQ(LsmInfoAtCreation::Applicable(kProximalLevel,
+                                              /*is_bottommost=*/false),
+                info);
+      // optimize_filters_for_hits skips filters only on bottommost outputs;
+      // proximal L1 must still receive is_bottommost=false and build a filter.
+      EXPECT_GT(props.filter_size, 0U);
+    } else if (file.level == kLastLevel) {
+      ++saw_last;
+      EXPECT_EQ("k1", file.smallestkey);
+      EXPECT_EQ("k4", file.largestkey);
+      EXPECT_EQ(
+          LsmInfoAtCreation::Applicable(kLastLevel, /*is_bottommost=*/true),
+          info);
+      EXPECT_EQ(props.filter_size, 0U);
+    }
+  }
+  EXPECT_EQ(1, saw_proximal);
+  EXPECT_EQ(1, saw_last);
+  EXPECT_EQ("cold1", Get("k1"));
+  EXPECT_EQ("hot2", Get("k2"));
+  EXPECT_EQ("hot3", Get("k3"));
+  EXPECT_EQ("cold4", Get("k4"));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+// Regression test: a proximal file holding TimedPut entries whose preferred
+// (write-time-derived) seqnos cannot be swapped in while a snapshot is held
+// must not be marked by CompactForTieringCollector. Otherwise every proximal
+// rewrite would be re-marked and the same entries would be compacted again
+// and again until the snapshot is released.
+TEST_F(TieredCompactionTest,
+       ProximalTimedPutWithSnapshotNotMarkedForTieringCompaction) {
+  const int kNumLevels = 7;
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleUniversal;
+  options.preclude_last_level_data_seconds = 60;
+  options.preserve_internal_time_seconds = 0;
+  options.num_levels = kNumLevels;
+  options.last_level_temperature = Temperature::kCold;
+  options.disable_auto_compactions = true;
+  ConfigOptions config_options;
+  config_options.ignore_unsupported_options = false;
+  std::shared_ptr<TablePropertiesCollectorFactory> factory;
+  std::string id = CompactForTieringCollectorFactory::kClassName();
+  ASSERT_OK(TablePropertiesCollectorFactory::CreateFromString(
+      config_options, "compaction_trigger_ratio=0.4; id=" + id, &factory));
+  options.table_properties_collector_factories.push_back(factory);
+  DestroyAndReopen(options);
+
+  // Seed the last level (L6) with old TimedPut entries; with no snapshot
+  // held, their preferred seqnos are swapped in and they go to the last
+  // level.
+  for (int i = 0; i < 10; i++) {
+    ASSERT_OK(TimedPut(Key(i), "seed", 50));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ("0,0,0,0,0,0,1", FilesPerLevel());
+
+  // Hold a snapshot, then write TimedPut entries with an old write time.
+  // The snapshot prevents their preferred seqnos from being swapped in, so
+  // by their actual seqnos they stay above the last-level threshold and are
+  // routed to the proximal level (L5), even though the collector would judge
+  // them old enough by their preferred seqnos.
+  const Snapshot* snapshot = db_->GetSnapshot();
+  for (int i = 10; i < 20; i++) {
+    ASSERT_OK(TimedPut(Key(i), "proximal", 50));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ("0,0,0,0,0,1,1", FilesPerLevel());
+
+  std::vector<FileMetaData*> proximal_files = GetLevelFileMetadatas(5);
+  ASSERT_EQ(1U, proximal_files.size());
+  // The proximal file must not be marked for another tiering compaction.
+  EXPECT_FALSE(proximal_files[0]->marked_for_compaction);
+  const uint64_t proximal_file_number = proximal_files[0]->fd.GetNumber();
+
+  // Re-enable auto compactions. If the proximal file were (re-)marked,
+  // auto compaction would repeatedly rewrite it and TEST_WaitForCompact()
+  // would not return while the snapshot is held; with the collector off
+  // for proximal outputs, it returns with the file and layout unchanged.
+  ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "false"}}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  EXPECT_EQ("0,0,0,0,0,1,1", FilesPerLevel());
+  proximal_files = GetLevelFileMetadatas(5);
+  ASSERT_EQ(1U, proximal_files.size());
+  EXPECT_EQ(proximal_file_number, proximal_files[0]->fd.GetNumber());
+  EXPECT_FALSE(proximal_files[0]->marked_for_compaction);
+  for (int i = 0; i < 20; i++) {
+    EXPECT_EQ(i < 10 ? "seed" : "proximal", Get(Key(i)));
+  }
+  db_->ReleaseSnapshot(snapshot);
 }
 
 // This test was essentially for a hacked-up version on future functionality.

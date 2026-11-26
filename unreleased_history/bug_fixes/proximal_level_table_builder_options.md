@@ -1,0 +1,1 @@
+Fixed a bug where, with per-key placement (`preclude_last_level_data_seconds`), compaction output files placed on the proximal level were built as if they were on the last level. With `optimize_filters_for_hits`, they were written without filters, and table properties collectors and filter policies saw them as last-level files.

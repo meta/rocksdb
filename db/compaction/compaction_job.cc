@@ -3033,18 +3033,35 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
   // TODO(hx235): pass in the correct `oldest_key_time` instead of `0`
   const ReadOptions read_options(Env::IOActivity::kCompaction);
   const WriteOptions write_options(Env::IOActivity::kCompaction);
+  // A proximal output needs its own level and is_bottommost=false: it is
+  // not on the bottommost level, so level-based table factories must not
+  // build it with bottommost format and, with optimize_filters_for_hits,
+  // it must still build its filters.
+  const int output_level = outputs.IsProximalLevel()
+                               ? sub_compact->compaction->GetProximalLevel()
+                               : sub_compact->compaction->output_level();
+  const bool is_bottommost = !outputs.IsProximalLevel() && bottommost_level_;
   TableBuilderOptions tboptions(
       cfd->ioptions(), sub_compact->compaction->mutable_cf_options(),
       read_options, write_options, cfd->internal_comparator(),
       cfd->internal_tbl_prop_coll_factories(),
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(), cfd->GetID(),
-      cfd->GetName(), sub_compact->compaction->output_level(), newest_key_time,
-      bottommost_level_, TableFileCreationReason::kCompaction,
-      0 /* oldest_key_time */, db_id_, db_session_id_,
-      sub_compact->compaction->max_output_file_size(), file_number,
+      cfd->GetName(), output_level, newest_key_time, is_bottommost,
+      TableFileCreationReason::kCompaction, 0 /* oldest_key_time */, db_id_,
+      db_session_id_, sub_compact->compaction->max_output_file_size(),
+      file_number,
       proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/,
       dbname_ /*db_name*/, IsRemoteCompaction() /*is_remote_compaction*/);
+  // Mark only outputs actually routed to the proximal level by per-key
+  // placement, so table properties collectors (e.g.
+  // CompactForTieringCollector) can tell them apart from ordinary outputs
+  // created on the same level. The seqno threshold is deliberately not
+  // overloaded with kMaxSequenceNumber for this: that sentinel already
+  // means tiering is disabled, and other threshold consumers (e.g.
+  // CompactForTieringCollector, which asserts the threshold is not the
+  // sentinel) must keep seeing the real threshold.
+  tboptions.is_proximal_level_output = outputs.IsProximalLevel();
 
   outputs.NewBuilder(tboptions);
 

@@ -74,6 +74,57 @@ TEST(CompactForTieringCollector, LastLevelFile) {
   }
 }
 
+TEST(CompactForTieringCollector, ProximalLevelOutputFile) {
+  TablePropertiesCollectorFactory::Context context;
+  context.column_family_id = 1;
+  // Proximal level: the level above the last level (num_levels - 2).
+  context.level_at_creation = 4;
+  context.num_levels = 6;
+  context.last_level_inclusive_max_seqno_threshold = 50;
+  context.is_proximal_level_output = true;
+
+  // No collector is created for an output routed to the proximal level by
+  // per-key placement, so such files are never marked for tiering
+  // compaction.
+  for (double compaction_trigger_ratio : {0.1, 0.4, 1.0, 1.5}) {
+    auto factory =
+        NewCompactForTieringCollectorFactory(compaction_trigger_ratio);
+    std::unique_ptr<TablePropertiesCollector> collector(
+        factory->CreateTablePropertiesCollector(context));
+    ASSERT_EQ(nullptr, collector);
+  }
+
+  // Same when the proximal level is L0 in a 2-level DB: routing, not the
+  // level number, decides.
+  context.level_at_creation = 0;
+  context.num_levels = 2;
+  auto factory = NewCompactForTieringCollectorFactory(0.4);
+  std::unique_ptr<TablePropertiesCollector> collector(
+      factory->CreateTablePropertiesCollector(context));
+  ASSERT_EQ(nullptr, collector);
+}
+
+TEST(CompactForTieringCollector, OrdinaryFileOnProximalLevel) {
+  TablePropertiesCollectorFactory::Context context;
+  context.column_family_id = 1;
+  // Same level as the proximal level, but this is an ordinary output that
+  // was not routed there by per-key placement.
+  context.level_at_creation = 4;
+  context.num_levels = 6;
+  context.last_level_inclusive_max_seqno_threshold = 50;
+  context.is_proximal_level_output = false;
+
+  // A collector is still created, so ordinary files on this level remain
+  // eligible to be marked for tiering compaction.
+  for (double compaction_trigger_ratio : {0.1, 0.4, 1.0, 1.5}) {
+    auto factory =
+        NewCompactForTieringCollectorFactory(compaction_trigger_ratio);
+    std::unique_ptr<TablePropertiesCollector> collector(
+        factory->CreateTablePropertiesCollector(context));
+    ASSERT_NE(nullptr, collector);
+  }
+}
+
 TEST(CompactForTieringCollector, CollectorEnabled) {
   TablePropertiesCollectorFactory::Context context;
   context.column_family_id = 1;
