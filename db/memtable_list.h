@@ -505,6 +505,14 @@ class MemTableList {
     return newest_udts;
   }
 
+  // DB mutex held. Removes the head marks of every memtable in the list (see
+  // MemTableHeadMark).
+  void ClearHeadMarks() {
+    for (ReadOnlyMemTable* m : current_->memlist_) {
+      m->ClearHeadMarks();
+    }
+  }
+
   void AssignAtomicFlushSeq(const SequenceNumber& seq) {
     const auto& memlist = current_->memlist_;
     // Scan the memtable list from new to old

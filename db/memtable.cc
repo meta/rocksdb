@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -268,6 +269,21 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
   const Comparator* ucmp = cmp.user_comparator();
   assert(ucmp);
   ts_sz_ = ucmp->timestamp_size();
+  // See the Limits paragraph of MemTableHeadMark. Reasons: only conversion
+  // scans publish marks; the validation walk and the reader's seek need an
+  // ordered skip list; with unordered_write or two_write_queues, a write can
+  // publish its sequence number before its memtable insert, which breaks the
+  // handshake; inplace_update_support changes entries without an insert;
+  // FIFO compaction deletes old SST files without ingest_sst_lock, so it
+  // cannot clear the marks when a deletion makes an older key visible again
+  // (see the DeleteFilesInRanges() paragraph of MemTableHeadMark).
+  head_marks_enabled_ =
+      mutable_cf_options.min_tombstones_for_range_conversion > 0 &&
+      ts_sz_ == 0 && !moptions_.inplace_update_support &&
+      ioptions.compaction_style != kCompactionStyleFIFO &&
+      !ioptions.unordered_write && !ioptions.two_write_queues &&
+      std::strcmp(ioptions.memtable_factory->Name(),
+                  SkipListFactory::kClassName()) == 0;
 }
 
 MemTable::~MemTable() {
@@ -1046,6 +1062,507 @@ void MemTable::BumpIngestVersionBarrier(uint64_t version_number) {
   }
 }
 
+uint64_t MemTable::HeadMarkBatchPostProcess(
+    const MemTablePostProcessInfo& info) {
+  if (info.num_live_entries > 0) {
+    SequenceNumber cur = max_inserted_seq_.LoadRelaxed();
+    while (cur < info.max_live_seq &&
+           !max_inserted_seq_.CasWeakRelaxed(cur, info.max_live_seq)) {
+    }
+  }
+  // This increment uses acq_rel because head marks use num_entries_ as the
+  // handshake (see MemTableHeadMark).
+  const uint64_t old_num_entries = num_entries_.FetchAdd(info.num_entries);
+  if (info.num_live_entries > MemTablePostProcessInfo::kMaxLiveKeys) {
+    LowerHeadMarks(info.min_live_key, info.max_live_key);
+  } else {
+    for (size_t i = 0; i < info.num_live_entries; ++i) {
+      LowerHeadMarkForKey(info.live_keys[i]);
+    }
+  }
+  return old_num_entries;
+}
+
+size_t MemTable::FindHeadMarkCell(HeadMarkDirection dir,
+                                  const HeadMarkTable& table,
+                                  const Slice& key) const {
+  const HeadMarkOrder order = OrderOf(dir);
+  // The hull check. Claims are sorted and never overlap, so the last claim
+  // ends last. A queue tail key stops here.
+  if (order(key, table.min_start) < 0 ||
+      order(key, table.cells[table.num_cells - 1]->mark.Load()->end) >= 0) {
+    return table.num_cells;
+  }
+  return SearchHeadMarkCells(dir, table, key);
+}
+
+size_t MemTable::SearchHeadMarkCells(HeadMarkDirection dir,
+                                     const HeadMarkTable& table,
+                                     const Slice& key) const {
+  const HeadMarkOrder order = OrderOf(dir);
+  // The first cell whose start is > key; the cell before it is the answer.
+  size_t lo = 0;
+  size_t hi = table.num_cells;
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (order(table.cells[mid]->start, key) <= 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo == 0 ? table.num_cells : lo - 1;
+}
+
+size_t MemTable::FindHeadMarkCellHolding(const HeadMarkTable& table,
+                                         const MemTableHeadMark* mark) {
+  for (size_t i = 0; i < table.num_cells; ++i) {
+    if (table.cells[i]->mark.LoadRelaxed() == mark) {
+      return i;
+    }
+  }
+  return table.num_cells;
+}
+
+void MemTable::LowerHeadMarks(const Slice& lo, const Slice& hi) {
+  // In the reverse order, the smallest key of [lo, hi] is `hi`.
+  if (MayLowerHeadMarks(HeadMarkDirection::kForward, lo, hi) ||
+      MayLowerHeadMarks(HeadMarkDirection::kReverse, hi, lo)) {
+    MutexLock l(&head_mark_mu_);
+    LowerHeadMarksLocked(HeadMarkDirection::kForward, lo, hi);
+    LowerHeadMarksLocked(HeadMarkDirection::kReverse, hi, lo);
+  }
+}
+
+bool MemTable::MayLowerHeadMarks(HeadMarkDirection dir, const Slice& lo,
+                                 const Slice& hi) const {
+  const HeadMarkTable* table = head_marks_[static_cast<int>(dir)].Load();
+  if (table == nullptr) {
+    return false;
+  }
+  const HeadMarkOrder order = OrderOf(dir);
+  if (order(hi, table->min_start) < 0) {
+    return false;
+  }
+  // Claims are disjoint and sorted by start, so their ends are sorted too.
+  // Among the claims that start at or before `hi`, the last one has the
+  // largest end. If that end is at or before `lo`, no claim overlaps
+  // [lo, hi], and the mutex is not needed. Otherwise LowerHeadMarksLocked()
+  // checks every claim.
+  const size_t i = FindHeadMarkCell(dir, *table, hi);
+  const size_t last = table->num_cells - 1;
+  const MemTableHeadMark* m =
+      table->cells[i == table->num_cells ? last : i]->mark.Load();
+  return order(lo, m->end) < 0;
+}
+
+bool MemTable::HeadMarkClaimMayHoldKey(HeadMarkDirection dir,
+                                       const HeadMarkTable& table,
+                                       const Slice& key) const {
+  TEST_SYNC_POINT("MemTable::HeadMarkClaimMayHoldKey");
+  const size_t i = SearchHeadMarkCells(dir, table, key);
+  return i < table.num_cells &&
+         OrderOf(dir)(key, table.cells[i]->mark.Load()->end) < 0;
+}
+
+void MemTable::LowerHeadMarksLocked(HeadMarkDirection dir, const Slice& lo,
+                                    const Slice& hi) {
+  head_mark_mu_.AssertHeld();
+  // A publisher may have replaced the table since the caller loaded it, so
+  // search the current one.
+  const HeadMarkTable* table = head_marks_[static_cast<int>(dir)].LoadRelaxed();
+  if (table == nullptr) {
+    return;
+  }
+  const HeadMarkOrder order = OrderOf(dir);
+  for (size_t i = 0; i < table->num_cells; ++i) {
+    HeadMarkCell* cell = table->cells[i];
+    const MemTableHeadMark* m = cell->mark.LoadRelaxed();
+    if (order(m->start, m->end) >= 0 || order(m->start, hi) > 0 ||
+        order(lo, m->end) >= 0) {
+      continue;
+    }
+    if (m->start_exclusive && order(lo, m->start) == 0 &&
+        order(hi, m->start) == 0) {
+      // The key is the exclusive start, which the mark does not claim.
+      continue;
+    }
+    // Every key of [lo, hi] is at or after lo, so [start, max(start, lo))
+    // holds none.
+    const Slice& new_end = order(lo, m->start) > 0 ? lo : m->start;
+    const Slice& usable_end =
+        order(m->usable_end, new_end) < 0 ? m->usable_end : new_end;
+    TEST_SYNC_POINT_CALLBACK("MemTable::LowerHeadMarks:Lower",
+                             const_cast<MemTableHeadMark*>(m));
+    // A lowering is never refused, so it counts its bytes without a
+    // reservation (see ReserveHeadMarkBytes()).
+    head_mark_bytes_.FetchAddRelaxed(sizeof(MemTableHeadMark));
+    cell->mark.Store(NewHeadMark(m->start, m->start_exclusive, new_end,
+                                 usable_end, m->seq, m->ingest_version,
+                                 /*lowered=*/true));
+  }
+}
+
+const MemTableHeadMark* MemTable::NewHeadMark(
+    const Slice& start, bool start_exclusive, const Slice& end,
+    const Slice& usable_end, SequenceNumber seq, uint64_t ingest_version,
+    bool lowered) {
+  char* mem = AllocateHeadMarkBytes(sizeof(MemTableHeadMark), /*aligned=*/true);
+  return new (mem) MemTableHeadMark{
+      start, end, usable_end, seq, ingest_version, lowered, start_exclusive};
+}
+
+char* MemTable::AllocateHeadMarkBytes(size_t n, bool aligned) {
+  return aligned ? arena_.AllocateAligned(n) : arena_.Allocate(n);
+}
+
+Slice MemTable::CopyToArena(const Slice& s) {
+  if (s.empty()) {
+    // The arena does not allocate 0 bytes. The empty key is a valid seek
+    // target, so a mark can start at it.
+    return Slice();
+  }
+  char* mem = AllocateHeadMarkBytes(s.size(), /*aligned=*/false);
+  memcpy(mem, s.data(), s.size());
+  return Slice(mem, s.size());
+}
+
+bool MemTable::ReserveHeadMarkBytes(size_t n) {
+  const size_t budget = kHeadMarkBaseBudget + data_size_.LoadRelaxed();
+  if (head_mark_bytes_.FetchAddRelaxed(n) + n > budget) {
+    // Only this reservation's own bytes are taken back, so the count never
+    // drops below the bytes that the marks really allocated.
+    head_mark_bytes_.FetchSubRelaxed(n);
+    return false;
+  }
+  return true;
+}
+
+void MemTable::PublishHeadMarkTableLocked(HeadMarkDirection dir,
+                                          HeadMarkCell* const* cells,
+                                          size_t n) {
+  head_mark_mu_.AssertHeld();
+  assert(n > 0 && n <= kMaxHeadMarks);
+  char* mem = AllocateHeadMarkBytes(sizeof(HeadMarkTable), /*aligned=*/true);
+  HeadMarkTable* table = new (mem) HeadMarkTable();
+  std::copy(cells, cells + n, table->cells);
+  table->num_cells = n;
+  table->min_start = cells[0]->start;
+  head_marks_[static_cast<int>(dir)].Store(table);
+}
+
+const MemTableHeadMark* MemTable::FindUsableHeadMark(
+    HeadMarkDirection dir, const Slice& user_key, bool key_included,
+    SequenceNumber read_seq, uint64_t read_version) const {
+  const HeadMarkTable* table = head_marks_[static_cast<int>(dir)].Load();
+  if (table == nullptr) {
+    return nullptr;
+  }
+  const size_t i = FindHeadMarkCell(dir, *table, user_key);
+  if (i == table->num_cells) {
+    return nullptr;
+  }
+  const MemTableHeadMark* m = table->cells[i]->mark.Load();
+  const HeadMarkOrder order = OrderOf(dir);
+  if (m->seq > read_seq || m->ingest_version > read_version ||
+      order(user_key, m->usable_end) >= 0) {
+    return nullptr;
+  }
+  // An exclusive start is not deleted, so the seek may skip from it only if
+  // the seek does not include it.
+  if (m->start_exclusive && key_included && order(user_key, m->start) == 0) {
+    return nullptr;
+  }
+  return m;
+}
+
+HeadMarkPublishResult MemTable::ExtendHeadMarkLocked(
+    HeadMarkDirection dir, const Slice& end, SequenceNumber seq,
+    const MemTableHeadMark* sender, HeadMarkCell** cell,
+    const MemTableHeadMark** claim, Slice* walk_end) {
+  head_mark_mu_.AssertHeld();
+  const HeadMarkTable* table = head_marks_[static_cast<int>(dir)].LoadRelaxed();
+  const size_t i =
+      table == nullptr ? 0 : FindHeadMarkCellHolding(*table, sender);
+  if (table == nullptr || i == table->num_cells) {
+    // A writer lowered the sender, another scan changed it, or an ingestion
+    // cleared it. Its usable_end may no longer be valid.
+    return HeadMarkPublishResult::kRefusedChanged;
+  }
+  const HeadMarkOrder order = OrderOf(dir);
+  // Stop at the next claim, so claims stay disjoint. The run is deleted up to
+  // `end`, so any prefix of it is deleted too.
+  const bool capped =
+      i + 1 < table->num_cells && order(table->cells[i + 1]->start, end) < 0;
+  const Slice new_end_view = capped ? table->cells[i + 1]->start : end;
+  if (order(new_end_view, sender->usable_end) <= 0) {
+    return HeadMarkPublishResult::kNothingToExtend;
+  }
+  *cell = table->cells[i];
+  if (order(new_end_view, sender->end) <= 0) {
+    // The sender already claims the run, so only its usable end can grow, and
+    // only up to the end of this scan's run: the scan did not see the rest of
+    // the claim, and the sender's walk may have stopped before a live entry
+    // there. The caller walks [usable_end, run end) of the sender itself and
+    // allocates nothing unless the walk gets past the usable end. A reader at
+    // an old snapshot can repeat this for every seek (the walk stops at the
+    // same newer live entry each time), so allocating a new claim here would
+    // grow the arena with each seek.
+    *claim = sender;
+    *walk_end = new_end_view;
+    return HeadMarkPublishResult::kExtended;
+  }
+  if (!ReserveHeadMarkBytes((capped ? 0 : end.size()) +
+                            sizeof(MemTableHeadMark))) {
+    return HeadMarkPublishResult::kRefusedBudget;
+  }
+  const Slice new_end = capped ? new_end_view : CopyToArena(end);
+  // The sender is still in its cell, so no ingestion happened since its
+  // publish.
+  *claim = NewHeadMark(sender->start, sender->start_exclusive, new_end,
+                       sender->usable_end, seq, sender->ingest_version,
+                       /*lowered=*/false);
+  (*cell)->mark.Store(*claim);
+  *walk_end = new_end;
+  return HeadMarkPublishResult::kExtended;
+}
+
+HeadMarkPublishResult MemTable::AddHeadMarkLocked(
+    HeadMarkDirection dir, const Slice& start, bool start_exclusive,
+    const Slice& end, SequenceNumber seq, uint64_t ingest_version,
+    HeadMarkCell** cell, const MemTableHeadMark** claim) {
+  head_mark_mu_.AssertHeld();
+  const HeadMarkTable* table = head_marks_[static_cast<int>(dir)].LoadRelaxed();
+  const HeadMarkOrder order = OrderOf(dir);
+  // Keep the cells with a non-empty claim; a writer may have lowered a claim
+  // to nothing. An exclusive start counts as inclusive here, which can only
+  // refuse more.
+  HeadMarkCell* cells[kMaxHeadMarks + 1];
+  size_t n = 0;
+  size_t insert_at = 0;
+  for (size_t i = 0; table != nullptr && i < table->num_cells; ++i) {
+    HeadMarkCell* c = table->cells[i];
+    const MemTableHeadMark* m = c->mark.LoadRelaxed();
+    if (order(m->start, m->end) >= 0) {
+      continue;
+    }
+    if (order(start, m->end) < 0 && order(m->start, end) < 0) {
+      return HeadMarkPublishResult::kRefusedOverlap;
+    }
+    if (order(m->start, start) < 0) {
+      insert_at = n + 1;
+    }
+    cells[n++] = c;
+  }
+  if (n == kMaxHeadMarks) {
+    return HeadMarkPublishResult::kRefusedFull;
+  }
+  // The new mark allocates the two key copies, the cell, the mark and the
+  // new table below.
+  if (!ReserveHeadMarkBytes(start.size() + end.size() + sizeof(HeadMarkCell) +
+                            sizeof(MemTableHeadMark) + sizeof(HeadMarkTable))) {
+    return HeadMarkPublishResult::kRefusedBudget;
+  }
+  const Slice start_copy = CopyToArena(start);
+  char* mem = AllocateHeadMarkBytes(sizeof(HeadMarkCell), /*aligned=*/true);
+  *cell = new (mem) HeadMarkCell(start_copy);
+  // Nothing is usable before the validation walk.
+  *claim = NewHeadMark(start_copy, start_exclusive, CopyToArena(end),
+                       start_copy, seq, ingest_version, /*lowered=*/false);
+  (*cell)->mark.Store(*claim);
+  assert(insert_at <= n && n < kMaxHeadMarks);
+  for (size_t i = n; i > insert_at; --i) {
+    cells[i] = cells[i - 1];
+  }
+  cells[insert_at] = *cell;
+  PublishHeadMarkTableLocked(dir, cells, n + 1);
+  return HeadMarkPublishResult::kPublished;
+}
+
+Slice MemTable::ValidateHeadMarkRange(HeadMarkDirection dir,
+                                      const MemTableHeadMark& claim,
+                                      const Slice& to,
+                                      SequenceNumber seq) const {
+  const Slice& from = claim.usable_end;
+  if (max_inserted_seq_.Load() <= seq) {
+    return to;
+  }
+  const HeadMarkOrder order = OrderOf(dir);
+  const bool reverse = dir == HeadMarkDirection::kReverse;
+  std::unique_ptr<MemTableRep::Iterator> iter(table_->GetIterator());
+  std::string seek_key;
+  if (reverse) {
+    if (claim.start_exclusive && order(from, claim.start) == 0) {
+      // `from` is the exclusive start, which the claim does not hold. Seek
+      // before its first entry, so that the walk visits none of its versions,
+      // however many there are.
+      AppendInternalKey(&seek_key, ParsedInternalKey(from, kMaxSequenceNumber,
+                                                     kValueTypeForSeek));
+    } else {
+      // The last entry of `from`, so that every entry of `from` is visited.
+      AppendInternalKey(&seek_key,
+                        ParsedInternalKey(from, 0, kValueTypeForSeekForPrev));
+    }
+    iter->SeekForPrev(seek_key, nullptr);
+  } else {
+    AppendInternalKey(&seek_key, ParsedInternalKey(from, kMaxSequenceNumber,
+                                                   kValueTypeForSeek));
+    iter->Seek(seek_key, nullptr);
+  }
+  size_t walked = 0;
+  for (; iter->Valid(); reverse ? iter->Prev() : iter->Next()) {
+    const Slice internal_key = GetLengthPrefixedSlice(iter->key());
+    const Slice user_key = ExtractUserKey(internal_key);
+    TEST_SYNC_POINT_CALLBACK("MemTable::ValidateHeadMarkRange:Step",
+                             const_cast<Slice*>(&user_key));
+    if (order(user_key, to) >= 0) {
+      return to;
+    }
+    if (++walked > kMaxHeadMarkWalk) {
+      // Keep the part checked so far; it ends before this key.
+      return user_key;
+    }
+    SequenceNumber entry_seq;
+    ValueType type;
+    UnPackSequenceAndType(ExtractInternalKeyFooter(internal_key), &entry_seq,
+                          &type);
+    if (entry_seq > seq && !IsHeadMarkDeleteType(type)) {
+      return user_key;
+    }
+  }
+  return to;
+}
+
+HeadMarkPublishResult MemTable::PublishHeadMark(
+    HeadMarkDirection dir, const Slice& start, bool start_exclusive,
+    const Slice& end, SequenceNumber seq, const MemTableHeadMark* sender,
+    bool run_is_long, uint64_t version_number,
+    const HeadMarkIngestState& ingest, port::RWMutex& ingest_sst_lock) {
+  if (!head_marks_enabled_) {
+    return HeadMarkPublishResult::kDisabled;
+  }
+  if (!run_is_long && (sender == nullptr || !sender->lowered)) {
+    return HeadMarkPublishResult::kRefusedShort;
+  }
+  const HeadMarkOrder order = OrderOf(dir);
+  assert(order(start, end) < 0);
+  HeadMarkCell* cell = nullptr;
+  const MemTableHeadMark* claim = nullptr;
+  // The end of the part of the claim that the step 4 walk checks.
+  Slice walk_end;
+  {
+    // The scan's active memtable may have become immutable since. The same
+    // check as in AddLogicallyRedundantRangeTombstone().
+    if (is_immutable_.LoadRelaxed()) {
+      return HeadMarkPublishResult::kRefusedImmutable;
+    }
+    ReadLock rl(&immutable_mutex_);
+    if (is_immutable_.LoadRelaxed()) {
+      return HeadMarkPublishResult::kRefusedImmutable;
+    }
+    // An ingestion holds this lock as a reader from before it clears the
+    // marks until it has recorded its Version and sequence number.
+    TryWriteLock ingest_wl(&ingest_sst_lock);
+    if (!ingest_wl.OwnsLock()) {
+      return HeadMarkPublishResult::kRefusedIngest;
+    }
+    MutexLock l(&head_mark_mu_);
+    // A scan whose Version predates the latest ingestion is refused even if
+    // its sequence number is not older (see "File ingestion" at
+    // MemTableHeadMark).
+    const uint64_t ingest_version = ingest.version_number.Load();
+    if (version_number < ingest_version || seq < ingest.seqno.Load()) {
+      return HeadMarkPublishResult::kRefusedIngest;
+    }
+    const HeadMarkPublishResult result =
+        sender != nullptr
+            ? ExtendHeadMarkLocked(dir, end, seq, sender, &cell, &claim,
+                                   &walk_end)
+            : AddHeadMarkLocked(dir, start, start_exclusive, end, seq,
+                                ingest_version, &cell, &claim);
+    if (claim == nullptr) {
+      return result;
+    }
+    if (sender == nullptr) {
+      walk_end = claim->end;
+    }
+  }
+  // Publish step 3 of the MemTableHeadMark comment, the handshake. This
+  // publish inserts no entry, so it adds 0; the read-modify-write is still in
+  // the single modification order of num_entries_.
+  num_entries_.FetchAdd(0);
+  TEST_SYNC_POINT_CALLBACK("MemTable::PublishHeadMark:BeforeValidate",
+                           const_cast<MemTableHeadMark*>(claim));
+  const Slice checked_end = ValidateHeadMarkRange(dir, *claim, walk_end, seq);
+  if (order(checked_end, claim->usable_end) > 0) {
+    RaiseHeadMarkUsableEnd(dir, cell, claim, checked_end, seq);
+  }
+  return sender != nullptr ? HeadMarkPublishResult::kExtended
+                           : HeadMarkPublishResult::kPublished;
+}
+
+void MemTable::RaiseHeadMarkUsableEnd(HeadMarkDirection dir, HeadMarkCell* cell,
+                                      const MemTableHeadMark* claim,
+                                      const Slice& usable_end,
+                                      SequenceNumber seq) {
+  // The memtable list counts a memtable's memory when the memtable becomes
+  // immutable, so the arena allocates only while the memtable is mutable. This
+  // read lock, held to the end of the function, keeps MarkImmutable() (which
+  // takes it as a writer) from running during the allocation. If the memtable
+  // became immutable since the claim, or the new mark and the copy of
+  // usable_end do not fit in the byte budget, the claim keeps its usable end.
+  ReadLock rl(&immutable_mutex_);
+  if (is_immutable_.LoadRelaxed() ||
+      !ReserveHeadMarkBytes(usable_end.size() + sizeof(MemTableHeadMark))) {
+    return;
+  }
+  // Allocate before taking head_mark_mu_, so the mutex covers only the check
+  // and the store below, and a writer that lowers a mark waits only for those.
+  // arena_ is a ConcurrentArena, so this allocation is safe while writers and
+  // other scans allocate from it at the same time. usable_end can be the end of
+  // the scan's run, which the scan owns, so copy it. If the check fails, the
+  // new mark stays unused in the arena; that happens only when a writer, a scan
+  // or an ingestion changed the cell during the walk, and its bytes stay
+  // counted.
+  const MemTableHeadMark* raised =
+      NewHeadMark(claim->start, claim->start_exclusive, claim->end,
+                  CopyToArena(usable_end), seq, claim->ingest_version,
+                  /*lowered=*/false);
+  TEST_SYNC_POINT("MemTable::RaiseHeadMarkUsableEnd:Allocated");
+  MutexLock l(&head_mark_mu_);
+  const HeadMarkTable* table = head_marks_[static_cast<int>(dir)].LoadRelaxed();
+  // If a writer lowered the claim, keep the writer's mark. If an ingestion
+  // cleared the table, the cell is gone.
+  if (table == nullptr || cell->mark.LoadRelaxed() != claim ||
+      FindHeadMarkCellHolding(*table, claim) == table->num_cells) {
+    return;
+  }
+  cell->mark.Store(raised);
+}
+
+void MemTable::ClearHeadMarks() {
+  if (!head_marks_enabled_) {
+    return;
+  }
+  // The caller holds ingest_sst_lock as a reader, so no publish stores a new
+  // table now. A writer's lowering or a scan's raise that runs at the same
+  // time stores only into a cell of the table that it loaded, which no reader
+  // can reach after these stores. So the clear does not take head_mark_mu_, and
+  // the caller, which holds the DB mutex, does not wait for a lowering.
+  head_marks_[0].Store(nullptr);
+  head_marks_[1].Store(nullptr);
+}
+
+std::vector<MemTableHeadMark> MemTable::TEST_HeadMarks(
+    HeadMarkDirection dir) const {
+  std::vector<MemTableHeadMark> marks;
+  const HeadMarkTable* table = head_marks_[static_cast<int>(dir)].Load();
+  for (size_t i = 0; table != nullptr && i < table->num_cells; ++i) {
+    marks.push_back(*table->cells[i]->mark.Load());
+  }
+  return marks;
+}
+
 port::RWMutex* MemTable::GetLock(const Slice& key) {
   return &locks_[GetSliceRangedNPHash(key, locks_.size())];
 }
@@ -1205,13 +1722,32 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
     // (non-concurrent), these counters may be concurrently modified by
     // BatchPostProcess() (e.g., from AddLogicallyRedundantRangeTombstone
     // called on a read path).
-    activate_flush_initiator = num_entries_.FetchAddRelaxed(1) == 0;
+    if (UNLIKELY(head_marks_enabled_)) {
+      // Head mark handshake (see MemTableHeadMark): raise max_inserted_seq_,
+      // increment num_entries_ (acq_rel), then check the marks. A plain load
+      // and store is enough for max_inserted_seq_: read-path conversion
+      // (AddLogicallyRedundantRangeTombstone()) can run BatchPostProcess() at
+      // the same time, but it inserts only range tombstones, which never
+      // change max_inserted_seq_.
+      if (!IsHeadMarkDeleteType(type) && s > max_inserted_seq_.LoadRelaxed()) {
+        max_inserted_seq_.StoreRelaxed(s);
+      }
+      activate_flush_initiator = num_entries_.FetchAdd(1) == 0;
+    } else {
+      activate_flush_initiator = num_entries_.FetchAddRelaxed(1) == 0;
+    }
     data_size_.FetchAddRelaxed(encoded_len);
     if (type == kTypeDeletion || type == kTypeSingleDeletion ||
         type == kTypeDeletionWithTimestamp) {
       num_deletes_.FetchAddRelaxed(1);
     } else if (type == kTypeRangeDeletion) {
       num_range_deletes_.FetchAddRelaxed(1);
+    }
+    // The mark check comes after all counter updates, so that no locked
+    // read-modify-write waits for its loads. key_slice is the user key in the
+    // entry (marks are off with user-defined timestamps).
+    if (UNLIKELY(head_marks_enabled_) && !IsHeadMarkDeleteType(type)) {
+      LowerHeadMarkForKey(key_slice);
     }
 
     if (bloom_filter_ && prefix_extractor_ &&
@@ -1233,6 +1769,24 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
     }
 
     assert(post_process_info != nullptr);
+    if (UNLIKELY(head_marks_enabled_) && !IsHeadMarkDeleteType(type)) {
+      // BatchPostProcess() does the head mark handshake for the whole batch.
+      const Comparator* ucmp = comparator_.comparator.user_comparator();
+      MemTablePostProcessInfo& info = *post_process_info;
+      if (info.num_live_entries == 0 ||
+          ucmp->Compare(key_slice, info.min_live_key) < 0) {
+        info.min_live_key = key_slice;
+      }
+      if (info.num_live_entries == 0 ||
+          ucmp->Compare(key_slice, info.max_live_key) > 0) {
+        info.max_live_key = key_slice;
+      }
+      if (info.num_live_entries < MemTablePostProcessInfo::kMaxLiveKeys) {
+        info.live_keys[info.num_live_entries] = key_slice;
+      }
+      ++info.num_live_entries;
+      info.max_live_seq = std::max(info.max_live_seq, s);
+    }
     post_process_info->num_entries++;
     post_process_info->data_size += encoded_len;
     if (type == kTypeDeletion || type == kTypeSingleDeletion ||

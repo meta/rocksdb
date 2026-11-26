@@ -10,6 +10,7 @@
 #include "table/merging_iterator.h"
 
 #include "db/arena_wrapped_db_iter.h"
+#include "db/memtable.h"
 #include "monitoring/file_read_sample.h"
 #include "test_util/sync_point.h"
 
@@ -338,6 +339,38 @@ class MergingIterator : public InternalIterator {
     }
   }
 
+  void SeekWithHeadMarks(const Slice& target, SequenceNumber read_seq,
+                         uint64_t read_version,
+                         const ReadOnlyMemTable* mark_mem,
+                         const MemTableHeadMark** used_mark) override {
+    head_mark_used_ = nullptr;
+    if (!head_mark_mems_.empty()) {
+      head_mark_seek_ = true;
+      head_mark_read_seq_ = read_seq;
+      head_mark_read_version_ = read_version;
+      head_mark_mem_ = mark_mem;
+    }
+    Seek(target);
+    assert(!head_mark_seek_);
+    *used_mark = head_mark_used_;
+  }
+
+  void SeekForPrevWithHeadMarks(const Slice& target, SequenceNumber read_seq,
+                                uint64_t read_version,
+                                const ReadOnlyMemTable* mark_mem,
+                                const MemTableHeadMark** used_mark) override {
+    head_mark_used_ = nullptr;
+    if (!head_mark_mems_.empty()) {
+      head_mark_seek_ = true;
+      head_mark_read_seq_ = read_seq;
+      head_mark_read_version_ = read_version;
+      head_mark_mem_ = mark_mem;
+    }
+    SeekForPrev(target);
+    assert(!head_mark_seek_);
+    *used_mark = head_mark_used_;
+  }
+
   void SeekForPrev(const Slice& target) override {
     assert(range_tombstone_iters_.empty() ||
            range_tombstone_iters_.size() == children_.size());
@@ -651,6 +684,42 @@ class MergingIterator : public InternalIterator {
 
   bool SkipPrevDeleted();
 
+  // Head marks (see MemTableHeadMark). If memtable `mem` has a usable mark
+  // that contains the user key of *search_key, sets *search_key to (usable
+  // end, kMaxSequenceNumber), so that this level and every older level seek
+  // there. The mark says that every key of [user key, usable end) in this
+  // level and in older levels is deleted for this reader, so the result is
+  // the same as stepping over the range.
+  void SeekOverHeadMark(const ReadOnlyMemTable* mem, IterKey* search_key);
+
+  // The reverse form of SeekOverHeadMark(), for SeekForPrevImpl(). If memtable
+  // `mem` has a usable reverse mark that contains the user key of
+  // *search_key, sets *search_key to (usable end, 0,
+  // kValueTypeForSeekForPrev), so that this level and every older level
+  // position at the last entry at or before the usable end. A mark with
+  // start_exclusive does not contain its start, but a search that also
+  // excludes that key can use the mark there. Internal keys sort the versions
+  // of one user key by decreasing sequence number, so a reverse search key
+  // with sequence number 0 includes its user key, and one with
+  // kMaxSequenceNumber excludes it and positions below it. DBIter uses the
+  // exclusive form for a seek clamped to iterate_upper_bound, and the merge
+  // uses it when a covering range tombstone of a newer level moves the older
+  // levels to the tombstone's start.
+  void SeekForPrevOverHeadMark(const ReadOnlyMemTable* mem,
+                               IterKey* search_key);
+
+  // (child index, memtable) of the children that read a memtable with head
+  // marks, in child order.
+  autovector<std::pair<size_t, const ReadOnlyMemTable*>, 4> head_mark_mems_;
+  // Set by SeekWithHeadMarks() and SeekForPrevWithHeadMarks() for the first
+  // SeekImpl() or SeekForPrevImpl() of their seek only, so the reseeks after
+  // it do not use marks.
+  bool head_mark_seek_ = false;
+  SequenceNumber head_mark_read_seq_ = 0;
+  uint64_t head_mark_read_version_ = 0;
+  const ReadOnlyMemTable* head_mark_mem_ = nullptr;
+  const MemTableHeadMark* head_mark_used_ = nullptr;
+
   // Invariant: at the end of each InternalIterator API,
   // current_ points to minHeap_.top().iter (maxHeap_ if backward scanning)
   // or nullptr if no child iterator is valid.
@@ -779,6 +848,10 @@ class MergingIterator : public InternalIterator {
 // minHeap_.
 void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
                                bool range_tombstone_reseek) {
+  const bool use_head_marks = head_mark_seek_;
+  head_mark_seek_ = false;
+  assert(!use_head_marks || starting_level == 0);
+  size_t next_head_mark_mem = 0;
   // active range tombstones before `starting_level` remain active
   ClearHeaps(false /* clear_active */);
   ParsedInternalKey pik;
@@ -837,7 +910,18 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
   // we need to remember them for async requests.
   // (level, target) pairs
   autovector<std::pair<size_t, std::string>> prefetched_target;
+  // Only a range tombstone or a head mark of a newer level can move the seek
+  // key of a level away from `target`. Without either, a child that returns
+  // TryAgain is sought again at `target` (see the end of this function).
+  const bool seek_key_may_move = !range_tombstone_iters_.empty() ||
+                                 (use_head_marks && !head_mark_mems_.empty());
   for (auto level = starting_level; level < children_.size(); ++level) {
+    if (use_head_marks && next_head_mark_mem < head_mark_mems_.size() &&
+        head_mark_mems_[next_head_mark_mem].first == level) {
+      SeekOverHeadMark(head_mark_mems_[next_head_mark_mem].second,
+                       &current_search_key);
+      ++next_head_mark_mem;
+    }
     {
       PERF_TIMER_GUARD(seek_child_seek_time);
       children_[level].iter.Seek(current_search_key.GetInternalKey());
@@ -845,15 +929,19 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
 
     PERF_COUNTER_ADD(seek_child_seek_count, 1);
 
+    // The seek key of this level may differ from `target`, so remember it.
+    // Copy it only if it differs. An empty string stands for `target`,
+    // because an internal key is never empty.
+    if (seek_key_may_move && children_[level].iter.status().IsTryAgain()) {
+      const Slice search_key = current_search_key.GetInternalKey();
+      prefetched_target.emplace_back(
+          level, search_key == target ? std::string() : search_key.ToString());
+    }
     if (!range_tombstone_iters_.empty()) {
       if (range_tombstone_reseek) {
         // This seek is to some range tombstone end key.
         // Should only happen when there are range tombstones.
         PERF_COUNTER_ADD(internal_range_del_reseek_count, 1);
-      }
-      if (children_[level].iter.status().IsTryAgain()) {
-        prefetched_target.emplace_back(
-            level, current_search_key.GetInternalKey().ToString());
       }
       UnownedPtr<TruncatedRangeDelIterator> range_tombstone_iter =
           range_tombstone_iters_[level].get();
@@ -908,7 +996,7 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
     }
   }
 
-  if (range_tombstone_iters_.empty()) {
+  if (!seek_key_may_move) {
     for (auto& child : children_) {
       if (child.iter.status().IsTryAgain()) {
         child.iter.Seek(target);
@@ -922,7 +1010,8 @@ void MergingIterator::SeekImpl(const Slice& target, size_t starting_level,
   } else {
     for (auto& prefetch : prefetched_target) {
       // (level, target) pairs
-      children_[prefetch.first].iter.Seek(prefetch.second);
+      children_[prefetch.first].iter.Seek(
+          prefetch.second.empty() ? target : Slice(prefetch.second));
       {
         PERF_TIMER_GUARD(seek_min_heap_time);
         AddToMinHeapOrCheckStatus(&children_[prefetch.first]);
@@ -1085,9 +1174,49 @@ bool MergingIterator::SkipNextDeleted() {
   return false /* current key not deleted */;
 }
 
+void MergingIterator::SeekOverHeadMark(const ReadOnlyMemTable* mem,
+                                       IterKey* search_key) {
+  const MemTableHeadMark* mark = mem->FindUsableHeadMark(
+      HeadMarkDirection::kForward, search_key->GetUserKey(),
+      /*key_included=*/true, head_mark_read_seq_, head_mark_read_version_);
+  if (mark == nullptr) {
+    return;
+  }
+  if (mem == head_mark_mem_) {
+    head_mark_used_ = mark;
+  }
+  TEST_SYNC_POINT_CALLBACK("MergingIterator::SeekOverHeadMark",
+                           const_cast<MemTableHeadMark*>(mark));
+  search_key->SetInternalKey(mark->usable_end, kMaxSequenceNumber,
+                             kValueTypeForSeek);
+}
+
+void MergingIterator::SeekForPrevOverHeadMark(const ReadOnlyMemTable* mem,
+                                              IterKey* search_key) {
+  const bool key_included =
+      ExtractInternalKeyFooter(search_key->GetInternalKey()) >> 8 !=
+      kMaxSequenceNumber;
+  const MemTableHeadMark* mark = mem->FindUsableHeadMark(
+      HeadMarkDirection::kReverse, search_key->GetUserKey(), key_included,
+      head_mark_read_seq_, head_mark_read_version_);
+  if (mark == nullptr) {
+    return;
+  }
+  if (mem == head_mark_mem_) {
+    head_mark_used_ = mark;
+  }
+  TEST_SYNC_POINT_CALLBACK("MergingIterator::SeekForPrevOverHeadMark",
+                           const_cast<MemTableHeadMark*>(mark));
+  search_key->SetInternalKey(mark->usable_end, 0, kValueTypeForSeekForPrev);
+}
+
 void MergingIterator::SeekForPrevImpl(const Slice& target,
                                       size_t starting_level,
                                       bool range_tombstone_reseek) {
+  const bool use_head_marks = head_mark_seek_;
+  head_mark_seek_ = false;
+  assert(!use_head_marks || starting_level == 0);
+  size_t next_head_mark_mem = 0;
   // active range tombstones before `starting_level` remain active
   ClearHeaps(false /* clear_active */);
   InitMaxHeap();
@@ -1122,7 +1251,16 @@ void MergingIterator::SeekForPrevImpl(const Slice& target,
   // we need to remember them for async requests.
   // (level, target) pairs
   autovector<std::pair<size_t, std::string>> prefetched_target;
+  // See SeekImpl().
+  const bool seek_key_may_move = !range_tombstone_iters_.empty() ||
+                                 (use_head_marks && !head_mark_mems_.empty());
   for (auto level = starting_level; level < children_.size(); ++level) {
+    if (use_head_marks && next_head_mark_mem < head_mark_mems_.size() &&
+        head_mark_mems_[next_head_mark_mem].first == level) {
+      SeekForPrevOverHeadMark(head_mark_mems_[next_head_mark_mem].second,
+                              &current_search_key);
+      ++next_head_mark_mem;
+    }
     {
       PERF_TIMER_GUARD(seek_child_seek_time);
       children_[level].iter.SeekForPrev(current_search_key.GetInternalKey());
@@ -1130,15 +1268,18 @@ void MergingIterator::SeekForPrevImpl(const Slice& target,
 
     PERF_COUNTER_ADD(seek_child_seek_count, 1);
 
+    // The seek key of this level may differ from `target`, so remember it.
+    // Copy it only if it differs (see SeekImpl()).
+    if (seek_key_may_move && children_[level].iter.status().IsTryAgain()) {
+      const Slice search_key = current_search_key.GetInternalKey();
+      prefetched_target.emplace_back(
+          level, search_key == target ? std::string() : search_key.ToString());
+    }
     if (!range_tombstone_iters_.empty()) {
       if (range_tombstone_reseek) {
         // This seek is to some range tombstone end key.
         // Should only happen when there are range tombstones.
         PERF_COUNTER_ADD(internal_range_del_reseek_count, 1);
-      }
-      if (children_[level].iter.status().IsTryAgain()) {
-        prefetched_target.emplace_back(
-            level, current_search_key.GetInternalKey().ToString());
       }
       UnownedPtr<TruncatedRangeDelIterator> range_tombstone_iter =
           range_tombstone_iters_[level].get();
@@ -1177,7 +1318,7 @@ void MergingIterator::SeekForPrevImpl(const Slice& target,
     }
   }
 
-  if (range_tombstone_iters_.empty()) {
+  if (!seek_key_may_move) {
     for (auto& child : children_) {
       if (child.iter.status().IsTryAgain()) {
         child.iter.SeekForPrev(target);
@@ -1191,7 +1332,8 @@ void MergingIterator::SeekForPrevImpl(const Slice& target,
   } else {
     for (auto& prefetch : prefetched_target) {
       // (level, target) pairs
-      children_[prefetch.first].iter.SeekForPrev(prefetch.second);
+      children_[prefetch.first].iter.SeekForPrev(
+          prefetch.second.empty() ? target : Slice(prefetch.second));
       {
         PERF_TIMER_GUARD(seek_max_heap_time);
         AddToMaxHeapOrCheckStatus(&children_[prefetch.first]);
@@ -1695,6 +1837,7 @@ MergeIteratorBuilder::~MergeIteratorBuilder() {
 }
 
 void MergeIteratorBuilder::AddIterator(InternalIterator* iter) {
+  ++num_iters_;
   if (!use_merging_iter && first_iter != nullptr) {
     merge_iter->AddIterator(first_iter);
     use_merging_iter = true;
@@ -1711,6 +1854,7 @@ void MergeIteratorBuilder::AddPointAndTombstoneIterator(
     InternalIterator* point_iter,
     std::unique_ptr<TruncatedRangeDelIterator>&& tombstone_iter,
     std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr) {
+  ++num_iters_;
   // tombstone_iter_ptr != nullptr means point_iter is a LevelIterator.
   bool add_range_tombstone = tombstone_iter ||
                              !merge_iter->range_tombstone_iters_.empty() ||
@@ -1742,6 +1886,13 @@ void MergeIteratorBuilder::AddPointAndTombstoneIterator(
     }
   } else {
     first_iter = point_iter;
+  }
+}
+
+void MergeIteratorBuilder::SetHeadMarkMemTable(const ReadOnlyMemTable* mem) {
+  assert(num_iters_ > 0);
+  if (mem->HeadMarksEnabled()) {
+    merge_iter->head_mark_mems_.emplace_back(num_iters_ - 1, mem);
   }
 }
 

@@ -27,6 +27,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "trace_replay/block_cache_tracer.h"
+#include "util/atomic.h"
 #include "util/cast_util.h"
 #include "util/hash_containers.h"
 #include "util/mutexlock.h"
@@ -415,6 +416,7 @@ class ColumnFamilyData {
   void SetMemtable(MemTable* new_mem) {
     AssignMemtableID(new_mem);
     mem_ = new_mem;
+    may_have_head_marks_ = may_have_head_marks_ || mem_->HeadMarksEnabled();
     if (ioptions_.disallow_memtable_writes) {
       mem_->MarkImmutable();
     }
@@ -528,6 +530,21 @@ class ColumnFamilyData {
   uint64_t GetSuperVersionNumberRelaxed() const {
     return super_version_number_.load(std::memory_order_relaxed);
   }
+
+  // The number of the Version that installed the latest successful file
+  // ingestion, or 0. See DBImpl::SuperVersionMissesIngestion().
+  uint64_t GetLastIngestVersionNumber() const {
+    return last_ingest_version_number_.LoadRelaxed();
+  }
+
+  // Called under the DB mutex by the ingestion, after LogAndApply() and before
+  // the ingested sequence numbers are published.
+  void SetLastIngestVersionNumber(uint64_t version_number) {
+    if (last_ingest_version_number_.LoadRelaxed() < version_number) {
+      last_ingest_version_number_.StoreRelaxed(version_number);
+    }
+  }
+
   // Only intended for use by DBImpl::InstallSuperVersion() and variants
   void InstallSuperVersion(SuperVersionContext* sv_context,
                            InstrumentedMutex* db_mutex,
@@ -674,6 +691,25 @@ class ColumnFamilyData {
   // tombstone conversion.
   port::RWMutex& GetIngestSstLock() { return ingest_sst_lock_; }
 
+  // The ingestion state that head mark publishing checks (see
+  // MemTableHeadMark).
+  const HeadMarkIngestState& GetHeadMarkIngestState() const {
+    return head_mark_ingest_state_;
+  }
+
+  // Called by file ingestion and DeleteFilesInRanges() under the DB mutex
+  // while they hold ingest_sst_lock_. Both change the SST files so that a key
+  // in a mark's range can become visible (see MemTableHeadMark).
+  // ClearHeadMarks() removes the marks of every memtable of this column
+  // family; call it before the new Version is installed. It returns at once if
+  // no memtable of this column family had head marks enabled (see
+  // may_have_head_marks_). RecordFileChangeForHeadMarks() then records the
+  // installed Version's number and the largest ingested sequence number (0 for
+  // DeleteFilesInRanges(), which keeps the recorded one).
+  void ClearHeadMarks();
+  void RecordFileChangeForHeadMarks(uint64_t version_number,
+                                    SequenceNumber seqno);
+
  private:
   friend class ColumnFamilySet;
   ColumnFamilyData(
@@ -739,6 +775,13 @@ class ColumnFamilyData {
   // InstallSuperVersion(), i.e. incremented every time super_version_
   // changes.
   std::atomic<uint64_t> super_version_number_;
+
+  // See GetLastIngestVersionNumber(). Written under the DB mutex and read
+  // without it. Readers load it after they load the last sequence number
+  // (acquire), and the ingestion stores it before it publishes the sequence
+  // number (release), so a reader that sees an ingested sequence number also
+  // sees this value.
+  RelaxedAtomic<uint64_t> last_ingest_version_number_{0};
 
   // Thread's local copy of SuperVersion pointer
   // This needs to be destructed before mutex_
@@ -811,6 +854,14 @@ class ColumnFamilyData {
   // Used to synchronize IngestExternalFile with range tombstone conversion. See
   // also Memtable::ingest_seqno_barrier_.
   port::RWMutex ingest_sst_lock_;
+
+  HeadMarkIngestState head_mark_ingest_state_;
+
+  // True once SetMemtable() installed an active memtable with head marks
+  // enabled. Only the active memtable gets marks, so while this is false no
+  // memtable of this column family has marks. It stays true for the life of
+  // the column family. Read and written under the DB mutex.
+  bool may_have_head_marks_ = false;
 };
 
 // ColumnFamilySet has interesting thread-safety requirements
