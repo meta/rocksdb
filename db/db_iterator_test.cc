@@ -9392,8 +9392,9 @@ TEST_P(ReadPathRangeTombstoneTest, IngestedFileSurvivesOlderIterator) {
 
 // NewIterator() references the SuperVersion before it reads the sequence
 // number. An ingestion plus a write in between gives the iterator a sequence
-// number above the ingested files' while its SuperVersion lacks them. It must
-// not convert the deleted keys around those files into a range tombstone.
+// number above the ingested files'. The iterator must then read with the
+// SuperVersion that has the files, so it sees them and does not convert the
+// deleted keys around them into a range tombstone.
 TEST_P(ReadPathRangeTombstoneTest,
        IngestedFileSurvivesIteratorWithOlderSuperVersion) {
   for (bool new_seqno : {false, true}) {
@@ -9450,7 +9451,7 @@ TEST_P(ReadPathRangeTombstoneTest,
     }
     ASSERT_TRUE(found);
 
-    // The iterator reads past the write of "z" but not the ingested file.
+    // The iterator reads past the write of "z" and sees the ingested file.
     attempted_insert_ranges_.clear();
     std::vector<std::string> seen;
     if (Forward()) {
@@ -9463,10 +9464,12 @@ TEST_P(ReadPathRangeTombstoneTest,
       }
     }
     ASSERT_OK(iter->status());
-    ASSERT_EQ(seen, std::vector<std::string>({"a", "e", "z"}));
+    ASSERT_EQ(seen, new_seqno
+                        ? std::vector<std::string>({"a", "b", "c", "e", "z"})
+                        : std::vector<std::string>({"a", "c", "e", "z"}));
     iter.reset();
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-    AssertRange(0, "b", "e");
+    // No two deleted keys are next to each other in that view.
+    ASSERT_EQ(attempted_insert_ranges_.size(), 0);
 
     EXPECT_EQ(Get("c"), "vc");
     EXPECT_EQ(Get("b"), new_seqno ? "vb2" : "NOT_FOUND");
@@ -9474,6 +9477,417 @@ TEST_P(ReadPathRangeTombstoneTest,
     Reopen(options);
     EXPECT_EQ(Get("c"), "vc");
   }
+}
+
+// A read references its SuperVersion before it reads the sequence number. If
+// a file ingestion runs in between, the read gets the ingested file's
+// sequence number S but a SuperVersion without the file. A newer iterator can
+// then convert a run that the file's delete completes, at S. Without a fix,
+// the old read sees that range tombstone but not the rest of the file: it
+// sees the ingested delete of "b" but not the ingested put of "ax". The read
+// must see either the whole ingestion or none of it.
+TEST_P(ReadPathRangeTombstoneTest, ReadDoesNotSeePartOfIngestion) {
+  enum class Read { kIterator, kMultiGet, kRefresh };
+  for (Read read : {Read::kIterator, Read::kMultiGet, Read::kRefresh}) {
+    SCOPED_TRACE("read " + std::to_string(static_cast<int>(read)));
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    // An SST file holds "b". The memtable deletes "a" and "c" around it.
+    ASSERT_OK(Put("b", "old"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("a"));
+    ASSERT_OK(Delete("c"));
+    ASSERT_OK(Put("d", "vd"));
+    // The ingested file puts "ax" and deletes "b". No memtable key is in
+    // ["ax", "b"], so the ingestion does not flush the memtable. The file
+    // overlaps the SST file, so it gets a new sequence number.
+    const std::string file = dbname_ + "/ingest.sst";
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("ax", "new"));
+      ASSERT_OK(writer.Delete("b"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    std::unique_ptr<Iterator> refreshed;
+    if (read == Read::kRefresh) {
+      refreshed.reset(db_->NewIterator(ReadOptions()));
+      // An unrelated ingestion changes the SuperVersion, so Refresh() builds
+      // a new iterator tree.
+      const std::string other = dbname_ + "/other.sst";
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(other));
+      ASSERT_OK(writer.Put("z", "vz"));
+      ASSERT_OK(writer.Finish());
+      ASSERT_OK(db_->IngestExternalFile({other}, IngestExternalFileOptions()));
+    }
+
+    // Runs once, after the read references its SuperVersion and before it
+    // reads the sequence number: ingest the file, then let a new iterator
+    // convert the run "b", "c". This runs on another thread, because MultiGet()
+    // holds this thread's thread-local SuperVersion slot.
+    const char* pause = read == Read::kIterator ? "DBImpl::NewIterator:1"
+                        : read == Read::kMultiGet
+                            ? "DBImpl::MultiCFSnapshot::SingleCFAfterRefSV"
+                            : "ArenaWrappedDBIter::DoRefresh:AfterRefSV";
+    bool paused = false;
+    SyncPoint::GetInstance()->SetCallBack(pause, [&](void*) {
+      if (paused) {
+        return;
+      }
+      paused = true;
+      port::Thread writer([&]() {
+        ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+        std::unique_ptr<Iterator> converter(db_->NewIterator(ReadOptions()));
+        if (Forward()) {
+          converter->Seek("b");
+          ASSERT_TRUE(converter->Valid());
+          ASSERT_EQ("d", converter->key().ToString());
+        } else {
+          converter->SeekForPrev("cc");
+          ASSERT_TRUE(converter->Valid());
+          ASSERT_EQ("ax", converter->key().ToString());
+        }
+        ASSERT_OK(converter->status());
+      });
+      writer.join();
+    });
+    attempted_insert_ranges_.clear();
+
+    std::vector<std::string> seen;
+    if (read == Read::kMultiGet) {
+      const Slice keys[] = {"ax", "b"};
+      PinnableSlice values[2];
+      Status statuses[2];
+      db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), 2, keys, values,
+                    statuses);
+      for (int i = 0; i < 2; ++i) {
+        if (statuses[i].ok()) {
+          seen.push_back(keys[i].ToString());
+        } else {
+          ASSERT_TRUE(statuses[i].IsNotFound());
+        }
+      }
+    } else {
+      std::unique_ptr<Iterator> iter;
+      if (read == Read::kIterator) {
+        iter.reset(db_->NewIterator(ReadOptions()));
+      } else {
+        ASSERT_OK(refreshed->Refresh());
+        iter = std::move(refreshed);
+      }
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+    }
+    SyncPoint::GetInstance()->ClearCallBack(pause);
+    ASSERT_TRUE(paused);
+    ASSERT_EQ(1, attempted_insert_ranges_.size());
+
+    // The read sees the ingested put of "ax" with the ingested delete of "b".
+    std::vector<std::string> expected;
+    if (read == Read::kMultiGet) {
+      expected = {"ax"};
+    } else if (read == Read::kIterator) {
+      expected = {"ax", "d"};
+    } else {
+      expected = {"ax", "d", "z"};
+    }
+    ASSERT_EQ(expected, seen);
+  }
+}
+
+// A read that replaces its SuperVersion (see ReadDoesNotSeePartOfIngestion)
+// must read its sequence number again after it references the new
+// SuperVersion. In this test the memtable holds "k" = "v1". The read
+// references its SuperVersion, an ingestion of an unrelated key runs, and the
+// read reads sequence number S. Before the read references the new
+// SuperVersion, "k" = "v2" is written at a sequence number above S and
+// flushed. No snapshot needs "v1", so the flush keeps only "v2". A read at S
+// with the new SuperVersion would find no version of "k".
+TEST_P(ReadPathRangeTombstoneTest, ReplacedSuperVersionReadsNewSequence) {
+  enum class Read { kIterator, kMultiGet, kRefresh };
+  for (Read read : {Read::kIterator, Read::kMultiGet, Read::kRefresh}) {
+    SCOPED_TRACE("read " + std::to_string(static_cast<int>(read)));
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("k", "v1"));
+    auto write_file = [&](const std::string& name, const std::string& key) {
+      const std::string file = dbname_ + "/" + name;
+      SstFileWriter writer(EnvOptions(), options);
+      EXPECT_OK(writer.Open(file));
+      EXPECT_OK(writer.Put(key, "v"));
+      EXPECT_OK(writer.Finish());
+      return file;
+    };
+    const std::string file = write_file("ingest.sst", "z");
+
+    std::unique_ptr<Iterator> refreshed;
+    if (read == Read::kRefresh) {
+      refreshed.reset(db_->NewIterator(ReadOptions()));
+      // An unrelated ingestion changes the SuperVersion, so Refresh() builds
+      // a new iterator tree.
+      ASSERT_OK(db_->IngestExternalFile({write_file("other.sst", "y")},
+                                        IngestExternalFileOptions()));
+    }
+
+    // The ingestion and the write run on another thread, because MultiGet()
+    // holds this thread's thread-local SuperVersion slot.
+    const char* pause = read == Read::kIterator ? "DBImpl::NewIterator:1"
+                        : read == Read::kMultiGet
+                            ? "DBImpl::MultiCFSnapshot::SingleCFAfterRefSV"
+                            : "ArenaWrappedDBIter::DoRefresh:AfterRefSV";
+    bool paused = false;
+    SyncPoint::GetInstance()->SetCallBack(pause, [&](void*) {
+      if (paused) {
+        return;
+      }
+      paused = true;
+      port::Thread ingester([&]() {
+        ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+      });
+      ingester.join();
+    });
+    bool replaced = false;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock", [&](void*) {
+          if (replaced) {
+            return;
+          }
+          replaced = true;
+          port::Thread writer([&]() {
+            ASSERT_OK(Put("k", "v2"));
+            ASSERT_OK(Flush());
+          });
+          writer.join();
+        });
+
+    std::vector<std::string> seen;
+    if (read == Read::kMultiGet) {
+      PinnableSlice value;
+      Status status;
+      const Slice key("k");
+      db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), 1, &key, &value,
+                    &status);
+      ASSERT_OK(status);
+      seen.push_back("k=" + value.ToString());
+    } else {
+      std::unique_ptr<Iterator> iter;
+      if (read == Read::kIterator) {
+        iter.reset(db_->NewIterator(ReadOptions()));
+      } else {
+        ASSERT_OK(refreshed->Refresh());
+        iter = std::move(refreshed);
+      }
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString() + "=" + iter->value().ToString());
+      }
+      ASSERT_OK(iter->status());
+    }
+    SyncPoint::GetInstance()->ClearCallBack(pause);
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock");
+    ASSERT_TRUE(paused);
+    ASSERT_TRUE(replaced);
+
+    std::vector<std::string> expected;
+    if (read == Read::kMultiGet) {
+      expected = {"k=v2"};
+    } else if (read == Read::kIterator) {
+      expected = {"k=v2", "z=v"};
+    } else {
+      expected = {"k=v2", "y=v", "z=v"};
+    }
+    ASSERT_EQ(expected, seen);
+  }
+}
+
+// A read with a timestamp checks it against full_history_ts_low of its
+// SuperVersion. A read that replaces its SuperVersion (see
+// ReadDoesNotSeePartOfIngestion) checks the new SuperVersion too. In this
+// test the read at timestamp 10 references its SuperVersion, which passes
+// the check, and an unrelated ingestion runs. Before the read references the
+// new SuperVersion, full_history_ts_low rises to 20 and a flush installs a
+// SuperVersion with it. The read must fail as if it had started after that.
+TEST_P(ReadPathRangeTombstoneTest, ReplacedSuperVersionChecksReadTimestamp) {
+  enum class Read { kIterator, kMultiGet };
+  for (Read read : {Read::kIterator, Read::kMultiGet}) {
+    SCOPED_TRACE("read " + std::to_string(static_cast<int>(read)));
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    DestroyAndReopen(options);
+    std::string ts_buf;
+    ASSERT_OK(db_->Put(WriteOptions(), "k", EncodeU64Ts(1, &ts_buf), "v"));
+    const std::string file = dbname_ + "/ingest.sst";
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("z", EncodeU64Ts(1, &ts_buf), "v"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    // The ingestion, the write and the flush run on another thread, because
+    // MultiGet() holds this thread's thread-local SuperVersion slot.
+    const char* pause = read == Read::kIterator
+                            ? "DBImpl::NewIterator:1"
+                            : "DBImpl::MultiCFSnapshot::SingleCFAfterRefSV";
+    bool paused = false;
+    SyncPoint::GetInstance()->SetCallBack(pause, [&](void*) {
+      if (paused) {
+        return;
+      }
+      paused = true;
+      port::Thread ingester([&]() {
+        ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+      });
+      ingester.join();
+    });
+    bool replaced = false;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock", [&](void*) {
+          if (replaced) {
+            return;
+          }
+          replaced = true;
+          port::Thread writer([&]() {
+            std::string buf;
+            ASSERT_OK(db_->IncreaseFullHistoryTsLow(
+                db_->DefaultColumnFamily(), EncodeU64Ts(20, &buf).ToString()));
+            ASSERT_OK(
+                db_->Put(WriteOptions(), "k", EncodeU64Ts(30, &buf), "v2"));
+            ASSERT_OK(Flush());
+          });
+          writer.join();
+        });
+
+    std::string read_ts_buf;
+    const Slice read_ts = EncodeU64Ts(10, &read_ts_buf);
+    ReadOptions ro;
+    ro.timestamp = &read_ts;
+    Status status;
+    if (read == Read::kMultiGet) {
+      PinnableSlice value;
+      const Slice key("k");
+      db_->MultiGet(ro, db_->DefaultColumnFamily(), 1, &key, &value, &status);
+    } else {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      iter->SeekToFirst();
+      status = iter->status();
+    }
+    SyncPoint::GetInstance()->ClearCallBack(pause);
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock");
+    ASSERT_TRUE(paused);
+    ASSERT_TRUE(replaced);
+    ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+  }
+}
+
+// A read with a table_filter fails when conversion is on (see
+// ReadOptions::table_filter). A read that replaces its SuperVersion (see
+// ReadDoesNotSeePartOfIngestion) checks the new SuperVersion too. In this test
+// conversion is off when the iterator references its SuperVersion. Before it
+// reads the sequence number, SetOptions() turns conversion on and an unrelated
+// ingestion runs, so the iterator replaces its SuperVersion with one that has
+// conversion on. The iterator must fail as if it had started after that.
+TEST_P(ReadPathRangeTombstoneTest, ReplacedSuperVersionChecksTableFilter) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  const std::string file = dbname_ + "/ingest.sst";
+  {
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("z", "v"));
+    ASSERT_OK(writer.Finish());
+  }
+  bool paused = false;
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::NewIterator:1", [&](void*) {
+    if (paused) {
+      return;
+    }
+    paused = true;
+    ASSERT_OK(db_->SetOptions({{"min_tombstones_for_range_conversion", "2"}}));
+    ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+  });
+  std::function<bool(const TableProperties&)> filter =
+      [](const TableProperties&) { return true; };
+  ReadOptions ro;
+  ro.table_filter = &filter;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::NewIterator:1");
+  ASSERT_TRUE(paused);
+  ASSERT_TRUE(iter->status().IsInvalidArgument()) << iter->status().ToString();
+}
+
+// MultiCFSnapshot() reads one sequence number for several column families and
+// then references their SuperVersions, and it tries again if a SuperVersion
+// misses an ingestion. Its last try holds the DB mutex while it references
+// the SuperVersions, so it reads the sequence number after it takes the
+// mutex: a flush can then not drop a version that the sequence number needs.
+// In this test, two ingestions force the last try. Between the steps of that
+// try, "k" = "v2" is written and flushed, which drops "v1".
+TEST_P(ReadPathRangeTombstoneTest, MultiCFLastTryReadsSequenceUnderMutex) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ASSERT_OK(Put(0, "k", "v1"));
+  ASSERT_OK(Put(1, "x", "vx"));
+  int ingestions = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void*) {
+        // Each of the first two tries references the default column family
+        // first; an ingestion right after that makes the try fail.
+        if (ingestions >= 2) {
+          return;
+        }
+        const std::string file =
+            dbname_ + "/ingest" + std::to_string(ingestions) + ".sst";
+        const std::string key = "z" + std::to_string(ingestions);
+        ++ingestions;
+        port::Thread ingester([&]() {
+          SstFileWriter writer(EnvOptions(), options);
+          ASSERT_OK(writer.Open(file));
+          ASSERT_OK(writer.Put(key, "v"));
+          ASSERT_OK(writer.Finish());
+          ASSERT_OK(db_->IngestExternalFile(handles_[0], {file},
+                                            IngestExternalFileOptions()));
+        });
+        ingester.join();
+      });
+  bool last_try = false;
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::MultiCFSnapshot::LastTry",
+                                        [&](void*) {
+                                          last_try = true;
+                                          port::Thread writer([&]() {
+                                            ASSERT_OK(Put(0, "k", "v2"));
+                                            ASSERT_OK(Flush(0));
+                                          });
+                                          writer.join();
+                                        });
+  std::vector<ColumnFamilyHandle*> cfs = {handles_[0], handles_[1]};
+  std::vector<Slice> keys = {"k", "x"};
+  std::vector<std::string> values;
+  std::vector<Status> statuses =
+      db_->MultiGet(ReadOptions(), cfs, keys, &values);
+  SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::MultiCFSnapshot::AfterRefSV");
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::MultiCFSnapshot::LastTry");
+  ASSERT_EQ(2, ingestions);
+  ASSERT_TRUE(last_try);
+  ASSERT_OK(statuses[0]);
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ((std::vector<std::string>{"v2", "vx"}), values);
 }
 
 // One IngestExternalFiles() call installs files in two column families. Each
