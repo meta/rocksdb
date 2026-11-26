@@ -396,6 +396,9 @@ class TableCache {
   }
 
  private:
+  // DBImpl gets per-job SST readers for indirect blob GC, outside the DB mutex.
+  friend class DBImpl;
+
   // Gets a reader for the exact blob reference metadata of `file_meta`. It
   // first looks for the SST's reader in the table cache without I/O (the pinned
   // reader of the SST, or a cache lookup). That reader already read the table

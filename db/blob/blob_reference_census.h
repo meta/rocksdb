@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -414,7 +415,10 @@ namespace ROCKSDB_NAMESPACE {
 // CacheEntryRole::kBlobReferenceCensus, unless that role is disabled in
 // cache_usage_options, so the memory counts against the block cache capacity.
 // The charged memory is the worker state, the build state, the summaries that
-// a build or a compaction reads, the change log entries and the GC copies.
+// a build or a compaction reads, and the change log entries. An indirect blob
+// GC copy of the selected generation numbers (BlobReferenceCensusState) belongs
+// to the GC job. It is charged to CacheEntryRole::kIndirectBlobGcWorkingMemory
+// in the GC job's block cache instead (see SnapshotSelected()).
 // A charge of the worker state, the build state, a summary or a change log
 // entry that fails because the block cache is full does not fail the census
 // build or the install: that memory stays uncharged and the work goes on. What
@@ -525,12 +529,33 @@ class BlobGcCandidateHeap {
   static constexpr size_t kMaxSelectedFiles = kBlobGcMaxSelectedFiles;
   using Selection = std::array<uint64_t, kMaxSelectedFiles>;
 
+  // The garbage bytes and total bytes of each file of a Selection, at the same
+  // index. CutSelection() uses them.
+  struct SelectedFileBytes {
+    uint64_t garbage_bytes = 0;
+    uint64_t total_bytes = 0;
+  };
+  using SelectionBytes = std::array<SelectedFileBytes, kMaxSelectedFiles>;
+
+  // Keeps the leading files of `selection` whose garbage ratio is at least
+  // `garbage_ratio` (the indirect_blob_gc_garbage_ratio option), and clears the
+  // rest. Select() returns the files ranked by garbage ratio, so the files that
+  // stay are the best files that pass the ratio.
+  static void CutSelection(double garbage_ratio, const SelectionBytes& bytes,
+                           Selection* selection);
+
   void SetPhysicalFile(const BlobGcPhysicalFileSummary& file);
   void SetCoarseIndirectOriginFrontier(uint64_t frontier);
-  Status AdjustLiveBytes(uint64_t file_number, uint64_t bytes, bool add);
+  // Adds (`add` true) or subtracts `bytes` live bytes and `count` live values
+  // (census references) of one generation number on its physical file.
+  Status AdjustLiveBytes(uint64_t file_number, uint64_t bytes, uint64_t count,
+                         bool add);
   void DeletePhysicalFile(uint64_t file_number);
   bool IsIndirectOrigin(uint64_t file_number) const;
-  Selection Select() const;
+  // Returns the best kMaxSelectedFiles (8) files of the heap, ranked by
+  // garbage ratio, highest first, with no garbage ratio limit. When `bytes` is
+  // not null, it gets the bytes of each returned file.
+  Selection Select(SelectionBytes* bytes = nullptr) const;
   Selection SelectEmpty() const;
   uint64_t Revision(uint64_t file_number) const;
   size_t size() const { return candidates_.size(); }
@@ -555,21 +580,50 @@ class BlobGcCandidateHeap {
   }
   size_t MemoryUsage(size_t additional_candidates) const;
 
-  // Test only: the live bytes of each physical file in the heap, by file
-  // number. Used by the debug self-check.
-  std::map<uint64_t, uint64_t> TEST_LiveBytesByFile() const;
+  // Test only: the live bytes and the live value count of each physical file
+  // in the heap, by file number. Used by the debug self-check.
+  std::map<uint64_t, std::pair<uint64_t, uint64_t>>
+  TEST_LiveBytesAndCountByFile() const;
+
+  // The files that GC suppressed because their data or metadata is corrupt
+  // (Suppress() with `corrupt` true), for the property
+  // rocksdb.indirect-blob-gc-stats. `count` is the number of such files, and
+  // `files` holds the lowest kMaxReportedCorruptFiles (8) of their numbers,
+  // with 0 in the unused entries. A short fixed list keeps the property small
+  // when many files are corrupt.
+  static constexpr size_t kMaxReportedCorruptFiles = 8;
+  struct CorruptFileReport {
+    uint64_t count = 0;
+    std::array<uint64_t, kMaxReportedCorruptFiles> files{};
+  };
+  CorruptFileReport GetCorruptFileReport() const;
 
   // GC reports a file it could not use, and the heap takes the file out
-  // (suppresses it). The suppression stays across Version changes that do not
-  // touch the file. A change of the file's total bytes, live bytes, flags
-  // (is_indirect_origin, is_lost) or coarse pin ends it at once.
+  // (suppresses it), so that Select() picks other files. Suppress(file, 0) is a
+  // normal suppression. It stays across Version changes that do not touch the
+  // file. A change of the file's total bytes, live bytes, flags
+  // (is_indirect_origin, is_lost) or coarse pin ends it at once. A census
+  // rebuild also ends it, because the rebuild starts a new heap. A rise of the
+  // coarse frontier ends the suppression of every suppressed relocation file
+  // above the old frontier, whatever the reason for it, because the heap
+  // stores only whether a file is corrupt, not why GC skipped it (see
+  // SetCoarseIndirectOriginFrontier()).
   // SuppressTransient() is for transient failures: the file comes back after a
-  // retry delay (1 s, doubled per failure, at most 32 s). Suppress(file, 0) is
-  // for a corrupt file: it comes back only after a change to the file or a
-  // census rebuild. RetryDue() brings back the files whose delay has passed and
-  // returns the next retry time (0 if none).
-  void Suppress(uint64_t file_number, uint64_t retry_micros);
+  // retry delay (1 s, doubled per failure, at most 32 s). `corrupt` marks a
+  // file whose data or metadata is corrupt (see GetCorruptFileReport()).
+  // RetryDue() brings back the files whose delay has passed and returns the
+  // next retry time (0 if none).
+  // SuppressOversized() is a normal suppression for a file whose live values
+  // do not fit in the memory budget of one GC job. Unlike a normal
+  // suppression, a change of the live bytes ends it only when the file has at
+  // most `max_live_count` live values (the most that a job can hold). So a
+  // file whose SSTs keep being compacted is not picked again after each
+  // change while it still cannot fit. The other ends of a normal suppression
+  // still apply.
+  void Suppress(uint64_t file_number, uint64_t retry_micros,
+                bool corrupt = false);
   void SuppressTransient(uint64_t file_number, uint64_t now_micros);
+  void SuppressOversized(uint64_t file_number, uint64_t max_live_count);
   uint64_t RetryDue(uint64_t now_micros);
 
   static int CompareRatios(uint64_t lhs_garbage, uint64_t lhs_total,
@@ -581,12 +635,23 @@ class BlobGcCandidateHeap {
     uint64_t file_number = 0;
     uint64_t total_bytes = 0;
     uint64_t live_bytes = 0;
+    // The census references of the file's generation numbers. It uses the
+    // same sum as live_bytes, so it can be too high in the same way.
+    uint64_t live_count = 0;
     uint64_t retry_micros = 0;
     uint64_t revision = 0;
+    // Set by SuppressOversized(): the most live values that a GC job can hold.
+    uint64_t oversized_max_live_count = 0;
     size_t position = kNotInHeap;
     bool is_indirect_origin = false;
     bool is_lost = false;
     bool suppressed = false;
+    // Set by SuppressOversized(). While it is set, AdjustLiveBytes() keeps
+    // the file suppressed exactly while live_count is above
+    // oversized_max_live_count. Suppress() and the other callers of
+    // Activate() clear it.
+    bool oversized = false;
+    bool corrupt = false;
     bool coarse_pinned = false;
     uint8_t failures = 0;
   };
@@ -608,6 +673,8 @@ class BlobGcCandidateHeap {
   // (retry time, file number) of each suppressed file with a retry time. A
   // timer tick reads only the due entries, not every blob file.
   std::set<std::pair<uint64_t, uint64_t>> retries_;
+  // The numbers of the suppressed files with `corrupt` set.
+  std::set<uint64_t> corrupt_files_;
   uint64_t next_revision_ = 1;
   uint64_t coarse_indirect_origin_frontier_ = 0;
   uint64_t relocation_garbage_bytes_ = 0;
@@ -831,9 +898,10 @@ class BlobReferenceCensusState {
   SstFilesByGeneration generations_;
   // The generation numbers in this copy; null means every generation number.
   std::shared_ptr<const std::set<uint64_t>> selected_generations_;
-  // The block cache charge of this copy (CacheEntryRole::kBlobReferenceCensus),
-  // or null when the copy is not charged. The charge is the real size of the
-  // copy (SnapshotMemoryBound()).
+  // The block cache charge of this copy
+  // (CacheEntryRole::kIndirectBlobGcWorkingMemory, because the indirect blob GC
+  // job owns the copy), or null when the copy is not charged. The charge is the
+  // real size of the copy (SnapshotMemoryBound()).
   std::shared_ptr<CacheReservationManager> reservation_manager_;
   size_t snapshot_memory_bound_ = 0;
 };
@@ -1103,6 +1171,9 @@ class BlobReferenceCensus {
   // canceled.
   bool IsGcJobActive(uint64_t token) const;
 
+  // True while any GC job is registered (see BeginGcJob()).
+  bool HasGcJob() const;
+
   // REQUIRES: DB mutex held. Ends the GC job `token` (no-op for another
   // token). O(1), no allocation.
   void EndGcJob(uint64_t token);
@@ -1120,6 +1191,129 @@ class BlobReferenceCensus {
   // True from a rebuild install until the next BeginBuild(). A build slice that
   // fails because of that install restarts at once, without backoff.
   bool RebuildRequested() const;
+
+  // Before indirect blob GC copies a blob file, it reads the references of that
+  // file from the SSTs and checks them against the census. GC calls
+  // ReportMismatch() when the SSTs or the totals differ from the census for
+  // blob file `file_number`.
+  //
+  // Census mismatch state: ReportMismatch(), ClearMismatch(),
+  // TakeMismatchReport() and BeginBuild() share these fields:
+  // - The remembered files (unresolved_mismatch_files_): the files that GC
+  //   reported and that no later check of the same file found correct. The set
+  //   holds at most kMaxUnresolvedMismatchFiles (1024) files.
+  // - Two flags, mismatch_reported_ and rebuild_requested_. TryPublishWorker()
+  //   returns kStale while either flag is set, so a mismatching census cannot
+  //   become ready again. BeginBuild() clears both: the build that it starts
+  //   reads the current Version, which is the rebuild that a report asks for.
+  // - The number of mismatch rebuilds in a row (mismatch_rebuilds_in_a_row_).
+  //   A mismatch rebuild is a build that a mismatch report requested.
+  // In the table, f is the file number that GC passes.
+  //
+  //   Call                  Condition          Action                 Returns
+  //   --------------------  -----------------  ---------------------  -------
+  //   ReportMismatch(f)     f is remembered    count a suppression    true
+  //   ReportMismatch(f)     otherwise          remember f if the set  false
+  //                                            is not full; census
+  //                                            not ready; set both
+  //                                            flags
+  //   ClearMismatch(f)      -                  forget f; if f was     -
+  //                                            remembered, the set
+  //                                            is not full
+  //   TakeMismatchReport()  -                  clear                  the old
+  //                                            mismatch_reported_     flag
+  //
+  // After a first report of a file, the next build slice rebuilds the census
+  // from the current Version. A repeat report (true in the table) means that
+  // the rebuild did not clear the mismatch of that file. GC then suppresses
+  // that file and skips its input: the job decides no input, so it never uses
+  // a census entry that is known to be wrong. The suppression lasts until the
+  // file changes, the next census rebuild, or (for a relocation file) a rise
+  // of the coarse frontier (see BlobGcCandidateHeap::Suppress()). A rebuild
+  // that another file's report requests ends the suppression, but the file is
+  // still remembered, so its next report suppresses it again instead of
+  // requesting one more rebuild. So two or more files whose mismatch stays do
+  // not make the census rebuild again and again.
+  //
+  // The remembered files are forgotten when a census build that no mismatch
+  // report requested publishes (for example the first build after a rebuild
+  // install canceled a ready census). Such a build starts from scratch, so an
+  // old report does not apply to it. A mismatch rebuild is a mismatch rebuild
+  // until a build publishes: when it restarts before it publishes (after a
+  // change log overflow, a rebuild install or another failure), the restarted
+  // build keeps the remembered files and the counts. Otherwise each restart
+  // would forget the files and the backoff, and a lasting mismatch would cost
+  // one rebuild per report.
+  //
+  // Backoff: the census job restarts a mismatch rebuild at once, unless it is
+  // the third or a later one in a row (MismatchRebuildMustWait()). Then the
+  // rebuild waits, and the census job writes one ERROR line. The wait is 1 s
+  // for the first such wait and doubles for each later one, at most 32 s. The
+  // census counts the waits in a separate count (mismatch_rebuild_waits_, see
+  // TakeMismatchRebuildWaitStep()), so the wait doubles exactly once per real
+  // wait. It does not use the count of failed builds, because each mismatch
+  // rebuild runs OK slices, and an OK slice sets the failed-build count back to
+  // 0. It does not use the count of mismatch rebuilds in a row either: a report
+  // that arrives after the census job took the last report fails the next
+  // publish, and the job can wait again before the next slice counts that
+  // report. Both counts go back to 0 when a GC check finds no mismatch after a
+  // publish (NoteCensusCheckMatched()), and when a build that no report
+  // requested publishes. The remembered set is full from a report that the set
+  // cannot hold, until a matching check forgets a remembered file
+  // (ClearMismatch()) or a build that no report requested publishes. While the
+  // set is full, a matching check does not reset the counts, so the backoff
+  // alone limits the rebuilds of the files that the set cannot hold.
+  bool ReportMismatch(uint64_t file_number);
+
+  // GC calls this for each checked input of a job when no input of that job
+  // mismatched the SSTs. The census forgets `file_number` if it remembers it,
+  // so a later mismatch of the file requests a rebuild again. Other remembered
+  // files stay, so a match of one file does not hide a repeat mismatch of a
+  // different file. A forgotten file leaves room in the remembered set, so
+  // ClearMismatch() also clears the full state, and the next first report of a
+  // file is remembered.
+  void ClearMismatch(uint64_t file_number);
+
+  // GC calls this once per job when it checked at least one input and found no
+  // mismatch. It resets the count of mismatch rebuilds in a row, unless the
+  // remembered set is full (see ReportMismatch()).
+  void NoteCensusCheckMatched();
+
+  // True when the next mismatch rebuild must wait for the backoff: more than
+  // kMismatchRebuildsWithoutBackoff (2) mismatch rebuilds in a row were
+  // requested (see ReportMismatch()). For tests.
+  bool MismatchRebuildMustWait() const;
+
+  // The census job calls this once when a rebuild is requested after a failed
+  // build. It returns 0 when MismatchRebuildMustWait() is false, or when the
+  // build did not fail because of a mismatch report (TakeMismatchReport() did
+  // not return true since the build started; for example, a rebuild install
+  // canceled it): the rebuild starts at once. Otherwise the rebuild waits, and
+  // the call counts one more wait and returns the new count: 1 for the first
+  // wait, 2 for the second, and so on. The census job doubles the wait with
+  // this number, and the ERROR line uses the same number (see
+  // ReportMismatch()). One locked call reads and counts, so the decision, the
+  // wait and the ERROR line use one value. The wait is counted before the
+  // census job knows that it will wait. When the run ends early (shutdown or a
+  // dropped column family), the counted wait never happens. This is harmless:
+  // the next wait is one step longer, and the limit stays 32 s.
+  uint32_t TakeMismatchRebuildWaitStep();
+
+  // The number of remembered files and the count of mismatch rebuilds in a row
+  // (see ReportMismatch()). For tests.
+  size_t unresolved_mismatch_file_count() const;
+  uint32_t mismatch_rebuilds_in_a_row() const;
+
+  // Returns how many times GC suppressed a candidate because a census rebuild
+  // did not clear its mismatch.
+  uint64_t gc_mismatch_suppress_count() const {
+    return gc_mismatch_suppress_count_.load(std::memory_order_relaxed);
+  }
+
+  // Returns true if a ReportMismatch() requested a rebuild since the last call,
+  // and clears the flag. The census build slice calls it to fail the running
+  // build. A true result counts one mismatch rebuild (see ReportMismatch()).
+  bool TakeMismatchReport();
 
   // After a change log overflow, the build restarts at once, one time only.
   // From then until a build publishes, each build has the larger limit
@@ -1144,8 +1338,9 @@ class BlobReferenceCensus {
 
   // Monitoring (the property rocksdb.indirect-blob-gc-stats). Most of these
   // read and write relaxed atomics only. StayingMemoryBytes() also takes
-  // worker_state_mutex_ for a short time. None of them takes the worker mutex,
-  // so a property read never waits for a running census build.
+  // worker_state_mutex_, and the corrupt file report calls take
+  // published_corrupt_mutex_, each for a short time. None of them takes the
+  // worker mutex, so a property read never waits for a running census build.
   //
   // An estimate of the census memory that stays: the worker state (its last
   // cache reservation size) plus the change log entries that the census holds.
@@ -1234,6 +1429,17 @@ class BlobReferenceCensus {
   uint64_t PublishedRelocationGarbageBytes() const {
     return published_relocation_garbage_.load(std::memory_order_relaxed);
   }
+  // The corrupt file report of the last publish. A small mutex keeps the count
+  // and the list from two different publishes apart.
+  void SetPublishedCorruptFiles(
+      const BlobGcCandidateHeap::CorruptFileReport& report) {
+    std::lock_guard<std::mutex> lock(published_corrupt_mutex_);
+    published_corrupt_files_ = report;
+  }
+  BlobGcCandidateHeap::CorruptFileReport PublishedCorruptFiles() const {
+    std::lock_guard<std::mutex> lock(published_corrupt_mutex_);
+    return published_corrupt_files_;
+  }
   void NoteBuildStart(uint64_t now_micros) {
     build_start_micros_.store(now_micros, std::memory_order_relaxed);
   }
@@ -1270,10 +1476,13 @@ class BlobReferenceCensus {
       uint64_t token, const std::vector<BlobGcPhysicalFileSummary>& files);
   Status SetWorkerCoarseIndirectOriginFrontier(uint64_t token,
                                                uint64_t frontier);
-  BlobGcCandidateHeap::Selection SelectWorkerCandidates(uint64_t token);
+  BlobGcCandidateHeap::Selection SelectWorkerCandidates(
+      uint64_t token, BlobGcCandidateHeap::SelectionBytes* bytes = nullptr);
   BlobGcCandidateHeap::Selection SelectWorkerEmptyCandidates(uint64_t token);
   uint64_t WorkerRelocationGarbageBytes(uint64_t token) const;
   BlobGcCandidateHeap::Totals WorkerCandidateTotals(uint64_t token) const;
+  BlobGcCandidateHeap::CorruptFileReport WorkerCorruptFileReport(
+      uint64_t token) const;
   uint64_t RetryWorkerCandidates(uint64_t token, uint64_t now_micros);
   bool NeedsWorkerRun(uint64_t version_number) const;
 
@@ -1293,12 +1502,16 @@ class BlobReferenceCensus {
 
   // Call without the DB mutex. GC reports the files it could not use. A report
   // from a replaced worker, or for a file whose revision changed, is ignored.
-  // Files in `transient_files` get a retry delay; the other files wait for a
-  // change (see BlobGcCandidateHeap::Suppress()).
-  void SuppressWorkerCandidates(const BlobGcCandidateStamp& stamp,
-                                const std::vector<uint64_t>& files,
-                                const std::set<uint64_t>& transient_files,
-                                uint64_t now_micros);
+  // Files in `transient_files` get a retry delay. Files in `oversized_files`
+  // map to the most live values that a GC job can hold, and stay suppressed
+  // until they have no more than that (BlobGcCandidateHeap::
+  // SuppressOversized()). The other files wait for a change (see
+  // BlobGcCandidateHeap::Suppress()).
+  void SuppressWorkerCandidates(
+      const BlobGcCandidateStamp& stamp, const std::vector<uint64_t>& files,
+      const std::set<uint64_t>& transient_files,
+      const std::map<uint64_t, uint64_t>& oversized_files, uint64_t now_micros,
+      const std::set<uint64_t>& corrupt_files = {});
   Status ApplyWorkerDelta(uint64_t token,
                           const BlobReferenceCensusDelta& delta);
   uint64_t WorkerVersionNumber() const;
@@ -1317,14 +1530,17 @@ class BlobReferenceCensus {
 
   // Call without the DB mutex, after BeginGcJob() registered the job at
   // `version_number`. Copies the holders of `generation_numbers` only. The copy
-  // does not block an install.
+  // does not block an install. A non-null `gc_block_cache` is charged for the
+  // copy under CacheEntryRole::kIndirectBlobGcWorkingMemory.
   Status SnapshotSelected(uint64_t token, uint64_t version_number,
                           const std::set<uint64_t>& generation_numbers,
+                          const std::shared_ptr<Cache>& gc_block_cache,
                           std::shared_ptr<BlobReferenceCensusState>* state);
 
   // Same copy as SnapshotSelected(), without the GC job checks.
   Status ReadSelectedSnapshot(
       uint64_t version_number, const std::set<uint64_t>& generation_numbers,
+      const std::shared_ptr<Cache>& gc_block_cache,
       std::shared_ptr<BlobReferenceCensusState>* state) const;
 
   // Test only: builds a full copy of every generation number. Call without the
@@ -1333,11 +1549,12 @@ class BlobReferenceCensus {
   std::shared_ptr<const BlobReferenceCensusState> TEST_GetReadyState(
       uint64_t version_number) const;
 
-  // Test only: adds up the live bytes of every generation number of the worker
-  // on its physical file again, and compares the sums with the live bytes in
-  // the candidate heap. It also checks that each generation number's physical
-  // file matches its route. True if all match, or if the census is no longer
-  // ready for `version_number`. Otherwise describes the first difference in
+  // Test only: adds up the live bytes and the live value counts of every
+  // generation number of the worker on its physical file again, and compares
+  // the sums with the candidate heap. It also checks that each generation
+  // number's physical file matches its route. True if all match, or if the
+  // census is no longer ready for `version_number`. Otherwise describes the
+  // first difference in
   // `*difference`. Call without the DB mutex.
   bool TEST_CheckCandidateLiveBytes(uint64_t version_number,
                                     std::string* difference) const;
@@ -1362,6 +1579,7 @@ class BlobReferenceCensus {
   Status CopyWorkerSnapshot(
       const WorkerState& worker, uint64_t version_number,
       const std::set<uint64_t>& generation_numbers,
+      const std::shared_ptr<Cache>& gc_block_cache,
       std::shared_ptr<BlobReferenceCensusState>* state) const;
   static size_t SnapshotMemoryBound(const BlobReferenceCensusState& state);
 
@@ -1510,6 +1728,51 @@ class BlobReferenceCensus {
   bool canceled_ = false;
   std::vector<std::shared_ptr<const BlobReferenceSstSummary>> rebuild_seeds_;
   bool rebuild_requested_ = false;
+  bool mismatch_reported_ = false;
+  // The remembered files of the census mismatch state (see ReportMismatch()).
+  // At most kMaxUnresolvedMismatchFiles (1024) files. The number is a choice,
+  // not a measurement: the set costs at most about 32 KB (8 bytes per file
+  // plus the hash table overhead, an estimate), and more than 1024 files with
+  // a lasting mismatch means that exact metadata is broken widely. Past the
+  // cap the set does not grow, and the rebuild backoff alone limits the cost.
+  static constexpr size_t kMaxUnresolvedMismatchFiles = 1024;
+  UnorderedSet<uint64_t> unresolved_mismatch_files_;
+  // True from a report that the set could not remember because the set was
+  // full, until ClearMismatch() forgets a file or a build that no report
+  // requested publishes.
+  bool unresolved_mismatch_files_full_ = false;
+  // Mismatch rebuilds in a row, and the limit without backoff (2, a choice:
+  // one rebuild for a first report, and one more for a report that a rebuild
+  // of another file caused).
+  static constexpr uint32_t kMismatchRebuildsWithoutBackoff = 2;
+  // The count can wrap only after 2^32 mismatch rebuilds in a row. Once the
+  // count is above 2, every mismatch rebuild waits at least 1 s, so this cannot
+  // happen in practice.
+  uint32_t mismatch_rebuilds_in_a_row_ = 0;
+  // The mismatch rebuild waits that TakeMismatchRebuildWaitStep() counted. It
+  // goes back to 0 in the same places as mismatch_rebuilds_in_a_row_. It can
+  // wrap only after 2^32 waits of at least 1 s each, which cannot happen in
+  // practice.
+  uint32_t mismatch_rebuild_waits_ = 0;
+  // The condition of MismatchRebuildMustWait(). REQUIRES: mutex_ held.
+  bool MismatchRebuildMustWaitLocked() const {
+    return mismatch_rebuilds_in_a_row_ > kMismatchRebuildsWithoutBackoff;
+  }
+  // A mismatch report requested a rebuild, and no build has published since.
+  // TakeMismatchReport() sets it, and BeginBuild() sets it for a report that
+  // it clears. Every publish clears it. BeginBuild() copies it to
+  // build_for_mismatch_, so a restart of a mismatch rebuild that did not
+  // publish is a mismatch rebuild too. TryPublishWorker() sets
+  // build_for_mismatch_ to true at the first publish of a build, so only that
+  // first publish of a build that no report requested starts the mismatch
+  // state again.
+  bool mismatch_rebuild_unpublished_ = false;
+  bool build_for_mismatch_ = false;
+  // The running build failed because of a mismatch report: TakeMismatchReport()
+  // returned true since BeginBuild(). Only then does
+  // TakeMismatchRebuildWaitStep() take a wait step. BeginBuild() clears it.
+  bool build_failed_for_mismatch_ = false;
+  std::atomic<uint64_t> gc_mismatch_suppress_count_{0};
   // An overflow restart ran and no build has published since. While it is set,
   // BeginBuild() gives the build cursor the restart limit
   // (kMaxRestartLogMemory).
@@ -1534,6 +1797,8 @@ class BlobReferenceCensus {
   std::atomic<uint64_t> published_coarse_pinned_bytes_{0};
   std::atomic<uint64_t> published_coarse_pinned_garbage_{0};
   std::atomic<uint64_t> published_relocation_garbage_{0};
+  mutable std::mutex published_corrupt_mutex_;
+  BlobGcCandidateHeap::CorruptFileReport published_corrupt_files_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
