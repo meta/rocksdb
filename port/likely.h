@@ -16,3 +16,13 @@
 #define LIKELY(x) (x)
 #define UNLIKELY(x) (x)
 #endif
+
+// Keeps a function out of line, for a rarely run path, so that its caller
+// stays small.
+#if defined(__GNUC__) || defined(__clang__)
+#define ROCKSDB_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define ROCKSDB_NOINLINE __declspec(noinline)
+#else
+#define ROCKSDB_NOINLINE
+#endif
