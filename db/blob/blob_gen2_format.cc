@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,17 +40,33 @@ namespace {
 // format, since a SimpleGen2Blob record's trailer uses the same
 // builtin-checksum scheme; shared by the scalar and batched readers so both
 // report the same diagnostics.
+//
+// With kCRC32c and a non-null `payload_crc32c`, a passing check also sets
+// *payload_crc32c to the CRC32C of the payload alone. It is computed in the
+// same pass, so a caller that checks the logical CRC of an uncompressed value
+// does not read the bytes again.
 Status VerifySimpleGen2BlobChecksum(ChecksumType checksum_type,
                                     uint32_t base_context_checksum,
                                     const char* record, size_t payload_size,
                                     uint64_t record_offset,
-                                    const std::string& file_name) {
+                                    const std::string& file_name,
+                                    std::optional<uint32_t>* payload_crc32c) {
   uint32_t stored = DecodeFixed32(record + payload_size + 1);
   const uint32_t modifier =
       ChecksumModifierForContext(base_context_checksum, record_offset);
   stored -= modifier;
-  const uint32_t computed = ComputeBuiltinChecksumWithLastByte(
-      checksum_type, record, payload_size, record[payload_size]);
+  uint32_t computed = 0;
+  if (checksum_type == kCRC32c && payload_crc32c != nullptr) {
+    const uint32_t payload_crc = crc32c::Value(record, payload_size);
+    computed = crc32c::Mask(
+        crc32c::Extend(payload_crc, &record[payload_size], /*size=*/1));
+    if (stored == computed) {
+      *payload_crc32c = payload_crc;
+    }
+  } else {
+    computed = ComputeBuiltinChecksumWithLastByte(
+        checksum_type, record, payload_size, record[payload_size]);
+  }
   if (stored == computed) {
     return Status::OK();
   }
@@ -120,24 +137,12 @@ Status ReadAndVerifySimpleGen2BlobRecord(
   if (read_options.verify_checksums) {
     const Status checksum_status = VerifySimpleGen2BlobChecksum(
         checksum_type, base_context_checksum, record, payload_size,
-        record_offset, file->file_name());
+        record_offset, file->file_name(), /*payload_crc32c=*/nullptr);
     if (!checksum_status.ok()) {
       return checksum_status;
     }
   }
 
-  // The compression marker matched the blob index above, but SimpleGen2Blob
-  // payloads are currently written uncompressed only (see
-  // WriteSimpleGen2BlobRecord), so a record that actually carries a compression
-  // type is not readable here. This guards a corrupt or forward-incompatible
-  // record whose (compressed) marker happened to agree with a (compressed)
-  // index.
-  if (compression != kNoCompression) {
-    return Status::Corruption("Blob record compression " +
-                              std::to_string(static_cast<int>(compression)) +
-                              " is not supported in " + file->file_name() +
-                              " at offset " + std::to_string(record_offset));
-  }
   return Status::OK();
 }
 
@@ -221,7 +226,7 @@ constexpr size_t kGen2ReadInlineSize = 32;
 
 // Reads the byte ranges in `slots` from `file`. Each slot gets its bytes in buf
 // and its result in *status. The whole-record and the range batch readers below
-// share this helper. One call reads one batch: the reads of one SST and one
+// share this helper. One call reads one batch: the reads of one file and one
 // read kind (see the batch readers in blob_gen2_format.h).
 //
 // Background: FSRandomAccessFile::MultiRead requires that the requests of one
@@ -249,8 +254,9 @@ constexpr size_t kGen2ReadInlineSize = 32;
 //    reader reads into its own aligned buffer instead. It aligns the physical
 //    reads to the alignment that the file requires, and may merge them,
 //    before it calls the file system.
-// 4. Issue all physical reads in one MultiRead call. The call is made only when
-//    at least one slot needs bytes and preparing the I/O options succeeds.
+// 4. Issue all physical reads in one MultiRead call, or in one plain Read when
+//    there is only one physical read. The call is made only when at least one
+//    slot needs bytes and preparing the I/O options succeeds.
 // 5. Route results. Each member gets the status of its physical read. Each
 //    member that read OK copies its own slice of the returned bytes into its
 //    buf, unless the slice is already there. The covering member's buf is a
@@ -418,8 +424,16 @@ void MultiReadGen2(const ReadOptions& read_options,
   if (s.ok()) {
     AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
     TEST_SYNC_POINT_CALLBACK("MultiReadGen2:Requests", &read_reqs);
-    s = file->MultiRead(opts, read_reqs.data(), read_reqs.size(),
-                        &direct_io_context, &dbg);
+    if (read_reqs.size() == 1) {
+      // One physical read (for example, a Get of one relocated value) uses a
+      // plain positional read, without the MultiRead submit and wait.
+      TEST_SYNC_POINT("MultiReadGen2:SingleRead");
+      file->Read(opts, &read_reqs[0], &direct_io_context, &dbg);
+      s = Status::OK();
+    } else {
+      s = file->MultiRead(opts, read_reqs.data(), read_reqs.size(),
+                          &direct_io_context, &dbg);
+    }
   }
   if (!s.ok()) {
     // The call failed as a whole. s goes to every member below, so the
@@ -514,20 +528,12 @@ void ReadAndVerifySimpleGen2BlobRecords(const ReadOptions& read_options,
     if (read_options.verify_checksums) {
       *reqs[i].status = VerifySimpleGen2BlobChecksum(
           checksum_type, base_context_checksum, record, payload_size,
-          reqs[i].record_offset, file->file_name());
+          reqs[i].record_offset, file->file_name(),
+          reqs[i].extras != nullptr ? &reqs[i].extras->payload_crc32c
+                                    : nullptr);
       if (!reqs[i].status->ok()) {
         continue;
       }
-    }
-    // See ReadAndVerifySimpleGen2BlobRecord: the marker matched the index, but
-    // only uncompressed SimpleGen2Blob payloads are currently supported.
-    if (compression != kNoCompression) {
-      *reqs[i].status = Status::Corruption(
-          "Blob record compression " +
-          std::to_string(static_cast<int>(compression)) +
-          " is not supported in " + file->file_name() + " at offset " +
-          std::to_string(reqs[i].record_offset));
-      continue;
     }
   }
 }
@@ -585,9 +591,6 @@ IOStatus WriteSimpleGen2BlobRecord(WritableFileWriter* file,
                                    uint64_t record_offset, const Slice& payload,
                                    CompressionType compression) {
   assert(file != nullptr);
-  // Placeholder for future embedded blob compression support; only
-  // uncompressed payloads are currently written.
-  assert(compression == kNoCompression);
 
   std::array<char, kSimpleGen2BlobTrailerSize> trailer{};
   trailer[0] = lossless_cast<char>(compression);

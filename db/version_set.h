@@ -1143,7 +1143,10 @@ class Version {
   // TTL/inlined/same-file or compressed blob index (the lazy caller only routes
   // uncompressed separate-file references here; other cases take the
   // whole-value GetBlob path). The caller must ensure range_offset +
-  // range_length <= blob_index.size().
+  // range_length <= blob_index.size(). For an indirect index, a range of an
+  // uncompressed value never checks a CRC. Callers send only strict parts of a
+  // value (see ReadPathBlobResolver::ResolveColumnRange), and a range is not
+  // turned into a whole read.
   Status GetBlobRange(const ReadOptions& read_options, const Slice& user_key,
                       const BlobIndex& blob_index, uint64_t range_offset,
                       size_t range_length, PinnableSlice* value,
@@ -1321,6 +1324,16 @@ class Version {
   const Comparator* user_comparator() const {
     return storage_info_.user_comparator_;
   }
+
+  // Checks a stable blob cache hit. The stable blob cache key names the blob
+  // file and offset of a value, but not the column family or the Version. So
+  // a hit can return a value whose blob file is not in this Version, for
+  // example when a corrupt or foreign BlobIndex names a blob file of another
+  // column family. Returns OK when the blob file of `blob_index` is in this
+  // Version. Otherwise returns the same Corruption as a cache miss for that
+  // file. The check is one binary search in the blob file list of this
+  // Version and does no I/O. It does not check the cached value itself.
+  Status CheckStableCacheHitHasFile(const BlobIndex& blob_index) const;
 
   // Returns true if the filter blocks in the specified level will not be
   // checked during read operations. In certain cases (trivial move or preload),
