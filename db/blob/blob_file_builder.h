@@ -85,7 +85,9 @@ class BlobFileBuilder {
   Status OpenBlobFileIfNeeded();
   Status CompressBlobIfNeeded(Slice* blob,
                               GrowableBuffer* compressed_blob) const;
+  // `value_crc32c`, when non-null, is the CRC32C of `blob`, already computed.
   Status WriteBlobToFile(const Slice& key, const Slice& blob,
+                         const uint32_t* value_crc32c,
                          uint64_t* blob_file_number, uint64_t* blob_offset);
   Status CloseBlobFile();
   Status CloseBlobFileIfNeeded();
@@ -103,6 +105,7 @@ class BlobFileBuilder {
   std::unique_ptr<Compressor> blob_compressor_;
   mutable Compressor::ManagedWorkingArea blob_compressor_wa_;
   PrepopulateBlobCache prepopulate_blob_cache_;
+  bool enable_blob_indirection_;
   const FileOptions* file_options_;
   const WriteOptions* write_options_;
   const std::string db_id_;

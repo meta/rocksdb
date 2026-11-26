@@ -20,6 +20,7 @@
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_sequential_reader.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
@@ -243,6 +244,55 @@ class BlobFileChecksumCapturingFS : public FileSystemWrapper {
   int capture_count_ = 0;
 };
 
+TEST_F(DBBlobBasicTest, FifoRejectsFeatureButPreservesLegacyBlobDb) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.max_open_files = -1;
+  options.compaction_style = kCompactionStyleFIFO;
+  options.num_levels = 1;
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("legacy", "legacy_value"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("legacy"), "legacy_value");
+  ASSERT_TRUE(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_indirection", "true"}})
+                  .IsNotSupported());
+  ColumnFamilyOptions feature(options);
+  feature.enable_blob_indirection = true;
+  ColumnFamilyHandle* handle = nullptr;
+  ASSERT_TRUE(db_->CreateColumnFamily(feature, "unsupported", &handle)
+                  .IsNotSupported());
+  ASSERT_EQ(handle, nullptr);
+  Close();
+  options.enable_blob_indirection = true;
+  ASSERT_TRUE(TryReopen(options).IsNotSupported());
+  std::unique_ptr<DB> readonly;
+  ASSERT_TRUE(
+      DB::OpenForReadOnly(options, dbname_, &readonly).IsNotSupported());
+  ASSERT_EQ(readonly, nullptr);
+  // The multi-CF read-only open and the secondary open check each CF too.
+  std::vector<ColumnFamilyHandle*> handles;
+  ASSERT_TRUE(DB::OpenForReadOnly(
+                  DBOptions(options), dbname_,
+                  {ColumnFamilyDescriptor(kDefaultColumnFamilyName,
+                                          ColumnFamilyOptions(options))},
+                  &handles, &readonly)
+                  .IsNotSupported());
+  ASSERT_EQ(readonly, nullptr);
+  ASSERT_TRUE(handles.empty());
+  std::unique_ptr<DB> secondary;
+  ASSERT_TRUE(DB::OpenAsSecondary(options, dbname_,
+                                  test::PerThreadDBPath(env_, "fifo_secondary"),
+                                  &secondary)
+                  .IsNotSupported());
+  ASSERT_EQ(secondary, nullptr);
+  options.enable_blob_indirection = false;
+  Reopen(options);
+  ASSERT_EQ(Get("legacy"), "legacy_value");
+}
+
 TEST_F(DBBlobBasicTest, GetBlob) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
@@ -268,6 +318,261 @@ TEST_F(DBBlobBasicTest, GetBlob) {
   PinnableSlice result;
   ASSERT_TRUE(db_->Get(read_options, db_->DefaultColumnFamily(), key, &result)
                   .IsIncomplete());
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionWritesExactSstMetadata) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+  ASSERT_OK(Put("key1", "blob_value_1"));
+  ASSERT_OK(Put("key2", "blob_value_2"));
+  ASSERT_OK(Flush());
+
+  // The flush writes unflattened references (generation == origin), so the
+  // normal blob read path finds each value in its origin blob file.
+  ASSERT_EQ(Get("key1"), "blob_value_1");
+  ASSERT_EQ(Get("key2"), "blob_value_2");
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1);
+  const auto& user_properties =
+      properties.begin()->second->user_collected_properties;
+  const auto descriptor_it =
+      user_properties.find(kBlobReferenceDescriptorPropertyName);
+  ASSERT_NE(descriptor_it, user_properties.end());
+
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(descriptor_it->second,
+                                                        &descriptor));
+  EXPECT_FALSE(descriptor.IsEmpty());
+  EXPECT_EQ(descriptor.reference_count, 2);
+  EXPECT_EQ(descriptor.stored_value_bytes,
+            strlen("blob_value_1") + strlen("blob_value_2"));
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionWritesCompleteEmptySstMetadata) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 1024;
+
+  Reopen(options);
+  ASSERT_OK(Put("key", "inline"));
+  ASSERT_OK(Flush());
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1);
+  const auto& user_properties =
+      properties.begin()->second->user_collected_properties;
+  const auto descriptor_it =
+      user_properties.find(kBlobReferenceDescriptorPropertyName);
+  ASSERT_NE(descriptor_it, user_properties.end());
+
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(descriptor_it->second,
+                                                        &descriptor));
+  EXPECT_TRUE(descriptor.IsEmpty());
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionIsDisabledByDefault) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("key"), "blob_value");
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1);
+  const auto& user_properties =
+      properties.begin()->second->user_collected_properties;
+  EXPECT_EQ(user_properties.count(kBlobReferenceDescriptorPropertyName), 0);
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionCanBeEnabledDynamically) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1);
+  const auto& user_properties =
+      properties.begin()->second->user_collected_properties;
+  EXPECT_EQ(user_properties.count(kBlobReferenceDescriptorPropertyName), 1);
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionTracksAllWideColumnBlobReferences) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 4;
+
+  Reopen(options);
+  const WideColumns columns{{kDefaultWideColumnName, "default_blob"},
+                            {"inline", "x"},
+                            {"secondary", "secondary_blob"}};
+  ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), "key",
+                           columns));
+  ASSERT_OK(Flush());
+
+  PinnableWideColumns result;
+  ASSERT_OK(db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), "key",
+                           &result));
+  ASSERT_EQ(result.columns(), columns);
+
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 1);
+  const auto& user_properties =
+      properties.begin()->second->user_collected_properties;
+  const auto descriptor_it =
+      user_properties.find(kBlobReferenceDescriptorPropertyName);
+  ASSERT_NE(descriptor_it, user_properties.end());
+  BlobReferenceMetadataDescriptor descriptor;
+  ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(descriptor_it->second,
+                                                        &descriptor));
+  EXPECT_EQ(descriptor.reference_count, 2);
+  EXPECT_EQ(descriptor.stored_value_bytes,
+            strlen("default_blob") + strlen("secondary_blob"));
+}
+
+TEST_F(DBBlobBasicTest, WideColumnReferencedBlobBytesWithAndWithoutCollector) {
+  // With the option on, the table builder walks an entity once for both the
+  // referenced_blob_bytes property and the reference collector. The property
+  // must be the same as with the option off, where only the property walk
+  // runs.
+  const std::string key = "key";
+  const std::string default_blob = "default_blob";
+  const std::string secondary_blob = "secondary_blob";
+  const WideColumns columns{{kDefaultWideColumnName, default_blob},
+                            {"inline", "x"},
+                            {"secondary", secondary_blob}};
+  const uint64_t expected =
+      default_blob.size() + secondary_blob.size() +
+      2 * BlobLogRecord::CalculateAdjustmentForRecordHeader(key.size());
+  for (bool indirection : {false, true}) {
+    SCOPED_TRACE(indirection);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = indirection;
+    options.min_blob_size = 4;
+    DestroyAndReopen(options);
+    ASSERT_OK(db_->PutEntity(WriteOptions(), db_->DefaultColumnFamily(), key,
+                             columns));
+    ASSERT_OK(Flush());
+
+    TablePropertiesCollection properties;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+    ASSERT_EQ(properties.size(), 1);
+    const auto& table_properties = *properties.begin()->second;
+    ASSERT_EQ(table_properties.user_collected_properties.count(
+                  kBlobReferenceDescriptorPropertyName),
+              indirection ? 1 : 0);
+    ASSERT_EQ(table_properties.referenced_blob_bytes, expected);
+  }
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionRejectsUnsupportedOptionCombinations) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_indirection = true;
+  ASSERT_TRUE(TryReopen(options).IsInvalidArgument());
+
+  options.enable_blob_files = true;
+  options.enable_blob_direct_write = true;
+  options.allow_concurrent_memtable_write = false;
+  ASSERT_TRUE(TryReopen(options).IsNotSupported());
+
+  options.enable_blob_direct_write = false;
+  options.table_factory.reset(NewPlainTableFactory());
+  ASSERT_TRUE(TryReopen(options).IsNotSupported());
+}
+
+TEST_F(DBBlobBasicTest,
+       BlobIndirectionRejectsDynamicEnableForUnsupportedTableFactory) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.table_factory.reset(NewPlainTableFactory());
+  options.prefix_extractor.reset(NewNoopTransform());
+  Reopen(options);
+
+  ASSERT_TRUE(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_indirection", "true"}})
+                  .IsNotSupported());
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionFlushesWhenMetadataCannotBeCharged) {
+  // A block cache of capacity 1 with strict_capacity_limit rejects every
+  // charge of the blob reference buffers. The flush still succeeds, with the
+  // buffers uncharged, and sets no background error, so later writes and
+  // flushes work.
+  LRUCacheOptions cache_options;
+  cache_options.capacity = 1;
+  cache_options.num_shard_bits = 0;
+  cache_options.strict_capacity_limit = true;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = NewLRUCache(cache_options);
+
+  Options options = GetDefaultOptions();
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+  std::atomic<int> failed_charges{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobReferenceMetadataCollector::CountUnchargedCharge",
+      [&](void*) { failed_charges.fetch_add(1, std::memory_order_relaxed); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(Put("key", "blob_value"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_OK(Put("key2", "blob_value2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // The collector ran and its charges failed, and each SST still has the
+  // exact reference metadata.
+  ASSERT_GT(failed_charges.load(std::memory_order_relaxed), 0);
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 2);
+  for (const auto& [file_name, table_properties] : properties) {
+    SCOPED_TRACE(file_name);
+    const auto descriptor_it = table_properties->user_collected_properties.find(
+        kBlobReferenceDescriptorPropertyName);
+    ASSERT_NE(descriptor_it, table_properties->user_collected_properties.end());
+    BlobReferenceMetadataDescriptor descriptor;
+    ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(descriptor_it->second,
+                                                          &descriptor));
+    EXPECT_EQ(descriptor.reference_count, 1);
+  }
+  // A read that tries to add a block to this full cache fails, so read
+  // without filling the cache.
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  std::string value;
+  ASSERT_OK(db_->Get(read_options, "key", &value));
+  ASSERT_EQ(value, "blob_value");
+  ASSERT_OK(db_->Get(read_options, "key2", &value));
+  ASSERT_EQ(value, "blob_value2");
 }
 
 TEST_F(DBBlobBasicTest, BlobFileChecksumInFileOptions) {
