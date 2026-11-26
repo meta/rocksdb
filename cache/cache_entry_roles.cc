@@ -28,6 +28,7 @@ std::array<std::string, kNumCacheEntryRoles> kCacheEntryRoleToCamelString{{
     "ReadaheadBuffer",
     "BlobReferenceMetadataBuildingBuffer",
     "BlobReferenceCensus",
+    "IndirectBlobGcWorkingMemory",
     "Misc",
 }};
 
@@ -48,6 +49,7 @@ std::array<std::string, kNumCacheEntryRoles> kCacheEntryRoleToHyphenString{{
     "readahead-buffer",
     "blob-reference-metadata-building-buffer",
     "blob-reference-census",
+    "indirect-blob-gc-working-memory",
     "misc",
 }};
 

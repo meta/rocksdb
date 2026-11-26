@@ -26,7 +26,76 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+struct BlobReference;
 struct BlobReferenceGroup;
+
+// Receives the references of requested groups in a form the caller chooses, for
+// example a compact copy (see BlobReferenceGroupRead::sink).
+class BlobReferenceSink {
+ public:
+  virtual ~BlobReferenceSink() = default;
+  virtual size_t size() const = 0;
+
+  // How many more references Append() accepts.
+  virtual size_t Room() const = 0;
+  virtual Status Append(const BlobReference& reference) = 0;
+
+  // Drops the references after the first `size`.
+  virtual void Truncate(size_t size) = 0;
+
+  // A key for the storage that Append() writes to. ReadBlobReferences()
+  // checks all requests with the same identity against one shared Room().
+  // Override it only when two sink objects write to the same storage.
+  virtual const void* identity() const { return this; }
+};
+
+// One request of a batch read of exact blob references from one SST: a group
+// key and the vector (or sink) its references are appended to.
+struct BlobReferenceGroupRead {
+  // Only the group key (encoding class, generation number, origin) is used.
+  // With `whole_generation`, only the generation number is used.
+  const BlobReferenceGroup* group = nullptr;
+  // Reads every group of the SST with this generation number (any class, any
+  // origin) into one output. The found totals are the sum over those groups.
+  // The status is NotFound if there is no such group. Each group is read like
+  // its own request. On an error, only the failed group's references are
+  // dropped. The output keeps the references of the other groups of the
+  // generation number, earlier and later, and the status is the error of the
+  // first failed group. Requests of a batch are either all whole-generation
+  // (sorted by generation number, unique) or all single-group requests (each
+  // names one class, generation number and origin).
+  bool whole_generation = false;
+  // Must have room for the group's references. Used when `sink` is null.
+  std::vector<BlobReference>* output = nullptr;
+  // Must have room for the group's references. Before the read, each group is
+  // checked against Room() (or the free capacity of `output`), minus the
+  // references of earlier requests with the same sink. A group with more
+  // references gets Aborted, and nothing is appended for it. An Append() error
+  // fails the group like a decode error.
+  BlobReferenceSink* sink = nullptr;
+  // The group's totals from this SST's reference index. Each read sets them
+  // to 0 before it reads the index, then sets them when the SST has the
+  // group. After a failed call they are not meaningful, like the status.
+  uint64_t found_reference_count = 0;
+  uint64_t found_stored_value_bytes = 0;
+  uint64_t found_record_bytes = 0;
+  // Set by the read: OK, or the error of this group only. See
+  // TableReader::ReadBlobReferences() for the error codes. The caller must
+  // check it, except after the whole call fails (see ReadBlobReferences()).
+  // A caller that builds a request but does not read it (for example, it
+  // stops before the call) must mark this status as checked, because a
+  // default Status starts unchecked.
+  Status status;
+};
+
+// Largest number of on-disk bytes of blob reference data blocks that one
+// MultiRead batch holds in memory (256 KB). It is the size of the read buffer
+// that ReadBlobReferences() allocates. 256 KB is an estimate (not measured): it
+// holds many data blocks per read but keeps the buffer small. With MultiRead, a
+// single data block whose on-disk size (with its trailer) is larger than this
+// fails the read with Corruption. With mmap or direct I/O, blocks are read one
+// at a time and this limit does not apply.
+inline constexpr size_t kBlobReferenceReadBatchBytes = 256 * 1024;
 
 class Iterator;
 struct ParsedInternalKey;
@@ -159,6 +228,74 @@ class TableReader {
     (void)expected_descriptor;
     (void)before_allocation;
     (void)groups;
+    return Status::NotSupported(
+        "Exact blob reference metadata is not supported");
+  }
+
+  // Reads the references of several groups of this SST from its exact reference
+  // metadata. Each request is a BlobReferenceGroupRead. The batch form lets one
+  // call read several groups that share data blocks, so that each block is
+  // read and decompressed only once. Indirect blob GC reads, from each SST,
+  // all generation numbers of its inputs that the SST holds, in one batch of
+  // whole-generation requests.
+  //
+  // Input: single-group requests must be sorted by group key (encoding class,
+  // generation number, origin). Whole-generation requests must be sorted by
+  // generation number. A batch has no repeats and does not mix the two kinds;
+  // otherwise InvalidArgument. Each output must already have capacity for its
+  // group, so that its owner can charge the memory before this call.
+  //
+  // Reads: it decodes the reference index once and reads each needed data block
+  // once. Adjacent blocks are read together, in MultiRead batches of at most
+  // kBlobReferenceReadBatchBytes (one block at a time with mmap or direct I/O).
+  //
+  // Index memory report: when set, `after_index_read` gets the memory in bytes
+  // of the decoded reference index, right after it is decoded and before any
+  // data block is read. The caller can charge it there. The size grows with the
+  // number of groups and blocks of the SST, so a fixed estimate can be too
+  // small. If the callback returns non-OK, this function returns that status.
+  //
+  // Results: each found group reports its index totals in the found_* fields.
+  // A request gets an error status in the cases below, and the other requests
+  // continue:
+  // - NotFound: the SST does not have the group.
+  // - Aborted: the group does not fit its output.
+  // - Corruption: a block of the group is corrupt, or the references read for
+  //   the group do not match its index totals.
+  // Errors of the whole call: if the requests are not sorted, or the
+  // descriptor or the reference index cannot be read or decoded, the call
+  // returns the error before it reads any group. The request statuses are
+  // then not meaningful, and every output is unchanged. If a data block read
+  // fails (for example with an I/O error), the call returns that error and
+  // also sets it on every request that has not finished. A request that has
+  // already finished keeps its status and its output. Callers must check the
+  // return value before they read a request status. When the call fails, it
+  // marks every request status as checked, so a caller that stops at the call
+  // error does not need to read them. After a successful call, the caller
+  // must check every request status.
+  //
+  // A failed request drops only the references it appended. A request that
+  // fails before it appends anything leaves the output unchanged. So when
+  // several requests or calls share one output, the references that earlier
+  // requests or the caller appended stay. For a whole-generation request, this
+  // holds for each group, not for the whole request (see
+  // BlobReferenceGroupRead::whole_generation).
+  //
+  // The default returns NotSupported, because SSTs with exact reference
+  // metadata must be block-based tables.
+  virtual Status ReadBlobReferences(
+      const ReadOptions& read_options, const Slice& expected_descriptor,
+      const std::function<Status(size_t index_bytes)>& after_index_read,
+      std::vector<BlobReferenceGroupRead>* requests) const {
+    (void)read_options;
+    (void)expected_descriptor;
+    (void)after_index_read;
+    // The call fails, so mark the request statuses as checked (see above).
+    if (requests != nullptr) {
+      for (BlobReferenceGroupRead& request : *requests) {
+        request.status.PermitUncheckedError();
+      }
+    }
     return Status::NotSupported(
         "Exact blob reference metadata is not supported");
   }

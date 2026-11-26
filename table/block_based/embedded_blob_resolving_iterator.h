@@ -50,8 +50,10 @@ namespace ROCKSDB_NAMESPACE {
 //     carry an embedded blob segment.
 //
 // Only created when the table advertises an embedded blob segment and the
-// caller is not the SST dump tool (which must keep seeing raw BlobIndex
-// values).
+// caller is neither the SST dump tool nor the blob relocation reader. Both must
+// see the raw entries: the SST dump tool prints raw BlobIndex values, and the
+// relocation reader checks the key type of each location entry itself (see
+// BlockBasedTable::NewIteratorImpl()).
 //
 // kAllowUnpreparedValue mirrors the caller's allow_unprepared_value and is a
 // template parameter so the lazy (hot, user-iteration) path carries no

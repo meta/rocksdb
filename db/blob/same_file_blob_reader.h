@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 
 #include "db/blob/blob_constants.h"
 #include "db/blob/blob_gen2_format.h"
@@ -55,6 +57,20 @@ struct SameFileBlobReadRequest {
   // Standalone readers only (see SameFileBlobStandaloneRead); not owned. May be
   // null.
   SameFileBlobStandaloneRead* standalone = nullptr;
+};
+
+// One stored-byte read, used when indirect blob GC copies a value out of a
+// relocation file. The read checks the stored CRC of the value and, unless the
+// file uses kNoChecksum, the record checksum in the SimpleGen2 trailer. It
+// never decompresses the value. When stored_payload is not null, it receives
+// the exact stored bytes (which may be compressed or not). It points into the
+// call's CoalescedReadBuffers. When stored_payload is null, the read only
+// checks the value.
+struct StoredSameFileBlobReadRequest {
+  const BlobIndex& blob_index;
+  Slice* stored_payload = nullptr;
+  Status& status;
+  uint32_t stored_checksum = 0;
 };
 
 // Narrow interface for resolving a same-file ("embedded") blob reference
