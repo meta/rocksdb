@@ -42,8 +42,14 @@ class BlobLogWriter {
 
   ~BlobLogWriter();
 
+  // The base signature: ConstructBlobHeader(..., /*value_crc32c=*/nullptr).
   static void ConstructBlobHeader(std::string* buf, const Slice& key,
                                   const Slice& val, uint64_t expiration);
+  // `value_crc32c`, if not null, is the CRC32C of `val` (see
+  // BlobLogRecord::EncodeHeaderTo()).
+  static void ConstructBlobHeader(std::string* buf, const Slice& key,
+                                  const Slice& val, uint64_t expiration,
+                                  const uint32_t* value_crc32c);
 
   Status AddRecord(const WriteOptions& write_options, const Slice& key,
                    const Slice& val, uint64_t* key_offset,
@@ -52,6 +58,14 @@ class BlobLogWriter {
   Status AddRecord(const WriteOptions& write_options, const Slice& key,
                    const Slice& val, uint64_t expiration, uint64_t* key_offset,
                    uint64_t* blob_offset);
+
+  // Same as AddRecord() without expiration, but `value_crc32c` is the CRC32C
+  // of `val`, already computed by the caller, so `val` is not read again for
+  // the record CRC.
+  Status AddRecordWithValueCrc(const WriteOptions& write_options,
+                               const Slice& key, const Slice& val,
+                               uint32_t value_crc32c, uint64_t* key_offset,
+                               uint64_t* blob_offset);
 
   Status EmitPhysicalRecord(const WriteOptions& write_options,
                             const std::string& headerbuf, const Slice& key,
