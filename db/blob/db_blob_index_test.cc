@@ -368,6 +368,35 @@ TEST(BlobIndexTest, IndirectBlobIndexRoundTrip) {
   std::string reencoded;
   blob_index.EncodeTo(&reencoded);
   EXPECT_EQ(reencoded, encoded);
+
+  ASSERT_OK(blob_index.SetGenerationFileNumber(/*generation_file_number=*/401));
+  EXPECT_EQ(blob_index.generation_file_number(), 401U);
+  EXPECT_EQ(blob_index.origin_file_number(), kOrigin);
+  EXPECT_EQ(blob_index.original_value_offset(), kOffset);
+  EXPECT_EQ(blob_index.size(), kSize);
+  EXPECT_EQ(blob_index.compression(), kZSTD);
+  EXPECT_EQ(blob_index.stable_checksum(), kChecksum);
+  blob_index.EncodeTo(&reencoded);
+  BlobIndex flattened;
+  ASSERT_OK(flattened.DecodeFrom(reencoded));
+  EXPECT_EQ(flattened.generation_file_number(), 401U);
+  EXPECT_EQ(flattened.origin_file_number(), kOrigin);
+
+  // The type follows the generation: equal to the origin gives the short
+  // unflattened type, above it gives the flattened type, and below it is
+  // rejected.
+  ASSERT_TRUE(
+      blob_index.SetGenerationFileNumber(kOrigin - 1).IsInvalidArgument());
+  ASSERT_OK(blob_index.SetGenerationFileNumber(kOrigin));
+  blob_index.EncodeTo(&reencoded);
+  ASSERT_EQ(static_cast<BlobIndex::Type>(reencoded[0]),
+            BlobIndex::Type::kIndirectBlob);
+  ASSERT_OK(flattened.DecodeFrom(reencoded));
+  EXPECT_EQ(flattened.generation_file_number(), kOrigin);
+  ASSERT_OK(blob_index.SetGenerationFileNumber(401));
+  blob_index.EncodeTo(&reencoded);
+  ASSERT_EQ(static_cast<BlobIndex::Type>(reencoded[0]),
+            BlobIndex::Type::kIndirectFlattenedBlob);
 }
 
 // An uncompressed indirect index stores no stored CRC, so stored_checksum()
@@ -551,6 +580,59 @@ TEST(BlobIndexTest, IndirectBlobIndexRejectsInvalidFileNumbers) {
                {kMax + 2, kMax + 1})}) {
     SCOPED_TRACE(Slice(bad).ToString(/*hex=*/true));
     EXPECT_TRUE(decoded.DecodeFrom(bad).IsCorruption());
+  }
+}
+
+TEST(BlobIndexTest, StableChecksumEncodingAndFlattening) {
+  const std::string payload = "stored-value";
+  for (CompressionType compression : {kNoCompression, kZSTD}) {
+    SCOPED_TRACE(static_cast<int>(compression));
+    const uint32_t logical = crc32c::Value(payload.data(), payload.size());
+    const uint32_t stored =
+        BlobIndex::ComputeStoredChecksum(payload, compression);
+    std::string encoded;
+    BlobIndex::EncodeUnflattenedIndirectBlob(
+        &encoded, {.origin_file_number = 100,
+                   .original_value_offset = 42,
+                   .stored_value_size = payload.size(),
+                   .compression = compression,
+                   .stable_checksum = logical,
+                   .stored_checksum = stored});
+    BlobIndex index;
+    ASSERT_OK(index.DecodeFrom(encoded));
+    ASSERT_OK(index.Validate());
+    ASSERT_EQ(index.stable_checksum(), logical);
+    ASSERT_EQ(index.stored_checksum(), stored);
+    // The stored CRC is written only for compressed values; for kNoCompression
+    // it is derived from the logical CRC.
+    std::string uncompressed;
+    BlobIndex::EncodeUnflattenedIndirectBlob(
+        &uncompressed, {.origin_file_number = 100,
+                        .original_value_offset = 42,
+                        .stored_value_size = payload.size(),
+                        .compression = kNoCompression,
+                        .stable_checksum = logical,
+                        .stored_checksum = BlobIndex::ComputeStoredChecksum(
+                            payload, kNoCompression)});
+    ASSERT_EQ(encoded.size(),
+              uncompressed.size() + (compression == kNoCompression ? 0 : 4));
+    ASSERT_OK(index.SetGenerationFileNumber(200));
+    std::string flattened;
+    index.EncodeTo(&flattened);
+    BlobIndex decoded;
+    ASSERT_OK(decoded.DecodeFrom(flattened));
+    ASSERT_EQ(decoded.generation_file_number(), 200U);
+    ASSERT_EQ(decoded.stored_checksum(), stored);
+    BlobReference reference;
+    bool included = false;
+    ASSERT_OK(BlobReference::FromBlobIndex(decoded, &reference, &included));
+    ASSERT_TRUE(included);
+    ASSERT_EQ(reference.stored_checksum, stored);
+    for (size_t length = 0; length < encoded.size(); ++length) {
+      BlobIndex truncated;
+      ASSERT_TRUE(
+          truncated.DecodeFrom(Slice(encoded.data(), length)).IsCorruption());
+    }
   }
 }
 
@@ -3303,6 +3385,32 @@ TEST(BlobGcCandidateHeapTest, RanksUpdatesAndRetiresPhysicalFiles) {
   ASSERT_FALSE(heap.IsIndirectOrigin(20));
 }
 
+TEST(BlobReferenceCensusTest, RetirementSelectionResumesAfterCursor) {
+  // In this example, generation numbers 1 to 65 route to relocation file 100,
+  // and no SST holds them. One selection returns at most 64 numbers (one route
+  // retirement batch). Route retirement may skip some of them, for example
+  // while one of them is a live file in the input Version of a running
+  // compaction. The next selection starts after the last visited number, so the
+  // numbers after the first 64 are not starved.
+  BlobReferenceCensus census;
+  auto forward = std::make_shared<BlobRelocationState>();
+  for (uint64_t generation = 1; generation <= 65; ++generation) {
+    forward->SetRoute(BlobRelocationRoute(generation, 100));
+  }
+  forward->Seal();
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 7, forward, nullptr));
+  ASSERT_OK(census.FinalizeWorkerBuild(token));
+  BlobReferenceCensus::RetirementSelection selected =
+      census.SelectWorkerRetirementSources(token);
+  for (size_t i = 0; i < selected.size(); ++i) {
+    ASSERT_EQ(selected[i], i + 1);
+  }
+  selected = census.SelectWorkerRetirementSources(token);
+  ASSERT_EQ(selected[0], 65U);
+  ASSERT_EQ(selected[1], 1U);
+}
+
 TEST(BlobReferenceCensusTest, MetadataCommitIsExclusive) {
   // Route retirement and the indirect blob GC install both make metadata-only
   // commits. Only one may run at a time, so a second BeginMetadataCommit()
@@ -3670,7 +3778,10 @@ TEST(BlobReferenceCensusTest, SelectedSnapshotOwnsItsCacheReservation) {
   ASSERT_EQ(cache->GetPinnedUsage(), worker_charge);
 }
 
-TEST(BlobReferenceCensusTest, SelectedSnapshotRejectsUnchargedAllocation) {
+TEST(BlobReferenceCensusTest, SelectedSnapshotGoesOnUnchargedWhenCacheIsFull) {
+  // Route retirement's copy (ReadSelectedSnapshot()) does not fail when the
+  // block cache is full: the copy stays uncharged and the census counts the
+  // failed charge.
   const std::shared_ptr<Cache> cache =
       NewLRUCache(2 * 1024 * 1024, /*num_shard_bits=*/0,
                   /*strict_capacity_limit=*/true);
@@ -3684,9 +3795,10 @@ TEST(BlobReferenceCensusTest, SelectedSnapshotRejectsUnchargedAllocation) {
   ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
             BlobReferenceCensus::PublishResult::kPublished);
   std::shared_ptr<BlobReferenceCensusState> selected;
-  ASSERT_TRUE(
-      census.ReadSelectedSnapshot(7, {10}, cache, &selected).IsMemoryLimit());
-  ASSERT_EQ(selected, nullptr);
+  const uint64_t uncharged_before = census.uncharged_charge_count();
+  ASSERT_OK(census.ReadSelectedSnapshot(7, {10}, cache, &selected));
+  ASSERT_NE(selected, nullptr);
+  ASSERT_GT(census.uncharged_charge_count(), uncharged_before);
   ASSERT_TRUE(census.IsReady(7));
 }
 

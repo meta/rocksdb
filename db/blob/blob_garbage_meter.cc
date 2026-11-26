@@ -5,10 +5,13 @@
 
 #include "db/blob/blob_garbage_meter.h"
 
+#include <limits>
+
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
+#include "port/likely.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -38,6 +41,14 @@ Status BlobGarbageMeter::GetBlobReferenceDetails(const ParsedInternalKey& ikey,
 
   if (blob_index.IsInlined() || blob_index.HasTTL()) {
     return Status::Corruption("Unexpected TTL/inlined blob index");
+  }
+  // An unflattened indirect reference still points to a record in a normal
+  // blob file, so it counts in that file's garbage accounting. A flattened
+  // reference points to a relocation file. The census tracks the live bytes of
+  // a relocation file, so the garbage meter skips the reference.
+  if (blob_index.IsIndirect() &&
+      blob_index.generation_file_number() != blob_index.origin_file_number()) {
+    return Status::OK();
   }
   if (blob_index.IsSameFile()) {
     return Status::OK();

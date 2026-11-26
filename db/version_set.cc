@@ -2948,6 +2948,41 @@ Status Version::CheckStableCacheHitHasFile(const BlobIndex& blob_index) const {
   return FindBlobPhysicalFile(blob_index, &physical_file, &routed);
 }
 
+Status Version::ValidateBlobReferenceGeneration(uint64_t generation) const {
+  const BlobFileTable& table = storage_info_.GetBlobFileTable();
+  uint64_t value = table.Find(generation);
+  if (BlobFileTable::IsRoute(value)) {
+    // A target is never a route key, so this is the last hop.
+    value = table.Find(BlobFileTable::RouteTarget(value));
+    if (!BlobFileTable::IsRelocationFile(value)) {
+      return Status::Corruption("Blob relocation route target is missing");
+    }
+  }
+  if (value == 0 && table.size() == 0) {
+    // Empty file table (no format fence): only a normal blob file can match.
+    const BlobFileMetaData* const normal =
+        storage_info_.PeekBlobFileMetaData(generation);
+    return normal != nullptr && normal->IsIndirectOrigin()
+               ? Status::OK()
+               : Status::Corruption(
+                     "Blob reference generation number is not readable");
+  }
+  if (value == 0) {
+    return Status::Corruption(
+        "Blob reference generation number is not readable");
+  }
+  if (BlobFileTable::IsBlobFile(value)) {
+    if (BlobFileTable::AsBlobFile(value)->IsIndirectOrigin()) {
+      return Status::OK();
+    }
+    return Status::Corruption("Indirect blob generation is not relocatable");
+  }
+  if (BlobFileTable::IsLost(value)) {
+    return Status::NotFound("Blob relocation file is marked lost");
+  }
+  return Status::OK();
+}
+
 Status Version::ResolveBlobPhysicalFile(const BlobIndex& blob_index,
                                         BlobPhysicalFile* physical_file) const {
   assert(physical_file != nullptr);
@@ -6143,7 +6178,8 @@ struct VersionSet::ManifestWriter {
   std::optional<uint64_t> compaction_phase_anchor_time;
   // True for the first writer of a LogAndApply() call that passed a
   // precondition callback (pre_cb). Such a writer is called a precondition
-  // writer. pre_cb checks that the caller's edit is still valid, and it runs
+  // writer. pre_cb checks that the caller's edit is still valid. For example,
+  // indirect blob GC checks that its input is still installable. pre_cb runs
   // only when this writer is at the queue head. Only the first writer of the
   // call gets the flag, because the writers of one call are queued together
   // and only the first one waits for the queue head. ProcessManifestWrites()
@@ -7276,16 +7312,24 @@ Status VersionSet::ProcessManifestWrites(
         // batch ends after the writers of the leader's caller. This gives the
         // caller two properties:
         // - The Versions that the call installs hold only the caller's own
-        //   edits, so the caller can treat the new current Version as its own
-        //   result.
+        //   edits. Indirect blob GC relies on this when it applies its
+        //   job-start suppressions to the new current Version.
         // - Another caller's edit cannot fail this batch, and a failure of
-        //   this batch cannot fail another caller, so the caller can treat a
-        //   Corruption from VersionBuilder as its own failure.
+        //   this batch cannot fail another caller. Route retirement relies on
+        //   this, because it treats a Corruption from VersionBuilder as a
+        //   failed check of its own protocol.
         // The precondition itself does not need the barrier: edits apply in
         // queue order, so a later edit cannot change the state that the
-        // precondition checked. We estimate that the lost grouping costs
-        // little: MANIFEST writes are rare, so a precondition writer seldom
-        // has another writer queued behind it to group with.
+        // precondition checked. Precondition writers are indirect blob GC
+        // installs, route retirement, and compaction installs whose output has
+        // a flattened reference or depends on a blob file of the input Version
+        // (see CompactionJob::InstallCompactionResults()). SetOptions() also
+        // passes a precondition, but its dummy edits normally form their own
+        // batch. So in a column family with blob indirection, most compaction
+        // installs (an estimate) get no group commit with other callers. A
+        // benchmark found no clear cost from this: in its workload, MANIFEST
+        // writes were rare, so a compaction install seldom had another writer
+        // to group with.
         break;
       }
       if (manifest_writers_[writer_index]->requires_precondition) {
@@ -8355,7 +8399,8 @@ Status VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
 
   // Unlocked apply: the leader of a LogAndApplyWithUnlockedApply() call (see
   // ManifestWriter::apply_unlocked) applies its edit without the DB mutex,
-  // because the edit can be large. This is safe for these reasons:
+  // because the edit can be large (an indirect blob GC install has one change
+  // per route). This is safe for these reasons:
   // - The edit and the builder belong to this writer. The builder holds a
   //   reference to its base Version, so that Version stays alive.
   // - The writer stays at the queue head, so no other Version is installed
