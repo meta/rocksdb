@@ -907,6 +907,49 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     }
   }
 
+  // Reserve a pending flush-completion notification for every CF that the
+  // NotifyOnFlushCompleted loop below may service, before
+  // InstallMemtableAtomicFlushResults() removes the flushed memtables. The
+  // removal runs in a LogAndApply writer callback, and another thread can lead
+  // the MANIFEST batch and run that callback. That thread can release the DB
+  // mutex when its LogAndApply() call returns, before this thread takes the
+  // mutex back. If the reservation came after the install, a
+  // Flush(wait=true, listener_wait=true) waiter could then see the memtables
+  // removed and no pending notification, and return before OnFlushCompleted
+  // runs. The notify loop also releases and takes the mutex again between
+  // CFs, so the reservations stay until it is done. A reservation for a CF
+  // that gets no notification (the install fails, or the CF is dropped) only
+  // makes waiters wait until the release below.
+  autovector<uint8_t> reserved_flush_notification;
+  reserved_flush_notification.reserve(num_cfs);
+  {
+    const bool has_listeners = !immutable_db_options_.listeners.empty();
+    for (int i = 0; i != num_cfs; ++i) {
+      // The install fills the committed flush job info, so this checks the
+      // flushed memtables instead.
+      const bool reserve = s.ok() && has_listeners &&
+                           !switched_to_mempurge[i] && !cfds[i]->IsDropped() &&
+                           !jobs[i]->GetMemTables().empty();
+      if (reserve) {
+        cfds[i]->imm()->AddPendingFlushNotifications(1);
+      }
+      reserved_flush_notification.push_back(reserve ? 1 : 0);
+    }
+  }
+  // Release the reservations on every exit path (RAII) so a future early return
+  // cannot leak the count and hang listener_wait waiters. Done independently of
+  // the notify loop's skips so the count stays balanced even if a CF was
+  // dropped after it was reserved. The DB mutex is held throughout this
+  // function, including at scope exit, which SubPendingFlushNotifications()
+  // requires.
+  Defer release_flush_notifications([&] {
+    for (int i = 0; i != num_cfs; ++i) {
+      if (reserved_flush_notification[i]) {
+        cfds[i]->imm()->SubPendingFlushNotifications(1);
+      }
+    }
+  });
+
   if (s.ok()) {
     autovector<ColumnFamilyData*> tmp_cfds;
     autovector<const autovector<ReadOnlyMemTable*>*> mems_list;
@@ -930,42 +973,6 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
         committed_flush_jobs_info, &job_context->memtables_to_free,
         directories_.GetDbDir(), log_buffer);
   }
-
-  // Reserve a pending flush-completion notification for every CF that the
-  // NotifyOnFlushCompleted loop below will service, while the DB mutex is still
-  // held continuously since InstallMemtableAtomicFlushResults removed the
-  // memtables. This closes the window where a
-  // Flush(wait=true, listener_wait=true) waiter could observe an atomic flush
-  // as finished before a later CF's OnFlushCompleted has run, since the notify
-  // loop releases and re-acquires the mutex between CFs. The reservations are
-  // released by a matching pass after the notify loop.
-  autovector<uint8_t> reserved_flush_notification;
-  reserved_flush_notification.reserve(num_cfs);
-  {
-    const bool has_listeners = !immutable_db_options_.listeners.empty();
-    for (int i = 0; i != num_cfs; ++i) {
-      const bool reserve = s.ok() && has_listeners &&
-                           !switched_to_mempurge[i] && !cfds[i]->IsDropped() &&
-                           !jobs[i]->GetCommittedFlushJobsInfo()->empty();
-      if (reserve) {
-        cfds[i]->imm()->AddPendingFlushNotifications(1);
-      }
-      reserved_flush_notification.push_back(reserve ? 1 : 0);
-    }
-  }
-  // Release the reservations on every exit path (RAII) so a future early return
-  // cannot leak the count and hang listener_wait waiters. Done independently of
-  // the notify loop's skips so the count stays balanced even if a CF was
-  // dropped after it was reserved. The DB mutex is held throughout this
-  // function, including at scope exit, which SubPendingFlushNotifications()
-  // requires.
-  Defer release_flush_notifications([&] {
-    for (int i = 0; i != num_cfs; ++i) {
-      if (reserved_flush_notification[i]) {
-        cfds[i]->imm()->SubPendingFlushNotifications(1);
-      }
-    }
-  });
 
   if (!s.ok()) {
     // If the atomic flush's combined MANIFEST write failed, the output files
