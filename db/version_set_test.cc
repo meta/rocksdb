@@ -190,11 +190,12 @@ class VersionStorageInfoTestBase : public testing::Test {
   void AddBlob(uint64_t blob_file_number, uint64_t total_blob_count,
                uint64_t total_blob_bytes,
                BlobFileMetaData::LinkedSsts linked_ssts,
-               uint64_t garbage_blob_count, uint64_t garbage_blob_bytes) {
+               uint64_t garbage_blob_count, uint64_t garbage_blob_bytes,
+               bool is_indirect_origin = false) {
     auto shared_meta = SharedBlobFileMetaData::Create(
         blob_file_number, total_blob_count, total_blob_bytes,
         /* checksum_method */ std::string(),
-        /* checksum_value */ std::string());
+        /* checksum_value */ std::string(), is_indirect_origin);
     auto meta =
         BlobFileMetaData::Create(std::move(shared_meta), std::move(linked_ssts),
                                  garbage_blob_count, garbage_blob_bytes);
@@ -656,6 +657,73 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCEmpty) {
   vstorage_.ComputeFilesMarkedForForcedBlobGC(
       age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true);
 
+  ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+}
+
+TEST_F(VersionStorageInfoTest, ForcedBlobGCUnlinkedIndirectOriginIsOldest) {
+  // Indirect origin #10 was relocated, so no SST links it, but it stays in the
+  // Version until its blob file retirement record. Normal blob file #11 is
+  // linked by SST #1. Nothing is marked: with enable_blob_indirection on, the
+  // oldest file is an indirect origin, and with it off, #10 has no SST to
+  // compact.
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  constexpr int level = 0;
+  constexpr uint64_t sst = 1;
+  constexpr uint64_t indirect_origin = 10;
+  constexpr uint64_t legacy_blob = 11;
+
+  Add(level, sst, "bar", "foo", /*file_size=*/1000, legacy_blob);
+  AddBlob(indirect_origin, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+          BlobFileMetaData::LinkedSsts{}, /*garbage_blob_count=*/9,
+          /*garbage_blob_bytes=*/900, /*is_indirect_origin=*/true);
+  AddBlob(legacy_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+          BlobFileMetaData::LinkedSsts{sst}, /*garbage_blob_count=*/9,
+          /*garbage_blob_bytes=*/900);
+  UpdateVersionStorageInfo();
+
+  constexpr double age_cutoff = 1.0;
+  constexpr double force_threshold = 0.5;
+  for (const bool enable_blob_indirection : {false, true}) {
+    SCOPED_TRACE(enable_blob_indirection);
+    vstorage_.ComputeFilesMarkedForForcedBlobGC(
+        age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true,
+        enable_blob_indirection);
+    ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+  }
+}
+
+TEST_F(VersionStorageInfoTest, ForcedBlobGCLinkedIndirectOriginIsOldest) {
+  // Indirect origin #10 still holds its values, so SST #1 links it.
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  constexpr int level = 0;
+  constexpr uint64_t sst = 1;
+  constexpr uint64_t indirect_origin = 10;
+
+  Add(level, sst, "bar", "foo", /*file_size=*/1000, indirect_origin);
+  AddBlob(indirect_origin, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+          BlobFileMetaData::LinkedSsts{sst}, /*garbage_blob_count=*/9,
+          /*garbage_blob_bytes=*/900, /*is_indirect_origin=*/true);
+  UpdateVersionStorageInfo();
+
+  constexpr double age_cutoff = 1.0;
+  constexpr double force_threshold = 0.5;
+
+  // With enable_blob_indirection off, compaction rewrites the values of #10
+  // into new normal blob files, so compacting SST #1 frees #10.
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true,
+      /*enable_blob_indirection=*/false);
+  const auto& marked = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(marked.size(), 1);
+  ASSERT_EQ(marked[0], std::make_pair(level, vstorage_.LevelFiles(level)[0]));
+
+  // With enable_blob_indirection on, compaction keeps the references to #10 as
+  // they are, so compacting SST #1 cannot free #10.
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true,
+      /*enable_blob_indirection=*/true);
   ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
 }
 
@@ -1556,15 +1624,172 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   EXPECT_EQ(kGroupSize - 1, count);
 }
 
+TEST_F(VersionSetTest, BlobFinalizationDoesNotHoldDBMutex) {
+  NewDB();
+
+  std::promise<void> finalization_started;
+  std::future<void> finalization_started_future =
+      finalization_started.get_future();
+  std::promise<void> release_finalization;
+  std::future<void> release_finalization_future =
+      release_finalization.get_future();
+  std::promise<void> follower_queued;
+  std::future<void> follower_queued_future = follower_queued.get_future();
+  std::atomic<bool> block_first_finalization{true};
+  std::atomic<bool> expect_follower_queue{false};
+  std::atomic<bool> follower_queue_signaled{false};
+  const auto wait_or_abort = [](std::future<void>* future,
+                                const char* description) {
+    if (future->wait_for(std::chrono::seconds(50)) !=
+        std::future_status::ready) {
+      fprintf(stderr, "Timed out waiting for %s\n", description);
+      abort();
+    }
+  };
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization", [&](void*) {
+        if (block_first_finalization.exchange(false,
+                                              std::memory_order_relaxed)) {
+          finalization_started.set_value();
+          release_finalization_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+        if (expect_follower_queue.load(std::memory_order_relaxed) &&
+            !follower_queue_signaled.exchange(true,
+                                              std::memory_order_relaxed)) {
+          follower_queued.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status leader_status;
+  Status follower_status;
+  VersionEdit leader_edit;
+  leader_edit.SetDBId("leader");
+  port::Thread leader(
+      [&] { leader_status = LogAndApplyToDefaultCF(leader_edit); });
+  wait_or_abort(&finalization_started_future, "blob finalization");
+  expect_follower_queue.store(true, std::memory_order_relaxed);
+
+  VersionEdit follower_edit;
+  follower_edit.SetDBId("follower");
+  port::Thread follower(
+      [&] { follower_status = LogAndApplyToDefaultCF(follower_edit); });
+  wait_or_abort(&follower_queued_future, "the following MANIFEST writer");
+
+  release_finalization.set_value();
+  leader.join();
+  follower.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(leader_status);
+  ASSERT_OK(follower_status);
+}
+
+TEST_F(VersionSetTest, BlobFinalizationFailureKeepsManifestWriter) {
+  NewDB();
+  // The first edit opens the MANIFEST writer that the failure must keep.
+  VersionEdit first_edit;
+  first_edit.SetDBId("first");
+  ASSERT_OK(LogAndApplyToDefaultCF(first_edit));
+  const uint64_t manifest_file_number = versions_->manifest_file_number();
+
+  // Fail only the consistency check run by blob finalization, which happens
+  // before any MANIFEST record is written.
+  std::atomic<bool> in_finalization{false};
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization",
+      [&](void*) { in_finalization.store(true); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterBlobFinalization",
+      [&](void*) { in_finalization.store(false); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        if (in_finalization.load()) {
+          *static_cast<Status*>(arg) = Status::Corruption("finalization");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  VersionEdit failed_edit;
+  failed_edit.SetDBId("failed");
+  ASSERT_EQ(LogAndApplyToDefaultCF(failed_edit).code(), Status::kCorruption);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // No MANIFEST write was attempted, so the next edit reuses the writer.
+  VersionEdit next_edit;
+  next_edit.SetDBId("next");
+  ASSERT_OK(LogAndApplyToDefaultCF(next_edit));
+  ASSERT_EQ(versions_->manifest_file_number(), manifest_file_number);
+}
+
+TEST_F(VersionSetTest, BlobFinalizationFailureKeepsManifestIOError) {
+  // A batch whose blob finalization fails does no MANIFEST I/O, so it must
+  // keep an earlier MANIFEST I/O error in io_status(). A later batch that
+  // writes a new MANIFEST clears the error.
+  NewDB();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+        *static_cast<IOStatus*>(arg) = IOStatus::IOError("injected sync");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  VersionEdit io_error_edit;
+  io_error_edit.SetDBId("io_error");
+  ASSERT_EQ(LogAndApplyToDefaultCF(io_error_edit).code(), Status::kIOError);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(versions_->io_status().code(), Status::kIOError);
+
+  // Fail only the consistency check run by blob finalization.
+  std::atomic<bool> in_finalization{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization",
+      [&](void*) { in_finalization.store(true); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterBlobFinalization",
+      [&](void*) { in_finalization.store(false); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        if (in_finalization.load()) {
+          *static_cast<Status*>(arg) = Status::Corruption("finalization");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  VersionEdit failed_edit;
+  failed_edit.SetDBId("failed");
+  ASSERT_EQ(LogAndApplyToDefaultCF(failed_edit).code(), Status::kCorruption);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(versions_->io_status().code(), Status::kIOError);
+
+  // A batch that writes a new MANIFEST clears the error.
+  VersionEdit next_edit;
+  next_edit.SetDBId("next");
+  ASSERT_OK(LogAndApplyToDefaultCF(next_edit));
+  EXPECT_OK(versions_->io_status());
+}
+
 namespace {
 // Runs `fn` on its own thread and aborts if it does not return in time. A
 // LogAndApply queued behind a stranded writer is never woken, and the
-// VersionSet cannot be torn down while it waits.
+// VersionSet cannot be torn down while it waits. The limit is 50 seconds: it
+// gives a slow or loaded test host time to finish, and it stays below the
+// 60-second limit for a unit test, so the abort still names the hang.
 Status RunOrAbortOnHang(const std::function<Status()>& fn) {
   std::promise<Status> result;
   std::future<Status> finished = result.get_future();
   port::Thread runner([&] { result.set_value(fn()); });
-  if (finished.wait_for(std::chrono::seconds(30)) !=
+  if (finished.wait_for(std::chrono::seconds(50)) !=
       std::future_status::ready) {
     fprintf(stderr, "LogAndApply did not finish: stranded manifest writer\n");
     abort();
@@ -1612,7 +1837,8 @@ TEST_F(VersionSetTest, FailedEditReleasesEveryWriterInTheBatch) {
   mutex_.Lock();
   const Status s = versions_->LogAndApply(
       cfds, read_options_, write_options_, edit_lists, &mutex_,
-      /*dir_contains_current_file=*/nullptr, /*new_descriptor_log=*/false,
+      /*dir_contains_current_file=*/nullptr,
+      /*new_descriptor_log=*/false,
       /*new_cf_options=*/nullptr, manifest_wcbs);
   mutex_.Unlock();
   ASSERT_TRUE(s.IsCorruption()) << s.ToString();
@@ -1621,6 +1847,42 @@ TEST_F(VersionSetTest, FailedEditReleasesEveryWriterInTheBatch) {
     EXPECT_EQ(Status::kCorruption, callback_codes[i]) << "writer " << i;
   }
 
+  ASSERT_OK(RunOrAbortOnHang([&] {
+    VersionEdit next;
+    next.SetDBId("next_db_id");
+    return LogAndApplyToDefaultCF(next);
+  }));
+}
+
+// Only a column family add has a null column family, and a column family add
+// is always processed alone. So a null column family in a grouped batch is a
+// caller bug. The batch must fail with Corruption instead of crashing, and it
+// must still take every writer off the queue.
+TEST_F(VersionSetTest, NullColumnFamilyInBatchReturnsCorruption) {
+  NewDB();
+
+  // Two writers from one call: the default column family, then a null one.
+  VersionEdit default_cf_edit;
+  default_cf_edit.SetDBId("db_id_1");
+  VersionEdit null_cf_edit;
+  null_cf_edit.SetDBId("db_id_2");
+  autovector<ColumnFamilyData*> cfds;
+  cfds.emplace_back(versions_->GetColumnFamilySet()->GetDefault());
+  cfds.emplace_back(nullptr);
+  autovector<autovector<VersionEdit*>> edit_lists;
+  edit_lists.emplace_back(autovector<VersionEdit*>{&default_cf_edit});
+  edit_lists.emplace_back(autovector<VersionEdit*>{&null_cf_edit});
+  const uint64_t manifest_file_number = versions_->manifest_file_number();
+  mutex_.Lock();
+  const Status s = versions_->LogAndApply(
+      cfds, read_options_, write_options_, edit_lists, &mutex_,
+      /*dir_contains_current_file=*/nullptr, /*new_descriptor_log=*/false,
+      /*new_cf_options=*/nullptr);
+  mutex_.Unlock();
+  ASSERT_EQ(s.code(), Status::kCorruption) << s.ToString();
+  ASSERT_EQ(versions_->manifest_file_number(), manifest_file_number);
+
+  // The queue is empty again, so the next call does not wait forever.
   ASSERT_OK(RunOrAbortOnHang([&] {
     VersionEdit next;
     next.SetDBId("next_db_id");
@@ -1786,6 +2048,272 @@ TEST_F(VersionSetTest, FailedVersionBuildReleasesTheBatch) {
     next.SetDBId("next_db_id");
     return LogAndApplyToDefaultCF(next);
   }));
+}
+
+TEST_F(VersionSetTest, FailedFencedVersionBuildDefersRelocationState) {
+  // As above, but the edit also activates the format and adds a relocation
+  // file. The candidate Version and the builder are destroyed under the mutex.
+  // The candidate Version is the only owner of its relocation state, so
+  // ~Version() hands the file table to the VersionSet, and a later JobContext
+  // frees it without the mutex.
+  NewDB();
+
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  // Add two legacy SSTs in an edit before the fence. The fenced edit adds only
+  // the relocation file: a new SST in a fenced edit would need exact reference
+  // metadata.
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles({SstInfo(100, kDefaultColumnFamilyName, "a",
+                                 /*lvl=*/1, /*epoch_number=*/100),
+                         SstInfo(101, kDefaultColumnFamilyName, "c",
+                                 /*lvl=*/1, /*epoch_number=*/101)},
+                        &file_metas);
+  ASSERT_EQ(file_metas.size(), 2U);
+  VersionEdit files;
+  for (const FileMetaData& meta : file_metas) {
+    files.AddFile(/*level=*/1, meta);
+  }
+  ASSERT_OK(LogAndApplyToDefaultCF(files));
+  VersionEdit edit;
+  edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+  edit.AddBlobRelocationFile(BlobRelocationFileAddition(
+      /*file_number=*/102, /*file_size=*/4096,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      encoded_directory, /*tail_size=*/1));
+
+  bool armed = false;
+  bool injected = false;
+  size_t deferred_states = 0;
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // Arm the failure when blob finalization starts. It then fails the
+  // consistency check at the end of finalization, when the candidate Version
+  // already holds its relocation state.
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization",
+      [&](void*) { armed = !injected; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        if (armed) {
+          *static_cast<Status*>(arg) = Status::Corruption("Inject corruption");
+          armed = false;
+          injected = true;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::~Version:DeferRelocationState",
+      [&](void*) { ++deferred_states; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  int callback_calls = 0;
+  Status::Code callback_code = Status::kOk;
+  mutex_.Lock();
+  const Status s = versions_->LogAndApply(
+      versions_->GetColumnFamilySet()->GetDefault(), read_options_,
+      write_options_, &edit, &mutex_, /*dir_contains_current_file=*/nullptr,
+      /*new_descriptor_log=*/false, /*column_family_options=*/nullptr,
+      [&](const Status& cb_status) {
+        ++callback_calls;
+        callback_code = cb_status.code();
+      });
+  mutex_.Unlock();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(injected) << s.ToString();
+  ASSERT_EQ(deferred_states, 1U);
+  std::vector<std::shared_ptr<void>> deferred;
+  mutex_.Lock();
+  versions_->TakeObsoleteBlobRelocationStates(&deferred);
+  mutex_.Unlock();
+  EXPECT_EQ(deferred.size(), 1U);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  EXPECT_EQ(1, callback_calls);
+  EXPECT_EQ(Status::kCorruption, callback_code);
+
+  ASSERT_OK(RunOrAbortOnHang([&] {
+    VersionEdit next;
+    next.SetDBId("next_db_id");
+    return LogAndApplyToDefaultCF(next);
+  }));
+}
+
+TEST_F(VersionSetTest, LogAndApplyRejectsReaddedRelocationState) {
+  // File numbers are never reused, so replay rejects adding back a relocation
+  // route or file that an earlier edit of the same MANIFEST deleted.
+  // LogAndApply rejects it when it writes, so the bug cannot first show up at
+  // the next open. A new MANIFEST starts without deletion history, for replay
+  // and for LogAndApply.
+  NewDB();
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  const BlobRelocationFileAddition addition(
+      /*file_number=*/102, /*file_size=*/4096,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      encoded_directory, /*tail_size=*/1);
+  const BlobRelocationRoute route(/*source_file_number=*/77,
+                                  /*physical_file_number=*/102);
+  {
+    VersionEdit edit;
+    edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+    edit.AddBlobRelocationFile(addition);
+    edit.SetBlobRelocationRoute(route);
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+  {
+    VersionEdit edit;
+    edit.DeleteBlobRelocationRoute(/*source_file_number=*/77);
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+  {
+    VersionEdit edit;
+    edit.SetBlobRelocationRoute(route);
+    ASSERT_TRUE(LogAndApplyToDefaultCF(edit).IsCorruption());
+  }
+  // Number 77 is the old file number of the deleted route, so it belongs to an
+  // old file. A new blob file or relocation file with that number is rejected
+  // too. Replay would reject it, so the next open would fail.
+  {
+    VersionEdit edit;
+    edit.AddBlobFile(/*blob_file_number=*/77, /*total_blob_count=*/1,
+                     /*total_blob_bytes=*/100, std::string(), std::string());
+    const Status status = LogAndApplyToDefaultCF(edit);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    ASSERT_NE(status.ToString().find("names a route deleted earlier"),
+              std::string::npos)
+        << status.ToString();
+  }
+  {
+    VersionEdit edit;
+    edit.AddBlobRelocationFile(BlobRelocationFileAddition(
+        /*file_number=*/77, /*file_size=*/4096,
+        /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+        encoded_directory, /*tail_size=*/1));
+    const Status status = LogAndApplyToDefaultCF(edit);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    ASSERT_NE(status.ToString().find("names a route deleted earlier"),
+              std::string::npos)
+        << status.ToString();
+  }
+  {
+    VersionEdit edit;
+    edit.DeleteBlobRelocationFile(/*file_number=*/102);
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+  {
+    VersionEdit edit;
+    edit.AddBlobRelocationFile(addition);
+    ASSERT_TRUE(LogAndApplyToDefaultCF(edit).IsCorruption());
+  }
+  // The rejected edits were not written: the MANIFEST still replays.
+  CloseDB();
+  ReopenDB();
+  ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(102),
+            nullptr);
+  // After reopen, the next write starts a new MANIFEST with a snapshot, which
+  // has no deletion history.
+  {
+    VersionEdit edit;
+    edit.AddBlobRelocationFile(addition);
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+  CloseDB();
+  ReopenDB();
+  cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(102),
+            nullptr);
+}
+
+TEST_F(VersionSetTest, ReusedManifestRejectsReaddedRelocationState) {
+  // With reuse_manifest_on_open, writes after reopen go to the replayed
+  // MANIFEST, which already holds the deletions. LogAndApply must still reject
+  // adding the deleted state back; otherwise the next open fails.
+  NewDB();
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  const BlobRelocationFileAddition addition(
+      /*file_number=*/102, /*file_size=*/4096,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      encoded_directory, /*tail_size=*/1);
+  const BlobRelocationRoute route(/*source_file_number=*/77,
+                                  /*physical_file_number=*/102);
+  {
+    VersionEdit edit;
+    edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+    edit.AddBlobRelocationFile(addition);
+    edit.SetBlobRelocationRoute(route);
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+  {
+    VersionEdit edit;
+    edit.DeleteBlobRelocationRoute(/*source_file_number=*/77);
+    edit.DeleteBlobRelocationFile(/*file_number=*/102);
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+  std::string manifest_before;
+  GetManifestPath(&manifest_before);
+  CloseDB();
+  imm_db_options_.reuse_manifest_on_open = true;
+  ReopenDB();
+  {
+    VersionEdit edit;
+    edit.SetBlobRelocationRoute(route);
+    edit.AddBlobRelocationFile(addition);
+    const Status status = LogAndApplyToDefaultCF(edit);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  }
+  {
+    VersionEdit edit;
+    edit.AddBlobRelocationFile(addition);
+    ASSERT_TRUE(LogAndApplyToDefaultCF(edit).IsCorruption());
+  }
+  // The replayed route deletion also seeds the check of a new file whose
+  // number is the deleted route.
+  {
+    VersionEdit edit;
+    edit.AddBlobFile(/*blob_file_number=*/77, /*total_blob_count=*/1,
+                     /*total_blob_bytes=*/100, std::string(), std::string());
+    const Status status = LogAndApplyToDefaultCF(edit);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    ASSERT_NE(status.ToString().find("names a route deleted earlier"),
+              std::string::npos)
+        << status.ToString();
+  }
+  // An unrelated write goes to the same MANIFEST, and it still replays.
+  {
+    VersionEdit edit;
+    edit.SetLastSequence(1);
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+  std::string manifest_after;
+  GetManifestPath(&manifest_after);
+  ASSERT_EQ(manifest_after, manifest_before);
+  CloseDB();
+  ReopenDB();
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(102),
+            nullptr);
 }
 
 TEST_F(VersionSetTest, PersistBlobFileStateInNewManifest) {
@@ -2026,6 +2554,101 @@ TEST_F(VersionSetTest, AddLiveBlobFiles) {
 
   // Clean up previous version.
   first_version->Unref();
+}
+
+TEST_F(VersionSetTest, LastUnrefFreesOnlyRelocationStateUnlocked) {
+  // A Version is destroyed under the DB mutex. When the last reference drops
+  // and the Version holds relocation state, only that state is freed without
+  // the mutex.
+  NewDB();
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  int unlocked = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::UnrefAndFreeBlobRelocationState:Unlocked", [&](void* arg) {
+        auto* db_mutex = static_cast<InstrumentedMutex*>(arg);
+        ASSERT_TRUE(db_mutex->TryLock());
+        db_mutex->Unlock();
+        ++unlocked;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (const bool with_relocation_state : {false, true}) {
+    SCOPED_TRACE(with_relocation_state);
+    Version* const old_version = cfd->current();
+    ASSERT_NE(old_version, nullptr);
+    mutex_.Lock();
+    old_version->Ref();
+    if (with_relocation_state) {
+      BlobRelocationDirectoryBuilder directory_builder;
+      ASSERT_OK(directory_builder.Add(
+          /*origin_file_number=*/77, /*original_value_offset=*/11,
+          /*stored_value_size=*/17, kNoCompression));
+      ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+      BlobRelocationDirectory directory;
+      ASSERT_OK(directory_builder.Finish(&directory));
+      std::string encoded_directory;
+      directory.EncodeTo(&encoded_directory);
+      old_version->storage_info()->SetBlobIndirectionFormatVersion(
+          kBlobIndirectionManifestFormatVersion);
+      old_version->storage_info()->AddBlobRelocationFile(
+          BlobRelocationFileMetaData::Create(BlobRelocationFileAddition(
+              /*file_number=*/102, /*file_size=*/4096, std::string(),
+              std::string(), encoded_directory, /*tail_size=*/1)));
+      old_version->storage_info()->SealBlobRelocationState();
+    }
+    versions_->TEST_CreateAndAppendVersion(cfd);
+    old_version->UnrefAndFreeBlobRelocationState(&mutex_);
+    mutex_.Unlock();
+    ASSERT_EQ(unlocked, with_relocation_state ? 1 : 0);
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(VersionSetTest, IndirectReferenceToUnfencedBlobFileIsNotRelocatable) {
+  // A read of a kIndirectBlob reference finds the physical file in the file
+  // table of the Version (Version::ResolveBlobPhysicalFile()). A Version
+  // without the per-CF format fence has an empty file table. Valid edits never
+  // give such a Version a blob file that a kIndirectBlob reference names,
+  // because VersionBuilder rejects an indirect-origin blob file without the
+  // fence. So this test adds blob file 234 to the storage info by hand, as
+  // AddLiveBlobFiles does, and reads a reference whose origin and generation
+  // are file 234. The read returns Corruption before it opens any file.
+  NewDB();
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  Version* const version = cfd->current();
+  VersionStorageInfo* const storage_info = version->storage_info();
+  ASSERT_FALSE(storage_info->HasBlobIndirectionFormat());
+  constexpr uint64_t kBlobFileNumber = 234;
+  storage_info->AddBlobFile(BlobFileMetaData::Create(
+      SharedBlobFileMetaData::Create(kBlobFileNumber, /*total_blob_count=*/1,
+                                     /*total_blob_bytes=*/100,
+                                     /*checksum_method=*/std::string(),
+                                     /*checksum_value=*/std::string()),
+      BlobFileMetaData::LinkedSsts(), /*garbage_blob_count=*/0,
+      /*garbage_blob_bytes=*/0));
+  ASSERT_EQ(storage_info->GetBlobFileTable().size(), 0U);
+
+  std::string encoded;
+  BlobIndex::EncodeUnflattenedIndirectBlob(
+      &encoded, {.origin_file_number = kBlobFileNumber,
+                 .original_value_offset = 100,
+                 .stored_value_size = 5,
+                 .compression = kNoCompression,
+                 .stable_checksum = 0,
+                 .stored_checksum = 0});
+  BlobIndex blob_index;
+  ASSERT_OK(blob_index.DecodeFrom(encoded));
+  PinnableSlice value;
+  const Status status = version->GetBlob(ReadOptions(), "key", blob_index,
+                                         /*prefetch_buffer=*/nullptr, &value,
+                                         /*bytes_read=*/nullptr);
+  ASSERT_EQ(status.code(), Status::kCorruption) << status.ToString();
+  ASSERT_NE(
+      status.ToString().find("Indirect blob generation is not relocatable"),
+      std::string::npos)
+      << status.ToString();
 }
 
 TEST_F(VersionSetTest, ObsoleteBlobFile) {
@@ -3312,6 +3935,865 @@ TEST_F(VersionSetAtomicGroupTest,
   EXPECT_TRUE(reactive_versions_->TEST_read_edits_in_atomic_group() == 0);
   EXPECT_TRUE(reactive_versions_->replay_buffer().size() == 0);
   EXPECT_EQ(kAtomicGroupSize, num_recovered_edits_);
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       ReactiveVersionSetRejectsDeletionOfAnotherColumnFamilysFile) {
+  // Column family 2 deletes relocation file 100 during catch-up. Column family
+  // 2 has no live relocation file 100 (it is an SST of column family 1), so
+  // the catch-up fails and column family 2 keeps its Version.
+  constexpr uint64_t kTableFileNumber = 100;
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles({SstInfo(kTableFileNumber, kColumnFamilyName1, "key",
+                                 /*epoch_number=*/kTableFileNumber)},
+                        &file_metas);
+  ASSERT_EQ(file_metas.size(), 1U);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().AddFile(/*level=*/0, file_metas.front());
+  edits_.back().SetNextFile(kTableFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/2);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  ColumnFamilyData* second_cfd =
+      reactive_versions_->GetColumnFamilySet()->GetColumnFamily(2);
+  ASSERT_NE(second_cfd, nullptr);
+  Version* const version_before_collision = second_cfd->current();
+  ASSERT_NE(version_before_collision, nullptr);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/2);
+  edits_.back().DeleteBlobRelocationFile(kTableFileNumber);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+
+  InstrumentedMutex mu;
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  mu.Lock();
+  Status status = reactive_versions_->ReadAndApply(
+      &mu, &manifest_reader, manifest_reader_status.get(), &cfds_changed,
+      /*files_to_delete=*/nullptr);
+  mu.Unlock();
+
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find(
+                "Blob relocation file deletion names no live file"),
+            std::string::npos)
+      << status.ToString();
+  ASSERT_EQ(second_cfd->current(), version_before_collision);
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       ReactivePointInTimeFallbackKeepsVersionAndReleasesMutex) {
+  table_factory_.reset(NewBlockBasedTableFactory());
+  cf_options_.table_factory = table_factory_;
+  mutable_cf_options_.table_factory = table_factory_;
+  for (auto& column_family : column_families_) {
+    column_family.options.table_factory = table_factory_;
+  }
+  reactive_versions_ = std::make_shared<ReactiveVersionSet>(
+      dbname_, &imm_db_options_, mutable_db_options_, env_options_,
+      table_cache_.get(), &write_buffer_manager_, &write_controller_,
+      /*io_tracer=*/nullptr, /*db_id=*/"test-db",
+      /*db_session_id=*/"test-session", /*defer_sst_file_opening=*/false);
+
+  constexpr uint64_t kTableFileNumber = 100;
+  constexpr uint64_t kMissingRelocationFileNumber = 101;
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles({SstInfo(kTableFileNumber, kColumnFamilyName1, "key",
+                                 /*epoch_number=*/kTableFileNumber)},
+                        &file_metas);
+  ASSERT_EQ(file_metas.size(), 1U);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().AddFile(/*level=*/0, file_metas.front());
+  edits_.back().SetNextFile(kMissingRelocationFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  for (uint32_t column_family_id : {1U, 2U}) {
+    edits_.emplace_back();
+    edits_.back().SetColumnFamily(column_family_id);
+    edits_.back().SetBlobIndirectionFormatVersion(
+        kBlobIndirectionManifestFormatVersion);
+    edits_.back().SetLastSequence(last_seqno_++);
+  }
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().DeleteFile(/*level=*/0, kTableFileNumber);
+  edits_.back().AddBlobRelocationFile(BlobRelocationFileAddition(
+      kMissingRelocationFileNumber,
+      /*file_size=*/4096, /*checksum_method=*/std::string(),
+      /*checksum_value=*/std::string(), encoded_directory, /*tail_size=*/1));
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+
+  InstrumentedMutex mu;
+  size_t decode_unlocked = 0;
+  size_t verify_unlocked = 0;
+  size_t save_unlocked = 0;
+  const auto assert_unlocked = [](void* arg, size_t* count) {
+    auto* db_mutex = static_cast<InstrumentedMutex*>(arg);
+    ASSERT_NE(db_mutex, nullptr);
+    ASSERT_TRUE(db_mutex->TryLock());
+    db_mutex->Unlock();
+    ++*count;
+  };
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestTailer::DecodeVersionEdit:Unlocked",
+      [&](void* arg) { assert_unlocked(arg, &decode_unlocked); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestTailer::VerifyBlobRelocationFile:Unlocked",
+      [&](void* arg) { assert_unlocked(arg, &verify_unlocked); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestTailer::SaveVersionTo:Unlocked",
+      [&](void* arg) { assert_unlocked(arg, &save_unlocked); });
+
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  mu.Lock();
+  Status status = reactive_versions_->ReadAndApply(
+      &mu, &manifest_reader, manifest_reader_status.get(), &cfds_changed,
+      /*files_to_delete=*/nullptr);
+  mu.Unlock();
+  ASSERT_OK(status);
+  ASSERT_GT(decode_unlocked, 0U);
+  ASSERT_GT(verify_unlocked, 0U);
+  ASSERT_GT(save_unlocked, 0U);
+  // There is no unlocked hook for builder Apply() and the Version install: they
+  // change file reference counts, so they run under the DB mutex. Only the
+  // relocation file check inside Apply() runs without it.
+
+  ColumnFamilyData* first_cfd =
+      reactive_versions_->GetColumnFamilySet()->GetColumnFamily(1);
+  ASSERT_NE(first_cfd, nullptr);
+  ASSERT_TRUE(first_cfd->current()
+                  ->storage_info()
+                  ->GetFileLocation(kTableFileNumber)
+                  .IsValid());
+  ASSERT_EQ(first_cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                kMissingRelocationFileNumber),
+            nullptr);
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       RecoveryAcceptsRelocationFileDeletionOfOwnColumnFamily) {
+  // Column family 1 adds relocation file 100 and then deletes it, and the
+  // MANIFEST repeats the deletion. Replay accepts both deletions: the first
+  // one names a live relocation file of column family 1, and the repeat names
+  // a file that the builder already deleted. The DB opens without the file.
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  constexpr uint64_t kRelocationFileNumber = 100;
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().AddBlobRelocationFile(BlobRelocationFileAddition(
+      kRelocationFileNumber, /*file_size=*/4096,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      encoded_directory, /*tail_size=*/1));
+  edits_.back().SetNextFile(kRelocationFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  for (int i = 0; i < 2; ++i) {
+    edits_.emplace_back();
+    edits_.back().SetColumnFamily(/*column_family_id=*/1);
+    edits_.back().DeleteBlobRelocationFile(kRelocationFileNumber);
+    edits_.back().SetLastSequence(last_seqno_++);
+  }
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  ASSERT_OK(versions_->Recover(column_families_, /*read_only=*/false));
+  ColumnFamilyData* const cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(1);
+  ASSERT_NE(cfd, nullptr);
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                kRelocationFileNumber),
+            nullptr);
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       RecoveryRejectsRelocationRecordOfAnotherColumnFamily) {
+  // VersionBuilder applies a relocation record to the state of the edit's own
+  // column family. Column family 2 deletes relocation file 100, which only
+  // column family 1 lists, so replay rejects the record.
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  constexpr uint64_t kRelocationFileNumber = 100;
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().AddBlobRelocationFile(BlobRelocationFileAddition(
+      kRelocationFileNumber, /*file_size=*/4096,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      encoded_directory, /*tail_size=*/1));
+  edits_.back().SetNextFile(kRelocationFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/2);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().DeleteBlobRelocationFile(kRelocationFileNumber);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  const Status status =
+      versions_->Recover(column_families_, /*read_only=*/false);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find(
+                "Blob relocation file deletion names no live file"),
+            std::string::npos)
+      << status.ToString();
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       RecoveryRejectsLossRecordOfAnotherColumnFamily) {
+  // VersionBuilder applies a loss record to the state of the edit's own column
+  // family. Column family 2 marks relocation file 100 lost, but only column
+  // family 1 lists that file, so replay rejects the record.
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  constexpr uint64_t kRelocationFileNumber = 100;
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().AddBlobRelocationFile(BlobRelocationFileAddition(
+      kRelocationFileNumber, /*file_size=*/4096,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      encoded_directory, /*tail_size=*/1));
+  edits_.back().SetNextFile(kRelocationFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/2);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().MarkBlobPhysicalFileLost(kRelocationFileNumber);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  const Status status =
+      versions_->Recover(column_families_, /*read_only=*/false);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("Blob relocation loss names no live target"),
+            std::string::npos)
+      << status.ToString();
+}
+
+TEST_F(VersionSetAtomicGroupTest, ReactiveFailedApplyIsFinal) {
+  constexpr uint64_t kRelocationFileNumber = 100;
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  reactive_versions_->SetTrustManifestRecovery(true);
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().AddBlobRelocationFile(BlobRelocationFileAddition(
+      kRelocationFileNumber,
+      /*file_size=*/4096, /*checksum_method=*/std::string(),
+      /*checksum_value=*/std::string(), encoded_directory, /*tail_size=*/1));
+  edits_.back().DeleteFile(/*level=*/0, /*file=*/999);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+
+  InstrumentedMutex mu;
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  mu.Lock();
+  const Status first_status = reactive_versions_->ReadAndApply(
+      &mu, &manifest_reader, manifest_reader_status.get(), &cfds_changed,
+      /*files_to_delete=*/nullptr);
+  mu.Unlock();
+  ASSERT_TRUE(first_status.IsCorruption()) << first_status.ToString();
+
+  ColumnFamilyData* first_cfd =
+      reactive_versions_->GetColumnFamilySet()->GetColumnFamily(1);
+  ASSERT_NE(first_cfd, nullptr);
+  ASSERT_EQ(first_cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                kRelocationFileNumber),
+            nullptr);
+
+  mu.Lock();
+  const Status retry_status = reactive_versions_->ReadAndApply(
+      &mu, &manifest_reader, manifest_reader_status.get(), &cfds_changed,
+      /*files_to_delete=*/nullptr);
+  mu.Unlock();
+  ASSERT_EQ(retry_status.ToString(), first_status.ToString());
+  ASSERT_EQ(first_cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                kRelocationFileNumber),
+            nullptr);
+}
+
+// An error from applying a MANIFEST record is final in catch-up (see
+// ReactiveVersionSet::resume_after_manifest_read_error_). This test fails the
+// apply of an atomic group, and then the primary switches to a new MANIFEST.
+// Catch-up still returns the same error and applies no part of the group.
+TEST_F(VersionSetAtomicGroupTest,
+       ReactiveFailedAtomicReplayStaysFinalAfterManifestSwitch) {
+  CreateCurrentFile();
+  log_writer_.reset();
+  ASSERT_OK(versions_->Recover(column_families_, /*read_only=*/false));
+
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  ColumnFamilyData* primary_first_cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(1);
+  ColumnFamilyData* primary_second_cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(2);
+  ASSERT_NE(primary_first_cfd, nullptr);
+  ASSERT_NE(primary_second_cfd, nullptr);
+  edits_.clear();
+  edits_.resize(2);
+  edits_[0].SetColumnFamily(/*column_family_id=*/1);
+  edits_[0].MarkAtomicGroup(/*remaining_entries=*/1);
+  edits_[1].SetColumnFamily(/*column_family_id=*/2);
+  edits_[1].MarkAtomicGroup(/*remaining_entries=*/0);
+  autovector<ColumnFamilyData*> cfds{primary_first_cfd, primary_second_cfd};
+  autovector<autovector<VersionEdit*>> edit_lists;
+  edit_lists.emplace_back(autovector<VersionEdit*>{&edits_[0]});
+  edit_lists.emplace_back(autovector<VersionEdit*>{&edits_[1]});
+  InstrumentedMutex primary_mu;
+  primary_mu.Lock();
+  Status status = versions_->LogAndApply(
+      cfds, ReadOptions(), WriteOptions(), edit_lists, &primary_mu,
+      /*dir_contains_current_file=*/nullptr,
+      /*new_descriptor_log=*/false, /*new_cf_options=*/nullptr,
+      /*manifest_wcbs=*/{}, /*pre_cb=*/{},
+      /*max_file_opening_threads=*/1);
+  primary_mu.Unlock();
+  ASSERT_OK(status);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionEditHandlerBase::Iterate:BeforeApplyAtomicGroupEdit",
+      [](void* arg) {
+        *static_cast<Status*>(arg) =
+            Status::Corruption("injected atomic replay failure");
+      });
+  InstrumentedMutex reactive_mu;
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  reactive_mu.Lock();
+  status = reactive_versions_->ReadAndApply(
+      &reactive_mu, &manifest_reader, manifest_reader_status.get(),
+      &cfds_changed, /*files_to_delete=*/nullptr);
+  reactive_mu.Unlock();
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  const Status apply_status = status;
+  ColumnFamilyData* reactive_first_cfd =
+      reactive_versions_->GetColumnFamilySet()->GetColumnFamily(1);
+  ASSERT_NE(reactive_first_cfd, nullptr);
+  Version* const version_after_failure = reactive_first_cfd->current();
+
+  VersionEdit rotate;
+  ColumnFamilyData* primary_default_cfd =
+      versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(primary_default_cfd, nullptr);
+  primary_mu.Lock();
+  status = versions_->LogAndApply(primary_default_cfd, ReadOptions(),
+                                  WriteOptions(), &rotate, &primary_mu,
+                                  /*dir_contains_current_file=*/nullptr,
+                                  /*new_descriptor_log=*/true);
+  primary_mu.Unlock();
+  ASSERT_OK(status);
+
+  reactive_mu.Lock();
+  const Status retry_status = reactive_versions_->ReadAndApply(
+      &reactive_mu, &manifest_reader, manifest_reader_status.get(),
+      &cfds_changed, /*files_to_delete=*/nullptr);
+  reactive_mu.Unlock();
+  ASSERT_EQ(retry_status.ToString(), apply_status.ToString());
+  ASSERT_EQ(reactive_first_cfd->current(), version_after_failure);
+}
+
+TEST_F(VersionSetAtomicGroupTest, ReactiveIdenticalRelocationRepeatIsAccepted) {
+  // Catch-up replays a relocation file addition that the builder already has.
+  // An identical repeat is accepted.
+  constexpr uint64_t kRelocationFileNumber = 100;
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  BlobRelocationFileAddition addition(
+      kRelocationFileNumber,
+      /*file_size=*/4096, /*checksum_method=*/std::string(),
+      /*checksum_value=*/std::string(), encoded_directory, /*tail_size=*/1);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().AddBlobRelocationFile(addition);
+  edits_.back().SetNextFile(kRelocationFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  reactive_versions_->SetTrustManifestRecovery(true);
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().AddBlobRelocationFile(addition);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+
+  InstrumentedMutex mu;
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  mu.Lock();
+  Status status = reactive_versions_->ReadAndApply(
+      &mu, &manifest_reader, manifest_reader_status.get(), &cfds_changed,
+      /*files_to_delete=*/nullptr);
+  mu.Unlock();
+  ASSERT_OK(status);
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       ReactiveManifestSwitchFreesReplacedBuilderUnlocked) {
+  // Catch-up applies a relocation file addition to the default column family,
+  // so the builder of that column family holds a staged relocation change.
+  // When catch-up switches to a new MANIFEST, it replaces that builder. The
+  // replaced builder frees its staged relocation change without the DB mutex.
+  // For example, relocation file 100 holds one value of blob file 77.
+  constexpr uint64_t kRelocationFileNumber = 100;
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  const BlobRelocationFileAddition addition(
+      kRelocationFileNumber,
+      /*file_size=*/4096, /*checksum_method=*/std::string(),
+      /*checksum_value=*/std::string(), encoded_directory, /*tail_size=*/1);
+
+  // Blob indirection state needs a Block-Based Table writer, as in
+  // ReactivePointInTimeFallbackKeepsVersionAndReleasesMutex.
+  table_factory_.reset(NewBlockBasedTableFactory());
+  cf_options_.table_factory = table_factory_;
+  mutable_cf_options_.table_factory = table_factory_;
+  for (auto& column_family : column_families_) {
+    column_family.options.table_factory = table_factory_;
+  }
+  CreateCurrentFile();
+  log_writer_.reset();
+  ASSERT_OK(versions_->Recover(column_families_, /*read_only=*/false));
+  // The relocation file does not exist, so catch-up must not check it.
+  reactive_versions_->SetTrustManifestRecovery(true);
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  ColumnFamilyData* const primary_default_cfd =
+      versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(primary_default_cfd, nullptr);
+  InstrumentedMutex primary_mu;
+  VersionEdit install;
+  install.SetColumnFamily(primary_default_cfd->GetID());
+  install.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  install.AddBlobRelocationFile(addition);
+  primary_mu.Lock();
+  Status status = versions_->LogAndApply(primary_default_cfd, ReadOptions(),
+                                         WriteOptions(), &install, &primary_mu,
+                                         /*dir_contains_current_file=*/nullptr,
+                                         /*new_descriptor_log=*/false);
+  primary_mu.Unlock();
+  ASSERT_OK(status);
+
+  InstrumentedMutex reactive_mu;
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  reactive_mu.Lock();
+  status = reactive_versions_->ReadAndApply(
+      &reactive_mu, &manifest_reader, manifest_reader_status.get(),
+      &cfds_changed, /*files_to_delete=*/nullptr);
+  reactive_mu.Unlock();
+  ASSERT_OK(status);
+  ColumnFamilyData* const reactive_default_cfd =
+      reactive_versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(reactive_default_cfd, nullptr);
+  ASSERT_NE(reactive_default_cfd->current()
+                ->storage_info()
+                ->GetBlobRelocationFileMetaData(kRelocationFileNumber),
+            nullptr);
+
+  VersionEdit rotate;
+  primary_mu.Lock();
+  status = versions_->LogAndApply(primary_default_cfd, ReadOptions(),
+                                  WriteOptions(), &rotate, &primary_mu,
+                                  /*dir_contains_current_file=*/nullptr,
+                                  /*new_descriptor_log=*/true);
+  primary_mu.Unlock();
+  ASSERT_OK(status);
+
+  int unlocked_replace_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestTailer::ReplaceBuilder:Unlocked", [&](void* arg) {
+        auto* const db_mutex = static_cast<InstrumentedMutex*>(arg);
+        ASSERT_EQ(db_mutex, &reactive_mu);
+        ASSERT_TRUE(db_mutex->TryLock());
+        db_mutex->Unlock();
+        ++unlocked_replace_calls;
+      });
+  reactive_mu.Lock();
+  status = reactive_versions_->ReadAndApply(
+      &reactive_mu, &manifest_reader, manifest_reader_status.get(),
+      &cfds_changed, /*files_to_delete=*/nullptr);
+  reactive_mu.Unlock();
+  ASSERT_OK(status);
+  ASSERT_GE(unlocked_replace_calls, 1);
+  ASSERT_NE(reactive_default_cfd->current()
+                ->storage_info()
+                ->GetBlobRelocationFileMetaData(kRelocationFileNumber),
+            nullptr);
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       ReactiveConflictingRelocationRepeatFailsInApply) {
+  // Catch-up replays a relocation file addition that differs from the file
+  // the builder has, then drops the column family. Apply() compares the repeat
+  // and fails with Corruption, so the drop is not applied and the column
+  // family keeps the original file.
+  constexpr uint64_t kRelocationFileNumber = 100;
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  const BlobRelocationFileAddition original(
+      kRelocationFileNumber,
+      /*file_size=*/4096, /*checksum_method=*/std::string(),
+      /*checksum_value=*/std::string(), encoded_directory, /*tail_size=*/1);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().AddBlobRelocationFile(original);
+  edits_.back().SetNextFile(kRelocationFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  reactive_versions_->SetTrustManifestRecovery(true);
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().AddBlobRelocationFile(BlobRelocationFileAddition(
+      kRelocationFileNumber,
+      /*file_size=*/8192, /*checksum_method=*/std::string(),
+      /*checksum_value=*/std::string(), encoded_directory, /*tail_size=*/1));
+  edits_.back().SetLastSequence(last_seqno_++);
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().DropColumnFamily();
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+
+  InstrumentedMutex mu;
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  mu.Lock();
+  const Status status = reactive_versions_->ReadAndApply(
+      &mu, &manifest_reader, manifest_reader_status.get(), &cfds_changed,
+      /*files_to_delete=*/nullptr);
+  mu.Unlock();
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ColumnFamilyData* first_cfd =
+      reactive_versions_->GetColumnFamilySet()->GetColumnFamily(1);
+  ASSERT_NE(first_cfd, nullptr);
+  const std::shared_ptr<BlobRelocationFileMetaData> metadata =
+      first_cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+          kRelocationFileNumber);
+  ASSERT_NE(metadata, nullptr);
+  ASSERT_EQ(metadata->GetFileSize(), 4096U);
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       ReactiveColumnFamilyDropRemovesChangedPointer) {
+  constexpr uint64_t kTableFileNumber = 100;
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles({SstInfo(kTableFileNumber, kColumnFamilyName1, "key",
+                                 /*epoch_number=*/kTableFileNumber)},
+                        &file_metas);
+  ASSERT_EQ(file_metas.size(), 1U);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().AddFile(/*level=*/0, file_metas.front());
+  edits_.back().SetNextFile(kTableFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/2);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().SetLogNumber(7);
+  edits_.back().SetLastSequence(last_seqno_++);
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().DropColumnFamily();
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+
+  InstrumentedMutex mu;
+  size_t builder_destroyed_unlocked = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestTailer::DestroyVersionBuilder:Unlocked", [&](void* arg) {
+        auto* db_mutex = static_cast<InstrumentedMutex*>(arg);
+        ASSERT_EQ(db_mutex, &mu);
+        ASSERT_TRUE(db_mutex->TryLock());
+        db_mutex->Unlock();
+        ++builder_destroyed_unlocked;
+      });
+
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  mu.Lock();
+  Status status = reactive_versions_->ReadAndApply(
+      &mu, &manifest_reader, manifest_reader_status.get(), &cfds_changed,
+      /*files_to_delete=*/nullptr);
+  mu.Unlock();
+  ASSERT_OK(status);
+  // The dropped CF's builder staged no relocation change, so it is destroyed
+  // under the DB mutex without an unlock.
+  ASSERT_EQ(builder_destroyed_unlocked, 0U);
+  ASSERT_EQ(reactive_versions_->GetColumnFamilySet()->GetColumnFamily(1),
+            nullptr);
+  for (ColumnFamilyData* cfd : cfds_changed) {
+    ASSERT_NE(cfd->GetID(), 1U);
+  }
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       ReactiveManifestSwitchKeepsSecondaryOnlyColumnFamily) {
+  constexpr uint64_t kTableFileNumber = 100;
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles({SstInfo(kTableFileNumber, kColumnFamilyName1, "key",
+                                 /*epoch_number=*/kTableFileNumber)},
+                        &file_metas);
+  ASSERT_EQ(file_metas.size(), 1U);
+
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().AddFile(/*level=*/0, file_metas.front());
+  edits_.back().SetNextFile(kTableFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  std::unique_ptr<log::FragmentBufferedReader> manifest_reader;
+  std::unique_ptr<log::Reader::Reporter> manifest_reporter;
+  std::unique_ptr<Status> manifest_reader_status;
+  ASSERT_OK(reactive_versions_->Recover(column_families_, &manifest_reader,
+                                        &manifest_reporter,
+                                        &manifest_reader_status));
+
+  log_writer_.reset();
+  ASSERT_OK(versions_->Recover(column_families_, /*read_only=*/false));
+  ColumnFamilyData* primary_first_cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(1);
+  ColumnFamilyData* primary_second_cfd =
+      versions_->GetColumnFamilySet()->GetColumnFamily(2);
+  ASSERT_NE(primary_first_cfd, nullptr);
+  ASSERT_NE(primary_second_cfd, nullptr);
+
+  InstrumentedMutex primary_mu;
+  primary_first_cfd->Ref();
+  VersionEdit drop;
+  drop.SetColumnFamily(/*column_family_id=*/1);
+  drop.DropColumnFamily();
+  primary_mu.Lock();
+  Status status = versions_->LogAndApply(primary_first_cfd, ReadOptions(),
+                                         WriteOptions(), &drop, &primary_mu,
+                                         /*dir_contains_current_file=*/nullptr);
+  primary_mu.Unlock();
+  ASSERT_OK(status);
+
+  VersionEdit rotate;
+  ColumnFamilyData* primary_default_cfd =
+      versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(primary_default_cfd, nullptr);
+  primary_mu.Lock();
+  status = versions_->LogAndApply(primary_default_cfd, ReadOptions(),
+                                  WriteOptions(), &rotate, &primary_mu,
+                                  /*dir_contains_current_file=*/nullptr,
+                                  /*new_descriptor_log=*/true);
+  primary_mu.Unlock();
+  ASSERT_OK(status);
+
+  InstrumentedMutex reactive_mu;
+  std::unordered_set<ColumnFamilyData*> cfds_changed;
+  size_t unlocked_candidate_deletions = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestTailer::DiscardVersions:Unlocked", [&](void* arg) {
+        auto* db_mutex = static_cast<InstrumentedMutex*>(arg);
+        ASSERT_NE(db_mutex, nullptr);
+        ASSERT_TRUE(db_mutex->TryLock());
+        db_mutex->Unlock();
+        ++unlocked_candidate_deletions;
+      });
+  reactive_mu.Lock();
+  status = reactive_versions_->ReadAndApply(
+      &reactive_mu, &manifest_reader, manifest_reader_status.get(),
+      &cfds_changed, /*files_to_delete=*/nullptr);
+  reactive_mu.Unlock();
+  // The new MANIFEST starts with a complete snapshot, which has no CF 1
+  // (dropped on the primary). The secondary still has CF 1, which lists table
+  // 100.
+  ASSERT_OK(status);
+  // Discarded candidates are deleted under the DB mutex. A candidate that is
+  // the last owner of its relocation state frees it without the mutex.
+  ASSERT_LE(unlocked_candidate_deletions, 1U);
+
+  ColumnFamilyData* reactive_first_cfd =
+      reactive_versions_->GetColumnFamilySet()->GetColumnFamily(1);
+  ColumnFamilyData* reactive_second_cfd =
+      reactive_versions_->GetColumnFamilySet()->GetColumnFamily(2);
+  ASSERT_NE(reactive_first_cfd, nullptr);
+  ASSERT_NE(reactive_second_cfd, nullptr);
+  ASSERT_TRUE(reactive_first_cfd->current()
+                  ->storage_info()
+                  ->GetFileLocation(kTableFileNumber)
+                  .IsValid());
+
+  primary_mu.Lock();
+  primary_first_cfd->UnrefAndTryDelete();
+  primary_mu.Unlock();
 }
 
 TEST_F(VersionSetAtomicGroupTest,
@@ -5164,6 +6646,222 @@ TEST_P(ChargeFileMetadataTestWithParam, Basic) {
   } else {
     EXPECT_TRUE(s.ok());
   }
+}
+
+TEST_F(VersionSetTest, IndirectBlobReadRouteSignals) {
+  // Checks the signals of Version::ResolveBlobPhysicalFile():
+  // - BLOB_DB_INDIRECT_READ_ROUTED goes up by one for each read that finds its
+  //   file through a route, and does not change for other reads.
+  // - Its Corruption messages name the generation, origin and route target
+  //   file numbers, so a LOG line shows which reference failed.
+  // For example, relocation file 102 holds the moved values of blob file 77,
+  // and route 77 -> 102 sends reads of file 77 to file 102.
+  imm_db_options_.statistics = CreateDBStatistics();
+  Statistics* const stats = imm_db_options_.statistics.get();
+  // The column family reads the raw pointer.
+  imm_db_options_.stats = stats;
+  NewDB();
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  {
+    VersionEdit edit;
+    edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+    edit.AddBlobRelocationFile(BlobRelocationFileAddition(
+        /*file_number=*/102, /*file_size=*/4096,
+        /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+        encoded_directory, /*tail_size=*/1));
+    edit.SetBlobRelocationRoute(BlobRelocationRoute(
+        /*source_file_number=*/77, /*physical_file_number=*/102));
+    ASSERT_OK(LogAndApplyToDefaultCF(edit));
+  }
+  Version* const version =
+      versions_->GetColumnFamilySet()->GetDefault()->current();
+  // Reads the reference with generation number `generation` and origin
+  // `origin`. This test DB has no relocation file reader (its table factory is
+  // not block-based) and file 102 does not exist on disk, so a read that gets
+  // past the route and file lookup fails when it opens the file.
+  const auto read = [&](uint64_t generation, uint64_t origin) {
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(&encoded, generation,
+                                  {.origin_file_number = origin,
+                                   .original_value_offset = 11,
+                                   .stored_value_size = 17,
+                                   .compression = kNoCompression,
+                                   .stable_checksum = 0,
+                                   .stored_checksum = 0});
+    BlobIndex blob_index;
+    EXPECT_OK(blob_index.DecodeFrom(encoded));
+    PinnableSlice value;
+    return version->GetBlob(ReadOptions(), "key", blob_index,
+                            /*prefetch_buffer=*/nullptr, &value,
+                            /*bytes_read=*/nullptr);
+  };
+  const auto routed = [&]() {
+    return stats->getTickerCount(BLOB_DB_INDIRECT_READ_ROUTED);
+  };
+  ASSERT_EQ(routed(), 0);
+
+  // A reference to file 77 goes through the route.
+  ASSERT_NOK(read(/*generation=*/77, /*origin=*/77));
+  ASSERT_EQ(routed(), 1);
+  // A flattened reference names file 102 itself: no route.
+  ASSERT_NOK(read(/*generation=*/102, /*origin=*/77));
+  ASSERT_EQ(routed(), 1);
+
+  // An unknown generation number: the message names the generation and the
+  // origin, and there is no route.
+  {
+    const Status status = read(/*generation=*/999, /*origin=*/999);
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    ASSERT_NE(status.ToString().find("generation 999, origin 999"),
+              std::string::npos)
+        << status.ToString();
+    ASSERT_EQ(status.ToString().find("route target"), std::string::npos)
+        << status.ToString();
+    ASSERT_EQ(routed(), 1);
+  }
+
+  // A route whose target is not a live relocation file. Valid edits cannot
+  // make such a route (VersionBuilder checks every route target), so the test
+  // changes the file table of this Version directly, then puts it back. The
+  // message names the target, for example file 555. The read finds no file,
+  // so the ticker does not change.
+  {
+    BlobFileTable& table =
+        const_cast<BlobFileTable&>(version->storage_info()->GetBlobFileTable());
+    uint32_t count = 0;
+    const uint64_t old_value = table.Find(77, &count);
+    ASSERT_TRUE(BlobFileTable::IsRoute(old_value));
+    table.Apply({{77, BlobFileTable::RouteValue(555), count}});
+    const Status status = read(/*generation=*/77, /*origin=*/77);
+    table.Apply({{77, old_value, count}});
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    ASSERT_NE(
+        status.ToString().find("generation 77, origin 77, route target 555"),
+        std::string::npos)
+        << status.ToString();
+    ASSERT_EQ(routed(), 1);
+  }
+}
+
+class BlobIndirectionPropertyTest : public DBTestBase {
+ public:
+  BlobIndirectionPropertyTest()
+      : DBTestBase("blob_indirection_property_test", /*env_do_fsync=*/false) {}
+};
+
+TEST_F(BlobIndirectionPropertyTest, FormatVersionAndRoutedReads) {
+  // rocksdb.blob-indirection-format-version is the per-CF format fence: 0 for
+  // a column family without a fence, and the format version after the first
+  // flush with enable_blob_indirection. The fence stays when the option is
+  // turned off again. Reads without routes never tick
+  // BLOB_DB_INDIRECT_READ_ROUTED. A stable checksum mismatch names the file
+  // numbers and the offset of the reference.
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  // A compressed value has a stored checksum of its own, so a wrong stable
+  // checksum is found by the stable checksum check, not by the record check.
+  const bool compressed = Snappy_Supported();
+  if (compressed) {
+    options.blob_compression_type = kSnappyCompression;
+  }
+  DestroyAndReopen(options);
+  const auto format_version = [&]() {
+    uint64_t value = 0;
+    EXPECT_TRUE(db_->GetIntProperty(
+        DB::Properties::kBlobIndirectionFormatVersion, &value));
+    return value;
+  };
+  const auto routed = [&]() {
+    return options.statistics->getTickerCount(BLOB_DB_INDIRECT_READ_ROUTED);
+  };
+
+  // Blob files without blob indirection.
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("key1"), "value1");
+  ASSERT_EQ(format_version(), 0);
+  ASSERT_EQ(routed(), 0);
+
+  options.enable_blob_indirection = true;
+  Reopen(options);
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(format_version(), kBlobIndirectionManifestFormatVersion);
+  ASSERT_EQ(Get("key1"), "value1");
+  ASSERT_EQ(Get("key2"), "value2");
+  ASSERT_EQ(routed(), 0);
+
+  if (compressed) {
+    // Reads the reference of a compressible value with its stable checksum
+    // changed. The record itself is valid.
+    const std::string value(1000, 'c');
+    ASSERT_OK(Put("key3", value));
+    ASSERT_OK(Flush());
+    PinnableSlice raw;
+    bool is_blob_index = false;
+    DBImpl::GetImplOptions get_options;
+    get_options.column_family = db_->DefaultColumnFamily();
+    get_options.value = &raw;
+    get_options.is_blob_index = &is_blob_index;
+    ASSERT_OK(dbfull()->GetImpl(ReadOptions(), "key3", get_options));
+    ASSERT_TRUE(is_blob_index);
+    BlobIndex blob_index;
+    ASSERT_OK(blob_index.DecodeFrom(raw));
+    ASSERT_TRUE(blob_index.IsIndirect());
+    ASSERT_NE(blob_index.compression(), kNoCompression);
+    std::string encoded;
+    BlobIndex::EncodeIndirectBlob(
+        &encoded, blob_index.generation_file_number(),
+        {.origin_file_number = blob_index.origin_file_number(),
+         .original_value_offset = blob_index.original_value_offset(),
+         .stored_value_size = blob_index.size(),
+         .compression = blob_index.compression(),
+         .stable_checksum = blob_index.stable_checksum() + 1,
+         .stored_checksum = blob_index.stored_checksum()});
+    BlobIndex wrong_checksum;
+    ASSERT_OK(wrong_checksum.DecodeFrom(encoded));
+    ColumnFamilyData* const cfd =
+        static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+    Version* version = nullptr;
+    {
+      InstrumentedMutexLock lock(dbfull()->mutex());
+      version = cfd->current();
+      version->Ref();
+    }
+    PinnableSlice result;
+    const Status status = version->GetBlob(
+        ReadOptions(), "key3", wrong_checksum, /*prefetch_buffer=*/nullptr,
+        &result, /*bytes_read=*/nullptr);
+    {
+      InstrumentedMutexLock lock(dbfull()->mutex());
+      version->Unref();
+    }
+    ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+    const std::string expected =
+        "Stable blob checksum mismatch: generation " +
+        std::to_string(blob_index.generation_file_number()) + ", origin " +
+        std::to_string(blob_index.origin_file_number()) + ", original offset " +
+        std::to_string(blob_index.original_value_offset());
+    ASSERT_NE(status.ToString().find(expected), std::string::npos)
+        << status.ToString();
+    ASSERT_EQ(routed(), 0);
+  }
+
+  options.enable_blob_indirection = false;
+  Reopen(options);
+  ASSERT_EQ(format_version(), kBlobIndirectionManifestFormatVersion);
+  ASSERT_EQ(Get("key2"), "value2");
 }
 }  // namespace ROCKSDB_NAMESPACE
 

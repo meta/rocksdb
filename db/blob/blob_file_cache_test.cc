@@ -10,6 +10,7 @@
 
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_writer.h"
+#include "env/composite_env_wrapper.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -20,6 +21,8 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/options.h"
 #include "rocksdb/statistics.h"
+#include "rocksdb/table.h"
+#include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 
@@ -326,6 +329,102 @@ TEST_F(BlobFileCacheTest, GetBlobFileReaderIOError) {
   ASSERT_EQ(options.statistics->getTickerCount(NO_FILE_ERRORS), 1);
 }
 
+TEST_F(BlobFileCacheTest, RelocationOpenRemembersOnlyFileErrors) {
+  // BlobFileCache remembers a failed relocation open for a short time only when
+  // the error comes from the file itself: Corruption, or a missing file
+  // reported as IOError(PathNotFound). Other IOErrors and TimedOut can be
+  // short-lived, so the next read opens the file again.
+  class OpenFailureFS : public FileSystemWrapper {
+   public:
+    explicit OpenFailureFS(const std::shared_ptr<FileSystem>& target)
+        : FileSystemWrapper(target) {}
+    const char* Name() const override { return "OpenFailureFS"; }
+    IOStatus NewRandomAccessFile(const std::string& fname,
+                                 const FileOptions& opts,
+                                 std::unique_ptr<FSRandomAccessFile>* result,
+                                 IODebugContext* dbg) override {
+      if (!next_error.ok()) {
+        IOStatus error = next_error;
+        next_error = IOStatus::OK();
+        return error;
+      }
+      return target()->NewRandomAccessFile(fname, opts, result, dbg);
+    }
+    IOStatus next_error;
+  };
+  const auto fs = std::make_shared<OpenFailureFS>(mock_env_->GetFileSystem());
+  CompositeEnvWrapper env(mock_env_.get(), fs);
+  Options options;
+  options.env = &env;
+  options.statistics = CreateDBStatistics();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileCacheTest_RelocationOpenRemembers"),
+      0);
+  options.enable_blob_files = true;
+  std::shared_ptr<Cache> backing_cache = NewLRUCache(10);
+  ImmutableOptions immutable_options(options);
+  FileOptions file_options;
+  BlobFileCache blob_file_cache(
+      backing_cache.get(), &immutable_options, &file_options,
+      /*column_family_id=*/1, /*blob_file_read_hist=*/nullptr,
+      /*io_tracer=*/nullptr, /*db_session_id=*/"session",
+      /*block_cache_tracer=*/nullptr);
+  const MutableCFOptions mutable_cf_options(options);
+  // A file that exists but is not a relocation table.
+  constexpr uint64_t file_number = 77;
+  ASSERT_OK(WriteStringToFile(
+      fs.get(), std::string(4096, 'x'),
+      BlobFileName(immutable_options.cf_paths.front().path, file_number)));
+  const BlobPhysicalFile blob_file{
+      BlobFileOpenInfo{file_number, Slice(), Slice()},
+      /*file_size=*/4096, /*is_relocation=*/true,
+      /*tail_size=*/1024,
+      /*directory_digest=*/1};
+  const auto open = [&](const ReadOptions& read_options) {
+    CacheHandleGuard<BlobFileReader> reader;
+    return blob_file_cache.GetRelocationFileReader(read_options, blob_file,
+                                                   mutable_cf_options, &reader);
+  };
+  const auto opens = [&]() {
+    return options.statistics->getTickerCount(NO_FILE_OPENS);
+  };
+
+  for (const IOStatus& injected :
+       {IOStatus::IOError("injected"), IOStatus::TimedOut("injected")}) {
+    SCOPED_TRACE(injected.ToString());
+    fs->next_error = injected;
+    const uint64_t before = opens();
+    const Status first = open(ReadOptions());
+    EXPECT_EQ(first.code(), injected.code()) << first.ToString();
+    // Not remembered: the next read opens the file again and gets its own
+    // result (here Corruption, because the file is not a relocation table).
+    const Status second = open(ReadOptions());
+    EXPECT_TRUE(second.IsCorruption()) << second.ToString();
+    EXPECT_EQ(opens(), before + 2);
+    // The Corruption is remembered: no new open within the 1-second window
+    // (kFailedRelocationOpenMicros).
+    EXPECT_TRUE(open(ReadOptions()).IsCorruption());
+    EXPECT_EQ(opens(), before + 2);
+    // ForgetFailedRelocationOpen() drops the remembered failure, so the next
+    // round is clean.
+    blob_file_cache.ForgetFailedRelocationOpen(file_number);
+  }
+
+  // A missing file (IOError(PathNotFound)) is remembered like Corruption.
+  fs->next_error = IOStatus::PathNotFound("injected");
+  const uint64_t before = opens();
+  const Status missing = open(ReadOptions());
+  EXPECT_TRUE(missing.IsPathNotFound()) << missing.ToString();
+  EXPECT_EQ(opens(), before + 1);
+  const Status again = open(ReadOptions());
+  EXPECT_TRUE(again.IsPathNotFound()) << again.ToString();
+  EXPECT_EQ(opens(), before + 1);
+  blob_file_cache.ForgetFailedRelocationOpen(file_number);
+  EXPECT_TRUE(open(ReadOptions()).IsCorruption());
+  EXPECT_EQ(opens(), before + 2);
+}
+
 TEST_F(BlobFileCacheTest, GetBlobFileReaderCacheFull) {
   Options options;
   options.env = mock_env_.get();
@@ -367,6 +466,118 @@ TEST_F(BlobFileCacheTest, GetBlobFileReaderCacheFull) {
   ASSERT_EQ(reader.GetValue(), nullptr);
   ASSERT_EQ(options.statistics->getTickerCount(NO_FILE_OPENS), 1);
   ASSERT_EQ(options.statistics->getTickerCount(NO_FILE_ERRORS), 1);
+}
+
+TEST_F(BlobFileCacheTest, RelocationOpenFailureTickers) {
+  // Checks the two tickers of failed relocation file opens:
+  // - BLOB_RELOCATION_FILE_OPEN_FAILURES counts each real open of a relocation
+  //   file that fails.
+  // - BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS counts each read that gets the
+  //   remembered failure of an earlier open, without a new open.
+  // A failed open of a normal blob file counts in NO_FILE_ERRORS only. A mock
+  // clock moves past the 1-second window (kFailedRelocationOpenMicros) without
+  // a sleep.
+  class OpenFailureFS : public FileSystemWrapper {
+   public:
+    explicit OpenFailureFS(const std::shared_ptr<FileSystem>& target)
+        : FileSystemWrapper(target) {}
+    const char* Name() const override { return "OpenFailureFS"; }
+    IOStatus NewRandomAccessFile(const std::string& fname,
+                                 const FileOptions& opts,
+                                 std::unique_ptr<FSRandomAccessFile>* result,
+                                 IODebugContext* dbg) override {
+      if (!next_error.ok()) {
+        IOStatus error = next_error;
+        next_error = IOStatus::OK();
+        return error;
+      }
+      return target()->NewRandomAccessFile(fname, opts, result, dbg);
+    }
+    IOStatus next_error;
+  };
+  const auto fs = std::make_shared<OpenFailureFS>(mock_env_->GetFileSystem());
+  const auto clock =
+      std::make_shared<MockSystemClock>(mock_env_->GetSystemClock());
+  clock->SetCurrentTime(100);
+  CompositeEnvWrapper env(mock_env_.get(), fs, clock);
+  Options options;
+  options.env = &env;
+  options.statistics = CreateDBStatistics();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileCacheTest_RelocationOpenFailureTickers"),
+      0);
+  options.enable_blob_files = true;
+  std::shared_ptr<Cache> backing_cache = NewLRUCache(10);
+  ImmutableOptions immutable_options(options);
+  FileOptions file_options;
+  BlobFileCache blob_file_cache(
+      backing_cache.get(), &immutable_options, &file_options,
+      /*column_family_id=*/1, /*blob_file_read_hist=*/nullptr,
+      /*io_tracer=*/nullptr, /*db_session_id=*/"session",
+      /*block_cache_tracer=*/nullptr);
+  const MutableCFOptions mutable_cf_options(options);
+  const auto ticker = [&](Tickers t) {
+    return options.statistics->getTickerCount(t);
+  };
+
+  // A normal blob file that does not exist (file 76): the failed open counts
+  // in NO_FILE_ERRORS, not in the relocation tickers.
+  {
+    CacheHandleGuard<BlobFileReader> reader;
+    const BlobFileOpenInfo normal_file{76, Slice(), Slice()};
+    ASSERT_NOK(
+        blob_file_cache.GetBlobFileReader(ReadOptions(), normal_file, &reader));
+    ASSERT_EQ(ticker(NO_FILE_ERRORS), 1);
+    ASSERT_EQ(ticker(BLOB_RELOCATION_FILE_OPEN_FAILURES), 0);
+    ASSERT_EQ(ticker(BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS), 0);
+  }
+
+  // For example, relocation file 77 exists but is not a relocation table, so
+  // its open fails with Corruption. Relocation file 78 does not exist.
+  ASSERT_OK(WriteStringToFile(
+      fs.get(), std::string(4096, 'x'),
+      BlobFileName(immutable_options.cf_paths.front().path, 77)));
+  const auto open = [&](uint64_t file_number) {
+    const BlobPhysicalFile file{BlobFileOpenInfo{file_number, Slice(), Slice()},
+                                /*file_size=*/4096, /*is_relocation=*/true,
+                                /*tail_size=*/1024,
+                                /*directory_digest=*/1};
+    CacheHandleGuard<BlobFileReader> reader;
+    return blob_file_cache.GetRelocationFileReader(ReadOptions(), file,
+                                                   mutable_cf_options, &reader);
+  };
+
+  for (const uint64_t file_number : {uint64_t{77}, uint64_t{78}}) {
+    SCOPED_TRACE("file " + std::to_string(file_number));
+    const uint64_t failures = ticker(BLOB_RELOCATION_FILE_OPEN_FAILURES);
+    const uint64_t hits = ticker(BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS);
+    // The first read opens the file and fails.
+    ASSERT_NOK(open(file_number));
+    ASSERT_EQ(ticker(BLOB_RELOCATION_FILE_OPEN_FAILURES), failures + 1);
+    ASSERT_EQ(ticker(BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS), hits);
+    // The next two reads get the remembered failure.
+    ASSERT_NOK(open(file_number));
+    ASSERT_NOK(open(file_number));
+    ASSERT_EQ(ticker(BLOB_RELOCATION_FILE_OPEN_FAILURES), failures + 1);
+    ASSERT_EQ(ticker(BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS), hits + 2);
+    // After the window ends, the next read opens the file again.
+    clock->SleepForMicroseconds(2 * 1000 * 1000);
+    ASSERT_NOK(open(file_number));
+    ASSERT_EQ(ticker(BLOB_RELOCATION_FILE_OPEN_FAILURES), failures + 2);
+    ASSERT_EQ(ticker(BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS), hits + 2);
+    blob_file_cache.ForgetFailedRelocationOpen(file_number);
+  }
+
+  // A short-lived IOError counts as a failed open but is not remembered, so it
+  // never gives a cache hit. The next read opens file 77 again.
+  const uint64_t failures = ticker(BLOB_RELOCATION_FILE_OPEN_FAILURES);
+  const uint64_t hits = ticker(BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS);
+  fs->next_error = IOStatus::IOError("injected");
+  ASSERT_TRUE(open(77).IsIOError());
+  ASSERT_TRUE(open(77).IsCorruption());
+  ASSERT_EQ(ticker(BLOB_RELOCATION_FILE_OPEN_FAILURES), failures + 2);
+  ASSERT_EQ(ticker(BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS), hits);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

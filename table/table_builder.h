@@ -32,7 +32,9 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Slice;
+class BlobIndex;
 class BlobSource;
+struct BlobReferenceSstSummary;
 
 struct TableReaderOptions {
   // @param skip_filters Disables loading/accessing the filter block
@@ -240,6 +242,12 @@ inline const char* TableBuilderNewTableReasonToString(
 struct TableBuilderAddContext {
   TableBuilderNewTableReason new_table_reason =
       TableBuilderNewTableReason::kNone;
+  // Input, optional. When the value is a kTypeBlobIndex, the caller can pass
+  // its own decode of the value here, so that the builder does not decode it
+  // again. Compaction decodes each output BlobIndex once and shares it with
+  // the builder, the blob garbage meter and the file metadata update.
+  // nullptr: the builder decodes the value itself.
+  const BlobIndex* decoded_blob_index = nullptr;
 };
 
 // TableBuilder provides the interface used to build a Table
@@ -329,6 +337,17 @@ class TableBuilder {
 
   // Returns table properties
   virtual TableProperties GetTableProperties() const = 0;
+
+  // Returns the immutable summary of the exact blob references this builder
+  // collected (see BlobReferenceSstSummary). Returns null if exact metadata was
+  // not enabled, Finish() has not run, or the build failed. BuildTable() (used
+  // by flush, WAL recovery and RepairDB) and compaction put it in the output's
+  // FileMetaData, so the MANIFEST install can add the SST to the census without
+  // reopening the new SST.
+  virtual std::shared_ptr<const BlobReferenceSstSummary>
+  GetBlobReferenceSstSummary() const {
+    return nullptr;
+  }
 
   // Return file checksum
   virtual std::string GetFileChecksum() const = 0;

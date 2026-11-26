@@ -128,15 +128,10 @@ class CompactionOutputs {
 
   // Update output table properties from already populated TableProperties.
   // Used for remote compaction
-  void UpdateTableProperties(const TableProperties& table_properties) {
-    current_output().table_properties =
-        std::make_shared<TableProperties>(table_properties);
-  }
+  void UpdateTableProperties(const TableProperties& table_properties);
+
   // Update output table properties from table builder
-  void UpdateTableProperties() {
-    current_output().table_properties =
-        std::make_shared<TableProperties>(GetTableProperties());
-  }
+  void UpdateTableProperties();
 
   IOStatus WriterSyncClose(const Status& intput_status, SystemClock* clock,
                            Statistics* statistics, bool use_fsync);
@@ -426,6 +421,15 @@ class CompactionOutputs {
   // The smallest key of the current output file, this is set when current
   // output file's smallest key is a range tombstone start key.
   InternalKey range_tombstone_lower_bound_;
+
+  // Decodes the kTypeBlobIndex value `value` of the current key. Returns null
+  // if the decode fails. The result lives until the next call. It is out of
+  // line and kept apart from AddToOutput() so that a key that is not a blob
+  // index does no extra work there (no BlobIndex is built on that path).
+  ROCKSDB_NOINLINE const BlobIndex* DecodeOutputBlobIndex(const Slice& value);
+  // The decode buffer of DecodeOutputBlobIndex(). BlobIndex::DecodeFrom()
+  // resets it before each decode, so one member serves every key.
+  BlobIndex output_blob_index_;
 
   // Used for calls to compaction->KeyRangeNotExistsBeyondOutputLevel() in
   // CompactionOutputs::AddRangeDels().

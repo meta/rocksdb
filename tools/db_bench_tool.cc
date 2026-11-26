@@ -1318,6 +1318,15 @@ DEFINE_int32(
     ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().blob_file_starting_level,
     "[Integrated BlobDB] The starting level for blob files.");
 
+DEFINE_bool(pin_blob_relocation_location_blocks,
+            ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                .pin_blob_relocation_location_blocks,
+            "[Integrated BlobDB] Keep all location blocks of a relocation "
+            "file in memory while its reader is open, so lookups of relocated "
+            "values skip the index and block cache lookups (see "
+            "pin_blob_relocation_location_blocks in "
+            "include/rocksdb/advanced_options.h).");
+
 DEFINE_bool(use_blob_cache, false, "[Integrated BlobDB] Enable blob cache.");
 
 DEFINE_bool(
@@ -6547,6 +6556,8 @@ class Benchmark {
     options.blob_compaction_readahead_size =
         FLAGS_blob_compaction_readahead_size;
     options.blob_file_starting_level = FLAGS_blob_file_starting_level;
+    options.pin_blob_relocation_location_blocks =
+        FLAGS_pin_blob_relocation_location_blocks;
     options.read_triggered_compaction_threshold =
         FLAGS_read_triggered_compaction_threshold;
 

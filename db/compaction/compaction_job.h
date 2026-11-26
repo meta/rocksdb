@@ -50,6 +50,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Arena;
+struct BlobReferenceSstSummary;
 class CompactionState;
 class ErrorHandler;
 class MemTable;
@@ -258,6 +259,12 @@ class CompactionJob {
 
   CompactionJobStats* job_stats_;
 
+  // Reference summaries of the exact input SSTs. Their memory is charged to
+  // CacheEntryRole::kBlobReferenceCensus when that role is charged. The job
+  // keeps them until the install edit hands them to the census.
+  std::vector<std::shared_ptr<const BlobReferenceSstSummary>>
+      input_blob_reference_summaries_;
+
   // Lower bound for the minimal sequence number whose write time is
   // preserved. See Prepare().
   SequenceNumber preserve_time_min_seqno_floor_ = 0;
@@ -328,6 +335,14 @@ class CompactionJob {
   void ReleaseSubcompactionResources();
 
   void InitializeCompactionRun();
+
+  // To remove an SST, the census delta needs the SST's reference summary. This
+  // reads the summary of every exact input SST while the job holds its inputs,
+  // so the install edit can hand them to the census. Every compaction reads
+  // them, also a full compaction, so every install updates the census with a
+  // delta. If a read fails, it stops, and the missing summary makes the census
+  // rebuild instead.
+  void ReadInputBlobReferenceSummaries();
   void RunSubcompactions();
   void RecordRemoteCompactionInputBlobFileCount();
   void UpdateTimingStats(uint64_t start_micros);

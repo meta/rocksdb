@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <limits>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -118,6 +119,88 @@ TEST(Coding, Varint32) {
     ASSERT_EQ(VarintLength(actual), p - start);
   }
   ASSERT_EQ(p, s.data() + s.size());
+}
+
+TEST(Coding, CanonicalVarint) {
+  // 0x85 0x00 is an overlong encoding of 5; the minimal one is 0x05.
+  const std::string overlong("\x85\x00", 2);
+  const std::string minimal("\x05", 1);
+  {
+    Slice input(overlong);
+    uint32_t value = 0;
+    ASSERT_FALSE(GetCanonicalVarint32(&input, &value));
+    input = Slice(minimal);
+    ASSERT_TRUE(GetCanonicalVarint32(&input, &value));
+    ASSERT_EQ(value, 5U);
+    ASSERT_TRUE(input.empty());
+  }
+  {
+    Slice input(overlong);
+    uint64_t value = 0;
+    ASSERT_FALSE(GetCanonicalVarint64(&input, &value));
+    input = Slice(minimal);
+    ASSERT_TRUE(GetCanonicalVarint64(&input, &value));
+    ASSERT_EQ(value, 5U);
+    ASSERT_TRUE(input.empty());
+  }
+}
+
+TEST(Coding, CanonicalVarintRejectsBitsAboveTypeWidth) {
+  // The last byte of a maximum-length varint has room for more bits than the
+  // type holds. GetVarint32/64 drop those bits, so a second encoding of the
+  // same value decodes. The canonical decoders accept only the encoding that
+  // PutVarint32/64 write.
+  {
+    std::string minimal;
+    PutVarint32(&minimal, std::numeric_limits<uint32_t>::max());
+    ASSERT_EQ(minimal.size(), 5U);
+    // The 5th byte holds bits 28 to 31, so its minimal value is 0x0F.
+    std::string extra_bits = minimal;
+    extra_bits[4] = 0x1F;
+    uint32_t value = 0;
+    Slice input(extra_bits);
+    ASSERT_TRUE(GetVarint32(&input, &value));
+    ASSERT_EQ(value, std::numeric_limits<uint32_t>::max());
+    input = Slice(extra_bits);
+    ASSERT_FALSE(GetCanonicalVarint32(&input, &value));
+    input = Slice(minimal);
+    ASSERT_TRUE(GetCanonicalVarint32(&input, &value));
+    ASSERT_EQ(value, std::numeric_limits<uint32_t>::max());
+    ASSERT_TRUE(input.empty());
+  }
+  {
+    // 2^63 encodes as nine 0x80 bytes and a 10th byte of 0x01, which holds
+    // bit 63. A 10th byte of 0x03 sets bit 64 too, which uint64_t drops.
+    const uint64_t top_bit = uint64_t{1} << 63;
+    std::string minimal;
+    PutVarint64(&minimal, top_bit);
+    ASSERT_EQ(minimal.size(), 10U);
+    ASSERT_EQ(minimal[9], 0x01);
+    std::string extra_bits = minimal;
+    extra_bits[9] = 0x03;
+    uint64_t value = 0;
+    Slice input(extra_bits);
+    ASSERT_TRUE(GetVarint64(&input, &value));
+    ASSERT_EQ(value, top_bit);
+    input = Slice(extra_bits);
+    ASSERT_FALSE(GetCanonicalVarint64(&input, &value));
+    input = Slice(minimal);
+    ASSERT_TRUE(GetCanonicalVarint64(&input, &value));
+    ASSERT_EQ(value, top_bit);
+    ASSERT_TRUE(input.empty());
+  }
+  {
+    // The two largest uint64_t values still round-trip.
+    for (uint64_t value : {std::numeric_limits<uint64_t>::max(),
+                           std::numeric_limits<uint64_t>::max() - 1}) {
+      std::string encoded;
+      PutVarint64(&encoded, value);
+      uint64_t decoded = 0;
+      Slice input(encoded);
+      ASSERT_TRUE(GetCanonicalVarint64(&input, &decoded));
+      ASSERT_EQ(decoded, value);
+    }
+  }
 }
 
 TEST(Coding, Varint64) {
