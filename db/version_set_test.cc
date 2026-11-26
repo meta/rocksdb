@@ -1556,6 +1556,161 @@ TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   EXPECT_EQ(kGroupSize - 1, count);
 }
 
+TEST_F(VersionSetTest, BlobFinalizationDoesNotHoldDBMutex) {
+  NewDB();
+
+  std::promise<void> finalization_started;
+  std::future<void> finalization_started_future =
+      finalization_started.get_future();
+  std::promise<void> release_finalization;
+  std::future<void> release_finalization_future =
+      release_finalization.get_future();
+  std::promise<void> follower_queued;
+  std::future<void> follower_queued_future = follower_queued.get_future();
+  std::atomic<bool> block_first_finalization{true};
+  std::atomic<bool> expect_follower_queue{false};
+  std::atomic<bool> follower_queue_signaled{false};
+  const auto wait_or_abort = [](std::future<void>* future,
+                                const char* description) {
+    if (future->wait_for(std::chrono::seconds(50)) !=
+        std::future_status::ready) {
+      fprintf(stderr, "Timed out waiting for %s\n", description);
+      abort();
+    }
+  };
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization", [&](void*) {
+        if (block_first_finalization.exchange(false,
+                                              std::memory_order_relaxed)) {
+          finalization_started.set_value();
+          release_finalization_future.wait();
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+        if (expect_follower_queue.load(std::memory_order_relaxed) &&
+            !follower_queue_signaled.exchange(true,
+                                              std::memory_order_relaxed)) {
+          follower_queued.set_value();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status leader_status;
+  Status follower_status;
+  VersionEdit leader_edit;
+  leader_edit.SetDBId("leader");
+  port::Thread leader(
+      [&] { leader_status = LogAndApplyToDefaultCF(leader_edit); });
+  wait_or_abort(&finalization_started_future, "blob finalization");
+  expect_follower_queue.store(true, std::memory_order_relaxed);
+
+  VersionEdit follower_edit;
+  follower_edit.SetDBId("follower");
+  port::Thread follower(
+      [&] { follower_status = LogAndApplyToDefaultCF(follower_edit); });
+  wait_or_abort(&follower_queued_future, "the following MANIFEST writer");
+
+  release_finalization.set_value();
+  leader.join();
+  follower.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(leader_status);
+  ASSERT_OK(follower_status);
+}
+
+TEST_F(VersionSetTest, BlobFinalizationFailureKeepsManifestWriter) {
+  NewDB();
+  // The first edit opens the MANIFEST writer that the failure must keep.
+  VersionEdit first_edit;
+  first_edit.SetDBId("first");
+  ASSERT_OK(LogAndApplyToDefaultCF(first_edit));
+  const uint64_t manifest_file_number = versions_->manifest_file_number();
+
+  // Fail only the consistency check run by blob finalization, which happens
+  // before any MANIFEST record is written.
+  std::atomic<bool> in_finalization{false};
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization",
+      [&](void*) { in_finalization.store(true); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterBlobFinalization",
+      [&](void*) { in_finalization.store(false); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        if (in_finalization.load()) {
+          *static_cast<Status*>(arg) = Status::Corruption("finalization");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  VersionEdit failed_edit;
+  failed_edit.SetDBId("failed");
+  ASSERT_EQ(LogAndApplyToDefaultCF(failed_edit).code(), Status::kCorruption);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // No MANIFEST write was attempted, so the next edit reuses the writer.
+  VersionEdit next_edit;
+  next_edit.SetDBId("next");
+  ASSERT_OK(LogAndApplyToDefaultCF(next_edit));
+  ASSERT_EQ(versions_->manifest_file_number(), manifest_file_number);
+}
+
+TEST_F(VersionSetTest, BlobFinalizationFailureKeepsManifestIOError) {
+  // A batch whose blob finalization fails does no MANIFEST I/O, so it must
+  // keep an earlier MANIFEST I/O error in io_status(). A later batch that
+  // writes a new MANIFEST clears the error.
+  NewDB();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+        *static_cast<IOStatus*>(arg) = IOStatus::IOError("injected sync");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  VersionEdit io_error_edit;
+  io_error_edit.SetDBId("io_error");
+  ASSERT_EQ(LogAndApplyToDefaultCF(io_error_edit).code(), Status::kIOError);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(versions_->io_status().code(), Status::kIOError);
+
+  // Fail only the consistency check run by blob finalization.
+  std::atomic<bool> in_finalization{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization",
+      [&](void*) { in_finalization.store(true); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterBlobFinalization",
+      [&](void*) { in_finalization.store(false); });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        if (in_finalization.load()) {
+          *static_cast<Status*>(arg) = Status::Corruption("finalization");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  VersionEdit failed_edit;
+  failed_edit.SetDBId("failed");
+  ASSERT_EQ(LogAndApplyToDefaultCF(failed_edit).code(), Status::kCorruption);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(versions_->io_status().code(), Status::kIOError);
+
+  // A batch that writes a new MANIFEST clears the error.
+  VersionEdit next_edit;
+  next_edit.SetDBId("next");
+  ASSERT_OK(LogAndApplyToDefaultCF(next_edit));
+  EXPECT_OK(versions_->io_status());
+}
+
 namespace {
 // Runs `fn` on its own thread and aborts if it does not return in time. A
 // LogAndApply queued behind a stranded writer is never woken, and the
@@ -1612,7 +1767,8 @@ TEST_F(VersionSetTest, FailedEditReleasesEveryWriterInTheBatch) {
   mutex_.Lock();
   const Status s = versions_->LogAndApply(
       cfds, read_options_, write_options_, edit_lists, &mutex_,
-      /*dir_contains_current_file=*/nullptr, /*new_descriptor_log=*/false,
+      /*dir_contains_current_file=*/nullptr,
+      /*new_descriptor_log=*/false,
       /*new_cf_options=*/nullptr, manifest_wcbs);
   mutex_.Unlock();
   ASSERT_TRUE(s.IsCorruption()) << s.ToString();
@@ -1621,6 +1777,42 @@ TEST_F(VersionSetTest, FailedEditReleasesEveryWriterInTheBatch) {
     EXPECT_EQ(Status::kCorruption, callback_codes[i]) << "writer " << i;
   }
 
+  ASSERT_OK(RunOrAbortOnHang([&] {
+    VersionEdit next;
+    next.SetDBId("next_db_id");
+    return LogAndApplyToDefaultCF(next);
+  }));
+}
+
+// Only a column family add has a null column family, and a column family add
+// is always processed alone. So a null column family in a grouped batch is a
+// caller bug. The batch must fail with Corruption instead of crashing, and it
+// must still take every writer off the queue.
+TEST_F(VersionSetTest, NullColumnFamilyInBatchReturnsCorruption) {
+  NewDB();
+
+  // Two writers from one call: the default column family, then a null one.
+  VersionEdit default_cf_edit;
+  default_cf_edit.SetDBId("db_id_1");
+  VersionEdit null_cf_edit;
+  null_cf_edit.SetDBId("db_id_2");
+  autovector<ColumnFamilyData*> cfds;
+  cfds.emplace_back(versions_->GetColumnFamilySet()->GetDefault());
+  cfds.emplace_back(nullptr);
+  autovector<autovector<VersionEdit*>> edit_lists;
+  edit_lists.emplace_back(autovector<VersionEdit*>{&default_cf_edit});
+  edit_lists.emplace_back(autovector<VersionEdit*>{&null_cf_edit});
+  const uint64_t manifest_file_number = versions_->manifest_file_number();
+  mutex_.Lock();
+  const Status s = versions_->LogAndApply(
+      cfds, read_options_, write_options_, edit_lists, &mutex_,
+      /*dir_contains_current_file=*/nullptr, /*new_descriptor_log=*/false,
+      /*new_cf_options=*/nullptr);
+  mutex_.Unlock();
+  ASSERT_EQ(s.code(), Status::kCorruption) << s.ToString();
+  ASSERT_EQ(versions_->manifest_file_number(), manifest_file_number);
+
+  // The queue is empty again, so the next call does not wait forever.
   ASSERT_OK(RunOrAbortOnHang([&] {
     VersionEdit next;
     next.SetDBId("next_db_id");

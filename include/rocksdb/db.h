@@ -2162,9 +2162,33 @@ class DB {
   // SetDBOptions, a valid call that changes no option value returns OK without
   // doing anything. This does not apply to a call that sets an object option
   // such as table_factory or one of its fields. It also does not apply after
-  // an options or column family update fails part way or fails to write the
-  // OPTIONS file. Then SetOptions applies in full, and SetDBOptions writes the
-  // OPTIONS file even if no option value changes.
+  // an earlier call fails after its new options take effect (for example, it
+  // fails to write the OPTIONS file), or after a call that creates or drops
+  // several column families with track_options_file_number_in_manifest stops
+  // part way, or after a failed SetOptions call that parsed a key for a
+  // Customizable option, such as table_factory or one of its fields, even if
+  // that key changed nothing (see the ATOMICITY NOTE). Then SetOptions applies
+  // in full, and SetDBOptions writes the OPTIONS file even if no option value
+  // changes.
+  //
+  // ATOMICITY NOTE: a SetOptions call over several column families is
+  // all-or-nothing for the options. If the options for any of the column
+  // families are invalid, or any of them is dropped, the call fails and no
+  // column family's options change. A failure after the new options take
+  // effect, such as a failed OPTIONS file write, returns an error and keeps
+  // the new options. One exception: a key that sets a field inside a
+  // Customizable option, such as
+  // "table_factory.filter_policy.bloom_before_level" for a Ribbon filter
+  // policy, or a field of a custom prefix extractor or compression manager,
+  // can change the live object in place. The same holds for a mutable field
+  // of a custom object in an option that SetOptions cannot replace, such as
+  // merge_operator ("merge_operator.<field>" or
+  // "merge_operator={<field>=<value>}"), and for a field of a custom object
+  // that a whole table factory value sets, such as
+  // "block_based_table_factory={filter_policy.<id>.<field>=<value>}": the new
+  // factory shares that object with the old one. Such a change takes effect
+  // when the call parses it, for every column family that shares the object,
+  // and a failed call does not undo it.
   //
   // EXAMPLES:
   //  s = db->SetOptions(cfh, {{"ttl", "36000"}});
