@@ -453,7 +453,15 @@ void CompactionOutputs::NoteBlobReferenceLimitCut(const Slice& next_key) {
 
 const BlobIndex* CompactionOutputs::DecodeOutputBlobIndex(
     const CompactionIterator& c_iter, const Slice& value) {
-  if (c_iter.OutputBlobIndex() != nullptr) {
+  // The test hook in AddToOutput() can replace the value (debug builds only);
+  // then decode the new value.
+#ifndef NDEBUG
+  const bool same_value = value.data() == c_iter.value().data() &&
+                          value.size() == c_iter.value().size();
+#else
+  constexpr bool same_value = true;
+#endif
+  if (same_value && c_iter.OutputBlobIndex() != nullptr) {
     return c_iter.OutputBlobIndex();
   }
   return output_blob_index_.DecodeFrom(value).ok() ? &output_blob_index_
@@ -545,7 +553,10 @@ Status CompactionOutputs::AddToOutput(
   }
 
   assert(builder_ != nullptr);
-  const Slice& value = c_iter.value();
+  Slice value = c_iter.value();
+  // Tests replace the value here to build malformed remote compaction output
+  // (see compaction_service_test.cc).
+  TEST_SYNC_POINT_CALLBACK("CompactionOutputs::AddToOutput:Value", &value);
   // Decode a kTypeBlobIndex value once, and share the decode with the table
   // builder, the blob garbage meter and the file metadata update below. If the
   // compaction iterator already decoded this value (when it checked whether to

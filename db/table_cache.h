@@ -396,8 +396,10 @@ class TableCache {
   }
 
  private:
-  // DBImpl gets per-job SST readers for indirect blob GC, outside the DB mutex.
+  // DBImpl gets per-job SST readers for indirect blob GC, and CompactionJob
+  // opens one to check a remote compaction output, both outside the DB mutex.
   friend class DBImpl;
+  friend class CompactionJob;
 
   // Gets a reader for the exact blob reference metadata of `file_meta`. It
   // first looks for the SST's reader in the table cache without I/O (the pinned

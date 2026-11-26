@@ -1284,6 +1284,37 @@ TEST_P(CompactionIteratorTest, EmptyResult) {
   ASSERT_FALSE(c_iter_->Valid());
 }
 
+// A compaction without a blob file builder calls DeclineSstOnlyBlobOutput() for
+// a value only when the SST-only blob output policy is set (see
+// SetSstOnlyBlobOutputPolicy()). Without the policy, which is the usual case,
+// no key calls it. With the policy, a large value fails the compaction with
+// TryAgain.
+TEST_P(CompactionIteratorTest, SstOnlyBlobOutputCheckedOnlyWithPolicy) {
+  int decline_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionIterator::DeclineSstOnlyBlobOutput",
+      [&](void* /*arg*/) { ++decline_calls; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  RunTest({test::KeyStr("a", 3, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+          {"value-a", "value-b"},
+          {test::KeyStr("a", 3, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+          {"value-a", "value-b"});
+  EXPECT_EQ(decline_calls, 0);
+
+  // With the policy set, a value of at least the minimum size (4 bytes here)
+  // fails the compaction with TryAgain.
+  InitIterators({test::KeyStr("a", 3, kTypeValue)}, {"value-a"}, {}, {},
+                kMaxSequenceNumber);
+  c_iter_->SetSstOnlyBlobOutputPolicy(/*min_blob_size=*/4);
+  c_iter_->SeekToFirst();
+  EXPECT_TRUE(c_iter_->status().IsTryAgain());
+  EXPECT_EQ(decline_calls, 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 // If there is a corruption after a single deletion, the compaction should fail.
 TEST_P(CompactionIteratorTest, CorruptionAfterSingleDeletion) {
   InitIterators({test::KeyStr("a", 5, kTypeSingleDeletion),

@@ -2983,6 +2983,34 @@ Status Version::ValidateBlobReferenceGeneration(uint64_t generation) const {
   return Status::OK();
 }
 
+Status Version::ValidateBlobReferenceGroup(uint64_t generation,
+                                           uint64_t origin) const {
+  Status status = ValidateBlobReferenceGeneration(generation);
+  if (!status.ok()) {
+    return status;
+  }
+  const BlobFileTable& table = storage_info_.GetBlobFileTable();
+  const uint64_t value = table.Find(generation);
+  bool matches = false;
+  if (BlobFileTable::IsRoute(value)) {
+    // `generation` is a route's old file number: an old normal blob file
+    // (unflattened: origin == generation) or an old relocation file (flattened:
+    // origin < generation).
+    matches = origin <= generation;
+  } else if (BlobFileTable::IsRelocationFile(value)) {
+    matches = origin < generation;
+  } else {
+    // Here `generation` is a live normal blob file, also when the file table is
+    // empty. It holds only its own values.
+    matches = origin == generation;
+  }
+  if (!matches) {
+    return Status::Corruption(
+        "Blob reference origin does not match its generation number");
+  }
+  return Status::OK();
+}
+
 Status Version::ResolveBlobPhysicalFile(const BlobIndex& blob_index,
                                         BlobPhysicalFile* physical_file) const {
   assert(physical_file != nullptr);
@@ -6925,15 +6953,9 @@ Status VersionSet::BuildBlobReferenceCensusDelta(
       // Flush and compaction prepare the summary of a new exact SST before they
       // queue the edit. Recovered SSTs do not come here, ingestion into a
       // fenced CF is rejected, and RepairDB rejects a DB that uses the format.
-      // So a missing summary is a bug, with one known gap: the output of a
-      // remote compaction has a descriptor but no summary, so debug builds
-      // stop at the assert below. Remote compaction of a column family with
-      // the format fence is not supported yet. enable_blob_indirection is
-      // rejected outside tests
-      // (ColumnFamilyData::TEST_SetAllowBlobIndirection()), so only tests can
-      // reach it. The SST has its reference metadata on disk, so the commit
-      // goes ahead and the census is rebuilt from disk. Indirect blob GC waits
-      // for the rebuild.
+      // So a missing summary is a bug. The SST has its reference metadata on
+      // disk, so the commit goes ahead and the census is rebuilt from disk.
+      // Indirect blob GC waits for the rebuild.
 #ifndef NDEBUG
       // Debug builds stop here; a test sets `expected` to check the
       // release behavior below.
