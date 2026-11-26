@@ -184,6 +184,7 @@ CompactionIterator::CompactionIterator(
       env_(env),
       clock_(env_->GetSystemClock().get()),
       report_detailed_time_(report_detailed_time),
+      check_large_values_(blob_file_builder != nullptr),
       range_del_agg_(range_del_agg),
       blob_file_builder_(blob_file_builder),
       compaction_(std::move(compaction)),
@@ -1707,8 +1708,42 @@ bool CompactionIterator::DeletionIsObsolete() {
                                                     &level_ptrs_);
 }
 
+bool CompactionIterator::DeclineSstOnlyBlobOutput(const Slice& value) {
+  // Tests count the calls: there must be none when the policy is not set.
+  TEST_SYNC_POINT("CompactionIterator::DeclineSstOnlyBlobOutput");
+  if (!sst_only_min_blob_size_.has_value() || value.empty() ||
+      value.size() < *sst_only_min_blob_size_) {
+    return false;
+  }
+  status_ = Status::TryAgain("SST-only compaction requires blob-file output");
+  validity_info_.Invalidate();
+  return true;
+}
+
+void CompactionIterator::DeclineSstOnlyColumnOutput() {
+  for (const WideColumn& column : entity_columns_) {
+    if (DeclineSstOnlyBlobOutput(column.value())) {
+      return;
+    }
+  }
+}
+
+void CompactionIterator::DeclineSstOnlyFetchedBlobOutput(
+    const std::vector<std::pair<size_t, PinnableSlice>>& fetched_blob_values) {
+  for (const auto& fetched : fetched_blob_values) {
+    if (DeclineSstOnlyBlobOutput(fetched.second)) {
+      return;
+    }
+  }
+}
+
 bool CompactionIterator::ExtractLargeValueIfNeededImpl() {
-  if (!blob_file_builder_) {
+  if (!check_large_values_) {
+    return false;
+  }
+  if (UNLIKELY(blob_file_builder_ == nullptr)) {
+    // The SST-only blob output policy is set.
+    DeclineSstOnlyBlobOutput(value_);
     return false;
   }
 
@@ -1993,7 +2028,7 @@ void CompactionIterator::ExtractLargeColumnValuesIfNeeded() {
   assert(ikey_.type == kTypeWideColumnEntity);
 
   // Check if blob extraction is enabled
-  if (!blob_file_builder_) {
+  if (!check_large_values_) {
     return;
   }
 
@@ -2025,6 +2060,12 @@ void CompactionIterator::ExtractLargeColumnValuesIfNeeded() {
   // serialization, and the benefit is marginal since full rewrites happen
   // naturally during blob GC.
   if (UNLIKELY(!entity_blob_columns_.empty())) {
+    return;
+  }
+
+  if (UNLIKELY(blob_file_builder_ == nullptr)) {
+    // The SST-only blob output policy is set.
+    DeclineSstOnlyColumnOutput();
     return;
   }
 
@@ -2148,38 +2189,44 @@ CompactionIterator::RelocateBlobValues(
     const std::vector<std::pair<size_t, PinnableSlice>>& fetched_blob_values) {
   std::vector<std::pair<size_t, BlobIndex>> new_blob_columns;
 
-  if (blob_file_builder_) {
-    for (const auto& fv : fetched_blob_values) {
-      const size_t col_idx = fv.first;
-      const Slice col_value(fv.second);
+  if (!check_large_values_) {
+    return new_blob_columns;
+  }
+  if (UNLIKELY(blob_file_builder_ == nullptr)) {
+    // The SST-only blob output policy is set.
+    DeclineSstOnlyFetchedBlobOutput(fetched_blob_values);
+    return new_blob_columns;
+  }
+  for (const auto& fv : fetched_blob_values) {
+    const size_t col_idx = fv.first;
+    const Slice col_value(fv.second);
 
-      std::string temp_blob_index;
-      Status status =
-          blob_file_builder_->Add(user_key(), col_value, &temp_blob_index);
+    std::string temp_blob_index;
+    Status status =
+        blob_file_builder_->Add(user_key(), col_value, &temp_blob_index);
+    if (!status.ok()) {
+      status_ = status;
+      validity_info_.Invalidate();
+      new_blob_columns.clear();
+      break;
+    }
+
+    if (!temp_blob_index.empty()) {
+      BlobIndex blob_idx;
+      status = blob_idx.DecodeFrom(temp_blob_index);
       if (!status.ok()) {
         status_ = status;
         validity_info_.Invalidate();
         new_blob_columns.clear();
         break;
       }
+      new_blob_columns.emplace_back(col_idx, blob_idx);
 
-      if (!temp_blob_index.empty()) {
-        BlobIndex blob_idx;
-        status = blob_idx.DecodeFrom(temp_blob_index);
-        if (!status.ok()) {
-          status_ = status;
-          validity_info_.Invalidate();
-          new_blob_columns.clear();
-          break;
-        }
-        new_blob_columns.emplace_back(col_idx, blob_idx);
-
-        // Track relocation stats here (after successful relocation)
-        ++iter_stats_.num_blobs_relocated;
-        iter_stats_.total_blob_bytes_relocated += col_value.size();
-      }
-      // If temp_blob_index is empty, the value will be inlined
+      // Track relocation stats here (after successful relocation)
+      ++iter_stats_.num_blobs_relocated;
+      iter_stats_.total_blob_bytes_relocated += col_value.size();
     }
+    // If temp_blob_index is empty, the value will be inlined
   }
 
   return new_blob_columns;

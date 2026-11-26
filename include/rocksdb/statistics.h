@@ -695,6 +695,10 @@ enum Tickers : uint32_t {
   REMOTE_COMPACT_INPUT_BLOB_FILE_COUNT,
   // Number of remote compaction results declined by the primary because blob
   // metadata, files, or capabilities failed validation before installation.
+  // It also counts feature-aware remote compactions (enable_blob_indirection)
+  // that the worker declined with TryAgain, because a worker contract check
+  // failed or the job needed new blob file output. Each such compaction runs
+  // locally.
   REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
 
   // Number of entries that reads treated as deleted, or as wide-column
@@ -823,6 +827,12 @@ enum Tickers : uint32_t {
   // that installed indirect blob GC jobs freed: the size of the removed input
   // files minus the size of the new relocation files.
   INDIRECT_BLOB_GC_BYTES_RECLAIMED,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // feature-aware compactions that ran locally from the start because their
+  // output would be coarse, which the primary does not accept from a remote
+  // worker.
+  REMOTE_COMPACT_COARSE_FALLBACK_COUNT,
 
   TICKER_ENUM_MAX
 };

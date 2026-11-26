@@ -2295,7 +2295,7 @@ void CompactionJob::CreateBlobFileBuilder(
 
   // TODO: BlobDB to support output_to_proximal_level compaction, which needs
   //  2 builders, so may need to move to `CompactionOutputs`
-  if (mutable_cf_options.enable_blob_files &&
+  if (AllowBlobFileCreation() && mutable_cf_options.enable_blob_files &&
       sub_compact->compaction->output_level() >=
           mutable_cf_options.blob_file_starting_level) {
     blob_file_builder = std::make_unique<BlobFileBuilder>(
@@ -2347,6 +2347,12 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
           preserve_seqno_after_, nullptr /* input_version */,
           Env::IOActivity::kCompaction,
           GetBlobGarbageCollectionCutoffFileNumber());
+  const MutableCFOptions& mutable_options = compaction->mutable_cf_options();
+  if (!AllowBlobFileCreation() && mutable_options.enable_blob_files &&
+      compaction->output_level() >= mutable_options.blob_file_starting_level) {
+    compaction_iterator->SetSstOnlyBlobOutputPolicy(
+        mutable_options.min_blob_size);
+  }
   return compaction_iterator;
 }
 

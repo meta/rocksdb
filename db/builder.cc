@@ -94,9 +94,16 @@ Status ExtractBlobReferenceClassificationFromTableProperties(
     return Status::OK();
   }
   if (!meta->blob_reference_descriptor.empty()) {
-    return Status::Corruption(
+    Status both_status = Status::Corruption(
         "SST has both exact blob reference metadata and a coarse "
         "classification");
+    // Lets a test model a remote worker that writes such an SST, by clearing
+    // this error on the worker.
+    TEST_SYNC_POINT_CALLBACK(
+        "ExtractBlobReferenceClassificationFromTableProperties:"
+        "BothProperties",
+        &both_status);
+    return both_status;
   }
   Status status = DecodeBlobReferenceClassification(
       property->second, &meta->oldest_coarse_indirect_origin_file_number);

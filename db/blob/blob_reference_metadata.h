@@ -615,10 +615,12 @@ struct BlobReferenceMetadataDescriptor {
   uint32_t column_family_id =
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily;
   // High and low halves of a 128-bit fingerprint of the relocation state
-  // (relocation files and routes) that the SST was built with. A compaction
-  // output stores the fingerprint of the compaction's input Version (see
-  // VersionStorageInfo::ComputeBlobRelocationStateFingerprint()). 0 means not
-  // set. DecodeFrom() does not check it.
+  // (relocation files and routes) that the SST was built with. Flush writes 0
+  // (not set). A compaction output stores the fingerprint of the compaction's
+  // input Version (see
+  // VersionStorageInfo::ComputeBlobRelocationStateFingerprint()), and the
+  // primary of a remote compaction checks it against its own request.
+  // DecodeFrom() does not check it.
   uint64_t route_snapshot_fingerprint_high = 0;
   uint64_t route_snapshot_fingerprint_low = 0;
   // The file number the SST had when it was built. It can differ from the
@@ -658,8 +660,9 @@ struct BlobReferenceMetadataDescriptor {
 // references, which stay on disk. It is immutable and shared by pointer, so
 // the cache charge belongs to this one object, not to each owner.
 struct BlobReferenceSstSummary {
-  // Same as descriptor.sst_file_number: the build file number, which may
-  // differ from the current file name.
+  // The SST's file number in the Version. A remote compaction output gets a
+  // new file number when the primary imports it, so for such an output this
+  // differs from descriptor.sst_file_number (the build file number).
   uint64_t file_number = 0;
   BlobReferenceMetadataDescriptor descriptor;
   // Cache charge for MemoryUsage(), moved from the collector. Both are null

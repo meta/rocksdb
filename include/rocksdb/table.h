@@ -547,8 +547,10 @@ struct BlockBasedTableOptions {
   // summary, and so its charge, until it has added the SST to its counts. This
   // can last until a later census build.
   // A compaction also charges here the lists it uses to check the blob
-  // references of its outputs. If that charge fails because the cache is
-  // full, the compaction goes on with the lists uncharged and logs a WARN.
+  // references of its outputs, including the list of allowed generation
+  // numbers that the primary builds for a remote compaction. If that charge
+  // fails because the cache is full, the compaction goes on with the lists
+  // uncharged and logs a WARN.
   // If such memory usage exceeds the available space left in the block cache
   // at some point (i.e, causing a cache full under
   // `LRUCacheOptions::strict_capacity_limit` = true), that memory is not

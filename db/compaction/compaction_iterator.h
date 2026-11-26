@@ -332,6 +332,15 @@ class CompactionIterator {
 
   static uint64_t ComputeBlobGarbageCollectionCutoffFileNumber(
       const CompactionProxy* compaction);
+  // Makes the iterator return TryAgain instead of writing a blob file when a
+  // value of at least `min_blob_size` bytes needs blob-file output.
+  // CompactionJob sets it when AllowBlobFileCreation() is false, so the
+  // iterator has no blob file builder. Call it before the first SeekToFirst().
+  void SetSstOnlyBlobOutputPolicy(uint64_t min_blob_size) {
+    assert(blob_file_builder_ == nullptr);
+    sst_only_min_blob_size_ = min_blob_size;
+    check_large_values_ = true;
+  }
 
   // Seek to the beginning of the compaction iterator output.
   //
@@ -422,6 +431,21 @@ class CompactionIterator {
   // value got extracted to a blob file, false otherwise.
   bool ExtractLargeValueIfNeededImpl();
 
+  // Fails the compaction with TryAgain when it may not create blob files
+  // (sst_only_min_blob_size_ is set) and `value` would go to a blob file.
+  // Returns true in that case. Such compactions are rare, so it is cold.
+  ROCKSDB_COLD bool DeclineSstOnlyBlobOutput(const Slice& value);
+
+  // Calls DeclineSstOnlyBlobOutput() for each column of entity_columns_ until
+  // one declines. ExtractLargeColumnValuesIfNeeded() calls it only when the
+  // policy is set, so the column loop there has no policy check.
+  ROCKSDB_COLD void DeclineSstOnlyColumnOutput();
+
+  // Calls DeclineSstOnlyBlobOutput() for each fetched blob value until one
+  // declines. RelocateBlobValues() calls it only when the policy is set.
+  ROCKSDB_COLD void DeclineSstOnlyFetchedBlobOutput(
+      const std::vector<std::pair<size_t, PinnableSlice>>& fetched_blob_values);
+
   // Extracts large values as described above, and updates the internal key's
   // type to kTypeBlobIndex if the value got extracted. Should only be called
   // for regular values (kTypeValue).
@@ -448,9 +472,10 @@ class CompactionIterator {
   // generation number. The type follows the new generation number (see
   // BlobIndex::SetGenerationFileNumber()). The origin, the original offset and
   // the CRCs do not change, and blob values are never read. These do not
-  // flatten: remote compaction, coarse L0 output (see coarse_blob_output_),
-  // compactions with enable_blob_indirection off, and input Versions without
-  // the indirection format. Once no SST uses the old generation number, route
+  // flatten: a remote compaction that CompactionJob::AllowBlobIndexFlattening()
+  // does not allow, coarse L0 output (see coarse_blob_output_), compactions
+  // with enable_blob_indirection off, and input Versions without the
+  // indirection format. Once no SST uses the old generation number, route
   // retirement can delete its route. See the relocation overview in
   // db/blob/blob_relocation_manifest.h.
   //
@@ -589,6 +614,13 @@ class CompactionIterator {
   Env* env_;
   SystemClock* clock_;
   const bool report_detailed_time_;
+  // True when a value may need a blob file: the compaction has a blob file
+  // builder, or the SST-only blob output policy is set (see
+  // SetSstOnlyBlobOutputPolicy()). The two never exist together. The per-key
+  // paths test this bool first, in place of the builder pointer. Without the
+  // policy, it is true exactly when the builder exists, so a compaction
+  // without a builder runs only this one test, as it would test the pointer.
+  bool check_large_values_;
   CompactionRangeDelAggregator* range_del_agg_;
   BlobFileBuilder* blob_file_builder_;
   std::unique_ptr<CompactionProxy> compaction_;
@@ -714,7 +746,8 @@ class CompactionIterator {
   bool has_output_blob_index_ = false;
 
   // False for BuildTable() (flush, WAL recovery and RepairDB), for
-  // FlushJob::MemPurge(), and for a remote compaction (see
+  // FlushJob::MemPurge(), and for a remote compaction, unless it is a
+  // feature-aware job whose column family has enable_blob_indirection on (see
   // CompactionJob::AllowBlobIndexFlattening()).
   const bool allow_blob_index_flattening_;
 
@@ -806,6 +839,11 @@ class CompactionIterator {
 
   // Max seqno that can be zeroed out at last level (various reasons)
   const SequenceNumber preserve_seqno_after_ = kMaxSequenceNumber;
+
+  // The minimum value size of the SST-only blob output policy. It is set only
+  // when the compaction may not create blob files. The per-key paths read it
+  // only in cold code, so it stays away from the hot members.
+  std::optional<uint64_t> sst_only_min_blob_size_;
 
   void AdvanceInputIter() { input_.Next(); }
 
