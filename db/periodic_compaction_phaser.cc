@@ -40,6 +40,15 @@ PeriodicCompactionPhaseParams PeriodicCompactionPhaser::ParamsForCf(
   return params;
 }
 
+PeriodicCompactionPhaseParams PeriodicCompactionPhaser::ParamsForCfAtAnchor(
+    uint32_t cf_id, uint64_t anchor_time) const {
+  PeriodicCompactionPhaseParams params = ParamsForCf(cf_id);
+  if (params.recovery_percent > 0) {
+    params.anchor_time = anchor_time;
+  }
+  return params;
+}
+
 uint64_t PeriodicCompactionPhaser::TriggerTime(
     uint64_t file_modification_time, uint64_t periodic_compaction_seconds,
     const PeriodicCompactionPhaseParams& params) {
