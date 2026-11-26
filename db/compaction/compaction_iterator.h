@@ -25,6 +25,7 @@
 #include "db/range_del_aggregator.h"
 #include "db/snapshot_checker.h"
 #include "options/cf_options.h"
+#include "port/likely.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/slice.h"
 
@@ -171,6 +172,7 @@ class CompactionIterator {
 
     virtual bool enable_blob_garbage_collection() const = 0;
 
+    virtual bool enable_blob_indirection() const = 0;
     virtual double blob_garbage_collection_age_cutoff() const = 0;
 
     virtual uint64_t blob_compaction_readahead_size() const = 0;
@@ -220,6 +222,10 @@ class CompactionIterator {
 
     bool enable_blob_garbage_collection() const override {
       return compaction_->enable_blob_garbage_collection();
+    }
+
+    bool enable_blob_indirection() const override {
+      return compaction_->mutable_cf_options().enable_blob_indirection;
     }
 
     double blob_garbage_collection_age_cutoff() const override {
@@ -273,7 +279,8 @@ class CompactionIterator {
       BlobFileBuilder* blob_file_builder, bool allow_data_in_errors,
       bool enforce_single_del_contracts,
       const std::atomic<bool>& manual_compaction_canceled,
-      bool must_count_input_entries, const Compaction* compaction = nullptr,
+      bool must_count_input_entries, bool allow_blob_index_flattening,
+      const Compaction* compaction = nullptr,
       const CompactionFilter* compaction_filter = nullptr,
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
@@ -296,7 +303,7 @@ class CompactionIterator {
       bool enforce_single_del_contracts,
       const std::atomic<bool>& manual_compaction_canceled,
       std::unique_ptr<CompactionProxy> compaction,
-      bool must_count_input_entries,
+      bool must_count_input_entries, bool allow_blob_index_flattening,
       const CompactionFilter* compaction_filter = nullptr,
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
@@ -389,6 +396,17 @@ class CompactionIterator {
 
   bool IsDeleteRangeSentinelKey() const { return is_range_del_; }
 
+  bool HasFlattenedBlobIndex() const { return has_flattened_blob_index_; }
+
+  // The decode of value() that FlattenBlobIfNeeded() made for the current
+  // kTypeBlobIndex entry (after flattening, if it flattened), or nullptr if it
+  // made none, for example without the indirection format.
+  // CompactionOutputs::AddToOutput() uses it, so that it does not decode the
+  // same value again.
+  const BlobIndex* OutputBlobIndex() const {
+    return has_output_blob_index_ ? &output_blob_index_ : nullptr;
+  }
+
  private:
   // Processes the input stream to find the next output
   void NextFromInput();
@@ -424,6 +442,50 @@ class CompactionIterator {
   // Note: the stacked BlobDB implementation's compaction filter based GC
   // algorithm is also called from here.
   void GarbageCollectBlobIfNeeded();
+
+  // Flattening: rewrites the generation number of an indirect BlobIndex to its
+  // route target when the pinned input Version has a route for that
+  // generation number. The type follows the new generation number (see
+  // BlobIndex::SetGenerationFileNumber()). The origin, the original offset and
+  // the CRCs do not change, and blob values are never read. These do not
+  // flatten: remote compaction, coarse L0 output (see coarse_blob_output_),
+  // compactions with enable_blob_indirection off, and input Versions without
+  // the indirection format. Once no SST uses the old generation number, route
+  // retirement can delete its route. See the relocation overview in
+  // db/blob/blob_relocation_manifest.h.
+  //
+  // TODO: flattening happens only when a compaction rewrites an SST for another
+  // reason, so a cold SST can keep routes alive for a long time (Version
+  // memory, MANIFEST snapshot size, one route lookup per read). A later change
+  // could add a compaction reason (for example
+  // CompactionReason::kBlobRouteFlattening) that marks the SSTs holding routed
+  // generation numbers (the census knows them) for compaction when the route
+  // count or route memory passes a limit, the way kForcedBlobGC marks files for
+  // compaction-time blob GC. Such compactions add write work, so they must be
+  // bounded.
+  //
+  // Call sites: PrepareOutput() flattens a plain value with
+  // FlattenBlobIfNeeded(). GarbageCollectEntityBlobsIfNeeded() flattens a
+  // wide-column entity: with FlattenEntityBlobIndexesIfNeeded() when blob GC
+  // is off or no column needs GC, and through SerializeEntityAfterGC() (which
+  // calls FlattenBlobIndexesIfNeeded() on the kept columns) after a GC
+  // rewrite.
+  //
+  // FlattenBlobIndexIfNeeded() flattens one BlobIndex and returns true if it
+  // changed it.
+  bool FlattenBlobIndexIfNeeded(BlobIndex* blob_index);
+
+  // Flattens value_ of a kTypeBlobIndex record. It is out of line, so that
+  // PrepareOutput() stays small for compactions without the indirection format.
+  ROCKSDB_NOINLINE void FlattenBlobIfNeeded();
+
+  // Flattens the blob columns of the current wide-column entity, then
+  // serializes the entity again if a column changed.
+  void FlattenEntityBlobIndexesIfNeeded();
+
+  // Flattens each BlobIndex in `blob_columns`. Returns true if any changed.
+  bool FlattenBlobIndexesIfNeeded(
+      std::vector<std::pair<size_t, BlobIndex>>* blob_columns);
 
   // Garbage collects blob references within wide column entities. For entities
   // that contain blob column references, this method checks if any of the
@@ -646,6 +708,46 @@ class CompactionIterator {
   std::unique_ptr<PrefetchBufferCollection> prefetch_buffers_;
 
   std::string blob_index_;
+  // See OutputBlobIndex(). Cleared when the iterator moves and at the start of
+  // PrepareOutput(), so it never describes an earlier entry.
+  BlobIndex output_blob_index_;
+  bool has_output_blob_index_ = false;
+
+  // False for BuildTable() (flush, WAL recovery and RepairDB), for
+  // FlushJob::MemPurge(), and for a remote compaction (see
+  // CompactionJob::AllowBlobIndexFlattening()).
+  const bool allow_blob_index_flattening_;
+
+  // True when the compaction writes coarse L0 output: L0 output without exact
+  // reference metadata (see Compaction::CollectExactBlobReferences()). Such
+  // output keeps compaction-time blob GC for indirect values: when that GC is
+  // on, it rewrites the values in the oldest blob files (see
+  // blob_garbage_collection_age_cutoff). It does not flatten. A coarse SST has
+  // no reference list, so the census cannot see which relocation file a
+  // flattened reference in it would use. Its coarse frontier (the oldest
+  // indirect-origin file number a coarse SST may reference) protects only
+  // unflattened references, whose generation number is an indirect origin
+  // (indirect blob GC skips such files, see
+  // VersionStorageInfo::IsCoarseIndirectOriginBlobPinned(); route retirement
+  // skips such routes, see BlobGcCandidateHeap::IsCoarsePinnedGeneration()).
+  // The constructor computes it once, outside the DB mutex, so the iterator
+  // does not scan the input SSTs for every value.
+  const bool coarse_blob_output_;
+  bool has_flattened_blob_index_ = false;
+  // Fast paths for FlattenBlobIndexIfNeeded(), which runs for every indirect
+  // value. The input Version is fixed for the whole compaction, so its routes
+  // never change, and a cached answer cannot go stale.
+  // - input_route_state_: whether the input Version has any route. It is
+  //   read once, at the first indirect value. With no route, no lookup runs.
+  // - last_route_generation_ and last_route_target_: the last generation that
+  //   was looked up, and its route target (kInvalidBlobFileNumber when it has
+  //   no route). Consecutive keys usually share a generation, so most values
+  //   skip the lookup. A file number is never kInvalidBlobFileNumber (0), so
+  //   the initial value matches no generation.
+  enum class InputRouteState : uint8_t { kUnknown, kNoRoutes, kHasRoutes };
+  InputRouteState input_route_state_ = InputRouteState::kUnknown;
+  uint64_t last_route_generation_ = kInvalidBlobFileNumber;
+  uint64_t last_route_target_ = kInvalidBlobFileNumber;
   PinnableSlice blob_value_;
   std::string compaction_filter_value_;
   InternalKey compaction_filter_skip_until_;
@@ -676,6 +778,10 @@ class CompactionIterator {
   // input record and whenever the filter rewrites the entity value.
   bool entity_deserialized_{false};
   bool output_prepared_{false};
+  // True when the input Version has the blob indirection format, so a blob
+  // index may need flattening. It is fixed for the life of the iterator, so the
+  // per-key paths read this bool instead of the Version.
+  bool input_has_blob_indirection_format_ = false;
   // "level_ptrs" holds indices that remember which file of an associated
   // level we were last checking during the last call to compaction->
   // KeyNotExistsBeyondOutputLevel(). This allows future calls to the function

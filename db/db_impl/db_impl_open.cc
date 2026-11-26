@@ -8,9 +8,12 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <algorithm>
 #include <cinttypes>
+#include <limits>
 #include <memory>
+#include <set>
 
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -29,7 +32,10 @@
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "rocksdb/wal_filter.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "test_util/sync_point.h"
+#include "util/defer.h"
+#include "util/random.h"
 #include "util/rate_limiter_impl.h"
 #include "util/string_util.h"
 #include "util/udt_util.h"
@@ -472,6 +478,15 @@ Status DBImpl::Recover(
   bool& is_new_db = recovery_ctx ? recovery_ctx->is_new_db_ : tmp_is_new_db;
   assert(db_lock_ == nullptr);
   std::vector<std::string> files_in_dbname;
+  if (read_only) {
+    // Read-only opens (DBImplReadOnly and CompactedDBImpl) do not call
+    // ValidateOptions(), so the blob indirection FIFO check runs here, once per
+    // CF. Secondary opens run it in OpenAsSecondaryImpl().
+    Status s = CheckBlobIndirectionCompactionStyle(column_families);
+    if (!s.ok()) {
+      return s;
+    }
+  }
   if (!read_only) {
     Status s = directories_.SetDirectories(fs_.get(), dbname_,
                                            immutable_db_options_.wal_dir,
@@ -629,7 +644,17 @@ Status DBImpl::Recover(
   if (!s.ok()) {
     return s;
   }
-
+  if (!read_only) {
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd == nullptr || cfd->IsDropped()) {
+        continue;
+      }
+      s = cfd->ValidateBlobIndirectionOptionsAfterRecovery();
+      if (!s.ok()) {
+        return s;
+      }
+    }
+  }
   if (s.ok() && !read_only) {
     for (auto cfd : *versions_->GetColumnFamilySet()) {
       const auto& moptions = cfd->GetLatestMutableCFOptions();
@@ -705,7 +730,8 @@ Status DBImpl::Recover(
             for (const FileMetaData* f : level_files) {
               edit.DeleteFile(from_level, f->fd.GetNumber());
               // Keeps f->temperature, which can be different from
-              // `last_level_temperature`
+              // `last_level_temperature`, and all other persisted metadata,
+              // so exact blob references remain attached to the same SST.
               edit.AddExistingFile(to_level, *f, kProvenanceMovedBetweenLevels);
               ROCKS_LOG_WARN(immutable_db_options_.info_log,
                              "[%s] Moving #%" PRIu64
@@ -2178,6 +2204,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
   // Note that here we treat flush as level 0 compaction in internal stats
   InternalStats::CompactionStats flush_stats(CompactionReason::kFlush,
                                              1 /* count */);
+  bool output_built_with_indirection = false;
   {
     ScopedArenaPtr<InternalIterator> iter(
         logical_strip_timestamp
@@ -2195,6 +2222,8 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     // Get the latest mutable cf options while the mutex is still locked
     const MutableCFOptions mutable_cf_options_copy =
         cfd->GetLatestMutableCFOptions();
+    output_built_with_indirection =
+        mutable_cf_options_copy.enable_blob_indirection;
     bool paranoid_file_checks =
         cfd->GetLatestMutableCFOptions().paranoid_file_checks;
 
@@ -2255,6 +2284,9 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           dbname_ /* db_name */);
       Version* version = cfd->current();
       version->Ref();
+      tboptions.track_blob_reference_classification =
+          UsesBlobIndirection(mutable_cf_options_copy, version->storage_info());
+      tboptions.collect_blob_reference_metadata = false;
       TableProperties temp_table_proerties;
       s = BuildTable(
           dbname_, versions_.get(), immutable_db_options_, tboptions,
@@ -2338,6 +2370,10 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
 
   if (s.ok() && has_output) {
     edit->AddFile(level, meta);
+    // The WAL recovery flush can be the first job that writes indirect
+    // BlobIndexes. So, like a normal flush, it sets the per-CF format fence
+    // when its SST was built with enable_blob_indirection on.
+    edit->MaybeSetBlobIndirectionFormatFence(output_built_with_indirection);
 
     for (const auto& blob : blob_file_additions) {
       edit->AddBlobFile(blob);
@@ -3060,6 +3096,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     if (impl->immutable_db_options_.open_files_async) {
       impl->ScheduleAsyncFileOpening();
     }
+    if (impl->read_only_) {
+      impl->bg_blob_reference_census_state_ =
+          DBImpl::BlobReferenceCensusJobState::kComplete;
+    }
     impl->MaybeScheduleAsyncWALPrecreate(
         impl->GetWalPreallocateBlockSize(max_write_buffer_size));
     impl->mutex_.Unlock();
@@ -3096,6 +3136,13 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   }
   if (s.ok()) {
     s = impl->StartPeriodicTaskScheduler();
+  }
+  if (s.ok() && !impl->read_only_) {
+    // The census job may start now (see
+    // DBImpl::blob_reference_census_job_allowed_).
+    InstrumentedMutexLock lock(&impl->mutex_);
+    impl->blob_reference_census_job_allowed_ = true;
+    impl->ScheduleBlobReferenceCensus();
   }
   if (s.ok()) {
     s = impl->RegisterRecordSeqnoTimeWorker();
@@ -3260,4 +3307,1164 @@ void DBImpl::BGWorkAsyncFileOpen(void* arg) {
   TEST_SYNC_POINT("DBImpl::BGWorkAsyncFileOpen:Done");
 }
 
+void DBImpl::ScheduleBlobReferenceCensus() {
+  ScheduleBlobReferenceCensus(/*requested_cfd=*/nullptr);
+}
+
+void DBImpl::ScheduleBlobReferenceCensus(ColumnFamilyData* requested_cfd) {
+  mutex_.AssertHeld();
+  if (read_only_ || shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  const auto needs_census = [](ColumnFamilyData* cfd) {
+    if (cfd == nullptr || cfd->IsDropped()) {
+      return false;
+    }
+    Version* const current = cfd->current();
+    if (current == nullptr ||
+        !current->storage_info()->HasBlobIndirectionFormat()) {
+      return false;
+    }
+    // A fenced CF recovered from the MANIFEST gets its census here.
+    return cfd->GetOrCreateBlobReferenceCensus()->NeedsWorkerRun(
+        current->GetVersionNumber());
+  };
+
+  const auto enqueue = [this, &needs_census](ColumnFamilyData* cfd) {
+    const bool needed = needs_census(cfd);
+    if (cfd != nullptr && cfd->queued_for_blob_reference_census_) {
+      // A running census job may end after an apply after an install
+      // published the census, so the job queues the CF again at its end (see
+      // blob_reference_census_rerun_).
+      cfd->blob_reference_census_rerun_ |=
+          needed && cfd->blob_reference_census_running_;
+      return;
+    }
+    const bool rerun = cfd != nullptr &&
+                       std::exchange(cfd->blob_reference_census_rerun_, false);
+    if (!needed && !(rerun && !cfd->IsDropped() &&
+                     cfd->blob_reference_census() != nullptr)) {
+      return;
+    }
+    cfd->blob_reference_census()->SetBuildWakeup(
+        [](void* db, void* owner) {
+          static_cast<DBImpl*>(db)->ScheduleBlobReferenceCensus(
+              static_cast<ColumnFamilyData*>(owner));
+        },
+        this, cfd);
+    cfd->Ref();
+    cfd->queued_for_blob_reference_census_ = true;
+    cfd->next_blob_reference_census_ = nullptr;
+    if (blob_reference_census_queue_tail_ == nullptr) {
+      assert(blob_reference_census_queue_head_ == nullptr);
+      blob_reference_census_queue_head_ = cfd;
+    } else {
+      blob_reference_census_queue_tail_->next_blob_reference_census_ = cfd;
+    }
+    blob_reference_census_queue_tail_ = cfd;
+  };
+
+  if (requested_cfd != nullptr) {
+    enqueue(requested_cfd);
+  } else {
+    TEST_SYNC_POINT("DBImpl::ScheduleBlobReferenceCensus:AllColumnFamilies");
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      enqueue(cfd);
+    }
+  }
+  // While PauseBackgroundWork() is in effect, the queue keeps the column
+  // families, and ContinueBackgroundWork() schedules the job again. The same
+  // holds while a recovery waits for background work (see
+  // blob_reference_census_recovery_waits_); ResumeImpl() schedules the job
+  // again after its wait.
+  if (!blob_reference_census_job_allowed_ ||
+      bg_blob_reference_census_state_ ==
+          BlobReferenceCensusJobState::kScheduled ||
+      bg_compaction_paused_ > 0 || blob_reference_census_recovery_waits_ > 0) {
+    return;
+  }
+  if (blob_reference_census_queue_head_ == nullptr) {
+    bg_blob_reference_census_state_ = BlobReferenceCensusJobState::kComplete;
+    return;
+  }
+
+  bg_blob_reference_census_state_ = BlobReferenceCensusJobState::kScheduled;
+  env_->Schedule(&DBImpl::BGWorkBlobReferenceCensus, this, Env::Priority::LOW,
+                 &bg_blob_reference_census_state_,
+                 &DBImpl::UnscheduleBlobReferenceCensus);
+}
+
+void DBImpl::UnscheduleBlobReferenceCensus(void* arg) {
+  auto* db = static_cast<DBImpl*>(arg);
+  db->mutex_.AssertHeld();
+
+  ColumnFamilyData* pending = db->blob_reference_census_queue_head_;
+  if (db->blob_reference_census_queue_tail_ != nullptr) {
+    db->blob_reference_census_queue_tail_->next_blob_reference_census_ =
+        db->blob_reference_census_retry_head_;
+  } else {
+    pending = db->blob_reference_census_retry_head_;
+  }
+  db->blob_reference_census_queue_head_ = nullptr;
+  db->blob_reference_census_queue_tail_ = nullptr;
+  db->blob_reference_census_retry_head_ = nullptr;
+  db->blob_reference_census_retry_tail_ = nullptr;
+  db->blob_reference_census_retry_count_ = 0;
+  // Release each retained CF in a separate critical section. A dropped CF can
+  // run nontrivial destruction from its final UnrefAndTryDelete().
+  db->mutex_.Unlock();
+  while (pending != nullptr) {
+    db->mutex_.Lock();
+    ColumnFamilyData* const next = pending->next_blob_reference_census_;
+    pending->next_blob_reference_census_ = nullptr;
+    pending->queued_for_blob_reference_census_ = false;
+    BlobReferenceCensusGarbage garbage = pending->CancelBlobReferenceCensus();
+    db->mutex_.Unlock();
+    // An initial build that waits between slices pins its CFD: the deleter of
+    // its starting Version releases a CFD reference. This makes a cycle CFD ->
+    // census -> build context -> CFD. Free the census garbage, which breaks the
+    // cycle, before dropping the queue's pin. This also covers dropped CFs,
+    // which ColumnFamilySet iteration no longer visits.
+    garbage = {};
+    db->ReleaseColumnFamilyDataRef(pending);
+    pending = next;
+  }
+  db->mutex_.Lock();
+  db->bg_blob_reference_census_state_ = BlobReferenceCensusJobState::kComplete;
+  db->bg_cv_.SignalAll();
+}
+
+Status DBImpl::BuildBlobReferenceCensus(
+    ColumnFamilyData* cfd, bool* incomplete, bool* overflowed,
+    BlobReferenceCensus::RetirementSelection* retirement_sources) {
+  assert(cfd != nullptr && incomplete != nullptr && overflowed != nullptr &&
+         retirement_sources != nullptr);
+  *incomplete = false;
+  *overflowed = false;
+  retirement_sources->fill(0);
+  if (!blob_reference_census_retry_registered_.exchange(
+          true, std::memory_order_acq_rel)) {
+    const Status registration = periodic_task_scheduler_.Register(
+        PeriodicTaskType::kBlobReferenceCensus,
+        [this]() { RetryBlobReferenceCensus(); },
+        /*run_immediately=*/false);
+    if (!registration.ok()) {
+      blob_reference_census_retry_registered_.store(false,
+                                                    std::memory_order_release);
+      return registration;
+    }
+  }
+  BlobReferenceCensus& census = *cfd->blob_reference_census();
+  bool mismatch_reported = census.TakeMismatchReport();
+  TEST_SYNC_POINT_CALLBACK(
+      "DBImpl::BuildBlobReferenceCensus:AfterTakeMismatchReport",
+      &mismatch_reported);
+  if (mismatch_reported) {
+    // Indirect blob GC reported a census mismatch. Fail this build.
+    // ReportMismatch() also set RebuildRequested(), so a new build starts at
+    // once from the current Version. This status fails only the build slice. It
+    // is not a background error. Any non-OK status would do: the slice caller
+    // (BGWorkBlobReferenceCensus) normally sees RebuildRequested() and restarts
+    // at once. Corruption names the cause: the census does not match the SSTs.
+    return Status::Corruption("Blob GC found a census mismatch");
+  }
+  std::shared_ptr<BlobReferenceCensusBuildContext> context =
+      census.GetBuildContext();
+  Status status;
+  if (context == nullptr) {
+    Version* starting_version = nullptr;
+    uint64_t token = 0;
+    {
+      InstrumentedMutexLock lock(&mutex_);
+      if (shutting_down_.load(std::memory_order_acquire) || cfd->IsDropped()) {
+        status = Status::ShutdownInProgress();
+        return status;
+      }
+      starting_version = cfd->current();
+      starting_version->Ref();
+      cfd->Ref();
+      token = census.BeginBuild();
+      const uint64_t now_micros = immutable_db_options_.clock->NowMicros();
+      census.NoteUnready(now_micros);
+      census.NoteBuildStart(now_micros);
+    }
+    context = std::make_shared<BlobReferenceCensusBuildContext>();
+    context->token = token;
+    for (std::shared_ptr<const BlobReferenceSstSummary>& seed :
+         census.TakeRebuildSeeds()) {
+      const uint64_t file_number = seed->file_number;
+      context->seeds.emplace(file_number, std::move(seed));
+    }
+    context->starting_version = std::shared_ptr<Version>(
+        starting_version, [this, cfd](Version* version) {
+          {
+            InstrumentedMutexLock lock(&mutex_);
+            version->UnrefAndFreeBlobRelocationState(&mutex_);
+          }
+          ReleaseColumnFamilyDataRef(cfd);
+        });
+    const BlockBasedTableOptions* table_options =
+        GetBlockBasedTableWriterOptions(
+            starting_version->GetMutableCFOptions().table_factory.get());
+    std::shared_ptr<Cache> block_cache;
+    if (table_options != nullptr && table_options->block_cache != nullptr) {
+      const CacheEntryRoleOptions::Decision charged =
+          table_options->cache_usage_options.options_overrides
+              .at(CacheEntryRole::kBlobReferenceCensus)
+              .charged;
+      if (charged != CacheEntryRoleOptions::Decision::kDisabled) {
+        block_cache = table_options->block_cache;
+        context->reservation_manager = std::make_shared<
+            CacheReservationManagerImpl<CacheEntryRole::kBlobReferenceCensus>>(
+            block_cache);
+        context->uncharged_charges = census.uncharged_charge_counter();
+        context->summary_reservation_manager =
+            std::make_shared<ConcurrentCacheReservationManager>(
+                std::make_shared<CacheReservationManagerImpl<
+                    CacheEntryRole::kBlobReferenceCensus>>(block_cache));
+      }
+    }
+    size_t starting_file_count = 0;
+    for (int level = 0; level < starting_version->storage_info()->num_levels();
+         ++level) {
+      starting_file_count +=
+          starting_version->storage_info()->LevelFiles(level).size();
+    }
+    status = context->ReserveInitialFiles(starting_file_count);
+    if (status.ok()) {
+      status = census.ResetWorkerState(
+          token, starting_version->GetVersionNumber(),
+          starting_version->storage_info()->GetBlobRelocationState(),
+          std::move(block_cache));
+    }
+    if (status.ok()) {
+      std::vector<BlobGcPhysicalFileSummary> physical_files;
+      physical_files.reserve(
+          starting_version->storage_info()->GetBlobFiles().size());
+      for (const std::shared_ptr<BlobFileMetaData>& file :
+           starting_version->storage_info()->GetBlobFiles()) {
+        if (file->IsIndirectOrigin()) {
+          physical_files.push_back({file->GetBlobFileNumber(),
+                                    file->GetTotalBlobBytes(),
+                                    /*is_indirect_origin=*/true});
+        }
+      }
+      status = census.SetWorkerPhysicalFiles(token, physical_files);
+      if (status.ok()) {
+        status = census.SetWorkerCoarseIndirectOriginFrontier(
+            token, starting_version->storage_info()
+                       ->OldestCoarseIndirectOriginFileNumber());
+      }
+    }
+    if (!census.TrySetBuildContext(context) && status.ok()) {
+      status = Status::Aborted("Blob reference census build became stale");
+    }
+    if (!status.ok()) {
+      return status;
+    }
+    // Lets tests stop a new build (for example a restart after an overflow)
+    // after its build cursor opened and before it applies any delta.
+    TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:NewBuildReady");
+    TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:NewBuildWait");
+  }
+
+  const auto catch_up = [&]() -> Status {
+    // A stored failure may have changed the worker: rebuild instead of applying
+    // that delta again.
+    if (!context->failure.ok()) {
+      return context->failure;
+    }
+    bool log_overflowed = false;
+    if (context->pending_deltas.empty()) {
+      Status take_status = census.TakeBuildDeltas(
+          context->token, &context->pending_deltas, &log_overflowed);
+      if (!take_status.ok()) {
+        return take_status;
+      }
+      if (log_overflowed) {
+        *overflowed = true;
+        return Status::Aborted("Blob reference census build cursor overflowed");
+      }
+    }
+    while (!context->pending_deltas.empty()) {
+      const std::shared_ptr<const BlobReferenceCensusDelta>& delta =
+          context->pending_deltas.front();
+      if (delta == nullptr) {
+        return Status::Corruption("Null blob reference census delta");
+      }
+      Status apply_status = census.ApplyWorkerDelta(context->token, *delta);
+      TEST_SYNC_POINT_CALLBACK(
+          "DBImpl::BuildBlobReferenceCensus:CatchUpApplyStatus", &apply_status);
+      if (!apply_status.ok()) {
+        return apply_status;
+      }
+      if (!context->scan_complete) {
+        for (uint64_t file_number : delta->removed_files) {
+          if (context->starting_version->storage_info()
+                  ->GetFileMetaDataByNumber(file_number) != nullptr) {
+            context->deleted_starting_files.insert(file_number);
+          }
+        }
+      }
+      // The delta is applied, so it leaves the queue now, whatever the
+      // acknowledgment returns.
+      const size_t weight = delta->QueueWeight();
+      context->pending_deltas.pop_front();
+      apply_status = census.AcknowledgeBuildDeltas(context->token, weight);
+      if (!apply_status.ok()) {
+        if (census.BuildCursorOverflowed(context->token)) {
+          *overflowed = true;
+        }
+        return apply_status;
+      }
+    }
+    return Status::OK();
+  };
+
+  // The initial build reads the summary of every exact SST (an SST with a
+  // reference descriptor) in the starting Version. It runs in slices, so one
+  // LOW-priority task never runs long. A slice visits at most kMaxFilesPerSlice
+  // (16, an estimate) SSTs, and SSTs without a descriptor count too. The
+  // starting Version stays pinned across slices. Between reads, the build
+  // applies and acknowledges the edits installed in the meantime, so they do
+  // not pile up until the scan ends.
+  constexpr size_t kMaxFilesPerSlice = 16;
+  size_t visited = 0;
+  TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeCatchUpReady");
+  TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeCatchUpWait");
+  status = catch_up();
+  if (status.IsTryAgain()) {
+    *incomplete = true;
+    return Status::OK();
+  }
+  if (!context->scan_complete && status.ok()) {
+    Version& version = *context->starting_version;
+    VersionStorageInfo* const storage = version.storage_info();
+    const MutableCFOptions& options = version.GetMutableCFOptions();
+    ReadOptions read_options(Env::IOActivity::kCompaction);
+    read_options.fill_cache = false;
+    read_options.rate_limiter_priority = Env::IO_LOW;
+    while (status.ok() && context->level < storage->num_levels() &&
+           visited < kMaxFilesPerSlice) {
+      const std::vector<FileMetaData*>& files =
+          storage->LevelFiles(context->level);
+      if (context->next_file == files.size()) {
+        ++context->level;
+        context->next_file = 0;
+        continue;
+      }
+      FileMetaData* const file = files[context->next_file++];
+      ++visited;
+      if (shutting_down_.load(std::memory_order_acquire)) {
+        return Status::ShutdownInProgress();
+      }
+      if (file->blob_reference_descriptor.empty()) {
+        continue;
+      }
+      const uint64_t file_number = file->fd.GetNumber();
+      TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeReadFileReady");
+      TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeReadFileWait");
+      TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:BeforeReadFile");
+      status = catch_up();
+      if (status.IsTryAgain()) {
+        // An indirect blob GC job copies its snapshot. Visit this SST again in
+        // the next run.
+        --context->next_file;
+        *incomplete = true;
+        return Status::OK();
+      }
+      if (!status.ok()) {
+        break;
+      }
+      if (context->deleted_starting_files.count(file_number) != 0) {
+        continue;
+      }
+      std::shared_ptr<const BlobReferenceSstSummary> summary;
+      const auto seed = context->seeds.find(file_number);
+      if (seed != context->seeds.end()) {
+        summary = seed->second;
+        context->seeds.erase(seed);
+      } else {
+        TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:ReadSst");
+        status = cfd->table_cache()->ReadBlobReferenceSstSummary(
+            read_options, versions_->file_options(), cfd->internal_comparator(),
+            *file, options, &summary, context->summary_reservation_manager,
+            census.uncharged_charge_counter());
+      }
+      TEST_SYNC_POINT_CALLBACK(
+          "DBImpl::BuildBlobReferenceCensus:ReadFileStatus", &status);
+      if (!status.ok()) {
+        break;
+      }
+      TEST_SYNC_POINT("DBImpl::BuildBlobReferenceCensus:AfterReadFile");
+      status = catch_up();
+      if (status.IsTryAgain()) {
+        // Keep the summary, so the next run adds this SST without reading it
+        // again.
+        context->seeds[file_number] = std::move(summary);
+        --context->next_file;
+        *incomplete = true;
+        return Status::OK();
+      }
+      if (status.ok() &&
+          context->deleted_starting_files.count(file_number) == 0) {
+        status = census.AddStartingFile(context->token, std::move(summary));
+      }
+    }
+    if (status.ok() && context->level == storage->num_levels()) {
+      context->scan_complete = true;
+      context->starting_version.reset();
+      std::set<uint64_t>().swap(context->deleted_starting_files);
+      context->seeds.clear();
+      status = context->ReserveInitialFiles(0);
+    }
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  if (!context->scan_complete) {
+    *incomplete = true;
+    return Status::OK();
+  }
+  status = catch_up();
+  if (status.IsTryAgain()) {
+    *incomplete = true;
+    return Status::OK();
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  status = census.FinalizeWorkerBuild(context->token);
+  if (!status.ok()) {
+    return status;
+  }
+  const BlobReferenceCensus::RetirementSelection selected =
+      census.SelectWorkerRetirementSources(context->token);
+  status = PublishBlobReferenceCensusWorker(cfd, context.get(), incomplete);
+  if (status.IsAborted() && census.BuildCursorOverflowed(context->token)) {
+    // TryPublishWorker() returns kStale also when the build cursor overflowed
+    // after the last catch-up. Report it as an overflow, so the census job
+    // restarts the build or counts the overflow, as for an overflow that a
+    // slice finds.
+    *overflowed = true;
+  }
+  if (status.ok() && !*incomplete) {
+    // The census is published. The caller runs route retirement on these
+    // numbers after it releases the census's worker_run_mutex().
+    *retirement_sources = selected;
+  }
+  return status;
+}
+
+Status DBImpl::PublishBlobReferenceCensusWorker(
+    ColumnFamilyData* cfd, BlobReferenceCensusBuildContext* context,
+    bool* incomplete) {
+  BlobReferenceCensus& census = *cfd->blob_reference_census();
+  const uint64_t applied_version = census.WorkerVersionNumber();
+  // The census job reads candidate_retry_micros under the DB mutex, so it is
+  // stored below, after the DB mutex is taken.
+  const uint64_t candidate_retry_micros = census.RetryWorkerCandidates(
+      context->token, immutable_db_options_.clock->NowMicros());
+  BlobGcCandidateHeap::SelectionBytes candidate_bytes{};
+  BlobGcCandidateHeap::Selection candidates =
+      census.SelectWorkerCandidates(context->token, &candidate_bytes);
+  const BlobGcCandidateHeap::Selection empty_candidates =
+      census.SelectWorkerEmptyCandidates(context->token);
+  const uint64_t relocation_garbage =
+      census.WorkerRelocationGarbageBytes(context->token);
+  const BlobGcCandidateHeap::Totals candidate_totals =
+      census.WorkerCandidateTotals(context->token);
+  const BlobGcCandidateHeap::CorruptFileReport corrupt_files =
+      census.WorkerCorruptFileReport(context->token);
+  TEST_SYNC_POINT("DBImpl::PublishBlobReferenceCensusWorker:BeforeLockReady");
+  TEST_SYNC_POINT("DBImpl::PublishBlobReferenceCensusWorker:BeforeLockWait");
+  InstrumentedMutexLock lock(&mutex_);
+  context->candidate_retry_micros = candidate_retry_micros;
+  if (shutting_down_.load(std::memory_order_acquire) || cfd->IsDropped()) {
+    return Status::ShutdownInProgress();
+  }
+  const BlobReferenceCensus::PublishResult result = census.TryPublishWorker(
+      context->token, applied_version, cfd->current()->GetVersionNumber());
+  if (result == BlobReferenceCensus::PublishResult::kPublished) {
+    // The census matches cfd->current(), so these are the options that a GC
+    // job at this Version reads for its own garbage ratio check.
+    BlobGcCandidateHeap::CutSelection(
+        cfd->current()->GetMutableCFOptions().indirect_blob_gc_garbage_ratio,
+        candidate_bytes, &candidates);
+    census.NoteReady();
+    census.SetPublishedTotals(candidate_totals, relocation_garbage);
+    census.SetPublishedCorruptFiles(corrupt_files);
+    if (candidates[0] != kInvalidBlobFileNumber &&
+        cfd->IndirectBlobGcOptionsAllowJob()) {
+      // A running GC job keeps the idle time at 0. The job's end starts it
+      // again if candidates remain.
+      if (!census.HasGcJob()) {
+        cfd->NoteIndirectBlobGcCandidates(
+            immutable_db_options_.clock->NowMicros());
+      }
+    } else {
+      cfd->ClearIndirectBlobGcCandidates();
+    }
+    const uint64_t build_start_micros = census.TakeBuildStartMicros();
+    if (build_start_micros != 0) {
+      const uint64_t now_micros = immutable_db_options_.clock->NowMicros();
+      ROCKS_LOG_INFO(
+          immutable_db_options_.info_log,
+          "[%s] Blob reference census is ready at Version %" PRIu64
+          " after %" PRIu64 " ms",
+          cfd->GetName().c_str(), applied_version,
+          (now_micros - std::min(now_micros, build_start_micros)) / 1000);
+    }
+    cfd->current()->storage_info()->SetBlobGcCandidates(candidates);
+    cfd->current()->storage_info()->SetEmptyBlobGcCandidates(empty_candidates);
+    cfd->current()->storage_info()->SetBlobRelocationGarbageBytes(
+        relocation_garbage);
+    EnqueuePendingCompaction(cfd);
+    MaybeScheduleFlushOrCompaction();
+  } else if (result == BlobReferenceCensus::PublishResult::kStale) {
+    return Status::Aborted(
+        "Blob reference census build is stale (replaced, canceled or "
+        "overflowed)");
+  } else {
+    *incomplete = true;
+  }
+  return Status::OK();
+}
+
+void DBImpl::ApplyBlobReferenceCensusAfterInstall(
+    const autovector<BlobReferenceCensusApplyTarget>& targets) {
+  mutex_.AssertHeld();
+  // Step 1: the steps below release the DB mutex, so wake the waiters of the
+  // job's result first. A job of a DB without blob indirection has no target
+  // and an empty deferred cleanup, so it skips this.
+  if (!targets.empty() || versions_->HasDeferredPublicationCleanup()) {
+    bg_cv_.SignalAll();
+    atomic_flush_install_cv_.SignalAll();
+  }
+  // Step 2: the job has installed its SuperVersions, so the census state that
+  // its LogAndApply batch replaced can now be freed without the DB mutex.
+  versions_->ReleaseDeferredPublicationCleanup(&mutex_);
+  // `targets` holds only the column families with a census that this job
+  // flushed or compacted (also when the job failed). A column family dropped
+  // before the job ended is not in it. So the work is O(the job's column
+  // families), and a DB without blob indirection has none. Each one is
+  // visited in any scheduling state (queued, running or in the retry list).
+  bool any_live = false;
+  for (const BlobReferenceCensusApplyTarget& target : targets) {
+    any_live = any_live || !target.cfd->IsDropped();
+  }
+  if (any_live) {
+    mutex_.Unlock();
+    for (const BlobReferenceCensusApplyTarget& target : targets) {
+      // A drop after the check above only makes the apply useless work: the
+      // reference keeps the column family alive.
+      ApplyBlobReferenceCensusDeltas(target.cfd, target.version_number);
+    }
+    mutex_.Lock();
+  }
+  for (const BlobReferenceCensusApplyTarget& target : targets) {
+    target.cfd->UnrefAndTryDelete();
+  }
+  assert(blob_reference_census_pending_applies_ >= targets.size());
+  blob_reference_census_pending_applies_ -= targets.size();
+  if (!targets.empty() && blob_reference_census_pending_applies_ == 0) {
+    bg_cv_.SignalAll();
+  }
+  TEST_SYNC_POINT("DBImpl::ApplyBlobReferenceCensusAfterInstall:Done");
+}
+
+void DBImpl::ApplyBlobReferenceCensusDeltas(ColumnFamilyData* cfd,
+                                            uint64_t max_version_number) {
+  TEST_SYNC_POINT_CALLBACK("DBImpl::ApplyBlobReferenceCensusDeltas:Start", cfd);
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  if (census == nullptr || shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::unique_lock<std::mutex> run_lock(census->worker_run_mutex(),
+                                        std::try_to_lock);
+  if (!run_lock.owns_lock()) {
+    return;
+  }
+  const std::shared_ptr<BlobReferenceCensusBuildContext> context =
+      census->GetBuildContext();
+  if (context == nullptr || !context->scan_complete) {
+    return;
+  }
+  // An earlier failure (of an apply after an install, or of a census job run)
+  // may have changed the worker part way. The census job fails the build with
+  // it, so this thread applies nothing more.
+  if (!context->failure.ok()) {
+    return;
+  }
+  bool applied = false;
+  // Set when the next delta belongs to a Version after max_version_number. The
+  // census job applies it and the later deltas, so the job thread that runs
+  // this apply stays busy only for its own delta and the deltas before it.
+  bool reached_bound = false;
+  Status status;
+  while (status.ok() && !reached_bound) {
+    if (context->pending_deltas.empty()) {
+      bool overflowed = false;
+      status = census->TakeBuildDeltas(context->token, &context->pending_deltas,
+                                       &overflowed);
+      if (!status.ok() || overflowed || context->pending_deltas.empty()) {
+        // The census job handles an overflow (a restart, or a failure on a
+        // second overflow) and an error (a rebuild). No delta is taken on an
+        // overflow.
+        status = overflowed ? Status::Incomplete() : status;
+        break;
+      }
+    }
+    while (!context->pending_deltas.empty()) {
+      const std::shared_ptr<const BlobReferenceCensusDelta> delta =
+          context->pending_deltas.front();
+      if (delta == nullptr) {
+        status = Status::Corruption("Null blob reference census delta");
+        break;
+      }
+      if (delta->version_number > max_version_number) {
+        reached_bound = true;
+        break;
+      }
+      // TryAgain (an indirect blob GC job copies its snapshot) changes nothing,
+      // so the delta stays at the front for the census job. After any other
+      // failure the delta may be partly applied, so it must never be applied
+      // again (see below).
+      status = census->ApplyWorkerDelta(context->token, *delta);
+      TEST_SYNC_POINT_CALLBACK(
+          "DBImpl::ApplyBlobReferenceCensusDeltas:ApplyStatus", &status);
+      if (!status.ok()) {
+        break;
+      }
+      context->pending_deltas.pop_front();
+      applied = true;
+      status =
+          census->AcknowledgeBuildDeltas(context->token, delta->QueueWeight());
+      if (!status.ok()) {
+        break;
+      }
+    }
+  }
+  if (!status.ok() && !status.IsTryAgain() && !status.IsIncomplete() &&
+      census->GetBuildContext() == context) {
+    // A context that a new build replaced or that Cancel() detached is
+    // dropped anyway, so it stores nothing and logs nothing.
+    if (census->BuildCursorOverflowed(context->token)) {
+      // The census job restarts or fails the build after the overflow. Drop
+      // the queued deltas, so the failed one is never applied again.
+      context->pending_deltas.clear();
+    } else {
+      // Later applies after an install skip this build, and the census job
+      // fails the build with this failure.
+      context->failure = status;
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "[%s] Blob reference census apply after an install "
+                     "failed; the census job rebuilds the census: %s",
+                     cfd->GetName().c_str(), status.ToString().c_str());
+    }
+  }
+  if (!status.ok() || !applied || reached_bound) {
+    return;
+  }
+  // A publish that fails or must wait is left to the census job. The install
+  // queued it, or, if the column family is in the retry list, the periodic task
+  // runs it.
+  status = census->FinalizeWorkerBuild(context->token);
+  if (status.ok()) {
+    bool incomplete = false;
+    PublishBlobReferenceCensusWorker(cfd, context.get(), &incomplete)
+        .PermitUncheckedError();
+  } else if (status.IsCorruption() && census->GetBuildContext() == context) {
+    // Only a failed Finalize() returns Corruption here. It may have built some
+    // holder sets and not others, so the census job must fail the build. Store
+    // the failure as for a failed delta above. Other errors (a replaced worker,
+    // or a failed memory charge after a complete Finalize()) are left to the
+    // census job, which retries the publish.
+    context->failure = status;
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "[%s] Blob reference census finalize after an install "
+                   "failed; the census job rebuilds the census: %s",
+                   cfd->GetName().c_str(), status.ToString().c_str());
+  }
+}
+
+void DBImpl::CheckBlobReferenceCensus(ColumnFamilyData* cfd) {
+  bool force = false;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::CheckBlobReferenceCensus:Force", &force);
+  if (!force && !Random::GetTLSInstance()->OneIn(16)) {
+    return;
+  }
+  Version* version = nullptr;
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    if (shutting_down_.load(std::memory_order_acquire) || cfd->IsDropped()) {
+      return;
+    }
+    version = cfd->current();
+    version->Ref();
+  }
+  Defer release_version([this, version]() {
+    InstrumentedMutexLock lock(&mutex_);
+    version->UnrefAndFreeBlobRelocationState(&mutex_);
+  });
+  const std::shared_ptr<const BlobReferenceCensusState> actual =
+      cfd->blob_reference_census()->TEST_GetReadyState(
+          version->GetVersionNumber());
+  if (actual == nullptr) {
+    // The census moved on to a later Version, or the block cache was too full
+    // to charge the copy.
+    return;
+  }
+  ReadOptions read_options(Env::IOActivity::kCompaction);
+  read_options.fill_cache = false;
+  std::vector<std::shared_ptr<const BlobReferenceSstSummary>> files;
+  VersionStorageInfo* const storage = version->storage_info();
+  for (int level = 0; level < storage->num_levels(); ++level) {
+    for (FileMetaData* file : storage->LevelFiles(level)) {
+      if (file->blob_reference_descriptor.empty()) {
+        continue;
+      }
+      std::shared_ptr<const BlobReferenceSstSummary> summary;
+      const Status status = cfd->table_cache()->ReadBlobReferenceSstSummary(
+          read_options, versions_->file_options(), cfd->internal_comparator(),
+          *file, version->GetMutableCFOptions(), &summary,
+          /*reservation_manager=*/nullptr, /*uncharged_reads=*/nullptr);
+      if (!status.ok()) {
+        // The check is best effort, for example when a file was deleted.
+        return;
+      }
+      files.push_back(std::move(summary));
+    }
+  }
+  std::shared_ptr<BlobReferenceCensusState> expected;
+  Status status = BlobReferenceCensus::BuildState(version->GetVersionNumber(),
+                                                  files, &expected);
+  std::string difference;
+  if (status.ok() && expected->SameMemberships(*actual, &difference) &&
+      cfd->blob_reference_census()->TEST_CheckCandidateLiveBytes(
+          version->GetVersionNumber(), &difference)) {
+    return;
+  }
+  ROCKS_LOG_ERROR(
+      immutable_db_options_.info_log,
+      "Blob reference census of CF %s does not match Version %" PRIu64
+      ": %s %s",
+      cfd->GetName().c_str(), version->GetVersionNumber(),
+      status.ToString().c_str(), difference.c_str());
+  assert(false);
+}
+
+void DBImpl::RetryBlobReferenceCensus() {
+  // A column family that joins the retry list after this check waits for the
+  // next tick.
+  if (blob_reference_census_retry_count_.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+  InstrumentedMutexLock lock(&mutex_);
+  if (shutting_down_.load(std::memory_order_acquire) || read_only_) {
+    return;
+  }
+  const uint64_t now = immutable_db_options_.clock->NowMicros();
+  // Check at most 32 CFs of the retry list (an estimate), in round-robin order,
+  // so the DB mutex is never held for a walk over all CFs.
+  const size_t count = std::min<size_t>(32, blob_reference_census_retry_count_);
+  for (size_t index = 0; index < count; ++index) {
+    ColumnFamilyData* const cfd = blob_reference_census_retry_head_;
+    blob_reference_census_retry_head_ = cfd->next_blob_reference_census_;
+    --blob_reference_census_retry_count_;
+    if (blob_reference_census_retry_head_ == nullptr) {
+      blob_reference_census_retry_tail_ = nullptr;
+    }
+    cfd->next_blob_reference_census_ = nullptr;
+    // Move the CF to the run queue when it is dropped, when its retry time has
+    // come, or when it has no failures and NeedsWorkerRun() is true.
+    // NeedsWorkerRun() is also true after a failed build, so a CF with failures
+    // waits for its exponential backoff. Only a CF without failures (it waits
+    // for candidates or for a snapshot to publish) can run early for new work.
+    if (cfd->IsDropped() || cfd->blob_reference_census_retry_micros_ <= now ||
+        (cfd->blob_reference_census_failures_ == 0 &&
+         cfd->blob_reference_census()->NeedsWorkerRun(
+             cfd->current()->GetVersionNumber()))) {
+      if (blob_reference_census_queue_tail_ == nullptr) {
+        blob_reference_census_queue_head_ = cfd;
+      } else {
+        blob_reference_census_queue_tail_->next_blob_reference_census_ = cfd;
+      }
+      blob_reference_census_queue_tail_ = cfd;
+    } else {
+      if (blob_reference_census_retry_tail_ == nullptr) {
+        blob_reference_census_retry_head_ = cfd;
+      } else {
+        blob_reference_census_retry_tail_->next_blob_reference_census_ = cfd;
+      }
+      blob_reference_census_retry_tail_ = cfd;
+      ++blob_reference_census_retry_count_;
+    }
+  }
+  if (blob_reference_census_queue_head_ != nullptr) {
+    // Passing an already queued CF dispatches the existing queue without
+    // adding a reference or scanning the ColumnFamilySet.
+    ScheduleBlobReferenceCensus(blob_reference_census_queue_head_);
+  }
+}
+
+void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
+  TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:Start");
+  DBImpl* const db = static_cast<DBImpl*>(arg);
+  ColumnFamilyData* cfd = nullptr;
+  bool should_build = false;
+  {
+    InstrumentedMutexLock lock(&db->mutex_);
+    // An install that leaves a census behind schedules this job, so freeing
+    // the census state that such installs replaced here bounds how long it
+    // waits (see VersionSet::ReleaseDeferredPublicationCleanup()).
+    db->versions_->ReleaseDeferredPublicationCleanup(&db->mutex_);
+    cfd = db->blob_reference_census_queue_head_;
+    assert(cfd != nullptr);
+    db->blob_reference_census_queue_head_ = cfd->next_blob_reference_census_;
+    if (db->blob_reference_census_queue_head_ == nullptr) {
+      db->blob_reference_census_queue_tail_ = nullptr;
+    }
+    cfd->next_blob_reference_census_ = nullptr;
+    // Keep queued=true while running: concurrent installs must not start a
+    // second worker or duplicate this CF's intrusive queue entry.
+    cfd->blob_reference_census_running_ = true;
+    should_build = !db->shutting_down_.load(std::memory_order_acquire) &&
+                   !cfd->IsDropped();
+  }
+  bool incomplete = false;
+  bool overflowed = false;
+  TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:BeforeBuildReady");
+  TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:BeforeBuildWait");
+  Status status;
+  if (should_build) {
+    // FailBuild() below runs after the run lock is released. Store a failure
+    // first, under the run lock, so an apply after an install that takes the
+    // run lock in between applies nothing (a failed delta may still be
+    // queued).
+    const auto store_failure = [cfd](const Status& failure) {
+      const std::shared_ptr<BlobReferenceCensusBuildContext> context =
+          cfd->blob_reference_census()->GetBuildContext();
+      if (context != nullptr && context->failure.ok()) {
+        context->failure = failure;
+      }
+    };
+    BlobReferenceCensus* const census = cfd->blob_reference_census();
+    // A census charge that found the block cache full went on uncharged (see
+    // AllowUnchargedCensusCharge() in blob_reference_census.cc). Count the
+    // build once and log one WARN line for it. A change log charge of an
+    // install that runs at the same time can also be counted here.
+    // REQUIRES: the census's worker_run_mutex() is held.
+    const auto note_uncharged = [db, cfd, census](uint64_t uncharged_before) {
+      const uint64_t uncharged_after = census->uncharged_charge_count();
+      if (uncharged_after == uncharged_before) {
+        return;
+      }
+      const std::shared_ptr<BlobReferenceCensusBuildContext> context =
+          census->GetBuildContext();
+      if (context != nullptr && !context->uncharged_build_counted) {
+        context->uncharged_build_counted = true;
+        census->NoteUnchargedBuild();
+        ROCKS_LOG_WARN(db->immutable_db_options_.info_log,
+                       "Blob reference census of CF %s is built partly "
+                       "uncharged, because the block cache is full (%" PRIu64
+                       " uncharged census charges so far)",
+                       cfd->GetName().c_str(), uncharged_after);
+      }
+    };
+    BlobReferenceCensus::RetirementSelection retirement_sources{};
+    {
+      std::lock_guard<std::mutex> run_lock(census->worker_run_mutex());
+      const uint64_t uncharged_before = census->uncharged_charge_count();
+      status = db->BuildBlobReferenceCensus(cfd, &incomplete, &overflowed,
+                                            &retirement_sources);
+      note_uncharged(uncharged_before);
+      if (!status.ok()) {
+        store_failure(status);
+      }
+    }
+    if (status.ok() && !incomplete) {
+      // Route retirement runs only here, in the census job, after the census
+      // is published. It writes the MANIFEST, which can be slow and can fail.
+      // So the apply step that a flush or compaction thread runs after its
+      // install (see "Apply after an install" in
+      // db/blob/blob_reference_census.h) does not run it, and that thread is
+      // never delayed or failed by it. It runs without the run lock, so such
+      // an apply is not skipped while route retirement waits for its
+      // MANIFEST write. An install that lands after route retirement pinned
+      // its Version makes the precondition fail, and route retirement ends
+      // with TryAgain. If the census moves to a newer Version before the pin,
+      // route retirement uses that Version and checks every selected number
+      // again there.
+      bool retired = false;
+      // The census snapshot of route retirement also goes on uncharged when
+      // the cache is full (see BlobReferenceCensus::ReadSelectedSnapshot()),
+      // and counts toward the same build.
+      const uint64_t uncharged_before = census->uncharged_charge_count();
+      status =
+          db->RetireBlobRelocationRoutes(cfd, retirement_sources, &retired);
+      if (census->uncharged_charge_count() != uncharged_before) {
+        std::lock_guard<std::mutex> run_lock(census->worker_run_mutex());
+        note_uncharged(uncharged_before);
+      }
+      if (!status.ok() && !status.IsShutdownInProgress() &&
+          !status.IsColumnFamilyDropped() && !status.IsCorruption()) {
+        // Route retirement is optional cleanup, so its failure does not drop
+        // the census: a dropped census is rebuilt by reading every SST index
+        // again, and route retirement could then fail again in a loop. For
+        // example, TryAgain means that the state changed before the MANIFEST
+        // write: an indirect blob GC job took a target as input, a running
+        // compaction holds a selected number, or another MANIFEST write
+        // installed a new Version. A full block cache does not fail route
+        // retirement (see BlobReferenceCensus::ReadSelectedSnapshot()); a
+        // MemoryLimit here means that the snapshot size overflowed. A MANIFEST
+        // write error and a Corruption of the MANIFEST write already set a
+        // background error in RetireBlobRelocationRoutes(), which returns OK
+        // for the latter. Only a shutdown, a dropped column family and a
+        // Corruption stop the census here. Such a Corruption comes from the
+        // census snapshot read, so the census itself is broken and is rebuilt.
+        // A MemoryLimit gets a WARN line, so that the skipped cleanup is
+        // visible. The next census publish tries again.
+        if (status.IsMemoryLimit()) {
+          ROCKS_LOG_WARN(db->immutable_db_options_.info_log,
+                         "[%s] Blob route retirement skipped: %s",
+                         cfd->GetName().c_str(), status.ToString().c_str());
+        } else {
+          ROCKS_LOG_INFO(db->immutable_db_options_.info_log,
+                         "[%s] Blob route retirement skipped: %s",
+                         cfd->GetName().c_str(), status.ToString().c_str());
+        }
+        status = Status::OK();
+      }
+      if (!status.ok()) {
+        std::lock_guard<std::mutex> run_lock(
+            cfd->blob_reference_census()->worker_run_mutex());
+        store_failure(status);
+      }
+      // A route deletion installs a new Version. Mark the run incomplete, so
+      // the census worker runs again and catches up with that Version.
+      incomplete |= retired;
+    }
+  } else {
+    status = Status::ShutdownInProgress();
+  }
+  if (should_build && !status.ok()) {
+    TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:FailedRunReady");
+    TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:FailedRunWait");
+  }
+  // A change-log overflow restarts the build at once, one time only, on the
+  // latest Version, with the larger restart limit (see
+  // BlobReferenceCensus::UseOverflowRestart()). A second overflow before a
+  // publish fails the build, which then backs off like any other failure.
+  const bool restart_after_overflow =
+      overflowed && cfd->blob_reference_census()->UseOverflowRestart();
+  // A rebuild install (see BlobReferenceCensusDelta::rebuild) or a census
+  // mismatch report invalidated this build. The next build starts at once,
+  // unless this build failed because of a mismatch report and mismatch reports
+  // requested more than two rebuilds in a row. That rebuild waits instead: 1 s
+  // for the first such wait, doubled for each later one
+  // (TakeMismatchRebuildWaitStep()), at most 32 s (see
+  // BlobReferenceCensus::ReportMismatch()).
+  const bool rebuild_requested =
+      !status.ok() && !overflowed &&
+      cfd->blob_reference_census()->RebuildRequested();
+  // Take the wait step once: the call also counts the wait, and a GC job can
+  // reset the counts at any time (see
+  // BlobReferenceCensus::NoteCensusCheckMatched()). The ERROR line and the
+  // retry delay below use the same value as this decision. The failed-build
+  // retry delay uses the same 1 s start and the same limit of 6 steps (32 s).
+  constexpr uint64_t kFirstFailureRetryMicros = 1000 * 1000;
+  constexpr uint32_t kMaxCountedFailures = 6;
+  const uint32_t mismatch_rebuild_wait_step =
+      rebuild_requested
+          ? cfd->blob_reference_census()->TakeMismatchRebuildWaitStep()
+          : 0;
+  const bool mismatch_rebuild_waits = mismatch_rebuild_wait_step > 0;
+  const uint32_t mismatch_backoff_step =
+      std::min(mismatch_rebuild_wait_step, kMaxCountedFailures);
+  const uint64_t mismatch_rebuild_delay_micros =
+      mismatch_rebuild_waits
+          ? kFirstFailureRetryMicros << (mismatch_backoff_step - 1)
+          : 0;
+  const bool restart_for_rebuild = rebuild_requested && !mismatch_rebuild_waits;
+  // Every failed build logs its status (see "Errors and rebuild" in
+  // db/blob/blob_reference_census.h for the retry policy). A build that a
+  // rebuild install canceled fails with Aborted. This is a normal restart that
+  // needs no action, and DeleteFilesInRange() can cause many of them, so it
+  // logs at INFO. A rebuild that must wait for the backoff after repeated
+  // census mismatches logs at ERROR. Any other status logs at WARN, or at
+  // ERROR for Corruption.
+  if (mismatch_rebuild_waits) {
+    ROCKS_LOG_ERROR(
+        db->immutable_db_options_.info_log,
+        "Blob reference census of CF %s: indirect blob GC found census "
+        "mismatches after more than two rebuilds in a row; the next rebuild "
+        "waits %" PRIu64 " s (wait %" PRIu32
+        " in a row; each later wait doubles, at most 32 s; GC waits until the "
+        "census is ready)",
+        cfd->GetName().c_str(), mismatch_rebuild_delay_micros / 1000000,
+        mismatch_rebuild_wait_step);
+  } else if (restart_for_rebuild && status.IsAborted()) {
+    ROCKS_LOG_INFO(db->immutable_db_options_.info_log,
+                   "Blob reference census of CF %s restarts on the latest "
+                   "Version after a rebuild install canceled its build: %s",
+                   cfd->GetName().c_str(), status.ToString().c_str());
+  } else if (restart_for_rebuild && status.IsCorruption()) {
+    ROCKS_LOG_ERROR(db->immutable_db_options_.info_log,
+                    "Blob reference census of CF %s does not match its SSTs "
+                    "and is rebuilt on the latest Version: %s",
+                    cfd->GetName().c_str(), status.ToString().c_str());
+  } else if (restart_for_rebuild) {
+    ROCKS_LOG_WARN(db->immutable_db_options_.info_log,
+                   "Blob reference census of CF %s is rebuilt on the latest "
+                   "Version after a build failed: %s",
+                   cfd->GetName().c_str(), status.ToString().c_str());
+  } else if (restart_after_overflow) {
+    ROCKS_LOG_WARN(db->immutable_db_options_.info_log,
+                   "Blob reference census of CF %s restarts after its change "
+                   "log overflowed: %s",
+                   cfd->GetName().c_str(), status.ToString().c_str());
+  } else if (overflowed) {
+    RecordTick(db->stats_, BLOB_DB_CENSUS_RESTART_OVERFLOW_COUNT);
+    ROCKS_LOG_WARN(db->immutable_db_options_.info_log,
+                   "Blob reference census of CF %s overflowed its change log "
+                   "again before it published; it retries after a backoff "
+                   "(GC waits until the census is ready)",
+                   cfd->GetName().c_str());
+  } else if (status.IsCorruption()) {
+    ROCKS_LOG_ERROR(db->immutable_db_options_.info_log,
+                    "Blob reference census of CF %s does not match its "
+                    "SSTs and is rebuilt: %s",
+                    cfd->GetName().c_str(), status.ToString().c_str());
+  } else if (!status.ok() && !status.IsShutdownInProgress()) {
+    ROCKS_LOG_WARN(db->immutable_db_options_.info_log,
+                   "Blob reference census unavailable for CF %s: %s",
+                   cfd->GetName().c_str(), status.ToString().c_str());
+  }
+#ifndef NDEBUG
+  if (status.ok() && !incomplete && should_build) {
+    db->CheckBlobReferenceCensus(cfd);
+  }
+#endif  // NDEBUG
+  BlobReferenceCensusGarbage garbage;
+  bool retained_for_retry = false;
+  {
+    InstrumentedMutexLock lock(&db->mutex_);
+    cfd->blob_reference_census_running_ = false;
+    cfd->queued_for_blob_reference_census_ = false;
+    if (!status.ok()) {
+      const std::shared_ptr<BlobReferenceCensusBuildContext> context =
+          cfd->blob_reference_census()->GetBuildContext();
+      if (context != nullptr) {
+        garbage = cfd->blob_reference_census()->FailBuild(context->token);
+      }
+      cfd->blob_reference_census()->NoteUnready(
+          db->immutable_db_options_.clock->NowMicros());
+    }
+    // What happens next, by the result of this run:
+    //   - Rebuild install (restart_for_rebuild): schedule again at once.
+    //   - Change log overflow (restart_after_overflow): restart at once, one
+    //     time only, with the restart limit.
+    //   - Other failure, also a second overflow before a publish: retry list,
+    //     after 1 s, doubled after each failure, at most 32 s. A mismatch
+    //     rebuild that waits (mismatch_rebuild_waits) doubles its wait with the
+    //     count of such waits instead.
+    //   - OK, but an indirect blob GC snapshot is pending (snapshot_paused):
+    //     retry list after 1 ms (1000 microseconds).
+    //   - OK and waiting for candidates (waiting_for_candidates): retry list at
+    //     candidate_retry_micros.
+    //   - Any other case: ScheduleBlobReferenceCensus() below. It puts the
+    //     column family at the back of the run queue when it still has work. A
+    //     run that waits for an install (kInstallPending) is not queued;
+    //     Install() or CancelInstallPreparation() wakes it.
+    // The retry list is checked by the periodic task
+    // (PeriodicTaskType::kBlobReferenceCensus), which runs once per second. One
+    // second matches the shortest retry delays: the first retry after a failed
+    // build, and the first retry of a candidate that failed for a transient
+    // reason. A column family with failures runs at the first tick after its
+    // retry time.
+    // A column family without failures can run at an earlier tick when it has
+    // new work (NeedsWorkerRun()).
+    const bool snapshot_paused =
+        status.ok() && incomplete &&
+        cfd->blob_reference_census()->IsSnapshotPending();
+    const std::shared_ptr<BlobReferenceCensusBuildContext> retry_context =
+        cfd->blob_reference_census()->GetBuildContext();
+    const bool waiting_for_candidates =
+        status.ok() && !incomplete && retry_context != nullptr &&
+        retry_context->candidate_retry_micros != 0 &&
+        !cfd->blob_reference_census()->NeedsWorkerRun(
+            cfd->current()->GetVersionNumber());
+    if (status.ok()) {
+      cfd->blob_reference_census_failures_ = 0;
+    }
+    if ((!status.ok() || snapshot_paused || waiting_for_candidates) &&
+        !restart_after_overflow && !restart_for_rebuild &&
+        !db->shutting_down_.load(std::memory_order_acquire) &&
+        !cfd->IsDropped()) {
+      // The retry delays are fixed choices, not measured: a short 1 ms wait
+      // while an indirect blob GC snapshot is pending, and for failures 1 s
+      // that doubles after each failure, up to 32 s from the sixth failure on.
+      // The periodic task checks the retry list only once per second, so the
+      // 1 ms wait really lasts until the next tick, up to 1 s.
+      constexpr uint64_t kSnapshotRetryMicros = 1000;
+      uint64_t delay = kSnapshotRetryMicros;
+      if (!status.ok()) {
+        cfd->blob_reference_census_failures_ = std::min<uint32_t>(
+            cfd->blob_reference_census_failures_ + 1, kMaxCountedFailures);
+        // Each mismatch rebuild runs OK slices, and an OK slice sets the
+        // failure count back to 0. So a mismatch rebuild that waits uses the
+        // delay that it computed from the count of mismatch rebuilds that
+        // waited (mismatch_rebuild_delay_micros).
+        delay = mismatch_rebuild_waits
+                    ? mismatch_rebuild_delay_micros
+                    : kFirstFailureRetryMicros
+                          << (cfd->blob_reference_census_failures_ - 1);
+        TEST_SYNC_POINT_CALLBACK(
+            "DBImpl::BGWorkBlobReferenceCensus:FailureRetryDelay", &delay);
+      }
+      cfd->blob_reference_census_retry_micros_ =
+          waiting_for_candidates
+              ? retry_context->candidate_retry_micros
+              : db->immutable_db_options_.clock->NowMicros() + delay;
+      cfd->queued_for_blob_reference_census_ = true;
+      if (db->blob_reference_census_retry_tail_ == nullptr) {
+        db->blob_reference_census_retry_head_ = cfd;
+      } else {
+        db->blob_reference_census_retry_tail_->next_blob_reference_census_ =
+            cfd;
+      }
+      db->blob_reference_census_retry_tail_ = cfd;
+      ++db->blob_reference_census_retry_count_;
+      retained_for_retry = true;
+    } else {
+      cfd->blob_reference_census_failures_ = 0;
+    }
+    if (!db->shutting_down_.load(std::memory_order_acquire)) {
+      // An incomplete CF goes to the back. Every invocation returns to LOW,
+      // allowing ordinary compactions and other CFs to run between slices.
+      db->ScheduleBlobReferenceCensus(cfd);
+    }
+  }
+  garbage = {};
+  if (!retained_for_retry) {
+    db->ReleaseColumnFamilyDataRef(cfd);
+  }
+  TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:Done");
+  // Mark the job complete only after the cleanup without the mutex (Version,
+  // CFD and change log) is done, not after the last census change. Close and
+  // the next worker wait for this state. Otherwise Close could free this DB
+  // while the deleters above still lock its mutex.
+  {
+    InstrumentedMutexLock lock(&db->mutex_);
+    db->bg_blob_reference_census_state_ =
+        BlobReferenceCensusJobState::kComplete;
+    if (!db->shutting_down_.load(std::memory_order_acquire) &&
+        db->blob_reference_census_queue_head_ != nullptr) {
+      db->ScheduleBlobReferenceCensus(db->blob_reference_census_queue_head_);
+    }
+    db->bg_cv_.SignalAll();
+  }
+}
 }  // namespace ROCKSDB_NAMESPACE

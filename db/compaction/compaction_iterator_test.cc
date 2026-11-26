@@ -198,6 +198,8 @@ class FakeCompaction : public CompactionIterator::CompactionProxy {
 
   bool enable_blob_garbage_collection() const override { return false; }
 
+  bool enable_blob_indirection() const override { return true; }
+
   double blob_garbage_collection_age_cutoff() const override { return 0.0; }
 
   uint64_t blob_compaction_readahead_size() const override { return 0; }
@@ -334,8 +336,9 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
         nullptr /* blob_file_builder */, true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse_,
-        std::move(compaction), /*must_count_input_entries=*/false, filter,
-        &shutting_down_, /*info_log=*/nullptr, full_history_ts_low));
+        std::move(compaction), /*must_count_input_entries=*/false,
+        /*allow_blob_index_flattening=*/true, filter, &shutting_down_,
+        /*info_log=*/nullptr, full_history_ts_low));
     c_iter_->SetMissingBlobRepairIterator(repair_iter_.get());
   }
 
@@ -2528,6 +2531,36 @@ TEST_P(CompactionIteratorTsGcTest, HistoryGcKeepsWideBlobTimestamp) {
   ASSERT_EQ(c_iter_->iter_stats().num_blobs_read, 0);
 }
 
+TEST_P(CompactionIteratorTsGcTest,
+       HistoryGcFindsWideBlobWithoutValidatingIndex) {
+  // When the history GC zeroes a sequence number, the compaction iterator
+  // looks for external blob references with
+  // WideColumnSerialization::ForEachBlobFileNumber(), the same walk that
+  // RocksDB uses when blob indirection is off. It
+  // only decodes each blob index and does not run BlobIndex::Validate(). Here
+  // the blob index has a compression type that is neither built in nor
+  // custom. Validate() rejects it, but the compaction must still keep the
+  // timestamp of the entity.
+  std::string history_low;
+  PutFixed64(&history_low, 104);
+  const CompressionType invalid_compression =
+      static_cast<CompressionType>(kLastBuiltinCompression + 1);
+  ASSERT_LT(invalid_compression, kFirstCustomCompression);
+  std::string blob_encoding;
+  BlobIndex::EncodeBlob(&blob_encoding, /*file_number=*/20, /*offset=*/100,
+                        /*size=*/200, invalid_compression);
+  BlobIndex blob;
+  ASSERT_OK(blob.DecodeFrom(blob_encoding));
+  ASSERT_EQ(blob.Validate().code(), Status::kCorruption);
+  std::string entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", "inline"}, {"b", ""}}, {{1, blob}}, entity));
+  RunTest({test::KeyStr(103, "a", 5, kTypeWideColumnEntity)}, {entity},
+          {test::KeyStr(103, "a", 0, kTypeWideColumnEntity)}, {entity},
+          kMaxSequenceNumber, nullptr, nullptr, true, kMaxSequenceNumber, false,
+          &history_low);
+}
+
 TEST_P(CompactionIteratorTsGcTest, HistoryGcKeepsBlobSnapshotStripes) {
   AddSnapshot(4, 4);
   std::string history_low;
@@ -3042,7 +3075,8 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
         write_hint, nullptr /*IOTracer*/,
         nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
         immutable_options.cf_paths.front().path, &blob_file_paths_,
-        &blob_file_additions_);
+        &blob_file_additions_,
+        /*blob_source=*/nullptr);
 
     // Set up the input iterator
     const Comparator* cmp = BytewiseComparator();
@@ -3075,7 +3109,8 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
         &blob_file_builder, true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/, manual_compaction_canceled,
         nullptr /*compaction*/, false /*must_count_input_entries*/,
-        nullptr /*compaction_filter*/, &shutting_down);
+        false /*allow_blob_index_flattening*/, nullptr /*compaction_filter*/,
+        &shutting_down);
 
     c_iter.SeekToFirst();
     while (c_iter.Valid()) {
@@ -3369,6 +3404,10 @@ class FakeCompactionWithBlobGC : public CompactionIterator::CompactionProxy {
     return enable_blob_gc_;
   }
 
+  bool enable_blob_indirection() const override {
+    return enable_blob_indirection_;
+  }
+
   double blob_garbage_collection_age_cutoff() const override {
     return blob_gc_age_cutoff_;
   }
@@ -3392,6 +3431,7 @@ class FakeCompactionWithBlobGC : public CompactionIterator::CompactionProxy {
   // NOTE: Integration tests for entity blob GC with a real Version exist in
   // db_wide_basic_test.cc (CompactionFilterWithBlobGC test).
   bool enable_blob_gc_ = false;
+  bool enable_blob_indirection_ = true;
   double blob_gc_age_cutoff_ = 1.0;
 };
 
@@ -3485,7 +3525,8 @@ class WideColumnEntityBlobGCTest : public testing::Test {
           nullptr /*BlobFileCompletionCallback*/,
           BlobFileCreationReason::kCompaction,
           immutable_options.cf_paths.front().path, &blob_file_paths_,
-          &blob_file_additions_);
+          &blob_file_additions_,
+          /*blob_source=*/nullptr);
     }
 
     // Set up the input iterator
@@ -3525,7 +3566,8 @@ class WideColumnEntityBlobGCTest : public testing::Test {
         blob_file_builder.get(), true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/, manual_compaction_canceled,
         std::move(fake_compaction), false /*must_count_input_entries*/,
-        compaction_filter, &shutting_down);
+        true /*allow_blob_index_flattening*/, compaction_filter,
+        &shutting_down);
 
     c_iter.SeekToFirst();
     while (c_iter.Valid()) {
@@ -3959,7 +4001,7 @@ TEST_F(WideColumnEntityBlobGCTest, EagerBlobResolutionWithoutFetcher) {
       kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
       Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
       true, true, manual_compaction_canceled, std::move(fake_compaction), false,
-      &filter, &shutting_down);
+      true /*allow_blob_index_flattening*/, &filter, &shutting_down);
 
   c_iter.SeekToFirst();
   ASSERT_FALSE(c_iter.Valid());
@@ -4023,7 +4065,7 @@ TEST_F(WideColumnEntityBlobGCTest,
       kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
       Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
       true, true, manual_compaction_canceled, std::move(fake_compaction), false,
-      &keep_filter, &shutting_down);
+      true /*allow_blob_index_flattening*/, &keep_filter, &shutting_down);
 
   c_iter.SeekToFirst();
   ASSERT_TRUE(c_iter.Valid());

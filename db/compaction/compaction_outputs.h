@@ -15,6 +15,7 @@
 #include "db/compaction/compaction_iterator.h"
 #include "db/internal_stats.h"
 #include "db/output_validator.h"
+#include "port/likely.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -41,6 +42,11 @@ class CompactionOutputs {
     OutputValidator validator;
     bool finished;
     bool is_proximal_level;
+    // True when the output was closed because it already held
+    // blob_indirection_max_references_per_sst blob references when the next
+    // user key arrived (see CompactionOutputs::AddToOutput()). Used by the
+    // event log.
+    bool closed_by_blob_reference_limit = false;
     std::shared_ptr<const TableProperties> table_properties;
   };
 
@@ -128,15 +134,10 @@ class CompactionOutputs {
 
   // Update output table properties from already populated TableProperties.
   // Used for remote compaction
-  void UpdateTableProperties(const TableProperties& table_properties) {
-    current_output().table_properties =
-        std::make_shared<TableProperties>(table_properties);
-  }
+  Status UpdateTableProperties(const TableProperties& table_properties);
+
   // Update output table properties from table builder
-  void UpdateTableProperties() {
-    current_output().table_properties =
-        std::make_shared<TableProperties>(GetTableProperties());
-  }
+  Status UpdateTableProperties();
 
   IOStatus WriterSyncClose(const Status& intput_status, SystemClock* clock,
                            Statistics* statistics, bool use_fsync);
@@ -185,6 +186,10 @@ class CompactionOutputs {
   }
 
   FileMetaData* GetMetaData() { return &current_output().meta; }
+
+  bool CurrentOutputClosedByBlobReferenceLimit() const {
+    return outputs_.back().closed_by_blob_reference_limit;
+  }
 
   bool HasOutput() const { return !outputs_.empty(); }
 
@@ -296,6 +301,10 @@ class CompactionOutputs {
   uint64_t GetCurrentKeyGrandparentOverlappedBytes(
       const Slice& internal_key) const;
 
+  // Counts and logs a cut of the current output by the blob reference limit
+  // before `next_key`, and marks the output for the event log.
+  ROCKSDB_COLD void NoteBlobReferenceLimitCut(const Slice& next_key);
+
   // Add current key from compaction_iterator to the output file. If needed
   // close and open new compaction output with the functions provided.
   Status AddToOutput(CompactionIterator& c_iter,
@@ -373,6 +382,9 @@ class CompactionOutputs {
   // indicate if this CompactionOutputs obj for proximal_level, should always
   // be false if per_key_placement feature is not enabled.
   const bool is_proximal_level_;
+  // The input Version has the blob indirection format. Fixed for the
+  // compaction, so AddToOutput() reads this instead of the Version per key.
+  const bool input_has_blob_indirection_format_;
 
   // partitioner information
   std::unique_ptr<SstPartitioner> partitioner_;
@@ -392,6 +404,11 @@ class CompactionOutputs {
   // A flag determines if this subcompaction has been split by the cursor
   // for RoundRobin compaction
   bool is_split_ = false;
+
+  // True when builder_ collects exact blob reference metadata, so it can
+  // reach the per-SST reference limit. Set by NewBuilder(). Other keys skip
+  // the limit check.
+  bool builder_collects_blob_references_ = false;
 
   // We also maintain the output split key for each subcompaction to avoid
   // repetitive comparison in ShouldStopBefore()
@@ -426,6 +443,17 @@ class CompactionOutputs {
   // The smallest key of the current output file, this is set when current
   // output file's smallest key is a range tombstone start key.
   InternalKey range_tombstone_lower_bound_;
+
+  // Decodes the kTypeBlobIndex value `value` of the current key, or reuses
+  // the decode of the compaction iterator. Returns null if the decode fails.
+  // The result lives until the next call. It is out of line and kept apart
+  // from AddToOutput() so that a key that is not a blob index does no extra
+  // work there (no BlobIndex is built on that path).
+  ROCKSDB_NOINLINE const BlobIndex* DecodeOutputBlobIndex(
+      const CompactionIterator& c_iter, const Slice& value);
+  // The decode buffer of DecodeOutputBlobIndex(). BlobIndex::DecodeFrom()
+  // resets it before each decode, so one member serves every key.
+  BlobIndex output_blob_index_;
 
   // Used for calls to compaction->KeyRangeNotExistsBeyondOutputLevel() in
   // CompactionOutputs::AddRangeDels().
