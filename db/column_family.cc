@@ -40,6 +40,7 @@
 #include "port/port.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/merging_iterator.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
@@ -1793,6 +1794,33 @@ Status ColumnFamilyData::ValidateOptions(
   return s;
 }
 
+Status ColumnFamilyData::ValidateBlobIndirectionOptionsAfterRecovery() const {
+  Status s = CheckBlobIndirectionCompactionStyle(
+      ioptions_.compaction_style,
+      GetLatestMutableCFOptions().enable_blob_indirection ||
+          (current_ != nullptr &&
+           current_->storage_info()->HasBlobIndirectionFormat()));
+  if (!s.ok()) {
+    return s;
+  }
+  if (current_ == nullptr ||
+      !current_->storage_info()->HasBlobIndirectionFormat()) {
+    return Status::OK();
+  }
+  if (ioptions_.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob direct write cannot open a column family with blob indirection "
+        "state");
+  }
+
+  if (GetBlockBasedTableWriterOptions(
+          initial_cf_options_.table_factory.get()) == nullptr) {
+    return Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
+  }
+  return Status::OK();
+}
+
 Status ColumnFamilyData::PrepareMutableCFOptions(
     const DBOptions& db_opts,
     const std::unordered_map<std::string, std::string>& options_map,
@@ -1813,6 +1841,22 @@ Status ColumnFamilyData::PrepareMutableCFOptions(
     // FIXME: we should call SanitizeOptions() too or consolidate it with
     // ValidateOptions().
     s = ValidateOptions(db_opts, cf_opts);
+  }
+  // A CF with the format fence needs a supported compaction style and a
+  // Block-Based Table writer: its later flush and compaction outputs must store
+  // blob reference metadata, which only the Block-Based Table writes, and
+  // relocation files must stay readable. Turning enable_blob_indirection off
+  // does not remove the fence.
+  const bool has_blob_indirection_state =
+      current_ != nullptr &&
+      current_->storage_info()->HasBlobIndirectionFormat();
+  if (s.ok() && has_blob_indirection_state) {
+    s = CheckBlobIndirectionCompactionStyle(cf_opts.compaction_style, true);
+  }
+  if (s.ok() && has_blob_indirection_state &&
+      GetBlockBasedTableWriterOptions(cf_opts.table_factory.get()) == nullptr) {
+    s = Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
   }
   if (s.ok()) {
     *mutable_cf_options = MutableCFOptions(cf_opts);
