@@ -1015,6 +1015,58 @@ class VersionBuilder::Rep : public MutableScalars {
     return Status::OK();
   }
 
+  // Background: the L0 check above compares only neighbor files. Files with
+  // one epoch number are ordered by largest seqno, not by key, so with three
+  // or more files of one epoch, two files that are not neighbors are never
+  // compared. Base RocksDB writes one L0 file per epoch (a flush or an L0
+  // compaction output is never split), but in a column family with the blob
+  // indirection format fence, the blob reference cap can cut one L0
+  // compaction output into an epoch run of many files (see
+  // VersionStorageInfo::ExpandExactL0Inputs()). Pickers take whole runs, and
+  // this check makes sure that no Version installs two overlapping files of
+  // one epoch, for example after a picker bug. L0 reads order overlapping
+  // files by epoch, so such files would have no defined order.
+  //
+  // How: L0 is sorted by epoch, so the files of one epoch are next to each
+  // other. For each epoch with more than one file, sort those files by
+  // smallest key and compare each file with the next one in key order.
+  // REQUIRED: L0 passed the neighbor check, with epoch numbers present.
+  Status CheckL0EpochRunsDoNotOverlap(const VersionStorageInfo* vstorage,
+                                      const InternalKeyComparator* icmp) const {
+    assert(vstorage);
+    assert(icmp);
+    const std::vector<FileMetaData*>& l0_files = vstorage->LevelFiles(0);
+    std::vector<const FileMetaData*> run;
+    size_t begin = 0;
+    while (begin < l0_files.size()) {
+      size_t end = begin + 1;
+      while (end < l0_files.size() &&
+             l0_files[end]->epoch_number == l0_files[begin]->epoch_number) {
+        ++end;
+      }
+      if (end - begin > 1) {
+        run.assign(l0_files.begin() + begin, l0_files.begin() + end);
+        std::sort(run.begin(), run.end(), level_nonzero_cmp_);
+        for (size_t i = 1; i < run.size(); ++i) {
+          const FileMetaData* lhs = run[i - 1];
+          const FileMetaData* rhs = run[i];
+          if (icmp->Compare(lhs->largest, rhs->smallest) >= 0) {
+            std::ostringstream oss;
+            oss << "L0 files of same epoch number but overlapping range #"
+                << lhs->fd.GetNumber()
+                << " , largest key: " << lhs->largest.DebugString(true)
+                << " vs. file #" << rhs->fd.GetNumber()
+                << " , smallest key: " << rhs->smallest.DebugString(true)
+                << " , epoch number: " << lhs->epoch_number;
+            return Status::Corruption("VersionBuilder", oss.str());
+          }
+        }
+      }
+      begin = end;
+    }
+    return Status::OK();
+  }
+
   // Make sure table files are sorted correctly and that the links between
   // table files and blob files are consistent.
   Status CheckConsistencyDetails(const VersionStorageInfo* vstorage) const {
@@ -1082,11 +1134,18 @@ class VersionBuilder::Rep : public MutableScalars {
           return Status::OK();
         };
 
-        const Status s = CheckConsistencyDetailsForLevel(
+        Status s = CheckConsistencyDetailsForLevel(
             vstorage, /* level */ 0, l0_checker,
             "VersionBuilder::CheckConsistency0", &expected_linked_ssts);
         if (!s.ok()) {
           return s;
+        }
+        if (epoch_number_requirement == EpochNumberRequirement::kMustPresent &&
+            vstorage->HasBlobIndirectionFormat()) {
+          s = CheckL0EpochRunsDoNotOverlap(vstorage, icmp);
+          if (!s.ok()) {
+            return s;
+          }
         }
       }
 
@@ -2219,8 +2278,9 @@ class VersionBuilder::Rep : public MutableScalars {
       // a fenced CF this is allowed only for a level move: the SST is already
       // in this Version and the same edit deletes it from its current level.
       // Such an SST can be older than the fence. Every SST built after the
-      // fence has a descriptor, also when it keeps no blob reference. The
-      // current copy must have no descriptor and no coarse frontier either.
+      // fence has a descriptor, a coarse frontier, or the legacy marker
+      // (blob_reference_legacy_metadata), also when it keeps no blob reference.
+      // The current copy must have no descriptor and no coarse frontier either.
       // Otherwise SaveTo() would mark the moved copy legacy: an exact SST
       // would lose its exact metadata, and a coarse SST would stop pinning
       // the indirect origins it may still reference.
