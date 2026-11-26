@@ -1457,6 +1457,26 @@ bool ColumnFamilyData::ReturnThreadLocalSuperVersion(SuperVersion* sv) {
   return false;
 }
 
+void ColumnFamilyData::ClearHeadMarks() {
+  if (!may_have_head_marks_) {
+    return;
+  }
+  TEST_SYNC_POINT("ColumnFamilyData::ClearHeadMarks:Clear");
+  mem_->ClearHeadMarks();
+  imm_.ClearHeadMarks();
+}
+
+void ColumnFamilyData::RecordFileChangeForHeadMarks(uint64_t version_number,
+                                                    SequenceNumber seqno) {
+  // The DB mutex serializes the callers, so a load and a store are enough.
+  if (head_mark_ingest_state_.version_number.LoadRelaxed() < version_number) {
+    head_mark_ingest_state_.version_number.Store(version_number);
+  }
+  if (head_mark_ingest_state_.seqno.LoadRelaxed() < seqno) {
+    head_mark_ingest_state_.seqno.Store(seqno);
+  }
+}
+
 void ColumnFamilyData::InstallSuperVersion(
     SuperVersionContext* sv_context, InstrumentedMutex* db_mutex,
     std::optional<std::shared_ptr<SeqnoToTimeMapping>>

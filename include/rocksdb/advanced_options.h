@@ -1464,6 +1464,20 @@ struct AdvancedColumnFamilyOptions {
   //     ingested file seqno OR the iterator's Version predates a file
   //     ingested while the active memtable was current.
   //
+  // A memtable created while this option is > 0 also keeps head marks. When a
+  // scan that starts with Seek() sees such a run of point tombstones right
+  // after its seek, in its merged view of the memtables and SST files, it
+  // records the deleted range as a head mark in the active memtable. A later
+  // Seek() into the range then skips the range in one step, in that memtable
+  // and in every older memtable and SST file. Head marks live only in memory
+  // and change no data. They are not used with user-defined timestamps,
+  // inplace_update_support, unordered_write, two_write_queues, FIFO compaction,
+  // memtables that are not skip lists, or iterators with a read callback,
+  // table_filter or ignore_range_deletions. After a compaction filter returns
+  // kRemoveAndSkipUntil, a scan that uses a head mark can miss a key that Get()
+  // returns, and a range tombstone that the scan converts can then hide it from
+  // Get() too. A scan that cannot use a mark works as it does without one.
+  //
   // Read-write iterators using ReadOptions::table_filter are rejected while
   // this option is enabled, see more details in ReadOptions::table_filter
   // comments.

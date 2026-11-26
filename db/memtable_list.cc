@@ -338,6 +338,7 @@ void MemTableListVersion::AddIterators(
       }
       merge_iter_builder->AddPointAndTombstoneIterator(
           mem_iter_guard.release(), std::move(mem_tombstone_iter));
+      merge_iter_builder->SetHeadMarkMemTable(m);
     }
   }
 }
