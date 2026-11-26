@@ -27,6 +27,7 @@
 #include "cache/cache_reservation_manager.h"
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_meta.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/dbformat.h"
 #include "db/internal_stats.h"
 #include "db/table_cache.h"
@@ -788,6 +789,12 @@ class VersionBuilder::Rep : public MutableScalars {
       RecordSetMembership(missing_blob_relocation_files_,
                           undo_->missing_blob_relocation_files, file_number);
     }
+    for (uint64_t file_number : edit.GetBlobPhysicalFileLosses()) {
+      RecordMapEntry(blob_relocation_file_changes_,
+                     undo_->blob_relocation_files, file_number);
+      RecordSetMembership(missing_blob_relocation_files_,
+                          undo_->missing_blob_relocation_files, file_number);
+    }
     const auto touch_route = [&](uint64_t old_file_number,
                                  const BlobRelocationRoute* replacement) {
       RecordMapEntry(blob_relocation_route_changes_,
@@ -1131,8 +1138,9 @@ class VersionBuilder::Rep : public MutableScalars {
 
       const uint64_t blob_file_number = blob_file_meta->GetBlobFileNumber();
 
-      if (blob_file_meta->GetGarbageBlobCount() >=
-          blob_file_meta->GetTotalBlobCount()) {
+      if (!blob_file_meta->IsIndirectOrigin() &&
+          blob_file_meta->GetGarbageBlobCount() >=
+              blob_file_meta->GetTotalBlobCount()) {
         std::ostringstream oss;
         oss << "Blob file #" << blob_file_number
             << " consists entirely of garbage";
@@ -1428,12 +1436,15 @@ class VersionBuilder::Rep : public MutableScalars {
                                 ioptions->cf_paths.front().path);
       }
       // This runs under the DB mutex when the last Version or LogAndApply
-      // version builder that owns the file is destroyed. It runs without the
-      // DB mutex when ManifestTailer frees relocation state (see "Freeing
-      // relocation state" at VersionSet::FreeBlobRelocationState()). Because
-      // it can run under the DB mutex, it must not take the stripe mutex of
-      // the file, which a relocation file open can hold while it reads its
-      // location blocks. So it only drops a remembered failed open, and
+      // version builder that owns the file is destroyed. It runs without the DB
+      // mutex when ManifestTailer or Version::UnrefAndFreeBlobRelocationState()
+      // frees relocation state (see "Freeing relocation state" at
+      // VersionSet::FreeBlobRelocationState()). It also runs without the DB
+      // mutex when VersionSet::ReleaseDeferredPublicationCleanup() frees census
+      // state that holds the last reference to the file metadata. Because it
+      // can run under the DB mutex, it must not take the stripe mutex of the
+      // file, which a relocation file open can hold while it reads its location
+      // blocks. So it only drops a remembered failed open, and
       // PurgeObsoleteFiles() evicts the cached reader later (see
       // BlobFileCache::Evict()). While file deletions are disabled, no purge
       // runs, so the reader of an obsolete relocation file stays cached until
@@ -1480,9 +1491,10 @@ class VersionBuilder::Rep : public MutableScalars {
 
   // Checks and applies the format fence and the relocation records of one
   // edit. Steps:
-  //   1. Reject accepted-loss records, and check the per-CF fence (records
-  //      need it; the compaction style must allow it).
-  //   2. Stage relocation file additions and deletions in local maps.
+  //   1. Check the per-CF fence (records need it; the compaction style must
+  //      allow it).
+  //   2. Stage relocation file additions, deletions and accepted losses in
+  //      local maps. A lost file stays in the Version, marked lost.
   //   3. Stage route sets and deletions, and the change in the route count of
   //      each target.
   //   4. Check the final state: no route to a deleted or missing file, no route
@@ -1491,21 +1503,16 @@ class VersionBuilder::Rep : public MutableScalars {
   //   5. Only then commit the staged changes to the builder's change maps, so a
   //      bad edit changes nothing.
   Status ApplyBlobRelocationState(const VersionEdit& edit) {
-    // Step 1: loss records and the per-CF fence.
-    if (!edit.GetBlobPhysicalFileLosses().empty()) {
-      // VersionEdit decodes blob physical file loss records, but the builder
-      // does not apply them. Fail with NotSupported rather than skip one
-      // silently.
-      return Status::NotSupported(
-          "Accepted blob file loss records are not supported");
-    }
     const bool has_records = !edit.GetBlobRelocationFileAdditions().empty() ||
                              !edit.GetBlobRelocationFileDeletions().empty() ||
+                             !edit.GetBlobPhysicalFileLosses().empty() ||
                              !edit.GetBlobRelocationRoutes().empty() ||
-                             !edit.GetBlobRelocationRouteDeletions().empty();
+                             !edit.GetBlobRelocationRouteDeletions().empty() ||
+                             !edit.GetBlobFileRetirements().empty();
     if (!has_records && !edit.HasBlobIndirectionFormatVersion()) {
       return Status::OK();
     }
+    // Step 1: check the per-CF fence.
     uint32_t final_format_version = blob_indirection_format_version_;
     if (edit.HasBlobIndirectionFormatVersion()) {
       const uint32_t requested = edit.GetBlobIndirectionFormatVersion();
@@ -1532,7 +1539,7 @@ class VersionBuilder::Rep : public MutableScalars {
       return Status::OK();
     }
 
-    // Step 2: stage relocation file additions and deletions.
+    // Step 2: stage relocation file additions, deletions and accepted losses.
     using StagedFile =
         std::optional<std::shared_ptr<BlobRelocationFileMetaData>>;
     using StagedRoute = std::optional<BlobRelocationRoute>;
@@ -1540,6 +1547,14 @@ class VersionBuilder::Rep : public MutableScalars {
     std::map<uint64_t, StagedRoute> staged_routes;
     std::map<uint64_t, int64_t> staged_target_count_deltas;
     std::set<uint64_t> seen_file_additions;
+    std::set<uint64_t> newly_created_files;
+    const std::set<uint64_t> file_losses(
+        edit.GetBlobPhysicalFileLosses().begin(),
+        edit.GetBlobPhysicalFileLosses().end());
+    if (file_losses.size() != edit.GetBlobPhysicalFileLosses().size() ||
+        file_losses.count(kInvalidBlobFileNumber) != 0) {
+      return Status::Corruption("Invalid or duplicate blob relocation loss");
+    }
     std::set<uint64_t> seen_route_additions;
     std::set<uint64_t> new_table_file_numbers;
     std::set<uint64_t> new_blob_file_numbers;
@@ -1621,7 +1636,8 @@ class VersionBuilder::Rep : public MutableScalars {
         }
         continue;
       }
-      if (track_found_and_missing_files_) {
+      bool marked_lost = file_losses.count(addition.GetFileNumber()) != 0;
+      if (track_found_and_missing_files_ && !marked_lost) {
         assert(version_edit_handler_ != nullptr);
         status =
             version_edit_handler_->VerifyBlobRelocationFile(cfd_, addition);
@@ -1632,11 +1648,31 @@ class VersionBuilder::Rep : public MutableScalars {
           return status;
         }
       }
-      // Stage metadata without a deleter. If a later check fails, dropping it
-      // must not mark the file obsolete. The commit step below creates the
-      // Version-owned metadata with the real deleter.
-      staged_files.emplace(addition.GetFileNumber(),
-                           BlobRelocationFileMetaData::Create(addition));
+      std::shared_ptr<BlobRelocationFileMetaData> added =
+          BlobRelocationFileMetaData::Create(addition);
+      newly_created_files.insert(addition.GetFileNumber());
+      if (marked_lost) {
+        added = BlobRelocationFileMetaData::CreateMarkedLost(std::move(added));
+      }
+      staged_files.emplace(addition.GetFileNumber(), std::move(added));
+    }
+
+    for (uint64_t file_number : file_losses) {
+      const std::shared_ptr<BlobRelocationFileMetaData> current =
+          get_final_file(file_number);
+      if (current == nullptr ||
+          std::find(edit.GetBlobRelocationFileDeletions().begin(),
+                    edit.GetBlobRelocationFileDeletions().end(), file_number) !=
+              edit.GetBlobRelocationFileDeletions().end()) {
+        return Status::Corruption("Blob relocation loss names no live target");
+      }
+      if (!current->IsMarkedLost()) {
+        staged_files[file_number] =
+            BlobRelocationFileMetaData::CreateMarkedLost(current);
+      }
+      if (track_found_and_missing_files_) {
+        missing_blob_relocation_files_.erase(file_number);
+      }
     }
 
     for (uint64_t file_number : edit.GetBlobRelocationFileDeletions()) {
@@ -1816,8 +1852,17 @@ class VersionBuilder::Rep : public MutableScalars {
         continue;
       }
       const std::shared_ptr<BlobRelocationFileMetaData>& staged = *file.second;
-      blob_relocation_file_changes_[file.first] =
-          CreateVersionOwnedBlobRelocationFile(staged->GetAddition());
+      if (newly_created_files.count(file.first) == 0) {
+        blob_relocation_file_changes_[file.first] = staged;
+      } else {
+        std::shared_ptr<BlobRelocationFileMetaData> owned =
+            CreateVersionOwnedBlobRelocationFile(staged->GetAddition());
+        if (staged->IsMarkedLost()) {
+          owned =
+              BlobRelocationFileMetaData::CreateMarkedLost(std::move(owned));
+        }
+        blob_relocation_file_changes_[file.first] = std::move(owned);
+      }
     }
     for (auto& route : staged_routes) {
       blob_relocation_route_changes_[route.first] = std::move(route.second);
@@ -1839,6 +1884,23 @@ class VersionBuilder::Rep : public MutableScalars {
 
     assert(base_vstorage_);
     return base_vstorage_->GetFileLocation(file_number).GetLevel();
+  }
+
+  // The metadata of SST `file_number` at `level`, its current level: the
+  // copy that an earlier edit of this builder added, or else the copy in the
+  // base Version. Null if neither has it.
+  const FileMetaData* GetCurrentTableFile(int level,
+                                          uint64_t file_number) const {
+    if (level >= 0 && level < num_levels_) {
+      const auto& added_files = levels_[level].added_files;
+      const std::unordered_map<uint64_t, FileMetaData*>::const_iterator it =
+          added_files.find(file_number);
+      if (it != added_files.end()) {
+        return it->second;
+      }
+    }
+    assert(base_vstorage_);
+    return base_vstorage_->GetFileMetaDataByNumber(file_number);
   }
 
   uint64_t GetOldestBlobFileNumberForTableFile(int level,
@@ -2005,6 +2067,26 @@ class VersionBuilder::Rep : public MutableScalars {
 
     FileMetaData* const f = new FileMetaData(meta);
     f->refs = 1;
+    // A Version does not keep the in-memory blob reference summary of an SST
+    // alive. The census delta takes the summary from the edit (see
+    // VersionSet::ProcessManifestWrites()). Later readers read the reference
+    // metadata from the SST file.
+    f->blob_reference_summary.reset();
+    if (blob_indirection_format_version_ ==
+            kBlobIndirectionManifestFormatVersion &&
+        f->blob_reference_descriptor.empty()) {
+      // An empty descriptor means the SST has no exact reference metadata.
+      // ValidateBlobReferenceMetadata() allows this only for a coarse SST
+      // (frontier set: the SST records the oldest indirect-origin file number
+      // it may reference; see "Coarse SST" in
+      // db/blob/blob_reference_metadata.h), a level move of an SST already in
+      // the Version, or an SST with the legacy marker. Mark every such SST
+      // without a frontier as legacy, so an edit that copies its metadata (for
+      // example a trivial move) carries the marker.
+      f->blob_reference_legacy_metadata =
+          f->oldest_coarse_indirect_origin_file_number ==
+          kInvalidBlobFileNumber;
+    }
 
     if (file_metadata_cache_res_mgr_) {
       Status s = file_metadata_cache_res_mgr_->UpdateCacheReservation(
@@ -2088,6 +2170,83 @@ class VersionBuilder::Rep : public MutableScalars {
     return Status::OK();
   }
 
+  Status ValidateBlobReferenceMetadata(const VersionEdit& edit) const {
+    uint32_t final_format_version = blob_indirection_format_version_;
+    if (edit.HasBlobIndirectionFormatVersion()) {
+      final_format_version = edit.GetBlobIndirectionFormatVersion();
+    }
+
+    for (const auto& new_file : edit.GetNewFiles()) {
+      const FileMetaData& meta = new_file.second;
+      if (meta.oldest_coarse_indirect_origin_file_number !=
+          kInvalidBlobFileNumber) {
+        if (final_format_version != kBlobIndirectionManifestFormatVersion ||
+            meta.oldest_coarse_indirect_origin_file_number > kFileNumberMask ||
+            meta.blob_reference_legacy_metadata ||
+            !meta.blob_reference_descriptor.empty()) {
+          return Status::Corruption("Invalid coarse blob reference metadata");
+        }
+        continue;
+      }
+      if (!meta.blob_reference_descriptor.empty()) {
+        if (meta.blob_reference_legacy_metadata) {
+          return Status::Corruption("Conflicting blob reference metadata");
+        }
+        if (final_format_version != kBlobIndirectionManifestFormatVersion) {
+          return Status::Corruption(
+              "Exact blob reference metadata requires the format fence");
+        }
+        BlobReferenceMetadataDescriptor descriptor;
+        Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+            meta.blob_reference_descriptor, &descriptor);
+        if (!status.ok()) {
+          return status;
+        }
+        continue;
+      }
+      if (meta.blob_reference_legacy_metadata) {
+        if (final_format_version != kBlobIndirectionManifestFormatVersion) {
+          return Status::Corruption(
+              "Legacy blob reference metadata requires the format fence");
+        }
+        continue;
+      }
+      if (final_format_version != kBlobIndirectionManifestFormatVersion) {
+        continue;
+      }
+
+      // The SST has no descriptor, no legacy marker and no coarse frontier. In
+      // a fenced CF this is allowed only for a level move: the SST is already
+      // in this Version and the same edit deletes it from its current level.
+      // Such an SST can be older than the fence. Every SST built after the
+      // fence has a descriptor, also when it keeps no blob reference. The
+      // current copy must have no descriptor and no coarse frontier either.
+      // Otherwise SaveTo() would mark the moved copy legacy: an exact SST
+      // would lose its exact metadata, and a coarse SST would stop pinning
+      // the indirect origins it may still reference.
+      const uint64_t file_number = meta.fd.GetNumber();
+      const int current_level = GetCurrentLevelForTableFile(file_number);
+      if (current_level ==
+              VersionStorageInfo::FileLocation::Invalid().GetLevel() ||
+          edit.GetDeletedFiles().find({current_level, file_number}) ==
+              edit.GetDeletedFiles().end()) {
+        return Status::Corruption(
+            "An SST added after the format fence has no exact blob reference "
+            "metadata");
+      }
+      const FileMetaData* const current =
+          GetCurrentTableFile(current_level, file_number);
+      if (current == nullptr || !current->blob_reference_descriptor.empty() ||
+          current->oldest_coarse_indirect_origin_file_number !=
+              kInvalidBlobFileNumber) {
+        return Status::Corruption(
+            "A level move drops the exact or coarse blob reference metadata of "
+            "an SST");
+      }
+    }
+    return Status::OK();
+  }
+
   // Apply all of the edits in *edit to the current state.
   Status Apply(const VersionEdit* edit) {
     if (edit == nullptr) {
@@ -2101,6 +2260,12 @@ class VersionBuilder::Rep : public MutableScalars {
         return s;
       }
       base_checked_ = true;
+    }
+    {
+      const Status s = ValidateBlobReferenceMetadata(*edit);
+      if (!s.ok()) {
+        return s;
+      }
     }
 
     // In tracking mode, snapshot how to undo this edit before mutating, so
@@ -2142,8 +2307,10 @@ class VersionBuilder::Rep : public MutableScalars {
       if (edit->HasBlobIndirectionFormatVersion() ||
           !edit->GetBlobRelocationFileAdditions().empty() ||
           !edit->GetBlobRelocationFileDeletions().empty() ||
+          !edit->GetBlobPhysicalFileLosses().empty() ||
           !edit->GetBlobRelocationRoutes().empty() ||
-          !edit->GetBlobRelocationRouteDeletions().empty()) {
+          !edit->GetBlobRelocationRouteDeletions().empty() ||
+          !edit->GetBlobFileRetirements().empty()) {
         version_updated = true;
       }
     }
@@ -2368,23 +2535,42 @@ class VersionBuilder::Rep : public MutableScalars {
   template <typename Meta>
   void AddBlobFileIfNeeded(VersionStorageInfo* vstorage, Meta&& meta,
                            uint64_t blob_file_number,
+                           uint64_t oldest_linked_blob_file,
                            std::vector<uint64_t>* dropped_blob_files) const {
     assert(vstorage);
     assert(meta);
     assert(dropped_blob_files);
 
-    if (retired_blob_files_.count(blob_file_number) != 0) {
+    const auto& linked_ssts = meta->GetLinkedSsts();
+    // Legacy rules: a normal blob file below the oldest linked blob file
+    // (`oldest_linked_blob_file`) has no reader left, and a normal blob file
+    // that no SST links and whose values all count as garbage is dropped too.
+    // Neither rule applies to an indirect origin. After it is relocated, an
+    // SST can still use its file number as a generation number without linking
+    // it through oldest_blob_file_number. An indirect origin leaves the Version
+    // only through a blob file retirement record, so its life never depends on
+    // its garbage count. This is a change from base RocksDB behavior.
+    // SaveRuleKeepsBlobFile() holds these rules, so that best-efforts recovery
+    // (MissesNeededBlobFile()) uses the same decision.
+    if (!SaveRuleKeepsBlobFile(
+            blob_file_number, meta->IsIndirectOrigin(), linked_ssts.empty(),
+            meta->GetGarbageBlobCount() >= meta->GetTotalBlobCount(),
+            oldest_linked_blob_file)) {
       return;
     }
-    const auto& linked_ssts = meta->GetLinkedSsts();
     if (track_found_and_missing_files_) {
       if (missing_blob_files_.find(blob_file_number) !=
           missing_blob_files_.end()) {
-        // A blob file without linked SST files or live blobs was deleted as
-        // obsolete, so no SST file references it.
-        if (record_missing_blob_files_as_dropped_ &&
-            (!linked_ssts.empty() ||
-             meta->GetGarbageBlobCount() < meta->GetTotalBlobCount())) {
+        // A normal blob file without linked SST files or live blobs was deleted
+        // as obsolete, so no SST file references it. When missing blob files
+        // are recorded as dropped, a missing indirect origin is always
+        // recorded, even when all its values count as garbage. This rule is
+        // defensive. Until a blob file retirement record removes an indirect
+        // origin, only unflattened references read values from it. So when all
+        // its values count as garbage, no SST reads from it, unless the garbage
+        // count is wrong. When the garbage count is right, no read sees it as
+        // dropped.
+        if (record_missing_blob_files_as_dropped_) {
           dropped_blob_files->push_back(blob_file_number);
         }
         return;
@@ -2398,11 +2584,6 @@ class VersionBuilder::Rep : public MutableScalars {
         }
         return;
       }
-    }
-
-    if (linked_ssts.empty() &&
-        meta->GetGarbageBlobCount() >= meta->GetTotalBlobCount()) {
-      return;
     }
 
     vstorage->AddBlobFile(std::forward<Meta>(meta));
@@ -2421,31 +2602,47 @@ class VersionBuilder::Rep : public MutableScalars {
     vstorage->ReserveBlob(base_vstorage_->GetBlobFiles().size() +
                           mutable_blob_file_metas_.size());
 
-    if (min_oldest_blob_file_num == kInvalidBlobFileNumber) {
+    // The oldest linked blob file is the smallest oldest_blob_file_number of
+    // the saved SSTs. It comes from the SSTs, not from the blob files that list
+    // linked SSTs. In a fenced CF an SST can have, as its oldest blob file, an
+    // indirect origin that blob file retirement removed. That SST links no blob
+    // file in this Version, but it can still reference newer normal blob files.
+    const uint64_t oldest_linked_blob_file = min_oldest_blob_file_num;
+
+    // In a legacy CF (format version 0), an invalid oldest linked blob file
+    // means that no SST references a blob file, so no blob file is saved. A
+    // fenced CF cannot take this shortcut: its indirect origins leave only
+    // through blob file retirement records, whatever the oldest linked blob
+    // file is.
+    if (blob_indirection_format_version_ == 0 &&
+        oldest_linked_blob_file == kInvalidBlobFileNumber) {
       return;
     }
 
     auto process_base =
-        [this, vstorage, dropped_blob_files](
+        [this, vstorage, oldest_linked_blob_file, dropped_blob_files](
             const std::shared_ptr<BlobFileMetaData>& base_meta) {
           assert(base_meta);
 
           AddBlobFileIfNeeded(vstorage, base_meta,
                               base_meta->GetBlobFileNumber(),
-                              dropped_blob_files);
+                              oldest_linked_blob_file, dropped_blob_files);
 
           return true;
         };
 
-    auto process_mutable = [this, vstorage, dropped_blob_files](
-                               const MutableBlobFileMetaData& mutable_meta) {
-      AddBlobFileIfNeeded(vstorage, CreateBlobFileMetaData(mutable_meta),
-                          mutable_meta.GetBlobFileNumber(), dropped_blob_files);
+    auto process_mutable =
+        [this, vstorage, oldest_linked_blob_file,
+         dropped_blob_files](const MutableBlobFileMetaData& mutable_meta) {
+          AddBlobFileIfNeeded(vstorage, CreateBlobFileMetaData(mutable_meta),
+                              mutable_meta.GetBlobFileNumber(),
+                              oldest_linked_blob_file, dropped_blob_files);
 
-      return true;
-    };
+          return true;
+        };
 
-    auto process_both = [this, vstorage, dropped_blob_files](
+    auto process_both = [this, vstorage, oldest_linked_blob_file,
+                         dropped_blob_files](
                             const std::shared_ptr<BlobFileMetaData>& base_meta,
                             const MutableBlobFileMetaData& mutable_meta) {
       assert(base_meta);
@@ -2459,19 +2656,22 @@ class VersionBuilder::Rep : public MutableScalars {
         assert(base_meta->GetLinkedSsts() == mutable_meta.GetLinkedSsts());
 
         AddBlobFileIfNeeded(vstorage, base_meta, base_meta->GetBlobFileNumber(),
-                            dropped_blob_files);
+                            oldest_linked_blob_file, dropped_blob_files);
 
         return true;
       }
 
       AddBlobFileIfNeeded(vstorage, CreateBlobFileMetaData(mutable_meta),
-                          mutable_meta.GetBlobFileNumber(), dropped_blob_files);
+                          mutable_meta.GetBlobFileNumber(),
+                          oldest_linked_blob_file, dropped_blob_files);
 
       return true;
     };
 
-    MergeBlobFileMetas(min_oldest_blob_file_num, process_base, process_mutable,
-                       process_both);
+    MergeBlobFileMetas(blob_indirection_format_version_ == 0
+                           ? oldest_linked_blob_file
+                           : kInvalidBlobFileNumber,
+                       process_base, process_mutable, process_both);
   }
 
   // Save into *vstorage the dropped blob files of the base Version and of the
@@ -2576,17 +2776,23 @@ class VersionBuilder::Rep : public MutableScalars {
   }
 
   // The keep decision of the save rule (SaveBlobFilesTo() and
-  // AddBlobFileIfNeeded()) for a blob file that exists on disk. A blob file is
-  // saved unless a blob file retirement record removed it, it is below
-  // `oldest_linked_blob_file` (the smallest oldest_blob_file_number of the
-  // saved SSTs; kInvalidBlobFileNumber means that no SST has one, so no blob
-  // file is saved), or no SST links it and all its values count as garbage.
-  bool SaveRuleKeepsBlobFile(uint64_t blob_file_number,
-                             bool /*is_indirect_origin*/, bool no_linked_ssts,
-                             bool all_garbage,
+  // AddBlobFileIfNeeded()) for a blob file that exists on disk. A blob file
+  // that a blob file retirement record removed is not saved. An indirect origin
+  // is saved otherwise: it leaves the Version only through its retirement. A
+  // normal blob file is not saved when it is below `oldest_linked_blob_file`
+  // (the smallest oldest_blob_file_number of the saved SSTs;
+  // kInvalidBlobFileNumber means that no SST has one), or when no SST links it
+  // and all its values count as garbage.
+  bool SaveRuleKeepsBlobFile(uint64_t blob_file_number, bool is_indirect_origin,
+                             bool no_linked_ssts, bool all_garbage,
                              uint64_t oldest_linked_blob_file) const {
-    if (retired_blob_files_.count(blob_file_number) != 0 ||
-        oldest_linked_blob_file == kInvalidBlobFileNumber ||
+    if (retired_blob_files_.count(blob_file_number) != 0) {
+      return false;
+    }
+    if (is_indirect_origin) {
+      return true;
+    }
+    if (oldest_linked_blob_file == kInvalidBlobFileNumber ||
         blob_file_number < oldest_linked_blob_file) {
       return false;
     }
@@ -2660,11 +2866,11 @@ class VersionBuilder::Rep : public MutableScalars {
   // Whether a missing blob file is one that the save rule would keep in this
   // point's Version (SaveRuleKeepsBlobFile()). Such a point is incomplete. A
   // file that a dropped-file record of a best_efforts_blob_db_repair open
-  // names is accepted as missing. The cheap check comes first: a missing
-  // blob file that is not an indirect origin, that no SST links and whose
-  // values all count as garbage is never needed. For every other missing
-  // file, the check needs the oldest linked blob file, which
-  // MinOldestBlobFileOfSavedSsts() keeps incrementally.
+  // names is accepted as missing. The cheap checks come first: a missing
+  // indirect origin that is not retired is always needed, and a missing
+  // normal blob file that no SST links and that is all garbage is never
+  // needed. Only a remaining normal blob file needs the oldest linked blob
+  // file, and MinOldestBlobFileOfSavedSsts() keeps it incrementally.
   bool MissesNeededBlobFile() const {
     uint64_t oldest_linked_blob_file = kInvalidBlobFileNumber;
     bool have_oldest_linked = false;
@@ -2753,6 +2959,11 @@ class VersionBuilder::Rep : public MutableScalars {
     return !l0_missing_files_.empty() || !non_l0_missing_files_.empty() ||
            missing_blob_files_high_ != kInvalidBlobFileNumber ||
            !missing_blob_relocation_files_.empty();
+  }
+
+  bool HasMissingBlobRelocationFiles() const {
+    assert(track_found_and_missing_files_);
+    return !missing_blob_relocation_files_.empty();
   }
 
   std::vector<std::string> GetAndClearIntermediateFiles() {
@@ -3018,6 +3229,29 @@ class VersionBuilder::Rep : public MutableScalars {
                     &dropped_blob_files);
     SaveDroppedBlobFilesTo(vstorage, saved_min_oldest_blob_file_num_,
                            std::move(dropped_blob_files));
+    if (blob_indirection_format_version_ != 0) {
+      // SaveBlobFilesTo() can drop a normal blob file just because the oldest
+      // linked blob file moved, even when no edit names the file. So compare
+      // the base and the new blob file lists here, outside the DB mutex, and
+      // record every base file that is gone. The census delta removes the same
+      // files from its candidate heap, so the heap and the Version agree on the
+      // live blob files.
+      const VersionStorageInfo::BlobFiles& next_files =
+          vstorage->GetBlobFiles();
+      size_t next = 0;
+      for (const std::shared_ptr<BlobFileMetaData>& file :
+           base_vstorage_->GetBlobFiles()) {
+        const uint64_t file_number = file->GetBlobFileNumber();
+        while (next < next_files.size() &&
+               next_files[next]->GetBlobFileNumber() < file_number) {
+          ++next;
+        }
+        if (next == next_files.size() ||
+            next_files[next]->GetBlobFileNumber() != file_number) {
+          vstorage->RecordRemovedBlobFile(file_number);
+        }
+      }
+    }
     vstorage->SetBlobIndirectionFormatVersion(blob_indirection_format_version_);
 
     Status base_state_status = base_vstorage_->ValidateBlobRelocationState();
@@ -3119,6 +3353,12 @@ class VersionBuilder::Rep : public MutableScalars {
 #endif
     if (!status.ok()) {
       return status;
+    }
+    if (!blob_relocation_file_changes_.empty() ||
+        !blob_relocation_route_changes_.empty() ||
+        blob_indirection_format_version_ !=
+            base_vstorage_->GetBlobIndirectionFormatVersion()) {
+      vstorage->ComputeBlobRelocationStateFingerprint();
     }
     return CheckConsistency(vstorage);
   }
@@ -3268,6 +3508,10 @@ void VersionBuilder::RecordMissingBlobFilesAsDropped() {
 
 std::shared_ptr<void> VersionBuilder::ReleaseBlobRelocationChanges() {
   return rep_->ReleaseBlobRelocationChanges();
+}
+
+bool VersionBuilder::HasMissingBlobRelocationFiles() const {
+  return rep_->HasMissingBlobRelocationFiles();
 }
 
 std::vector<std::string> VersionBuilder::GetAndClearIntermediateFiles() {

@@ -34,6 +34,7 @@
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/builder.h"
 #include "db/coalescing_iterator.h"
 #include "db/compaction/compaction_job.h"
@@ -458,7 +459,18 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   unscheduled_flushes_ = 0;
 
   TEST_SYNC_POINT("DBImpl::ResumeImpl:BeforeWaitForBackgroundWork");
+  // Wait for at most the running blob reference census slice (see
+  // blob_reference_census_recovery_waits_). The census serves only indirect
+  // blob GC, so the background error must not stay set until a whole census
+  // build ends.
+  ++blob_reference_census_recovery_waits_;
   WaitForBackgroundWork();
+  assert(blob_reference_census_recovery_waits_ > 0);
+  --blob_reference_census_recovery_waits_;
+  if (blob_reference_census_recovery_waits_ == 0) {
+    // Start the census job again for the column families in its queue.
+    ScheduleBlobReferenceCensus();
+  }
 
   TEST_SYNC_POINT("DBImpl::ResumeImpl:Start");
 
@@ -833,7 +845,9 @@ void DBImpl::WaitForBackgroundWork() {
   while (remote_compaction_pool_jobs_ || CompactionsScheduled() ||
          bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
          bg_pressure_callback_in_progress_ ||
-         bg_async_file_open_state_ == AsyncFileOpenState::kScheduled) {
+         bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
+         bg_blob_reference_census_state_ ==
+             BlobReferenceCensusJobState::kScheduled) {
     bg_cv_.Wait();
   }
 }
@@ -849,6 +863,49 @@ void DBImpl::WaitForAsyncFileOpen() {
     bg_cv_.Wait();
   }
 }
+
+#ifndef NDEBUG
+void DBImpl::TEST_WaitForBlobReferenceCensus() {
+  // Move CFs on the retry list that can run now back to the LOW queue.
+  // Otherwise waiting only for the scheduled task can return before a CF's
+  // catch-up slice runs.
+  RetryBlobReferenceCensus();
+  InstrumentedMutexLock lock(&mutex_);
+  // A test can request a candidate refresh without a Version installation (for
+  // example, by ending a metadata-only commit). Drive that queued work before
+  // waiting; production uses its retry timer.
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    ScheduleBlobReferenceCensus(cfd);
+  }
+  for (;;) {
+    // Also wait for the applies that flush and compaction jobs owe: a manual
+    // compaction can return before its job ran
+    // ApplyBlobReferenceCensusAfterInstall().
+    while ((bg_blob_reference_census_state_ ==
+                BlobReferenceCensusJobState::kScheduled ||
+            blob_reference_census_pending_applies_ > 0) &&
+           !shutting_down_.load(std::memory_order_acquire)) {
+      bg_cv_.Wait();
+    }
+    bool deferred_catch_up = false;
+    for (ColumnFamilyData* cfd = blob_reference_census_retry_head_;
+         cfd != nullptr; cfd = cfd->next_blob_reference_census_) {
+      // A CF whose build failed may stay unavailable on purpose. Wait only for
+      // CFs without failures that still have work to do.
+      deferred_catch_up |= !cfd->IsDropped() &&
+                           cfd->blob_reference_census_failures_ == 0 &&
+                           cfd->blob_reference_census()->NeedsWorkerRun(
+                               cfd->current()->GetVersionNumber());
+    }
+    if (!deferred_catch_up || shutting_down_.load(std::memory_order_acquire)) {
+      break;
+    }
+    mutex_.Unlock();
+    RetryBlobReferenceCensus();
+    mutex_.Lock();
+  }
+}
+#endif  // NDEBUG
 
 void DBImpl::NotifyOnDBShutdownBegin() {
   mutex_.AssertHeld();
@@ -917,10 +974,23 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   shutting_down_.store(true, std::memory_order_release);
   bg_cv_.SignalAll();
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
+  env_->UnSchedule(&bg_blob_reference_census_state_, Env::Priority::LOW);
   if (!wait) {
     return;
   }
   WaitForBackgroundWork();
+  // A census worker registers its retry task on first use, which can be after
+  // the periodic tasks were canceled, so unregister it again here.
+  // WaitForBackgroundWork() above also waited for the worker's cleanup without
+  // the mutex (CFD pins and change log).
+  mutex_.Unlock();
+  periodic_task_scheduler_.Unregister(PeriodicTaskType::kBlobReferenceCensus)
+      .PermitUncheckedError();
+  mutex_.Lock();
+  if (blob_reference_census_queue_head_ != nullptr ||
+      blob_reference_census_retry_head_ != nullptr) {
+    UnscheduleBlobReferenceCensus(this);
+  }
 }
 
 Status DBImpl::MaybeReleaseTimestampedSnapshotsAndCheck() {
@@ -1202,6 +1272,8 @@ Status DBImpl::CloseHelper() {
          bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
          bg_purge_scheduled_ || bg_pressure_callback_in_progress_ ||
          bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
+         bg_blob_reference_census_state_ ==
+             BlobReferenceCensusJobState::kScheduled ||
          async_wal_precreate_state_ == AsyncWALPrecreateState::kScheduled ||
          pending_purge_obsolete_files_ ||
          error_handler_.IsRecoveryInProgress()) {
@@ -1209,7 +1281,33 @@ Status DBImpl::CloseHelper() {
     bg_cv_.Wait();
   }
 
+  // A census worker registers its retry task on first use, which can be after
+  // the first CancelPeriodicTaskScheduler() call, so unregister it again. No
+  // worker remains after the wait above. The census state can be as large as
+  // the live SST set, so it is freed below without the DB mutex.
   mutex_.Unlock();
+  periodic_task_scheduler_.Unregister(PeriodicTaskType::kBlobReferenceCensus)
+      .PermitUncheckedError();
+  mutex_.Lock();
+  if (blob_reference_census_queue_head_ != nullptr ||
+      blob_reference_census_retry_head_ != nullptr) {
+    UnscheduleBlobReferenceCensus(this);
+  }
+  // Free the census state that LogAndApply replaced (see
+  // VersionSet::ReleaseDeferredPublicationCleanup()). It can hold build
+  // contexts, which need the DB and its column families.
+  versions_->ReleaseDeferredPublicationCleanup(&mutex_);
+  std::vector<BlobReferenceCensusGarbage> census_garbage;
+  const size_t column_family_count =
+      versions_->GetColumnFamilySet()->NumberOfColumnFamilies();
+  mutex_.Unlock();
+  census_garbage.reserve(column_family_count);
+  mutex_.Lock();
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    census_garbage.emplace_back(cfd->CancelBlobReferenceCensus());
+  }
+  mutex_.Unlock();
+  std::vector<BlobReferenceCensusGarbage>().swap(census_garbage);
   ReleaseRemoteCompactionPool();
   mutex_.Lock();
 
@@ -1356,6 +1454,14 @@ Status DBImpl::CloseHelper() {
       }
     }
   }
+
+  // The close-time MANIFEST writes above (WAL markers, VersionSet::Close()) can
+  // add census state to the deferred census cleanup. Free it without the DB
+  // mutex while the DB and its column families still exist (see
+  // VersionSet::ReleaseDeferredPublicationCleanup()). This runs before the
+  // purge drain below, so a purge that starts while the mutex is released here
+  // is still waited for.
+  versions_->ReleaseDeferredPublicationCleanup(&mutex_);
 
   // Drain obsolete-file purge work started AFTER the early CloseHelper wait
   // near the top of this method. A late SuperVersion cleanup -- a dropped
@@ -1868,6 +1974,7 @@ void DBImpl::DumpStats() {
 
   // Also probe block cache(s) for problems, dump to info log
   UnorderedSet<Cache*> probed_caches;
+  std::vector<std::string> blob_gc_warnings;
   TEST_SYNC_POINT("DBImpl::DumpStats:StartRunning");
   {
     InstrumentedMutexLock l(&mutex_);
@@ -1912,8 +2019,32 @@ void DBImpl::DumpStats() {
       if (cfd->initialized()) {
         cfd->internal_stats()->GetStringProperty(*property_info, *property,
                                                  &stats);
+        if (cfd->blob_reference_census() != nullptr) {
+          // kCensusUnreadyWarnMicros (10 minutes, a fixed choice): a census
+          // that stays unready this long blocks the work that needs it. This
+          // check runs here, not in the census job, so it also fires when that
+          // job is stuck, paused or never scheduled.
+          constexpr uint64_t kCensusUnreadyWarnMicros =
+              10ULL * 60 * 1000 * 1000;
+          const uint64_t unready_micros =
+              cfd->internal_stats()->BlobReferenceCensusUnreadyMicros();
+          if (unready_micros > kCensusUnreadyWarnMicros) {
+            blob_gc_warnings.push_back(
+                "[" + cfd->GetName() +
+                "] Blob reference census has been unready for " +
+                std::to_string(unready_micros / 1000000) + " s (state: " +
+                (cfd->blob_reference_census_failures() > 0 ? "failed"
+                                                           : "building") +
+                ", failed builds in a row (max 6): " +
+                std::to_string(cfd->blob_reference_census_failures()) +
+                "); the work that needs the census waits");
+          }
+        }
       }
     }
+  }
+  for (const std::string& warning : blob_gc_warnings) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log, "%s", warning.c_str());
   }
   TEST_SYNC_POINT("DBImpl::DumpStats:2");
   ROCKS_LOG_INFO(immutable_db_options_.info_log,
@@ -2223,6 +2354,11 @@ Status DBImpl::SetOptions(
         }
         cfd->MarkOptionsInstalled();
       }
+      // Every SuperVersion is installed, so readers can no longer see a mix of
+      // new options and Versions with old SuperVersions. Now free the census
+      // payloads that LogAndApply deferred. This unlocks the DB mutex while it
+      // frees them and then locks it again.
+      versions_->ReleaseDeferredPublicationCleanup(&mutex_);
 
       persist_options_status =
           WriteOptionsFile(write_options, true /*db_mutex_already_held*/);
@@ -5727,6 +5863,9 @@ Status DBImpl::DropColumnFamilyWithOptionsFile(
       }
       is_snapshot_supported_ = new_is_snapshot_supported;
     }
+    // Free the census state of the dropped column family without the DB mutex
+    // (see VersionSet::ReleaseDeferredPublicationCleanup()).
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
     bg_cv_.SignalAll();
   }
 
@@ -6827,6 +6966,11 @@ void DBImpl::CleanupSuperVersion(SuperVersion* sv) {
   RecordTick(stats_, NUMBER_SUPERVERSION_RELEASES);
 }
 
+void DBImpl::ReleaseColumnFamilyDataRef(ColumnFamilyData* cfd) {
+  InstrumentedMutexLock lock(&mutex_);
+  cfd->UnrefAndTryDelete();
+}
+
 void DBImpl::ReturnAndCleanupSuperVersion(ColumnFamilyData* cfd,
                                           SuperVersion* sv) {
   if (!cfd->ReturnThreadLocalSuperVersion(sv)) {
@@ -7278,6 +7422,11 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
       deleted_file->being_compacted = false;
     }
     input_version->Unref();
+    // The new SuperVersion is installed, so the census state that the
+    // LogAndApply batch replaced can be freed now (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()). Without this, it would
+    // wait for the next flush or compaction, or for the census job.
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
     FindObsoleteFiles(&job_context, false);
   }  // lock released here
 

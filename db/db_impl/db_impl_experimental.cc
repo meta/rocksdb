@@ -147,6 +147,9 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
           cfd, job_context.superversion_contexts.data(),
           /*defer_snapshot_refresh=*/false);
     }
+    // Free the census state that the LogAndApply batch replaced (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()).
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
   }  // lock released here
   LogFlush(immutable_db_options_.info_log);
   job_context.Clean();
