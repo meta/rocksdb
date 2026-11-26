@@ -353,6 +353,7 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
      "rocksdb.blob.relocation.file.open.failures"},
     {BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS,
      "rocksdb.blob.relocation.failed.open.cache.hits"},
+    {BLOB_DB_INDIRECT_READ_ROUTED, "rocksdb.blobdb.indirect.read.routed"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

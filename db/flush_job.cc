@@ -1167,6 +1167,8 @@ Status FlushJob::WriteLevel0Table() {
       // Add file to L0
       TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", &meta_);
       edit_->AddFile(0 /* level */, meta_);
+      edit_->MaybeSetBlobIndirectionFormatFence(
+          mutable_cf_options_.enable_blob_indirection);
     }
 
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));
