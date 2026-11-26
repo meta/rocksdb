@@ -64,6 +64,8 @@ GetContext::GetContext(
     *seq_ = kMaxSequenceNumber;
   }
   sample_ = should_sample_file_read();
+  has_blob_value_loss_ =
+      blob_fetcher_ != nullptr && blob_fetcher_->HasBlobValueLoss();
 }
 
 GetContext::GetContext(const Comparator* ucmp,
@@ -443,6 +445,33 @@ bool GetContext::SaveValue(const ParsedInternalKey& parsed_key,
       // when we need to return timestamp to user. If a range tombstone has a
       // higher seqno than point tombstone, its timestamp should be returned.
       type = kTypeRangeDeletion;
+    }
+    // An entity without its lost blob columns. Consumers copy it, since it
+    // has no pinner. The loss check runs after the range tombstone check, like
+    // the dropped-file check below: a key that a newer range tombstone covers
+    // is decided by the tombstone, so it is not counted as a lost read and its
+    // value is not parsed.
+    std::string repaired_entity;
+    if (UNLIKELY(has_blob_value_loss_) &&
+        (type == kTypeBlobIndex || type == kTypeWideColumnEntity)) {
+      bool lost = false;
+      const Status status =
+          blob_fetcher_->IsBlobValueLost(type, value, &lost, &repaired_entity);
+      if (!status.ok()) {
+        state_ = kCorrupt;
+        *read_status = status;
+        return false;
+      }
+      if (lost) {
+        // Reuse ordinary deletion/merge handling without exposing an older
+        // version of this key. No stable cache or lazy column is consulted.
+        type = kTypeDeletion;
+        RecordTick(statistics_, BLOB_DB_LOST_BLOB_READ_COUNT);
+      } else if (!repaired_entity.empty()) {
+        unpacked_value = repaired_entity;
+        value_pinner = nullptr;
+        RecordTick(statistics_, BLOB_DB_LOST_BLOB_READ_COUNT);
+      }
     }
     const VersionStorageInfo* const storage_with_dropped_blob_files =
         (type == kTypeBlobIndex || type == kTypeWideColumnEntity) &&

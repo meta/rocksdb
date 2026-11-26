@@ -353,7 +353,11 @@ struct ColumnFamilyMetaData {
   uint64_t blob_file_size = 0;
   // The number of blob files in this column family.
   size_t blob_file_count = 0;
-  // The metadata of the blobs in this column family.
+  // The metadata of the blobs in this column family. With blob indirection
+  // (AdvancedColumnFamilyOptions::enable_blob_indirection), the list also
+  // holds the relocation files that indirect blob GC wrote, after the other
+  // blob files, and blob_file_size and blob_file_count count them too. A
+  // relocation file has no garbage accounting, so its garbage fields are 0.
   std::vector<BlobMetaData> blob_files;
 };
 

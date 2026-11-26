@@ -31,7 +31,9 @@ VersionBlobFetcherBase::VersionBlobFetcherBase(const Version* version,
                                                bool allow_write_path_fallback)
     : version_(version),
       blob_file_cache_(blob_file_cache),
-      allow_write_path_fallback_(allow_write_path_fallback) {
+      allow_write_path_fallback_(allow_write_path_fallback),
+      has_lost_blob_relocation_files_(
+          VersionHasLostBlobRelocationFiles(version)) {
   if (version_ != nullptr &&
       UNLIKELY(!version_->storage_info()->GetDroppedBlobFiles().empty())) {
     storage_with_dropped_blob_files_ = version_->storage_info();
@@ -54,6 +56,25 @@ Status VersionBlobFetcherBase::FetchBlob(const Slice& user_key,
   return BlobFilePartitionManager::ResolveBlobDirectWriteIndex(
       read_options, user_key, blob_index, version_, blob_file_cache_,
       prefetch_buffer, blob_value, bytes_read);
+}
+
+Status VersionBlobFetcherBase::IsBlobValueLost(
+    ValueType type, const Slice& value, bool* lost,
+    std::string* repaired_entity) const {
+  if (version_ != nullptr) {
+    return version_->IsBlobValueLost(type, value, lost, repaired_entity);
+  }
+  return BlobFetcher::IsBlobValueLost(type, value, lost, repaired_entity);
+}
+
+bool VersionBlobFetcherBase::VersionHasLostBlobRelocationFiles(
+    const Version* version) {
+  return version != nullptr &&
+         version->storage_info()->HasLostBlobRelocationFiles();
+}
+
+bool VersionBlobFetcherBase::HasBlobValueLoss() const {
+  return has_lost_blob_relocation_files_;
 }
 
 Status VersionBlobFetcherBase::FetchBlobRange(

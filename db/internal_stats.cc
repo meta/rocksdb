@@ -22,6 +22,7 @@
 
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_entry_stats.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/write_stall_stats.h"
@@ -340,6 +341,15 @@ static const std::string live_blob_file_garbage_size =
 static const std::string blob_cache_capacity = "blob-cache-capacity";
 static const std::string blob_cache_usage = "blob-cache-usage";
 static const std::string blob_cache_pinned_usage = "blob-cache-pinned-usage";
+static const std::string blob_relocation_lost_files =
+    "blob-relocation-lost-files";
+static const std::string indirect_blob_gc_idle_micros_with_candidates =
+    "indirect-blob-gc-idle-micros-with-candidates";
+static const std::string indirect_blob_gc_stats = "indirect-blob-gc-stats";
+static const std::string blob_reference_census_unready_micros =
+    "blob-reference-census-unready-micros";
+static const std::string blob_indirection_format_version_name =
+    "blob-indirection-format-version";
 
 const std::string DB::Properties::kNumFilesAtLevelPrefix =
     rocksdb_prefix + num_files_at_level_prefix;
@@ -470,6 +480,16 @@ const std::string DB::Properties::kBlobCacheUsage =
     rocksdb_prefix + blob_cache_usage;
 const std::string DB::Properties::kBlobCachePinnedUsage =
     rocksdb_prefix + blob_cache_pinned_usage;
+const std::string DB::Properties::kBlobRelocationLostFiles =
+    rocksdb_prefix + blob_relocation_lost_files;
+const std::string DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates =
+    rocksdb_prefix + indirect_blob_gc_idle_micros_with_candidates;
+const std::string DB::Properties::kIndirectBlobGcStats =
+    rocksdb_prefix + indirect_blob_gc_stats;
+const std::string DB::Properties::kBlobReferenceCensusUnreadyMicros =
+    rocksdb_prefix + blob_reference_census_unready_micros;
+const std::string DB::Properties::kBlobIndirectionFormatVersion =
+    rocksdb_prefix + blob_indirection_format_version_name;
 
 const std::string InternalStats::kPeriodicCFStats =
     DB::Properties::kCFStats + ".periodic";
@@ -680,6 +700,23 @@ const UnorderedMap<std::string, DBPropertyInfo>
         {DB::Properties::kBlobCachePinnedUsage,
          {false, nullptr, &InternalStats::HandleBlobCachePinnedUsage, nullptr,
           nullptr}},
+        {DB::Properties::kBlobRelocationLostFiles,
+         {false, nullptr, &InternalStats::HandleBlobRelocationLostFiles,
+          nullptr, nullptr}},
+        {DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates,
+         {false, nullptr,
+          &InternalStats::HandleIndirectBlobGcIdleMicrosWithCandidates, nullptr,
+          nullptr}},
+        {DB::Properties::kIndirectBlobGcStats,
+         {false, &InternalStats::HandleIndirectBlobGcStatsString, nullptr,
+          &InternalStats::HandleIndirectBlobGcStats, nullptr}},
+        {DB::Properties::kBlobReferenceCensusUnreadyMicros,
+         {false, nullptr,
+          &InternalStats::HandleBlobReferenceCensusUnreadyMicros, nullptr,
+          nullptr}},
+        {DB::Properties::kBlobIndirectionFormatVersion,
+         {false, nullptr, &InternalStats::HandleBlobIndirectionFormatVersion,
+          nullptr, nullptr}},
 };
 
 InternalStats::InternalStats(int num_levels, SystemClock* clock,
@@ -927,8 +964,15 @@ bool InternalStats::HandleBlobStats(std::string* value, Slice /*suffix*/) {
 
   std::ostringstream oss;
 
-  oss << "Number of blob files: " << vstorage->GetBlobFiles().size()
-      << "\nTotal size of blob files: " << blob_st.total_file_size
+  // The relocation file count is printed only when there are relocation
+  // files, so the text stays the same as in base RocksDB otherwise.
+  const size_t relocation_file_count =
+      vstorage->GetBlobRelocationFiles().size();
+  oss << "Number of blob files: " << vstorage->GetBlobFiles().size();
+  if (relocation_file_count != 0) {
+    oss << " (+" << relocation_file_count << " relocation files)";
+  }
+  oss << "\nTotal size of blob files: " << blob_st.total_file_size
       << "\nTotal size of garbage in blob files: " << blob_st.total_garbage_size
       << "\nBlob file space amplification: " << blob_st.space_amp << '\n';
 
@@ -1002,6 +1046,174 @@ bool InternalStats::HandleBlobCacheUsage(uint64_t* value, DBImpl* /*db*/,
     return true;
   }
   return false;
+}
+
+bool InternalStats::HandleBlobIndirectionFormatVersion(uint64_t* value,
+                                                       DBImpl* /*db*/,
+                                                       Version* /*version*/) {
+  assert(value);
+  assert(cfd_);
+  const Version* const current = cfd_->current();
+  assert(current);
+  *value = current->storage_info()->GetBlobIndirectionFormatVersion();
+  return true;
+}
+
+uint64_t InternalStats::BlobReferenceCensusUnreadyMicros() const {
+  assert(cfd_);
+  const BlobReferenceCensus* const census = cfd_->blob_reference_census();
+  const Version* const current = cfd_->current();
+  // A column family with enable_blob_indirection on but without its own
+  // format fence has a census object (its first install creates it), but the
+  // census job builds only fenced column families. Such a census is not
+  // waiting for anything, so it is not unready.
+  if (census == nullptr ||
+      !current->storage_info()->HasBlobIndirectionFormat() ||
+      census->IsReady(current->GetVersionNumber())) {
+    return 0;
+  }
+  const uint64_t since = census->UnreadySinceMicros();
+  const uint64_t now = clock_->NowMicros();
+  return since == 0 || now < since ? 0 : now - since;
+}
+
+bool InternalStats::HandleBlobReferenceCensusUnreadyMicros(
+    uint64_t* value, DBImpl* /*db*/, Version* /*version*/) {
+  assert(value);
+  *value = BlobReferenceCensusUnreadyMicros();
+  return true;
+}
+
+// DB::GetProperty() needs a string handler for every property (db_stress, for
+// example, reads every property with it). The string form has one "key=value"
+// line per map key, in key order.
+bool InternalStats::HandleIndirectBlobGcStatsString(std::string* value,
+                                                    Slice suffix) {
+  assert(value);
+  std::map<std::string, std::string> values;
+  if (!HandleIndirectBlobGcStats(&values, suffix)) {
+    return false;
+  }
+  value->clear();
+  for (const auto& [key, val] : values) {
+    value->append(key);
+    value->append("=");
+    value->append(val);
+    value->append("\n");
+  }
+  return true;
+}
+
+bool InternalStats::HandleIndirectBlobGcStats(
+    std::map<std::string, std::string>* values, Slice /*suffix*/) {
+  assert(values);
+  assert(cfd_);
+  const Version* const current = cfd_->current();
+  assert(current);
+  const VersionStorageInfo* const vstorage = current->storage_info();
+  const BlobReferenceCensus* const census = cfd_->blob_reference_census();
+  const char* state = "none";
+  // Without the per-CF format fence the census job does not build the census
+  // (see BlobReferenceCensusUnreadyMicros()), so the state is "none".
+  if (census != nullptr && vstorage->HasBlobIndirectionFormat()) {
+    if (census->IsReady(current->GetVersionNumber())) {
+      state = "ready";
+    } else if (cfd_->blob_reference_census_failures() > 0) {
+      state = "failed";
+    } else {
+      state = "building";
+    }
+  }
+  (*values)["census-state"] = state;
+  (*values)["census-unready-micros"] =
+      std::to_string(BlobReferenceCensusUnreadyMicros());
+  (*values)["census-consecutive-failures"] =
+      std::to_string(cfd_->blob_reference_census_failures());
+  (*values)["census-builds"] =
+      std::to_string(census != nullptr ? census->build_count() : 0);
+  (*values)["census-uncharged-builds"] =
+      std::to_string(census != nullptr ? census->uncharged_build_count() : 0);
+  (*values)["census-uncharged-charges"] =
+      std::to_string(census != nullptr ? census->uncharged_charge_count() : 0);
+  (*values)["census-bytes"] =
+      std::to_string(census != nullptr ? census->StayingMemoryBytes() : 0);
+  (*values)["route-count"] =
+      std::to_string(vstorage->GetBlobRelocationRouteCount());
+  // How long the oldest route that route retirement could not delete yet has
+  // waited (a duration, 0 when none waits). A route waits when route
+  // retirement defers its batch, or when the MANIFEST write of a full batch
+  // gets TryAgain.
+  const uint64_t retirement_since =
+      census != nullptr ? census->RetirementPendingSinceMicros() : 0;
+  const uint64_t retirement_now = clock_->NowMicros();
+  (*values)["retirement-pending-micros"] =
+      std::to_string(retirement_since == 0 || retirement_now < retirement_since
+                         ? 0
+                         : retirement_now - retirement_since);
+  (*values)["relocation-file-count"] =
+      std::to_string(vstorage->GetBlobRelocationFiles().size());
+  (*values)["relocation-file-bytes"] =
+      std::to_string(vstorage->GetBlobRelocationFileBytes());
+  (*values)["lost-relocation-files"] =
+      std::to_string(vstorage->GetLostBlobRelocationFileCount());
+  (*values)["coarse-sst-count"] = std::to_string(vstorage->CoarseSstCount());
+  (*values)["lowest-coarse-frontier"] =
+      std::to_string(vstorage->OldestCoarseIndirectOriginFileNumber());
+  const BlobGcCandidateHeap::Totals totals =
+      census != nullptr ? census->PublishedTotals()
+                        : BlobGcCandidateHeap::Totals{};
+  (*values)["tracked-files"] = std::to_string(totals.candidate_count);
+  (*values)["idle-micros-with-candidates"] =
+      std::to_string(IndirectBlobGcIdleMicrosWithCandidates());
+  (*values)["garbage-bytes-collectable"] =
+      std::to_string(totals.collectable_garbage_bytes);
+  (*values)["garbage-bytes-suppressed"] =
+      std::to_string(totals.suppressed_garbage_bytes);
+  (*values)["coarse-pinned-files"] = std::to_string(totals.coarse_pinned_files);
+  (*values)["coarse-pinned-bytes"] = std::to_string(totals.coarse_pinned_bytes);
+  (*values)["coarse-pinned-garbage-bytes"] =
+      std::to_string(totals.coarse_pinned_garbage_bytes);
+  (*values)["relocation-garbage-bytes"] = std::to_string(
+      census != nullptr ? census->PublishedRelocationGarbageBytes() : 0);
+  const BlobGcCandidateHeap::CorruptFileReport corrupt =
+      census != nullptr ? census->PublishedCorruptFiles()
+                        : BlobGcCandidateHeap::CorruptFileReport{};
+  (*values)["corrupt-input-files"] = std::to_string(corrupt.count);
+  std::string corrupt_list;
+  for (uint64_t file_number : corrupt.files) {
+    if (file_number == 0) {
+      break;
+    }
+    if (!corrupt_list.empty()) {
+      corrupt_list.push_back(',');
+    }
+    corrupt_list.append(std::to_string(file_number));
+  }
+  (*values)["corrupt-input-file-list"] = corrupt_list;
+  return true;
+}
+
+uint64_t InternalStats::IndirectBlobGcIdleMicrosWithCandidates() const {
+  assert(cfd_);
+  const uint64_t since = cfd_->IndirectBlobGcCandidatesSinceMicros();
+  const uint64_t now = clock_->NowMicros();
+  return since == 0 || now < since ? 0 : now - since;
+}
+
+bool InternalStats::HandleIndirectBlobGcIdleMicrosWithCandidates(
+    uint64_t* value, DBImpl* /*db*/, Version* /*version*/) {
+  assert(value);
+  *value = IndirectBlobGcIdleMicrosWithCandidates();
+  return true;
+}
+
+bool InternalStats::HandleBlobRelocationLostFiles(uint64_t* value,
+                                                  DBImpl* /*db*/,
+                                                  Version* /*version*/) {
+  assert(value);
+  assert(cfd_);
+  *value = cfd_->current()->storage_info()->GetLostBlobRelocationFileCount();
+  return true;
 }
 
 bool InternalStats::HandleBlobCachePinnedUsage(uint64_t* value, DBImpl* /*db*/,

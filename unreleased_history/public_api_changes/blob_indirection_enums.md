@@ -1,0 +1,1 @@
+Added `BlobFileCreationReason::kIndirectBlobGC`, `TableReaderCaller::kBlobRelocationFileRead`, and the cache entry roles `CacheEntryRole::kBlobReferenceMetadataBuildingBuffer`, `CacheEntryRole::kBlobReferenceCensus` and `CacheEntryRole::kIndirectBlobGcWorkingMemory`.

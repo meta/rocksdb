@@ -10817,6 +10817,36 @@ unsigned char rocksdb_options_get_enable_blob_files(rocksdb_options_t* opt) {
   return opt->rep.enable_blob_files;
 }
 
+void rocksdb_options_set_enable_blob_indirection(rocksdb_options_t* opt,
+                                                 unsigned char v) {
+  opt->rep.enable_blob_indirection = v;
+}
+
+unsigned char rocksdb_options_get_enable_blob_indirection(
+    rocksdb_options_t* opt) {
+  return opt->rep.enable_blob_indirection;
+}
+
+void rocksdb_options_set_pin_blob_relocation_location_blocks(
+    rocksdb_options_t* opt, unsigned char v) {
+  opt->rep.pin_blob_relocation_location_blocks = v;
+}
+
+unsigned char rocksdb_options_get_pin_blob_relocation_location_blocks(
+    rocksdb_options_t* opt) {
+  return opt->rep.pin_blob_relocation_location_blocks;
+}
+
+void rocksdb_options_set_blob_indirection_max_references_per_sst(
+    rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.blob_indirection_max_references_per_sst = v;
+}
+
+uint64_t rocksdb_options_get_blob_indirection_max_references_per_sst(
+    rocksdb_options_t* opt) {
+  return opt->rep.blob_indirection_max_references_per_sst;
+}
+
 void rocksdb_options_set_min_blob_size(rocksdb_options_t* opt, uint64_t v) {
   opt->rep.min_blob_size = v;
 }
@@ -10876,6 +10906,26 @@ void rocksdb_options_set_blob_gc_force_threshold(rocksdb_options_t* opt,
 
 double rocksdb_options_get_blob_gc_force_threshold(rocksdb_options_t* opt) {
   return opt->rep.blob_garbage_collection_force_threshold;
+}
+
+void rocksdb_options_set_indirect_blob_gc_read_coalesce_bytes(
+    rocksdb_options_t* opt, uint64_t v) {
+  opt->rep.indirect_blob_gc_read_coalesce_bytes = v;
+}
+
+uint64_t rocksdb_options_get_indirect_blob_gc_read_coalesce_bytes(
+    rocksdb_options_t* opt) {
+  return opt->rep.indirect_blob_gc_read_coalesce_bytes;
+}
+
+void rocksdb_options_set_indirect_blob_gc_garbage_ratio(rocksdb_options_t* opt,
+                                                        double v) {
+  opt->rep.indirect_blob_gc_garbage_ratio = v;
+}
+
+double rocksdb_options_get_indirect_blob_gc_garbage_ratio(
+    rocksdb_options_t* opt) {
+  return opt->rep.indirect_blob_gc_garbage_ratio;
 }
 
 void rocksdb_options_set_blob_compaction_readahead_size(rocksdb_options_t* opt,

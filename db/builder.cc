@@ -16,6 +16,7 @@
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_garbage_meter.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/dbformat.h"
@@ -69,6 +70,74 @@ void ExtractTimestampFromTableProperties(const TableProperties& tp,
   if (max_ts_iter != tp.user_collected_properties.end()) {
     meta->max_timestamp = max_ts_iter->second;
   }
+}
+
+void ExtractBlobReferenceDescriptorFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta) {
+  assert(meta != nullptr);
+  meta->blob_reference_legacy_metadata = false;
+  const auto descriptor =
+      tp.user_collected_properties.find(kBlobReferenceDescriptorPropertyName);
+  if (descriptor == tp.user_collected_properties.end()) {
+    meta->blob_reference_descriptor.clear();
+  } else {
+    meta->blob_reference_descriptor = descriptor->second;
+  }
+}
+
+Status ExtractBlobReferenceClassificationFromTableProperties(
+    const TableProperties& tp, FileMetaData* meta) {
+  meta->oldest_coarse_indirect_origin_file_number = kInvalidBlobFileNumber;
+  const auto property = tp.user_collected_properties.find(
+      kBlobReferenceClassificationPropertyName);
+  if (property == tp.user_collected_properties.end()) {
+    return Status::OK();
+  }
+  if (!meta->blob_reference_descriptor.empty()) {
+    Status both_status = Status::Corruption(
+        "SST has both exact blob reference metadata and a coarse "
+        "classification");
+    // Lets a test model a remote worker that writes such an SST, by clearing
+    // this error on the worker.
+    TEST_SYNC_POINT_CALLBACK(
+        "ExtractBlobReferenceClassificationFromTableProperties:"
+        "BothProperties",
+        &both_status);
+    return both_status;
+  }
+  Status status = DecodeBlobReferenceClassification(
+      property->second, &meta->oldest_coarse_indirect_origin_file_number);
+  if (status.ok()) {
+    // A classification with frontier 0 means that the SST has no indirect
+    // references (see "Coarse SST" in db/blob/blob_reference_metadata.h). It
+    // needs no pin, so we store it like a legacy SST
+    // (blob_reference_legacy_metadata = true). Recovery then accepts it without
+    // exact metadata.
+    meta->blob_reference_legacy_metadata =
+        meta->oldest_coarse_indirect_origin_file_number ==
+        kInvalidBlobFileNumber;
+  }
+  return status;
+}
+
+Status RejectBlobIndirectionTableProperties(const TableProperties& props,
+                                            const char* operation) {
+  FileMetaData metadata;
+  ExtractBlobReferenceDescriptorFromTableProperties(props, &metadata);
+  Status status =
+      ExtractBlobReferenceClassificationFromTableProperties(props, &metadata);
+  if (!status.ok()) {
+    return status;
+  }
+  if (!metadata.blob_reference_descriptor.empty() ||
+      metadata.oldest_coarse_indirect_origin_file_number !=
+          kInvalidBlobFileNumber) {
+    return Status::NotSupported(
+        std::string(operation) +
+        " does not carry blob indirection metadata (relocation files and "
+        "routes)");
+  }
+  return Status::OK();
 }
 
 Status BuildTable(
@@ -201,7 +270,8 @@ Status BuildTable(
             event_logger, ioptions.listeners, dbname,
             tboptions.column_family_name, fname, job_id, meta->fd,
             kInvalidBlobFileNumber, tp, tboptions.reason, s, file_checksum,
-            file_checksum_func_name);
+            file_checksum_func_name,
+            /*blob_references=*/nullptr);
         return s;
       }
 
@@ -240,7 +310,8 @@ Status BuildTable(
                   tboptions.column_family_name, write_hint, io_tracer,
                   blob_callback, blob_creation_reason,
                   ioptions.cf_paths.front().path, &blob_file_paths,
-                  blob_file_additions)
+                  blob_file_additions,
+                  version != nullptr ? version->cfd()->blob_source() : nullptr)
             : nullptr);
 
     const std::atomic<bool> kManualCompactionCanceledFalse{false};
@@ -252,6 +323,7 @@ Status BuildTable(
         ioptions.enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
         true /* must_count_input_entries */,
+        false /* allow_blob_index_flattening */,
         /*compaction=*/nullptr, compaction_filter.get(),
         /*shutting_down=*/nullptr, db_options.info_log, full_history_ts_low,
         std::nullopt, version, tboptions.read_options.io_activity);
@@ -432,6 +504,15 @@ Status BuildTable(
       tp = builder
                ->GetTableProperties();  // refresh now that builder is finished
       ExtractTimestampFromTableProperties(tp, meta);
+      ExtractBlobReferenceDescriptorFromTableProperties(tp, meta);
+      s = ExtractBlobReferenceClassificationFromTableProperties(tp, meta);
+      meta->blob_reference_summary = builder->GetBlobReferenceSstSummary();
+      TEST_SYNC_POINT_CALLBACK("BuildTable:BlobReferenceSummary", meta);
+      if (s.ok() && meta->blob_reference_summary != nullptr &&
+          meta->blob_reference_summary->file_number != meta->fd.GetNumber()) {
+        s = Status::Corruption(
+            "Blob reference summary is for another SST file number");
+      }
       if (memtable_payload_bytes != nullptr &&
           memtable_garbage_bytes != nullptr) {
         const CompactionIterationStats& ci_stats = c_iter.iter_stats();
@@ -610,7 +691,8 @@ Status BuildTable(
       event_logger, ioptions.listeners, dbname, tboptions.column_family_name,
       fname, job_id, meta->fd, meta->oldest_blob_file_number, tp,
       tboptions.reason, status_for_listener, file_checksum,
-      file_checksum_func_name);
+      file_checksum_func_name,
+      /*blob_references=*/nullptr);
 
   return s;
 }

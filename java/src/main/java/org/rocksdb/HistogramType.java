@@ -291,6 +291,20 @@ public enum HistogramType {
    */
   IO_DISPATCHER_ASYNC_READ_PREFETCH_LEAD_MICROS((byte) 0x4E),
 
+  /**
+   * Number of blob references in each compaction output SST that has exact
+   * blob reference metadata (DBs that use or have used
+   * enable_blob_indirection).
+   */
+  COMPACTION_OUTPUT_BLOB_REFERENCES((byte) 0x4F),
+
+  /**
+   * Used only by DBs that use or have used enable_blob_indirection. Time of
+   * each indirect blob GC job that began, from its start to its end, in
+   * microseconds.
+   */
+  INDIRECT_BLOB_GC_JOB_MICROS((byte) 0x50),
+
   // 0x3E is reserved for backwards compatibility on current minor version.
   HISTOGRAM_ENUM_MAX((byte) 0x3E);
 
