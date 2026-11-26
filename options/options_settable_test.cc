@@ -764,6 +764,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "enable_blob_files=true;"
       "enable_blob_indirection=true;"
       "pin_blob_relocation_location_blocks=true;"
+      "blob_indirection_max_references_per_sst=4096;"
       "enable_blob_direct_write=true;"
       "min_blob_size=256;"
       "blob_file_size=1000000;"

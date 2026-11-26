@@ -642,13 +642,14 @@ std::string BuildTableForTest(
   const CompressionOptions compression_options;
   // Column family 0 and file number 12 are example values; the exact
   // metadata needs a known column family and a file number.
-  const TableBuilderOptions tbo(
+  TableBuilderOptions tbo(
       ioptions, moptions, read_options, write_options, icmp, &factories,
       kNoCompression, compression_options, /*_column_family_id=*/0,
       kDefaultColumnFamilyName, /*_level=*/1, kUnknownNewestKeyTime,
       /*_is_bottommost=*/false, TableFileCreationReason::kCompaction,
       /*_oldest_key_time=*/0, /*_db_id=*/"db", /*_db_session_id=*/"session",
       /*_target_file_size=*/0, /*_cur_file_num=*/12);
+  tbo.collect_blob_reference_metadata = true;
 
   auto sink = std::make_unique<test::StringSink>();
   test::StringSink* const sink_ptr = sink.get();
@@ -769,6 +770,9 @@ TEST(BlobReferenceMetadataTest, EmptyRoundTrip) {
   ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(encoded_descriptor,
                                                         &decoded_descriptor));
   EXPECT_TRUE(decoded_descriptor.IsEmpty());
+  EXPECT_TRUE(decoded_descriptor.HasSstIdentity());
+  EXPECT_EQ(decoded_descriptor.column_family_id, 0U);
+  EXPECT_EQ(decoded_descriptor.sst_file_number, 1U);
 
   BlobReferenceIndex index;
   std::vector<BlobReference> references;
@@ -4319,6 +4323,12 @@ TEST_F(DBBlobIndexTest, FlushRecordsExactReferenceMetadata) {
   const std::string value(100, 'v');
   ASSERT_OK(Put(1, key, value));
   ASSERT_OK(Flush(1));
+  // Flush writes only the classification. The compaction output (level 1 or
+  // higher) has the exact descriptor and reference blocks.
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, handles_[1], nullptr, nullptr));
 
   TablePropertiesCollection properties;
   ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[1], &properties));
@@ -4386,6 +4396,12 @@ TEST_F(DBBlobIndexTest, ReferenceDataBlocksUseTableCompression) {
       ASSERT_OK(Put(Key(i), std::string(100, 'v')));
     }
     ASSERT_OK(Flush());
+    // Flush writes only the classification. The compaction output (level 1 or
+    // higher) is exact.
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
 
     TablePropertiesCollection properties;
     ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
