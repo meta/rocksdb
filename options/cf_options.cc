@@ -1442,6 +1442,23 @@ bool MutableCFOptionsUnchangedByMap(
          new_options == base_options;
 }
 
+bool OptionsMapSetsCustomizableOption(
+    const std::unordered_map<std::string, std::string>& options_map) {
+  for (const auto& opt : options_map) {
+    std::string elem_name;
+    const OptionTypeInfo* opt_info = OptionTypeInfo::Find(
+        opt.first, cf_mutable_options_type_info, &elem_name);
+    if (opt_info == nullptr) {
+      opt_info = OptionTypeInfo::Find(opt.first, cf_immutable_options_type_info,
+                                      &elem_name);
+    }
+    if (opt_info != nullptr && opt_info->IsCustomizable()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 Status GetStringFromMutableCFOptions(const ConfigOptions& config_options,
                                      const MutableCFOptions& mutable_opts,
                                      std::string* opt_string) {
