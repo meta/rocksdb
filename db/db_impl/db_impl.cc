@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <deque>
 #include <forward_list>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -33,6 +34,7 @@
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_reference_census.h"
 #include "db/builder.h"
 #include "db/coalescing_iterator.h"
 #include "db/compaction/compaction_job.h"
@@ -457,7 +459,18 @@ Status DBImpl::ResumeImpl(DBRecoverContext context,
   unscheduled_flushes_ = 0;
 
   TEST_SYNC_POINT("DBImpl::ResumeImpl:BeforeWaitForBackgroundWork");
+  // Wait for at most the running blob reference census slice (see
+  // blob_reference_census_recovery_waits_). The census serves only indirect
+  // blob GC, so the background error must not stay set until a whole census
+  // build ends.
+  ++blob_reference_census_recovery_waits_;
   WaitForBackgroundWork();
+  assert(blob_reference_census_recovery_waits_ > 0);
+  --blob_reference_census_recovery_waits_;
+  if (blob_reference_census_recovery_waits_ == 0) {
+    // Start the census job again for the column families in its queue.
+    ScheduleBlobReferenceCensus();
+  }
 
   TEST_SYNC_POINT("DBImpl::ResumeImpl:Start");
 
@@ -832,7 +845,9 @@ void DBImpl::WaitForBackgroundWork() {
   while (remote_compaction_pool_jobs_ || CompactionsScheduled() ||
          bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
          bg_pressure_callback_in_progress_ ||
-         bg_async_file_open_state_ == AsyncFileOpenState::kScheduled) {
+         bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
+         bg_blob_reference_census_state_ ==
+             BlobReferenceCensusJobState::kScheduled) {
     bg_cv_.Wait();
   }
 }
@@ -848,6 +863,49 @@ void DBImpl::WaitForAsyncFileOpen() {
     bg_cv_.Wait();
   }
 }
+
+#ifndef NDEBUG
+void DBImpl::TEST_WaitForBlobReferenceCensus() {
+  // Move CFs on the retry list that can run now back to the LOW queue.
+  // Otherwise waiting only for the scheduled task can return before a CF's
+  // catch-up slice runs.
+  RetryBlobReferenceCensus();
+  InstrumentedMutexLock lock(&mutex_);
+  // A test can request a candidate refresh without a Version installation (for
+  // example, by ending a metadata-only commit). Drive that queued work before
+  // waiting; production uses its retry timer.
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    ScheduleBlobReferenceCensus(cfd);
+  }
+  for (;;) {
+    // Also wait for the applies that flush and compaction jobs owe: a manual
+    // compaction can return before its job ran
+    // ApplyBlobReferenceCensusAfterInstall().
+    while ((bg_blob_reference_census_state_ ==
+                BlobReferenceCensusJobState::kScheduled ||
+            blob_reference_census_pending_applies_ > 0) &&
+           !shutting_down_.load(std::memory_order_acquire)) {
+      bg_cv_.Wait();
+    }
+    bool deferred_catch_up = false;
+    for (ColumnFamilyData* cfd = blob_reference_census_retry_head_;
+         cfd != nullptr; cfd = cfd->next_blob_reference_census_) {
+      // A CF whose build failed may stay unavailable on purpose. Wait only for
+      // CFs without failures that still have work to do.
+      deferred_catch_up |= !cfd->IsDropped() &&
+                           cfd->blob_reference_census_failures_ == 0 &&
+                           cfd->blob_reference_census()->NeedsWorkerRun(
+                               cfd->current()->GetVersionNumber());
+    }
+    if (!deferred_catch_up || shutting_down_.load(std::memory_order_acquire)) {
+      break;
+    }
+    mutex_.Unlock();
+    RetryBlobReferenceCensus();
+    mutex_.Lock();
+  }
+}
+#endif  // NDEBUG
 
 void DBImpl::NotifyOnDBShutdownBegin() {
   mutex_.AssertHeld();
@@ -916,10 +974,23 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   shutting_down_.store(true, std::memory_order_release);
   bg_cv_.SignalAll();
   env_->UnSchedule(&bg_async_file_open_state_, Env::Priority::HIGH);
+  env_->UnSchedule(&bg_blob_reference_census_state_, Env::Priority::LOW);
   if (!wait) {
     return;
   }
   WaitForBackgroundWork();
+  // A census worker registers its retry task on first use, which can be after
+  // the periodic tasks were canceled, so unregister it again here.
+  // WaitForBackgroundWork() above also waited for the worker's cleanup without
+  // the mutex (CFD pins and change log).
+  mutex_.Unlock();
+  periodic_task_scheduler_.Unregister(PeriodicTaskType::kBlobReferenceCensus)
+      .PermitUncheckedError();
+  mutex_.Lock();
+  if (blob_reference_census_queue_head_ != nullptr ||
+      blob_reference_census_retry_head_ != nullptr) {
+    UnscheduleBlobReferenceCensus(this);
+  }
 }
 
 Status DBImpl::MaybeReleaseTimestampedSnapshotsAndCheck() {
@@ -1201,6 +1272,8 @@ Status DBImpl::CloseHelper() {
          bg_flush_scheduled_ || bg_wbm_flush_scheduled_ ||
          bg_purge_scheduled_ || bg_pressure_callback_in_progress_ ||
          bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
+         bg_blob_reference_census_state_ ==
+             BlobReferenceCensusJobState::kScheduled ||
          async_wal_precreate_state_ == AsyncWALPrecreateState::kScheduled ||
          pending_purge_obsolete_files_ ||
          error_handler_.IsRecoveryInProgress()) {
@@ -1208,7 +1281,33 @@ Status DBImpl::CloseHelper() {
     bg_cv_.Wait();
   }
 
+  // A census worker registers its retry task on first use, which can be after
+  // the first CancelPeriodicTaskScheduler() call, so unregister it again. No
+  // worker remains after the wait above. The census state can be as large as
+  // the live SST set, so it is freed below without the DB mutex.
   mutex_.Unlock();
+  periodic_task_scheduler_.Unregister(PeriodicTaskType::kBlobReferenceCensus)
+      .PermitUncheckedError();
+  mutex_.Lock();
+  if (blob_reference_census_queue_head_ != nullptr ||
+      blob_reference_census_retry_head_ != nullptr) {
+    UnscheduleBlobReferenceCensus(this);
+  }
+  // Free the census state that LogAndApply replaced (see
+  // VersionSet::ReleaseDeferredPublicationCleanup()). It can hold build
+  // contexts, which need the DB and its column families.
+  versions_->ReleaseDeferredPublicationCleanup(&mutex_);
+  std::vector<BlobReferenceCensusGarbage> census_garbage;
+  const size_t column_family_count =
+      versions_->GetColumnFamilySet()->NumberOfColumnFamilies();
+  mutex_.Unlock();
+  census_garbage.reserve(column_family_count);
+  mutex_.Lock();
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    census_garbage.emplace_back(cfd->CancelBlobReferenceCensus());
+  }
+  mutex_.Unlock();
+  std::vector<BlobReferenceCensusGarbage>().swap(census_garbage);
   ReleaseRemoteCompactionPool();
   mutex_.Lock();
 
@@ -1355,6 +1454,14 @@ Status DBImpl::CloseHelper() {
       }
     }
   }
+
+  // The close-time MANIFEST writes above (WAL markers, VersionSet::Close()) can
+  // add census state to the deferred census cleanup. Free it without the DB
+  // mutex while the DB and its column families still exist (see
+  // VersionSet::ReleaseDeferredPublicationCleanup()). This runs before the
+  // purge drain below, so a purge that starts while the mutex is released here
+  // is still waited for.
+  versions_->ReleaseDeferredPublicationCleanup(&mutex_);
 
   // Drain obsolete-file purge work started AFTER the early CloseHelper wait
   // near the top of this method. A late SuperVersion cleanup -- a dropped
@@ -1867,6 +1974,7 @@ void DBImpl::DumpStats() {
 
   // Also probe block cache(s) for problems, dump to info log
   UnorderedSet<Cache*> probed_caches;
+  std::vector<std::string> blob_gc_warnings;
   TEST_SYNC_POINT("DBImpl::DumpStats:StartRunning");
   {
     InstrumentedMutexLock l(&mutex_);
@@ -1907,12 +2015,51 @@ void DBImpl::DumpStats() {
     property_info = GetPropertyInfo(*property);
     assert(property_info != nullptr);
     assert(!property_info->need_out_of_mutex);
+    // Indirect blob GC that stays idle while it has candidates for longer than
+    // one stats period is starved, for example by LSM compactions.
+    const uint64_t period_micros =
+        uint64_t{mutable_db_options_.stats_dump_period_sec} * 1000 * 1000;
     for (auto cfd : *versions_->GetColumnFamilySet()) {
       if (cfd->initialized()) {
         cfd->internal_stats()->GetStringProperty(*property_info, *property,
                                                  &stats);
+        if (cfd->blob_reference_census() != nullptr) {
+          // kCensusUnreadyWarnMicros (10 minutes, a fixed choice): a census
+          // that stays unready this long blocks the work that needs it. This
+          // check runs here, not in the census job, so it also fires when that
+          // job is stuck, paused or never scheduled.
+          constexpr uint64_t kCensusUnreadyWarnMicros =
+              10ULL * 60 * 1000 * 1000;
+          const uint64_t unready_micros =
+              cfd->internal_stats()->BlobReferenceCensusUnreadyMicros();
+          if (unready_micros > kCensusUnreadyWarnMicros) {
+            blob_gc_warnings.push_back(
+                "[" + cfd->GetName() +
+                "] Blob reference census has been unready for " +
+                std::to_string(unready_micros / 1000000) + " s (state: " +
+                (cfd->blob_reference_census_failures() > 0 ? "failed"
+                                                           : "building") +
+                ", failed builds in a row (max 6): " +
+                std::to_string(cfd->blob_reference_census_failures()) +
+                "); the work that needs the census waits");
+          }
+        }
+        if (period_micros != 0 && cfd->blob_reference_census() != nullptr) {
+          const uint64_t idle_micros =
+              cfd->internal_stats()->IndirectBlobGcIdleMicrosWithCandidates();
+          if (idle_micros > period_micros) {
+            blob_gc_warnings.push_back("[" + cfd->GetName() +
+                                       "] Indirect blob GC has had candidates "
+                                       "for " +
+                                       std::to_string(idle_micros / 1000000) +
+                                       " s without starting a job");
+          }
+        }
       }
     }
+  }
+  for (const std::string& warning : blob_gc_warnings) {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log, "%s", warning.c_str());
   }
   TEST_SYNC_POINT("DBImpl::DumpStats:2");
   ROCKS_LOG_INFO(immutable_db_options_.info_log,
@@ -1990,22 +2137,76 @@ Status DBImpl::SetOptions(
     return Status::OK();
   }
 
-  for (const auto& cf_opts : column_families_opts_map) {
-    if (cf_opts.second.empty()) {
+  // SetOptions() changes the options of all the given column families, or of
+  // none. Apart from options changed in place (see the ATOMICITY NOTE at
+  // DB::SetOptions()), readers never see a mix of old and new options and
+  // Versions. The steps:
+  // 1. Group the input maps by column family (ColumnFamilyOptionsUpdate).
+  // 2. Return early if no map changes any option, unless an earlier call left
+  //    the OPTIONS file or the seqno-to-time worker out of date.
+  // 3. Under the DB mutex, read a new phasing anchor if any map sets
+  //    periodic_compaction_seconds, even to its current value (see
+  //    VersionSet::PrepareCompactionPhaseReanchor()). Build one dummy edit
+  //    per column family, and one MutableCFOptionsPublication that holds an
+  //    options entry for each column family.
+  // 4. Make one LogAndApply() call. pre_cb prepares the options of every
+  //    column family. LogAndApply() builds the new Versions and publishes them
+  //    with the options and the anchor. The comment above
+  //    MutableCFOptionsPublication (version_set.h) lists how.
+  // 5. Install the new SuperVersions before the DB mutex is released.
+  // 6. Write one OPTIONS file. WriteOptionsFile() releases the DB mutex
+  //    during the file write.
+  // 7. Update the seqno-to-time worker if any map sets
+  //    preserve_internal_time_seconds or preclude_last_level_data_seconds, or
+  //    if an earlier update of the worker failed.
+
+  // One column family and all the options maps given for it, in the order they
+  // are applied. `sets_customizable_option` is true when a map has a key for a
+  // Customizable option, such as the table factory (see
+  // OptionsMapSetsCustomizableOption()). Parsing such a key can change a live
+  // object in place (see pre_cb below).
+  using OptionsMap = std::unordered_map<std::string, std::string>;
+  struct ColumnFamilyOptionsUpdate {
+    std::reference_wrapper<ColumnFamilyData> cfd;
+    std::vector<std::reference_wrapper<const OptionsMap>> options_maps;
+    bool sets_customizable_option = false;
+  };
+  // Group the input by column family. Two different handles can point to the
+  // same column family, and the single LogAndApply call below takes each column
+  // family only once. So one writer applies all maps of a column family, in the
+  // iteration order of the input map. The same pass rejects an empty map and
+  // notes whether any map sets periodic_compaction_seconds (new phasing
+  // anchor), or sets preserve_internal_time_seconds or
+  // preclude_last_level_data_seconds (seqno-to-time worker update). It reads
+  // only the caller's handles and maps, so it runs before any lock is taken.
+  std::vector<ColumnFamilyOptionsUpdate> column_family_updates;
+  UnorderedMap<ColumnFamilyData*, size_t> update_index_by_cfd;
+  bool changing_periodic_compaction_seconds = false;
+  bool needs_seqno_worker = false;
+  for (const auto& [handle, options_map] : column_families_opts_map) {
+    if (options_map.empty()) {
       ROCKS_LOG_WARN(immutable_db_options_.info_log,
                      "SetOptions() on column family [%s], empty input",
-                     cf_opts.first->GetName().c_str());
+                     handle->GetName().c_str());
       return Status::InvalidArgument("empty input");
     }
-  }
-
-  autovector<std::pair<ColumnFamilyData*,
-                       const std::unordered_map<std::string, std::string>*>>
-      column_family_datas;
-  for (const auto& cf_opts : column_families_opts_map) {
-    column_family_datas.push_back(
-        {static_cast_with_check<ColumnFamilyHandleImpl>(cf_opts.first)->cfd(),
-         &cf_opts.second});
+    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(handle)->cfd();
+    const auto [it, inserted] =
+        update_index_by_cfd.emplace(cfd, column_family_updates.size());
+    if (inserted) {
+      column_family_updates.push_back({*cfd, {std::cref(options_map)}});
+    } else {
+      column_family_updates[it->second].options_maps.push_back(
+          std::cref(options_map));
+    }
+    if (OptionsMapSetsCustomizableOption(options_map)) {
+      column_family_updates[it->second].sets_customizable_option = true;
+    }
+    changing_periodic_compaction_seconds |=
+        options_map.count("periodic_compaction_seconds") > 0;
+    needs_seqno_worker |=
+        options_map.count("preserve_internal_time_seconds") > 0 ||
+        options_map.count("preclude_last_level_data_seconds") > 0;
   }
 
   DeferredInstrumentedMutexLock ol(
@@ -2021,9 +2222,15 @@ Status DBImpl::SetOptions(
     bool unchanged = true;
     {
       InstrumentedMutexLock l(&mutex_);
-      for (const auto& cfd_opts : column_family_datas) {
-        if (!cfd_opts.first->SetOptionsIsNoOp(db_options, *cfd_opts.second)) {
-          unchanged = false;
+      for (const auto& update : column_family_updates) {
+        for (const auto& options_map : update.options_maps) {
+          if (!update.cfd.get().SetOptionsIsNoOp(db_options,
+                                                 options_map.get())) {
+            unchanged = false;
+            break;
+          }
+        }
+        if (!unchanged) {
           break;
         }
       }
@@ -2032,92 +2239,135 @@ Status DBImpl::SetOptions(
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "SetOptions() on [%zu] column families, input option "
                      "values are not changed, skipping updating.",
-                     column_family_datas.size());
+                     column_family_updates.size());
       return Status::OK();
     }
   }
 
-  autovector<MutableCFOptions>
-      new_options_copy;  // For logging outside of DB mutex
+  // The new options of each column family, in the order of
+  // column_family_updates. Each entry starts as a copy of the latest options,
+  // and pre_cb applies the input maps to it under the DB mutex. The entries are
+  // also used for logging after the DB mutex is released.
+  MutableCFOptionsPublication options_publication;
+  autovector<MutableCFOptions>& prepared_options =
+      options_publication.new_mutable_cf_options;
   Status s;
   Status persist_options_status;
   SuperVersionContext sv_context(/* create_superversion */ true);
   {
     InstrumentedMutexLock l(&mutex_);
-    // Manifest writers + Version appenders like flush and compaction use
-    // LogAndApply, which releases DB mutex to wait for other manifest writers
-    // and for the manifest write. We need to append a Version for the options
-    // to take full effect (e.g. compaction scores), but we don't want to
-    // interleave with other callers of LogAndApply, which could at least
-    // temporarily roll back option changes. Thus, we use a special call to
-    // LogAndApply that allows us to
+    // Steps 3 to 6 of the list at the top of this function. If the options were
+    // published before LogAndApply(), another caller that already built its
+    // Version (for example, a flush that is writing the MANIFEST with the DB
+    // mutex released) could install that Version afterwards. That Version has
+    // the old options, so readers would see new options with an old Version. So
+    // LogAndApply() publishes the options together with the new Versions.
+    // pre_cb runs when this call reaches the head of the MANIFEST writer queue,
+    // so a column family drop that was queued before this call is already
+    // applied, and the IsDropped() check in pre_cb sees it. pre_cb also
+    // prepares the options. If either step fails, the call fails before
+    // anything is published.
     //
-    // (a) Apply the options update when we know we are the exclusive version
-    // appender + (fake) manifest writer, and
-    //
-    // (b) Append a new Version without manifest write nor DB mutex release
-    //
-    // Thus aren't releasing the DB mutex from LogAndApply calling pre_cb,
-    // through installing the new Version until the end of this block, after
-    // installing the new SuperVersion.
-    VersionEdit dummy_edit;
-    dummy_edit.MarkNoManifestWriteDummy();
-    TEST_SYNC_POINT_CALLBACK("DBImpl::SetOptions:dummy_edit", &dummy_edit);
-    // If any CF is changing periodic_compaction_seconds, (re)anchor phasing to
-    // now BEFORE the new Version is built below, so the new Version's scoring
-    // spreads a turn-down's newly past-due cohort over the phase grid (within
-    // ~N/4 of now) instead of firing it all at once (a herd). Anchoring is
-    // DB-level and benign to CFs that are not changing their interval.
-    bool changing_periodic_compaction_seconds = false;
-    for (const auto& cfd_opts : column_family_datas) {
-      if (cfd_opts.second->count("periodic_compaction_seconds") > 0) {
-        changing_periodic_compaction_seconds = true;
-        break;
-      }
-    }
-    if (changing_periodic_compaction_seconds) {
-      versions_->ReanchorCompactionPhase();
-    }
-    for (const auto& cfd_opts : column_family_datas) {
-      auto* cfd = cfd_opts.first;
-      const auto* options_map_ptr = cfd_opts.second;
-      auto pre_cb = [&]() -> Status {
-        Status cb_s = cfd->SetOptions(db_options, *options_map_ptr);
-        if (cb_s.ok()) {
-          new_options_copy.emplace_back(cfd->GetLatestMutableCFOptions());
-        }
-        return cb_s;
-      };
+    // If any map sets periodic_compaction_seconds, read a new phasing anchor
+    // (the current time). LogAndApply() publishes it later. See
+    // VersionSet::PrepareCompactionPhaseReanchor().
+    options_publication.compaction_phase_anchor_time =
+        changing_periodic_compaction_seconds
+            ? versions_->PrepareCompactionPhaseReanchor()
+            : std::nullopt;
 
-      s = versions_->LogAndApply(
-          cfd, read_options, write_options, &dummy_edit, &mutex_,
-          directories_.GetDbDir(), false /*new_descriptor_log=*/,
-          nullptr /*new_opts*/, {} /*manifest_wcb*/, pre_cb);
-      if (!versions_->io_status().ok()) {
-        assert(!s.ok());
-        error_handler_.SetBGError(versions_->io_status(),
-                                  BackgroundErrorReason::kManifestWrite);
-      }
-      if (!s.ok()) {
-        if (!new_options_copy.empty()) {
-          // The options that this call already changed are not in the OPTIONS
-          // file or the seqno-to-time worker. A failure that changed nothing
-          // leaves both up to date.
-          options_file_stale_ = true;
-          seqno_time_worker_stale_ = true;
-        }
-        break;
-      }
+    autovector<ColumnFamilyData*> cfds;
+    autovector<autovector<VersionEdit*>> edit_lists;
+    std::vector<std::unique_ptr<VersionEdit>> dummy_edits;
+    const size_t num_cfds = column_family_updates.size();
+    cfds.reserve(num_cfds);
+    edit_lists.reserve(num_cfds);
+    dummy_edits.reserve(num_cfds);
+    prepared_options.reserve(num_cfds);
+    // Build one edit per column family for the single LogAndApply call. Each
+    // edit is a dummy that writes nothing to the MANIFEST. Each prepared entry
+    // starts as a copy of the latest options. options_mutex_ keeps other
+    // SetOptions calls from changing the latest options before pre_cb applies
+    // the input maps on top of this copy.
+    for (const auto& update : column_family_updates) {
+      cfds.push_back(&update.cfd.get());
+      dummy_edits.emplace_back(new VersionEdit());
+      dummy_edits.back()->MarkNoManifestWriteDummy();
+      TEST_SYNC_POINT_CALLBACK("DBImpl::SetOptions:dummy_edit",
+                               dummy_edits.back().get());
+      edit_lists.emplace_back();
+      edit_lists.back().push_back(dummy_edits.back().get());
+      prepared_options.emplace_back(
+          update.cfd.get().GetLatestMutableCFOptions());
     }
 
+    // LogAndApply runs this under the DB mutex, once this call is at the head
+    // of the manifest writer queue. It first checks that no column family is
+    // dropped, so a dropped column family fails the call before any input map
+    // is parsed. Then it applies every input map to the prepared options. A
+    // dropped column family or an invalid map fails the whole call before any
+    // options or Version is published, so a failure leaves the options of
+    // every column family unchanged. The exception is a key for a
+    // Customizable option, such as filter_policy.bloom_before_level in the
+    // table factory or a mutable field of a custom merge operator (see the
+    // ATOMICITY NOTE at DB::SetOptions()). Parsing it can change the live,
+    // shared object at once, and a failure does not undo the change. So
+    // `customizable_option_parsed` records that the maps of a column family
+    // with such a key were parsed, and a failed call then marks the OPTIONS
+    // file stale.
+    bool customizable_option_parsed = false;
+    auto pre_cb = [&]() -> Status {
+      for (const auto& update : column_family_updates) {
+        if (update.cfd.get().IsDropped()) {
+          return Status::ColumnFamilyDropped();
+        }
+      }
+      for (size_t i = 0; i < num_cfds; ++i) {
+        auto& cfd = column_family_updates[i].cfd.get();
+        customizable_option_parsed |=
+            column_family_updates[i].sets_customizable_option;
+        for (const auto& options_map : column_family_updates[i].options_maps) {
+          Status cb_s = cfd.PrepareMutableCFOptions(
+              db_options, options_map.get(), &prepared_options[i]);
+          if (!cb_s.ok()) {
+            return cb_s;
+          }
+        }
+      }
+      return Status::OK();
+    };
+
+    s = versions_->LogAndApply(cfds, read_options, write_options, edit_lists,
+                               &mutex_, directories_.GetDbDir(),
+                               /*new_descriptor_log=*/false,
+                               /*new_cf_options=*/nullptr, /*manifest_wcbs=*/{},
+                               pre_cb, /*max_file_opening_threads=*/1,
+                               &options_publication);
+    if (!versions_->io_status().ok()) {
+      assert(!s.ok());
+      error_handler_.SetBGError(versions_->io_status(),
+                                BackgroundErrorReason::kManifestWrite);
+    }
+    if (!s.ok() && customizable_option_parsed) {
+      // A Customizable object (or an object it holds) changed in place can be
+      // live now, but the OPTIONS file does not have it (see pre_cb). The next
+      // SetOptions() or SetDBOptions() call writes the file again.
+      options_file_stale_ = true;
+    }
     if (s.ok()) {
       // Trigger possible flush/compactions. This has to be before we persist
       // options to file, otherwise there will be a deadlock with writer
       // thread.
-      for (const auto& cfd_opts : column_family_datas) {
-        auto* cfd = cfd_opts.first;
+      for (const auto& update : column_family_updates) {
+        auto* cfd = &update.cfd.get();
         assert(cfd != nullptr);
         InstallSuperVersionForConfigChange(cfd, &sv_context);
+        // The indirect blob GC idle time counts only while the options let a
+        // GC job run. When they turn GC on, the census publish of the new
+        // Version starts it again.
+        if (!cfd->IndirectBlobGcOptionsAllowJob()) {
+          cfd->ClearIndirectBlobGcCandidates();
+        }
         if (auto* blob_partition_manager = cfd->blob_partition_manager()) {
           blob_partition_manager->SetBlobWriterMaxBufferSize(
               cfd->GetLatestMutableCFOptions()
@@ -2125,15 +2375,20 @@ Status DBImpl::SetOptions(
         }
         cfd->MarkOptionsInstalled();
       }
+      // Every SuperVersion is installed, so readers can no longer see a mix of
+      // new options and Versions with old SuperVersions. Now free the census
+      // payloads that LogAndApply deferred. This unlocks the DB mutex while it
+      // frees them and then locks it again.
+      versions_->ReleaseDeferredPublicationCleanup(&mutex_);
 
       persist_options_status =
           WriteOptionsFile(write_options, true /*db_mutex_already_held*/);
       bg_cv_.SignalAll();
 
 #ifndef NDEBUG
-      for (size_t i = 0; i < column_family_datas.size(); ++i) {
-        auto* cfd = column_family_datas[i].first;
-        assert(new_options_copy[i] == cfd->GetLatestMutableCFOptions());
+      for (size_t i = 0; i < column_family_updates.size(); ++i) {
+        auto* cfd = &column_family_updates[i].cfd.get();
+        assert(prepared_options[i] == cfd->GetLatestMutableCFOptions());
         assert(cfd->GetLatestMutableCFOptions() ==
                cfd->GetCurrentMutableCFOptions());
         assert(cfd->GetCurrentMutableCFOptions() ==
@@ -2144,44 +2399,35 @@ Status DBImpl::SetOptions(
   }
   sv_context.Clean();
 
-  if (s.ok()) {
-    // A stale worker can lag the time options of any column family, so update
-    // it even if this request sets no time option.
-    bool needs_seqno_worker = update_seqno_worker;
-    for (const auto& cf_opts : column_families_opts_map) {
-      if (cf_opts.second.count("preserve_internal_time_seconds") > 0 ||
-          cf_opts.second.count("preclude_last_level_data_seconds") > 0) {
-        needs_seqno_worker = true;
-        break;
-      }
-    }
-    if (needs_seqno_worker) {
-      s = RegisterRecordSeqnoTimeWorker();
-    }
+  // If an earlier RegisterRecordSeqnoTimeWorker() call failed
+  // (seqno_time_worker_stale_), the worker can lag the time options of any
+  // column family. So update it even when this request sets no time option.
+  if (s.ok() && (needs_seqno_worker || update_seqno_worker)) {
+    s = RegisterRecordSeqnoTimeWorker();
   }
 
   ROCKS_LOG_INFO(immutable_db_options_.info_log,
                  "SetOptions() on [%zu] column families, inputs:",
-                 column_family_datas.size());
-  for (size_t i = 0; i < column_family_datas.size(); ++i) {
-    const auto* cfd = column_family_datas[i].first;
-    const auto* options_map_ptr = column_family_datas[i].second;
+                 column_families_opts_map.size());
+  size_t input_index = 0;
+  for (const auto& [handle, options_map] : column_families_opts_map) {
     ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "Set options on column family [%s] (%zu/%zu), inputs:",
-                   cfd->GetName().c_str(), i, column_family_datas.size());
-    for (const auto& o : *options_map_ptr) {
+                   handle->GetName().c_str(), input_index++,
+                   column_families_opts_map.size());
+    for (const auto& o : options_map) {
       ROCKS_LOG_INFO(immutable_db_options_.info_log, "%s: %s\n",
                      o.first.c_str(), o.second.c_str());
     }
   }
   if (s.ok()) {
-    for (size_t i = 0; i < column_family_datas.size(); ++i) {
-      const auto* cfd = column_family_datas[i].first;
+    for (size_t i = 0; i < column_family_updates.size(); ++i) {
+      const auto& cfd = column_family_updates[i].cfd.get();
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "Set options on column family [%s] (%zu/%zu) succeeded, "
                      "updated CF options:",
-                     cfd->GetName().c_str(), i, column_family_datas.size());
-      new_options_copy[i].Dump(immutable_db_options_.info_log.get());
+                     cfd.GetName().c_str(), i, column_family_updates.size());
+      prepared_options[i].Dump(immutable_db_options_.info_log.get());
     }
     if (!persist_options_status.ok()) {
       // NOTE: WriteOptionsFile already logs on failure
@@ -5638,6 +5884,9 @@ Status DBImpl::DropColumnFamilyWithOptionsFile(
       }
       is_snapshot_supported_ = new_is_snapshot_supported;
     }
+    // Free the census state of the dropped column family without the DB mutex
+    // (see VersionSet::ReleaseDeferredPublicationCleanup()).
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
     bg_cv_.SignalAll();
   }
 
@@ -6738,6 +6987,11 @@ void DBImpl::CleanupSuperVersion(SuperVersion* sv) {
   RecordTick(stats_, NUMBER_SUPERVERSION_RELEASES);
 }
 
+void DBImpl::ReleaseColumnFamilyDataRef(ColumnFamilyData* cfd) {
+  InstrumentedMutexLock lock(&mutex_);
+  cfd->UnrefAndTryDelete();
+}
+
 void DBImpl::ReturnAndCleanupSuperVersion(ColumnFamilyData* cfd,
                                           SuperVersion* sv) {
   if (!cfd->ReturnThreadLocalSuperVersion(sv)) {
@@ -7189,6 +7443,11 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
       deleted_file->being_compacted = false;
     }
     input_version->Unref();
+    // The new SuperVersion is installed, so the census state that the
+    // LogAndApply batch replaced can be freed now (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()). Without this, it would
+    // wait for the next flush or compaction, or for the census job.
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
     FindObsoleteFiles(&job_context, false);
   }  // lock released here
 
@@ -8774,8 +9033,8 @@ Status DBImpl::CommitFileIngestionHandles(
       // the lock-free path.
       status = versions_->LogAndApply(
           cfds_to_commit, read_options, write_options, edit_lists, &mutex_,
-          directories_.GetDbDir(), false /* new_descriptor_log */,
-          nullptr /* new_cf_options */, manifest_wcbs, {} /* pre_cb */,
+          directories_.GetDbDir(), /*new_descriptor_log=*/false,
+          /*new_cf_options=*/nullptr, manifest_wcbs, /*pre_cb=*/{},
           max_file_opening_threads);
       // It is safe to update VersionSet last seqno here after LogAndApply since
       // LogAndApply persists last sequence number from VersionEdits,

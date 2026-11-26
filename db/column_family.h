@@ -37,6 +37,8 @@ namespace ROCKSDB_NAMESPACE {
 class Version;
 class VersionSet;
 class VersionStorageInfo;
+class BlobReferenceCensus;
+struct BlobReferenceCensusGarbage;
 class MemTable;
 class MemTableListVersion;
 class CompactionPicker;
@@ -284,6 +286,16 @@ Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options);
 Status CheckCFPathsSupported(const DBOptions& db_options,
                              const ColumnFamilyOptions& cf_options);
 
+// Returns NotSupported when `has_blob_indirection` is true and `style` is
+// kCompactionStyleFIFO, because blob indirection does not support FIFO
+// compaction. ColumnFamilyData::ValidateOptions() calls it for one CF.
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection);
+// Runs the check above for each CF of an open request. Read-only and secondary
+// opens call it, because they do not call ValidateOptions().
+Status CheckBlobIndirectionCompactionStyle(
+    const std::vector<ColumnFamilyDescriptor>& column_families);
+
 ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                                       bool read_only,
                                       const ColumnFamilyOptions& src);
@@ -377,25 +389,120 @@ class ColumnFamilyData {
   // Validate CF options against DB options
   static Status ValidateOptions(const DBOptions& db_options,
                                 const ColumnFamilyOptions& cf_options);
-  // REQUIRES: DB mutex held
-  Status SetOptions(
+
+  // Runs only when the DB is opened for writing (not read-only), after
+  // MANIFEST recovery. If enable_blob_indirection is on or the CF has the
+  // format fence, it checks that the compaction style is supported. If the CF
+  // has the fence, it also checks that blob direct write is off and that the
+  // table factory can write Block-Based Tables. REQUIRES: DB mutex held.
+  Status ValidateBlobIndirectionOptionsAfterRecovery() const;
+
+  // Test-only, not public API. Until the indirect blob GC stack is complete,
+  // ValidateOptions rejects enable_blob_indirection unless a test allows it.
+  static void TEST_SetAllowBlobIndirection(bool allow);
+
+  // DBImpl::SetOptions() must change the options of all its column families or
+  // none, so it changes them in two steps: prepare every column family, then
+  // publish them all together. This is the prepare step. It applies
+  // `options_map` on top of `*mutable_cf_options`, validates the result, and
+  // stores the result back in `*mutable_cf_options`. It does not change the
+  // options of this column family. REQUIRES: DB mutex held. The caller starts
+  // `*mutable_cf_options` from a copy of the latest options of this column
+  // family. It must make sure that no one changes those options before the
+  // publish step. DBImpl::SetOptions() holds options_mutex_ for this.
+  Status PrepareMutableCFOptions(
       const DBOptions& db_options,
-      const std::unordered_map<std::string, std::string>& options_map);
+      const std::unordered_map<std::string, std::string>& options_map,
+      MutableCFOptions* mutable_cf_options) const;
+
+  // The publish step: makes options from PrepareMutableCFOptions() the latest
+  // options of this column family. LogAndApply() calls it for
+  // DBImpl::SetOptions(). Readers see the new options only after
+  // DBImpl::SetOptions() installs a new SuperVersion. Then
+  // DBImpl::SetOptions() calls MarkOptionsInstalled().
+  // REQUIRES: DB mutex held.
+  void PublishMutableCFOptions(const MutableCFOptions& mutable_cf_options);
+
   // REQUIRES: DB mutex held
-  // Returns true if the column family is not dropped, SetOptions(db_options,
-  // options_map) would succeed without changing any option, and options from
-  // an earlier SetOptions() are not still waiting for MarkOptionsInstalled().
+  // Returns true if the column family is not dropped, applying `options_map`
+  // with PrepareMutableCFOptions() would succeed without changing any option,
+  // and options from an earlier PublishMutableCFOptions() are not still
+  // waiting for MarkOptionsInstalled().
   // Can return false for a request that changes nothing, for example one that
   // sets a table factory field.
   bool SetOptionsIsNoOp(
       const DBOptions& db_options,
       const std::unordered_map<std::string, std::string>& options_map) const;
   // REQUIRES: DB mutex held
-  // Call after the options from SetOptions() are in the current SuperVersion
-  // and every other user of them is updated.
+  // Call after the options from PublishMutableCFOptions() are in the current
+  // SuperVersion and every other user of them is updated.
   void MarkOptionsInstalled() { options_install_pending_ = false; }
 
   InternalStats* internal_stats() { return internal_stats_.get(); }
+
+  // The blob reference census of this CF (see db/blob/blob_reference_census.h).
+  // It is null until the CF first needs it. Two paths create it, both through
+  // GetOrCreateBlobReferenceCensus():
+  // - a Version install (LogAndApply()) for a CF whose current Version has the
+  //   per-CF format fence, or for a CF with enable_blob_indirection when the DB
+  //   has the DB-global format fence after the install. Examples are the
+  //   install that activates the format, and the SetOptions() call that turns
+  //   the option on (it installs new Versions without a MANIFEST record). Both
+  //   fences are described under "MANIFEST records" in
+  //   db/blob/blob_relocation_manifest.h;
+  // - census scheduling for a CF recovered from the MANIFEST with the format
+  //   fence.
+  // Once created, the census lives as long as the CFD.
+  BlobReferenceCensus* blob_reference_census() {
+    return blob_reference_census_.load(std::memory_order_acquire);
+  }
+  const BlobReferenceCensus* blob_reference_census() const {
+    return blob_reference_census_.load(std::memory_order_acquire);
+  }
+  // The number of failed census builds in a row (see
+  // blob_reference_census_failures_). REQUIRES: DB mutex held.
+  uint32_t blob_reference_census_failures() const {
+    return blob_reference_census_failures_;
+  }
+  // Indirect blob GC idle time: the DB clock time since which this column
+  // family has had GC candidates and no GC job began, or 0. It measures
+  // whether GC falls behind, so it counts only while the options let a GC job
+  // run (IndirectBlobGcOptionsAllowJob()). While the options allow it, a census
+  // publish with candidates while no GC job runs, and the end of a GC job that
+  // leaves candidates, start it. A GC job start, a census publish without
+  // candidates or with the options off, and a SetOptions() call that turns GC
+  // off clear it.
+  void NoteIndirectBlobGcCandidates(uint64_t now_micros) {
+    uint64_t expected = 0;
+    indirect_blob_gc_candidates_since_micros_.compare_exchange_strong(
+        expected, now_micros, std::memory_order_relaxed);
+  }
+  void ClearIndirectBlobGcCandidates() {
+    indirect_blob_gc_candidates_since_micros_.store(0,
+                                                    std::memory_order_relaxed);
+  }
+  uint64_t IndirectBlobGcCandidatesSinceMicros() const {
+    return indirect_blob_gc_candidates_since_micros_.load(
+        std::memory_order_relaxed);
+  }
+  // True when the latest options let an indirect blob GC job run: blob files,
+  // blob GC and blob indirection are on, and auto compactions are not disabled.
+  // These are the option checks of NeedsCompaction(). The census can exist
+  // while they are off, because it follows the Version format, not the
+  // options. REQUIRES: DB mutex held.
+  bool IndirectBlobGcOptionsAllowJob() const {
+    return !mutable_cf_options_.disable_auto_compactions &&
+           mutable_cf_options_.enable_blob_files &&
+           mutable_cf_options_.enable_blob_garbage_collection &&
+           mutable_cf_options_.enable_blob_indirection;
+  }
+
+  // REQUIRES: DB mutex held.
+  BlobReferenceCensus* GetOrCreateBlobReferenceCensus();
+
+  // REQUIRES: DB mutex held. The caller must destroy the returned state after
+  // it releases the DB mutex.
+  BlobReferenceCensusGarbage CancelBlobReferenceCensus();
 
   MemTableList* imm() { return &imm_; }
   MemTable* mem() { return mem_; }
@@ -676,6 +783,7 @@ class ColumnFamilyData {
 
  private:
   friend class ColumnFamilySet;
+  friend class DBImpl;
   ColumnFamilyData(
       uint32_t id, const std::string& name, Version* dummy_versions,
       Cache* table_cache, WriteBufferManager* write_buffer_manager,
@@ -716,9 +824,10 @@ class ColumnFamilyData {
   const bool is_delete_range_supported_;
   const bool is_table_builder_supported_;
 
-  // True from a successful SetOptions() until MarkOptionsInstalled(). A
-  // DB::SetOptions() call that fails on a later column family leaves it set
-  // for the column families it already changed.
+  // True from PublishMutableCFOptions() until MarkOptionsInstalled().
+  // DBImpl::SetOptions() installs the options of all the column families it
+  // changes together, inside LogAndApply, after every one of them is prepared.
+  // So it sets this flag for every column family it changes, or for none.
   bool options_install_pending_ = false;
 
   std::unique_ptr<TableCache> table_cache_;
@@ -726,6 +835,10 @@ class ColumnFamilyData {
   std::unique_ptr<BlobSource> blob_source_;
   // Per-CF manager for write-path blob direct-write files.
   std::shared_ptr<BlobFilePartitionManager> blob_partition_manager_;
+  // Owns the census. blob_reference_census_ points to the same object, so
+  // readers that do not hold the DB mutex can load it.
+  std::unique_ptr<BlobReferenceCensus> blob_reference_census_storage_;
+  std::atomic<BlobReferenceCensus*> blob_reference_census_{nullptr};
 
   std::unique_ptr<InternalStats> internal_stats_;
 
@@ -769,6 +882,24 @@ class ColumnFamilyData {
   // If true, this ColumnFamily is in DBImpl::compaction_queue_ or its parked
   // compaction set.
   bool queued_for_compaction_;
+
+  // State for the background census worker, protected by the DB mutex. DBImpl
+  // keeps two intrusive lists of CFs, linked by next_blob_reference_census_:
+  // the run queue and the retry list. While queued_for_blob_reference_census_
+  // is true, the CF is in one of the lists or its census is running, and the
+  // census scheduler holds one reference to the CF. A running census worker
+  // releases that reference when it is done, or keeps it when it moves the CF
+  // to the retry list. blob_reference_census_retry_micros_ is the time when the
+  // retry list moves the CF back to the run queue. A CF with no failed build
+  // can move back earlier when its census has new work.
+  // blob_reference_census_failures_ counts failed builds in a row (capped at
+  // 6). After a failure, the retry delay is 1 second, doubled for each failure
+  // in a row, so at most 32 seconds.
+  bool queued_for_blob_reference_census_ = false;
+  ColumnFamilyData* next_blob_reference_census_ = nullptr;
+  uint64_t blob_reference_census_retry_micros_ = 0;
+  uint32_t blob_reference_census_failures_ = 0;
+  std::atomic<uint64_t> indirect_blob_gc_candidates_since_micros_{0};
 
   // Read outside the DB mutex by compaction workers (acquire-loaded roughly
   // every 1024 records in ProcessKeyValueCompaction). Given its own cache line

@@ -620,6 +620,110 @@ TEST_F(DBSecondaryTest, InternalCompactionMultiLevels) {
   //  cfh, input1, &result));
 }
 
+TEST_F(DBSecondaryTest, CatchUpAfterPrimaryDeletesObsoleteNormalBlobFile) {
+  // In a column family with the blob indirection format fence, the primary
+  // turns enable_blob_indirection off and writes a normal blob file, which
+  // later becomes obsolete and is deleted. The secondary tails the MANIFEST
+  // that has the file's addition. Its catch-up (ManifestTailer) must still
+  // accept the newest point, so the obsolete file does not count as a missing
+  // needed file.
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "value-fence"));
+  ASSERT_OK(Flush());
+  options.enable_blob_indirection = false;
+  Reopen(options);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+
+  // No catch-up runs between the file's addition and its deletion, so the
+  // catch-up below applies the addition when the file is already gone.
+  ASSERT_OK(Put("a", "old-a"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("a", "new-a"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact;
+  compact.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact, nullptr, nullptr));
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_OK(Put("late", "value-late"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "late", &value));
+  ASSERT_EQ(value, "value-late");
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ(value, "new-a");
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "fence", &value));
+  ASSERT_EQ(value, "value-fence");
+}
+
+TEST_F(DBSecondaryTest, CatchUpAfterPrimaryDropsNormalBlobBelowOldest) {
+  // In a column family with the blob indirection format fence, the primary
+  // turns enable_blob_indirection off, writes normal blob file N, and then
+  // removes, with DeleteFilesInRange(), the only SST that links N. N is then
+  // below the oldest blob file of every remaining SST, so it leaves the
+  // Version and is deleted. The secondary tails the MANIFEST that has N's
+  // addition. Its catch-up must still accept the newest point.
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  // The fence SST holds an inline value, so it has no oldest blob file.
+  options.min_blob_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "value-fence"));
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(dbfull()
+                  ->GetVersionSet()
+                  ->GetColumnFamilySet()
+                  ->GetDefault()
+                  ->current()
+                  ->storage_info()
+                  ->HasBlobIndirectionFormat());
+  MoveFilesToLevel(2);
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  Reopen(options);
+  Options secondary_options = options;
+  secondary_options.max_open_files = -1;
+  OpenSecondary(secondary_options);
+
+  ASSERT_OK(Put("a", "value-a"));
+  ASSERT_OK(Flush());
+  const uint64_t normal = GetBlobFileNumbers().back();
+  // DeleteFilesInRange() does not delete L0 files. No catch-up runs between
+  // N's addition and its deletion, so the catch-up below applies the addition
+  // when N is already gone.
+  MoveFilesToLevel(1);
+  ASSERT_OK(Put("m", "value-m"));
+  ASSERT_OK(Flush());
+  const Slice begin("a");
+  const Slice end("b");
+  ASSERT_OK(
+      DeleteFilesInRange(db_.get(), db_->DefaultColumnFamily(), &begin, &end));
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_EQ(Get("a"), "NOT_FOUND");
+  ASSERT_TRUE(env_->FileExists(BlobFileName(dbname_, normal)).IsNotFound());
+  ASSERT_OK(Put("late", "value-late"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "late", &value));
+  ASSERT_EQ(value, "value-late");
+  ASSERT_OK(db_secondary_->Get(ReadOptions(), "m", &value));
+  ASSERT_EQ(value, "value-m");
+}
+
 TEST_F(DBSecondaryTest, GetMergeOperands) {
   Options options;
   options.merge_operator = MergeOperators::CreateStringAppendOperator();
@@ -2568,6 +2672,69 @@ TEST_F(DBSecondaryTest, CatchUpKeepsUnflushedWalData) {
   VerifySecondaryValue(handles_secondary_[1], "bar", "v1");
 }
 
+TEST_F(DBSecondaryTest, ConcurrentCatchUpWaitsAcrossUnlockedManifestWork) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("key", "old"));
+  ASSERT_OK(Flush());
+  options.max_open_files = -1;
+  OpenSecondary(options);
+  ASSERT_OK(Put("key", "new"));
+  ASSERT_OK(Flush());
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool paused = false;
+  bool release = false;
+  unsigned attempts = 0;
+  std::atomic<bool> second_completed{false};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImplSecondary::TryCatchUpWithPrimary:BeforeCatchUpLock", [&](void*) {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        ++attempts;
+        gate_cv.notify_all();
+      });
+  sync_point->SetCallBack("ManifestTailer::DecodeVersionEdit:Unlocked",
+                          [&](void*) {
+                            std::unique_lock<std::mutex> lock(gate_mutex);
+                            if (paused) {
+                              return;
+                            }
+                            paused = true;
+                            gate_cv.notify_all();
+                            gate_cv.wait(lock, [&] { return release; });
+                          });
+  sync_point->EnableProcessing();
+  Status first_status;
+  Status second_status;
+  port::Thread first(
+      [&] { first_status = db_secondary_->TryCatchUpWithPrimary(); });
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate_cv.wait(lock, [&] { return paused; });
+  }
+  port::Thread second([&] {
+    second_status = db_secondary_->TryCatchUpWithPrimary();
+    second_completed.store(true);
+  });
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate_cv.wait(lock, [&] { return attempts == 2; });
+    EXPECT_FALSE(second_completed.load());
+    release = true;
+    gate_cv.notify_all();
+  }
+  first.join();
+  second.join();
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+  ASSERT_OK(first_status);
+  ASSERT_OK(second_status);
+  VerifySecondaryValue("key", "new");
+}
+
 TEST_F(DBSecondaryTest, NewIteratorsConsistentViewDuringCatchUp) {
   Options options;
   options.env = env_;
@@ -3438,6 +3605,88 @@ TEST_F(DBSecondaryManifestReadErrorTest, CatchUpResumesInsideAtomicGroup) {
 
   ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
   VerifySecondaryHasFlushes(cfs, kNumFlushes, kKeySize);
+}
+
+// As in CatchUpResumesInsideAtomicGroup, a failed MANIFEST read cuts an atomic
+// group, so the tailer holds the first records of the group. Then the primary
+// starts a new MANIFEST, so the next call switches to it. The new MANIFEST
+// lists every table file again in its first records, so the switch must drop
+// the records of the cut group. The tailer resets its read state without the
+// DB mutex when it switches.
+TEST_F(DBSecondaryManifestReadErrorTest,
+       CatchUpSwitchesManifestAfterReadErrorInsideAtomicGroup) {
+  Options options;
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  options.atomic_flush = true;
+  const std::vector<std::string> cf_names = {"cf1", "cf2", "cf3"};
+  const std::vector<int> cfs = {0, 1, 2, 3};
+  CreateAndReopenWithCF(cf_names, options);
+  for (int cf : cfs) {
+    ASSERT_OK(Put(cf, "foo", "v1"));
+  }
+  ASSERT_OK(Flush(cfs));
+  OpenSecondaryOnFailingFs(options, cf_names);
+  const size_t records_read_at_open = ReadPrimaryManifestRecords().size();
+
+  // As in CatchUpResumesInsideAtomicGroup, the block boundaries cut groups.
+  constexpr int kNumFlushes = 4;
+  constexpr size_t kKeySize = 10000;
+  FlushWithLongKeys(cfs, kNumFlushes, kKeySize);
+
+  // Find the first block boundary after the first record of a group and before
+  // the end of that group.
+  const std::vector<ManifestRecord> records = ReadPrimaryManifestRecords();
+  uint64_t cut = 0;
+  for (size_t i = records_read_at_open; cut == 0 && i < records.size(); ++i) {
+    const VersionEdit& first = records[i].edit;
+    if (!first.IsInAtomicGroup()) {
+      continue;
+    }
+    const size_t last = i + first.GetRemainingEntries();
+    ASSERT_LT(last, records.size());
+    const uint64_t boundary = (records[i].end_offset + log::kBlockSize - 1) /
+                              log::kBlockSize * log::kBlockSize;
+    if (boundary < records[last].end_offset) {
+      cut = boundary;
+    }
+    i = last;
+  }
+  ASSERT_GT(cut, 0);
+
+  failing_fs_->FailReadsAt(cut);
+  const Status s = db_secondary_->TryCatchUpWithPrimary();
+  failing_fs_->Disarm();
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+  ASSERT_EQ(1, failing_fs_->failed_reads());
+  auto* const reactive_versions = static_cast_with_check<ReactiveVersionSet>(
+      db_secondary_full()->GetVersionSet());
+  // The tailer holds the first records of the cut group.
+  ASSERT_GT(reactive_versions->TEST_read_edits_in_atomic_group(), 0);
+
+  // The primary writes a new MANIFEST when it opens, and CURRENT names it.
+  const uint64_t old_manifest_number = dbfull()->TEST_Current_Manifest_FileNo();
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "cf1", "cf2", "cf3"},
+                           options);
+  ASSERT_NE(old_manifest_number, dbfull()->TEST_Current_Manifest_FileNo());
+
+  int unlocked_switch_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestTailer::PrepareToReadNewManifest:Unlocked", [&](void* arg) {
+        auto* const mu = static_cast<InstrumentedMutex*>(arg);
+        ASSERT_TRUE(mu->TryLock());
+        mu->Unlock();
+        ++unlocked_switch_calls;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+  ASSERT_EQ(0, reactive_versions->TEST_read_edits_in_atomic_group());
+  ASSERT_EQ(1, unlocked_switch_calls);
+  VerifySecondaryHasFlushes(cfs, kNumFlushes, kKeySize);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 // The next two tests replace the MANIFEST while the secondary has it open,

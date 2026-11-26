@@ -10,6 +10,9 @@
 #include <memory>
 #include <utility>
 
+#include "db/blob/blob_relocation_file.h"
+#include "db/blob/blob_relocation_manifest.h"
+#include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
@@ -23,6 +26,7 @@
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/utilities/options_util.h"
+#include "table/block_based/block_based_table_builder.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -1252,6 +1256,142 @@ TEST_F(LdbCmdTest, CustomComparator) {
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), &cfds));
+}
+
+TEST_F(LdbCmdTest, ManifestDumpPrintsBlobIndirectionSummary) {
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_blob_indirection_summary");
+  ASSERT_OK(DestroyDB(dbname, options));
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname, &db));
+  DBImpl* const db_impl = static_cast_with_check<DBImpl>(db.get());
+  VersionSet* const version_set = db_impl->GetVersionSet();
+  ColumnFamilyData* const cfd = version_set->GetColumnFamilySet()->GetDefault();
+
+  // Writes a relocation file with one value. File number 1 is an example old
+  // file: the relocation file lists it as a served file, so a route can send
+  // its reads to the relocation file.
+  constexpr uint64_t kOldFileNumber = 1;
+  db_impl->TEST_LockMutex();
+  const uint64_t file_number = version_set->NewFileNumber();
+  db_impl->TEST_UnlockMutex();
+  Options relocation_options = options;
+  relocation_options.cf_paths.emplace_back(dbname, /*target_size=*/0);
+  const BlockBasedTableOptions table_options;
+  const ImmutableOptions immutable_options(relocation_options);
+  const MutableCFOptions mutable_options(relocation_options);
+  const std::string path = BlobFileName(dbname, file_number);
+  std::unique_ptr<WritableFileWriter> writer;
+  ASSERT_OK(WritableFileWriter::Create(options.env->GetFileSystem(), path,
+                                       FileOptions(), &writer,
+                                       /*dbg=*/nullptr));
+  const InternalKeyComparator comparator(BytewiseComparator());
+  BlobRelocationTableFileInfo file_info;
+  file_info.column_family_id = cfd->GetID();
+  file_info.column_family_name = kDefaultColumnFamilyName;
+  file_info.db_id = "test-db";
+  file_info.db_session_id = "test-session";
+  file_info.file_number = file_number;
+  std::unique_ptr<BlockBasedTableBuilder> builder;
+  ASSERT_OK(NewBlobRelocationTableBuilder(
+      immutable_options, mutable_options, table_options, ReadOptions(),
+      WriteOptions(), comparator, file_info, writer.get(), &builder));
+  ASSERT_OK(builder->AddBlobRelocation(kOldFileNumber,
+                                       /*original_value_offset=*/11, "payload",
+                                       kNoCompression));
+  ASSERT_OK(builder->AddBlobRelocationServedFile(kOldFileNumber));
+  ASSERT_OK(builder->Finish());
+  BlobRelocationFileMetadata metadata;
+  ASSERT_OK(builder->GetBlobRelocationFileMetadata(&metadata));
+  ASSERT_OK(writer->Close(IOOptions(), /*dbg=*/nullptr));
+  uint64_t file_size = 0;
+  ASSERT_OK(options.env->GetFileSize(path, &file_size));
+
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
+  edit.AddBlobRelocationFile(BlobRelocationFileAddition(
+      file_number, file_size, /*checksum_method=*/std::string(),
+      /*checksum_value=*/std::string(), metadata.encoded_directory,
+      metadata.tail_size));
+  edit.SetBlobRelocationRoute(BlobRelocationRoute(kOldFileNumber, file_number));
+  db_impl->TEST_LockMutex();
+  ASSERT_OK(version_set->LogAndApply(
+      cfd, ReadOptions(), WriteOptions(), &edit, db_impl->TEST_Mutex(),
+      /*dir_contains_current_file=*/nullptr, /*new_descriptor_log=*/false,
+      /*column_family_options=*/nullptr, /*manifest_wcb=*/{},
+      /*pre_cb=*/{}));
+  db_impl->TEST_UnlockMutex();
+  db.reset();
+
+  const std::string db_argument = "--db=" + dbname;
+  const char* arguments[] = {"./ldb", db_argument.c_str(), "manifest_dump"};
+  testing::internal::CaptureStdout();
+  const int result =
+      LDBCommandRunner::RunCommand(3, arguments, options, LDBOptions(),
+                                   /*column_families=*/nullptr);
+  const std::string output = testing::internal::GetCapturedStdout();
+  ASSERT_EQ(result, 0);
+  const std::string expected =
+      "--- blob indirection --- format version: " +
+      std::to_string(kBlobIndirectionManifestFormatVersion) +
+      ", relocation files: 1 (" + std::to_string(file_size) +
+      " bytes, 1 values), routes: 1";
+  EXPECT_NE(output.find(expected), std::string::npos) << output;
+  EXPECT_NE(output.find("db blob indirection format version " +
+                        std::to_string(kBlobIndirectionManifestFormatVersion)),
+            std::string::npos)
+      << output;
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+TEST_F(LdbCmdTest, ManifestDumpPrintsBlobReferenceMetadata) {
+  ColumnFamilyData::TEST_SetAllowBlobIndirection(true);
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_blob_reference_metadata");
+  ASSERT_OK(DestroyDB(dbname, options));
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname, &db));
+  ASSERT_OK(db->Put(WriteOptions(), "key1", "value1"));
+  ASSERT_OK(db->Put(WriteOptions(), "key2", "value2"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+  // A compaction to L1 always writes exact reference metadata.
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db->CompactRange(compact_options, nullptr, nullptr));
+  db.reset();
+
+  const std::string db_argument = "--db=" + dbname;
+  const char* arguments[] = {"./ldb", db_argument.c_str(), "manifest_dump",
+                             "--verbose"};
+  testing::internal::CaptureStdout();
+  const int result =
+      LDBCommandRunner::RunCommand(4, arguments, options, LDBOptions(),
+                                   /*column_families=*/nullptr);
+  const std::string output = testing::internal::GetCapturedStdout();
+  ASSERT_EQ(result, 0);
+  // The AddFile record of the compaction output.
+  EXPECT_NE(
+      output.find(
+          " blob_references: exact (2 references, 12 stored value bytes)"),
+      std::string::npos)
+      << output;
+  EXPECT_NE(output.find("--- blob reference metadata --- exact SSTs: 1, coarse "
+                        "SSTs: 0 (lowest frontier 0), legacy SSTs: 0"),
+            std::string::npos)
+      << output;
+  ASSERT_OK(DestroyDB(dbname, options));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

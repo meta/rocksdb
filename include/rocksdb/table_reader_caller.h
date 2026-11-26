@@ -35,6 +35,10 @@ enum TableReaderCaller : char {
   // A list of callers that are either not interesting for analysis or are
   // calling from a test environment, e.g., unit test, benchmark, etc.
   kUncategorized = 14,
+  // Block reads of a blob relocation file (blob indirection): its index and
+  // location blocks. Record reads do not use the block cache. The relocation
+  // reader checks the raw location entries itself.
+  kBlobRelocationFileRead = 15,
   // All callers should be added before kMaxBlockCacheLookupCaller.
   kMaxBlockCacheLookupCaller
 };
