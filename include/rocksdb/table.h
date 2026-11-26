@@ -536,7 +536,52 @@ struct BlockBasedTableOptions {
   // (iii) Compatible existing behavior:
   // Same as kDisabled.
   //
-  // (f) Other CacheEntryRole
+  // (f) CacheEntryRole::kBlobReferenceMetadataBuildingBuffer
+  // (i) If kEnabled:
+  // Charge memory usage of the buffers that record the blob references of an
+  // SST while the SST is built. The SST stores these references as its exact
+  // blob reference metadata. Only SSTs built with blob indirection (see
+  // `enable_blob_indirection`) use these buffers.
+  // When the SST is finished, the charge of these buffers moves to the
+  // in-memory summary of the SST. The blob reference census keeps that
+  // summary, and so its charge, until it has added the SST to its counts. This
+  // can last until a later census build.
+  // If such memory usage exceeds the available space left in the block cache
+  // at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), that memory is not
+  // charged and the SST build continues.
+  // (ii) If kDisabled:
+  // Does not charge the memory usage mentioned above.
+  // (iii) Compatible existing behavior:
+  // Same as kEnabled.
+  //
+  // (g) CacheEntryRole::kBlobReferenceCensus
+  // (i) If kEnabled:
+  // Charge memory usage of the blob reference census, the in-memory reverse
+  // index from blob files to the SSTs that reference them. The charge covers
+  // the census, its build state, its queued changes, and the SST summaries
+  // that a census build or a compaction reads for the census. Only a column
+  // family that uses blob indirection (see `enable_blob_indirection`) has a
+  // census.
+  // If such memory usage exceeds the available space left in the block cache
+  // at some point (i.e, causing a cache full under
+  // `LRUCacheOptions::strict_capacity_limit` = true), that memory is not
+  // charged and the census work continues: the census still becomes ready,
+  // and installs still update it. So with strict_capacity_limit, census
+  // memory can exceed the block cache capacity. The census job logs a WARN
+  // line, and the census-uncharged-builds key of
+  // `DB::Properties::kIndirectBlobGcStats` counts such builds. No flush,
+  // compaction, census build or write fails because of this charge.
+  // (ii) If kDisabled:
+  // Does not charge the census itself, its build state or its queued changes.
+  // The SST summaries that a census build or a compaction reads are then
+  // charged as CacheEntryRole::kBlobReferenceMetadataBuildingBuffer instead,
+  // unless that role is disabled too. A summary that the full block cache
+  // cannot hold is read uncharged, as described in (i).
+  // (iii) Compatible existing behavior:
+  // Same as kEnabled.
+  //
+  // (h) Other CacheEntryRole
   // Not supported.
   // `Status::kNotSupported` will be returned if
   // `CacheEntryRoleOptions::charged` is set to {`kEnabled`, `kDisabled`}.

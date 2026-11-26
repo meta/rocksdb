@@ -6,10 +6,40 @@
 #include "table/adaptive/adaptive_table_factory.h"
 
 #include "port/port.h"
+#include "table/block_based/block_based_table_factory.h"
 #include "table/format.h"
 #include "table/table_builder.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+const BlockBasedTableOptions* GetBlockBasedTableWriterOptions(
+    const TableFactory* table_factory) {
+  if (table_factory == nullptr) {
+    return nullptr;
+  }
+  const AdaptiveTableFactory* adaptive =
+      table_factory->CheckedCast<AdaptiveTableFactory>();
+  return adaptive != nullptr
+             ? adaptive->GetBlockBasedTableWriterOptions()
+             : table_factory->GetOptions<BlockBasedTableOptions>();
+}
+
+std::shared_ptr<CacheReservationManager>
+GetBlobReferenceCacheReservationManager(const TableFactory* table_factory) {
+  if (table_factory == nullptr) {
+    return nullptr;
+  }
+  const AdaptiveTableFactory* adaptive =
+      table_factory->CheckedCast<AdaptiveTableFactory>();
+  if (adaptive != nullptr) {
+    return adaptive->GetBlobReferenceCacheReservationManager();
+  }
+  const BlockBasedTableFactory* block_based =
+      table_factory->CheckedCast<BlockBasedTableFactory>();
+  return block_based != nullptr
+             ? block_based->GetBlobReferenceCacheReservationManager()
+             : nullptr;
+}
 
 AdaptiveTableFactory::AdaptiveTableFactory(
     std::shared_ptr<TableFactory> table_factory_to_write,
@@ -117,6 +147,20 @@ std::string AdaptiveTableFactory::GetPrintableOptions() const {
     ret.append(buffer);
   }
   return ret;
+}
+
+const BlockBasedTableOptions*
+AdaptiveTableFactory::GetBlockBasedTableWriterOptions() const {
+  return table_factory_to_write_->GetOptions<BlockBasedTableOptions>();
+}
+
+std::shared_ptr<CacheReservationManager>
+AdaptiveTableFactory::GetBlobReferenceCacheReservationManager() const {
+  const BlockBasedTableFactory* block_based =
+      table_factory_to_write_->CheckedCast<BlockBasedTableFactory>();
+  return block_based != nullptr
+             ? block_based->GetBlobReferenceCacheReservationManager()
+             : nullptr;
 }
 
 TableFactory* NewAdaptiveTableFactory(

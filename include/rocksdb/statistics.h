@@ -700,6 +700,42 @@ enum Tickers : uint32_t {
   // hide. An iterator can count an entry again when it moves back to it.
   BLOB_DB_DROPPED_BLOB_READ_COUNT,
 
+  // Number of times a blob reference census build overflowed its change log
+  // again after an overflow restart, before it published. The census then
+  // retries after a backoff (DBs that use enable_blob_indirection).
+  BLOB_DB_CENSUS_RESTART_OVERFLOW_COUNT,
+
+  // Number of compaction output SSTs that were closed because they already held
+  // blob_indirection_max_references_per_sst blob references when the next user
+  // key arrived (DBs that use or have used enable_blob_indirection).
+  COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // times a relocation file reader failed to open (the file is missing,
+  // corrupt, or could not be read). Opens of normal blob files count in
+  // NO_FILE_ERRORS only.
+  BLOB_RELOCATION_FILE_OPEN_FAILURES,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // reads that got the remembered result of an earlier failed relocation file
+  // open, without opening the file again (see BlobFileCache).
+  BLOB_RELOCATION_FAILED_OPEN_CACHE_HITS,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // blob cache misses that found the value through a route (the reference names
+  // an old file whose live values moved to a relocation file).
+  BLOB_DB_INDIRECT_READ_ROUTED,
+
+  // Used only by DBs that use or have used enable_blob_indirection. Number of
+  // L0 trivial move picks (leveled compaction) that stopped at a coarse L0
+  // file, because a coarse file must be rewritten with exact blob reference
+  // metadata when it leaves L0. The pick stops before it checks whether the
+  // coarse file could move at all (key range and overlap with the output
+  // level), so the count includes files that could not have moved anyway. It
+  // also counts the same file again at each pick while that file is the
+  // oldest L0 file not yet picked.
+  COMPACTION_COARSE_L0_TRIVIAL_MOVE_BLOCKED,
+
   TICKER_ENUM_MAX
 };
 
@@ -887,6 +923,10 @@ enum Histograms : uint32_t {
 
   // Time spent opening the secondary DB inside DB::OpenAndCompact().
   OPEN_AND_COMPACT_DB_OPEN_MICROS,
+
+  // Number of blob references in each compaction output SST that has exact blob
+  // reference metadata (DBs that use or have used enable_blob_indirection).
+  COMPACTION_OUTPUT_BLOB_REFERENCES,
 
   HISTOGRAM_ENUM_MAX
 };

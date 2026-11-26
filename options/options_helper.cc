@@ -393,6 +393,11 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
 
   // Blob file related options
   cf_opts->enable_blob_files = moptions.enable_blob_files;
+  cf_opts->enable_blob_indirection = moptions.enable_blob_indirection;
+  cf_opts->pin_blob_relocation_location_blocks =
+      moptions.pin_blob_relocation_location_blocks;
+  cf_opts->blob_indirection_max_references_per_sst =
+      moptions.blob_indirection_max_references_per_sst;
   cf_opts->min_blob_size = moptions.min_blob_size;
   cf_opts->blob_file_size = moptions.blob_file_size;
   cf_opts->blob_file_writable_file_max_buffer_size =
