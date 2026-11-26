@@ -48,6 +48,14 @@ class VersionBuilder {
 
   bool CheckConsistencyForNumLevels();
 
+  // Applies `edit` to the builder. The caller must make sure that no other
+  // thread uses the builder and that its base Version stays alive. Callers
+  // usually do this by holding the DB mutex. Offline tools that own the
+  // VersionSet alone (for example OfflineManifestWriter) hold no DB mutex. In
+  // the unlocked apply of LogAndApplyWithUnlockedApply(),
+  // VersionSet::LogAndApplyHelper() owns the builder, holds a reference to its
+  // base Version and is the head of the MANIFEST writer queue, so no other
+  // thread changes the builder or installs a Version.
   Status Apply(const VersionEdit* edit);
 
   // Save the current Version to the provided `vstorage`.
