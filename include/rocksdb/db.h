@@ -2781,6 +2781,25 @@ class DB {
   //     the files cannot be ingested to the bottommost level, and it is the
   //     user's responsibility to clear the bottommost level in the overlapping
   //     range before re-attempting the ingestion.
+  // (5) Blob indirection (AdvancedColumnFamilyOptions::enable_blob_indirection,
+  //     experimental) adds these results. The references in such files need
+  //     relocation files and routes of the DB that wrote them, and ingestion
+  //     does not carry those.
+  //     - NotSupported for an SST whose table properties hold blob indirection
+  //       metadata, in every column family.
+  //     - With IngestExternalFileOptions::allow_db_generated_files, in a column
+  //       family that has written data with blob indirection, has the option
+  //       on, or has a flush or compaction running that was started with it
+  //       on: NotSupported for a file with a reference to a value in another
+  //       blob file. This is a best-effort early check: such a reference
+  //       resolves only through the DB's own blob files, and a read of a blob
+  //       file that the DB does not have fails with Corruption, as without
+  //       blob indirection.
+  //     - With allow_db_generated_files: TryAgain when the column family gets
+  //       into that state after the files were prepared, because the files must
+  //       then be checked for such references. Ingest again; the new call
+  //       checks them. With the two-phase API below, a failed commit rolls the
+  //       handle back, so prepare the files again.
   //
   // EXPERIMENTAL: the temperatures of the files after ingestion are currently
   // determined like this:
@@ -2812,6 +2831,8 @@ class DB {
   // column families with iterators, iterator on one column family may return
   // ingested data, while iterator on other column family returns old data.
   // Users can use snapshot for a consistent view of data.
+  // It returns the same blob indirection results as IngestExternalFile()
+  // (note (5) there).
   // If your db ingests multiple SST files using this API, i.e. args.size()
   // > 1, then RocksDB 5.15 and earlier will not be able to open it.
   //
@@ -2861,6 +2882,9 @@ class DB {
   // appear in `handles` (so for overlapping keys a later handle's data wins).
   // Handles that target the same column family must have been prepared with the
   // same IngestExternalFileOptions. On failure all handles are rolled back.
+  // Prepare and commit return the same blob indirection results as
+  // IngestExternalFile() (note (5) there). A TryAgain from commit means that
+  // the files must be prepared again.
   virtual Status CommitFileIngestionHandles(
       std::vector<std::unique_ptr<FileIngestionHandle>> handles) = 0;
 
@@ -2890,9 +2914,16 @@ class DB {
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
   // Import never brings blob files, so it returns NotSupported if any file in
-  // `metadata` references blob files (oldest_blob_file_number != 0). Importing
-  // files without blob references into a column family with
-  // `enable_blob_files` is allowed.
+  // `metadata` references blob files (oldest_blob_file_number != 0). It also
+  // returns NotSupported if the table properties of a file show that the file
+  // can hold blob indirection references. Such a file can have
+  // oldest_blob_file_number 0, so the first check does not catch it. The
+  // exported `metadata` cannot carry the blob indirection state that such a
+  // file needs (see Checkpoint::ExportColumnFamily in utilities/checkpoint.h).
+  // A column family that uses or has used enable_blob_indirection can write
+  // such files, also after the option is turned off. SST files that pass both
+  // checks can be imported, also when `options` turns on enable_blob_files for
+  // the new column family.
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,
       const ImportColumnFamilyOptions& import_options,

@@ -65,6 +65,33 @@ TEST_F(LdbCmdTest, HelpAndVersion) {
   ASSERT_NE(0, LDBCommandRunner::RunCommand(2, bad, o, lo, nullptr));
 }
 
+TEST_F(LdbCmdTest, DumpRelocationFileDoesNotUseBlobLogDecoder) {
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_relocation_dump_test");
+  ASSERT_OK(options.env->CreateDirIfMissing(dbname));
+  const std::string path = BlobFileName(dbname, 1);
+  ASSERT_OK(WriteStringToFile(
+      options.env,
+      Slice(kBlobRelocationFilePrefix, kBlobRelocationFilePrefixSize), path));
+  const std::string path_argument = "--path=" + path;
+  const char* arguments[] = {"./ldb", "dump", path_argument.c_str()};
+  testing::internal::CaptureStdout();
+  testing::internal::CaptureStderr();
+  const int result = LDBCommandRunner::RunCommand(3, arguments, options,
+                                                  LDBOptions(), nullptr);
+  const std::string output = testing::internal::GetCapturedStdout();
+  const std::string errors = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(result, 0);
+  EXPECT_NE(output.find("Relocation file (embedded-blob SST)"),
+            std::string::npos);
+  EXPECT_EQ(errors.find("Corruption"), std::string::npos);
+  EXPECT_EQ(errors.find("Failed:"), std::string::npos);
+  ASSERT_OK(options.env->DeleteFile(path));
+  ASSERT_OK(options.env->DeleteDir(dbname));
+}
+
 TEST_F(LdbCmdTest, HexToString) {
   // map input to expected outputs.
   // odd number of "hex" half bytes doesn't make sense

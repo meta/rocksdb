@@ -1528,6 +1528,17 @@ class VersionSetTestBase {
     mutex_.Unlock();
   }
 
+  void UseBlockBasedWriterForBlobIndirection(ColumnFamilyData* cfd) {
+    // These metadata tests use MockTable readers. Format
+    // activation still needs a Block-Based Table writer factory, as it does in
+    // production.
+    MutableCFOptions mutable_options(cfd->GetLatestMutableCFOptions());
+    mutable_options.table_factory.reset(NewBlockBasedTableFactory());
+    mutex_.Lock();
+    cfd->PublishMutableCFOptions(mutable_options);
+    mutex_.Unlock();
+  }
+
   ColumnFamilyData* CreateColumnFamily(const std::string& cf_name,
                                        const ColumnFamilyOptions& cf_options) {
     VersionEdit new_cf;
@@ -1704,6 +1715,81 @@ TEST_F(VersionSetTest, PreconditionAloneKeepsDbMutexForApply) {
   ASSERT_OK(status);
   ASSERT_EQ(unlocked_applies, 0);
   ASSERT_EQ(precondition_checks, 1);
+}
+
+TEST_F(VersionSetTest, PreconditionedWriterIsManifestBatchBarrier) {
+  NewDB();
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  const uint64_t original_version_number = cfd->current()->GetVersionNumber();
+
+  std::promise<void> apply_unlocked;
+  std::future<void> apply_unlocked_future = apply_unlocked.get_future();
+  std::promise<void> release_apply;
+  std::future<void> release_apply_future = release_apply.get_future();
+  std::promise<void> follower_queued;
+  std::future<void> follower_queued_future = follower_queued.get_future();
+  std::atomic<bool> signal_follower_queue{false};
+  std::atomic<bool> follower_signaled{false};
+  std::atomic<size_t> same_cf_group_count{0};
+  std::atomic<size_t> new_version_count{0};
+
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+  sync_point->SetCallBack("VersionSet::LogAndApplyHelper:ApplyUnlocked",
+                          [&](void*) {
+                            apply_unlocked.set_value();
+                            release_apply_future.wait();
+                          });
+  sync_point->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting", [&](void*) {
+        if (signal_follower_queue.load(std::memory_order_relaxed) &&
+            !follower_signaled.exchange(true, std::memory_order_relaxed)) {
+          follower_queued.set_value();
+        }
+      });
+  sync_point->SetCallBack("VersionSet::ProcessManifestWrites:SameColumnFamily",
+                          [&](void*) { same_cf_group_count.fetch_add(1); });
+  sync_point->SetCallBack("VersionSet::ProcessManifestWrites:NewVersion",
+                          [&](void*) { new_version_count.fetch_add(1); });
+  sync_point->EnableProcessing();
+
+  Status leader_status;
+  VersionEdit leader_edit;
+  leader_edit.SetDBId("preconditioned_leader");
+  // The leader applies its edit without the DB mutex, so the follower can
+  // queue behind it while the leader is at the queue head.
+  port::Thread leader([&] {
+    mutex_.Lock();
+    leader_status = versions_->LogAndApplyWithUnlockedApply(
+        cfd, read_options_, write_options_, &leader_edit, &mutex_,
+        /*dir_contains_current_file=*/nullptr, [] { return Status::OK(); });
+    mutex_.Unlock();
+  });
+  ASSERT_EQ(apply_unlocked_future.wait_for(std::chrono::seconds(50)),
+            std::future_status::ready);
+
+  signal_follower_queue.store(true, std::memory_order_relaxed);
+  Status follower_status;
+  VersionEdit follower_edit;
+  follower_edit.SetDBId("follower");
+  port::Thread follower(
+      [&] { follower_status = LogAndApplyToDefaultCF(follower_edit); });
+  ASSERT_EQ(follower_queued_future.wait_for(std::chrono::seconds(50)),
+            std::future_status::ready);
+
+  release_apply.set_value();
+  leader.join();
+  follower.join();
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+
+  ASSERT_OK(leader_status);
+  ASSERT_OK(follower_status);
+  ASSERT_EQ(same_cf_group_count.load(), 0U);
+  ASSERT_EQ(new_version_count.load(), 2U);
+  ASSERT_GT(cfd->current()->GetVersionNumber(), original_version_number);
 }
 
 TEST_F(VersionSetTest, BlobFinalizationDoesNotHoldDBMutex) {
@@ -2413,6 +2499,8 @@ TEST_F(VersionSetTest, FailedFencedVersionBuildDefersRelocationState) {
     files.AddFile(/*level=*/1, meta);
   }
   ASSERT_OK(LogAndApplyToDefaultCF(files));
+  UseBlockBasedWriterForBlobIndirection(
+      versions_->GetColumnFamilySet()->GetDefault());
   VersionEdit edit;
   edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
   edit.AddBlobRelocationFile(BlobRelocationFileAddition(
@@ -2482,6 +2570,8 @@ TEST_F(VersionSetTest, LogAndApplyRejectsReaddedRelocationState) {
   // the next open. A new MANIFEST starts without deletion history, for replay
   // and for LogAndApply.
   NewDB();
+  UseBlockBasedWriterForBlobIndirection(
+      versions_->GetColumnFamilySet()->GetDefault());
   BlobRelocationDirectoryBuilder directory_builder;
   ASSERT_OK(directory_builder.Add(
       /*origin_file_number=*/77, /*original_value_offset=*/11,
@@ -2552,6 +2642,8 @@ TEST_F(VersionSetTest, LogAndApplyRejectsReaddedRelocationState) {
   // The rejected edits were not written: the MANIFEST still replays.
   CloseDB();
   ReopenDB();
+  UseBlockBasedWriterForBlobIndirection(
+      versions_->GetColumnFamilySet()->GetDefault());
   ColumnFamilyData* cfd = versions_->GetColumnFamilySet()->GetDefault();
   ASSERT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(102),
             nullptr);
@@ -2564,6 +2656,8 @@ TEST_F(VersionSetTest, LogAndApplyRejectsReaddedRelocationState) {
   }
   CloseDB();
   ReopenDB();
+  UseBlockBasedWriterForBlobIndirection(
+      versions_->GetColumnFamilySet()->GetDefault());
   cfd = versions_->GetColumnFamilySet()->GetDefault();
   ASSERT_NE(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(102),
             nullptr);
@@ -2574,6 +2668,8 @@ TEST_F(VersionSetTest, ReusedManifestRejectsReaddedRelocationState) {
   // MANIFEST, which already holds the deletions. LogAndApply must still reject
   // adding the deleted state back; otherwise the next open fails.
   NewDB();
+  UseBlockBasedWriterForBlobIndirection(
+      versions_->GetColumnFamilySet()->GetDefault());
   BlobRelocationDirectoryBuilder directory_builder;
   ASSERT_OK(directory_builder.Add(
       /*origin_file_number=*/77, /*original_value_offset=*/11,
@@ -2607,6 +2703,8 @@ TEST_F(VersionSetTest, ReusedManifestRejectsReaddedRelocationState) {
   CloseDB();
   imm_db_options_.reuse_manifest_on_open = true;
   ReopenDB();
+  UseBlockBasedWriterForBlobIndirection(
+      versions_->GetColumnFamilySet()->GetDefault());
   {
     VersionEdit edit;
     edit.SetBlobRelocationRoute(route);
@@ -2642,6 +2740,8 @@ TEST_F(VersionSetTest, ReusedManifestRejectsReaddedRelocationState) {
   ASSERT_EQ(manifest_after, manifest_before);
   CloseDB();
   ReopenDB();
+  UseBlockBasedWriterForBlobIndirection(
+      versions_->GetColumnFamilySet()->GetDefault());
   ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
   ASSERT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(102),
             nullptr);
@@ -7000,6 +7100,8 @@ TEST_F(VersionSetTest, IndirectBlobReadRouteSignals) {
   // The column family reads the raw pointer.
   imm_db_options_.stats = stats;
   NewDB();
+  UseBlockBasedWriterForBlobIndirection(
+      versions_->GetColumnFamilySet()->GetDefault());
   BlobRelocationDirectoryBuilder directory_builder;
   ASSERT_OK(directory_builder.Add(
       /*origin_file_number=*/77, /*original_value_offset=*/11,
