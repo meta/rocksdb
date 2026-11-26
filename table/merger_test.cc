@@ -6,6 +6,9 @@
 #include <string>
 #include <vector>
 
+#include "db/memtable.h"
+#include "memory/arena.h"
+#include "rocksdb/memtablerep.h"
 #include "table/merging_iterator.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -171,6 +174,75 @@ TEST_F(MergerTest, SeekToLastTest) {
     AssertEquivalence();
     Prev(50000);
   }
+}
+
+namespace {
+// Returns TryAgain from its first Seek(), like a table iterator that started an
+// async read, and records every seek target.
+class TryAgainOnceIterator : public VectorIterator {
+ public:
+  using VectorIterator::VectorIterator;
+  void Seek(const Slice& target) override {
+    targets.push_back(target.ToString());
+    VectorIterator::Seek(target);
+    try_again_ = targets.size() == 1;
+  }
+  bool Valid() const override { return !try_again_ && VectorIterator::Valid(); }
+  Status status() const override {
+    return try_again_ ? Status::TryAgain() : Status::OK();
+  }
+  std::vector<std::string> targets;
+
+ private:
+  bool try_again_ = false;
+};
+}  // namespace
+
+TEST_F(MergerTest, HeadMarkSeekRetriesTryAgainChildAtMovedKey) {
+  // A memtable head mark (see MemTableHeadMark) moves the seek of the
+  // memtable level and every older level. An older level that returns
+  // TryAgain must be sought again at the moved key, not at the original
+  // target. No level has range tombstones here.
+  Options options;
+  options.min_tombstones_for_range_conversion = 1;
+  options.memtable_factory = std::make_shared<SkipListFactory>();
+  ImmutableOptions ioptions(options);
+  WriteBufferManager wb(options.db_write_buffer_size);
+  std::unique_ptr<MemTable> mem(new MemTable(
+      icomp_, ioptions, MutableCFOptions(options), &wb, /*earliest_seq=*/1,
+      0 /* column_family_id */, nullptr /* flush_initiator */));
+  HeadMarkIngestState ingest;
+  port::RWMutex ingest_sst_lock;
+  ASSERT_EQ(HeadMarkPublishResult::kPublished,
+            mem->PublishHeadMark("q", "q0010", /*seq=*/10, /*sender=*/nullptr,
+                                 /*run_is_long=*/true, /*version_number=*/1,
+                                 ingest, ingest_sst_lock));
+
+  auto ikey = [](const std::string& user_key, SequenceNumber seq) {
+    return InternalKey(user_key, seq, kTypeValue).Encode().ToString();
+  };
+  Arena arena;
+  MergeIteratorBuilder builder(&icomp_, &arena);
+  // Level 0 stands for the memtable, level 1 for an older file with an old
+  // put inside the mark.
+  builder.AddIterator(
+      new (arena.AllocateAligned(sizeof(VectorIterator)))
+          VectorIterator({ikey("q0010", 5)}, {"live"}, &icomp_));
+  builder.SetHeadMarkMemTable(mem.get());
+  auto* older = new (arena.AllocateAligned(sizeof(TryAgainOnceIterator)))
+      TryAgainOnceIterator({ikey("q0003", 1), ikey("q0011", 1)}, {"old", "v"},
+                           &icomp_);
+  builder.AddIterator(older);
+  InternalIterator* iter = builder.Finish();
+  const MemTableHeadMark* used = nullptr;
+  iter->SeekWithHeadMarks(ikey("q", kMaxSequenceNumber), /*read_seq=*/20,
+                          /*read_version=*/1, mem.get(), &used);
+  ASSERT_NE(nullptr, used);
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("q0010", ExtractUserKey(iter->key()).ToString());
+  ASSERT_EQ(2, older->targets.size());
+  ASSERT_EQ("q0010", ExtractUserKey(older->targets[1]).ToString());
+  iter->~InternalIterator();
 }
 
 }  // namespace ROCKSDB_NAMESPACE
