@@ -33,6 +33,8 @@ class Slice;
 class BlobLogWriter;
 class IOTracer;
 class BlobFileCompletionCallback;
+class BlobSource;
+struct StableBlobFingerprint;
 
 class BlobFileBuilder {
  public:
@@ -50,7 +52,8 @@ class BlobFileBuilder {
                   BlobFileCreationReason creation_reason,
                   std::string blob_output_path,
                   std::vector<std::string>* output_file_paths,
-                  std::vector<BlobFileAddition>* blob_file_additions);
+                  std::vector<BlobFileAddition>* blob_file_additions,
+                  BlobSource* blob_source);
 
   BlobFileBuilder(std::function<uint64_t()> file_number_generator,
                   FileSystem* fs, const ImmutableOptions* immutable_options,
@@ -66,7 +69,8 @@ class BlobFileBuilder {
                   BlobFileCreationReason creation_reason,
                   std::string blob_output_path,
                   std::vector<std::string>* output_file_paths,
-                  std::vector<BlobFileAddition>* blob_file_additions);
+                  std::vector<BlobFileAddition>* blob_file_additions,
+                  BlobSource* blob_source);
 
   BlobFileBuilder(const BlobFileBuilder&) = delete;
   BlobFileBuilder& operator=(const BlobFileBuilder&) = delete;
@@ -92,8 +96,15 @@ class BlobFileBuilder {
   Status CloseBlobFile();
   Status CloseBlobFileIfNeeded();
 
-  Status PutBlobIntoCacheIfNeeded(const Slice& blob, uint64_t blob_file_number,
-                                  uint64_t blob_offset) const;
+  // Inserts a value into the blob cache right after flush writes it to the blob
+  // file, through BlobSource::PrepopulateFlushBlob. Does nothing unless
+  // prepopulate_blob_cache is kFlushOnly, this builder writes flush output, and
+  // blob_source_ is set. `fingerprint` is non-null only for a value with an
+  // indirect BlobIndex (enable_blob_indirection); such a value is cached under
+  // its stable identity.
+  Status PutBlobIntoCacheIfNeeded(
+      const Slice& blob, uint64_t blob_file_number, uint64_t blob_offset,
+      const StableBlobFingerprint* fingerprint) const;
 
   std::function<uint64_t()> file_number_generator_;
   FileSystem* fs_;
@@ -108,8 +119,6 @@ class BlobFileBuilder {
   bool enable_blob_indirection_;
   const FileOptions* file_options_;
   const WriteOptions* write_options_;
-  const std::string db_id_;
-  const std::string db_session_id_;
   int job_id_;
   uint32_t column_family_id_;
   std::string column_family_name_;
@@ -120,6 +129,9 @@ class BlobFileBuilder {
   const std::string blob_output_path_;
   std::vector<std::string>* output_file_paths_;
   std::vector<BlobFileAddition>* blob_file_additions_;
+  // Used for flush blob cache prepopulation. May be null; then nothing is
+  // prepopulated.
+  BlobSource* blob_source_;
   std::unique_ptr<BlobLogWriter> writer_;
   uint64_t blob_count_;
   uint64_t blob_bytes_;
