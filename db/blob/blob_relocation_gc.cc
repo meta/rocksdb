@@ -32,8 +32,10 @@ ImmutableFields(const BlobRelocationLiveValue& value) {
 }  // namespace
 
 BlobRelocationMemoryTracker::BlobRelocationMemoryTracker(
-    std::shared_ptr<CacheReservationManager> cache_reservation_manager)
-    : cache_reservation_manager_(std::move(cache_reservation_manager)) {}
+    std::shared_ptr<CacheReservationManager> cache_reservation_manager,
+    size_t max_bytes)
+    : cache_reservation_manager_(std::move(cache_reservation_manager)),
+      max_bytes_(max_bytes) {}
 
 Status BlobRelocationMemoryTracker::SetReservation(size_t* current_bytes,
                                                    size_t requested_bytes) {
@@ -41,7 +43,7 @@ Status BlobRelocationMemoryTracker::SetReservation(size_t* current_bytes,
     return Status::Corruption("Invalid blob relocation memory reservation");
   }
   const size_t retained = reserved_bytes_ - *current_bytes;
-  if (requested_bytes > kMaxBytes - retained) {
+  if (retained > max_bytes_ || requested_bytes > max_bytes_ - retained) {
     return Status::MemoryLimit("Blob relocation live sets exceed limit");
   }
   const size_t target = retained + requested_bytes;
@@ -60,7 +62,8 @@ BlobRelocationLiveSet::BlobRelocationLiveSet(
     std::shared_ptr<CacheReservationManager> cache_reservation_manager,
     std::vector<uint64_t> generation_numbers)
     : BlobRelocationLiveSet(std::make_shared<BlobRelocationMemoryTracker>(
-                                std::move(cache_reservation_manager)),
+                                std::move(cache_reservation_manager),
+                                BlobRelocationMemoryTracker::kMaxBytes),
                             std::move(generation_numbers)) {}
 
 BlobRelocationLiveSet::BlobRelocationLiveSet(
@@ -179,6 +182,10 @@ Status BlobRelocationLiveSet::Finalize() {
   // Copies of one value agree on record_overhead (see Finalize() in the
   // header). If they did not, the sort puts the smallest record_overhead first,
   // and the loop below keeps it.
+  //
+  // The choice of record_overhead does not change the indirect blob GC
+  // decision: for a relocation input, the GC job computes the live record bytes
+  // again as stored bytes plus one trailer per value.
   std::sort(values_.begin(), values_.end(),
             [&](const BlobRelocationLiveValue& lhs,
                 const BlobRelocationLiveValue& rhs) {
