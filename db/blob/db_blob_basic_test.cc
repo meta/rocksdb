@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <set>
@@ -46,16 +47,21 @@
 #include "rocksdb/experimental.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/lazy_wide_columns.h"
+#include "rocksdb/sst_partitioner.h"
 #include "rocksdb/trace_reader_writer.h"
 #include "rocksdb/trace_record.h"
+#include "rocksdb/utilities/backup_engine.h"
 #include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/options_util.h"
 #include "rocksdb/utilities/replayer.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/table_builder.h"
 #include "test_util/sync_point.h"
+#include "test_util/testutil.h"
+#include "trace_replay/block_cache_tracer.h"
 #include "util/compression.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
@@ -163,7 +169,7 @@ class DBBlobBasicTest : public DBTestBase {
   }
 
   // Blob indirection is on. Indirect blob GC stays off, because blob GC and
-  // auto compaction are disabled.
+  // auto compaction are disabled. EnableIndirectBlobGC() turns both on.
   Options IndirectBlobGCOptions() {
     Options options = GetDefaultOptions();
     options.create_if_missing = true;
@@ -174,6 +180,84 @@ class DBBlobBasicTest : public DBTestBase {
     options.disable_auto_compactions = true;
     options.env->SetBackgroundThreads(2, Env::Priority::LOW);
     return options;
+  }
+
+  // WriteIndirectBlobGCCandidate() writes kIndirectBlobGCKeyCount (4) keys with
+  // 4 KB values into one blob file, deletes all but the last `live_keys` of
+  // them and compacts. It returns the blob file number.
+  static constexpr size_t kIndirectBlobGCKeyCount = 4;
+  static std::string IndirectBlobGCKey(size_t i) {
+    return "key" + std::to_string(i);
+  }
+  static std::string IndirectBlobGCValue(size_t i) {
+    return std::string(4096, static_cast<char>('a' + i));
+  }
+  uint64_t WriteIndirectBlobGCCandidate(size_t live_keys) {
+    for (size_t i = 0; i < kIndirectBlobGCKeyCount; ++i) {
+      EXPECT_OK(Put(IndirectBlobGCKey(i), IndirectBlobGCValue(i)));
+    }
+    EXPECT_OK(Flush());
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const uint64_t file_number = cfd->current()
+                                     ->storage_info()
+                                     ->GetBlobFiles()
+                                     .back()
+                                     ->GetBlobFileNumber();
+    for (size_t i = 0; i + live_keys < kIndirectBlobGCKeyCount; ++i) {
+      EXPECT_OK(Delete(IndirectBlobGCKey(i)));
+    }
+    EXPECT_OK(Flush());
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    EXPECT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    return file_number;
+  }
+
+  void EnableIndirectBlobGC() {
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"disable_auto_compactions", "false"},
+                               {"enable_blob_garbage_collection", "true"}}));
+    for (int round = 0; round < 3; ++round) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    }
+  }
+
+  std::set<uint64_t> BlobFilesOnDisk() {
+    std::vector<std::string> files;
+    EXPECT_OK(env_->GetChildren(dbname_, &files));
+    std::set<uint64_t> result;
+    for (const std::string& name : files) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(name, &number, /*info_log_name_prefix=*/"", &type) &&
+          type == kBlobFile) {
+        result.insert(number);
+      }
+    }
+    return result;
+  }
+
+  uint64_t RouteTarget(uint64_t file_number) {
+    return dbfull()
+        ->GetVersionSet()
+        ->GetColumnFamilySet()
+        ->GetDefault()
+        ->current()
+        ->storage_info()
+        ->GetBlobRelocationRouteTarget(file_number);
+  }
+
+  bool HasBlobFile(uint64_t file_number) {
+    return dbfull()
+               ->GetVersionSet()
+               ->GetColumnFamilySet()
+               ->GetDefault()
+               ->current()
+               ->storage_info()
+               ->GetBlobFileMetaData(file_number) != nullptr;
   }
 
   void AssertBlobReference(const Slice& key, uint64_t blob_file_number) {
@@ -584,6 +668,25 @@ class DBBlobBasicTest : public DBTestBase {
     return Flush();
   }
 
+  // Registers an indirect blob GC job on the census of `cfd` at its current
+  // Version and ends it at once. Returns the status of
+  // BlobReferenceCensus::BeginGcJob(): Busy while an indirect blob GC install
+  // has an unknown MANIFEST result, OK when a GC job could start.
+  Status TryBeginGcJob(ColumnFamilyData* cfd) {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    BlobReferenceCensus* const census = cfd->blob_reference_census();
+    if (census == nullptr) {
+      return Status::NotFound("No blob reference census");
+    }
+    uint64_t token = 0;
+    Status status =
+        census->BeginGcJob(cfd->current()->GetVersionNumber(), &token);
+    if (status.ok()) {
+      census->EndGcJob(token);
+    }
+    return status;
+  }
+
   // Checks that Get() and MultiGet() find a live key next to a reference cap
   // cut inside a range tombstone.
   //
@@ -789,6 +892,114 @@ class DBBlobBasicTest : public DBTestBase {
         installed->GetFileSize(), /*is_relocation=*/true,
         installed->GetTailSize(), installed->GetDirectoryDigest()};
   }
+
+  // Coarse pin race tests. A flush takes its blob file number (for example 25)
+  // early, and installs its coarse L0 SST (frontier 25; see "Coarse SST" in
+  // db/blob/blob_reference_metadata.h) later. A GC job that selects an input
+  // numbered above 25 in between sees the coarse pin appear before it installs.
+  // These helpers make that order with sync points, without sleeps.
+  //
+  // SetUpCoarsePinRace() installs two one-shot pauses. Each pause holds a
+  // background thread without the DB mutex:
+  //   - Flush pause: the first flush that reaches
+  //     "BuildTable:BeforeFinishBuildTable" after *pause_flush becomes true.
+  //     Its blob file number is allocated, and its coarse SST is not
+  //     installed yet. The test waits for it with
+  //     "DBBlobBasicTest::CoarsePinRace:WaitFlushPaused" and lets it go on
+  //     with "DBBlobBasicTest::CoarsePinRace:ResumeFlush".
+  //   - GC pause: the first indirect blob GC job that reaches
+  //     "DBImpl::RunIndirectBlobGC:BeforeOutputWork" after *pause_gc becomes
+  //     true. It has selected its inputs and has not installed. The test
+  //     waits for it with "DBBlobBasicTest::CoarsePinRace:WaitGcPaused" and
+  //     lets it go on with "DBBlobBasicTest::CoarsePinRace:ResumeGc".
+  // *stale_installs counts the install checks (in the LogAndApply
+  // precondition) that found a stale input.
+  void SetUpCoarsePinRace(std::atomic<bool>* pause_flush,
+                          std::atomic<bool>* pause_gc,
+                          std::atomic<int>* stale_installs) {
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->LoadDependency(
+        {{"DBBlobBasicTest::CoarsePinRace:FlushPaused",
+          "DBBlobBasicTest::CoarsePinRace:WaitFlushPaused"},
+         {"DBBlobBasicTest::CoarsePinRace:ResumeFlush",
+          "DBBlobBasicTest::CoarsePinRace:FlushResumed"},
+         {"DBBlobBasicTest::CoarsePinRace:GcPaused",
+          "DBBlobBasicTest::CoarsePinRace:WaitGcPaused"},
+         {"DBBlobBasicTest::CoarsePinRace:ResumeGc",
+          "DBBlobBasicTest::CoarsePinRace:GcResumed"}});
+    sync_point->SetCallBack("BuildTable:BeforeFinishBuildTable",
+                            [pause_flush](void* /*arg*/) {
+                              if (pause_flush->exchange(false)) {
+                                TEST_SYNC_POINT(
+                                    "DBBlobBasicTest::CoarsePinRace:"
+                                    "FlushPaused");
+                                TEST_SYNC_POINT(
+                                    "DBBlobBasicTest::CoarsePinRace:"
+                                    "FlushResumed");
+                              }
+                            });
+    sync_point->SetCallBack(
+        "DBImpl::RunIndirectBlobGC:BeforeOutputWork",
+        [pause_gc](void* /*arg*/) {
+          if (pause_gc->exchange(false)) {
+            TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:GcPaused");
+            TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:GcResumed");
+          }
+        });
+    sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:InstallPrecondition",
+                            [stale_installs](void* arg) {
+                              if (!*static_cast<bool*>(arg)) {
+                                stale_installs->fetch_add(1);
+                              }
+                            });
+    sync_point->EnableProcessing();
+  }
+
+  // Starts a background flush of `value` under `key`, and returns when the
+  // flush pause of SetUpCoarsePinRace() holds it. The caller set *pause_flush
+  // to true.
+  void StartPausedCoarseFlush(const std::string& key,
+                              const std::string& value) {
+    ASSERT_OK(Put(key, value));
+    FlushOptions flush_options;
+    flush_options.wait = false;
+    ASSERT_OK(db_->Flush(flush_options));
+    TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:WaitFlushPaused");
+  }
+
+  // Compacts every L0 and L1 SST into L1, so a deletion in L0 drops the
+  // references to the deleted values. CompactFiles() does not flush the
+  // memtables, so it runs while a flush is paused. CompactFiles() has no
+  // blob_garbage_collection_policy, so the helper turns compaction-time blob
+  // GC off for the compaction. Otherwise the compaction may move live values
+  // into a new blob file, and the test inputs would lose their live values.
+  // The helper turns blob GC on again afterwards, because indirect blob GC
+  // relocates live values only when enable_blob_garbage_collection is true.
+  void CompactL0AndL1IntoL1() {
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_garbage_collection", "false"}}));
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    std::vector<std::string> inputs;
+    for (int level = 0; level <= 1; ++level) {
+      for (const auto& file : metadata.levels[level].files) {
+        inputs.push_back(file.name);
+      }
+    }
+    ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*level=*/1));
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_garbage_collection", "true"}}));
+  }
+
+  bool IsCoarsePinned(uint64_t file_number) {
+    return dbfull()
+        ->GetVersionSet()
+        ->GetColumnFamilySet()
+        ->GetDefault()
+        ->current()
+        ->storage_info()
+        ->IsCoarseIndirectOriginBlobPinned(file_number);
+  }
 };
 
 class BlobFileChecksumCapturingFS : public FileSystemWrapper {
@@ -833,6 +1044,1848 @@ class BlobFileChecksumCapturingFS : public FileSystemWrapper {
   std::string file_checksum_func_name_;
   int capture_count_ = 0;
 };
+
+namespace {
+
+// Keeps every info log line, so that the indirect blob GC signal tests can
+// check the LOG lines that a job writes. A WARN or ERROR line starts with
+// "[WARN] " or "[ERROR] " (see Logger::Logv()).
+class IndirectBlobGcLogCapture : public Logger {
+ public:
+  using Logger::Logv;
+  void Logv(const char* format, va_list ap) override {
+    char buffer[4096];
+    vsnprintf(buffer, sizeof(buffer), format, ap);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      lines_.emplace_back(buffer);
+    }
+    line_added_.notify_all();
+  }
+  // The number of lines that contain every string of `parts`.
+  size_t Count(const std::vector<std::string>& parts) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return CountLocked(parts);
+  }
+
+  // Waits until a line contains every string of `parts`. Returns false if no
+  // such line arrives within `timeout`. The timeout only keeps a broken test
+  // from hanging; a passing test never reaches it.
+  bool WaitFor(const std::vector<std::string>& parts,
+               std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return line_added_.wait_for(lock, timeout,
+                                [&] { return CountLocked(parts) > 0; });
+  }
+
+ private:
+  // REQUIRES: mutex_ held.
+  size_t CountLocked(const std::vector<std::string>& parts) const {
+    size_t count = 0;
+    for (const std::string& line : lines_) {
+      bool all = true;
+      for (const std::string& part : parts) {
+        all = all && line.find(part) != std::string::npos;
+      }
+      count += all ? 1 : 0;
+    }
+    return count;
+  }
+
+  std::mutex mutex_;
+  std::condition_variable line_added_;
+  std::vector<std::string> lines_;
+};
+
+// Records the path and the creation reason of each blob file that a listener
+// sees start.
+class BlobCreationReasonRecorder : public EventListener {
+ public:
+  void OnBlobFileCreationStarted(
+      const BlobFileCreationBriefInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    started_.emplace_back(info.file_path, info.reason);
+  }
+  // The paths of the started blob files whose reason is `reason`.
+  std::vector<std::string> Paths(BlobFileCreationReason reason) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> result;
+    for (const auto& entry : started_) {
+      if (entry.second == reason) {
+        result.push_back(entry.first);
+      }
+    }
+    return result;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::pair<std::string, BlobFileCreationReason>> started_;
+};
+
+// A DB clock that moves only when the test calls Advance(). The idle time
+// test uses it, so that two reads of the idle time give the same value and
+// the test can make the idle time longer than the stats period without a
+// sleep. Only the DB clock is manual: sleeps and timed waits still use the
+// real clock.
+class ManualIndirectBlobGcClock : public SystemClockWrapper {
+ public:
+  explicit ManualIndirectBlobGcClock(const std::shared_ptr<SystemClock>& base)
+      : SystemClockWrapper(base), now_micros_(base->NowMicros()) {}
+  static const char* kClassName() { return "ManualIndirectBlobGcClock"; }
+  const char* Name() const override { return kClassName(); }
+  uint64_t NowMicros() override { return now_micros_.load(); }
+  void Advance(uint64_t micros) { now_micros_.fetch_add(micros); }
+
+ private:
+  std::atomic<uint64_t> now_micros_;
+};
+
+// The indirect blob GC tickers and their values at one point in time.
+struct IndirectBlobGcTickers {
+  static constexpr std::array<Tickers, 14> kTickers{
+      {INDIRECT_BLOB_GC_JOBS_STARTED, INDIRECT_BLOB_GC_JOBS_INSTALLED,
+       INDIRECT_BLOB_GC_JOBS_STALE, INDIRECT_BLOB_GC_JOBS_NOTHING_INSTALLED,
+       INDIRECT_BLOB_GC_JOBS_FAILED, INDIRECT_BLOB_GC_CORRUPT_INPUTS,
+       INDIRECT_BLOB_GC_OVERSIZED_INPUTS, INDIRECT_BLOB_GC_KEYS_RELOCATED,
+       INDIRECT_BLOB_GC_BYTES_RELOCATED, INDIRECT_BLOB_GC_BYTES_READ,
+       INDIRECT_BLOB_GC_BYTES_RECLAIMED, INDIRECT_BLOB_GC_CENSUS_MISMATCHES,
+       BLOB_DB_GC_FAILURES, BLOB_DB_GC_NUM_KEYS_RELOCATED}};
+  explicit IndirectBlobGcTickers(Statistics* statistics) {
+    for (Tickers ticker : kTickers) {
+      values[ticker] = statistics->getTickerCount(ticker);
+    }
+  }
+  std::map<uint32_t, uint64_t> values;
+  // The count of `ticker` since `before`.
+  uint64_t Since(const IndirectBlobGcTickers& before, Tickers ticker) const {
+    return values.at(ticker) - before.values.at(ticker);
+  }
+};
+
+}  // namespace
+
+// Values larger than kIndirectBlobGCReadBatchBytes (1 MB) are streamed in
+// chunks, not read in a batch. INDIRECT_BLOB_GC_BYTES_READ counts the bytes
+// that the stream reads, as the batch path does: the stored bytes of each
+// value, plus the record trailer (kSimpleGen2BlobTrailerSize) for a relocation
+// file input.
+TEST_F(DBBlobBasicTest, IndirectBlobGCBytesReadCountsStreamedValue) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  // Half of the values in each input become garbage. File overhead (headers,
+  // footer, table blocks) keeps the exact garbage ratio a little below 0.5, so
+  // the test uses a lower threshold.
+  options.indirect_blob_gc_garbage_ratio = 0.25;
+  options.enable_blob_garbage_collection = true;
+  DestroyAndReopen(options);
+  Statistics* const statistics = options.statistics.get();
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  constexpr size_t kLargeValueSize = 2 * 1024 * 1024;
+  const auto key = [](int i) { return "large" + std::to_string(i); };
+  const auto large_value = [](int i) {
+    return std::string(kLargeValueSize, static_cast<char>('a' + i));
+  };
+  // Four 2 MB values in one normal blob file. Two of them become garbage.
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put(key(i), large_value(i)));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Delete(key(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  // Normal input: GC streams the two live values.
+  const IndirectBlobGcTickers before_normal(statistics);
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t relocation = RouteTarget(origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  const IndirectBlobGcTickers after_normal(statistics);
+  ASSERT_EQ(after_normal.Since(before_normal, INDIRECT_BLOB_GC_KEYS_RELOCATED),
+            2U);
+  ASSERT_EQ(after_normal.Since(before_normal, INDIRECT_BLOB_GC_BYTES_READ),
+            2 * kLargeValueSize);
+
+  // Relocation input: one of its two values becomes garbage, and GC streams
+  // the other one.
+  ASSERT_OK(Delete(key(2)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const IndirectBlobGcTickers before_relocation(statistics);
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {relocation}));
+  const IndirectBlobGcTickers after_relocation(statistics);
+  ASSERT_EQ(after_relocation.Since(before_relocation,
+                                   INDIRECT_BLOB_GC_KEYS_RELOCATED),
+            1U);
+  ASSERT_EQ(
+      after_relocation.Since(before_relocation, INDIRECT_BLOB_GC_BYTES_READ),
+      kLargeValueSize + kSimpleGen2BlobTrailerSize);
+  ASSERT_EQ(Get(key(3)), large_value(3));
+}
+
+// Checks the signals of an indirect blob GC job that installs: the job
+// outcome tickers, the job histogram, the relocation byte and key tickers, the
+// creation reason that listeners see for the relocation file, the end-of-job
+// LOG line, and the idle time: a job start clears it, and it is 0 after a job
+// that leaves no file to collect.
+TEST_F(DBBlobBasicTest, IndirectBlobGCInstalledJobSignals) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  auto recorder = std::make_shared<BlobCreationReasonRecorder>();
+  options.listeners.push_back(recorder);
+  DestroyAndReopen(options);
+  // Three of the four values are garbage, so GC relocates the live one.
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  Statistics* const statistics = options.statistics.get();
+  const IndirectBlobGcTickers before(statistics);
+  ASSERT_TRUE(recorder->Paths(BlobFileCreationReason::kIndirectBlobGC).empty());
+
+  // A job that has started clears the idle time of its column family. Blob GC
+  // is off at first, so the census publish does not start the idle time. Then
+  // GC is turned on while a sync point keeps the first GC pick from starting a
+  // job, so the census publish notes the candidate (at time `noted_micros`).
+  // During the job the idle time is 0: a census publish does not start it
+  // while a GC job is registered.
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(cfd->IndirectBlobGcCandidatesSinceMicros(), 0U);
+  std::atomic<bool> block_gc{true};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:IndirectBlobGCCandidates", [&](void* arg) {
+        if (block_gc.load()) {
+          static_cast<std::vector<uint64_t>*>(arg)->clear();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  const uint64_t noted_micros = cfd->IndirectBlobGcCandidatesSinceMicros();
+  ASSERT_NE(noted_micros, 0U);
+  block_gc.store(false);
+  std::atomic<int> idle_reads{0};
+  std::atomic<uint64_t> since_during_job{noted_micros};
+  std::atomic<uint64_t> idle_during_job{1};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:BeforeOutputWork", [&](void*) {
+        since_during_job.store(cfd->IndirectBlobGcCandidatesSinceMicros());
+        uint64_t idle = 1;
+        EXPECT_TRUE(db_->GetIntProperty(
+            DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates, &idle));
+        idle_during_job.store(idle);
+        ++idle_reads;
+      });
+  // A flush installs a new Version, and its census publish queues GC again.
+  ASSERT_OK(Put("other", "o"));
+  ASSERT_OK(Flush());
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  const uint64_t target = RouteTarget(file_number);
+  ASSERT_NE(target, kInvalidBlobFileNumber);
+
+  const IndirectBlobGcTickers after(statistics);
+  const uint64_t started = after.Since(before, INDIRECT_BLOB_GC_JOBS_STARTED);
+  ASSERT_GE(started, 1U);
+  ASSERT_GE(after.Since(before, INDIRECT_BLOB_GC_JOBS_INSTALLED), 1U);
+  // Each started job has exactly one outcome.
+  ASSERT_EQ(started,
+            after.Since(before, INDIRECT_BLOB_GC_JOBS_INSTALLED) +
+                after.Since(before, INDIRECT_BLOB_GC_JOBS_STALE) +
+                after.Since(before, INDIRECT_BLOB_GC_JOBS_NOTHING_INSTALLED) +
+                after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED));
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED), 0U);
+  ASSERT_EQ(after.Since(before, BLOB_DB_GC_FAILURES), 0U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 0U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CENSUS_MISMATCHES), 0U);
+  // The job histogram has one sample per started job.
+  HistogramData job_micros;
+  statistics->histogramData(INDIRECT_BLOB_GC_JOB_MICROS, &job_micros);
+  ASSERT_EQ(job_micros.count, started);
+
+  // One live value was relocated. The base ticker counts the same keys,
+  // because no compaction-time blob GC ran.
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_KEYS_RELOCATED), 1U);
+  ASSERT_EQ(after.Since(before, BLOB_DB_GC_NUM_KEYS_RELOCATED), 1U);
+  ASSERT_GE(after.Since(before, INDIRECT_BLOB_GC_BYTES_RELOCATED),
+            IndirectBlobGCValue(0).size());
+  ASSERT_GT(after.Since(before, INDIRECT_BLOB_GC_BYTES_READ), 0U);
+  // The input held four 4 KB values; the output holds one.
+  ASSERT_GT(after.Since(before, INDIRECT_BLOB_GC_BYTES_RECLAIMED), 0U);
+
+  // Listeners see the relocation file with the indirect blob GC reason.
+  ASSERT_EQ(recorder->Paths(BlobFileCreationReason::kIndirectBlobGC),
+            std::vector<std::string>{BlobFileName(dbname_, target)});
+
+  // The end-of-job line names the outcome and the relocated value count.
+  ASSERT_EQ(log->Count({"Indirect blob GC job ended: installed",
+                        "1 values relocated"}),
+            1U);
+
+  ASSERT_GE(idle_reads.load(), 1);
+  ASSERT_EQ(since_during_job.load(), 0U);
+  ASSERT_EQ(idle_during_job.load(), 0U);
+  // The job left no file that GC can pick (the relocation file has no
+  // garbage), so the idle time stays 0.
+  std::map<std::string, std::string> gc_stats;
+  ASSERT_TRUE(
+      db_->GetMapProperty(DB::Properties::kIndirectBlobGcStats, &gc_stats));
+  ASSERT_EQ(gc_stats["garbage-bytes-collectable"], "0");
+  ASSERT_EQ(gc_stats["idle-micros-with-candidates"], "0");
+  uint64_t idle = 1;
+  ASSERT_TRUE(db_->GetIntProperty(
+      DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates, &idle));
+  ASSERT_EQ(idle, 0U);
+}
+
+// Checks the signals of stale jobs. A census mismatch (injected once) makes
+// the first job stale before it reads any input, and rebuilds the census. A
+// failed install check (injected once) makes the second job stale after it
+// read its input. A later job installs. The end-of-job line of each stale job
+// says that it installed nothing.
+TEST_F(DBBlobBasicTest, IndirectBlobGCStaleJobSignals) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  Statistics* const statistics = options.statistics.get();
+  const IndirectBlobGcTickers before(statistics);
+  std::atomic<int> checks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:CensusTotalsCheck", [&](void* arg) {
+        if (checks++ == 0) {
+          *static_cast<bool*>(arg) = true;
+        }
+      });
+  std::atomic<int> install_checks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:InstallPrecondition", [&](void* arg) {
+        if (install_checks++ == 0) {
+          *static_cast<bool*>(arg) = false;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_GE(checks.load(), 2);
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+
+  const IndirectBlobGcTickers after(statistics);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CENSUS_MISMATCHES), 1U);
+  ASSERT_GE(install_checks.load(), 2);
+  ASSERT_GE(after.Since(before, INDIRECT_BLOB_GC_JOBS_STALE), 2U);
+  ASSERT_GE(after.Since(before, INDIRECT_BLOB_GC_JOBS_INSTALLED), 1U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED), 0U);
+  // A stale job is not a failure.
+  ASSERT_EQ(after.Since(before, BLOB_DB_GC_FAILURES), 0U);
+  HistogramData job_micros;
+  statistics->histogramData(INDIRECT_BLOB_GC_JOB_MICROS, &job_micros);
+  ASSERT_EQ(job_micros.count,
+            after.Since(before, INDIRECT_BLOB_GC_JOBS_STARTED));
+  ASSERT_GE(log->Count({"Indirect blob GC job ended: stale",
+                        "0 inputs read, 0 installed"}),
+            1U);
+  ASSERT_GE(log->Count({"Indirect blob GC job ended: stale",
+                        "1 inputs read, 0 installed"}),
+            1U);
+  ASSERT_GE(log->Count({"Indirect blob GC job ended: installed",
+                        "1 inputs read, 1 installed"}),
+            1U);
+}
+
+// Checks the signals of a job that ends without an install and without an
+// error: an injected live-set validation failure suppresses the only input.
+TEST_F(DBBlobBasicTest, IndirectBlobGCNothingInstalledJobSignals) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  Statistics* const statistics = options.statistics.get();
+  const IndirectBlobGcTickers before(statistics);
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:AfterLiveSet", [](void* arg) {
+        *static_cast<Status*>(arg) = Status::Corruption("injected fault");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+
+  const IndirectBlobGcTickers after(statistics);
+  const uint64_t started = after.Since(before, INDIRECT_BLOB_GC_JOBS_STARTED);
+  ASSERT_GE(started, 1U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_NOTHING_INSTALLED),
+            started);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_INSTALLED), 0U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED), 0U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_KEYS_RELOCATED), 0U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_BYTES_RELOCATED), 0U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_BYTES_RECLAIMED), 0U);
+  HistogramData job_micros;
+  statistics->histogramData(INDIRECT_BLOB_GC_JOB_MICROS, &job_micros);
+  ASSERT_EQ(job_micros.count, started);
+  ASSERT_GE(log->Count({"Indirect blob GC job ended: nothing installed",
+                        "0 inputs read, 0 installed"}),
+            1U);
+}
+
+// Checks the signals of a failed job: an injected write error of the output
+// fails the job. The job counts in both the indirect blob GC failure ticker
+// and the base BLOB_DB_GC_FAILURES ticker, and the error WARN line names
+// indirect blob GC.
+TEST_F(DBBlobBasicTest, IndirectBlobGCFailedJobSignals) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  Statistics* const statistics = options.statistics.get();
+  const IndirectBlobGcTickers before(statistics);
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:AfterAddBlobRelocation", [](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("injected write fault");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  dbfull()->TEST_WaitForCompact().PermitUncheckedError();
+  ASSERT_TRUE(dbfull()->TEST_GetBGError().IsIOError());
+  ASSERT_TRUE(HasBlobFile(file_number));
+  // TEST_WaitForCompact() returns as soon as the job sets the background
+  // error. The job writes its end-of-job line to the LogBuffer of the
+  // background thread, and BackgroundCallCompaction() copies that buffer to
+  // the LOG only after the error is set, right before it logs "Waiting after
+  // background compaction error". Wait for that line, so that the end-of-job
+  // line is in the LOG before the checks below.
+  ASSERT_TRUE(log->WaitFor(
+      {"Waiting after background compaction error", "injected write fault"},
+      std::chrono::seconds(30)));
+
+  const IndirectBlobGcTickers after(statistics);
+  const uint64_t failed = after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED);
+  ASSERT_GE(failed, 1U);
+  ASSERT_EQ(after.Since(before, BLOB_DB_GC_FAILURES), failed);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_INSTALLED), 0U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_KEYS_RELOCATED), 0U);
+  HistogramData job_micros;
+  statistics->histogramData(INDIRECT_BLOB_GC_JOB_MICROS, &job_micros);
+  ASSERT_EQ(job_micros.count,
+            after.Since(before, INDIRECT_BLOB_GC_JOBS_STARTED));
+  // The job read its input and installed nothing.
+  ASSERT_GE(log->Count({"Indirect blob GC job ended: failed",
+                        "1 inputs read, 0 installed"}),
+            1U);
+  ASSERT_GE(
+      log->Count({"[WARN] ",
+                  "Indirect blob GC error: IO error: injected write fault"}),
+      1U);
+  ASSERT_EQ(log->Count({"Compaction error: ", "injected write fault"}), 0U);
+}
+
+// Checks the corrupt input signals: a flipped bit in the reference block of
+// one input fails only that input. The ticker counts it and an ERROR line
+// names the input and the Status, also when the other inputs install.
+TEST_F(DBBlobBasicTest, IndirectBlobGCCorruptInputSignals) {
+  if (encrypted_env_) {
+    // test::CorruptFile() rewrites the whole SST, and the encrypted env gives
+    // the new file a new encryption prefix that the open reader does not use.
+    ROCKSDB_GTEST_BYPASS("Test corrupts an SST that has an open reader");
+    return;
+  }
+  Options options = IndirectBlobGCOptions();
+  // Corrupt SST metadata is skipped whatever paranoid_checks is. The test uses
+  // true, the value that turns corrupt blob data into a background error.
+  options.paranoid_checks = true;
+  // Keep every reference in one SST.
+  options.target_file_size_base = 1 << 30;
+  options.statistics = CreateDBStatistics();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  // Origin 0 holds many 100-byte values, so its live group spans several
+  // reference blocks. Origins 1 and 2 hold four 4 KB values each. Half of
+  // origin 0 and three quarters of origins 1 and 2 become garbage.
+  for (int o = 0; o < 3; ++o) {
+    const int count = o == 0 ? 18000 : 4;
+    for (int i = 0; i < count; ++i) {
+      ASSERT_OK(
+          Put("o" + std::to_string(o) + "-" + Key(i),
+              std::string(o == 0 ? 100 : 4096, static_cast<char>('a' + o))));
+    }
+    ASSERT_OK(Flush());
+  }
+  std::vector<uint64_t> origins;
+  for (const auto& blob_file : cfd->current()->storage_info()->GetBlobFiles()) {
+    origins.push_back(blob_file->GetBlobFileNumber());
+  }
+  ASSERT_EQ(origins.size(), 3U);
+  for (int o = 0; o < 3; ++o) {
+    const int dead = o == 0 ? 9000 : 3;
+    for (int i = 0; i < dead; ++i) {
+      ASSERT_OK(Delete("o" + std::to_string(o) + "-" + Key(i)));
+    }
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const FileMetaData* const sst = OnlySstForTest(cfd);
+  ASSERT_NE(sst, nullptr);
+  const BlobReferenceIndex index = ReadBlobReferenceIndexForTest(*sst);
+  ASSERT_EQ(index.groups.size(), 3U);
+  ASSERT_EQ(index.groups[0].group.origin_file_number, origins[0]);
+  ASSERT_GE(index.groups[1].start_block, index.groups[0].start_block + 2);
+  // Flip one byte in a middle reference block of origin 0.
+  ASSERT_OK(test::CorruptFile(
+      env_, MakeTableFileName(dbname_, sst->fd.GetNumber()),
+      static_cast<int>(index.blocks[index.groups[0].start_block + 1].offset() +
+                       1),
+      /*bytes_to_corrupt=*/1, /*verify_checksum=*/false));
+
+  Statistics* const statistics = options.statistics.get();
+  const IndirectBlobGcTickers before(statistics);
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(RouteTarget(origins[0]), kInvalidBlobFileNumber);
+  ASSERT_NE(RouteTarget(origins[1]), kInvalidBlobFileNumber);
+  ASSERT_NE(RouteTarget(origins[2]), kInvalidBlobFileNumber);
+
+  const IndirectBlobGcTickers after(statistics);
+  ASSERT_GE(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 1U);
+  ASSERT_GE(after.Since(before, INDIRECT_BLOB_GC_JOBS_INSTALLED), 1U);
+  ASSERT_GE(after.Since(before, INDIRECT_BLOB_GC_KEYS_RELOCATED), 2U);
+  // A corrupt input is not a job failure.
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED), 0U);
+  ASSERT_GE(log->Count({"[ERROR] ", "Indirect blob GC found corrupt input #" +
+                                        std::to_string(origins[0]) +
+                                        ": Corruption: "}),
+            1U);
+  ASSERT_EQ(log->Count({"Indirect blob GC found corrupt input #" +
+                        std::to_string(origins[1])}),
+            0U);
+}
+
+// Background for the corrupt input tests below: indirect blob GC treats two
+// kinds of corruption in different ways.
+// - Corrupt blob data: a record that fails its checksum, or a header or footer
+//   that cannot be read when GC opens the input. GC follows
+//   DBOptions::paranoid_checks, like compaction. With paranoid_checks true, the
+//   job returns Corruption and the DB gets a background error with reason
+//   kCompaction. With paranoid_checks false, GC only skips the file.
+// - Corrupt exact SST metadata: GC always skips the file and never sets a
+//   background error.
+// In both cases GC writes an ERROR line, counts INDIRECT_BLOB_GC_CORRUPT_INPUTS
+// and marks the file as corrupt in the census. GC does the same for invalid
+// input metadata and for a census mismatch that stays after a rebuild; these
+// tests do not cover those two. The property rocksdb.indirect-blob-gc-stats
+// shows the marked files (corrupt-input-files and corrupt-input-file-list)
+// until the file changes or the census is rebuilt. A marked relocation file
+// also leaves the list when the coarse frontier rises.
+
+namespace {
+
+// Records the reason of each background error, so that a test can check that
+// corrupt blob data is reported as a compaction error.
+class BackgroundErrorReasonRecorder : public EventListener {
+ public:
+  const char* Name() const override { return "BackgroundErrorReasonRecorder"; }
+  void OnBackgroundError(BackgroundErrorReason reason,
+                         Status* /*bg_error*/) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reasons_.push_back(reason);
+  }
+  std::vector<BackgroundErrorReason> Reasons() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reasons_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<BackgroundErrorReason> reasons_;
+};
+
+}  // namespace
+
+// Helpers for the corrupt input tests: they damage one blob file on disk,
+// turn indirect blob GC on and check the outcome.
+class DBBlobGCCorruptInputTest : public DBBlobBasicTest {
+ protected:
+  // IndirectBlobGCOptions() with the given paranoid_checks, statistics, a LOG
+  // capture and a background error listener.
+  Options CorruptInputOptions(bool paranoid_checks) {
+    Options options = IndirectBlobGCOptions();
+    options.paranoid_checks = paranoid_checks;
+    options.statistics = CreateDBStatistics();
+    log_ = std::make_shared<IndirectBlobGcLogCapture>();
+    options.info_log = log_;
+    errors_ = std::make_shared<BackgroundErrorReasonRecorder>();
+    options.listeners.push_back(errors_);
+    return options;
+  }
+
+  // Flips one bit in the middle of the first copy of `value` in the file. The
+  // tests use 4 KB values of one repeated byte, and blob compression is off,
+  // so the value bytes appear in the file as they are. The flipped bit makes
+  // the stored checksum of that record wrong.
+  Status FlipBitInValue(const std::string& path, const std::string& value) {
+    std::string contents;
+    Status s = ReadFileToString(env_, path, &contents);
+    if (!s.ok()) {
+      return s;
+    }
+    const size_t pos = contents.find(value);
+    if (pos == std::string::npos) {
+      return Status::NotFound("Value not found in " + path);
+    }
+    contents[pos + value.size() / 2] ^= 0x01;
+    return WriteStringToFile(env_, contents, path, /*should_sync=*/true);
+  }
+
+  // Overwrites `count` bytes of the file with 0xff, starting at `offset` from
+  // the start of the file, or from the end when `from_end` is true.
+  Status OverwriteBytes(const std::string& path, size_t offset, size_t count,
+                        bool from_end) {
+    std::string contents;
+    Status s = ReadFileToString(env_, path, &contents);
+    if (!s.ok()) {
+      return s;
+    }
+    if (offset + count > contents.size()) {
+      return Status::InvalidArgument("Range is past the end of " + path);
+    }
+    const size_t start = from_end ? contents.size() - offset - count : offset;
+    for (size_t i = 0; i < count; ++i) {
+      contents[start + i] = static_cast<char>(0xff);
+    }
+    return WriteStringToFile(env_, contents, path, /*should_sync=*/true);
+  }
+
+  // The indirect blob GC candidates that the census published on the current
+  // Version of `cfd`, in pick order.
+  std::vector<uint64_t> GcCandidates(ColumnFamilyData* cfd) {
+    std::vector<uint64_t> files;
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    cfd->current()->storage_info()->GetBlobPhysicalFilesForIndirectBlobGC(
+        BlobGcCandidateHeap::kMaxSelectedFiles, &files);
+    return files;
+  }
+
+  std::map<std::string, std::string> GcStats() {
+    std::map<std::string, std::string> stats;
+    EXPECT_TRUE(
+        db_->GetMapProperty(DB::Properties::kIndirectBlobGcStats, &stats));
+    return stats;
+  }
+
+  // Waits until corrupt-input-files is `expected`. The census publishes the
+  // corrupt files in a background job after the GC job ends, so one wait for
+  // the census may not be enough. The round limit only keeps a broken test
+  // from hanging.
+  void WaitForCorruptInputFiles(const std::string& expected) {
+    for (int round = 0; round < 100; ++round) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      if (GcStats()["corrupt-input-files"] == expected) {
+        return;
+      }
+      dbfull()->TEST_WaitForCompact().PermitUncheckedError();
+    }
+    FAIL() << "corrupt-input-files is " << GcStats()["corrupt-input-files"]
+           << ", expected " << expected;
+  }
+
+  // Turns indirect blob GC on and checks the outcome for one input whose blob
+  // data is corrupt.
+  // - paranoid_checks true: the job fails with Corruption, the background
+  //   error is a Corruption with reason kCompaction.
+  // - paranoid_checks false: no background error, and the census lists the
+  //   file as corrupt.
+  // In both cases the ticker counts the file once and an ERROR line names it.
+  void ExpectCorruptBlobDataOutcome(uint64_t file_number,
+                                    bool paranoid_checks) {
+    Statistics* const statistics = dbfull()->GetOptions().statistics.get();
+    const IndirectBlobGcTickers before(statistics);
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"disable_auto_compactions", "false"},
+                               {"enable_blob_garbage_collection", "true"}}));
+    const std::string error_prefix =
+        "Indirect blob GC found corrupt input #" + std::to_string(file_number);
+    if (paranoid_checks) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      const Status wait_status = dbfull()->TEST_WaitForCompact();
+      ASSERT_TRUE(wait_status.IsCorruption()) << wait_status.ToString();
+      const Status background_error = dbfull()->TEST_GetBGError();
+      ASSERT_TRUE(background_error.IsCorruption())
+          << background_error.ToString();
+      ASSERT_NE(
+          background_error.ToString().find("#" + std::to_string(file_number) +
+                                           " has corrupt blob data"),
+          std::string::npos)
+          << background_error.ToString();
+      const std::vector<BackgroundErrorReason> reasons = errors_->Reasons();
+      ASSERT_FALSE(reasons.empty());
+      ASSERT_EQ(reasons.front(), BackgroundErrorReason::kCompaction);
+      // The job writes the ERROR line before it returns, so the line is in
+      // the LOG already. The wait only keeps a broken test from hanging.
+      ASSERT_TRUE(log_->WaitFor({"[ERROR] ", error_prefix + ": Corruption: "},
+                                std::chrono::seconds(30)));
+    } else {
+      for (int round = 0; round < 3; ++round) {
+        dbfull()->TEST_WaitForBlobReferenceCensus();
+        ASSERT_OK(dbfull()->TEST_WaitForCompact());
+      }
+      ASSERT_OK(dbfull()->TEST_GetBGError());
+      ASSERT_TRUE(errors_->Reasons().empty());
+      ASSERT_GE(log_->Count({"[ERROR] ", error_prefix + ": Corruption: "}), 1U);
+      ASSERT_NO_FATAL_FAILURE(WaitForCorruptInputFiles("1"));
+      ASSERT_EQ(GcStats()["corrupt-input-file-list"],
+                std::to_string(file_number));
+    }
+    const IndirectBlobGcTickers after(statistics);
+    ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 1U);
+  }
+
+  // Writes kIndirectBlobGCKeyCount (4) keys, and lets GC move the last two
+  // into a relocation file. Then it deletes one of the two, so that the
+  // relocation file is a GC input with half of its bytes as garbage. Returns
+  // the relocation file number. Automatic compactions stay off, so GC does
+  // not run on the relocation file yet.
+  uint64_t WriteRelocationGCCandidate() {
+    EXPECT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_garbage_collection", "true"}}));
+    for (size_t i = 0; i < kIndirectBlobGCKeyCount; ++i) {
+      EXPECT_OK(Put(IndirectBlobGCKey(i), IndirectBlobGCValue(i)));
+    }
+    EXPECT_OK(Flush());
+    ColumnFamilyData* cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const uint64_t origin = cfd->current()
+                                ->storage_info()
+                                ->GetBlobFiles()
+                                .back()
+                                ->GetBlobFileNumber();
+    for (size_t i = 0; i < 2; ++i) {
+      EXPECT_OK(Delete(IndirectBlobGCKey(i)));
+    }
+    EXPECT_OK(Flush());
+    EXPECT_OK(BuildExactSstAtLevel1());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    EXPECT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+    const uint64_t relocation_file = RouteTarget(origin);
+    EXPECT_NE(relocation_file, kInvalidBlobFileNumber);
+    EXPECT_OK(Delete(IndirectBlobGCKey(2)));
+    EXPECT_OK(Flush());
+    EXPECT_OK(BuildExactSstAtLevel1());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    return relocation_file;
+  }
+
+  bool HasRelocationFile(uint64_t file_number) {
+    return dbfull()
+               ->GetVersionSet()
+               ->GetColumnFamilySet()
+               ->GetDefault()
+               ->current()
+               ->storage_info()
+               ->GetBlobRelocationFileMetaData(file_number) != nullptr;
+  }
+
+  std::shared_ptr<IndirectBlobGcLogCapture> log_;
+  std::shared_ptr<BackgroundErrorReasonRecorder> errors_;
+};
+
+// Checks a corrupt record in a normal blob file input. Corrupt blob data means
+// that a user value cannot be read, so GC follows paranoid_checks like
+// compaction: with true the DB stops with a compaction background error, and
+// with false GC only skips the file and shows it in the property. The file
+// stays in both cases.
+TEST_F(DBBlobGCCorruptInputTest, CorruptNormalBlobRecordFollowsParanoidChecks) {
+  if (encrypted_env_) {
+    // The test rewrites a blob file with a plain-text search for a value.
+    ROCKSDB_GTEST_BYPASS("Test searches for a value in an encrypted file");
+    return;
+  }
+  for (const bool paranoid_checks : {true, false}) {
+    SCOPED_TRACE("paranoid_checks=" + std::to_string(paranoid_checks));
+    DestroyAndReopen(CorruptInputOptions(paranoid_checks));
+    // Key 3 is the only live value of the file.
+    const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+    ASSERT_OK(FlipBitInValue(BlobFileName(dbname_, file_number),
+                             IndirectBlobGCValue(3)));
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectCorruptBlobDataOutcome(file_number, paranoid_checks));
+    ASSERT_TRUE(HasBlobFile(file_number));
+    ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+    Close();
+  }
+}
+
+// Checks a corrupt record in a relocation file input. A relocation file holds
+// user values too, so the outcome is the same as for a normal blob file: with
+// paranoid_checks true a compaction background error, with false a skip that
+// the property shows.
+TEST_F(DBBlobGCCorruptInputTest, CorruptRelocationRecordFollowsParanoidChecks) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_BYPASS("Test searches for a value in an encrypted file");
+    return;
+  }
+  for (const bool paranoid_checks : {true, false}) {
+    SCOPED_TRACE("paranoid_checks=" + std::to_string(paranoid_checks));
+    DestroyAndReopen(CorruptInputOptions(paranoid_checks));
+    const uint64_t relocation_file = WriteRelocationGCCandidate();
+    ASSERT_NE(relocation_file, kInvalidBlobFileNumber);
+    // Key 3 is the only live value of the relocation file. GC reads the
+    // relocation file with a reader that it opens itself, so no cached value
+    // hides the flipped bit.
+    ASSERT_OK(FlipBitInValue(BlobFileName(dbname_, relocation_file),
+                             IndirectBlobGCValue(3)));
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectCorruptBlobDataOutcome(relocation_file, paranoid_checks));
+    ASSERT_TRUE(HasRelocationFile(relocation_file));
+    Close();
+  }
+}
+
+// Checks a relocation file input whose location entries overlap: a sync point
+// in the relocation reader points the second live value at the record of the
+// first. The reader reports Corruption for the second value, so GC handles it
+// as corrupt blob data and follows paranoid_checks: with true the job fails
+// with Corruption, with false GC only skips the file. In both cases GC counts
+// the input in INDIRECT_BLOB_GC_CORRUPT_INPUTS and counts no failed job.
+TEST_F(DBBlobGCCorruptInputTest, OverlappingRelocationEntriesAreCorrupt) {
+  for (const bool paranoid_checks : {true, false}) {
+    SCOPED_TRACE("paranoid_checks=" + std::to_string(paranoid_checks));
+    Options options = CorruptInputOptions(paranoid_checks);
+    // The relocation file keeps 3 of its 4 values, so its exact garbage ratio
+    // is about 0.25. The test uses a lower threshold.
+    options.indirect_blob_gc_garbage_ratio = 0.2;
+    options.enable_blob_garbage_collection = true;
+    DestroyAndReopen(options);
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    // Keys 0 to 5 go to one normal blob file. GC moves keys 2 to 5 to a
+    // relocation file. Then key 2 is deleted.
+    for (int i = 0; i < 6; ++i) {
+      ASSERT_OK(Put("key" + std::to_string(i),
+                    std::string(4096, static_cast<char>('a' + i))));
+    }
+    ASSERT_OK(Flush());
+    const uint64_t origin = cfd->current()
+                                ->storage_info()
+                                ->GetBlobFiles()
+                                .back()
+                                ->GetBlobFileNumber();
+    for (int i = 0; i < 2; ++i) {
+      ASSERT_OK(Delete("key" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(BuildExactSstAtLevel1());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+    const uint64_t relocation_file = RouteTarget(origin);
+    ASSERT_NE(relocation_file, kInvalidBlobFileNumber);
+    ASSERT_OK(Delete("key2"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(BuildExactSstAtLevel1());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+
+    std::atomic<int> changed{0};
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "BlobRelocationFileReader::MultiGetStoredBlobs:FoundIndexes",
+        [&](void* arg) {
+          auto* const indexes = static_cast<std::vector<BlobIndex>*>(arg);
+          if (indexes->size() >= 2 && changed++ == 0) {
+            (*indexes)[1] = (*indexes)[0];
+          }
+        });
+    sync_point->EnableProcessing();
+    auto cleanup = Defer([sync_point] {
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+    Statistics* const statistics = options.statistics.get();
+    const IndirectBlobGcTickers before(statistics);
+    const Status s =
+        dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {relocation_file});
+    ASSERT_EQ(changed.load(), 1);
+    if (paranoid_checks) {
+      ASSERT_EQ(s.code(), Status::Code::kCorruption) << s.ToString();
+    } else {
+      ASSERT_OK(s);
+    }
+    const IndirectBlobGcTickers after(statistics);
+    ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 1U);
+    ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED),
+              paranoid_checks ? 1U : 0U);
+    ASSERT_EQ(log_->Count({"Indirect blob GC internal error"}), 0U);
+    ASSERT_GE(log_->Count({"[ERROR] ",
+                           "Indirect blob GC found corrupt input #" +
+                               std::to_string(relocation_file),
+                           "location entries overlap"}),
+              1U);
+    ASSERT_TRUE(HasRelocationFile(relocation_file));
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    ASSERT_EQ(Get("key5"), std::string(4096, 'f'));
+    Close();
+  }
+}
+
+// A value read that fails with InvalidArgument means that the blob reader
+// rejected the read request. DecideInputs() already rejects live values that
+// overlap, so only a GC programming check returns it. It is a GC internal
+// error, not corrupt data. A sync point makes the first value read of the job
+// fail with InvalidArgument, or with Corruption for comparison. The batch read
+// path (4 KB values) and the streaming path (2 MB values, above the 1 MB batch
+// limit) follow the same rules:
+// - InvalidArgument, with both values of paranoid_checks: the job returns OK,
+//   so the caller sets no background error. GC writes an "internal error"
+//   ERROR line, counts the job in INDIRECT_BLOB_GC_JOBS_FAILED and
+//   BLOB_DB_GC_FAILURES, does not count INDIRECT_BLOB_GC_CORRUPT_INPUTS, and
+//   suppresses the input, so the next census publish does not offer it.
+// - Corruption: with paranoid_checks true the job fails with Corruption; with
+//   false GC only skips the input. GC counts the input in
+//   INDIRECT_BLOB_GC_CORRUPT_INPUTS and writes a corrupt-input ERROR line.
+// In all cases GC installs nothing and keeps the file.
+TEST_F(DBBlobGCCorruptInputTest, RejectedValueReadIsInternalError) {
+  constexpr size_t kLargeValueSize = 2 * 1024 * 1024;
+  for (int test_case = 0; test_case < 8; ++test_case) {
+    const bool rejected = (test_case & 4) == 0;
+    const Status injected_status =
+        rejected ? Status::InvalidArgument("injected bad read")
+                 : Status::Corruption("injected bad read");
+    const bool streamed = (test_case & 2) != 0;
+    const bool paranoid_checks = (test_case & 1) != 0;
+    SCOPED_TRACE(injected_status.ToString() +
+                 " streamed=" + std::to_string(streamed) +
+                 " paranoid_checks=" + std::to_string(paranoid_checks));
+    Options options = CorruptInputOptions(paranoid_checks);
+    // Half of the values become garbage. File overhead keeps the exact garbage
+    // ratio a little below 0.5, so the test uses a lower threshold.
+    options.indirect_blob_gc_garbage_ratio = 0.25;
+    options.enable_blob_garbage_collection = true;
+    DestroyAndReopen(options);
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const size_t value_size = streamed ? kLargeValueSize : 4096;
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(Put("key" + std::to_string(i),
+                    std::string(value_size, static_cast<char>('a' + i))));
+    }
+    ASSERT_OK(Flush());
+    const uint64_t file_number = cfd->current()
+                                     ->storage_info()
+                                     ->GetBlobFiles()
+                                     .back()
+                                     ->GetBlobFileNumber();
+    for (int i = 0; i < 2; ++i) {
+      ASSERT_OK(Delete("key" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(BuildExactSstAtLevel1());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_EQ(GcCandidates(cfd), std::vector<uint64_t>{file_number});
+
+    std::atomic<int> injected{0};
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "DBImpl::RunIndirectBlobGC:BatchReadStatuses", [&](void* arg) {
+          auto* const statuses = static_cast<std::vector<Status>*>(arg);
+          if (!statuses->empty() && injected++ == 0) {
+            (*statuses)[0] = injected_status;
+          }
+        });
+    sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:StreamSourceStatus",
+                            [&](void* arg) {
+                              if (injected++ == 0) {
+                                *static_cast<Status*>(arg) = injected_status;
+                              }
+                            });
+    sync_point->EnableProcessing();
+    auto cleanup = Defer([sync_point] {
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+    Statistics* const statistics = options.statistics.get();
+    const IndirectBlobGcTickers before(statistics);
+    const Status s = dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {file_number});
+    ASSERT_EQ(injected.load(), 1);
+    const IndirectBlobGcTickers after(statistics);
+    if (rejected) {
+      ASSERT_OK(s);
+      ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 0U);
+      ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED), 1U);
+      ASSERT_EQ(after.Since(before, BLOB_DB_GC_FAILURES), 1U);
+      ASSERT_EQ(log_->Count(
+                    {"[ERROR] ", "Indirect blob GC internal error on input #" +
+                                     std::to_string(file_number) +
+                                     ": Invalid argument: injected bad read"}),
+                1U);
+      ASSERT_EQ(log_->Count({"Indirect blob GC found corrupt input"}), 0U);
+      ASSERT_EQ(log_->Count({"corrupt blob data"}), 0U);
+    } else {
+      if (paranoid_checks) {
+        ASSERT_EQ(s.code(), Status::Code::kCorruption) << s.ToString();
+        ASSERT_NE(s.ToString().find("#" + std::to_string(file_number) +
+                                    " has corrupt blob data"),
+                  std::string::npos)
+            << s.ToString();
+      } else {
+        ASSERT_OK(s);
+      }
+      ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 1U);
+      ASSERT_GE(log_->Count({"[ERROR] ",
+                             "Indirect blob GC found corrupt input #" +
+                                 std::to_string(file_number) + ": Corruption: ",
+                             "injected bad read"}),
+                1U);
+    }
+    ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_KEYS_RELOCATED), 0U);
+    ASSERT_TRUE(HasBlobFile(file_number));
+    ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    // The census publishes the suppression in a background job after the GC
+    // job ends.
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_TRUE(GcCandidates(cfd).empty());
+    ASSERT_EQ(Get("key3"), std::string(value_size, 'd'));
+    Close();
+  }
+}
+
+// Two live values of one origin that overlap mean that the exact references
+// in the SSTs are inconsistent. GC finds this from the finalized live set,
+// before it reads any stored bytes, and handles it like a bad reference block
+// in an SST: it suppresses the input, writes a corrupt-input ERROR line and
+// counts INDIRECT_BLOB_GC_CORRUPT_INPUTS, and it never fails the job, with
+// both values of paranoid_checks. The live set cannot hold an overlap in a
+// correct DB, so a sync point moves the second live value into the first.
+TEST_F(DBBlobGCCorruptInputTest, OverlappingLiveValuesAreCorruptMetadata) {
+  for (const bool paranoid_checks : {true, false}) {
+    SCOPED_TRACE("paranoid_checks=" + std::to_string(paranoid_checks));
+    Options options = CorruptInputOptions(paranoid_checks);
+    // Half of the values become garbage. File overhead keeps the exact garbage
+    // ratio a little below 0.5, so the test uses a lower threshold.
+    options.indirect_blob_gc_garbage_ratio = 0.25;
+    options.enable_blob_garbage_collection = true;
+    DestroyAndReopen(options);
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(Put("key" + std::to_string(i),
+                    std::string(4096, static_cast<char>('a' + i))));
+    }
+    ASSERT_OK(Flush());
+    const uint64_t file_number = cfd->current()
+                                     ->storage_info()
+                                     ->GetBlobFiles()
+                                     .back()
+                                     ->GetBlobFileNumber();
+    for (int i = 0; i < 2; ++i) {
+      ASSERT_OK(Delete("key" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(BuildExactSstAtLevel1());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+
+    int changed = 0;
+    int reads = 0;
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "DBImpl::RunIndirectBlobGC:FinalizedLiveSet", [&](void* arg) {
+          // The live set owns its values and is not const; references() only
+          // gives a const view of them.
+          auto& values = const_cast<std::vector<BlobRelocationLiveValue>&>(
+              static_cast<BlobRelocationLiveSet*>(arg)->references());
+          ASSERT_EQ(values.size(), 2U);
+          // The second value now starts 1 byte before the end of the first.
+          // The sort order stays the same.
+          values[1].original_value_offset =
+              values[0].original_value_offset + values[0].stored_value_size - 1;
+          ++changed;
+        });
+    sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:BatchReadStatuses",
+                            [&](void* /*arg*/) { ++reads; });
+    sync_point->EnableProcessing();
+    auto cleanup = Defer([sync_point] {
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+    Statistics* const statistics = options.statistics.get();
+    const IndirectBlobGcTickers before(statistics);
+    ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {file_number}));
+    ASSERT_EQ(changed, 1);
+    ASSERT_EQ(reads, 0);
+    const IndirectBlobGcTickers after(statistics);
+    ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 1U);
+    ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED), 0U);
+    ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_KEYS_RELOCATED), 0U);
+    ASSERT_EQ(log_->Count({"[ERROR] ",
+                           "Indirect blob GC found corrupt input #" +
+                               std::to_string(file_number) + ": Corruption: ",
+                           "Overlapping live blob values"}),
+              1U);
+    ASSERT_TRUE(HasBlobFile(file_number));
+    ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    ASSERT_NO_FATAL_FAILURE(WaitForCorruptInputFiles("1"));
+    ASSERT_EQ(GcStats()["corrupt-input-file-list"],
+              std::to_string(file_number));
+    ASSERT_EQ(Get("key3"), std::string(4096, 'd'));
+    Close();
+  }
+}
+
+// A backup holds the table and blob files of the DB (LiveFilesPinRequest), and
+// re-enables file deletions before it copies them, only if the DB pinned every
+// listed table and blob file. Relocation files are listed as blob files, so
+// they must be pinned too. Here indirect blob GC removes a relocation file from
+// the Version after deletions are re-enabled. The backup must still copy it,
+// and the restored DB must read the value that it holds.
+TEST_F(DBBlobBasicTest, PinnedBackupKeepsRelocationFileThatGcRemoves) {
+  Options options = IndirectBlobGCOptions();
+  // Indirect blob GC runs only with blob GC on. Auto compactions stay off,
+  // so GC runs only when the test calls it.
+  options.enable_blob_garbage_collection = true;
+  DestroyAndReopen(options);
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  // Keys 0 to 3 go to one normal blob file. GC moves keys 2 and 3 to a
+  // relocation file. Then key 2 is deleted, so key 3 is the only live value
+  // of the relocation file, and the relocation file is a GC input.
+  for (size_t i = 0; i < kIndirectBlobGCKeyCount; ++i) {
+    ASSERT_OK(Put(IndirectBlobGCKey(i), IndirectBlobGCValue(i)));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  for (size_t i = 0; i < 2; ++i) {
+    ASSERT_OK(Delete(IndirectBlobGCKey(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t relocation = RouteTarget(origin);
+  ASSERT_NE(relocation, kInvalidBlobFileNumber);
+  ASSERT_OK(Delete(IndirectBlobGCKey(2)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  // This sync point runs only on the pinned path, right after the backup
+  // re-enables file deletions and before it copies table and blob files.
+  int pinned_path_runs = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "BackupEngineImpl::CreateNewBackupWithMetadata:"
+      "FileDeletionsEnabledBeforeTableFiles",
+      [&](void* /*arg*/) {
+        ++pinned_path_runs;
+        ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {relocation}));
+        ASSERT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                      relocation),
+                  nullptr);
+        dbfull()->TEST_DeleteObsoleteFiles();
+        EXPECT_OK(env_->FileExists(BlobFileName(dbname_, relocation)));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string backup_dir = dbname_ + "_backup";
+  const std::string restore_dir = dbname_ + "_restore";
+  ASSERT_OK(DestroyDir(env_, backup_dir));
+  BackupEngine* raw_engine = nullptr;
+  ASSERT_OK(
+      BackupEngine::Open(env_, BackupEngineOptions(backup_dir), &raw_engine));
+  std::unique_ptr<BackupEngine> engine(raw_engine);
+  ASSERT_OK(engine->CreateNewBackup(db_.get()));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(pinned_path_runs, 1);
+  // The backup released its pin, so the purge now deletes the file.
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_TRUE(env_->FileExists(BlobFileName(dbname_, relocation)).IsNotFound());
+
+  Close();
+  ASSERT_OK(DestroyDir(env_, restore_dir));
+  ASSERT_OK(engine->RestoreDBFromLatestBackup(restore_dir, restore_dir));
+  ASSERT_OK(env_->FileExists(BlobFileName(restore_dir, relocation)));
+  std::unique_ptr<DB> restored;
+  ASSERT_OK(DB::Open(options, restore_dir, &restored));
+  for (size_t i = 0; i < kIndirectBlobGCKeyCount; ++i) {
+    std::string value;
+    const Status s = restored->Get(ReadOptions(), IndirectBlobGCKey(i), &value);
+    if (i == 3) {
+      ASSERT_OK(s);
+      ASSERT_EQ(value, IndirectBlobGCValue(i));
+    } else {
+      ASSERT_TRUE(s.IsNotFound()) << i;
+    }
+  }
+  restored.reset();
+  ASSERT_OK(DestroyDir(env_, restore_dir));
+  ASSERT_OK(DestroyDir(env_, backup_dir));
+}
+
+// Checks that a corrupt record fails only its own input when paranoid_checks
+// is false. Three blob files are GC inputs, and the second one has a corrupt
+// live value. GC skips that file and still relocates the other two, maybe in a
+// later job. With paranoid_checks true the same record stops the DB with a
+// compaction background error, and the corrupt file is not relocated.
+TEST_F(DBBlobGCCorruptInputTest,
+       CorruptBlobRecordStaysLocalOnlyWithoutParanoid) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_BYPASS("Test searches for a value in an encrypted file");
+    return;
+  }
+  for (const bool paranoid_checks : {false, true}) {
+    SCOPED_TRACE("paranoid_checks=" + std::to_string(paranoid_checks));
+    DestroyAndReopen(CorruptInputOptions(paranoid_checks));
+    // Each origin gets four 4 KB values with a byte of its own, and three of
+    // the four values become garbage. The live value of origin o is key 3 of
+    // that origin.
+    const auto key = [](int o, int i) {
+      return "o" + std::to_string(o) + "-key" + std::to_string(i);
+    };
+    const auto value = [](int o, int i) {
+      return std::string(4096, static_cast<char>('a' + 4 * o + i));
+    };
+    std::vector<uint64_t> origins;
+    for (int o = 0; o < 3; ++o) {
+      for (int i = 0; i < 4; ++i) {
+        ASSERT_OK(Put(key(o, i), value(o, i)));
+      }
+      ASSERT_OK(Flush());
+      origins.push_back(dbfull()
+                            ->GetVersionSet()
+                            ->GetColumnFamilySet()
+                            ->GetDefault()
+                            ->current()
+                            ->storage_info()
+                            ->GetBlobFiles()
+                            .back()
+                            ->GetBlobFileNumber());
+    }
+    for (int o = 0; o < 3; ++o) {
+      for (int i = 0; i < 3; ++i) {
+        ASSERT_OK(Delete(key(o, i)));
+      }
+    }
+    ASSERT_OK(Flush());
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    ASSERT_OK(FlipBitInValue(BlobFileName(dbname_, origins[1]), value(1, 3)));
+
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectCorruptBlobDataOutcome(origins[1], paranoid_checks));
+    ASSERT_EQ(RouteTarget(origins[1]), kInvalidBlobFileNumber);
+    ASSERT_TRUE(HasBlobFile(origins[1]));
+    if (!paranoid_checks) {
+      ASSERT_NE(RouteTarget(origins[0]), kInvalidBlobFileNumber);
+      ASSERT_NE(RouteTarget(origins[2]), kInvalidBlobFileNumber);
+      ASSERT_EQ(Get(key(0, 3)), value(0, 3));
+      ASSERT_EQ(Get(key(2, 3)), value(2, 3));
+    }
+    Close();
+  }
+}
+
+// Checks a blob file that GC cannot open: a damaged header of a normal blob
+// file, and a damaged footer of a relocation file. The file data cannot be
+// read at all, so this is corrupt blob data with the same two outcomes as a
+// corrupt record. The DB is reopened after the damage, so that no reader that
+// was opened earlier is in the blob file cache.
+TEST_F(DBBlobGCCorruptInputTest,
+       CorruptHeaderOrFooterAtOpenFollowsParanoidChecks) {
+  if (encrypted_env_) {
+    // The encrypted env keeps a prefix at the start of the file, so the
+    // offsets of the header and footer are not the plain-text offsets.
+    ROCKSDB_GTEST_BYPASS("Test overwrites plain-text file offsets");
+    return;
+  }
+  for (const bool relocation : {false, true}) {
+    for (const bool paranoid_checks : {true, false}) {
+      SCOPED_TRACE("relocation=" + std::to_string(relocation) +
+                   " paranoid_checks=" + std::to_string(paranoid_checks));
+      const Options options = CorruptInputOptions(paranoid_checks);
+      DestroyAndReopen(options);
+      uint64_t file_number = kInvalidBlobFileNumber;
+      if (relocation) {
+        file_number = WriteRelocationGCCandidate();
+      } else {
+        file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+      }
+      ASSERT_NE(file_number, kInvalidBlobFileNumber);
+      Close();
+      // A normal blob file starts with the magic number of its header. A
+      // relocation file is a block-based table, and it ends with the magic
+      // number of its footer (8 bytes).
+      ASSERT_OK(OverwriteBytes(BlobFileName(dbname_, file_number),
+                               /*offset=*/0, /*count=*/4,
+                               /*from_end=*/relocation));
+      Reopen(options);
+      ASSERT_NO_FATAL_FAILURE(
+          ExpectCorruptBlobDataOutcome(file_number, paranoid_checks));
+      if (relocation) {
+        ASSERT_TRUE(HasRelocationFile(file_number));
+      } else {
+        ASSERT_TRUE(HasBlobFile(file_number));
+      }
+      Close();
+    }
+  }
+}
+
+// Checks corrupt exact SST metadata with paranoid_checks true. The blob data
+// is still readable, and compaction does not read this metadata, so GC only
+// skips the input: no background error, one ticker count, and the property
+// lists the blob file.
+TEST_F(DBBlobGCCorruptInputTest, CorruptSstMetadataNeverSetsBackgroundError) {
+  if (encrypted_env_) {
+    // test::CorruptFile() rewrites the whole SST, and the encrypted env gives
+    // the new file a new encryption prefix that the open reader does not use.
+    ROCKSDB_GTEST_BYPASS("Test corrupts an SST that has an open reader");
+    return;
+  }
+  DestroyAndReopen(CorruptInputOptions(/*paranoid_checks=*/true));
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const FileMetaData* const sst = OnlySstForTest(cfd);
+  ASSERT_NE(sst, nullptr);
+  const BlobReferenceIndex index = ReadBlobReferenceIndexForTest(*sst);
+  ASSERT_EQ(index.groups.size(), 1U);
+  ASSERT_EQ(index.groups[0].group.origin_file_number, file_number);
+  // Flip one byte in the reference block of the only group.
+  ASSERT_OK(test::CorruptFile(
+      env_, MakeTableFileName(dbname_, sst->fd.GetNumber()),
+      static_cast<int>(index.blocks[index.groups[0].start_block].offset() + 1),
+      /*bytes_to_corrupt=*/1, /*verify_checksum=*/false));
+
+  Statistics* const statistics = dbfull()->GetOptions().statistics.get();
+  const IndirectBlobGcTickers before(statistics);
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_TRUE(errors_->Reasons().empty());
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_TRUE(HasBlobFile(file_number));
+  const IndirectBlobGcTickers after(statistics);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 1U);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_JOBS_FAILED), 0U);
+  ASSERT_GE(log_->Count({"[ERROR] ", "Indirect blob GC found corrupt input #" +
+                                         std::to_string(file_number) +
+                                         ": Corruption: "}),
+            1U);
+  ASSERT_NO_FATAL_FAILURE(WaitForCorruptInputFiles("1"));
+  ASSERT_EQ(GcStats()["corrupt-input-file-list"], std::to_string(file_number));
+}
+
+// Checks an SST that cannot be opened while GC reads its blob references. A
+// sync point makes the open fail with Corruption, the way a bad footer would.
+// An SST that cannot be opened means that user data is damaged, so GC follows
+// paranoid_checks like compaction: with true the job fails with a Corruption
+// background error (kCompaction); with false GC skips the blob files that the
+// SST references. The blob files are not corrupt, so
+// INDIRECT_BLOB_GC_CORRUPT_INPUTS stays 0 in both cases, and an ERROR line
+// names the SST. The callback is armed after the census is ready, so only the
+// GC job sees the failed open.
+TEST_F(DBBlobGCCorruptInputTest, SstOpenFailureFollowsParanoidChecks) {
+  for (const bool paranoid_checks : {true, false}) {
+    SCOPED_TRACE("paranoid_checks=" + std::to_string(paranoid_checks));
+    DestroyAndReopen(CorruptInputOptions(paranoid_checks));
+    const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const FileMetaData* const sst = OnlySstForTest(cfd);
+    ASSERT_NE(sst, nullptr);
+    const uint64_t sst_number = sst->fd.GetNumber();
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+
+    std::atomic<int> failed_opens{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "TableCache::GetBlobReferenceReader:Lookup", [&](void* arg) {
+          ++failed_opens;
+          *static_cast<Status*>(arg) = Status::Corruption("bad SST footer");
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    auto cleanup = Defer([] {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    });
+    Statistics* const statistics = dbfull()->GetOptions().statistics.get();
+    const IndirectBlobGcTickers before(statistics);
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"disable_auto_compactions", "false"},
+                               {"enable_blob_garbage_collection", "true"}}));
+    for (int round = 0; round < 3; ++round) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      dbfull()->TEST_WaitForCompact().PermitUncheckedError();
+    }
+    ASSERT_GE(failed_opens.load(), 1);
+    const Status background_error = dbfull()->TEST_GetBGError();
+    if (paranoid_checks) {
+      ASSERT_TRUE(background_error.IsCorruption())
+          << background_error.ToString();
+      ASSERT_NE(background_error.ToString().find("cannot open SST #" +
+                                                 std::to_string(sst_number)),
+                std::string::npos)
+          << background_error.ToString();
+      const std::vector<BackgroundErrorReason> reasons = errors_->Reasons();
+      ASSERT_FALSE(reasons.empty());
+      ASSERT_EQ(reasons.front(), BackgroundErrorReason::kCompaction);
+    } else {
+      ASSERT_OK(background_error);
+      ASSERT_TRUE(errors_->Reasons().empty());
+    }
+    ASSERT_TRUE(HasBlobFile(file_number));
+    ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+    const IndirectBlobGcTickers after(statistics);
+    ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 0U);
+    ASSERT_GE(log_->Count({"[ERROR] ", "Indirect blob GC cannot open SST #" +
+                                           std::to_string(sst_number)}),
+              1U);
+  }
+}
+
+// Checks a job that finds corrupt SST metadata and then ends stale on a census
+// mismatch (injected through a sync point). The job ends before it decides its
+// inputs, but it still reports the corrupt input: an ERROR line and one count
+// in INDIRECT_BLOB_GC_CORRUPT_INPUTS. The mismatch rebuilds the census, which
+// ends the suppression, so the next job finds the corruption again and reports
+// it a second time. After that, the property lists the file and no more job
+// picks it.
+TEST_F(DBBlobGCCorruptInputTest, CorruptSstMetadataReportedOnStaleJob) {
+  if (encrypted_env_) {
+    // test::CorruptFile() rewrites the whole SST, and the encrypted env gives
+    // the new file a new encryption prefix that the open reader does not use.
+    ROCKSDB_GTEST_BYPASS("Test corrupts an SST that has an open reader");
+    return;
+  }
+  DestroyAndReopen(CorruptInputOptions(/*paranoid_checks=*/true));
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const FileMetaData* const sst = OnlySstForTest(cfd);
+  ASSERT_NE(sst, nullptr);
+  const BlobReferenceIndex index = ReadBlobReferenceIndexForTest(*sst);
+  ASSERT_EQ(index.groups.size(), 1U);
+  ASSERT_OK(test::CorruptFile(
+      env_, MakeTableFileName(dbname_, sst->fd.GetNumber()),
+      static_cast<int>(index.blocks[index.groups[0].start_block].offset() + 1),
+      /*bytes_to_corrupt=*/1, /*verify_checksum=*/false));
+
+  // The first job's census check reports a mismatch, so that job ends stale.
+  std::atomic<int> checks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:CensusTotalsCheck", [&](void* arg) {
+        if (checks++ == 0) {
+          *static_cast<bool*>(arg) = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  Statistics* const statistics = dbfull()->GetOptions().statistics.get();
+  const IndirectBlobGcTickers before(statistics);
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_NO_FATAL_FAILURE(WaitForCorruptInputFiles("1"));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_GE(checks.load(), 1);
+  const IndirectBlobGcTickers after(statistics);
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CENSUS_MISMATCHES), 1U);
+  ASSERT_GE(after.Since(before, INDIRECT_BLOB_GC_JOBS_STALE), 1U);
+  // One report from the stale job and one from the job after the rebuild.
+  ASSERT_EQ(after.Since(before, INDIRECT_BLOB_GC_CORRUPT_INPUTS), 2U);
+  ASSERT_EQ(log_->Count({"[ERROR] ", "Indirect blob GC found corrupt input #" +
+                                         std::to_string(file_number) +
+                                         ": Corruption: "}),
+            2U);
+  ASSERT_EQ(GcStats()["corrupt-input-file-list"], std::to_string(file_number));
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_TRUE(HasBlobFile(file_number));
+}
+
+// Checks when a file leaves the corrupt file list of the property. The census
+// keeps the mark only while the file is unchanged and the census is not
+// rebuilt:
+// 1. GC skips a file with a corrupt record (paranoid_checks false).
+// 2. A reopen rebuilds the census, so the list is empty.
+// 3. GC skips the file again. Then the corrupt value is deleted, so the file
+//    changes. The mark goes away, and GC relocates the other live value.
+TEST_F(DBBlobGCCorruptInputTest, CorruptInputListClearsOnRebuildOrChange) {
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_BYPASS("Test searches for a value in an encrypted file");
+    return;
+  }
+  const Options options = CorruptInputOptions(/*paranoid_checks=*/false);
+  DestroyAndReopen(options);
+  // Keys 2 and 3 are live. Key 2 gets the corrupt record.
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/2);
+  ASSERT_OK(FlipBitInValue(BlobFileName(dbname_, file_number),
+                           IndirectBlobGCValue(2)));
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectCorruptBlobDataOutcome(file_number, /*paranoid_checks=*/false));
+
+  // The options turn automatic compactions off, so no GC job runs after the
+  // reopen.
+  Reopen(options);
+  ASSERT_NO_FATAL_FAILURE(WaitForCorruptInputFiles("0"));
+  ASSERT_EQ(GcStats()["corrupt-input-file-list"], "");
+
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectCorruptBlobDataOutcome(file_number, /*paranoid_checks=*/false));
+  ASSERT_OK(Delete(IndirectBlobGCKey(2)));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_NO_FATAL_FAILURE(WaitForCorruptInputFiles("0"));
+  ASSERT_EQ(GcStats()["corrupt-input-file-list"], "");
+  for (int round = 0; round < 3; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_EQ(Get(IndirectBlobGCKey(3)), IndirectBlobGCValue(3));
+}
+
+// Checks the idle time signals. Candidates exist and the options let GC run,
+// but a sync point keeps every GC pick from starting a job. The idle time
+// property grows with the DB clock and equals the idle-micros-with-candidates
+// map key. DumpStats() writes a WARN line only when the idle time is longer
+// than stats_dump_period_sec.
+TEST_F(DBBlobBasicTest, IndirectBlobGCIdleTimeSignals) {
+  auto clock =
+      std::make_shared<ManualIndirectBlobGcClock>(env_->GetSystemClock());
+  CompositeEnvWrapper env(env_, clock);
+  Options options = IndirectBlobGCOptions();
+  options.env = &env;
+  // 60 s is an example period; the test moves the clock past it.
+  constexpr unsigned int kStatsPeriodSec = 60;
+  options.stats_dump_period_sec = kStatsPeriodSec;
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:IndirectBlobGCCandidates",
+      [](void* arg) { static_cast<std::vector<uint64_t>*>(arg)->clear(); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  const auto read_idle = [&](uint64_t* property, uint64_t* map_key) {
+    ASSERT_TRUE(db_->GetIntProperty(
+        DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates, property));
+    std::map<std::string, std::string> gc_stats;
+    ASSERT_TRUE(
+        db_->GetMapProperty(DB::Properties::kIndirectBlobGcStats, &gc_stats));
+    ASSERT_NE(gc_stats["tracked-files"], "0");
+    *map_key = std::stoull(gc_stats["idle-micros-with-candidates"]);
+  };
+  const std::vector<std::string> warn{"[WARN] ",
+                                      "Indirect blob GC has had candidates"};
+  uint64_t idle = 0;
+  uint64_t idle_key = 0;
+  ASSERT_NO_FATAL_FAILURE(read_idle(&idle, &idle_key));
+  ASSERT_EQ(idle, idle_key);
+  // The idle time is shorter than the stats period: no WARN line.
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 0U);
+
+  // 30 s is half of the period: still no WARN line.
+  clock->Advance(uint64_t{kStatsPeriodSec / 2} * 1000 * 1000);
+  uint64_t half_period_idle = 0;
+  ASSERT_NO_FATAL_FAILURE(read_idle(&half_period_idle, &idle_key));
+  ASSERT_EQ(half_period_idle, idle_key);
+  ASSERT_EQ(half_period_idle - idle, uint64_t{kStatsPeriodSec / 2} * 1000000);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 0U);
+
+  // Past the period, DumpStats() warns once per call.
+  clock->Advance(uint64_t{kStatsPeriodSec} * 1000 * 1000);
+  uint64_t long_idle = 0;
+  ASSERT_NO_FATAL_FAILURE(read_idle(&long_idle, &idle_key));
+  ASSERT_EQ(long_idle, idle_key);
+  ASSERT_GT(long_idle, uint64_t{kStatsPeriodSec} * 1000000);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 1U);
+  ASSERT_EQ(log->Count({"[default] Indirect blob GC has had candidates for " +
+                        std::to_string(long_idle / 1000000) +
+                        " s without starting a job"}),
+            1U);
+  Close();
+}
+
+// Checks that a DB without blob indirection keeps every indirect blob GC
+// signal at 0, also when compaction-time blob GC relocates values and the
+// clock passes the stats period.
+// Checks that a GC job that runs longer than one stats period does not count
+// as idle time. The test holds a GC job after it has started, makes the census
+// publish a new Version while the job is held (a flush, then a census run),
+// and moves the manual DB clock past stats_dump_period_sec. The publish sees
+// that a GC job is registered, so it does not start the idle time again:
+// DumpStats() writes no idle WARN, and the idle property stays 0. After the
+// job is released and installs, no file is left to collect, so the idle time
+// stays 0.
+TEST_F(DBBlobBasicTest, IndirectBlobGCLongJobIsNotIdle) {
+  auto clock =
+      std::make_shared<ManualIndirectBlobGcClock>(env_->GetSystemClock());
+  CompositeEnvWrapper env(env_, clock);
+  Options options = IndirectBlobGCOptions();
+  options.env = &env;
+  // 60 s is an example period; the test moves the clock past it.
+  constexpr unsigned int kStatsPeriodSec = 60;
+  options.stats_dump_period_sec = kStatsPeriodSec;
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  // Holds the first GC job before its output work, after the job has started
+  // and registered on the census.
+  std::atomic<bool> hold_job{true};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"DBBlobBasicTest::LongJob:Held", "DBBlobBasicTest::LongJob:WaitHeld"},
+       {"DBBlobBasicTest::LongJob:Release",
+        "DBBlobBasicTest::LongJob:Released"}});
+  sync_point->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:BeforeOutputWork", [&](void*) {
+        if (hold_job.exchange(false)) {
+          TEST_SYNC_POINT("DBBlobBasicTest::LongJob:Held");
+          TEST_SYNC_POINT("DBBlobBasicTest::LongJob:Released");
+        }
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  TEST_SYNC_POINT("DBBlobBasicTest::LongJob:WaitHeld");
+
+  // A flush installs a new Version, and the census publishes it while the job
+  // is held. The GC input is still a file to collect in that Version.
+  ASSERT_OK(Put("other", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    ASSERT_TRUE(cfd->blob_reference_census()->IsReady(
+        cfd->current()->GetVersionNumber()));
+  }
+  std::map<std::string, std::string> gc_stats;
+  ASSERT_TRUE(
+      db_->GetMapProperty(DB::Properties::kIndirectBlobGcStats, &gc_stats));
+  ASSERT_NE(gc_stats["garbage-bytes-collectable"], "0");
+
+  // The job has run for longer than one stats period.
+  clock->Advance(uint64_t{kStatsPeriodSec + 1} * 1000 * 1000);
+  const std::vector<std::string> warn{"[WARN] ",
+                                      "Indirect blob GC has had candidates"};
+  uint64_t idle = 1;
+  ASSERT_TRUE(db_->GetIntProperty(
+      DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates, &idle));
+  ASSERT_EQ(idle, 0U);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 0U);
+
+  TEST_SYNC_POINT("DBBlobBasicTest::LongJob:Release");
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  // The job installed and left no file to collect, so the idle time stays 0
+  // also after more time passes.
+  clock->Advance(uint64_t{kStatsPeriodSec + 1} * 1000 * 1000);
+  ASSERT_TRUE(db_->GetIntProperty(
+      DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates, &idle));
+  ASSERT_EQ(idle, 0U);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 0U);
+  Close();
+}
+
+// Checks that the idle time counts only while the options let a GC job run.
+// The census exists whenever the Version has the blob indirection format, but
+// GC also needs blob GC on and auto compactions on. The test moves the manual
+// DB clock past stats_dump_period_sec in each state:
+// 1. Blob GC off: the idle time stays 0, and DumpStats() writes no WARN line.
+// 2. Blob GC on, auto compactions off: the same.
+// 3. Both on, and a sync point keeps the GC job from starting: the idle time
+//    grows, and DumpStats() warns.
+// 4. SetOptions() turns blob GC off again: the idle time goes back to 0.
+TEST_F(DBBlobBasicTest, IndirectBlobGCIdleTimeOnlyWhenGcCanRun) {
+  auto clock =
+      std::make_shared<ManualIndirectBlobGcClock>(env_->GetSystemClock());
+  CompositeEnvWrapper env(env_, clock);
+  Options options = IndirectBlobGCOptions();
+  options.env = &env;
+  // 60 s is an example period; the test moves the clock past it.
+  constexpr unsigned int kStatsPeriodSec = 60;
+  constexpr uint64_t kPastPeriodMicros =
+      uint64_t{kStatsPeriodSec + 1} * 1000 * 1000;
+  options.stats_dump_period_sec = kStatsPeriodSec;
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  // The DB uses `env` and `clock`, so close it before they go away, also when
+  // an assertion ends the test early.
+  auto close_db = Defer([this] { Close(); });
+  WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const std::vector<std::string> warn{"[WARN] ",
+                                      "Indirect blob GC has had candidates"};
+  const auto idle = [&]() {
+    uint64_t value = 0;
+    EXPECT_TRUE(db_->GetIntProperty(
+        DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates, &value));
+    return value;
+  };
+
+  // 1. Blob GC off.
+  clock->Advance(kPastPeriodMicros);
+  ASSERT_EQ(idle(), 0U);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 0U);
+
+  // 2. Blob GC on, auto compactions off.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  clock->Advance(kPastPeriodMicros);
+  ASSERT_EQ(idle(), 0U);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 0U);
+
+  // 3. GC can run, but every GC pick finds no candidate, so no job starts.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:IndirectBlobGCCandidates",
+      [](void* arg) { static_cast<std::vector<uint64_t>*>(arg)->clear(); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  clock->Advance(kPastPeriodMicros);
+  ASSERT_GE(idle(), kPastPeriodMicros);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 1U);
+
+  // 4. Blob GC off again.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_garbage_collection", "false"}}));
+  ASSERT_EQ(idle(), 0U);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  clock->Advance(kPastPeriodMicros);
+  ASSERT_EQ(idle(), 0U);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count(warn), 1U);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCSignalsStayZeroWithoutIndirection) {
+  Options options = IndirectBlobGCOptions();
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = true;
+  options.blob_garbage_collection_age_cutoff = 1.0;
+  options.stats_dump_period_sec = 1;
+  options.statistics = CreateDBStatistics();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  auto recorder = std::make_shared<BlobCreationReasonRecorder>();
+  options.listeners.push_back(recorder);
+  DestroyAndReopen(options);
+  WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"}}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  // Compaction-time blob GC relocated the live value.
+  Statistics* const statistics = options.statistics.get();
+  ASSERT_GT(statistics->getTickerCount(BLOB_DB_GC_NUM_KEYS_RELOCATED), 0U);
+  for (Tickers ticker : IndirectBlobGcTickers::kTickers) {
+    if (ticker != BLOB_DB_GC_NUM_KEYS_RELOCATED) {
+      ASSERT_EQ(statistics->getTickerCount(ticker), 0U) << ticker;
+    }
+  }
+  HistogramData job_micros;
+  statistics->histogramData(INDIRECT_BLOB_GC_JOB_MICROS, &job_micros);
+  ASSERT_EQ(job_micros.count, 0U);
+  ASSERT_TRUE(recorder->Paths(BlobFileCreationReason::kIndirectBlobGC).empty());
+  uint64_t idle = 1;
+  ASSERT_TRUE(db_->GetIntProperty(
+      DB::Properties::kIndirectBlobGcIdleMicrosWithCandidates, &idle));
+  ASSERT_EQ(idle, 0U);
+  dbfull()->DumpStats();
+  ASSERT_EQ(log->Count({"Indirect blob GC"}), 0U);
+}
 
 TEST_F(DBBlobBasicTest, ExactReferenceBudgetKeepsCompleteL0Histories) {
   // A user key's history is all its kept versions, including deletions and
@@ -1264,6 +3317,112 @@ TEST_F(DBBlobBasicTest, IndirectBlobGcStatsCoarseKeys) {
     ASSERT_EQ(NumTableFilesAtLevel(0), 1);
     ASSERT_EQ(coarse_keys(), zero);
   }
+}
+
+TEST_F(DBBlobBasicTest, RoutedReadIsInBlockCacheTrace) {
+  // A Get of a value that indirect blob GC moved to a relocation file goes
+  // through a route (BLOB_DB_INDIRECT_READ_ROUTED goes up). While a block
+  // cache trace runs, the block reads of the relocation file are in the trace
+  // with the caller kBlobRelocationFileRead, because the DB passes its block
+  // cache tracer to the relocation file readers. The first Get misses in the
+  // block cache. A second Get finds the data block in the block cache, and the
+  // cache hit is traced too.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.statistics = CreateDBStatistics();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  // The table reader traces only block cache lookups. The index block is not
+  // kept in the block cache (cache_index_and_filter_blocks is false), so the
+  // records are data block lookups.
+  //
+  // The block cache has one shard (census_shard_safe_cache). The blob reference
+  // census charges its memory to the block cache in reservation entries of
+  // 256 KB each. NewLRUCache(8 MB) has 16 shards of 512 KB, and two such
+  // entries can fill the shard that holds the data block of the relocation
+  // file. Then the block does not stay in the cache, and the second Get misses
+  // again. With one 8 MB shard, the census charge leaves room for the block.
+  const auto set_block_cache = [&options]() {
+    BlockBasedTableOptions table_options;
+    LRUCacheOptions census_shard_safe_cache;
+    census_shard_safe_cache.capacity = 8 << 20;
+    census_shard_safe_cache.num_shard_bits = 0;
+    table_options.block_cache = census_shard_safe_cache.MakeSharedCache();
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  };
+  set_block_cache();
+  DestroyAndReopen(options);
+  // Four values go to one blob file. Three of them are deleted, so indirect
+  // blob GC moves the live value of "key3" to a relocation file and adds a
+  // route from the blob file to it.
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin),
+      kInvalidBlobFileNumber);
+  // Reopen with a new, empty block cache, so the traced Get reads the blocks
+  // of the relocation file.
+  set_block_cache();
+  Reopen(options);
+  // The census builds again in the background after the reopen. Wait for it,
+  // so its block cache charge is in place before the traced Gets.
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  const std::string trace_path = dbname_ + "/block_cache_trace";
+  {
+    std::unique_ptr<TraceWriter> trace_writer;
+    ASSERT_OK(
+        NewFileTraceWriter(env_, EnvOptions(), trace_path, &trace_writer));
+    ASSERT_OK(
+        db_->StartBlockCacheTrace(TraceOptions(), std::move(trace_writer)));
+  }
+  const uint64_t routed_before =
+      options.statistics->getTickerCount(BLOB_DB_INDIRECT_READ_ROUTED);
+  ASSERT_EQ(Get("key3"), value);
+  ASSERT_EQ(options.statistics->getTickerCount(BLOB_DB_INDIRECT_READ_ROUTED),
+            routed_before + 1);
+  ASSERT_EQ(Get("key3"), value);
+  ASSERT_EQ(options.statistics->getTickerCount(BLOB_DB_INDIRECT_READ_ROUTED),
+            routed_before + 2);
+  ASSERT_OK(db_->EndBlockCacheTrace());
+
+  std::unique_ptr<TraceReader> trace_reader;
+  ASSERT_OK(NewFileTraceReader(env_, EnvOptions(), trace_path, &trace_reader));
+  BlockCacheTraceReader reader(std::move(trace_reader));
+  BlockCacheTraceHeader header;
+  ASSERT_OK(reader.ReadHeader(&header));
+  size_t data_block_misses = 0;
+  size_t data_block_hits = 0;
+  BlockCacheTraceRecord record;
+  while (reader.ReadAccess(&record).ok()) {
+    if (record.caller == TableReaderCaller::kBlobRelocationFileRead &&
+        record.block_type == TraceType::kBlockTraceDataBlock) {
+      ++(record.is_cache_hit ? data_block_hits : data_block_misses);
+    }
+  }
+  ASSERT_GT(data_block_misses, 0U);
+  ASSERT_GT(data_block_hits, 0U);
 }
 
 namespace {
@@ -1873,6 +4032,160 @@ TEST_F(DBBlobBasicTest, BlobReferenceOptionRange) {
             4096U);
 }
 
+TEST_F(DBBlobBasicTest, BlobMetadataAmbiguityResolvesAfterManifestRecovery) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  options.max_bgerror_resume_count = 0;
+  CreateAndReopenWithCF({"blob"}, options);
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put(1, "key" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush(1));
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(handles_[1])->cfd();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete(1, "key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush(1));
+  CompactRangeOptions exact_options;
+  exact_options.change_level = true;
+  exact_options.target_level = 1;
+  exact_options.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  exact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(db_->CompactRange(exact_options, handles_[1], nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  std::atomic<int> failures{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+        if (failures.fetch_add(1) == 0) {
+          auto* status = static_cast<IOStatus*>(arg);
+          *status = IOStatus::IOError("Injected retryable blob MANIFEST error");
+          status->SetRetryable(true);
+        }
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_TRUE(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}).IsIOError());
+  ASSERT_EQ(failures.load(), 1);
+  // The MANIFEST write result is unknown, so no indirect blob GC job can start
+  // until MANIFEST recovery.
+  ASSERT_TRUE(TryBeginGcJob(cfd).IsBusy());
+  // TEST_RunIndirectBlobGCBatch does not report errors through
+  // BackgroundCompaction. So the test sets the same retryable MANIFEST error as
+  // the background error, and then calls Resume().
+  const IOStatus io_status = dbfull()->GetVersionSet()->io_status();
+  ASSERT_TRUE(io_status.IsIOError());
+  dbfull()->TEST_SetBGError(io_status, BackgroundErrorReason::kManifestWrite);
+  sync_point->ClearCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest");
+  ASSERT_OK(db_->Resume());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(TryBeginGcJob(cfd));
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, handles_[1], nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(Get(1, "key3"), value);
+  ASSERT_OK(Put(1, "after-recovery", value));
+}
+TEST_F(DBBlobBasicTest, IndirectBlobGCRunsAfterAmbiguityResolves) {
+  // A background indirect blob GC install fails its MANIFEST write, so the
+  // outcome of its metadata commit is unknown until recovery. A GC attempt in
+  // that state (BeginGcJob returns Busy) ends with no error and no install.
+  // After Resume() recovers the MANIFEST, GC runs again by itself: no new write
+  // and no manual compaction is needed.
+  Options options = IndirectBlobGCOptions();
+  options.max_bgerror_resume_count = 0;
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  std::atomic<int> failures{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+        if (failures.fetch_add(1) == 0) {
+          auto* status = static_cast<IOStatus*>(arg);
+          *status = IOStatus::IOError("Injected retryable blob MANIFEST error");
+          status->SetRetryable(true);
+        }
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  dbfull()->TEST_WaitForCompact().PermitUncheckedError();
+  ASSERT_EQ(failures.load(), 1);
+  ASSERT_TRUE(dbfull()->TEST_GetBGError().IsIOError());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(TryBeginGcJob(cfd).IsBusy());
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+
+  // While the outcome is unknown, a GC attempt ends quietly.
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {file_number}));
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+
+  sync_point->ClearCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest");
+  ASSERT_OK(db_->Resume());
+  for (int round = 0; round < 3; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_FALSE(HasBlobFile(file_number));
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+TEST_F(DBBlobBasicTest, RepairRefusesDbWithValidRelocationFile) {
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("legacy", "value"));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  const ImmutableOptions immutable_options = cfd->ioptions();
+  const MutableCFOptions mutable_options = cfd->GetLatestMutableCFOptions();
+  Close();
+  const std::string payload = "stored";
+  BlobRelocationFileMetadata metadata;
+  uint64_t size = 0;
+  constexpr uint64_t number = 1000000;
+  WriteRelocationFileForDBTest(
+      immutable_options, mutable_options, BlockBasedTableOptions(), 0, number,
+      {{1, 42, payload, kNoCompression}}, &metadata, &size);
+  const std::string path = BlobFileName(dbname_, number);
+  std::string before;
+  ASSERT_OK(ReadFileToString(env_, path, &before));
+  ASSERT_TRUE(RepairDB(dbname_, options).IsNotSupported());
+  std::string after;
+  ASSERT_OK(ReadFileToString(env_, path, &after));
+  ASSERT_EQ(before, after);
+}
 TEST_F(DBBlobBasicTest, BlobReferenceCensusShutdownAfterDispatch) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
@@ -2559,6 +4872,298 @@ TEST_F(DBBlobBasicTest, SetOptionsOnFencedColumnFamilyPublishesAtomically) {
   ASSERT_TRUE(cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
 }
 
+TEST_F(DBBlobBasicTest, IndirectBlobGCRelocatesExactLiveSet) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  ASSERT_OK(Put("older", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  const std::array<std::string, 4> values{
+      {std::string(4096, 'a'), std::string(4096, 'b'), std::string(4096, 'c'),
+       std::string(4096, 'd')}};
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_OK(Put(keys[i], values[i]));
+  }
+  ASSERT_OK(Flush());
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 2U);
+  const uint64_t older_file_number = cfd->current()
+                                         ->storage_info()
+                                         ->GetBlobFiles()
+                                         .front()
+                                         ->GetBlobFileNumber();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .back()
+                                          ->GetBlobFileNumber();
+  ASSERT_LT(older_file_number, origin_file_number);
+
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  std::shared_ptr<BlobFileMetaData> source =
+      cfd->current()->storage_info()->GetBlobFileMetaData(origin_file_number);
+  ASSERT_NE(source, nullptr);
+  ASSERT_GE(source->GetGarbageBlobBytes(),
+            source->GetTotalBlobBytes() - source->GetGarbageBlobBytes());
+  source.reset();
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  const uint64_t route_target =
+      storage->GetBlobRelocationRouteTarget(origin_file_number);
+  ASSERT_NE(route_target, kInvalidBlobFileNumber);
+  ASSERT_NE(storage->GetBlobRelocationFileMetaData(route_target), nullptr);
+  ASSERT_NE(storage->GetBlobFileMetaData(older_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    std::string ignored;
+    ASSERT_TRUE(db_->Get(ReadOptions(), keys[i], &ignored).IsNotFound());
+  }
+  ASSERT_EQ(Get(keys.back()), values.back());
+  ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+
+  // In MANIFEST replay, the old record that added the input comes before the
+  // blob file retirement record of the input. Reopen must accept that the input
+  // file is gone from disk, while the older normal blob file is still live.
+  const std::string source_path =
+      BlobFileName(cfd->ioptions().cf_paths.front().path, origin_file_number);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_TRUE(options.env->FileExists(source_path).IsNotFound());
+  Reopen(options);
+  ASSERT_EQ(Get(keys.back()), values.back());
+  ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(older_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_NE(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+
+  // Compaction garbage accounting (the per-blob-file garbage counters) still
+  // uses the value's origin file number. Indirect blob GC has done the blob
+  // file retirement of the origin file, so the compaction must ignore that
+  // garbage update instead of failing.
+  ASSERT_OK(Delete(keys.back()));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  std::string ignored;
+  ASSERT_TRUE(db_->Get(ReadOptions(), keys.back(), &ignored).IsNotFound());
+  ASSERT_OK(Put("post_gc", "still writable"));
+  ASSERT_OK(Flush());
+
+  Reopen(options);
+  ASSERT_EQ(Get("post_gc"), "still writable");
+}
+
+namespace {
+// Sends every compaction back to local execution. With a separate remote
+// compaction pool, background compactions still start on remote coordinator
+// threads.
+class LocalOnlyCompactionService : public CompactionService {
+ public:
+  const char* Name() const override { return "LocalOnlyCompactionService"; }
+  CompactionServiceScheduleResponse Schedule(
+      const CompactionServiceJobInfo& /*info*/,
+      const std::string& /*compaction_service_input*/) override {
+    return CompactionServiceScheduleResponse(
+        CompactionServiceJobStatus::kUseLocal);
+  }
+  CompactionServiceJobStatus Wait(const std::string& /*scheduled_job_id*/,
+                                  std::string* /*result*/) override {
+    return CompactionServiceJobStatus::kUseLocal;
+  }
+};
+}  // namespace
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCChargesItsOwnCacheRole) {
+  const auto role_bytes = [](Cache* cache, CacheEntryRole role) {
+    size_t bytes = 0;
+    cache->ApplyToAllEntries(
+        [&](const Slice& /*key*/, Cache::ObjectPtr /*value*/, size_t charge,
+            const Cache::CacheItemHelper* helper) {
+          if (helper != nullptr && helper->role == role) {
+            bytes += charge;
+          }
+        },
+        Cache::ApplyToAllEntriesOptions());
+    return bytes;
+  };
+  for (const bool charged : {true, false}) {
+    SCOPED_TRACE(charged);
+    BlockBasedTableOptions table_options;
+    table_options.block_cache = NewLRUCache(64 << 20);
+    if (!charged) {
+      table_options.cache_usage_options
+          .options_overrides[CacheEntryRole::kIndirectBlobGcWorkingMemory] = {
+          CacheEntryRoleOptions::Decision::kDisabled};
+    }
+    Cache* const cache = table_options.block_cache.get();
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = false;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("older", std::string(4096, 'o')));
+    ASSERT_OK(Flush());
+    const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+    for (const std::string& key : keys) {
+      ASSERT_OK(Put(key, std::string(4096, key.back())));
+    }
+    ASSERT_OK(Flush());
+    for (size_t i = 0; i + 1 < keys.size(); ++i) {
+      ASSERT_OK(Delete(keys[i]));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+    // When charging is on, indirect blob GC charges its working memory to the
+    // block cache under CacheEntryRole::kIndirectBlobGcWorkingMemory while the
+    // live set exists. When that role is disabled, GC charges nothing.
+    std::atomic<size_t> gc_bytes{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::RunIndirectBlobGC:AfterLiveSet", [&](void* /*arg*/) {
+          gc_bytes = std::max(
+              gc_bytes.load(),
+              role_bytes(cache, CacheEntryRole::kIndirectBlobGcWorkingMemory));
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"disable_auto_compactions", "false"},
+                               {"enable_blob_garbage_collection", "true"}}));
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    ASSERT_EQ(cfd->current()->storage_info()->GetBlobRelocationFiles().size(),
+              1U);
+    if (charged) {
+      ASSERT_GT(gc_bytes.load(), 0U);
+    } else {
+      ASSERT_EQ(gc_bytes.load(), 0U);
+    }
+    // The charge ends with the job. The block cache entry stats
+    // (DB::Properties::kBlockCacheEntryStats) have a separate entry for
+    // CacheEntryRole::kIndirectBlobGcWorkingMemory.
+    ASSERT_EQ(role_bytes(cache, CacheEntryRole::kIndirectBlobGcWorkingMemory),
+              0U);
+    std::map<std::string, std::string> values;
+    ASSERT_TRUE(
+        db_->GetMapProperty(DB::Properties::kBlockCacheEntryStats, &values));
+    ASSERT_EQ(values.count(BlockCacheEntryStatsMapKeys::UsedBytes(
+                  CacheEntryRole::kIndirectBlobGcWorkingMemory)),
+              1U);
+    ASSERT_EQ(Get(keys.back()), std::string(4096, keys.back().back()));
+    ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+  }
+}
+
+TEST_F(DBBlobBasicTest, RelocationFileOpenIOErrorIsNotRemembered) {
+  // A short-lived open failure of a relocation file (IOError, or TimedOut from
+  // one reader's deadline) fails only the read that hit it. The next read opens
+  // the file again.
+  class OpenFailureFS : public FileSystemWrapper {
+   public:
+    explicit OpenFailureFS(const std::shared_ptr<FileSystem>& target)
+        : FileSystemWrapper(target) {}
+    const char* Name() const override { return "OpenFailureFS"; }
+    IOStatus NewRandomAccessFile(const std::string& fname,
+                                 const FileOptions& opts,
+                                 std::unique_ptr<FSRandomAccessFile>* result,
+                                 IODebugContext* dbg) override {
+      if (fname.size() >= fail_suffix.size() &&
+          fname.compare(fname.size() - fail_suffix.size(), fail_suffix.size(),
+                        fail_suffix) == 0 &&
+          fail_next.exchange(false)) {
+        return fail_with;
+      }
+      return target()->NewRandomAccessFile(fname, opts, result, dbg);
+    }
+    std::string fail_suffix;
+    IOStatus fail_with;
+    std::atomic<bool> fail_next{false};
+  };
+  const auto fs = std::make_shared<OpenFailureFS>(env_->GetFileSystem());
+  CompositeEnvWrapper fault_env(env_, fs);
+  Options options = GetDefaultOptions();
+  options.env = &fault_env;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t relocation_file =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(relocation_file, kInvalidBlobFileNumber);
+
+  fs->fail_suffix = BlobFileName("", relocation_file);
+  for (const IOStatus& injected :
+       {IOStatus::IOError("Injected relocation file open failure"),
+        IOStatus::TimedOut("Injected relocation file open timeout")}) {
+    SCOPED_TRACE(injected.ToString());
+    fs->fail_with = injected;
+    // Drop the cached reader, so the read opens the file again.
+    // BlobFileCache::Evict() is for normal blob files only.
+    TableCache::Evict(dbfull()->TEST_table_cache(), relocation_file);
+    fs->fail_next.store(true);
+    std::string result;
+    const Status status = db_->Get(ReadOptions(), "key3", &result);
+    EXPECT_EQ(status.code(), injected.code()) << status.ToString();
+    ASSERT_FALSE(fs->fail_next.load());
+    ASSERT_EQ(Get("key3"), value);
+  }
+  Close();
+}
+
 TEST_F(DBBlobBasicTest, SequentialL0FilesDoNotStall) {
   // Sequential inserts make L0 files with disjoint key ranges. Run twice:
   // - Coarse L0 files (plain Flush()) are never trivially moved, so the level
@@ -2613,6 +5218,1962 @@ TEST_F(DBBlobBasicTest, SequentialL0FilesDoNotStall) {
   }
 }
 
+TEST_F(DBBlobBasicTest, IndirectBlobGCTotalsCheckRebuildsCensus) {
+  // Indirect blob GC compares the SSTs it read with the census record. An
+  // injected mismatch aborts the job and rebuilds the census; the retried job
+  // then relocates the live value.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("older", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  for (const std::string& key : keys) {
+    ASSERT_OK(Put(key, std::string(4096, key.back())));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .back()
+                                          ->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  std::atomic<int> checks{0};
+  std::atomic<int> rebuilds{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:CensusTotalsCheck", [&](void* arg) {
+        if (checks++ == 0) {
+          *static_cast<bool*>(arg) = true;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BuildBlobReferenceCensus:ReadSst",
+      [&](void* /*arg*/) { ++rebuilds; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  for (int round = 0; round < 3; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  EXPECT_GE(checks.load(), 2);
+  // The census was rebuilt by reading the SSTs again.
+  EXPECT_GT(rebuilds.load(), 0);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  EXPECT_NE(cfd->current()->storage_info()->GetBlobRelocationRouteTarget(
+                origin_file_number),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(Get(keys.back()), std::string(4096, keys.back().back()));
+  ASSERT_EQ(Get("older"), std::string(4096, 'o'));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCSuppressesMismatchRebuildCannotClear) {
+  // A mismatch that stays after the census rebuild suppresses that input until
+  // its census bytes change, instead of rebuilding at every Version. An
+  // unrelated Version does not retry the input. A change to its references
+  // does.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  DestroyAndReopen(options);
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  for (const std::string& key : keys) {
+    ASSERT_OK(Put(key, std::string(4096, key.back())));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .back()
+                                          ->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  std::atomic<bool> inject{true};
+  std::atomic<int> checks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:CensusTotalsCheck", [&](void* arg) {
+        ++checks;
+        if (inject.load()) {
+          *static_cast<bool*>(arg) = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  for (int round = 0; round < 5; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  // The first mismatch rebuilt the census. The second mismatch suppressed the
+  // input. No more GC attempts followed.
+  EXPECT_EQ(cfd->blob_reference_census()->gc_mismatch_suppress_count(), 1U);
+  EXPECT_EQ(checks.load(), 2);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  EXPECT_EQ(cfd->current()->storage_info()->GetBlobRelocationRouteTarget(
+                origin_file_number),
+            kInvalidBlobFileNumber);
+
+  // An unrelated Version keeps the input suppressed.
+  inject = false;
+  ASSERT_OK(Put("other", "v"));
+  ASSERT_OK(Flush());
+  for (int round = 0; round < 5; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  EXPECT_EQ(checks.load(), 2);
+
+  // Dropping the last live value changes the input's census bytes. GC runs
+  // again, finds no live value, and removes the input by blob file retirement,
+  // with no output.
+  ASSERT_OK(Delete(keys.back()));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  for (int round = 0; round < 5; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  EXPECT_GT(checks.load(), 2);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  EXPECT_EQ(
+      cfd->current()->storage_info()->GetBlobFileMetaData(origin_file_number),
+      nullptr);
+  EXPECT_EQ(cfd->current()->storage_info()->GetBlobRelocationRouteTarget(
+                origin_file_number),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(Get(keys.back()), "NOT_FOUND");
+  ASSERT_EQ(Get("other"), "v");
+}
+
+// Writes two blob files with four 4 KB values each: keys "a0" to "a3" in the
+// first and "b0" to "b3" in the second. It deletes all but the last value of
+// each and compacts, so both files are indirect blob GC candidates. Returns
+// the two blob file numbers.
+static std::pair<uint64_t, uint64_t> WriteTwoMismatchCandidates(DBImpl* db) {
+  std::array<uint64_t, 2> files{};
+  const std::array<char, 2> prefixes{{'a', 'b'}};
+  for (size_t f = 0; f < files.size(); ++f) {
+    for (int i = 0; i < 4; ++i) {
+      EXPECT_OK(db->Put(WriteOptions(),
+                        std::string(1, prefixes[f]) + std::to_string(i),
+                        std::string(4096, 'v')));
+    }
+    EXPECT_OK(db->Flush(FlushOptions()));
+    files[f] = db->GetVersionSet()
+                   ->GetColumnFamilySet()
+                   ->GetDefault()
+                   ->current()
+                   ->storage_info()
+                   ->GetBlobFiles()
+                   .back()
+                   ->GetBlobFileNumber();
+  }
+  for (size_t f = 0; f < files.size(); ++f) {
+    for (int i = 0; i < 3; ++i) {
+      EXPECT_OK(db->Delete(WriteOptions(),
+                           std::string(1, prefixes[f]) + std::to_string(i)));
+    }
+  }
+  EXPECT_OK(db->Flush(FlushOptions()));
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  EXPECT_OK(db->CompactRange(compact_options, nullptr, nullptr));
+  return {files[0], files[1]};
+}
+
+// Two files whose census mismatch stays after every rebuild. The test injects
+// a mismatch at every census totals check (up to 20 checks, an example bound
+// that lets the test finish if the census loops). An injected mismatch is
+// charged to the first input of the job. The census remembers both files, so
+// after one rebuild for each file every later report suppresses its file, and
+// the loop stops. GC skips the suppressed inputs: both files stay in the
+// Version, with no route and no output.
+TEST_F(DBBlobBasicTest, IndirectBlobGCTwoPersistentMismatchesDoNotLoop) {
+  Options options = IndirectBlobGCOptions();
+  DestroyAndReopen(options);
+  const auto files = WriteTwoMismatchCandidates(dbfull());
+  std::atomic<int> checks{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:CensusTotalsCheck", [&](void* arg) {
+        if (checks.fetch_add(1) < 20) {
+          *static_cast<bool*>(arg) = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  ASSERT_NE(census, nullptr);
+  const uint64_t builds_before = census->build_count();
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  for (int round = 0; round < 5; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  // One rebuild for each file, then only suppressions.
+  EXPECT_LT(checks.load(), 20);
+  EXPECT_LE(census->build_count() - builds_before, 2U);
+  EXPECT_GE(census->gc_mismatch_suppress_count(), 2U);
+  EXPECT_EQ(census->unresolved_mismatch_file_count(), 2U);
+  {
+    // The loop stopped because both files are suppressed, not because of the
+    // rebuild backoff: the census is ready and no build failed.
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_EQ(cfd->blob_reference_census_failures(), 0U);
+    EXPECT_TRUE(census->IsReady(cfd->current()->GetVersionNumber()));
+  }
+  EXPECT_TRUE(HasBlobFile(files.first));
+  EXPECT_TRUE(HasBlobFile(files.second));
+  EXPECT_EQ(RouteTarget(files.first), kInvalidBlobFileNumber);
+  EXPECT_EQ(RouteTarget(files.second), kInvalidBlobFileNumber);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(Get("a3"), std::string(4096, 'v'));
+  ASSERT_EQ(Get("b3"), std::string(4096, 'v'));
+}
+
+// Sets up the state that the mismatch file cap tests start from. It opens the
+// DB with `options`, writes the two candidates of WriteTwoMismatchCandidates()
+// and returns their file numbers in `files`. Two sync points inject a census
+// mismatch at each totals check (up to 20 checks, an example bound that lets
+// the test finish if the census loops; `checks` counts them) and set the cap
+// of the remembered set to 1 file (an example value). Then it turns on GC and
+// lets the census and GC run 5 rounds. The census is left in this state: it
+// remembers 1 of the 2 files, so the set is full; the other file requested a
+// rebuild at each report, so the count of mismatch rebuilds in a row is above
+// 2 (kMismatchRebuildsWithoutBackoff); and the next rebuild waits 1 s. With a
+// manual DB clock in `options.env`, the wait does not pass, so no census build
+// runs after this function returns. The caller clears the sync points before
+// `checks` goes away, and closes the DB before the clock goes away.
+static void ReachMismatchFileCapBackoff(DBTestBase* test,
+                                        const Options& options,
+                                        std::atomic<int>* checks,
+                                        std::pair<uint64_t, uint64_t>* files) {
+  test->DestroyAndReopen(options);
+  *files = WriteTwoMismatchCandidates(test->dbfull());
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:CensusTotalsCheck", [checks](void* arg) {
+        if (checks->fetch_add(1) < 20) {
+          *static_cast<bool*>(arg) = true;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobReferenceCensus::ReportMismatch:MaxFiles",
+      [](void* arg) { *static_cast<size_t*>(arg) = 1; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(
+      test->db_->SetOptions(test->db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  for (int round = 0; round < 5; ++round) {
+    test->dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(test->dbfull()->TEST_WaitForCompact());
+  }
+}
+
+// The remembered set has a cap. ReachMismatchFileCapBackoff() sets it to 1
+// file for two files whose mismatch stays. The census remembers only the first
+// file, and the set does not grow. The second file then requests a rebuild at
+// each report. The third mismatch rebuild in a row waits 1 s, with one ERROR
+// line, and each later wait is twice as long, up to 32 s. The test uses a
+// manual DB clock, so a wait passes only when the test moves the clock. The
+// test moves the clock past each wait and lets the census and GC run again,
+// and it checks every wait. Before one build publishes, the test injects one
+// more mismatch report. The census job took the last report before that
+// build, so the publish fails and the job waits before it counts the new
+// report. That wait must still double, because the census counts the waits.
+TEST_F(DBBlobBasicTest, IndirectBlobGCMismatchFileCapUsesBackoff) {
+  auto clock =
+      std::make_shared<ManualIndirectBlobGcClock>(env_->GetSystemClock());
+  CompositeEnvWrapper env(env_, clock);
+  Options options = IndirectBlobGCOptions();
+  options.env = &env;
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  // The DB uses `env` and `clock`, so close it before they go away, also when
+  // an assertion ends the test early.
+  auto close_db = Defer([this] { Close(); });
+  // The retry delay of each census build that waits. The test only reads the
+  // delay and does not change it. The sync point callbacks use these and
+  // report_before_publish (see below), so they are declared before `cleanup`,
+  // which clears the callbacks.
+  std::mutex delays_mutex;
+  std::vector<uint64_t> delays;
+  std::atomic<bool> report_before_publish{false};
+  std::atomic<int> checks{0};
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BGWorkBlobReferenceCensus:FailureRetryDelay",
+      [&delays_mutex, &delays](void* arg) {
+        std::lock_guard<std::mutex> lock(delays_mutex);
+        delays.push_back(*static_cast<uint64_t*>(arg));
+      });
+  const auto delay_count = [&delays_mutex, &delays]() {
+    std::lock_guard<std::mutex> lock(delays_mutex);
+    return delays.size();
+  };
+  std::pair<uint64_t, uint64_t> files;
+  ASSERT_NO_FATAL_FAILURE(
+      ReachMismatchFileCapBackoff(this, options, &checks, &files));
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  ASSERT_NE(census, nullptr);
+  EXPECT_EQ(census->unresolved_mismatch_file_count(), 1U);
+  EXPECT_TRUE(census->MismatchRebuildMustWait());
+  {
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    EXPECT_GE(cfd->blob_reference_census_failures(), 1U);
+    EXPECT_FALSE(census->IsReady(cfd->current()->GetVersionNumber()));
+  }
+  EXPECT_EQ(log->Count({"[ERROR] ",
+                        "more than two rebuilds in a row; the next rebuild "
+                        "waits "}),
+            1U);
+  EXPECT_LT(checks.load(), 20);
+  ASSERT_EQ(delay_count(), 1U);
+
+  // From here, every totals check injects a mismatch. For each later wait, the
+  // test moves the clock to the end of the last wait, and runs the census and
+  // GC until the next mismatch rebuild waits. That takes up to 5 rounds (an
+  // example bound). The expected waits are 1 s, 2 s, 4 s, 8 s, 16 s, and then
+  // 32 s (the limit) two times.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:CensusTotalsCheck",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  // When armed, the next census publish first gets one mismatch report, as if
+  // a GC job reported while the build ran. File number 0 is never remembered,
+  // so the report always requests a rebuild. The test arms it once, before
+  // the fourth wait (an example choice).
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::PublishBlobReferenceCensusWorker:BeforeLockReady",
+      [&report_before_publish, census](void*) {
+        if (report_before_publish.exchange(false)) {
+          census->ReportMismatch(0);
+        }
+      });
+  constexpr uint64_t kSecondMicros = 1000 * 1000;
+  const std::vector<uint64_t> expected_delays = {
+      1 * kSecondMicros, 2 * kSecondMicros,  4 * kSecondMicros,
+      8 * kSecondMicros, 16 * kSecondMicros, 32 * kSecondMicros,
+      32 * kSecondMicros};
+  for (size_t wait = 1; wait < expected_delays.size(); ++wait) {
+    SCOPED_TRACE("wait " + std::to_string(wait));
+    if (wait == 3) {
+      report_before_publish.store(true);
+    }
+    clock->Advance(expected_delays[wait - 1]);
+    for (int round = 0; round < 5 && delay_count() == wait; ++round) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    }
+    ASSERT_EQ(delay_count(), wait + 1);
+  }
+  EXPECT_FALSE(report_before_publish.load());
+  {
+    std::lock_guard<std::mutex> lock(delays_mutex);
+    EXPECT_EQ(delays, expected_delays);
+  }
+  EXPECT_EQ(census->unresolved_mismatch_file_count(), 1U);
+  EXPECT_EQ(log->Count({"[ERROR] ",
+                        "more than two rebuilds in a row; the next rebuild "
+                        "waits "}),
+            expected_delays.size());
+  // The ERROR line names the wait that the census job uses.
+  EXPECT_EQ(
+      log->Count({"[ERROR] ", "the next rebuild waits 2 s (wait 2 in a row"}),
+      1U);
+  EXPECT_EQ(log->Count({"[ERROR] ", "the next rebuild waits 32 s"}), 2U);
+}
+
+// A matching check that forgets a remembered file leaves room in the full
+// remembered set. ReachMismatchFileCapBackoff() first fills the set (cap of 1
+// file) and makes the next mismatch rebuild wait for the backoff. The manual
+// DB clock keeps the census job in that wait, so no build runs during the rest
+// of the test. The test then makes the census calls of a GC job whose check
+// matched both files: ClearMismatch() for each checked input, then
+// NoteCensusCheckMatched(). The set has room again, so the count of mismatch
+// rebuilds in a row goes back to 0, and the next mismatch rebuild does not
+// wait. A first report of a file is remembered again.
+TEST_F(DBBlobBasicTest, IndirectBlobGCMismatchFileCapResetsAfterMatch) {
+  auto clock =
+      std::make_shared<ManualIndirectBlobGcClock>(env_->GetSystemClock());
+  CompositeEnvWrapper env(env_, clock);
+  Options options = IndirectBlobGCOptions();
+  options.env = &env;
+  // The DB uses `env` and `clock`, so close it before they go away, also when
+  // an assertion ends the test early.
+  auto close_db = Defer([this] { Close(); });
+  std::atomic<int> checks{0};
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  std::pair<uint64_t, uint64_t> files;
+  ASSERT_NO_FATAL_FAILURE(
+      ReachMismatchFileCapBackoff(this, options, &checks, &files));
+  BlobReferenceCensus* const census = dbfull()
+                                          ->GetVersionSet()
+                                          ->GetColumnFamilySet()
+                                          ->GetDefault()
+                                          ->blob_reference_census();
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->unresolved_mismatch_file_count(), 1U);
+  ASSERT_TRUE(census->MismatchRebuildMustWait());
+
+  // The census calls of a GC job whose check matched both inputs. The test
+  // does not know which file the census remembers, so it clears both. Clearing
+  // a file that the census does not remember changes nothing.
+  census->ClearMismatch(files.first);
+  census->ClearMismatch(files.second);
+  census->NoteCensusCheckMatched();
+  EXPECT_EQ(census->unresolved_mismatch_file_count(), 0U);
+  EXPECT_EQ(census->mismatch_rebuilds_in_a_row(), 0U);
+  EXPECT_FALSE(census->MismatchRebuildMustWait());
+
+  // A first report of a file is remembered again, and it does not suppress
+  // the file.
+  EXPECT_FALSE(census->ReportMismatch(files.second));
+  EXPECT_EQ(census->unresolved_mismatch_file_count(), 1U);
+}
+
+// A census mismatch report that arrives after the census job took the last
+// report (TakeMismatchReport()) and before the new build starts (BeginBuild())
+// asks for the rebuild that starts there. BeginBuild() clears the report, so
+// the new build publishes and the census is ready without a failed build and
+// its backoff.
+TEST_F(DBBlobBasicTest, CensusMismatchDuringBuildStartDoesNotBackOff) {
+  Options options = IndirectBlobGCOptions();
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  BlobReferenceCensus* const census = cfd->blob_reference_census();
+  ASSERT_NE(census, nullptr);
+  std::atomic<bool> armed{false};
+  std::atomic<int> injected{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BuildBlobReferenceCensus:AfterTakeMismatchReport",
+      [&](void* arg) {
+        // Inject at the first build slice that took no report: the restart
+        // after the report below, right before BeginBuild().
+        // The injected report names another file (an example number that no
+        // report named yet), so the census treats it as a first report.
+        if (!*static_cast<bool*>(arg) && armed.exchange(false)) {
+          if (!census->ReportMismatch(file_number + 1000)) {
+            ++injected;
+          }
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  // A first report fails the current build, and the census job restarts it
+  // at once.
+  census->ReportMismatch(file_number);
+  armed = true;
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(injected.load(), 1);
+  InstrumentedMutexLock lock(dbfull()->mutex());
+  EXPECT_EQ(cfd->blob_reference_census_failures(), 0U);
+  EXPECT_TRUE(census->IsReady(cfd->current()->GetVersionNumber()));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCMatchClearsRememberedMismatch) {
+  // The census remembers the file of its last mismatch report. A second
+  // mismatch of the same file, with no match in between, means the rebuild did
+  // not help, so GC suppresses the file. When a GC job checks the file and the
+  // census matches, GC forgets the mismatch. Then a later mismatch of the file
+  // is a new problem: it must request a census rebuild, not suppress the file.
+  //
+  // The job checks (counted from 1) do this:
+  //   1. An injected mismatch. The census is rebuilt.
+  //   2. A match. The test stops this job before it decides any input (it sets
+  //      plan_end to 0), so the file stays a candidate.
+  //   3. An injected mismatch. It must request a census rebuild again.
+  //   4. A match. The job relocates the live value.
+  DestroyAndReopen(IndirectBlobGCOptions());
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+
+  std::atomic<int> checks{0};
+  std::atomic<int> rebuild_reads{0};
+  std::atomic<int> rebuild_reads_at_check3{-1};
+  std::atomic<bool> stop_job_after_match{false};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:CensusTotalsCheck", [&](void* arg) {
+        const int check = ++checks;
+        bool* const census_mismatch = static_cast<bool*>(arg);
+        if (check == 1 || check == 3) {
+          *census_mismatch = true;
+        }
+        if (check == 2) {
+          EXPECT_FALSE(*census_mismatch);
+          stop_job_after_match = true;
+        }
+        if (check == 3) {
+          rebuild_reads_at_check3 = rebuild_reads.load();
+        }
+      });
+  sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:PlanEnd", [&](void* arg) {
+    if (stop_job_after_match.exchange(false)) {
+      *static_cast<size_t*>(arg) = 0;
+    }
+  });
+  sync_point->SetCallBack("DBImpl::BuildBlobReferenceCensus:ReadSst",
+                          [&](void* /*arg*/) { ++rebuild_reads; });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  // The mismatch at check 3 was not suppressed: it rebuilt the census (the
+  // build read the SSTs again), and a later job relocated the live value.
+  EXPECT_EQ(cfd->blob_reference_census()->gc_mismatch_suppress_count(), 0U);
+  ASSERT_GE(checks.load(), 4);
+  EXPECT_GT(rebuild_reads.load(), rebuild_reads_at_check3.load());
+  EXPECT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  const size_t live_key = kIndirectBlobGCKeyCount - 1;
+  ASSERT_EQ(Get(IndirectBlobGCKey(live_key)), IndirectBlobGCValue(live_key));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCKeepsSnapshotVersions) {
+  // A value hidden by a newer write but visible to a snapshot is live: indirect
+  // blob GC relocates it, and the snapshot still reads it.
+  const Options options = IndirectBlobGCOptions();
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  const std::string key = IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1);
+  const std::string old_value =
+      IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1);
+  const Snapshot* const snapshot = db_->GetSnapshot();
+  ASSERT_OK(Put(key, "new value"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_FALSE(HasBlobFile(file_number));
+  ReadOptions snapshot_read;
+  snapshot_read.snapshot = snapshot;
+  std::string value;
+  ASSERT_OK(db_->Get(snapshot_read, key, &value));
+  ASSERT_EQ(value, old_value);
+  ASSERT_EQ(Get(key), "new value");
+  db_->ReleaseSnapshot(snapshot);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCRetiresFileWithNoLiveValue) {
+  // The real indirect blob GC path removes a file with no live value by blob
+  // file retirement: no output, no route.
+  const Options options = IndirectBlobGCOptions();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("other", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/0);
+  ASSERT_TRUE(HasBlobFile(file_number));
+  const std::set<uint64_t> before = BlobFilesOnDisk();
+
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_FALSE(HasBlobFile(file_number));
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  std::set<uint64_t> expected = before;
+  expected.erase(file_number);
+  ASSERT_EQ(BlobFilesOnDisk(), expected);
+  ASSERT_EQ(Get("other"), std::string(4096, 'o'));
+  Reopen(options);
+  ASSERT_FALSE(HasBlobFile(file_number));
+  ASSERT_EQ(Get("other"), std::string(4096, 'o'));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCRetriesStaleInputAtQueueHead) {
+  // The install check in the MANIFEST queue fails once (injected), as if the
+  // input changed while the install waited. The job deletes its output and is
+  // retried, and the retry installs a new output.
+  const Options options = IndirectBlobGCOptions();
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  const std::set<uint64_t> before = BlobFilesOnDisk();
+  std::atomic<int> attempts{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:InstallPrecondition", [&](void* arg) {
+        if (attempts.fetch_add(1) == 0) {
+          *static_cast<bool*>(arg) = false;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  // The first install check failed; a later attempt installed.
+  ASSERT_GE(attempts.load(), 2);
+  const uint64_t target = RouteTarget(file_number);
+  ASSERT_NE(target, kInvalidBlobFileNumber);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  // Only the second output is left: the first was deleted.
+  dbfull()->TEST_DeleteObsoleteFiles();
+  std::set<uint64_t> expected = before;
+  expected.erase(file_number);
+  expected.insert(target);
+  ASSERT_EQ(BlobFilesOnDisk(), expected);
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCCompactionInstallsAfterGC) {
+  // A compaction starts before GC and installs after GC installs. Its outputs
+  // still use the input as the generation, and reads follow the route.
+  Options options = IndirectBlobGCOptions();
+  // GC needs a second compaction slot while the compaction waits. RocksDB runs
+  // more than one compaction only under compaction pressure, so the test holds
+  // a compaction pressure token.
+  options.max_background_compactions = 2;
+  options.env->SetBackgroundThreads(3, Env::Priority::LOW);
+  DestroyAndReopen(options);
+  std::unique_ptr<WriteControllerToken> pressure =
+      dbfull()->TEST_write_controler().GetCompactionPressureToken();
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  const std::string key = IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1);
+  // A second SST over the same range, so the compaction rewrites the SST that
+  // holds the reference.
+  ASSERT_OK(Put("key9", "small"));
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BackgroundCompaction:NonTrivial:BeforeRun",
+        "DBBlobBasicTest::EnableGC"},
+       {"DBImpl::RunIndirectBlobGC:Installed",
+        "DBImpl::BackgroundCompaction:NonTrivial:AfterRun"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  port::Thread compaction([&]() {
+    CompactRangeOptions compact_options;
+    compact_options.exclusive_manual_compaction = false;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    // Keep the references: compaction-time blob GC would move the value to a
+    // new blob file instead.
+    compact_options.blob_garbage_collection_policy =
+        BlobGarbageCollectionPolicy::kDisable;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  });
+  TEST_SYNC_POINT("DBBlobBasicTest::EnableGC");
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  compaction.join();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  pressure.reset();
+
+  const uint64_t target = RouteTarget(file_number);
+  ASSERT_NE(target, kInvalidBlobFileNumber);
+  ASSERT_FALSE(HasBlobFile(file_number));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(Get(key), IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+  ASSERT_EQ(Get("key9"), "small");
+  ASSERT_NO_FATAL_FAILURE(ExpectCensusMatchesVersion());
+  Reopen(options);
+  ASSERT_EQ(Get(key), IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCInstallsAfterReferenceDropped) {
+  // The input has two live values. A compaction drops the reference to one of
+  // them after indirect blob GC has chosen its live set (the list of values
+  // that it will copy) and before GC copies them. GC copies the live set it
+  // chose, so the output holds both values, and the dropped one is garbage in
+  // the output.
+  //
+  // GC does not follow that compaction: it installs on its first try, with
+  // the routes of its census snapshot. The census job applies the
+  // compaction's change, so the census then counts only the reference that
+  // is left.
+  //
+  // Both values are 4 KB, so the output is then 50% garbage. GC skips a file
+  // only when less than half of its bytes are garbage, so a later GC job may
+  // relocate the output again. Sync point callbacks record two facts about
+  // the first install: how many GC jobs had started, and how many entries the
+  // output holds. The test checks the census and the values at the end.
+  Options options = IndirectBlobGCOptions();
+  // The compaction that drops the reference needs a second compaction slot
+  // while GC runs. RocksDB runs more than one compaction only under compaction
+  // pressure, so the test holds a compaction pressure token.
+  options.max_background_compactions = 2;
+  options.env->SetBackgroundThreads(3, Env::Priority::LOW);
+  DestroyAndReopen(options);
+  std::unique_ptr<WriteControllerToken> pressure =
+      dbfull()->TEST_write_controler().GetCompactionPressureToken();
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/2);
+  const std::string dropped_key =
+      IndirectBlobGCKey(kIndirectBlobGCKeyCount - 2);
+  const std::string kept_key = IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1);
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::RunIndirectBlobGC:AfterLiveSet",
+        "DBBlobBasicTest::DropReference"},
+       {"DBBlobBasicTest::ReferenceDropped",
+        "DBImpl::RunIndirectBlobGC:BeforeOutputWork"}});
+  int gc_jobs = 0;
+  int jobs_at_first_install = 0;
+  uint64_t first_target = kInvalidBlobFileNumber;
+  uint64_t first_output_entries = 0;
+  // Only GC jobs run these callbacks, and only one GC job runs per column
+  // family at a time. The test thread reads the values only after all
+  // background work ends.
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:AfterLiveSet", [&](void*) { ++gc_jobs; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:AfterMetadataInstall", [&](void* arg) {
+        if (jobs_at_first_install != 0) {
+          return;
+        }
+        jobs_at_first_install = gc_jobs;
+        VersionStorageInfo* const storage =
+            static_cast<ColumnFamilyData*>(arg)->current()->storage_info();
+        first_target = storage->GetBlobRelocationRouteTarget(file_number);
+        const std::shared_ptr<BlobRelocationFileMetaData> output =
+            storage->GetBlobRelocationFileMetaData(first_target);
+        first_output_entries =
+            output != nullptr ? output->GetTotalEntries() : 0;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  TEST_SYNC_POINT("DBBlobBasicTest::DropReference");
+  ASSERT_OK(Delete(dropped_key));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.exclusive_manual_compaction = false;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  const std::string begin = IndirectBlobGCKey(0);
+  const Slice begin_slice(begin);
+  const Slice end_slice(kept_key);
+  ASSERT_OK(db_->CompactRange(compact_options, &begin_slice, &end_slice));
+  TEST_SYNC_POINT("DBBlobBasicTest::ReferenceDropped");
+  for (int round = 0; round < 3; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  pressure.reset();
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  // The first GC job installed, so it was not retried with a new live set. Its
+  // output holds both values.
+  ASSERT_EQ(jobs_at_first_install, 1);
+  ASSERT_NE(first_target, kInvalidBlobFileNumber);
+  ASSERT_EQ(first_output_entries, 2U);
+  ASSERT_FALSE(HasBlobFile(file_number));
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  const BlobCensusGenerationTotals* const totals =
+      census->FindTotals(file_number);
+  ASSERT_NE(totals, nullptr);
+  ASSERT_EQ(totals->reference_count, 1U);
+  ASSERT_EQ(Get(kept_key), IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+  ASSERT_EQ(Get(dropped_key), "NOT_FOUND");
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCManifestFailureKeepsOutputUntilReopen) {
+  // The indirect blob GC install fails to write the MANIFEST. The output is
+  // quarantined, not deleted, and the input stays. This is also the state after
+  // a crash between the output rename and the install: on reopen the output,
+  // which the MANIFEST does not know, is removed and the input is kept.
+  Options options = IndirectBlobGCOptions();
+  options.max_bgerror_resume_count = 0;
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  const std::set<uint64_t> before = BlobFilesOnDisk();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:InstallPrecondition",
+      [&](void*) { env_->manifest_write_error_.store(true); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  dbfull()->TEST_WaitForCompact().PermitUncheckedError();
+  ASSERT_NOK(dbfull()->TEST_GetBGError());
+  SyncPoint::GetInstance()->DisableProcessing();
+  env_->manifest_write_error_.store(false);
+
+  ASSERT_TRUE(HasBlobFile(file_number));
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+  const std::set<uint64_t> after_failure = BlobFilesOnDisk();
+  std::vector<uint64_t> outputs;
+  std::set_difference(after_failure.begin(), after_failure.end(),
+                      before.begin(), before.end(),
+                      std::back_inserter(outputs));
+  ASSERT_EQ(outputs.size(), 1U);
+
+  Close();
+  Reopen(options);
+  ASSERT_TRUE(HasBlobFile(file_number));
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_EQ(BlobFilesOnDisk().count(outputs[0]), 0U);
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+namespace {
+// Checks that a failed invariant check is not retried on the same inputs. A
+// sync point makes BuildEdit() fail its invariant check, a state that normal
+// operation never reaches. The job ends stale and gives its input a normal
+// suppression, in the census and in the current Version, so the retried pick
+// does not take the input again. The callback injects the failure only for the
+// first 20 jobs (an example bound): if the input were retried without end, the
+// bound still lets the test finish.
+TEST_F(DBBlobBasicTest, IndirectBlobGCInvariantFailureIsNotRetriedAtOnce) {
+  Options options = IndirectBlobGCOptions();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  std::atomic<int> injected{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:InjectInvariantFailure", [&](void* arg) {
+        if (injected.load() < 20) {
+          ++injected;
+          *static_cast<bool*>(arg) = true;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:InvariantFailed",
+      [](void* arg) { *static_cast<bool*>(arg) = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(injected.load(), 1);
+  ASSERT_TRUE(HasBlobFile(file_number));
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_GE(log->Count({"[ERROR] ",
+                        "Indirect blob GC invariant check failed: "
+                        "injected by a test"}),
+            1U);
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+// Checks that the disk space check never defers an input with no live value.
+// Input A holds four 16 KB values, all deleted. Input B holds four 4 KB values,
+// one of them live. A is larger on disk, but it needs no output and no space,
+// and removing it frees space. The SstFileManager allows only 1 byte more than
+// the current files, so the space check fails for B's output. A job with both
+// inputs defers B and still removes A. Auto compactions stay off, so only the
+// job that the test runs collects files.
+TEST_F(DBBlobBasicTest, IndirectBlobGCDiskSpaceKeepsEmptyInputRemoval) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  std::shared_ptr<SstFileManager> sst_file_manager(NewSstFileManager(env_));
+  options.sst_file_manager = sst_file_manager;
+  DestroyAndReopen(options);
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), std::string(16 << 10, 'd')));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t empty_input = cfd->current()
+                                   ->storage_info()
+                                   ->GetBlobFiles()
+                                   .back()
+                                   ->GetBlobFileNumber();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  const uint64_t live_input = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  ASSERT_NE(empty_input, live_input);
+  ASSERT_TRUE(HasBlobFile(empty_input));
+  ASSERT_TRUE(HasBlobFile(live_input));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  sst_file_manager->SetMaxAllowedSpaceUsage(sst_file_manager->GetTotalSize() +
+                                            1);
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_OK(
+      dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {empty_input, live_input}));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_FALSE(HasBlobFile(empty_input));
+  ASSERT_EQ(RouteTarget(empty_input), kInvalidBlobFileNumber);
+  ASSERT_TRUE(HasBlobFile(live_input));
+  ASSERT_EQ(RouteTarget(live_input), kInvalidBlobFileNumber);
+  ASSERT_EQ(options.statistics->getTickerCount(COMPACTION_CANCELLED), 0U);
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+// Checks the CompactionTooLarge return of a GC job. Files A and B each hold
+// four 4 KB values with one live value, so both are candidates. The
+// SstFileManager allows only 1 byte more than the current files, so the disk
+// space check fails for the output of a job whose only input is A. The job
+// returns CompactionTooLarge, counts COMPACTION_CANCELLED, sets no background
+// error and keeps A. A is then not picked first (the test does not tell the
+// move of A behind B in the current Version apart from a census publish that
+// already left A out), and the census gives A a transient suppression: with
+// the manual DB clock stopped, the next census list has only B. After
+// the disk space limit is lifted and the clock moves 1 s (the first retry
+// delay), GC collects A. Auto compactions stay off until then, so only the job
+// that the test runs collects files.
+TEST_F(DBBlobBasicTest, IndirectBlobGCSingleInputCompactionTooLarge) {
+  auto clock =
+      std::make_shared<ManualIndirectBlobGcClock>(env_->GetSystemClock());
+  CompositeEnvWrapper env(env_, clock);
+  Options options = IndirectBlobGCOptions();
+  options.env = &env;
+  options.statistics = CreateDBStatistics();
+  std::shared_ptr<SstFileManager> sst_file_manager(NewSstFileManager(env_));
+  options.sst_file_manager = sst_file_manager;
+  DestroyAndReopen(options);
+  // The DB uses `env` and `clock`, so close it before they go away, also when
+  // an assertion ends the test early.
+  auto close_db = Defer([this] { Close(); });
+  for (const char* prefix : {"a", "b"}) {
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(Put(prefix + std::to_string(i), std::string(4096, *prefix)));
+    }
+    ASSERT_OK(Flush());
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_OK(Delete(prefix + std::to_string(i)));
+    }
+  }
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  // The candidate list of the current Version, in pick order.
+  const auto candidates = [&]() {
+    std::vector<uint64_t> files;
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    cfd->current()->storage_info()->GetBlobPhysicalFilesForIndirectBlobGC(
+        BlobGcCandidateHeap::kMaxSelectedFiles, &files);
+    return files;
+  };
+  const std::vector<uint64_t> before = candidates();
+  ASSERT_EQ(before.size(), 2U);
+  const uint64_t input = before[0];
+  const uint64_t other = before[1];
+  sst_file_manager->SetMaxAllowedSpaceUsage(sst_file_manager->GetTotalSize() +
+                                            1);
+
+  const Status s = dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {input});
+  ASSERT_TRUE(s.IsCompactionTooLarge()) << s.ToString();
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(options.statistics->getTickerCount(COMPACTION_CANCELLED), 1U);
+  ASSERT_TRUE(HasBlobFile(input));
+  ASSERT_EQ(RouteTarget(input), kInvalidBlobFileNumber);
+  // The deferred input is not picked first. The census may already have
+  // published its new list, which does not hold the input at all. So this
+  // check alone does not show which of the two keeps the input out.
+  const std::vector<uint64_t> after_deferral = candidates();
+  ASSERT_FALSE(after_deferral.empty());
+  ASSERT_EQ(after_deferral.front(), other);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(candidates(), std::vector<uint64_t>{other});
+
+  sst_file_manager->SetMaxAllowedSpaceUsage(0);
+  clock->Advance(1000 * 1000);
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_NE(RouteTarget(input), kInvalidBlobFileNumber);
+  ASSERT_EQ(Get("a3"), std::string(4096, 'a'));
+  ASSERT_EQ(Get("b3"), std::string(4096, 'b'));
+}
+
+class BlobFileEventRecorder : public EventListener {
+ public:
+  // Tests check only some of the recorded statuses. A vector resize moves the
+  // statuses, so they are marked checked here, not when they are recorded.
+  ~BlobFileEventRecorder() override {
+    for (const auto& file : created_) {
+      file.second.PermitUncheckedError();
+    }
+  }
+  void OnBlobFileCreationStarted(
+      const BlobFileCreationBriefInfo& /*info*/) override {
+    ++started_;
+  }
+  int started() const { return started_.load(); }
+  void OnBlobFileCreated(const BlobFileCreationInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    created_.emplace_back(info.file_path, info.status);
+  }
+  void OnBlobFileDeleted(const BlobFileDeletionInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    deleted_.push_back(info.file_path);
+  }
+  // Tests check only some of the returned statuses.
+  std::vector<std::pair<std::string, Status>> created() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::pair<std::string, Status>> result = created_;
+    for (const auto& file : result) {
+      file.second.PermitUncheckedError();
+    }
+    return result;
+  }
+  std::vector<std::string> deleted() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return deleted_;
+  }
+
+ private:
+  std::atomic<int> started_{0};
+  std::mutex mutex_;
+  std::vector<std::pair<std::string, Status>> created_;
+  std::vector<std::string> deleted_;
+};
+}  // namespace
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCRelocatesValueOverReadBatch) {
+  // A live value larger than one indirect blob GC read batch
+  // (kIndirectBlobGCReadBatchBytes, 1 MB) is streamed in
+  // kBlobRelocationStreamChunkSize (256 KB) chunks, so GC relocates the file
+  // that holds it.
+  const Options options = IndirectBlobGCOptions();
+  DestroyAndReopen(options);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("dead" + std::to_string(i), std::string(4 << 20, 'd')));
+  }
+  ASSERT_OK(Put("large", std::string(9 << 20, 'l')));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t file_number = cfd->current()
+                                   ->storage_info()
+                                   ->GetBlobFiles()
+                                   .back()
+                                   ->GetBlobFileNumber();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("dead" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_FALSE(HasBlobFile(file_number));
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_EQ(Get("large"), std::string(9 << 20, 'l'));
+  Reopen(options);
+  ASSERT_EQ(Get("large"), std::string(9 << 20, 'l'));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCFailedOutputSendsNoDeleteEvent) {
+  // An output that fails before its rename never had its final name:
+  // listeners see a failed creation and no deletion of that name.
+  Options options = IndirectBlobGCOptions();
+  auto recorder = std::make_shared<BlobFileEventRecorder>();
+  options.listeners.push_back(recorder);
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  const size_t created_before = recorder->created().size();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:AfterAddBlobRelocation", [](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("injected write fault");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  dbfull()->TEST_WaitForCompact().PermitUncheckedError();
+  ASSERT_TRUE(dbfull()->TEST_GetBGError().IsIOError());
+
+  const std::vector<std::pair<std::string, Status>> created =
+      recorder->created();
+  ASSERT_EQ(created.size(), created_before + 1);
+  const std::string& output_path = created.back().first;
+  ASSERT_TRUE(created.back().second.IsIOError());
+  for (const std::string& deleted : recorder->deleted()) {
+    ASSERT_NE(deleted, output_path);
+  }
+  ASSERT_TRUE(env_->FileExists(output_path).IsNotFound());
+  ASSERT_TRUE(HasBlobFile(file_number));
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+// An output whose rename reported failure gets a failed creation event. The
+// rename may still have created the final name, so the job deletes that name,
+// but listeners see no deletion event for it. A sync point reports failure
+// after the rename took effect.
+TEST_F(DBBlobBasicTest, IndirectBlobGCFailedRenameSendsNoDeleteEvent) {
+  Options options = IndirectBlobGCOptions();
+  auto recorder = std::make_shared<BlobFileEventRecorder>();
+  options.listeners.push_back(recorder);
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  const size_t created_before = recorder->created().size();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:AfterRenameOutput", [](void* arg) {
+        Status* const status = static_cast<Status*>(arg);
+        if (status->ok()) {
+          *status = Status::IOError("injected rename fault");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  dbfull()->TEST_WaitForCompact().PermitUncheckedError();
+  ASSERT_TRUE(dbfull()->TEST_GetBGError().IsIOError());
+
+  const std::vector<std::pair<std::string, Status>> created =
+      recorder->created();
+  ASSERT_EQ(created.size(), created_before + 1);
+  const std::string& output_path = created.back().first;
+  ASSERT_TRUE(created.back().second.IsIOError());
+  for (const std::string& deleted : recorder->deleted()) {
+    ASSERT_NE(deleted, output_path);
+  }
+  ASSERT_TRUE(env_->FileExists(output_path).IsNotFound());
+  ASSERT_TRUE(HasBlobFile(file_number));
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCTempOutputSurvivesFullPurge) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  for (const std::string& key : keys) {
+    ASSERT_OK(Put(key, std::string(4096, key.back())));
+  }
+  ASSERT_OK(Flush());
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  // A full obsolete-file scan runs while the output of indirect blob GC is
+  // still a temp file.
+  std::atomic<int> purges{0};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:BeforeRenameOutputs",
+                          [&](void*) {
+                            if (purges.fetch_add(1) == 0) {
+                              dbfull()->TEST_DeleteObsoleteFiles();
+                            }
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_GE(purges.load(), 1);
+
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(Get(keys.back()), std::string(4096, keys.back().back()));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCRunsAsLocalWorkWithSeparateRemotePool) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.compaction_service = std::make_shared<LocalOnlyCompactionService>();
+  options.use_separate_remote_compaction_pool = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+  Reopen(options);
+
+  ASSERT_OK(Put("older", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+  const std::array<std::string, 4> keys{{"key0", "key1", "key2", "key3"}};
+  for (const std::string& key : keys) {
+    ASSERT_OK(Put(key, std::string(4096, key.back())));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 2U);
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .back()
+                                          ->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  std::mutex threads_mutex;
+  std::set<std::thread::id> local_work_threads;
+  std::atomic<int> gc_output_phases{0};
+  std::atomic<int> gc_output_phases_in_local_work{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::BGWorkLocalCompaction:Start", [&](void*) {
+    std::lock_guard<std::mutex> lock(threads_mutex);
+    local_work_threads.insert(std::this_thread::get_id());
+  });
+  sync_point->SetCallBack("DBImpl::BGWorkLocalCompaction:Finished", [&](void*) {
+    std::lock_guard<std::mutex> lock(threads_mutex);
+    local_work_threads.erase(std::this_thread::get_id());
+  });
+  sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:AfterLiveSet", [&](void*) {
+    ++gc_output_phases;
+    std::lock_guard<std::mutex> lock(threads_mutex);
+    if (local_work_threads.count(std::this_thread::get_id()) != 0) {
+      ++gc_output_phases_in_local_work;
+    }
+  });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  // Indirect blob GC data work runs in the LOW pool under a local compaction
+  // credit, not on the remote coordinator thread.
+  ASSERT_GT(gc_output_phases.load(), 0);
+  ASSERT_EQ(gc_output_phases_in_local_work.load(), gc_output_phases.load());
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(Get(keys.back()), std::string(4096, keys.back().back()));
+}
+
+// With a separate remote compaction pool, the scheduler releases the DB mutex
+// while the GC job waits for a local compaction credit. Here SetOptions()
+// turns blob GC off in that window (from a sync point at the start of the local
+// work). The job then ends with no suppression, so after GC is turned on again,
+// a later job collects the input.
+TEST_F(DBBlobBasicTest,
+       IndirectBlobGCOptionsOffBeforeLocalWorkDoesNotSuppress) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  options.compaction_service = std::make_shared<LocalOnlyCompactionService>();
+  options.use_separate_remote_compaction_pool = true;
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+
+  std::atomic<bool> turned_off{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BGWorkLocalCompaction:Start", [&](void*) {
+        if (!turned_off.exchange(true)) {
+          ASSERT_OK(
+              db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_garbage_collection", "false"}}));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_TRUE(turned_off.load());
+  // The job ended before it registered with the census, so it did not start
+  // and the input is still there.
+  ASSERT_EQ(options.statistics->getTickerCount(INDIRECT_BLOB_GC_JOBS_STARTED),
+            0U);
+  ASSERT_TRUE(HasBlobFile(file_number));
+
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_FALSE(HasBlobFile(file_number));
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCChangesDuringCopy) {
+  // Indirect blob GC does not follow the Version changes after its census
+  // snapshot. This test makes changes while GC copies its first output, in two
+  // modes:
+  // - kDropDuringCopy: the column family is dropped. The job installs
+  //   nothing.
+  // - kInstallsDuringCopy: two flushes install two other Versions. GC still
+  //   installs its edit, and every value stays readable.
+  // In both modes the job never sets a background error, and writes continue.
+  enum Mode { kDropDuringCopy, kInstallsDuringCopy };
+  for (int mode = kDropDuringCopy; mode <= kInstallsDuringCopy; ++mode) {
+    SCOPED_TRACE(mode);
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = false;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+    DestroyAndReopen(options);
+    CreateAndReopenWithCF({"gc"}, options);
+    const std::string live_value(4096, 'v');
+    // Two input blob files, each with one live value, so the job writes two
+    // outputs.
+    for (const char* prefix : {"first", "second"}) {
+      for (int i = 0; i < 4; ++i) {
+        ASSERT_OK(Put(1, prefix + std::to_string(i),
+                      i == 3 ? live_value : std::string(4096, 'd')));
+      }
+      ASSERT_OK(Flush(1));
+    }
+    for (const char* prefix : {"first", "second"}) {
+      for (int i = 0; i < 3; ++i) {
+        ASSERT_OK(Delete(1, prefix + std::to_string(i)));
+      }
+    }
+    ASSERT_OK(Flush(1));
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr,
+                                nullptr));
+
+    std::atomic<int> copies{0};
+    std::atomic<int> installs{0};
+    SyncPoint* sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "DBImpl::RunIndirectBlobGC:AfterAddBlobRelocation", [&](void*) {
+          if (copies.fetch_add(1) != 0) {
+            return;
+          }
+          if (mode == kDropDuringCopy) {
+            ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+            return;
+          }
+          for (int i = 0; i < 2; ++i) {
+            ASSERT_OK(Put(1, "other" + std::to_string(i), "value"));
+            ASSERT_OK(Flush(1));
+          }
+        });
+    sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:Installed",
+                            [&](void*) { installs.fetch_add(1); });
+    sync_point->EnableProcessing();
+    auto cleanup = Defer([sync_point] {
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+    // blob_file_size (6000) makes the indirect blob GC target output size 5400
+    // bytes. Each input holds one live 4 KB value, and its estimated output
+    // size (which includes a 64 KB fixed overhead) is larger than the target.
+    // So each input gets its own output.
+    ASSERT_OK(db_->SetOptions(handles_[1],
+                              {{"disable_auto_compactions", "false"},
+                               {"enable_blob_garbage_collection", "true"},
+                               {"blob_file_size", "6000"}}));
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    ASSERT_GT(copies.load(), 0);
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+    ASSERT_OK(Put("after", "write"));
+    ASSERT_EQ(Get("after"), "write");
+    if (mode == kDropDuringCopy) {
+      // The job ended at its install check.
+      ASSERT_EQ(installs.load(), 0);
+    } else {
+      // One job copied both live values and installed once.
+      ASSERT_EQ(installs.load(), 1);
+      ASSERT_EQ(copies.load(), 2);
+      ASSERT_EQ(Get(1, "first3"), live_value);
+      ASSERT_EQ(Get(1, "second3"), live_value);
+      ASSERT_EQ(Get(1, "other1"), "value");
+    }
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    Close();
+  }
+}
+
+TEST_F(DBBlobBasicTest,
+       IndirectBlobGCColumnFamilyDropAfterSnapshotEndsWithoutError) {
+  // The CF is dropped right after indirect blob GC takes its census snapshot
+  // (at the SnapshotSelected sync point). The job then ends with no background
+  // error, and writes continue.
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.paranoid_checks = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"gc"}, options);
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put(1, "key" + std::to_string(i), std::string(4096, 'd')));
+  }
+  ASSERT_OK(Flush(1));
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete(1, "key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(
+      db_->CompactRange(CompactRangeOptions(), handles_[1], nullptr, nullptr));
+
+  std::atomic<bool> dropped{false};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:SnapshotSelected",
+                          [&](void*) {
+                            if (!dropped.exchange(true)) {
+                              ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+                            }
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(handles_[1],
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_TRUE(dropped.load());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_OK(Put("after", "write"));
+  ASSERT_EQ(Get("after"), "write");
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCWithMmapReads) {
+  // Indirect blob GC opens normal blob-file inputs for direct reads, except
+  // when mmap reads are on, because the two cannot be combined. GC still works
+  // with mmap reads.
+  if (encrypted_env_) {
+    ROCKSDB_GTEST_BYPASS("Test requires mmap reads");
+    return;
+  }
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.allow_mmap_reads = true;
+  Reopen(options);
+  const std::string live_value(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i),
+                  i == 3 ? live_value : std::string(4096, 'd')));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin =
+      cfd->current()->storage_info()->GetBlobFiles()[0]->GetBlobFileNumber();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin),
+      kInvalidBlobFileNumber);
+  ASSERT_EQ(Get("key3"), live_value);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCPacksOriginsAndReclaimsRelocation) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  const std::array<std::string, 4> first_keys{
+      {"first0", "first1", "first2", "first3"}};
+  const std::array<std::string, 4> second_keys{
+      {"second0", "second1", "second2", "second3"}};
+  const std::string first_live_value(4096, 'a');
+  const std::string second_live_value(4096, 'b');
+  for (size_t i = 0; i < first_keys.size(); ++i) {
+    ASSERT_OK(Put(first_keys[i],
+                  i + 1 == first_keys.size()
+                      ? first_live_value
+                      : std::string(4096, static_cast<char>('c' + i))));
+  }
+  ASSERT_OK(Flush());
+  for (size_t i = 0; i < second_keys.size(); ++i) {
+    ASSERT_OK(Put(second_keys[i],
+                  i + 1 == second_keys.size()
+                      ? second_live_value
+                      : std::string(4096, static_cast<char>('g' + i))));
+  }
+  ASSERT_OK(Flush());
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 2U);
+  const uint64_t first_origin =
+      cfd->current()->storage_info()->GetBlobFiles()[0]->GetBlobFileNumber();
+  const uint64_t second_origin =
+      cfd->current()->storage_info()->GetBlobFiles()[1]->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < first_keys.size(); ++i) {
+    ASSERT_OK(Delete(first_keys[i]));
+    ASSERT_OK(Delete(second_keys[i]));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  std::atomic<size_t> unlocked_apply_count{0};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("VersionSet::LogAndApplyHelper:ApplyUnlocked",
+                          [&](void*) { unlocked_apply_count.fetch_add(1); });
+  sync_point->EnableProcessing();
+  auto cleanup_sync_point = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_GT(unlocked_apply_count.load(), 0U);
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  uint64_t first_route = storage->GetBlobRelocationRouteTarget(first_origin);
+  uint64_t second_route = storage->GetBlobRelocationRouteTarget(second_origin);
+  ASSERT_NE(first_route, kInvalidBlobFileNumber);
+  ASSERT_NE(second_route, kInvalidBlobFileNumber);
+  const uint64_t packed_file_number = first_route;
+  ASSERT_EQ(second_route, packed_file_number);
+  std::shared_ptr<BlobRelocationFileMetaData> packed_file =
+      storage->GetBlobRelocationFileMetaData(packed_file_number);
+  ASSERT_NE(packed_file, nullptr);
+  // One output holds both inputs: one live value of each origin.
+  ASSERT_EQ(packed_file->GetTotalEntries(), 2U);
+  ASSERT_EQ(storage->GetBlobFileMetaData(first_origin), nullptr);
+  ASSERT_EQ(storage->GetBlobFileMetaData(second_origin), nullptr);
+  ASSERT_EQ(Get(first_keys.back()), first_live_value);
+  ASSERT_EQ(Get(second_keys.back()), second_live_value);
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "true"},
+                             {"enable_blob_garbage_collection", "false"}}));
+  ASSERT_OK(Delete(first_keys.back()));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobRelocationRouteTarget(second_origin),
+            kInvalidBlobFileNumber);
+  const std::shared_ptr<const BlobReferenceCensusState> before_regc_census =
+      GetCensusSnapshot(cfd);
+  ASSERT_NE(before_regc_census, nullptr);
+  ASSERT_EQ(before_regc_census->GetSstCount(first_origin), 0U);
+  ASSERT_GT(before_regc_census->GetSstCount(second_origin), 0U);
+  ASSERT_EQ(Get(second_keys.back()), second_live_value);
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"},
+                             {"blob_file_size", "0"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  storage = cfd->current()->storage_info();
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(first_origin),
+            kInvalidBlobFileNumber);
+  second_route = storage->GetBlobRelocationRouteTarget(second_origin);
+  ASSERT_NE(second_route, kInvalidBlobFileNumber);
+  ASSERT_NE(second_route, packed_file_number);
+  ASSERT_EQ(storage->GetBlobRelocationFileMetaData(packed_file_number),
+            nullptr);
+  // Refresh this thread's cached SuperVersion after indirect blob GC before
+  // checking that no reader still holds the relocation file that GC deleted
+  // (kBlobRelocationFileDeletion).
+  ASSERT_EQ(Get(second_keys.back()), second_live_value);
+  ASSERT_EQ(packed_file.use_count(), 1U);
+  std::string ignored;
+  ASSERT_TRUE(
+      db_->Get(ReadOptions(), first_keys.back(), &ignored).IsNotFound());
+
+  const std::string packed_path =
+      BlobFileName(cfd->ioptions().cf_paths.front().path, packed_file_number);
+  packed_file.reset();
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_OK(dbfull()->TEST_WaitForPurge());
+  ASSERT_TRUE(options.env->FileExists(packed_path).IsNotFound());
+  Reopen(options);
+  ASSERT_EQ(Get(second_keys.back()), second_live_value);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCRelocationInputIsNotPinned) {
+  // With pin_blob_relocation_location_blocks on, indirect blob GC still opens a
+  // relocation input without keeping its location blocks: GC is about to
+  // reclaim the file. GC opens the input with its own reader, outside the blob
+  // file cache, so user reads never reuse that unpinned reader. The test checks
+  // that GC's reader pins no location block, and that the cache holds no reader
+  // of the input while GC runs.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  // GC moves the two live values of the origin into a relocation file.
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t relocation_file =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(relocation_file, kInvalidBlobFileNumber);
+
+  // One of the two relocated values becomes garbage, so the relocation file
+  // is a GC input. No read opens it before GC does.
+  ASSERT_OK(Delete("key2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ASSERT_OK(db_->SetOptions({{"pin_blob_relocation_location_blocks", "true"}}));
+  // SetOptions() installs a new Version. GC starts only when the census is
+  // ready at the current Version, so wait for the census job to catch up.
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  TableCache::Evict(dbfull()->TEST_table_cache(), relocation_file);
+
+  int checks = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:InputsOpened", [&](void*) {
+        Cache* const cache = dbfull()->TEST_table_cache();
+        uint64_t number = relocation_file;
+        Cache::Handle* const handle = cache->Lookup(GetSliceForKey(&number));
+        if (handle != nullptr) {
+          cache->Release(handle);
+        }
+        EXPECT_EQ(handle, nullptr);
+        ++checks;
+      });
+  int opened = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:RelocationInputOpened", [&](void* arg) {
+        const auto* reader = static_cast<const BlobFileReader*>(arg);
+        ASSERT_NE(reader, nullptr);
+        ASSERT_NE(reader->relocation(), nullptr);
+        EXPECT_EQ(reader->relocation()->pinned_location_block_bytes(), 0U);
+        ++opened;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Status status =
+      dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {relocation_file});
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(status);
+  EXPECT_EQ(checks, 1);
+  EXPECT_EQ(opened, 1);
+  ASSERT_EQ(Get("key3"), value);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCRelocationInputHasNoGenerationCap) {
+  // Indirect blob GC collects a relocation file together with the generation
+  // numbers of every old file routed to it, with no cap on how many there are.
+  // Here 300 old blob files route to one relocation file R. After two of every
+  // three values die, GC collects R: the live generation numbers route to the
+  // new output, and the routes of the dead generation numbers are removed.
+  Options options = IndirectBlobGCOptions();
+  // Each value goes to its own blob file.
+  options.blob_file_size = 1;
+  DestroyAndReopen(options);
+  constexpr size_t kGenerationCount = 300;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (size_t i = 0; i < kGenerationCount; ++i) {
+    char key[16];
+    snprintf(key, sizeof(key), "k%03zu", i);
+    keys.emplace_back(key);
+    values.push_back(std::string(100, static_cast<char>('a' + i % 26)) +
+                     std::to_string(i));
+    ASSERT_OK(Put(keys.back(), values.back()));
+  }
+  ASSERT_OK(FlushInjectedBlobIndexesWithExactMetadata());
+
+  VersionSet* const version_set = dbfull()->GetVersionSet();
+  ColumnFamilyData* cfd = version_set->GetColumnFamilySet()->GetDefault();
+  std::vector<uint64_t> generations;
+  for (const auto& file : cfd->current()->storage_info()->GetBlobFiles()) {
+    generations.push_back(file->GetBlobFileNumber());
+  }
+  // The flush writes the values in key order, and blob_file_size = 1 closes
+  // each blob file after one value. So the sorted generations[i] is the blob
+  // file of keys[i].
+  ASSERT_EQ(generations.size(), kGenerationCount);
+  std::sort(generations.begin(), generations.end());
+
+  dbfull()->TEST_LockMutex();
+  const uint64_t relocation_file_number = version_set->NewFileNumber();
+  dbfull()->TEST_UnlockMutex();
+  Options relocation_options = options;
+  relocation_options.cf_paths.clear();
+  relocation_options.cf_paths.emplace_back(dbname_, /*target_size=*/0);
+  BlockBasedTableOptions table_options;
+  relocation_options.table_factory.reset(
+      NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(relocation_options);
+  const MutableCFOptions mutable_options(relocation_options);
+  std::vector<RelocationTestRecord> records;
+  for (size_t i = 0; i < kGenerationCount; ++i) {
+    const uint64_t value_offset =
+        BlobLogHeader::kSize + BlobLogRecord::kHeaderSize + keys[i].size();
+    records.push_back(
+        {generations[i], value_offset, values[i], kNoCompression});
+  }
+  BlobRelocationFileMetadata metadata;
+  uint64_t relocation_file_size = 0;
+  WriteRelocationFileForDBTest(
+      immutable_options, mutable_options, table_options, cfd->GetID(),
+      relocation_file_number, records, &metadata, &relocation_file_size);
+  VersionEdit install;
+  install.SetColumnFamily(cfd->GetID());
+  install.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  install.AddBlobRelocationFile(BlobRelocationFileAddition(
+      relocation_file_number, relocation_file_size,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      metadata.encoded_directory, metadata.tail_size));
+  for (uint64_t generation : generations) {
+    install.SetBlobRelocationRoute(
+        BlobRelocationRoute(generation, relocation_file_number));
+    install.RetireBlobFile(generation);
+  }
+  ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
+  // LogAndApply alone installs no SuperVersion; reopen to read the new Version.
+  Reopen(options);
+  for (size_t i = 0; i < kGenerationCount; ++i) {
+    ASSERT_EQ(Get(keys[i]), values[i]);
+  }
+
+  // Keep one value in three.
+  for (size_t i = 0; i < kGenerationCount; ++i) {
+    if (i % 3 != 0) {
+      ASSERT_OK(Delete(keys[i]));
+    }
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_EQ(storage->GetBlobRelocationFileMetaData(relocation_file_number),
+            nullptr);
+  const uint64_t output = RouteTarget(generations[0]);
+  ASSERT_NE(output, kInvalidBlobFileNumber);
+  ASSERT_NE(output, relocation_file_number);
+  for (size_t i = 0; i < kGenerationCount; ++i) {
+    SCOPED_TRACE(i);
+    if (i % 3 == 0) {
+      ASSERT_EQ(RouteTarget(generations[i]), output);
+      ASSERT_EQ(Get(keys[i]), values[i]);
+    } else {
+      ASSERT_EQ(RouteTarget(generations[i]), kInvalidBlobFileNumber);
+    }
+  }
+  Reopen(options);
+  for (size_t i = 0; i < kGenerationCount; i += 3) {
+    ASSERT_EQ(Get(keys[i]), values[i]);
+  }
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCReclaimsEmptyRelocationFile) {
+  // A relocation file with no live value left is removed together with its
+  // routes, and indirect blob GC writes no output for it.
+  const Options options = IndirectBlobGCOptions();
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  const uint64_t relocation_file_number = RouteTarget(file_number);
+  ASSERT_NE(relocation_file_number, kInvalidBlobFileNumber);
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "true"},
+                             {"enable_blob_garbage_collection", "false"}}));
+  ASSERT_OK(Delete(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)));
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  dbfull()->TEST_DeleteObsoleteFiles();
+  const std::set<uint64_t> before = BlobFilesOnDisk();
+  ASSERT_EQ(before.count(relocation_file_number), 1U);
+
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
+                relocation_file_number),
+            nullptr);
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+  dbfull()->TEST_DeleteObsoleteFiles();
+  ASSERT_OK(dbfull()->TEST_WaitForPurge());
+  std::set<uint64_t> expected = before;
+  expected.erase(relocation_file_number);
+  ASSERT_EQ(BlobFilesOnDisk(), expected);
+  Reopen(options);
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)), "NOT_FOUND");
+}
+
 TEST_F(DBBlobBasicTest, BlobReferenceReadChecksSharedOutputRoom) {
   // Indirect blob GC reads all generation numbers of one input into one live
   // set, so several requests of a batch read share one output. Each request is
@@ -2656,6 +7217,257 @@ TEST_F(DBBlobBasicTest, BlobReferenceReadChecksSharedOutputRoom) {
   ASSERT_TRUE(requests[1].status.IsAborted()) << requests[1].status.ToString();
   ASSERT_EQ(output.size(), 1U);
   ASSERT_EQ(output[0].generation_file_number, generations[0]);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCCorruptionIsCandidateLocal) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  ASSERT_OK(Put("dead1", std::string(4096, 'a')));
+  ASSERT_OK(Put("dead2", std::string(4096, 'b')));
+  ASSERT_OK(Put("dead3", std::string(4096, 'c')));
+  ASSERT_OK(Put("live", std::string(4096, 'd')));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  ASSERT_OK(Delete("dead1"));
+  ASSERT_OK(Delete("dead2"));
+  ASSERT_OK(Delete("dead3"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  std::atomic<int> attempts{0};
+  sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:AfterLiveSet",
+                          [&](void* argument) {
+                            ++attempts;
+                            *static_cast<Status*>(argument) =
+                                Status::Corruption("injected candidate fault");
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(Get("live"), std::string(4096, 'd'));
+  ASSERT_EQ(attempts.load(), 1);
+  ASSERT_OK(Put("after", "still writable"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(Get("after"), "still writable");
+  // The census keeps the candidate suppressed across the new Version.
+  for (int round = 0; round < 3; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  ASSERT_EQ(attempts.load(), 1);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCOutputCorruptionIsBackgroundError) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  ASSERT_OK(Put("dead1", std::string(4096, 'a')));
+  ASSERT_OK(Put("dead2", std::string(4096, 'b')));
+  ASSERT_OK(Put("dead3", std::string(4096, 'c')));
+  ASSERT_OK(Put("live", std::string(4096, 'd')));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  ASSERT_OK(Delete("dead1"));
+  ASSERT_OK(Delete("dead2"));
+  ASSERT_OK(Delete("dead3"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:AfterOutputWork",
+                          [](void* argument) {
+                            *static_cast<Status*>(argument) =
+                                Status::Corruption("injected output fault");
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const Status wait_status = dbfull()->TEST_WaitForCompact();
+  ASSERT_TRUE(wait_status.IsCorruption()) << wait_status.ToString();
+  const Status background_error = dbfull()->TEST_GetBGError();
+  ASSERT_TRUE(background_error.IsCorruption()) << background_error.ToString();
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(Get("live"), std::string(4096, 'd'));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCMixedReadErrorIsBackgroundError) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i),
+                  std::string(4096, static_cast<char>('a' + i))));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "BlobFileReader::MultiGetStoredBlobsForRelocation:TamperWithResult",
+      [](void* argument) {
+        auto* statuses = static_cast<std::vector<Status>*>(argument);
+        ASSERT_GE(statuses->size(), 2U);
+        (*statuses)[0] =
+            Status::Corruption("injected candidate-local read fault");
+        (*statuses)[1] = Status::IOError("injected external read fault");
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const Status wait_status = dbfull()->TEST_WaitForCompact();
+  ASSERT_TRUE(wait_status.IsIOError()) << wait_status.ToString();
+  const Status background_error = dbfull()->TEST_GetBGError();
+  ASSERT_TRUE(background_error.IsIOError()) << background_error.ToString();
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+}
+
+TEST_F(DBBlobBasicTest,
+       IndirectBlobGCOutputCorruptionPrecedesSourceCorruption) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.env->SetBackgroundThreads(2, Env::Priority::LOW);
+
+  Reopen(options);
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i),
+                  std::string(4096, static_cast<char>('a' + i))));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin_file_number = cfd->current()
+                                          ->storage_info()
+                                          ->GetBlobFiles()
+                                          .front()
+                                          ->GetBlobFileNumber();
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("key" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "BlobFileReader::MultiGetStoredBlobsForRelocation:TamperWithResult",
+      [](void* argument) {
+        auto* statuses = static_cast<std::vector<Status>*>(argument);
+        ASSERT_GE(statuses->size(), 2U);
+        (*statuses)[1] = Status::Corruption("injected source-record fault");
+      });
+  sync_point->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:AfterAddBlobRelocation", [](void* argument) {
+        *static_cast<Status*>(argument) =
+            Status::Corruption("injected output-format fault");
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const Status wait_status = dbfull()->TEST_WaitForCompact();
+  ASSERT_TRUE(wait_status.IsCorruption()) << wait_status.ToString();
+  const Status background_error = dbfull()->TEST_GetBGError();
+  ASSERT_TRUE(background_error.IsCorruption()) << background_error.ToString();
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(origin_file_number), nullptr);
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
 }
 
 TEST_F(DBBlobBasicTest, BlobReferenceCensusCatchesDeletionDuringInitialScan) {
@@ -3466,6 +8278,63 @@ TEST_F(DBBlobBasicTest, UniversalOneLevelPartialCompactionKeepsNewerL0Coarse) {
       expected = "mid" + std::to_string(key);
     }
     ASSERT_EQ(Get(Key(key)), expected);
+  }
+  ExpectCensusMatchesVersion();
+}
+
+TEST_F(DBBlobBasicTest, UniversalOneLevelFullCompactionLetsIndirectBlobGcRun) {
+  // Universal compaction with one level: flushes are coarse, and a coarse SST
+  // pins its blob file, so indirect blob GC skips it. The test makes one blob
+  // file 3/4 garbage and checks that GC skips it while only coarse SSTs exist.
+  // A full compaction writes exact output (it is bottommost), which removes the
+  // pin. GC then collects the blob file and the live value is still readable.
+  Options options =
+      UniversalOneLevelIndirectionOptions(IndirectBlobGCOptions());
+  // Indirect blob GC relocates live values only when blob GC is on. Auto
+  // compaction stays off, so GC runs only when the test calls it.
+  options.enable_blob_garbage_collection = true;
+  DestroyAndReopen(options);
+  for (size_t i = 0; i < kIndirectBlobGCKeyCount; ++i) {
+    ASSERT_OK(Put(IndirectBlobGCKey(i), IndirectBlobGCValue(i)));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 1U);
+  const uint64_t blob_file = blob_files.front();
+  // Delete all keys but the last one, so 3 of the 4 values are garbage.
+  for (size_t i = 0; i + 1 < kIndirectBlobGCKeyCount; ++i) {
+    ASSERT_OK(Delete(IndirectBlobGCKey(i)));
+  }
+  ASSERT_OK(Flush());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_TRUE(IsCoarsePinned(blob_file));
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {blob_file}));
+  ASSERT_TRUE(HasBlobFile(blob_file));
+  ASSERT_EQ(RouteTarget(blob_file), kInvalidBlobFileNumber);
+
+  // The full compaction runs with compaction-time blob GC off, so the values
+  // stay in their blob file and only indirect blob GC can move them.
+  CompactRangeOptions full;
+  full.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  full.blob_garbage_collection_policy = BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(db_->CompactRange(full, nullptr, nullptr));
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_EQ(storage->LevelFiles(0).size(), 1U);
+  ASSERT_FALSE(
+      storage->LevelFiles(0).front()->blob_reference_descriptor.empty());
+  ASSERT_EQ(GetBlobFileNumbers(), blob_files);
+  ASSERT_FALSE(IsCoarsePinned(blob_file));
+
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {blob_file}));
+  ASSERT_FALSE(HasBlobFile(blob_file));
+  ASSERT_NE(RouteTarget(blob_file), kInvalidBlobFileNumber);
+  const size_t live = kIndirectBlobGCKeyCount - 1;
+  ASSERT_EQ(Get(IndirectBlobGCKey(live)), IndirectBlobGCValue(live));
+  for (size_t i = 0; i < live; ++i) {
+    ASSERT_EQ(Get(IndirectBlobGCKey(i)), "NOT_FOUND");
   }
   ExpectCensusMatchesVersion();
 }
@@ -5383,6 +10252,975 @@ TEST_F(DBBlobBasicTest, ReadBlobReferencesBatchReadsEachBlockOnce) {
 
 namespace {
 
+// Writes `origins` blob files with `per_origin` values of `value_size` bytes
+// each, and deletes all but the last `live` values of each file. One full
+// compaction then writes every live reference into one SST (the caller sets a
+// large target_file_size_base). Fills `origin_numbers` with the blob file
+// numbers in file-number order, and `live_keys` with the keys of the live
+// values.
+void WriteGarbageHeavyOrigins(DBBlobBasicTest* test, DB* db, size_t origins,
+                              size_t per_origin, size_t live, size_t value_size,
+                              std::vector<uint64_t>* origin_numbers,
+                              std::vector<std::string>* live_keys) {
+  ColumnFamilyData* cfd = static_cast_with_check<DBImpl>(db)
+                              ->GetVersionSet()
+                              ->GetColumnFamilySet()
+                              ->GetDefault();
+  for (size_t o = 0; o < origins; ++o) {
+    for (size_t i = 0; i < per_origin; ++i) {
+      const std::string key =
+          "o" + std::to_string(o) + "-" + DBTestBase::Key(static_cast<int>(i));
+      ASSERT_OK(db->Put(WriteOptions(), key,
+                        std::string(value_size, static_cast<char>('a' + o))));
+      if (i + live >= per_origin) {
+        live_keys->push_back(key);
+      }
+    }
+    ASSERT_OK(db->Flush(FlushOptions()));
+  }
+  for (const auto& blob_file : cfd->current()->storage_info()->GetBlobFiles()) {
+    origin_numbers->push_back(blob_file->GetBlobFileNumber());
+  }
+  for (size_t o = 0; o < origins; ++o) {
+    for (size_t i = 0; i + live < per_origin; ++i) {
+      ASSERT_OK(
+          db->Delete(WriteOptions(), "o" + std::to_string(o) + "-" +
+                                         DBTestBase::Key(static_cast<int>(i))));
+    }
+  }
+  ASSERT_OK(db->Flush(FlushOptions()));
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db->CompactRange(compact_options, nullptr, nullptr));
+  (void)test;
+}
+
+Options SstMajorGCOptions(Options options) {
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.target_file_size_base = 1 << 30;
+  options.create_if_missing = true;
+  return options;
+}
+
+}  // namespace
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCReadsSharedSstOnce) {
+  // Four inputs whose live groups share one SST and one reference block. The
+  // job reads that SST once, with all four groups in one batch, and closes its
+  // reader before going on.
+  Options options = SstMajorGCOptions(GetDefaultOptions());
+  DestroyAndReopen(options);
+  std::vector<uint64_t> origins;
+  std::vector<std::string> live_keys;
+  WriteGarbageHeavyOrigins(this, db_.get(), 4, 4, 1, 4096, &origins,
+                           &live_keys);
+  ASSERT_EQ(origins.size(), 4U);
+
+  std::atomic<size_t> largest_batch{0};
+  std::atomic<size_t> open_reader_charge{0};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:SstBatchRead", [&](void* arg) {
+        const auto* report = static_cast<std::pair<size_t, size_t>*>(arg);
+        largest_batch.store(std::max(largest_batch.load(), report->first));
+        open_reader_charge.fetch_add(report->second);
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  EXPECT_EQ(largest_batch.load(), 4U);
+  EXPECT_EQ(open_reader_charge.load(), 0U);
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  for (uint64_t origin : origins) {
+    EXPECT_NE(
+        cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin),
+        kInvalidBlobFileNumber)
+        << origin;
+  }
+  for (size_t i = 0; i < live_keys.size(); ++i) {
+    EXPECT_EQ(Get(live_keys[i]), std::string(4096, static_cast<char>('a' + i)));
+  }
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCCorruptGroupFailsOnlyItsInput) {
+  // The first origin's live group spans several reference blocks; a flipped bit
+  // in a middle block fails only that input. The other inputs, whose groups are
+  // in other blocks of the same SST, are still relocated.
+  if (encrypted_env_) {
+    // test::CorruptFile() rewrites the whole SST. The encrypted env gives the
+    // new file a new random encryption prefix, but the open table reader keeps
+    // the old one. That reader then decrypts the whole file to garbage, so GC
+    // does not see just one flipped bit.
+    ROCKSDB_GTEST_BYPASS("Test corrupts an SST that has an open reader");
+    return;
+  }
+  Options options = SstMajorGCOptions(GetDefaultOptions());
+  DestroyAndReopen(options);
+  std::vector<uint64_t> origins;
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  for (int o = 0; o < 3; ++o) {
+    const int count = o == 0 ? 18000 : 4;
+    for (int i = 0; i < count; ++i) {
+      // Origin 0 holds many 100-byte values, so its live group spans several
+      // reference blocks. Origins 1 and 2 hold four 4 KB values each.
+      ASSERT_OK(
+          Put("o" + std::to_string(o) + "-" + Key(i),
+              std::string(o == 0 ? 100 : 4096, static_cast<char>('a' + o))));
+    }
+    ASSERT_OK(Flush());
+  }
+  for (const auto& blob_file : cfd->current()->storage_info()->GetBlobFiles()) {
+    origins.push_back(blob_file->GetBlobFileNumber());
+  }
+  ASSERT_EQ(origins.size(), 3U);
+  for (int o = 0; o < 3; ++o) {
+    const int dead = o == 0 ? 9000 : 3;
+    for (int i = 0; i < dead; ++i) {
+      ASSERT_OK(Delete("o" + std::to_string(o) + "-" + Key(i)));
+    }
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const FileMetaData* const sst = OnlySstForTest(cfd);
+  ASSERT_NE(sst, nullptr);
+  const BlobReferenceIndex index = ReadBlobReferenceIndexForTest(*sst);
+  ASSERT_EQ(index.groups.size(), 3U);
+  ASSERT_EQ(index.groups[0].group.origin_file_number, origins[0]);
+  ASSERT_GE(index.groups[1].start_block, index.groups[0].start_block + 2);
+  ASSERT_OK(test::CorruptFile(
+      env_, MakeTableFileName(dbname_, sst->fd.GetNumber()),
+      static_cast<int>(index.blocks[index.groups[0].start_block + 1].offset() +
+                       1),
+      /*bytes_to_corrupt=*/1, /*verify_checksum=*/false));
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  EXPECT_EQ(storage->GetBlobRelocationRouteTarget(origins[0]),
+            kInvalidBlobFileNumber);
+  EXPECT_NE(storage->GetBlobFileMetaData(origins[0]), nullptr);
+  for (size_t o = 1; o < origins.size(); ++o) {
+    EXPECT_NE(storage->GetBlobRelocationRouteTarget(origins[o]),
+              kInvalidBlobFileNumber)
+        << o;
+  }
+}
+
+// Checks an input whose exact live set cannot fit in the GC memory budget even
+// as the only live set of the job. A sync point shrinks the budget to the
+// fixed charges that a job holds next to the live set, plus 20 KB, an example
+// size. The fixed charges are the I/O workspace (2 x 1 MB + 2 x 256 KB) and the
+// SST reader (64 KB + 2 x 256 KB). Of the 20 KB, the estimate of the planned
+// read list takes 1,152 bytes here (16 entries of 72 bytes), so a job can hold
+// at most 483 live values ((20,480 - 1,152) / 40 bytes). The input has 800 live
+// values, which need 32,000 bytes (40 bytes each), so they can never fit. The
+// 800 values would fit in the budget minus the I/O workspace alone, so a limit
+// that leaves out the SST reader charge would let the live set be reserved, and
+// the reader charge would then fail with a transient suppression that is
+// retried. GC counts the input in INDIRECT_BLOB_GC_OVERSIZED_INPUTS, writes a
+// WARN line, and gives it a normal suppression. The test then moves the manual
+// DB clock past the longest transient retry delay (32 s) and makes the census
+// publish a new Version. No new GC job starts, because a normal suppression
+// does not end with time. Then the test deletes 10 live values three times.
+// Each delete changes the live bytes of the file, but the file still cannot
+// fit, so no new GC job starts either. At last the file keeps 300 live values,
+// which is at most 483, so the suppression ends. The test restores the full
+// budget first, and GC then collects the file.
+TEST_F(DBBlobBasicTest, IndirectBlobGCOversizedInputIsNotRetried) {
+  auto clock =
+      std::make_shared<ManualIndirectBlobGcClock>(env_->GetSystemClock());
+  CompositeEnvWrapper env(env_, clock);
+  Options options = IndirectBlobGCOptions();
+  options.env = &env;
+  options.statistics = CreateDBStatistics();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  // The DB uses `env` and `clock`, so close it before they go away, also when
+  // an assertion ends the test early.
+  auto close_db = Defer([this] { Close(); });
+  constexpr int kKeys = 2000;
+  constexpr int kDeletedKeys = 1200;
+  const auto key = [](int i) {
+    std::string k = std::to_string(i);
+    return "k" + std::string(4 - k.size(), '0') + k;
+  };
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Put(key(i), std::string(64, 'v')));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t file_number = cfd->current()
+                                   ->storage_info()
+                                   ->GetBlobFiles()
+                                   .back()
+                                   ->GetBlobFileNumber();
+  for (int i = 0; i < kDeletedKeys; ++i) {
+    ASSERT_OK(Delete(key(i)));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  constexpr size_t kIoWorkspaceBytes = 2 * (1 << 20) + 2 * (256 << 10);
+  constexpr size_t kSstReaderBytes = (64 << 10) + 2 * (256 << 10);
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:MemoryBudget", [](void* arg) {
+        *static_cast<size_t*>(arg) =
+            kIoWorkspaceBytes + kSstReaderBytes + (20 << 10);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  Statistics* const statistics = options.statistics.get();
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  const uint64_t started =
+      statistics->getTickerCount(INDIRECT_BLOB_GC_JOBS_STARTED);
+  ASSERT_GE(started, 1U);
+  ASSERT_EQ(statistics->getTickerCount(INDIRECT_BLOB_GC_OVERSIZED_INPUTS),
+            started);
+  ASSERT_GE(log->Count({"[WARN] ", "Indirect blob GC skips blob file #" +
+                                       std::to_string(file_number) +
+                                       ": its exact live set of 800 values"}),
+            1U);
+  ASSERT_TRUE(HasBlobFile(file_number));
+
+  clock->Advance(uint64_t{64} * 1000 * 1000);
+  ASSERT_OK(Put("other", "o"));
+  ASSERT_OK(Flush());
+  for (int round = 0; round < 3; ++round) {
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  }
+  ASSERT_EQ(statistics->getTickerCount(INDIRECT_BLOB_GC_JOBS_STARTED), started);
+  ASSERT_TRUE(HasBlobFile(file_number));
+  ASSERT_EQ(Get(key(kKeys - 1)), std::string(64, 'v'));
+
+  // Deletes the keys [begin, end), and lets the compaction, the census and GC
+  // run until no more work is queued.
+  const auto delete_keys = [&](int begin, int end) {
+    for (int i = begin; i < end; ++i) {
+      ASSERT_OK(Delete(key(i)));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    for (int round = 0; round < 3; ++round) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    }
+  };
+  // 790, 780 and 770 live values are left: still too many.
+  for (int round = 0; round < 3; ++round) {
+    const int begin = kDeletedKeys + round * 10;
+    ASSERT_NO_FATAL_FAILURE(delete_keys(begin, begin + 10));
+    ASSERT_EQ(statistics->getTickerCount(INDIRECT_BLOB_GC_JOBS_STARTED),
+              started);
+    ASSERT_TRUE(HasBlobFile(file_number));
+  }
+  ASSERT_EQ(statistics->getTickerCount(INDIRECT_BLOB_GC_OVERSIZED_INPUTS),
+            started);
+  // 300 live values are left, which fit: GC moves them.
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_NO_FATAL_FAILURE(delete_keys(kDeletedKeys + 30, kKeys - 300));
+  ASSERT_GT(statistics->getTickerCount(INDIRECT_BLOB_GC_JOBS_STARTED), started);
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(Get(key(kKeys - 1)), std::string(64, 'v'));
+}
+
+// Checks that an oversized input is suppressed also when the job ends before
+// it decides its inputs. File B (input 0) has 2 live values and fits. File A
+// (input 1) has 800 live values and never fits the shrunk budget (see
+// IndirectBlobGCOversizedInputIsNotRetried for the budget). A sync point
+// reports a census mismatch in the first two jobs. GC reports an injected
+// mismatch for input 0, so the mismatch names B in both jobs:
+// 1. Job 1: the first report of B rebuilds the census, and the job ends stale.
+// 2. Job 2: the census remembers B from job 1 (see
+//    BlobReferenceCensus::ReportMismatch()), so GC suppresses only B and
+//    decides no input.
+// A was planned as oversized in job 2 but never decided. GC must still suppress
+// it, so the census does not offer it again and the next job does not plan it
+// and count it again. Job 2 must also suppress A in the current Version, so
+// that a job that runs before the census publishes its new candidate list does
+// not plan A again. Before job 2, the test holds the next census job at its
+// start, so after job 2 it can check the candidates of the current Version
+// before the census publishes.
+TEST_F(DBBlobBasicTest, IndirectBlobGCOversizedInputSuppressedOnEarlyEnd) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  // The census offers a file with at least this exact garbage ratio. File A
+  // has 60% garbage, and file overhead keeps B a little below 50%.
+  options.indirect_blob_gc_garbage_ratio = 0.25;
+  options.enable_blob_garbage_collection = true;
+  DestroyAndReopen(options);
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  constexpr int kKeys = 2000;
+  constexpr int kDeletedKeys = 1200;
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(Put("a" + Key(i), std::string(64, 'v')));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t file_a = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("b" + Key(i), std::string(4096, 'w')));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t file_b = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  ASSERT_NE(file_a, file_b);
+  for (int i = 0; i < kDeletedKeys; ++i) {
+    ASSERT_OK(Delete("a" + Key(i)));
+  }
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Delete("b" + Key(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  // The census offers a file only after its candidate list is published.
+  const auto candidates = [&]() {
+    std::vector<uint64_t> files;
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    cfd->current()->storage_info()->GetBlobPhysicalFilesForIndirectBlobGC(
+        BlobGcCandidateHeap::kMaxSelectedFiles, &files);
+    return std::set<uint64_t>(files.begin(), files.end());
+  };
+  ASSERT_EQ(candidates(), (std::set<uint64_t>{file_a, file_b}));
+
+  constexpr size_t kIoWorkspaceBytes = 2 * (1 << 20) + 2 * (256 << 10);
+  constexpr size_t kSstReaderBytes = (64 << 10) + 2 * (256 << 10);
+  // While hold_census is true, the census job waits at its start, so it
+  // cannot publish a new candidate list.
+  std::mutex hold_mutex;
+  std::condition_variable hold_cv;
+  bool hold_census = false;
+  std::atomic<int> checks{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:MemoryBudget", [](void* arg) {
+        *static_cast<size_t*>(arg) =
+            kIoWorkspaceBytes + kSstReaderBytes + (20 << 10);
+      });
+  sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:CensusTotalsCheck",
+                          [&](void* arg) {
+                            if (checks++ < 2) {
+                              *static_cast<bool*>(arg) = true;
+                            }
+                          });
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Start",
+                          [&](void* /*arg*/) {
+                            std::unique_lock<std::mutex> lock(hold_mutex);
+                            hold_cv.wait(lock, [&] { return !hold_census; });
+                          });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  const auto release_census = [&]() {
+    {
+      std::lock_guard<std::mutex> lock(hold_mutex);
+      hold_census = false;
+    }
+    hold_cv.notify_all();
+  };
+  // Releases the census job also when an assertion ends the test early.
+  auto release = Defer(release_census);
+  Statistics* const statistics = options.statistics.get();
+  const Status job1 =
+      dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {file_b, file_a});
+  ASSERT_EQ(job1.code(), Status::Code::kTryAgain) << job1.ToString();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(candidates().count(file_a), 1U);
+  {
+    std::lock_guard<std::mutex> lock(hold_mutex);
+    hold_census = true;
+  }
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {file_b, file_a}));
+  ASSERT_EQ(checks.load(), 2);
+  ASSERT_EQ(statistics->getTickerCount(INDIRECT_BLOB_GC_OVERSIZED_INPUTS), 2U);
+  ASSERT_EQ(candidates().count(file_a), 0U);
+  release_census();
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_TRUE(candidates().empty());
+  ASSERT_TRUE(HasBlobFile(file_a));
+  ASSERT_TRUE(HasBlobFile(file_b));
+}
+
+// A failed block cache charge of GC working memory must degrade, not loop.
+// The block cache is a strict 2 MB LRU cache (an example size). It is large
+// enough for the flush and the compaction of the test, but it cannot hold the
+// 2.5 MB I/O workspace charge of a GC job, so the charge fails. GC then
+// skips every input with a transient suppression and an INFO "skipped file"
+// line that names the reason, and the job is not retried at once: one job
+// starts, and the input stays.
+TEST_F(DBBlobBasicTest, IndirectBlobGCFullCacheSkipsWithLogLine) {
+  Options options = IndirectBlobGCOptions();
+  options.statistics = CreateDBStatistics();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = NewLRUCache(2 << 20, /*num_shard_bits=*/0,
+                                          /*strict_capacity_limit=*/true);
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  EXPECT_EQ(options.statistics->getTickerCount(INDIRECT_BLOB_GC_JOBS_STARTED),
+            1U);
+  EXPECT_GE(log->Count({"Indirect blob GC skipped file #" +
+                        std::to_string(file_number) +
+                        ": blob GC I/O workspace cache pressure"}),
+            1U);
+  EXPECT_TRUE(HasBlobFile(file_number));
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+// When the live set of a later input cannot be charged (injected through a
+// sync point), that input and the later ones wait for a later job. The job
+// writes an INFO line that names the deferred input, and it still relocates
+// the first input.
+TEST_F(DBBlobBasicTest, IndirectBlobGCMemoryDeferralIsLogged) {
+  Options options = IndirectBlobGCOptions();
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  WriteTwoMismatchCandidates(dbfull());
+  std::atomic<int> reservations{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:ReserveLiveSet", [&](void* arg) {
+        if (++reservations == 2) {
+          *static_cast<Status*>(arg) =
+              Status::MemoryLimit("injected live set limit");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_GE(reservations.load(), 2);
+  EXPECT_GE(log->Count({"Indirect blob GC defers blob file #",
+                        "the GC memory budget or its block cache charge is "
+                        "full"}),
+            1U);
+  ASSERT_EQ(Get("a3"), std::string(4096, 'v'));
+  ASSERT_EQ(Get("b3"), std::string(4096, 'v'));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCMemoryLimitDefersOrSuppresses) {
+  // If the live-set reservation fails for a later input, that input and every
+  // input after it wait for a later job. If it fails for the first input,
+  // indirect blob GC suppresses only that input and still plans the other
+  // inputs. Neither case reports a census mismatch.
+  for (const int failing_reservation : {2, 1}) {
+    SCOPED_TRACE(failing_reservation);
+    Options options = SstMajorGCOptions(GetDefaultOptions());
+    DestroyAndReopen(options);
+    std::vector<uint64_t> origins;
+    std::vector<std::string> live_keys;
+    WriteGarbageHeavyOrigins(this, db_.get(), 4, 4, 1, 4096, &origins,
+                             &live_keys);
+
+    std::atomic<int> reservations{0};
+    std::atomic<int> first_plan_end{-1};
+    std::atomic<int> census_mismatches{0};
+    SyncPoint* sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "DBImpl::RunIndirectBlobGC:ReserveLiveSet", [&](void* arg) {
+          if (++reservations == failing_reservation) {
+            *static_cast<Status*>(arg) =
+                Status::MemoryLimit("injected live set limit");
+          }
+        });
+    // A deferred or suppressed input reads no groups, so GC must not check its
+    // census totals. The callback counts mismatches; the test expects none.
+    sync_point->SetCallBack("DBImpl::RunIndirectBlobGC:CensusTotalsCheck",
+                            [&](void* arg) {
+                              if (*static_cast<bool*>(arg)) {
+                                ++census_mismatches;
+                              }
+                            });
+    sync_point->SetCallBack(
+        "DBImpl::RunIndirectBlobGC:PlanEnd", [&](void* arg) {
+          int expected = -1;
+          first_plan_end.compare_exchange_strong(
+              expected, static_cast<int>(*static_cast<size_t*>(arg)));
+        });
+    sync_point->EnableProcessing();
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"disable_auto_compactions", "false"},
+                               {"enable_blob_garbage_collection", "true"}}));
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    ASSERT_GE(reservations.load(), failing_reservation);
+    EXPECT_EQ(census_mismatches.load(), 0);
+    if (failing_reservation == 2) {
+      // The inputs after the first input are deferred.
+      EXPECT_EQ(first_plan_end.load(), 1);
+    } else {
+      // The first input is suppressed and the later ones are planned.
+      EXPECT_GT(first_plan_end.load(), 1);
+    }
+  }
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCSnapshotMemoryLimitBacksOff) {
+  // A census snapshot that does not fit the memory budget is transient: its
+  // candidates back off, and the job is not retried every few milliseconds.
+  Options options = SstMajorGCOptions(GetDefaultOptions());
+  DestroyAndReopen(options);
+  std::vector<uint64_t> origins;
+  std::vector<std::string> live_keys;
+  WriteGarbageHeavyOrigins(this, db_.get(), 4, 4, 1, 4096, &origins,
+                           &live_keys);
+  std::vector<std::string> live_values;
+  for (const std::string& key : live_keys) {
+    live_values.push_back(Get(key));
+  }
+
+  std::atomic<int> snapshots{0};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:SnapshotSelected", [&](void* arg) {
+        ++snapshots;
+        *static_cast<Status*>(arg) = Status::MemoryLimit("injected");
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  // Without the back-off this wait would not end: the retried pick would return
+  // the same candidates again.
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_GE(snapshots.load(), 1);
+  ASSERT_LE(snapshots.load(), 2);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  for (size_t i = 0; i < live_keys.size(); ++i) {
+    ASSERT_EQ(Get(live_keys[i]), live_values[i]);
+  }
+}
+
+// Tests of the indirect_blob_gc_garbage_ratio option. Indirect blob GC rewrites
+// a blob file only when its garbage ratio (garbage record bytes / record bytes)
+// is at least this option. The census applies the option when it publishes the
+// candidates of a Version (BlobGcCandidateHeap::CutSelection()), and the GC job
+// applies it again to the exact garbage of each input (DecideInputs()).
+class DBBlobBasicGarbageRatioTest : public DBBlobBasicTest {
+ protected:
+  // Writes `total` keys with 4 KB values into one new blob file, deletes the
+  // first `deleted` keys, and returns the blob file number. All keys of one
+  // call have the same length, so after a compaction drops the deleted keys,
+  // `deleted` / `total` is the exact garbage ratio of the file.
+  uint64_t WriteBlobFileWithGarbage(const std::string& prefix, int total,
+                                    int deleted) {
+    for (int i = 0; i < total; ++i) {
+      EXPECT_OK(Put(GarbageRatioKey(prefix, i), GarbageRatioValue(i)));
+    }
+    EXPECT_OK(Flush());
+    const uint64_t file_number = DefaultCfd()
+                                     ->current()
+                                     ->storage_info()
+                                     ->GetBlobFiles()
+                                     .back()
+                                     ->GetBlobFileNumber();
+    for (int i = 0; i < deleted; ++i) {
+      EXPECT_OK(Delete(GarbageRatioKey(prefix, i)));
+    }
+    EXPECT_OK(Flush());
+    return file_number;
+  }
+  static std::string GarbageRatioKey(const std::string& prefix, int i) {
+    return prefix + std::to_string(i);
+  }
+  static std::string GarbageRatioValue(int i) {
+    return std::string(4096, static_cast<char>('a' + i));
+  }
+
+  ColumnFamilyData* DefaultCfd() {
+    return dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  }
+
+  // The indirect blob GC candidates that the census published on the current
+  // Version of the default column family.
+  std::set<uint64_t> CurrentGcCandidates() {
+    std::vector<uint64_t> files;
+    InstrumentedMutexLock lock(dbfull()->mutex());
+    DefaultCfd()
+        ->current()
+        ->storage_info()
+        ->GetBlobPhysicalFilesForIndirectBlobGC(
+            BlobGcCandidateHeap::kMaxSelectedFiles, &files);
+    return std::set<uint64_t>(files.begin(), files.end());
+  }
+
+  // True if indirect blob GC collected the file: its live values moved to a
+  // relocation file (a route exists), or the file is gone.
+  bool Collected(uint64_t file_number) {
+    return RouteTarget(file_number) != kInvalidBlobFileNumber ||
+           !HasBlobFile(file_number);
+  }
+
+  // Checks that the live keys of a WriteBlobFileWithGarbage() call still read
+  // their values.
+  void CheckLiveKeys(const std::string& prefix, int total, int deleted) {
+    for (int i = deleted; i < total; ++i) {
+      ASSERT_EQ(Get(GarbageRatioKey(prefix, i)), GarbageRatioValue(i));
+    }
+  }
+};
+
+TEST_F(DBBlobBasicGarbageRatioTest, IndirectBlobGCGarbageRatioRange) {
+  // indirect_blob_gc_garbage_ratio must be in (0, 1]. At 0, GC would pick files
+  // with no garbage, and a value above 1 can never be reached. Option
+  // validation rejects a bad value with InvalidArgument at open, at
+  // CreateColumnFamily() and at SetOptions(). A failed SetOptions() keeps the
+  // old value.
+  Options options = IndirectBlobGCOptions();
+  for (const double bad :
+       {0.0, -0.1, 1.5, std::numeric_limits<double>::quiet_NaN()}) {
+    SCOPED_TRACE("ratio=" + std::to_string(bad));
+    options.indirect_blob_gc_garbage_ratio = bad;
+    ASSERT_EQ(TryReopen(options).code(), Status::Code::kInvalidArgument);
+  }
+  for (const double good : {1.0, 0.01}) {
+    SCOPED_TRACE("ratio=" + std::to_string(good));
+    options.indirect_blob_gc_garbage_ratio = good;
+    ASSERT_OK(TryReopen(options));
+    ASSERT_EQ(db_->GetOptions().indirect_blob_gc_garbage_ratio, good);
+  }
+
+  options.indirect_blob_gc_garbage_ratio = 0.5;
+  ASSERT_OK(TryReopen(options));
+  ColumnFamilyOptions bad_cf_options(options);
+  bad_cf_options.indirect_blob_gc_garbage_ratio = 0.0;
+  ColumnFamilyHandle* handle = nullptr;
+  ASSERT_EQ(
+      db_->CreateColumnFamily(bad_cf_options, "bad_ratio", &handle).code(),
+      Status::Code::kInvalidArgument);
+  ASSERT_EQ(handle, nullptr);
+
+  ASSERT_EQ(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"indirect_blob_gc_garbage_ratio", "0"}})
+                .code(),
+            Status::Code::kInvalidArgument);
+  ASSERT_EQ(db_->GetOptions().indirect_blob_gc_garbage_ratio, 0.5);
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"indirect_blob_gc_garbage_ratio", "0.3"}}));
+  ASSERT_EQ(db_->GetOptions().indirect_blob_gc_garbage_ratio, 0.3);
+}
+
+TEST_F(DBBlobBasicGarbageRatioTest,
+       IndirectBlobGCGarbageRatioDecidesCollection) {
+  // Indirect blob GC must skip a blob file whose garbage ratio is below
+  // indirect_blob_gc_garbage_ratio, and must collect it when the ratio is low
+  // enough. In this example, blob file "a" has 4 values with 3 deleted (75%
+  // garbage), and blob file "b" has 10 values with 4 deleted (40% garbage).
+  //
+  // With the ratio 0.5, the census publishes only file "a" as a candidate. The
+  // census never gives file "b" to a GC job, so the test also checks the GC
+  // job's own check: a sync point puts file "b" into the candidate list of the
+  // first GC run, as a stale candidate list could. The job reads the exact
+  // garbage of file "b", skips it, and logs a reason that names the option.
+  //
+  // With the ratio 0.3 and the same files, the census publishes both files,
+  // and GC collects file "b".
+  constexpr int kTotalA = 4;
+  constexpr int kDeletedA = 3;
+  constexpr int kTotalB = 10;
+  constexpr int kDeletedB = 4;
+  for (const double ratio : {0.5, 0.3}) {
+    SCOPED_TRACE("ratio=" + std::to_string(ratio));
+    Options options = IndirectBlobGCOptions();
+    options.indirect_blob_gc_garbage_ratio = ratio;
+    auto log = std::make_shared<IndirectBlobGcLogCapture>();
+    options.info_log = log;
+    DestroyAndReopen(options);
+    const uint64_t file_a = WriteBlobFileWithGarbage("a", kTotalA, kDeletedA);
+    const uint64_t file_b = WriteBlobFileWithGarbage("b", kTotalB, kDeletedB);
+    ASSERT_NE(file_a, file_b);
+    ASSERT_OK(BuildExactSstAtLevel1());
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+
+    const std::set<uint64_t> candidates = CurrentGcCandidates();
+    ASSERT_EQ(candidates.count(file_a), 1U);
+    ASSERT_EQ(candidates.count(file_b), ratio < 0.4 ? 1U : 0U);
+
+    // With the ratio 0.5, the first background compaction run that sees a
+    // ready census and a candidate gets file "b" as its only candidate. That
+    // run then starts an indirect blob GC job on file "b".
+    std::atomic<int> injected{0};
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    if (ratio >= 0.4) {
+      sync_point->SetCallBack(
+          "DBImpl::BackgroundCompaction():BeforePickCompaction",
+          [&](void* /*arg*/) {
+            // The DB mutex is held here.
+            ColumnFamilyData* const cfd = DefaultCfd();
+            Version* const current = cfd->current();
+            BlobReferenceCensus* const census = cfd->blob_reference_census();
+            if (injected.load() != 0 || census == nullptr ||
+                !census->IsReady(current->GetVersionNumber()) ||
+                current->storage_info()->BlobPhysicalFileForIndirectBlobGC() ==
+                    kInvalidBlobFileNumber) {
+              return;
+            }
+            BlobGcCandidateHeap::Selection only_b{};
+            only_b[0] = file_b;
+            current->storage_info()->SetBlobGcCandidates(only_b);
+            ++injected;
+          });
+      sync_point->EnableProcessing();
+    }
+    const Defer cleanup([sync_point] {
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+    ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+
+    const std::string skipped = "Indirect blob GC skipped file #" +
+                                std::to_string(file_b) +
+                                ": exact garbage ratio is below "
+                                "indirect_blob_gc_garbage_ratio (";
+    if (ratio >= 0.4) {
+      ASSERT_EQ(injected.load(), 1);
+      // The job logs the reason when the background run ends. The timeout only
+      // keeps a broken test from hanging.
+      ASSERT_TRUE(log->WaitFor({skipped + "0.5)"}, std::chrono::minutes(5)));
+      ASSERT_EQ(RouteTarget(file_b), kInvalidBlobFileNumber);
+      ASSERT_TRUE(HasBlobFile(file_b));
+      ASSERT_EQ(CurrentGcCandidates().count(file_b), 0U);
+    } else {
+      ASSERT_TRUE(Collected(file_b));
+      ASSERT_EQ(log->Count({"exact garbage ratio is below "
+                            "indirect_blob_gc_garbage_ratio"}),
+                0U);
+    }
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+    ASSERT_NO_FATAL_FAILURE(CheckLiveKeys("a", kTotalA, kDeletedA));
+    ASSERT_NO_FATAL_FAILURE(CheckLiveKeys("b", kTotalB, kDeletedB));
+    Close();
+  }
+}
+
+TEST_F(DBBlobBasicGarbageRatioTest,
+       IndirectBlobGCGarbageRatioSetOptionsReselects) {
+  // SetOptions() runs the census again at once, so a new
+  // indirect_blob_gc_garbage_ratio applies to the next candidate selection
+  // without waiting for a flush or a compaction. In this example, blob file "b"
+  // has 10 values with 4 deleted (40% garbage). With the ratio 0.5 it is not a
+  // candidate. After SetOptions() sets the ratio to 0.3, the next census run
+  // selects it, and GC collects it.
+  constexpr int kTotal = 10;
+  constexpr int kDeleted = 4;
+  Options options = IndirectBlobGCOptions();
+  options.indirect_blob_gc_garbage_ratio = 0.5;
+  DestroyAndReopen(options);
+  const uint64_t file_b = WriteBlobFileWithGarbage("b", kTotal, kDeleted);
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_EQ(CurrentGcCandidates().count(file_b), 0U);
+
+  // Wait for the census run that SetOptions() schedules, without
+  // TEST_WaitForBlobReferenceCensus(): that helper schedules a census run
+  // itself, so it would hide a missing run. Blob GC is still off, so no GC job
+  // takes the file before the check.
+  std::mutex done_mutex;
+  std::condition_variable done_cv;
+  int census_runs = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("DBImpl::BGWorkBlobReferenceCensus:Done",
+                          [&](void* /*arg*/) {
+                            std::lock_guard<std::mutex> lock(done_mutex);
+                            ++census_runs;
+                            done_cv.notify_all();
+                          });
+  sync_point->EnableProcessing();
+  const Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"indirect_blob_gc_garbage_ratio", "0.3"}}));
+  {
+    // The timeout only keeps a broken test from hanging.
+    std::unique_lock<std::mutex> lock(done_mutex);
+    ASSERT_TRUE(done_cv.wait_for(lock, std::chrono::minutes(5),
+                                 [&] { return census_runs > 0; }));
+  }
+  ASSERT_EQ(CurrentGcCandidates().count(file_b), 1U);
+  sync_point->DisableProcessing();
+  sync_point->ClearAllCallBacks();
+
+  ASSERT_NO_FATAL_FAILURE(EnableIndirectBlobGC());
+  ASSERT_TRUE(Collected(file_b));
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_NO_FATAL_FAILURE(CheckLiveKeys("b", kTotal, kDeleted));
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCWorkspaceChargeFailureSuppressesOnce) {
+  // Indirect blob GC charges its I/O workspace to the block cache before it
+  // reads any input. When that charge fails, SelectInputs() suppresses every
+  // input once, with a transient suppression. The check for the block-based
+  // table format that follows must not suppress the inputs a second time.
+  // A second suppression would count as a second failure and double the
+  // first retry delay from 1 s to 2 s (see
+  // BlobGcCandidateHeap::SuppressTransient()).
+  //
+  // This block cache fails the first insert of the GC working memory role
+  // after the job has copied its census snapshot. The snapshot charge uses the
+  // same role, so the cache is armed only after the snapshot. The workspace
+  // charge is then the first insert of that role.
+  class FailWorkspaceChargeCache : public CacheWrapper {
+   public:
+    explicit FailWorkspaceChargeCache(std::shared_ptr<Cache> target)
+        : CacheWrapper(std::move(target)) {}
+    const char* Name() const override { return "FailWorkspaceChargeCache"; }
+    using Cache::Insert;
+    Status Insert(const Slice& key, ObjectPtr value,
+                  const CacheItemHelper* helper, size_t charge,
+                  Handle** handle = nullptr, Priority priority = Priority::LOW,
+                  const Slice& compressed_value = Slice(),
+                  CompressionType type = kNoCompression) override {
+      if (helper != nullptr &&
+          helper->role == CacheEntryRole::kIndirectBlobGcWorkingMemory &&
+          armed.exchange(false)) {
+        ++failed_inserts;
+        return Status::MemoryLimit("injected GC workspace charge failure");
+      }
+      return CacheWrapper::Insert(key, value, helper, charge, handle, priority,
+                                  compressed_value, type);
+    }
+    std::atomic<bool> armed{false};
+    std::atomic<int> failed_inserts{0};
+  };
+  auto cache =
+      std::make_shared<FailWorkspaceChargeCache>(NewLRUCache(64 << 20));
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = cache;
+  auto clock =
+      std::make_shared<ManualIndirectBlobGcClock>(env_->GetSystemClock());
+  CompositeEnvWrapper env(env_, clock);
+  Options options = IndirectBlobGCOptions();
+  options.env = &env;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  auto log = std::make_shared<IndirectBlobGcLogCapture>();
+  options.info_log = log;
+  DestroyAndReopen(options);
+  // The DB uses the local `env`, so close it before `env` goes away, also when
+  // an assertion ends the test early.
+  auto close_db = Defer([this] { Close(); });
+  const uint64_t file_number = WriteIndirectBlobGCCandidate(/*live_keys=*/1);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+
+  // `jobs` counts the GC jobs that reach input selection (one census snapshot
+  // per job). Only the first job gets the charge failure.
+  std::atomic<int> jobs{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::RunIndirectBlobGC:SnapshotSelected", [&](void* arg) {
+        if (static_cast<Status*>(arg)->ok() && ++jobs == 1) {
+          cache->armed = true;
+        }
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  // Runs the census and the GC jobs until no more work is queued.
+  const auto run_gc = [&]() {
+    for (int round = 0; round < 3; ++round) {
+      dbfull()->TEST_WaitForBlobReferenceCensus();
+      ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    }
+  };
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  ASSERT_NO_FATAL_FAILURE(run_gc());
+
+  // The first job failed the charge, and suppressed its input once, for the
+  // workspace reason only. The DB clock does not move, so no retry is due yet.
+  ASSERT_EQ(cache->failed_inserts.load(), 1);
+  ASSERT_EQ(jobs.load(), 1);
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+  const std::string skipped =
+      "Indirect blob GC skipped file #" + std::to_string(file_number) + ": ";
+  ASSERT_EQ(log->Count({skipped + "blob GC I/O workspace cache pressure"}), 1U);
+  ASSERT_EQ(log->Count({skipped + "block-based table format is required"}), 0U);
+  ASSERT_EQ(log->Count({"Indirect blob GC skipped file #"}), 1U);
+
+  // Just before 1 s, the input is still suppressed: no new job starts.
+  constexpr uint64_t kFirstRetryMicros = 1000 * 1000;
+  clock->Advance(kFirstRetryMicros - 1000);
+  ASSERT_NO_FATAL_FAILURE(run_gc());
+  ASSERT_EQ(jobs.load(), 1);
+  ASSERT_EQ(RouteTarget(file_number), kInvalidBlobFileNumber);
+
+  // At 1 s after the failure, the census brings the input back, and a new job
+  // collects it. A double suppression would keep it out until 2 s.
+  clock->Advance(1000);
+  ASSERT_NO_FATAL_FAILURE(run_gc());
+  ASSERT_EQ(jobs.load(), 2);
+  ASSERT_NE(RouteTarget(file_number), kInvalidBlobFileNumber);
+  ASSERT_EQ(cache->failed_inserts.load(), 1);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(Get(IndirectBlobGCKey(kIndirectBlobGCKeyCount - 1)),
+            IndirectBlobGCValue(kIndirectBlobGCKeyCount - 1));
+}
+
+namespace {
+
 // Opens a new table reader for `file`, outside the shared table cache.
 Status OpenFreshTableReaderForTest(ColumnFamilyData* cfd,
                                    const FileMetaData& file,
@@ -5911,6 +11749,299 @@ TEST_F(DBBlobBasicTest, BlobRelocationLossAndFingerprintSurviveReopen) {
   check_lost();
 }
 
+TEST_F(DBBlobBasicTest, IndirectBlobGCKeepsRelocationPinnedByCoarseSst) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+
+  Reopen(options);
+  const std::string key = "key";
+  const std::string value = "value-routed-from-a-coarse-sst";
+  ASSERT_OK(Put(key, value));
+  // Flush output is coarse: the exact census does not index it.
+  ASSERT_OK(Flush());
+
+  VersionSet* version_set = dbfull()->GetVersionSet();
+  ColumnFamilyData* cfd = version_set->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_EQ(storage->GetBlobFiles().size(), 1U);
+  const uint64_t origin_file_number =
+      storage->GetBlobFiles().front()->GetBlobFileNumber();
+  ASSERT_TRUE(storage->IsCoarseIndirectOriginBlobPinned(origin_file_number));
+  const uint64_t value_offset =
+      BlobLogHeader::kSize + BlobLogRecord::kHeaderSize + key.size();
+
+  dbfull()->TEST_LockMutex();
+  const uint64_t relocation_file_number = version_set->NewFileNumber();
+  dbfull()->TEST_UnlockMutex();
+  Options relocation_options = options;
+  relocation_options.cf_paths.clear();
+  relocation_options.cf_paths.emplace_back(dbname_, /*target_size=*/0);
+  BlockBasedTableOptions table_options;
+  relocation_options.table_factory.reset(
+      NewBlockBasedTableFactory(table_options));
+  const ImmutableOptions immutable_options(relocation_options);
+  const MutableCFOptions mutable_options(relocation_options);
+  BlobRelocationFileMetadata metadata;
+  uint64_t relocation_file_size = 0;
+  WriteRelocationFileForDBTest(
+      immutable_options, mutable_options, table_options, cfd->GetID(),
+      relocation_file_number,
+      {{origin_file_number, value_offset, value, kNoCompression}}, &metadata,
+      &relocation_file_size);
+
+  // Route the coarse-pinned indirect-origin file to the relocation file.
+  VersionEdit install;
+  install.SetColumnFamily(cfd->GetID());
+  install.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  install.AddBlobRelocationFile(BlobRelocationFileAddition(
+      relocation_file_number, relocation_file_size,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      metadata.encoded_directory, metadata.tail_size));
+  install.SetBlobRelocationRoute(
+      BlobRelocationRoute(origin_file_number, relocation_file_number));
+  install.RetireBlobFile(origin_file_number);
+  ASSERT_OK(ApplyVersionEdit(&install, /*new_descriptor_log=*/false));
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  // The coarse SST still needs the route, so indirect blob GC must not treat
+  // the routed relocation file as empty and delete it
+  // (kBlobRelocationFileDeletion).
+  storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobRelocationFileMetaData(relocation_file_number),
+            nullptr);
+  ASSERT_NE(storage->GetBlobRelocationRouteTarget(origin_file_number),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(Get(key), value);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCCollectsRelocationInputAboveCoarseFlush) {
+  // A coarse SST pins indirect-origin blob files only. A relocation input is
+  // never pinned, even when its number is at or above the frontier of a coarse
+  // SST. This test makes that case with a real flush:
+  //   1. A flush takes its blob file number (for example 25) and pauses.
+  //   2. GC job 1 collects normal file A (below 25) into relocation file R
+  //      (for example 30, above 25).
+  //   3. A compaction drops one of the two values in R, so R is half garbage.
+  //   4. GC job 2 selects R and pauses before it installs.
+  //   5. The flush installs its coarse SST (frontier 25). R is now at or above
+  //      the frontier.
+  //   6. GC job 2 installs: R is collected, with no stale job and no assert.
+  Options options = IndirectBlobGCOptions();
+  // Indirect blob GC relocates live values only when blob GC is on. Auto
+  // compaction stays off, so GC runs only when the test calls it.
+  options.enable_blob_garbage_collection = true;
+  DestroyAndReopen(options);
+  for (size_t i = 0; i < kIndirectBlobGCKeyCount; ++i) {
+    ASSERT_OK(Put(IndirectBlobGCKey(i), IndirectBlobGCValue(i)));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .back()
+                              ->GetBlobFileNumber();
+  // Keys 2 and 3 stay live in A. Key 2 is deleted by an L0 SST that the test
+  // compacts after GC job 1.
+  ASSERT_OK(Delete(IndirectBlobGCKey(0)));
+  ASSERT_OK(Delete(IndirectBlobGCKey(1)));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  ASSERT_OK(Delete(IndirectBlobGCKey(2)));
+  ASSERT_OK(Flush());
+
+  std::atomic<bool> pause_flush{true};
+  std::atomic<bool> pause_gc{false};
+  std::atomic<int> stale_installs{0};
+  SetUpCoarsePinRace(&pause_flush, &pause_gc, &stale_installs);
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  const std::string flush_key = "flush-key";
+  const std::string flush_value(4096, 'f');
+  ASSERT_NO_FATAL_FAILURE(StartPausedCoarseFlush(flush_key, flush_value));
+
+  // GC job 1 allocates R after the flush took its blob file number, so R is
+  // above it.
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  const uint64_t relocation_file = RouteTarget(origin);
+  ASSERT_NE(relocation_file, kInvalidBlobFileNumber);
+  ASSERT_NO_FATAL_FAILURE(CompactL0AndL1IntoL1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_FALSE(IsCoarsePinned(relocation_file));
+
+  pause_gc = true;
+  Status gc_status;
+  port::Thread gc_thread([&]() {
+    gc_status = dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {relocation_file});
+  });
+  TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:WaitGcPaused");
+  TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:ResumeFlush");
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  // The coarse SST of the flush is installed, and R is at or above its
+  // frontier.
+  ASSERT_NE(
+      cfd->current()->storage_info()->OldestCoarseIndirectOriginFileNumber(),
+      kInvalidBlobFileNumber);
+  ASSERT_TRUE(IsCoarsePinned(relocation_file));
+  ASSERT_FALSE(IsCoarsePinned(origin));
+  TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:ResumeGc");
+  gc_thread.join();
+
+  ASSERT_OK(gc_status);
+  ASSERT_EQ(stale_installs.load(), 0);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  // R is collected: its live value moved to a new relocation file, and the
+  // route of A now points to that file.
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_EQ(storage->GetBlobRelocationFileMetaData(relocation_file), nullptr);
+  const uint64_t new_target = RouteTarget(origin);
+  ASSERT_NE(new_target, kInvalidBlobFileNumber);
+  ASSERT_NE(new_target, relocation_file);
+  ASSERT_NE(storage->GetBlobRelocationFileMetaData(new_target), nullptr);
+  const size_t live_key = kIndirectBlobGCKeyCount - 1;
+  ASSERT_EQ(Get(IndirectBlobGCKey(live_key)), IndirectBlobGCValue(live_key));
+  ASSERT_EQ(Get(IndirectBlobGCKey(2)), "NOT_FOUND");
+  ASSERT_EQ(Get(flush_key), flush_value);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  Reopen(options);
+  ASSERT_EQ(Get(IndirectBlobGCKey(live_key)), IndirectBlobGCValue(live_key));
+  ASSERT_EQ(Get(flush_key), flush_value);
+}
+
+TEST_F(DBBlobBasicTest, IndirectBlobGCNormalInputPinnedByCoarseFlushIsStale) {
+  // A normal input that becomes coarse pinned while a GC job runs makes the
+  // job stale: the install check returns TryAgain and nothing is installed.
+  // The coarse SST may reference the input, so GC must not move it. It is a
+  // normal race, not a broken invariant, so a debug build does not assert.
+  //   1. A flush takes its blob file number (for example 25) and pauses.
+  //   2. An L0 to L0 compaction with compaction-time blob GC moves 4 values
+  //      into a new normal blob file N (for example 28, above 25). Its output
+  //      is a coarse L0 SST, because compaction-time blob GC rewrites an
+  //      indirect value only into coarse L0 output. An exact L1 SST below the
+  //      key range, written first, makes this compaction not bottommost,
+  //      because a bottommost compaction writes exact output.
+  //   3. A second compaction, without blob GC, writes the L0 and L1 SSTs as
+  //      one exact L1 SST and drops 2 of the 4 values, so N is half garbage
+  //      and no coarse SST is left.
+  //   4. GC job 1 selects N and pauses before it installs.
+  //   5. The flush installs its coarse SST (frontier 25), which pins N.
+  //   6. GC job 1 is stale and installs nothing.
+  //   7. When the coarse SST is rewritten as an exact SST, the pin goes away
+  //      and GC job 2 collects N.
+  Options options = IndirectBlobGCOptions();
+  // Indirect blob GC relocates live values only when blob GC is on. Auto
+  // compaction stays off, so GC runs only when the test calls it.
+  options.enable_blob_garbage_collection = true;
+  DestroyAndReopen(options);
+  // The L1 SST covers the key range of the L0 SSTs: "key" sorts before "key0",
+  // and "key9" sorts after "key3".
+  ASSERT_OK(Put("key", "low"));
+  ASSERT_OK(Put("key9", "high"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  for (size_t i = 0; i < kIndirectBlobGCKeyCount; ++i) {
+    ASSERT_OK(Put(IndirectBlobGCKey(i), IndirectBlobGCValue(i)));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t flushed_blob_file = cfd->current()
+                                         ->storage_info()
+                                         ->GetBlobFiles()
+                                         .back()
+                                         ->GetBlobFileNumber();
+  std::string value_sst;
+  {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+    value_sst = metadata.levels[0].files.front().name;
+  }
+  ASSERT_OK(Delete(IndirectBlobGCKey(0)));
+  ASSERT_OK(Delete(IndirectBlobGCKey(1)));
+  ASSERT_OK(Flush());
+
+  std::atomic<bool> pause_flush{true};
+  std::atomic<bool> pause_gc{false};
+  std::atomic<int> stale_installs{0};
+  SetUpCoarsePinRace(&pause_flush, &pause_gc, &stale_installs);
+  auto cleanup = Defer([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  const std::string flush_key = "flush-key";
+  const std::string flush_value(4096, 'f');
+  ASSERT_NO_FATAL_FAILURE(StartPausedCoarseFlush(flush_key, flush_value));
+
+  // Compaction-time blob GC with age cutoff 1.0 (every blob file is old
+  // enough) moves every value of the first L0 SST into a new blob file N,
+  // which is numbered above the flush's blob file.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"blob_garbage_collection_age_cutoff", "1.0"}}));
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), {value_sst}, /*level=*/0));
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  const uint64_t input = storage->GetBlobFiles().back()->GetBlobFileNumber();
+  ASSERT_GT(input, flushed_blob_file);
+  ASSERT_TRUE(storage->GetBlobFileMetaData(input)->IsIndirectOrigin());
+  // Drop keys 0 and 1, so half of N is garbage.
+  ASSERT_NO_FATAL_FAILURE(CompactL0AndL1IntoL1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_FALSE(IsCoarsePinned(input));
+
+  pause_gc = true;
+  Status gc_status;
+  port::Thread gc_thread([&]() {
+    gc_status = dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {input});
+  });
+  TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:WaitGcPaused");
+  TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:ResumeFlush");
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_TRUE(IsCoarsePinned(input));
+  TEST_SYNC_POINT("DBBlobBasicTest::CoarsePinRace:ResumeGc");
+  gc_thread.join();
+
+  // The job is stale (TryAgain) and installs nothing: N keeps its values and
+  // has no route.
+  ASSERT_EQ(gc_status.code(), Status::Code::kTryAgain) << gc_status.ToString();
+  ASSERT_EQ(stale_installs.load(), 1);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_TRUE(HasBlobFile(input));
+  ASSERT_EQ(RouteTarget(input), kInvalidBlobFileNumber);
+  for (size_t i = 2; i < kIndirectBlobGCKeyCount; ++i) {
+    ASSERT_EQ(Get(IndirectBlobGCKey(i)), IndirectBlobGCValue(i));
+  }
+  ASSERT_EQ(Get(IndirectBlobGCKey(0)), "NOT_FOUND");
+  ASSERT_EQ(Get(flush_key), flush_value);
+
+  // Rewriting the coarse L0 SST as an exact SST removes the pin, and a later
+  // job collects N.
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_FALSE(IsCoarsePinned(input));
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {input}));
+  ASSERT_EQ(stale_installs.load(), 1);
+  ASSERT_FALSE(HasBlobFile(input));
+  ASSERT_NE(RouteTarget(input), kInvalidBlobFileNumber);
+  for (size_t i = 2; i < kIndirectBlobGCKeyCount; ++i) {
+    ASSERT_EQ(Get(IndirectBlobGCKey(i)), IndirectBlobGCValue(i));
+  }
+  ASSERT_EQ(Get(flush_key), flush_value);
+}
+
 TEST_F(DBBlobBasicTest, BlobRelocationRouteSurvivesReplayAndManifestSnapshot) {
   Options options = GetDefaultOptions();
   options.enable_blob_files = true;
@@ -6363,6 +12494,127 @@ TEST_F(DBBlobBasicTest, BestEffortsRecoveryRollsBackRetirement) {
   ASSERT_EQ(Get(key), expected);
 }
 
+TEST_F(DBBlobBasicTest, BestEffortsRecoveryFallbackPastGcOfNonOldestBlob) {
+  // Best-efforts recovery (without best_efforts_blob_db_repair) falls back to
+  // the newest point in the MANIFEST that it accepts as complete. In a column
+  // family with the blob indirection format fence, a point is complete only
+  // when every blob file that it lists exists. The base rule (a missing blob
+  // file below the smallest oldest_blob_file_number of the SSTs, or linked
+  // only to missing L0 files, is not needed) does not hold there: indirect
+  // blob GC deletes its input files without rewriting the SSTs that reference
+  // them.
+  //
+  // In this example, blob file B1 holds "a1" and "b1", and blob file B2 holds
+  // "a2", "b2" and some deleted keys. A full compaction writes two SSTs, one
+  // with "a1" and "a2" and one with "b1" and "b2". B1 is the oldest blob file
+  // of both SSTs, so no SST links B2. Indirect blob GC moves the live values
+  // of B2 to relocation file R and deletes B2. Then the newest point is made
+  // unusable:
+  // - kDeleteRelocationFile: R is deleted, so the point after the GC edit
+  //   needs a missing relocation file.
+  // - kTruncateManifest: the MANIFEST is cut right before the GC edit.
+  // The point before the GC edit lists B2, which is gone from disk, so
+  // recovery does not accept it. The points before the compaction miss the
+  // flushed SSTs that the compaction deleted. So recovery falls back to the
+  // first point, an empty DB: every read is NotFound, never Corruption.
+  enum class Variant { kDeleteRelocationFile, kTruncateManifest };
+  for (const Variant variant :
+       {Variant::kDeleteRelocationFile, Variant::kTruncateManifest}) {
+    SCOPED_TRACE(variant == Variant::kDeleteRelocationFile
+                     ? "kDeleteRelocationFile"
+                     : "kTruncateManifest");
+    Options options = GetDefaultOptions();
+    options.create_if_missing = true;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = true;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    // Cut compaction output at each change of the first key byte, so the
+    // "a*" keys and the "b*" keys go to different SSTs.
+    options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(1);
+    DestroyAndReopen(options);
+
+    const std::string value_a2(1024, '2');
+    const std::string value_b2(1024, '3');
+    ASSERT_OK(Put("a1", "value-a1"));
+    ASSERT_OK(Put("b1", "value-b1"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("a2", value_a2));
+    ASSERT_OK(Put("b2", value_b2));
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(Put("c" + std::to_string(i), std::string(1024, 'g')));
+    }
+    ASSERT_OK(Flush());
+    std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+    ASSERT_EQ(blob_files.size(), 2U);
+    const uint64_t b1 = blob_files[0];
+    const uint64_t b2 = blob_files[1];
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_OK(Delete("c" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(BuildExactSstAtLevel1());
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+    ASSERT_EQ(NumTableFilesAtLevel(1), 2);
+
+    ColumnFamilyData* cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    {
+      const VersionStorageInfo* storage = cfd->current()->storage_info();
+      for (const FileMetaData* file : storage->LevelFiles(1)) {
+        ASSERT_EQ(file->oldest_blob_file_number, b1);
+      }
+      const auto b2_meta = storage->GetBlobFileMetaData(b2);
+      ASSERT_NE(b2_meta, nullptr);
+      ASSERT_TRUE(b2_meta->GetLinkedSsts().empty());
+    }
+
+    const uint64_t manifest_number = dbfull()->TEST_Current_Manifest_FileNo();
+    const std::string manifest_path =
+        DescriptorFileName(dbname_, manifest_number);
+    uint64_t manifest_size_before_gc = 0;
+    ASSERT_OK(env_->GetFileSize(manifest_path, &manifest_size_before_gc));
+
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {b2}));
+    cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const uint64_t relocation =
+        cfd->current()->storage_info()->GetBlobRelocationRouteTarget(b2);
+    ASSERT_NE(relocation, kInvalidBlobFileNumber);
+    ASSERT_EQ(dbfull()->TEST_Current_Manifest_FileNo(), manifest_number);
+    // The GC edit retires B2, so B2 leaves the Version and is deleted.
+    ASSERT_EQ(cfd->current()->storage_info()->GetBlobFileMetaData(b2), nullptr);
+    dbfull()->TEST_DeleteObsoleteFiles();
+    ASSERT_TRUE(env_->FileExists(BlobFileName(dbname_, b2)).IsNotFound());
+    ASSERT_OK(env_->FileExists(BlobFileName(dbname_, relocation)));
+    ASSERT_EQ(Get("a2"), value_a2);
+    ASSERT_EQ(Get("b2"), value_b2);
+    Close();
+
+    if (variant == Variant::kDeleteRelocationFile) {
+      ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+    } else {
+      ASSERT_OK(
+          test::TruncateFile(env_, manifest_path, manifest_size_before_gc));
+    }
+
+    options.best_efforts_recovery = true;
+    ASSERT_OK(TryReopen(options));
+    for (const char* key : {"a1", "b1", "a2", "b2"}) {
+      SCOPED_TRACE(key);
+      std::string value;
+      const Status s = db_->Get(ReadOptions(), key, &value);
+      ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+    }
+    std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+    it->SeekToFirst();
+    ASSERT_FALSE(it->Valid());
+    ASSERT_OK(it->status());
+    ASSERT_TRUE(GetBlobFileNumbers().empty());
+  }
+}
+
 TEST_F(DBBlobBasicTest, PinnedOldVersionReadsReplacedBlobMetadata) {
   // The file table of a Version does not own its blob file entries; the
   // Version's blob file vector does. An iterator pins an old Version; later
@@ -6717,6 +12969,15 @@ TEST_F(DBBlobBasicTest, RelocationFileListedByOneColumnFamilyIsNotPurged) {
       BlobFileName(dbname_, relocation_file_number);
 
   // Check 1: "two" lists R, then deletes R.
+  //
+  // In "two", R has no route and no SST uses it, so R holds no live value. The
+  // background census job can then list R as a file to remove, and indirect
+  // blob GC can remove R from "two" before the deletion edit below. Then the
+  // deletion edit would fail, because R is no longer live in "two". The test
+  // calls PauseBackgroundWork() so that no census job and no GC job runs
+  // between the two edits. PauseBackgroundWork() also waits for the jobs that
+  // already run.
+  ASSERT_OK(db_->PauseBackgroundWork());
   {
     VersionEdit two_addition;
     two_addition.SetColumnFamily(two_cfd->GetID());
@@ -6729,6 +12990,7 @@ TEST_F(DBBlobBasicTest, RelocationFileListedByOneColumnFamilyIsNotPurged) {
     ASSERT_OK(ApplyVersionEdit(two_cfd, &two_deletion,
                                /*new_descriptor_log=*/false));
   }
+  ASSERT_OK(db_->ContinueBackgroundWork());
   ASSERT_EQ(two_cfd->current()->storage_info()->GetBlobRelocationFileMetaData(
                 relocation_file_number),
             nullptr);
@@ -13372,6 +19634,133 @@ TEST_F(DBBlobBasicTest, CoarseIntraL0CompactionUsesAgeBasedBlobGc) {
   ASSERT_EQ(Get("key"), "blob_value");
 }
 
+TEST_F(DBBlobBasicTest, RelocatingOldestRootPreservesUnlinkedIndirectOrigins) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("old" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("new", value));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto& roots = cfd->current()->storage_info()->GetBlobFiles();
+  ASSERT_EQ(roots.size(), 2U);
+  const uint64_t oldest = roots.front()->GetBlobFileNumber();
+  const uint64_t newer = roots.back()->GetBlobFileNumber();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Delete("old" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Both generations now occur in one exact SST, but the legacy linkage
+  // records only the oldest one. Relocating it must not drop the newer root.
+  const VersionStorageInfo* storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobFileMetaData(newer), nullptr);
+  ASSERT_TRUE(storage->GetBlobFileMetaData(newer)->GetLinkedSsts().empty());
+  const auto census = GetCensusSnapshot(cfd);
+  ASSERT_NE(census, nullptr);
+  ASSERT_EQ(census->GetSstCount(oldest), 1U);
+  ASSERT_EQ(census->GetSstCount(newer), 1U);
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  // SetOptions installs a new Version; indirect blob GC is scheduled only after
+  // the census has caught up with it and published its candidates.
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobRelocationRouteTarget(oldest),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(storage->GetBlobFileMetaData(oldest), nullptr);
+  ASSERT_NE(storage->GetBlobFileMetaData(newer), nullptr);
+  ASSERT_EQ(Get("old3"), value);
+  ASSERT_EQ(Get("new"), value);
+
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = false;
+  Reopen(options);
+  ASSERT_EQ(Get("old3"), value);
+  ASSERT_EQ(Get("new"), value);
+}
+
+TEST_F(DBBlobBasicTest, RelocationPropertiesIncludePhysicalOverheadAndGarbage) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.min_blob_size = 0;
+  Reopen(options);
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), value));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin = cfd->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  ASSERT_OK(Delete("key0"));
+  ASSERT_OK(Delete("key1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const uint64_t physical =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(physical, kInvalidBlobFileNumber);
+  auto relocation =
+      cfd->current()->storage_info()->GetBlobRelocationFileMetaData(physical);
+  ASSERT_NE(relocation, nullptr);
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobStats().total_file_size,
+            relocation->GetFileSize());
+  ASSERT_OK(Delete("key2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(BuildExactSstAtLevel1());
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  const auto stats = storage->GetBlobStats();
+  ASSERT_EQ(stats.total_file_size, relocation->GetFileSize());
+  ASSERT_EQ(stats.total_garbage_size,
+            value.size() + kSimpleGen2BlobTrailerSize);
+  uint64_t table_bytes = 0;
+  for (int level = 0; level < storage->num_levels(); ++level) {
+    for (const FileMetaData* file : storage->LevelFiles(level)) {
+      table_bytes += file->fd.GetFileSize();
+    }
+  }
+  ASSERT_EQ(storage->EstimateLiveDataSize(),
+            table_bytes + stats.total_file_size - stats.total_garbage_size);
+  ASSERT_GT(stats.total_file_size - stats.total_garbage_size,
+            value.size() + kSimpleGen2BlobTrailerSize);
+  // Version-owned metadata must be released before its VersionSet is closed.
+  relocation.reset();
+  Reopen(options);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ColumnFamilyData* const reopened_cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(reopened_cfd->current()
+                ->storage_info()
+                ->GetBlobStats()
+                .total_garbage_size,
+            stats.total_garbage_size);
+  ASSERT_EQ(Get("key3"), value);
+}
+
 namespace {
 
 // The keys that "rocksdb.indirect-blob-gc-stats" reports from the census diff
@@ -13590,8 +19979,13 @@ TEST_F(DBBlobBasicTest, CensusSignalsStayOffWithoutBlobIndirection) {
 
   const std::map<std::string, std::string> stats = GetCensusSignals(db_.get());
   for (const auto& entry : stats) {
-    EXPECT_EQ(entry.second, entry.first == "census-state" ? "none" : "0")
-        << entry.first;
+    // corrupt-input-file-list is a list of file numbers, so it is empty (not
+    // "0") when no file is corrupt.
+    const char* const off_value = entry.first == "census-state" ? "none"
+                                  : entry.first == "corrupt-input-file-list"
+                                      ? ""
+                                      : "0";
+    EXPECT_EQ(entry.second, off_value) << entry.first;
   }
   ASSERT_EQ(GetCensusUnreadyProperty(db_.get()), 0U);
 

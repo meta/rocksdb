@@ -42,6 +42,8 @@
 #include "table/table_builder.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
+#include "util/crc32c.h"
 #include "util/defer.h"
 #include "util/random.h"
 #include "util/string_util.h"
@@ -3098,7 +3100,8 @@ TEST(BlobReferenceCensusTest, MutableWorkerPublishesOnlyCaughtUpEpoch) {
   {
     ASSERT_OK(census.BeginGcJob(9, &gc_token));
     std::shared_ptr<BlobReferenceCensusState> selected;
-    ASSERT_OK(census.SnapshotSelected(gc_token, 9, {10, 20}, &selected));
+    ASSERT_OK(census.SnapshotSelected(gc_token, 9, {10, 20},
+                                      /*gc_block_cache=*/nullptr, &selected));
     ASSERT_EQ(selected->GetSstCount(10), 0U);
     ASSERT_EQ(selected->GetSstCount(20), 1U);
     census.EndGcJob(gc_token);
@@ -3273,13 +3276,25 @@ TEST(BlobGcCandidateHeapTest, RanksUpdatesAndRetiresPhysicalFiles) {
   heap.SetPhysicalFile({10, 1000, true});
   heap.SetPhysicalFile({20, 2000, false});
   heap.SetPhysicalFile({30, 1000, false});
-  ASSERT_OK(heap.AdjustLiveBytes(10, 300, true));
-  ASSERT_OK(heap.AdjustLiveBytes(20, 200, true));
-  ASSERT_OK(heap.AdjustLiveBytes(30, 800, true));
-  ASSERT_EQ(heap.Select()[0], 20U);
-  ASSERT_EQ(heap.Select()[1], 10U);
-  ASSERT_EQ(heap.Select()[2], 0U);
-  ASSERT_OK(heap.AdjustLiveBytes(30, 800, false));
+  ASSERT_OK(heap.AdjustLiveBytes(10, 300, 3, true));
+  ASSERT_OK(heap.AdjustLiveBytes(20, 200, 2, true));
+  ASSERT_OK(heap.AdjustLiveBytes(30, 800, 8, true));
+  // In this example, file 30 has 800 of its 1000 bytes live, so its garbage
+  // ratio is 20%. Select() ranks files by garbage ratio and has no garbage
+  // limit, so it returns file 30 as the third file. The census job then
+  // applies the indirect_blob_gc_garbage_ratio option with CutSelection(). At
+  // 0.5, the cut removes file 30 and keeps files 20 (90%) and 10 (70%).
+  BlobGcCandidateHeap::SelectionBytes selected_bytes{};
+  BlobGcCandidateHeap::Selection selected = heap.Select(&selected_bytes);
+  ASSERT_EQ(selected[0], 20U);
+  ASSERT_EQ(selected[1], 10U);
+  ASSERT_EQ(selected[2], 30U);
+  ASSERT_EQ(selected[3], 0U);
+  BlobGcCandidateHeap::CutSelection(0.5, selected_bytes, &selected);
+  ASSERT_EQ(selected[0], 20U);
+  ASSERT_EQ(selected[1], 10U);
+  ASSERT_EQ(selected[2], 0U);
+  ASSERT_OK(heap.AdjustLiveBytes(30, 800, 8, false));
   ASSERT_EQ(heap.Select()[0], 30U);
   heap.DeletePhysicalFile(30);
   ASSERT_EQ(heap.Select()[0], 20U);
@@ -3331,6 +3346,77 @@ TEST(BlobReferenceCensusTest, MetadataCommitFencesGcJobStart) {
   census.EndGcJob(gc_token);
 }
 
+TEST(BlobGcCandidateHeapTest, CutSelectionKeepsLeadingFilesAtRatio) {
+  // The census job calls CutSelection() with the indirect_blob_gc_garbage_ratio
+  // option, so that indirect blob GC gets only files with enough garbage.
+  // Select() returns the files ranked by garbage ratio, best first. So the cut
+  // keeps the leading files whose garbage is at least the ratio times their
+  // size, and clears every file after the first one that fails. A file exactly
+  // at the ratio is kept, with the same rule as the GC job check
+  // (DBImpl::IndirectBlobGCJob::DecideInputs()).
+  //
+  // In this example, files 10 to 15 have 1000 bytes each, and 1000, 900, 500,
+  // 300, 100 and 0 garbage bytes (100%, 90%, 50%, 30%, 10% and 0% garbage).
+  BlobGcCandidateHeap heap;
+  constexpr uint64_t kFileBytes = 1000;
+  const std::array<uint64_t, 6> garbage_bytes = {1000, 900, 500, 300, 100, 0};
+  for (size_t i = 0; i < garbage_bytes.size(); ++i) {
+    const uint64_t file_number = 10 + i;
+    heap.SetPhysicalFile({file_number, kFileBytes, false});
+    if (garbage_bytes[i] != kFileBytes) {
+      ASSERT_OK(heap.AdjustLiveBytes(file_number, kFileBytes - garbage_bytes[i],
+                                     /*count=*/1, /*add=*/true));
+    }
+  }
+  BlobGcCandidateHeap::SelectionBytes bytes{};
+  const BlobGcCandidateHeap::Selection all = heap.Select(&bytes);
+  const BlobGcCandidateHeap::Selection expected_all = {10, 11, 12, 13,
+                                                       14, 15, 0,  0};
+  ASSERT_EQ(all, expected_all);
+  for (size_t i = 0; i < garbage_bytes.size(); ++i) {
+    ASSERT_EQ(bytes[i].garbage_bytes, garbage_bytes[i]);
+    ASSERT_EQ(bytes[i].total_bytes, kFileBytes);
+  }
+
+  struct CutCase {
+    double ratio;
+    BlobGcCandidateHeap::Selection expected;
+  };
+  // At 0.3, file 13 (exactly 30%) is kept. At 0.5, file 12 (exactly 50%) is
+  // kept. At 1.0, only file 10 (100%) is kept.
+  const CutCase cases[] = {
+      {0.3, {10, 11, 12, 13, 0, 0, 0, 0}},
+      {0.5, {10, 11, 12, 0, 0, 0, 0, 0}},
+      {1.0, {10, 0, 0, 0, 0, 0, 0, 0}},
+  };
+  for (const CutCase& cut_case : cases) {
+    SCOPED_TRACE("ratio=" + std::to_string(cut_case.ratio));
+    BlobGcCandidateHeap::Selection selection = all;
+    BlobGcCandidateHeap::CutSelection(cut_case.ratio, bytes, &selection);
+    ASSERT_EQ(selection, cut_case.expected);
+  }
+
+  // The cut keeps only a leading part. In this example list, file 14 (10%)
+  // comes before file 12 (50%). At 0.3, file 14 fails, so file 12 is cleared
+  // too, although it passes. An empty slot (file number 0) also ends the list.
+  BlobGcCandidateHeap::Selection unordered = {11, 14, 12, 0, 13, 0, 0, 0};
+  BlobGcCandidateHeap::SelectionBytes unordered_bytes{};
+  unordered_bytes[0] = {900, kFileBytes};
+  unordered_bytes[1] = {100, kFileBytes};
+  unordered_bytes[2] = {500, kFileBytes};
+  unordered_bytes[4] = {300, kFileBytes};
+  BlobGcCandidateHeap::CutSelection(0.3, unordered_bytes, &unordered);
+  const BlobGcCandidateHeap::Selection expected_unordered = {11, 0, 0, 0,
+                                                             0,  0, 0, 0};
+  ASSERT_EQ(unordered, expected_unordered);
+  BlobGcCandidateHeap::Selection gap = {11, 0, 13, 0, 0, 0, 0, 0};
+  BlobGcCandidateHeap::SelectionBytes gap_bytes{};
+  gap_bytes[0] = {900, kFileBytes};
+  gap_bytes[2] = {300, kFileBytes};
+  BlobGcCandidateHeap::CutSelection(0.3, gap_bytes, &gap);
+  ASSERT_EQ(gap, expected_unordered);
+}
+
 TEST(BlobGcCandidateHeapTest, ExactPortableRatioOrdering) {
   const uint64_t max = std::numeric_limits<uint64_t>::max();
   ASSERT_GT(BlobGcCandidateHeap::CompareRatios(max - 1, max, max - 2, max), 0);
@@ -3359,6 +3445,118 @@ TEST(BlobReferenceCensusTest, AmbiguousMetadataCommitBlocksNextCommit) {
   ASSERT_TRUE(census.BeginMetadataCommit().IsColumnFamilyDropped());
 }
 
+TEST(BlobReferenceCensusTest, RepeatedMismatchIsTrackedPerFile) {
+  BlobReferenceCensus census;
+  // A first report for a file requests a rebuild.
+  ASSERT_FALSE(census.ReportMismatch(10));
+  // A report for another file is not a repeat: it requests a rebuild too.
+  ASSERT_FALSE(census.ReportMismatch(20));
+  // The same file again, with no match in between, is a repeat.
+  ASSERT_TRUE(census.ReportMismatch(20));
+  ASSERT_EQ(census.gc_mismatch_suppress_count(), 1U);
+  // A matching indirect blob GC check clears it.
+  census.ClearMismatch(20);
+  ASSERT_FALSE(census.ReportMismatch(20));
+}
+
+TEST(BlobReferenceCensusTest, ClearMismatchForgetsOnlyItsOwnFile) {
+  // Indirect blob GC calls ClearMismatch() for each checked input of a job when
+  // no input of that job mismatched. A match of another file must keep the
+  // remembered mismatch, so that a match of one file does not hide a repeat
+  // mismatch of a different file. A match of the same file forgets it, so its
+  // next mismatch requests a rebuild again.
+  BlobReferenceCensus census;
+  ASSERT_FALSE(census.ReportMismatch(20));
+  // A match of file 30 keeps the mismatch of file 20: the next mismatch of
+  // file 20 is a repeat.
+  census.ClearMismatch(30);
+  ASSERT_TRUE(census.ReportMismatch(20));
+  ASSERT_EQ(census.gc_mismatch_suppress_count(), 1U);
+  // A match of file 20 forgets it: the next mismatch of file 20 requests a
+  // rebuild and is not counted as suppressed.
+  census.ClearMismatch(20);
+  ASSERT_FALSE(census.ReportMismatch(20));
+  ASSERT_EQ(census.gc_mismatch_suppress_count(), 1U);
+}
+
+TEST(BlobReferenceCensusTest, MismatchReportBlocksPublish) {
+  // After indirect blob GC reports a mismatch, the census is not ready, and the
+  // worker of the same build cannot publish it again (for example from the
+  // apply after an install) before the census job rebuilds it.
+  BlobReferenceCensus census;
+  const uint64_t token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(token, 3, nullptr, nullptr));
+  ASSERT_OK(census.FinalizeWorkerBuild(token));
+  ASSERT_EQ(census.TryPublishWorker(token, 3, 3),
+            BlobReferenceCensus::PublishResult::kPublished);
+  ASSERT_TRUE(census.IsReady(3));
+  ASSERT_FALSE(census.ReportMismatch(10));
+  ASSERT_FALSE(census.IsReady(3));
+  ASSERT_EQ(census.TryPublishWorker(token, 3, 3),
+            BlobReferenceCensus::PublishResult::kStale);
+  ASSERT_FALSE(census.IsReady(3));
+  // The census job takes the report and fails the build. The next build can
+  // publish again.
+  ASSERT_TRUE(census.TakeMismatchReport());
+  auto garbage = census.FailBuild(token);
+  const uint64_t next_token = census.BeginBuild();
+  ASSERT_OK(census.ResetWorkerState(next_token, 3, nullptr, nullptr));
+  ASSERT_OK(census.FinalizeWorkerBuild(next_token));
+  ASSERT_EQ(census.TryPublishWorker(next_token, 3, 3),
+            BlobReferenceCensus::PublishResult::kPublished);
+}
+
+TEST(BlobGcCandidateHeapTest, OversizedFileStaysSuppressedUntilItFits) {
+  // GC found that file 10 has 800 live values, and that a job can hold at most
+  // 500. The file stays suppressed while its live values change but stay above
+  // 500. It comes back when it has 500 live values or fewer. File 20 has a
+  // normal suppression, which any change of its live bytes ends.
+  BlobGcCandidateHeap heap;
+  heap.SetPhysicalFile({10, 100000, false});
+  heap.SetPhysicalFile({20, 100000, false});
+  ASSERT_OK(heap.AdjustLiveBytes(10, 8000, 800, /*add=*/true));
+  ASSERT_OK(heap.AdjustLiveBytes(20, 8000, 800, /*add=*/true));
+  heap.SuppressOversized(10, /*max_live_count=*/500);
+  heap.Suppress(20, /*retry_micros=*/0);
+  ASSERT_EQ(heap.Select()[0], 0U);
+  // A census change subtracts the old totals of a generation number, then
+  // adds the new ones: 800 -> 0 -> 790 live values for file 10.
+  ASSERT_OK(heap.AdjustLiveBytes(10, 8000, 800, /*add=*/false));
+  ASSERT_OK(heap.AdjustLiveBytes(10, 7900, 790, /*add=*/true));
+  ASSERT_OK(heap.AdjustLiveBytes(20, 100, 10, /*add=*/false));
+  ASSERT_EQ(heap.Select()[0], 20U);
+  ASSERT_EQ(heap.Select()[1], 0U);
+  // 790 - 290 = 500 live values: file 10 fits now.
+  ASSERT_OK(heap.AdjustLiveBytes(10, 2900, 290, /*add=*/false));
+  ASSERT_EQ(heap.Select()[0], 10U);
+  ASSERT_EQ(heap.Select()[1], 20U);
+}
+
+TEST(BlobGcCandidateHeapTest, FrontierRiseRetriesSuppressedRelocationFiles) {
+  // Indirect blob GC suppressed relocation files 15, 30 and 50, for example
+  // because a coarse SST pinned a generation number routed to them. When the
+  // lowest coarse frontier of the Version rises from 20 to 40 (the coarse
+  // frontier of an SST is the oldest indirect-origin file number a coarse SST
+  // may reference), the heap retries every suppressed relocation file above the
+  // old frontier (30 and 50). File 15 stays suppressed.
+  BlobGcCandidateHeap heap;
+  heap.SetCoarseIndirectOriginFrontier(20);
+  heap.SetPhysicalFile({15, 1000, false});
+  heap.SetPhysicalFile({30, 1000, false});
+  heap.SetPhysicalFile({50, 1000, false});
+  heap.Suppress(15, /*retry_micros=*/0);
+  heap.Suppress(30, /*retry_micros=*/0);
+  heap.Suppress(50, /*retry_micros=*/0);
+  ASSERT_EQ(heap.Select()[0], 0U);
+  heap.SetCoarseIndirectOriginFrontier(40);
+  const BlobGcCandidateHeap::Selection selected = heap.Select();
+  ASSERT_NE(selected[0], 0U);
+  ASSERT_NE(selected[1], 0U);
+  ASSERT_EQ(selected[2], 0U);
+  ASSERT_NE(selected[0], 15U);
+  ASSERT_NE(selected[1], 15U);
+}
+
 TEST(BlobGcCandidateHeapTest, SuppressionIsRelevantAndRetryable) {
   BlobGcCandidateHeap heap;
   heap.SetPhysicalFile({10, 1000, false});
@@ -3375,7 +3573,7 @@ TEST(BlobGcCandidateHeapTest, SuppressionIsRelevantAndRetryable) {
   // File 10 is suppressed with no retry time, as after a corruption. A change
   // to another file (file 20) does not clear the suppression. A live-byte
   // change of file 10 itself does.
-  ASSERT_OK(heap.AdjustLiveBytes(10, 100, true));
+  ASSERT_OK(heap.AdjustLiveBytes(10, 100, 1, true));
   ASSERT_EQ(heap.Select()[1], 10U);
 }
 
@@ -3420,7 +3618,7 @@ TEST(BlobReferenceCensusTest, CandidateFailureUsesRelevantRevision) {
   ASSERT_OK(census.ApplyWorkerDelta(token, delta));
   // The delta changed only file 20, so the failure report for file 10, made
   // with the stamp of Version 7, still applies and suppresses file 10.
-  census.SuppressWorkerCandidates(stamp, {10}, {}, 0);
+  census.SuppressWorkerCandidates(stamp, {10}, {}, {}, 0);
   ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 20U);
   ASSERT_EQ(census.SelectWorkerCandidates(token)[1], 0U);
 
@@ -3431,10 +3629,10 @@ TEST(BlobReferenceCensusTest, CandidateFailureUsesRelevantRevision) {
   ASSERT_OK(census.ApplyWorkerDelta(token, delta));
   // File 20 changed after the stamp was taken, so this old failure report must
   // not suppress it, even though the file number is the same.
-  census.SuppressWorkerCandidates(stamp, {20}, {}, 0);
+  census.SuppressWorkerCandidates(stamp, {20}, {}, {}, 0);
   ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 20U);
   ASSERT_OK(census.CaptureCandidateStamp(9, {20}, &stamp));
-  census.SuppressWorkerCandidates(stamp, {20}, {20}, 100);
+  census.SuppressWorkerCandidates(stamp, {20}, {20}, {}, 100);
   ASSERT_EQ(census.SelectWorkerCandidates(token)[0], 0U);
   ASSERT_EQ(census.RetryWorkerCandidates(token, 1000099), 1000100U);
   ASSERT_EQ(census.RetryWorkerCandidates(token, 1000100), 0U);
@@ -3442,14 +3640,14 @@ TEST(BlobReferenceCensusTest, CandidateFailureUsesRelevantRevision) {
   // A second transient failure in a row doubles the retry delay, from 1 second
   // to 2 seconds. A change to the file resets the failure count. The test
   // passes the current time as an argument, so it never sleeps.
-  census.SuppressWorkerCandidates(stamp, {20}, {20}, 2000000);
+  census.SuppressWorkerCandidates(stamp, {20}, {20}, {}, 2000000);
   ASSERT_EQ(census.RetryWorkerCandidates(token, 2000001), 4000000U);
   auto canceled = census.FailBuild(token);
   const uint64_t replacement = census.BeginBuild();
   ASSERT_NE(replacement, token);
   ASSERT_OK(census.ResetWorkerState(replacement, 10, nullptr, nullptr));
   ASSERT_OK(census.SetWorkerPhysicalFiles(replacement, {{20, 1000, true}}));
-  census.SuppressWorkerCandidates(stamp, {20}, {}, 0);
+  census.SuppressWorkerCandidates(stamp, {20}, {}, {}, 0);
   ASSERT_EQ(census.SelectWorkerCandidates(replacement)[0], 20U);
 }
 
@@ -3466,7 +3664,7 @@ TEST(BlobReferenceCensusTest, SelectedSnapshotOwnsItsCacheReservation) {
   const size_t worker_charge = cache->GetPinnedUsage();
   ASSERT_GT(worker_charge, 0U);
   std::shared_ptr<BlobReferenceCensusState> selected;
-  ASSERT_OK(census.ReadSelectedSnapshot(7, {10}, &selected));
+  ASSERT_OK(census.ReadSelectedSnapshot(7, {10}, cache, &selected));
   ASSERT_GT(cache->GetPinnedUsage(), worker_charge);
   selected.reset();
   ASSERT_EQ(cache->GetPinnedUsage(), worker_charge);
@@ -3486,7 +3684,8 @@ TEST(BlobReferenceCensusTest, SelectedSnapshotRejectsUnchargedAllocation) {
   ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
             BlobReferenceCensus::PublishResult::kPublished);
   std::shared_ptr<BlobReferenceCensusState> selected;
-  ASSERT_TRUE(census.ReadSelectedSnapshot(7, {10}, &selected).IsMemoryLimit());
+  ASSERT_TRUE(
+      census.ReadSelectedSnapshot(7, {10}, cache, &selected).IsMemoryLimit());
   ASSERT_EQ(selected, nullptr);
   ASSERT_TRUE(census.IsReady(7));
 }
@@ -3577,7 +3776,8 @@ TEST(BlobReferenceCensusTest, GcJobPausesWorkerUntilSnapshot) {
   ASSERT_EQ(census.WorkerVersionNumber(), 3U);
 
   std::shared_ptr<BlobReferenceCensusState> selected;
-  ASSERT_OK(census.SnapshotSelected(gc_token, 3, {10}, &selected));
+  ASSERT_OK(census.SnapshotSelected(gc_token, 3, {10},
+                                    /*gc_block_cache=*/nullptr, &selected));
   ASSERT_EQ(selected->GetSstCount(10), 1U);
   ASSERT_FALSE(census.IsSnapshotPending());
   ASSERT_OK(census.ApplyWorkerDelta(token, delta));
@@ -3960,6 +4160,87 @@ TEST(BlobReferenceCensusTest, PublishEndsRestartLimit) {
   bool overflowed = false;
   ASSERT_OK(census.TakeBuildDeltas(token, &deltas, &overflowed));
   ASSERT_TRUE(overflowed);
+  garbage = census.FailBuild(token);
+}
+
+TEST(BlobReferenceCensusTest, RestartedMismatchRebuildKeepsMismatchState) {
+  // A mismatch rebuild can fail and restart before it publishes: after a
+  // change log overflow, a rebuild install or another failure. The census sees
+  // each restart as FailBuild() and BeginBuild(), so a rebuild install
+  // restarts the build in the same way as another failure. The restarted build
+  // is still the rebuild that the report asked for, so its publish must keep
+  // the remembered files and the count of mismatch rebuilds in a row. Each
+  // case of the loop uses a different restart; kNone has no restart.
+  enum class Restart { kNone, kOverflow, kOtherFailure };
+  for (Restart restart :
+       {Restart::kNone, Restart::kOverflow, Restart::kOtherFailure}) {
+    SCOPED_TRACE("restart=" + std::to_string(static_cast<int>(restart)));
+    BlobReferenceCensus census;
+    uint64_t token = census.BeginBuild();
+    ASSERT_OK(census.ResetWorkerState(token, 7, nullptr, nullptr));
+    ASSERT_OK(census.FinalizeWorkerBuild(token));
+    ASSERT_EQ(census.TryPublishWorker(token, 7, 7),
+              BlobReferenceCensus::PublishResult::kPublished);
+    // GC reports file 100 for the first time. The census job takes the report
+    // and fails the build, and the mismatch rebuild starts.
+    ASSERT_FALSE(census.ReportMismatch(100));
+    ASSERT_TRUE(census.TakeMismatchReport());
+    auto garbage = census.FailBuild(token);
+    token = census.BeginBuild();
+    if (restart == Restart::kOverflow) {
+      ASSERT_TRUE(census.UseOverflowRestart());
+    }
+    if (restart != Restart::kNone) {
+      garbage = census.FailBuild(token);
+      token = census.BeginBuild();
+    }
+    ASSERT_OK(census.ResetWorkerState(token, 8, nullptr, nullptr));
+    ASSERT_OK(census.FinalizeWorkerBuild(token));
+    ASSERT_EQ(census.TryPublishWorker(token, 8, 8),
+              BlobReferenceCensus::PublishResult::kPublished);
+    ASSERT_EQ(census.unresolved_mismatch_file_count(), 1U);
+    ASSERT_EQ(census.mismatch_rebuilds_in_a_row(), 1U);
+    // The next report of file 100 is a repeat, so GC suppresses the file
+    // instead of asking for one more rebuild.
+    ASSERT_TRUE(census.ReportMismatch(100));
+    // A later build that no report requested (here, a retry after a failure)
+    // starts the mismatch state again at its first publish.
+    garbage = census.FailBuild(token);
+    token = census.BeginBuild();
+    ASSERT_OK(census.ResetWorkerState(token, 9, nullptr, nullptr));
+    ASSERT_OK(census.FinalizeWorkerBuild(token));
+    ASSERT_EQ(census.TryPublishWorker(token, 9, 9),
+              BlobReferenceCensus::PublishResult::kPublished);
+    ASSERT_EQ(census.unresolved_mismatch_file_count(), 0U);
+    ASSERT_EQ(census.mismatch_rebuilds_in_a_row(), 0U);
+    garbage = census.FailBuild(token);
+  }
+}
+
+TEST(BlobReferenceCensusTest, MismatchWaitStepOnlyAfterMismatchFailure) {
+  // After more than two mismatch rebuilds in a row, only a build that failed
+  // because of a mismatch report waits. A restart for another reason (for
+  // example a rebuild install from DeleteFilesInRange()) starts at once.
+  BlobReferenceCensus census;
+  uint64_t token = census.BeginBuild();
+  // Three first reports of files 100, 101 and 102, each with a mismatch
+  // rebuild.
+  for (uint64_t file : {100, 101, 102}) {
+    ASSERT_FALSE(census.ReportMismatch(file));
+    ASSERT_TRUE(census.TakeMismatchReport());
+    auto garbage = census.FailBuild(token);
+    token = census.BeginBuild();
+  }
+  ASSERT_TRUE(census.MismatchRebuildMustWait());
+  // The running build fails with no pending report: no wait step.
+  ASSERT_FALSE(census.TakeMismatchReport());
+  ASSERT_EQ(census.TakeMismatchRebuildWaitStep(), 0U);
+  auto garbage = census.FailBuild(token);
+  token = census.BeginBuild();
+  // A fourth report fails the build: it waits, and this is the first wait.
+  ASSERT_FALSE(census.ReportMismatch(103));
+  ASSERT_TRUE(census.TakeMismatchReport());
+  ASSERT_EQ(census.TakeMismatchRebuildWaitStep(), 1U);
   garbage = census.FailBuild(token);
 }
 

@@ -583,14 +583,16 @@ struct BlockBasedTableOptions {
   //
   // (h) CacheEntryRole::kIndirectBlobGcWorkingMemory
   // (i) If kEnabled:
-  // Charge memory usage of indirect blob GC. Indirect blob GC is a background
-  // job that copies the live values out of a blob file with a lot of garbage
-  // (see `enable_blob_indirection`). Its working memory holds the exact list
-  // of live references to the file.
+  // Charge memory usage of indirect blob GC jobs. Indirect blob GC is a
+  // background job that copies the live values out of a few blob files with
+  // a lot of garbage (see `enable_blob_indirection`). A job charges the live
+  // references of its input files, its copy of the census entries of these
+  // files, its list of planned SST reads, its SST readers, and its read
+  // buffers.
   // If such memory usage exceeds the available space left in the block cache
   // at some point (i.e, causing a cache full under
-  // `LRUCacheOptions::strict_capacity_limit` = true), the charge fails with
-  // Status::MemoryLimit().
+  // `LRUCacheOptions::strict_capacity_limit` = true), GC skips the files that
+  // it cannot charge and tries them again later. The GC job does not fail.
   // (ii) If kDisabled:
   // Does not charge the memory usage mentioned above.
   // (iii) Compatible existing behavior:
