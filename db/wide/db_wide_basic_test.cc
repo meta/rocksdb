@@ -7,8 +7,11 @@
 #include <cctype>
 #include <memory>
 
+#include "db/blob/blob_index.h"
 #include "db/db_test_util.h"
+#include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_column_test_util.h"
+#include "db/write_batch_internal.h"
 #include "port/stack_trace.h"
 #include "rocksdb/utilities/stackable_db.h"
 #include "test_util/testutil.h"
@@ -3482,6 +3485,83 @@ TEST_F(DBWideBasicTest, EmptyEntityWithBlobOptions) {
         db_->Get(ReadOptions(), db_->DefaultColumnFamily(), key, &result));
     ASSERT_TRUE(result.empty());
   }
+}
+
+TEST_F(DBWideBasicTest, OptionOffFlushAndCompactionSkipBlobIndexValidate) {
+  // Background: with enable_blob_indirection off, the table builder,
+  // FileMetaData::UpdateBoundaries() and BlobGarbageMeter read the blob
+  // indexes of an entity through
+  // WideColumnSerialization::ForEachBlobFileNumber(). It only decodes each
+  // blob index. Only the reference collector, which runs with the option on,
+  // uses ForEachBlobIndex(), which also runs BlobIndex::Validate().
+  //
+  // This test writes an entity whose blob column has a compression type that
+  // is neither built in nor custom, so Validate() rejects it. RocksDB never
+  // writes such a blob index, but a raw WriteBatch can. Flush and compaction
+  // never read the blob, so they must succeed.
+  Options options = GetBlobTestOptions();
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 50;
+  Reopen(options);
+
+  // Make a real blob file, so that the entity refers to a blob file that the
+  // version knows.
+  ASSERT_OK(Put("blob_owner", GenerateLargeValue(100)));
+  ASSERT_OK(Flush());
+  const std::vector<uint64_t> blob_files = GetBlobFileNumbers();
+  ASSERT_EQ(blob_files.size(), 1);
+
+  // The first value after the built-in types is not a valid blob compression
+  // type, because custom types start at kFirstCustomCompression.
+  const CompressionType invalid_compression =
+      static_cast<CompressionType>(kLastBuiltinCompression + 1);
+  ASSERT_LT(invalid_compression, kFirstCustomCompression);
+  // The blob is never read, so the offset is an example value. The size (1000
+  // bytes) is much larger than the 100-byte blob of "blob_owner", so the
+  // property check below can tell the two SSTs apart.
+  std::string blob_index_encoding;
+  BlobIndex::EncodeBlob(&blob_index_encoding, blob_files[0], /*offset=*/100,
+                        /*size=*/1000, invalid_compression);
+  BlobIndex blob_index;
+  ASSERT_OK(blob_index.DecodeFrom(blob_index_encoding));
+  ASSERT_EQ(blob_index.Validate().code(), Status::kCorruption);
+
+  const WideColumns columns{{"x1", ""}, {"x2", "inline"}};
+  std::string entity;
+  ASSERT_OK(
+      WideColumnSerialization::SerializeV2(columns, {{0, blob_index}}, entity));
+  ASSERT_EQ(WideColumnSerialization::ForEachBlobIndex(
+                entity, [](const BlobIndex&) { return Status::OK(); })
+                .code(),
+            Status::kCorruption);
+
+  WriteBatch batch;
+  ASSERT_OK(WriteBatchInternal::PutEntitySerialized(
+      &batch, /*column_family_id=*/0, "bad_compression_entity", entity));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  ASSERT_OK(Flush());
+
+  // The flush found the blob column: the new SST counts its bytes.
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_EQ(properties.size(), 2);
+  uint64_t max_referenced_blob_bytes = 0;
+  for (const auto& entry : properties) {
+    max_referenced_blob_bytes =
+        std::max(max_referenced_blob_bytes,
+                 entry.second->referenced_blob_bytes.value_or(0));
+  }
+  ASSERT_GE(max_referenced_blob_bytes, blob_index.size());
+
+  // The compaction also walks the entity in the compaction iterator and in
+  // BlobGarbageMeter. kForce makes it rewrite the SSTs instead of moving them.
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  ASSERT_EQ(GetBlobFileNumbers(), blob_files);
 }
 
 TEST_F(DBWideBasicTest, EntityBlobReverseIteration) {

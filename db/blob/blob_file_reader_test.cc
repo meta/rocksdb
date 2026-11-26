@@ -23,6 +23,7 @@
 #include "rocksdb/options.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
+#include "util/coding.h"
 #include "util/compression.h"
 #include "utilities/fault_injection_env.h"
 
@@ -1000,6 +1001,184 @@ TEST_F(BlobFileReaderTest, IncorrectColumnFamily) {
                                      blob_file_read_hist, blob_file_number,
                                      nullptr /*IOTracer*/, &reader)
                   .IsCorruption());
+}
+
+namespace {
+
+// Writes blob file `blob_file_number` with one blob and a version 2 header,
+// which is the header that blob indirection writes. The header names
+// `header_file_number`. A test passes another number than `blob_file_number`
+// to make a header that does not match the file name.
+void WriteVersion2BlobFile(const ImmutableOptions& immutable_options,
+                           uint32_t column_family_id, uint64_t blob_file_number,
+                           uint64_t header_file_number, const Slice& key,
+                           const Slice& blob, uint64_t* blob_offset) {
+  const std::string blob_file_path =
+      BlobFileName(immutable_options.cf_paths.front().path, blob_file_number);
+  std::unique_ptr<FSWritableFile> file;
+  ASSERT_OK(NewWritableFile(immutable_options.fs.get(), blob_file_path, &file,
+                            FileOptions()));
+  std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+      std::move(file), blob_file_path, FileOptions(), immutable_options.clock));
+  BlobLogWriter blob_log_writer(std::move(file_writer), immutable_options.clock,
+                                /*statistics=*/nullptr, blob_file_number,
+                                /*use_fsync=*/false, /*do_flush=*/false);
+
+  BlobLogHeader header(column_family_id, kNoCompression, /*_has_ttl=*/false,
+                       ExpirationRange());
+  header.version = kVersion2;
+  header.file_number = header_file_number;
+  ASSERT_OK(blob_log_writer.WriteHeader(WriteOptions(), header));
+
+  uint64_t key_offset = 0;
+  ASSERT_OK(blob_log_writer.AddRecord(WriteOptions(), key, blob, &key_offset,
+                                      blob_offset));
+
+  // The footer of a version 2 file is the same as in version 1.
+  BlobLogFooter footer;
+  footer.blob_count = 1;
+  std::string checksum_method;
+  std::string checksum_value;
+  ASSERT_OK(blob_log_writer.AppendFooter(WriteOptions(), footer,
+                                         &checksum_method, &checksum_value));
+}
+
+}  // anonymous namespace
+
+TEST(BlobLogHeaderTest, Version2HoldsFileNumber) {
+  // A version 2 header stores the file's own number in the first
+  // expiration-range field and 0 in the second one. Its flags byte is 0.
+  BlobLogHeader header(/*_column_family_id=*/7, kNoCompression,
+                       /*_has_ttl=*/false, ExpirationRange());
+  header.version = kVersion2;
+  header.file_number = 42;
+  std::string encoded;
+  header.EncodeTo(&encoded);
+  ASSERT_EQ(encoded.size(), BlobLogHeader::kSize);
+
+  BlobLogHeader decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  EXPECT_EQ(decoded.version, kVersion2);
+  EXPECT_EQ(decoded.column_family_id, 7U);
+  EXPECT_EQ(decoded.file_number, 42U);
+  EXPECT_FALSE(decoded.has_ttl);
+  EXPECT_EQ(decoded.expiration_range, ExpirationRange());
+
+  // Byte offsets in the 30-byte header: version at 4, flags at 12, and the two
+  // expiration-range fields at 14 and 22.
+  const auto changed = [](const std::string& src, size_t offset,
+                          const std::string& bytes) {
+    std::string copy = src;
+    copy.replace(offset, bytes.size(), bytes);
+    return copy;
+  };
+  std::string version3;
+  PutFixed32(&version3, 3);
+  std::string zero64;
+  PutFixed64(&zero64, 0);
+  std::string one64;
+  PutFixed64(&one64, 1);
+  struct BadHeader {
+    const char* name;
+    std::string bytes;
+    const char* message;
+  };
+  const std::vector<BadHeader> bad_v2{
+      {"unknown version 3", changed(encoded, 4, version3),
+       "Unknown header version"},
+      {"file number 0", changed(encoded, 14, zero64),
+       "Invalid blob file number"},
+      {"nonzero second field", changed(encoded, 22, one64),
+       "Invalid blob file number"},
+      {"has_ttl in version 2", changed(encoded, 12, std::string(1, '\x01')),
+       "Invalid blob file flags"},
+      {"flag bit 2 in version 2", changed(encoded, 12, std::string(1, '\x04')),
+       "Invalid blob file flags"},
+  };
+  for (const auto& bad : bad_v2) {
+    SCOPED_TRACE(bad.name);
+    BlobLogHeader rejected;
+    const Status s = rejected.DecodeFrom(bad.bytes);
+    ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+    EXPECT_NE(s.ToString().find(bad.message), std::string::npos)
+        << s.ToString();
+  }
+
+  // Version 1 has no file number.
+  BlobLogHeader v1(/*_column_family_id=*/7, kNoCompression, /*_has_ttl=*/false,
+                   ExpirationRange());
+  std::string encoded_v1;
+  v1.EncodeTo(&encoded_v1);
+  BlobLogHeader decoded_v1;
+  ASSERT_OK(decoded_v1.DecodeFrom(encoded_v1));
+  EXPECT_EQ(decoded_v1.version, kVersion1);
+  EXPECT_EQ(decoded_v1.file_number, kInvalidBlobFileNumber);
+}
+
+TEST_F(BlobFileReaderTest, OpensVersion2File) {
+  // A version 2 file whose header names the file's own number opens, and its
+  // blob reads back.
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileReaderTest_OpensVersion2File"),
+      0);
+  options.enable_blob_files = true;
+  ImmutableOptions immutable_options(options);
+
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t blob_file_number = 5;
+  const std::string key = "key";
+  const std::string blob = "blob";
+  uint64_t blob_offset = 0;
+  WriteVersion2BlobFile(immutable_options, column_family_id, blob_file_number,
+                        /*header_file_number=*/blob_file_number, key, blob,
+                        &blob_offset);
+
+  std::unique_ptr<BlobFileReader> reader;
+  ASSERT_OK(BlobFileReader::Create(
+      immutable_options, ReadOptions(), FileOptions(), column_family_id,
+      /*blob_file_read_hist=*/nullptr, blob_file_number,
+      /*io_tracer=*/nullptr, &reader));
+  ASSERT_NE(reader, nullptr);
+
+  std::unique_ptr<BlobContents> value;
+  uint64_t bytes_read = 0;
+  ASSERT_OK(reader->GetBlob(ReadOptions(), key, blob_offset, blob.size(),
+                            kNoCompression, /*prefetch_buffer=*/nullptr,
+                            /*allocator=*/nullptr, &value, &bytes_read));
+  ASSERT_NE(value, nullptr);
+  EXPECT_EQ(value->data(), blob);
+}
+
+TEST_F(BlobFileReaderTest, Version2FileNumberMismatch) {
+  // A version 2 header names the file's own number. When it names another
+  // number (for example, the file was copied or renamed), the open fails.
+  Options options;
+  options.env = mock_env_.get();
+  options.cf_paths.emplace_back(
+      test::PerThreadDBPath(mock_env_.get(),
+                            "BlobFileReaderTest_Version2FileNumberMismatch"),
+      0);
+  options.enable_blob_files = true;
+  ImmutableOptions immutable_options(options);
+
+  constexpr uint32_t column_family_id = 1;
+  constexpr uint64_t blob_file_number = 5;
+  uint64_t blob_offset = 0;
+  WriteVersion2BlobFile(immutable_options, column_family_id, blob_file_number,
+                        /*header_file_number=*/blob_file_number + 1, "key",
+                        "blob", &blob_offset);
+
+  std::unique_ptr<BlobFileReader> reader;
+  const Status s = BlobFileReader::Create(
+      immutable_options, ReadOptions(), FileOptions(), column_family_id,
+      /*blob_file_read_hist=*/nullptr, blob_file_number,
+      /*io_tracer=*/nullptr, &reader);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  EXPECT_NE(s.ToString().find("Blob file number mismatch"), std::string::npos)
+      << s.ToString();
 }
 
 TEST_F(BlobFileReaderTest, BlobCRCError) {

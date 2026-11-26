@@ -33,6 +33,7 @@
 #include "db/blob/blob_gen2_format.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/dbformat.h"
 #include "db/wide/wide_column_serialization.h"
 #include "logging/logging.h"
@@ -266,6 +267,21 @@ Compressor* MaybeCloneSpecialized(
     return specialized.release();
   } else {
     return compressor;
+  }
+}
+
+// Adds the size of the blob record that `blob_index` points to, record header
+// included, to the referenced_blob_bytes table property. The property counts
+// only non-TTL references to other blob files; inlined, TTL and same-file
+// indexes are skipped. It is unset after an entry failed to decode, and then it
+// stays unset.
+void AddReferencedBlobBytes(const BlobIndex& blob_index, uint64_t user_key_size,
+                            std::optional<uint64_t>* referenced_blob_bytes) {
+  if (referenced_blob_bytes->has_value() && !blob_index.IsInlined() &&
+      !blob_index.HasTTL() && !blob_index.IsSameFile()) {
+    **referenced_blob_bytes +=
+        blob_index.size() +
+        BlobLogRecord::CalculateAdjustmentForRecordHeader(user_key_size);
   }
 }
 }  // namespace
@@ -1057,6 +1073,10 @@ struct BlockBasedTableBuilder::Rep {
   // the hot paths use this instead of repeating the downcast.
   BuiltinIndexFactoryBuilder* builtin_index_builder = nullptr;
   std::string index_separator_scratch;
+  // Decode buffer for a kTypeBlobIndex value in AddImpl(), when the caller did
+  // not pass a decode. A member, so that a key does not build a BlobIndex.
+  // BlobIndex::DecodeFrom() resets it before each decode.
+  BlobIndex add_blob_index;
 
   // Custom indexes built alongside the built-in index.
   struct CustomIndex {
@@ -1308,6 +1328,7 @@ struct BlockBasedTableBuilder::Rep {
   uint64_t buffer_limit = 0;
   std::shared_ptr<CacheReservationManager>
       compression_dict_buffer_cache_res_mgr;
+  std::unique_ptr<BlobReferenceMetadataCollector> blob_reference_collector;
   const bool use_delta_encoding_for_index_values;
   std::unique_ptr<FilterBlockBuilder> filter_builder;
   OffsetableCacheKey base_cache_key;
@@ -1548,7 +1569,8 @@ struct BlockBasedTableBuilder::Rep {
   }
 
   Rep(const BlockBasedTableOptions& table_opt, const TableBuilderOptions& tbo,
-      WritableFileWriter* f)
+      WritableFileWriter* f,
+      std::shared_ptr<CacheReservationManager> blob_reference_cache_res_mgr)
       : ioptions(tbo.ioptions),
         prefix_extractor(tbo.moptions.prefix_extractor),
         write_options(tbo.write_options),
@@ -1834,6 +1856,24 @@ struct BlockBasedTableBuilder::Rep {
               table_options.block_cache);
     } else {
       compression_dict_buffer_cache_res_mgr = nullptr;
+    }
+
+    // The exact blob reference metadata (db/blob/blob_reference_metadata.h)
+    // records the CF ID and the SST file number, so a reader can check that the
+    // metadata belongs to this SST.
+    // SstFileWriter output has no DB file number, and some outputs have no
+    // known CF. Such outputs get no collector and no exact metadata. Every
+    // other output needs a nonzero SST file number; the collector fails the
+    // build without one.
+    if (tbo.moptions.enable_blob_indirection &&
+        tbo.reason != TableFileCreationReason::kSstFileWriter &&
+        tbo.column_family_id !=
+            TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) {
+      blob_reference_collector =
+          std::make_unique<BlobReferenceMetadataCollector>(
+              std::move(blob_reference_cache_res_mgr),
+              BlobReferenceSstIdentity{.column_family_id = tbo.column_family_id,
+                                       .sst_file_number = tbo.cur_file_num});
     }
 
     // Common user-key prefix feature (format_version >= 8) for index-like
@@ -2182,12 +2222,14 @@ struct BlockBasedTableBuilder::Rep {
 
 BlockBasedTableBuilder::BlockBasedTableBuilder(
     const BlockBasedTableOptions& table_options, const TableBuilderOptions& tbo,
-    WritableFileWriter* file) {
+    WritableFileWriter* file,
+    std::shared_ptr<CacheReservationManager> blob_reference_cache_res_mgr) {
   BlockBasedTableOptions sanitized_table_options(table_options);
   auto ucmp = tbo.internal_comparator.user_comparator();
   assert(ucmp);
   (void)ucmp;  // avoids unused variable error.
-  rep_ = std::make_unique<Rep>(sanitized_table_options, tbo, file);
+  rep_ = std::make_unique<Rep>(sanitized_table_options, tbo, file,
+                               std::move(blob_reference_cache_res_mgr));
 
   TEST_SYNC_POINT_CALLBACK(
       "BlockBasedTableBuilder::BlockBasedTableBuilder:PreSetupBaseCacheKey",
@@ -2209,6 +2251,11 @@ BlockBasedTableBuilder::~BlockBasedTableBuilder() {
 }
 
 void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
+  AddImpl(ikey, value, /*decoded_blob_index=*/nullptr);
+}
+
+void BlockBasedTableBuilder::AddImpl(const Slice& ikey, const Slice& value,
+                                     const BlobIndex* decoded_blob_index) {
   Rep* r = rep_.get();
   assert(rep_->state != Rep::State::kClosed);
   if (UNLIKELY(!ok())) {
@@ -2259,25 +2306,31 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
 #endif  // !NDEBUG
 
     const auto account_blob_index = [&](const BlobIndex& blob_index) {
-      if (r->props.referenced_blob_bytes.has_value() &&
-          !blob_index.IsInlined() && !blob_index.HasTTL() &&
-          !blob_index.IsSameFile()) {
-        const uint64_t blob_record_overhead =
-            BlobLogRecord::CalculateAdjustmentForRecordHeader(
-                ExtractUserKey(entry_ikey).size());
-        *r->props.referenced_blob_bytes +=
-            blob_index.size() + blob_record_overhead;
-      }
+      AddReferencedBlobBytes(blob_index, ExtractUserKey(entry_ikey).size(),
+                             &r->props.referenced_blob_bytes);
     };
+    // A kTypeBlobIndex value is decoded once here, for the referenced bytes
+    // property and for the reference collector below. The caller's decode is
+    // used when it decoded this same value (MaybeExtractEmbeddedBlobs() does
+    // not change a kTypeBlobIndex value).
+    const BlobIndex* value_blob_index = nullptr;
     if (value_type == kTypeBlobIndex) {
-      BlobIndex blob_index;
-      Status s = blob_index.DecodeFrom(entry_value);
-      if (!s.ok()) {
+      if (decoded_blob_index != nullptr && entry_value.data() == value.data()) {
+        value_blob_index = decoded_blob_index;
+      } else if (r->add_blob_index.DecodeFrom(entry_value).ok()) {
+        value_blob_index = &r->add_blob_index;
+      }
+    }
+    if (value_type == kTypeBlobIndex) {
+      if (value_blob_index == nullptr) {
         r->props.referenced_blob_bytes.reset();
       } else {
-        account_blob_index(blob_index);
+        account_blob_index(*value_blob_index);
       }
-    } else if (value_type == kTypeWideColumnEntity) {
+    } else if (value_type == kTypeWideColumnEntity &&
+               r->blob_reference_collector == nullptr) {
+      // With a collector, AddBlobReferences() below walks the entity once for
+      // both this property and the collector.
       Status s = WideColumnSerialization::ForEachBlobFileNumber(
           entry_value, [&](const BlobIndex& blob_index) {
             account_blob_index(blob_index);
@@ -2305,6 +2358,18 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
             r->last_ikey.empty()
                 ? Slice{}
                 : ExtractUserKeyAndStripTimestamp(r->last_ikey, r->ts_sz));
+      }
+    }
+
+    // The reference metadata work runs only for an SST that collects
+    // references, and only for the two value types that can hold a blob
+    // reference. Other entries and other SSTs keep the base Add() path. It is
+    // in an out-of-line helper for the same reason.
+    if (r->blob_reference_collector != nullptr &&
+        (value_type == kTypeBlobIndex || value_type == kTypeWideColumnEntity)) {
+      if (!AddBlobReferences(entry_ikey, entry_value, value_type,
+                             value_blob_index)) {
+        return;
       }
     }
 
@@ -2355,11 +2420,46 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
   }
 }
 
+bool BlockBasedTableBuilder::AddBlobReferences(
+    const Slice& entry_ikey, const Slice& entry_value, ValueType value_type,
+    const BlobIndex* value_blob_index) {
+  Rep* const r = rep_.get();
+  auto* const blob_reference_collector = r->blob_reference_collector.get();
+  auto& collector = *blob_reference_collector;
+  const uint64_t user_key_size = ExtractUserKey(entry_ikey).size();
+  // AddImpl() calls this only for kTypeBlobIndex and kTypeWideColumnEntity
+  // entries. MaybeExtractEmbeddedBlobs() changes the key type only of
+  // kTypeValue entries, so the key type is still `value_type`.
+  assert(ExtractValueType(entry_ikey) == value_type);
+  Status reference_status;
+  if (value_type == kTypeBlobIndex) {
+    // A blob index that does not decode fails the build. Decoding it
+    // again gives the error; this happens only for a corrupt value.
+    reference_status = value_blob_index == nullptr
+                           ? BlobIndex().DecodeFrom(entry_value)
+                           : collector.Add(*value_blob_index, user_key_size);
+  } else if (value_type == kTypeWideColumnEntity) {
+    // AddImpl() skips its own walk of the entity when the SST collects
+    // references, so this walk also counts the referenced_blob_bytes property.
+    reference_status = WideColumnSerialization::ForEachBlobIndex(
+        entry_value, [&](const BlobIndex& blob_index) {
+          AddReferencedBlobBytes(blob_index, user_key_size,
+                                 &r->props.referenced_blob_bytes);
+          return collector.Add(blob_index, user_key_size);
+        });
+  }
+  if (!reference_status.ok()) {
+    r->SetStatus(reference_status);
+    return false;
+  }
+  return true;
+}
+
 TableBuilderAddResult BlockBasedTableBuilder::TryAdd(
     const Slice& ikey, const Slice& value, TableBuilderAddContext* context) {
   assert(context != nullptr);
   context->new_table_reason = TableBuilderNewTableReason::kNone;
-  Add(ikey, value);
+  AddImpl(ikey, value, context->decoded_blob_index);
   return TableBuilderAddResult::kAdded;
 }
 
@@ -2961,12 +3061,23 @@ void BlockBasedTableBuilder::WriteMaybeCompressedBlock(
     BlockType block_type, const Slice* uncompressed_block_data,
     bool* skip_delta_encoding,
     const uint32_t* precomputed_block_contents_crc32c) {
+  WriteMaybeCompressedBlock(block_contents, comp_type, handle, block_type,
+                            uncompressed_block_data, skip_delta_encoding,
+                            precomputed_block_contents_crc32c,
+                            /*warm_cache=*/true);
+}
+
+void BlockBasedTableBuilder::WriteMaybeCompressedBlock(
+    const Slice& block_contents, CompressionType comp_type, BlockHandle* handle,
+    BlockType block_type, const Slice* uncompressed_block_data,
+    bool* skip_delta_encoding,
+    const uint32_t* precomputed_block_contents_crc32c, bool warm_cache) {
   // Must have pre-checked status in single-threaded context
   assert(status().ok());
   assert(io_status().ok());
   rep_->SetIOStatus(WriteMaybeCompressedBlockImpl(
       block_contents, comp_type, handle, block_type, uncompressed_block_data,
-      skip_delta_encoding, precomputed_block_contents_crc32c));
+      skip_delta_encoding, precomputed_block_contents_crc32c, warm_cache));
 }
 
 IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
@@ -2974,6 +3085,17 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
     BlockType block_type, const Slice* uncompressed_block_data,
     bool* skip_delta_encoding,
     const uint32_t* precomputed_block_contents_crc32c) {
+  return WriteMaybeCompressedBlockImpl(
+      block_contents, comp_type, handle, block_type, uncompressed_block_data,
+      skip_delta_encoding, precomputed_block_contents_crc32c,
+      /*warm_cache=*/true);
+}
+
+IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
+    const Slice& block_contents, CompressionType comp_type, BlockHandle* handle,
+    BlockType block_type, const Slice* uncompressed_block_data,
+    bool* skip_delta_encoding,
+    const uint32_t* precomputed_block_contents_crc32c, bool warm_cache) {
   // File format contains a sequence of blocks where each block has:
   //    block_data: uint8[n]
   //    compression_type: uint8
@@ -3117,7 +3239,7 @@ IOStatus BlockBasedTableBuilder::WriteMaybeCompressedBlockImpl(
     }
   }
 
-  if (r->warm_cache_config.enabled) {
+  if (r->warm_cache_config.enabled && warm_cache) {
     io_s = status_to_io_status(
         InsertBlockInCacheHelper(*uncompressed_block_data, handle, block_type));
     if (UNLIKELY(!io_s.ok())) {
@@ -3400,6 +3522,8 @@ Status BlockBasedTableBuilder::InsertBlockInCacheHelper(
     BlockType block_type) {
   Cache* block_cache = rep_->table_options.block_cache.get();
   Status s;
+  TEST_SYNC_POINT_CALLBACK("BlockBasedTableBuilder::InsertBlockInCacheHelper",
+                           &block_type);
   auto helper =
       GetCacheItemHelper(block_type, rep_->ioptions.lowest_used_cache_tier);
   if (block_cache && helper && helper->create_cb) {
@@ -3776,6 +3900,90 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteBlobReferenceMetadata(
+    MetaIndexBuilder* meta_index_builder) {
+  // The collector's memory and charge are released when it is destroyed.
+  std::unique_ptr<BlobReferenceMetadataCollector> collector =
+      std::move(rep_->blob_reference_collector);
+  if (collector == nullptr || !ok()) {
+    return;
+  }
+
+  // The reference data blocks use the compressor of the SST's own index
+  // blocks, which never has a dictionary, so readers need only the table's
+  // decompressor. As for other blocks, a reference data block stays raw when
+  // compression does not pay. The reference index block is never compressed
+  // (see db/blob/blob_reference_metadata.h).
+  BlobReferenceMetadataDescriptor descriptor;
+  Status status = collector->Finish(
+      [&](const Slice& block, bool is_index_block,
+          BlockHandle* handle) -> Status {
+        CompressionType type = kNoCompression;
+        uint32_t compressed_crc32c = 0;
+        if (!is_index_block) {
+          Status compress_status = CompressAndVerifyBlock(
+              block, /*is_data_block=*/false, rep_->index_block_working_area,
+              &rep_->single_threaded_compressed_output, &type,
+              &compressed_crc32c);
+          if (!compress_status.ok()) {
+            return compress_status;
+          }
+        }
+        // The reference blocks use BlockType::kUserDefinedIndex, so RocksDB
+        // keeps their contents as plain bytes and never parses them as a
+        // Block. The reference index block also needs a type in
+        // BlockBasedTable::GetBlockTypeForMetaBlockByName(); see the comment
+        // there. BlockBasedTable::BlockTypeMaybeCompressed() returns false for
+        // this type, so the table's normal block read path (RetrieveBlock())
+        // would not decompress a compressed reference data block. A reader
+        // must read these blocks with BlockFetcher and maybe_compressed set.
+        WriteMaybeCompressedBlock(
+            type == kNoCompression
+                ? block
+                : Slice(rep_->single_threaded_compressed_output),
+            type, handle, BlockType::kUserDefinedIndex,
+            is_index_block ? nullptr : &block,
+            /*skip_delta_encoding=*/nullptr,
+            type == kNoCompression || rep_->table_options.checksum != kCRC32c
+                ? nullptr
+                : &compressed_crc32c,
+            // No reader looks up reference blocks in the block cache, so
+            // warming them would only take cache space.
+            /*warm_cache=*/false);
+        rep_->single_threaded_compressed_output.Reset();
+        return rep_->GetStatus();
+      },
+      &descriptor, /*summary=*/nullptr);
+  // The descriptor is filled only when Finish() succeeds, so the line names
+  // the SST by the file number of the table properties. The reservation
+  // manager is shared by all SSTs that are being built, so a failed charge
+  // means that the shared block cache was full, not that this SST is large.
+  if (collector->uncharged_charge_failures() > 0) {
+    ROCKS_LOG_WARN(rep_->ioptions.logger,
+                   "SST #%" PRIu64 ": %" PRIu64
+                   " block cache charges for blob reference buffers failed "
+                   "because the shared block cache was full; that memory is "
+                   "not charged",
+                   rep_->props.orig_file_number,
+                   collector->uncharged_charge_failures());
+  }
+  if (!status.ok()) {
+    rep_->SetStatus(status);
+    return;
+  }
+  meta_index_builder->Add(kBlobReferenceIndexBlockName,
+                          descriptor.index_handle);
+  std::string encoded_descriptor;
+  descriptor.EncodeTo(&encoded_descriptor);
+  const auto [unused, inserted] = rep_->props.user_collected_properties.emplace(
+      kBlobReferenceDescriptorPropertyName, std::move(encoded_descriptor));
+  (void)unused;
+  if (!inserted) {
+    rep_->SetStatus(Status::Corruption(
+        "Duplicate blob reference descriptor table property"));
+  }
+}
+
 void BlockBasedTableBuilder::WriteCompressionDictBlock(
     MetaIndexBuilder* meta_index_builder) {
   Slice compression_dict;
@@ -4079,6 +4287,11 @@ Status BlockBasedTableBuilder::Finish() {
   // if any, have joined so the estimate is now quiescent).
   r->AutoSkipWriteBack();
 
+  // The census and indirect blob GC read the exact blob reference metadata; a
+  // normal table open does not. So these blocks are written before the tail
+  // (tail_start_offset), and a table open does not prefetch them.
+  MetaIndexBuilder meta_index_builder;
+  WriteBlobReferenceMetadata(&meta_index_builder);
   r->props.tail_start_offset = r->offset.LoadRelaxed();
 
   // Read the clock when finishing rather than when starting, so that this
@@ -4101,7 +4314,6 @@ Status BlockBasedTableBuilder::Finish() {
   //    7. Footer
   BlockHandle metaindex_block_handle;
   BlockHandle index_block_handle;
-  MetaIndexBuilder meta_index_builder;
   WriteFilterBlock(&meta_index_builder);
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
   WriteCompressionDictBlock(&meta_index_builder);
@@ -4144,6 +4356,7 @@ void BlockBasedTableBuilder::Abandon() {
   if (rep_->IsParallelCompressionActive()) {
     StopParallelCompression(/*abort=*/true);
   }
+  rep_->blob_reference_collector.reset();
   rep_->state = Rep::State::kClosed;
   rep_->GetIOStatus().PermitUncheckedError();
 }
@@ -4209,13 +4422,22 @@ uint64_t BlockBasedTableBuilder::EstimatedTailSize() const {
     estimated_tail_size += rep_->range_del_block.CurrentSizeEstimate();
   }
 
-  // 5. Estimate properties block size conservatively (~1-2KB)
+  // 5. Add an upper bound of the exact blob reference metadata size. These
+  // blocks are written before tail_start_offset, so they are not part of the
+  // tail. They are counted here because output file size planning uses this
+  // estimate.
+  if (rep_->blob_reference_collector) {
+    estimated_tail_size +=
+        rep_->blob_reference_collector->EstimatedEncodedSize();
+  }
+
+  // 6. Estimate properties block size conservatively (~1-2KB)
   estimated_tail_size += 2048;
 
-  // 6. Estimate meta-index block size conservatively (~1KB)
+  // 7. Estimate meta-index block size conservatively (~1KB)
   estimated_tail_size += 1024;
 
-  // 7. Add footer size
+  // 8. Add footer size
   estimated_tail_size += Footer::kMaxEncodedLength;
 
   return estimated_tail_size;

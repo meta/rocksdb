@@ -35,6 +35,17 @@ class CacheReservationManager {
   class CacheReservationHandle {
    public:
     virtual ~CacheReservationHandle() = default;
+
+    // Sets the memory that this handle owns to `memory_used` bytes. The other
+    // handles of the same manager keep the memory they own. The manager's new
+    // total is its old total minus this handle's old size plus `memory_used`.
+    // When the cache cannot reserve the new total, Resize() returns an error,
+    // but the handle still owns `memory_used`, the same as after a failed
+    // MakeCacheReservation(). A later Resize() or the handle's destructor
+    // releases it.
+    // When the new total would overflow size_t, Resize() returns MemoryLimit
+    // and the handle keeps its old size.
+    virtual Status Resize(std::size_t memory_used) = 0;
   };
   virtual ~CacheReservationManager() = default;
   virtual Status UpdateCacheReservation(std::size_t new_memory_used) = 0;
@@ -76,6 +87,7 @@ class CacheReservationManagerImpl
         std::size_t incremental_memory_used,
         std::shared_ptr<CacheReservationManagerImpl> cache_res_mgr);
     ~CacheReservationHandle() override;
+    Status Resize(std::size_t memory_used) override;
 
    private:
     std::size_t incremental_memory_used_;
@@ -254,6 +266,10 @@ class ConcurrentCacheReservationManager
     ~CacheReservationHandle() override {
       std::lock_guard<std::mutex> lock(cache_res_mgr_->cache_res_mgr_mu_);
       cache_res_handle_.reset();
+    }
+    Status Resize(std::size_t memory_used) override {
+      std::lock_guard<std::mutex> lock(cache_res_mgr_->cache_res_mgr_mu_);
+      return cache_res_handle_->Resize(memory_used);
     }
 
    private:
