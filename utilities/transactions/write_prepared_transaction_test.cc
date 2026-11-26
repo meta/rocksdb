@@ -4343,11 +4343,11 @@ TEST_P(WritePreparedTransactionTest, WCWPWALForwardIncompatibility) {
   CrossCompatibilityTest(WRITE_PREPARED, WRITE_COMMITTED, !empty_wal);
 }
 
-// With insert_seq = read iterator seqno, insertion depends on the latest
-// published read seq. In one-write-queue mode, the latest read seq reaches the
-// prepared seq, so insertion is blocked. In two-write-queues mode, the latest
-// published seq can still lag the prepared seq, so insertion remains safe and
-// is allowed.
+// This test scans point tombstones in both directions while a WritePrepared
+// transaction is prepared and not yet committed. A converted range tombstone
+// gets the scan's read sequence number. It expects one converted range
+// tombstone only with two write queues and ordered writes, where the latest
+// published sequence number can still be below the prepare sequence number.
 TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
   for (bool forward : {true, false}) {
     SCOPED_TRACE(forward ? "forward" : "reverse");
@@ -4384,9 +4384,15 @@ TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
     ASSERT_OK(txn->Put("z", "txn_val"));
     ASSERT_OK(txn->Prepare());
 
-    // Pre-commit: one-write-queue mode publishes the prepare seq to readers,
-    // so insertion must be discarded. Two-write-queues mode can still expose
-    // an older published seq to readers, so insertion remains safe.
+    // Before the commit, the test scans the point deletes in three
+    // configurations:
+    // - One write queue: the scan's read sequence number is at or above the
+    //   prepare sequence number, so the transaction guard discards the
+    //   conversion.
+    // - Two write queues with ordered writes: the scan reads below the
+    //   prepare sequence number and inserts one range tombstone.
+    // - unordered_write, which also uses two write queues: the iterator turns
+    //   conversion off, so nothing is inserted.
     {
       ReadOptions read_opts;
       std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
@@ -4399,12 +4405,14 @@ TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
       }
       EXPECT_OK(iter->status());
     }
-    const size_t expected_insertions = options.two_write_queues ? 1u : 0u;
+    const bool expect_insertion =
+        options.two_write_queues && !options.unordered_write;
+    const size_t expected_insertions = expect_insertion ? 1u : 0u;
     EXPECT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
         expected_insertions);
-    EXPECT_EQ(inserted_ranges.size(), expected_insertions);
-    if (options.two_write_queues) {
+    ASSERT_EQ(inserted_ranges.size(), expected_insertions);
+    if (expect_insertion) {
       EXPECT_EQ(inserted_ranges[0].first, "c");
       EXPECT_EQ(inserted_ranges[0].second, "h");
     }
