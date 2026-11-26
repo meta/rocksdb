@@ -356,9 +356,11 @@ Status WideColumnSerialization::DeserializeV1(
   return Status::OK();
 }
 
-Status WideColumnSerialization::DeserializeV2Impl(
-    Slice& input, uint32_t num_columns, std::vector<WideColumn>& columns,
-    std::vector<ValueType>& column_types) {
+template <typename Visit>
+Status WideColumnSerialization::WalkV2Columns(Slice& input,
+                                              uint32_t num_columns,
+                                              bool stop_without_blobs,
+                                              Visit&& visit) {
   // Section 2: SKIP INFO (3 varints)
   uint32_t name_sizes_bytes = 0;
   uint32_t value_sizes_bytes = 0;
@@ -377,12 +379,14 @@ Status WideColumnSerialization::DeserializeV2Impl(
   if (input.size() < num_columns) {
     return Status::Corruption("Error decoding wide column types");
   }
-  column_types.resize(num_columns);
+  const char* types = input.data();
   for (uint32_t i = 0; i < num_columns; ++i) {
-    column_types[i] = static_cast<ValueType>(input[i]);
-    if (!IsValidColumnValueType(column_types[i])) {
+    if (!IsValidColumnValueType(static_cast<ValueType>(types[i]))) {
       return Status::Corruption("Unsupported wide column ValueType");
     }
+  }
+  if (stop_without_blobs && !ContainsBlobType(types, num_columns)) {
+    return Status::OK();
   }
   input.remove_prefix(num_columns);
 
@@ -409,10 +413,9 @@ Status WideColumnSerialization::DeserializeV2Impl(
   const size_t total_values_bytes =
       input.size() - name_sizes_bytes - value_sizes_bytes - names_bytes;
 
-  columns.reserve(num_columns);
   size_t name_pos = 0;
   size_t value_pos = 0;
-
+  Slice prev_name;
   for (uint32_t i = 0; i < num_columns; ++i) {
     // Decode name size from section 4
     uint32_t ns = 0;
@@ -434,11 +437,9 @@ Status WideColumnSerialization::DeserializeV2Impl(
     if (ns > names_bytes - name_pos) {
       return Status::Corruption("Error decoding wide column name");
     }
-    Slice name(s6 + name_pos, ns);
-
-    if (!columns.empty()) {
-      if (Status so = ValidateColumnOrder(columns.back().name(), name);
-          !so.ok()) {
+    const Slice name(s6 + name_pos, ns);
+    if (i > 0) {
+      if (Status so = ValidateColumnOrder(prev_name, name); !so.ok()) {
         return so;
       }
     }
@@ -447,8 +448,12 @@ Status WideColumnSerialization::DeserializeV2Impl(
     if (vs > total_values_bytes - value_pos) {
       return Status::Corruption("Error decoding wide column value payload");
     }
-
-    columns.emplace_back(name, Slice(s7 + value_pos, vs));
+    if (Status sv = visit(i, static_cast<ValueType>(types[i]), name,
+                          Slice(s7 + value_pos, vs));
+        !sv.ok()) {
+      return sv;
+    }
+    prev_name = name;
     name_pos += ns;
     value_pos += vs;
   }
@@ -462,6 +467,29 @@ Status WideColumnSerialization::DeserializeV2Impl(
   }
 
   return Status::OK();
+}
+
+Status WideColumnSerialization::DeserializeV2Impl(
+    Slice& input, uint32_t num_columns, std::vector<WideColumn>& columns,
+    std::vector<ValueType>& column_types) {
+  // num_columns comes from the entity, so a corrupt entity can claim far more
+  // columns than it holds. Reserve only when the first column is visited:
+  // WalkV2Columns() visits a column only after it has checked that the input
+  // holds one type byte per column. So a count larger than the input is
+  // rejected before the decoder allocates memory for it. A smaller bogus count
+  // reserves at most one WideColumn and one type byte per input byte, as in
+  // base.
+  return WalkV2Columns(
+      input, num_columns, /*stop_without_blobs=*/false,
+      [&](uint32_t i, ValueType type, const Slice& name, const Slice& value) {
+        if (i == 0) {
+          column_types.reserve(num_columns);
+          columns.reserve(num_columns);
+        }
+        column_types.push_back(type);
+        columns.emplace_back(name, value);
+        return Status::OK();
+      });
 }
 
 Status WideColumnSerialization::Deserialize(
@@ -701,6 +729,70 @@ Status WideColumnSerialization::ForEachBlobFileNumber(
       }
     }
     value_pos += vs;
+  }
+
+  return Status::OK();
+}
+
+Status WideColumnSerialization::ForEachBlobIndex(
+    const Slice& input,
+    const std::function<Status(const BlobIndex&)>& callback) {
+  Slice input_ref = input;
+
+  uint32_t version = 0;
+  if (!GetVarint32(&input_ref, &version)) {
+    return Status::Corruption("Error decoding wide column version");
+  }
+
+  if (version > kVersion2) {
+    return Status::Corruption("Corrupt or unsupported wide column version");
+  }
+
+  uint32_t num_columns = 0;
+  if (!GetVarint32(&input_ref, &num_columns)) {
+    return Status::Corruption("Error decoding number of wide columns");
+  }
+
+  // V1 entities cannot hold blob columns. Callers need only the blob
+  // references, so the framing checks are skipped for V1.
+  if (version < kVersion2) {
+    return Status::OK();
+  }
+
+  // First check the whole entity, and decode and validate every blob index.
+  // Call `callback` only after all checks pass, so a malformed later column
+  // cannot give callers only part of the blob indexes.
+  autovector<BlobIndex, 8> blob_indexes;
+  Status s = WalkV2Columns(
+      input_ref, num_columns, /*stop_without_blobs=*/true,
+      [&](uint32_t /*index*/, ValueType type, const Slice& /*name*/,
+          const Slice& value) {
+        if (type != kTypeBlobIndex) {
+          return Status::OK();
+        }
+        if (value.empty()) {
+          return Status::Corruption("Empty blob index in wide column");
+        }
+        BlobIndex blob_index;
+        Status bs = blob_index.DecodeFrom(value);
+        if (bs.ok()) {
+          bs = blob_index.Validate();
+        }
+        if (!bs.ok()) {
+          return Status::Corruption("Error decoding blob index in wide column");
+        }
+        blob_indexes.push_back(blob_index);
+        return Status::OK();
+      });
+  if (!s.ok()) {
+    return s;
+  }
+
+  for (const BlobIndex& blob_index : blob_indexes) {
+    Status callback_status = callback(blob_index);
+    if (!callback_status.ok()) {
+      return callback_status;
+    }
   }
 
   return Status::OK();

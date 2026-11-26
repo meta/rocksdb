@@ -129,7 +129,8 @@ class BlobFileReader {
 
   static Status ReadHeader(const RandomAccessFileReader* file_reader,
                            const ReadOptions& read_options,
-                           uint32_t column_family_id, Statistics* statistics,
+                           uint32_t column_family_id, uint64_t blob_file_number,
+                           Statistics* statistics,
                            CompressionType* compression_type);
 
   static Status ReadFooter(const RandomAccessFileReader* file_reader,

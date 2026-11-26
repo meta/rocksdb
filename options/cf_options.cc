@@ -644,6 +644,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, enable_blob_files),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"enable_blob_indirection",
+         {offsetof(struct MutableCFOptions, enable_blob_indirection),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"min_blob_size",
          {offsetof(struct MutableCFOptions, min_blob_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -1377,6 +1381,8 @@ void MutableCFOptions::Dump(Logger* log) const {
   // Blob file related options
   ROCKS_LOG_INFO(log, "                        enable_blob_files: %s",
                  enable_blob_files ? "true" : "false");
+  ROCKS_LOG_INFO(log, "                  enable_blob_indirection: %s",
+                 enable_blob_indirection ? "true" : "false");
   ROCKS_LOG_INFO(log, "                            min_blob_size: %" PRIu64,
                  min_blob_size);
   ROCKS_LOG_INFO(log, "                           blob_file_size: %" PRIu64,
@@ -1440,6 +1446,23 @@ bool MutableCFOptionsUnchangedByMap(
                                       /*info_log=*/nullptr, &new_options)
              .ok() &&
          new_options == base_options;
+}
+
+bool OptionsMapSetsCustomizableOption(
+    const std::unordered_map<std::string, std::string>& options_map) {
+  for (const auto& opt : options_map) {
+    std::string elem_name;
+    const OptionTypeInfo* opt_info = OptionTypeInfo::Find(
+        opt.first, cf_mutable_options_type_info, &elem_name);
+    if (opt_info == nullptr) {
+      opt_info = OptionTypeInfo::Find(opt.first, cf_immutable_options_type_info,
+                                      &elem_name);
+    }
+    if (opt_info != nullptr && opt_info->IsCustomizable()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 Status GetStringFromMutableCFOptions(const ConfigOptions& config_options,
