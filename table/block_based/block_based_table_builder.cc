@@ -1712,8 +1712,13 @@ struct BlockBasedTableBuilder::Rep {
         index_block_working_area.compress =
             index_block_compressor->ObtainWorkingArea();
       }
+      // The caller can ask to ignore the dictionary guidance (see
+      // TableBuilderOptions::ignore_data_block_dictionary). DictDisabled takes
+      // the branch below that compresses without a dictionary.
       data_block_dict_guidance =
-          basic_compressor->GetDictGuidance(CacheEntryRole::kDataBlock);
+          tbo.ignore_data_block_dictionary
+              ? Compressor::DictConfig{Compressor::DictDisabled{}}
+              : basic_compressor->GetDictGuidance(CacheEntryRole::kDataBlock);
       if (auto* sampling =
               std::get_if<Compressor::DictSampling>(&data_block_dict_guidance);
           sampling != nullptr && sampling->max_sample_bytes > 0) {
@@ -3507,6 +3512,14 @@ Status BlockBasedTableBuilder::StartBlobRelocationFile() {
         "Blob relocation file requires the bytewise comparator without "
         "timestamps");
   }
+  // NewBlobRelocationTableBuilder() sets
+  // TableBuilderOptions::ignore_data_block_dictionary, so the builder never
+  // buffers data blocks for dictionary sampling.
+  if (r->state == Rep::State::kBuffered) {
+    return Status::InvalidArgument(
+        "Blob relocation file builder must not buffer data blocks for "
+        "dictionary sampling");
+  }
   assert(!r->IsParallelCompressionActive());
 
   IOOptions io_options;
@@ -3562,30 +3575,12 @@ Status BlockBasedTableBuilder::AddBlobRelocation(uint64_t origin_file_number,
                                                  const Slice& stored_payload,
                                                  CompressionType compression) {
   Rep* r = rep_.get();
-  if (r->blob_relocation_directory_builder == nullptr) {
-    return Status::InvalidArgument("Blob relocation file has not been started");
+  Status add_status = CheckBlobRelocationValue(
+      origin_file_number, stored_payload.size(), compression);
+  if (!add_status.ok()) {
+    return add_status;
   }
-  if (!ok()) {
-    return status();
-  }
-  if (stored_payload.size() > kMaxSimpleGen2BlobPayloadSize) {
-    return Status::InvalidArgument("Blob relocation value is too large");
-  }
-  if (!CompressionTypeSupported(compression)) {
-    return Status::InvalidArgument(
-        "Blob relocation compression type is not supported");
-  }
-
-  if (origin_file_number >= r->props.orig_file_number) {
-    Status invalid = Status::InvalidArgument(
-        "Blob relocation origin must be older than the file");
-    r->SetStatus(invalid);
-    return invalid;
-  }
-  if (stored_payload.empty()) {
-    return Status::InvalidArgument("Blob relocation value is empty");
-  }
-  Status add_status = r->blob_relocation_directory_builder->Add(
+  add_status = r->blob_relocation_directory_builder->Add(
       origin_file_number, original_value_offset, stored_payload.size(),
       compression);
   if (!add_status.ok()) {
@@ -3605,6 +3600,35 @@ Status BlockBasedTableBuilder::AddBlobRelocation(uint64_t origin_file_number,
   AddToBlobRelocationGroup(origin_file_number, original_value_offset,
                            stored_payload.size(), record_offset);
   return status();
+}
+
+Status BlockBasedTableBuilder::CheckBlobRelocationValue(
+    uint64_t origin_file_number, uint64_t stored_value_size,
+    CompressionType compression) {
+  Rep* r = rep_.get();
+  if (r->blob_relocation_directory_builder == nullptr) {
+    return Status::InvalidArgument("Blob relocation file has not been started");
+  }
+  if (!ok()) {
+    return status();
+  }
+  if (stored_value_size == 0) {
+    return Status::InvalidArgument("Blob relocation value is empty");
+  }
+  if (stored_value_size > kMaxSimpleGen2BlobPayloadSize) {
+    return Status::InvalidArgument("Blob relocation value is too large");
+  }
+  if (!CompressionTypeSupported(compression)) {
+    return Status::InvalidArgument(
+        "Blob relocation compression type is not supported");
+  }
+  if (origin_file_number >= r->props.orig_file_number) {
+    Status invalid = Status::InvalidArgument(
+        "Blob relocation origin must be older than the file");
+    r->SetStatus(invalid);
+    return invalid;
+  }
+  return Status::OK();
 }
 
 void BlockBasedTableBuilder::PrepareBlobRelocationGroup(
@@ -3662,6 +3686,48 @@ void BlockBasedTableBuilder::FinishBlobRelocationGroup() {
       internal_key);
   group.count = 0;
   Add(Slice(internal_key, sizeof(internal_key)), group.encoded);
+}
+
+Status BlockBasedTableBuilder::AddBlobRelocation(
+    uint64_t origin_file_number, uint64_t original_value_offset,
+    uint64_t stored_value_size, CompressionType compression,
+    uint32_t stored_checksum, const VerifiedBlobStoredSource& source) {
+  Rep* r = rep_.get();
+  Status status = CheckBlobRelocationValue(origin_file_number,
+                                           stored_value_size, compression);
+  if (!status.ok()) {
+    return status;
+  }
+  // StartBlobRelocationFile() requires embedded blob support.
+  assert(r->embedded_blob_options != nullptr);
+  assert(!r->IsParallelCompressionActive());
+  status = r->blob_relocation_directory_builder->Add(
+      origin_file_number, original_value_offset, stored_value_size,
+      compression);
+  if (status.ok()) {
+    PrepareBlobRelocationGroup(origin_file_number);
+    status = this->status();
+  }
+  const uint64_t offset = r->get_offset();
+  if (status.ok()) {
+    status = WriteSimpleGen2BlobRecordStream(
+        r->file, r->write_options, r->table_options.checksum,
+        r->base_context_checksum, offset, stored_value_size, compression,
+        stored_checksum, source);
+  }
+  if (!status.ok()) {
+    r->SetStatus(status);
+    return status;
+  }
+  if (!r->embedded_blob_state) {
+    r->embedded_blob_state = std::make_unique<Rep::EmbeddedBlobState>();
+  }
+  r->set_offset(offset + stored_value_size + kSimpleGen2BlobTrailerSize);
+  ++r->embedded_blob_state->stats.blob_count;
+  r->embedded_blob_state->stats.payload_bytes += stored_value_size;
+  AddToBlobRelocationGroup(origin_file_number, original_value_offset,
+                           stored_value_size, offset);
+  return this->status();
 }
 
 Status BlockBasedTableBuilder::GetBlobRelocationFileMetadata(
@@ -4804,18 +4870,34 @@ Status NewBlobRelocationTableBuilder(
   relocation_options.table_factory = std::make_shared<BlockBasedTableFactory>(
       MakeBlobRelocationTableOptions(table_options));
   InternalTblPropCollFactories collectors;
-  const CompressionOptions no_compression_options;
+  // Compression choice: see the NewBlobRelocationTableBuilder() comment in the
+  // header.
+  const bool use_bottommost =
+      mutable_cf_options.bottommost_compression != kDisableCompressionOption;
+  const CompressionType compression =
+      use_bottommost ? mutable_cf_options.bottommost_compression
+                     : mutable_cf_options.compression;
+  CompressionOptions compression_options =
+      use_bottommost && mutable_cf_options.bottommost_compression_opts.enabled
+          ? mutable_cf_options.bottommost_compression_opts
+          : mutable_cf_options.compression_opts;
+  compression_options.max_dict_bytes = 0;
+  compression_options.zstd_max_train_bytes = 0;
+  compression_options.parallel_threads = 1;
   EmbeddedBlobSstBuilderOptions embedded_options;
   embedded_options.min_blob_size = 0;
-  const TableBuilderOptions builder_options(
+  TableBuilderOptions builder_options(
       ioptions, relocation_options, read_options, write_options, comparator,
-      &collectors, kNoCompression, no_compression_options,
-      file_info.column_family_id, file_info.column_family_name, /*level=*/-1,
-      kUnknownNewestKeyTime, /*is_bottommost=*/false, file_info.reason,
+      &collectors, compression, compression_options, file_info.column_family_id,
+      file_info.column_family_name, /*level=*/-1, kUnknownNewestKeyTime,
+      /*is_bottommost=*/false, file_info.reason,
       /*oldest_key_time=*/0, file_info.db_id, file_info.db_session_id,
       file_info.target_file_size, file_info.file_number, kMaxSequenceNumber,
       Slice(file_info.db_name), /*is_remote_compaction=*/false,
       &embedded_options);
+  // Ignore the dictionary guidance of the compressor for the data blocks (see
+  // the header comment).
+  builder_options.ignore_data_block_dictionary = true;
   builder->reset(static_cast_with_check<BlockBasedTableBuilder>(
       relocation_options.table_factory->NewTableBuilder(builder_options,
                                                         file)));
