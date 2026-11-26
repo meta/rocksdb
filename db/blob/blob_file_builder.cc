@@ -29,6 +29,7 @@
 #include "test_util/sync_point.h"
 #include "trace_replay/io_tracer.h"
 #include "util/compression.h"
+#include "util/crc32c.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -81,6 +82,7 @@ BlobFileBuilder::BlobFileBuilder(
                               ? blob_compressor_->ObtainWorkingArea()
                               : Compressor::ManagedWorkingArea{}),
       prepopulate_blob_cache_(mutable_cf_options->prepopulate_blob_cache),
+      enable_blob_indirection_(mutable_cf_options->enable_blob_indirection),
       file_options_(file_options),
       write_options_(write_options),
       db_id_(std::move(db_id)),
@@ -144,9 +146,23 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
   uint64_t blob_file_number = 0;
   uint64_t blob_offset = 0;
 
+  // The logical CRC and the stored CRC are defined under "Checksums" in
+  // db/blob/blob_index.h.
+  //
+  // With indirection, the CRC32C of the stored (maybe compressed) bytes is
+  // computed once and used three times:
+  //   - The blob log record CRC covers the key and the stored bytes. It is
+  //     made by combining the key's CRC with this CRC.
+  //   - The stored CRC in the BlobIndex is this CRC extended with the
+  //     compression byte.
+  //   - For an uncompressed value, this CRC is also the logical CRC (the
+  //     value of BlobIndex::stable_checksum()).
+  const uint32_t stored_bytes_crc =
+      enable_blob_indirection_ ? crc32c::Value(blob.data(), blob.size()) : 0;
   {
-    const Status s =
-        WriteBlobToFile(key, blob, &blob_file_number, &blob_offset);
+    const Status s = WriteBlobToFile(
+        key, blob, enable_blob_indirection_ ? &stored_bytes_crc : nullptr,
+        &blob_file_number, &blob_offset);
     if (!s.ok()) {
       return s;
     }
@@ -169,8 +185,24 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
     }
   }
 
-  BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset, blob.size(),
-                        blob_compression_type_);
+  if (enable_blob_indirection_) {
+    const uint32_t stable_checksum =
+        blob_compression_type_ == kNoCompression
+            ? stored_bytes_crc
+            : crc32c::Value(value.data(), value.size());
+    const uint32_t stored_checksum = BlobIndex::ExtendChecksumWithCompression(
+        stored_bytes_crc, blob_compression_type_);
+    BlobIndex::EncodeUnflattenedIndirectBlob(
+        blob_index, {.origin_file_number = blob_file_number,
+                     .original_value_offset = blob_offset,
+                     .stored_value_size = blob.size(),
+                     .compression = blob_compression_type_,
+                     .stable_checksum = stable_checksum,
+                     .stored_checksum = stored_checksum});
+  } else {
+    BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset,
+                          blob.size(), blob_compression_type_);
+  }
 
   return Status::OK();
 }
@@ -259,6 +291,12 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
 
   BlobLogHeader header(column_family_id_, blob_compression_type_, has_ttl,
                        expiration_range);
+  // A blob file of blob indirection gets a version 2 header, which records the
+  // file's own number (see db/blob/blob_log_format.h).
+  if (enable_blob_indirection_) {
+    header.version = kVersion2;
+    header.file_number = blob_file_number;
+  }
 
   {
     Status s = blob_log_writer->WriteHeader(*write_options_, header);
@@ -308,6 +346,7 @@ Status BlobFileBuilder::CompressBlobIfNeeded(
 }
 
 Status BlobFileBuilder::WriteBlobToFile(const Slice& key, const Slice& blob,
+                                        const uint32_t* value_crc32c,
                                         uint64_t* blob_file_number,
                                         uint64_t* blob_offset) {
   assert(IsBlobFileOpen());
@@ -316,8 +355,12 @@ Status BlobFileBuilder::WriteBlobToFile(const Slice& key, const Slice& blob,
 
   uint64_t key_offset = 0;
 
-  Status s =
-      writer_->AddRecord(*write_options_, key, blob, &key_offset, blob_offset);
+  Status s = value_crc32c != nullptr
+                 ? writer_->AddRecordWithValueCrc(*write_options_, key, blob,
+                                                  *value_crc32c, &key_offset,
+                                                  blob_offset)
+                 : writer_->AddRecord(*write_options_, key, blob, &key_offset,
+                                      blob_offset);
 
   TEST_SYNC_POINT_CALLBACK("BlobFileBuilder::WriteBlobToFile:AddRecord", &s);
 

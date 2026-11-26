@@ -32,6 +32,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class BlobIndex;
+
 // Tag numbers for serialized VersionEdit.  These numbers are written to
 // disk and should not be changed. The number should be forward compatible so
 // users can down-grade RocksDB safely. A future Tag is ignored by doing '&'
@@ -423,6 +425,12 @@ struct FileMetaData {
   // the last key to be the largest).
   Status UpdateBoundaries(const Slice& key, const Slice& value,
                           SequenceNumber seqno, ValueType value_type);
+
+  // Same as above. `decoded_blob_index`, if not nullptr, is the caller's decode
+  // of a kTypeBlobIndex `value`. It saves a second decode.
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type,
+                          const BlobIndex* decoded_blob_index);
 
   // Unlike UpdateBoundaries, ranges do not need to be presented in any
   // particular order.
