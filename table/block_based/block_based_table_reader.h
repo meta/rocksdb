@@ -543,6 +543,9 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
       const ReadOptions& read_options, const Slice& expected_descriptor,
       const std::function<Status(size_t index_bytes)>& after_index_read,
       std::vector<BlobReferenceGroupRead>* requests) const override;
+  Status VerifyBlobReferenceMetadata(
+      const ReadOptions& read_options,
+      const Slice& expected_descriptor) const override;
 
   const SeqnoToTimeMapping& GetSeqnoToTimeMapping() const;
 
