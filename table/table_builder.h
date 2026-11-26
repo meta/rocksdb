@@ -221,6 +221,14 @@ struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
   // leaves 0.
   uint64_t blob_route_snapshot_fingerprint_high = 0;
   uint64_t blob_route_snapshot_fingerprint_low = 0;
+  // When true, the block-based table builder ignores the data-block dictionary
+  // guidance of its compressor (sampling and pre-defined dictionaries), so it
+  // never buffers data blocks for dictionary sampling. A compressor that
+  // brings its own dictionary can still use it, and the builder then writes
+  // that dictionary block as usual. Every builder except the one of
+  // NewBlobRelocationTableBuilder() leaves it false; that function's comment
+  // says why it sets it.
+  bool ignore_data_block_dictionary = false;
   // Non-null only for table builders that should write eligible large values as
   // same-file ("embedded") blob records. Currently only honored by
   // BlockBasedTableBuilder.
