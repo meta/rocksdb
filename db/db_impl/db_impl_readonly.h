@@ -103,6 +103,11 @@ class DBImplReadOnly : public DBImpl {
                WriteBatch* /*updates*/) override {
     return Status::NotSupported("Not supported operation in read only mode.");
   }
+  Status IncreaseFullHistoryTsLow(ColumnFamilyHandle* /*column_family*/,
+                                  std::string /*ts_low*/) override {
+    return Status::NotSupported("Not supported operation in read only mode.");
+  }
+
   using DBImpl::CompactRange;
   Status CompactRange(const CompactRangeOptions& /*options*/,
                       ColumnFamilyHandle* /*column_family*/,

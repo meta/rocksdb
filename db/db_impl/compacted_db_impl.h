@@ -109,6 +109,11 @@ class CompactedDBImpl : public DBImpl {
                WriteBatch* /*updates*/) override {
     return Status::NotSupported("Not supported in compacted db mode.");
   }
+  Status IncreaseFullHistoryTsLow(ColumnFamilyHandle* /*column_family*/,
+                                  std::string /*ts_low*/) override {
+    return Status::NotSupported("Not supported in compacted db mode.");
+  }
+
   using DBImpl::CompactRange;
   Status CompactRange(const CompactRangeOptions& /*options*/,
                       ColumnFamilyHandle* /*column_family*/,
