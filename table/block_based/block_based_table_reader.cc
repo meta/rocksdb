@@ -9,12 +9,15 @@
 #include "table/block_based/block_based_table_reader.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -81,8 +84,10 @@
 #include "table/sst_file_writer_collectors.h"
 #include "table/two_level_iterator.h"
 #include "test_util/sync_point.h"
+#include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
+#include "util/defer.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 
@@ -1949,6 +1954,168 @@ void BlockBasedTable::MultiGetSameFileBlob(
   }
 }
 
+void BlockBasedTable::MultiGetStoredSameFileBlob(
+    const ReadOptions& read_options, uint64_t coalesce_bytes, size_t num_reads,
+    StoredSameFileBlobReadRequest* reqs, uint64_t max_stored_bytes,
+    CoalescedReadBuffers* buffers, uint64_t* bytes_read) const {
+  if (bytes_read != nullptr) {
+    *bytes_read = 0;
+  }
+  if (num_reads == 0) {
+    return;
+  }
+  if (reqs == nullptr) {
+    return;
+  }
+  if (rep_ == nullptr || buffers == nullptr) {
+    // Set every status: the caller's statuses can already be OK, and an OK
+    // status with an empty payload would look like a successful read.
+    const Status error =
+        rep_ == nullptr
+            ? Status::Corruption("Blob relocation table is not open")
+            : Status::InvalidArgument("Missing blob GC read buffers");
+    for (size_t i = 0; i < num_reads; ++i) {
+      reqs[i].status = error;
+    }
+    return;
+  }
+  const Rep& rep = *rep_;
+
+  struct Pending {
+    size_t request_index = 0;
+    size_t payload_size = 0;
+    uint64_t record_offset = 0;
+    size_t record_size = 0;
+  };
+  std::vector<Pending> pending;
+  pending.reserve(num_reads);
+  uint64_t total_stored_bytes = 0;
+  for (size_t i = 0; i < num_reads; ++i) {
+    StoredSameFileBlobReadRequest& req = reqs[i];
+    if (req.stored_payload != nullptr) {
+      *req.stored_payload = Slice();
+    }
+    req.status = Status::OK();
+    size_t payload_size = 0;
+    size_t record_size = 0;
+    req.status =
+        ValidateEmbeddedBlobIndex(req.blob_index, &payload_size, &record_size);
+    if (!req.status.ok()) {
+      continue;
+    }
+    if (payload_size >
+        max_stored_bytes - std::min(total_stored_bytes, max_stored_bytes)) {
+      req.status =
+          Status::MemoryLimit("Stored blob relocation batch exceeds limit");
+      continue;
+    }
+    total_stored_bytes += payload_size;
+    pending.push_back(
+        Pending{i, payload_size, req.blob_index.offset(), record_size});
+  }
+  if (pending.empty()) {
+    return;
+  }
+  // Records follow key order, so this sort is usually a no-op.
+  std::sort(pending.begin(), pending.end(),
+            [](const Pending& lhs, const Pending& rhs) {
+              return lhs.record_offset < rhs.record_offset;
+            });
+  std::vector<uint64_t> offsets(pending.size());
+  std::vector<size_t> lengths(pending.size());
+  uint64_t total_record_bytes = 0;
+  for (size_t i = 0; i < pending.size(); ++i) {
+    offsets[i] = pending[i].record_offset;
+    lengths[i] = pending[i].record_size;
+    total_record_bytes += pending[i].record_size;
+  }
+  std::vector<Slice> records(pending.size());
+  std::vector<Status> statuses(pending.size());
+  // The buffer limit is the requested bytes plus max_stored_bytes for the
+  // merged gaps (see ReadCoalescedRanges()). Reads past it are deferred
+  // (Incomplete).
+  ReadCoalescedRanges(
+      read_options, rep.file.get(), coalesce_bytes, max_stored_bytes,
+      total_record_bytes +
+          std::min(max_stored_bytes,
+                   std::numeric_limits<uint64_t>::max() - total_record_bytes),
+      pending.size(), offsets.data(), lengths.data(), records.data(),
+      statuses.data(), buffers,
+      /*num_reads=*/nullptr, /*read_bytes=*/nullptr);
+
+  uint64_t successful_bytes = 0;
+  for (size_t i = 0; i < pending.size(); ++i) {
+    const Pending& entry = pending[i];
+    StoredSameFileBlobReadRequest& req = reqs[entry.request_index];
+    req.status = statuses[i];
+    if (req.status.ok()) {
+      req.status = VerifySimpleGen2BlobRecord(
+          rep.footer.checksum_type(), rep.footer.base_context_checksum(),
+          records[i], entry.payload_size, entry.record_offset,
+          req.blob_index.compression(), rep.file->file_name());
+    }
+    if (!req.status.ok()) {
+      continue;
+    }
+    const Slice stored(records[i].data(), entry.payload_size);
+    if (BlobIndex::ComputeStoredChecksum(
+            stored, req.blob_index.compression()) != req.stored_checksum) {
+      req.status =
+          Status::Corruption("Stored checksum mismatch while relocating blob");
+      continue;
+    }
+    if (req.stored_payload != nullptr) {
+      *req.stored_payload = stored;
+    }
+    successful_bytes += entry.record_size;
+  }
+  if (bytes_read != nullptr) {
+    *bytes_read = successful_bytes;
+  }
+}
+
+Status BlockBasedTable::StreamStoredSameFileBlob(
+    const ReadOptions& read_options, const BlobIndex& blob_index,
+    uint32_t stored_checksum, const BlobChunkConsumer& consumer) const {
+  size_t payload_size = 0;
+  size_t record_size = 0;
+  Status status =
+      ValidateEmbeddedBlobIndex(blob_index, &payload_size, &record_size);
+  if (!status.ok()) {
+    return status;
+  }
+  // Validate the trailer before delivery. The stored CRC, checked while
+  // streaming, verifies the payload whatever checksum type the file uses.
+  std::array<char, kSimpleGen2BlobTrailerSize> trailer{};
+  IOOptions options;
+  IODebugContext debug_context;
+  status = rep_->file->PrepareIOOptions(read_options, options, &debug_context);
+  Slice trailer_slice;
+  if (status.ok()) {
+    status = rep_->file->Read(blob_index.offset() + payload_size,
+                              trailer.size(), options, &trailer_slice,
+                              trailer.data(), &debug_context);
+  }
+  if (!status.ok()) {
+    return status;
+  }
+  if (trailer_slice.size() != trailer.size() ||
+      lossless_cast<CompressionType>(trailer_slice[0]) !=
+          blob_index.compression()) {
+    return Status::Corruption("Invalid streaming blob trailer");
+  }
+  if (rep_->footer.checksum_type() == kCRC32c &&
+      DecodeFixed32(trailer_slice.data() + 1) !=
+          crc32c::Mask(stored_checksum) +
+              ChecksumModifierForContext(rep_->footer.base_context_checksum(),
+                                         blob_index.offset())) {
+    return Status::Corruption("Streaming blob trailer checksum mismatch");
+  }
+  return StreamAndVerifyBlobStoredPayload(
+      read_options, rep_->file.get(), blob_index.offset(), payload_size,
+      blob_index.compression(), stored_checksum, consumer);
+}
+
 Status BlockBasedTable::MaybeResolveEmbeddedValue(
     const ReadOptions& read_options, const Slice& internal_key,
     const Slice& value, std::string* resolved_internal_key,
@@ -2564,66 +2731,561 @@ std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
   return rep_->table_properties;
 }
 
-Status BlockBasedTable::ReadBlobReferenceGroups(
-    const ReadOptions& caller_read_options, const Slice& expected_descriptor,
-    const std::function<Status(size_t buffer_bytes)>& before_allocation,
-    std::vector<BlobReferenceGroup>* groups) const {
-  if (groups == nullptr) {
-    return Status::InvalidArgument("Null blob reference group output");
-  }
+namespace {
 
-  const auto properties = GetTableProperties();
-  if (properties == nullptr) {
+// Reads one metadata block with checksum verification, without filling the
+// block cache and without the persistent cache. Data blocks may be
+// compressed; the index is not.
+// Blob reference metadata blocks have no block type of their own. They use
+// BlockType::kUserDefinedIndex, the type that GetBlockTypeForMetaBlockByName()
+// gives the reference index block (kBlobReferenceIndexBlockName).
+Status ReadBlobReferenceMetadataBlock(const BlockBasedTable::Rep& rep,
+                                      const ReadOptions& caller_read_options,
+                                      const BlockHandle& handle,
+                                      bool maybe_compressed,
+                                      BlockContents* contents) {
+  // No persistent cache, also for a reader from the table cache, so census
+  // reads and indirect blob GC reads never fill it (as fill_cache=false does
+  // for the block cache).
+  const PersistentCacheOptions no_persistent_cache;
+  ReadOptions read_options(caller_read_options);
+  read_options.fill_cache = false;
+  read_options.verify_checksums = true;
+  IOStatus io_status =
+      BlockFetcher(rep.file.get(), nullptr /* prefetch_buffer */, rep.footer,
+                   read_options, handle, contents, rep.ioptions,
+                   maybe_compressed /* do_uncompress */, maybe_compressed,
+                   BlockType::kUserDefinedIndex,
+                   maybe_compressed ? rep.decompressor.get() : nullptr,
+                   no_persistent_cache)
+          .ReadBlockContents();
+  return io_status;
+}
+
+// Checks the descriptor against the table property, then reads and decodes
+// the reference index.
+Status ReadBlobReferenceIndex(const BlockBasedTable::Rep& rep,
+                              const ReadOptions& read_options,
+                              const Slice& expected_descriptor,
+                              BlobReferenceMetadataDescriptor* descriptor,
+                              BlobReferenceIndex* index) {
+  if (rep.table_properties == nullptr) {
     return Status::Corruption("Missing table properties");
   }
-  const auto property = properties->user_collected_properties.find(
-      kBlobReferenceDescriptorPropertyName);
-  if (property == properties->user_collected_properties.end()) {
+  const UserCollectedProperties::const_iterator property =
+      rep.table_properties->user_collected_properties.find(
+          kBlobReferenceDescriptorPropertyName);
+  if (property == rep.table_properties->user_collected_properties.end()) {
     return Status::Corruption("Missing required blob reference descriptor");
   }
   if (Slice(property->second) != expected_descriptor) {
     return Status::Corruption("Blob reference descriptor mismatch");
   }
+  Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
+      expected_descriptor, descriptor);
+  if (!status.ok()) {
+    return status;
+  }
+  BlockContents index_contents;
+  status = ReadBlobReferenceMetadataBlock(
+      rep, read_options, descriptor->index_handle,
+      /*maybe_compressed=*/false, &index_contents);
+  if (!status.ok()) {
+    return status;
+  }
+  return DecodeBlobReferenceIndex(index_contents.data, *descriptor, index);
+}
+
+// Helper of BlockBasedTable::ReadBlobReferences(). It reads the reference data
+// blocks `blocks` (block ordinals in increasing order) and calls `visit` for
+// each one in order with its uncompressed contents. The contents stay valid
+// only during the call.
+// - Batches: the reads go through MultiRead in batches of at most
+//   kBlobReferenceReadBatchBytes (256 KB) of on-disk bytes (block plus
+//   trailer). A block larger than the batch budget returns Corruption. With
+//   mmap reads or direct I/O, the blocks are read one at a time instead.
+// - Requests: each run of adjacent blocks in a batch is one read request.
+// - Checks: each block is checked with its trailer checksum. A block that
+//   fails its checksum or decompression is passed to `visit` with an empty
+//   Slice and its Corruption status. Other read errors are returned.
+Status ReadBlobReferenceDataBlocks(
+    const BlockBasedTable::Rep& rep, const ReadOptions& read_options,
+    const BlobReferenceIndex& index, const std::vector<size_t>& blocks,
+    const std::function<Status(size_t block, const Slice& contents,
+                               const Status& block_status)>& visit) {
+  RandomAccessFileReader* const file = rep.file.get();
+  if (rep.ioptions.allow_mmap_reads || file->use_direct_io()) {
+    // With mmap reads or direct I/O, read the same blocks one at a time
+    // through the normal block read path (ReadBlobReferenceMetadataBlock())
+    // instead of the batched MultiRead path below.
+    for (size_t block : blocks) {
+      BlockContents contents;
+      Status status =
+          ReadBlobReferenceMetadataBlock(rep, read_options, index.blocks[block],
+                                         /*maybe_compressed=*/true, &contents);
+      if (!status.ok() && !status.IsCorruption()) {
+        return status;
+      }
+      status = visit(block, status.ok() ? contents.data : Slice(), status);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    return Status::OK();
+  }
+  const auto on_disk_size = [&](size_t block) {
+    return static_cast<size_t>(
+        BlockBasedTable::BlockSizeWithTrailer(index.blocks[block]));
+  };
+  size_t batch_budget = kBlobReferenceReadBatchBytes;
+  TEST_SYNC_POINT_CALLBACK(
+      "BlockBasedTable::ReadBlobReferenceDataBlocks:BatchBytes", &batch_budget);
+  std::unique_ptr<char[]> buffer(new char[batch_budget]);
+  size_t next = 0;
+  while (next < blocks.size()) {
+    // One batch: as many blocks as fit in the buffer, at least one.
+    const size_t batch_begin = next;
+    size_t batch_bytes = 0;
+    while (next < blocks.size() &&
+           batch_bytes + on_disk_size(blocks[next]) <= batch_budget) {
+      batch_bytes += on_disk_size(blocks[next]);
+      ++next;
+    }
+    if (next == batch_begin) {
+      return Status::Corruption("Blob reference data block is too large");
+    }
+    // One read request per run of adjacent blocks.
+    std::vector<FSReadRequest> requests;
+    std::vector<size_t> request_of_block;
+    std::vector<size_t> buffer_offset_of_block;
+    size_t buffer_offset = 0;
+    for (size_t i = batch_begin; i < next; ++i) {
+      const BlockHandle& handle = index.blocks[blocks[i]];
+      if (requests.empty() ||
+          requests.back().offset + requests.back().len != handle.offset()) {
+        FSReadRequest request;
+        request.offset = handle.offset();
+        request.len = 0;
+        request.scratch = buffer.get() + buffer_offset;
+        requests.push_back(std::move(request));
+      }
+      requests.back().len += on_disk_size(blocks[i]);
+      request_of_block.push_back(requests.size() - 1);
+      buffer_offset_of_block.push_back(buffer_offset);
+      buffer_offset += on_disk_size(blocks[i]);
+    }
+    TEST_SYNC_POINT_CALLBACK(
+        "BlockBasedTable::ReadBlobReferenceDataBlocks:MultiRead", &requests);
+    IOOptions io_options;
+    IODebugContext dbg;
+    IOStatus io_status = file->PrepareIOOptions(read_options, io_options, &dbg);
+    if (io_status.ok()) {
+      io_status = file->MultiRead(io_options, requests.data(), requests.size(),
+                                  /*aligned_buf=*/nullptr, &dbg);
+    }
+    // The loop below can return at the first failed request, and a failed call
+    // leaves the request statuses unread, so mark them all as checked here (as
+    // ReadCoalescedRanges() does). The loop still reads each status it needs.
+    for (FSReadRequest& request : requests) {
+      request.status.PermitUncheckedError();
+    }
+    if (!io_status.ok()) {
+      return io_status;
+    }
+    for (size_t i = batch_begin; i < next; ++i) {
+      const size_t block = blocks[i];
+      const BlockHandle& handle = index.blocks[block];
+      const FSReadRequest& request =
+          requests[request_of_block[i - batch_begin]];
+      if (!request.status.ok()) {
+        return request.status;
+      }
+      const size_t offset_in_request =
+          buffer_offset_of_block[i - batch_begin] -
+          lossless_cast<size_t>(request.scratch - buffer.get());
+      Status status;
+      if (request.result.size() != request.len) {
+        status = Status::Corruption("Truncated blob reference block read");
+      }
+      const char* const data = request.result.data() + offset_in_request;
+      const size_t size = static_cast<size_t>(handle.size());
+      if (status.ok()) {
+        status =
+            VerifyBlockChecksum(rep.footer, data, size, file->file_name(),
+                                handle.offset(), BlockType::kUserDefinedIndex);
+      }
+      BlockContents contents;
+      if (status.ok()) {
+        const CompressionType type = lossless_cast<CompressionType>(data[size]);
+        if (type == kNoCompression) {
+          contents = BlockContents(Slice(data, size));
+        } else if (rep.decompressor == nullptr) {
+          status = Status::Corruption(
+              "Compressed blob reference block without a decompressor");
+        } else {
+          status = DecompressSerializedBlock(
+              data, size, type, *rep.decompressor, &contents, rep.ioptions);
+        }
+      }
+      if (!status.ok() && !status.IsCorruption()) {
+        return status;
+      }
+      status = visit(block, status.ok() ? contents.data : Slice(), status);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+  }
+  return Status::OK();
+}
+
+// Decode state of one request of a batch read.
+struct BlobReferenceGroupReadState {
+  // The first and last data block that hold this group, as positions in
+  // index.blocks.
+  size_t first_block = 0;
+  size_t last_block = 0;
+  // The output size when this request started to append, valid once
+  // `started` is true.
+  size_t output_begin = 0;
+  std::optional<BlobReferenceGroupDecoder> decoder;
+  bool started = false;
+  // True when the request has finished, with success or with an error. The
+  // block visitor skips it.
+  bool done = false;
+};
+
+}  // namespace
+
+Status BlockBasedTable::ReadBlobReferenceGroups(
+    const ReadOptions& read_options, const Slice& expected_descriptor,
+    const std::function<Status(size_t buffer_bytes)>& before_allocation,
+    std::vector<BlobReferenceGroup>* groups) const {
+  if (groups == nullptr) {
+    return Status::InvalidArgument("Null blob reference group output");
+  }
+  if (rep_ == nullptr) {
+    return Status::Corruption("Missing block-based table reader state");
+  }
+  // The index holds every group total, so no data block is read. The decoder
+  // checks that the totals add up to the descriptor.
+  BlobReferenceMetadataDescriptor descriptor;
+  BlobReferenceIndex index;
+  Status status = ReadBlobReferenceIndex(
+      *rep_, read_options, expected_descriptor, &descriptor, &index);
+  return status.ok()
+             ? CopyIndirectBlobReferenceGroups(index, before_allocation, groups)
+             : status;
+}
+
+namespace {
+// Appends to a reserved vector, for requests without a sink.
+class VectorBlobReferenceSink : public BlobReferenceSink {
+ public:
+  explicit VectorBlobReferenceSink(std::vector<BlobReference>* output)
+      : output_(output) {}
+  size_t size() const override { return output_->size(); }
+  size_t Room() const override { return output_->capacity() - output_->size(); }
+  Status Append(const BlobReference& reference) override {
+    if (output_->size() == output_->capacity()) {
+      return Status::Corruption("Blob reference group count mismatch");
+    }
+    output_->push_back(reference);
+    return Status::OK();
+  }
+  void Truncate(size_t size) override { output_->resize(size); }
+  const void* identity() const override { return output_; }
+
+ private:
+  std::vector<BlobReference>* output_;
+};
+
+// Reads the exact groups `reads` (sorted by key, unique) from the decoded
+// `index` into `sinks`.
+Status ReadIndexedBlobReferenceGroups(
+    const BlockBasedTable::Rep& rep, const ReadOptions& read_options,
+    const BlobReferenceIndex& index, std::vector<BlobReferenceGroupRead>& reads,
+    const std::vector<BlobReferenceSink*>& sinks) {
+  // Merge the sorted requests with the sorted index groups, and collect the
+  // blocks that the found groups need. A request whose group is absent fails
+  // with NotFound. A request whose group does not fit its output fails with
+  // Aborted. A group ends in the block where the next group starts. If the next
+  // group starts at the beginning of its block (run_offset 0), the group ends
+  // in the block before. The last group ends in the last data block.
+  // (start_block and run_offset are fields of BlobReferenceIndexEntry in
+  // db/blob/blob_reference_metadata.h.)
+  //
+  // For example, group G starts in block 3, and the next group H starts in
+  // block 4. There are two cases:
+  //
+  //   (a) H starts inside block 4      (b) H starts at the first byte of
+  //       (run_offset > 0):                block 4 (run_offset 0):
+  //       G ends in block 4.               G ends in block 3.
+  //
+  //       | block 3   | block 4   |        | block 3   | block 4   |
+  //       |  [G=======|===][H==   |        |  [G======]|[H=========|
+  std::vector<BlobReferenceGroupReadState> states(reads.size());
+  std::vector<size_t> blocks;
+  // Several requests can share one sink: a whole-generation read becomes one
+  // request per group, and indirect blob GC reads all generation numbers of one
+  // input into one live set. Requests that share one sink share its room.
+  // Before any decode, each request is checked against the room left after the
+  // earlier requests of that sink. A request that does not fit gets Aborted and
+  // adds nothing.
+  UnorderedMap<const void*, uint64_t> planned_by_sink;
+  size_t group = 0;
+  for (size_t i = 0; i < reads.size(); ++i) {
+    const BlobReferenceGroup& requested = *reads[i].group;
+    while (group < index.groups.size() &&
+           index.groups[group].group.group_key() < requested.group_key()) {
+      ++group;
+    }
+    BlobReferenceGroupReadState& state = states[i];
+    state.done = true;
+    if (group == index.groups.size() ||
+        !(index.groups[group].group.group_key() == requested.group_key())) {
+      reads[i].status = Status::NotFound("Blob reference group is absent");
+      continue;
+    }
+    const BlobReferenceIndexEntry& entry = index.groups[group];
+    reads[i].found_reference_count = entry.group.reference_count;
+    reads[i].found_stored_value_bytes = entry.group.stored_value_bytes;
+    reads[i].found_record_bytes = entry.group.record_bytes;
+    uint64_t& planned = planned_by_sink[sinks[i]->identity()];
+    const uint64_t room = sinks[i]->Room();
+    if (entry.group.reference_count >
+        room - std::min<uint64_t>(planned, room)) {
+      reads[i].status =
+          Status::Aborted("Blob reference group exceeds the reserved output");
+      continue;
+    }
+    planned += entry.group.reference_count;
+    state.decoder.emplace(index, group);
+    state.first_block = entry.start_block;
+    if (group + 1 < index.groups.size()) {
+      const BlobReferenceIndexEntry& next = index.groups[group + 1];
+      state.last_block =
+          next.run_offset == 0 ? next.start_block - 1 : next.start_block;
+    } else {
+      state.last_block = index.blocks.size() - 1;
+    }
+    state.done = false;
+    for (size_t block = state.first_block; block <= state.last_block; ++block) {
+      if (blocks.empty() || blocks.back() < block) {
+        blocks.push_back(block);
+      }
+    }
+  }
+
+  // Fails one request. A request that started to append drops only what it
+  // appended (its output goes back to output_begin). A request that fails
+  // before it appended anything leaves the output unchanged. Several requests,
+  // or several calls, can share one output, so the references that earlier
+  // requests or the caller appended always stay. A request that is cut short
+  // fails in its last block (see below), before any later request of the same
+  // output starts. So a failure never removes a later request's references.
+  const auto fail = [&](size_t i, const Status& error) {
+    reads[i].status = error;
+    if (states[i].started) {
+      sinks[i]->Truncate(states[i].output_begin);
+    }
+    states[i].done = true;
+  };
+  size_t first_open = 0;
+  Status status = ReadBlobReferenceDataBlocks(
+      rep, read_options, index, blocks,
+      [&](size_t block, const Slice& contents, const Status& block_status) {
+        // Requests are sorted by group key, so their first blocks do not
+        // decrease. first_open is the first request that has not finished. The
+        // loop stops at the first request that starts after this block.
+        for (size_t i = first_open;
+             i < reads.size() &&
+             (states[i].done || states[i].first_block <= block);
+             ++i) {
+          BlobReferenceGroupReadState& state = states[i];
+          if (state.done || state.last_block < block) {
+            continue;
+          }
+          if (!block_status.ok()) {
+            fail(i, block_status);
+            continue;
+          }
+          if (block == state.first_block) {
+            // Earlier requests or calls may have appended to the same output;
+            // this request starts after them.
+            state.output_begin = sinks[i]->size();
+            state.started = true;
+          }
+          BlobReferenceSink& output = *sinks[i];
+          // BlobReferenceGroupDecoder does all format checks of the group. This
+          // loop only checks that the decoder expects this block and that the
+          // output has room.
+          Status run_status =
+              state.decoder->next_block() != block
+                  ? Status::Corruption("Blob reference group is cut short")
+                  : state.decoder->DecodeRun(
+                        contents, [&](const BlobReference& reference) {
+                          if (output.Room() == 0) {
+                            return Status::Corruption(
+                                "Blob reference group count mismatch");
+                          }
+                          return output.Append(reference);
+                        });
+          if (run_status.ok() && !state.decoder->done() &&
+              block == state.last_block) {
+            // The group's last block ended while references are still
+            // missing. Fail the request at its last block, so that it is
+            // marked done and first_open can move past it. The loop at the end
+            // of this function would fail it the same way.
+            run_status =
+                Status::Corruption("Blob reference group is cut short");
+          }
+          if (run_status.ok() && state.decoder->done()) {
+            state.done = true;
+          }
+          if (!run_status.ok()) {
+            fail(i, run_status);
+          }
+        }
+        while (first_open < reads.size() && states[first_open].done) {
+          ++first_open;
+        }
+        return Status::OK();
+      });
+  if (!status.ok()) {
+    for (size_t i = 0; i < reads.size(); ++i) {
+      if (!states[i].done) {
+        fail(i, status);
+      }
+    }
+    return status;
+  }
+  for (size_t i = 0; i < reads.size(); ++i) {
+    if (!states[i].done) {
+      fail(i, Status::Corruption("Blob reference group is cut short"));
+    }
+  }
+  return Status::OK();
+}
+
+}  // namespace
+
+Status BlockBasedTable::ReadBlobReferences(
+    const ReadOptions& read_options, const Slice& expected_descriptor,
+    const std::function<Status(size_t index_bytes)>& after_index_read,
+    std::vector<BlobReferenceGroupRead>* requests) const {
+  if (requests == nullptr) {
+    return Status::InvalidArgument("Missing blob reference batch state");
+  }
+  std::vector<BlobReferenceGroupRead>& reads = *requests;
+  // When the whole call fails, the caller may skip the request statuses (see
+  // TableReader::ReadBlobReferences()), so mark them as checked here.
+  const auto fail_call = [&reads](Status call_status) {
+    for (BlobReferenceGroupRead& read : reads) {
+      read.status.PermitUncheckedError();
+    }
+    return call_status;
+  };
+  if (rep_ == nullptr) {
+    return fail_call(
+        Status::InvalidArgument("Missing blob reference batch state"));
+  }
+  std::vector<VectorBlobReferenceSink> vector_sinks;
+  vector_sinks.reserve(reads.size());
+  std::vector<BlobReferenceSink*> sinks(reads.size());
+  const bool whole_generation = !reads.empty() && reads[0].whole_generation;
+  for (size_t i = 0; i < reads.size(); ++i) {
+    // Request i - 1 passed this check, so its group is not null.
+    const bool out_of_order =
+        i > 0 && reads[i].group != nullptr &&
+        (whole_generation ? reads[i - 1].group->generation_file_number >=
+                                reads[i].group->generation_file_number
+                          : !(reads[i - 1].group->group_key() <
+                              reads[i].group->group_key()));
+    if (reads[i].group == nullptr ||
+        (reads[i].output == nullptr && reads[i].sink == nullptr) ||
+        reads[i].whole_generation != whole_generation || out_of_order) {
+      return fail_call(Status::InvalidArgument(
+          "Blob reference batch requests must be sorted and unique"));
+    }
+    if (reads[i].sink != nullptr) {
+      sinks[i] = reads[i].sink;
+    } else {
+      vector_sinks.emplace_back(reads[i].output);
+      sinks[i] = &vector_sinks.back();
+    }
+    reads[i].status = Status::OK();
+    reads[i].found_reference_count = 0;
+    reads[i].found_stored_value_bytes = 0;
+    reads[i].found_record_bytes = 0;
+  }
 
   BlobReferenceMetadataDescriptor descriptor;
-  Status status = BlobReferenceMetadataDescriptor::DecodeFrom(
-      expected_descriptor, &descriptor);
-  if (!status.ok()) {
-    return status;
-  }
-
-  // Keep the caller's I/O activity, rate limiter priority and deadlines.
-  ReadOptions read_options = caller_read_options;
-  read_options.fill_cache = false;
-  read_options.verify_checksums = true;
-  // No persistent cache, also for a reader from the table cache, so census and
-  // indirect blob GC reads never fill it (as fill_cache=false does for the
-  // block cache).
-  const auto read_block = [&](const BlockHandle& handle,
-                              BlockContents* contents) -> Status {
-    IOStatus io_status =
-        BlockFetcher(rep_->file.get(), nullptr /* prefetch_buffer */,
-                     rep_->footer, read_options, handle, contents,
-                     rep_->ioptions, false /* do_uncompress */,
-                     false /* maybe_compressed */, BlockType::kUserDefinedIndex,
-                     nullptr /* decompressor */, PersistentCacheOptions())
-            .ReadBlockContents();
-    return io_status;
-  };
-
-  BlockContents index_contents;
-  status = read_block(descriptor.index_handle, &index_contents);
-  if (!status.ok()) {
-    return status;
-  }
-  // The index holds every group total, so no data block is read. The
-  // decoder checks that the totals add up to the descriptor.
   BlobReferenceIndex index;
-  status = DecodeBlobReferenceIndex(index_contents.data, descriptor, &index);
+  Status status = ReadBlobReferenceIndex(
+      *rep_, read_options, expected_descriptor, &descriptor, &index);
   if (!status.ok()) {
-    return status;
+    return fail_call(status);
   }
-  return CopyIndirectBlobReferenceGroups(index, before_allocation, groups);
+  if (after_index_read) {
+    status = after_index_read(
+        sizeof(index) + index.blocks.capacity() * sizeof(BlockHandle) +
+        index.groups.capacity() * sizeof(BlobReferenceIndexEntry));
+    if (!status.ok()) {
+      return fail_call(status);
+    }
+  }
+  if (!whole_generation) {
+    status = ReadIndexedBlobReferenceGroups(*rep_, read_options, index, reads,
+                                            sinks);
+    return status.ok() ? status : fail_call(status);
+  }
+
+  // Expand each generation into its exact groups, in index order (sorted by
+  // key), then add the results up per generation.
+  std::vector<BlobReferenceGroupRead> group_reads;
+  std::vector<BlobReferenceSink*> group_sinks;
+  std::vector<size_t> owners;
+  for (const BlobReferenceIndexEntry& entry : index.groups) {
+    const std::vector<BlobReferenceGroupRead>::const_iterator request =
+        std::lower_bound(
+            reads.begin(), reads.end(), entry.group.generation_file_number,
+            [](const BlobReferenceGroupRead& read, uint64_t generation) {
+              return read.group->generation_file_number < generation;
+            });
+    if (request == reads.end() || request->group->generation_file_number !=
+                                      entry.group.generation_file_number) {
+      continue;
+    }
+    const size_t owner = lossless_cast<size_t>(request - reads.cbegin());
+    BlobReferenceGroupRead group_read;
+    group_read.group = &entry.group;
+    group_read.sink = sinks[owner];
+    group_reads.push_back(std::move(group_read));
+    group_sinks.push_back(sinks[owner]);
+    owners.push_back(owner);
+  }
+  std::vector<bool> found(reads.size(), false);
+  status = ReadIndexedBlobReferenceGroups(*rep_, read_options, index,
+                                          group_reads, group_sinks);
+  for (size_t i = 0; i < group_reads.size(); ++i) {
+    BlobReferenceGroupRead& read = reads[owners[i]];
+    found[owners[i]] = true;
+    read.found_reference_count += group_reads[i].found_reference_count;
+    read.found_stored_value_bytes += group_reads[i].found_stored_value_bytes;
+    read.found_record_bytes += group_reads[i].found_record_bytes;
+    // Check the group status first, so that it is checked also when the
+    // request already failed.
+    if (!group_reads[i].status.ok() && read.status.ok()) {
+      read.status = group_reads[i].status;
+    }
+  }
+  for (size_t i = 0; i < reads.size(); ++i) {
+    if (!found[i]) {
+      reads[i].status = Status::NotFound("Blob reference generation is absent");
+    }
+  }
+  return status.ok() ? status : fail_call(status);
 }
 
 const SeqnoToTimeMapping& BlockBasedTable::GetSeqnoToTimeMapping() const {
@@ -3386,9 +4048,13 @@ InternalIterator* BlockBasedTable::NewIteratorImpl(
       /*input_iter=*/nullptr, /*get_context=*/nullptr, &lookup_context));
   // Same-file ("embedded") blob references are resolved by a wrapper iterator
   // so the block-based iterator never exposes an unresolved BlobIndex. The SST
-  // dump tool must keep seeing raw BlobIndex values, so it is excluded.
+  // dump tool and the blob relocation reader must keep seeing raw values, so
+  // they are excluded. The relocation reader checks the key type of each
+  // location entry itself.
   const bool resolve_embedded_values =
-      caller != TableReaderCaller::kSSTDumpTool && HasEmbeddedBlobRecords();
+      caller != TableReaderCaller::kSSTDumpTool &&
+      caller != TableReaderCaller::kBlobRelocationFileRead &&
+      HasEmbeddedBlobRecords();
   // When wrapping, the inner iterator must materialize each data block (it must
   // not defer to the index's first key), so force allow_unprepared_value off;
   // the wrapper re-introduces value laziness above it.

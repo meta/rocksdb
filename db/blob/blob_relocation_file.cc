@@ -377,6 +377,14 @@ BlockBasedTableOptions MakeBlobRelocationTableOptions(
   // so a record copied to another offset fails its check. Relocation files are
   // a new file kind, so this has no compatibility cost.
   options.format_version = std::max<uint32_t>(options.format_version, 6);
+  // Relocation files use kCRC32c for block and record checksums, whatever
+  // checksum type the table options set, unless they set kNoChecksum. A record
+  // trailer can then reuse the stored CRC32C of the value, so streaming a value
+  // needs no second checksum pass over its payload. Normal SSTs and blob files
+  // keep their configured checksum type.
+  if (options.checksum != kNoChecksum) {
+    options.checksum = kCRC32c;
+  }
   options.index_type = BlockBasedTableOptions::kBinarySearch;
   // A lookup key usually lies between two location entry keys, so a data
   // block hash index (exact keys only) cannot help, and the index key of a
