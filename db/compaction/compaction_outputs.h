@@ -382,6 +382,9 @@ class CompactionOutputs {
   // indicate if this CompactionOutputs obj for proximal_level, should always
   // be false if per_key_placement feature is not enabled.
   const bool is_proximal_level_;
+  // The input Version has the blob indirection format. Fixed for the
+  // compaction, so AddToOutput() reads this instead of the Version per key.
+  const bool input_has_blob_indirection_format_;
 
   // partitioner information
   std::unique_ptr<SstPartitioner> partitioner_;
@@ -441,11 +444,13 @@ class CompactionOutputs {
   // output file's smallest key is a range tombstone start key.
   InternalKey range_tombstone_lower_bound_;
 
-  // Decodes the kTypeBlobIndex value `value` of the current key. Returns null
-  // if the decode fails. The result lives until the next call. It is out of
-  // line and kept apart from AddToOutput() so that a key that is not a blob
-  // index does no extra work there (no BlobIndex is built on that path).
-  ROCKSDB_NOINLINE const BlobIndex* DecodeOutputBlobIndex(const Slice& value);
+  // Decodes the kTypeBlobIndex value `value` of the current key, or reuses
+  // the decode of the compaction iterator. Returns null if the decode fails.
+  // The result lives until the next call. It is out of line and kept apart
+  // from AddToOutput() so that a key that is not a blob index does no extra
+  // work there (no BlobIndex is built on that path).
+  ROCKSDB_NOINLINE const BlobIndex* DecodeOutputBlobIndex(
+      const CompactionIterator& c_iter, const Slice& value);
   // The decode buffer of DecodeOutputBlobIndex(). BlobIndex::DecodeFrom()
   // resets it before each decode, so one member serves every key.
   BlobIndex output_blob_index_;

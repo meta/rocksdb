@@ -895,6 +895,14 @@ size_t BlobReferenceCensus::WorkerState::MemoryUsage(
   // Candidate map nodes, heap pointer capacity and retry set nodes (see
   // BlobGcCandidateHeap::MemoryUsage()). Only this worker changes the heap.
   add(1, candidates.MemoryUsage(additional_candidates));
+  // One set node per routed generation number with no holder. The set
+  // normally has no more entries than forward_state has routes. During a delta
+  // it can briefly hold generation numbers whose routes were just deleted, so
+  // the charge uses the larger of the two counts. A std::set node adds about 4
+  // pointers (an estimate). The charge is taken before the set grows.
+  add(std::max(retirement_generations.size(),
+               forward_state != nullptr ? forward_state->route_count() : 0),
+      sizeof(uint64_t) + 4 * sizeof(void*));
   return bytes;
 }
 
@@ -1080,9 +1088,20 @@ Status BlobReferenceCensus::WorkerState::ApplyFiles(
       }
       slot_set_bytes -= GenerationBytes(entry);
       generations.erase(found);
+      MarkRetirementIfRouted(generation);
+    } else if (finalized) {
+      retirement_generations.erase(generation);
     }
   }
   return Status::OK();
+}
+
+void BlobReferenceCensus::WorkerState::MarkRetirementIfRouted(
+    uint64_t generation) {
+  if (forward_state != nullptr &&
+      forward_state->FindRouteTarget(generation) != kInvalidBlobFileNumber) {
+    retirement_generations.insert(generation);
+  }
 }
 
 Status BlobReferenceCensus::WorkerState::Finalize() {
@@ -1150,6 +1169,17 @@ Status BlobReferenceCensus::WorkerState::Finalize() {
     } else {
       ++found;
     }
+  }
+  // Route retirement can delete the route of every routed generation number
+  // that no SST holds. Finalize() makes one pass over the routes per build.
+  // Later deltas keep the set up to date.
+  retirement_generations.clear();
+  if (forward_state != nullptr) {
+    forward_state->ForEachRoute([this](const BlobRelocationRoute& route) {
+      if (generations.count(route.GetOldFileNumber()) == 0) {
+        retirement_generations.insert(route.GetOldFileNumber());
+      }
+    });
   }
   finalized = true;
   return Status::OK();
@@ -1370,6 +1400,57 @@ BlobGcCandidateHeap::Selection BlobReferenceCensus::SelectWorkerEmptyCandidates(
              : BlobGcCandidateHeap::Selection{};
 }
 
+BlobReferenceCensus::RetirementSelection
+BlobReferenceCensus::SelectWorkerRetirementSources(uint64_t token) {
+  std::shared_ptr<WorkerState> worker = LoadWorkerState();
+  std::lock_guard<std::mutex> lock(worker_mutex_);
+  RetirementSelection result{};
+  if (worker == nullptr || worker->token != token || !worker->finalized ||
+      worker->retirement_generations.empty()) {
+    return result;
+  }
+  // Visit the set at most once, starting after the cursor and wrapping around,
+  // so generation numbers that stay pinned do not starve the others.
+  auto iterator =
+      worker->retirement_generations.upper_bound(worker->retirement_cursor);
+  size_t output = 0;
+  for (size_t visited = 0; output < result.size() &&
+                           visited < worker->retirement_generations.size();
+       ++visited) {
+    if (iterator == worker->retirement_generations.end()) {
+      iterator = worker->retirement_generations.begin();
+    }
+    const uint64_t generation = *iterator++;
+    worker->retirement_cursor = generation;
+    // A route into an input of the running indirect blob GC job cannot be
+    // deleted now (see BeginGcJob()). Skip it here, so it does not take one of
+    // the 64 selection slots and no census snapshot is read for it.
+    // RetireBlobRelocationRoutes() checks the GC inputs again.
+    const uint64_t target =
+        worker->forward_state != nullptr
+            ? worker->forward_state->FindRouteTarget(generation)
+            : kInvalidBlobFileNumber;
+    if (IsGcInputFile(target)) {
+      TEST_SYNC_POINT_CALLBACK(
+          "BlobReferenceCensus::SelectWorkerRetirementSources:SkipGcInput",
+          const_cast<uint64_t*>(&generation));
+      continue;
+    }
+    // A generation number at or above the coarse frontier is skipped, because
+    // a coarse SST has no reference list, so the census cannot prove that no
+    // coarse SST holds it. This is defense in depth: no known path gives a
+    // route to a number that a coarse SST holds. Indirect blob GC does not
+    // select an indirect origin at or above the frontier, and a coarse SST
+    // holds no routed or flattened number. The skip also delays the routes of
+    // old relocation files at or above the frontier, which a coarse SST can
+    // never hold. RetireBlobRelocationRoutes() checks the frontier again.
+    if (!worker->candidates.IsCoarsePinnedGeneration(generation)) {
+      result[output++] = generation;
+    }
+  }
+  return result;
+}
+
 bool BlobReferenceCensus::NeedsWorkerRun(uint64_t version_number) const {
   std::lock_guard<std::mutex> lock(mutex_);
   return !build_waiting_for_install_ &&
@@ -1558,10 +1639,23 @@ Status BlobReferenceCensus::ApplyWorkerDelta(
     return status;
   }
   worker->forward_state = delta.forward_state;
+  // WorkerState::MemoryUsage() charges the retirement set for the larger of
+  // its size and the route count of the new state. Charge it before the loop
+  // below can grow the set.
+  status = worker->Reserve(0);
+  if (!status.ok()) {
+    return status;
+  }
   for (uint64_t generation : delta.changed_routes) {
     const std::map<uint64_t, WorkerGeneration>::iterator found =
         worker->generations.find(generation);
     if (found == worker->generations.end()) {
+      // A generation number with no holder: route retirement can delete its
+      // route if it still has one.
+      if (worker->finalized) {
+        worker->retirement_generations.erase(generation);
+        worker->MarkRetirementIfRouted(generation);
+      }
       continue;
     }
     const uint64_t target = worker->ResolvePhysical(generation);
@@ -1686,8 +1780,9 @@ Status BlobReferenceCensus::SnapshotSelected(
       return Status::TryAgain("Selected census snapshot epoch changed");
     }
   }
-  Status status = CopyWorkerSnapshot(*worker, version_number,
-                                     generation_numbers, gc_block_cache, state);
+  Status status =
+      CopyWorkerSnapshot(*worker, version_number, generation_numbers,
+                         gc_block_cache, state, /*uncharged_charges=*/nullptr);
   {
     std::lock_guard<std::mutex> log_lock(mutex_);
     snapshot_pending_ = false;
@@ -1711,8 +1806,9 @@ Status BlobReferenceCensus::ReadSelectedSnapshot(
     return Status::TryAgain("Selected census snapshot epoch changed");
   }
   std::shared_ptr<BlobReferenceCensusState> copy;
-  Status status = CopyWorkerSnapshot(*worker, version_number,
-                                     generation_numbers, gc_block_cache, &copy);
+  Status status =
+      CopyWorkerSnapshot(*worker, version_number, generation_numbers,
+                         gc_block_cache, &copy, &uncharged_charge_count_);
   if (status.ok()) {
     *state = std::move(copy);
   }
@@ -1734,7 +1830,8 @@ BlobReferenceCensus::TEST_GetReadyState(uint64_t version_number) const {
   std::shared_ptr<BlobReferenceCensusState> result;
   const Status status =
       CopyWorkerSnapshot(*worker, version_number, generation_numbers,
-                         /*gc_block_cache=*/nullptr, &result);
+                         /*gc_block_cache=*/nullptr, &result,
+                         /*uncharged_charges=*/nullptr);
   if (!status.ok()) {
     // The copy keeps the strict charge of a GC copy, so a full block cache
     // fails it with MemoryLimit. Then there is no copy to return.
@@ -1804,7 +1901,8 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
     const WorkerState& worker, uint64_t version_number,
     const std::set<uint64_t>& generation_numbers,
     const std::shared_ptr<Cache>& gc_block_cache,
-    std::shared_ptr<BlobReferenceCensusState>* state) const {
+    std::shared_ptr<BlobReferenceCensusState>* state,
+    std::atomic<uint64_t>* uncharged_charges) const {
   if (!worker.finalized) {
     return Status::TryAgain("Census build has not finished");
   }
@@ -1835,7 +1933,10 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
   if (gc_block_cache != nullptr) {
     reservation_manager = std::make_shared<CacheReservationManagerImpl<
         CacheEntryRole::kIndirectBlobGcWorkingMemory>>(gc_block_cache);
-    const Status status = reservation_manager->UpdateCacheReservation(bytes);
+    Status status = reservation_manager->UpdateCacheReservation(bytes);
+    if (uncharged_charges != nullptr) {
+      status = AllowUnchargedCensusCharge(std::move(status), uncharged_charges);
+    }
     if (!status.ok()) {
       return status;
     }
@@ -1874,6 +1975,9 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
   if (result->reservation_manager_ != nullptr) {
     Status status = result->reservation_manager_->UpdateCacheReservation(
         result->snapshot_memory_bound_);
+    if (uncharged_charges != nullptr) {
+      status = AllowUnchargedCensusCharge(std::move(status), uncharged_charges);
+    }
     if (!status.ok()) {
       return status;
     }
@@ -2679,6 +2783,7 @@ BlobReferenceCensusGarbage BlobReferenceCensus::Cancel() {
                BlobReferenceCensusGarbage::kBuildCursorSlot);
   build_cursor_.token = 0;
   gc_job_token_ = 0;
+  gc_input_files_.clear();
   garbage.log_entries[BlobReferenceCensusGarbage::kLogTailSlot] =
       std::move(log_tail_);
   // The seeds are charged summaries: hand them to the caller, so they are freed
@@ -2701,10 +2806,12 @@ bool BlobReferenceCensus::IsSnapshotPending() const {
 }
 
 Status BlobReferenceCensus::BeginGcJob(uint64_t version_number,
+                                       std::vector<uint64_t> candidate_files,
                                        uint64_t* token) {
   if (token == nullptr || version_number == 0) {
     return Status::InvalidArgument("Invalid blob GC job start");
   }
+  std::sort(candidate_files.begin(), candidate_files.end());
   {
     // Return TryAgain early, without mutex_, when a metadata commit is in
     // progress. The check is repeated under mutex_ below.
@@ -2741,6 +2848,7 @@ Status BlobReferenceCensus::BeginGcJob(uint64_t version_number,
   if (gc_job_token_ == 0) {
     gc_job_token_ = next_gc_token_++;
   }
+  gc_input_files_ = std::move(candidate_files);
   snapshot_pending_ = worker_ready;
   *token = gc_job_token_;
   return Status::OK();
@@ -2761,7 +2869,15 @@ void BlobReferenceCensus::EndGcJob(uint64_t token) {
   if (token != 0 && token == gc_job_token_) {
     gc_job_token_ = 0;
     snapshot_pending_ = false;
+    gc_input_files_.clear();
   }
+}
+
+bool BlobReferenceCensus::IsGcInputFile(uint64_t file_number) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return gc_job_token_ != 0 &&
+         std::binary_search(gc_input_files_.begin(), gc_input_files_.end(),
+                            file_number);
 }
 
 // Groundwork for indirect blob GC jobs (see "Groundwork term" in the top

@@ -451,7 +451,11 @@ void CompactionOutputs::NoteBlobReferenceLimitCut(const Slice& next_key) {
           TableBuilderNewTableReason::kBlobReferenceLimit));
 }
 
-const BlobIndex* CompactionOutputs::DecodeOutputBlobIndex(const Slice& value) {
+const BlobIndex* CompactionOutputs::DecodeOutputBlobIndex(
+    const CompactionIterator& c_iter, const Slice& value) {
+  if (c_iter.OutputBlobIndex() != nullptr) {
+    return c_iter.OutputBlobIndex();
+  }
   return output_blob_index_.DecodeFrom(value).ok() ? &output_blob_index_
                                                    : nullptr;
 }
@@ -544,12 +548,14 @@ Status CompactionOutputs::AddToOutput(
   const Slice& value = c_iter.value();
   // Decode a kTypeBlobIndex value once, and share the decode with the table
   // builder, the blob garbage meter and the file metadata update below. If the
-  // decode fails, each of them decodes again and reports the error as usual.
+  // compaction iterator already decoded this value (when it checked whether to
+  // flatten it), use that decode. If the decode fails, each of them decodes
+  // again and reports the error as usual.
   // Other keys do no extra work: DecodeOutputBlobIndex() is out of line and
   // builds no BlobIndex on this path.
   const BlobIndex* shared_blob_index = nullptr;
   if (c_iter.ikey().type == kTypeBlobIndex) {
-    shared_blob_index = DecodeOutputBlobIndex(value);
+    shared_blob_index = DecodeOutputBlobIndex(c_iter, value);
   }
   bool retried_after_new_table = false;
   while (true) {
@@ -666,8 +672,14 @@ Status CompactionOutputs::AddToOutput(
     smallest_preferred_seqno_ =
         std::min(smallest_preferred_seqno_, preferred_seqno);
   }
-  s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
-                                             ikey.type, shared_blob_index);
+  if (input_has_blob_indirection_format_) {
+    s = current_output().meta.UpdateBoundaries(
+        key, value, ikey.sequence, ikey.type,
+        *compaction_->input_version()->storage_info(), shared_blob_index);
+  } else {
+    s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
+                                               ikey.type, shared_blob_index);
+  }
 
   return s;
 }
@@ -1035,7 +1047,13 @@ void CompactionOutputs::FillFilesToCutForTtl() {
 
 CompactionOutputs::CompactionOutputs(const Compaction* compaction,
                                      const bool is_proximal_level)
-    : compaction_(compaction), is_proximal_level_(is_proximal_level) {
+    : compaction_(compaction),
+      is_proximal_level_(is_proximal_level),
+      input_has_blob_indirection_format_(compaction->input_version() !=
+                                             nullptr &&
+                                         compaction->input_version()
+                                             ->storage_info()
+                                             ->HasBlobIndirectionFormat()) {
   partitioner_ = compaction->output_level() == 0
                      ? nullptr
                      : compaction->CreateSstPartitioner();

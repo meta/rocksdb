@@ -1670,6 +1670,15 @@ class Version {
 
   const MutableCFOptions& GetMutableCFOptions() { return mutable_cf_options_; }
 
+  // Checks that a reference with generation number `generation` can still be
+  // read in this Version, with the same file table rules as an indirect read,
+  // without opening a file: `generation` is a live indirect-origin blob file, a
+  // live relocation file, or a route to a live relocation file. Returns
+  // NotFound for a relocation file marked lost and Corruption otherwise.
+  // Compaction uses it to check the generation numbers that its output SSTs
+  // write.
+  Status ValidateBlobReferenceGeneration(uint64_t generation) const;
+
   InternalIterator* TEST_GetLevelIterator(
       const ReadOptions& read_options, MergeIteratorBuilder* merge_iter_builder,
       int level, bool allow_unprepared_value);

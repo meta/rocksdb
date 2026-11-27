@@ -3332,7 +3332,19 @@ void DBImpl::ScheduleBlobReferenceCensus(ColumnFamilyData* requested_cfd) {
   };
 
   const auto enqueue = [this, &needs_census](ColumnFamilyData* cfd) {
-    if (!needs_census(cfd) || cfd->queued_for_blob_reference_census_) {
+    const bool needed = needs_census(cfd);
+    if (cfd != nullptr && cfd->queued_for_blob_reference_census_) {
+      // A running census job may end after an apply after an install
+      // published the census, so the job queues the CF again at its end (see
+      // blob_reference_census_rerun_).
+      cfd->blob_reference_census_rerun_ |=
+          needed && cfd->blob_reference_census_running_;
+      return;
+    }
+    const bool rerun = cfd != nullptr &&
+                       std::exchange(cfd->blob_reference_census_rerun_, false);
+    if (!needed && !(rerun && !cfd->IsDropped() &&
+                     cfd->blob_reference_census() != nullptr)) {
       return;
     }
     cfd->blob_reference_census()->SetBuildWakeup(
@@ -3423,11 +3435,14 @@ void DBImpl::UnscheduleBlobReferenceCensus(void* arg) {
   db->bg_cv_.SignalAll();
 }
 
-Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete,
-                                        bool* overflowed) {
-  assert(cfd != nullptr && incomplete != nullptr && overflowed != nullptr);
+Status DBImpl::BuildBlobReferenceCensus(
+    ColumnFamilyData* cfd, bool* incomplete, bool* overflowed,
+    BlobReferenceCensus::RetirementSelection* retirement_sources) {
+  assert(cfd != nullptr && incomplete != nullptr && overflowed != nullptr &&
+         retirement_sources != nullptr);
   *incomplete = false;
   *overflowed = false;
+  retirement_sources->fill(0);
   if (!blob_reference_census_retry_registered_.exchange(
           true, std::memory_order_acq_rel)) {
     const Status registration = periodic_task_scheduler_.Register(
@@ -3724,6 +3739,8 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete,
   if (!status.ok()) {
     return status;
   }
+  const BlobReferenceCensus::RetirementSelection selected =
+      census.SelectWorkerRetirementSources(context->token);
   status = PublishBlobReferenceCensusWorker(cfd, context.get(), incomplete);
   if (status.IsAborted() && census.BuildCursorOverflowed(context->token)) {
     // TryPublishWorker() returns kStale also when the build cursor overflowed
@@ -3731,6 +3748,11 @@ Status DBImpl::BuildBlobReferenceCensus(ColumnFamilyData* cfd, bool* incomplete,
     // restarts the build or counts the overflow, as for an overflow that a
     // slice finds.
     *overflowed = true;
+  }
+  if (status.ok() && !*incomplete) {
+    // The census is published. The caller runs route retirement on these
+    // numbers after it releases the census's worker_run_mutex().
+    *retirement_sources = selected;
   }
   return status;
 }
@@ -4107,6 +4129,7 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
     cfd->next_blob_reference_census_ = nullptr;
     // Keep queued=true while running: concurrent installs must not start a
     // second worker or duplicate this CF's intrusive queue entry.
+    cfd->blob_reference_census_running_ = true;
     should_build = !db->shutting_down_.load(std::memory_order_acquire) &&
                    !cfd->IsDropped();
   }
@@ -4116,17 +4139,28 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
   TEST_SYNC_POINT("DBImpl::BGWorkBlobReferenceCensus:BeforeBuildWait");
   Status status;
   if (should_build) {
-    std::lock_guard<std::mutex> run_lock(
-        cfd->blob_reference_census()->worker_run_mutex());
+    // FailBuild() below runs after the run lock is released. Store a failure
+    // first, under the run lock, so an apply after an install that takes the
+    // run lock in between applies nothing (a failed delta may still be
+    // queued).
+    const auto store_failure = [cfd](const Status& failure) {
+      const std::shared_ptr<BlobReferenceCensusBuildContext> context =
+          cfd->blob_reference_census()->GetBuildContext();
+      if (context != nullptr && context->failure.ok()) {
+        context->failure = failure;
+      }
+    };
     BlobReferenceCensus* const census = cfd->blob_reference_census();
-    const uint64_t uncharged_before = census->uncharged_charge_count();
-    status = db->BuildBlobReferenceCensus(cfd, &incomplete, &overflowed);
     // A census charge that found the block cache full went on uncharged (see
     // AllowUnchargedCensusCharge() in blob_reference_census.cc). Count the
     // build once and log one WARN line for it. A change log charge of an
     // install that runs at the same time can also be counted here.
-    const uint64_t uncharged_after = census->uncharged_charge_count();
-    if (uncharged_after != uncharged_before) {
+    // REQUIRES: the census's worker_run_mutex() is held.
+    const auto note_uncharged = [db, cfd, census](uint64_t uncharged_before) {
+      const uint64_t uncharged_after = census->uncharged_charge_count();
+      if (uncharged_after == uncharged_before) {
+        return;
+      }
       const std::shared_ptr<BlobReferenceCensusBuildContext> context =
           census->GetBuildContext();
       if (context != nullptr && !context->uncharged_build_counted) {
@@ -4138,16 +4172,79 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
                        " uncharged census charges so far)",
                        cfd->GetName().c_str(), uncharged_after);
       }
-    }
-    if (!status.ok()) {
-      // FailBuild() below runs after the run lock is released. Store the
-      // failure first, so an apply after an install that takes the run lock
-      // in between applies nothing (a failed delta may still be queued).
-      const std::shared_ptr<BlobReferenceCensusBuildContext> context =
-          cfd->blob_reference_census()->GetBuildContext();
-      if (context != nullptr && context->failure.ok()) {
-        context->failure = status;
+    };
+    BlobReferenceCensus::RetirementSelection retirement_sources{};
+    {
+      std::lock_guard<std::mutex> run_lock(census->worker_run_mutex());
+      const uint64_t uncharged_before = census->uncharged_charge_count();
+      status = db->BuildBlobReferenceCensus(cfd, &incomplete, &overflowed,
+                                            &retirement_sources);
+      note_uncharged(uncharged_before);
+      if (!status.ok()) {
+        store_failure(status);
       }
+    }
+    if (status.ok() && !incomplete) {
+      // Route retirement runs only here, in the census job, after the census
+      // is published. It writes the MANIFEST, which can be slow and can fail.
+      // So the apply step that a flush or compaction thread runs after its
+      // install (see "Apply after an install" in
+      // db/blob/blob_reference_census.h) does not run it, and that thread is
+      // never delayed or failed by it. It runs without the run lock, so such
+      // an apply is not skipped while route retirement waits for its
+      // MANIFEST write. An install that lands after route retirement pinned
+      // its Version makes the precondition fail, and route retirement ends
+      // with TryAgain. If the census moves to a newer Version before the pin,
+      // route retirement uses that Version and checks every selected number
+      // again there.
+      bool retired = false;
+      // The census snapshot of route retirement also goes on uncharged when
+      // the cache is full (see BlobReferenceCensus::ReadSelectedSnapshot()),
+      // and counts toward the same build.
+      const uint64_t uncharged_before = census->uncharged_charge_count();
+      status =
+          db->RetireBlobRelocationRoutes(cfd, retirement_sources, &retired);
+      if (census->uncharged_charge_count() != uncharged_before) {
+        std::lock_guard<std::mutex> run_lock(census->worker_run_mutex());
+        note_uncharged(uncharged_before);
+      }
+      if (!status.ok() && !status.IsShutdownInProgress() &&
+          !status.IsColumnFamilyDropped() && !status.IsCorruption()) {
+        // Route retirement is optional cleanup, so its failure does not drop
+        // the census: a dropped census is rebuilt by reading every SST index
+        // again, and route retirement could then fail again in a loop. For
+        // example, TryAgain means that the state changed before the MANIFEST
+        // write: an indirect blob GC job took a target as input, a running
+        // compaction holds a selected number, or another MANIFEST write
+        // installed a new Version. A full block cache does not fail route
+        // retirement (see BlobReferenceCensus::ReadSelectedSnapshot()); a
+        // MemoryLimit here means that the snapshot size overflowed. A MANIFEST
+        // write error and a Corruption of the MANIFEST write already set a
+        // background error in RetireBlobRelocationRoutes(), which returns OK
+        // for the latter. Only a shutdown, a dropped column family and a
+        // Corruption stop the census here. Such a Corruption comes from the
+        // census snapshot read, so the census itself is broken and is rebuilt.
+        // A MemoryLimit gets a WARN line, so that the skipped cleanup is
+        // visible. The next census publish tries again.
+        if (status.IsMemoryLimit()) {
+          ROCKS_LOG_WARN(db->immutable_db_options_.info_log,
+                         "[%s] Blob route retirement skipped: %s",
+                         cfd->GetName().c_str(), status.ToString().c_str());
+        } else {
+          ROCKS_LOG_INFO(db->immutable_db_options_.info_log,
+                         "[%s] Blob route retirement skipped: %s",
+                         cfd->GetName().c_str(), status.ToString().c_str());
+        }
+        status = Status::OK();
+      }
+      if (!status.ok()) {
+        std::lock_guard<std::mutex> run_lock(
+            cfd->blob_reference_census()->worker_run_mutex());
+        store_failure(status);
+      }
+      // A route deletion installs a new Version. Mark the run incomplete, so
+      // the census worker runs again and catches up with that Version.
+      incomplete |= retired;
     }
   } else {
     status = Status::ShutdownInProgress();
@@ -4254,6 +4351,7 @@ void DBImpl::BGWorkBlobReferenceCensus(void* arg) {
   bool retained_for_retry = false;
   {
     InstrumentedMutexLock lock(&db->mutex_);
+    cfd->blob_reference_census_running_ = false;
     cfd->queued_for_blob_reference_census_ = false;
     if (!status.ok()) {
       const std::shared_ptr<BlobReferenceCensusBuildContext> context =
