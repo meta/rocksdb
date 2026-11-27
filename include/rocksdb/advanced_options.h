@@ -1087,8 +1087,7 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   bool enable_blob_files = false;
 
-  // Experimental, and not complete yet. Option validation returns NotSupported
-  // for this option until the rest of the feature is in place.
+  // Experimental.
   //
   // Purpose: let indirect blob GC move the live values out of a blob file that
   // has a lot of garbage without rewriting the SSTs that point to them. When
@@ -1101,8 +1100,7 @@ struct AdvancedColumnFamilyOptions {
   // and a later compaction rewrites them with the exact list. See
   // db/blob/blob_reference_metadata.h for how it works.
   //
-  // Requirements and limits (option validation checks these after the
-  // NotSupported check above):
+  // Requirements and limits (option validation checks these):
   //   - enable_blob_files must be true (else InvalidArgument).
   //   - The table format must be block-based (else NotSupported).
   //   - enable_blob_direct_write must be false (else NotSupported).
@@ -1110,7 +1108,11 @@ struct AdvancedColumnFamilyOptions {
   //     column families that do not set this option keep their existing
   //     BlobDB behavior.
   // Turning the option off stops new values from using kIndirectBlob. The
-  // SSTs and blob files that were already written keep their format.
+  // SSTs and blob files that were already written keep their format. So once
+  // a column family has written data with this option, the block-based
+  // table, blob direct write and FIFO limits above stay in force, also after
+  // the option is turned off: DB open checks all three, and SetOptions()
+  // checks the table format.
   //
   // Indirect blob GC writes moved values into relocation files. Blob files and
   // relocation files that hold no live value are removed from the MANIFEST by

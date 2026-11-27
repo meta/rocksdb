@@ -201,6 +201,52 @@ jobs:
     - run: ulimit -S -n `ulimit -H -n` && make V=1 -j8 CRASH_TEST_EXT_ARGS='--duration=1800 --max_key=2500000' blackbox_crash_test_with_atomic_flush
     - run: rm -rf /dev/shm/rocksdb.*
     - run: ulimit -S -n `ulimit -H -n` && make V=1 -j8 CRASH_TEST_EXT_ARGS='--duration=1800 --max_key=2500000' blackbox_crash_test_with_multiops_wc_txn
+  build-linux-arm-crashtest-blob-indirection:
+    if: ${{ github.repository_owner == 'meta' }}
+    runs-on:
+      labels: 4-core-ubuntu-arm
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - uses: "./.github/actions/pre-steps"
+    - run: sudo apt-get update && sudo apt-get install -y build-essential libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev
+    - run: sudo mount -o remount,size=16G /dev/shm
+    - name: Ensure swap space
+      run: |-
+        if sudo swapon --show=NAME --noheadings --raw | grep -Fxq /swapfile; then
+          echo "/swapfile is already active"
+        else
+          sudo dd bs=1048576 count=4096 if=/dev/zero of=/swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+        fi
+        sudo swapon --show
+    # No --max_key: the blob indirection profile keeps a small key space so
+    # that indirect blob GC runs within the test.
+    - run: ulimit -S -n `ulimit -H -n` && make V=1 -j8 CRASH_TEST_EXT_ARGS='--duration=1800' crash_test_with_blob_indirection
+  build-linux-arm-crashtest-blob-indirection-toggle:
+    if: ${{ github.repository_owner == 'meta' }}
+    runs-on:
+      labels: 4-core-ubuntu-arm
+    steps:
+    - uses: actions/checkout@v4.1.0
+    - uses: "./.github/actions/pre-steps"
+    - run: sudo apt-get update && sudo apt-get install -y build-essential libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev
+    - run: sudo mount -o remount,size=16G /dev/shm
+    - name: Ensure swap space
+      run: |-
+        if sudo swapon --show=NAME --noheadings --raw | grep -Fxq /swapfile; then
+          echo "/swapfile is already active"
+        else
+          sudo dd bs=1048576 count=4096 if=/dev/zero of=/swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+        fi
+        sudo swapon --show
+    # No --max_key: the blob indirection profile keeps a small key space so
+    # that indirect blob GC runs within the test.
+    - run: ulimit -S -n `ulimit -H -n` && make V=1 -j8 CRASH_TEST_EXT_ARGS='--duration=1800' crash_test_with_blob_indirection_toggle
   build-examples:
     if: ${{ github.repository_owner == 'meta' }}
     runs-on:

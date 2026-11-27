@@ -1387,7 +1387,6 @@ TEST_F(LdbCmdTest, ManifestDumpPrintsBlobIndirectionSummary) {
 }
 
 TEST_F(LdbCmdTest, ManifestDumpPrintsBlobReferenceMetadata) {
-  ColumnFamilyData::TEST_SetAllowBlobIndirection(true);
   Options options;
   options.env = TryLoadCustomOrDefaultEnv();
   options.create_if_missing = true;

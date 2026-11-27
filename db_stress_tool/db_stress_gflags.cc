@@ -575,6 +575,58 @@ DEFINE_bool(
     "[Integrated BlobDB] Enable writing large values to separate blob files.");
 
 DEFINE_bool(
+    enable_blob_indirection,
+    ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().enable_blob_indirection,
+    "[Integrated BlobDB] Give new blob values a stable identity so that "
+    "indirect blob GC can relocate them without rewriting SSTs.");
+
+DEFINE_uint64(blob_indirection_max_references_per_sst,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .blob_indirection_max_references_per_sst,
+              "[Integrated BlobDB] With enable_blob_indirection, the most blob "
+              "references one compaction output SST takes before a new output "
+              "starts at the next user key.");
+
+DEFINE_bool(pin_blob_relocation_location_blocks,
+            ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                .pin_blob_relocation_location_blocks,
+            "[Integrated BlobDB] With enable_blob_indirection, keep the "
+            "location blocks of each relocation file in memory while its "
+            "reader is open.");
+
+DEFINE_double(indirect_blob_gc_garbage_ratio,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .indirect_blob_gc_garbage_ratio,
+              "[Integrated BlobDB] With enable_blob_indirection, the smallest "
+              "garbage ratio of a blob file or relocation file that indirect "
+              "blob GC rewrites, in (0, 1].");
+
+DEFINE_uint64(indirect_blob_gc_read_coalesce_bytes,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .indirect_blob_gc_read_coalesce_bytes,
+              "[Integrated BlobDB] With enable_blob_indirection, the largest "
+              "gap between two live values for which indirect blob GC still "
+              "reads both values with one I/O. One read is at most 1 MB. 0 "
+              "reads each value on its own.");
+
+DEFINE_bool(allow_setting_blob_indirection_dynamically, false,
+            "[Integrated BlobDB] Let SetOptions turn enable_blob_indirection "
+            "on and off while the test runs.");
+
+DEFINE_bool(blob_indirection_retire_routes_at_once, false,
+            "[Integrated BlobDB] Debug builds only: each time route "
+            "retirement runs (in the background census job), it removes at "
+            "once every route that it picked, instead of waiting for a batch "
+            "of 64 routes or 10 minutes. This makes route retirement and its "
+            "kill points run in short stress tests.");
+
+DEFINE_bool(blob_indirection_require_gc, false,
+            "[Integrated BlobDB] Fail the run if no indirect blob GC collected "
+            "an input file. The count includes input files that held no live "
+            "value. Requires --statistics and --enable_blob_indirection or "
+            "--allow_setting_blob_indirection_dynamically.");
+
+DEFINE_bool(
     enable_blob_direct_write,
     ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().enable_blob_direct_write,
     "[Integrated BlobDB] Enable direct-write blob file creation on "

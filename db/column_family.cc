@@ -1597,24 +1597,8 @@ Status CheckBlobIndirectionCompactionStyle(
   return Status::OK();
 }
 
-namespace {
-std::atomic<bool> allow_blob_indirection_for_test{false};
-}  // namespace
-
-void ColumnFamilyData::TEST_SetAllowBlobIndirection(bool allow) {
-  allow_blob_indirection_for_test.store(allow, std::memory_order_relaxed);
-}
-
 Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
-  // Blob indirection is not complete in this part of the indirect blob GC
-  // stack, and data written with it may not stay readable. So the option is
-  // rejected unless a test allows it through TEST_SetAllowBlobIndirection().
-  if (cf_options.enable_blob_indirection &&
-      !allow_blob_indirection_for_test.load(std::memory_order_relaxed)) {
-    return Status::NotSupported(
-        "enable_blob_indirection is not supported in this revision");
-  }
   Status s = CheckBlobIndirectionCompactionStyle(
       cf_options.compaction_style, cf_options.enable_blob_indirection);
   if (!s.ok()) {

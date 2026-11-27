@@ -397,10 +397,6 @@ class ColumnFamilyData {
   // table factory can write Block-Based Tables. REQUIRES: DB mutex held.
   Status ValidateBlobIndirectionOptionsAfterRecovery() const;
 
-  // Test-only, not public API. Until the indirect blob GC stack is complete,
-  // ValidateOptions rejects enable_blob_indirection unless a test allows it.
-  static void TEST_SetAllowBlobIndirection(bool allow);
-
   // DBImpl::SetOptions() must change the options of all its column families or
   // none, so it changes them in two steps: prepare every column family, then
   // publish them all together. This is the prepare step. It applies

@@ -148,6 +148,20 @@ class StressTest {
   virtual void VerifyDb(ThreadState* thread) const = 0;
   virtual void ContinuouslyVerifyDb(ThreadState* /*thread*/) const = 0;
   void PrintStatistics();
+
+  // Prints how much indirect blob GC work ran in this db_stress run, over all
+  // its DB opens (see blob_indirection_gc_totals_before_reopen_). With
+  // --blob_indirection_require_gc, fails the run if GC collected no input file.
+  void ReportBlobIndirectionGc(SharedState* shared) const;
+
+  // Prints the relocation files and routes that the DB holds just before the
+  // database operations start.
+  // Whitebox crash tests kill most runs, so they never print the end-of-run
+  // indirect blob GC report; this line shows the GC work that earlier runs made
+  // durable. Fails the run if the DB holds a lost relocation file: only an
+  // open with best_efforts_blob_db_repair marks a file lost, and db_stress
+  // never uses that option.
+  void ReportBlobIndirectionState(SharedState* shared) const;
   bool MightHaveUnsyncedDataLoss() {
     return FLAGS_sync_fault_injection || FLAGS_disable_wal ||
            FLAGS_manual_wal_flush_one_in > 0;
@@ -677,6 +691,16 @@ class StressTest {
   std::vector<std::string> column_family_names_;
   std::atomic<int> new_column_family_name_;
   int num_times_reopened_;
+  // Indirect blob GC ticker counts of the DB opens before the current one.
+  // Each open creates a new Statistics object (InitializeOptionsGeneral()), so
+  // Reopen() adds the counts of the closing open here, and
+  // ReportBlobIndirectionGc() adds the counts of the current open.
+  struct BlobIndirectionGcTotals {
+    uint64_t files_collected = 0;
+    uint64_t files_written = 0;
+    uint64_t routes_retired = 0;
+  };
+  BlobIndirectionGcTotals blob_indirection_gc_totals_before_reopen_;
   std::unordered_map<std::string, std::vector<std::string>> options_table_;
   std::vector<std::string> options_index_;
   std::atomic<bool> db_preload_finished_;

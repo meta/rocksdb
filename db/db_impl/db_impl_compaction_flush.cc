@@ -460,6 +460,7 @@ Status DBImpl::RetireBlobRelocationRoutes(
     return result;
   };
   TEST_SYNC_POINT("DBImpl::RetireBlobRelocationRoutes:BeforeLogAndApply");
+  TEST_KILL_RANDOM("DBImpl::RetireBlobRelocationRoutes:BeforeLogAndApply");
   mutex_.Lock();
   if (error_handler_.IsBGWorkStopped()) {
     // Background work is stopped; this optional cleanup writes nothing.
@@ -2955,6 +2956,7 @@ void DBImpl::IndirectBlobGCJob::WriteOutputs() {
       !eligible_inputs.empty()) {
     IOOptions io_options;
     TEST_SYNC_POINT("DBImpl::RunIndirectBlobGC:BeforeRenameOutputs");
+    TEST_KILL_RANDOM("DBImpl::RunIndirectBlobGC:BeforeRenameOutputs");
     for (OutputState& output : outputs) {
       output.rename_attempted = true;
       status =
@@ -3389,6 +3391,7 @@ void DBImpl::IndirectBlobGCJob::Install() {
   // (protocol steps 2 and 3; for example, compaction C1 flattens 10 to 400
   // and compaction C2 then keeps 400), or flattens to a number that protocol
   // steps 3 and 4 cover. So no running compaction can make the edit unsafe.
+  TEST_KILL_RANDOM("DBImpl::RunIndirectBlobGC:BeforeLogAndApply");
   bool metadata_commit_intent = false;
   bool other_install_during_job = true;
   status = db_->versions_->LogAndApplyWithUnlockedApply(
@@ -3475,6 +3478,7 @@ void DBImpl::IndirectBlobGCJob::Install() {
             kInvalidBlobFileNumber) {
       db_->EnqueuePendingCompaction(cfd);
     }
+    TEST_KILL_RANDOM("DBImpl::RunIndirectBlobGC:AfterLogAndApply");
     RecordTick(db_->stats_, BLOB_DB_GC_NUM_FILES, published_input_count);
     RecordTick(db_->stats_, BLOB_DB_GC_NUM_NEW_FILES, published_output_count);
     RecordTick(db_->stats_, BLOB_DB_GC_NUM_KEYS_RELOCATED,
