@@ -234,43 +234,98 @@ Status BlobFileCache::GetRelocationFileReader(
         return Status::OK();
       },
       [&](std::unique_ptr<BlobFileReader>* reader) {
-        if (db_session_id_.empty()) {
-          return Status::NotSupported(
-              "Blob relocation file reads need a DB session id");
-        }
-        std::shared_ptr<const TableFactory> factory;
-        Status s = GetRelocationTableFactory(mutable_cf_options, &factory);
-        if (!s.ok()) {
-          return s;
-        }
-        std::unique_ptr<BlobRelocationFileReader> relocation;
-        s = BlobRelocationFileReader::Open(
-            *immutable_options_, read_options, GetFileOptions(file.open_info),
-            blob_file_read_hist_, column_family_id_, file, db_session_id_,
-            std::move(factory), mutable_cf_options.compression_manager.get(),
-            mutable_cf_options.block_protection_bytes_per_key,
-            mutable_cf_options.pin_blob_relocation_location_blocks, io_tracer_,
-            block_cache_tracer_, &relocation);
-        if (s.ok()) {
-          reader->reset(new BlobFileReader(std::move(relocation)));
-        }
-        return s;
+        return OpenRelocationFileReader(read_options, file, mutable_cf_options,
+                                        reader);
       },
       blob_file_reader);
+}
+
+Status BlobFileCache::OpenRelocationFileReaderUncached(
+    const ReadOptions& read_options, const BlobPhysicalFile& file,
+    const MutableCFOptions& mutable_cf_options,
+    std::unique_ptr<BlobFileReader>* blob_file_reader) {
+  assert(blob_file_reader);
+  assert(!*blob_file_reader);
+  Statistics* const statistics = immutable_options_->stats;
+  RecordTick(statistics, NO_FILE_OPENS);
+  const Status s = OpenRelocationFileReader(
+      read_options, file, mutable_cf_options, blob_file_reader);
+  if (!s.ok()) {
+    ROCKS_LOG_WARN(immutable_options_->logger,
+                   "BlobFileCache uncached open failed for relocation file "
+                   "%" PRIu64 " in CF %u: %s",
+                   file.open_info.file_number, column_family_id_,
+                   s.ToString().c_str());
+    RecordTick(statistics, NO_FILE_ERRORS);
+    RecordTick(statistics, BLOB_RELOCATION_FILE_OPEN_FAILURES);
+  }
+  return s;
+}
+
+Status BlobFileCache::OpenRelocationFileReader(
+    const ReadOptions& read_options, const BlobPhysicalFile& file,
+    const MutableCFOptions& mutable_cf_options,
+    std::unique_ptr<BlobFileReader>* blob_file_reader) {
+  if (db_session_id_.empty()) {
+    return Status::NotSupported(
+        "Blob relocation file reads need a DB session id");
+  }
+  std::shared_ptr<const TableFactory> factory;
+  Status s = GetRelocationTableFactory(mutable_cf_options, &factory);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<BlobRelocationFileReader> relocation;
+  s = BlobRelocationFileReader::Open(
+      *immutable_options_, read_options, GetFileOptions(file.open_info),
+      blob_file_read_hist_, column_family_id_, file, db_session_id_,
+      std::move(factory), mutable_cf_options.compression_manager.get(),
+      mutable_cf_options.block_protection_bytes_per_key,
+      mutable_cf_options.pin_blob_relocation_location_blocks, io_tracer_,
+      block_cache_tracer_, &relocation);
+  if (s.ok()) {
+    blob_file_reader->reset(new BlobFileReader(std::move(relocation)));
+  }
+  return s;
 }
 
 Status BlobFileCache::OpenBlobFileReaderUncached(
     const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
     std::unique_ptr<BlobFileReader>* blob_file_reader,
     bool allow_footer_skip_retry) {
+  return OpenBlobFileReaderUncached(read_options, blob_file, blob_file_reader,
+                                    allow_footer_skip_retry,
+                                    /*prefer_direct_reads=*/false);
+}
+
+Status BlobFileCache::OpenBlobFileReaderUncached(
+    const ReadOptions& read_options, const BlobFileOpenInfo& blob_file,
+    std::unique_ptr<BlobFileReader>* blob_file_reader,
+    bool allow_footer_skip_retry, bool prefer_direct_reads) {
   assert(blob_file_reader);
   assert(!*blob_file_reader);
 
   Statistics* const statistics = immutable_options_->stats;
   RecordTick(statistics, NO_FILE_OPENS);
 
-  Status s = OpenBlobFileReader(read_options, blob_file,
-                                allow_footer_skip_retry, blob_file_reader);
+  Status s;
+  FileOptions file_options = GetFileOptions(blob_file);
+  // See OpenBlobFileReaderUncached() in blob_file_cache.h.
+  if (prefer_direct_reads && !file_options.use_mmap_reads) {
+    file_options.use_direct_reads = true;
+    s = BlobFileReader::Create(
+        *immutable_options_, read_options, file_options, column_family_id_,
+        blob_file_read_hist_, blob_file.file_number, io_tracer_,
+        /*skip_footer_validation=*/false, blob_file_reader);
+    if (s.ok()) {
+      return s;
+    }
+    // The file system may not support direct reads; the buffered open below
+    // reports any real error again.
+    blob_file_reader->reset();
+  }
+  s = OpenBlobFileReader(read_options, blob_file, allow_footer_skip_retry,
+                         blob_file_reader);
   if (!s.ok()) {
     RecordTick(statistics, NO_FILE_ERRORS);
   }

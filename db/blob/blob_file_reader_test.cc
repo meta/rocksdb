@@ -711,7 +711,8 @@ TEST(BlobRelocationMemoryTrackerTest, LiveSetsShareOneBudget) {
   constexpr size_t kMB = size_t{1} << 20;
   std::shared_ptr<BlobRelocationMemoryTracker> tracker =
       std::make_shared<BlobRelocationMemoryTracker>(
-          std::shared_ptr<CacheReservationManager>());
+          std::shared_ptr<CacheReservationManager>(),
+          BlobRelocationMemoryTracker::kMaxBytes);
   size_t first_share = 0;
   size_t second_share = 0;
   ASSERT_OK(tracker->SetReservation(&first_share, 40 * kMB));
