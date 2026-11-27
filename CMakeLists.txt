@@ -790,6 +790,7 @@ set(SOURCES
         db/blob/blob_log_writer.cc
         db/blob/blob_relocation_file.cc
         db/blob/blob_relocation_manifest.cc
+        db/blob/blob_reference_census.cc
         db/blob/blob_reference_metadata.cc
         db/blob/blob_source.cc
         db/blob/blob_write_batch_transformer.cc

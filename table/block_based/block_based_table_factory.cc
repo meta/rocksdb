@@ -1041,6 +1041,7 @@ Status BlockBasedTableFactory::ValidateOptions(
     static const std::set<CacheEntryRole> kMemoryChargingSupported = {
         CacheEntryRole::kCompressionDictionaryBuildingBuffer,
         CacheEntryRole::kBlobReferenceMetadataBuildingBuffer,
+        CacheEntryRole::kBlobReferenceCensus,
         CacheEntryRole::kFilterConstruction,
         CacheEntryRole::kBlockBasedTableReader,
         CacheEntryRole::kFileMetadata,

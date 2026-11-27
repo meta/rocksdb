@@ -190,11 +190,12 @@ class VersionStorageInfoTestBase : public testing::Test {
   void AddBlob(uint64_t blob_file_number, uint64_t total_blob_count,
                uint64_t total_blob_bytes,
                BlobFileMetaData::LinkedSsts linked_ssts,
-               uint64_t garbage_blob_count, uint64_t garbage_blob_bytes) {
+               uint64_t garbage_blob_count, uint64_t garbage_blob_bytes,
+               bool is_indirect_origin = false) {
     auto shared_meta = SharedBlobFileMetaData::Create(
         blob_file_number, total_blob_count, total_blob_bytes,
         /* checksum_method */ std::string(),
-        /* checksum_value */ std::string());
+        /* checksum_value */ std::string(), is_indirect_origin);
     auto meta =
         BlobFileMetaData::Create(std::move(shared_meta), std::move(linked_ssts),
                                  garbage_blob_count, garbage_blob_bytes);
@@ -656,6 +657,73 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCEmpty) {
   vstorage_.ComputeFilesMarkedForForcedBlobGC(
       age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true);
 
+  ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+}
+
+TEST_F(VersionStorageInfoTest, ForcedBlobGCUnlinkedIndirectOriginIsOldest) {
+  // Indirect origin #10 was relocated, so no SST links it, but it stays in the
+  // Version until its blob file retirement record. Normal blob file #11 is
+  // linked by SST #1. Nothing is marked: with enable_blob_indirection on, the
+  // oldest file is an indirect origin, and with it off, #10 has no SST to
+  // compact.
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  constexpr int level = 0;
+  constexpr uint64_t sst = 1;
+  constexpr uint64_t indirect_origin = 10;
+  constexpr uint64_t legacy_blob = 11;
+
+  Add(level, sst, "bar", "foo", /*file_size=*/1000, legacy_blob);
+  AddBlob(indirect_origin, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+          BlobFileMetaData::LinkedSsts{}, /*garbage_blob_count=*/9,
+          /*garbage_blob_bytes=*/900, /*is_indirect_origin=*/true);
+  AddBlob(legacy_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+          BlobFileMetaData::LinkedSsts{sst}, /*garbage_blob_count=*/9,
+          /*garbage_blob_bytes=*/900);
+  UpdateVersionStorageInfo();
+
+  constexpr double age_cutoff = 1.0;
+  constexpr double force_threshold = 0.5;
+  for (const bool enable_blob_indirection : {false, true}) {
+    SCOPED_TRACE(enable_blob_indirection);
+    vstorage_.ComputeFilesMarkedForForcedBlobGC(
+        age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true,
+        enable_blob_indirection);
+    ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+  }
+}
+
+TEST_F(VersionStorageInfoTest, ForcedBlobGCLinkedIndirectOriginIsOldest) {
+  // Indirect origin #10 still holds its values, so SST #1 links it.
+  vstorage_.SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  constexpr int level = 0;
+  constexpr uint64_t sst = 1;
+  constexpr uint64_t indirect_origin = 10;
+
+  Add(level, sst, "bar", "foo", /*file_size=*/1000, indirect_origin);
+  AddBlob(indirect_origin, /*total_blob_count=*/10, /*total_blob_bytes=*/1000,
+          BlobFileMetaData::LinkedSsts{sst}, /*garbage_blob_count=*/9,
+          /*garbage_blob_bytes=*/900, /*is_indirect_origin=*/true);
+  UpdateVersionStorageInfo();
+
+  constexpr double age_cutoff = 1.0;
+  constexpr double force_threshold = 0.5;
+
+  // With enable_blob_indirection off, compaction rewrites the values of #10
+  // into new normal blob files, so compacting SST #1 frees #10.
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true,
+      /*enable_blob_indirection=*/false);
+  const auto& marked = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(marked.size(), 1);
+  ASSERT_EQ(marked[0], std::make_pair(level, vstorage_.LevelFiles(level)[0]));
+
+  // With enable_blob_indirection on, compaction keeps the references to #10 as
+  // they are, so compacting SST #1 cannot free #10.
+  vstorage_.ComputeFilesMarkedForForcedBlobGC(
+      age_cutoff, force_threshold, /*enable_blob_garbage_collection=*/true,
+      /*enable_blob_indirection=*/true);
   ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
 }
 
@@ -1999,38 +2067,39 @@ TEST_F(VersionSetTest, FailedFencedVersionBuildDefersRelocationState) {
   ASSERT_OK(directory_builder.Finish(&directory));
   std::string encoded_directory;
   directory.EncodeTo(&encoded_directory);
+  // Add two legacy SSTs in an edit before the fence. The fenced edit adds only
+  // the relocation file: a new SST in a fenced edit would need exact reference
+  // metadata.
+  std::vector<FileMetaData> file_metas;
+  CreateDummyTableFiles({SstInfo(100, kDefaultColumnFamilyName, "a",
+                                 /*lvl=*/1, /*epoch_number=*/100),
+                         SstInfo(101, kDefaultColumnFamilyName, "c",
+                                 /*lvl=*/1, /*epoch_number=*/101)},
+                        &file_metas);
+  ASSERT_EQ(file_metas.size(), 2U);
+  VersionEdit files;
+  for (const FileMetaData& meta : file_metas) {
+    files.AddFile(/*level=*/1, meta);
+  }
+  ASSERT_OK(LogAndApplyToDefaultCF(files));
   VersionEdit edit;
   edit.SetBlobIndirectionFormatVersion(kBlobIndirectionManifestFormatVersion);
   edit.AddBlobRelocationFile(BlobRelocationFileAddition(
       /*file_number=*/102, /*file_size=*/4096,
       /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
       encoded_directory, /*tail_size=*/1));
-  for (const auto& [file_number, smallest, largest] :
-       {std::make_tuple(uint64_t{100}, "a", "b"),
-        std::make_tuple(uint64_t{101}, "c", "d")}) {
-    edit.AddFile(/*level=*/1, file_number, /*file_path_id=*/0,
-                 /*file_size=*/100, InternalKey(smallest, 1, kTypeValue),
-                 InternalKey(largest, 1, kTypeValue), /*smallest_seqno=*/1,
-                 /*largest_seqno=*/1, /*marked_for_compaction=*/false,
-                 Temperature::kUnknown, kInvalidBlobFileNumber,
-                 kUnknownOldestAncestorTime, kUnknownFileCreationTime,
-                 /*epoch_number=*/file_number, kUnknownFileChecksum,
-                 kUnknownFileChecksumFuncName, kNullUniqueId64x2,
-                 /*compensated_range_deletion_size=*/0, /*tail_size=*/0,
-                 /*user_defined_timestamps_persisted=*/true);
-  }
 
-  // The file-pair hook fires only for a level that holds two files. Here that
-  // is the Version this batch builds, never the empty base. So the injected
-  // failure lands in the last CheckConsistency() of SaveBlobFilesAndCheckTo(),
-  // after the batch is assembled.
   bool armed = false;
   bool injected = false;
   size_t deferred_states = 0;
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
-  SyncPoint::GetInstance()->SetCallBack("VersionBuilder::CheckConsistency1",
-                                        [&](void*) { armed = !injected; });
+  // Arm the failure when blob finalization starts. It then fails the
+  // consistency check at the end of finalization, when the candidate Version
+  // already holds its relocation state.
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization",
+      [&](void*) { armed = !injected; });
   SyncPoint::GetInstance()->SetCallBack(
       "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
         if (armed) {
@@ -2057,7 +2126,7 @@ TEST_F(VersionSetTest, FailedFencedVersionBuildDefersRelocationState) {
   mutex_.Unlock();
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
-  ASSERT_TRUE(injected);
+  ASSERT_TRUE(injected) << s.ToString();
   ASSERT_EQ(deferred_states, 1U);
   std::vector<std::shared_ptr<void>> deferred;
   mutex_.Lock();
@@ -2485,6 +2554,55 @@ TEST_F(VersionSetTest, AddLiveBlobFiles) {
 
   // Clean up previous version.
   first_version->Unref();
+}
+
+TEST_F(VersionSetTest, LastUnrefFreesOnlyRelocationStateUnlocked) {
+  // A Version is destroyed under the DB mutex. When the last reference drops
+  // and the Version holds relocation state, only that state is freed without
+  // the mutex.
+  NewDB();
+  ColumnFamilyData* const cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_NE(cfd, nullptr);
+  int unlocked = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::UnrefAndFreeBlobRelocationState:Unlocked", [&](void* arg) {
+        auto* db_mutex = static_cast<InstrumentedMutex*>(arg);
+        ASSERT_TRUE(db_mutex->TryLock());
+        db_mutex->Unlock();
+        ++unlocked;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  for (const bool with_relocation_state : {false, true}) {
+    SCOPED_TRACE(with_relocation_state);
+    Version* const old_version = cfd->current();
+    ASSERT_NE(old_version, nullptr);
+    mutex_.Lock();
+    old_version->Ref();
+    if (with_relocation_state) {
+      BlobRelocationDirectoryBuilder directory_builder;
+      ASSERT_OK(directory_builder.Add(
+          /*origin_file_number=*/77, /*original_value_offset=*/11,
+          /*stored_value_size=*/17, kNoCompression));
+      ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+      BlobRelocationDirectory directory;
+      ASSERT_OK(directory_builder.Finish(&directory));
+      std::string encoded_directory;
+      directory.EncodeTo(&encoded_directory);
+      old_version->storage_info()->SetBlobIndirectionFormatVersion(
+          kBlobIndirectionManifestFormatVersion);
+      old_version->storage_info()->AddBlobRelocationFile(
+          BlobRelocationFileMetaData::Create(BlobRelocationFileAddition(
+              /*file_number=*/102, /*file_size=*/4096, std::string(),
+              std::string(), encoded_directory, /*tail_size=*/1)));
+      old_version->storage_info()->SealBlobRelocationState();
+    }
+    versions_->TEST_CreateAndAppendVersion(cfd);
+    old_version->UnrefAndFreeBlobRelocationState(&mutex_);
+    mutex_.Unlock();
+    ASSERT_EQ(unlocked, with_relocation_state ? 1 : 0);
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_F(VersionSetTest, IndirectReferenceToUnfencedBlobFileIsNotRelocatable) {
@@ -4080,6 +4198,49 @@ TEST_F(VersionSetAtomicGroupTest,
   ASSERT_TRUE(status.IsCorruption()) << status.ToString();
   ASSERT_NE(status.ToString().find(
                 "Blob relocation file deletion names no live file"),
+            std::string::npos)
+      << status.ToString();
+}
+
+TEST_F(VersionSetAtomicGroupTest,
+       RecoveryRejectsLossRecordOfAnotherColumnFamily) {
+  // VersionBuilder applies a loss record to the state of the edit's own column
+  // family. Column family 2 marks relocation file 100 lost, but only column
+  // family 1 lists that file, so replay rejects the record.
+  BlobRelocationDirectoryBuilder directory_builder;
+  ASSERT_OK(directory_builder.Add(
+      /*origin_file_number=*/77, /*original_value_offset=*/11,
+      /*stored_value_size=*/17, kNoCompression));
+  ASSERT_OK(directory_builder.AddServedFile(/*file_number=*/77));
+  BlobRelocationDirectory directory;
+  ASSERT_OK(directory_builder.Finish(&directory));
+  std::string encoded_directory;
+  directory.EncodeTo(&encoded_directory);
+  constexpr uint64_t kRelocationFileNumber = 100;
+  edits_.clear();
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/1);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().AddBlobRelocationFile(BlobRelocationFileAddition(
+      kRelocationFileNumber, /*file_size=*/4096,
+      /*checksum_method=*/std::string(), /*checksum_value=*/std::string(),
+      encoded_directory, /*tail_size=*/1));
+  edits_.back().SetNextFile(kRelocationFileNumber + 1);
+  edits_.back().SetLastSequence(last_seqno_++);
+  edits_.emplace_back();
+  edits_.back().SetColumnFamily(/*column_family_id=*/2);
+  edits_.back().SetBlobIndirectionFormatVersion(
+      kBlobIndirectionManifestFormatVersion);
+  edits_.back().MarkBlobPhysicalFileLost(kRelocationFileNumber);
+  edits_.back().SetLastSequence(last_seqno_++);
+  AddNewEditsToLog(static_cast<int>(edits_.size()));
+  CreateCurrentFile();
+
+  const Status status =
+      versions_->Recover(column_families_, /*read_only=*/false);
+  ASSERT_TRUE(status.IsCorruption()) << status.ToString();
+  ASSERT_NE(status.ToString().find("Blob relocation loss names no live target"),
             std::string::npos)
       << status.ToString();
 }

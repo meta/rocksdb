@@ -74,6 +74,8 @@ class Writer;
 
 class BlobIndex;
 struct BlobPhysicalFile;
+struct BlobReferenceCensusDelta;
+struct BlobReferenceCensusPreparedInstall;
 class Compaction;
 class LogBuffer;
 class LookupKey;
@@ -275,6 +277,10 @@ class VersionStorageInfo {
       double blob_garbage_collection_age_cutoff,
       double blob_garbage_collection_force_threshold,
       bool enable_blob_garbage_collection);
+  void ComputeFilesMarkedForForcedBlobGC(
+      double blob_garbage_collection_age_cutoff,
+      double blob_garbage_collection_force_threshold,
+      bool enable_blob_garbage_collection, bool enable_blob_indirection);
 
   // This computes read_triggered_compaction_files_ and is called by
   // ComputeCompactionScore()
@@ -477,6 +483,77 @@ class VersionStorageInfo {
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   using BlobFiles = std::vector<std::shared_ptr<BlobFileMetaData>>;
   const BlobFiles& GetBlobFiles() const { return blob_files_; }
+  uint64_t OldestCoarseIndirectOriginFileNumber() const {
+    return oldest_coarse_indirect_origin_file_number_;
+  }
+  bool IsCoarseIndirectOriginBlobPinned(uint64_t file_number) const {
+    return oldest_coarse_indirect_origin_file_number_ !=
+               kInvalidBlobFileNumber &&
+           file_number >= oldest_coarse_indirect_origin_file_number_;
+  }
+
+  // Indirect blob GC candidate hints of this Version. The census worker keeps
+  // one heap per column family that ranks the physical blob files by garbage
+  // ratio. Outside the DB mutex it selects at most kBlobGcMaxSelectedFiles (8)
+  // files; under the mutex it stores them here. The fixed-size array keeps
+  // publishing and reading the hints cheap, and building a Version never scans
+  // or sorts all blob files. A hint is not proof of garbage: GC checks the
+  // exact references before it moves any value.
+  void SetBlobGcCandidates(
+      const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files);
+  void SetBlobRelocationGarbageBytes(uint64_t bytes) {
+    blob_relocation_garbage_bytes_.store(
+        std::min(bytes, BlobRelocationStateForRead().RecordBytes()),
+        std::memory_order_relaxed);
+  }
+  // The garbage record bytes of the relocation files. Until the census
+  // publishes the value for this Version, it is the value of the Version this
+  // one was built from. So it can stay stale until the next publish, which
+  // can be a long time while the census is unready. For example, after GC
+  // deletes a relocation file with much garbage, the value still counts that
+  // garbage. It never exceeds the record bytes of the current relocation
+  // files, because an edit can delete a relocation file after the value was
+  // published.
+  uint64_t BlobRelocationGarbageBytesForRead() const {
+    return std::min(
+        blob_relocation_garbage_bytes_.load(std::memory_order_relaxed),
+        BlobRelocationStateForRead().RecordBytes());
+  }
+  void SetEmptyBlobGcCandidates(
+      const std::array<uint64_t, kBlobGcMaxSelectedFiles>& files) {
+    empty_blob_files_for_indirect_blob_gc_ = files;
+  }
+  bool HasEmptyBlobGcCandidate() const {
+    return empty_blob_files_for_indirect_blob_gc_[0] != kInvalidBlobFileNumber;
+  }
+  void GetEmptyBlobGcCandidates(size_t max_files,
+                                std::vector<uint64_t>* files) const;
+  void RecordRemovedBlobFile(uint64_t file_number) {
+    removed_blob_files_.push_back(file_number);
+  }
+  const std::vector<uint64_t>& RemovedBlobFiles() const {
+    return removed_blob_files_;
+  }
+
+  // Intended user: indirect blob GC. It picks candidate physical files of
+  // this Version (BlobPhysicalFileForIndirectBlobGC(),
+  // GetBlobPhysicalFilesForIndirectBlobGC()), and suppresses or defers files
+  // that it cannot use now, so that the next pick in this Version takes other
+  // files:
+  // - SuppressBlobFileForIndirectBlobGC() removes the file from the candidate
+  //   list and from the list of empty files (GetEmptyBlobGcCandidates()).
+  // - DeferBlobFilesForIndirectBlobGC() moves each given file to the end of the
+  //   candidate list, so that the other candidates are picked first.
+  // Both change only the lists of this Version. A new Version starts with
+  // empty lists, and the census sets the lists of the current Version each
+  // time it publishes (SetBlobGcCandidates() and SetEmptyBlobGcCandidates()),
+  // so a publish replaces these changes.
+  void SuppressBlobFileForIndirectBlobGC(uint64_t physical_file_number);
+  void DeferBlobFilesForIndirectBlobGC(
+      const std::vector<uint64_t>& physical_file_numbers);
+  uint64_t BlobPhysicalFileForIndirectBlobGC() const;
+  void GetBlobPhysicalFilesForIndirectBlobGC(
+      size_t max_files, std::vector<uint64_t>* physical_file_numbers) const;
 
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   BlobFiles::const_iterator GetBlobFileMetaDataLB(
@@ -579,6 +656,10 @@ class VersionStorageInfo {
 
   void ShareBlobRelocationState(const VersionStorageInfo& base) {
     blob_relocation_state_ = base.blob_relocation_state_;
+    blob_relocation_state_fingerprint_high_ =
+        base.blob_relocation_state_fingerprint_high_;
+    blob_relocation_state_fingerprint_low_ =
+        base.blob_relocation_state_fingerprint_low_;
   }
 
   // Moves out the relocation state before this Version is destroyed under the
@@ -624,6 +705,10 @@ class VersionStorageInfo {
   size_t GetBlobRelocationRouteCount() const {
     return BlobRelocationStateForRead().route_count();
   }
+  // The total size of the live relocation files.
+  uint64_t GetBlobRelocationFileBytes() const {
+    return BlobRelocationStateForRead().PhysicalFileBytes();
+  }
   // Visits every route, in no particular order.
   template <typename Fn>
   void ForEachBlobRelocationRoute(Fn&& fn) const {
@@ -636,6 +721,10 @@ class VersionStorageInfo {
   const BlobFileTable& GetBlobFileTable() const {
     return BlobRelocationStateForRead().table();
   }
+  bool HasLostBlobRelocationFiles() const {
+    return BlobRelocationStateForRead().HasLostFiles();
+  }
+  bool IsBlobReferenceLost(const BlobIndex& index) const;
 
   std::shared_ptr<BlobRelocationFileMetaData> GetBlobRelocationFileMetaData(
       uint64_t file_number) const;
@@ -672,6 +761,25 @@ class VersionStorageInfo {
     return blob_indirection_format_version_ != 0;
   }
 
+  // Identity of this Version's relocation state. The fingerprint has 128 bits
+  // and depends only on the relocation files, the routes and the format
+  // version, not on the order of the changes. Its intended user is remote
+  // compaction: the job sends the fingerprint of the Version it was planned on,
+  // so the worker can check that it builds SSTs with the same routes. 128 bits
+  // make an accidental match of two different states very unlikely (an
+  // estimate, not measured).
+  uint64_t GetBlobRelocationStateFingerprintHigh() const {
+    return blob_relocation_state_fingerprint_high_;
+  }
+  uint64_t GetBlobRelocationStateFingerprintLow() const {
+    return blob_relocation_state_fingerprint_low_;
+  }
+
+  // Stores the fingerprint of this Version's relocation files and routes (see
+  // BlobRelocationState::ComputeFingerprint()). It is O(1). VersionBuilder
+  // calls it outside the DB mutex when the relocation state or the format
+  // version changes.
+  void ComputeBlobRelocationStateFingerprint();
   // Brings the file table of a fenced Version up to date with its blob files:
   // `rebuild` adds every live blob file (the first fenced Version); otherwise
   // only the blob files in `changed_blob_file_numbers` are set or erased. A
@@ -714,6 +822,13 @@ class VersionStorageInfo {
       total_file_size += meta->GetBlobFileSize();
       total_garbage_size += meta->GetGarbageBlobBytes();
     }
+    // Relocation files take disk space too. Their total size comes from the
+    // relocation state, so it is counted even before the census is ready. The
+    // blob size, garbage and space-amp DB properties (internal_stats.cc) read
+    // these totals. The garbage of relocation files comes from the census (see
+    // BlobRelocationGarbageBytesForRead()).
+    total_file_size += BlobRelocationStateForRead().PhysicalFileBytes();
+    total_garbage_size += BlobRelocationGarbageBytesForRead();
 
     double space_amp = 0.0;
     if (total_file_size > total_garbage_size) {
@@ -973,6 +1088,24 @@ class VersionStorageInfo {
 
   // Vector of blob files in version sorted by blob file number.
   BlobFiles blob_files_;
+  uint64_t oldest_coarse_indirect_origin_file_number_ = kInvalidBlobFileNumber;
+  // Blob files of the base Version that are gone from this Version.
+  // VersionBuilder::SaveBlobFilesAndCheckTo() records them outside the DB mutex
+  // for the census delta. This is not the set of retired files, and it is never
+  // written to the MANIFEST.
+  std::vector<uint64_t> removed_blob_files_;
+  std::array<uint64_t, kBlobGcMaxSelectedFiles>
+      blob_files_for_indirect_blob_gc_{};
+  size_t blob_files_for_indirect_blob_gc_count_ = 0;
+  // Garbage record bytes in the relocation files, from the census. A new
+  // Version starts with the value of the Version it is built from, so the blob
+  // garbage properties do not drop to 0 after every flush or compaction. The
+  // census publish then sets the exact value for this Version. Read it through
+  // BlobRelocationGarbageBytesForRead(). Atomic because approximate live-data
+  // properties can read a pinned Version without the DB mutex.
+  std::atomic<uint64_t> blob_relocation_garbage_bytes_{0};
+  std::array<uint64_t, kBlobGcMaxSelectedFiles>
+      empty_blob_files_for_indirect_blob_gc_{};
 
   // See GetDroppedBlobFiles().
   std::vector<uint64_t> dropped_blob_files_;
@@ -993,6 +1126,10 @@ class VersionStorageInfo {
   }
   BlobRelocationState& MutableBlobRelocationState();
   uint32_t blob_indirection_format_version_ = 0;
+  // A hash of the relocation files and routes of this Version (see
+  // ComputeBlobRelocationStateFingerprint()).
+  uint64_t blob_relocation_state_fingerprint_high_ = 0;
+  uint64_t blob_relocation_state_fingerprint_low_ = 0;
 
   // Level that L0 data should be compacted to. All levels < base_level_ should
   // be empty. -1 if it is not level-compaction so it's not applicable.
@@ -1342,6 +1479,13 @@ class Version {
   // and return true. Otherwise, return false.
   bool Unref();
 
+  // Like Unref(), for a Version pinned by background work. The Version is
+  // destroyed under `mu` like every Version; when this drops the last
+  // reference, only its relocation state, which can be large, is freed
+  // without `mu` (see VersionSet::FreeBlobRelocationState()).
+  // REQUIRES: `mu` (the DB mutex) held.
+  void UnrefAndFreeBlobRelocationState(InstrumentedMutex* mu);
+
   // Add all files listed in the current version to *live_table_files and
   // *live_blob_files.
   void AddLiveFiles(std::vector<uint64_t>* live_table_files,
@@ -1456,7 +1600,8 @@ class Version {
   // file takes one lookup, and a route takes two (the target is always a live
   // relocation file). It returns Corruption when the generation number is
   // unknown, when a route target is missing, or when a normal blob file is not
-  // the indirect origin of the reference.
+  // the indirect origin of the reference. It returns NotFound when the
+  // physical file is a relocation file that an accepted loss marked lost.
   Status ResolveBlobPhysicalFile(const BlobIndex& blob_index,
                                  BlobPhysicalFile* physical_file) const;
 
@@ -1789,6 +1934,46 @@ class VersionSet {
 
   void WakeUpWaitingManifestWriters();
 
+  // Deferred census cleanup. A LogAndApply batch must not release the DB mutex
+  // between the install of its new Versions and the end of the batch (the
+  // writer callbacks), and the caller must not release it before it installs
+  // its SuperVersions. Otherwise another thread can see a half-finished
+  // install, for example a new L0 file whose flushed memtable is still in the
+  // immutable memtable list. But the census state that a batch replaces can be
+  // large, and it can hold a build context whose starting Version takes the DB
+  // mutex when it is released. So LogAndApply keeps that state in a list here
+  // and frees none of it. Census state can also hold relocation file metadata,
+  // whose deleter uses its column family, so each entry also holds a reference
+  // to its column family (ColumnFamilyData::Ref()).
+  //
+  // This function frees the list: it releases the DB mutex, frees the census
+  // state, takes the mutex again and drops the column family references. It
+  // does nothing, and keeps the mutex, when the list is empty. A caller calls
+  // it at a point where it may release the DB mutex, after it has installed
+  // its SuperVersions:
+  // - Flush and compaction jobs, in
+  //   DBImpl::ApplyBlobReferenceCensusAfterInstall().
+  // - The census job, when it starts. A SuperVersion install whose census is
+  //   behind schedules that job, so an install by a caller that is not listed
+  //   here usually waits only until the census job runs.
+  // - The user-thread installs CompactFiles(), DeleteFilesInRanges(),
+  //   ReFitLevel() (CompactRange() with change_level) and PromoteL0(), and
+  //   also SetOptions(), DropColumnFamily() and DB close.
+  // A LogAndApply call that installs no SuperVersion waits for the next of
+  // these calls. While background work is paused, the census job and the
+  // background jobs do not run, so such an entry can wait until background
+  // work continues or the DB closes; its memory stays charged to the block
+  // cache meanwhile. The column family references keep a later free safe.
+  // REQUIRES: *mu held.
+  void ReleaseDeferredPublicationCleanup(InstrumentedMutex* mu);
+  // True when the deferred census cleanup above has entries to free.
+  // REQUIRES: DB mutex held.
+  bool HasDeferredPublicationCleanup() const {
+    return !deferred_publication_census_installs_.empty() ||
+           !deferred_publication_census_garbage_.empty() ||
+           !deferred_publication_census_cfds_.empty();
+  }
+
   // Freeing relocation state
   //
   // Why: the relocation state of a fenced Version (mainly its file table) can
@@ -1801,7 +1986,9 @@ class VersionSet {
   //
   // There are two paths:
   //   1. Explicit release (the Versions and builders that ManifestTailer
-  //      deletes): the caller moves the state into `holders` with
+  //      deletes, and a Version that background work pins and releases with
+  //      Version::UnrefAndFreeBlobRelocationState()): the caller moves the
+  //      state into `holders` with
   //      VersionStorageInfo::ReleaseBlobRelocationState() and
   //      VersionBuilder::ReleaseBlobRelocationChanges(), destroys the Version
   //      or builder under the mutex, and then calls this function, which frees
@@ -1832,8 +2019,9 @@ class VersionSet {
   // file):
   //   1. The last owner of the file's metadata drops it: usually the last
   //      Version that lists the file or a LogAndApply version builder, both
-  //      destroyed under the DB mutex, or, for the ManifestTailer, relocation
-  //      state that is freed without the mutex.
+  //      destroyed under the DB mutex, or, for the ManifestTailer and
+  //      Version::UnrefAndFreeBlobRelocationState(), relocation state that is
+  //      freed without the mutex.
   //   2. The metadata deleter (VersionBuilder) adds the file to the obsolete
   //      blob files and drops a remembered failed open. It does not evict the
   //      cached reader, because a reader open can hold the stripe mutex of the
@@ -2584,6 +2772,15 @@ class VersionSet {
   // Queue of writers to the manifest file
   std::deque<ManifestWriter*> manifest_writers_;
 
+  // The deferred census cleanup (see ReleaseDeferredPublicationCleanup()).
+  // Protected by the DB mutex.
+  std::vector<BlobReferenceCensusPreparedInstall>
+      deferred_publication_census_installs_;
+  std::vector<BlobReferenceCensusGarbage> deferred_publication_census_garbage_;
+  // One reference (ColumnFamilyData::Ref()) for each column family whose census
+  // state is in the two lists above.
+  std::vector<ColumnFamilyData*> deferred_publication_census_cfds_;
+
   // Current size of manifest file
   uint64_t manifest_file_size_;
 
@@ -2667,6 +2864,49 @@ class VersionSet {
   ErrorHandler* const error_handler_;
 
  private:
+  // The blob reference census installs of one ProcessManifestWrites() batch.
+  // The census of a column family (BlobReferenceCensus, see
+  // db/blob/blob_reference_census.h) follows each new Version of the column
+  // family in four steps:
+  // 1. Reserve, under the DB mutex: ReserveBlobReferenceCensusInstalls()
+  //    reserves an install for each new Version that needs one.
+  // 2. Prepare, without the DB mutex: PrepareBlobReferenceCensusInstalls()
+  //    builds the delta of each such Version (BuildBlobReferenceCensusDelta())
+  //    and prepares its install.
+  // 3. Install, under the DB mutex: ProcessManifestWrites() installs each
+  //    prepared install when it appends the new Version. The old census state
+  //    becomes garbage.
+  // 4. Free, without the DB mutex: ProcessManifestWrites() cancels the unused
+  //    reservations under the mutex, and moves the installs and the garbage to
+  //    the deferred census cleanup, which is freed later without the mutex
+  //    (see ReleaseDeferredPublicationCleanup()).
+  // The struct is defined in version_set.cc, which includes the census types.
+  struct BlobReferenceCensusInstallBatch;
+
+  // Step 1 (see BlobReferenceCensusInstallBatch). REQUIRES: DB mutex held.
+  // `pending_format_version` is the DB-global blob indirection format version
+  // after this batch commits: the current one, or the one this batch
+  // activates. It is 0 only when the DB has no format fence, and then no
+  // column family needs a census.
+  void ReserveBlobReferenceCensusInstalls(
+      const autovector<Version*>& versions, uint32_t pending_format_version,
+      BlobReferenceCensusInstallBatch* batch) const;
+
+  // Step 2. Runs without the DB mutex. Returns Corruption for an edit that the
+  // census cannot apply. A failure to prepare one install does not fail the
+  // batch: that census is invalidated and rebuilt instead.
+  Status PrepareBlobReferenceCensusInstalls(
+      const autovector<VersionEdit*>& batch_edits,
+      const autovector<Version*>& versions,
+      BlobReferenceCensusInstallBatch* batch) const;
+
+  // Builds the census delta from the current Version of the column family of
+  // `version` to `version`, from the edits of that column family in
+  // `batch_edits`. Part of step 2.
+  Status BuildBlobReferenceCensusDelta(
+      const autovector<VersionEdit*>& batch_edits, Version* version,
+      std::shared_ptr<BlobReferenceCensusDelta>* delta) const;
+
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
   Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,
                                InstrumentedMutex* mu,
