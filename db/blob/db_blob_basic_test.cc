@@ -24,6 +24,7 @@
 #include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "db/wide/wide_column_serialization.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
@@ -352,6 +353,262 @@ TEST_F(DBBlobBasicTest, BlobIndirectionWritesExactSstMetadata) {
   EXPECT_EQ(descriptor.reference_count, 2);
   EXPECT_EQ(descriptor.stored_value_bytes,
             strlen("blob_value_1") + strlen("blob_value_2"));
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionReadsCompressedUnflattenedIndexes) {
+  if (!CompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_SKIP("ZSTD is required for this test");
+    return;
+  }
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.blob_compression_type = kZSTD;
+  options.blob_cache = NewLRUCache(1 << 20);
+
+  Reopen(options);
+  const std::array<std::string, 2> expected{std::string(4096, 'a'),
+                                            std::string(4096, 'b')};
+  ASSERT_OK(Put("key1", expected[0]));
+  ASSERT_OK(Put("key2", expected[1]));
+  ASSERT_OK(Flush());
+
+  const std::array<Slice, 2> keys{{"key2", "key1"}};
+  std::array<PinnableSlice, 2> values;
+  std::array<Status, 2> statuses;
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  db_->MultiGet(read_options, db_->DefaultColumnFamily(), keys.size(),
+                keys.data(), values.data(), statuses.data());
+  ASSERT_OK(statuses[0]);
+  ASSERT_OK(statuses[1]);
+  EXPECT_EQ(values[0], expected[1]);
+  EXPECT_EQ(values[1], expected[0]);
+
+  PinnableSlice value;
+  read_options.fill_cache = true;
+  ASSERT_OK(db_->Get(read_options, db_->DefaultColumnFamily(), "key1", &value));
+  EXPECT_EQ(value, expected[0]);
+  value.Reset();
+  read_options.fill_cache = false;
+  read_options.read_tier = kBlockCacheTier;
+  ASSERT_OK(db_->Get(read_options, db_->DefaultColumnFamily(), "key1", &value));
+  EXPECT_EQ(value, expected[0]);
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionPrepopulatesOnlyStableCacheKey) {
+  Options options = GetDefaultOptions();
+  std::shared_ptr<Cache> blob_cache = NewLRUCache(1 << 20);
+  std::shared_ptr<Cache> block_cache = NewLRUCache(1 << 20);
+  options.blob_cache = blob_cache;
+  BlockBasedTableOptions table_options;
+  table_options.block_cache = block_cache;
+  table_options.cache_index_and_filter_blocks = false;
+  table_options.cache_usage_options.options_overrides.insert(
+      {CacheEntryRole::kBlobCache,
+       {/* charged = */ CacheEntryRoleOptions::Decision::kEnabled}});
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.prepopulate_blob_cache = PrepopulateBlobCache::kFlushOnly;
+  options.statistics = CreateDBStatistics();
+
+  Reopen(options);
+  const std::string expected = "prepopulated-stable-value";
+  ASSERT_OK(Put("key", expected));
+  const size_t block_cache_usage_before_flush = block_cache->GetUsage();
+  ASSERT_OK(Flush());
+  ASSERT_EQ(options.statistics->getTickerCount(BLOB_DB_CACHE_ADD), 1U);
+  EXPECT_GT(block_cache->GetUsage(), block_cache_usage_before_flush);
+
+  std::atomic<int> blob_file_opens{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobFileReader::OpenFile:NewRandomAccessFile",
+      [&blob_file_opens](void* /*arg*/) { ++blob_file_opens; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  PinnableSlice value;
+  const Status status =
+      db_->Get(ReadOptions(), db_->DefaultColumnFamily(), "key", &value);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(status);
+  EXPECT_EQ(value, expected);
+  EXPECT_EQ(blob_file_opens.load(), 0);
+  EXPECT_EQ(options.statistics->getTickerCount(BLOB_DB_CACHE_MISS), 0U);
+  EXPECT_EQ(options.statistics->getTickerCount(BLOB_DB_CACHE_HIT), 1U);
+}
+
+TEST_F(DBBlobBasicTest, StableCacheHitChecksBlobFileInVersion) {
+  // The stable blob cache key names a value by (origin file, offset), not by
+  // column family. Setup: CF "a" writes a value to blob file O and reads it, so
+  // the value is in the shared blob cache. CF "b" then gets a BlobIndex that
+  // names the same (O, offset), written with WriteBatchInternal as a corrupt
+  // index would be. O is not in CF b's Version, so reads in CF b must fail
+  // with Corruption even though the cache holds the value. This covers Get and
+  // MultiGet (Version::GetBlob and Version::MultiGetBlob), and the lazy reads
+  // (Version::GetBlobRange and Version::MultiGetBlobLazy).
+  std::shared_ptr<Cache> blob_cache = NewLRUCache(1 << 20);
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  // Required by GetEntityLazy.
+  options.max_open_files = -1;
+  options.disable_auto_compactions = true;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.blob_cache = blob_cache;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"a", "b"}, options);
+  const std::string key = "key";
+  const std::string value = "a-value";
+  ASSERT_OK(Put(1, key, value));
+  ASSERT_OK(Flush(1));
+  // This read puts the value into the stable blob cache.
+  ASSERT_EQ(Get(1, key), value);
+
+  ColumnFamilyData* cfd_a =
+      static_cast<ColumnFamilyHandleImpl*>(handles_[1])->cfd();
+  const uint64_t origin = cfd_a->current()
+                              ->storage_info()
+                              ->GetBlobFiles()
+                              .front()
+                              ->GetBlobFileNumber();
+  BlobIndex::IndirectBlobFields fields;
+  fields.origin_file_number = origin;
+  fields.original_value_offset =
+      BlobLogHeader::kSize + BlobLogRecord::kHeaderSize + key.size();
+  fields.stored_value_size = value.size();
+  fields.compression = kNoCompression;
+  // A cache hit does not read the stable checksum.
+  fields.stable_checksum = 0;
+  std::string encoded;
+  BlobIndex::EncodeUnflattenedIndirectBlob(&encoded, fields);
+  WriteBatch batch;
+  ASSERT_OK(WriteBatchInternal::PutBlobIndex(&batch, 2, "foreign", encoded));
+  ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  ASSERT_OK(Flush(2));
+  // The lazy reads below need an entity with a blob column (a plain value is
+  // read at once by GetEntityLazy()). One SST must not hold the same blob
+  // reference twice, so the entity goes to a second SST.
+  WriteBatch entity_batch;
+  BlobIndex foreign_index;
+  ASSERT_OK(foreign_index.DecodeFrom(encoded));
+  std::string entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(WideColumns{{"data", ""}},
+                                                 {{0, foreign_index}}, entity));
+  ASSERT_OK(WriteBatchInternal::PutEntitySerialized(&entity_batch, 2,
+                                                    "foreign_entity", entity));
+  ASSERT_OK(db_->Write(WriteOptions(), &entity_batch));
+  ASSERT_OK(Flush(2));
+  ColumnFamilyData* cfd_b =
+      static_cast<ColumnFamilyHandleImpl*>(handles_[2])->cfd();
+  ASSERT_EQ(cfd_b->current()->storage_info()->GetBlobFileMetaData(origin),
+            nullptr);
+
+  PinnableSlice result;
+  Status s = db_->Get(ReadOptions(), handles_[2], "foreign", &result);
+  ASSERT_EQ(s.code(), Status::kCorruption) << s.ToString();
+  EXPECT_EQ(s.ToString(), "Corruption: Invalid blob file number");
+
+  std::array<Slice, 1> keys{{"foreign"}};
+  std::array<PinnableSlice, 1> values;
+  std::array<Status, 1> statuses;
+  db_->MultiGet(ReadOptions(), handles_[2], keys.size(), keys.data(),
+                values.data(), statuses.data());
+  ASSERT_EQ(statuses[0].code(), Status::kCorruption) << statuses[0].ToString();
+
+  // Lazy reads of the entity's blob column. A single strict range read goes
+  // through Version::GetBlobRange. A batch of reads over a MultiGetEntityLazy
+  // result goes through Version::MultiGetBlobLazy.
+  LazyWideColumns lazy;
+  ASSERT_OK(
+      db_->GetEntityLazy(ReadOptions(), handles_[2], "foreign_entity", &lazy));
+  ASSERT_EQ(lazy.size(), 1U);
+  PinnableSlice range;
+  s = lazy.ResolveColumnRange(lazy[0], /*offset=*/1, /*length=*/3, &range);
+  ASSERT_EQ(s.code(), Status::kCorruption) << s.ToString();
+
+  const std::array<Slice, 1> lazy_keys{{"foreign_entity"}};
+  LazyWideColumnsBatch lazy_batch;
+  std::array<Status, 1> lazy_get_statuses;
+  db_->MultiGetEntityLazy(ReadOptions(), handles_[2], lazy_keys.size(),
+                          lazy_keys.data(), &lazy_batch,
+                          lazy_get_statuses.data());
+  ASSERT_OK(lazy_get_statuses[0]);
+  ASSERT_EQ(lazy_batch.size(), 1U);
+  std::array<PinnableSlice, 2> lazy_results;
+  std::array<Status, 2> lazy_statuses;
+  std::array<LazyColumnReadRequest, 2> reads;
+  for (size_t i = 0; i < reads.size(); ++i) {
+    reads[i].column = &lazy_batch[0][0];
+    reads[i].offset = i;
+    reads[i].length = 3;
+    reads[i].result = &lazy_results[i];
+    reads[i].status = &lazy_statuses[i];
+  }
+  ASSERT_OK(lazy_batch.MultiResolve(reads.size(), reads.data()));
+  for (const Status& lazy_status : lazy_statuses) {
+    ASSERT_EQ(lazy_status.code(), Status::kCorruption)
+        << lazy_status.ToString();
+  }
+
+  // CF a still reads its value from the cache.
+  ASSERT_EQ(Get(1, key), value);
+}
+
+TEST_F(DBBlobBasicTest, BlobIndirectionMultiGetReadsOnlyCacheMisses) {
+  // MultiGet looks up every indirect value in the stable blob cache first. A
+  // hit is filled at once; only the misses are grouped by file and read. Each
+  // key is looked up in the cache once.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.blob_cache = NewLRUCache(1 << 20);
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+  constexpr int kKeys = 8;
+  std::vector<std::string> keys;
+  std::vector<std::string> expected;
+  for (int i = 0; i < kKeys; ++i) {
+    keys.push_back("key" + std::to_string(i));
+    expected.push_back("stable-value-" + std::to_string(i));
+    ASSERT_OK(Put(keys.back(), expected.back()));
+  }
+  ASSERT_OK(Flush());
+  // Cache the even keys.
+  for (int i = 0; i < kKeys; i += 2) {
+    ASSERT_EQ(Get(keys[i]), expected[i]);
+  }
+
+  Statistics* const statistics = options.statistics.get();
+  const uint64_t hits = statistics->getTickerCount(BLOB_DB_CACHE_HIT);
+  const uint64_t misses = statistics->getTickerCount(BLOB_DB_CACHE_MISS);
+  std::atomic<size_t> file_reads{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlobFileReader::MultiGetBlob:Requests", [&](void* arg) {
+        file_reads += static_cast<std::vector<FSReadRequest>*>(arg)->size();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::vector<Slice> key_slices(keys.begin(), keys.end());
+  std::vector<PinnableSlice> values(kKeys);
+  std::vector<Status> statuses(kKeys);
+  ReadOptions read_options;
+  read_options.fill_cache = false;
+  db_->MultiGet(read_options, db_->DefaultColumnFamily(), kKeys,
+                key_slices.data(), values.data(), statuses.data());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_OK(statuses[i]) << i;
+    EXPECT_EQ(values[i], expected[i]) << i;
+  }
+  EXPECT_EQ(statistics->getTickerCount(BLOB_DB_CACHE_HIT), hits + kKeys / 2);
+  EXPECT_EQ(statistics->getTickerCount(BLOB_DB_CACHE_MISS), misses + kKeys / 2);
+  EXPECT_EQ(file_reads.load(), static_cast<size_t>(kKeys / 2));
 }
 
 TEST_F(DBBlobBasicTest, BlobIndirectionWritesCompleteEmptySstMetadata) {

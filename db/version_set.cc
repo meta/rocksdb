@@ -2922,6 +2922,19 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
       version_number_(version_number),
       io_tracer_(io_tracer) {}
 
+Status Version::CheckStableCacheHitHasFile(const BlobIndex& blob_index) const {
+  const uint64_t blob_file_number = blob_index.file_number();
+  const VersionStorageInfo::BlobFiles& blob_files =
+      storage_info_.GetBlobFiles();
+  const VersionStorageInfo::BlobFiles::const_iterator it =
+      storage_info_.GetBlobFileMetaDataLB(blob_file_number);
+  if (it != blob_files.end() &&
+      (*it)->GetBlobFileNumber() == blob_file_number) {
+    return Status::OK();
+  }
+  return UnknownBlobFileStatus(storage_info_, blob_file_number);
+}
+
 Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
                         const BlobIndex& blob_index,
                         FilePrefetchBuffer* prefetch_buffer,
@@ -2930,6 +2943,24 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
 
   if (blob_index.HasTTL() || blob_index.IsInlined()) {
     return Status::Corruption("Unexpected TTL/inlined blob index");
+  }
+
+  assert(blob_source_);
+  // An indirect value is looked up in the stable blob cache first, before any
+  // file lookup (see BlobSource::GetIndirectBlobFromCache()).
+  if (blob_index.IsIndirect()) {
+    const Status status = blob_source_->GetIndirectBlobFromCache(
+        blob_index, /*range_offset=*/0, kWholeBlobLength, value);
+    if (status.ok()) {
+      const Status file_status = CheckStableCacheHitHasFile(blob_index);
+      if (!file_status.ok()) {
+        value->Reset();
+      }
+      return file_status;
+    }
+    if (!status.IsNotFound()) {
+      return status;
+    }
   }
 
   const uint64_t blob_file_number = blob_index.file_number();
@@ -2950,6 +2981,13 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
   const BlobFileOpenInfo blob_file{blob_file_number,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
+  if (blob_index.IsIndirect()) {
+    return blob_source_->GetIndirectBlob(
+        read_options, user_key, blob_index,
+        BlobPhysicalFile{blob_file, blob_file_meta->GetBlobFileSize()},
+        mutable_cf_options_, /*range_offset=*/0, kWholeBlobLength,
+        prefetch_buffer, value, bytes_read, /*cache_checked=*/true);
+  }
   const Status s = blob_source_->GetBlob(
       read_options, user_key, blob_file, blob_index.offset(),
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
@@ -2968,10 +3006,29 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
     return Status::Corruption("Unexpected TTL/inlined blob index");
   }
 
-  // A strict sub-range of a compressed blob cannot be decompressed in
-  // isolation; the caller resolves such columns whole and slices instead.
+  // A value cannot be range-read when it is compressed, because a byte range
+  // cannot be decompressed alone; callers read the whole value and slice it.
+  // A range read of an uncompressed value checks no CRC. Callers send only
+  // strict parts of a value (see ReadPathBlobResolver::ResolveColumnRange).
   if (blob_index.compression() != kNoCompression) {
     return Status::Corruption("Cannot range-read a compressed blob");
+  }
+
+  assert(blob_source_);
+  // As in GetBlob, the stable blob cache comes first for an indirect value.
+  if (blob_index.IsIndirect()) {
+    const Status status = blob_source_->GetIndirectBlobFromCache(
+        blob_index, range_offset, range_length, value);
+    if (status.ok()) {
+      const Status file_status = CheckStableCacheHitHasFile(blob_index);
+      if (!file_status.ok()) {
+        value->Reset();
+      }
+      return file_status;
+    }
+    if (!status.IsNotFound()) {
+      return status;
+    }
   }
 
   const uint64_t blob_file_number = blob_index.file_number();
@@ -2989,6 +3046,14 @@ Status Version::GetBlobRange(const ReadOptions& read_options,
   const BlobFileOpenInfo blob_file{blob_file_number,
                                    blob_file_meta->GetChecksumValue(),
                                    blob_file_meta->GetChecksumMethod()};
+  if (blob_index.IsIndirect()) {
+    return blob_source_->GetIndirectBlob(
+        read_options, user_key, blob_index,
+        BlobPhysicalFile{blob_file, blob_file_meta->GetBlobFileSize()},
+        mutable_cf_options_, range_offset, range_length,
+        /*prefetch_buffer=*/nullptr, value, bytes_read,
+        /*cache_checked=*/true);
+  }
   return blob_source_->GetBlobRange(
       read_options, user_key, blob_file, blob_index.offset(),
       blob_file_meta->GetBlobFileSize(), blob_index.size(),
@@ -3011,8 +3076,10 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
   // of that file's current (most recently started, still fillable) batch.
   autovector<BlobFileReadRequests> whole_reqs;
   autovector<BlobFileRangeReadRequests> range_reqs;
+  autovector<BlobFileIndirectReadRequests> indirect_reqs;
   std::unordered_map<uint64_t, size_t> whole_idx;
   std::unordered_map<uint64_t, size_t> range_idx;
+  UnorderedMap<uint64_t, size_t> indirect_idx;
 
   for (auto& req : reqs) {
     assert(req.user_key);
@@ -3024,6 +3091,22 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     if (blob_index.HasTTL() || blob_index.IsInlined()) {
       *req.status = Status::Corruption("Unexpected TTL/inlined blob index");
       continue;
+    }
+    // A stable blob cache hit is filled at once. Only misses are grouped by
+    // file and read.
+    if (blob_index.IsIndirect()) {
+      *req.status = blob_source_->GetIndirectBlobFromCache(
+          blob_index, req.range_offset, req.range_length, req.result);
+      if (req.status->ok()) {
+        *req.status = CheckStableCacheHitHasFile(blob_index);
+        if (!req.status->ok()) {
+          req.result->Reset();
+        }
+        continue;
+      }
+      if (!req.status->IsNotFound()) {
+        continue;
+      }
     }
 
     const uint64_t file_number = blob_index.file_number();
@@ -3038,6 +3121,27 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     const BlobFileOpenInfo blob_file{file_number,
                                      blob_file_meta->GetChecksumValue(),
                                      blob_file_meta->GetChecksumMethod()};
+
+    if (blob_index.IsIndirect()) {
+      size_t idx;
+      const UnorderedMap<uint64_t, size_t>::const_iterator it =
+          indirect_idx.find(file_number);
+      if (it != indirect_idx.end() &&
+          indirect_reqs[it->second].requests.size() <
+              MultiGetContext::MAX_BATCH_SIZE) {
+        idx = it->second;
+      } else {
+        idx = indirect_reqs.size();
+        indirect_idx[file_number] = idx;
+        indirect_reqs.push_back(BlobFileIndirectReadRequests{
+            BlobPhysicalFile{blob_file, file_size},
+            std::vector<IndirectBlobReadRequest>()});
+      }
+      indirect_reqs[idx].requests.push_back(IndirectBlobReadRequest{
+          *req.user_key, &blob_index, req.range_offset, req.range_length,
+          req.result, req.status, /*cache_checked=*/true});
+      continue;
+    }
 
     if (req.range_length == kWholeBlobLength) {
       // Append to this file's current batch, or start a new batch when the file
@@ -3097,6 +3201,12 @@ void Version::MultiGetBlobLazy(const ReadOptions& read_options,
     blob_source_->MultiGetBlobRange(read_options, range_reqs,
                                     /*bytes_read=*/nullptr);
   }
+  for (BlobFileIndirectReadRequests& file_requests : indirect_reqs) {
+    std::vector<IndirectBlobReadRequest>& batch = file_requests.requests;
+    blob_source_->MultiGetIndirectBlobFromOneFile(
+        read_options, file_requests.file, mutable_cf_options_, batch.size(),
+        batch.data(), /*bytes_read=*/nullptr);
+  }
 }
 
 void Version::MultiGetBlob(
@@ -3111,6 +3221,10 @@ void Version::MultiGetBlob(
     const auto blob_file_meta = storage_info_.GetBlobFileMetaData(file_number);
 
     autovector<BlobReadRequest> blob_reqs_in_file;
+    // BlobSource takes a pointer and a count, so the requests must be
+    // contiguous. A std::vector is used because autovector is not contiguous
+    // once it grows past its inline storage.
+    std::vector<IndirectBlobReadRequest> indirect_blob_reqs_in_file;
     BlobReadContexts& blobs_in_file = ctx.second;
     for (auto& blob : blobs_in_file) {
       const BlobIndex& blob_index = blob.blob_index;
@@ -3124,6 +3238,22 @@ void Version::MultiGetBlob(
       } else {
         assert(key_context->columns);
         key_context->columns->Reset();
+      }
+
+      // A stable blob cache hit is filled at once. Only misses are read.
+      if (blob_index.IsIndirect()) {
+        *key_context->s = blob_source_->GetIndirectBlobFromCache(
+            blob_index, /*range_offset=*/0, kWholeBlobLength, &blob.result);
+        if (key_context->s->ok()) {
+          *key_context->s = CheckStableCacheHitHasFile(blob_index);
+          if (!key_context->s->ok()) {
+            blob.result.Reset();
+          }
+          continue;
+        }
+        if (!key_context->s->IsNotFound()) {
+          continue;
+        }
       }
 
       if (!blob_file_meta) {
@@ -3140,6 +3270,14 @@ void Version::MultiGetBlob(
         continue;
       }
 
+      if (blob_index.IsIndirect()) {
+        indirect_blob_reqs_in_file.push_back(IndirectBlobReadRequest{
+            key_context->get_context->ukey_to_get_blob_value(), &blob_index,
+            /*range_offset=*/0, kWholeBlobLength, &blob.result, key_context->s,
+            /*cache_checked=*/true});
+        continue;
+      }
+
       blob_reqs_in_file.emplace_back(
           key_context->get_context->ukey_to_get_blob_value(),
           blob_index.offset(), blob_index.size(), blob_index.compression(),
@@ -3151,6 +3289,16 @@ void Version::MultiGetBlob(
                                        blob_file_meta->GetChecksumValue(),
                                        blob_file_meta->GetChecksumMethod()};
       blob_reqs.emplace_back(blob_file, file_size, blob_reqs_in_file);
+    }
+    if (!indirect_blob_reqs_in_file.empty() && blob_file_meta != nullptr) {
+      const BlobFileOpenInfo blob_file{file_number,
+                                       blob_file_meta->GetChecksumValue(),
+                                       blob_file_meta->GetChecksumMethod()};
+      blob_source_->MultiGetIndirectBlobFromOneFile(
+          read_options,
+          BlobPhysicalFile{blob_file, blob_file_meta->GetBlobFileSize()},
+          mutable_cf_options_, indirect_blob_reqs_in_file.size(),
+          indirect_blob_reqs_in_file.data(), /*bytes_read=*/nullptr);
     }
   }
 

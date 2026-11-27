@@ -393,6 +393,9 @@ TEST(BlobIndexTest, IndirectStoredChecksumMatchesEncoding) {
       ASSERT_OK(blob_index.DecodeFrom(encoded));
       EXPECT_EQ(blob_index.stable_checksum(), kStableChecksum);
       EXPECT_EQ(blob_index.stored_checksum(), expected_stored_checksum);
+      EXPECT_TRUE(blob_index.fingerprint() ==
+                  (StableBlobFingerprint{789, compression, kStableChecksum,
+                                         expected_stored_checksum}));
       EXPECT_NE(blob_index.DebugString(/*output_hex=*/false)
                     .find(" stored_crc:" +
                           std::to_string(expected_stored_checksum) + " "),
@@ -501,6 +504,45 @@ TEST(BlobIndexTest, FlattenedBlobRoundTripAndCanonicalGeneration) {
     BlobIndex decoded;
     EXPECT_TRUE(decoded.DecodeFrom(Slice(encoded.data(), size)).IsCorruption())
         << "accepted truncated size " << size;
+  }
+}
+
+TEST(BlobIndexTest, IndirectBlobIndexRejectsInvalidFileNumbers) {
+  // A file number must be in [1, BlobIndex::kMaxFileNumber]. The test writes
+  // the type byte and the file numbers by hand and copies the other fields
+  // from a valid index of origin 77 (one varint byte).
+  std::string valid;
+  BlobIndex::EncodeUnflattenedIndirectBlob(&valid,
+                                           {.origin_file_number = 77,
+                                            .original_value_offset = 88,
+                                            .stored_value_size = 99,
+                                            .compression = kNoCompression,
+                                            .stable_checksum = 1234,
+                                            .stored_checksum = 0});
+  const std::string other_fields = valid.substr(2);
+  const auto encode = [&](BlobIndex::Type type,
+                          std::initializer_list<uint64_t> file_numbers) {
+    std::string encoded(1, static_cast<char>(type));
+    for (uint64_t file_number : file_numbers) {
+      PutVarint64(&encoded, file_number);
+    }
+    return encoded + other_fields;
+  };
+  constexpr uint64_t kMax = BlobIndex::kMaxFileNumber;
+  BlobIndex decoded;
+  ASSERT_OK(decoded.DecodeFrom(encode(BlobIndex::Type::kIndirectBlob, {kMax})));
+  ASSERT_OK(decoded.DecodeFrom(
+      encode(BlobIndex::Type::kIndirectFlattenedBlob, {kMax, 77})));
+  for (const std::string& bad :
+       {encode(BlobIndex::Type::kIndirectBlob, {0}),
+        encode(BlobIndex::Type::kIndirectBlob, {kMax + 1}),
+        encode(BlobIndex::Type::kIndirectBlob,
+               {std::numeric_limits<uint64_t>::max()}),
+        encode(BlobIndex::Type::kIndirectFlattenedBlob, {kMax + 1, 77}),
+        encode(BlobIndex::Type::kIndirectFlattenedBlob,
+               {kMax + 2, kMax + 1})}) {
+    SCOPED_TRACE(Slice(bad).ToString(/*hex=*/true));
+    EXPECT_TRUE(decoded.DecodeFrom(bad).IsCorruption());
   }
 }
 
@@ -3286,6 +3328,65 @@ TEST_F(DBBlobIndexTest, EmbeddedBlobIteratorWithFirstKeyIndex) {
   ASSERT_OK(iter->status());
   EXPECT_EQ(iter->key(), "k2");
   EXPECT_EQ(iter->value(), big2);
+}
+
+TEST_F(DBBlobIndexTest, CompressedSameFileRangeIsRejectedWithBlobSource) {
+  // As in base RocksDB, a range of a compressed value is not supported. The
+  // table reader of a DB-owned SST (it has a BlobSource) returns Corruption for
+  // one, from the scalar and the batched read, before any other check, so a
+  // kBlockCacheTier read gets Corruption too. Base SSTs never hold a compressed
+  // embedded blob, so the test uses a made-up same-file index.
+  Options options = GetTestOptions();
+  options.max_open_files = -1;
+  DestroyAndReopen(options);
+  const std::string sst_path = dbname_ + "/embedded_compressed_range.sst";
+  SstFileWriterEmbeddedBlobOptions embedded_blob_options;
+  embedded_blob_options.min_blob_size = 8;
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.OpenWithEmbeddedBlobs(sst_path, embedded_blob_options));
+  ASSERT_OK(writer.Put("k1", std::string(1024, 'x')));
+  ASSERT_OK(writer.Finish());
+  ASSERT_OK(db_->IngestExternalFile({sst_path}, IngestExternalFileOptions()));
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const BlockBasedTable* table = nullptr;
+  for (int level = 0; level < cfd->NumberLevels() && table == nullptr;
+       ++level) {
+    for (const FileMetaData* file :
+         cfd->current()->storage_info()->LevelFiles(level)) {
+      table = static_cast<const BlockBasedTable*>(file->fd.pinned_reader.Get());
+    }
+  }
+  ASSERT_NE(table, nullptr);
+
+  std::string encoded;
+  BlobIndex::EncodeBlob(&encoded, kCurrentFileBlobIndexFileNumber,
+                        /*offset=*/0, /*size=*/16, kSnappyCompression);
+  BlobIndex index;
+  ASSERT_OK(index.DecodeFrom(encoded));
+  for (const ReadTier read_tier : {kReadAllTier, kBlockCacheTier}) {
+    ReadOptions read_options;
+    read_options.read_tier = read_tier;
+    PinnableSlice value;
+    EXPECT_TRUE(table
+                    ->GetSameFileBlob(
+                        read_options, index, /*range_offset=*/1,
+                        /*range_length=*/4,
+                        BlobVerifyPolicy::kVerifyIfNoAmplification, &value)
+                    .IsCorruption());
+    PinnableSlice batch_value;
+    Status batch_status;
+    SameFileBlobReadRequest request;
+    request.blob_index = &index;
+    request.range_offset = 1;
+    request.range_length = 4;
+    request.result = &batch_value;
+    request.status = &batch_status;
+    table->MultiGetSameFileBlob(read_options, /*num_reads=*/1, &request);
+    EXPECT_TRUE(batch_status.IsCorruption()) << batch_status.ToString();
+  }
+  ASSERT_EQ(Get("k1"), std::string(1024, 'x'));
 }
 
 // Backward iteration (Prev / SeekForPrev) over an embedded-blob SST must work,
