@@ -229,6 +229,8 @@ CompactionIterator::CompactionIterator(
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
       preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)) {
   assert(snapshots_ != nullptr);
+  blob_value_loss_possible_ =
+      blob_fetcher_ != nullptr && blob_fetcher_->HasBlobValueLoss();
   input_has_blob_indirection_format_ =
       compaction_ != nullptr && compaction_->input_version() != nullptr &&
       compaction_->input_version()->storage_info()->HasBlobIndirectionFormat();
@@ -288,6 +290,21 @@ void CompactionIterator::SetBlobFetcher(const Version* version,
       allow_write_path_fallback);
   blob_resolver_.Init(blob_fetcher_.get(), prefetch_buffers_.get(),
                       &iter_stats_);
+  blob_value_loss_possible_ = blob_fetcher_->HasBlobValueLoss();
+}
+
+bool CompactionIterator::CheckBlobValueLoss() {
+  bool lost = false;
+  status_ = blob_fetcher_->IsBlobValueLost(ikey_.type, value_, &lost,
+                                           /*repaired_entity=*/nullptr);
+  if (!status_.ok()) {
+    return false;
+  }
+  if (lost) {
+    // See lost_blob_value_.
+    lost_blob_value_ = true;
+  }
+  return true;
 }
 
 void CompactionIterator::ResetRecordCounts() {
@@ -325,6 +342,7 @@ void CompactionIterator::NextImpl() {
   }
   output_prepared_ = false;
   has_output_blob_index_ = false;
+  lost_blob_value_ = false;
   // If there is a merge output, return it before continuing to process the
   // input.
   if (merge_out_iter_.Valid()) {
@@ -1031,6 +1049,7 @@ void CompactionIterator::NextFromInput() {
   at_next_ = false;
   validity_info_.Invalidate();
   entity_deserialized_ = false;
+  lost_blob_value_ = false;
 
   while (!Valid() && input_.Valid() && !IsPausingManualCompaction() &&
          !IsShuttingDown()) {
@@ -1058,10 +1077,19 @@ void CompactionIterator::NextFromInput() {
       // clears has_current_user_key_.
       has_consumed_earlier_entries_of_current_key_ = false;
     }
+    lost_blob_value_ = false;
     TEST_SYNC_POINT_CALLBACK("CompactionIterator:ProcessKV", &ikey_);
     if (is_range_del_) {
       validity_info_.SetValid(kRangeDeletion);
       break;
+    }
+    // UNLIKELY: only a Version that marks relocation files lost can have lost
+    // values (see blob_value_loss_possible_).
+    if (UNLIKELY(blob_value_loss_possible_) &&
+        (ikey_.type == kTypeBlobIndex || ikey_.type == kTypeWideColumnEntity)) {
+      if (!CheckBlobValueLoss()) {
+        return;
+      }
     }
     // Update input statistics
     if (ikey_.type == kTypeDeletion || ikey_.type == kTypeSingleDeletion ||
@@ -1142,7 +1170,7 @@ void CompactionIterator::NextFromInput() {
 
       // Apply the compaction filter to the first committed version of the user
       // key.
-      if (current_key_committed_ &&
+      if (current_key_committed_ && !lost_blob_value_ &&
           !InvokeFilterIfNeeded(&need_skip, &skip_until, false)) {
         break;
       }
@@ -1164,7 +1192,7 @@ void CompactionIterator::NextFromInput() {
         current_key_committed_ = KeyCommitted(ikey_.sequence);
         // Apply the compaction filter to the first committed version of the
         // user key.
-        if (current_key_committed_ &&
+        if (current_key_committed_ && !lost_blob_value_ &&
             !InvokeFilterIfNeeded(&need_skip, &skip_until, false)) {
           break;
         }
@@ -2402,7 +2430,7 @@ Status CompactionIterator::OutputHasExternalBlobReferences(
 void CompactionIterator::PrepareOutput() {
   has_output_blob_index_ = false;
   if (Valid()) {
-    if (LIKELY(!is_range_del_)) {
+    if (LIKELY(!is_range_del_) && !lost_blob_value_) {
       if (ikey_.type == kTypeValue) {
         ExtractLargeValueIfNeeded();
       } else if (ikey_.type == kTypeBlobIndex) {
@@ -2458,7 +2486,8 @@ void CompactionIterator::PrepareOutput() {
     // KeyNotExistsBeyondOutputLevel() return true?
     if (Valid() && bottommost_level_ &&
         DefinitelyInSnapshot(ikey_.sequence, earliest_snapshot_) &&
-        ikey_.type != kTypeMerge && current_key_committed_ && !is_range_del_) {
+        ikey_.type != kTypeMerge && current_key_committed_ && !is_range_del_ &&
+        !lost_blob_value_) {
       assert(compaction_ != nullptr && !compaction_->allow_ingest_behind());
       if (ikey_.type == kTypeDeletion ||
           (ikey_.type == kTypeSingleDeletion && timestamp_size_ == 0)) {

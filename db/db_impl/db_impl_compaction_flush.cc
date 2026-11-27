@@ -249,6 +249,33 @@ std::shared_ptr<Cache> GetIndirectBlobGcWorkingMemoryCache(
              : nullptr;
 }
 
+// skip_missing_blob_files drops every reference whose blob file is absent. A
+// blob indirection reference names a generation, and a Version route can map
+// that generation to another physical file after indirect blob GC deletes it.
+// So the repair would drop live values. Reject the repair on any column family
+// that may hold such references: enable_blob_indirection is on, a flush or
+// compaction that started with it on is still running
+// (HasPendingBlobIndirectionOutput()), or the sticky format fence is set (it
+// stays after the option is turned off). A non-null `compaction` adds the
+// options and input Version it was picked with.
+// REQUIRES: DB mutex held.
+Status CheckSkipMissingBlobFilesSupported(ColumnFamilyData* cfd,
+                                          const Compaction* compaction) {
+  bool has_blob_indirection = cfd->MayUseBlobIndirection();
+  if (compaction != nullptr) {
+    has_blob_indirection =
+        has_blob_indirection ||
+        compaction->mutable_cf_options().enable_blob_indirection ||
+        compaction->input_version()->storage_info()->HasBlobIndirectionFormat();
+  }
+  if (!has_blob_indirection) {
+    return Status::OK();
+  }
+  return Status::NotSupported(
+      "skip_missing_blob_files is not supported on a column family with blob "
+      "indirection state");
+}
+
 }  // namespace
 
 Status DBImpl::RetireBlobRelocationRoutes(
@@ -2100,9 +2127,9 @@ void DBImpl::IndirectBlobGCJob::DecideInputs() {
           "exact live bytes exceed physical record bytes");
       continue;
     }
-    if (input.relocation_metadata != nullptr &&
-        input.relocation_metadata->IsMarkedLost() &&
-        input_live_record_bytes != 0) {
+    const bool marked_lost = input.relocation_metadata != nullptr &&
+                             input.relocation_metadata->IsMarkedLost();
+    if (marked_lost && input_live_record_bytes != 0) {
       // A lost relocation file (an accepted loss, recorded with
       // VersionEdit::MarkBlobPhysicalFileLost()) is never read in this
       // Version, so GC cannot copy the values that SSTs still reference.
@@ -5045,6 +5072,13 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
     return Status::NotSupported(
         "FIFO compaction does not support missing blob file repair.");
   }
+  if (options.skip_missing_blob_files) {
+    InstrumentedMutexLock l(&mutex_);
+    const Status guard = CheckSkipMissingBlobFilesSupported(cfd, nullptr);
+    if (!guard.ok()) {
+      return guard;
+    }
+  }
 
   bool flush_needed = true;
 
@@ -6374,6 +6408,21 @@ Status DBImpl::RunManualCompaction(
         }
         bg_cv_.SignalAll();
         continue;
+      }
+      if (compaction->skip_missing_blob_files()) {
+        // The feature can be turned on after the early check in
+        // CompactRangeInternal(). Check again with the picked inputs, before
+        // any work is scheduled.
+        const Status guard =
+            CheckSkipMissingBlobFilesSupported(cfd, compaction);
+        if (!guard.ok()) {
+          std::unique_ptr<Compaction> rejected(compaction);
+          rejected->ReleaseCompactionFiles(guard);
+          manual.status = guard;
+          manual.done = true;
+          bg_cv_.SignalAll();
+          continue;
+        }
       }
       ca = new CompactionArg;
       ca->db = this;

@@ -1352,6 +1352,16 @@ TEST_F(LdbCmdTest, ManifestDumpPrintsBlobIndirectionSummary) {
       /*dir_contains_current_file=*/nullptr, /*new_descriptor_log=*/false,
       /*column_family_options=*/nullptr, /*manifest_wcb=*/{},
       /*pre_cb=*/{}));
+  // Records the loss of the relocation file, as best_efforts_blob_db_repair
+  // does when the file is missing.
+  VersionEdit loss;
+  loss.SetColumnFamily(cfd->GetID());
+  loss.MarkBlobPhysicalFileLost(file_number);
+  ASSERT_OK(version_set->LogAndApply(
+      cfd, ReadOptions(), WriteOptions(), &loss, db_impl->TEST_Mutex(),
+      /*dir_contains_current_file=*/nullptr, /*new_descriptor_log=*/false,
+      /*column_family_options=*/nullptr, /*manifest_wcb=*/{},
+      /*pre_cb=*/{}));
   db_impl->TEST_UnlockMutex();
   db.reset();
 
@@ -1367,7 +1377,7 @@ TEST_F(LdbCmdTest, ManifestDumpPrintsBlobIndirectionSummary) {
       "--- blob indirection --- format version: " +
       std::to_string(kBlobIndirectionManifestFormatVersion) +
       ", relocation files: 1 (" + std::to_string(file_size) +
-      " bytes, 1 values), routes: 1";
+      " bytes, 1 values), routes: 1, lost relocation files: 1";
   EXPECT_NE(output.find(expected), std::string::npos) << output;
   EXPECT_NE(output.find("db blob indirection format version " +
                         std::to_string(kBlobIndirectionManifestFormatVersion)),

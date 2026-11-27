@@ -580,6 +580,10 @@ bool Compaction::InputCompressionMatchesOutput() const {
   return matches;
 }
 
+bool Compaction::RepairsLostBlobReferences() const {
+  return input_vstorage_->HasLostBlobRelocationFiles();
+}
+
 bool Compaction::IsTrivialMove() const {
   if (skip_missing_blob_files_) {
     return false;
@@ -676,7 +680,16 @@ bool Compaction::CollectExactBlobReferences() const {
   if (!UsesBlobIndirection(mutable_cf_options_, input_vstorage_)) {
     return false;
   }
-  if (output_level_ != 0 || bottommost_level_) {
+  // Loss repair output is exact even at L0. A coarse SST records only its
+  // frontier file number, and it pins every generation number at or above its
+  // frontier. A lost relocation file stays pinned while an old number routed to
+  // it is at or above that frontier. So a coarse output could keep the lost
+  // file pinned, and the lost file would not be removed. In normal operation a
+  // coarse L0 input never references a routed number (see "Coarse SST" in
+  // db/blob/blob_reference_metadata.h), so this rule matters only for SSTs
+  // whose blob indexes were written directly, for example by
+  // WriteBatchInternal::PutBlobIndex().
+  if (output_level_ != 0 || bottommost_level_ || RepairsLostBlobReferences()) {
     return true;
   }
   for (const CompactionInputFiles& level : inputs_) {

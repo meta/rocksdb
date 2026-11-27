@@ -3456,6 +3456,48 @@ TEST(BlobReferenceCensusTest, MetadataCommitFencesGcJobStart) {
   census.EndGcJob(gc_token);
 }
 
+TEST(BlobGcCandidateHeapTest, LostRelocationFileGarbageIsNotCounted) {
+  // A relocation file marked lost (best_efforts_blob_db_repair) has no
+  // readable values, so its garbage is left out of the relocation garbage
+  // total. While
+  // references to it remain, GC cannot collect from it, so its garbage is also
+  // left out of the collectable garbage (garbage-bytes-collectable of
+  // rocksdb.indirect-blob-gc-stats). When no reference remains, the empty-file
+  // cleanup removes it, so its bytes count as collectable again.
+  //
+  // In this example, relocation files 30 and 40 have 1000 bytes each. File 30
+  // has 400 live bytes (600 garbage bytes), and file 40 has 900 live bytes
+  // (100 garbage bytes).
+  BlobGcCandidateHeap heap;
+  heap.SetPhysicalFile({30, 1000, /*is_indirect_origin=*/false,
+                        /*is_lost=*/false});
+  heap.SetPhysicalFile({40, 1000, /*is_indirect_origin=*/false,
+                        /*is_lost=*/false});
+  ASSERT_OK(heap.AdjustLiveBytes(30, 400, /*count=*/4, /*add=*/true));
+  ASSERT_OK(heap.AdjustLiveBytes(40, 900, /*count=*/9, /*add=*/true));
+  EXPECT_EQ(heap.RelocationGarbageBytes(), 700U);
+  EXPECT_EQ(heap.GetTotals().collectable_garbage_bytes, 700U);
+  EXPECT_EQ(heap.Select()[0], 30U);
+
+  // File 30 is marked lost while its references remain.
+  heap.SetPhysicalFile({30, 1000, /*is_indirect_origin=*/false,
+                        /*is_lost=*/true});
+  EXPECT_EQ(heap.RelocationGarbageBytes(), 100U);
+  EXPECT_EQ(heap.GetTotals().collectable_garbage_bytes, 100U);
+  EXPECT_EQ(heap.Select()[0], 40U);
+  EXPECT_EQ(heap.Select()[1], 0U);
+
+  // Compactions remove the last references to file 30.
+  ASSERT_OK(heap.AdjustLiveBytes(30, 400, /*count=*/4, /*add=*/false));
+  EXPECT_EQ(heap.RelocationGarbageBytes(), 100U);
+  EXPECT_EQ(heap.GetTotals().collectable_garbage_bytes, 1100U);
+  EXPECT_EQ(heap.SelectEmpty()[0], 30U);
+
+  heap.DeletePhysicalFile(30);
+  EXPECT_EQ(heap.RelocationGarbageBytes(), 100U);
+  EXPECT_EQ(heap.GetTotals().collectable_garbage_bytes, 100U);
+}
+
 TEST(BlobGcCandidateHeapTest, CutSelectionKeepsLeadingFilesAtRatio) {
   // The census job calls CutSelection() with the indirect_blob_gc_garbage_ratio
   // option, so that indirect blob GC gets only files with enough garbage.

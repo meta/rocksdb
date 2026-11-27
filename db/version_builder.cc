@@ -1421,6 +1421,10 @@ class VersionBuilder::Rep : public MutableScalars {
                nullptr;
   }
 
+  bool IsBlobFileRetiredInBuilder(uint64_t file_number) const {
+    return retired_blob_files_.count(file_number) != 0;
+  }
+
   // True if an earlier edit applied to this builder deleted relocation file
   // `file_number`. It is not about blob file retirement.
   bool IsBlobRelocationFileDeletedInBuilder(uint64_t file_number) const {
@@ -1696,12 +1700,31 @@ class VersionBuilder::Rep : public MutableScalars {
         continue;
       }
       bool marked_lost = file_losses.count(addition.GetFileNumber()) != 0;
+#ifndef NDEBUG
+      // Tests mark a relocation file lost while a DB opens; the open then
+      // writes the loss into its new MANIFEST.
+      std::pair<uint64_t, bool*> test_loss{addition.GetFileNumber(),
+                                           &marked_lost};
+      TEST_SYNC_POINT_CALLBACK("VersionBuilder::MarkBlobFileLostForTest",
+                               &test_loss);
+#endif  // NDEBUG
       if (track_found_and_missing_files_ && !marked_lost) {
         assert(version_edit_handler_ != nullptr);
         status =
             version_edit_handler_->VerifyBlobRelocationFile(cfd_, addition);
-        if (status.IsPathNotFound() || status.IsNotFound() ||
-            status.IsCorruption()) {
+        const bool file_unusable = status.IsPathNotFound() ||
+                                   status.IsNotFound() || status.IsCorruption();
+        if (file_unusable && record_missing_blob_files_as_dropped_) {
+          // best_efforts_blob_db_repair: a missing or corrupt relocation file
+          // is marked lost, and the open writes the loss record into its new
+          // MANIFEST. Base RocksDB has no relocation files, so it has no
+          // dropped-file rule for them ("Lost relocation files" in
+          // db/blob/blob_relocation_manifest.h says why the file is not
+          // dropped). A missing relocation file does not cause a fallback in
+          // time. If a fallback crosses an indirect blob GC edit,
+          // CheckRepairFallbackAgainstGc() fails the open.
+          marked_lost = true;
+        } else if (file_unusable) {
           missing_blob_relocation_files_.insert(addition.GetFileNumber());
         } else if (!status.ok()) {
           return status;
@@ -1719,6 +1742,9 @@ class VersionBuilder::Rep : public MutableScalars {
     for (uint64_t file_number : file_losses) {
       const std::shared_ptr<BlobRelocationFileMetaData> current =
           get_final_file(file_number);
+      // A loss record names only a relocation file. A normal or origin blob
+      // file that is missing uses the base dropped-file record instead
+      // (kDroppedBlobFile, see best_efforts_blob_db_repair).
       if (current == nullptr ||
           std::find(edit.GetBlobRelocationFileDeletions().begin(),
                     edit.GetBlobRelocationFileDeletions().end(), file_number) !=
@@ -2738,7 +2764,11 @@ class VersionBuilder::Rep : public MutableScalars {
   // edits, plus `dropped`, the missing blob files SaveBlobFilesTo() recorded.
   // `min_oldest_blob_file_num` is the oldest blob file referenced by the SST
   // files in *vstorage; a blob file older than it, or in *vstorage, is not
-  // kept.
+  // kept. This rule also fits a dropped indirect origin. Indirect blob GC has
+  // not retired it, so it has no route, and only unflattened references can use
+  // it. Such a reference always sets oldest_blob_file_number (see
+  // UpdateFileMetaDataBoundaries()), so the origin stays in the list while an
+  // SST can use it.
   void SaveDroppedBlobFilesTo(VersionStorageInfo* vstorage,
                               uint64_t min_oldest_blob_file_num,
                               std::vector<uint64_t>&& dropped) const {
@@ -2987,6 +3017,10 @@ class VersionBuilder::Rep : public MutableScalars {
             (BlobFileLinksDescribeAllReferences()
                  ? missing_blob_files_high_ < GetMinOldestBlobFileNumber()
                  : !MissesNeededBlobFile()));
+  }
+
+  bool RecordsMissingBlobFilesAsDropped() const {
+    return record_missing_blob_files_as_dropped_;
   }
 
   void RecordMissingBlobFilesAsDropped() {
@@ -3566,12 +3600,21 @@ void VersionBuilder::RecordMissingBlobFilesAsDropped() {
   rep_->RecordMissingBlobFilesAsDropped();
 }
 
+bool VersionBuilder::RecordsMissingBlobFilesAsDropped() const {
+  return rep_->RecordsMissingBlobFilesAsDropped();
+}
+
 std::shared_ptr<void> VersionBuilder::ReleaseBlobRelocationChanges() {
   return rep_->ReleaseBlobRelocationChanges();
 }
 
 bool VersionBuilder::HasMissingBlobRelocationFiles() const {
   return rep_->HasMissingBlobRelocationFiles();
+}
+
+bool VersionBuilder::IsBlobFileRemovedByGc(uint64_t file_number) const {
+  return rep_->IsBlobFileRetiredInBuilder(file_number) ||
+         rep_->IsBlobRelocationFileDeletedInBuilder(file_number);
 }
 
 std::vector<std::string> VersionBuilder::GetAndClearIntermediateFiles() {

@@ -1095,8 +1095,9 @@ struct AdvancedColumnFamilyOptions {
   // this option is on, each new blob value gets a kIndirectBlob BlobIndex,
   // which keeps the value's identity (origin file and offset) when GC moves it.
   // Compaction outputs at L1 or deeper, outputs of a bottommost compaction,
-  // and L0 compaction outputs with an exact input save the exact list of blob
-  // references they keep. Flush outputs save only a coarse classification,
+  // L0 compaction outputs with an exact input, and every compaction output
+  // while the column family has a lost relocation file save the exact list of
+  // blob references they keep. Flush outputs save only a coarse classification,
   // and a later compaction rewrites them with the exact list. See
   // db/blob/blob_reference_metadata.h for how it works.
   //
@@ -1173,8 +1174,9 @@ struct AdvancedColumnFamilyOptions {
   // Experimental. Applies to compaction outputs with exact blob reference
   // metadata (the per-SST list of blob references that indirect blob GC reads).
   // With enable_blob_indirection on, or after the DB has used it, these are
-  // outputs at L1 or deeper, outputs of a bottommost compaction, and L0
-  // outputs that have an exact L0 input. When such an output SST holds this
+  // outputs at L1 or deeper, outputs of a bottommost compaction, L0 outputs
+  // that have an exact input, and every compaction output while the column
+  // family has a lost relocation file. When such an output SST holds this
   // many blob references, compaction starts a new output at the next user key.
   //
   // Build memory: while an SST is built, its blob references are kept in memory

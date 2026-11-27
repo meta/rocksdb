@@ -504,6 +504,12 @@ class CompactionIterator {
   // PrepareOutput() stays small for compactions without the indirection format.
   ROCKSDB_NOINLINE void FlattenBlobIfNeeded();
 
+  // Sets lost_blob_value_ when the current blob index or entity names a lost
+  // relocation file. Returns false, with status_ set, on an error. Called only
+  // when blob_value_loss_possible_. It is out of line, so that NextFromInput()
+  // stays small for the usual case with no lost values.
+  ROCKSDB_COLD bool CheckBlobValueLoss();
+
   // Flattens the blob columns of the current wide-column entity, then
   // serializes the entity again if a column changed.
   void FlattenEntityBlobIndexesIfNeeded();
@@ -811,9 +817,30 @@ class CompactionIterator {
   // input record and whenever the filter rewrites the entity value.
   bool entity_deserialized_{false};
   bool output_prepared_{false};
-  // True when the input Version has the blob indirection format, so a blob
-  // index may need flattening. It is fixed for the life of the iterator, so the
-  // per-key paths read this bool instead of the Version.
+  // A lost value is treated as deleted, but the iterator does not write a
+  // Delete. The record keeps its Put type and its reference, so SingleDelete
+  // and conflict checks still work. Only the normal rules drop it: a newer
+  // version of the key in the same snapshot stripe, a covering range
+  // tombstone, or a SingleDelete that pairs with it. In a
+  // CompactionJob run this stays false: when the input Version marks a file
+  // lost, CompactionJob puts a MissingBlobRepairIterator in front of this
+  // iterator, which turns lost references into deletions first. It is for
+  // other users that set a blob fetcher without that iterator (BuildTable()
+  // for flush and recovery). There, its effect is that the compaction filter
+  // does not run on a lost blob index or on an entity whose blob columns are
+  // all lost, so the filter does not read the lost file for them and the flush
+  // does not fail. An entity with only some lost blob columns still reaches
+  // the filter, and a filter that reads its columns reads the lost one too. A
+  // flush meets a lost value only when a blob index or blob column was written
+  // directly into the memtable.
+  bool lost_blob_value_{false};
+  // Fixed for one compaction or flush, so the per-key paths read these bools
+  // instead of a virtual call. blob_value_loss_possible_: the blob fetcher's
+  // Version marks relocation files lost (set in the constructor and in
+  // SetBlobFetcher(), which flush calls after construction).
+  // input_has_blob_indirection_format_: the input Version has the blob
+  // indirection format, so a blob index may need flattening.
+  bool blob_value_loss_possible_ = false;
   bool input_has_blob_indirection_format_ = false;
   // "level_ptrs" holds indices that remember which file of an associated
   // level we were last checking during the last call to compaction->

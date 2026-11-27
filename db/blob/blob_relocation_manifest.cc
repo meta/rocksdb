@@ -531,18 +531,23 @@ void BlobRelocationState::SetFile(
   if (file->IsMarkedLost()) {
     ++lost_file_count_;
   }
-  if (previous != nullptr && !aggregate_overflow_) {
+  // A lost file is not on disk for readers of this state, so the byte totals
+  // leave it out (see PhysicalFileBytes()).
+  if (previous != nullptr && !previous->IsMarkedLost() &&
+      !aggregate_overflow_) {
     physical_file_bytes_ -= previous->GetFileSize();
     record_bytes_ -= previous->GetTotalRecordBytes();
   }
-  if (file->GetFileSize() >
-          std::numeric_limits<uint64_t>::max() - physical_file_bytes_ ||
-      file->GetTotalRecordBytes() >
-          std::numeric_limits<uint64_t>::max() - record_bytes_) {
-    aggregate_overflow_ = true;
-  } else if (!aggregate_overflow_) {
-    physical_file_bytes_ += file->GetFileSize();
-    record_bytes_ += file->GetTotalRecordBytes();
+  if (!file->IsMarkedLost()) {
+    if (file->GetFileSize() >
+            std::numeric_limits<uint64_t>::max() - physical_file_bytes_ ||
+        file->GetTotalRecordBytes() >
+            std::numeric_limits<uint64_t>::max() - record_bytes_) {
+      aggregate_overflow_ = true;
+    } else if (!aggregate_overflow_) {
+      physical_file_bytes_ += file->GetFileSize();
+      record_bytes_ += file->GetTotalRecordBytes();
+    }
   }
   // A file set again keeps the routes to it.
   uint64_t route_count = 0;
@@ -573,8 +578,7 @@ void BlobRelocationState::DeleteFile(uint64_t file_number) {
             &digest_low_);
   if (file->IsMarkedLost()) {
     --lost_file_count_;
-  }
-  if (!aggregate_overflow_) {
+  } else if (!aggregate_overflow_) {
     physical_file_bytes_ -= file->GetFileSize();
     record_bytes_ -= file->GetTotalRecordBytes();
   }
