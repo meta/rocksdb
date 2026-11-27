@@ -193,11 +193,14 @@ class WideColumnSerialization {
       const std::function<Status(const BlobIndex&)>& callback);
 
   // Calls `callback` once for each blob column's BlobIndex, in column order,
-  // like ForEachBlobFileNumber(), but checks the whole entity first. The blob
-  // reference collector (BlockBasedTableBuilder::AddBlobReferences(), used only
-  // with enable_blob_indirection) needs this: it must not record part of a
-  // malformed entity in the reference metadata. Other code that needs only the
-  // blob references uses ForEachBlobFileNumber(), which costs less.
+  // like ForEachBlobFileNumber(), but checks the whole entity first. Two
+  // callers need this. The blob reference collector
+  // (BlockBasedTableBuilder::AddBlobReferences(), used only with
+  // enable_blob_indirection) must not record part of a malformed entity in the
+  // reference metadata. The ingestion scan (ValidateExternalTableBlobIndexes())
+  // must reject a malformed entity before the file enters the DB. Other code
+  // that needs only the blob references uses ForEachBlobFileNumber(), which
+  // costs less.
   //   - V1 entity: it cannot have blob columns. The function returns OK after
   //     the header and does not check the rest of the entity.
   //   - V2 entity without blob columns: the function returns OK after the

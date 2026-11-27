@@ -1758,8 +1758,8 @@ bool BlobReferenceCensus::TrySetBuildContext(
 Status BlobReferenceCensus::SnapshotSelected(
     uint64_t token, uint64_t version_number,
     const std::set<uint64_t>& generation_numbers,
-    const std::shared_ptr<Cache>& gc_block_cache,
-    std::shared_ptr<BlobReferenceCensusState>* state) {
+    const std::shared_ptr<Cache>& gc_block_cache, bool empty_files_only,
+    bool* copied_uncharged, std::shared_ptr<BlobReferenceCensusState>* state) {
   if (state == nullptr) {
     return Status::InvalidArgument("Null selected census snapshot");
   }
@@ -1780,9 +1780,10 @@ Status BlobReferenceCensus::SnapshotSelected(
       return Status::TryAgain("Selected census snapshot epoch changed");
     }
   }
-  Status status =
-      CopyWorkerSnapshot(*worker, version_number, generation_numbers,
-                         gc_block_cache, state, /*uncharged_charges=*/nullptr);
+  Status status = CopyWorkerSnapshot(
+      *worker, version_number, generation_numbers, gc_block_cache, state,
+      empty_files_only ? &uncharged_charge_count_ : nullptr,
+      /*uncharged_only_without_holders=*/true, copied_uncharged);
   {
     std::lock_guard<std::mutex> log_lock(mutex_);
     snapshot_pending_ = false;
@@ -1806,9 +1807,10 @@ Status BlobReferenceCensus::ReadSelectedSnapshot(
     return Status::TryAgain("Selected census snapshot epoch changed");
   }
   std::shared_ptr<BlobReferenceCensusState> copy;
-  Status status =
-      CopyWorkerSnapshot(*worker, version_number, generation_numbers,
-                         gc_block_cache, &copy, &uncharged_charge_count_);
+  Status status = CopyWorkerSnapshot(
+      *worker, version_number, generation_numbers, gc_block_cache, &copy,
+      &uncharged_charge_count_, /*uncharged_only_without_holders=*/false,
+      /*copied_uncharged=*/nullptr);
   if (status.ok()) {
     *state = std::move(copy);
   }
@@ -1831,7 +1833,9 @@ BlobReferenceCensus::TEST_GetReadyState(uint64_t version_number) const {
   const Status status =
       CopyWorkerSnapshot(*worker, version_number, generation_numbers,
                          /*gc_block_cache=*/nullptr, &result,
-                         /*uncharged_charges=*/nullptr);
+                         /*uncharged_charges=*/nullptr,
+                         /*uncharged_only_without_holders=*/false,
+                         /*copied_uncharged=*/nullptr);
   if (!status.ok()) {
     // The copy keeps the strict charge of a GC copy, so a full block cache
     // fails it with MemoryLimit. Then there is no copy to return.
@@ -1902,7 +1906,8 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
     const std::set<uint64_t>& generation_numbers,
     const std::shared_ptr<Cache>& gc_block_cache,
     std::shared_ptr<BlobReferenceCensusState>* state,
-    std::atomic<uint64_t>* uncharged_charges) const {
+    std::atomic<uint64_t>* uncharged_charges,
+    bool uncharged_only_without_holders, bool* copied_uncharged) const {
   if (!worker.finalized) {
     return Status::TryAgain("Census build has not finished");
   }
@@ -1918,6 +1923,7 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
     return Status::MemoryLimit("Selected blob census size overflow");
   }
   bytes += generation_numbers.size() * kSelectedGenerationBytes;
+  size_t holder_count = 0;
   for (uint64_t generation : generation_numbers) {
     const auto found = worker.generations.find(generation);
     if (found == worker.generations.end()) {
@@ -1927,6 +1933,7 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
         (std::numeric_limits<size_t>::max() - bytes) / sizeof(uint64_t)) {
       return Status::MemoryLimit("Selected blob census size overflow");
     }
+    holder_count += found->second.holders.count();
     bytes += found->second.holders.count() * sizeof(uint64_t);
   }
   std::shared_ptr<CacheReservationManager> reservation_manager;
@@ -1934,7 +1941,14 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
     reservation_manager = std::make_shared<CacheReservationManagerImpl<
         CacheEntryRole::kIndirectBlobGcWorkingMemory>>(gc_block_cache);
     Status status = reservation_manager->UpdateCacheReservation(bytes);
-    if (uncharged_charges != nullptr) {
+    // An uncharged copy must stay small without the cache limit. Without
+    // holders it has one entry per selected generation number and no SST
+    // numbers (see SnapshotSelected()).
+    if (uncharged_charges != nullptr &&
+        (!uncharged_only_without_holders || holder_count == 0)) {
+      if (status.IsMemoryLimit() && copied_uncharged != nullptr) {
+        *copied_uncharged = true;
+      }
       status = AllowUnchargedCensusCharge(std::move(status), uncharged_charges);
     }
     if (!status.ok()) {
@@ -1975,6 +1989,9 @@ Status BlobReferenceCensus::CopyWorkerSnapshot(
   if (result->reservation_manager_ != nullptr) {
     Status status = result->reservation_manager_->UpdateCacheReservation(
         result->snapshot_memory_bound_);
+    // This charge needs no holder_count check: the real size is at most the
+    // estimate, so with holders (first charge strict and successful) it can
+    // only shrink the reservation.
     if (uncharged_charges != nullptr) {
       status = AllowUnchargedCensusCharge(std::move(status), uncharged_charges);
     }

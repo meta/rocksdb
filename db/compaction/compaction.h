@@ -337,6 +337,14 @@ class Compaction {
 
   void FinalizeInputInfo(Version* input_version);
 
+  // A trivial move writes no output file, so its MANIFEST edit cannot set the
+  // format fence (VersionEdit::MaybeSetBlobIndirectionFormatFence() runs only
+  // for flush and compaction outputs). This ends the pending activation that
+  // FinalizeInputInfo() began, so that SetOptions(), ingestion and export do
+  // not treat the column family as pending because of the move. REQUIRES: DB
+  // mutex held.
+  void EndPendingBlobIndirectionActivation();
+
   struct InputLevelSummaryBuffer {
     char buffer[128];
   };
@@ -695,6 +703,11 @@ class Compaction {
   // ReleaseCompactionFiles() call sites; this flag guarantees that listeners
   // observe the callback exactly once per compaction.
   bool notify_on_compaction_pre_commit_called_ = false;
+
+  // True while this compaction counts as a pending activation of its column
+  // family (ColumnFamilyData::BeginBlobIndirectionCompaction()). Set by
+  // FinalizeInputInfo() when the options have enable_blob_indirection on.
+  bool pending_blob_indirection_activation_ = false;
 
   // Enable/disable GC collection for blobs during compaction.
   bool enable_blob_garbage_collection_;

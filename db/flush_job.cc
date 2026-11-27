@@ -212,6 +212,9 @@ void FlushJob::PickMemTable() {
   // will no longer be picked up for recovery.
   edit_->SetLogNumber(max_next_log_number);
   edit_->SetColumnFamily(cfd_->GetID());
+  if (mutable_cf_options_.enable_blob_indirection) {
+    cfd_->imm()->BeginBlobIndirectionActivation(m);
+  }
 
   // path 0 for level 0 file.
   meta_.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
@@ -1162,6 +1165,9 @@ Status FlushJob::WriteLevel0Table() {
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
     db_mutex_->Lock();
   }
+  const bool output_predates_blob_indirection =
+      !mutable_cf_options_.enable_blob_indirection &&
+      !base_->storage_info()->HasBlobIndirectionFormat();
   base_->Unref();
 
   // Note that if file_size is zero, the SST has been deleted and should not be
@@ -1171,6 +1177,8 @@ Status FlushJob::WriteLevel0Table() {
 
   if (s.ok()) {
     if (has_output) {
+      meta_.blob_reference_output_predates_indirection =
+          output_predates_blob_indirection;
       TEST_SYNC_POINT("DBImpl::FlushJob:SSTFileCreated");
       // if we have more than 1 background thread, then we cannot
       // insert files directly into higher levels because some other

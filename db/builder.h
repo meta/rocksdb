@@ -65,6 +65,13 @@ void ExtractBlobReferenceDescriptorFromTableProperties(
 Status ExtractBlobReferenceClassificationFromTableProperties(
     const TableProperties& tp, FileMetaData* meta);
 
+// Returns NotSupported if the properties carry blob indirection metadata (an
+// exact descriptor, or a coarse frontier that names an indirect origin): such
+// an SST may hold references that need routes of the DB that wrote it.
+// `operation` names the caller in the message. O(1); reads no data.
+Status RejectBlobIndirectionTableProperties(const TableProperties& props,
+                                            const char* operation);
+
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to number specified in meta. On success, the rest of
 // *meta will be filled with metadata about the generated table.

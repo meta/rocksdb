@@ -3183,7 +3183,9 @@ TEST(BlobReferenceCensusTest, MutableWorkerPublishesOnlyCaughtUpEpoch) {
     ASSERT_OK(census.BeginGcJob(9, &gc_token));
     std::shared_ptr<BlobReferenceCensusState> selected;
     ASSERT_OK(census.SnapshotSelected(gc_token, 9, {10, 20},
-                                      /*gc_block_cache=*/nullptr, &selected));
+                                      /*gc_block_cache=*/nullptr,
+                                      /*empty_files_only=*/false,
+                                      /*copied_uncharged=*/nullptr, &selected));
     ASSERT_EQ(selected->GetSstCount(10), 0U);
     ASSERT_EQ(selected->GetSstCount(20), 1U);
     census.EndGcJob(gc_token);
@@ -3889,7 +3891,9 @@ TEST(BlobReferenceCensusTest, GcJobPausesWorkerUntilSnapshot) {
 
   std::shared_ptr<BlobReferenceCensusState> selected;
   ASSERT_OK(census.SnapshotSelected(gc_token, 3, {10},
-                                    /*gc_block_cache=*/nullptr, &selected));
+                                    /*gc_block_cache=*/nullptr,
+                                    /*empty_files_only=*/false,
+                                    /*copied_uncharged=*/nullptr, &selected));
   ASSERT_EQ(selected->GetSstCount(10), 1U);
   ASSERT_FALSE(census.IsSnapshotPending());
   ASSERT_OK(census.ApplyWorkerDelta(token, delta));

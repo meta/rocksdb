@@ -665,6 +665,79 @@ class ColumnFamilyData {
     db_mutex->AssertHeld();
     return num_in_flight_compactions_;
   }
+
+  // Pending activation
+  //
+  // Background: activation is the first MANIFEST edit that sets the per-CF
+  // format fence. A flush or compaction that copied or picked its options with
+  // enable_blob_indirection on can still write that edit when it installs its
+  // output, even if SetOptions turned the option off in the meantime. Such a
+  // job is a "pending activation". Two counters and a per-memtable mark track
+  // it:
+  // 1. pending_blob_indirection_compactions_ (see
+  //    BeginBlobIndirectionCompaction()).
+  // 2. pending_blob_indirection_flushes_ (see BeginBlobIndirectionFlush()).
+  // 3. The per-memtable mark, pending_blob_indirection_activation_ in
+  //    ReadOnlyMemTable: FlushJob marks the first memtable that such a flush
+  //    picked (MemTableList::BeginBlobIndirectionActivation()). The mark
+  //    stays until the memtable is installed or rolled back. MemTableList
+  //    counts the marked memtables.
+  // HasPendingBlobIndirectionOutput() is true while any count or mark is set.
+
+  // A compaction picked with enable_blob_indirection on calls Begin when it
+  // takes its input Version and End when it releases it. While the count is
+  // not zero, the CF may still get its first format fence, even if the option
+  // was turned off. REQUIRES: DB mutex held.
+  void BeginBlobIndirectionCompaction() {
+    ++pending_blob_indirection_compactions_;
+  }
+  void EndBlobIndirectionCompaction() {
+    assert(pending_blob_indirection_compactions_ > 0);
+    --pending_blob_indirection_compactions_;
+  }
+
+  // A flush copies the options before it releases the DB mutex (for example
+  // to sync closed WALs) and picks its memtables later. A flush whose copy has
+  // enable_blob_indirection on calls Begin when it copies the options and End
+  // when it returns. The memtable activation (MemTableList) covers the time
+  // after the pick. So SetOptions sees the flush as pending during the whole
+  // window. REQUIRES: DB mutex held.
+  void BeginBlobIndirectionFlush() { ++pending_blob_indirection_flushes_; }
+  void EndBlobIndirectionFlush() {
+    assert(pending_blob_indirection_flushes_ > 0);
+    --pending_blob_indirection_flushes_;
+  }
+
+  // True while a pending activation exists (see "Pending activation" above).
+  // The CF may then get its first format fence. So SetOptions()
+  // (PrepareMutableCFOptions()), ingestion and export treat the CF like a
+  // fenced CF. The MANIFEST writer reads it through
+  // CheckBlobIndirectionTableWriter() before it publishes SetOptions()
+  // options. REQUIRES: DB mutex held.
+  bool HasPendingBlobIndirectionOutput() const {
+    return pending_blob_indirection_compactions_ != 0 ||
+           pending_blob_indirection_flushes_ != 0 ||
+           imm_.HasPendingBlobIndirectionActivation();
+  }
+
+  // True if the CF has the format fence or a pending activation (see "Pending
+  // activation" above). Its flush and compaction outputs then need a
+  // Block-Based Table writer and a supported compaction style.
+  // REQUIRES: DB mutex held.
+  bool HasBlobIndirectionStateOrPendingActivation() const;
+
+  // True if the latest options have enable_blob_indirection on, or
+  // HasBlobIndirectionStateOrPendingActivation() is true. Ingestion and
+  // export treat such a CF as one that uses blob indirection; the MANIFEST
+  // writer uses it in a debug check.
+  // REQUIRES: DB mutex held.
+  bool MayUseBlobIndirection() const;
+
+  // Returns NotSupported if HasBlobIndirectionStateOrPendingActivation() is
+  // true and `options` has no Block-Based Table writer, else OK. The MANIFEST
+  // writer calls it just before it publishes the options of SetOptions(). It
+  // is O(1). REQUIRES: DB mutex held.
+  Status CheckBlobIndirectionTableWriter(const MutableCFOptions& options) const;
   void inc_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
     db_mutex->AssertHeld();
     ++num_in_flight_compactions_;
@@ -907,7 +980,6 @@ class ColumnFamilyData {
   bool blob_reference_census_rerun_ = false;
   ColumnFamilyData* next_blob_reference_census_ = nullptr;
   uint64_t blob_reference_census_retry_micros_ = 0;
-  uint32_t blob_reference_census_failures_ = 0;
   std::atomic<uint64_t> indirect_blob_gc_candidates_since_micros_{0};
 
   // Read outside the DB mutex by compaction workers (acquire-loaded roughly
@@ -925,6 +997,11 @@ class ColumnFamilyData {
   // worker invocations, backs the public rocksdb.num-running-compactions
   // property, and excludes CompactFiles). Protected by the DB mutex.
   int num_in_flight_compactions_{0};
+  // The census failure count (see the census worker state above). It sits
+  // next to the int above, so that both fill one 8-byte slot.
+  uint32_t blob_reference_census_failures_ = 0;
+  size_t pending_blob_indirection_compactions_ = 0;
+  size_t pending_blob_indirection_flushes_ = 0;
 
   uint64_t prev_compaction_needed_bytes_;
 
