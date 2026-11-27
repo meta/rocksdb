@@ -7,12 +7,14 @@
 
 #include <atomic>
 #include <functional>
+#include <future>
 #include <memory>
 #include <set>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
 
+#include "db/blob/blob_reference_metadata.h"
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
 #include "db/job_context.h"
@@ -101,6 +103,238 @@ class ExternSSTFileLinkFailFallbackTest
   std::shared_ptr<ExternalSSTTestFS> fs_;
   std::unique_ptr<Env> test_env_;
 };
+
+TEST_F(ExternalSSTFileTestBase, PlainIngestionIntoFencedBlobColumnFamily) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_manifest_file_size = 1;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "blob"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+
+  const std::string external_path = sst_files_dir_ + "plain.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(external_path));
+  ASSERT_OK(writer.Put("plain", "plain-value"));
+  ASSERT_OK(writer.Finish());
+  ASSERT_OK(
+      db_->IngestExternalFile({external_path}, IngestExternalFileOptions()));
+  ASSERT_EQ(Get("plain"), "plain-value");
+
+  options.enable_blob_indirection = false;
+  const uint64_t manifest_before = dbfull()->TEST_Current_Manifest_FileNo();
+  VersionEdit snapshot_edit;
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  dbfull()->TEST_LockMutex();
+  Status snapshot_status = dbfull()->GetVersionSet()->LogAndApply(
+      cfd, ReadOptions(), WriteOptions(), &snapshot_edit,
+      dbfull()->TEST_Mutex(), nullptr, /*new_descriptor_log=*/true,
+      /*column_family_options=*/nullptr, /*manifest_wcb=*/{}, /*pre_cb=*/{});
+  dbfull()->TEST_UnlockMutex();
+  ASSERT_OK(snapshot_status);
+  ASSERT_GT(dbfull()->TEST_Current_Manifest_FileNo(), manifest_before);
+  Reopen(options);
+  ASSERT_EQ(Get("plain"), "plain-value");
+  ASSERT_EQ(Get("fence"), "blob");
+}
+
+TEST_F(ExternalSSTFileTestBase, RejectForeignBlobReferencesBeforeCopy) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "blob"));
+  ASSERT_OK(Flush());
+
+  Options donor_options = options;
+  donor_options.create_if_missing = true;
+  donor_options.enable_blob_indirection = false;
+  const std::string donor_path = sst_files_dir_ + "donor";
+  std::unique_ptr<DB> donor;
+  ASSERT_OK(DB::Open(donor_options, donor_path, &donor));
+  ASSERT_OK(donor->Put(WriteOptions(), "foreign", "foreign-blob"));
+  ASSERT_OK(donor->Flush(FlushOptions()));
+  std::vector<std::string> files;
+  uint64_t manifest_size = 0;
+  ASSERT_OK(donor->GetLiveFiles(files, &manifest_size));
+  std::string external_path;
+  for (const std::string& file : files) {
+    uint64_t number;
+    FileType type;
+    if (ParseFileName(file, &number, &type) && type == kTableFile) {
+      external_path = donor_path + file;
+    }
+  }
+  ASSERT_FALSE(external_path.empty());
+  donor.reset();
+
+  size_t copies = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack("ExternalSstFileIngestionJob::Prepare:CopyFile",
+                          [&](void*) { ++copies; });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    EXPECT_OK(DestroyDB(donor_path, donor_options));
+  });
+  IngestExternalFileOptions ingestion_options;
+  ingestion_options.allow_db_generated_files = true;
+  ASSERT_TRUE(db_->IngestExternalFile({external_path}, ingestion_options)
+                  .IsNotSupported());
+  ASSERT_EQ(copies, 0U);
+  ASSERT_OK(env_->FileExists(external_path));
+  ASSERT_EQ(Get("fence"), "blob");
+}
+
+// An SST written with blob indirection has an exact reference descriptor even
+// when it holds only an inline value. Ingestion rejects such an SST from its
+// table properties in every column family: a legacy CF, and a fenced CF that
+// would otherwise scan the entries and find no separate-file reference.
+TEST_F(ExternalSSTFileTestBase, DescriptorFileRejectedInEveryColumnFamily) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("fence", "blob"));
+  ASSERT_OK(Flush());
+  Options legacy_options = options;
+  legacy_options.enable_blob_indirection = false;
+  ColumnFamilyHandle* legacy_cf = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(legacy_options, "legacy", &legacy_cf));
+  Defer destroy_legacy_cf(
+      [&] { EXPECT_OK(db_->DestroyColumnFamilyHandle(legacy_cf)); });
+
+  // The donor DB stores the value inline (min_blob_size is 1 MB).
+  Options donor_options = options;
+  donor_options.create_if_missing = true;
+  donor_options.min_blob_size = 1 << 20;
+  const std::string donor_path = sst_files_dir_ + "donor_descriptor";
+  // Declared before `donor`, so that the donor DB is closed before it is
+  // destroyed.
+  Defer destroy_donor([&] { EXPECT_OK(DestroyDB(donor_path, donor_options)); });
+  std::unique_ptr<DB> donor;
+  ASSERT_OK(DB::Open(donor_options, donor_path, &donor));
+  ASSERT_OK(donor->Put(WriteOptions(), "generated", "inline"));
+  ASSERT_OK(donor->Flush(FlushOptions()));
+  // A flush output gets only the coarse classification; a compaction output
+  // gets the exact descriptor.
+  CompactRangeOptions force;
+  force.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(donor->CompactRange(force, nullptr, nullptr));
+  std::vector<std::string> files;
+  uint64_t manifest_size = 0;
+  ASSERT_OK(donor->GetLiveFiles(files, &manifest_size));
+  std::string generated_path;
+  for (const std::string& file : files) {
+    uint64_t number;
+    FileType type;
+    if (ParseFileName(file, &number, &type) && type == kTableFile) {
+      generated_path = donor_path + file;
+    }
+  }
+  ASSERT_FALSE(generated_path.empty());
+  donor.reset();
+
+  SstFileReader reader(options);
+  ASSERT_OK(reader.Open(generated_path));
+  ASSERT_EQ(reader.GetTableProperties()->user_collected_properties.count(
+                kBlobReferenceDescriptorPropertyName),
+            1U);
+
+  IngestExternalFileOptions db_generated;
+  db_generated.allow_db_generated_files = true;
+  db_generated.move_files = false;
+  Status s = db_->IngestExternalFile(legacy_cf, {generated_path}, db_generated);
+  ASSERT_EQ(s.code(), Status::Code::kNotSupported) << s.ToString();
+  s = db_->IngestExternalFile(db_->DefaultColumnFamily(), {generated_path},
+                              db_generated);
+  ASSERT_EQ(s.code(), Status::Code::kNotSupported) << s.ToString();
+  ASSERT_EQ(Get("generated"), "NOT_FOUND");
+  ASSERT_EQ(Get("fence"), "blob");
+}
+
+// Turns blob indirection on after an ingestion prepared its file and before
+// the MANIFEST install. A DB-generated file (allow_db_generated_files) that
+// was not scanned gets TryAgain, and a new call scans it and ingests it. An
+// SstFileWriter file cannot hold a separate-file blob reference, so it needs
+// no scan and ingests at once.
+TEST_F(ExternalSSTFileTestBase, ActivationDuringIngestionRequiresRevalidation) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  const std::string writer_path = sst_files_dir_ + "plain.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(writer_path));
+  ASSERT_OK(writer.Put("plain", "plain-value"));
+  ASSERT_OK(writer.Finish());
+
+  // A donor DB writes an SST with an inline value (no blob reference).
+  Options donor_options = options;
+  donor_options.create_if_missing = true;
+  donor_options.min_blob_size = 1 << 20;
+  const std::string donor_path = sst_files_dir_ + "donor";
+  std::unique_ptr<DB> donor;
+  ASSERT_OK(DB::Open(donor_options, donor_path, &donor));
+  ASSERT_OK(donor->Put(WriteOptions(), "generated", "inline"));
+  ASSERT_OK(donor->Flush(FlushOptions()));
+  std::vector<std::string> files;
+  uint64_t manifest_size = 0;
+  ASSERT_OK(donor->GetLiveFiles(files, &manifest_size));
+  std::string generated_path;
+  for (const std::string& file : files) {
+    uint64_t number;
+    FileType type;
+    if (ParseFileName(file, &number, &type) && type == kTableFile) {
+      generated_path = donor_path + file;
+    }
+  }
+  ASSERT_FALSE(generated_path.empty());
+  donor.reset();
+
+  std::atomic<bool> turn_on{false};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "DBImpl::IngestExternalFiles:BeforeJobsRun:0", [&](void*) {
+        if (turn_on.exchange(false)) {
+          ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                                    {{"enable_blob_indirection", "true"}}));
+        }
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    EXPECT_OK(DestroyDB(donor_path, donor_options));
+  });
+  IngestExternalFileOptions db_generated;
+  db_generated.allow_db_generated_files = true;
+  db_generated.move_files = false;
+  turn_on = true;
+  ASSERT_TRUE(
+      db_->IngestExternalFile({generated_path}, db_generated).IsTryAgain());
+  ASSERT_OK(db_->IngestExternalFile({generated_path}, db_generated));
+  ASSERT_EQ(Get("generated"), "inline");
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "false"}}));
+  turn_on = true;
+  ASSERT_OK(
+      db_->IngestExternalFile({writer_path}, IngestExternalFileOptions()));
+  ASSERT_EQ(Get("plain"), "plain-value");
+}
 
 class ExternalSSTFileTest
     : public ExternalSSTFileTestBase,
@@ -383,6 +617,90 @@ class ExternalSSTFileTest
                                      IngestExternalFileOptions(), handle);
   }
 
+  // Writes one key with a DB, outside this test's DB, and returns the path of
+  // the SST file that the flush wrote. Ingesting that file needs
+  // allow_db_generated_files. The caller destroys the DB at `donor_path`.
+  void WriteDbGeneratedFile(const Options& donor_options,
+                            const std::string& donor_path,
+                            const std::string& key, const std::string& value,
+                            std::string* sst_path) {
+    std::unique_ptr<DB> donor;
+    ASSERT_OK(DB::Open(donor_options, donor_path, &donor));
+    ASSERT_OK(donor->Put(WriteOptions(), key, value));
+    ASSERT_OK(donor->Flush(FlushOptions()));
+    std::vector<std::string> files;
+    uint64_t manifest_size = 0;
+    ASSERT_OK(donor->GetLiveFiles(files, &manifest_size));
+    sst_path->clear();
+    for (const std::string& file : files) {
+      uint64_t number;
+      FileType type;
+      if (ParseFileName(file, &number, &type) && type == kTableFile) {
+        *sst_path = donor_path + file;
+      }
+    }
+    ASSERT_FALSE(sst_path->empty());
+  }
+
+  // Commits a prepared ingestion while a flush leads the MANIFEST writer
+  // queue. The flush leader is paused at the queue head until the ingestion
+  // has queued behind it, so the leader can take the ingestion into its
+  // batch. The caller puts a key in the memtable for the flush before the
+  // call. Reports how many writers the flush leader committed in its batch
+  // besides its own: 1 when the ingestion shared the flush batch, 0 when the
+  // ingestion led its own batch. Also reports how often the ingestion ran its
+  // publication check as the MANIFEST precondition.
+  void CommitPreparedIngestionBehindFlushLeader(
+      std::unique_ptr<FileIngestionHandle> handle, Status* ingestion_status,
+      int* grouped_writers, int* publication_checks) {
+    SyncPoint* const sync = SyncPoint::GetInstance();
+    bool first_writer = true;
+    std::atomic<int> done_wakeups{0};
+    std::atomic<int> checks{0};
+    sync->LoadDependency(
+        {{"IngestionBehindFlush:LeaderPaused", "IngestionBehindFlush:Commit"},
+         {"IngestionBehindFlush:Enqueued",
+          "IngestionBehindFlush:ResumeLeader"}});
+    sync->SetCallBack("VersionSet::LogAndApply:WakeUpAndNotDone",
+                      [&](void* arg) {
+                        if (first_writer) {
+                          first_writer = false;
+                          auto* mutex = static_cast<InstrumentedMutex*>(arg);
+                          mutex->Unlock();
+                          TEST_SYNC_POINT("IngestionBehindFlush:LeaderPaused");
+                          TEST_SYNC_POINT("IngestionBehindFlush:ResumeLeader");
+                          mutex->Lock();
+                        }
+                      });
+    sync->SetCallBack("VersionSet::LogAndApply:WakeUpAndDone",
+                      [&](void*) { done_wakeups.fetch_add(1); });
+    sync->SetCallBack("DBImpl::IngestExternalFiles:PublicationCheck",
+                      [&](void*) { checks.fetch_add(1); });
+    sync->EnableProcessing();
+
+    Status flush_status;
+    port::Thread flush_thread(
+        [&] { flush_status = db_->Flush(FlushOptions()); });
+    TEST_SYNC_POINT("IngestionBehindFlush:Commit");
+    sync->SetCallBack(
+        "VersionSet::LogAndApply:BeforeWriterWaiting",
+        [&](void*) { TEST_SYNC_POINT("IngestionBehindFlush:Enqueued"); });
+    port::Thread ingestion_thread([&] {
+      *ingestion_status = db_->CommitFileIngestionHandle(std::move(handle));
+    });
+    ingestion_thread.join();
+    flush_thread.join();
+    sync->DisableProcessing();
+    sync->ClearAllCallBacks();
+    sync->LoadDependency({});
+
+    ASSERT_OK(flush_status);
+    // Only a writer committed by an earlier leader is woken with its batch
+    // already done.
+    *grouped_writers = done_wakeups.load();
+    *publication_checks = checks.load();
+  }
+
  protected:
   int last_file_id_ = 0;
   bool two_phase_ingest_ = false;
@@ -592,6 +910,122 @@ TEST_F(ExternalSSTFileTest,
   ASSERT_EQ("new", Get("k"));
   ASSERT_EQ(1, CountLiveFiles());
   ASSERT_EQ(1, GetSstFileCount(dbname_));
+}
+
+// An ingestion of SstFileWriter files has no file that the blob indirection
+// publication check can reject, so its commit passes no MANIFEST precondition.
+// An earlier MANIFEST leader can then take it into its batch.
+TEST_F(ExternalSSTFileTest, PlainIngestionSharesEarlierManifestBatch) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(
+      GenerateAndPrepareExternalFile(options, {{"k", "ingested"}}, &handle));
+  ASSERT_OK(Put("f", "flushed"));
+
+  Status ingestion_status;
+  int grouped_writers = 0;
+  int publication_checks = 0;
+  CommitPreparedIngestionBehindFlushLeader(std::move(handle), &ingestion_status,
+                                           &grouped_writers,
+                                           &publication_checks);
+  ASSERT_OK(ingestion_status);
+  ASSERT_EQ(publication_checks, 0);
+  // A writer with a precondition would end the flush batch before it.
+  ASSERT_EQ(grouped_writers, 1);
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
+          ->cfd();
+  ASSERT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_EQ("ingested", Get("k"));
+  ASSERT_EQ("flushed", Get("f"));
+}
+
+// An ingestion of a DB-generated file that Prepare() did not scan (the column
+// family had no fence, the option off and no pending activation) passes the
+// publication check as its MANIFEST precondition. A writer with a
+// precondition is not taken into an earlier leader's batch, so the ingestion
+// leads its own batch and runs the check there.
+TEST_F(ExternalSSTFileTest, UnscannedDbGeneratedIngestionHasPrecondition) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  // The donor stores the value inline, so the file has no blob reference.
+  Options donor_options = options;
+  donor_options.create_if_missing = true;
+  donor_options.min_blob_size = 1 << 20;
+  const std::string donor_path = sst_files_dir_ + "donor";
+  Defer cleanup([&] { EXPECT_OK(DestroyDB(donor_path, donor_options)); });
+  std::string generated_path;
+  WriteDbGeneratedFile(donor_options, donor_path, "k", "ingested",
+                       &generated_path);
+  IngestExternalFileOptions db_generated;
+  db_generated.allow_db_generated_files = true;
+  db_generated.move_files = false;
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(db_->PrepareFileIngestion(db_->DefaultColumnFamily(),
+                                      {generated_path}, db_generated, &handle));
+  ASSERT_OK(Put("f", "flushed"));
+
+  Status ingestion_status;
+  int grouped_writers = 0;
+  int publication_checks = 0;
+  CommitPreparedIngestionBehindFlushLeader(std::move(handle), &ingestion_status,
+                                           &grouped_writers,
+                                           &publication_checks);
+  // The check runs once and passes: the column family still does not need
+  // the scan.
+  ASSERT_OK(ingestion_status);
+  ASSERT_EQ(publication_checks, 1);
+  ASSERT_EQ(grouped_writers, 0);
+  ASSERT_EQ("ingested", Get("k"));
+  ASSERT_EQ("flushed", Get("f"));
+}
+
+TEST_F(ExternalSSTFileTest, IngestionDoesNotShareActivatingBatch) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  // Prepared with the option off. The file is an SstFileWriter file, so
+  // preparation marks it checked without a scan.
+  std::unique_ptr<FileIngestionHandle> handle;
+  ASSERT_OK(
+      GenerateAndPrepareExternalFile(options, {{"k", "ingested"}}, &handle));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("f", "flushed"));
+
+  Status ingestion_status;
+  int grouped_writers = 0;
+  int publication_checks = 0;
+  CommitPreparedIngestionBehindFlushLeader(std::move(handle), &ingestion_status,
+                                           &grouped_writers,
+                                           &publication_checks);
+  // The activating flush ends its batch before a caller whose output is
+  // marked as made before activation (every ingested file is). The ingestion
+  // commits in its own batch after the fence. Its file is an SstFileWriter
+  // file, which cannot hold a separate-file blob reference, so it passes no
+  // precondition and needs no scan.
+  ASSERT_OK(ingestion_status);
+  ASSERT_EQ(publication_checks, 0);
+  ASSERT_EQ(grouped_writers, 0);
+  ColumnFamilyData* const cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
+          ->cfd();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_EQ("ingested", Get("k"));
+  ASSERT_EQ("flushed", Get("f"));
 }
 
 TEST_F(ExternalSSTFileTest, PreparedIngestionsSurvivePurgeAcrossCommit) {

@@ -312,6 +312,11 @@ class GetContext {
   // are never merged.
   bool do_merge_;
   bool has_newer_version_result_ = false;
+  // Whether blob_fetcher_ reads a Version with a lost relocation file
+  // (BlobFetcher::HasBlobValueLoss()). The fetcher does not change during the
+  // life of this object, so the constructor reads it once, and SaveValue()
+  // pays one predictable test per matched entry when no file is lost.
+  bool has_blob_value_loss_ = false;
   bool* is_blob_index_;
   // Used for block cache tracing only. A tracing get id uniquely identifies a
   // Get or a MultiGet.

@@ -229,6 +229,10 @@ class Compaction {
   // moving a single input file to the next level (no merging or splitting)
   bool IsTrivialMove() const;
 
+  // True if L0 file `file` holds coarse (pinning) blob metadata that must be
+  // rewritten as exact metadata when it leaves L0, so it cannot be moved.
+  static bool MustRewriteCoarseL0File(const FileMetaData& file);
+
   // The split user key in the output level if this compaction is required to
   // split the output files according to the existing cursor in the output
   // level under round-robin compaction policy. Empty indicates no required
@@ -333,6 +337,14 @@ class Compaction {
 
   void FinalizeInputInfo(Version* input_version);
 
+  // A trivial move writes no output file, so its MANIFEST edit cannot set the
+  // format fence (VersionEdit::MaybeSetBlobIndirectionFormatFence() runs only
+  // for flush and compaction outputs). This ends the pending activation that
+  // FinalizeInputInfo() began, so that SetOptions(), ingestion and export do
+  // not treat the column family as pending because of the move. REQUIRES: DB
+  // mutex held.
+  void EndPendingBlobIndirectionActivation();
+
   struct InputLevelSummaryBuffer {
     char buffer[128];
   };
@@ -371,6 +383,15 @@ class Compaction {
   //
   // PRE: input version has been set.
   bool RepairsMissingBlobReferences() const;
+
+  // Returns true iff the input Version marks relocation files lost (see "Lost
+  // relocation files" in db/blob/blob_relocation_manifest.h). This loss gate is
+  // separate from the missing-file gate above. With this gate on, the
+  // compaction replaces references to lost files with deletions or partial
+  // entities, writes exact reference metadata (also at L0), and runs locally.
+  //
+  // PRE: input version has been set.
+  bool RepairsLostBlobReferences() const;
 
   // test function to validate the functionality of IsBottommostLevel()
   // function -- determines if compaction with inputs and storage is bottommost
@@ -453,6 +474,25 @@ class Compaction {
   bool enable_blob_garbage_collection() const {
     return enable_blob_garbage_collection_;
   }
+
+  // Returns true when the output must have exact reference metadata: the DB
+  // uses blob indirection (the option is on, or the Version has the format),
+  // and one of these holds: the output level is L1 or deeper, the compaction
+  // is bottommost (at any level, including L0), an L0 input already has exact
+  // metadata, or the compaction repairs lost blob references. Otherwise the
+  // output gets at most the coarse classification. Called during unlocked job
+  // preparation.
+  //
+  // Why: a flush and an L0 compaction that is not bottommost stay coarse to
+  // save collector memory. Their data gets exact metadata when a later
+  // compaction rewrites it into L1 or deeper, or in a bottommost compaction.
+  // An output never loses exact metadata that an input has, because a coarse
+  // output would pin files again that the census already tracks exactly. A
+  // bottommost compaction always makes exact output, so coarse data gets exact
+  // metadata at the latest when a bottommost compaction rewrites it. This also
+  // holds with universal compaction and num_levels = 1, where no output goes
+  // to L1.
+  bool CollectExactBlobReferences() const;
 
   double blob_garbage_collection_age_cutoff() const {
     return blob_garbage_collection_age_cutoff_;
@@ -673,6 +713,11 @@ class Compaction {
   // ReleaseCompactionFiles() call sites; this flag guarantees that listeners
   // observe the callback exactly once per compaction.
   bool notify_on_compaction_pre_commit_called_ = false;
+
+  // True while this compaction counts as a pending activation of its column
+  // family (ColumnFamilyData::BeginBlobIndirectionCompaction()). Set by
+  // FinalizeInputInfo() when the options have enable_blob_indirection on.
+  bool pending_blob_indirection_activation_ = false;
 
   // Enable/disable GC collection for blobs during compaction.
   bool enable_blob_garbage_collection_;

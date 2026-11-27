@@ -1658,6 +1658,11 @@ TEST_F(CompactionJobTest, InputSerialization) {
   input.proximal_level = static_cast<int>(rnd.Uniform(8)) - 1;
   input.proximal_output_range_type = static_cast<int>(rnd.Uniform(4));
   input.keep_in_last_level_through_seqno = rnd64.Uniform(UINT64_MAX);
+  input.blob_indirection_protocol_version =
+      kBlobIndirectionCompactionServiceProtocolVersion;
+  input.blob_indirection_options_fingerprint = rnd64.Uniform(UINT64_MAX);
+  input.blob_relocation_state_fingerprint_high = rnd64.Uniform(UINT64_MAX);
+  input.blob_relocation_state_fingerprint_low = rnd64.Uniform(UINT64_MAX);
 
   std::string output;
   ASSERT_OK(input.Write(&output));
@@ -1848,6 +1853,9 @@ TEST_F(CompactionJobTest, ResultSerialization) {
   result.stats.is_full_compaction = rnd.OneIn(2);
   result.stats.num_single_del_mismatch = rnd64.Uniform(UINT64_MAX);
   result.stats.num_input_files = 9;
+  result.blob_indirection_protocol_version =
+      kBlobIndirectionCompactionServiceProtocolVersion;
+  result.has_flattened_blob_index = rnd.OneIn(2);
 
   std::string output;
   ASSERT_OK(result.Write(&output));

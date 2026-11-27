@@ -103,6 +103,7 @@ class Version;
 class VersionEdit;
 class VersionSet;
 class WriteCallback;
+struct BlobReferenceCensusBuildContext;
 struct JobContext;
 struct ExternalSstFileInfo;
 struct MemTableInfo;
@@ -1269,6 +1270,19 @@ class DBImpl : public DB
   // Un-reference the super version and clean it up if it is the last reference.
   void CleanupSuperVersion(SuperVersion* sv);
 
+  // Releases a column family reference that the blob reference census took
+  // with cfd->Ref(). The census takes one in two places:
+  // - ScheduleBlobReferenceCensus() takes one for each column family that it
+  //   queues. The column family keeps it while it waits in the run queue or
+  //   the retry list. The census job releases it when the column family leaves
+  //   both, and the cleanup of both lists at close releases the rest.
+  // - Each census build takes one when it starts, for its starting Version
+  //   (see BuildBlobReferenceCensus()). The deleter of that Version releases
+  //   it when the build context is freed.
+  // This function takes the DB mutex, so the caller must not hold it. The
+  // column family is deleted when its last reference is released.
+  void ReleaseColumnFamilyDataRef(ColumnFamilyData* cfd);
+
   // Un-reference the super version and return it to thread local cache if
   // needed. If it is the last reference of the super version. Clean it up
   // after un-referencing it.
@@ -1531,8 +1545,13 @@ class DBImpl : public DB
   Status TEST_WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options);
 
+  Status TEST_RunIndirectBlobGCBatch(
+      ColumnFamilyData* cfd,
+      const std::vector<uint64_t>& candidate_physical_file_numbers);
+
   // Wait for any background purge
   Status TEST_WaitForPurge();
+  void TEST_WaitForBlobReferenceCensus();
 
   // Get the background error status
   Status TEST_GetBGError();
@@ -1926,6 +1945,10 @@ class DBImpl : public DB
     std::vector<std::string> existing_db_files_;
     // All existing data files (SST files and Blob files) found during DB::Open.
     std::vector<std::string> existing_data_files_;
+    // Blob file numbers in each normalized DB path, from the same listing.
+    // The relocation file existence check uses it instead of FileExists.
+    UnorderedMap<std::string, UnorderedSet<uint64_t>>
+        blob_file_numbers_by_path_;
     bool is_new_db_ = false;
   };
 
@@ -2260,6 +2283,22 @@ class DBImpl : public DB
   // persisted to new Manifest after successfully syncing the new WAL.
   Status MaybeUpdateNextFileNumber(RecoveryContext* recovery_ctx);
 
+  // Fails with NotFound when a relocation file that the MANIFEST does not mark
+  // lost is absent from its directory. `blob_file_numbers_by_path` maps a
+  // normalized path to its blob file numbers; a path it does not have is
+  // listed once here and added. Does I/O only for such paths.
+  //
+  // Why only relocation files: normal and origin blob files keep the behavior
+  // of base RocksDB, which does not check blob files at open. A missing one
+  // fails only the reads of its values until a repair open drops it. For a
+  // relocation file, this check names the repair option at open time. The check
+  // runs whether or not paranoid_checks is set. It checks only that the file
+  // exists, not its size: a truncated relocation file fails the reads of its
+  // values with an error, and a repair open marks it lost.
+  Status CheckRelocationFilesExist(
+      UnorderedMap<std::string, UnorderedSet<uint64_t>>*
+          blob_file_numbers_by_path);
+
   // Track existing data files, including both referenced and unreferenced SST
   // and Blob files in SstFileManager. This is only called during DB::Open and
   // it's called before any file deletion start so that their deletion can be
@@ -2328,6 +2367,94 @@ class DBImpl : public DB
   // shutdown begins.
   void WaitForAsyncFileOpen();
 
+  // Schedules the background job that builds and updates the blob reference
+  // census of each fenced CF (see db/blob/blob_reference_census.h). Only
+  // indirect blob GC uses the census; reads never wait for it. The overload
+  // without a CF queues every CF that needs a run.
+  void ScheduleBlobReferenceCensus();
+  void ScheduleBlobReferenceCensus(ColumnFamilyData* requested_cfd);
+  static void BGWorkBlobReferenceCensus(void* arg);
+  static void UnscheduleBlobReferenceCensus(void* arg);
+
+  // `*incomplete` is true when this run did not make the census ready: the scan
+  // has more slices, catch-up must wait while an indirect blob GC job copies
+  // its snapshot, or an install is being prepared. The job runs again later
+  // (see "Scheduling" in db/blob/blob_reference_census.h). `*overflowed`
+  // reports a change-log overflow. The first overflow restarts the build at
+  // once with the restart limit. A second overflow before a publish fails the
+  // build, which then backs off. When the run publishes the census,
+  // `*retirement_sources` gets the generation numbers that route retirement
+  // may delete (see RetireBlobRelocationRoutes()); otherwise it is all zero.
+  // The caller runs route retirement after it releases the census's
+  // worker_run_mutex().
+  Status BuildBlobReferenceCensus(
+      ColumnFamilyData* cfd, bool* incomplete, bool* overflowed,
+      BlobReferenceCensus::RetirementSelection* retirement_sources);
+
+  // Selects the indirect blob GC candidates of the census worker of `cfd` and
+  // publishes the census for the current Version if the worker has applied
+  // every install. Sets `*incomplete` if the publish must wait (an install is
+  // pending or not yet applied). Returns Aborted if the build is stale,
+  // ShutdownInProgress during shutdown or after a drop. Takes the DB mutex.
+  // REQUIRES: the caller holds the census's worker_run_mutex() and not the DB
+  // mutex.
+  Status PublishBlobReferenceCensusWorker(
+      ColumnFamilyData* cfd, BlobReferenceCensusBuildContext* context,
+      bool* incomplete);
+
+  // One column family whose census a background flush or compaction applies
+  // after its install (see ApplyBlobReferenceCensusAfterInstall()). At the end
+  // of the job, under the DB mutex, the job records `version_number`: the
+  // number of the current Version, which is at or after the Version that the
+  // job installed. The apply stops after the delta of that Version. So it
+  // applies the job's own delta and the deltas queued before it. It can also
+  // apply the delta of a later install that happened while the job had the DB
+  // mutex released after its install (for example while it notified its event
+  // listeners), but never a delta installed after the job recorded the number.
+  struct BlobReferenceCensusApplyTarget {
+    ColumnFamilyData* cfd = nullptr;
+    uint64_t version_number = 0;
+  };
+
+  // Called at the end of each background flush and compaction
+  // (BackgroundCallFlush() and BackgroundCallCompaction()), with the DB mutex
+  // held. `targets` are the column families with a census that this job
+  // flushed or compacted (also when the job failed; a dropped column family is
+  // left out), each with a reference (`census_cfds`): BackgroundFlush() keeps
+  // the flush job's reference, and BackgroundCompaction() takes a new one.
+  // Steps:
+  //   1. It wakes the waiters of bg_cv_ and atomic_flush_install_cv_ if it is
+  //      going to release the DB mutex. The job's result is already installed,
+  //      and every wait checks its condition in a loop, so a waiter (for
+  //      example Flush() with wait=true) does not wait for the steps below.
+  //   2. It frees the deferred census cleanup without the DB mutex (see
+  //      VersionSet::ReleaseDeferredPublicationCleanup()).
+  //   3. It releases the DB mutex and applies the queued census deltas of each
+  //      target, up to the target's Version (see "Apply after an install" in
+  //      db/blob/blob_reference_census.h).
+  //   4. It takes the DB mutex again, drops the references and returns.
+  // It never fails the caller's job. A column family that is dropped while
+  // this function has the DB mutex released gets its last Unref here, after
+  // the job's FindObsoleteFiles(). Its files are then deleted by the next
+  // obsolete-file pass or at close, so they do not leak.
+  void ApplyBlobReferenceCensusAfterInstall(
+      const autovector<BlobReferenceCensusApplyTarget>& targets);
+
+  // Applies the queued deltas of one column family, in order, up to and
+  // including the delta of Version `max_version_number`. The census job
+  // applies the later deltas. If it applied at least one delta and no delta is
+  // left, it then tries to publish the census. Does nothing if another thread
+  // runs the worker, if the build has not started or has not finished its
+  // scan of the SSTs, or if the build has a stored failure
+  // (BlobReferenceCensusBuildContext::failure). REQUIRES: DB mutex not held.
+  void ApplyBlobReferenceCensusDeltas(ColumnFamilyData* cfd,
+                                      uint64_t max_version_number);
+
+  // Debug builds: rebuilds the expected per-generation-number records of the
+  // published Version from its SSTs and compares them with the census. Each
+  // call runs the check with a random 1 in 16 chance, unless a test forces it.
+  void CheckBlobReferenceCensus(ColumnFamilyData* cfd);
+  void RetryBlobReferenceCensus();
   void InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap();
 
   // Return true to proceed with current WAL record whose content is stored in
@@ -2693,6 +2820,15 @@ class DBImpl : public DB
 
   // Delete any unneeded files and stale in-memory entries.
   void DeleteObsoleteFiles();
+  friend class CheckpointImpl;
+
+  // Reads the SST metadata for ExportColumnFamily(). It checks the CF under
+  // the same DB mutex hold: it returns NotSupported if enable_blob_indirection
+  // is on, an activation is pending, or the format fence is set. One lock hold
+  // means that no flush or compaction can activate the CF between the check
+  // and the read.
+  Status GetColumnFamilyMetaDataForExport(ColumnFamilyHandle* column_family,
+                                          ColumnFamilyMetaData* metadata);
   // Delete obsolete files and log status and information of file deletion
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                               const std::string& path_to_sync, FileType type,
@@ -3323,23 +3459,182 @@ class DBImpl : public DB
   void CleanupSessionTmpDir();
   // `min_output_file_number` is the job's pending_outputs_ number, a lower
   // bound on the numbers of the output files it creates.
-  Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
-                              LogBuffer* log_buffer,
-                              PrepickedCompaction* prepicked_compaction,
-                              Env::Priority thread_pri,
-                              bool separate_remote_pool,
-                              int* deferred_compactions,
-                              uint64_t min_output_file_number);
-  Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
-                         LogBuffer* log_buffer, FlushReason* reason,
-                         bool* flush_rescheduled_to_retain_udt,
-                         Env::Priority thread_pri);
+  Status BackgroundCompaction(
+      bool* madeProgress, JobContext* job_context, LogBuffer* log_buffer,
+      PrepickedCompaction* prepicked_compaction, Env::Priority thread_pri,
+      bool separate_remote_pool, int* deferred_compactions,
+      uint64_t min_output_file_number,
+      autovector<BlobReferenceCensusApplyTarget>* census_cfds);
+  Status BackgroundFlush(
+      bool* madeProgress, JobContext* job_context, LogBuffer* log_buffer,
+      FlushReason* reason, bool* flush_rescheduled_to_retain_udt,
+      Env::Priority thread_pri,
+      autovector<BlobReferenceCensusApplyTarget>* census_cfds);
 
   Compaction* CreateIntendedCompactionForwardedToBottomPriorityPool(
       Compaction* c);
   bool EnoughRoomForCompaction(ColumnFamilyData* cfd,
                                const std::vector<CompactionInputFiles>& inputs,
                                bool* sfm_bookkeeping, LogBuffer* log_buffer);
+
+  // Route retirement deletes the routes that no SST uses any more. It sets
+  // `*made_progress` when it wrote a route deletion edit.
+  //
+  // Background: the census job (BGWorkBlobReferenceCensus() in
+  // db_impl_open.cc) calls this without the DB mutex and without the census's
+  // worker_run_mutex(), right after BuildBlobReferenceCensus() publishes a
+  // ready census. `selected` holds up to kBlobRouteRetirementBatchSize (64)
+  // routed generation numbers with no holder (see
+  // BlobReferenceCensus::SelectWorkerRetirementSources()). Two places delete
+  // routes: this function, and the indirect blob GC install edit. The GC edit
+  // deletes the routes into a relocation input only when that input gets no
+  // output. When the input gets an output, the edit re-points all routes into
+  // it to the output, held or not, and this function deletes the unheld ones
+  // later (see "Install protocol" in IndirectBlobGCJob::Install()).
+  // Compaction never decides from its own inputs that a generation number is
+  // unused.
+  //
+  // Running compactions: a compaction may write a generation number that no
+  // installed SST holds yet. It writes the route target of a number in its
+  // input Version (a flattened number). So this function never deletes route
+  // G -> X while G is a live file in the input Version of a running
+  // compaction. "Compaction safety protocol for blob relocation" in
+  // db/compaction/compaction_job.h gives an example and the invariants. With
+  // this rule, no compaction waits for or is retried because of route
+  // retirement.
+  //
+  // Steps:
+  // 1. Pin the current Version.
+  // 2. Without the DB mutex, read a census snapshot of the selected generation
+  //    numbers.
+  // 3. Under the DB mutex, keep a generation number G only if all of these
+  //    are true:
+  //    - no SST holds it (the census snapshot has no holder for it);
+  //    - it is below the lowest coarse frontier of the Version, or there is no
+  //      coarse frontier (the coarse frontier of an SST is the oldest
+  //      indirect-origin file number a coarse SST may reference);
+  //    - it still has a route;
+  //    - its route target is not an input of the running GC job;
+  //    - G is not a live blob file or relocation file in the input Version of
+  //      any compaction in CompactionPicker::compactions_in_progress_.
+  //      Compactions with no input Version write no SST data and are skipped.
+  //      This costs at most one BlobFileTable lookup per selected number and
+  //      per running compaction whose input Version is not the pinned
+  //      Version.
+  // 4. Batch: write nothing unless this call can delete 64 routes (a full
+  //    selection), or it selected 64 numbers and can delete at least 32 of
+  //    them (for example, running compactions hold the others), or routes have
+  //    been pending for kBlobRouteRetirementMaxPendingMicros (10 minutes). The
+  //    census stores only the time when routes were first left pending. A
+  //    call that can delete nothing resets that time, unless running
+  //    compactions hold some of the selected numbers. A deferred call still
+  //    reads the census snapshot in step 2, because the number of routes to
+  //    delete is known only after steps 2 and 3. Batching is only a cost
+  //    choice. Skipping routes that a running compaction may write (step 3) is
+  //    a correctness rule (see "Compaction safety protocol for blob relocation"
+  //    in db/compaction/compaction_job.h).
+  //
+  //    When it runs: the 10-minute limit is checked only when the census job
+  //    runs, and the census job runs only when something queues it: a
+  //    SuperVersion install (for example after a flush, a compaction, a GC
+  //    install or a route retirement), DB open, ContinueBackgroundWork(), the
+  //    end of a GC job, a rebuild after a census mismatch, or a census wakeup
+  //    when a pending install ends (Install() or CancelInstallPreparation()).
+  //    The periodic census task (once per second) also runs the job for column
+  //    families on the census retry list whose retry time has come, for example
+  //    after a failed build or for a suppressed GC candidate (see "Scheduling"
+  //    in db/blob/blob_reference_census.h). So in an idle column family,
+  //    waiting routes usually stay until the next install. They cost only
+  //    Version memory and space in a new MANIFEST snapshot: when no SST uses a
+  //    relocation file, indirect blob GC removes it as an empty input, and that
+  //    edit deletes the routes into it.
+  // 5. Write the route deletion records as a metadata commit: the
+  //    LogAndApply() precondition calls BeginMetadataCommit(). The
+  //    precondition returns TryAgain if the current Version is not the pinned
+  //    Version, if the census changed, or if a route target became a GC
+  //    input. It also runs the running-compaction check of step 3 again. A
+  //    compaction picked after step 3 has the pinned Version as its input
+  //    Version, where G is already a route, so the check matters only for
+  //    compactions registered before step 3, and it costs little. With
+  //    TryAgain, the routes keep waiting for a later census publish. If no
+  //    pending time is set yet (a full batch), the call sets it, so
+  //    retirement-pending-micros shows routes that keep getting TryAgain.
+  // 6. If the MANIFEST write fails with an I/O error, the result is unknown.
+  //    Set a background error, so MANIFEST recovery decides the result. Until
+  //    then, no GC job or route retirement starts: BeginGcJob() returns Busy,
+  //    and BeginMetadataCommit() returns TryAgain, so route retirement writes
+  //    nothing and tries again at a later census publish. Compactions do not
+  //    wait: both possible results keep every number that a running compaction
+  //    may write.
+  // 7. If the MANIFEST write fails with Corruption (from VersionBuilder), a
+  //    check of the protocol failed. Log it and set a background error with
+  //    the compaction reason, then return OK, so the census stays ready. With
+  //    paranoid_checks (the default), this stops writes and background work
+  //    until the DB is reopened. Without it, a later census publish tries
+  //    again. A Corruption of the census snapshot read in step 2 is returned,
+  //    and the census job rebuilds the census.
+  Status RetireBlobRelocationRoutes(
+      ColumnFamilyData* cfd,
+      const BlobReferenceCensus::RetirementSelection& selected,
+      bool* made_progress);
+
+  // Runs one indirect blob GC job. The job collects 1 to 8 input files (normal
+  // blob files or relocation files) of `cfd`, whose file numbers are
+  // `candidate_physical_file_numbers`, into new relocation files, and installs
+  // the result with one MANIFEST edit. BackgroundCompaction() calls it. The
+  // overview at the top of db/blob/blob_relocation_gc.h lists the job steps and
+  // says why GC suppresses inputs. IndirectBlobGCJob in
+  // db_impl_compaction_flush.cc holds the code and lists every suppression
+  // reason.
+  //
+  // DB mutex: held on entry and held on return. The job releases it while it
+  // reads and writes files, and takes it again for short steps.
+  //
+  // Out parameters (each must be non-null; otherwise the call returns
+  // InvalidArgument):
+  // - `*made_progress` is set to true when the MANIFEST edit is installed.
+  // - `*sfm_reserved_bytes` must be 0 on entry. It is set to the bytes that
+  //   the job reserved in the SstFileManager for its outputs. The caller
+  //   releases that reservation.
+  // - `*retryable_stale_input` is set to false when the job starts, and to true
+  //   when the job returns TryAgain because an input or the census changed
+  //   while the job ran (a stale job). A later job can then retry the same
+  //   inputs. It is not changed when the call returns InvalidArgument.
+  //
+  // Other parameters:
+  // - `log_buffer` receives the job's progress lines: the live bytes of each
+  //   input that DecideInputs() checks, the skipped inputs when the job
+  //   installs nothing, and the install summary. Errors go to the info log. It
+  //   can be null.
+  // - `job_id` names the job in the logs and in the blob file listener calls.
+  //
+  // `empty_files_only`: the job runs because normal GC cannot (see
+  // BackgroundCompaction()), so it only removes files with no live value from
+  // the Version and copies nothing.
+  //
+  // Return codes:
+  // - OK: the edit is installed, or no input was collected because every
+  //   input was suppressed or deferred, or another GC job or an earlier
+  //   metadata commit with an unknown outcome blocks the job (Busy from
+  //   BlobReferenceCensus::BeginGcJob()).
+  // - TryAgain: the job installs nothing. `*retryable_stale_input` is set for a
+  //   stale job, when the census is not ready, and when a metadata-only commit
+  //   is in progress.
+  // - CompactionTooLarge: the SstFileManager has not enough disk space for
+  //   the outputs, even with only one input left.
+  // - InvalidArgument: a null argument or a wrong number of inputs.
+  // - Others: ShutdownInProgress, ColumnFamilyDropped, Incomplete (the
+  //   compaction was aborted), and I/O or Corruption errors.
+  Status RunIndirectBlobGCBatch(
+      ColumnFamilyData* cfd,
+      const std::vector<uint64_t>& candidate_physical_file_numbers,
+      bool* made_progress, uint64_t* sfm_reserved_bytes,
+      bool* retryable_stale_input, LogBuffer* log_buffer, int job_id,
+      bool empty_files_only);
+
+  // The job of RunIndirectBlobGCBatch(), with one method per phase. It is
+  // defined in db_impl_compaction_flush.cc.
+  class IndirectBlobGCJob;
 
   // Request compaction tasks token from compaction thread limiter.
   // It always succeeds if force = true or limiter is disable.
@@ -3811,18 +4106,17 @@ class DBImpl : public DB
   InstrumentedMutex options_mutex_;
 
   // True when the OPTIONS file can lag the options or column families in
-  // effect: the last OPTIONS file write failed, SetOptions() changed options
-  // and then failed before it wrote the file, or a column family batch with
-  // track_options_file_number_in_manifest stopped part way. Then SetOptions()
-  // and SetDBOptions() write the file even for a request that changes no
-  // option. A successful WriteOptionsFile() clears it, and so does a tracked
-  // column family change that commits a current snapshot. Protected by
-  // options_mutex_.
+  // effect: the last OPTIONS file write failed, a column family batch with
+  // track_options_file_number_in_manifest stopped part way, or a failed
+  // SetOptions() call parsed a key for a Customizable option, which can change
+  // a shared object in place (see SetOptions()). Then SetOptions() and
+  // SetDBOptions() write the file even for a request that changes no option. A
+  // successful WriteOptionsFile() clears it, and so does a tracked column
+  // family change that commits a current snapshot. Protected by options_mutex_.
   bool options_file_stale_ = false;
 
   // True when the seqno-to-time worker can lag the time options of the column
-  // families: the last RegisterRecordSeqnoTimeWorker() failed, or SetOptions()
-  // changed options and then failed before it updated the worker. Then
+  // families, because the last RegisterRecordSeqnoTimeWorker() failed. Then
   // SetOptions() updates the worker even for a request that changes no option.
   // A successful RegisterRecordSeqnoTimeWorker() clears it. Protected by
   // options_mutex_.
@@ -4204,6 +4498,11 @@ class DBImpl : public DB
   // CompactionService::Wait(), counted per executed subcompaction.
   std::atomic<int> num_running_remote_compactions_ = 0;
 
+  // An indirect blob GC job removes whole relocation files and re-points the
+  // routes into them, so only one GC job runs per column family. Protected by
+  // mutex_.
+  std::set<uint32_t> indirect_blob_gc_cfs_in_progress_;
+
   // number of background memtable flush jobs, submitted to the HIGH pool
   int bg_flush_scheduled_ = 0;
 
@@ -4237,6 +4536,47 @@ class DBImpl : public DB
   // Tracks whether background async file opening has been scheduled/completed.
   AsyncFileOpenState bg_async_file_open_state_ =
       AsyncFileOpenState::kNotScheduled;
+
+  enum class BlobReferenceCensusJobState : uint8_t {
+    kNotScheduled = 0,
+    kScheduled,
+    kComplete,
+  };
+  BlobReferenceCensusJobState bg_blob_reference_census_state_ =
+      BlobReferenceCensusJobState::kNotScheduled;
+  // Two intrusive lists of CFs, linked through
+  // ColumnFamilyData::next_blob_reference_census_: the run queue
+  // (queue_head/tail) and the retry list (retry_head/tail). Adding a CF is O(1)
+  // and allocates nothing, so option changes and SuperVersion installs can
+  // enqueue a CF under the DB mutex without scanning all CFs.
+  ColumnFamilyData* blob_reference_census_queue_head_ = nullptr;
+  ColumnFamilyData* blob_reference_census_queue_tail_ = nullptr;
+  ColumnFamilyData* blob_reference_census_retry_head_ = nullptr;
+  ColumnFamilyData* blob_reference_census_retry_tail_ = nullptr;
+  // Changed only under the DB mutex. It is atomic so that the periodic task
+  // (RetryBlobReferenceCensus()) can return without the DB mutex when the retry
+  // list is empty, which is the usual case.
+  std::atomic<size_t> blob_reference_census_retry_count_{0};
+  std::atomic<bool> blob_reference_census_retry_registered_{false};
+  // The census job registers its retry task in periodic_task_scheduler_, so
+  // it may start only after DB::Open() has started that scheduler. Until then,
+  // ScheduleBlobReferenceCensus() only queues column families. Protected by
+  // mutex_.
+  bool blob_reference_census_job_allowed_ = false;
+  // The number of census applies that flush and compaction jobs owe: each job
+  // adds one per column family when it installs, and
+  // ApplyBlobReferenceCensusAfterInstall() removes them. Such an apply never
+  // waits, so TEST_WaitForBlobReferenceCensus() can wait for it. Protected by
+  // mutex_.
+  size_t blob_reference_census_pending_applies_ = 0;
+  // The number of DB::Resume() or automatic recovery calls that wait in
+  // WaitForBackgroundWork(). The census job puts a column family with more
+  // work back in its run queue after each slice. While this count is not zero,
+  // ScheduleBlobReferenceCensus() only queues column families and does not
+  // start the job, so a recovery waits for at most the running slice and not
+  // for the whole census build. ResumeImpl() starts the job again after its
+  // wait. Protected by mutex_.
+  int blob_reference_census_recovery_waits_ = 0;
 
   // State machine for the single async WAL precreation slot protected by
   // mutex_. Background precreation failure returns to kNotScheduled; foreground

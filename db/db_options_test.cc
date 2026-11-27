@@ -8,11 +8,14 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -26,8 +29,11 @@
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/merge_operator.h"
 #include "rocksdb/rate_limiter.h"
+#include "rocksdb/slice_transform.h"
 #include "rocksdb/stats_history.h"
+#include "rocksdb/utilities/options_type.h"
 #include "rocksdb/utilities/options_util.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
@@ -133,6 +139,15 @@ class DBOptionsTest : public DBTestBase {
     return ColumnFamilyOptions();
   }
 
+  // Returns the text of the latest OPTIONS file.
+  std::string LatestOptionsFileText() {
+    std::string name;
+    EXPECT_OK(GetLatestOptionsFileName(dbname_, env_, &name));
+    std::string text;
+    EXPECT_OK(ReadFileToString(env_, dbname_ + "/" + name, &text));
+    return text;
+  }
+
   // Returns the sorted column family names in the latest OPTIONS file. Unlike
   // LoadLatestOptions(), this keeps the names that MANIFEST does not list.
   std::vector<std::string> PersistedCFNames() {
@@ -166,6 +181,65 @@ class DBOptionsTest : public DBTestBase {
       ColumnFamilyHandle* cfh,
       const std::unordered_map<std::string, std::string>& opts) {
     return WritesOptionsFile([&]() { return db_->SetOptions(cfh, opts); });
+  }
+
+  // Runs the rounds of the SetOptionsFailureAfter*MarksOptionsFileStale tests.
+  // These tests check one rule: when a failed SetOptions() call changed a
+  // Customizable option in place before it failed, the next SetOptions() call
+  // must write the OPTIONS file, even if it changes no option.
+  //
+  // There is one round for each column family. In round `invalid`,
+  // handles_[invalid] gets the invalid map {"not_an_option", "1"} and every
+  // other column family gets valid_map(invalid), so the call fails with
+  // InvalidArgument. The call parses the maps in the map iteration order, so
+  // only a round where a valid map comes before the invalid one can change the
+  // live value. Then:
+  // 1. changed(invalid) reports whether the live object holds the value of
+  //    round `invalid`.
+  // 2. If `persisted` is set, persisted(invalid) reports whether the latest
+  //    OPTIONS file holds that value. It must not hold it yet.
+  // 3. A SetOptions() call that changes no option must write the OPTIONS file
+  //    exactly when the round changed the live value. After that call, the
+  //    OPTIONS file must hold the value exactly when the round changed it.
+  // 4. A second such call must not write the OPTIONS file.
+  // Adds the number of rounds that changed the live value to
+  // `*changed_rounds`.
+  void RunFailedSetOptionsRounds(
+      const std::function<std::unordered_map<std::string, std::string>(size_t)>&
+          valid_map,
+      const std::function<bool(size_t)>& changed,
+      const std::function<bool(size_t)>& persisted, int* changed_rounds) {
+    const std::unordered_map<std::string, std::string> no_op_options = {
+        {"write_buffer_size",
+         std::to_string(dbfull()->GetOptions(handles_[0]).write_buffer_size)}};
+    for (size_t invalid = 0; invalid < handles_.size(); ++invalid) {
+      SCOPED_TRACE("invalid column family " + std::to_string(invalid));
+      std::unordered_map<ColumnFamilyHandle*,
+                         std::unordered_map<std::string, std::string>>
+          options_map;
+      for (size_t i = 0; i < handles_.size(); ++i) {
+        options_map[handles_[i]] =
+            i == invalid
+                ? std::unordered_map<std::string, std::string>{{"not_an_option",
+                                                                "1"}}
+                : valid_map(invalid);
+      }
+      ASSERT_EQ(dbfull()->SetOptions(options_map).code(),
+                Status::Code::kInvalidArgument);
+      const bool round_changed = changed(invalid);
+      if (round_changed) {
+        ++*changed_rounds;
+      }
+      if (persisted) {
+        ASSERT_FALSE(persisted(invalid));
+      }
+      ASSERT_EQ(SetOptionsWritesOptionsFile(handles_[0], no_op_options),
+                round_changed);
+      if (persisted) {
+        ASSERT_EQ(persisted(invalid), round_changed);
+      }
+      ASSERT_FALSE(SetOptionsWritesOptionsFile(handles_[0], no_op_options));
+    }
   }
 
   // Runs fn() while OPTIONS file writes on fs fail, and returns its status.
@@ -1909,10 +1983,10 @@ TEST_F(DBOptionsTest, SetOptionsNoManifestWrite) {
   ASSERT_OK(Put("x", "x"));
   ASSERT_OK(Flush());
 
-  // In addition to checking manifest file, we want to ensure that SetOptions
-  // is essentially atomic, without releasing the DB mutex between applying
-  // the options to the cfd and installing new Version and SuperVersion. We
-  // probabilistically verify that by attempting to catch an inconsistency.
+  // Besides the manifest file, check what readers see. SetOptions builds the
+  // new Version with the DB mutex released. Until it publishes, a reader must
+  // see the old options with the old Version. After that, it must see the new
+  // options with the new Version.
   auto* const cfd =
       static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
   SyncPoint::GetInstance()->DisableProcessing();
@@ -1929,14 +2003,15 @@ TEST_F(DBOptionsTest, SetOptionsNoManifestWrite) {
             cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
         t = std::thread([mu, cfd]() {
           InstrumentedMutexLock l(mu);
-          // Assuming above correctness, we can only acquire the mutex after
-          // options fully installed.
-          ASSERT_TRUE(
-              cfd->GetLatestMutableCFOptions().disable_auto_compactions);
-          ASSERT_TRUE(
+          // Depending on thread timing, this reader runs before or after the
+          // publication, but it never sees a mix of old and new state.
+          const bool disabled =
+              cfd->GetLatestMutableCFOptions().disable_auto_compactions;
+          ASSERT_EQ(
+              disabled,
               cfd->current()->GetMutableCFOptions().disable_auto_compactions);
-          ASSERT_TRUE(
-              cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
+          ASSERT_EQ(disabled,
+                    cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
         });
       });
   SyncPoint::GetInstance()->EnableProcessing();
@@ -1955,6 +2030,9 @@ TEST_F(DBOptionsTest, SetOptionsNoManifestWrite) {
   // Verify that our above check was activated and completed
   ASSERT_TRUE(t.has_value());
   t->join();
+  ASSERT_TRUE(cfd->GetLatestMutableCFOptions().disable_auto_compactions);
+  ASSERT_TRUE(cfd->current()->GetMutableCFOptions().disable_auto_compactions);
+  ASSERT_TRUE(cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
 
@@ -1968,6 +2046,189 @@ TEST_F(DBOptionsTest, SetOptionsNoManifestWrite) {
   ASSERT_EQ(Get("x"), "x");
 }
 
+TEST_F(DBOptionsTest, SetOptionsForcedManifestRunsPreconditionOnce) {
+  // The pre_cb of SetOptions() prepares the new options from the input map.
+  // It runs once per call. If it ran again, a pointer-valued option such as
+  // prefix_extractor would get a second new object, and the options that
+  // SetOptions() publishes would differ from the options in the new Version.
+  // The test makes the dummy edit a real MANIFEST edit, as in
+  // SetOptionsForcedManifestPublishesPreparedState.
+  auto* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  bool forced_manifest_write = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SetOptions:dummy_edit", [&](void* arg) {
+        static_cast<VersionEdit*>(arg)->Clear();
+        forced_manifest_write = true;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Status status =
+      db_->SetOptions({{"prefix_extractor", "rocksdb.FixedPrefix.4"}});
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(status);
+  ASSERT_TRUE(forced_manifest_write);
+  ASSERT_NE(cfd->GetLatestMutableCFOptions().prefix_extractor, nullptr);
+  ASSERT_EQ(cfd->GetLatestMutableCFOptions().prefix_extractor,
+            cfd->current()->GetMutableCFOptions().prefix_extractor);
+}
+
+TEST_F(DBOptionsTest, SetOptionsForcedManifestPublishesPreparedState) {
+  auto* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  ASSERT_FALSE(cfd->GetLatestMutableCFOptions().disable_auto_compactions);
+
+  bool forced_manifest_write = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SetOptions:dummy_edit", [&](void* arg) {
+        auto* dummy_edit = static_cast<VersionEdit*>(arg);
+        dummy_edit->Clear();
+        forced_manifest_write = true;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const Status status = db_->SetOptions({{"disable_auto_compactions", "true"}});
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(status);
+  ASSERT_TRUE(forced_manifest_write);
+  ASSERT_TRUE(cfd->GetLatestMutableCFOptions().disable_auto_compactions);
+  ASSERT_TRUE(cfd->current()->GetMutableCFOptions().disable_auto_compactions);
+  ASSERT_TRUE(cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
+}
+
+TEST_F(DBOptionsTest, SetOptionsForcedManifestWriterIsBatchBoundary) {
+  // SetOptions normally uses dummy MANIFEST writers, one per column family,
+  // that are never grouped with another caller's writers. A test can clear the
+  // dummy flag (DBImpl::SetOptions:dummy_edit), and then the SetOptions writer
+  // is a normal writer that carries prepared options. Such a writer must never
+  // be grouped with another caller's writers, before or after, because the
+  // batch publishes only the options of its leader's caller.
+  //
+  // Writer W0 (an empty edit) blocks inside its MANIFEST write. Behind it
+  // queue the callers of one round in order: N is a caller with an empty edit,
+  // S is the SetOptions caller. When W0 is done, the next caller leads the
+  // next batch. The rounds:
+  // - "NS": S comes right after the leader's own writers.
+  // - "NNS": S comes after a caller that is not the leader's.
+  // - "SN": S leads; the N after it must lead its own batch.
+  // In each round SetOptions publishes its options. A writer that is woken
+  // already done was grouped into an earlier batch
+  // (VersionSet::LogAndApply:WakeUpAndDone); only the second N of "NNS" may
+  // be.
+  auto* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  VersionSet* const versions = dbfull()->GetVersionSet();
+  for (const std::string round : {"NS", "NNS", "SN"}) {
+    SCOPED_TRACE(round);
+    // Each round flips disable_auto_compactions.
+    const bool new_value =
+        !cfd->GetLatestMutableCFOptions().disable_auto_compactions;
+    ManifestWriteBlocker manifest_write_blocker;
+    std::atomic<int> woken_done{0};
+    manifest_write_blocker.Install();
+    SyncPoint::GetInstance()->SetCallBack(
+        "VersionSet::LogAndApply:WakeUpAndDone", [&](void*) { ++woken_done; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::SetOptions:dummy_edit",
+        [&](void* arg) { static_cast<VersionEdit*>(arg)->Clear(); });
+    SyncPoint::GetInstance()->EnableProcessing();
+    const auto apply_empty_edit = [&](Status* status) {
+      VersionEdit edit;
+      edit.SetColumnFamily(cfd->GetID());
+      dbfull()->TEST_LockMutex();
+      *status = versions->LogAndApply(cfd, ReadOptions(), WriteOptions(), &edit,
+                                      dbfull()->TEST_Mutex(),
+                                      /*dir_contains_current_file=*/nullptr);
+      dbfull()->TEST_UnlockMutex();
+    };
+
+    // W0, then the callers of the round in order.
+    std::vector<Status> statuses(1 + round.size());
+    std::vector<std::thread> callers;
+    callers.emplace_back([&] { apply_empty_edit(&statuses[0]); });
+    ASSERT_TRUE(manifest_write_blocker.WaitForFirstWriteBlocked());
+    for (size_t k = 0; k < round.size(); ++k) {
+      Status* const status = &statuses[1 + k];
+      if (round[k] == 'S') {
+        callers.emplace_back([&, status] {
+          *status = db_->SetOptions(
+              {{"disable_auto_compactions", new_value ? "true" : "false"}});
+        });
+      } else {
+        callers.emplace_back([&, status] { apply_empty_edit(status); });
+      }
+      ASSERT_TRUE(
+          manifest_write_blocker.WaitForQueuedCallers(static_cast<int>(2 + k)));
+    }
+    manifest_write_blocker.ReleaseFirstWrite();
+    for (auto& caller : callers) {
+      caller.join();
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    for (const Status& status : statuses) {
+      ASSERT_OK(status);
+    }
+    ASSERT_EQ(cfd->GetLatestMutableCFOptions().disable_auto_compactions,
+              new_value);
+    ASSERT_EQ(cfd->current()->GetMutableCFOptions().disable_auto_compactions,
+              new_value);
+    EXPECT_EQ(woken_done.load(), round == "NNS" ? 1 : 0);
+  }
+}
+
+TEST_F(DBOptionsTest, SetOptionsPublishesCompactionPhaseAtomically) {
+  env_->SetMockSleep();
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.disable_auto_compactions = true;
+  options.periodic_compaction_phase_recovery_percent = 25;
+  Reopen(options);
+
+  auto* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  VersionSet* const versions = dbfull()->GetVersionSet();
+  const PeriodicCompactionPhaseParams before =
+      versions->GetPeriodicCompactionPhaseParams(cfd->GetID());
+  ASSERT_EQ(cfd->current()
+                ->storage_info()
+                ->TEST_GetPeriodicCompactionPhaseParams()
+                .anchor_time,
+            before.anchor_time);
+
+  env_->MockSleepForSeconds(60);
+  int callbacks = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeBlobFinalization", [&](void*) {
+        ++callbacks;
+        const PeriodicCompactionPhaseParams during =
+            versions->GetPeriodicCompactionPhaseParams(cfd->GetID());
+        ASSERT_EQ(during.anchor_time, before.anchor_time);
+        ASSERT_EQ(cfd->current()
+                      ->storage_info()
+                      ->TEST_GetPeriodicCompactionPhaseParams()
+                      .anchor_time,
+                  before.anchor_time);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(db_->SetOptions({{"periodic_compaction_seconds", "3600"}}));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(callbacks, 1);
+  const PeriodicCompactionPhaseParams after =
+      versions->GetPeriodicCompactionPhaseParams(cfd->GetID());
+  ASSERT_GT(after.anchor_time, before.anchor_time);
+  ASSERT_EQ(cfd->current()
+                ->storage_info()
+                ->TEST_GetPeriodicCompactionPhaseParams()
+                .anchor_time,
+            after.anchor_time);
+}
+
 TEST_F(DBOptionsTest, SetOptionsMultipleColumnFamilies) {
   Options options;
   options.create_if_missing = true;
@@ -1975,37 +2236,504 @@ TEST_F(DBOptionsTest, SetOptionsMultipleColumnFamilies) {
   options.disable_auto_compactions = true;
   Reopen(options);
 
-  // Create two additional column families
-  CreateColumnFamilies({"cf1", "cf2"}, options);
-  ReopenWithColumnFamilies({"default", "cf1", "cf2"}, options);
+  const std::vector<std::string> column_family_names = {
+      "cf1", "cf2", "cf3", "cf4", "cf5", "cf6", "cf7", "cf8"};
+  CreateColumnFamilies(column_family_names, options);
+  std::vector<std::string> reopen_column_family_names = {"default"};
+  reopen_column_family_names.insert(reopen_column_family_names.end(),
+                                    column_family_names.begin(),
+                                    column_family_names.end());
+  ReopenWithColumnFamilies(reopen_column_family_names, options);
 
   // Verify initial state - auto compaction should be disabled
-  ASSERT_TRUE(dbfull()->GetOptions(handles_[0]).disable_auto_compactions);
-  ASSERT_TRUE(dbfull()->GetOptions(handles_[1]).disable_auto_compactions);
-  ASSERT_TRUE(dbfull()->GetOptions(handles_[2]).disable_auto_compactions);
+  for (auto* handle : handles_) {
+    ASSERT_TRUE(dbfull()->GetOptions(handle).disable_auto_compactions);
+  }
 
   // Set options on multiple column families at once
-  ASSERT_OK(dbfull()->SetOptions({handles_[1], handles_[2]},
+  std::vector<ColumnFamilyHandle*> changed_handles(handles_.begin() + 1,
+                                                   handles_.end());
+  ASSERT_OK(dbfull()->SetOptions(changed_handles,
                                  {{"disable_auto_compactions", "false"}}));
 
   ASSERT_TRUE(
       dbfull()->GetOptions(handles_[0]).disable_auto_compactions);  // unchanged
-  ASSERT_FALSE(
-      dbfull()->GetOptions(handles_[1]).disable_auto_compactions);  // changed
-  ASSERT_FALSE(
-      dbfull()->GetOptions(handles_[2]).disable_auto_compactions);  // changed
+  for (size_t i = 1; i < handles_.size(); ++i) {
+    ASSERT_FALSE(
+        dbfull()->GetOptions(handles_[i]).disable_auto_compactions);  // changed
+  }
 
   std::unordered_map<ColumnFamilyHandle*,
                      std::unordered_map<std::string, std::string>>
       options_map;
+  for (auto* handle : handles_) {
+    options_map[handle] = {{"disable_auto_compactions", "true"}};
+  }
   options_map[handles_[0]] = {{"disable_auto_compactions", "false"}};
-  options_map[handles_[1]] = {{"disable_auto_compactions", "true"}};
-  options_map[handles_[2]] = {{"disable_auto_compactions", "true"}};
   ASSERT_OK(dbfull()->SetOptions(options_map));
 
   ASSERT_FALSE(dbfull()->GetOptions(handles_[0]).disable_auto_compactions);
-  ASSERT_TRUE(dbfull()->GetOptions(handles_[1]).disable_auto_compactions);
-  ASSERT_TRUE(dbfull()->GetOptions(handles_[2]).disable_auto_compactions);
+  for (size_t i = 1; i < handles_.size(); ++i) {
+    ASSERT_TRUE(dbfull()->GetOptions(handles_[i]).disable_auto_compactions);
+  }
+
+  // Two different handles can point to one column family. SetOptions must apply
+  // the maps of both handles in one update of that column family. Two writers
+  // for one column family would share one Version in ProcessManifestWrites, and
+  // the options of one writer would be lost.
+  auto alias = dbfull()->GetColumnFamilyHandleUnlocked(handles_[1]->GetID());
+  ASSERT_NE(alias, nullptr);
+  options_map.clear();
+  options_map[handles_[1]] = {{"write_buffer_size", "1048576"}};
+  options_map[alias.get()] = {{"max_write_buffer_number", "4"}};
+  ASSERT_OK(dbfull()->SetOptions(options_map));
+  const ColumnFamilyOptions aliased_options = dbfull()->GetOptions(handles_[1]);
+  ASSERT_EQ(aliased_options.write_buffer_size, 1048576U);
+  ASSERT_EQ(aliased_options.max_write_buffer_number, 4);
+}
+
+TEST_F(DBOptionsTest, SetOptionsMultipleColumnFamiliesIsAllOrNothing) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.track_options_file_number_in_manifest = true;
+  CreateAndReopenWithCF({"cf1", "cf2"}, options);
+  ASSERT_EQ(handles_.size(), 3U);
+
+  std::vector<size_t> write_buffer_sizes;
+  for (auto* handle : handles_) {
+    write_buffer_sizes.push_back(
+        dbfull()->GetOptions(handle).write_buffer_size);
+  }
+  OptionsFileManifestState before;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &before));
+  ASSERT_TRUE(before.has_committed_options_file_number);
+
+  // Each round sets two valid maps and one invalid map, and the invalid map
+  // must fail the whole call. Each round puts the invalid map on a different
+  // column family. So, whatever the map iteration order is, at least one round
+  // handles a valid column family before the invalid one.
+  for (size_t invalid = 0; invalid < handles_.size(); ++invalid) {
+    SCOPED_TRACE("invalid column family " + std::to_string(invalid));
+    std::unordered_map<ColumnFamilyHandle*,
+                       std::unordered_map<std::string, std::string>>
+        options_map;
+    for (size_t i = 0; i < handles_.size(); ++i) {
+      options_map[handles_[i]] =
+          i == invalid
+              ? std::unordered_map<std::string, std::string>{{"not_an_option",
+                                                              "1"}}
+              : std::unordered_map<std::string, std::string>{
+                    {"write_buffer_size", "1048576"}};
+    }
+    ASSERT_EQ(dbfull()->SetOptions(options_map).code(),
+              Status::Code::kInvalidArgument);
+
+    for (size_t i = 0; i < handles_.size(); ++i) {
+      ASSERT_EQ(dbfull()->GetOptions(handles_[i]).write_buffer_size,
+                write_buffer_sizes[i]);
+      auto* cfd = static_cast<ColumnFamilyHandleImpl*>(handles_[i])->cfd();
+      ASSERT_EQ(cfd->current()->GetMutableCFOptions().write_buffer_size,
+                write_buffer_sizes[i]);
+    }
+  }
+  OptionsFileManifestState after;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &after));
+  ASSERT_TRUE(after.has_committed_options_file_number);
+  ASSERT_EQ(after.committed_options_file_number,
+            before.committed_options_file_number);
+
+  // A dropped column family also fails the whole call: the other column
+  // families keep their options, and no OPTIONS file is committed. The drop
+  // itself commits an OPTIONS file, so the state is read after it.
+  ASSERT_OK(db_->DropColumnFamily(handles_[2]));
+  OptionsFileManifestState after_drop;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &after_drop));
+  std::unordered_map<ColumnFamilyHandle*,
+                     std::unordered_map<std::string, std::string>>
+      options_map;
+  for (auto* handle : handles_) {
+    options_map[handle] = {{"write_buffer_size", "1048576"}};
+  }
+  ASSERT_EQ(dbfull()->SetOptions(options_map).code(),
+            Status::Code::kColumnFamilyDropped);
+  for (size_t i = 0; i < 2; ++i) {
+    ASSERT_EQ(dbfull()->GetOptions(handles_[i]).write_buffer_size,
+              write_buffer_sizes[i]);
+  }
+  OptionsFileManifestState after_failed_call;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &after_failed_call));
+  ASSERT_EQ(after_failed_call.committed_options_file_number,
+            after_drop.committed_options_file_number);
+}
+
+namespace {
+std::string BloomBeforeLevel(const std::shared_ptr<TableFactory>& factory) {
+  const auto* table_options = factory->GetOptions<BlockBasedTableOptions>();
+  std::string value;
+  EXPECT_OK(table_options->filter_policy->GetOption({}, "bloom_before_level",
+                                                    &value));
+  return value;
+}
+}  // namespace
+
+TEST_F(DBOptionsTest,
+       SetOptionsFailureAfterInPlaceChangeMarksOptionsFileStale) {
+  // filter_policy.bloom_before_level of a Ribbon filter policy is changed in
+  // place inside the table factory (see the ATOMICITY NOTE at
+  // DB::SetOptions()). Here all three column families share one policy. Each
+  // round sets bloom_before_level on two column families and an invalid
+  // option on the third, so the call fails (see RunFailedSetOptionsRounds()).
+  // When the call parsed bloom_before_level before it failed, the new value is
+  // live but not in the OPTIONS file, so the next SetOptions() call must write
+  // the OPTIONS file even though it changes no option. Otherwise that call
+  // does nothing. The map iteration order is the same in every round, so the
+  // round with the invalid map on the column family that the map iterates
+  // last parses bloom_before_level first.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewRibbonFilterPolicy(10, 0));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  CreateAndReopenWithCF({"cf1", "cf2"}, options);
+  ASSERT_EQ(handles_.size(), 3U);
+
+  // Each round sets its own value, so a value that a later check finds comes
+  // from that round. When the invalid map comes first, no map that sets
+  // bloom_before_level was parsed. Then nothing changed and the OPTIONS file
+  // is up to date.
+  const auto round_value = [](size_t invalid) {
+    return std::to_string(invalid + 1);
+  };
+  int changed_rounds = 0;
+  ASSERT_NO_FATAL_FAILURE(RunFailedSetOptionsRounds(
+      [&](size_t invalid) {
+        return std::unordered_map<std::string, std::string>{
+            {"table_factory.filter_policy.bloom_before_level",
+             round_value(invalid)}};
+      },
+      [&](size_t invalid) {
+        return BloomBeforeLevel(
+                   dbfull()->GetOptions(handles_[0]).table_factory) ==
+               round_value(invalid);
+      },
+      [&](size_t invalid) {
+        return BloomBeforeLevel(PersistedCFOptions("cf1").table_factory) ==
+               round_value(invalid);
+      },
+      &changed_rounds));
+  ASSERT_GT(changed_rounds, 0);
+
+  // A dropped column family fails the call before any map is parsed. So the
+  // shared policy keeps its value, and the OPTIONS file stays up to date. The
+  // test sets the option on cf1 and cf2, then drops the column family that the
+  // map iterates last. If the call checked each column family only right
+  // before it parses that column family's maps, it would parse the map of the
+  // other column family first.
+  const std::string before_drop =
+      BloomBeforeLevel(dbfull()->GetOptions(handles_[0]).table_factory);
+  const std::unordered_map<std::string, std::string> no_op_options = {
+      {"write_buffer_size",
+       std::to_string(dbfull()->GetOptions(handles_[0]).write_buffer_size)}};
+  std::unordered_map<ColumnFamilyHandle*,
+                     std::unordered_map<std::string, std::string>>
+      options_map;
+  for (size_t i = 1; i < handles_.size(); ++i) {
+    options_map[handles_[i]] = {
+        {"table_factory.filter_policy.bloom_before_level", "7"}};
+  }
+  ColumnFamilyHandle* last_handle = nullptr;
+  for (const auto& entry : options_map) {
+    last_handle = entry.first;
+  }
+  ASSERT_NE(last_handle, nullptr);
+  ASSERT_OK(db_->DropColumnFamily(last_handle));
+  ASSERT_EQ(dbfull()->SetOptions(options_map).code(),
+            Status::Code::kColumnFamilyDropped);
+  ASSERT_EQ(BloomBeforeLevel(dbfull()->GetOptions(handles_[0]).table_factory),
+            before_drop);
+  ASSERT_FALSE(SetOptionsWritesOptionsFile(handles_[0], no_op_options));
+}
+
+namespace {
+// A prefix extractor with one registered option, as an application could
+// write. SetOptions() can set that option on the live object with the key
+// "prefix_extractor.FieldPrefixExtractor.field".
+class FieldPrefixExtractor : public SliceTransform {
+ public:
+  FieldPrefixExtractor() { RegisterOptions("field", &field_, &kTypeInfo); }
+  static const char* kClassName() { return "FieldPrefixExtractor"; }
+  const char* Name() const override { return kClassName(); }
+  Slice Transform(const Slice& src) const override {
+    return Slice(src.data(), 1);
+  }
+  bool InDomain(const Slice& src) const override { return !src.empty(); }
+  int field() const { return field_; }
+
+ private:
+  int field_ = 0;
+  static const std::unordered_map<std::string, OptionTypeInfo> kTypeInfo;
+};
+const std::unordered_map<std::string, OptionTypeInfo>
+    FieldPrefixExtractor::kTypeInfo = {
+        {"field",
+         {0, OptionType::kInt, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}}};
+}  // namespace
+
+TEST_F(DBOptionsTest,
+       SetOptionsFailureAfterCustomizableFieldChangeMarksOptionsFileStale) {
+  // The same rule as in
+  // SetOptionsFailureAfterInPlaceChangeMarksOptionsFileStale, for a field of a
+  // custom prefix extractor that two column families share. Each round sets
+  // the field on one column family and an invalid option on the other (see
+  // RunFailedSetOptionsRounds()).
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  const auto prefix_extractor = std::make_shared<FieldPrefixExtractor>();
+  options.prefix_extractor = prefix_extractor;
+  CreateAndReopenWithCF({"cf1"}, options);
+  ASSERT_EQ(handles_.size(), 2U);
+
+  const auto round_value = [](size_t invalid) {
+    return static_cast<int>(invalid) + 5;
+  };
+  int changed_rounds = 0;
+  ASSERT_NO_FATAL_FAILURE(RunFailedSetOptionsRounds(
+      [&](size_t invalid) {
+        return std::unordered_map<std::string, std::string>{
+            {"prefix_extractor.FieldPrefixExtractor.field",
+             std::to_string(round_value(invalid))}};
+      },
+      [&](size_t invalid) {
+        // The live object is still the one that the column families share.
+        EXPECT_EQ(dbfull()->GetOptions(handles_[0]).prefix_extractor.get(),
+                  prefix_extractor.get());
+        return prefix_extractor->field() == round_value(invalid);
+      },
+      /*persisted=*/nullptr, &changed_rounds));
+  ASSERT_GT(changed_rounds, 0);
+}
+
+namespace {
+// A merge operator with one field that it registers as mutable, as an
+// application could write. merge_operator is an option that SetOptions()
+// cannot replace, but SetOptions() can set the mutable field on the live
+// object with the key "merge_operator.field" or "merge_operator={field=<n>}".
+class FieldMergeOperator : public MergeOperator {
+ public:
+  FieldMergeOperator() { RegisterOptions("field", &field_, &kTypeInfo); }
+  static const char* kClassName() { return "FieldMergeOperator"; }
+  const char* Name() const override { return kClassName(); }
+  int field() const { return field_; }
+
+ private:
+  int field_ = 0;
+  static const std::unordered_map<std::string, OptionTypeInfo> kTypeInfo;
+};
+const std::unordered_map<std::string, OptionTypeInfo>
+    FieldMergeOperator::kTypeInfo = {
+        {"field",
+         {0, OptionType::kInt, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}}};
+}  // namespace
+
+TEST_F(DBOptionsTest,
+       SetOptionsFailureAfterMergeOperatorFieldChangeMarksOptionsFileStale) {
+  // The same rule as in
+  // SetOptionsFailureAfterInPlaceChangeMarksOptionsFileStale, for a mutable
+  // field of a custom merge operator that two column families share. The test
+  // tries two key forms, "merge_operator.field" and
+  // "merge_operator={field=<n>}", in two rounds each. Each round sets the field
+  // on one column family and an invalid option on the other (see
+  // RunFailedSetOptionsRounds()).
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  const auto merge_operator = std::make_shared<FieldMergeOperator>();
+  options.merge_operator = merge_operator;
+  CreateAndReopenWithCF({"cf1"}, options);
+  ASSERT_EQ(handles_.size(), 2U);
+
+  int changed_rounds[2] = {0, 0};
+  for (int form = 0; form < 2; ++form) {
+    SCOPED_TRACE("form " + std::to_string(form));
+    // Every round of both forms sets its own value.
+    const auto round_value = [form](size_t invalid) {
+      return form * 10 + static_cast<int>(invalid) + 5;
+    };
+    ASSERT_NO_FATAL_FAILURE(RunFailedSetOptionsRounds(
+        [&](size_t invalid) {
+          const std::string value = std::to_string(round_value(invalid));
+          return form == 0
+                     ? std::unordered_map<std::string,
+                                          std::string>{{"merge_operator.field",
+                                                        value}}
+                     : std::unordered_map<std::string, std::string>{
+                           {"merge_operator", "{field=" + value + "}"}};
+        },
+        [&](size_t invalid) {
+          // The live object is still the one that the column families share.
+          EXPECT_EQ(dbfull()->GetOptions(handles_[0]).merge_operator.get(),
+                    merge_operator.get());
+          return merge_operator->field() == round_value(invalid);
+        },
+        [&](size_t invalid) {
+          // The type is not registered, so the test searches the file text.
+          return LatestOptionsFileText().find(
+                     "field=" + std::to_string(round_value(invalid))) !=
+                 std::string::npos;
+        },
+        &changed_rounds[form]));
+  }
+  ASSERT_GT(changed_rounds[0], 0);
+  ASSERT_GT(changed_rounds[1], 0);
+}
+
+namespace {
+// A filter policy with one registered field, as an application could write.
+// It uses a Bloom filter for the filter itself. When a block-based table
+// factory with this policy is set through a whole-key value such as
+// "block_based_table_factory={filter_policy.FieldFilterPolicy.field=<n>}",
+// SetOptions() configures a clone of the factory, but the clone shares this
+// policy, so the field changes on the live object.
+class FieldFilterPolicy : public FilterPolicy {
+ public:
+  FieldFilterPolicy() : bloom_(NewBloomFilterPolicy(10)) {
+    RegisterOptions("field", &field_, &kTypeInfo);
+  }
+  static const char* kClassName() { return "FieldFilterPolicy"; }
+  const char* Name() const override { return kClassName(); }
+  const char* CompatibilityName() const override {
+    return bloom_->CompatibilityName();
+  }
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext& context) const override {
+    return bloom_->GetBuilderWithContext(context);
+  }
+  FilterBitsReader* GetFilterBitsReader(const Slice& contents) const override {
+    return bloom_->GetFilterBitsReader(contents);
+  }
+  int field() const { return field_; }
+
+ private:
+  std::unique_ptr<const FilterPolicy> bloom_;
+  int field_ = 0;
+  static const std::unordered_map<std::string, OptionTypeInfo> kTypeInfo;
+};
+const std::unordered_map<std::string, OptionTypeInfo>
+    FieldFilterPolicy::kTypeInfo = {
+        {"field",
+         {0, OptionType::kInt, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}}};
+}  // namespace
+
+TEST_F(DBOptionsTest,
+       SetOptionsFailureAfterWholeKeyNestedFieldChangeMarksOptionsFileStale) {
+  // The same rule as in
+  // SetOptionsFailureAfterInPlaceChangeMarksOptionsFileStale, for the key
+  // "block_based_table_factory", which sets the whole table factory. The call
+  // configures a clone of the factory, but the clone shares the custom filter
+  // policy of the two column families, so a field of that policy changes on
+  // the live object. Each round sets the field on one column family and an
+  // invalid option on the other (see RunFailedSetOptionsRounds()).
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  const auto filter_policy = std::make_shared<FieldFilterPolicy>();
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy = filter_policy;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  CreateAndReopenWithCF({"cf1"}, options);
+  ASSERT_EQ(handles_.size(), 2U);
+
+  const auto round_value = [](size_t invalid) {
+    return static_cast<int>(invalid) + 5;
+  };
+  int changed_rounds = 0;
+  ASSERT_NO_FATAL_FAILURE(RunFailedSetOptionsRounds(
+      [&](size_t invalid) {
+        return std::unordered_map<std::string, std::string>{
+            {"block_based_table_factory",
+             "{filter_policy.FieldFilterPolicy.field=" +
+                 std::to_string(round_value(invalid)) + "}"}};
+      },
+      [&](size_t invalid) {
+        return filter_policy->field() == round_value(invalid);
+      },
+      [&](size_t invalid) {
+        // The type is not registered, so the test searches the file text.
+        return LatestOptionsFileText().find(
+                   "field=" + std::to_string(round_value(invalid))) !=
+               std::string::npos;
+      },
+      &changed_rounds));
+  ASSERT_GT(changed_rounds, 0);
+}
+
+TEST_F(DBOptionsTest, SetOptionsMultipleColumnFamiliesCommitsOneOptionsFile) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.track_options_file_number_in_manifest = true;
+  CreateAndReopenWithCF({"cf1", "cf2"}, options);
+  ASSERT_EQ(handles_.size(), 3U);
+
+  OptionsFileManifestState before;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &before));
+  ASSERT_TRUE(before.has_committed_options_file_number);
+
+  std::unordered_map<ColumnFamilyHandle*,
+                     std::unordered_map<std::string, std::string>>
+      options_map;
+  options_map[handles_[1]] = {{"write_buffer_size", "1048576"}};
+  options_map[handles_[2]] = {{"max_write_buffer_number", "5"}};
+  ASSERT_OK(dbfull()->SetOptions(options_map));
+
+  // One SetOptions call writes one OPTIONS file and commits its number once.
+  OptionsFileManifestState after;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dbname_, env_->GetFileSystem().get(), &after));
+  ASSERT_TRUE(after.has_committed_options_file_number);
+  ASSERT_GT(after.committed_options_file_number,
+            before.committed_options_file_number);
+  ASSERT_EQ(after.committed_options_file_number,
+            dbfull()->GetVersionSet()->options_file_number());
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  int new_options_files = 0;
+  for (const auto& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kOptionsFile &&
+        number > before.committed_options_file_number) {
+      ++new_options_files;
+    }
+  }
+  ASSERT_EQ(new_options_files, 1);
+
+  // The committed OPTIONS file holds the new values of every column family.
+  DBOptions loaded_db_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cfs;
+  ConfigOptions config_options;
+  config_options.env = env_;
+  ASSERT_OK(LoadLatestOptions(config_options, dbname_, &loaded_db_options,
+                              &loaded_cfs, nullptr));
+  ASSERT_EQ(loaded_cfs.size(), 3U);
+  for (const auto& cf : loaded_cfs) {
+    if (cf.name == "cf1") {
+      ASSERT_EQ(cf.options.write_buffer_size, 1048576U);
+    } else if (cf.name == "cf2") {
+      ASSERT_EQ(cf.options.max_write_buffer_number, 5);
+    } else {
+      ASSERT_EQ(cf.name, kDefaultColumnFamilyName);
+      ASSERT_EQ(cf.options.write_buffer_size, options.write_buffer_size);
+    }
+  }
 }
 
 TEST_F(DBOptionsTest, SetOptionsSkipsUnchangedValues) {
@@ -2111,12 +2839,12 @@ TEST_F(DBOptionsTest, SetDBOptionsRewritesStaleOptionsFile) {
       SetOptionsWritesOptionsFile(db_->DefaultColumnFamily(), cf_opts));
 }
 
-TEST_F(DBOptionsTest, SetOptionsFinishesUpdateLeftIncompleteByFailure) {
+TEST_F(DBOptionsTest, SetOptionsFailureLeavesNoIncompleteUpdate) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"one", "two"}, options);
 
-  // DB::SetOptions() changes the column families in the iteration order of
-  // the map and stops at the first error.
+  // One valid and one invalid map. SetOptions() validates every map before it
+  // changes any column family, so the valid map must not be applied either.
   std::unordered_map<ColumnFamilyHandle*,
                      std::unordered_map<std::string, std::string>>
       opts_map = {{handles_[1], {}}, {handles_[2], {}}};
@@ -2126,11 +2854,11 @@ TEST_F(DBOptionsTest, SetOptionsFinishesUpdateLeftIncompleteByFailure) {
   (++it)->second = {{"no_such_option", "1"}};
   ASSERT_EQ(db_->SetOptions(opts_map).code(), Status::Code::kInvalidArgument);
 
-  // The first column family has the new value, but its SuperVersion, the
-  // OPTIONS file and the seqno-to-time worker do not.
+  // The options, the SuperVersion, the OPTIONS file and the seqno-to-time
+  // worker all keep the old state.
   ColumnFamilyData* const changed_cfd =
       static_cast_with_check<ColumnFamilyHandleImpl>(changed_cfh)->cfd();
-  ASSERT_EQ(db_->GetOptions(changed_cfh).preserve_internal_time_seconds, 3600);
+  ASSERT_EQ(db_->GetOptions(changed_cfh).preserve_internal_time_seconds, 0);
   {
     InstrumentedMutexLock l(dbfull()->mutex());
     ASSERT_EQ(changed_cfd->GetCurrentMutableCFOptions()
@@ -2144,18 +2872,14 @@ TEST_F(DBOptionsTest, SetOptionsFinishesUpdateLeftIncompleteByFailure) {
       dbfull()->TEST_GetPeriodicTaskScheduler();
   ASSERT_FALSE(scheduler.TEST_HasTask(PeriodicTaskType::kRecordSeqnoTime));
 
-  // A request on another column family that changes nothing is applied, and
-  // it updates the OPTIONS file and the worker.
-  ASSERT_TRUE(SetOptionsWritesOptionsFile(
+  // The failed call changed no column family, no OPTIONS file and no
+  // seqno-to-time worker, so a request that changes nothing is skipped.
+  ASSERT_FALSE(SetOptionsWritesOptionsFile(
       handles_[0],
       {{"write_buffer_size", std::to_string(options.write_buffer_size)}}));
-  ASSERT_EQ(
-      PersistedCFOptions(changed_cfh->GetName()).preserve_internal_time_seconds,
-      3600);
-  ASSERT_TRUE(scheduler.TEST_HasTask(PeriodicTaskType::kRecordSeqnoTime));
 
-  // The changed column family still needs a new SuperVersion, so the same
-  // request on it is applied once more before it is skipped.
+  // The valid map on its own is applied in full. The same request again is then
+  // skipped.
   const std::unordered_map<std::string, std::string> opts = {
       {"preserve_internal_time_seconds", "3600"}};
   ASSERT_TRUE(SetOptionsWritesOptionsFile(changed_cfh, opts));
@@ -2165,6 +2889,10 @@ TEST_F(DBOptionsTest, SetOptionsFinishesUpdateLeftIncompleteByFailure) {
                   .preserve_internal_time_seconds,
               3600);
   }
+  ASSERT_EQ(
+      PersistedCFOptions(changed_cfh->GetName()).preserve_internal_time_seconds,
+      3600);
+  ASSERT_TRUE(scheduler.TEST_HasTask(PeriodicTaskType::kRecordSeqnoTime));
   ASSERT_FALSE(SetOptionsWritesOptionsFile(changed_cfh, opts));
 }
 

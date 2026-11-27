@@ -40,6 +40,8 @@ enum class BlobFileCreationReason {
   kFlush,
   kCompaction,
   kRecovery,
+  // A relocation file written by indirect blob GC (enable_blob_indirection).
+  kIndirectBlobGC,
 };
 
 // The types of files RocksDB uses in a DB directory. (Available for

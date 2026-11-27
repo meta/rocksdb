@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "db/blob/blob_log_sequential_reader.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/compaction/compaction_outputs.h"
 #include "db/db_test_util.h"
 #include "env/composite_env_wrapper.h"
@@ -36,9 +37,12 @@
 #include "rocksdb/advanced_compression.h"
 #include "rocksdb/concurrent_task_limiter.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/utilities/debug.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_util.h"
 #include "table/block_based/block_based_table_factory.h"
+#include "table/block_based/block_based_table_reader.h"
+#include "table/format.h"
 #include "table/unique_id_impl.h"
 #include "test_util/merge_filter_test_util.h"
 #include "test_util/mock_time_env.h"
@@ -324,6 +328,29 @@ class UnregisteredFilterPolicy : public FilterPolicy {
   std::unique_ptr<const FilterPolicy> base_policy_;
 };
 
+// Counts the info log lines that report a rejected remote output: an output
+// whose indirect reference group names a generation number that the job's
+// inputs do not hold (step 5 of
+// CompactionJob::ValidateRemoteExactBlobMetadata()). The primary logs this
+// status when it runs the job locally instead.
+class UnheldGenerationRejectionLogger : public Logger {
+ public:
+  using Logger::Logv;
+  void Logv(const char* format, va_list ap) override {
+    char buffer[1024];
+    vsnprintf(buffer, sizeof(buffer), format, ap);
+    if (std::string(buffer).find("Remote output names a generation number "
+                                 "that its inputs do not hold") !=
+        std::string::npos) {
+      rejections_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  int rejections() const { return rejections_.load(std::memory_order_relaxed); }
+
+ private:
+  std::atomic<int> rejections_{0};
+};
+
 class UnregisteredPrefixTransform : public SliceTransform {
  public:
   const char* Name() const override { return "UnregisteredPrefixTransform"; }
@@ -470,10 +497,13 @@ class MyTestCompactionService : public CompactionService {
       // while DbStressCompactionService deliberately picks kFailure. Tests can
       // select the latter behavior here as well. Real cancellation
       // (kManualCompactionPaused) is handled as a failure.
-      return return_incomplete_as_failure_
-                 ? CompactionServiceJobStatus::kFailure
-                 : CompactionServiceJobStatus::kUseLocal;
+      if (return_incomplete_as_failure_) {
+        failure_wait_count_.fetch_add(1);
+        return CompactionServiceJobStatus::kFailure;
+      }
+      return CompactionServiceJobStatus::kUseLocal;
     } else {
+      failure_wait_count_.fetch_add(1);
       return CompactionServiceJobStatus::kFailure;
     }
   }
@@ -519,6 +549,8 @@ class MyTestCompactionService : public CompactionService {
   }
 
   int GetCompactionNum() { return compaction_num_.load(); }
+  // How many times Wait() returned kFailure because the worker call failed.
+  int GetFailureWaitCount() { return failure_wait_count_.load(); }
 
   std::string GetLastOutputDirectoryName() {
     InstrumentedMutexLock l(&mutex_);
@@ -654,6 +686,7 @@ class MyTestCompactionService : public CompactionService {
   std::string override_wait_result_;
   std::function<void(std::string*)> wait_result_mutator_;
   bool return_incomplete_as_failure_ = false;
+  std::atomic<int> failure_wait_count_{0};
   bool table_factory_from_options_file_ = false;
   std::unordered_map<std::string, std::string> worker_options_override_;
   std::vector<std::shared_ptr<EventListener>> listeners_;
@@ -728,6 +761,237 @@ class CompactionServiceTest : public DBTestBase {
     EXPECT_GT(num_data_blocks, 0);
     return num_data_blocks == 0 ? 0 : data_size / num_data_blocks;
   }
+
+  void PrepareBlobIndirectionFallbackTest() {
+    PrepareBlobIndirectionFallbackTest(/*info_log=*/nullptr);
+  }
+
+  // Opens the DB with blob indirection and writes two L0 SSTs. The first holds
+  // "a" and "b" with blob values. The second holds a deletion of "a". The
+  // flush writes the format fence, so the next compaction is a feature-aware
+  // remote job. `info_log` replaces the default info log when it is not null.
+  void PrepareBlobIndirectionFallbackTest(
+      const std::shared_ptr<Logger>& info_log) {
+    Options options = CurrentOptions();
+    if (info_log != nullptr) {
+      options.info_log = info_log;
+    }
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = false;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    options.max_subcompactions = 1;
+    ReopenWithCompactionService(&options);
+
+    ASSERT_OK(Put("a", std::string(4096, 'a')));
+    ASSERT_OK(Put("b", std::string(4096, 'b')));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("a"));
+    ASSERT_OK(Flush());
+  }
+
+  // Runs a compaction and checks that the worker got the job and that the
+  // primary then ran it locally. The two counters tell a declined remote
+  // attempt apart from a job that never went to the worker.
+  void VerifyBlobIndirectionLocalFallback() {
+    MyTestCompactionService* const service = GetCompactionService();
+    const int compactions_before = service->GetCompactionNum();
+    const int local_before = service->GetUseLocalInstallationCount();
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    ASSERT_GT(service->GetCompactionNum(), compactions_before);
+    ASSERT_GT(service->GetUseLocalInstallationCount(), local_before);
+    ASSERT_EQ(service->GetFinalCompactionServiceJobStatus(),
+              CompactionServiceJobStatus::kUseLocal);
+    ASSERT_EQ(Get("b"), std::string(4096, 'b'));
+    std::string value;
+    ASSERT_TRUE(db_->Get(ReadOptions(), "a", &value).IsNotFound());
+  }
+
+  // Helpers for the tests of the remote output generation check (step 5 of
+  // CompactionJob::ValidateRemoteExactBlobMetadata()). They use the default
+  // column family.
+  //
+  // Opens the DB with blob indirection and the given info log, with indirect
+  // blob GC and automatic compactions off. Then it writes the keys "dead0",
+  // "dead1", "dead2" and "live" into one blob file, deletes the "dead" keys,
+  // and compacts everything into one exact SST at L1. Returns the number of
+  // that blob file in `origin`. Three of its four values are garbage, so
+  // indirect blob GC can collect it (see RouteBlobFileByGc()).
+  void OpenAndWriteBlobFileToL1(const std::shared_ptr<Logger>& info_log,
+                                uint64_t* origin) {
+    Options options = CurrentOptions();
+    options.info_log = info_log;
+    options.enable_blob_files = true;
+    options.enable_blob_indirection = true;
+    options.enable_blob_garbage_collection = false;
+    options.min_blob_size = 0;
+    options.disable_auto_compactions = true;
+    options.max_subcompactions = 1;
+    ReopenWithCompactionService(&options);
+
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_OK(Put("dead" + std::to_string(i),
+                    std::string(4096, static_cast<char>('a' + i))));
+    }
+    ASSERT_OK(Put("live", RoutedLiveValue()));
+    ASSERT_OK(Flush());
+    ColumnFamilyData* const cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+    *origin =
+        cfd->current()->storage_info()->GetBlobFiles()[0]->GetBlobFileNumber();
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_OK(Delete("dead" + std::to_string(i)));
+    }
+    ASSERT_OK(Flush());
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+    ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  }
+
+  // Runs indirect blob GC on blob file `origin`. GC moves the live value into
+  // a new relocation file and adds the route origin -> target. Returns the
+  // relocation file number in `target`. GC is off again when it returns.
+  void RouteBlobFileByGc(uint64_t origin, uint64_t* target) {
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_garbage_collection", "true"}}));
+    // SetOptions() installs a new Version. GC starts only when the census is
+    // ready at the current Version, so wait for the census job first.
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ColumnFamilyData* cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_garbage_collection", "false"}}));
+    cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    const VersionStorageInfo* const storage = cfd->current()->storage_info();
+    *target = storage->GetBlobRelocationRouteTarget(origin);
+    ASSERT_NE(*target, kInvalidBlobFileNumber);
+    ASSERT_NE(storage->PeekBlobRelocationFileMetaData(*target), nullptr);
+  }
+
+  // Writes `key` with a blob value and flushes it. Flush output is a coarse
+  // SST at L0, and its frontier (see "Coarse SST" in
+  // db/blob/blob_reference_metadata.h) is its new blob file. Returns the number
+  // of that blob file in `blob_file`.
+  void FlushCoarseSst(const std::string& key, uint64_t* blob_file) {
+    ColumnFamilyData* cfd =
+        dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    std::set<uint64_t> blob_files_before;
+    for (const auto& blob : cfd->current()->storage_info()->GetBlobFiles()) {
+      blob_files_before.insert(blob->GetBlobFileNumber());
+    }
+    ASSERT_OK(Put(key, CoarseValue(key)));
+    ASSERT_OK(Flush());
+    cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    *blob_file = kInvalidBlobFileNumber;
+    for (const auto& blob : cfd->current()->storage_info()->GetBlobFiles()) {
+      if (blob_files_before.count(blob->GetBlobFileNumber()) == 0) {
+        ASSERT_EQ(*blob_file, kInvalidBlobFileNumber);
+        *blob_file = blob->GetBlobFileNumber();
+      }
+    }
+    ASSERT_NE(*blob_file, kInvalidBlobFileNumber);
+  }
+
+  static std::string CoarseValue(const std::string& key) {
+    return std::string(4096, key.back());
+  }
+
+  // Returns the L0 SST whose smallest key is `key`, as a CompactFiles() input
+  // name.
+  std::string L0SstName(const std::string& key) {
+    ColumnFamilyMetaData metadata;
+    db_->GetColumnFamilyMetaData(&metadata);
+    for (const SstFileMetaData& file : metadata.levels[0].files) {
+      if (file.smallestkey == key) {
+        return file.db_path + "/" + file.name;
+      }
+    }
+    ADD_FAILURE() << "No L0 SST starts with " << key;
+    return "";
+  }
+
+  // Makes the worker write a wrong reference. On the worker, every output
+  // reference with generation number `from` gets generation number
+  // `generation` and origin `origin`. The worker then writes matching SST data
+  // and checksummed exact metadata, so only step 5 of the primary's check can
+  // find the problem. The local run that follows a rejection is not changed.
+  // `*tampered_values` counts the changed values. The callbacks stay until
+  // the caller clears them.
+  void TamperWorkerReferences(uint64_t from, uint64_t generation,
+                              uint64_t origin, size_t* tampered_values) {
+    auto tampered_index = std::make_shared<std::string>();
+    auto tamper_worker = std::make_shared<std::atomic<bool>>(true);
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "CompactionOutputs::AddToOutput:Value", [=](void* argument) {
+          if (!tamper_worker->load()) {
+            return;
+          }
+          auto* value = static_cast<Slice*>(argument);
+          BlobIndex index;
+          ASSERT_OK(index.DecodeFrom(*value));
+          ASSERT_TRUE(index.IsIndirect());
+          if (index.generation_file_number() != from) {
+            return;
+          }
+          BlobIndex::EncodeIndirectBlob(
+              tampered_index.get(), generation,
+              {.origin_file_number = origin,
+               .original_value_offset = index.original_value_offset(),
+               .stored_value_size = index.size(),
+               .compression = index.compression(),
+               .stable_checksum = index.stable_checksum(),
+               .stored_checksum = index.stored_checksum()});
+          *value = Slice(*tampered_index);
+          ++*tampered_values;
+        });
+    // The worker run ends here, so the local run is not changed.
+    sync_point->SetCallBack("CompactionServiceCompactionJob::Run:0",
+                            [=](void*) { tamper_worker->store(false); });
+  }
+
+  // Compacts the L0 SST that starts with `key` alone into L1 on the worker,
+  // and checks that the primary rejected the worker output with the step 5
+  // Corruption and ran the job locally.
+  void CompactL0SstAndExpectUnheldGenerationRejection(
+      const std::string& key,
+      const std::shared_ptr<UnheldGenerationRejectionLogger>& logger) {
+    CompactFilesAndExpectUnheldGenerationRejection({L0SstName(key)},
+                                                   /*output_level=*/1, logger);
+  }
+
+  // Compacts `input_files` into `output_level` on the worker, and checks that
+  // the primary rejected the worker output with the step 5 Corruption and ran
+  // the job locally.
+  void CompactFilesAndExpectUnheldGenerationRejection(
+      const std::vector<std::string>& input_files, int output_level,
+      const std::shared_ptr<UnheldGenerationRejectionLogger>& logger) {
+    const int compactions_before = GetCompactionService()->GetCompactionNum();
+    const int local_before =
+        GetCompactionService()->GetUseLocalInstallationCount();
+    const int rejections_before = logger->rejections();
+    ASSERT_OK(
+        db_->CompactFiles(CompactionOptions(), input_files, output_level));
+    ASSERT_GT(GetCompactionService()->GetCompactionNum(), compactions_before);
+    CompactionServiceResult result;
+    GetCompactionService()->GetResult(&result);
+    ASSERT_OK(result.status);
+    ASSERT_EQ(result.blob_indirection_protocol_version,
+              kBlobIndirectionCompactionServiceProtocolVersion);
+    ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+              CompactionServiceJobStatus::kUseLocal);
+    ASSERT_EQ(GetCompactionService()->GetUseLocalInstallationCount(),
+              local_before + 1);
+    ASSERT_EQ(logger->rejections(), rejections_before + 1);
+  }
+
+  static std::string RoutedLiveValue() { return std::string(4096, 'v'); }
 
   void GenerateTestData(bool move_files_manually = false) {
     // Generate 20 files @ L2 Per CF
@@ -1736,6 +2000,1414 @@ TEST_F(CompactionServiceTest, SuccessfulWaitWithFailedResultInstallsNoOutput) {
   EXPECT_EQ(Get("key"), "value");
 }
 
+TEST_F(CompactionServiceTest, BlobIndirectionUsesValidatedWorkerSnapshot) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.blob_file_size = 1 << 20;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  const std::array<std::string, 4> keys{{"dead0", "dead1", "dead2", "live"}};
+  const std::string live_value(4096, 'v');
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_OK(
+        Put(keys[i], i + 1 == keys.size()
+                         ? live_value
+                         : std::string(4096, static_cast<char>('a' + i))));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+  const uint64_t origin =
+      cfd->current()->storage_info()->GetBlobFiles()[0]->GetBlobFileNumber();
+
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(Get(keys.back()), live_value);
+  std::shared_ptr<BlobFileMetaData> source =
+      cfd->current()->storage_info()->GetBlobFileMetaData(origin);
+  if (cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin) ==
+      kInvalidBlobFileNumber) {
+    ASSERT_NE(source, nullptr);
+    ASSERT_GE(source->GetGarbageBlobBytes(),
+              source->GetTotalBlobBytes() - source->GetGarbageBlobBytes());
+    source.reset();
+    // A wait for compactions does not guarantee that background indirect blob
+    // GC has run, so run GC on the origin directly.
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_garbage_collection", "true"}}));
+    // SetOptions() installs a new Version. GC starts only when the census is
+    // ready at the current Version, so wait for the census job to catch up.
+    dbfull()->TEST_WaitForBlobReferenceCensus();
+    ASSERT_OK(dbfull()->TEST_RunIndirectBlobGCBatch(cfd, {origin}));
+    ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                              {{"enable_blob_garbage_collection", "false"}}));
+  }
+
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* before = cfd->current()->storage_info();
+  const uint64_t target = before->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(target, kInvalidBlobFileNumber);
+  const int local_before =
+      GetCompactionService()->GetUseLocalInstallationCount();
+  const uint64_t expected_fingerprint_high =
+      before->GetBlobRelocationStateFingerprintHigh();
+  const uint64_t expected_fingerprint_low =
+      before->GetBlobRelocationStateFingerprintLow();
+
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_EQ(result.blob_indirection_protocol_version,
+            kBlobIndirectionCompactionServiceProtocolVersion);
+  ASSERT_TRUE(result.has_flattened_blob_index);
+  // The primary installed the remote output, which holds the flattened
+  // generation number.
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kSuccess);
+  ASSERT_EQ(GetCompactionService()->GetUseLocalInstallationCount(),
+            local_before);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ColumnFamilyData* const installed_cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto census =
+      installed_cfd->blob_reference_census()->TEST_GetReadyState(
+          installed_cfd->current()->GetVersionNumber());
+  ASSERT_NE(census, nullptr);
+  ASSERT_GT(census->GetSstCount(target), 0U);
+  ASSERT_EQ(census->GetSstCount(origin), 0U);
+  CompactionServiceInput input;
+  GetCompactionService()->GetInput(&input);
+  ASSERT_EQ(input.blob_relocation_state_fingerprint_high,
+            expected_fingerprint_high);
+  ASSERT_EQ(input.blob_relocation_state_fingerprint_low,
+            expected_fingerprint_low);
+  ASSERT_EQ(Get(keys.back()), live_value);
+  // The primary read the reference summary of each remote output before the
+  // install, so the census applied the install as a delta and was not rebuilt.
+  ASSERT_EQ(dbfull()
+                ->GetVersionSet()
+                ->GetColumnFamilySet()
+                ->GetDefault()
+                ->blob_reference_census()
+                ->missing_summary_rebuild_count(),
+            0U);
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionAcceptsUnflattenedRoutedName) {
+  // Indirect blob GC moves the live value of blob file `origin` into a
+  // relocation file and routes `origin` to it. Then enable_blob_indirection is
+  // turned off, so compaction does not flatten: the remote output keeps the
+  // reference with generation == origin, and the generation number `origin` now
+  // has a route. The group check accepts it (a route key may be an old normal
+  // blob file), so the primary installs the remote output instead of running
+  // the job locally.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  const std::array<std::string, 4> keys{{"dead0", "dead1", "dead2", "live"}};
+  const std::string live_value(4096, 'v');
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_OK(
+        Put(keys[i], i + 1 == keys.size()
+                         ? live_value
+                         : std::string(4096, static_cast<char>('a' + i))));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin =
+      cfd->current()->storage_info()->GetBlobFiles()[0]->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "true"},
+                             {"enable_blob_garbage_collection", "false"},
+                             {"enable_blob_indirection", "false"}}));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t target =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(target, kInvalidBlobFileNumber);
+
+  const int local_before =
+      GetCompactionService()->GetUseLocalInstallationCount();
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_EQ(result.blob_indirection_protocol_version,
+            kBlobIndirectionCompactionServiceProtocolVersion);
+  ASSERT_FALSE(result.has_flattened_blob_index);
+  ASSERT_EQ(GetCompactionService()->GetUseLocalInstallationCount(),
+            local_before);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin),
+      target);
+  ASSERT_EQ(Get(keys.back()), live_value);
+}
+
+TEST_F(CompactionServiceTest, RemoteOutputWithUnheldRouteNumberIsRejected) {
+  // Background: the primary accepts a remote output only if each indirect
+  // group names a generation number that an input group holds, or the route
+  // target of such a number. Route retirement may remove the route of any
+  // other routed number while the job runs, so such an output could lose
+  // values.
+  //
+  // Setup: indirect blob GC moves the live value of blob file `origin` into a
+  // relocation file and adds route origin -> target. The L1 SST still holds
+  // `origin`. A new L0 SST holds only the new blob file `other_blob`. The
+  // remote compaction of that L0 SST alone is changed on the worker so that
+  // its output names `origin`. `origin` has a route in the input Version, but
+  // no input holds it. The primary must reject the output and run the job
+  // locally.
+  struct CapturingLogger : public Logger {
+    using Logger::Logv;
+    void Logv(const char* format, va_list ap) override {
+      char buffer[1024];
+      vsnprintf(buffer, sizeof(buffer), format, ap);
+      std::lock_guard<std::mutex> lock(mutex);
+      if (std::string(buffer).find("Remote output names a generation number "
+                                   "that its inputs do not hold") !=
+          std::string::npos) {
+        ++rejections;
+      }
+    }
+    std::mutex mutex;
+    int rejections = 0;
+  };
+  auto logger = std::make_shared<CapturingLogger>();
+  Options options = CurrentOptions();
+  options.info_log = logger;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  const std::array<std::string, 4> keys{{"dead0", "dead1", "dead2", "live"}};
+  const std::string live_value(4096, 'v');
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_OK(
+        Put(keys[i], i + 1 == keys.size()
+                         ? live_value
+                         : std::string(4096, static_cast<char>('a' + i))));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin =
+      cfd->current()->storage_info()->GetBlobFiles()[0]->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "true"},
+                             {"enable_blob_garbage_collection", "false"}}));
+
+  // The L0 SST with key "zzz" does not overlap the L1 SST, so a compaction of
+  // it to L1 has no other input.
+  std::set<uint64_t> blob_files_before;
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  for (const auto& blob : cfd->current()->storage_info()->GetBlobFiles()) {
+    blob_files_before.insert(blob->GetBlobFileNumber());
+  }
+  ASSERT_OK(Put("zzz", std::string(4096, 'z')));
+  ASSERT_OK(Flush());
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  uint64_t other_blob = kInvalidBlobFileNumber;
+  for (const auto& blob : cfd->current()->storage_info()->GetBlobFiles()) {
+    if (blob_files_before.count(blob->GetBlobFileNumber()) == 0) {
+      other_blob = blob->GetBlobFileNumber();
+    }
+  }
+  ASSERT_NE(other_blob, kInvalidBlobFileNumber);
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_NE(storage->GetBlobRelocationRouteTarget(origin),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(other_blob),
+            kInvalidBlobFileNumber);
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+  ASSERT_EQ(metadata.levels[1].files.size(), 1U);
+  const SstFileMetaData& input_sst = metadata.levels[0].files.front();
+
+  // On the worker, rename every output reference of `other_blob` to
+  // generation number `origin`. The worker then writes matching SST data and
+  // checksummed exact metadata for it. The origin is set to `origin` too,
+  // because a generation number is never smaller than its origin.
+  std::string tampered_index;
+  bool tamper_worker = true;
+  size_t tampered_values = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionOutputs::AddToOutput:Value", [&](void* argument) {
+        if (!tamper_worker) {
+          return;
+        }
+        auto* value = static_cast<Slice*>(argument);
+        BlobIndex index;
+        ASSERT_OK(index.DecodeFrom(*value));
+        ASSERT_TRUE(index.IsIndirect());
+        ASSERT_EQ(index.generation_file_number(), other_blob);
+        BlobIndex::EncodeIndirectBlob(
+            &tampered_index, origin,
+            {.origin_file_number = origin,
+             .original_value_offset = index.original_value_offset(),
+             .stored_value_size = index.size(),
+             .compression = index.compression(),
+             .stable_checksum = index.stable_checksum(),
+             .stored_checksum = index.stored_checksum()});
+        *value = Slice(tampered_index);
+        ++tampered_values;
+      });
+  sync_point->SetCallBack("CompactionServiceCompactionJob::Run:0",
+                          [&](void*) { tamper_worker = false; });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  const int compactions_before = GetCompactionService()->GetCompactionNum();
+  const int local_before =
+      GetCompactionService()->GetUseLocalInstallationCount();
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(),
+                              {input_sst.db_path + "/" + input_sst.name}, 1));
+  ASSERT_GT(tampered_values, 0U);
+  ASSERT_GT(GetCompactionService()->GetCompactionNum(), compactions_before);
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_EQ(result.blob_indirection_protocol_version,
+            kBlobIndirectionCompactionServiceProtocolVersion);
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kUseLocal);
+  ASSERT_EQ(GetCompactionService()->GetUseLocalInstallationCount(),
+            local_before + 1);
+  {
+    std::lock_guard<std::mutex> lock(logger->mutex);
+    ASSERT_EQ(logger->rejections, 1);
+  }
+  // The local compaction wrote the right reference.
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(Get("zzz"), std::string(4096, 'z'));
+  ASSERT_EQ(Get(keys.back()), live_value);
+}
+
+TEST_F(CompactionServiceTest,
+       RemoteOutputRoutedNumberPinnedOnlyOutsideJobIsRejected) {
+  // Background: a remote output may name a generation number that no input
+  // group holds only as a coarse reference of a coarse input SST of the same
+  // job. A coarse reference must name a number with no route, so a routed
+  // number that no input holds is rejected, even when an SST outside the job
+  // pins it by number.
+  // Route retirement could remove its route while the job runs. The test
+  // RemoteOutputUnroutedBlobPinnedOnlyOutsideJobIsRejected checks the
+  // frontier rule alone, with a number that has no route.
+  //
+  // Setup: indirect blob GC moves the live value of blob file `origin` into a
+  // relocation file and adds the route origin -> target. A coarse L0 SST with
+  // key "aaa" is outside the job, and its frontier is `origin`, so the Version
+  // pins `origin` by number. The job compacts only the coarse L0 SST with key
+  // "zzz". Its frontier is its own blob file `job_blob`, which is above
+  // `origin`. The worker output is changed to name `origin`. No job input
+  // holds `origin`, it is below the job's frontier, and it has a route. So the
+  // primary must reject the output and run the job locally.
+  auto logger = std::make_shared<UnheldGenerationRejectionLogger>();
+  uint64_t origin = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(OpenAndWriteBlobFileToL1(logger, &origin));
+  uint64_t target = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(RouteBlobFileByGc(origin, &target));
+
+  // "aaa" is flushed after "zzz": a compaction of an L0 file into L1 also
+  // takes every older L0 file (CompactFiles() adds them), so "aaa" must be
+  // the newer file to stay outside the job.
+  uint64_t job_blob = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(FlushCoarseSst("zzz", &job_blob));
+
+  // No write path makes a coarse SST whose frontier is a routed number: a
+  // flush pins only its own new blob files, and GC does not collect a pinned
+  // blob file. So the test lowers the frontier of the "aaa" flush output to
+  // `origin` when the flush builds it.
+  bool lower_frontier = true;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "BuildTable:BlobReferenceSummary", [&](void* argument) {
+        if (!lower_frontier) {
+          return;
+        }
+        auto* meta = static_cast<FileMetaData*>(argument);
+        ASSERT_GT(meta->oldest_coarse_indirect_origin_file_number, origin);
+        meta->oldest_coarse_indirect_origin_file_number = origin;
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  uint64_t outside_blob = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(FlushCoarseSst("aaa", &outside_blob));
+  lower_frontier = false;
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(origin), target);
+  ASSERT_GT(job_blob, origin);
+  // The Version pins `origin` only because of the SST outside the job. A
+  // number-only check against the Version frontier would accept `origin`.
+  ASSERT_EQ(storage->OldestCoarseIndirectOriginFileNumber(), origin);
+  ASSERT_TRUE(storage->IsCoarseIndirectOriginBlobPinned(origin));
+  ASSERT_EQ(NumTableFilesAtLevel(0), 2);
+
+  size_t tampered_values = 0;
+  TamperWorkerReferences(job_blob, /*generation=*/origin, /*origin=*/origin,
+                         &tampered_values);
+  ASSERT_NO_FATAL_FAILURE(
+      CompactL0SstAndExpectUnheldGenerationRejection("zzz", logger));
+  ASSERT_GT(tampered_values, 0U);
+  // The local compaction wrote the right reference. The SST outside the job
+  // stays at L0.
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+  ASSERT_EQ(Get("zzz"), CoarseValue("zzz"));
+  ASSERT_EQ(Get("aaa"), CoarseValue("aaa"));
+  ASSERT_EQ(Get("live"), RoutedLiveValue());
+}
+
+TEST_F(CompactionServiceTest,
+       RemoteOutputUnroutedBlobPinnedOnlyOutsideJobIsRejected) {
+  // Background: a remote output may name a generation number that no input
+  // group holds only as a coarse reference of a coarse input SST of the same
+  // job. The primary compares the number with the lowest coarse frontier of
+  // the job's own inputs, not with the frontier of the whole input Version.
+  // An SST outside the job does not protect the number: another compaction
+  // can rewrite that SST while the job runs, and then indirect blob GC can
+  // collect the blob file and route retirement can remove its route.
+  //
+  // Setup: the exact L1 SST holds blob file `origin`. A coarse L0 SST with
+  // key "aaa" is outside the job, and its frontier is its own blob file
+  // `outside_blob`. So the Version pins `outside_blob`. `outside_blob` is a
+  // live indirect-origin normal blob file with no route, so it meets every
+  // coarse reference condition except the frontier of the job. The job
+  // compacts only the L1 SST into L2, so it has no coarse input. The worker
+  // output is changed to name `outside_blob` (generation == origin). The
+  // primary must reject the output and run the job locally.
+  auto logger = std::make_shared<UnheldGenerationRejectionLogger>();
+  uint64_t origin = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(OpenAndWriteBlobFileToL1(logger, &origin));
+  uint64_t outside_blob = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(FlushCoarseSst("aaa", &outside_blob));
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_NE(outside_blob, origin);
+  // The Version pins `outside_blob` only because of the SST outside the job.
+  // A check that used the Version frontier with the other coarse reference
+  // conditions would accept `outside_blob`.
+  ASSERT_EQ(storage->OldestCoarseIndirectOriginFileNumber(), outside_blob);
+  ASSERT_TRUE(storage->IsCoarseIndirectOriginBlobPinned(outside_blob));
+  const std::shared_ptr<BlobFileMetaData> outside_meta =
+      storage->GetBlobFileMetaData(outside_blob);
+  ASSERT_NE(outside_meta, nullptr);
+  ASSERT_TRUE(outside_meta->IsIndirectOrigin());
+  ASSERT_EQ(storage->GetBlobRelocationRouteTarget(outside_blob),
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(storage->PeekBlobRelocationFileMetaData(outside_blob), nullptr);
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[0].files.size(), 1U);
+  ASSERT_EQ(metadata.levels[1].files.size(), 1U);
+  const SstFileMetaData& l1_sst = metadata.levels[1].files.front();
+
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  size_t tampered_values = 0;
+  TamperWorkerReferences(origin, /*generation=*/outside_blob,
+                         /*origin=*/outside_blob, &tampered_values);
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_NO_FATAL_FAILURE(CompactFilesAndExpectUnheldGenerationRejection(
+      {l1_sst.db_path + "/" + l1_sst.name}, /*output_level=*/2, logger));
+  ASSERT_GT(tampered_values, 0U);
+  // The local compaction wrote the right reference. The SST outside the job
+  // stays at L0.
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(2), 1);
+  ASSERT_EQ(Get("aaa"), CoarseValue("aaa"));
+  ASSERT_EQ(Get("live"), RoutedLiveValue());
+}
+
+TEST_F(CompactionServiceTest,
+       RemoteOutputRelocationNumberAboveJobFrontierIsRejected) {
+  // Background: a coarse SST holds only references whose generation number
+  // is its origin, and that number is a live normal blob file. So a remote
+  // output may name a number at or above the coarse frontier of a job input
+  // only for such a reference. A relocation file number at or above the
+  // frontier is not covered: no job input holds it, so GC of that relocation
+  // file can add a route from it and route retirement can remove that route
+  // while the job runs.
+  //
+  // Setup: the job compacts the coarse L0 SST with key "zzz" alone. Its
+  // frontier is its blob file `job_blob`. Then indirect blob GC moves the
+  // live value of the older blob file `origin` into the relocation file
+  // `target`, whose number is above `job_blob`. The worker output is changed
+  // to name `target` (with origin `job_blob`, so the origin check passes).
+  // The primary must reject the output and run the job locally.
+  auto logger = std::make_shared<UnheldGenerationRejectionLogger>();
+  uint64_t origin = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(OpenAndWriteBlobFileToL1(logger, &origin));
+  uint64_t job_blob = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(FlushCoarseSst("zzz", &job_blob));
+  uint64_t target = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(RouteBlobFileByGc(origin, &target));
+
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  ASSERT_GT(target, job_blob);
+  ASSERT_EQ(storage->OldestCoarseIndirectOriginFileNumber(), job_blob);
+  // A number-only check against the frontier would accept `target`.
+  ASSERT_TRUE(storage->IsCoarseIndirectOriginBlobPinned(target));
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  size_t tampered_values = 0;
+  TamperWorkerReferences(job_blob, /*generation=*/target, /*origin=*/job_blob,
+                         &tampered_values);
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_NO_FATAL_FAILURE(
+      CompactL0SstAndExpectUnheldGenerationRejection("zzz", logger));
+  ASSERT_GT(tampered_values, 0U);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(Get("zzz"), CoarseValue("zzz"));
+  ASSERT_EQ(Get("live"), RoutedLiveValue());
+}
+
+TEST_F(CompactionServiceTest, RemoteOutputCoarseInputReferenceIsAccepted) {
+  // Background: a coarse input SST has no reference groups, so the primary
+  // cannot list its numbers. The worker writes exact output for it, and the
+  // primary accepts a group of that output that no input group holds when
+  // it is a coarse reference of the job: generation number == origin, at or
+  // above the lowest coarse frontier of the job's inputs, a live
+  // indirect-origin blob file, no route from it, and not a relocation file.
+  //
+  // Setup: indirect blob GC adds the route origin -> target, and the exact L1
+  // SST holds `origin`. A new coarse L0 SST with key "zzz" holds its blob
+  // file `job_blob`. The remote job compacts both SSTs into L1. The output
+  // names `target`, because the worker flattens `origin` (an input group
+  // holds `origin`, and `target` is its route target). It also names
+  // `job_blob` (the coarse reference). The primary must install the output,
+  // and every value must read back.
+  auto logger = std::make_shared<UnheldGenerationRejectionLogger>();
+  uint64_t origin = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(OpenAndWriteBlobFileToL1(logger, &origin));
+  uint64_t target = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(RouteBlobFileByGc(origin, &target));
+  uint64_t job_blob = kInvalidBlobFileNumber;
+  ASSERT_NO_FATAL_FAILURE(FlushCoarseSst("zzz", &job_blob));
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  {
+    const VersionStorageInfo* const storage = cfd->current()->storage_info();
+    ASSERT_EQ(storage->OldestCoarseIndirectOriginFileNumber(), job_blob);
+    const std::shared_ptr<BlobFileMetaData> coarse_blob =
+        storage->GetBlobFileMetaData(job_blob);
+    ASSERT_NE(coarse_blob, nullptr);
+    ASSERT_TRUE(coarse_blob->IsIndirectOrigin());
+    ASSERT_EQ(storage->GetBlobRelocationRouteTarget(job_blob),
+              kInvalidBlobFileNumber);
+  }
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[1].files.size(), 1U);
+  const SstFileMetaData& l1_sst = metadata.levels[1].files.front();
+
+  const int local_before =
+      GetCompactionService()->GetUseLocalInstallationCount();
+  ASSERT_OK(db_->CompactFiles(
+      CompactionOptions(),
+      {L0SstName("zzz"), l1_sst.db_path + "/" + l1_sst.name}, 1));
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_EQ(result.blob_indirection_protocol_version,
+            kBlobIndirectionCompactionServiceProtocolVersion);
+  ASSERT_TRUE(result.has_flattened_blob_index);
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kSuccess);
+  ASSERT_EQ(GetCompactionService()->GetUseLocalInstallationCount(),
+            local_before);
+  ASSERT_EQ(logger->rejections(), 0);
+
+  // The installed output is exact and holds both numbers.
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(
+      cfd->current()->storage_info()->OldestCoarseIndirectOriginFileNumber(),
+      kInvalidBlobFileNumber);
+  const auto census = cfd->blob_reference_census()->TEST_GetReadyState(
+      cfd->current()->GetVersionNumber());
+  ASSERT_NE(census, nullptr);
+  ASSERT_GT(census->GetSstCount(job_blob), 0U);
+  ASSERT_GT(census->GetSstCount(target), 0U);
+  ASSERT_EQ(census->GetSstCount(origin), 0U);
+  ASSERT_EQ(Get("zzz"), CoarseValue("zzz"));
+  ASSERT_EQ(Get("live"), RoutedLiveValue());
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionFlattensWithLiveBlobFile) {
+  // Indirect blob GC moves the live value of blob file `origin` into a
+  // relocation file and removes `origin` by blob file retirement. A flush then
+  // keeps one live normal blob file, so the worker meters blob garbage. The
+  // remote compaction flattens the reference with generation `origin` to the
+  // route target and reports the input flow of `origin` as garbage. `origin` is
+  // a routed generation number with no garbage counts, so the primary skips
+  // that garbage and installs the output instead of running the job locally.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  const std::array<std::string, 4> keys{{"dead0", "dead1", "dead2", "live"}};
+  const std::string live_value(4096, 'v');
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ASSERT_OK(
+        Put(keys[i], i + 1 == keys.size()
+                         ? live_value
+                         : std::string(4096, static_cast<char>('a' + i))));
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t origin =
+      cfd->current()->storage_info()->GetBlobFiles()[0]->GetBlobFileNumber();
+  for (size_t i = 0; i + 1 < keys.size(); ++i) {
+    ASSERT_OK(Delete(keys[i]));
+  }
+  ASSERT_OK(Flush());
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "false"},
+                             {"enable_blob_garbage_collection", "true"}}));
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"disable_auto_compactions", "true"},
+                             {"enable_blob_garbage_collection", "false"}}));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const uint64_t target =
+      cfd->current()->storage_info()->GetBlobRelocationRouteTarget(origin);
+  ASSERT_NE(target, kInvalidBlobFileNumber);
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFileMetaData(origin),
+            nullptr);
+  // A live normal blob file in the input Version.
+  ASSERT_OK(Put("other", std::string(4096, 'o')));
+  ASSERT_OK(Flush());
+
+  const int local_before =
+      GetCompactionService()->GetUseLocalInstallationCount();
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.has_flattened_blob_index);
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kSuccess);
+  ASSERT_EQ(GetCompactionService()->GetUseLocalInstallationCount(),
+            local_before);
+  dbfull()->TEST_WaitForBlobReferenceCensus();
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const auto census = cfd->blob_reference_census()->TEST_GetReadyState(
+      cfd->current()->GetVersionNumber());
+  ASSERT_NE(census, nullptr);
+  ASSERT_GT(census->GetSstCount(target), 0U);
+  ASSERT_EQ(census->GetSstCount(origin), 0U);
+  ASSERT_EQ(Get(keys.back()), live_value);
+  ASSERT_EQ(Get("other"), std::string(4096, 'o'));
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionCoarseOutputStaysLocal) {
+  // With universal compaction and one level, every output is at level 0. Flush
+  // output is coarse, so a compaction of only flushed files writes coarse
+  // output, unless the compaction is bottommost (a bottommost compaction
+  // writes exact output). The primary accepts only exact feature output, so it
+  // runs a coarse job locally and does not schedule it on a worker.
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 1;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+  // An older L0 SST covers the key range of the two newer flushes: "key" sorts
+  // before "key0", and "key9" sorts after "key1". A compaction of only the two
+  // newer flushes is then not bottommost, so its output is coarse.
+  ASSERT_OK(Put("key", "low"));
+  ASSERT_OK(Put("key9", "high"));
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), std::string(4096, 'v')));
+    ASSERT_OK(Flush());
+  }
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[0].files.size(), 3U);
+  // L0 is newest first, so the first two files are the two newer flushes.
+  const std::vector<std::string> inputs{metadata.levels[0].files[0].name,
+                                        metadata.levels[0].files[1].name};
+  const int compactions_before = GetCompactionService()->GetCompactionNum();
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/0));
+  ASSERT_EQ(GetCompactionService()->GetCompactionNum(), compactions_before);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 2);
+  const FileMetaData* const output = dbfull()
+                                         ->GetVersionSet()
+                                         ->GetColumnFamilySet()
+                                         ->GetDefault()
+                                         ->current()
+                                         ->storage_info()
+                                         ->LevelFiles(0)
+                                         .front();
+  ASSERT_TRUE(output->blob_reference_descriptor.empty());
+  ASSERT_NE(output->oldest_coarse_indirect_origin_file_number,
+            kInvalidBlobFileNumber);
+  ASSERT_EQ(Get("key"), "low");
+  ASSERT_EQ(Get("key9"), "high");
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), std::string(4096, 'v'));
+  }
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionRejectsIncapableWorkerResult) {
+  PrepareBlobIndirectionFallbackTest();
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [](void* argument) {
+        auto** result = static_cast<CompactionServiceResult**>(argument);
+        (*result)->blob_indirection_protocol_version = 0;
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  VerifyBlobIndirectionLocalFallback();
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionRejectsMismatchedWorkerSnapshot) {
+  PrepareBlobIndirectionFallbackTest();
+
+  GetCompactionService()->ReturnIncompleteAsFailure(true);
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [](void* argument) {
+        auto* input = static_cast<CompactionServiceInput*>(argument);
+        input->blob_relocation_state_fingerprint_high ^= 1;
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  VerifyBlobIndirectionLocalFallback();
+  // The worker itself declined: its result has TryAgain with the name of the
+  // failed check, and no output. The primary's descriptor check alone would
+  // also make the job run locally, so check the worker's result too. The
+  // worker call returned OK, so the service did not report a failure.
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_EQ(result.status.code(), Status::Code::kTryAgain)
+      << result.status.ToString();
+  ASSERT_NE(
+      result.status.ToString().find("relocation state fingerprint differs"),
+      std::string::npos)
+      << result.status.ToString();
+  ASSERT_EQ(result.blob_indirection_protocol_version, 0U);
+  ASSERT_TRUE(result.output_files.empty());
+  ASSERT_EQ(GetCompactionService()->GetFailureWaitCount(), 0);
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionWorkerOptionMismatchFallsBack) {
+  // The worker's own enable_blob_indirection differs from the primary's, so
+  // its options fingerprint differs; the worker declines and the primary
+  // runs the job locally.
+  PrepareBlobIndirectionFallbackTest();
+  GetCompactionService()->ReturnIncompleteAsFailure(true);
+  GetCompactionService()->SetWorkerOptionOverride("enable_blob_indirection",
+                                                  "false");
+  VerifyBlobIndirectionLocalFallback();
+  CompactionServiceResult result;
+  GetCompactionService()->GetResult(&result);
+  ASSERT_EQ(result.status.code(), Status::Code::kTryAgain)
+      << result.status.ToString();
+  ASSERT_NE(result.status.ToString().find("options fingerprint differs"),
+            std::string::npos)
+      << result.status.ToString();
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionWorkerBlobPlacementMismatch) {
+  // min_blob_size and blob_file_starting_level decide whether a value needs
+  // blob output. A worker with other values could write a value inline where
+  // the primary would write it to a blob file, or the reverse, so both options
+  // are in the options fingerprint. Each override makes the fingerprints
+  // differ: the worker declines, and the primary runs the job locally.
+  const std::pair<std::string, std::string> overrides[] = {
+      {"min_blob_size", "1048576"},
+      {"blob_file_starting_level", "5"},
+  };
+  for (const auto& [name, value] : overrides) {
+    SCOPED_TRACE(name);
+    PrepareBlobIndirectionFallbackTest();
+    GetCompactionService()->ReturnIncompleteAsFailure(true);
+    GetCompactionService()->SetWorkerOptionOverride(name, value);
+    VerifyBlobIndirectionLocalFallback();
+    CompactionServiceResult result;
+    GetCompactionService()->GetResult(&result);
+    ASSERT_EQ(result.status.code(), Status::Code::kTryAgain)
+        << result.status.ToString();
+    ASSERT_NE(result.status.ToString().find("options fingerprint differs"),
+              std::string::npos)
+        << result.status.ToString();
+  }
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionRejectsRemoteBlobFileOutput) {
+  // The worker reports a blob file addition, which a feature-aware result may
+  // not have. The primary must decline it at the blob indirection contract
+  // check. A later check would also decline it (the primary reserved no blob
+  // file numbers), so the test checks the WARN line of the contract check.
+  std::shared_ptr<WarningCountingLogger> log =
+      std::make_shared<WarningCountingLogger>(
+          "does not match the blob indirection contract");
+  PrepareBlobIndirectionFallbackTest(log);
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [](void* argument) {
+        auto** result = static_cast<CompactionServiceResult**>(argument);
+        (*result)->blob_file_additions.emplace_back(
+            /*blob_file_number=*/1000, /*total_blob_count=*/1,
+            /*total_blob_bytes=*/1, /*checksum_method=*/"",
+            /*checksum_value=*/"");
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  VerifyBlobIndirectionLocalFallback();
+  ASSERT_EQ(log->count(), 1);
+}
+
+TEST_F(CompactionServiceTest,
+       BlobIndirectionRejectsCorruptExactMetadataPayload) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  const std::string value(4096, 'v');
+  ASSERT_OK(Put("legacy", value));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  MyTestCompactionService* const service = GetCompactionService();
+  const int compaction_num_before = service->GetCompactionNum();
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(service->GetCompactionNum(), compaction_num_before);
+
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [&](void* argument) {
+        auto** result = static_cast<CompactionServiceResult**>(argument);
+        ASSERT_NE(*result, nullptr);
+        ASSERT_EQ((*result)->output_files.size(), 1U);
+        const CompactionServiceOutputFile& output = (*result)->output_files[0];
+        const auto property =
+            output.table_properties.user_collected_properties.find(
+                kBlobReferenceDescriptorPropertyName);
+        ASSERT_NE(property,
+                  output.table_properties.user_collected_properties.end());
+        BlobReferenceMetadataDescriptor descriptor;
+        ASSERT_OK(BlobReferenceMetadataDescriptor::DecodeFrom(property->second,
+                                                              &descriptor));
+        ASSERT_GT(descriptor.reference_count, 0U);
+        ASSERT_GT(descriptor.index_handle.offset(),
+                  BlockBasedTable::kBlockTrailerSize);
+        const uint64_t corruption_offset = descriptor.index_handle.offset() -
+                                           BlockBasedTable::kBlockTrailerSize -
+                                           1;
+        ASSERT_LT(corruption_offset, 1U << 30);
+        const std::string file_name =
+            (*result)->output_path + "/" + output.file_name;
+        ASSERT_OK(test::CorruptFile(env_, file_name,
+                                    static_cast<int>(corruption_offset), 1,
+                                    false /* verify_checksum */));
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_GT(service->GetCompactionNum(), compaction_num_before);
+  // The primary declined the corrupt output and ran the job locally.
+  ASSERT_EQ(service->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kUseLocal);
+  ASSERT_EQ(Get("legacy"), value);
+}
+
+TEST_F(CompactionServiceTest,
+       BlobIndirectionRejectsMismatchedActualTableIdentity) {
+  PrepareBlobIndirectionFallbackTest();
+
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceJob::Install:ActualTableIdentity", [](void* argument) {
+        auto* const identity =
+            static_cast<std::pair<uint64_t, uint64_t>*>(argument);
+        ++identity->first;
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kUseLocal);
+  ASSERT_EQ(Get("b"), std::string(4096, 'b'));
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "a", &value).IsNotFound());
+}
+
+TEST_F(CompactionServiceTest,
+       BlobIndirectionRejectsChecksummedUnresolvedGroup) {
+  PrepareBlobIndirectionFallbackTest();
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  // The flush already wrote the format fence, so this first compaction is
+  // not a first activation. It runs remotely and installs one exact SST. The
+  // test changes the worker output of the next compaction, which rewrites
+  // that SST.
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kSuccess);
+  const int fallbacks_before =
+      GetCompactionService()->GetUseLocalInstallationCount();
+  std::string invalid_index;
+  bool tamper_worker = true;
+  size_t tampered_values = 0;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionOutputs::AddToOutput:Value", [&](void* argument) {
+        if (!tamper_worker) {
+          return;
+        }
+        auto* value = static_cast<Slice*>(argument);
+        BlobIndex index;
+        ASSERT_OK(index.DecodeFrom(*value));
+        ASSERT_TRUE(index.IsIndirect());
+        ASSERT_EQ(index.generation_file_number(), index.origin_file_number());
+        // Keep the generation number (a live normal blob file) but set the
+        // origin to generation - 1, a file number that is not a blob file. A
+        // live normal blob file must be its own origin, so the primary must
+        // decline the output. The real builder writes matching SST data and
+        // checksummed exact metadata for it.
+        ASSERT_GT(index.origin_file_number(), 1U);
+        BlobIndex::EncodeIndirectBlob(
+            &invalid_index, index.generation_file_number(),
+            {.origin_file_number = index.origin_file_number() - 1,
+             .original_value_offset = index.original_value_offset(),
+             .stored_value_size = index.size(),
+             .compression = index.compression(),
+             .stable_checksum = index.stable_checksum(),
+             .stored_checksum = index.stored_checksum()});
+        *value = Slice(invalid_index);
+        ++tampered_values;
+      });
+  sync_point->SetCallBack("CompactionServiceCompactionJob::Run:0",
+                          [&](void*) { tamper_worker = false; });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([&] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_GT(tampered_values, 0U);
+  ASSERT_GT(GetCompactionService()->GetUseLocalInstallationCount(),
+            fallbacks_before);
+  ASSERT_EQ(Get("b"), std::string(4096, 'b'));
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "a", &value).IsNotFound());
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionFirstActivationStaysLocal) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  const std::string value(4096, 'v');
+  ASSERT_OK(Put("key", value));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  auto my_cs = GetCompactionService();
+  const int compaction_num_before = my_cs->GetCompactionNum();
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  ASSERT_EQ(my_cs->GetCompactionNum(), compaction_num_before);
+  ASSERT_EQ(Get("key"), value);
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionFenceDuringLegacyRemoteJob) {
+  // A remote compaction is built while the column family has no format fence
+  // and the option is off. Before the worker opens the DB, the option is
+  // turned on and a flush writes the fence. The worker sees the fence and
+  // writes feature metadata, so the primary declines the legacy job's result
+  // (case 2 in ValidateBlobGCCompactionServiceResult()) and runs the job
+  // locally. The local outputs were made for a job built before the fence, so
+  // they are installed as legacy-marked SSTs
+  // (FileMetaData::blob_reference_legacy_metadata), and no background error is
+  // set.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+  const std::string value(4096, 'v');
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), value));
+    ASSERT_OK(Flush());
+  }
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  bool job_waiting = false;
+  bool release_job = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MyTestCompactionService::Wait:BeforeOpenAndCompact", [&](void*) {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        job_waiting = true;
+        state_changed.notify_all();
+        state_changed.wait(lock, [&] { return release_job; });
+      });
+  int declined = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompactionWithCompactionService:"
+      "BlobGCResultDeclined",
+      [&](void* arg) {
+        EXPECT_TRUE(static_cast<Status*>(arg)->IsIncomplete());
+        ++declined;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto my_cs = GetCompactionService();
+  const int compaction_num_before = my_cs->GetCompactionNum();
+  Status compact_status;
+  port::Thread compactor([&] {
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    compact_status = db_->CompactRange(compact_options, nullptr, nullptr);
+  });
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    state_changed.wait(lock, [&] { return job_waiting; });
+  }
+  // The remote job is built. Turn the option on, and let a flush write the
+  // fence.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  ASSERT_OK(Put("key2", value));
+  ASSERT_OK(Flush());
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    release_job = true;
+    state_changed.notify_all();
+  }
+  compactor.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(compact_status);
+  EXPECT_EQ(declined, 1);
+  EXPECT_GT(my_cs->GetCompactionNum(), compaction_num_before);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), value);
+  }
+  // The compaction outputs (every SST below L0; the flush that wrote the fence
+  // stays in L0) are legacy-marked.
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  const VersionStorageInfo* const storage = cfd->current()->storage_info();
+  size_t compaction_outputs = 0;
+  for (int level = 1; level < storage->num_levels(); ++level) {
+    for (const FileMetaData* file : storage->LevelFiles(level)) {
+      ++compaction_outputs;
+      EXPECT_TRUE(file->blob_reference_legacy_metadata);
+      EXPECT_TRUE(file->blob_reference_descriptor.empty());
+    }
+  }
+  EXPECT_GT(compaction_outputs, 0U);
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionWorkerDeclinesNewBlobOutput) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  ReopenWithCompactionService(&options);
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(Put("fence", std::string(4096, 'f')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  MyTestCompactionService* const service = GetCompactionService();
+  const int compaction_num_before = service->GetCompactionNum();
+  const int local_fallbacks_before = service->GetUseLocalInstallationCount();
+  const int failures_before = service->GetFailureWaitCount();
+  ASSERT_OK(Put("merge", std::string(4096, 'a')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Merge("merge", std::string(4096, 'b')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  ASSERT_GT(service->GetCompactionNum(), compaction_num_before);
+  // CompactRange can run additional SST-only jobs after the merge job. Check
+  // the complete callback history, not just the last successful job.
+  ASSERT_GT(service->GetUseLocalInstallationCount(), local_fallbacks_before);
+  // The worker returned OK with TryAgain in its result, so a service that maps
+  // a failed worker call to kFailure still forwards the decline.
+  ASSERT_EQ(service->GetFailureWaitCount(), failures_before);
+  const std::vector<CompactionServiceResult> results = service->GetResults();
+  ASSERT_TRUE(std::any_of(results.begin(), results.end(),
+                          [](const CompactionServiceResult& result) {
+                            return result.status.IsTryAgain();
+                          }));
+  ASSERT_EQ(Get("merge"),
+            std::string(4096, 'a') + "," + std::string(4096, 'b'));
+
+  Arena arena;
+  const ReadOptions read_options;
+  ScopedArenaPtr<InternalIterator> iter(
+      dbfull()->NewInternalIterator(read_options, &arena, kMaxSequenceNumber));
+  InternalKey seek_key("merge", kMaxSequenceNumber, kValueTypeForSeek);
+  iter->Seek(seek_key.Encode());
+  ASSERT_TRUE(iter->Valid());
+  ParsedInternalKey key;
+  ASSERT_OK(ParseInternalKey(iter->key(), &key, true));
+  ASSERT_EQ(key.user_key, "merge");
+  ASSERT_EQ(key.type, kTypeBlobIndex);
+  BlobIndex index;
+  ASSERT_OK(index.DecodeFrom(iter->value()));
+  ASSERT_TRUE(index.IsIndirect());
+  ASSERT_OK(iter->status());
+}
+
+// A feature-aware remote job may not create blob files. With
+// compaction-time blob GC on, such a job rewrites a legacy (direct) blob value
+// below the GC age cutoff, and the rewrite needs a new blob file. The worker
+// declines the job with TryAgain, and the primary runs it locally.
+TEST_F(CompactionServiceTest, BlobIndirectionWorkerDeclinesLegacyBlobGc) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  // Write a legacy blob value while enable_blob_indirection is off.
+  const std::string value(4096, 'v');
+  ASSERT_OK(Put("legacy", value));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+  const uint64_t legacy_blob_file = cfd->current()
+                                        ->storage_info()
+                                        ->GetBlobFiles()
+                                        .front()
+                                        ->GetBlobFileNumber();
+
+  // The first activation compaction runs locally and gives the Version the
+  // indirection format. Blob GC is off, so the legacy value stays.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_indirection", "true"}}));
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_NE(
+      cfd->current()->storage_info()->GetBlobFileMetaData(legacy_blob_file),
+      nullptr);
+
+  // With the age cutoff 1.0, every blob file is below the cutoff, so the next
+  // compaction rewrites the legacy value.
+  ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                            {{"enable_blob_garbage_collection", "true"},
+                             {"blob_garbage_collection_age_cutoff", "1.0"}}));
+  MyTestCompactionService* const service = GetCompactionService();
+  const int compaction_num_before = service->GetCompactionNum();
+  const int local_fallbacks_before = service->GetUseLocalInstallationCount();
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  // The worker ran the job and declined it with TryAgain, and the primary ran
+  // it locally.
+  ASSERT_GT(service->GetCompactionNum(), compaction_num_before);
+  ASSERT_GT(service->GetUseLocalInstallationCount(), local_fallbacks_before);
+  const std::vector<CompactionServiceResult> results = service->GetResults();
+  ASSERT_TRUE(std::any_of(results.begin(), results.end(),
+                          [](const CompactionServiceResult& result) {
+                            return result.status.IsTryAgain();
+                          }));
+
+  // The local job rewrote the legacy value, so its blob file is gone, and the
+  // value reads back unchanged.
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(
+      cfd->current()->storage_info()->GetBlobFileMetaData(legacy_blob_file),
+      nullptr);
+  ASSERT_EQ(Get("legacy"), value);
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionManualGcOverridesStayLocal) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(Put("fence", std::string(4096, 'f')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  MyTestCompactionService* const service = GetCompactionService();
+  const int compaction_num_before = service->GetCompactionNum();
+  ASSERT_OK(Put("disable", std::string(4096, 'd')));
+  ASSERT_OK(Flush());
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kDisable;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(service->GetCompactionNum(), compaction_num_before);
+
+  ASSERT_OK(Put("cutoff", std::string(4096, 'c')));
+  ASSERT_OK(Flush());
+  compact_options.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kUseDefault;
+  compact_options.blob_garbage_collection_age_cutoff = 0.9;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(service->GetCompactionNum(), compaction_num_before);
+  ASSERT_EQ(Get("disable"), std::string(4096, 'd'));
+  ASSERT_EQ(Get("cutoff"), std::string(4096, 'c'));
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionWorkerGcOverrideFallsBack) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  const std::string value(4096, 'v');
+  ASSERT_OK(Put("key", value));
+  ASSERT_OK(Flush());
+  MyTestCompactionService* const service = GetCompactionService();
+  service->SetWorkerOptionOverride("enable_blob_garbage_collection", "false");
+
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+
+  ASSERT_EQ(service->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kUseLocal);
+  CompactionServiceResult result;
+  service->GetResult(&result);
+  ASSERT_EQ(result.status.code(), Status::Code::kTryAgain)
+      << result.status.ToString();
+  ASSERT_NE(result.status.ToString().find("options fingerprint differs"),
+            std::string::npos)
+      << result.status.ToString();
+  ASSERT_EQ(Get("key"), value);
+}
+
+TEST_F(CompactionServiceTest, LegacyJobDeclinesFeatureOutputFromWorker) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = false;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  ASSERT_OK(Put("a", std::string(4096, 'a')));
+  ASSERT_OK(Put("b", std::string(4096, 'b')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Flush());
+
+  // The primary builds a legacy job, but the worker runs with
+  // enable_blob_indirection on, as after an activation that the primary job
+  // did not see. The worker then writes blob indirection metadata, which the
+  // legacy install path must not import.
+  MyTestCompactionService* const service = GetCompactionService();
+  service->SetWorkerOptionOverride("enable_blob_indirection", "true");
+  const int compaction_num_before = service->GetCompactionNum();
+  const int local_fallbacks_before = service->GetUseLocalInstallationCount();
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_GT(service->GetCompactionNum(), compaction_num_before);
+  ASSERT_GT(service->GetUseLocalInstallationCount(), local_fallbacks_before);
+
+  // The local rerun of the same legacy job writes legacy output.
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_FALSE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  TablePropertiesCollection properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&properties));
+  ASSERT_FALSE(properties.empty());
+  for (const auto& file_properties : properties) {
+    const auto& user_properties =
+        file_properties.second->user_collected_properties;
+    ASSERT_EQ(user_properties.count(kBlobReferenceDescriptorPropertyName), 0U);
+    ASSERT_EQ(user_properties.count(kBlobReferenceClassificationPropertyName),
+              0U);
+  }
+  ASSERT_EQ(Get("b"), std::string(4096, 'b'));
+  std::string value;
+  ASSERT_TRUE(db_->Get(ReadOptions(), "a", &value).IsNotFound());
+}
+
 namespace {
 
 // A CompressionManager that records, per GetCompressorForSST() call, whether
@@ -1902,6 +3574,101 @@ TEST_F(CompactionServiceTest, MissingBlobRepairRunsLocallyPerCall) {
   ASSERT_OK(db_->CompactRange(regular, nullptr, nullptr));
   ASSERT_GT(service->GetCompactionNum(), remote_compactions);
   ASSERT_EQ(Get("key"), "value3");
+}
+
+TEST_F(CompactionServiceTest, LostRelocationFileRepairRunsLocally) {
+  // A loss record marks a relocation file lost when the DB cannot read it. A
+  // compaction whose input Version has such a file turns the references to it
+  // into deletions (loss repair). The primary does not check a worker's loss
+  // repair, so the compaction runs locally (a conservative choice), also with
+  // a compaction service configured.
+  //
+  // The test runs the same steps twice. Indirect blob GC moves the live value
+  // of "live" into a relocation file. Then the DB reopens, and in the second
+  // run (lose == true) the relocation file is deleted and marked lost during
+  // the open. The first run (lose == false) is the control: the same
+  // compaction goes to the compaction service.
+  for (const bool lose : {false, true}) {
+    SCOPED_TRACE("lose=" + std::to_string(lose));
+    uint64_t origin = kInvalidBlobFileNumber;
+    ASSERT_NO_FATAL_FAILURE(
+        OpenAndWriteBlobFileToL1(/*info_log=*/nullptr, &origin));
+    uint64_t relocation = kInvalidBlobFileNumber;
+    ASSERT_NO_FATAL_FAILURE(RouteBlobFileByGc(origin, &relocation));
+    // "other" is in a new L0 SST and a new blob file. So the compaction below
+    // has L0 and L1 inputs, and only the L1 SST references the relocation
+    // file.
+    const std::string other_value(4096, 'o');
+    ASSERT_OK(Put("other", other_value));
+    ASSERT_OK(Flush());
+
+    // The reopen uses the options of the last open (set by
+    // OpenAndWriteBlobFileToL1()), which include the compaction service.
+    Options options = last_options_;
+    Close();
+    // Close() cancels the waiting jobs of the service; allow new jobs.
+    GetCompactionService()->SetCanceled(false);
+    if (lose) {
+      ASSERT_OK(env_->DeleteFile(BlobFileName(dbname_, relocation)));
+      // This hook marks the relocation file lost while the DB opens, and the
+      // open writes the loss record into its new MANIFEST.
+      SyncPoint::GetInstance()->SetCallBack(
+          "VersionBuilder::MarkBlobFileLostForTest", [&](void* arg) {
+            auto* const file = static_cast<std::pair<uint64_t, bool*>*>(arg);
+            if (file->first == relocation) {
+              *file->second = true;
+            }
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+    ASSERT_OK(TryReopenWithColumnFamilies(
+        {kDefaultColumnFamilyName, "cf_1", "cf_2", "cf_3"}, options));
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    const VersionStorageInfo* storage = dbfull()
+                                            ->GetVersionSet()
+                                            ->GetColumnFamilySet()
+                                            ->GetDefault()
+                                            ->current()
+                                            ->storage_info();
+    ASSERT_EQ(storage->HasLostBlobRelocationFiles(), lose);
+    ASSERT_NE(storage->PeekBlobRelocationFileMetaData(relocation), nullptr);
+    ASSERT_EQ(
+        storage->PeekBlobRelocationFileMetaData(relocation)->IsMarkedLost(),
+        lose);
+
+    const int compactions_before = GetCompactionService()->GetCompactionNum();
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+    ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+    ASSERT_EQ(Get("other"), other_value);
+    std::vector<KeyVersion> versions;
+    ASSERT_OK(GetAllKeyVersions(db_.get(), Slice("live"), Slice("live"),
+                                /*max_num_ikeys=*/10, &versions));
+    if (lose) {
+      // CompactRange() runs one job per level here (L0 to L1, then the
+      // forced rewrite of L1). Every job ran locally, so the service saw no
+      // job.
+      ASSERT_EQ(GetCompactionService()->GetCompactionNum(), compactions_before);
+      // Loss repair turned the lost reference into a deletion. The output is
+      // at the bottommost level, so the compaction then dropped the deletion,
+      // and no version of "live" is left.
+      ASSERT_TRUE(versions.empty());
+      std::string value;
+      ASSERT_EQ(db_->Get(ReadOptions(), "live", &value).code(),
+                Status::kNotFound);
+    } else {
+      ASSERT_GT(GetCompactionService()->GetCompactionNum(), compactions_before);
+      ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+                CompactionServiceJobStatus::kSuccess);
+      ASSERT_EQ(versions.size(), 1U);
+      ASSERT_EQ(Get("live"), RoutedLiveValue());
+    }
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+  }
 }
 
 TEST_F(CompactionServiceTest, MissingBlobRepairRejectsFIFOWithoutFlushing) {
@@ -7536,6 +9303,28 @@ INSTANTIATE_TEST_CASE_P(LocalRouting, DedicatedCompactionFallbackTest,
                                         LocalRouting::kWait,
                                         LocalRouting::kInvalidResult));
 
+TEST_F(CompactionServiceTest, BlobIndirectionSubcompactionsStayLocal) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.min_blob_size = 0;
+  options.max_subcompactions = 10;
+  options.target_file_size_base = 1 << 10;  // 1KB
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+
+  GenerateTestData();
+  VerifyTestData();
+
+  auto my_cs = GetCompactionService();
+  const int compaction_num_before = my_cs->GetCompactionNum();
+  auto cro = CompactRangeOptions();
+  cro.max_subcompactions = 10;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  VerifyTestData();
+  ASSERT_EQ(my_cs->GetCompactionNum(), compaction_num_before);
+}
+
 class PropertySamplingCompactionService : public MyTestCompactionService {
  public:
   using MyTestCompactionService::MyTestCompactionService;
@@ -9199,7 +10988,8 @@ class ResumableCompactionService : public MyTestCompactionService {
                                 {} /* table_properties_collector_factories */),
         scenario_(scenario),
         output_file_key_interval_(output_file_key_interval),
-        merge_resumed_output_(merge_resumed_output) {}
+        merge_resumed_output_(merge_resumed_output),
+        blob_indirection_enabled_(options.enable_blob_indirection) {}
 
   // Set the user key where cancellation should happen.
   void SetCancelAtKey(const std::string& key, SequenceNumber seqno) {
@@ -9384,7 +11174,7 @@ class ResumableCompactionService : public MyTestCompactionService {
     }
 
     // Validate statistics based on scenario (only when cancelling at end)
-    if (cancel_at_key_.empty()) {
+    if (cancel_at_key_.empty() && !blob_indirection_enabled_) {
       if (scenario_ == TestScenario::kMultipleCancelToggleResumption) {
         // ASSUMPTION: Phase 1 processes all keys before cancellation
         EXPECT_GT(phase1_stats.count, 0);
@@ -9485,6 +11275,7 @@ class ResumableCompactionService : public MyTestCompactionService {
   TestScenario scenario_;
   const size_t output_file_key_interval_;
   const bool merge_resumed_output_;
+  const bool blob_indirection_enabled_;
   size_t output_key_count_ = 0;
   std::string cancel_at_key_;
   std::string second_cancel_at_key_;
@@ -9661,9 +11452,13 @@ class ResumableCompactionServiceTest : public CompactionServiceTest {
   }
 
   void RunCompactionCancelTest(
-      ResumableCompactionService::TestScenario scenario) {
+      ResumableCompactionService::TestScenario scenario,
+      bool enable_blob_indirection) {
     Options options = CurrentOptions();
     options.disable_auto_compactions = true;
+    options.enable_blob_files = enable_blob_indirection;
+    options.enable_blob_indirection = enable_blob_indirection;
+    options.min_blob_size = 1 << 20;
     std::shared_ptr<Statistics> statistics = CreateDBStatistics();
 
     options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
@@ -9676,6 +11471,18 @@ class ResumableCompactionServiceTest : public CompactionServiceTest {
     options.compaction_service = resume_cs;
 
     DestroyAndReopen(options);
+
+    if (enable_blob_indirection) {
+      ASSERT_OK(Put("feature_fence", "value"));
+      ASSERT_OK(Flush());
+      CompactRangeOptions fence_options;
+      fence_options.bottommost_level_compaction =
+          BottommostLevelCompaction::kForce;
+      ASSERT_OK(db_->CompactRange(fence_options, nullptr, nullptr));
+      ColumnFamilyData* cfd =
+          dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+      ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+    }
 
     GenerateTestData();
 
@@ -9700,6 +11507,7 @@ class ResumableCompactionServiceTest : public CompactionServiceTest {
     ASSERT_TRUE(result.stats.is_manual_compaction);
     ASSERT_TRUE(result.stats.is_remote_compaction);
     ASSERT_GT(result.output_files.size(), 0);
+    ASSERT_FALSE(result.has_flattened_blob_index);
 
     // The output stats cover every output file, including the files that a
     // resumed run restored instead of writing again.
@@ -9713,8 +11521,12 @@ class ResumableCompactionServiceTest : public CompactionServiceTest {
 
     uint64_t resumed_bytes =
         statistics->getTickerCount(REMOTE_COMPACT_RESUMED_BYTES);
-    if (scenario ==
-        ResumableCompactionService::TestScenario::kCancelThenResume) {
+    if (enable_blob_indirection) {
+      // Feature-aware progress does not persist the negotiated indirect blob GC
+      // contract, so the retry starts from a clean workspace.
+      ASSERT_EQ(resumed_bytes, 0);
+    } else if (scenario ==
+               ResumableCompactionService::TestScenario::kCancelThenResume) {
       // When resuming compaction, some bytes should be resumed from previous
       // progress
       ASSERT_GT(resumed_bytes, 0);
@@ -9757,18 +11569,28 @@ class ResumableCompactionServiceTest : public CompactionServiceTest {
 
 TEST_F(ResumableCompactionServiceTest, CompactionCancelThenResume) {
   RunCompactionCancelTest(
-      ResumableCompactionService::TestScenario::kCancelThenResume);
+      ResumableCompactionService::TestScenario::kCancelThenResume,
+      false /* enable_blob_indirection */);
 }
 
 TEST_F(ResumableCompactionServiceTest, CompactionCancelThenFreshStart) {
   RunCompactionCancelTest(
-      ResumableCompactionService::TestScenario::kCancelThenFreshStart);
+      ResumableCompactionService::TestScenario::kCancelThenFreshStart,
+      false /* enable_blob_indirection */);
 }
 
 TEST_F(ResumableCompactionServiceTest,
        CompactionMultipleCancelToggleResumption) {
-  RunCompactionCancelTest(ResumableCompactionService::TestScenario::
-                              kMultipleCancelToggleResumption);
+  RunCompactionCancelTest(
+      ResumableCompactionService::TestScenario::kMultipleCancelToggleResumption,
+      false /* enable_blob_indirection */);
+}
+
+TEST_F(ResumableCompactionServiceTest,
+       BlobIndirectionDoesNotResumeUnversionedProgress) {
+  RunCompactionCancelTest(
+      ResumableCompactionService::TestScenario::kCancelThenResume,
+      true /* enable_blob_indirection */);
 }
 
 TEST_F(ResumableCompactionServiceTest, BlobCompactionCancelThenResume) {
@@ -10275,6 +12097,98 @@ TEST_F(ResumableCompactionServiceTest,
 }
 
 TEST_F(ResumableCompactionServiceTest,
+       ExactBlobReferenceOutputResumesFromProgress) {
+  // At each output file boundary, the checkpoint saves a copy of the blob
+  // garbage meter, without the inflow of the key that the iterator already read
+  // for the next output file. The resumed job reads that key again, so its blob
+  // garbage is counted only once. Exact output (an SST that collects exact blob
+  // references) saves checkpoints and resumes in the same way as legacy output.
+  // Feature-aware remote jobs do not resume, because the progress format does
+  // not save the job's indirect blob GC fields (such as
+  // blob_indirection_protocol_version). So the test clears
+  // blob_indirection_protocol_version in a sync point callback, and the job
+  // reaches the worker as a legacy job. The worker then writes exact output for
+  // a legacy job, so the primary declines that output and runs the job locally.
+  // The test checks the worker's checkpoints and resume (persisted progress and
+  // REMOTE_COMPACT_RESUMED_BYTES), and that every value reads back after the
+  // local rerun.
+  const auto run_compaction = [&](bool exact_output,
+                                  size_t* persisted_progress_count) {
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.enable_blob_files = true;
+    options.enable_blob_garbage_collection = false;
+    options.min_blob_size = 0;
+    options.blob_file_starting_level = 0;
+    std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+
+    auto resume_cs = std::make_shared<ResumableCompactionService>(
+        dbname_, options, statistics,
+        ResumableCompactionService::TestScenario::kCancelThenResume,
+        /*output_file_key_interval=*/1);
+    resume_cs->SetCancelAtKey("c", kMaxSequenceNumber);
+    options.compaction_service = resume_cs;
+
+    DestroyAndReopen(options);
+    // Legacy blob references are written before exact output is enabled.
+    for (const char* const key : {"a", "b", "c", "d"}) {
+      ASSERT_OK(Put(key, std::string(100, key[0])));
+    }
+    ASSERT_OK(Flush());
+    CompactRangeOptions compact_options;
+    compact_options.bottommost_level_compaction =
+        BottommostLevelCompaction::kForce;
+    std::atomic<int> remote_jobs{0};
+    if (exact_output) {
+      ASSERT_OK(db_->SetOptions(db_->DefaultColumnFamily(),
+                                {{"enable_blob_indirection", "true"}}));
+      // The first activation runs locally. It sets the format fence and keeps
+      // the legacy blob references in exact output.
+      ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+      ColumnFamilyData* const cfd =
+          static_cast_with_check<ColumnFamilyHandleImpl>(
+              db_->DefaultColumnFamily())
+              ->cfd();
+      ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+    }
+
+    std::atomic<size_t> persisted_progress{0};
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+        [&](void* arg) {
+          // Reach the worker as a legacy job so that resumption stays on,
+          // while the worker still collects exact blob references.
+          static_cast<CompactionServiceInput*>(arg)
+              ->blob_indirection_protocol_version = 0;
+          ++remote_jobs;
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "CompactionJob::PersistSubcompactionProgress:Complete",
+        [&](void*) { ++persisted_progress; });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    db_->CompactRange(compact_options, nullptr, nullptr).PermitUncheckedError();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_GT(remote_jobs.load(), 0);
+
+    for (const char* const key : {"a", "b", "c", "d"}) {
+      EXPECT_EQ(Get(key), std::string(100, key[0]));
+    }
+    EXPECT_GT(statistics->getTickerCount(REMOTE_COMPACT_RESUMED_BYTES), 0);
+    *persisted_progress_count = persisted_progress.load();
+  };
+
+  size_t control_persisted_progress = 0;
+  run_compaction(/*exact_output=*/false, &control_persisted_progress);
+  EXPECT_GT(control_persisted_progress, 0);
+
+  size_t exact_output_persisted_progress = 0;
+  run_compaction(/*exact_output=*/true, &exact_output_persisted_progress);
+  EXPECT_GT(exact_output_persisted_progress, 0);
+}
+
+TEST_F(ResumableCompactionServiceTest,
        BlobCompactionResumePreservesFilteredBoundaryInflow) {
   for (const BoundaryFilterDecision decision :
        {BoundaryFilterDecision::kChangeValue, BoundaryFilterDecision::kRemove,
@@ -10522,6 +12436,154 @@ TEST_F(ResumableCompactionServiceTest,
   ASSERT_OK(status);
   ASSERT_EQ(resume_cs->GetUseLocalInstallationCount(), 0);
   VerifyTestData();
+}
+
+TEST_F(ResumableCompactionServiceTest,
+       BlobIndirectionExactL0RunCancelThenRetryKeepsOneEpoch) {
+  // Background. With blob indirection, the blob reference cap can cut one
+  // exact compaction output to L0 into several L0 files. These files must
+  // share one epoch number, so that together they are one sorted run (an
+  // "exact epoch run"). A resumed remote compaction would keep the files
+  // written before the interruption and write the rest later, so the run
+  // could lose keys, repeat keys, or get two epoch numbers.
+  //
+  // Setup. Universal compaction with num_levels = 1 writes every output to L0.
+  // Two flushes write 48 keys (key 0 to key 47): the second flush overwrites
+  // the even keys and deletes every key with key % 6 == 3. The full compaction
+  // is bottommost, so its output is exact and drops the 8 deletes. A cap of 16
+  // references (set with the sync point
+  // BlockBasedTableBuilder::BlobReferenceLimit) cuts the 40 live keys into 3
+  // files: key 0 to key 18, key 19 to key 37, and key 38 to key 47.
+  //
+  // The worker is cancelled at key 30, in the second file, after the cap has
+  // cut the first file. Then the job runs again with allow_resumption = true.
+  // A feature-aware job (blob indirection on) does not resume: the progress
+  // format does not persist the blob indirection contract, so the second run
+  // starts from a clean output folder (see
+  // DBImplSecondary::CompactWithoutInstallation).
+  //
+  // Checks:
+  //  - the first run cut at least one file, and no progress was persisted or
+  //    resumed;
+  //  - the installed result is the whole run: 3 L0 files with one epoch
+  //    number, the smallest epoch number of the inputs;
+  //  - a full scan and Get return exactly the expected data, also after a
+  //    reopen.
+  constexpr uint64_t kCap = 16;
+  constexpr int kKeys = 48;
+  constexpr int kCancelKey = 30;
+  constexpr size_t kExpectedFiles = 3;
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 1;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  std::shared_ptr<Statistics> statistics = CreateDBStatistics();
+  // output_file_key_interval = 0: only the cap cuts output files.
+  auto resume_cs = std::make_shared<ResumableCompactionService>(
+      dbname_, options, statistics,
+      ResumableCompactionService::TestScenario::kCancelThenResume,
+      /*output_file_key_interval=*/0);
+  resume_cs->SetCancelAtKey(Key(kCancelKey), kMaxSequenceNumber);
+  options.compaction_service = resume_cs;
+  DestroyAndReopen(options);
+
+  std::map<std::string, std::string> expected;
+  for (int i = 0; i < kKeys; ++i) {
+    expected[Key(i)] = "first" + std::to_string(i);
+    ASSERT_OK(Put(Key(i), expected[Key(i)]));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < kKeys; ++i) {
+    if (i % 6 == 3) {
+      expected.erase(Key(i));
+      ASSERT_OK(Delete(Key(i)));
+    } else if (i % 2 == 0) {
+      expected[Key(i)] = "second" + std::to_string(i);
+      ASSERT_OK(Put(Key(i), expected[Key(i)]));
+    }
+  }
+  ASSERT_OK(Flush());
+  ColumnFamilyData* const cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  uint64_t min_input_epoch = std::numeric_limits<uint64_t>::max();
+  for (const FileMetaData* file :
+       cfd->current()->storage_info()->LevelFiles(0)) {
+    min_input_epoch = std::min(min_input_epoch, file->epoch_number);
+  }
+  ASSERT_EQ(NumTableFilesAtLevel(0), 2);
+
+  // ResumableCompactionService::Wait() clears all callbacks when the job is
+  // done, so these callbacks live only for this compaction.
+  std::atomic<uint64_t> first_run_cuts{0};
+  std::atomic<int> persisted_progress{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "BlockBasedTableBuilder::BlobReferenceLimit",
+      [](void* arg) { *static_cast<uint64_t*>(arg) = kCap; });
+  sync_point->SetCallBack(
+      "ResumableCompactionService::AfterCancelledCompaction",
+      [&](void* /*arg*/) {
+        first_run_cuts = statistics->getTickerCount(
+            COMPACTION_OUTPUT_BLOB_REFERENCE_LIMIT_CUTS);
+      });
+  sync_point->SetCallBack(
+      "CompactionJob::PersistSubcompactionProgress:Complete",
+      [&](void* /*arg*/) { ++persisted_progress; });
+  sync_point->EnableProcessing();
+  const Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  CompactionServiceResult result;
+  resume_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+  ASSERT_EQ(resume_cs->GetUseLocalInstallationCount(), 0);
+  EXPECT_GE(first_run_cuts.load(), 1U);
+  EXPECT_EQ(persisted_progress.load(), 0);
+  EXPECT_EQ(statistics->getTickerCount(REMOTE_COMPACT_RESUMED_BYTES), 0U);
+
+  ASSERT_EQ(result.output_files.size(), kExpectedFiles);
+  for (const CompactionServiceOutputFile& file : result.output_files) {
+    EXPECT_EQ(file.epoch_number, min_input_epoch);
+  }
+  const std::vector<FileMetaData*>& outputs =
+      cfd->current()->storage_info()->LevelFiles(0);
+  ASSERT_EQ(outputs.size(), kExpectedFiles);
+  for (const FileMetaData* file : outputs) {
+    EXPECT_EQ(file->epoch_number, min_input_epoch);
+    EXPECT_FALSE(file->blob_reference_descriptor.empty());
+  }
+  EXPECT_EQ(cfd->current()->storage_info()->NumL0SortedRuns(), 1U);
+
+  auto verify = [&]() {
+    std::map<std::string, std::string> scanned;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      // A repeated key would show up as a second visit of the same key.
+      EXPECT_TRUE(
+          scanned.emplace(iter->key().ToString(), iter->value().ToString())
+              .second)
+          << iter->key().ToString();
+    }
+    ASSERT_OK(iter->status());
+    EXPECT_EQ(scanned, expected);
+    for (int i = 0; i < kKeys; ++i) {
+      const auto it = expected.find(Key(i));
+      EXPECT_EQ(Get(Key(i)), it == expected.end() ? "NOT_FOUND" : it->second);
+    }
+  };
+  verify();
+  Reopen(options);
+  verify();
 }
 
 class ResumableCompactionKeyTypeTest : public CompactionServiceTest {
@@ -11161,6 +13223,643 @@ TEST_F(CompactionServiceTest, BottommostFileWithEmptySeqnoTimeMapping) {
       ASSERT_EQ(f.largest_seqno, 0U);
     }
   }
+}
+
+namespace {
+
+// Counts the info log lines that contain a given text. The remote compaction
+// signal tests use it to check which decline site wrote its WARN line.
+class RemoteBlobSignalLogCapture : public Logger {
+ public:
+  explicit RemoteBlobSignalLogCapture(std::string text)
+      : text_(std::move(text)) {}
+  using Logger::Logv;
+  void Logv(const char* format, va_list ap) override {
+    char buffer[2048];
+    vsnprintf(buffer, sizeof(buffer), format, ap);
+    if (std::string(buffer).find(text_) != std::string::npos) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      last_match_ = buffer;
+      matches_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  int matches() const { return matches_.load(std::memory_order_relaxed); }
+  // The last line that contained the text.
+  std::string last_match() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_match_;
+  }
+
+ private:
+  const std::string text_;
+  std::atomic<int> matches_{0};
+  std::mutex mutex_;
+  std::string last_match_;
+};
+
+// The number of samples in COMPACTION_OUTPUT_BLOB_REFERENCES of the primary:
+// one per compaction output SST with exact blob reference metadata, from a
+// local compaction or from an installed remote compaction.
+uint64_t OutputReferenceSamples(Statistics* statistics) {
+  HistogramData data;
+  statistics->histogramData(COMPACTION_OUTPUT_BLOB_REFERENCES, &data);
+  return data.count;
+}
+
+}  // namespace
+
+TEST_F(CompactionServiceTest, BlobIndirectionCoarseFallbackCountsTicker) {
+  // A feature-aware compaction whose output is coarse runs locally from the
+  // start (see BlobIndirectionCoarseOutputStaysLocal). The primary counts it
+  // in REMOTE_COMPACT_COARSE_FALLBACK_COUNT, and no remote output exists to
+  // decline. The local output is coarse, so it adds no sample to
+  // COMPACTION_OUTPUT_BLOB_REFERENCES.
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 1;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  auto log = std::make_shared<RemoteBlobSignalLogCapture>(
+      "Coarse blob indirection output; running the compaction locally");
+  options.info_log = log;
+  ReopenWithCompactionService(&options);
+  // The older SST covers the key range of the two newer flushes, so a
+  // compaction of only the newer two is not bottommost and writes coarse
+  // output.
+  ASSERT_OK(Put("key", "low"));
+  ASSERT_OK(Put("key9", "high"));
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), std::string(4096, 'v')));
+    ASSERT_OK(Flush());
+  }
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[0].files.size(), 3U);
+  const std::vector<std::string> inputs{metadata.levels[0].files[0].name,
+                                        metadata.levels[0].files[1].name};
+  Statistics* const statistics = GetPrimaryStatistics();
+  ASSERT_EQ(statistics->getTickerCount(REMOTE_COMPACT_COARSE_FALLBACK_COUNT),
+            0U);
+  const int compactions_before = GetCompactionService()->GetCompactionNum();
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/0));
+  ASSERT_EQ(GetCompactionService()->GetCompactionNum(), compactions_before);
+  ASSERT_EQ(statistics->getTickerCount(REMOTE_COMPACT_COARSE_FALLBACK_COUNT),
+            1U);
+  ASSERT_EQ(log->matches(), 1);
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      0U);
+  ASSERT_EQ(OutputReferenceSamples(statistics), 0U);
+  ASSERT_EQ(Get("key0"), std::string(4096, 'v'));
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionRemoteOutputReferenceHistogram) {
+  // A feature-aware remote compaction that installs adds one sample per
+  // remote output SST to COMPACTION_OUTPUT_BLOB_REFERENCES on the primary, as
+  // a local compaction does. The sample is the number of blob references in
+  // the SST: here one, for key "b".
+  PrepareBlobIndirectionFallbackTest();
+  Statistics* const statistics = GetPrimaryStatistics();
+  ASSERT_EQ(OutputReferenceSamples(statistics), 0U);
+  const int local_before =
+      GetCompactionService()->GetUseLocalInstallationCount();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kSuccess);
+  ASSERT_EQ(GetCompactionService()->GetUseLocalInstallationCount(),
+            local_before);
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(files.size(), 1U);
+  HistogramData data;
+  statistics->histogramData(COMPACTION_OUTPUT_BLOB_REFERENCES, &data);
+  ASSERT_EQ(data.count, files.size());
+  ASSERT_EQ(data.sum, 1U);
+  ASSERT_EQ(statistics->getTickerCount(REMOTE_COMPACT_COARSE_FALLBACK_COUNT),
+            0U);
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      0U);
+  ASSERT_EQ(Get("b"), std::string(4096, 'b'));
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionContractDeclineCountsTicker) {
+  // The worker reports a result without the blob indirection protocol version.
+  // The primary declines it at the blob indirection contract check, counts the
+  // decline in REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT, and runs the job
+  // locally.
+  auto log = std::make_shared<RemoteBlobSignalLogCapture>(
+      "Remote blob indirection contract validation failed");
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  options.info_log = log;
+  ReopenWithCompactionService(&options);
+  ASSERT_OK(Put("a", std::string(4096, 'a')));
+  ASSERT_OK(Put("b", std::string(4096, 'b')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Flush());
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceCompactionJob::Run:0", [](void* argument) {
+        auto** result = static_cast<CompactionServiceResult**>(argument);
+        (*result)->blob_indirection_protocol_version = 0;
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Statistics* const statistics = GetPrimaryStatistics();
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      0U);
+  VerifyBlobIndirectionLocalFallback();
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      1U);
+  ASSERT_EQ(log->matches(), 1);
+  // The declined output was never imported, so the only sample is the one
+  // output of the local run.
+  ASSERT_EQ(OutputReferenceSamples(statistics), 1U);
+}
+
+TEST_F(CompactionServiceTest,
+       BlobIndirectionOutputValidationDeclineCountsTicker) {
+  // The primary reads a wrong column family ID from the table properties of
+  // the remote output (injected once), so the output validation fails. The
+  // primary declines the result, counts the decline in
+  // REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT, and runs the job locally.
+  auto log = std::make_shared<RemoteBlobSignalLogCapture>(
+      "Remote output validation failed");
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  options.info_log = log;
+  ReopenWithCompactionService(&options);
+  ASSERT_OK(Put("a", std::string(4096, 'a')));
+  ASSERT_OK(Put("b", std::string(4096, 'b')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Flush());
+
+  std::atomic<int> injected{0};
+  SyncPoint* sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceJob::Install:ActualTableIdentity", [&](void* argument) {
+        if (injected.fetch_add(1) == 0) {
+          static_cast<std::pair<uint64_t, uint64_t>*>(argument)->first += 1;
+        }
+      });
+  sync_point->EnableProcessing();
+  auto cleanup = Defer([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Statistics* const statistics = GetPrimaryStatistics();
+  VerifyBlobIndirectionLocalFallback();
+  ASSERT_EQ(injected.load(), 1);
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      1U);
+  ASSERT_EQ(log->matches(), 1);
+  // The primary rejected the remote output, so the only sample is the one
+  // output of the local run.
+  ASSERT_EQ(OutputReferenceSamples(statistics), 1U);
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+}
+
+TEST_F(CompactionServiceTest, RemoteBlobSignalsStayZeroWithoutIndirection) {
+  // A remote compaction of blob values without blob indirection installs
+  // normally and leaves the blob indirection remote signals at 0.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+  ASSERT_OK(Put("a", std::string(4096, 'a')));
+  ASSERT_OK(Put("b", std::string(4096, 'b')));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Flush());
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const SstFileMetaData& file : metadata.levels[0].files) {
+    inputs.push_back(file.db_path + "/" + file.name);
+  }
+  ASSERT_EQ(inputs.size(), 2U);
+  const int compactions_before = GetCompactionService()->GetCompactionNum();
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/1));
+  ASSERT_GT(GetCompactionService()->GetCompactionNum(), compactions_before);
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kSuccess);
+  Statistics* const statistics = GetPrimaryStatistics();
+  ASSERT_EQ(statistics->getTickerCount(REMOTE_COMPACT_COARSE_FALLBACK_COUNT),
+            0U);
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      0U);
+  ASSERT_EQ(OutputReferenceSamples(statistics), 0U);
+  ASSERT_EQ(Get("b"), std::string(4096, 'b'));
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionWorkerContractDeclineIsLogged) {
+  // The request carries a wrong relocation state fingerprint, so the worker
+  // declines the contract with TryAgain and names the failed check. The
+  // primary counts the decline in REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT,
+  // writes the worker's message to its info log, and runs the job locally.
+  std::shared_ptr<RemoteBlobSignalLogCapture> log =
+      std::make_shared<RemoteBlobSignalLogCapture>(
+          "Remote worker declined the blob indirection job");
+  PrepareBlobIndirectionFallbackTest(log);
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [](void* argument) {
+        static_cast<CompactionServiceInput*>(argument)
+            ->blob_relocation_state_fingerprint_low ^= 1;
+      });
+  sync_point->EnableProcessing();
+  Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Statistics* const statistics = GetPrimaryStatistics();
+  VerifyBlobIndirectionLocalFallback();
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      1U);
+  ASSERT_EQ(log->matches(), 1);
+  ASSERT_NE(log->last_match().find("relocation state fingerprint differs"),
+            std::string::npos)
+      << log->last_match();
+  // The worker wrote no output, so the only sample is the one output of the
+  // local run.
+  ASSERT_EQ(OutputReferenceSamples(statistics), 1U);
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionStartingLevelDeclineIsLogged) {
+  // With blob_file_starting_level = 1, a flush writes large values inline in
+  // L0. A remote compaction from L0 into L1 would have to write them to new
+  // blob files, which a feature-aware worker may not do. So the worker
+  // declines with TryAgain, and the primary counts the decline in
+  // REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT, logs it and runs the job
+  // locally. The local run writes the values to blob files.
+  std::shared_ptr<RemoteBlobSignalLogCapture> log =
+      std::make_shared<RemoteBlobSignalLogCapture>(
+          "Remote worker declined the blob indirection job");
+  Options options = CurrentOptions();
+  options.info_log = log;
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.blob_file_starting_level = 1;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  ReopenWithCompactionService(&options);
+
+  ASSERT_OK(Put("key", std::string(4096, 'v')));
+  ASSERT_OK(Flush());
+  ColumnFamilyData* cfd =
+      dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->current()->storage_info()->HasBlobIndirectionFormat());
+  ASSERT_TRUE(cfd->current()->storage_info()->GetBlobFiles().empty());
+
+  Statistics* const statistics = GetPrimaryStatistics();
+  MyTestCompactionService* const service = GetCompactionService();
+  const int compactions_before = service->GetCompactionNum();
+  const int local_before = service->GetUseLocalInstallationCount();
+  CompactRangeOptions compact_options;
+  compact_options.bottommost_level_compaction =
+      BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_EQ(service->GetCompactionNum(), compactions_before + 1);
+  ASSERT_EQ(service->GetUseLocalInstallationCount(), local_before + 1);
+  CompactionServiceResult result;
+  service->GetResult(&result);
+  ASSERT_EQ(result.status.code(), Status::Code::kTryAgain)
+      << result.status.ToString();
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      1U);
+  ASSERT_EQ(log->matches(), 1);
+  ASSERT_EQ(Get("key"), std::string(4096, 'v'));
+  cfd = dbfull()->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+  ASSERT_EQ(cfd->current()->storage_info()->GetBlobFiles().size(), 1U);
+}
+
+TEST_F(CompactionServiceTest,
+       BlobIndirectionRejectsSecondOutputAfterFirstImport) {
+  // The worker writes three output SSTs, one per key, because the SST
+  // partitioner cuts a file at each new first byte of the key. The primary
+  // imports and checks the first output, then the check of the second output
+  // fails (a wrong column family ID is injected). The primary must delete the
+  // first imported output, add no histogram sample for it, and run the job
+  // locally.
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_indirection = true;
+  options.enable_blob_garbage_collection = false;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  options.max_subcompactions = 1;
+  options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(1);
+  ReopenWithCompactionService(&options);
+  const std::array<std::string, 3> keys{{"a", "b", "c"}};
+  for (const std::string& key : keys) {
+    ASSERT_OK(Put(key, std::string(4096, key[0])));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("d", "small"));
+  ASSERT_OK(Delete("d"));
+  ASSERT_OK(Flush());
+
+  std::vector<std::string> sst_files_before;
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type = kTableFile;
+    if (ParseFileName(child, &number, &type) && type == kTableFile) {
+      sst_files_before.push_back(child);
+    }
+  }
+
+  std::atomic<int> checks{0};
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "CompactionServiceJob::Install:ActualTableIdentity", [&](void* argument) {
+        if (checks.fetch_add(1) == 1) {
+          static_cast<std::pair<uint64_t, uint64_t>*>(argument)->first += 1;
+        }
+      });
+  sync_point->EnableProcessing();
+  Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+  Statistics* const statistics = GetPrimaryStatistics();
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const SstFileMetaData& file : metadata.levels[0].files) {
+    inputs.push_back(file.db_path + "/" + file.name);
+  }
+  ASSERT_EQ(inputs.size(), 2U);
+  MyTestCompactionService* const service = GetCompactionService();
+  const int compactions_before = service->GetCompactionNum();
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/1));
+  ASSERT_EQ(service->GetCompactionNum(), compactions_before + 1);
+  CompactionServiceResult result;
+  service->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_EQ(result.output_files.size(), keys.size());
+  // The first output passed the check, and the second failed.
+  ASSERT_EQ(checks.load(), 2);
+  ASSERT_EQ(service->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kUseLocal);
+  ASSERT_EQ(
+      statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+      1U);
+  // Only the three outputs of the local run add a sample to
+  // COMPACTION_OUTPUT_BLOB_REFERENCES, not the imported first remote output.
+  ASSERT_EQ(OutputReferenceSamples(statistics), keys.size());
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  for (const std::string& key : keys) {
+    ASSERT_EQ(Get(key), std::string(4096, key[0]));
+  }
+
+  // Every SST in the DB directory is a live file or an input file that waits
+  // for deletion. So the primary deleted the imported first output.
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  ASSERT_EQ(live_files.size(), keys.size());
+  children.clear();
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type = kTableFile;
+    if (!ParseFileName(child, &number, &type) || type != kTableFile) {
+      continue;
+    }
+    const bool live = std::any_of(live_files.begin(), live_files.end(),
+                                  [&](const LiveFileMetaData& file) {
+                                    return file.file_number == number;
+                                  });
+    const bool input =
+        std::find(sst_files_before.begin(), sst_files_before.end(), child) !=
+        sst_files_before.end();
+    ASSERT_TRUE(live || input) << child;
+  }
+}
+
+TEST_F(CompactionServiceTest, BlobIndirectionRemoteL0OutputOpensAtLevel0) {
+  // A feature-aware remote compaction into L0 checks its output with a
+  // short-lived reader that does not go into the table cache. So the first
+  // reader of the output in the primary's table cache is opened at level 0,
+  // as for a local L0 output, and gets the level-dependent settings (for
+  // example the L0 metadata pinning).
+  PrepareBlobIndirectionFallbackTest();
+  const TableCache* const primary_table_cache = dbfull()
+                                                    ->GetVersionSet()
+                                                    ->GetColumnFamilySet()
+                                                    ->GetDefault()
+                                                    ->table_cache();
+  std::mutex mutex;
+  std::vector<std::pair<uint64_t, int>> cached_opens;
+  SyncPoint* const sync_point = SyncPoint::GetInstance();
+  sync_point->SetCallBack(
+      "TableCache::FindTable:OpenCachedReader", [&](void* argument) {
+        const auto& open =
+            *static_cast<std::tuple<const TableCache*, uint64_t, int>*>(
+                argument);
+        if (std::get<0>(open) == primary_table_cache) {
+          std::lock_guard<std::mutex> lock(mutex);
+          cached_opens.emplace_back(std::get<1>(open), std::get<2>(open));
+        }
+      });
+  sync_point->EnableProcessing();
+  Defer cleanup([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+  });
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const SstFileMetaData& file : metadata.levels[0].files) {
+    inputs.push_back(file.db_path + "/" + file.name);
+  }
+  ASSERT_EQ(inputs.size(), 2U);
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(), inputs, /*output_level=*/0));
+  ASSERT_EQ(GetCompactionService()->GetFinalCompactionServiceJobStatus(),
+            CompactionServiceJobStatus::kSuccess);
+  ASSERT_EQ(Get("b"), std::string(4096, 'b'));
+
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  ASSERT_EQ(files.size(), 1U);
+  ASSERT_EQ(files[0].level, 0);
+  std::lock_guard<std::mutex> lock(mutex);
+  const std::vector<std::pair<uint64_t, int>>::const_iterator first_open =
+      std::find_if(cached_opens.begin(), cached_opens.end(),
+                   [&](const std::pair<uint64_t, int>& open) {
+                     return open.first == files[0].file_number;
+                   });
+  ASSERT_NE(first_open, cached_opens.end());
+  ASSERT_EQ(first_open->second, 0);
+}
+
+// Adds a coarse classification property (frontier 0) to every SST that it
+// sees. The test below gives it to the worker only, so each remote output has
+// both an exact descriptor and a classification.
+class AddBlobReferenceClassificationCollector
+    : public TablePropertiesCollector {
+ public:
+  Status AddUserKey(const Slice& /*key*/, const Slice& /*value*/,
+                    EntryType /*type*/, SequenceNumber /*seq*/,
+                    uint64_t /*file_size*/) override {
+    return Status::OK();
+  }
+  Status Finish(UserCollectedProperties* properties) override {
+    std::string encoded;
+    EncodeBlobReferenceClassification(kInvalidBlobFileNumber, &encoded);
+    properties->emplace(kBlobReferenceClassificationPropertyName, encoded);
+    return Status::OK();
+  }
+  UserCollectedProperties GetReadableProperties() const override {
+    return UserCollectedProperties();
+  }
+  const char* Name() const override {
+    return "AddBlobReferenceClassificationCollector";
+  }
+};
+
+class AddBlobReferenceClassificationFactory
+    : public TablePropertiesCollectorFactory {
+ public:
+  TablePropertiesCollector* CreateTablePropertiesCollector(
+      TablePropertiesCollectorFactory::Context /*context*/) override {
+    return new AddBlobReferenceClassificationCollector();
+  }
+  const char* Name() const override {
+    return "AddBlobReferenceClassificationFactory";
+  }
+};
+
+TEST_F(CompactionServiceTest,
+       BlobIndirectionDeclinesOutputWithDescriptorAndClassification) {
+  // A remote output whose table properties have both an exact descriptor and
+  // a coarse classification must make the primary run the job locally, like
+  // any other failed check. A worker that runs this same code fails its own
+  // check first (ExtractBlobReferenceClassificationFromTableProperties()). A
+  // sync point clears that error on the worker only, to model a worker of
+  // another version that does not check. The worker finishes before the
+  // primary checks its result, so the callback stops clearing at the end of
+  // the worker run.
+  //
+  // Two cases:
+  //   1. The worker reports the classification in its result. The contract
+  //      check declines the result before the import.
+  //   2. The worker leaves the classification out of its result, but the
+  //      stored output file has it. The per-file check after the import
+  //      declines the output.
+  for (const bool reported : {true, false}) {
+    SCOPED_TRACE(reported ? "classification reported"
+                          : "classification only stored");
+    const std::string expected_line =
+        reported ? "Remote blob indirection contract validation failed"
+                 : "Remote output validation failed";
+    std::shared_ptr<RemoteBlobSignalLogCapture> log =
+        std::make_shared<RemoteBlobSignalLogCapture>(expected_line);
+    remote_table_properties_collector_factories.clear();
+    remote_table_properties_collector_factories.emplace_back(
+        std::make_shared<AddBlobReferenceClassificationFactory>());
+    PrepareBlobIndirectionFallbackTest(log);
+
+    std::atomic<bool> worker_done{false};
+    std::atomic<int> worker_errors_cleared{0};
+    SyncPoint* const sync_point = SyncPoint::GetInstance();
+    sync_point->SetCallBack(
+        "ExtractBlobReferenceClassificationFromTableProperties:BothProperties",
+        [&](void* argument) {
+          if (!worker_done.load()) {
+            *static_cast<Status*>(argument) = Status::OK();
+            worker_errors_cleared.fetch_add(1);
+          }
+        });
+    sync_point->SetCallBack(
+        "CompactionServiceCompactionJob::Run:0", [&](void* argument) {
+          worker_done.store(true);
+          CompactionServiceResult* const result =
+              *static_cast<CompactionServiceResult**>(argument);
+          for (CompactionServiceOutputFile& file : result->output_files) {
+            UserCollectedProperties& properties =
+                file.table_properties.user_collected_properties;
+            ASSERT_EQ(properties.count(kBlobReferenceDescriptorPropertyName),
+                      1U);
+            ASSERT_EQ(
+                properties.count(kBlobReferenceClassificationPropertyName), 1U);
+            if (!reported) {
+              properties.erase(kBlobReferenceClassificationPropertyName);
+            }
+          }
+        });
+    sync_point->EnableProcessing();
+    Defer cleanup([sync_point] {
+      sync_point->DisableProcessing();
+      sync_point->ClearAllCallBacks();
+    });
+
+    Statistics* const statistics = GetPrimaryStatistics();
+    VerifyBlobIndirectionLocalFallback();
+    ASSERT_GT(worker_errors_cleared.load(), 0);
+    CompactionServiceResult result;
+    GetCompactionService()->GetResult(&result);
+    ASSERT_OK(result.status);
+    ASSERT_EQ(result.output_files.size(), 1U);
+    ASSERT_EQ(
+        statistics->getTickerCount(REMOTE_COMPACT_BLOB_RESULT_DECLINED_COUNT),
+        1U);
+    ASSERT_EQ(log->matches(), 1);
+    ASSERT_NE(log->last_match().find(
+                  "both exact blob metadata and a coarse classification"),
+              std::string::npos)
+        << log->last_match();
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+    // The local output has exact metadata and no classification.
+    std::vector<LiveFileMetaData> files;
+    db_->GetLiveFilesMetaData(&files);
+    ASSERT_EQ(files.size(), 1U);
+    ColumnFamilyHandle* const default_cf = db_->DefaultColumnFamily();
+    TablePropertiesCollection properties;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(default_cf, &properties));
+    ASSERT_EQ(properties.size(), 1U);
+    const UserCollectedProperties& user_properties =
+        properties.begin()->second->user_collected_properties;
+    ASSERT_EQ(user_properties.count(kBlobReferenceDescriptorPropertyName), 1U);
+    ASSERT_EQ(user_properties.count(kBlobReferenceClassificationPropertyName),
+              0U);
+  }
+  remote_table_properties_collector_factories.clear();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

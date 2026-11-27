@@ -164,6 +164,14 @@ struct MutableCFOptions {
         preserve_internal_time_seconds(options.preserve_internal_time_seconds),
         verify_output_flags(options.verify_output_flags),
         enable_blob_files(options.enable_blob_files),
+        enable_blob_indirection(options.enable_blob_indirection),
+        pin_blob_relocation_location_blocks(
+            options.pin_blob_relocation_location_blocks),
+        blob_indirection_max_references_per_sst(
+            options.blob_indirection_max_references_per_sst),
+        indirect_blob_gc_read_coalesce_bytes(
+            options.indirect_blob_gc_read_coalesce_bytes),
+        indirect_blob_gc_garbage_ratio(options.indirect_blob_gc_garbage_ratio),
         min_blob_size(options.min_blob_size),
         blob_file_size(options.blob_file_size),
         blob_file_writable_file_max_buffer_size(
@@ -242,6 +250,11 @@ struct MutableCFOptions {
         preserve_internal_time_seconds(0),
         verify_output_flags(VerifyOutputFlags::kVerifyNone),
         enable_blob_files(false),
+        enable_blob_indirection(false),
+        pin_blob_relocation_location_blocks(false),
+        blob_indirection_max_references_per_sst(1 << 20),
+        indirect_blob_gc_read_coalesce_bytes(16384),
+        indirect_blob_gc_garbage_ratio(0.5),
         min_blob_size(0),
         blob_file_size(0),
         blob_file_writable_file_max_buffer_size(0),
@@ -350,6 +363,11 @@ struct MutableCFOptions {
 
   // Blob file related options
   bool enable_blob_files;
+  bool enable_blob_indirection;
+  bool pin_blob_relocation_location_blocks;
+  uint64_t blob_indirection_max_references_per_sst;
+  uint64_t indirect_blob_gc_read_coalesce_bytes;
+  double indirect_blob_gc_garbage_ratio;
   uint64_t min_blob_size;
   uint64_t blob_file_size;
   uint64_t blob_file_writable_file_max_buffer_size;
@@ -420,6 +438,34 @@ Status GetMutableOptionsFromStrings(
 // one of their fields can change the shared object in place.
 bool MutableCFOptionsUnchangedByMap(
     const MutableCFOptions& base_options,
+    const std::unordered_map<std::string, std::string>& options_map);
+
+// Returns true if options_map has a key for a Customizable option, mutable or
+// immutable, in any form: a field key such as
+// "table_factory.filter_policy.bloom_before_level" or "merge_operator.<field>",
+// or a whole-option key such as "block_based_table_factory" or
+// "merge_operator". Parsing such a key can change a live object in place, and
+// that object can be shared by several column families. Three examples:
+// - A field key of a mutable Customizable sets the field on the live object
+//   when that works (see TableFactoryParseFn()).
+// - The whole-option keys "block_based_table_factory" and
+//   "plain_table_factory" configure a clone of the live factory. The clone
+//   shares the nested objects of the live factory, such as its filter policy,
+//   so a value like "{filter_policy.<id>.<field>=<value>}" changes the shared
+//   policy. The key "table_factory" builds a new factory from its value
+//   instead, so it does not change the live factory.
+// - SetOptions() cannot replace the object of an immutable Customizable such
+//   as merge_operator, but it changes a field of the live object when the
+//   object registers that field as mutable (OptionTypeFlags::kMutable).
+// Some counted keys change no live object, for example
+// "table_factory=BlockBasedTable". Counting such a key has a cost after a
+// failed SetOptions() call: the next SetOptions() call that changes no option
+// does not return early. It builds new Versions and SuperVersions for its
+// column families and writes an OPTIONS file. This happens once for each
+// failed call. A field of a struct option (for example
+// "compaction_options_fifo.max_table_files_size") does not count, because
+// parsing it never changes a live object.
+bool OptionsMapSetsCustomizableOption(
     const std::unordered_map<std::string, std::string>& options_map);
 
 #ifndef NDEBUG

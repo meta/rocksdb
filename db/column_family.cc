@@ -20,6 +20,8 @@
 
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_reference_census.h"
+#include "db/blob/blob_reference_metadata.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -40,6 +42,7 @@
 #include "port/port.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
+#include "table/adaptive/adaptive_table_factory.h"
 #include "table/merging_iterator.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
@@ -686,7 +689,8 @@ ColumnFamilyData::ColumnFamilyData(
                                       db_session_id, fast_sst_open, name_));
     blob_file_cache_.reset(
         new BlobFileCache(_table_cache, &ioptions(), soptions(), id_,
-                          internal_stats_->GetBlobFileReadHist(), io_tracer));
+                          internal_stats_->GetBlobFileReadHist(), io_tracer,
+                          db_session_id, block_cache_tracer));
     blob_source_.reset(new BlobSource(ioptions_, mutable_cf_options_, db_id,
                                       db_session_id, blob_file_cache_.get()));
     // Let the table cache route same-file ("embedded") blob reads through the
@@ -750,6 +754,26 @@ ColumnFamilyData::ColumnFamilyData(
                   bbto->block_cache));
     }
   }
+}
+
+BlobReferenceCensus* ColumnFamilyData::GetOrCreateBlobReferenceCensus() {
+  if (blob_reference_census_storage_ == nullptr) {
+    blob_reference_census_storage_ = std::make_unique<BlobReferenceCensus>();
+    // A new census has no published view yet. Mark it unready now, so that a
+    // census whose first build never starts (the job is not scheduled, or
+    // background work is paused) reports its unready time instead of 0.
+    blob_reference_census_storage_->NoteUnready(ioptions_.clock->NowMicros());
+    blob_reference_census_.store(blob_reference_census_storage_.get(),
+                                 std::memory_order_release);
+  }
+  return blob_reference_census_storage_.get();
+}
+
+BlobReferenceCensusGarbage ColumnFamilyData::CancelBlobReferenceCensus() {
+  if (blob_reference_census_storage_ == nullptr) {
+    return {};
+  }
+  return blob_reference_census_storage_->Cancel();
 }
 
 // DB mutex held
@@ -1283,9 +1307,32 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 }
 
 bool ColumnFamilyData::NeedsCompaction() const {
-  return is_table_builder_supported_ &&
-         !mutable_cf_options_.disable_auto_compactions &&
-         compaction_picker_->NeedsCompaction(current_->storage_info());
+  Version* const current = current_;
+  // Removing blob files and relocation files that hold no live value from the
+  // Version is not an LSM compaction and copies no value. So it runs even when
+  // disable_auto_compactions is set or blob GC or blob indirection is off.
+  const BlobReferenceCensus* const census = blob_reference_census();
+  if (current != nullptr && census != nullptr &&
+      current->storage_info()->HasEmptyBlobGcCandidate() &&
+      census->IsReady(current->GetVersionNumber())) {
+    return true;
+  }
+  if (!is_table_builder_supported_ ||
+      mutable_cf_options_.disable_auto_compactions) {
+    return false;
+  }
+  if (current == nullptr) {
+    return false;
+  }
+  if (compaction_picker_->NeedsCompaction(current->storage_info())) {
+    return true;
+  }
+  return mutable_cf_options_.enable_blob_files &&
+         mutable_cf_options_.enable_blob_garbage_collection &&
+         mutable_cf_options_.enable_blob_indirection &&
+         current->storage_info()->BlobPhysicalFileForIndirectBlobGC() !=
+             kInvalidBlobFileNumber &&
+         census != nullptr && census->IsReady(current->GetVersionNumber());
 }
 
 Compaction* ColumnFamilyData::PickCompaction(
@@ -1530,9 +1577,33 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
   }
 }
 
+Status CheckBlobIndirectionCompactionStyle(CompactionStyle style,
+                                           bool has_blob_indirection) {
+  if (has_blob_indirection && style == kCompactionStyleFIFO) {
+    return Status::NotSupported("Blob indirection is incompatible with FIFO");
+  }
+  return Status::OK();
+}
+
+Status CheckBlobIndirectionCompactionStyle(
+    const std::vector<ColumnFamilyDescriptor>& column_families) {
+  for (const ColumnFamilyDescriptor& cf : column_families) {
+    Status s = CheckBlobIndirectionCompactionStyle(
+        cf.options.compaction_style, cf.options.enable_blob_indirection);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  return Status::OK();
+}
+
 Status ColumnFamilyData::ValidateOptions(
     const DBOptions& db_options, const ColumnFamilyOptions& cf_options) {
-  Status s;
+  Status s = CheckBlobIndirectionCompactionStyle(
+      cf_options.compaction_style, cf_options.enable_blob_indirection);
+  if (!s.ok()) {
+    return s;
+  }
   s = CheckCompressionSupported(cf_options);
   if (s.ok() && db_options.allow_concurrent_memtable_write) {
     s = CheckConcurrentWritesSupported(cf_options);
@@ -1604,6 +1675,37 @@ Status ColumnFamilyData::ValidateOptions(
       return Status::NotSupported(
           "Blob direct write does not support user-defined timestamps.");
     }
+  }
+  if (cf_options.enable_blob_indirection && !cf_options.enable_blob_files) {
+    return Status::InvalidArgument(
+        "enable_blob_indirection requires enable_blob_files=true");
+  }
+  if (cf_options.blob_indirection_max_references_per_sst <
+          kMinBlobIndirectionMaxReferencesPerSst ||
+      cf_options.blob_indirection_max_references_per_sst >
+          kMaxBlobIndirectionMaxReferencesPerSst) {
+    return Status::InvalidArgument(
+        "blob_indirection_max_references_per_sst must be in [" +
+        std::to_string(kMinBlobIndirectionMaxReferencesPerSst) + ", " +
+        std::to_string(kMaxBlobIndirectionMaxReferencesPerSst) + "]");
+  }
+  // The negated form also rejects NaN. At 0, GC would pick files with no
+  // garbage, and then could not make its outputs smaller than its inputs.
+  if (!(cf_options.indirect_blob_gc_garbage_ratio > 0.0 &&
+        cf_options.indirect_blob_gc_garbage_ratio <= 1.0)) {
+    return Status::InvalidArgument(
+        "indirect_blob_gc_garbage_ratio must be in (0, 1]");
+  }
+  if (cf_options.enable_blob_indirection &&
+      cf_options.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob indirection and blob direct write cannot be enabled together");
+  }
+  if (cf_options.enable_blob_indirection &&
+      !cf_options.table_factory->IsInstanceOf(
+          TableFactory::kBlockBasedTableName())) {
+    return Status::NotSupported(
+        "Blob indirection requires Block-Based Table format");
   }
   if (ucmp->timestamp_size() > 0 &&
       !cf_options.persist_user_defined_timestamps) {
@@ -1737,11 +1839,61 @@ Status ColumnFamilyData::ValidateOptions(
   return s;
 }
 
-Status ColumnFamilyData::SetOptions(
+Status ColumnFamilyData::ValidateBlobIndirectionOptionsAfterRecovery() const {
+  Status s = CheckBlobIndirectionCompactionStyle(
+      ioptions_.compaction_style,
+      GetLatestMutableCFOptions().enable_blob_indirection ||
+          (current_ != nullptr &&
+           current_->storage_info()->HasBlobIndirectionFormat()));
+  if (!s.ok()) {
+    return s;
+  }
+  if (current_ == nullptr ||
+      !current_->storage_info()->HasBlobIndirectionFormat()) {
+    return Status::OK();
+  }
+  if (ioptions_.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "Blob direct write cannot open a column family with blob indirection "
+        "state");
+  }
+
+  if (GetBlockBasedTableWriterOptions(
+          initial_cf_options_.table_factory.get()) == nullptr) {
+    return Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
+  }
+  return Status::OK();
+}
+
+bool ColumnFamilyData::HasBlobIndirectionStateOrPendingActivation() const {
+  return (current_ != nullptr &&
+          current_->storage_info()->HasBlobIndirectionFormat()) ||
+         HasPendingBlobIndirectionOutput();
+}
+
+bool ColumnFamilyData::MayUseBlobIndirection() const {
+  return GetLatestMutableCFOptions().enable_blob_indirection ||
+         HasBlobIndirectionStateOrPendingActivation();
+}
+
+Status ColumnFamilyData::CheckBlobIndirectionTableWriter(
+    const MutableCFOptions& options) const {
+  if (HasBlobIndirectionStateOrPendingActivation() &&
+      GetBlockBasedTableWriterOptions(options.table_factory.get()) == nullptr) {
+    return Status::NotSupported(
+        "Blob indirection state requires a Block-Based Table writer");
+  }
+  return Status::OK();
+}
+
+Status ColumnFamilyData::PrepareMutableCFOptions(
     const DBOptions& db_opts,
-    const std::unordered_map<std::string, std::string>& options_map) {
+    const std::unordered_map<std::string, std::string>& options_map,
+    MutableCFOptions* mutable_cf_options) const {
+  assert(mutable_cf_options != nullptr);
   ColumnFamilyOptions cf_opts =
-      BuildColumnFamilyOptions(initial_cf_options_, mutable_cf_options_);
+      BuildColumnFamilyOptions(initial_cf_options_, *mutable_cf_options);
   ConfigOptions config_opts;
   config_opts.mutable_options_only = true;
 #ifndef NDEBUG
@@ -1756,19 +1908,43 @@ Status ColumnFamilyData::SetOptions(
     // ValidateOptions().
     s = ValidateOptions(db_opts, cf_opts);
   }
+  // A CF with the format fence, or with a flush or compaction that was picked
+  // with the option on, needs a supported compaction style and a Block-Based
+  // Table writer: its later flush and compaction outputs must store blob
+  // reference metadata (exact metadata or the coarse classification), which
+  // only the Block-Based Table writes, and relocation files must stay readable.
+  // Turning enable_blob_indirection off does not cancel such a job, which may
+  // still set the first fence, and does not remove the fence. The pending check
+  // is O(1). A job can still become pending after this check, while the
+  // MANIFEST writer has the DB mutex released, so the writer checks the table
+  // factory again before it publishes the options
+  // (CheckBlobIndirectionTableWriter()).
+  if (s.ok() && HasBlobIndirectionStateOrPendingActivation()) {
+    s = CheckBlobIndirectionCompactionStyle(cf_opts.compaction_style, true);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  MutableCFOptions new_options(cf_opts);
+  new_options.RefreshDerivedOptions(ioptions_);
+  s = CheckBlobIndirectionTableWriter(new_options);
   if (s.ok()) {
-    mutable_cf_options_ = MutableCFOptions(cf_opts);
-    mutable_cf_options_.RefreshDerivedOptions(ioptions_);
-    options_install_pending_ = true;
+    *mutable_cf_options = std::move(new_options);
   }
   return s;
+}
+
+void ColumnFamilyData::PublishMutableCFOptions(
+    const MutableCFOptions& mutable_cf_options) {
+  mutable_cf_options_ = mutable_cf_options;
+  options_install_pending_ = true;
 }
 
 bool ColumnFamilyData::SetOptionsIsNoOp(
     const DBOptions& db_opts,
     const std::unordered_map<std::string, std::string>& options_map) const {
-  // SetOptions() validates the resulting options, so a request that changes
-  // nothing must pass the same check to return the same status.
+  // PrepareMutableCFOptions() validates the resulting options, so a request
+  // that changes nothing must pass the same check to return the same status.
   return !IsDropped() && !options_install_pending_ &&
          MutableCFOptionsUnchangedByMap(mutable_cf_options_, options_map) &&
          ValidateOptions(db_opts, GetLatestCFOptions()).ok();

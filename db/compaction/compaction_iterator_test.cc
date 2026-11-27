@@ -198,6 +198,8 @@ class FakeCompaction : public CompactionIterator::CompactionProxy {
 
   bool enable_blob_garbage_collection() const override { return false; }
 
+  bool enable_blob_indirection() const override { return true; }
+
   double blob_garbage_collection_age_cutoff() const override { return 0.0; }
 
   uint64_t blob_compaction_readahead_size() const override { return 0; }
@@ -321,8 +323,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
     InternalIterator* input = iter_.get();
     if (repair_enabled_) {
       repair_iter_ = std::make_unique<MissingBlobRepairIterator>(
-          input, repair_storage_.get(), cmp_->timestamp_size(),
-          repair_only_dropped_blob_files_);
+          input, repair_storage_.get(), cmp_->timestamp_size(), repair_mode_);
       input = repair_iter_.get();
     }
     c_iter_.reset(new CompactionIterator(
@@ -334,8 +335,9 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
         nullptr /* blob_file_builder */, true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse_,
-        std::move(compaction), /*must_count_input_entries=*/false, filter,
-        &shutting_down_, /*info_log=*/nullptr, full_history_ts_low));
+        std::move(compaction), /*must_count_input_entries=*/false,
+        /*allow_blob_index_flattening=*/true, filter, &shutting_down_,
+        /*info_log=*/nullptr, full_history_ts_low));
     c_iter_->SetMissingBlobRepairIterator(repair_iter_.get());
   }
 
@@ -345,7 +347,7 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
                                std::vector<uint64_t> dropped_files) {
     EnableMissingBlobRepair(healthy_files);
     repair_storage_->SetDroppedBlobFiles(std::move(dropped_files));
-    repair_only_dropped_blob_files_ = true;
+    repair_mode_ = MissingBlobRepairIterator::Mode::kDroppedOrLostFiles;
   }
 
   void EnableMissingBlobRepair(const std::vector<uint64_t>& healthy_files) {
@@ -425,7 +427,8 @@ class CompactionIteratorTest : public testing::TestWithParam<bool> {
   const std::atomic<bool> kManualCompactionCanceledFalse_{false};
   FakeCompaction* compaction_proxy_ = nullptr;
   bool repair_enabled_ = false;
-  bool repair_only_dropped_blob_files_ = false;
+  MissingBlobRepairIterator::Mode repair_mode_ =
+      MissingBlobRepairIterator::Mode::kMissingFiles;
 };
 
 TEST_P(CompactionIteratorTest, MergeBeforeFilterFullOrder) {
@@ -1098,9 +1101,9 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesInputErrors) {
   EnableMissingBlobRepair({20});
   std::unique_ptr<InternalIterator> failed_input(
       NewErrorInternalIterator(Status::IOError("Failed SST read")));
-  MissingBlobRepairIterator failed_repair(failed_input.get(),
-                                          repair_storage_.get(), 0,
-                                          /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator failed_repair(
+      failed_input.get(), repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kMissingFiles);
   failed_repair.SeekToFirst();
   ASSERT_FALSE(failed_repair.Valid());
   ASSERT_EQ(failed_repair.status().code(), Status::Code::kIOError);
@@ -1141,8 +1144,9 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairPreservesInputErrors) {
 
   FailingNextIterator input({test::KeyStr("a", 5, kTypeBlobIndex)},
                             {BlobIndexForFile(20)}, &icmp_);
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kMissingFiles);
   repair.SeekToFirst();
   ASSERT_OK(repair.status());
   ASSERT_TRUE(repair.Valid());
@@ -1165,8 +1169,9 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairOnlyDroppedBlobFiles) {
        test::KeyStr("c", 3, kTypeBlobIndex)},
       {BlobIndexForFile(10), BlobIndexForFile(20), BlobIndexForFile(30)},
       &icmp_);
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
-                                   /*only_dropped_blob_files=*/true);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kDroppedOrLostFiles);
   repair.SeekToFirst();
   ASSERT_TRUE(repair.Valid());
   ASSERT_EQ(repair.key(), test::KeyStr("a", 5, kTypeBlobIndex));
@@ -1230,8 +1235,9 @@ TEST_P(CompactionIteratorTest, MissingBlobRepairSeekAndNextUseRewrittenKeys) {
   VectorIterator input(
       {test::KeyStr("a", 5, kTypeBlobIndex), test::KeyStr("b", 4, kTypeValue)},
       {BlobIndexForFile(10), "healthy"}, &icmp_);
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kMissingFiles);
   const std::string deletion = test::KeyStr("a", 5, kTypeDeletion);
   repair.Seek(deletion);
   ASSERT_OK(repair.status());
@@ -1258,16 +1264,18 @@ TEST_P(CompactionIteratorTest,
   {
     std::unique_ptr<InternalIterator> input(
         NewErrorInternalIterator(Status::IOError("Failed SST read")));
-    MissingBlobRepairIterator repair(input.get(), repair_storage_.get(), 0,
-                                     /*only_dropped_blob_files=*/false);
+    MissingBlobRepairIterator repair(
+        input.get(), repair_storage_.get(), 0,
+        MissingBlobRepairIterator::Mode::kMissingFiles);
     ASSERT_FALSE(repair.Valid());
   }
   VectorIterator input({test::KeyStr("a", 5, kTypeWideColumnEntity)},
                        {"invalid entity"});
   input.SeekToFirst();
   ASSERT_TRUE(input.Valid());
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(), 0,
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), 0,
+      MissingBlobRepairIterator::Mode::kMissingFiles);
 }
 
 // It is possible that the output of the compaction iterator is empty even if
@@ -1279,6 +1287,37 @@ TEST_P(CompactionIteratorTest, EmptyResult) {
   c_iter_->SeekToFirst();
   ASSERT_OK(c_iter_->status());
   ASSERT_FALSE(c_iter_->Valid());
+}
+
+// A compaction without a blob file builder calls DeclineSstOnlyBlobOutput() for
+// a value only when the SST-only blob output policy is set (see
+// SetSstOnlyBlobOutputPolicy()). Without the policy, which is the usual case,
+// no key calls it. With the policy, a large value fails the compaction with
+// TryAgain.
+TEST_P(CompactionIteratorTest, SstOnlyBlobOutputCheckedOnlyWithPolicy) {
+  int decline_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionIterator::DeclineSstOnlyBlobOutput",
+      [&](void* /*arg*/) { ++decline_calls; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  RunTest({test::KeyStr("a", 3, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+          {"value-a", "value-b"},
+          {test::KeyStr("a", 3, kTypeValue), test::KeyStr("b", 2, kTypeValue)},
+          {"value-a", "value-b"});
+  EXPECT_EQ(decline_calls, 0);
+
+  // With the policy set, a value of at least the minimum size (4 bytes here)
+  // fails the compaction with TryAgain.
+  InitIterators({test::KeyStr("a", 3, kTypeValue)}, {"value-a"}, {}, {},
+                kMaxSequenceNumber);
+  c_iter_->SetSstOnlyBlobOutputPolicy(/*min_blob_size=*/4);
+  c_iter_->SeekToFirst();
+  EXPECT_TRUE(c_iter_->status().IsTryAgain());
+  EXPECT_EQ(decline_calls, 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 // If there is a corruption after a single deletion, the compaction should fail.
@@ -2407,9 +2446,9 @@ TEST_P(CompactionIteratorTsGcTest,
                        {BlobIndexForFile(10)});
   input.SeekToFirst();
   ASSERT_TRUE(input.Valid());
-  MissingBlobRepairIterator repair(&input, repair_storage_.get(),
-                                   cmp_->timestamp_size(),
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &input, repair_storage_.get(), cmp_->timestamp_size(),
+      MissingBlobRepairIterator::Mode::kMissingFiles);
 }
 
 TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryTrimming) {
@@ -2423,9 +2462,9 @@ TEST_P(CompactionIteratorTsGcTest, MissingBlobRepairRespectsHistoryTrimming) {
   std::string trim_timestamp;
   PutFixed64(&trim_timestamp, 103);
   HistoryTrimmingIterator trimmed(&input, cmp_, trim_timestamp);
-  MissingBlobRepairIterator repair(&trimmed, repair_storage_.get(),
-                                   cmp_->timestamp_size(),
-                                   /*only_dropped_blob_files=*/false);
+  MissingBlobRepairIterator repair(
+      &trimmed, repair_storage_.get(), cmp_->timestamp_size(),
+      MissingBlobRepairIterator::Mode::kMissingFiles);
   repair.SeekToFirst();
   ASSERT_OK(repair.status());
   ASSERT_TRUE(repair.Valid());
@@ -2526,6 +2565,36 @@ TEST_P(CompactionIteratorTsGcTest, HistoryGcKeepsWideBlobTimestamp) {
           {entity, inline_entity}, kMaxSequenceNumber, nullptr, nullptr, true,
           kMaxSequenceNumber, false, &history_low);
   ASSERT_EQ(c_iter_->iter_stats().num_blobs_read, 0);
+}
+
+TEST_P(CompactionIteratorTsGcTest,
+       HistoryGcFindsWideBlobWithoutValidatingIndex) {
+  // When the history GC zeroes a sequence number, the compaction iterator
+  // looks for external blob references with
+  // WideColumnSerialization::ForEachBlobFileNumber(), the same walk that
+  // RocksDB uses when blob indirection is off. It
+  // only decodes each blob index and does not run BlobIndex::Validate(). Here
+  // the blob index has a compression type that is neither built in nor
+  // custom. Validate() rejects it, but the compaction must still keep the
+  // timestamp of the entity.
+  std::string history_low;
+  PutFixed64(&history_low, 104);
+  const CompressionType invalid_compression =
+      static_cast<CompressionType>(kLastBuiltinCompression + 1);
+  ASSERT_LT(invalid_compression, kFirstCustomCompression);
+  std::string blob_encoding;
+  BlobIndex::EncodeBlob(&blob_encoding, /*file_number=*/20, /*offset=*/100,
+                        /*size=*/200, invalid_compression);
+  BlobIndex blob;
+  ASSERT_OK(blob.DecodeFrom(blob_encoding));
+  ASSERT_EQ(blob.Validate().code(), Status::kCorruption);
+  std::string entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(
+      WideColumns{{"", "inline"}, {"b", ""}}, {{1, blob}}, entity));
+  RunTest({test::KeyStr(103, "a", 5, kTypeWideColumnEntity)}, {entity},
+          {test::KeyStr(103, "a", 0, kTypeWideColumnEntity)}, {entity},
+          kMaxSequenceNumber, nullptr, nullptr, true, kMaxSequenceNumber, false,
+          &history_low);
 }
 
 TEST_P(CompactionIteratorTsGcTest, HistoryGcKeepsBlobSnapshotStripes) {
@@ -3042,7 +3111,8 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
         write_hint, nullptr /*IOTracer*/,
         nullptr /*BlobFileCompletionCallback*/, BlobFileCreationReason::kFlush,
         immutable_options.cf_paths.front().path, &blob_file_paths_,
-        &blob_file_additions_);
+        &blob_file_additions_,
+        /*blob_source=*/nullptr);
 
     // Set up the input iterator
     const Comparator* cmp = BytewiseComparator();
@@ -3075,7 +3145,8 @@ class WideColumnEntityBlobExtractionTest : public testing::Test {
         &blob_file_builder, true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/, manual_compaction_canceled,
         nullptr /*compaction*/, false /*must_count_input_entries*/,
-        nullptr /*compaction_filter*/, &shutting_down);
+        false /*allow_blob_index_flattening*/, nullptr /*compaction_filter*/,
+        &shutting_down);
 
     c_iter.SeekToFirst();
     while (c_iter.Valid()) {
@@ -3369,6 +3440,10 @@ class FakeCompactionWithBlobGC : public CompactionIterator::CompactionProxy {
     return enable_blob_gc_;
   }
 
+  bool enable_blob_indirection() const override {
+    return enable_blob_indirection_;
+  }
+
   double blob_garbage_collection_age_cutoff() const override {
     return blob_gc_age_cutoff_;
   }
@@ -3392,6 +3467,7 @@ class FakeCompactionWithBlobGC : public CompactionIterator::CompactionProxy {
   // NOTE: Integration tests for entity blob GC with a real Version exist in
   // db_wide_basic_test.cc (CompactionFilterWithBlobGC test).
   bool enable_blob_gc_ = false;
+  bool enable_blob_indirection_ = true;
   double blob_gc_age_cutoff_ = 1.0;
 };
 
@@ -3485,7 +3561,8 @@ class WideColumnEntityBlobGCTest : public testing::Test {
           nullptr /*BlobFileCompletionCallback*/,
           BlobFileCreationReason::kCompaction,
           immutable_options.cf_paths.front().path, &blob_file_paths_,
-          &blob_file_additions_);
+          &blob_file_additions_,
+          /*blob_source=*/nullptr);
     }
 
     // Set up the input iterator
@@ -3525,7 +3602,8 @@ class WideColumnEntityBlobGCTest : public testing::Test {
         blob_file_builder.get(), true /*allow_data_in_errors*/,
         true /*enforce_single_del_contracts*/, manual_compaction_canceled,
         std::move(fake_compaction), false /*must_count_input_entries*/,
-        compaction_filter, &shutting_down);
+        true /*allow_blob_index_flattening*/, compaction_filter,
+        &shutting_down);
 
     c_iter.SeekToFirst();
     while (c_iter.Valid()) {
@@ -3959,7 +4037,7 @@ TEST_F(WideColumnEntityBlobGCTest, EagerBlobResolutionWithoutFetcher) {
       kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
       Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
       true, true, manual_compaction_canceled, std::move(fake_compaction), false,
-      &filter, &shutting_down);
+      true /*allow_blob_index_flattening*/, &filter, &shutting_down);
 
   c_iter.SeekToFirst();
   ASSERT_FALSE(c_iter.Valid());
@@ -4023,7 +4101,7 @@ TEST_F(WideColumnEntityBlobGCTest,
       kMaxSequenceNumber, kMaxSequenceNumber, kMaxSequenceNumber, nullptr,
       Env::Default(), false, range_del_agg.get(), nullptr /*blob_file_builder*/,
       true, true, manual_compaction_canceled, std::move(fake_compaction), false,
-      &keep_filter, &shutting_down);
+      true /*allow_blob_index_flattening*/, &keep_filter, &shutting_down);
 
   c_iter.SeekToFirst();
   ASSERT_TRUE(c_iter.Valid());

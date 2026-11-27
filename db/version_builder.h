@@ -48,10 +48,50 @@ class VersionBuilder {
 
   bool CheckConsistencyForNumLevels();
 
+  // Applies `edit` to the builder. The caller must make sure that no other
+  // thread uses the builder and that its base Version stays alive. Callers
+  // usually do this by holding the DB mutex. Offline tools that own the
+  // VersionSet alone (for example OfflineManifestWriter) hold no DB mutex. In
+  // the unlocked apply of LogAndApplyWithUnlockedApply(),
+  // VersionSet::LogAndApplyHelper() owns the builder, holds a reference to its
+  // base Version and is the head of the MANIFEST writer queue, so no other
+  // thread changes the builder or installs a Version.
   Status Apply(const VersionEdit* edit);
 
   // Save the current Version to the provided `vstorage`.
-  Status SaveTo(VersionStorageInfo* vstorage) const;
+  Status SaveTo(VersionStorageInfo* vstorage);
+
+  // Saving a Version can also be done in two steps, so that step 2 (the blob
+  // files and the consistency check) can run with the DB mutex released (see
+  // VersionSet::ProcessManifestWrites()). Step 1 saves the SST metadata and
+  // the compact cursors. The caller must hold the DB mutex, because this step
+  // increments FileMetaData reference counts, which are not atomic.
+  Status SaveTableFilesTo(VersionStorageInfo* vstorage) const;
+
+  // Step 2, after SaveTableFilesTo(), does two things: it saves the blob file
+  // metadata and the list of dropped blob files (see
+  // VersionStorageInfo::GetDroppedBlobFiles()), and then it checks the
+  // consistency of the whole new Version, SST files and blob files. When
+  // force_consistency_checks is on (the default) or in debug builds, the check
+  // walks every SST. We expect, without a measurement, that this check is the
+  // main cost of this step. This step is different from
+  // VersionStorageInfo::PrepareForVersionAppend(), which builds derived data
+  // such as file indexes. VersionSet::AppendVersion() marks the
+  // VersionStorageInfo as finalized later.
+  //
+  // Step 2 does not need the DB mutex, because no other thread changes the
+  // state it reads. The builder and the new Version are not shared yet. The
+  // parts of the base Version that this step reads (its blob file list, its
+  // dropped blob file list and its relocation state, and the file numbers,
+  // keys, sequence numbers, epoch numbers and oldest blob file numbers of its
+  // SSTs) do not change while the base Version is referenced. So the caller
+  // must keep the base Version of the builder referenced until this returns.
+  //
+  // The step copies shared_ptr<BlobFileMetaData> (the reference count is
+  // atomic) and creates new BlobFileMetaData objects for the blob files that
+  // the edits add or change. It does not touch FileMetaData reference
+  // counts.
+  Status SaveBlobFilesAndCheckTo(VersionStorageInfo* vstorage);
 
   // Load table handlers for newly added files in the builder. This does not
   // load any files in the base storage.
@@ -87,6 +127,29 @@ class VersionBuilder {
   // REQUIRES: track_found_and_missing_files and allow_incomplete_valid_version
   // are true, and no edit has been applied yet.
   void RecordMissingBlobFilesAsDropped();
+
+  // Returns true after RecordMissingBlobFilesAsDropped() was called.
+  // VersionEditHandlerPointInTime::CheckRepairFallbackAgainstGc() uses it to
+  // skip the builders that do not record dropped blob files.
+  bool RecordsMissingBlobFilesAsDropped() const;
+
+  // Moves out the staged relocation file and route changes, which can be large
+  // after a long replay, so that they can be freed without the DB mutex while
+  // the builder itself is destroyed under it (see
+  // VersionSet::FreeBlobRelocationState()). Returns null when there is nothing
+  // to move. The builder must not be used afterwards.
+  std::shared_ptr<void> ReleaseBlobRelocationChanges();
+
+  // True if a relocation file that the current replay state still uses is
+  // missing on disk or fails verification. A file that an old edit added and a
+  // later edit deleted does not count. Requires tracking of found and missing
+  // files.
+  bool HasMissingBlobRelocationFiles() const;
+
+  // True if an edit applied to this builder removed blob file `file_number` on
+  // purpose: a blob file retirement (indirect blob GC moved its values) or a
+  // relocation file deletion.
+  bool IsBlobFileRemovedByGc(uint64_t file_number) const;
 
   // When applying a sequence of VersionEdits, intermediate files are the ones
   // that are added and then deleted. Returns the tracked files and clears them
@@ -127,6 +190,7 @@ class BaseReferencedVersionBuilder {
       bool allow_incomplete_valid_version = false);
   ~BaseReferencedVersionBuilder();
   VersionBuilder* version_builder() const { return version_builder_.get(); }
+  Version* base_version() const { return version_; }
 
  private:
   std::unique_ptr<VersionBuilder> version_builder_;

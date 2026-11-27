@@ -19,21 +19,31 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// Replaces references absent from an immutable input Version with deletions
-// or entities containing the surviving columns. With `only_dropped_blob_files`,
-// only references to blob files recorded as dropped in the input Version (see
-// VersionStorageInfo::GetDroppedBlobFiles()) are replaced; otherwise
-// references to any blob file absent from it are. Input values must already be
-// prepared, as they are for compaction input. Neither input is owned.
+// Replaces references that an immutable input Version cannot serve with
+// deletions or entities containing the surviving columns. Input values must
+// already be prepared, as they are for compaction input. Neither input is
+// owned.
 class MissingBlobRepairIterator : public InternalIterator {
  public:
+  // Which references are repaired.
+  enum class Mode {
+    // References to blob files absent from the input Version
+    // (skip_missing_blob_files).
+    kMissingFiles,
+    // References to blob files that the input Version records as dropped (see
+    // VersionStorageInfo::GetDroppedBlobFiles()), and indirect references
+    // whose physical file the input Version marks lost
+    // (VersionStorageInfo::IsBlobReferenceLost()).
+    kDroppedOrLostFiles,
+  };
+
   MissingBlobRepairIterator(InternalIterator* input,
                             const VersionStorageInfo* input_storage,
-                            size_t timestamp_size, bool only_dropped_blob_files)
+                            size_t timestamp_size, Mode mode)
       : input_(input),
         input_storage_(input_storage),
         timestamp_size_(timestamp_size),
-        only_dropped_blob_files_(only_dropped_blob_files) {
+        mode_(mode) {
     assert(input_);
     assert(input_storage_);
     Update();
@@ -159,11 +169,12 @@ class MissingBlobRepairIterator : public InternalIterator {
 
  private:
   // Only external, non-TTL indexes use the input Version's blob file set.
-  // Absence is checked in metadata; inline, same-file and legacy TTL indexes
-  // retain their existing resolution rules.
+  // Absence, drop and loss are checked in metadata; inline, same-file and
+  // legacy TTL indexes retain their existing resolution rules.
   bool IsMissing(const BlobIndex& index) const {
-    if (only_dropped_blob_files_) {
-      return input_storage_->IsDroppedBlobIndex(index);
+    if (mode_ == Mode::kDroppedOrLostFiles) {
+      return input_storage_->IsDroppedBlobIndex(index) ||
+             input_storage_->IsBlobReferenceLost(index);
     }
     if (index.IsInlined() || index.HasTTL() || index.IsSameFile()) {
       return false;
@@ -246,7 +257,7 @@ class MissingBlobRepairIterator : public InternalIterator {
   std::string repaired_key_;
   std::string repaired_value_;
   Status status_;
-  bool only_dropped_blob_files_;
+  Mode mode_;
   bool value_rewritten_ = false;
   bool repair_deletion_ = false;
 };

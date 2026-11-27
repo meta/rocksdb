@@ -7,19 +7,36 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <deque>
+#include <limits>
 #include <memory>
+#include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
+#include "cache/cache_reservation_manager.h"
+#include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_file_reader.h"
+#include "db/blob/blob_gen2_format.h"
+#include "db/blob/blob_index.h"
+#include "db/blob/blob_log_format.h"
+#include "db/blob/blob_reference_census.h"
+#include "db/blob/blob_relocation_file.h"
+#include "db/blob/blob_relocation_gc.h"
+#include "db/blob/blob_relocation_manifest.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "file/file_util.h"
+#include "file/filename.h"
+#include "file/read_write_util.h"
 #include "file/sst_file_manager_impl.h"
+#include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/perf_context_imp.h"
@@ -30,16 +47,152 @@
 #include "rocksdb/io_status.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
+#include "table/adaptive/adaptive_table_factory.h"
+#include "table/block_based/block_based_table_builder.h"
+#include "table/embedded_blob_sst.h"
+#include "table/table_builder.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/concurrent_task_limiter_impl.h"
 #include "util/defer.h"
+#include "util/math.h"
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
+
+// PlanLiveSetReads() walks the census SST list of each generation number of the
+// inputs. It checks for shutdown or a compaction abort at the first SST of each
+// list, and then once every 1024 SSTs (when the index in the list is a multiple
+// of 1024). ReadLiveSets() checks before each SST it reads. The interval of
+// 1024 is an estimate, not measured.
+constexpr uint64_t kIndirectBlobGCAbortCheckMask = (1 << 10) - 1;
+
+// Stored bytes of one read batch (1 MB, an estimate). A value larger than this
+// is streamed in kBlobRelocationStreamChunkSize (256 KB) chunks instead. One
+// coalesced read is also at most this size.
+constexpr uint64_t kIndirectBlobGCReadBatchBytes = 1024 * 1024;
+// The I/O workspace charge of one job, 2 x kIndirectBlobGCReadBatchBytes plus
+// 2 x kBlobRelocationStreamChunkSize (2.5 MB in total). SelectInputs() takes it
+// and explains its parts.
+constexpr uint64_t kIndirectBlobGCIoWorkspaceBytes =
+    2 * kIndirectBlobGCReadBatchBytes + 2 * kBlobRelocationStreamChunkSize;
+// The fixed charge of the one SST reader that the job holds open while it reads
+// blob references (576 KB). It is 64 KB for the table reader itself (an
+// estimate, also charged when the reader comes from the table cache, to keep
+// the charge simple), plus 2 x kBlobReferenceReadBatchBytes (256 KB each) for
+// one batch of raw blocks and its decompressed copies. ReadLiveSets() adds the
+// decoded reference index to it at its real size.
+constexpr size_t kIndirectBlobGCSstReaderBytes =
+    64 * 1024 + 2 * kBlobReferenceReadBatchBytes;
+// The planned read list of a job (group_reads) starts with room for 16 entries
+// (a fixed choice, not tuned) and doubles when it is full.
+constexpr size_t kIndirectBlobGCMinReadListEntries = 16;
+// kIndirectBlobGCBatchBytesPerValue (512 bytes, an estimate) is the fixed
+// memory of one value in a read batch, beyond its stored bytes: the request,
+// status and payload entries, and the record trailer. With the 1 MB batch, this
+// bounds a batch to at most 2048 values.
+constexpr uint64_t kIndirectBlobGCBatchBytesPerValue = 512;
+// Route retirement (DBImpl::RetireBlobRelocationRoutes()) runs in the census
+// job after each census publish. It writes route deletion records for routes
+// that have no holder (no SST uses their generation number). It writes one
+// MANIFEST edit when one call can delete 64 such routes, when it selected 64
+// and can delete at least 32 of them (for example, running compactions hold
+// the others), or when such routes have waited 10 minutes. All three values
+// (64, 32 and 10 minutes) are fixed choices, not measured. A pending route
+// costs only Version memory and space in a new MANIFEST snapshot, so a large
+// batch and a long wait are cheap. Batching is only a cost choice.
+// Skipping routes that a running compaction may write is a correctness rule
+// (see "Compaction safety protocol for blob relocation" in
+// db/compaction/compaction_job.h).
+constexpr uint64_t kBlobRouteRetirementBatchSize = 64;
+// The census selects at most one batch per publish
+// (BlobReferenceCensus::RetirementSelection), and the "selected 64" rule above
+// compares the selection size with the batch size, so the two must be equal.
+static_assert(
+    std::tuple_size<BlobReferenceCensus::RetirementSelection>::value ==
+        kBlobRouteRetirementBatchSize,
+    "A full census selection must be one route retirement batch");
+constexpr uint64_t kBlobRouteRetirementMaxPendingMicros =
+    10ULL * 60 * 1000 * 1000;
+// At most 8 inputs per GC job (a fixed limit, not tuned). It matches
+// kBlobGcMaxSelectedFiles (8), the number of candidates that the census
+// publishes to the Version.
+constexpr size_t kIndirectBlobGCMaxInputs = 8;
+// At most 8 outputs per indirect blob GC job (a fixed limit, not tuned). When
+// the inputs need more outputs, the input with the largest estimated output
+// waits for a later job. The estimated size of each output is at most the
+// target size (see kIndirectBlobGCMaxOutputBytes). An input with a larger
+// estimate gets an output of its own. The SstFileManager space check reserves
+// the estimated size of all outputs, capped at the total input size.
+constexpr size_t kIndirectBlobGCMaxOutputs = 8;
+// Cap for blob_file_size in indirect blob GC (1 GB, a fixed choice, not
+// measured). The target output size is 90% of min(blob_file_size,
+// kIndirectBlobGCMaxOutputBytes). The 90% is a fixed choice that leaves room
+// for error in the output size estimate. An input larger than the target gets
+// an output of its own, never larger than the input.
+constexpr uint64_t kIndirectBlobGCMaxOutputBytes = uint64_t{1} << 30;
+
+Status EstimateIndirectBlobGCPartitionBytes(uint64_t physical_live_record_bytes,
+                                            uint64_t reference_count,
+                                            uint64_t* estimated_bytes) {
+  if (estimated_bytes == nullptr) {
+    return Status::InvalidArgument("Null blob GC output size estimate");
+  }
+  // Output size estimate: 64 KB for the table tail and index, plus 48 bytes per
+  // value for its share of the location entries (estimates). One location
+  // entry packs up to 32 values of one origin, so a value needs much less than
+  // 48 bytes. The high value keeps the estimate on the safe side.
+  constexpr uint64_t kFixedOverhead = 64 * 1024;
+  constexpr uint64_t kPerEntryOverhead = 48;
+  if (reference_count >
+          (std::numeric_limits<uint64_t>::max() - kFixedOverhead) /
+              kPerEntryOverhead ||
+      physical_live_record_bytes > std::numeric_limits<uint64_t>::max() -
+                                       kFixedOverhead -
+                                       reference_count * kPerEntryOverhead) {
+    return Status::MemoryLimit("Blob relocation output estimate overflow");
+  }
+  *estimated_bytes = physical_live_record_bytes + kFixedOverhead +
+                     reference_count * kPerEntryOverhead;
+  return Status::OK();
+}
+
+// Checks the finalized live set of one indirect blob GC input for live values
+// that overlap. Finalize() sorts the values by (origin, original offset). The
+// origin is always a normal blob file, and it stores each value once, after the
+// end of the previous value. So two live values of one origin that overlap mean
+// that the exact references in the SSTs are inconsistent. GC finds this from
+// the references alone, before it reads any stored bytes, and handles it as
+// corrupt exact SST metadata (see DecideInputs()). Without this check, the read
+// of a normal blob file input would fail later, because ReadCoalescedRanges()
+// rejects overlapping ranges. It also returns Corruption when the range of one
+// value overflows.
+Status CheckIndirectBlobGCLiveValuesDoNotOverlap(
+    const std::vector<BlobRelocationLiveValue>& values) {
+  for (size_t i = 0; i < values.size(); ++i) {
+    const BlobRelocationLiveValue& value = values[i];
+    if (value.stored_value_size >
+        std::numeric_limits<uint64_t>::max() - value.original_value_offset) {
+      return Status::Corruption(
+          "Live blob value range overflows",
+          "origin #" + std::to_string(value.origin_file_number));
+    }
+    if (i + 1 < values.size() &&
+        values[i + 1].origin_file_number == value.origin_file_number &&
+        value.original_value_offset + value.stored_value_size >
+            values[i + 1].original_value_offset) {
+      return Status::Corruption(
+          "Overlapping live blob values in exact references",
+          "origin #" + std::to_string(value.origin_file_number) + ", offsets " +
+              std::to_string(value.original_value_offset) + " and " +
+              std::to_string(values[i + 1].original_value_offset));
+    }
+  }
+  return Status::OK();
+}
 
 void RecordAtomicFlushRequestReason(Statistics* stats,
                                     FlushReason flush_reason) {
@@ -77,7 +230,3575 @@ std::vector<uint64_t> MemTableIds(const autovector<ReadOnlyMemTable*>& mems) {
   return ids;
 }
 
+// The block cache to charge for indirect blob GC working memory, or null when
+// there is no block-based writer cache or charging for the role is disabled.
+std::shared_ptr<Cache> GetIndirectBlobGcWorkingMemoryCache(
+    const MutableCFOptions& mutable_cf_options) {
+  const BlockBasedTableOptions* const options =
+      GetBlockBasedTableWriterOptions(mutable_cf_options.table_factory.get());
+  if (options == nullptr || options->block_cache == nullptr) {
+    return nullptr;
+  }
+  const CacheEntryRoleOptions::Decision charged =
+      options->cache_usage_options.options_overrides
+          .at(CacheEntryRole::kIndirectBlobGcWorkingMemory)
+          .charged;
+  return charged == CacheEntryRoleOptions::Decision::kEnabled ||
+                 charged == CacheEntryRoleOptions::Decision::kFallback
+             ? options->block_cache
+             : nullptr;
+}
+
+// skip_missing_blob_files drops every reference whose blob file is absent. A
+// blob indirection reference names a generation, and a Version route can map
+// that generation to another physical file after indirect blob GC deletes it.
+// So the repair would drop live values. Reject the repair on any column family
+// that may hold such references: enable_blob_indirection is on, a flush or
+// compaction that started with it on is still running
+// (HasPendingBlobIndirectionOutput()), or the sticky format fence is set (it
+// stays after the option is turned off). A non-null `compaction` adds the
+// options and input Version it was picked with.
+// REQUIRES: DB mutex held.
+Status CheckSkipMissingBlobFilesSupported(ColumnFamilyData* cfd,
+                                          const Compaction* compaction) {
+  bool has_blob_indirection = cfd->MayUseBlobIndirection();
+  if (compaction != nullptr) {
+    has_blob_indirection =
+        has_blob_indirection ||
+        compaction->mutable_cf_options().enable_blob_indirection ||
+        compaction->input_version()->storage_info()->HasBlobIndirectionFormat();
+  }
+  if (!has_blob_indirection) {
+    return Status::OK();
+  }
+  return Status::NotSupported(
+      "skip_missing_blob_files is not supported on a column family with blob "
+      "indirection state");
+}
+
 }  // namespace
+
+Status DBImpl::RetireBlobRelocationRoutes(
+    ColumnFamilyData* cfd,
+    const BlobReferenceCensus::RetirementSelection& selected,
+    bool* made_progress) {
+  // The steps are in the comment at the declaration in db_impl.h.
+  BlobReferenceCensus& census = *cfd->blob_reference_census();
+  if (selected.front() == 0) {
+    // No generation number was selected, so no batch is pending.
+    census.SetRetirementPendingSinceMicros(0);
+    return Status::OK();
+  }
+  mutex_.Lock();
+  Version* const version = cfd->current();
+  if (cfd->IsDropped() || shutting_down_.load(std::memory_order_acquire)) {
+    mutex_.Unlock();
+    return Status::ShutdownInProgress();
+  }
+  version->Ref();
+  mutex_.Unlock();
+  Defer release_version([&] {
+    InstrumentedMutexLock lock(&mutex_);
+    version->UnrefAndFreeBlobRelocationState(&mutex_);
+  });
+  std::set<uint64_t> generations;
+  for (uint64_t generation : selected) {
+    if (generation == 0) {
+      break;
+    }
+    generations.insert(generation);
+  }
+  std::shared_ptr<BlobReferenceCensusState> state;
+  Status status = census.ReadSelectedSnapshot(
+      version->GetVersionNumber(), generations,
+      GetIndirectBlobGcWorkingMemoryCache(version->GetMutableCFOptions()),
+      &state);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RetireBlobRelocationRoutes:SnapshotStatus",
+                           &status);
+  if (!status.ok()) {
+    return status;
+  }
+  // Step 3: true if `generation` is a live blob file or relocation file in the
+  // input Version of a running compaction of this column family. Such a
+  // compaction may write it as a flattened number.
+  const auto held_by_running_compaction = [&](uint64_t generation) {
+    mutex_.AssertHeld();
+    for (const Compaction* compaction :
+         *cfd->compaction_picker()->compactions_in_progress()) {
+      const Version* const input = compaction->input_version();
+      // In the pinned Version `generation` is a route, not a live file.
+      if (input == nullptr || input == version) {
+        continue;
+      }
+      const uint64_t value =
+          input->storage_info()->GetBlobFileTable().Find(generation);
+      if (value != 0 && !BlobFileTable::IsRoute(value)) {
+        TEST_SYNC_POINT_CALLBACK(
+            "DBImpl::RetireBlobRelocationRoutes:HeldByRunningCompaction",
+            &generation);
+        return true;
+      }
+    }
+    return false;
+  };
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  std::vector<uint64_t> targets;
+  std::vector<uint64_t> retired_generations;
+  // The number of selected numbers that only the running-compaction rule
+  // keeps.
+  size_t held_count = 0;
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    for (uint64_t generation : generations) {
+      const uint64_t target =
+          version->storage_info()->GetBlobRelocationRouteTarget(generation);
+      // A route into an input of the running indirect blob GC job waits: the
+      // job's install checks the route count of that input. If the input gets
+      // an output, the GC edit re-points this route to it, and a later call
+      // can delete it.
+      // The coarse frontier check repeats the check of the selection, at the
+      // pinned Version. The census worker can apply new Versions after the
+      // selection (an apply after an install runs while this function runs),
+      // so the selection may have used the frontier of an older Version. Like
+      // the selection skip, this check is defense in depth (see
+      // SelectWorkerRetirementSources()).
+      if (state->GetSstCount(generation) != 0 ||
+          version->storage_info()->IsCoarseIndirectOriginBlobPinned(
+              generation) ||
+          target == kInvalidBlobFileNumber || census.IsGcInputFile(target)) {
+        continue;
+      }
+      if (held_by_running_compaction(generation)) {
+        ++held_count;
+        continue;
+      }
+      edit.DeleteBlobRelocationRoute(generation);
+      targets.push_back(target);
+      retired_generations.push_back(generation);
+    }
+  }
+  if (edit.GetBlobRelocationRouteDeletions().empty()) {
+    // When running compactions hold selected numbers, those routes still wait
+    // for retirement, so the pending time stays. Otherwise no route waits.
+    if (held_count == 0) {
+      census.SetRetirementPendingSinceMicros(0);
+    }
+    return Status::OK();
+  }
+  // A route with no holder costs only Version memory, so routes are deleted in
+  // batches. This saves a MANIFEST write and a Version install per flattening
+  // compaction. A call writes when one of these is true:
+  //   - it can delete a full batch (batch_size routes);
+  //   - it selected a full batch, and it can delete at least half of it (for
+  //     example, running compactions hold the others). Without this case,
+  //     one held number in each selection would defer route retirement to the
+  //     pending-time limit while a long compaction runs. It costs at most
+  //     twice the MANIFEST writes of full batches;
+  //   - routes have been pending for max_pending_micros.
+  uint64_t batch_size = kBlobRouteRetirementBatchSize;
+  uint64_t max_pending_micros = kBlobRouteRetirementMaxPendingMicros;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RetireBlobRelocationRoutes:BatchSize",
+                           &batch_size);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RetireBlobRelocationRoutes:MaxPending",
+                           &max_pending_micros);
+  const uint64_t now_micros = immutable_db_options_.clock->NowMicros();
+  const uint64_t pending_since = census.RetirementPendingSinceMicros();
+  const uint64_t deletions = edit.GetBlobRelocationRouteDeletions().size();
+  const bool full_batch =
+      deletions >= batch_size ||
+      (generations.size() >= batch_size && 2 * deletions >= batch_size);
+  if (!full_batch &&
+      (pending_since == 0 || now_micros - pending_since < max_pending_micros)) {
+    if (pending_since == 0) {
+      census.SetRetirementPendingSinceMicros(now_micros);
+    }
+    TEST_SYNC_POINT("DBImpl::RetireBlobRelocationRoutes:Deferred");
+    return Status::OK();
+  }
+  SuperVersionContext sv_context(true);
+  bool intent = false;
+  // The precondition runs once, under the DB mutex, when the call reaches the
+  // MANIFEST queue head (see the pre_cb contract of VersionSet::LogAndApply()).
+  // The edit is small: it holds at most kBlobRouteRetirementBatchSize (64)
+  // route deletions, one per selected number, so it is applied under the DB
+  // mutex. Most checks read state that cannot change while the call is at the
+  // queue head:
+  // - The current Version and column family drops change only through
+  //   LogAndApply().
+  // - No new GC job can start, because the precondition starts a metadata
+  //   commit (BeginMetadataCommit()). So the list that IsGcInputFile() checks
+  //   can only become empty (when the running job ends), which cannot make a
+  //   retirement unsafe.
+  // - A compaction picked later uses the current Version, where each retired
+  //   number is a route, so held_by_running_compaction() cannot become true.
+  // Census readiness can be cleared later by ReportMismatch() from the GC job
+  // that is already running, when it finds the census wrong for one of its
+  // inputs. That is still safe: the mismatched file is a GC input, and this
+  // call never retires a route into a GC input (the IsGcInputFile() check).
+  const auto precondition = [&]() -> Status {
+    mutex_.AssertHeld();
+    // LogAndApply() already fails a dropped column family before it runs the
+    // precondition; the IsDropped() check is a cheap defensive check.
+    if (cfd->IsDropped() || cfd->current() != version ||
+        !census.IsReady(version->GetVersionNumber())) {
+      return Status::TryAgain("Blob route retirement proof changed");
+    }
+    for (uint64_t target : targets) {
+      if (census.IsGcInputFile(target)) {
+        return Status::TryAgain("Blob route retirement target is a GC input");
+      }
+    }
+    for (uint64_t generation : retired_generations) {
+      if (held_by_running_compaction(generation)) {
+        return Status::TryAgain(
+            "Blob route retirement source is held by a running compaction");
+      }
+    }
+    Status result = census.BeginMetadataCommit();
+    intent = result.ok();
+    return result;
+  };
+  TEST_SYNC_POINT("DBImpl::RetireBlobRelocationRoutes:BeforeLogAndApply");
+  TEST_KILL_RANDOM("DBImpl::RetireBlobRelocationRoutes:BeforeLogAndApply");
+  mutex_.Lock();
+  if (error_handler_.IsBGWorkStopped()) {
+    // Background work is stopped; this optional cleanup writes nothing.
+    mutex_.Unlock();
+    return Status::Incomplete("Background work is stopped");
+  }
+  // Tests set a Corruption here to skip the MANIFEST write and act as if it
+  // failed with Corruption.
+  TEST_SYNC_POINT_CALLBACK(
+      "DBImpl::RetireBlobRelocationRoutes:ManifestWriteStatus", &status);
+  if (status.ok()) {
+    status = versions_->LogAndApply(
+        cfd, ReadOptions(Env::IOActivity::kCompaction),
+        WriteOptions(Env::IOActivity::kCompaction), &edit, &mutex_,
+        directories_.GetDbDir(), false, nullptr, {}, precondition);
+  }
+  if (intent) {
+    if (!status.ok() && !versions_->io_status().ok()) {
+      // The census worker wrote to the MANIFEST and the result is unknown. Set
+      // a background error, so MANIFEST recovery decides the result. Step 6 of
+      // the RetireBlobRelocationRoutes() comment in db_impl.h says what happens
+      // until then. The background error also stops all background work until
+      // recovery.
+      error_handler_.SetBGError(versions_->io_status(),
+                                BackgroundErrorReason::kManifestWrite);
+    }
+    census.EndMetadataCommit(status.ok() || versions_->io_status().ok());
+  }
+  if (status.ok()) {
+    RecordTick(stats_, BLOB_RELOCATION_ROUTES_RETIRED,
+               edit.GetBlobRelocationRouteDeletions().size());
+    InstallSuperVersionAndScheduleWork(cfd, &sv_context,
+                                       /*defer_snapshot_refresh=*/false);
+    census.SetRetirementPendingSinceMicros(0);
+    *made_progress = true;
+  } else if (status.IsTryAgain()) {
+    // The routes still wait for the next census publish. A full batch has not
+    // started the pending time yet, so start it here. Then
+    // retirement-pending-micros also shows a full batch that keeps getting
+    // TryAgain, not only a deferred one.
+    if (pending_since == 0) {
+      census.SetRetirementPendingSinceMicros(now_micros);
+    }
+  } else if (status.IsCorruption()) {
+    // A Corruption of the MANIFEST write (from VersionBuilder) means that a
+    // check of the protocol failed. It is not a census mismatch, so the census
+    // stays ready and is not rebuilt. The background error uses the compaction
+    // reason, so it follows paranoid_checks as other compaction Corruption
+    // does: with paranoid_checks (the default), it stops writes and background
+    // work until the DB is reopened; without it, the next census publish tries
+    // route retirement again.
+    ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                    "[%s] Blob route retirement failed: %s",
+                    cfd->GetName().c_str(), status.ToString().c_str());
+    error_handler_.SetBGError(status, BackgroundErrorReason::kCompaction);
+    status = Status::OK();
+  }
+  mutex_.Unlock();
+  sv_context.Clean();
+  return status;
+}
+
+// Background: indirect blob GC collects whole blob files (normal blob files
+// or relocation files) into new relocation files, without an LSM compaction.
+// The overview at the top of db/blob/blob_relocation_gc.h lists the job steps
+// and says why GC suppresses inputs. "Suppressed inputs" below lists every
+// reason.
+//
+// DBImpl::RunIndirectBlobGCBatch() checks its arguments, creates one
+// IndirectBlobGCJob on its stack and calls Run(). Run() calls one method per
+// phase, in order. The job reads DBImpl private members through db_.
+//
+// Terms: input, generation numbers of an input, input Version, census snapshot
+// and stale job are defined in the overview. Two more terms:
+// - GC job registration: the job registers with the census
+//   (BlobReferenceCensus::BeginGcJob()) and stays registered until Finish()
+//   (EndGcJob()). The census worker does not apply deltas while the job copies
+//   its census snapshot, and at most one GC job is registered per census. The
+//   job does not follow the Version changes after its snapshot (see "Install
+//   protocol" in Install()).
+// - Candidate stamp (BlobGcCandidateStamp): the census worker and the file
+//   revision of each candidate when the job starts. The census ignores a
+//   suppression with a stamp from an older census worker or an older file
+//   revision (see BlobGcCandidateStamp).
+//
+// State: the phases share their state through the data members below. A data
+// member has the name that the phase code uses for it, so the data members
+// have no trailing underscore.
+//
+// Job status: the job has two status channels. The return value of Start() says
+// only whether the job began: when it is not OK, or when gc_job_token is 0, the
+// job did not begin, and Run() returns that value at once. After Start() began
+// the job, the data member `status` is the job result until Run() returns.
+// Start() can set it to an error and still return OK. Each phase after Start()
+// also runs when `status` is not OK. Its loops check `status` first, so the
+// phase does no new work, but it still runs its cleanup and its test sync
+// points. Install() and Finish() decide what the job returns.
+//
+// Input outcomes: the outcome of one input is recorded in the places below.
+// For each outcome, the list says where it is recorded, which methods set it,
+// and which methods read it.
+// - Accepted (relocate, or remove when it has no live value): eligible_inputs
+//   and PhysicalInput::eligible. DecideInputs() sets them. PackOutputs(),
+//   OpenInputReaders(), WriteOutputs() and Install() read them.
+// - Suppressed: suppressed_files and suppression_reasons, two parallel vectors
+//   that each phase must keep in step. Any phase adds to them. Install() and
+//   Finish() read them. When `status` is CompactionTooLarge, Finish() adds
+//   capacity_deferred_files to suppressed_files (reason "deferred: outputs or
+//   disk space") and to transient_suppressions. Finish() also adds every input
+//   in corrupt_inputs that is not in suppressed_files yet (reason "corrupt
+//   input"). Install() runs before Finish(), so it does not log these reasons
+//   and does not suppress these inputs in the Version. "Suppressed inputs"
+//   below lists the reasons and says where GC records them.
+// - Suppressed with a backoff delay: also in transient_suppressions. Start(),
+//   SelectInputs(), DecideInputs() and Finish() add to it. Finish() reads it.
+// - Failed in the read phase (only this input fails): InputPlan::failed.
+//   PlanLiveSetReads() and ReadLiveSets() set it (fail_input()). ReadLiveSets()
+//   skips the reads of a failed input, and DecideInputs() suppresses it. When
+//   DecideInputs() does not reach a failed input, Finish() suppresses it only
+//   if it is corrupt (see corrupt_inputs).
+// - Waits for a later job (memory budget): deferred_input and plan_end.
+//   PlanLiveSetReads() sets both. DecideInputs() and PackOutputs() also set
+//   deferred_input. ReadLiveSets() and DecideInputs() handle only the first
+//   plan_end inputs. Install() reads deferred_input and schedules the column
+//   family again.
+// - Waits for a later job (outputs or disk space): capacity_deferred_files.
+//   PackOutputs() sets it, and also sets deferred_input. Install() and Finish()
+//   read it.
+// - Candidate-local failure (ends the whole job): candidate_local_failure_input
+//   and candidate_local_failure_reason. OpenInputReaders() and WriteOutputs()
+//   set them. WriteOutputs() reads them and adds the input to suppressed_files.
+//
+// Suppressed inputs: Finish() reports every suppressed input to the census
+// with the candidate stamp (BlobReferenceCensus::SuppressWorkerCandidates()),
+// also when the job fails. Install() also suppresses the inputs in the current
+// Version (VersionStorageInfo::SuppressBlobFileForIndirectBlobGC()), but only
+// when the job's decisions are still true for that Version:
+// - When the job ends without error and has no input to install, Install()
+//   suppresses them at once.
+// - When the job installs, Install() suppresses them only if no other Version
+//   was installed during the job, because a newer Version can hold SST
+//   metadata that makes an input eligible. Install() also suppresses each new
+//   output in the current Version, because a new output has no garbage yet.
+// - A stale or failed job does not suppress anything in the Version. When the
+//   job fails with CompactionTooLarge and the Version did not change, Install()
+//   moves the deferred inputs to the end of the Version's candidate list
+//   (VersionStorageInfo::DeferBlobFilesForIndirectBlobGC()).
+// The table lists every reason and the kind of its census suppression (see
+// "Suppression" in the overview). "Every input" means every input of the job,
+// and "every candidate" means every file that the job was given.
+//
+//   Reason                                          Kind
+//   ----------------------------------------------  --------------------------
+//   Start(): the census snapshot is over its        transient, every candidate
+//     memory budget or cannot be charged
+//   SelectInputs(): a coarse SST pins a             normal
+//     generation number of the input
+//   SelectInputs(): invalid input metadata (0       normal
+//     physical bytes or 0 record bytes)
+//   SelectInputs(): the I/O workspace cannot be     transient, every input
+//     charged to the block cache
+//   SelectInputs(): the table format is not         normal, every input
+//     block-based
+//   PlanLiveSetReads(): the census reference        normal
+//     count overflows
+//   ReadLiveSets() or DecideInputs(): corrupt       normal
+//     exact SST metadata (in DecideInputs(), also
+//     two live values that overlap in their origin
+//     file)
+//   ReadLiveSets(): an SST that references the      normal
+//     input cannot be opened (with paranoid_checks
+//     true, this fails the job instead)
+//   ReadLiveSets(): a census mismatch remains       normal
+//     after a rebuild
+//   PlanLiveSetReads(): the live set needs more     normal
+//     than the GC memory budget
+//     (BlobRelocationMemoryTracker::kMaxBytes, 64
+//     MB) minus the I/O workspace charge, the
+//     fixed SST reader charge and an estimate of
+//     the planned read list
+//   PlanLiveSetReads() or DecideInputs(): the live  transient
+//     set cannot be charged (block cache or GC
+//     memory budget) and no earlier input holds a
+//     share
+//   ReadLiveSets(): the SST reader or its           transient, every planned
+//     reference index cannot be charged to the        input
+//     GC memory budget
+//   DecideInputs(): exact live bytes above the      normal
+//     input's record bytes
+//   DecideInputs(): a lost relocation file that     normal
+//     SSTs still reference
+//   DecideInputs(): enable_blob_files,              normal
+//     enable_blob_indirection or
+//     enable_blob_garbage_collection is off in the
+//     latest options, and the input has live
+//     values
+//   DecideInputs(): exact garbage below             normal
+//     indirect_blob_gc_garbage_ratio
+//   DecideInputs(): the output size estimate        normal
+//     overflows
+//   DecideInputs(): an unexpected Corruption or     normal, every accepted
+//     MemoryLimit ends the decide step                input (transient for
+//                                                     MemoryLimit)
+//   PackOutputs(): not enough disk space even for   transient, every deferred
+//     one input (CompactionTooLarge)                  input
+//   OpenInputReaders(): the input cannot be         normal
+//     opened (MemoryLimit, NotSupported or
+//     Corruption; with paranoid_checks true, a
+//     Corruption also fails the job)
+//   WriteOutputs(): a source record is too large,   normal
+//     unsupported or corrupt. With paranoid_checks
+//     true, a corrupt record also fails the job.
+//   WriteOutputs(): a read request is rejected      normal
+//     (InvalidArgument, a GC internal error; see
+//     note_internal_error())
+//   WriteOutputs(): the outputs would not be        normal, every accepted
+//     smaller than the inputs                         input
+//   WriteOutputs(): an output file is larger than   normal, first input of
+//     its inputs                                      that output
+//   BuildEdit() or ValidatePhysicalInputs(): an     normal, every eligible
+//     invariant check fails (invariant_failed())      input
+//
+// Output, I/O and MANIFEST errors are not candidate-local. They use the normal
+// background-error handling.
+//
+// Lifecycle of the memory charges: the job charges most of its working memory
+// to memory_tracker. The total is at most
+// BlobRelocationMemoryTracker::kMaxBytes (64 MB). The charges are:
+// - I/O workspace: the buffers that the job uses to read and stream the input
+//   values. Its charge is 2 x kIndirectBlobGCReadBatchBytes (1 MB each) plus
+//   2 x kBlobRelocationStreamChunkSize (256 KB each), taken in SelectInputs().
+//   Its share is held in a local variable (io_workspace_bytes), so it is freed
+//   only when the last copy of memory_tracker goes away, when the job is
+//   destroyed. The release Defers below keep copies of memory_tracker.
+// - Planned read list (group_reads): taken in PlanLiveSetReads(). It grows by
+//   doubling, from kIndirectBlobGCMinReadListEntries (16) entries.
+//   release_group_read_charge frees it when the job is destroyed, after Run()
+//   returns, with the DB mutex held.
+// - SST reader (selected_reader_bytes): 576 KB plus the decoded reference
+//   index, taken in ReadLiveSets() for one SST at a time. The 576 KB is
+//   kIndirectBlobGCSstReaderBytes: a 64 KB reader estimate plus 2 x 256 KB
+//   read batches. It is freed after each SST and in Finish().
+//   release_selected_reader_charge is only a safety net.
+// - Live sets: 40 bytes per census reference, reserved in PlanLiveSetReads().
+//   WriteOutputs() frees them. PlanLiveSetReads() frees the live set of a
+//   deferred or failed input at once.
+// The census snapshot is charged to the same cache role, but not to
+// memory_tracker. It is taken in Start(), and Finish() frees it. Neither
+// release Defer is set when Start() ends the job.
+class DBImpl::IndirectBlobGCJob {
+ public:
+  // The arguments are those of RunIndirectBlobGCBatch(), already checked.
+  IndirectBlobGCJob(
+      DBImpl* db, ColumnFamilyData* cfd_arg,
+      const std::vector<uint64_t>& candidate_physical_file_numbers_arg,
+      bool* made_progress_arg, uint64_t* sfm_reserved_bytes_arg,
+      bool* retryable_stale_input_arg, LogBuffer* log_buffer_arg,
+      int job_id_arg, bool empty_files_only_arg)
+      : db_(db),
+        cfd(cfd_arg),
+        candidate_physical_file_numbers(candidate_physical_file_numbers_arg),
+        made_progress(made_progress_arg),
+        sfm_reserved_bytes(sfm_reserved_bytes_arg),
+        log_buffer(log_buffer_arg),
+        job_id(job_id_arg),
+        empty_files_only(empty_files_only_arg),
+        column_family(*cfd_arg),
+        stale_input_is_retryable(*retryable_stale_input_arg) {}
+
+  // Runs the job and returns its status. The contract (DB mutex, out
+  // parameters, return codes) is on RunIndirectBlobGCBatch() in db_impl.h.
+  // Run() calls the methods below in this order. The word in brackets is the
+  // name of the job step in the overview of db/blob/blob_relocation_gc.h that
+  // the method belongs to. The first job step (the candidate pick) runs before
+  // Run(), in BackgroundCompaction().
+  // 1. Start() [Plan]: check the census and the input Version, take a reference
+  //    to the input Version, register the GC job and release the DB mutex. Then
+  //    take the candidate stamp and the census snapshot. When the job cannot
+  //    begin, Run() returns at once.
+  // 2. SelectInputs() [Plan]: build the inputs and their generation numbers,
+  //    and suppress inputs with bad metadata or inputs that a coarse SST pins
+  //    (see the coarse pin comment in SelectInputs()).
+  // 3. PlanLiveSetReads() [Plan]: plan the SST reads of each input and reserve
+  //    its live set.
+  // 4. ReadLiveSets() [Read, Check]: read the planned generation numbers SST by
+  //    SST and check the census totals.
+  // 5. DecideInputs() [Decide]: decide each input in order.
+  // 6. PackOutputs() [Pack]: pack the inputs into outputs, check the disk
+  //    space, and get the output file numbers.
+  // 7. OpenInputReaders() [Copy]: open a reader for each input with live
+  //    values.
+  // 8. WriteOutputs() [Copy]: write, sync and rename the outputs, then release
+  //    the readers and the live sets.
+  // 9. Install() [Install]: take the DB mutex, build the MANIFEST edit and
+  //    install it with one LogAndApply() call.
+  // 10. Finish() [no job step, cleanup]: end the GC job registration, release
+  //     the input Version, suppress the skipped inputs, delete the outputs that
+  //     are not installed, and schedule the census worker.
+  //
+  // REQUIRES: DB mutex held. Returns with the DB mutex held.
+  Status Run();
+
+ private:
+  // One indirect blob GC input: a normal blob file or a relocation file.
+  // `generations` holds its generation numbers: the input itself and, for a
+  // relocation file, every old file routed to it.
+  struct PhysicalInput {
+    uint64_t file_number = 0;
+    uint64_t physical_bytes = 0;
+    uint64_t total_record_bytes = 0;
+    std::shared_ptr<BlobFileMetaData> normal_metadata;
+    std::shared_ptr<BlobRelocationFileMetaData> relocation_metadata;
+    // Sorted: the input and the old files routed to it at job start.
+    std::vector<uint64_t> generations;
+    // Sorted: the old files routed to the input at job start.
+    std::vector<uint64_t> routed_generations;
+    std::unique_ptr<BlobRelocationLiveSet> live_set;
+    size_t live_count = 0;
+    uint64_t physical_live_record_bytes = 0;
+    uint64_t estimated_bytes = 0;
+    size_t output_index = std::numeric_limits<size_t>::max();
+    bool eligible = false;
+  };
+  struct OutputState {
+    uint64_t file_number = 0;
+    std::string path;
+    std::string temporary_path;
+    std::string checksum_method;
+    std::string checksum_value;
+    BlobRelocationFileMetadata metadata;
+    BlobRelocationDirectory directory;
+    uint64_t file_size = 0;
+    uint64_t input_bytes = 0;
+    uint64_t value_bytes = 0;
+    size_t live_count = 0;
+    bool creation_started = false;
+    // A rename can fail after it took effect, so after a tried rename the final
+    // name may exist even when `renamed` is false.
+    bool rename_attempted = false;
+    bool renamed = false;
+  };
+  // The live sets are planned, read and checked with the types below. See the
+  // comment at the start of PlanLiveSetReads().
+  struct InputPlan {
+    bool planned = false;
+    bool failed = false;
+    bool transient = false;
+    const char* reason = nullptr;
+  };
+  // One read: every group of one generation number in one SST, and the census
+  // record it is checked against.
+  struct GroupRead {
+    uint64_t sst_file_number = 0;
+    BlobReferenceGroup group;
+    size_t input_index = 0;
+    size_t check_index = 0;
+  };
+  // The census record of one generation number, and what the SST reads found.
+  // After the reads, both must be equal for the same census Version.
+  struct GenerationCheck {
+    uint64_t generation = 0;
+    size_t input_index = 0;
+    BlobCensusGenerationTotals expected;
+    size_t expected_holders = 0;
+    BlobCensusGenerationTotals found;
+    size_t holders_found = 0;
+  };
+  // The open readers of one input. Only one of the two is set.
+  struct InputReader {
+    std::unique_ptr<BlobFileReader> normal;
+    std::unique_ptr<BlobFileReader> relocation;
+  };
+
+  // Takes a reference to the input Version (Ref()), checks that the census is
+  // ready for it, registers the GC job and releases the DB mutex. Then it
+  // takes the candidate stamp, finds the old files routed to each relocation
+  // input, and takes the census snapshot. When the job cannot begin, it
+  // releases the input Version if it took a reference, and returns the job's
+  // final status with the DB mutex held and no GC job registration
+  // (gc_job_token is 0):
+  // 1. TryAgain when there is no census or no input Version, or the census is
+  //    not ready for the input Version.
+  // 2. Corruption when the table cache or the blob file cache is missing.
+  // 3. OK when the latest options turn off enable_blob_files,
+  //    enable_blob_indirection or enable_blob_garbage_collection.
+  // 4. OK when BeginGcJob() returns Busy. For any other error, it returns that
+  //    error after locked_census_status().
+  // Otherwise it returns OK, sets `status` and returns without the DB mutex.
+  // REQUIRES: DB mutex held.
+  Status Start();
+
+  // Builds `inputs` and their generation numbers. It sets `status` to a stale
+  // TryAgain when a candidate changed. It suppresses an input with bad metadata
+  // or with a generation number pinned by a coarse SST. It also creates the
+  // memory tracker and charges the I/O workspace. When that charge fails, it
+  // gives every input a transient suppression. When the table format is not
+  // block-based, it gives every input a normal suppression. Called without the
+  // DB mutex.
+  void SelectInputs();
+
+  // Plans the SST reads of each input (group_reads, generation_checks) and
+  // reserves its live set. An input that does not fit the memory budget waits
+  // for a later job, with all later inputs (deferred_input), when an earlier
+  // input already holds a reservation. Otherwise its plan is marked failed.
+  // The failure is normal when the live set can never fit in the budget, and
+  // transient otherwise, and DecideInputs() suppresses the input with that
+  // kind. It sets
+  // census_mismatch when an SST that the census lists is not in the input
+  // Version. Called without the DB mutex.
+  void PlanLiveSetReads();
+
+  // Reads the planned generation numbers SST by SST into the live sets, then
+  // checks the totals found against the census. On a first census mismatch it
+  // takes the DB mutex for a short time to schedule a census rebuild. A
+  // mismatch that remains after a rebuild suppresses only that input. Called
+  // without the DB mutex.
+  void ReadLiveSets();
+
+  // Decides each planned input: relocate it, remove it (no live value), or
+  // suppress it. An accepted input joins eligible_inputs. When an input does
+  // not fit the memory budget after earlier inputs, it sets deferred_input.
+  // Called without the DB mutex.
+  void DecideInputs();
+
+  // Packs whole inputs into at most kIndirectBlobGCMaxOutputs (8) outputs and
+  // checks the disk space. When the inputs need more outputs or more space, the
+  // largest input waits (it moves from eligible_inputs to
+  // capacity_deferred_files). When only one input is left and the disk space
+  // check still fails, it sets `status` to CompactionTooLarge. It takes the DB
+  // mutex for a short time to get the output file numbers. Called without the
+  // DB mutex.
+  void PackOutputs();
+
+  // Opens a reader for each eligible input that has live values (`readers`). An
+  // input that cannot be opened (Corruption, MemoryLimit or NotSupported)
+  // becomes candidate_local_failure_input. A candidate-local failure in this
+  // phase or in WriteOutputs() ends the whole job: no output is installed, only
+  // the failed input is suppressed, and the other inputs stay candidates for a
+  // later job. Failures in the read phase (fail_input()) skip only their input.
+  // Called without the DB mutex.
+  void OpenInputReaders();
+
+  // Writes each output, then syncs and renames the outputs. Then it reports the
+  // outputs to the listeners, deletes the outputs that are not kept, and
+  // releases the readers and the live sets. A candidate-local failure here ends
+  // the whole job (see OpenInputReaders()). Called without the DB mutex.
+  //
+  // Error priority: a candidate-local failure blames one input. It is a source
+  // value that is corrupt or unsupported (Corruption or NotSupported; in the
+  // batched path also MemoryLimit, for a value that is too large), a read
+  // request that the reader rejects (InvalidArgument, see
+  // note_internal_error()), or an output that is larger than its inputs (the
+  // first input of that output is blamed).
+  // A source error of another kind (for example an I/O error) and an output
+  // write error have priority over it: the job returns that error, and
+  // candidate_local_failure_input stays unset. In the body, the test
+  // `candidate_local_failure_input == SIZE_MAX` means "no candidate-local
+  // failure yet".
+  void WriteOutputs();
+
+  // Takes the DB mutex. It ends the job without an edit when `status` is not
+  // OK, when the column family was dropped, or when the job is interrupted. On
+  // CompactionTooLarge it also defers the waiting inputs in the current
+  // Version, if the Version did not change. When no input is left to install,
+  // it suppresses the skipped inputs in the current Version and keeps `status`
+  // OK. Otherwise it releases the DB mutex to build the MANIFEST edit, and
+  // installs the edit with one LogAndApply() call that has a precondition (see
+  // "Install protocol" in the body). It marks in delete_renamed_outputs the
+  // outputs that Finish() must delete. Called without the DB mutex. Returns
+  // with the DB mutex held.
+  void Install();
+  // Install() helpers: BuildEdit() builds the MANIFEST edit, and
+  // ValidatePhysicalInputs() is the precondition of its LogAndApply() call.
+  // See their definitions.
+  Status BuildEdit();
+  Status ValidatePhysicalInputs();
+
+  // Ends the job: ends the GC job registration (EndGcJob()), releases the
+  // input Version, and suppresses the skipped inputs in the census heap. On
+  // CompactionTooLarge the inputs in capacity_deferred_files get a transient
+  // suppression. It deletes the renamed outputs marked in
+  // delete_renamed_outputs, releases most of the job's memory, and schedules
+  // the census worker (ScheduleBlobReferenceCensus()). It releases the DB mutex
+  // during this cleanup. The I/O workspace charge and the group read charge
+  // stay until the job is destroyed, with the DB mutex held (see "Lifecycle"
+  // above the class). Returns `status`.
+  // REQUIRES: DB mutex held. Returns with the DB mutex held.
+  Status Finish();
+
+  // Helpers that several phases use. Their comments are at their
+  // definitions.
+  Status stale_input(const char* message);
+  Status invariant_failed(const char* message);
+  Status unlocked_census_status(Status census_status);
+  Status locked_census_status(Status census_status);
+  Status interrupted();
+  void suppress_candidates_transiently(const char* reason);
+  void fail_input(size_t input_index, const char* reason);
+
+  DBImpl* const db_;
+
+  // The arguments of RunIndirectBlobGCBatch().
+  ColumnFamilyData* const cfd;
+  const std::vector<uint64_t>& candidate_physical_file_numbers;
+  bool* const made_progress;
+  uint64_t* const sfm_reserved_bytes;
+  LogBuffer* const log_buffer;
+  const int job_id;
+  const bool empty_files_only;
+
+  // column_family is *cfd, and stale_input_is_retryable is the
+  // retryable_stale_input argument of RunIndirectBlobGCBatch().
+  ColumnFamilyData& column_family;
+  bool& stale_input_is_retryable;
+
+  // Set by Start(), except `inputs`, which SelectInputs() fills. input_version
+  // is the input Version: Start() takes a reference to it (Ref()), and Finish()
+  // releases it. census is the job's census snapshot (defined in the overview
+  // in db/blob/blob_relocation_gc.h), not the census itself, which is
+  // blob_reference_census.
+  BlobReferenceCensus* blob_reference_census = nullptr;
+  Version* input_version = nullptr;
+  uint64_t input_version_number = 0;
+  std::shared_ptr<BlobReferenceCensusState> census;
+  VersionStorageInfo* input_storage = nullptr;
+  std::vector<PhysicalInput> inputs;
+  MutableCFOptions mutable_cf_options;
+  bool allow_value_relocation = false;
+  TableCache* table_cache = nullptr;
+  BlobFileCache* blob_file_cache = nullptr;
+  FileOptions blob_gc_file_options;
+  std::string output_directory;
+
+  // read_options is for the MANIFEST write (LogAndApply()). gc_read_options is
+  // for the SST and blob reads and for the output table builder: it does not
+  // fill the block cache and uses Env::IO_LOW.
+  ReadOptions read_options;
+  ReadOptions gc_read_options;
+  WriteOptions write_options;
+  WriteOptions manifest_write_options;
+
+  // A copy of the background error, taken under the DB mutex in Start().
+  // PackOutputs() runs without the DB mutex and passes it to the
+  // SstFileManager.
+  Status sfm_background_error;
+
+  // The token of the job's census registration (BeginGcJob()). 0 means that
+  // the job is not registered.
+  uint64_t gc_job_token = 0;
+
+  // The job status (see "Job status" in the class comment).
+  Status status;
+  std::shared_ptr<Cache> gc_block_cache;
+
+  // The inputs to suppress when the job ends, and the reason for each. The
+  // files in transient_suppressions get a transient suppression. Any phase can
+  // add to them. Install() and Finish() use them.
+  std::vector<uint64_t> suppressed_files;
+  std::vector<std::string> suppression_reasons;
+  std::set<uint64_t> transient_suppressions;
+  // The inputs whose live set can never fit in the memory budget, each with
+  // the most live values that a job can hold. PlanLiveSetReads() adds to it,
+  // and also adds each such input to suppressed_files at once. Finish() passes
+  // it to the census, which keeps such a file suppressed until its live count
+  // drops to that number (see BlobGcCandidateHeap::SuppressOversized()).
+  std::map<uint64_t, uint64_t> oversized_suppressions;
+  BlobGcCandidateStamp candidate_stamp;
+
+  // The old files routed to each relocation input, sorted.
+  std::map<uint64_t, std::vector<uint64_t>> routed_generations_by_input;
+
+  // source_table_options, memory_tracker and release_selected_reader_charge are
+  // set by SelectInputs(). eligible_inputs holds the indexes in `inputs` of the
+  // inputs that DecideInputs() accepts. DecideInputs() (on a live-set failure),
+  // PackOutputs() and WriteOutputs() can remove inputs from it.
+  // selected_reader_bytes is the charge of the SST reader that ReadLiveSets()
+  // holds open. deferred_input is true when an input waits for a later job (set
+  // by PlanLiveSetReads(), DecideInputs() or PackOutputs()).
+  std::optional<BlockBasedTableOptions> source_table_options;
+  std::shared_ptr<BlobRelocationMemoryTracker> memory_tracker;
+  std::vector<size_t> eligible_inputs;
+  size_t selected_reader_bytes = 0;
+  std::optional<Defer> release_selected_reader_charge;
+  bool deferred_input = false;
+
+  // Set by PlanLiveSetReads() and ReadLiveSets(). The planned inputs are the
+  // first plan_end inputs.
+  std::vector<GenerationCheck> generation_checks;
+  bool census_mismatch = false;
+
+  // The input whose census check failed (SIZE_MAX: none).
+  size_t mismatched_input = std::numeric_limits<size_t>::max();
+  // True when ReadLiveSets() ends the job with Corruption because an SST
+  // cannot be opened and paranoid_checks is on. DecideInputs() then keeps that
+  // status, so the job fails with a background error.
+  bool sst_open_fails_job = false;
+  // True after invariant_failed(). Finish() then also suppresses the inputs in
+  // the current Version, when it is still the input Version.
+  bool invariant_check_failed = false;
+  std::vector<InputPlan> plans;
+  std::vector<GroupRead> group_reads;
+  size_t group_read_bytes = 0;
+  std::optional<Defer> release_group_read_charge;
+  size_t plan_end = 0;
+
+  // Set by PackOutputs(). bins[i] lists the inputs of outputs[i].
+  uint64_t aggregate_input_bytes = 0;
+  std::vector<uint64_t> capacity_deferred_files;
+  std::vector<BlobRelocationPackingBin> bins;
+  std::vector<OutputState> outputs;
+
+  // Set by OpenInputReaders() and WriteOutputs(). An input that fails during
+  // reading or writing is candidate_local_failure_input (SIZE_MAX: none).
+  std::vector<InputReader> readers;
+  size_t candidate_local_failure_input = std::numeric_limits<size_t>::max();
+  const char* candidate_local_failure_reason = nullptr;
+
+  // Set by WriteOutputs() and Install().
+  std::unique_ptr<VersionEdit> edit;
+  std::array<bool, kIndirectBlobGCMaxOutputs> output_needed{};
+  size_t published_output_count = 0;
+  size_t published_relocated_count = 0;
+  uint64_t published_relocated_value_bytes = 0;
+  // read_input_count is the number of inputs that the job accepted after
+  // WriteOutputs(): the inputs it read and packed, plus inputs with no live
+  // value, which it only removes. published_input_count is the number of inputs
+  // that the installed edit removed; it stays 0 when the job installs nothing.
+  size_t read_input_count = 0;
+  size_t published_input_count = 0;
+  std::array<bool, kIndirectBlobGCMaxOutputs> delete_renamed_outputs{};
+
+  // Monitoring (tickers, the job histogram and the end-of-job line). Run()
+  // sets start_micros and reads the others after Finish(). WriteOutputs() adds
+  // to input_bytes_read and Install() sets bytes_written and installed.
+  uint64_t start_micros = 0;
+  uint64_t input_bytes_read = 0;
+  uint64_t bytes_written = 0;
+  bool installed = false;
+  // Inputs skipped because of corruption: file number -> what was found.
+  // `logged` is true when the code that found it already wrote an ERROR line.
+  // `fails_job` is true when the input fails the job (corrupt blob data with
+  // paranoid_checks). Finish() writes the other lines and counts
+  // INDIRECT_BLOB_GC_CORRUPT_INPUTS.
+  struct CorruptInput {
+    std::string detail;
+    bool logged = false;
+    bool fails_job = false;
+  };
+  std::map<uint64_t, CorruptInput> corrupt_inputs;
+  void note_corruption(uint64_t file_number, const Status& s,
+                       bool logged = false) {
+    CorruptInput& entry = corrupt_inputs[file_number];
+    if (entry.detail.empty()) {
+      entry.detail = s.ToString();
+    }
+    entry.logged = entry.logged || logged;
+  }
+  // True when a value read of the job was rejected with InvalidArgument (see
+  // note_internal_error()). RecordOutcome() then counts the job as failed.
+  bool internal_error = false;
+  // Notes a source value read that the blob reader rejected with
+  // InvalidArgument. DecideInputs() already rejected live values that overlap,
+  // so only a GC programming check returns it (for example, a normal read on a
+  // relocation file, or missing read buffers). It is not corrupt data, so it
+  // does not count in INDIRECT_BLOB_GC_CORRUPT_INPUTS and does not follow
+  // paranoid_checks. GC writes an ERROR line, gives the input a normal
+  // suppression, and RecordOutcome() counts the job in
+  // INDIRECT_BLOB_GC_JOBS_FAILED. It sets no background error, so writes go
+  // on. This is safe because a candidate-local failure ends the job without an
+  // install: GC publishes nothing from a failed job, so no data changes. The
+  // batch and the streaming read paths both use this rule.
+  void note_internal_error(uint64_t file_number, const Status& s) {
+    internal_error = true;
+    ROCKS_LOG_ERROR(db_->immutable_db_options_.info_log,
+                    "[%s] [JOB %d] Indirect blob GC internal error on input "
+                    "#%" PRIu64
+                    ": %s; the job installs nothing, and the file is skipped "
+                    "until it changes, the census is rebuilt or the coarse "
+                    "frontier rises (relocation files only)",
+                    cfd->GetName().c_str(), job_id, file_number,
+                    s.ToString().c_str());
+  }
+  // Records the job outcome (tickers, histogram, end-of-job line). REQUIRES:
+  // DB mutex held.
+  void RecordOutcome(const Status& result, size_t skipped_count);
+};
+
+Status DBImpl::RunIndirectBlobGCBatch(
+    ColumnFamilyData* cfd,
+    const std::vector<uint64_t>& candidate_physical_file_numbers,
+    bool* made_progress, uint64_t* sfm_reserved_bytes,
+    bool* retryable_stale_input, LogBuffer* log_buffer, int job_id,
+    bool empty_files_only) {
+  mutex_.AssertHeld();
+  if (cfd == nullptr || made_progress == nullptr ||
+      sfm_reserved_bytes == nullptr || retryable_stale_input == nullptr) {
+    return Status::InvalidArgument("Null indirect blob GC batch argument");
+  }
+  if (candidate_physical_file_numbers.empty() ||
+      candidate_physical_file_numbers.size() > kIndirectBlobGCMaxInputs) {
+    return Status::InvalidArgument("Invalid indirect blob GC batch size");
+  }
+  IndirectBlobGCJob job(this, cfd, candidate_physical_file_numbers,
+                        made_progress, sfm_reserved_bytes,
+                        retryable_stale_input, log_buffer, job_id,
+                        empty_files_only);
+  return job.Run();
+}
+
+Status DBImpl::IndirectBlobGCJob::Run() {
+  db_->mutex_.AssertHeld();
+  Status start_status = Start();
+  if (!start_status.ok() || gc_job_token == 0) {
+    // The job stops before SelectInputs() and Finish(), so nothing reads
+    // `status` or the copy of the background error.
+    status.PermitUncheckedError();
+    sfm_background_error.PermitUncheckedError();
+    return start_status;
+  }
+  RecordTick(db_->stats_, INDIRECT_BLOB_GC_JOBS_STARTED);
+  start_micros = db_->immutable_db_options_.clock->NowMicros();
+  cfd->ClearIndirectBlobGcCandidates();
+  SelectInputs();
+  PlanLiveSetReads();
+  ReadLiveSets();
+  DecideInputs();
+  PackOutputs();
+  OpenInputReaders();
+  WriteOutputs();
+  Install();
+  // Finish() clears suppressed_files, so count the skipped inputs first. The
+  // inputs that Finish() defers for outputs or disk space count too.
+  const size_t skipped_count =
+      suppressed_files.size() +
+      (status.IsCompactionTooLarge() ? capacity_deferred_files.size() : 0);
+  Status result = Finish();
+  RecordOutcome(result, skipped_count);
+  return result;
+}
+
+Status DBImpl::IndirectBlobGCJob::Start() {
+  assert(*sfm_reserved_bytes == 0);
+  stale_input_is_retryable = false;
+
+  blob_reference_census = cfd->blob_reference_census();
+  if (blob_reference_census == nullptr) {
+    return stale_input("Blob reference census is unavailable");
+  }
+
+  input_version = cfd->current();
+  if (input_version == nullptr) {
+    return stale_input("Indirect blob GC input Version is unavailable");
+  }
+  input_version->Ref();
+  input_version_number = input_version->GetVersionNumber();
+  if (!blob_reference_census->IsReady(input_version_number)) {
+    input_version->UnrefAndFreeBlobRelocationState(&db_->mutex_);
+    return stale_input("Blob reference census is not ready");
+  }
+
+  input_storage = input_version->storage_info();
+  inputs.reserve(candidate_physical_file_numbers.size());
+  mutable_cf_options = input_version->GetMutableCFOptions();
+  const MutableCFOptions& latest_options = cfd->GetLatestMutableCFOptions();
+  // A job that runs only to remove files with no live value from the Version
+  // copies no value, even if the options would allow it.
+  allow_value_relocation = !empty_files_only &&
+                           latest_options.enable_blob_files &&
+                           latest_options.enable_blob_indirection &&
+                           latest_options.enable_blob_garbage_collection;
+  // An empty-files-only job runs when the options do not allow normal GC (GC
+  // off or automatic compactions disabled), so only a normal job ends here.
+  if (!empty_files_only && !allow_value_relocation) {
+    // The scheduler checked the options under the DB mutex, but with a
+    // separate remote compaction pool it releases the DB mutex while the job
+    // waits for a local compaction credit, so SetOptions() can turn GC off in
+    // that window. The job then ends with no suppression. A suppression would
+    // keep the inputs out of later picks after GC is turned on again. A change
+    // of disable_auto_compactions does not end the job: it stops new picks,
+    // and a job that was picked may finish.
+    input_version->UnrefAndFreeBlobRelocationState(&db_->mutex_);
+    ROCKS_LOG_BUFFER(log_buffer,
+                     "[%s] Indirect blob GC did not start: the options turned "
+                     "blob GC off",
+                     cfd->GetName().c_str());
+    return Status::OK();
+  }
+  table_cache = cfd->table_cache();
+  blob_file_cache = cfd->blob_file_cache();
+  if (table_cache == nullptr || blob_file_cache == nullptr) {
+    input_version->UnrefAndFreeBlobRelocationState(&db_->mutex_);
+    return Status::Corruption("Missing indirect blob GC reader cache");
+  }
+  blob_gc_file_options = db_->file_options_for_compaction_;
+  output_directory = cfd->ioptions().cf_paths.front().path;
+  read_options = ReadOptions(Env::IOActivity::kCompaction);
+  gc_read_options = read_options;
+  gc_read_options.fill_cache = false;
+  gc_read_options.rate_limiter_priority = Env::IO_LOW;
+  write_options = WriteOptions(Env::IO_LOW, Env::IOActivity::kCompaction);
+  // Indirect blob GC data writes use IO_LOW. The MANIFEST write uses the
+  // default priority, so a MANIFEST write at the head of the writer queue does
+  // not wait behind the background rate limiter.
+  manifest_write_options = WriteOptions(Env::IOActivity::kCompaction);
+  sfm_background_error = db_->error_handler_.GetBGError();
+  // Under the DB mutex, so a route retirement that has not reached the
+  // MANIFEST queue head sees these inputs in its precondition.
+  status = blob_reference_census->BeginGcJob(
+      input_version_number, candidate_physical_file_numbers, &gc_job_token);
+  if (!status.ok()) {
+    input_version->UnrefAndFreeBlobRelocationState(&db_->mutex_);
+    if (status.IsBusy()) {
+      // Busy: an earlier metadata commit has an unknown outcome until recovery,
+      // or another indirect blob GC job is registered. Retrying now would only
+      // spin; a later Version picks GC again.
+      return Status::OK();
+    }
+    // TryAgain: a metadata commit is in progress, or the census is not ready
+    // for this Version; retry later.
+    stale_input_is_retryable = status.IsTryAgain();
+    return locked_census_status(std::move(status));
+  }
+
+  db_->mutex_.Unlock();
+
+  // Indirect blob GC working memory, including the selected census snapshot, is
+  // charged to its own cache role,
+  // CacheEntryRole::kIndirectBlobGcWorkingMemory.
+  gc_block_cache = GetIndirectBlobGcWorkingMemoryCache(mutable_cf_options);
+
+  status = blob_reference_census->CaptureCandidateStamp(
+      input_version_number, candidate_physical_file_numbers, &candidate_stamp);
+  if (status.IsTryAgain()) {
+    // The census changed or was canceled (for example, the CF was dropped).
+    stale_input_is_retryable = true;
+  }
+  // The old files routed to each relocation input, from one scan of the input
+  // Version's routes (without the DB mutex). selected_sources holds the
+  // generation numbers that the census snapshot copies: each candidate, and
+  // each old file routed to a relocation candidate.
+  std::set<uint64_t> selected_sources;
+  for (uint64_t file_number : candidate_physical_file_numbers) {
+    selected_sources.insert(file_number);
+    if (input_storage->PeekBlobRelocationFileMetaData(file_number) != nullptr) {
+      routed_generations_by_input[file_number];
+    }
+  }
+  if (!routed_generations_by_input.empty()) {
+    input_storage->ForEachBlobRelocationRoute(
+        [&](const BlobRelocationRoute& route) {
+          const auto input =
+              routed_generations_by_input.find(route.GetTargetFileNumber());
+          if (input != routed_generations_by_input.end()) {
+            input->second.push_back(route.GetOldFileNumber());
+            selected_sources.insert(route.GetOldFileNumber());
+          }
+        });
+    for (auto& input : routed_generations_by_input) {
+      std::sort(input.second.begin(), input.second.end());
+    }
+  }
+  if (status.ok()) {
+    // A job that only removes files with no live value copies its snapshot
+    // uncharged when the block cache is full (see SnapshotSelected()).
+    bool copied_uncharged = false;
+    const uint64_t uncharged_before =
+        blob_reference_census->uncharged_charge_count();
+    status = blob_reference_census->SnapshotSelected(
+        gc_job_token, input_version_number, selected_sources, gc_block_cache,
+        empty_files_only, &copied_uncharged, &census);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:SnapshotUncharged",
+                             &copied_uncharged);
+    // A job that fails later with a stale input is retried soon, and the
+    // retry can copy uncharged again. So the job logs only when the count of
+    // uncharged census charges reaches a new power of two, which bounds the
+    // number of lines.
+    const uint64_t uncharged_after =
+        blob_reference_census->uncharged_charge_count();
+    if (status.ok() && copied_uncharged && uncharged_after > 0 &&
+        (uncharged_before == 0 ||
+         FloorLog2(uncharged_after) > FloorLog2(uncharged_before))) {
+      ROCKS_LOG_WARN(db_->immutable_db_options_.info_log,
+                     "[%s] Indirect blob GC job %d copied its census snapshot "
+                     "uncharged, because the block cache is full; it only "
+                     "removes files with no live value (%" PRIu64
+                     " uncharged census charges so far)",
+                     cfd->GetName().c_str(), job_id, uncharged_after);
+    }
+    TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:SnapshotSelected",
+                             &status);
+    if (status.IsMemoryLimit()) {
+      suppress_candidates_transiently(
+          "selected census exceeds its memory budget");
+      status = stale_input("Blob GC census snapshot exceeds the memory budget");
+    } else {
+      status = unlocked_census_status(std::move(status));
+      if (status.IsTryAgain()) {
+        stale_input_is_retryable = true;
+      }
+    }
+  }
+  selected_sources.clear();
+  return Status::OK();
+}
+
+void DBImpl::IndirectBlobGCJob::SelectInputs() {
+  if (status.ok()) {
+    status = interrupted();
+  }
+  for (uint64_t file_number : candidate_physical_file_numbers) {
+    if (!status.ok()) {
+      break;
+    }
+    PhysicalInput input;
+    input.file_number = file_number;
+    input.normal_metadata = input_storage->GetBlobFileMetaData(file_number);
+    input.relocation_metadata =
+        input_storage->GetBlobRelocationFileMetaData(file_number);
+    if ((input.normal_metadata == nullptr) ==
+        (input.relocation_metadata == nullptr)) {
+      status = stale_input("Indirect blob GC candidate changed");
+      break;
+    }
+    input.generations.push_back(file_number);
+    if (input.normal_metadata != nullptr) {
+      if (!input.normal_metadata->IsIndirectOrigin() ||
+          input.normal_metadata->GetTotalBlobCount() == 0) {
+        status = stale_input("Indirect blob GC indirect-origin source changed");
+        break;
+      }
+      input.physical_bytes = input.normal_metadata->GetBlobFileSize();
+      input.total_record_bytes = input.normal_metadata->GetTotalBlobBytes();
+    } else {
+      // The input Version is this column family's, so it owns the file.
+      input.physical_bytes = input.relocation_metadata->GetFileSize();
+      input.total_record_bytes =
+          input.relocation_metadata->GetTotalRecordBytes();
+      input.routed_generations = routed_generations_by_input[file_number];
+      input.generations.insert(input.generations.end(),
+                               input.routed_generations.begin(),
+                               input.routed_generations.end());
+      std::sort(input.generations.begin(), input.generations.end());
+    }
+    // A coarse SST pins indirect-origin blob file numbers (see "Coarse SST" in
+    // blob_reference_metadata.h), so indirect blob GC skips a pinned input:
+    // a normal input whose file number is pinned, or a relocation input with
+    // a pinned routed generation number (an old indirect-origin file number
+    // that routes to it). In normal operation a coarse SST does not reference
+    // a routed number, but GC keeps this pin so that it never collects a file
+    // that a coarse SST may still read. When the pin goes away, the heap
+    // gives the input a new revision and GC can pick it again. Suppressing
+    // the input also removes it from the Version's GC candidate list, so a
+    // job with no output does not reschedule itself.
+    const bool coarse_pinned =
+        input.normal_metadata != nullptr
+            ? input_storage->IsCoarseIndirectOriginBlobPinned(file_number)
+            : std::any_of(
+                  input.routed_generations.begin(),
+                  input.routed_generations.end(), [&](uint64_t generation) {
+                    return input_storage->IsCoarseIndirectOriginBlobPinned(
+                        generation);
+                  });
+    if (coarse_pinned) {
+      suppressed_files.push_back(file_number);
+      suppression_reasons.emplace_back(
+          "coarse SST pins a generation number of the input");
+      continue;
+    }
+    if (input.physical_bytes == 0 || input.total_record_bytes == 0) {
+      // Bad metadata affects only this input: suppress it, and keep other
+      // background work running.
+      ROCKS_LOG_ERROR(db_->immutable_db_options_.info_log,
+                      "[%s] Indirect blob GC skipped blob file #%" PRIu64
+                      ": invalid input metadata",
+                      cfd->GetName().c_str(), file_number);
+      note_corruption(file_number, Status::Corruption("invalid input metadata"),
+                      /*logged=*/true);
+      suppressed_files.push_back(file_number);
+      suppression_reasons.emplace_back("invalid input metadata");
+      continue;
+    }
+    inputs.push_back(std::move(input));
+  }
+
+  const TableFactory* const table_factory =
+      mutable_cf_options.table_factory.get();
+  if (table_factory != nullptr) {
+    const BlockBasedTableOptions* options =
+        table_factory->GetOptions<BlockBasedTableOptions>();
+    const AdaptiveTableFactory* const adaptive_table_factory =
+        table_factory->CheckedCast<AdaptiveTableFactory>();
+    if (adaptive_table_factory != nullptr) {
+      options = adaptive_table_factory->GetBlockBasedTableWriterOptions();
+    }
+    if (options != nullptr) {
+      source_table_options.emplace(*options);
+    }
+  }
+
+  std::shared_ptr<CacheReservationManager> reservation_manager;
+  if (gc_block_cache != nullptr) {
+    reservation_manager = std::make_shared<CacheReservationManagerImpl<
+        CacheEntryRole::kIndirectBlobGcWorkingMemory>>(gc_block_cache);
+  }
+  // A test can shrink the budget, so that a small input does not fit in it.
+  size_t memory_budget_bytes = BlobRelocationMemoryTracker::kMaxBytes;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:MemoryBudget",
+                           &memory_budget_bytes);
+  memory_tracker = std::make_shared<BlobRelocationMemoryTracker>(
+      std::move(reservation_manager), memory_budget_bytes);
+  bool workspace_charge_failed = false;
+  // Charge the I/O workspace, the buffers that the job uses to read and stream
+  // the input values. The charge has 2 x kIndirectBlobGCReadBatchBytes for the
+  // read buffer of one batch, which holds the batch's stored bytes plus the
+  // dead gaps that coalescing merges into its reads (at most one more batch).
+  // Payloads are slices of this buffer. The charge also has 2 x
+  // kBlobRelocationStreamChunkSize (256 KB each) for values that are streamed
+  // in chunks, one value at a time: the chunk buffer of the stream reader
+  // (StreamAndVerifyBlobStoredPayload), and, with direct I/O, the aligned
+  // buffer that RandomAccessFileReader::Read allocates for each chunk. A
+  // streamed value is copied between batches, never during one. Charge the
+  // workspace before allocating exact live sets or read buffers.
+  size_t io_workspace_bytes = 0;
+  if (status.ok() && allow_value_relocation) {
+    const Status reservation_status = memory_tracker->SetReservation(
+        &io_workspace_bytes, kIndirectBlobGCIoWorkspaceBytes);
+    if (!reservation_status.ok()) {
+      for (const PhysicalInput& input : inputs) {
+        suppressed_files.push_back(input.file_number);
+        transient_suppressions.insert(input.file_number);
+        suppression_reasons.emplace_back(
+            "blob GC I/O workspace cache pressure");
+      }
+      workspace_charge_failed = true;
+      source_table_options.reset();
+    }
+  }
+
+  release_selected_reader_charge.emplace(
+      [memory_tracker = memory_tracker,
+       &selected_reader_bytes = selected_reader_bytes] {
+        memory_tracker->SetReservation(&selected_reader_bytes, 0)
+            .PermitUncheckedError();
+      });
+  // The workspace charge failure above already suppressed every input
+  // (transient), so suppress them for the table format only when the format
+  // is the reason.
+  if (status.ok() && !source_table_options.has_value() &&
+      !workspace_charge_failed) {
+    for (const PhysicalInput& input : inputs) {
+      suppressed_files.push_back(input.file_number);
+      suppression_reasons.emplace_back("block-based table format is required");
+    }
+  }
+}
+
+void DBImpl::IndirectBlobGCJob::PlanLiveSetReads() {
+  // The live sets are read SST by SST. First each input's reads are planned and
+  // its live set reserved, in input order; then each selected SST is opened
+  // once, its reference index decoded once and each needed data block read at
+  // most once; then each input is decided in order.
+  plans.resize(inputs.size());
+  release_group_read_charge.emplace([memory_tracker = memory_tracker,
+                                     &group_read_bytes = group_read_bytes] {
+    memory_tracker->SetReservation(&group_read_bytes, 0).PermitUncheckedError();
+  });
+  bool reserved_any = false;
+
+  // Plan the reads of each input and reserve its live set from the census
+  // reference counts of its generation numbers. An input whose live set can
+  // never fit, even as the only input of a job, is suppressed before any
+  // reservation (normal suppression, see below). When another input does not
+  // fit the memory budget, it and all later inputs wait for a later job if an
+  // earlier input holds a reservation. Otherwise the input gets a transient
+  // suppression, which has a retry time.
+  for (size_t input_index = 0;
+       status.ok() && source_table_options.has_value() &&
+       input_index < inputs.size();
+       ++input_index) {
+    status = interrupted();
+    if (!status.ok()) {
+      break;
+    }
+    PhysicalInput& input = inputs[input_index];
+    plan_end = input_index + 1;
+    InputPlan& plan = plans[input_index];
+    plan.planned = true;
+    // A job holds this input's live set, the I/O workspace charge, the planned
+    // read list and one SST reader at the same time. If the live set needs
+    // more than the budget minus the other three, a retry cannot fit it
+    // either. The input then gets a normal suppression that a change of its
+    // live bytes ends only when it has at most max_live_count live values (see
+    // BlobGcCandidateHeap::SuppressOversized()). The read list is estimated at
+    // twice its entries (one entry for each generation number of the input
+    // and each SST that holds it), because it grows by doubling. The SST reader
+    // is counted at its fixed charge (kIndirectBlobGCSstReaderBytes). Its
+    // decoded reference index is not known before the read, so it is left out.
+    // Each live value takes sizeof(BlobRelocationLiveValue) (40 bytes).
+    uint64_t total_live_count = 0;
+    size_t holder_count = 0;
+    for (uint64_t generation : input.generations) {
+      const std::vector<uint64_t>* const sst_files =
+          census->FindSstFiles(generation);
+      const BlobCensusGenerationTotals* const totals =
+          census->FindTotals(generation);
+      if (sst_files != nullptr) {
+        holder_count += sst_files->size();
+      }
+      if (totals != nullptr) {
+        total_live_count +=
+            std::min(totals->reference_count,
+                     std::numeric_limits<uint64_t>::max() - total_live_count);
+      }
+    }
+    const size_t max_bytes = memory_tracker->max_bytes();
+    const size_t read_list_bytes =
+        std::max(kIndirectBlobGCMinReadListEntries,
+                 2 * std::min(holder_count, max_bytes / sizeof(GroupRead))) *
+        sizeof(GroupRead);
+    const size_t fixed_bytes =
+        std::min<size_t>(max_bytes, kIndirectBlobGCIoWorkspaceBytes +
+                                        kIndirectBlobGCSstReaderBytes) +
+        std::min(max_bytes, read_list_bytes);
+    const size_t free_budget_bytes =
+        max_bytes - std::min(max_bytes, fixed_bytes);
+    const uint64_t max_live_count =
+        free_budget_bytes / sizeof(BlobRelocationLiveValue);
+    if (total_live_count > max_live_count) {
+      // The input is suppressed here, not in DecideInputs(), so that a job
+      // that ends before it decides its inputs also suppresses it. For
+      // example, a job that only suppresses a file with a remembered census
+      // mismatch decides no input. Install() then also suppresses this input
+      // in the current Version, so the next job does not plan it and count it
+      // again before the census publishes its new candidate list. A stale job
+      // does not get this: Install() returns before it suppresses anything,
+      // and after a first mismatch report the census rebuilds with a new
+      // worker that ignores the suppressions of the old one. The plan is
+      // marked as not planned, so DecideInputs() skips it.
+      plan.planned = false;
+      suppressed_files.push_back(input.file_number);
+      suppression_reasons.emplace_back(
+          "exact live set cannot fit in the memory budget");
+      oversized_suppressions[input.file_number] = max_live_count;
+      RecordTick(db_->stats_, INDIRECT_BLOB_GC_OVERSIZED_INPUTS);
+      ROCKS_LOG_WARN(
+          db_->immutable_db_options_.info_log,
+          "[%s] [JOB %d] Indirect blob GC skips blob file #%" PRIu64
+          ": its exact live set of %" PRIu64
+          " values needs more than the %" ROCKSDB_PRIszt
+          " bytes left in the job memory budget; the file is skipped until "
+          "it has at most %" PRIu64
+          " live values, the census is rebuilt or the coarse frontier rises "
+          "(relocation files only)",
+          cfd->GetName().c_str(), job_id, input.file_number, total_live_count,
+          free_budget_bytes, max_live_count);
+      continue;
+    }
+    input.live_set = std::make_unique<BlobRelocationLiveSet>(memory_tracker,
+                                                             input.generations);
+    const size_t first_group_read = group_reads.size();
+    const size_t first_generation_check = generation_checks.size();
+    uint64_t live_count = 0;
+    for (uint64_t generation : input.generations) {
+      const std::vector<uint64_t>* const sst_files =
+          census->FindSstFiles(generation);
+      const BlobCensusGenerationTotals* const totals =
+          census->FindTotals(generation);
+      if (sst_files == nullptr) {
+        continue;
+      }
+      // The live set is reserved from the census totals.
+      if (totals->reference_count > std::numeric_limits<size_t>::max() ||
+          totals->reference_count >
+              std::numeric_limits<uint64_t>::max() - live_count) {
+        status = Status::Corruption("Exact blob reference count overflow");
+        fail_input(input_index, "exact SST metadata is inconsistent");
+        break;
+      }
+      live_count += totals->reference_count;
+      const size_t check_index = generation_checks.size();
+      generation_checks.push_back(
+          {generation, input_index, *totals, sst_files->size(), {}, 0});
+      BlobReferenceGroup key;
+      key.generation_file_number = generation;
+      for (size_t i = 0; status.ok() && i < sst_files->size(); ++i) {
+        if ((i & kIndirectBlobGCAbortCheckMask) == 0) {
+          status = interrupted();
+          if (!status.ok()) {
+            break;
+          }
+        }
+        const uint64_t sst_file_number = (*sst_files)[i];
+        if (input_storage->GetFileMetaDataByNumber(sst_file_number) ==
+            nullptr) {
+          census_mismatch = true;
+          mismatched_input = input_index;
+          break;
+        }
+        if (group_reads.size() == group_reads.capacity()) {
+          const size_t capacity = group_reads.capacity() == 0
+                                      ? kIndirectBlobGCMinReadListEntries
+                                      : 2 * group_reads.capacity();
+          status = memory_tracker->SetReservation(&group_read_bytes,
+                                                  capacity * sizeof(GroupRead));
+          if (!status.ok()) {
+            break;
+          }
+          group_reads.reserve(capacity);
+        }
+        group_reads.push_back({sst_file_number, key, input_index, check_index});
+      }
+      if (!status.ok() || census_mismatch) {
+        break;
+      }
+    }
+    if (status.ok() && !census_mismatch) {
+      status = input.live_set->Reserve(static_cast<size_t>(live_count));
+      TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:ReserveLiveSet",
+                               &status);
+    }
+    if (!status.ok()) {
+      // A deferred or failed input reads nothing, so it has no totals to check
+      // either.
+      group_reads.resize(first_group_read);
+      generation_checks.resize(first_generation_check);
+      input.live_set.reset();
+    }
+    // Only the reference count overflow check above sets both Corruption and
+    // plan.failed. The cleanup above has run, so only this input fails.
+    if (status.IsCorruption() && plan.failed) {
+      status = Status::OK();
+      continue;
+    }
+    if (status.IsMemoryLimit()) {
+      status = Status::OK();
+      if (reserved_any) {
+        // The deferral is not a hot retry: the earlier inputs hold their
+        // reservations and this job finishes them, so the retried job starts
+        // with this input. If it then does not fit alone, it gets a
+        // suppression below.
+        ROCKS_LOG_BUFFER(log_buffer,
+                         "[%s] Indirect blob GC defers blob file #%" PRIu64
+                         " and %" ROCKSDB_PRIszt
+                         " later inputs to a later job: the GC memory budget "
+                         "or its block cache charge is full",
+                         cfd->GetName().c_str(), input.file_number,
+                         inputs.size() - input_index - 1);
+        plan.planned = false;
+        plan_end = input_index;
+        deferred_input = true;
+        break;
+      }
+      // No earlier input holds a live set, and the check above found that the
+      // live set can fit alone. So the failure is a short resource problem
+      // (for example, the block cache charge), and the suppression is
+      // transient.
+      plan.failed = true;
+      plan.transient = true;
+      plan.reason = "exact live set exceeds its memory budget";
+      continue;
+    }
+    if (!status.ok() || census_mismatch) {
+      break;
+    }
+    reserved_any = true;
+  }
+}
+
+void DBImpl::IndirectBlobGCJob::ReadLiveSets() {
+  // Read the planned generation numbers SST by SST. Corruption in a group or in
+  // an SST's metadata fails only the inputs that read it.
+  // TODO: when an SST's exact reference metadata is corrupt, GC suppresses
+  // every input that the SST references, so their garbage is never collected.
+  // A later change should fall back to reading the SST's key-value data (its
+  // blob indexes) to build the live set for those inputs.
+  std::sort(group_reads.begin(), group_reads.end(),
+            [](const GroupRead& lhs, const GroupRead& rhs) {
+              return std::make_tuple(lhs.sst_file_number,
+                                     lhs.group.generation_file_number) <
+                     std::make_tuple(rhs.sst_file_number,
+                                     rhs.group.generation_file_number);
+            });
+  std::vector<BlobReferenceGroupRead> batch;
+  std::vector<size_t> batch_inputs;
+  std::vector<size_t> batch_reads;
+  // Marks the request statuses of `batch` from index `first` on as checked.
+  // The loop below does not read them when it makes no read for the SST, when
+  // the reader charge, the reader open or the whole read fails, or when it
+  // stops at an earlier request. Without this, a build with
+  // ASSERT_STATUS_CHECKED aborts when `batch` drops them.
+  const auto permit_batch_statuses = [&batch](size_t first) {
+    for (size_t j = first; j < batch.size(); ++j) {
+      batch[j].status.PermitUncheckedError();
+    }
+  };
+  for (size_t begin = 0;
+       status.ok() && !census_mismatch && begin < group_reads.size();) {
+    size_t end = begin;
+    while (end < group_reads.size() && group_reads[end].sst_file_number ==
+                                           group_reads[begin].sst_file_number) {
+      ++end;
+    }
+    status = interrupted();
+    if (!status.ok()) {
+      break;
+    }
+    batch.clear();
+    batch_inputs.clear();
+    batch_reads.clear();
+    for (size_t i = begin; status.ok() && i < end; ++i) {
+      const GroupRead& read = group_reads[i];
+      if (plans[read.input_index].failed) {
+        continue;
+      }
+      BlobReferenceGroupRead group_read;
+      group_read.group = &read.group;
+      group_read.whole_generation = true;
+      group_read.sink = inputs[read.input_index].live_set.get();
+      batch.push_back(std::move(group_read));
+      batch_inputs.push_back(read.input_index);
+      batch_reads.push_back(i);
+    }
+    const uint64_t sst_file_number = group_reads[begin].sst_file_number;
+    begin = end;
+    if (!status.ok() || batch.empty()) {
+      permit_batch_statuses(0);
+      continue;
+    }
+    const FileMetaData* const file =
+        input_storage->GetFileMetaDataByNumber(sst_file_number);
+    // One reader is held at a time. Its charge is
+    // kIndirectBlobGCSstReaderBytes (576 KB, see its comment). The decoded
+    // reference index is added at its real size once it is decoded: it grows
+    // with the groups and blocks of the SST (one BlobReferenceIndexEntry per
+    // group), so an SST with many groups needs more than any fixed estimate.
+    constexpr size_t kReaderBytes = kIndirectBlobGCSstReaderBytes;
+    status =
+        memory_tracker->SetReservation(&selected_reader_bytes, kReaderBytes);
+    TableCache::BlobReferenceReader reader;
+    if (status.ok()) {
+      status = table_cache->GetBlobReferenceReader(
+          gc_read_options, blob_gc_file_options, cfd->internal_comparator(),
+          *file, mutable_cf_options, &reader);
+      if (status.IsCorruption()) {
+        // The SST cannot be opened (for example, a bad footer, meta-index
+        // block or properties block). That damages user data, unlike a bad
+        // reference block, so it follows the compaction rule: with
+        // paranoid_checks (the default) the job fails with Corruption, and the
+        // caller sets a background error with reason kCompaction. Without
+        // paranoid_checks, the inputs that this SST references are skipped.
+        // Their blob files are not corrupt, so they are not counted or listed
+        // as corrupt inputs.
+        reader.Reset();
+        memory_tracker->SetReservation(&selected_reader_bytes, 0)
+            .PermitUncheckedError();
+        permit_batch_statuses(0);
+        ROCKS_LOG_ERROR(
+            db_->immutable_db_options_.info_log,
+            "[%s] [JOB %d] Indirect blob GC cannot open SST #%" PRIu64
+            ": %s; %s",
+            cfd->GetName().c_str(), job_id, sst_file_number,
+            status.ToString().c_str(),
+            db_->immutable_db_options_.paranoid_checks
+                ? "the job fails with a background error "
+                  "(paranoid_checks)"
+                : "the blob files that it references are skipped");
+        if (db_->immutable_db_options_.paranoid_checks) {
+          status = Status::Corruption("Indirect blob GC cannot open SST #" +
+                                          std::to_string(sst_file_number),
+                                      status.ToString());
+          sst_open_fails_job = true;
+          break;
+        }
+        for (size_t input_index : batch_inputs) {
+          fail_input(input_index, "an SST that references it cannot be opened");
+        }
+        status = Status::OK();
+        continue;
+      }
+    }
+    if (status.ok()) {
+      status = reader->ReadBlobReferences(
+          gc_read_options, file->blob_reference_descriptor,
+          [&](size_t index_bytes) {
+            if (index_bytes >
+                std::numeric_limits<size_t>::max() - kReaderBytes) {
+              return Status::MemoryLimit("Blob reference index is too large");
+            }
+            return memory_tracker->SetReservation(&selected_reader_bytes,
+                                                  kReaderBytes + index_bytes);
+          },
+          &batch);
+    }
+    reader.Reset();
+    if (!status.ok()) {
+      permit_batch_statuses(0);
+    }
+    Status release_status =
+        memory_tracker->SetReservation(&selected_reader_bytes, 0);
+    release_status.PermitUncheckedError();
+    // Reports the batch size and the reader charge left after closing.
+    std::pair<size_t, size_t> batch_report{batch.size(), selected_reader_bytes};
+    TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:SstBatchRead",
+                             &batch_report);
+    if (status.IsCorruption()) {
+      for (size_t input_index : batch_inputs) {
+        fail_input(input_index, "exact SST metadata is corrupt");
+        note_corruption(inputs[input_index].file_number, status);
+      }
+      status = Status::OK();
+      continue;
+    }
+    if (!status.ok()) {
+      break;
+    }
+    for (size_t i = 0; i < batch.size(); ++i) {
+      if (batch[i].status.IsNotFound() || batch[i].status.IsAborted()) {
+        // The SST lacks the generation number, or has more references than the
+        // census.
+        census_mismatch = true;
+        mismatched_input = batch_inputs[i];
+        permit_batch_statuses(i + 1);
+        break;
+      }
+      if (batch[i].status.IsCorruption()) {
+        fail_input(batch_inputs[i], "exact SST metadata is corrupt");
+        note_corruption(inputs[batch_inputs[i]].file_number, batch[i].status);
+      } else if (!batch[i].status.ok()) {
+        status = batch[i].status;
+        permit_batch_statuses(i + 1);
+        break;
+      } else {
+        GenerationCheck& check =
+            generation_checks[group_reads[batch_reads[i]].check_index];
+        check.found.reference_count += batch[i].found_reference_count;
+        check.found.stored_value_bytes += batch[i].found_stored_value_bytes;
+        check.found.record_bytes += batch[i].found_record_bytes;
+        ++check.holders_found;
+      }
+    }
+  }
+  // The census totals check: for each generation number of an input that read
+  // all its SSTs, the number of SSTs found that hold the generation number, and
+  // their totals, must equal the census record. A first mismatch rebuilds the
+  // census and retries the job. A mismatch that remains after a rebuild
+  // suppresses only that input (see below). Only inputs that were planned, read
+  // and not failed are checked.
+  const GenerationCheck* mismatched_check = nullptr;
+  if (status.ok() && !census_mismatch) {
+    // A normal input that no SST holds in the census, while an SST still links
+    // to it as its oldest blob file: do not trust the census to remove the
+    // input (blob file retirement) with no output.
+    for (size_t input_index = 0; input_index < plan_end; ++input_index) {
+      const PhysicalInput& input = inputs[input_index];
+      if (plans[input_index].planned && !plans[input_index].failed &&
+          input.normal_metadata != nullptr &&
+          !input.normal_metadata->GetLinkedSsts().empty() &&
+          census->FindSstFiles(input.file_number) == nullptr) {
+        census_mismatch = true;
+        mismatched_input = input_index;
+        break;
+      }
+    }
+  }
+  if (status.ok() && !census_mismatch) {
+    for (const GenerationCheck& check : generation_checks) {
+      if (check.input_index >= plan_end || !plans[check.input_index].planned ||
+          plans[check.input_index].failed) {
+        continue;
+      }
+      if (check.holders_found != check.expected_holders ||
+          check.found.reference_count != check.expected.reference_count ||
+          check.found.stored_value_bytes != check.expected.stored_value_bytes ||
+          check.found.record_bytes != check.expected.record_bytes) {
+        census_mismatch = true;
+        mismatched_check = &check;
+        mismatched_input = check.input_index;
+        break;
+      }
+    }
+  }
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:CensusTotalsCheck",
+                           &census_mismatch);
+  if (status.ok() && !census_mismatch) {
+    // Every checked input matched the census. Forget a remembered mismatch of
+    // such an input, so that a later mismatch of it requests a rebuild again,
+    // and reset the count of mismatch rebuilds in a row (see
+    // BlobReferenceCensus::ReportMismatch()).
+    bool checked_any = false;
+    for (size_t input_index = 0; input_index < plan_end; ++input_index) {
+      if (plans[input_index].planned && !plans[input_index].failed) {
+        blob_reference_census->ClearMismatch(inputs[input_index].file_number);
+        checked_any = true;
+      }
+    }
+    if (checked_any) {
+      blob_reference_census->NoteCensusCheckMatched();
+    }
+  }
+  if (census_mismatch && mismatched_input >= inputs.size() && plan_end > 0) {
+    // Every real mismatch names its input; a test-injected one is charged to
+    // the first input.
+    mismatched_input = 0;
+  }
+  if (census_mismatch) {
+    const uint64_t mismatched_file = mismatched_input < inputs.size()
+                                         ? inputs[mismatched_input].file_number
+                                         : 0;
+    RecordTick(db_->stats_, INDIRECT_BLOB_GC_CENSUS_MISMATCHES);
+    if (blob_reference_census->ReportMismatch(mismatched_file)) {
+      // The rebuild did not clear the mismatch of this input. Skip only this
+      // input, with a normal suppression (it ends when the file changes, the
+      // census is rebuilt or, for a relocation file, the coarse frontier rises;
+      // see BlobGcCandidateHeap::Suppress()), rather than rebuilding at every
+      // Version. If it mismatches again after that, also after a rebuild that
+      // another file's report requested, it is skipped again without a
+      // rebuild, because the census remembers the file. This job decides no
+      // input and publishes nothing, so it never relocates by a census entry
+      // that is known to be wrong. It is not retried at once, so the next job,
+      // after the census drops this input from its candidates, takes the other
+      // inputs.
+      if (mismatched_check != nullptr) {
+        ROCKS_LOG_ERROR(
+            db_->immutable_db_options_.info_log,
+            "[%s] Blob GC skips blob file #%" PRIu64
+            " until it changes, the census is rebuilt or the coarse frontier "
+            "rises (relocation files only): the census rebuild did not clear "
+            "a mismatch for generation number %" PRIu64
+            ": holders %" ROCKSDB_PRIszt "/%" ROCKSDB_PRIszt
+            ", references %" PRIu64 "/%" PRIu64 " (found/expected)",
+            cfd->GetName().c_str(), mismatched_file,
+            mismatched_check->generation, mismatched_check->holders_found,
+            mismatched_check->expected_holders,
+            mismatched_check->found.reference_count,
+            mismatched_check->expected.reference_count);
+      } else {
+        ROCKS_LOG_ERROR(
+            db_->immutable_db_options_.info_log,
+            "[%s] Blob GC skips blob file #%" PRIu64
+            " until it changes, the census is rebuilt or the coarse frontier "
+            "rises (relocation files only): the census rebuild "
+            "did not clear a mismatch",
+            cfd->GetName().c_str(), mismatched_file);
+      }
+      note_corruption(
+          mismatched_file,
+          Status::Corruption("census mismatch remains after a rebuild"),
+          /*logged=*/true);
+      suppressed_files.push_back(mismatched_file);
+      suppression_reasons.emplace_back(
+          "census mismatch remains after a rebuild");
+      plan_end = 0;
+    } else {
+      ROCKS_LOG_ERROR(db_->immutable_db_options_.info_log,
+                      "[%s] Blob GC found SSTs that do not match the blob "
+                      "reference census for blob file #%" PRIu64
+                      "; the census is rebuilt",
+                      cfd->GetName().c_str(), mismatched_file);
+      {
+        InstrumentedMutexLock lock(&db_->mutex_);
+        db_->ScheduleBlobReferenceCensus(cfd);
+      }
+      status = stale_input("Blob reference census does not match the SSTs");
+    }
+  }
+  if (status.IsMemoryLimit()) {
+    // Reader and request charges come from the same budget as the live sets.
+    status = Status::OK();
+    for (size_t input_index = 0; input_index < plan_end; ++input_index) {
+      if (plans[input_index].planned && !plans[input_index].failed) {
+        fail_input(input_index,
+                   "SST reader memory charge exceeds the GC memory budget");
+        plans[input_index].transient = true;
+      }
+    }
+  }
+
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:PlanEnd", &plan_end);
+}
+
+void DBImpl::IndirectBlobGCJob::DecideInputs() {
+  // Decide each input in order.
+  for (size_t input_index = 0; status.ok() && input_index < plan_end;
+       ++input_index) {
+    PhysicalInput& input = inputs[input_index];
+    InputPlan& plan = plans[input_index];
+    if (!plan.planned) {
+      continue;
+    }
+    if (plan.transient) {
+      transient_suppressions.insert(input.file_number);
+    }
+    bool candidate_local_failure = plan.failed;
+    const char* candidate_reason = plan.reason;
+    if (!candidate_local_failure) {
+      status = input.live_set->Finalize();
+      if (status.ok()) {
+        // Lets a test change the finalized live values (for example, to make
+        // two of them overlap).
+        TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:FinalizedLiveSet",
+                                 input.live_set.get());
+        // Two live values that overlap are corrupt exact SST metadata, like a
+        // bad reference block in ReadLiveSets(): the input is suppressed and
+        // counted as corrupt, with no background error for either value of
+        // paranoid_checks.
+        status = CheckIndirectBlobGCLiveValuesDoNotOverlap(
+            input.live_set->references());
+      }
+      if (status.IsCorruption()) {
+        candidate_local_failure = true;
+        candidate_reason = "exact SST metadata is corrupt";
+        note_corruption(input.file_number, status);
+      }
+    }
+    uint64_t input_live_record_bytes = 0;
+    if (status.ok() && !candidate_local_failure) {
+      input.live_count = input.live_set->references().size();
+      input_live_record_bytes = input.live_set->live_record_bytes();
+      if (input.relocation_metadata != nullptr) {
+        // A relocation file holds each value as stored bytes and a trailer.
+        if (input.live_count > (std::numeric_limits<uint64_t>::max() -
+                                input.live_set->live_stored_value_bytes()) /
+                                   kSimpleGen2BlobTrailerSize) {
+          status = Status::Corruption("Relocation live byte count overflow");
+          candidate_local_failure = true;
+          candidate_reason = "exact SST metadata is corrupt";
+          note_corruption(input.file_number, status);
+        } else {
+          input_live_record_bytes =
+              input.live_set->live_stored_value_bytes() +
+              input.live_count * kSimpleGen2BlobTrailerSize;
+        }
+      }
+      input.physical_live_record_bytes = input_live_record_bytes;
+    }
+    if (status.IsMemoryLimit()) {
+      if (!eligible_inputs.empty()) {
+        // As in PlanLiveSetReads(), the earlier accepted inputs go on, so the
+        // retried job starts with this input.
+        ROCKS_LOG_BUFFER(log_buffer,
+                         "[%s] Indirect blob GC defers blob file #%" PRIu64
+                         " and the later inputs to a later job: the GC memory "
+                         "budget or its block cache charge is full",
+                         cfd->GetName().c_str(), input.file_number);
+        status = Status::OK();
+        deferred_input = true;
+        break;
+      }
+      candidate_local_failure = true;
+      candidate_reason = "exact live set exceeds its memory budget";
+      transient_suppressions.insert(input.file_number);
+    }
+    if (candidate_local_failure) {
+      status = Status::OK();
+      suppressed_files.push_back(input.file_number);
+      suppression_reasons.emplace_back(candidate_reason);
+      continue;
+    }
+    if (!status.ok()) {
+      break;
+    }
+    if (input_live_record_bytes > input.total_record_bytes) {
+      suppressed_files.push_back(input.file_number);
+      suppression_reasons.emplace_back(
+          "exact live bytes exceed physical record bytes");
+      continue;
+    }
+    const bool marked_lost = input.relocation_metadata != nullptr &&
+                             input.relocation_metadata->IsMarkedLost();
+    if (marked_lost && input_live_record_bytes != 0) {
+      // A lost relocation file (an accepted loss, recorded with
+      // VersionEdit::MarkBlobPhysicalFileLost()) is never read in this
+      // Version, so GC cannot copy the values that SSTs still reference.
+      suppressed_files.push_back(input.file_number);
+      suppression_reasons.emplace_back(
+          "lost relocation file still has SST references");
+      continue;
+    }
+    ROCKS_LOG_BUFFER(log_buffer,
+                     "[%s] Indirect blob GC exact candidate #%" PRIu64
+                     ": live=%" PRIu64 " total=%" PRIu64,
+                     cfd->GetName().c_str(), input.file_number,
+                     input_live_record_bytes, input.total_record_bytes);
+    if (!allow_value_relocation && input_live_record_bytes != 0) {
+      suppressed_files.push_back(input.file_number);
+      suppression_reasons.emplace_back("live-value relocation is disabled");
+      continue;
+    }
+    // Same rule as the census selection (BlobGcCandidateHeap::CutSelection()).
+    // Both read the options of the input Version.
+    const double garbage_ratio =
+        mutable_cf_options.indirect_blob_gc_garbage_ratio;
+    if (static_cast<double>(input.total_record_bytes -
+                            input_live_record_bytes) <
+        garbage_ratio * static_cast<double>(input.total_record_bytes)) {
+      char reason[96];
+      snprintf(reason, sizeof(reason),
+               "exact garbage ratio is below indirect_blob_gc_garbage_ratio "
+               "(%g)",
+               garbage_ratio);
+      suppressed_files.push_back(input.file_number);
+      suppression_reasons.emplace_back(reason);
+      continue;
+    }
+    if (input.live_count != 0) {
+      Status estimate_status = EstimateIndirectBlobGCPartitionBytes(
+          input.physical_live_record_bytes, input.live_count,
+          &input.estimated_bytes);
+      if (!estimate_status.ok()) {
+        estimate_status.PermitUncheckedError();
+        suppressed_files.push_back(input.file_number);
+        suppression_reasons.emplace_back(
+            "relocation output size estimate overflow");
+        continue;
+      }
+    }
+    input.eligible = true;
+    eligible_inputs.push_back(input_index);
+  }
+
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:AfterLiveSet", &status);
+  if ((status.IsCorruption() && !sst_open_fails_job) ||
+      status.IsMemoryLimit()) {
+    // This phase read only input and SST metadata, and created no output. So
+    // its failures suppress the affected inputs and do not set a background
+    // error. The exception is an SST that cannot be opened while
+    // paranoid_checks is on (sst_open_fails_job, see ReadLiveSets()).
+    for (size_t input_index : eligible_inputs) {
+      suppressed_files.push_back(inputs[input_index].file_number);
+      suppression_reasons.emplace_back("source live-set validation failed");
+      if (status.IsMemoryLimit()) {
+        transient_suppressions.insert(inputs[input_index].file_number);
+      }
+    }
+    eligible_inputs.clear();
+    status = Status::OK();
+  }
+  // Lets concurrency tests install a new SST after the job's live set is fixed
+  // but before output work begins.
+  TEST_SYNC_POINT("DBImpl::RunIndirectBlobGC:BeforeOutputWork");
+}
+
+void DBImpl::IndirectBlobGCJob::PackOutputs() {
+  capacity_deferred_files.reserve(eligible_inputs.size());
+  auto* const sfm = static_cast<SstFileManagerImpl*>(
+      db_->immutable_db_options_.sst_file_manager.get());
+  while (status.ok() && !eligible_inputs.empty()) {
+    // Whole inputs are packed; empty inputs need no output.
+    std::vector<BlobRelocationPackingItem> items;
+    std::vector<size_t> packed_inputs;
+    for (size_t input_index : eligible_inputs) {
+      PhysicalInput& input = inputs[input_index];
+      input.output_index = std::numeric_limits<size_t>::max();
+      if (input.estimated_bytes == 0) {
+        continue;
+      }
+      BlobRelocationPackingItem item;
+      item.input_file_number = input.file_number;
+      item.estimated_bytes = input.estimated_bytes;
+      for (const BlobRelocationOriginRun& run : input.live_set->origin_runs()) {
+        item.origins.push_back(run.origin_file_number);
+      }
+      items.push_back(std::move(item));
+      packed_inputs.push_back(input_index);
+    }
+    if (items.empty()) {
+      bins.clear();
+      break;
+    }
+    const uint64_t configured_output_bytes =
+        mutable_cf_options.blob_file_size == 0
+            ? 1
+            : std::min(mutable_cf_options.blob_file_size,
+                       kIndirectBlobGCMaxOutputBytes);
+    const uint64_t target_output_bytes = std::max<uint64_t>(
+        1, configured_output_bytes - configured_output_bytes / 10);
+    status = PlanBlobRelocationPacking(items, target_output_bytes,
+                                       kIndirectBlobGCMaxOutputs, &bins);
+    if (status.ok()) {
+      for (size_t output_index = 0; output_index < bins.size();
+           ++output_index) {
+        for (size_t& item_index : bins[output_index].item_indexes) {
+          item_index = packed_inputs[item_index];
+          inputs[item_index].output_index = output_index;
+        }
+      }
+      aggregate_input_bytes = 0;
+      uint64_t aggregate_estimated_bytes = 0;
+      for (size_t input_index : eligible_inputs) {
+        if (inputs[input_index].physical_bytes >
+                std::numeric_limits<uint64_t>::max() - aggregate_input_bytes ||
+            inputs[input_index].estimated_bytes >
+                std::numeric_limits<uint64_t>::max() -
+                    aggregate_estimated_bytes) {
+          status = Status::Corruption("Indirect blob GC input byte overflow");
+          break;
+        }
+        aggregate_input_bytes += inputs[input_index].physical_bytes;
+        aggregate_estimated_bytes += inputs[input_index].estimated_bytes;
+      }
+      // The outputs need about their estimated size, never more than the
+      // inputs, so the space check reserves the smaller of the two.
+      const uint64_t reserved_bytes =
+          std::min(aggregate_estimated_bytes, aggregate_input_bytes);
+      if (!status.ok() || sfm == nullptr ||
+          sfm->EnoughRoomForCompaction(reserved_bytes, output_directory,
+                                       sfm_background_error)) {
+        if (status.ok() && sfm != nullptr) {
+          *sfm_reserved_bytes = reserved_bytes;
+        }
+        break;
+      }
+      if (eligible_inputs.size() == 1) {
+        capacity_deferred_files.push_back(
+            inputs[eligible_inputs.front()].file_number);
+        status = Status::CompactionTooLarge();
+        RecordTick(db_->stats_, COMPACTION_CANCELLED, 1);
+        break;
+      }
+      status = Status::OK();
+      deferred_input = true;
+      bins.clear();
+    }
+    // Two paths reach the code below. (1) PlanBlobRelocationPacking() returned
+    // MemoryLimit: the inputs need more than kIndirectBlobGCMaxOutputs
+    // (8) outputs. That is not a memory error. (2) The disk space check above
+    // failed with more than one input left, and `status` was set back to OK.
+    if (!status.ok() && !status.IsMemoryLimit()) {
+      break;
+    }
+    // Too many outputs or not enough space: the input with the largest
+    // estimated output waits for a later job. An input with no live value
+    // (estimated_bytes is 0) is never deferred here. It needs no output and no
+    // space, and removing it frees space. When every input with a live value
+    // is deferred, the next loop finds no packing item, and the job still
+    // removes the inputs with no live value.
+    status = Status::OK();
+    const auto removed = std::max_element(
+        eligible_inputs.begin(), eligible_inputs.end(),
+        [&](size_t lhs, size_t rhs) {
+          return std::tie(inputs[lhs].estimated_bytes,
+                          inputs[lhs].file_number) <
+                 std::tie(inputs[rhs].estimated_bytes, inputs[rhs].file_number);
+        });
+    assert(removed != eligible_inputs.end());
+    assert(inputs[*removed].estimated_bytes != 0);
+    const size_t removed_input = *removed;
+    capacity_deferred_files.push_back(inputs[removed_input].file_number);
+    eligible_inputs.erase(removed);
+    inputs[removed_input].eligible = false;
+    inputs[removed_input].output_index = std::numeric_limits<size_t>::max();
+    deferred_input = true;
+  }
+  sfm_background_error.PermitUncheckedError();
+
+  outputs = std::vector<OutputState>(bins.size());
+  if (status.ok() && !outputs.empty()) {
+    db_->mutex_.Lock();
+    Version* const current = cfd->current();
+    if (cfd->IsDropped() || current == nullptr) {
+      status = stale_input("Indirect blob GC column family changed");
+    } else {
+      for (OutputState& output : outputs) {
+        output.file_number = db_->versions_->NewFileNumber();
+        output.path = BlobFileName(output_directory, output.file_number);
+        output.temporary_path =
+            TempFileName(output_directory, output.file_number);
+      }
+    }
+    db_->mutex_.Unlock();
+  }
+}
+
+void DBImpl::IndirectBlobGCJob::OpenInputReaders() {
+  readers = std::vector<InputReader>(inputs.size());
+  // Indirect blob GC opens a relocation input with its own reader, outside the
+  // blob file cache, and never pins its location blocks
+  // (pin_blob_relocation_location_blocks): GC is about to reclaim the file, and
+  // a pin would read every location block at IO_LOW and keep them charged for
+  // the whole job. The reader is not cached, so when GC does not reclaim the
+  // file, user reads do not reuse an unpinned reader.
+  MutableCFOptions gc_open_options = mutable_cf_options;
+  gc_open_options.pin_blob_relocation_location_blocks = false;
+  for (size_t input_index : eligible_inputs) {
+    if (!status.ok()) {
+      break;
+    }
+    if (inputs[input_index].live_count == 0) {
+      // Exact empty-file cleanup does not read source data or create output.
+      continue;
+    }
+    const PhysicalInput& input = inputs[input_index];
+    if (input.normal_metadata != nullptr) {
+      const BlobFileOpenInfo source_file{
+          input.file_number, input.normal_metadata->GetChecksumValue(),
+          input.normal_metadata->GetChecksumMethod()};
+      // Indirect blob GC input is cold data, and buffered io_uring reads of
+      // coalesced ranges can read more device bytes than needed. So GC prefers
+      // direct reads for normal blob file inputs (see
+      // OpenBlobFileReaderUncached()). User reads keep their cached buffered
+      // readers.
+      status = blob_file_cache->OpenBlobFileReaderUncached(
+          gc_read_options, source_file, &readers[input_index].normal,
+          /*allow_footer_skip_retry=*/false, /*prefer_direct_reads=*/true);
+      // A null reader is an invariant break. It is reported as Corruption on
+      // purpose, so it follows the same paranoid_checks rule as corrupt data.
+      if (status.ok() && readers[input_index].normal == nullptr) {
+        status = Status::Corruption("Blob file cache returned a null reader");
+      }
+    } else {
+      const BlobPhysicalFile source_file{
+          BlobFileOpenInfo{input.file_number,
+                           input.relocation_metadata->GetChecksumValue(),
+                           input.relocation_metadata->GetChecksumMethod()},
+          input.relocation_metadata->GetFileSize(), /*is_relocation=*/true,
+          input.relocation_metadata->GetTailSize(),
+          input.relocation_metadata->GetDirectoryDigest()};
+      status = blob_file_cache->OpenRelocationFileReaderUncached(
+          gc_read_options, source_file, gc_open_options,
+          &readers[input_index].relocation);
+      TEST_SYNC_POINT_CALLBACK(
+          "DBImpl::RunIndirectBlobGC:RelocationInputOpened",
+          readers[input_index].relocation.get());
+      if (status.ok() && readers[input_index].relocation == nullptr) {
+        status = Status::Corruption(
+            "Blob file cache returned a null relocation reader");
+      }
+    }
+    if (status.IsCorruption() || status.IsMemoryLimit() ||
+        status.IsNotSupported()) {
+      if (status.IsCorruption()) {
+        note_corruption(inputs[input_index].file_number, status);
+      }
+      candidate_local_failure_input = input_index;
+      candidate_local_failure_reason =
+          "the input file cannot be opened for relocation";
+      status = Status::OK();
+      break;
+    }
+  }
+  TEST_SYNC_POINT("DBImpl::RunIndirectBlobGC:InputsOpened");
+}
+
+void DBImpl::IndirectBlobGCJob::WriteOutputs() {
+  uint64_t aggregate_output_bytes = 0;
+  uint64_t total_relocated_value_bytes = 0;
+  size_t total_relocated_count = 0;
+  // This comparator must outlive each output's table builder.
+  const InternalKeyComparator relocation_comparator(BytewiseComparator());
+  for (size_t output_index = 0;
+       status.ok() &&
+       candidate_local_failure_input == std::numeric_limits<size_t>::max() &&
+       output_index < outputs.size();
+       ++output_index) {
+    OutputState& output = outputs[output_index];
+    status = interrupted();
+    if (!status.ok()) {
+      break;
+    }
+    output.creation_started = true;
+    db_->blob_callback_.OnBlobFileCreationStarted(
+        output.path, cfd->GetName(), job_id,
+        BlobFileCreationReason::kIndirectBlobGC);
+    FileOptions file_options = blob_gc_file_options;
+    file_options.open_contract = FileOpenContract::kNoReopenForWrite |
+                                 FileOpenContract::kNoReadersWhileOpenForWrite;
+    std::unique_ptr<FSWritableFile> file;
+    status = NewWritableFile(db_->fs_.get(), output.temporary_path, &file,
+                             file_options);
+    std::unique_ptr<WritableFileWriter> file_writer;
+    std::unique_ptr<BlockBasedTableBuilder> table_builder;
+    if (status.ok()) {
+      if (file == nullptr) {
+        status = Status::Corruption("File system returned a null blob GC file");
+      } else {
+        FSWritableFile& writable_file = *file;
+        writable_file.SetIOPriority(write_options.rate_limiter_priority);
+        FileTypeSet checksum_handoff_file_types =
+            db_->immutable_db_options_.checksum_handoff_file_types;
+        file_writer = std::make_unique<WritableFileWriter>(
+            std::move(file), output.temporary_path, file_options,
+            db_->immutable_db_options_.clock, db_->io_tracer_, db_->stats_,
+            Histograms::BLOB_DB_BLOB_FILE_WRITE_MICROS,
+            db_->immutable_db_options_.listeners,
+            db_->immutable_db_options_.file_checksum_gen_factory.get(),
+            checksum_handoff_file_types.Contains(FileType::kBlobFile), false);
+        BlobRelocationTableFileInfo file_info;
+        file_info.column_family_id = cfd->GetID();
+        file_info.column_family_name = cfd->GetName();
+        file_info.db_id = db_->db_id_;
+        file_info.db_session_id = db_->db_session_id_;
+        file_info.db_name = db_->dbname_;
+        file_info.file_number = output.file_number;
+        file_info.target_file_size = bins[output_index].estimated_bytes;
+        status = NewBlobRelocationTableBuilder(
+            cfd->ioptions(), mutable_cf_options, *source_table_options,
+            gc_read_options, write_options, relocation_comparator, file_info,
+            file_writer.get(), &table_builder);
+      }
+    }
+
+    // The output gets whole inputs. Its values must be added in (origin,
+    // original offset) order: each input's live set is in that order, and the
+    // inputs of one output share no origin, so the inputs' origin runs are
+    // merged by origin.
+    struct OutputRun {
+      size_t input_index = 0;
+      BlobRelocationOriginRun run;
+    };
+    std::vector<OutputRun> output_runs;
+    // The old file numbers this output can be routed from: its inputs and the
+    // old files routed to them at job start. The builder stores them in the
+    // file's directory as its served list. After the build, the output check
+    // below compares that list with these file numbers.
+    std::vector<uint64_t> served_generation_numbers;
+    for (size_t input_index : bins[output_index].item_indexes) {
+      const PhysicalInput& input = inputs[input_index];
+      output.input_bytes += input.physical_bytes;
+      served_generation_numbers.insert(served_generation_numbers.end(),
+                                       input.generations.begin(),
+                                       input.generations.end());
+      for (const BlobRelocationOriginRun& run : input.live_set->origin_runs()) {
+        output_runs.push_back({input_index, run});
+      }
+    }
+    std::sort(output_runs.begin(), output_runs.end(),
+              [](const OutputRun& lhs, const OutputRun& rhs) {
+                return lhs.run.origin_file_number < rhs.run.origin_file_number;
+              });
+    std::sort(served_generation_numbers.begin(),
+              served_generation_numbers.end());
+    for (size_t i = 0; status.ok() && i < served_generation_numbers.size();
+         ++i) {
+      if (i == 0 ||
+          served_generation_numbers[i - 1] != served_generation_numbers[i]) {
+        status = table_builder->AddBlobRelocationServedFile(
+            served_generation_numbers[i]);
+      }
+    }
+    for (const OutputRun& output_run : output_runs) {
+      if (!status.ok() ||
+          candidate_local_failure_input != std::numeric_limits<size_t>::max()) {
+        break;
+      }
+      const size_t run_input = output_run.input_index;
+      const PhysicalInput& input = inputs[run_input];
+      const std::vector<BlobRelocationLiveValue>& references =
+          input.live_set->references();
+      const uint64_t origin = output_run.run.origin_file_number;
+      const size_t run_end = output_run.run.end;
+      size_t next_reference = output_run.run.begin;
+      while (status.ok() && next_reference < run_end) {
+        status = interrupted();
+        if (!status.ok()) {
+          break;
+        }
+        const BlobRelocationLiveValue& next = references[next_reference];
+        if (next.stored_value_size > kIndirectBlobGCReadBatchBytes) {
+          BlobFileReader* const reader =
+              input.normal_metadata != nullptr
+                  ? readers[run_input].normal.get()
+                  : readers[run_input].relocation.get();
+          if (reader == nullptr || table_builder == nullptr) {
+            status = Status::Corruption("Missing streaming blob GC dependency");
+            break;
+          }
+          std::string encoded;
+          // Streaming looks the value up by its stable identity.
+          BlobIndex::EncodeIndirectBlob(
+              &encoded, origin,
+              {.origin_file_number = origin,
+               .original_value_offset = next.original_value_offset,
+               .stored_value_size = next.stored_value_size,
+               .compression = next.compression,
+               .stable_checksum = next.stable_checksum,
+               .stored_checksum = next.stored_checksum});
+          BlobIndex index;
+          status = index.DecodeFrom(encoded);
+          if (!status.ok()) {
+            break;
+          }
+          Status source_status;
+          Status delivery_status;
+          status = table_builder->AddBlobRelocation(
+              origin, next.original_value_offset, next.stored_value_size,
+              next.compression, next.stored_checksum,
+              [&](const BlobChunkConsumer& consumer) {
+                const auto deliver = [&](const Slice& chunk) {
+                  const Status interrupt_status = interrupted();
+                  delivery_status = interrupt_status.ok() ? consumer(chunk)
+                                                          : interrupt_status;
+                  return delivery_status;
+                };
+                source_status = reader->relocation() != nullptr
+                                    ? reader->relocation()->StreamStoredBlob(
+                                          gc_read_options, index, deliver)
+                                    : reader->StreamStoredBlobForRelocation(
+                                          gc_read_options, index, deliver);
+                TEST_SYNC_POINT_CALLBACK(
+                    "DBImpl::RunIndirectBlobGC:StreamSourceStatus",
+                    &source_status);
+                return source_status;
+              });
+          if (source_status.ok()) {
+            // Count the bytes the stream read, as the batch path below does:
+            // the stored bytes, plus the record trailer for a relocation file.
+            input_bytes_read +=
+                next.stored_value_size + (reader->relocation() != nullptr
+                                              ? kSimpleGen2BlobTrailerSize
+                                              : 0);
+          }
+          const bool source_fault = source_status.IsCorruption() ||
+                                    source_status.IsInvalidArgument() ||
+                                    source_status.IsNotSupported();
+          bool output_failed =
+              !delivery_status.ok() || (!status.ok() && source_status.ok());
+#ifndef NDEBUG
+          const std::string stream_status = status.ToString();
+#endif
+          TEST_SYNC_POINT_CALLBACK(
+              "DBImpl::RunIndirectBlobGC:AfterAddBlobRelocation", &status);
+#ifndef NDEBUG
+          // In debug builds, a test-injected destination failure also counts as
+          // an output failure. Status equality compares only the error code, so
+          // the status text is compared instead.
+          output_failed |= status.ToString() != stream_status;
+#endif
+          if (!source_status.ok() && !source_fault) {
+            // A source error other than Corruption, InvalidArgument or
+            // NotSupported (for example I/O or abort) is returned before a
+            // later output error, as in the batch path below.
+            status = source_status;
+          }
+          if (!status.ok()) {
+            // A corrupt, unsupported or rejected source value fails its input,
+            // and the unfinished output is not published. Keep a destination
+            // failure even when the source also failed.
+            if (source_fault && !output_failed) {
+              candidate_local_failure_input = run_input;
+              candidate_local_failure_reason = "blob stream source is corrupt";
+              if (source_status.IsCorruption()) {
+                note_corruption(inputs[run_input].file_number, source_status);
+              } else if (source_status.IsInvalidArgument()) {
+                note_internal_error(inputs[run_input].file_number,
+                                    source_status);
+                candidate_local_failure_reason =
+                    "indirect blob GC internal error";
+              }
+              status = Status::OK();
+            }
+            break;
+          }
+          output.value_bytes += next.stored_value_size;
+          ++output.live_count;
+          ++next_reference;
+          continue;
+        }
+        const size_t batch_begin = next_reference;
+        // A batch counts each value's stored bytes plus
+        // kIndirectBlobGCBatchBytesPerValue (see its comment), so it stays
+        // within the charged workspace also for tiny values.
+        // ReadCoalescedRanges() counts direct-read alignment in its buffer
+        // limit.
+        const uint64_t per_value_bytes = kIndirectBlobGCBatchBytesPerValue;
+        uint64_t batch_bytes = 0;
+        while (next_reference < run_end) {
+          const uint64_t value_size =
+              references[next_reference].stored_value_size;
+          if (value_size > kIndirectBlobGCReadBatchBytes) {
+            // A large value is streamed on its own by the branch above.
+            assert(next_reference != batch_begin);
+            break;
+          }
+          const uint64_t value_cost = value_size + per_value_bytes;
+          if (next_reference != batch_begin &&
+              value_cost >
+                  kIndirectBlobGCReadBatchBytes -
+                      std::min(batch_bytes, kIndirectBlobGCReadBatchBytes)) {
+            break;
+          }
+          batch_bytes += value_cost;
+          ++next_reference;
+          if (batch_bytes >= kIndirectBlobGCReadBatchBytes) {
+            break;
+          }
+        }
+        const size_t batch_size = next_reference - batch_begin;
+        std::vector<Slice> stored_payloads(batch_size);
+        std::vector<Status> read_statuses(batch_size);
+        CoalescedReadBuffers read_buffers;
+        const uint64_t coalesce_bytes =
+            mutable_cf_options.indirect_blob_gc_read_coalesce_bytes;
+        uint64_t bytes_read = 0;
+        if (input.normal_metadata != nullptr) {
+          std::vector<StoredNormalBlobReadRequest> requests(batch_size);
+          for (size_t i = 0; i < batch_size; ++i) {
+            const BlobRelocationLiveValue& reference =
+                references[batch_begin + i];
+            requests[i] =
+                StoredNormalBlobReadRequest{reference.original_value_offset,
+                                            reference.stored_value_size,
+                                            reference.compression,
+                                            &stored_payloads[i],
+                                            &read_statuses[i],
+                                            reference.stored_checksum};
+          }
+          BlobFileReader* const reader = readers[run_input].normal.get();
+          if (reader == nullptr) {
+            status =
+                Status::Corruption("Indirect blob GC reader is unavailable");
+            break;
+          }
+          reader->MultiGetStoredBlobsForRelocation(
+              gc_read_options, coalesce_bytes, requests.size(), requests.data(),
+              kIndirectBlobGCReadBatchBytes, &read_buffers, &bytes_read);
+        } else {
+          std::vector<StoredRelocationFileReadRequest> requests(batch_size);
+          for (size_t i = 0; i < batch_size; ++i) {
+            const BlobRelocationLiveValue& reference =
+                references[batch_begin + i];
+            requests[i] =
+                StoredRelocationFileReadRequest{origin,
+                                                reference.original_value_offset,
+                                                reference.stored_value_size,
+                                                reference.compression,
+                                                reference.stable_checksum,
+                                                &stored_payloads[i],
+                                                &read_statuses[i],
+                                                reference.stored_checksum};
+          }
+          const BlobFileReader* const reader =
+              readers[run_input].relocation.get();
+          if (reader == nullptr || reader->relocation() == nullptr) {
+            status = Status::Corruption(
+                "Indirect blob GC relocation reader is unavailable");
+            break;
+          }
+          reader->relocation()->MultiGetStoredBlobs(
+              gc_read_options, coalesce_bytes, requests.size(), requests.data(),
+              kIndirectBlobGCReadBatchBytes, &read_buffers, &bytes_read);
+        }
+        input_bytes_read += bytes_read;
+        TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:BatchReadStatuses",
+                                 &read_statuses);
+        // A read past the buffer limit is deferred (Incomplete). Keep the
+        // values before the first deferred one; the next batch starts there.
+        size_t read_count = batch_size;
+        for (size_t i = 0; i < batch_size; ++i) {
+          if (read_statuses[i].IsIncomplete()) {
+            read_count = i;
+            break;
+          }
+        }
+        if (read_count == 0) {
+          status = Status::Corruption("Indirect blob GC read made no progress");
+          break;
+        }
+        next_reference = batch_begin + read_count;
+        Status candidate_status;
+        Status external_status;
+        for (size_t i = 0; i < read_count; ++i) {
+          const Status& read_status = read_statuses[i];
+          if (read_status.ok()) {
+            continue;
+          }
+          // A candidate-local status blames only its input. A corrupt status
+          // in the same batch takes precedence, so that it still follows
+          // paranoid_checks. A rejected read request (InvalidArgument, a GC
+          // internal error, see note_internal_error()) comes next, then
+          // MemoryLimit and NotSupported. Within one rank the first status
+          // stays. Rank 0 means that the status is not candidate-local.
+          const auto candidate_rank = [](const Status& s) {
+            if (s.IsCorruption()) {
+              return 3;
+            }
+            if (s.IsInvalidArgument()) {
+              return 2;
+            }
+            return s.IsMemoryLimit() || s.IsNotSupported() ? 1 : 0;
+          };
+          const int rank = candidate_rank(read_status);
+          if (rank > 0) {
+            if (rank > candidate_rank(candidate_status)) {
+              candidate_status = read_status;
+            }
+          } else if (external_status.ok()) {
+            external_status = read_status;
+          }
+        }
+        // A corrupt, too large or unsupported source record, or a rejected
+        // read request, fails only its input. Record that first. A source I/O
+        // error or an output error still has priority and is returned.
+        const bool candidate_failed = !candidate_status.ok();
+        if (!external_status.ok()) {
+          status = external_status;
+          break;
+        }
+        if (table_builder == nullptr) {
+          status =
+              Status::Corruption("Indirect blob GC builder is unavailable");
+          break;
+        }
+        for (size_t i = 0; status.ok() && i < read_count; ++i) {
+          if (!read_statuses[i].ok()) {
+            continue;
+          }
+          const BlobRelocationLiveValue& reference =
+              references[batch_begin + i];
+          status = table_builder->AddBlobRelocation(
+              origin, reference.original_value_offset, stored_payloads[i],
+              reference.compression);
+          TEST_SYNC_POINT_CALLBACK(
+              "DBImpl::RunIndirectBlobGC:AfterAddBlobRelocation", &status);
+          if (status.ok()) {
+            output.value_bytes += reference.stored_value_size;
+            ++output.live_count;
+          }
+        }
+        // Keep an output failure even when another record in this batch is
+        // corrupt. All read statuses were checked first, so a source I/O error
+        // also keeps its priority.
+        if (status.ok() && candidate_failed) {
+          // A noted corruption fails the job when paranoid_checks is true (see
+          // the end of this function). A rejected read request never does
+          // (see note_internal_error()).
+          if (candidate_status.IsCorruption()) {
+            note_corruption(inputs[run_input].file_number, candidate_status);
+          } else if (candidate_status.IsInvalidArgument()) {
+            note_internal_error(inputs[run_input].file_number,
+                                candidate_status);
+          }
+          candidate_local_failure_input = run_input;
+          candidate_local_failure_reason =
+              candidate_status.IsInvalidArgument()
+                  ? "indirect blob GC internal error"
+                  : "blob source record is corrupt or too large";
+          break;
+        }
+      }
+    }
+
+    if (table_builder != nullptr) {
+      if (status.ok() &&
+          candidate_local_failure_input == std::numeric_limits<size_t>::max()) {
+        status = table_builder->Finish();
+        output.file_size = table_builder->FileSize();
+        if (status.ok()) {
+          status =
+              table_builder->GetBlobRelocationFileMetadata(&output.metadata);
+        }
+        if (status.ok()) {
+          status = BlobRelocationDirectory::DecodeFrom(
+              Slice(output.metadata.encoded_directory), &output.directory);
+        }
+        // Install check: the output holds exactly the live values of its
+        // inputs. Its directory has one origin entry per origin run, with the
+        // same count, first and last offset and record bytes, and it serves
+        // exactly the generation numbers of its inputs.
+        size_t expected_live_count = 0;
+        for (size_t input_index : bins[output_index].item_indexes) {
+          expected_live_count += inputs[input_index].live_count;
+        }
+        if (status.ok() &&
+            (output.live_count != expected_live_count ||
+             output.directory.total_entries() != expected_live_count ||
+             output.directory.origins().size() != output_runs.size())) {
+          status = Status::Corruption(
+              "Blob relocation output does not match the live values");
+        }
+        for (size_t k = 0; status.ok() && k < output_runs.size(); ++k) {
+          const BlobRelocationOriginRun& run = output_runs[k].run;
+          const std::vector<BlobRelocationLiveValue>& values =
+              inputs[output_runs[k].input_index].live_set->references();
+          uint64_t run_record_bytes = 0;
+          for (size_t i = run.begin; i < run.end; ++i) {
+            run_record_bytes += uint64_t{values[i].stored_value_size} +
+                                kSimpleGen2BlobTrailerSize;
+          }
+          const BlobRelocationOrigin& origin = output.directory.origins()[k];
+          if (run.begin >= run.end ||
+              origin.origin_file_number != run.origin_file_number ||
+              origin.entry_count != run.end - run.begin ||
+              origin.first_original_offset !=
+                  values[run.begin].original_value_offset ||
+              origin.last_original_offset !=
+                  values[run.end - 1].original_value_offset ||
+              origin.record_bytes != run_record_bytes) {
+            status = Status::Corruption(
+                "Blob relocation output does not match the live values");
+          }
+        }
+        if (status.ok()) {
+          std::vector<uint64_t> expected_served = served_generation_numbers;
+          expected_served.erase(
+              std::unique(expected_served.begin(), expected_served.end()),
+              expected_served.end());
+          if (output.directory.served_file_numbers() != expected_served) {
+            status = Status::Corruption(
+                "Blob relocation output does not serve its input generation "
+                "numbers");
+          }
+        }
+      } else {
+        table_builder->Abandon();
+      }
+      // A failed streamed source value also fails the builder, with the
+      // source status. When that value is a candidate-local failure, the
+      // output is not published, and the builder status must not fail the
+      // whole job. An output write error never sets a candidate-local failure,
+      // so it is still returned. After a candidate-local failure, the builder
+      // status is ignored even if it holds a write error: the output is
+      // abandoned and never published, so that error cannot affect any data.
+      IOStatus builder_io_status = table_builder->io_status();
+      if (status.ok() &&
+          candidate_local_failure_input == std::numeric_limits<size_t>::max() &&
+          !builder_io_status.ok()) {
+        status = builder_io_status;
+      } else {
+        builder_io_status.PermitUncheckedError();
+      }
+      table_builder.reset();
+    }
+    if (file_writer != nullptr) {
+      IOOptions io_options;
+      if (status.ok() &&
+          candidate_local_failure_input == std::numeric_limits<size_t>::max()) {
+        status =
+            WritableFileWriter::PrepareIOOptions(write_options, io_options);
+      }
+      if (status.ok() &&
+          candidate_local_failure_input == std::numeric_limits<size_t>::max()) {
+        status = db_->immutable_db_options_.use_fsync
+                     ? file_writer->Fsync(io_options)
+                     : file_writer->Sync(io_options);
+      }
+      IOStatus close_status = file_writer->Close(io_options);
+      if (status.ok() && !close_status.ok()) {
+        status = close_status;
+      } else {
+        close_status.PermitUncheckedError();
+      }
+      if (status.ok()) {
+        output.checksum_value = file_writer->GetFileChecksum();
+        output.checksum_method = file_writer->GetFileChecksumFuncName();
+        if (output.checksum_value == kUnknownFileChecksum) {
+          output.checksum_value.clear();
+        }
+        if (output.checksum_method == kUnknownFileChecksumFuncName) {
+          output.checksum_method.clear();
+        }
+        if (output.checksum_method.empty() != output.checksum_value.empty()) {
+          status = Status::Corruption(
+              "Incomplete blob relocation file checksum metadata");
+        }
+      }
+      file_writer.reset();
+    }
+    if (status.ok() &&
+        candidate_local_failure_input == std::numeric_limits<size_t>::max()) {
+      // Check that the output file is not larger than its inputs.
+      if (output.file_size > output.input_bytes ||
+          output.file_size >
+              std::numeric_limits<uint64_t>::max() - aggregate_output_bytes ||
+          output.value_bytes > std::numeric_limits<uint64_t>::max() -
+                                   total_relocated_value_bytes ||
+          output.live_count >
+              std::numeric_limits<size_t>::max() - total_relocated_count) {
+        candidate_local_failure_input = bins[output_index].item_indexes.front();
+        candidate_local_failure_reason =
+            "relocation output exceeds its bounded packing plan";
+      } else {
+        aggregate_output_bytes += output.file_size;
+        total_relocated_value_bytes += output.value_bytes;
+        total_relocated_count += output.live_count;
+      }
+    }
+  }
+
+  if (status.ok() &&
+      candidate_local_failure_input == std::numeric_limits<size_t>::max() &&
+      !outputs.empty() && aggregate_output_bytes >= aggregate_input_bytes) {
+    for (size_t input_index : eligible_inputs) {
+      suppressed_files.push_back(inputs[input_index].file_number);
+      suppression_reasons.emplace_back(
+          "packed relocation outputs would not reclaim bytes");
+      inputs[input_index].eligible = false;
+    }
+    eligible_inputs.clear();
+  }
+
+  if (status.ok() &&
+      candidate_local_failure_input == std::numeric_limits<size_t>::max() &&
+      !eligible_inputs.empty()) {
+    IOOptions io_options;
+    TEST_SYNC_POINT("DBImpl::RunIndirectBlobGC:BeforeRenameOutputs");
+    TEST_KILL_RANDOM("DBImpl::RunIndirectBlobGC:BeforeRenameOutputs");
+    for (OutputState& output : outputs) {
+      output.rename_attempted = true;
+      status =
+          db_->fs_->RenameFile(output.temporary_path, output.path, io_options,
+                               /*dbg=*/nullptr);
+      TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:AfterRenameOutput",
+                               &status);
+      if (!status.ok()) {
+        break;
+      }
+      output.renamed = true;
+    }
+    if (status.ok() && !outputs.empty()) {
+      FSDirectory* const data_dir = db_->GetDataDir(cfd, 0);
+      status = data_dir == nullptr
+                   ? Status::Corruption("Missing blob GC data directory")
+                   : data_dir->FsyncWithDirOptions(
+                         IOOptions(), nullptr,
+                         DirFsyncOptions(
+                             DirFsyncOptions::FsyncReason::kNewFileSynced));
+    }
+  }
+
+  for (OutputState& output : outputs) {
+    if (!output.creation_started) {
+      continue;
+    }
+    Status callback_input_status = status;
+    if (callback_input_status.ok() &&
+        (candidate_local_failure_input != std::numeric_limits<size_t>::max() ||
+         eligible_inputs.empty())) {
+      callback_input_status =
+          Status::TryAgain("Blob relocation batch was not published");
+    }
+    if (!output.renamed) {
+      // The output was not renamed, or the rename reported failure. Report a
+      // failed creation and do not register the file with the SstFileManager.
+      // The cleanup deletes the final name of a tried rename (see
+      // rename_attempted).
+      db_->blob_callback_.OnBlobFileAbandoned(
+          output.path, cfd->GetName(), job_id, output.file_number,
+          BlobFileCreationReason::kIndirectBlobGC,
+          callback_input_status.ok()
+              ? Status::TryAgain("Blob relocation output was not renamed")
+              : callback_input_status);
+      callback_input_status.PermitUncheckedError();
+      continue;
+    }
+    const Status completion_status = db_->blob_callback_.OnBlobFileCompleted(
+        output.path, cfd->GetName(), job_id, output.file_number,
+        BlobFileCreationReason::kIndirectBlobGC, callback_input_status,
+        output.checksum_value, output.checksum_method, output.live_count,
+        output.file_size, /*set_bg_error_on_space_limit=*/true);
+    callback_input_status.PermitUncheckedError();
+    if (status.ok() &&
+        candidate_local_failure_input == std::numeric_limits<size_t>::max() &&
+        !eligible_inputs.empty()) {
+      status = completion_status;
+    } else {
+      completion_status.PermitUncheckedError();
+    }
+  }
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:AfterOutputWork",
+                           &status);
+
+  if (candidate_local_failure_input != std::numeric_limits<size_t>::max()) {
+    const uint64_t failed_file =
+        inputs[candidate_local_failure_input].file_number;
+    suppressed_files.push_back(failed_file);
+    suppression_reasons.emplace_back(candidate_local_failure_reason);
+    eligible_inputs.clear();
+    // Corrupt blob data (a record, or the header or footer of the file) means
+    // that user values cannot be read. Compaction fails on such data, so with
+    // paranoid_checks (the default) GC fails too: the job returns Corruption,
+    // and the caller sets a background error with reason kCompaction. Without
+    // paranoid_checks, GC only skips the file. Finish() logs the file as an
+    // ERROR and counts INDIRECT_BLOB_GC_CORRUPT_INPUTS in both cases.
+    const auto corrupt = corrupt_inputs.find(failed_file);
+    if (corrupt != corrupt_inputs.end() && status.ok() &&
+        db_->immutable_db_options_.paranoid_checks) {
+      status = Status::Corruption("Indirect blob GC input #" +
+                                      std::to_string(failed_file) +
+                                      " has corrupt blob data",
+                                  corrupt->second.detail);
+      corrupt->second.fails_job = true;
+    }
+  }
+
+  const bool keep_outputs = status.ok() && !eligible_inputs.empty();
+  if (!keep_outputs) {
+    for (OutputState& output : outputs) {
+      if (!output.creation_started) {
+        continue;
+      }
+      db_->DeleteObsoleteFileImpl(job_id, output.temporary_path,
+                                  output_directory, kTempFile,
+                                  output.file_number);
+      if (output.rename_attempted) {
+        // A rename that reported failure may still have created the final
+        // name. Listeners saw OnBlobFileAbandoned() for that output, not a
+        // completed blob file, so its final name is deleted as a temporary
+        // file, with no blob file deletion event. A renamed output got
+        // OnBlobFileCompleted(), so its deletion sends the event.
+        db_->DeleteObsoleteFileImpl(job_id, output.path, output_directory,
+                                    output.renamed ? kBlobFile : kTempFile,
+                                    output.file_number);
+      }
+      output.renamed = false;
+    }
+  }
+
+  readers.clear();
+  for (PhysicalInput& input : inputs) {
+    if (input.live_set != nullptr) {
+      Status release_status = input.live_set->ReleaseWorkingMemory();
+      if (status.ok() && !release_status.ok()) {
+        status = release_status;
+      } else {
+        release_status.PermitUncheckedError();
+      }
+      input.live_set.reset();
+    }
+  }
+
+  read_input_count = eligible_inputs.size();
+  bins.clear();
+  source_table_options.reset();
+}
+
+// Builds the MANIFEST edit of the job from the census snapshot and the
+// routes of the input Version (see "Install protocol" in Install()). Called
+// without the DB mutex.
+Status DBImpl::IndirectBlobGCJob::BuildEdit() {
+  if (census == nullptr) {
+    return Status::Corruption("Blob GC census snapshot is unavailable");
+  }
+  output_needed.fill(false);
+  published_output_count = 0;
+  published_relocated_count = 0;
+  published_relocated_value_bytes = 0;
+  // Lets a test take the invariant_failed() path, which normal operation
+  // never reaches.
+  bool inject_invariant_failure = false;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:InjectInvariantFailure",
+                           &inject_invariant_failure);
+  if (inject_invariant_failure) {
+    return invariant_failed("injected by a test");
+  }
+
+  // A generation number is live if an SST holds it in the census snapshot,
+  // which shows the input Version. A running compaction can write only
+  // generation numbers that its input SSTs hold (counted here), or route
+  // targets of such numbers when it flattens (covered by
+  // keeps_all_generations below). See "Install protocol" in Install().
+  const auto generation_is_live = [&](uint64_t generation) {
+    return census->GetSstCount(generation) != 0;
+  };
+  const auto output_of = [&](const PhysicalInput& input) -> size_t {
+    return input.output_index < outputs.size()
+               ? input.output_index
+               : std::numeric_limits<size_t>::max();
+  };
+  // A relocation input that has an output keeps all of its generation
+  // numbers, held or not. A compaction may have flattened a reference to
+  // one of them after the census snapshot (see "Install protocol" in
+  // Install()). An input without an output keeps no route. None of its
+  // generation numbers can be live: point 4 of "Install protocol" (in the list
+  // after "This is safe") says why no compaction can flatten to such an input,
+  // so this is an invariant check below.
+  const auto keeps_all_generations = [&](const PhysicalInput& input) {
+    return input.normal_metadata == nullptr &&
+           output_of(input) != std::numeric_limits<size_t>::max();
+  };
+  for (size_t input_index : eligible_inputs) {
+    const PhysicalInput& input = inputs[input_index];
+    if (!keeps_all_generations(input) &&
+        std::none_of(input.generations.begin(), input.generations.end(),
+                     generation_is_live)) {
+      continue;
+    }
+    const size_t output_index = output_of(input);
+    if (output_index == std::numeric_limits<size_t>::max()) {
+      // Invariant: the same census snapshot decides liveness here and the
+      // outputs in DecideInputs(), which gives an output to every input
+      // with a live generation number.
+      return invariant_failed("Indirect blob GC live input has no output");
+    }
+    output_needed[output_index] = true;
+  }
+
+  edit = std::make_unique<VersionEdit>();
+  edit->SetColumnFamily(column_family.GetID());
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    if (!output_needed[i]) {
+      continue;
+    }
+    const OutputState& output = outputs[i];
+    edit->AddBlobRelocationFile(BlobRelocationFileAddition(
+        output.file_number, output.file_size, output.checksum_method,
+        output.checksum_value, output.metadata.encoded_directory,
+        output.metadata.tail_size));
+    ++published_output_count;
+    if (output.live_count >
+        std::numeric_limits<size_t>::max() - published_relocated_count) {
+      return Status::Corruption("Published blob GC count overflow");
+    }
+    published_relocated_count += output.live_count;
+    if (output.value_bytes > std::numeric_limits<uint64_t>::max() -
+                                 published_relocated_value_bytes) {
+      return Status::Corruption("Published blob GC byte count overflow");
+    }
+    published_relocated_value_bytes += output.value_bytes;
+  }
+
+  // Each generation number that an input keeps, including the input's own
+  // file number, gets a route to the input's output. For a relocation
+  // input, this re-points the routes into it. Which numbers an input keeps:
+  //   - A relocation input with an output keeps all of them, held or not.
+  //   - Any other input keeps only its live ones.
+  // A routed generation number that the input does not keep loses its
+  // route. Then the input leaves the Version: a normal input by blob file
+  // retirement, a relocation input by relocation file deletion. Route
+  // retirement later deletes the kept routes that no SST holds.
+  for (size_t input_index : eligible_inputs) {
+    const PhysicalInput& input = inputs[input_index];
+    const size_t output_index = output_of(input);
+    const uint64_t output_file_number =
+        output_index != std::numeric_limits<size_t>::max() &&
+                output_needed[output_index]
+            ? outputs[output_index].file_number
+            : kInvalidBlobFileNumber;
+    const bool keep_all = output_file_number != kInvalidBlobFileNumber &&
+                          keeps_all_generations(input);
+    for (uint64_t generation : input.generations) {
+      const bool routed = generation != input.file_number;
+      if (keep_all || generation_is_live(generation)) {
+        if (output_file_number == kInvalidBlobFileNumber) {
+          // Invariant: the same census snapshot decides liveness here and
+          // the outputs in DecideInputs() (see the check above).
+          return invariant_failed(
+              "Indirect blob GC live generation number has no output");
+        }
+        edit->SetBlobRelocationRoute(
+            BlobRelocationRoute(generation, output_file_number));
+      } else if (routed) {
+        edit->DeleteBlobRelocationRoute(generation);
+      }
+    }
+    if (input.normal_metadata != nullptr) {
+      edit->RetireBlobFile(input.file_number);
+    } else {
+      edit->DeleteBlobRelocationFile(input.file_number);
+    }
+  }
+  return Status::OK();
+}
+
+// At the MANIFEST queue head, check that each input is still valid:
+//   - A normal input is still an indirect origin with the same shared
+//     metadata. A compaction that adds garbage to it keeps its shared
+//     metadata, and only an indirect blob GC install retires an indirect
+//     origin. So this check is defensive. A change makes a normal stale job.
+//   - No input became pinned by a coarse SST (see the selection above for
+//     what pins an input). This is a normal stale job too. Example: a flush
+//     takes blob file number 25, indirect blob GC selects normal input 28,
+//     and then the flush installs its coarse SST with frontier 25 (see
+//     "Coarse SST" in db/blob/blob_reference_metadata.h), which pins file 28.
+//   - Invariant check (invariant_failed()), which cannot fail: a relocation
+//     input has the same metadata and the same number of routes into it.
+//     Only indirect blob GC adds routes or removes relocation files, and
+//     only one GC job runs per CF (indirect_blob_gc_cfs_in_progress_).
+//     Route retirement skips the routes into the inputs of the running GC
+//     job (IsGcInputFile()). So an equal route count means the same
+//     routes.
+Status DBImpl::IndirectBlobGCJob::ValidatePhysicalInputs() {
+  db_->mutex_.AssertHeld();
+  Version* const current = column_family.current();
+  if (column_family.IsDropped() || current == nullptr) {
+    return stale_input("Indirect blob GC column family changed");
+  }
+  VersionStorageInfo* const current_storage = current->storage_info();
+  for (size_t input_index : eligible_inputs) {
+    const PhysicalInput& input = inputs[input_index];
+    const bool coarse_pinned =
+        input.normal_metadata != nullptr
+            ? current_storage->IsCoarseIndirectOriginBlobPinned(
+                  input.file_number)
+            : std::any_of(
+                  input.routed_generations.begin(),
+                  input.routed_generations.end(), [&](uint64_t generation) {
+                    return current_storage->IsCoarseIndirectOriginBlobPinned(
+                        generation);
+                  });
+    if (coarse_pinned) {
+      return stale_input(
+          "Indirect blob GC input generation number became coarse");
+    }
+    if (input.normal_metadata != nullptr) {
+      const std::shared_ptr<BlobFileMetaData> current_metadata =
+          current_storage->GetBlobFileMetaData(input.file_number);
+      if (current_metadata == nullptr ||
+          !current_metadata->IsIndirectOrigin() ||
+          current_metadata->GetSharedMeta() !=
+              input.normal_metadata->GetSharedMeta()) {
+        return stale_input("Indirect blob GC indirect-origin input changed");
+      }
+      continue;
+    }
+    if (current_storage->GetBlobRelocationFileMetaData(input.file_number) !=
+            input.relocation_metadata ||
+        current_storage->GetBlobRelocationRouteTargetCount(input.file_number) !=
+            input.routed_generations.size()) {
+      return invariant_failed("Indirect blob GC relocation input changed");
+    }
+  }
+  return Status::OK();
+}
+
+void DBImpl::IndirectBlobGCJob::Install() {
+  db_->mutex_.Lock();
+
+  if (!status.ok()) {
+    Version* const current = cfd->current();
+    if (status.IsCompactionTooLarge() && !cfd->IsDropped() &&
+        current != nullptr &&
+        current->GetVersionNumber() == input_version_number) {
+      current->storage_info()->DeferBlobFilesForIndirectBlobGC(
+          capacity_deferred_files);
+    }
+    delete_renamed_outputs.fill(true);
+    return;
+  }
+  Version* current = cfd->current();
+  if (cfd->IsDropped() || current == nullptr) {
+    status = stale_input("Indirect blob GC column family changed");
+    delete_renamed_outputs.fill(true);
+    return;
+  }
+  status = interrupted();
+  if (!status.ok()) {
+    delete_renamed_outputs.fill(true);
+    return;
+  }
+  if (read_input_count == 0) {
+    VersionStorageInfo* const current_storage = current->storage_info();
+    for (size_t i = 0; i < suppressed_files.size(); ++i) {
+      current_storage->SuppressBlobFileForIndirectBlobGC(suppressed_files[i]);
+      ROCKS_LOG_BUFFER(log_buffer,
+                       "[%s] Indirect blob GC skipped file #%" PRIu64 ": %s",
+                       cfd->GetName().c_str(), suppressed_files[i],
+                       suppression_reasons[i].c_str());
+    }
+    if (deferred_input ||
+        current_storage->BlobPhysicalFileForIndirectBlobGC() !=
+            kInvalidBlobFileNumber) {
+      db_->EnqueuePendingCompaction(cfd);
+    }
+    // `status` is OK here, so the job returns OK.
+    return;
+  }
+
+  db_->mutex_.Unlock();
+  status = BuildEdit();
+  db_->mutex_.Lock();
+  status = locked_census_status(std::move(status));
+  if (!status.ok()) {
+    delete_renamed_outputs.fill(true);
+    return;
+  }
+
+  SuperVersionContext superversion_context(/*create_superversion=*/true);
+  // Install protocol: the job installs its edit with one LogAndApply() call.
+  // The census snapshot and the routes in the edit come from the input
+  // Version. The job does not follow the Version changes after it. This is
+  // safe, because the edit never misses a route that an SST needs:
+  //   1. Most changes after the snapshot add no holder of an input's
+  //      generation number. A compaction keeps or drops the references of its
+  //      input SSTs, which the snapshot already counts. A flush writes
+  //      indirect references only to the new blob files that it creates, which
+  //      are never inputs of this job. Ingestion rejects files with indirect
+  //      references (the blob indirection checks of
+  //      ExternalSstFileIngestionJob), and import rejects files with blob
+  //      indirection table properties (RejectBlobIndirectionTableProperties()).
+  //   2. Flattening can add a holder that the snapshot does not count. A
+  //      compaction rewrites a generation number to its route target in the
+  //      compaction's own input Version (see
+  //      CompactionIterator::FlattenBlobIndexIfNeeded()). That Version can be
+  //      older than this job's input Version. Example (the file numbers are
+  //      examples only): compaction C is picked while route 10 -> 400 exists.
+  //      Then an earlier indirect blob GC job moves file 400 into file 500 and
+  //      writes routes 400 -> 500 and 10 -> 500. This job starts on file 500.
+  //      No SST holds 400, so 400 is an unheld generation number of input 500.
+  //      Now C runs with its old Version, rewrites generation number 10 to 400
+  //      and installs. The snapshot does not count this new holder of 400.
+  //   3. BuildEdit() covers such a holder: a relocation input that has an
+  //      output routes every generation number to that output, held or not
+  //      (keeps_all_generations). In the example, route 400 -> output exists.
+  //   4. An input without an output has no holder of any of its generation
+  //      numbers in the snapshot. A compaction that flattens to one of them
+  //      holds a generation number that routes to the same input (GC re-points
+  //      every route into an input), and the snapshot counts that holder. So
+  //      nothing can flatten to such an input.
+  // So the edit can keep a route too many, which route retirement deletes
+  // later, but it never misses one.
+  //
+  // The edit can be large (one change per route), so the call applies it
+  // without the DB mutex (VersionSet::LogAndApplyWithUnlockedApply()). Its
+  // precondition runs once, under the DB mutex, when the call reaches the
+  // MANIFEST queue head (see the pre_cb contract of VersionSet::LogAndApply()).
+  // It does these steps:
+  //   1. It returns the interrupted() status at shutdown or compaction abort.
+  //   2. It checks that the column family is still alive and that the job is
+  //      still registered (IsGcJobActive()).
+  //   3. It records in other_install_during_job whether the current Version is
+  //      still the input Version.
+  //   4. It checks the inputs again (ValidatePhysicalInputs()).
+  //   5. It starts the metadata commit (BeginMetadataCommit()). Until
+  //      EndMetadataCommit() after the MANIFEST write, no other GC job or
+  //      metadata commit (for example, a route retirement) can start. When the
+  //      write result is unknown, BeginGcJob() returns Busy until recovery,
+  //      and a new metadata commit returns TryAgain.
+  // The precondition does not run again after the unlocked apply. That is
+  // safe because each check reads state that cannot change while the call is
+  // at the queue head: the column family and its current Version change only
+  // through LogAndApply(), and the job registration ends only by this job's
+  // own EndGcJob(), by a column family drop (which waits in the same MANIFEST
+  // queue), or at close after background jobs end. interrupted() can turn
+  // true later, but then the edit is still a valid install.
+  // Flushes and compactions do not wait for the GC job or its commit. A
+  // compaction that runs during the job keeps a number that the snapshot
+  // counts (protocol step 1), keeps a number that an earlier flatten wrote
+  // (protocol steps 2 and 3; for example, compaction C1 flattens 10 to 400
+  // and compaction C2 then keeps 400), or flattens to a number that protocol
+  // steps 3 and 4 cover. So no running compaction can make the edit unsafe.
+  TEST_KILL_RANDOM("DBImpl::RunIndirectBlobGC:BeforeLogAndApply");
+  bool metadata_commit_intent = false;
+  bool other_install_during_job = true;
+  status = db_->versions_->LogAndApplyWithUnlockedApply(
+      cfd, read_options, manifest_write_options, edit.get(), &db_->mutex_,
+      db_->directories_.GetDbDir(), [&]() {
+        Status precondition_status = interrupted();
+        if (!precondition_status.ok()) {
+          return precondition_status;
+        }
+        Version* const precondition_current = column_family.current();
+        if (column_family.IsDropped() || precondition_current == nullptr ||
+            census == nullptr) {
+          return stale_input("Indirect blob GC column family changed");
+        }
+        if (!blob_reference_census->IsGcJobActive(gc_job_token)) {
+          return stale_input("Blob GC job registration ended");
+        }
+        other_install_during_job =
+            precondition_current->GetVersionNumber() != input_version_number;
+        precondition_status = ValidatePhysicalInputs();
+        bool installable = precondition_status.ok();
+        TEST_SYNC_POINT_CALLBACK(
+            "DBImpl::RunIndirectBlobGC:InstallPrecondition", &installable);
+        if (precondition_status.ok() && !installable) {
+          precondition_status = stale_input("Indirect blob GC input changed");
+        }
+        if (precondition_status.ok()) {
+          precondition_status = blob_reference_census->BeginMetadataCommit();
+          metadata_commit_intent = precondition_status.ok();
+        }
+        return precondition_status;
+      });
+  if (metadata_commit_intent) {
+    // If the MANIFEST write fails with an I/O error, the edit may still be in
+    // the MANIFEST. Then indirect blob GC and metadata commits stay blocked
+    // until recovery shows the result. A rejection before the append is a clear
+    // failure, and the block is released.
+    blob_reference_census->EndMetadataCommit(status.ok() ||
+                                             db_->versions_->io_status().ok());
+  }
+  if (status.ok()) {
+    db_->InstallSuperVersionAndScheduleWork(cfd, &superversion_context,
+                                            /*defer_snapshot_refresh=*/false);
+    TEST_SYNC_POINT("DBImpl::RunIndirectBlobGC:Installed");
+    *made_progress = true;
+    installed = true;
+    published_input_count = read_input_count;
+    current = cfd->current();
+    TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:AfterMetadataInstall",
+                             cfd);
+    if (current == nullptr) {
+      status = Status::Corruption(
+          "Indirect blob GC installed an unavailable Version");
+    }
+  }
+  if (status.ok() && current != nullptr) {
+    VersionStorageInfo* const current_storage = current->storage_info();
+    // The job decided its suppressions from the input Version. A newer Version
+    // can hold SST metadata that makes a suppressed input eligible, so the
+    // suppressions apply to the current Version only when no other Version was
+    // installed during the job.
+    // other_install_during_job comes from the single precondition run at the
+    // MANIFEST queue head. No other Version can be installed between that run
+    // and this install, because the call holds the queue head until it
+    // returns.
+    const bool starting_suppressions_are_current = !other_install_during_job;
+    if (starting_suppressions_are_current) {
+      for (uint64_t file_number : suppressed_files) {
+        current_storage->SuppressBlobFileForIndirectBlobGC(file_number);
+      }
+    }
+    // A new output has no garbage yet. Suppress it in this Version, so that the
+    // next pick in this Version takes other candidates instead.
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      if (output_needed[i]) {
+        current_storage->SuppressBlobFileForIndirectBlobGC(
+            outputs[i].file_number);
+      } else {
+        delete_renamed_outputs[i] = true;
+      }
+    }
+    if (!starting_suppressions_are_current || deferred_input ||
+        current_storage->BlobPhysicalFileForIndirectBlobGC() !=
+            kInvalidBlobFileNumber) {
+      db_->EnqueuePendingCompaction(cfd);
+    }
+    TEST_KILL_RANDOM("DBImpl::RunIndirectBlobGC:AfterLogAndApply");
+    RecordTick(db_->stats_, BLOB_DB_GC_NUM_FILES, published_input_count);
+    RecordTick(db_->stats_, BLOB_DB_GC_NUM_NEW_FILES, published_output_count);
+    RecordTick(db_->stats_, BLOB_DB_GC_NUM_KEYS_RELOCATED,
+               published_relocated_count);
+    RecordTick(db_->stats_, BLOB_DB_GC_BYTES_RELOCATED,
+               published_relocated_value_bytes);
+    RecordTick(db_->stats_, INDIRECT_BLOB_GC_KEYS_RELOCATED,
+               published_relocated_count);
+    RecordTick(db_->stats_, INDIRECT_BLOB_GC_BYTES_RELOCATED,
+               published_relocated_value_bytes);
+    uint64_t removed_bytes = 0;
+    for (size_t input_index : eligible_inputs) {
+      removed_bytes += inputs[input_index].physical_bytes;
+    }
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      if (output_needed[i]) {
+        bytes_written += outputs[i].file_size;
+      }
+    }
+    RecordTick(db_->stats_, INDIRECT_BLOB_GC_BYTES_RECLAIMED,
+               removed_bytes - std::min(removed_bytes, bytes_written));
+    ROCKS_LOG_BUFFER(log_buffer,
+                     "[%s] Indirect blob GC packed %" ROCKSDB_PRIszt
+                     " physical inputs into %" ROCKSDB_PRIszt
+                     " relocation files (%" ROCKSDB_PRIszt " live blobs)",
+                     cfd->GetName().c_str(), published_input_count,
+                     published_output_count, published_relocated_count);
+  }
+
+  if (!status.ok()) {
+    const autovector<uint64_t>& quarantined =
+        db_->error_handler_.GetFilesToQuarantine();
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      if (outputs[i].renamed) {
+        delete_renamed_outputs[i] =
+            std::find(quarantined.begin(), quarantined.end(),
+                      outputs[i].file_number) == quarantined.end();
+      }
+    }
+  }
+  db_->mutex_.Unlock();
+  superversion_context.Clean();
+  db_->mutex_.Lock();
+}
+
+void DBImpl::IndirectBlobGCJob::RecordOutcome(const Status& result,
+                                              size_t skipped_count) {
+  db_->mutex_.AssertHeld();
+  Statistics* const stats = db_->stats_;
+  const char* outcome = nullptr;
+  if (installed) {
+    outcome = "installed";
+    RecordTick(stats, INDIRECT_BLOB_GC_JOBS_INSTALLED);
+  } else if (result.IsTryAgain() && stale_input_is_retryable) {
+    outcome = "stale";
+    RecordTick(stats, INDIRECT_BLOB_GC_JOBS_STALE);
+  } else if (!internal_error &&
+             (result.ok() || result.IsCompactionTooLarge() ||
+              result.IsIncomplete() || result.IsShutdownInProgress() ||
+              result.IsColumnFamilyDropped())) {
+    outcome = "nothing installed";
+    RecordTick(stats, INDIRECT_BLOB_GC_JOBS_NOTHING_INSTALLED);
+  } else {
+    // A GC internal error (see note_internal_error()) counts as a failed job,
+    // although the job returns OK and sets no background error.
+    outcome = "failed";
+    RecordTick(stats, INDIRECT_BLOB_GC_JOBS_FAILED);
+    RecordTick(stats, BLOB_DB_GC_FAILURES);
+  }
+  RecordTick(stats, INDIRECT_BLOB_GC_BYTES_READ, input_bytes_read);
+  const uint64_t now_micros = db_->immutable_db_options_.clock->NowMicros();
+  RecordInHistogram(stats, INDIRECT_BLOB_GC_JOB_MICROS,
+                    now_micros - std::min(now_micros, start_micros));
+  ROCKS_LOG_BUFFER(
+      log_buffer,
+      "[%s] [JOB %d] Indirect blob GC job ended: %s; %" ROCKSDB_PRIszt
+      " candidates, %" ROCKSDB_PRIszt " inputs read, %" ROCKSDB_PRIszt
+      " installed, %" ROCKSDB_PRIszt " skipped, %" ROCKSDB_PRIszt
+      " outputs, %" ROCKSDB_PRIszt " values relocated, %" PRIu64
+      " bytes read, %" PRIu64 " bytes written; status: %s",
+      cfd->GetName().c_str(), job_id, outcome,
+      candidate_physical_file_numbers.size(), read_input_count,
+      published_input_count, skipped_count, published_output_count,
+      published_relocated_count, input_bytes_read, bytes_written,
+      result.ToString().c_str());
+  // Candidates that remain start the idle time again, if the options still
+  // let a GC job run (see ColumnFamilyData::NoteIndirectBlobGcCandidates()).
+  if (!cfd->IsDropped() && cfd->IndirectBlobGcOptionsAllowJob() &&
+      cfd->current()->storage_info()->BlobPhysicalFileForIndirectBlobGC() !=
+          kInvalidBlobFileNumber) {
+    cfd->NoteIndirectBlobGcCandidates(now_micros);
+  }
+}
+
+Status DBImpl::IndirectBlobGCJob::Finish() {
+  db_->mutex_.AssertHeld();
+  // invariant_failed() suppressed the job's inputs in the census, but the
+  // census publishes its new candidate list later. BackgroundCompaction()
+  // queues the retry of a stale job at once, so also suppress the inputs in
+  // the current Version when it is still the input Version. Then the retry
+  // does not pick the same inputs again.
+  Version* const current = cfd->current();
+  if (invariant_check_failed && !cfd->IsDropped() && current != nullptr &&
+      current->GetVersionNumber() == input_version_number) {
+    for (uint64_t file_number : suppressed_files) {
+      current->storage_info()->SuppressBlobFileForIndirectBlobGC(file_number);
+    }
+  }
+  blob_reference_census->EndGcJob(gc_job_token);
+  gc_job_token = 0;
+  input_version->UnrefAndFreeBlobRelocationState(&db_->mutex_);
+  db_->mutex_.Unlock();
+  if (status.IsCompactionTooLarge()) {
+    for (uint64_t file_number : capacity_deferred_files) {
+      suppressed_files.push_back(file_number);
+      // Keeps suppression_reasons parallel to suppressed_files.
+      suppression_reasons.emplace_back("deferred: outputs or disk space");
+      transient_suppressions.insert(file_number);
+    }
+  }
+  // A corrupt input reaches suppressed_files in the phase that finds it. The
+  // exception is corrupt exact SST metadata that ReadLiveSets() finds:
+  // DecideInputs() adds that input. DecideInputs() does not reach the input in
+  // three cases:
+  // 1. The read phase ends with an error status (a census mismatch, an
+  //    interrupt or a read error in a later SST batch), so DecideInputs()
+  //    decides nothing.
+  // 2. A census mismatch remains after a rebuild, so plan_end is 0.
+  // 3. DecideInputs() stops early, at a memory deferral of an earlier input or
+  //    at an error.
+  // The input would then be dropped, so add every corrupt input that is not in
+  // suppressed_files yet. The loop below logs it and counts it, and
+  // SuppressWorkerCandidates() suppresses it in the census.
+  for (const auto& corrupt : corrupt_inputs) {
+    if (std::find(suppressed_files.begin(), suppressed_files.end(),
+                  corrupt.first) == suppressed_files.end()) {
+      suppressed_files.push_back(corrupt.first);
+      // Keeps suppression_reasons parallel to suppressed_files.
+      suppression_reasons.emplace_back("corrupt input");
+    }
+  }
+  // Install() logs the skipped inputs (INFO) only when the job accepted no
+  // input, so log them here when the job installed inputs. Every corrupt input
+  // counts INDIRECT_BLOB_GC_CORRUPT_INPUTS here and gets one ERROR line here,
+  // unless the code that found it already wrote one.
+  for (size_t i = 0; i < suppressed_files.size(); ++i) {
+    const uint64_t file_number = suppressed_files[i];
+    const auto corrupt = corrupt_inputs.find(file_number);
+    if (corrupt != corrupt_inputs.end()) {
+      RecordTick(db_->stats_, INDIRECT_BLOB_GC_CORRUPT_INPUTS);
+      if (!corrupt->second.logged) {
+        corrupt->second.logged = true;
+        ROCKS_LOG_ERROR(db_->immutable_db_options_.info_log,
+                        "[%s] [JOB %d] Indirect blob GC found corrupt input "
+                        "#%" PRIu64 ": %s; %s",
+                        cfd->GetName().c_str(), job_id, file_number,
+                        corrupt->second.detail.c_str(),
+                        corrupt->second.fails_job
+                            ? "the job fails with a background error "
+                              "(paranoid_checks)"
+                            : "the file is skipped until it changes, the "
+                              "census is rebuilt or the coarse frontier "
+                              "rises (relocation files only)");
+      }
+    } else if (published_input_count > 0 && i < suppression_reasons.size()) {
+      ROCKS_LOG_BUFFER(
+          log_buffer, "[%s] Indirect blob GC skipped file #%" PRIu64 ": %s",
+          cfd->GetName().c_str(), file_number, suppression_reasons[i].c_str());
+    }
+  }
+  std::set<uint64_t> corrupt_files;
+  for (const auto& corrupt : corrupt_inputs) {
+    corrupt_files.insert(corrupt.first);
+  }
+  blob_reference_census->SuppressWorkerCandidates(
+      candidate_stamp, suppressed_files, transient_suppressions,
+      oversized_suppressions, db_->immutable_db_options_.clock->NowMicros(),
+      corrupt_files);
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    OutputState& output = outputs[i];
+    if (output.renamed && delete_renamed_outputs[i]) {
+      db_->DeleteObsoleteFileImpl(job_id, output.path, output_directory,
+                                  kBlobFile, output.file_number);
+      output.renamed = false;
+    }
+  }
+  edit.reset();
+  outputs.clear();
+  eligible_inputs.clear();
+  inputs.clear();
+  // Release the SST reader charge (selected_reader_bytes) here, without the DB
+  // mutex, not in the return-scope cleanup after the caller takes the DB mutex
+  // again.
+  memory_tracker->SetReservation(&selected_reader_bytes, 0)
+      .PermitUncheckedError();
+  memory_tracker.reset();
+  census.reset();
+  suppressed_files.clear();
+  suppression_reasons.clear();
+  db_->mutex_.Lock();
+  db_->ScheduleBlobReferenceCensus(cfd);
+  return status;
+}
+
+// Marks the job as a stale job that a later job can retry, and returns TryAgain
+// with `message`.
+Status DBImpl::IndirectBlobGCJob::stale_input(const char* message) {
+  stale_input_is_retryable = true;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:StaleInput",
+                           const_cast<char*>(message));
+  return Status::TryAgain(message);
+}
+
+// An invariant check that should never fail: `message` names a state that the
+// rules of indirect blob GC exclude (see "Install protocol" in Install()).
+// Debug builds assert, unless a test injected the failure. Release builds log
+// an ERROR line and end the job as a stale job, which installs nothing.
+//
+// The failed state can last, so a retry of the same inputs would fail the same
+// check again, and each try would write and delete all the outputs. So every
+// eligible input of the job gets a normal suppression in the census (Finish()
+// reports suppressed_files). It ends when the file changes, when the census is
+// rebuilt or (for a relocation file) when the coarse frontier rises. Finish()
+// also suppresses the inputs in the current Version when it is still the input
+// Version, so the retried pick takes other candidates. It is not Corruption
+// and not a background error, because the job installs nothing and the user
+// data is not damaged.
+Status DBImpl::IndirectBlobGCJob::invariant_failed(const char* message) {
+  [[maybe_unused]] bool injected_by_test = false;
+  TEST_SYNC_POINT_CALLBACK("DBImpl::RunIndirectBlobGC:InvariantFailed",
+                           &injected_by_test);
+  assert(injected_by_test);
+  ROCKS_LOG_ERROR(db_->immutable_db_options_.info_log,
+                  "[%s] [JOB %d] Indirect blob GC invariant check failed: %s; "
+                  "the job's inputs are skipped until they change, the "
+                  "census is rebuilt or the coarse frontier rises (relocation "
+                  "files only)",
+                  cfd->GetName().c_str(), job_id, message);
+  invariant_check_failed = true;
+  for (size_t input_index : eligible_inputs) {
+    const uint64_t file_number = inputs[input_index].file_number;
+    if (std::find(suppressed_files.begin(), suppressed_files.end(),
+                  file_number) == suppressed_files.end()) {
+      suppressed_files.push_back(file_number);
+      suppression_reasons.emplace_back("invariant check failed");
+    }
+  }
+  return stale_input(message);
+}
+
+// Maps a census status without the DB mutex. Start() uses it for the status of
+// SnapshotSelected(). An Aborted status means that the job registration ended
+// (CF drop, census cancel). It makes the job stale, so a later job retries it.
+// At shutdown the job returns ShutdownInProgress. Neither is a background
+// error. With the DB mutex held, use locked_census_status() instead.
+Status DBImpl::IndirectBlobGCJob::unlocked_census_status(Status census_status) {
+  if (census_status.IsAborted()) {
+    if (db_->shutting_down_.load(std::memory_order_acquire)) {
+      return Status::ShutdownInProgress("DB shutdown during indirect blob GC");
+    }
+    return stale_input("Blob GC job registration ended");
+  }
+  return census_status;
+}
+
+// Maps a census status with the DB mutex held (Start() and Install()). When the
+// status is Aborted (the job registration ended), it returns
+// ColumnFamilyDropped if the column family was dropped, ShutdownInProgress if
+// the DB is shutting down, or else a stale job. Other statuses stay unchanged.
+Status DBImpl::IndirectBlobGCJob::locked_census_status(Status census_status) {
+  db_->mutex_.AssertHeld();
+  if (!census_status.IsAborted()) {
+    return census_status;
+  }
+  if (column_family.IsDropped()) {
+    return Status::ColumnFamilyDropped(
+        "Column family dropped during indirect blob GC");
+  }
+  if (db_->shutting_down_.load(std::memory_order_acquire)) {
+    return Status::ShutdownInProgress("DB shutdown during indirect blob GC");
+  }
+  return stale_input("Blob GC job registration ended");
+}
+
+// Returns ShutdownInProgress at DB shutdown, Incomplete when compactions are
+// aborted for the whole DB or for this column family, and OK otherwise.
+Status DBImpl::IndirectBlobGCJob::interrupted() {
+  if (db_->shutting_down_.load(std::memory_order_acquire)) {
+    return Status::ShutdownInProgress();
+  }
+  if (db_->IsCompactionAborted(cfd)) {
+    return Status::Incomplete(Status::SubCode::kCompactionAborted);
+  }
+  return Status::OK();
+}
+
+// Cache pressure is transient: back off every candidate of this job, so the
+// retried pick can run other candidates instead of the same ones again. The
+// census retries them later; the delay doubles after each failure, from 1 s up
+// to 32 s (fixed choices, not measured).
+void DBImpl::IndirectBlobGCJob::suppress_candidates_transiently(
+    const char* reason) {
+  for (uint64_t file_number : candidate_physical_file_numbers) {
+    if (transient_suppressions.insert(file_number).second) {
+      suppressed_files.push_back(file_number);
+      suppression_reasons.emplace_back(reason);
+    }
+  }
+}
+
+// Marks the input at `input_index` as failed in its plan. Only the first reason
+// is kept.
+void DBImpl::IndirectBlobGCJob::fail_input(size_t input_index,
+                                           const char* reason) {
+  InputPlan& plan = plans[input_index];
+  if (!plan.failed) {
+    plan.failed = true;
+    plan.reason = reason;
+  }
+}
 
 bool DBImpl::EnoughRoomForCompaction(
     ColumnFamilyData* cfd, const std::vector<CompactionInputFiles>& inputs,
@@ -528,12 +4249,23 @@ Status DBImpl::FlushMemTablesToOutputFiles(
   // intentional infrequent copy for each flush
   const MutableCFOptions mutable_cf_options_copy =
       cfd->GetLatestMutableCFOptions();
+  // Keep the flush pending for SetOptions from this copy on (see
+  // ColumnFamilyData::BeginBlobIndirectionFlush()).
+  const bool blob_indirection_flush =
+      mutable_cf_options_copy.enable_blob_indirection;
+  if (blob_indirection_flush) {
+    cfd->BeginBlobIndirectionFlush();
+  }
   SuperVersionContext* superversion_context =
       bg_flush_arg.superversion_context_;
   FlushReason flush_reason = bg_flush_arg.flush_reason_;
   Status s = FlushMemTableToOutputFile(
       cfd, mutable_cf_options_copy, made_progress, job_context, flush_reason,
       superversion_context, log_buffer, thread_pri);
+  mutex_.AssertHeld();
+  if (blob_indirection_flush) {
+    cfd->EndBlobIndirectionFlush();
+  }
   return s;
 }
 
@@ -575,6 +4307,16 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
   std::vector<MutableCFOptions> all_mutable_cf_options;
   int num_cfs = static_cast<int>(cfds.size());
   all_mutable_cf_options.reserve(num_cfs);
+  // The column families whose options copy has enable_blob_indirection on.
+  // They stay pending for SetOptions until this function returns (see
+  // ColumnFamilyData::BeginBlobIndirectionFlush()).
+  autovector<ColumnFamilyData*> blob_indirection_flush_cfds;
+  Defer end_blob_indirection_flushes([&]() {
+    mutex_.AssertHeld();
+    for (ColumnFamilyData* flush_cfd : blob_indirection_flush_cfds) {
+      flush_cfd->EndBlobIndirectionFlush();
+    }
+  });
   for (int i = 0; i < num_cfs; ++i) {
     auto cfd = cfds[i];
     FSDirectory* data_dir = GetDataDir(cfd, 0U);
@@ -597,6 +4339,10 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
 
     all_mutable_cf_options.emplace_back(cfd->GetLatestMutableCFOptions());
     const MutableCFOptions& mutable_cf_options = all_mutable_cf_options.back();
+    if (mutable_cf_options.enable_blob_indirection) {
+      cfd->BeginBlobIndirectionFlush();
+      blob_indirection_flush_cfds.push_back(cfd);
+    }
     uint64_t max_memtable_id = bg_flush_args[i].max_memtable_id_;
     FlushReason flush_reason = bg_flush_args[i].flush_reason_;
     jobs.emplace_back(new FlushJob(
@@ -907,6 +4653,49 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     }
   }
 
+  // Reserve a pending flush-completion notification for every CF that the
+  // NotifyOnFlushCompleted loop below may service, before
+  // InstallMemtableAtomicFlushResults() removes the flushed memtables. The
+  // removal runs in a LogAndApply writer callback, and another thread can lead
+  // the MANIFEST batch and run that callback. That thread can release the DB
+  // mutex when its LogAndApply() call returns, before this thread takes the
+  // mutex back. If the reservation came after the install, a
+  // Flush(wait=true, listener_wait=true) waiter could then see the memtables
+  // removed and no pending notification, and return before OnFlushCompleted
+  // runs. The notify loop also releases and takes the mutex again between
+  // CFs, so the reservations stay until it is done. A reservation for a CF
+  // that gets no notification (the install fails, or the CF is dropped) only
+  // makes waiters wait until the release below.
+  autovector<uint8_t> reserved_flush_notification;
+  reserved_flush_notification.reserve(num_cfs);
+  {
+    const bool has_listeners = !immutable_db_options_.listeners.empty();
+    for (int i = 0; i != num_cfs; ++i) {
+      // The install fills the committed flush job info, so this checks the
+      // flushed memtables instead.
+      const bool reserve = s.ok() && has_listeners &&
+                           !switched_to_mempurge[i] && !cfds[i]->IsDropped() &&
+                           !jobs[i]->GetMemTables().empty();
+      if (reserve) {
+        cfds[i]->imm()->AddPendingFlushNotifications(1);
+      }
+      reserved_flush_notification.push_back(reserve ? 1 : 0);
+    }
+  }
+  // Release the reservations on every exit path (RAII) so a future early return
+  // cannot leak the count and hang listener_wait waiters. Done independently of
+  // the notify loop's skips so the count stays balanced even if a CF was
+  // dropped after it was reserved. The DB mutex is held throughout this
+  // function, including at scope exit, which SubPendingFlushNotifications()
+  // requires.
+  Defer release_flush_notifications([&] {
+    for (int i = 0; i != num_cfs; ++i) {
+      if (reserved_flush_notification[i]) {
+        cfds[i]->imm()->SubPendingFlushNotifications(1);
+      }
+    }
+  });
+
   if (s.ok()) {
     autovector<ColumnFamilyData*> tmp_cfds;
     autovector<const autovector<ReadOnlyMemTable*>*> mems_list;
@@ -930,42 +4719,6 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
         committed_flush_jobs_info, &job_context->memtables_to_free,
         directories_.GetDbDir(), log_buffer);
   }
-
-  // Reserve a pending flush-completion notification for every CF that the
-  // NotifyOnFlushCompleted loop below will service, while the DB mutex is still
-  // held continuously since InstallMemtableAtomicFlushResults removed the
-  // memtables. This closes the window where a
-  // Flush(wait=true, listener_wait=true) waiter could observe an atomic flush
-  // as finished before a later CF's OnFlushCompleted has run, since the notify
-  // loop releases and re-acquires the mutex between CFs. The reservations are
-  // released by a matching pass after the notify loop.
-  autovector<uint8_t> reserved_flush_notification;
-  reserved_flush_notification.reserve(num_cfs);
-  {
-    const bool has_listeners = !immutable_db_options_.listeners.empty();
-    for (int i = 0; i != num_cfs; ++i) {
-      const bool reserve = s.ok() && has_listeners &&
-                           !switched_to_mempurge[i] && !cfds[i]->IsDropped() &&
-                           !jobs[i]->GetCommittedFlushJobsInfo()->empty();
-      if (reserve) {
-        cfds[i]->imm()->AddPendingFlushNotifications(1);
-      }
-      reserved_flush_notification.push_back(reserve ? 1 : 0);
-    }
-  }
-  // Release the reservations on every exit path (RAII) so a future early return
-  // cannot leak the count and hang listener_wait waiters. Done independently of
-  // the notify loop's skips so the count stays balanced even if a CF was
-  // dropped after it was reserved. The DB mutex is held throughout this
-  // function, including at scope exit, which SubPendingFlushNotifications()
-  // requires.
-  Defer release_flush_notifications([&] {
-    for (int i = 0; i != num_cfs; ++i) {
-      if (reserved_flush_notification[i]) {
-        cfds[i]->imm()->SubPendingFlushNotifications(1);
-      }
-    }
-  });
 
   if (!s.ok()) {
     // If the atomic flush's combined MANIFEST write failed, the output files
@@ -1119,11 +4872,13 @@ void DBImpl::NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
   if (shutting_down_.load(std::memory_order_acquire)) {
     return;
   }
+  // The stall decision counts L0 sorted runs, where an exact epoch run counts
+  // once (see VersionStorageInfo::NumL0SortedRuns()), so these flags do too.
   bool triggered_writes_slowdown =
-      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+      (cfd->current()->storage_info()->NumL0SortedRuns() >=
        mutable_cf_options.level0_slowdown_writes_trigger);
   bool triggered_writes_stop =
-      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+      (cfd->current()->storage_info()->NumL0SortedRuns() >=
        mutable_cf_options.level0_stop_writes_trigger);
   // release lock while notifying events
   mutex_.Unlock();
@@ -1164,11 +4919,13 @@ void DBImpl::NotifyOnFlushCompleted(
   if (shutting_down_.load(std::memory_order_acquire)) {
     return;
   }
+  // The stall decision counts L0 sorted runs, where an exact epoch run counts
+  // once (see VersionStorageInfo::NumL0SortedRuns()), so these flags do too.
   bool triggered_writes_slowdown =
-      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+      (cfd->current()->storage_info()->NumL0SortedRuns() >=
        mutable_cf_options.level0_slowdown_writes_trigger);
   bool triggered_writes_stop =
-      (cfd->current()->storage_info()->NumLevelFiles(0) >=
+      (cfd->current()->storage_info()->NumL0SortedRuns() >=
        mutable_cf_options.level0_stop_writes_trigger);
   // release lock while notifying events
   mutex_.Unlock();
@@ -1318,6 +5075,13 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
       cfd->ioptions().compaction_style == kCompactionStyleFIFO) {
     return Status::NotSupported(
         "FIFO compaction does not support missing blob file repair.");
+  }
+  if (options.skip_missing_blob_files) {
+    InstrumentedMutexLock l(&mutex_);
+    const Status guard = CheckSkipMissingBlobFilesSupported(cfd, nullptr);
+    if (!guard.ok()) {
+      return guard;
+    }
   }
 
   bool flush_needed = true;
@@ -1687,6 +5451,10 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
     // FindObsoleteFiles(). This is because job_context does not
     // catch all created files if compaction failed.
     FindObsoleteFiles(&job_context, !s.ok());
+    // The compaction has installed its SuperVersion, so the census state that
+    // its LogAndApply batch replaced can be freed now (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()).
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
   }  // release the mutex
 
   // delete unnecessary files if any, this is done outside the mutex
@@ -1711,6 +5479,7 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
 void DBImpl::PrepareTrivialMoveEdit(Compaction& c, LogBuffer* log_buffer,
                                     size_t& moved_files, size_t& moved_bytes) {
   mutex_.AssertHeld();
+  c.EndPendingBlobIndirectionActivation();
 
   ROCKS_LOG_BUFFER(log_buffer, "[%s] Moving %d files to level-%d\n",
                    c.column_family_data()->GetName().c_str(),
@@ -2055,8 +5824,14 @@ Status DBImpl::CompactFilesImpl(
 Status DBImpl::PauseBackgroundWork() {
   InstrumentedMutexLock guard_lock(&mutex_);
   bg_compaction_paused_++;
+  // The blob reference census job is background work too: it reads SSTs, stores
+  // GC candidates in the current Version, schedules compactions and writes the
+  // MANIFEST (route retirement). So wait for it. ScheduleBlobReferenceCensus()
+  // does not start it again while paused.
   while (CompactionsScheduled() > 0 || remote_compaction_pool_jobs_ > 0 ||
-         bg_flush_scheduled_ > 0 || bg_wbm_flush_scheduled_ > 0) {
+         bg_flush_scheduled_ > 0 || bg_wbm_flush_scheduled_ > 0 ||
+         bg_blob_reference_census_state_ ==
+             BlobReferenceCensusJobState::kScheduled) {
     TEST_SYNC_POINT("DBImpl::PauseBackgroundWork:Wait");
     bg_cv_.Wait();
   }
@@ -2077,6 +5852,9 @@ Status DBImpl::ContinueBackgroundWork() {
   // bg_work_paused_ is always no greater than bg_compaction_paused_
   if (bg_work_paused_ == 0) {
     MaybeScheduleFlushOrCompaction();
+    // Check every column family again and start the census job for those that
+    // need a census run (see ScheduleBlobReferenceCensus()).
+    ScheduleBlobReferenceCensus();
   }
   return Status::OK();
 }
@@ -2324,6 +6102,10 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
 
     InstallSuperVersionAndScheduleWork(cfd, &sv_context,
                                        /*defer_snapshot_refresh=*/false);
+    // Free the census state that the LogAndApply batch replaced (see
+    // VersionSet::ReleaseDeferredPublicationCleanup()). refitting_level_ is
+    // still set, so no other ReFitLevel() starts while the mutex is released.
+    versions_->ReleaseDeferredPublicationCleanup(&mutex_);
 
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log, "[%s] LogAndApply: %s\n",
                     cfd->GetName().c_str(), status.ToString().data());
@@ -2630,6 +6412,21 @@ Status DBImpl::RunManualCompaction(
         }
         bg_cv_.SignalAll();
         continue;
+      }
+      if (compaction->skip_missing_blob_files()) {
+        // The feature can be turned on after the early check in
+        // CompactRangeInternal(). Check again with the picked inputs, before
+        // any work is scheduled.
+        const Status guard =
+            CheckSkipMissingBlobFilesSupported(cfd, compaction);
+        if (!guard.ok()) {
+          std::unique_ptr<Compaction> rejected(compaction);
+          rejected->ReleaseCompactionFiles(guard);
+          manual.status = guard;
+          manual.done = true;
+          bg_cv_.SignalAll();
+          continue;
+        }
       }
       ca = new CompactionArg;
       ca->db = this;
@@ -4200,6 +7997,17 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
     out_file_metadata.db_ownership_start_time = copy_time;
     out_file_metadata.data_file_provenance =
         in_file->data_file_provenance | kProvenanceTemperatureChangedByCopy;
+    out_file_metadata.blob_reference_descriptor =
+        in_file->blob_reference_descriptor;
+    out_file_metadata.blob_reference_legacy_metadata =
+        in_file->blob_reference_legacy_metadata;
+    out_file_metadata.oldest_coarse_indirect_origin_file_number =
+        in_file->oldest_coarse_indirect_origin_file_number;
+    out_file_metadata.blob_reference_output_predates_indirection =
+        in_file->blob_reference_descriptor.empty() &&
+        !in_file->blob_reference_legacy_metadata &&
+        in_file->oldest_coarse_indirect_origin_file_number ==
+            kInvalidBlobFileNumber;
 
     if (out_table_properties) {
       c->SetOutputTableProperties(out_fname, out_table_properties);
@@ -4211,7 +8019,8 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
         out_table_properties ? *out_table_properties : TableProperties(),
         TableFileCreationReason::kCompaction, io_s,
         out_file_metadata.file_checksum,
-        out_file_metadata.file_checksum_func_name);
+        out_file_metadata.file_checksum_func_name,
+        /*blob_references=*/nullptr);
     unfinished_out_fname.clear();
 
     out_files->push_back(std::move(out_file_metadata));
@@ -4223,7 +8032,8 @@ IOStatus DBImpl::CopyTrivialCompactionFiles(
         &event_logger_, cfd->ioptions().listeners, dbname_, cfd->GetName(),
         unfinished_out_fname, job_id, FileDescriptor(), kInvalidBlobFileNumber,
         TableProperties(), TableFileCreationReason::kCompaction, io_s,
-        kUnknownFileChecksum, kUnknownFileChecksumFuncName);
+        kUnknownFileChecksum, kUnknownFileChecksumFuncName,
+        /*blob_references=*/nullptr);
   }
   return io_s;
 }
@@ -4334,8 +8144,9 @@ BackgroundJobPressure DBImpl::CaptureBackgroundJobPressure() const {
   // Uses the same inputs as RecalculateWriteStallConditions() in
   // column_family.cc:
   //   - l0_delay_trigger_count(): sorted run count used for write stall
-  //     decisions. Equals NumLevelFiles(0) for level compaction; for universal
-  //     compaction, also counts non-empty levels from L1+ as sorted runs.
+  //     decisions. Equals the L0 sorted run count for level compaction (see
+  //     VersionStorageInfo::NumL0SortedRuns()); for universal compaction, also
+  //     counts non-empty levels from L1+ as sorted runs.
   //   - estimated_compaction_needed_bytes(): pending compaction bytes.
   // Prefers slowdown/soft triggers (gradual); falls back to stop/hard triggers.
   // level0_slowdown_writes_trigger is sanitized to always be > 0;
@@ -4866,10 +8677,11 @@ void DBImpl::BackgroundCallWBMFlush() {
   bg_cv_.SignalAll();
 }
 
-Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
-                               LogBuffer* log_buffer, FlushReason* reason,
-                               bool* flush_rescheduled_to_retain_udt,
-                               Env::Priority thread_pri) {
+Status DBImpl::BackgroundFlush(
+    bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
+    FlushReason* reason, bool* flush_rescheduled_to_retain_udt,
+    Env::Priority thread_pri,
+    autovector<BlobReferenceCensusApplyTarget>* census_cfds) {
   mutex_.AssertHeld();
 
   Status status;
@@ -5001,7 +8813,14 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
     *reason = bg_flush_args[0].flush_reason_;
     for (auto& arg : bg_flush_args) {
       ColumnFamilyData* cfd = arg.cfd_;
-      if (cfd->UnrefAndTryDelete()) {
+      if (cfd->blob_reference_census() != nullptr && !cfd->IsDropped()) {
+        // The caller applies the census of `cfd` and then drops this
+        // reference. A dropped column family is released here as before, so
+        // FindObsoleteFiles() in the caller still sees its last reference go.
+        mutex_.AssertHeld();
+        census_cfds->push_back({cfd, cfd->current()->GetVersionNumber()});
+        ++blob_reference_census_pending_applies_;
+      } else if (cfd->UnrefAndTryDelete()) {
         arg.cfd_ = nullptr;
       }
     }
@@ -5036,9 +8855,12 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
         CaptureListenerPendingOutput(**pending_outputs_inserted_elem);
     FlushReason reason;
     bool flush_rescheduled_to_retain_udt = false;
-    Status s =
-        BackgroundFlush(&made_progress, &job_context, &log_buffer, &reason,
-                        &flush_rescheduled_to_retain_udt, thread_pri);
+    // The column families of this flush that have a census, each with a
+    // reference (see ApplyBlobReferenceCensusAfterInstall()).
+    autovector<BlobReferenceCensusApplyTarget> census_cfds;
+    Status s = BackgroundFlush(&made_progress, &job_context, &log_buffer,
+                               &reason, &flush_rescheduled_to_retain_udt,
+                               thread_pri, &census_cfds);
     if (s.IsTryAgain() && flush_rescheduled_to_retain_udt) {
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
       mutex_.Unlock();
@@ -5097,6 +8919,9 @@ void DBImpl::BackgroundCallFlush(Env::Priority thread_pri) {
       mutex_.Lock();
     }
     TEST_SYNC_POINT("DBImpl::BackgroundCallFlush:ContextCleanedUp");
+    // Wakes the waiters of the flush result before the deferred census
+    // cleanup and the census apply (see the function comment).
+    ApplyBlobReferenceCensusAfterInstall(census_cfds);
 
     assert(num_running_flushes_ > 0);
     num_running_flushes_--;
@@ -5153,10 +8978,13 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 : (bg_thread_pri == Env::Priority::BOTTOM
                                        ? bg_bottom_compaction_scheduled_ > 0
                                        : bg_compaction_scheduled_ > 0));
-    Status s = BackgroundCompaction(&made_progress, &job_context, &log_buffer,
-                                    prepicked_compaction, bg_thread_pri,
-                                    separate_remote_pool, &deferred_compactions,
-                                    **pending_outputs_inserted_elem);
+    // The column family of this compaction if it has a census, with a
+    // reference (see ApplyBlobReferenceCensusAfterInstall()).
+    autovector<BlobReferenceCensusApplyTarget> census_cfds;
+    Status s = BackgroundCompaction(
+        &made_progress, &job_context, &log_buffer, prepicked_compaction,
+        bg_thread_pri, separate_remote_pool, &deferred_compactions,
+        **pending_outputs_inserted_elem, &census_cfds);
     TEST_SYNC_POINT("BackgroundCallCompaction:1");
     if (s.IsBusy()) {
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
@@ -5239,6 +9067,9 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
       job_context.Clean();
       mutex_.Lock();
     }
+    // Wakes the waiters of the compaction result before the deferred census
+    // cleanup and the census apply (see the function comment).
+    ApplyBlobReferenceCensusAfterInstall(census_cfds);
 
     assert(num_running_compactions_ > 0);
     num_running_compactions_--;
@@ -5295,7 +9126,8 @@ Status DBImpl::BackgroundCompaction(
     bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
     PrepickedCompaction* prepicked_compaction, Env::Priority thread_pri,
     bool separate_remote_pool, int* deferred_compactions,
-    uint64_t min_output_file_number) {
+    uint64_t min_output_file_number,
+    autovector<BlobReferenceCensusApplyTarget>* census_cfds) {
   ManualCompactionState* manual_compaction =
       prepicked_compaction == nullptr
           ? nullptr
@@ -5341,6 +9173,17 @@ Status DBImpl::BackgroundCompaction(
   ColumnFamilyData* in_flight_cfd = nullptr;
   Defer end_in_flight_compaction([&]() {
     if (in_flight_cfd != nullptr) {
+      if (in_flight_cfd->blob_reference_census() != nullptr &&
+          !in_flight_cfd->IsDropped()) {
+        // The caller applies the census of this column family and then drops
+        // this reference. A dropped column family gets no extra reference, so
+        // the comment above stays true for it.
+        in_flight_cfd->Ref();
+        mutex_.AssertHeld();
+        census_cfds->push_back(
+            {in_flight_cfd, in_flight_cfd->current()->GetVersionNumber()});
+        ++blob_reference_census_pending_applies_;
+      }
       EndInFlightCompaction(in_flight_cfd);
     }
   });
@@ -5432,6 +9275,14 @@ Status DBImpl::BackgroundCompaction(
   std::unique_ptr<TaskLimiterToken> task_token;
 
   bool sfm_reserved_compact_space = false;
+  uint64_t sfm_reserved_blob_gc_bytes = 0;
+  bool ran_indirect_blob_gc = false;
+  bool indirect_blob_gc_stale_input = false;
+  ColumnFamilyData* indirect_blob_gc_cfd = nullptr;
+  IOStatus io_s;
+  // Some early paths return before any I/O runs, so mark the default status as
+  // checked. Each later assignment replaces it and is checked before return.
+  io_s.PermitUncheckedError();
   if (is_manual) {
     ManualCompactionState* m = manual_compaction;
     assert(m->in_progress);
@@ -5532,7 +9383,13 @@ Status DBImpl::BackgroundCompaction(
     // throughout the compaction procedure to make sure consistency. It will
     // eventually be installed into SuperVersion
     const auto& mutable_cf_options = cfd->GetLatestMutableCFOptions();
-    if (!mutable_cf_options.disable_auto_compactions && !cfd->IsDropped()) {
+    // A CF with automatic compactions disabled still enters here when it has a
+    // file with no live value. It picks no LSM compaction. If the census is
+    // ready, the indirect blob GC block below writes the MANIFEST record that
+    // removes the file (empty_files_only).
+    if ((!mutable_cf_options.disable_auto_compactions ||
+         cfd->current()->storage_info()->HasEmptyBlobGcCandidate()) &&
+        !cfd->IsDropped()) {
       // NOTE: try to avoid unnecessary copy of MutableCFOptions if
       // compaction is not necessary. Need to make sure mutex is held
       // until we make a copy in the following code
@@ -5544,10 +9401,13 @@ Status DBImpl::BackgroundCompaction(
         InitSnapshotContext(job_context);
         assert(is_snapshot_supported_ || snapshots_.empty());
       }
-      c.reset(cfd->PickCompaction(
-          mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
-          job_context->snapshot_checker, log_buffer,
-          thread_pri == Env::Priority::BOTTOM /* require_max_output_level */));
+      if (!mutable_cf_options.disable_auto_compactions) {
+        c.reset(cfd->PickCompaction(
+            mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
+            job_context->snapshot_checker, log_buffer,
+            thread_pri ==
+                Env::Priority::BOTTOM /* require_max_output_level */));
+      }
       if (c != nullptr && in_flight_cfd == nullptr) {
         in_flight_cfd = cfd;
         BeginInFlightCompaction(in_flight_cfd);
@@ -5611,15 +9471,107 @@ Status DBImpl::BackgroundCompaction(
             "but upon re-evaluation, no compaction was found necessary \n",
             cfd->GetName().c_str());
       }
+
+      // Normal LSM compaction comes first. Indirect blob GC runs only on a
+      // LOW-pool worker that has no pre-picked compaction and found no LSM
+      // compaction, and only when the census is ready. When blob files, blob GC
+      // and blob indirection are on and automatic compactions are enabled, GC
+      // takes up to kIndirectBlobGCMaxInputs (8) candidates in the order of
+      // the census ranking that the Version stores
+      // (GetBlobPhysicalFilesForIndirectBlobGC()), and RunIndirectBlobGCBatch()
+      // checks them again in full. Otherwise GC only removes files that hold no
+      // live value from the Version (empty_files_only below). Only one GC job
+      // runs per column family at a time (indirect_blob_gc_cfs_in_progress_).
+      BlobReferenceCensus* const blob_reference_census =
+          cfd == nullptr ? nullptr : cfd->blob_reference_census();
+      Version* const current_version =
+          cfd == nullptr ? nullptr : cfd->current();
+      if (status.ok() && c == nullptr && !is_prepicked && cfd != nullptr &&
+          job_context != nullptr && thread_pri == Env::Priority::LOW &&
+          blob_reference_census != nullptr && current_version != nullptr &&
+          blob_reference_census->IsReady(current_version->GetVersionNumber())) {
+        VersionStorageInfo* const storage = current_version->storage_info();
+        std::vector<uint64_t> candidates;
+        const bool empty_files_only =
+            !mutable_cf_options.enable_blob_files ||
+            !mutable_cf_options.enable_blob_garbage_collection ||
+            !mutable_cf_options.enable_blob_indirection ||
+            mutable_cf_options.disable_auto_compactions;
+        if (!empty_files_only) {
+          storage->GetBlobPhysicalFilesForIndirectBlobGC(
+              kIndirectBlobGCMaxInputs, &candidates);
+        } else {
+          // When indirect blob GC cannot run normally (enable_blob_files,
+          // enable_blob_garbage_collection or enable_blob_indirection off, or
+          // automatic compactions disabled), GC removes only files that hold no
+          // live value from the Version. No SST uses a value in such a file, so
+          // GC copies no value and rewrites no SST.
+          storage->GetEmptyBlobGcCandidates(kIndirectBlobGCMaxInputs,
+                                            &candidates);
+        }
+        // Lets a test keep GC from starting while the options allow it. It also
+        // holds back an empty-files-only job.
+        TEST_SYNC_POINT_CALLBACK(
+            "DBImpl::BackgroundCompaction:IndirectBlobGCCandidates",
+            &candidates);
+        if (!candidates.empty() &&
+            indirect_blob_gc_cfs_in_progress_.insert(cfd->GetID()).second) {
+          indirect_blob_gc_cfd = cfd;
+          ran_indirect_blob_gc = true;
+          if (in_flight_cfd == nullptr) {
+            in_flight_cfd = cfd;
+            BeginInFlightCompaction(in_flight_cfd);
+          }
+          // With a separate remote compaction pool this thread is a remote
+          // coordinator. Indirect blob GC then runs as local work: it waits for
+          // a local compaction credit, is counted in bg_compaction_scheduled_,
+          // and runs in the LOW pool. If RunLocalCompaction returns without
+          // running the job, its status is returned and GC did not run.
+          const auto run_indirect_blob_gc_job =
+              [&](const std::function<Status()>& gc) {
+                if (!separate_remote_pool) {
+                  return gc();
+                }
+                const std::atomic<bool> never_canceled{false};
+                bool gc_ran = false;
+                Status gc_status;
+                mutex_.Unlock();
+                Status local_status = RunLocalCompaction(
+                    [&]() {
+                      InstrumentedMutexLock gc_lock(&mutex_);
+                      gc_ran = true;
+                      gc_status = gc();
+                    },
+                    Env::Priority::LOW, cfd, never_canceled,
+                    /*is_manual=*/false);
+                mutex_.Lock();
+                if (gc_ran) {
+                  local_status.PermitUncheckedError();
+                  return gc_status;
+                }
+                return local_status;
+              };
+          status = run_indirect_blob_gc_job([&]() {
+            return RunIndirectBlobGCBatch(
+                cfd, candidates, made_progress, &sfm_reserved_blob_gc_bytes,
+                &indirect_blob_gc_stale_input, log_buffer, job_context->job_id,
+                empty_files_only);
+          });
+          io_s = versions_->io_status();
+          indirect_blob_gc_cfs_in_progress_.erase(cfd->GetID());
+        }
+      }
     }
   }
 
-  IOStatus io_s;
   bool compaction_released = false;
   if (c) {
     c->SetSeparateRemoteCompactionPoolSelected(separate_remote_pool);
   }
-  if (!c) {
+  if (ran_indirect_blob_gc) {
+    // The indirect blob GC job (RunIndirectBlobGCBatch()) completed the work
+    // and returned with mutex_ held.
+  } else if (!c) {
     // Nothing to do
     ROCKS_LOG_BUFFER(log_buffer, "Compaction nothing to do");
   } else if (c->deletion_compaction()) {
@@ -5918,6 +9870,8 @@ Status DBImpl::BackgroundCompaction(
     // Should handle error?
     compaction_job.Run().PermitUncheckedError();
     TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun");
+    TEST_SYNC_POINT(
+        "DBImpl::BackgroundCompaction:NonTrivial:AfterRun:WaitForRelocation");
     mutex_.Lock();
 
     if (immutable_db_options().compaction_service != nullptr) {
@@ -5990,13 +9944,51 @@ Status DBImpl::BackgroundCompaction(
                                 compaction_job_stats, job_context->job_id);
   }
 
+  if (sfm_reserved_blob_gc_bytes != 0) {
+    auto* const sfm = static_cast<SstFileManagerImpl*>(
+        immutable_db_options_.sst_file_manager.get());
+    assert(sfm != nullptr);
+    sfm->OnCompactionCompletion(sfm_reserved_blob_gc_bytes);
+  }
+
+  // Puts the column family that indirect blob GC ran on back in the compaction
+  // queue, so that a later worker picks GC again. With a separate remote pool,
+  // the new queue entry is counted in *deferred_compactions instead of
+  // unscheduled_compactions_, the same way as the compaction retry below.
+  // BackgroundCallCompaction() adds that count back to unscheduled_compactions_
+  // when this job ends.
+  const auto retry_indirect_blob_gc = [&]() {
+    if (indirect_blob_gc_cfd != nullptr && !indirect_blob_gc_cfd->IsDropped() &&
+        !error_handler_.IsBGWorkStopped()) {
+      const int unscheduled_before_retry = unscheduled_compactions_;
+      EnqueuePendingCompaction(indirect_blob_gc_cfd);
+      if (separate_remote_pool &&
+          unscheduled_compactions_ > unscheduled_before_retry) {
+        --unscheduled_compactions_;
+        restore_compaction_credit();
+      }
+    }
+  };
+
   if (status.ok() || status.IsCompactionTooLarge() ||
       status.IsManualCompactionPaused() || status.IsCompactionAborted()) {
+    if (status.IsCompactionTooLarge() || status.IsCompactionAborted()) {
+      retry_indirect_blob_gc();
+    }
     // Done
+  } else if (status.IsTryAgain() && ran_indirect_blob_gc &&
+             indirect_blob_gc_stale_input) {
+    // A stale input is not an error, so it becomes Busy. Busy sets no
+    // background error and does not count as one. BackgroundCallCompaction()
+    // then waits only 10 ms (to prevent a hot loop) instead of the 1 s wait
+    // after an error, and it skips the full obsolete-file scan.
+    retry_indirect_blob_gc();
+    status = Status::Busy("Indirect blob GC input changed");
   } else if (status.IsColumnFamilyDropped() || status.IsShutdownInProgress()) {
     // Ignore compaction errors found during shutting down
   } else {
-    ROCKS_LOG_WARN(immutable_db_options_.info_log, "Compaction error: %s",
+    ROCKS_LOG_WARN(immutable_db_options_.info_log, "%s error: %s",
+                   ran_indirect_blob_gc ? "Indirect blob GC" : "Compaction",
                    status.ToString().c_str());
     if (!io_s.ok()) {
       // Error while writing to MANIFEST.
@@ -6031,6 +10023,12 @@ Status DBImpl::BackgroundCompaction(
         --unscheduled_compactions_;
         restore_compaction_credit();
       }
+    } else if (ran_indirect_blob_gc) {
+      // Indirect blob GC hit a background error. If the error did not stop
+      // background work (for example, a retryable I/O error), put the CF back
+      // in the queue, the same as the compaction retry above.
+      // retry_indirect_blob_gc() does nothing if background work stopped.
+      retry_indirect_blob_gc();
     }
   }
   if (c != nullptr && !status.ok() &&
@@ -6143,6 +10141,10 @@ Compaction* DBImpl::CreateIntendedCompactionForwardedToBottomPriorityPool(
   cfd->compaction_picker()->RegisterCompaction(intended_compaction);
   vstorage->ComputeCompactionScore(io, mo, cfd->GetFullHistoryTsLow());
   intended_compaction->FinalizeInputInfo(cfd->current());
+  // The intended compaction only holds its input files until the bottom
+  // priority thread repicks. It writes no output, so it cannot set the format
+  // fence. The repicked compaction counts as pending with its own options.
+  intended_compaction->EndPendingBlobIndirectionActivation();
 
   return intended_compaction;
 }
@@ -6373,6 +10375,9 @@ void DBImpl::InstallSuperVersionAndScheduleWork(
   }
   cfd->InstallSuperVersion(sv_context, &mutex_,
                            std::move(new_seqno_to_time_mapping));
+  // Queue the census of this CF if it needs a run, for example when the CF got
+  // the format fence after open. The call is O(1).
+  ScheduleBlobReferenceCensus(cfd);
 
   // Refresh the seqno->time preserve-window bound used to gate bottommost file
   // marking, so a file whose largest seqno is still within the preserve window

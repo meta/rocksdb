@@ -1733,16 +1733,64 @@ bool StressTest::BuildOptionsTable() {
                         std::vector<std::string>{"0", "2", "4"});
   }
 
+  // True when blob indirection is on or SetOptions may turn it on. The
+  // SetOptions choices below then keep blob files on (blob indirection needs
+  // them) and pick values that make indirect blob GC run.
+  const bool blob_indirection_possible =
+      FLAGS_enable_blob_indirection ||
+      FLAGS_allow_setting_blob_indirection_dynamically;
+  if (FLAGS_allow_setting_blob_indirection_dynamically) {
+    // Mostly on, so that indirect blob GC makes relocation files and routes
+    // before the option is turned off again.
+    options_tbl.emplace(
+        "enable_blob_indirection",
+        std::vector<std::string>{"false", "true", "true", "true"});
+  }
+  if (FLAGS_allow_setting_blob_options_dynamically &&
+      blob_indirection_possible) {
+    // With a small cap (4096 references), compaction often starts a new output
+    // SST at the cap, which tests that path. The cap is a blob option, so it
+    // changes only when allow_setting_blob_options_dynamically is set.
+    options_tbl.emplace("blob_indirection_max_references_per_sst",
+                        std::vector<std::string>{"4096", "65536", "1048576"});
+    // A change applies to relocation file readers opened after it.
+    options_tbl.emplace("pin_blob_relocation_location_blocks",
+                        std::vector<std::string>{"false", "true"});
+    // A change applies from the next census run. A low value makes GC copy
+    // files with more live values, and a high value makes GC skip more files.
+    options_tbl.emplace("indirect_blob_gc_garbage_ratio",
+                        std::vector<std::string>{"0.25", "0.5", "0.75"});
+    // A change applies to the next indirect blob GC job. 0 reads each live
+    // value on its own, and 1048576 (the 1 MB read limit) merges every gap
+    // that fits in one read. The default (16384) is listed twice so that it
+    // is picked more often.
+    options_tbl.emplace("indirect_blob_gc_read_coalesce_bytes",
+                        std::vector<std::string>{"0", "4096", "16384", "16384",
+                                                 "65536", "1048576"});
+  }
   if (FLAGS_allow_setting_blob_options_dynamically) {
     options_tbl.emplace("enable_blob_files",
-                        std::vector<std::string>{"false", "true"});
+                        blob_indirection_possible
+                            ? std::vector<std::string>{"true"}
+                            : std::vector<std::string>{"false", "true"});
     options_tbl.emplace("min_blob_size",
                         std::vector<std::string>{"0", "8", "16"});
-    options_tbl.emplace("blob_file_size",
-                        std::vector<std::string>{"1M", "16M", "256M", "1G"});
+    // Blob indirection: small blob files reach the indirect blob GC garbage
+    // threshold quickly.
+    options_tbl.emplace(
+        "blob_file_size",
+        blob_indirection_possible
+            ? std::vector<std::string>{"256K", "1M", "4M"}
+            : std::vector<std::string>{"1M", "16M", "256M", "1G"});
     options_tbl.emplace("blob_compression_type", GetBlobCompressionTags());
-    options_tbl.emplace("enable_blob_garbage_collection",
-                        std::vector<std::string>{"false", "true"});
+    // Indirect blob GC needs enable_blob_garbage_collection on. With blob
+    // indirection, keep it on most of the time, but still turn it off sometimes
+    // while the DB holds relocation files and routes.
+    options_tbl.emplace(
+        "enable_blob_garbage_collection",
+        blob_indirection_possible
+            ? std::vector<std::string>{"false", "true", "true", "true"}
+            : std::vector<std::string>{"false", "true"});
     options_tbl.emplace(
         "blob_garbage_collection_age_cutoff",
         std::vector<std::string>{"0.0", "0.25", "0.5", "0.75", "1.0"});
@@ -2091,6 +2139,86 @@ std::string StressTest::DebugString(const Slice& value,
       << ", columns: " << WideColumnsToHex(columns);
 
   return oss.str();
+}
+
+void StressTest::ReportBlobIndirectionGc(SharedState* shared) const {
+  if (!FLAGS_enable_blob_indirection &&
+      !FLAGS_allow_setting_blob_indirection_dynamically) {
+    return;
+  }
+  std::shared_ptr<Statistics> stats =
+      db_ ? db_->GetOptions().statistics : nullptr;
+  if (!stats) {
+    if (FLAGS_blob_indirection_require_gc) {
+      VerificationAbort(shared,
+                        "blob_indirection_require_gc requires --statistics");
+    }
+    return;
+  }
+  // Only indirect blob GC records the file counts; compaction-time blob GC
+  // relocates values during compaction and records keys and bytes only. The
+  // collected count includes input files that held no live value, which GC
+  // removes without writing a relocation file.
+  const BlobIndirectionGcTotals& before =
+      blob_indirection_gc_totals_before_reopen_;
+  const uint64_t files_collected =
+      before.files_collected + stats->getTickerCount(BLOB_DB_GC_NUM_FILES);
+  const uint64_t files_written =
+      before.files_written + stats->getTickerCount(BLOB_DB_GC_NUM_NEW_FILES);
+  const uint64_t routes_retired =
+      before.routes_retired +
+      stats->getTickerCount(BLOB_RELOCATION_ROUTES_RETIRED);
+  // With several DBs (--num_dbs), the label tells which DB the line is for,
+  // as on the other lines of the driver.
+  const std::string db_label =
+      FLAGS_num_dbs > 1 ? "[" + GetDbLabel() + "] " : "";
+  fprintf(stdout,
+          "%sBlob indirection GC: %" PRIu64 " input files collected, %" PRIu64
+          " relocation files written, %" PRIu64 " routes retired\n",
+          db_label.c_str(), files_collected, files_written, routes_retired);
+  if (FLAGS_blob_indirection_require_gc && files_collected == 0) {
+    VerificationAbort(shared,
+                      "blob indirection is enabled but no indirect blob GC "
+                      "collected an input file in this run");
+  }
+}
+
+void StressTest::ReportBlobIndirectionState(SharedState* shared) const {
+  if ((!FLAGS_enable_blob_indirection &&
+       !FLAGS_allow_setting_blob_indirection_dynamically) ||
+      db_ == nullptr) {
+    return;
+  }
+  auto* const db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
+  uint64_t relocation_files = 0;
+  uint64_t lost_relocation_files = 0;
+  uint64_t routes = 0;
+  for (ColumnFamilyHandle* handle : column_families_) {
+    ColumnFamilyData* const cfd =
+        static_cast_with_check<ColumnFamilyHandleImpl>(handle)->cfd();
+    SuperVersion* const sv = cfd->GetReferencedSuperVersion(db_impl);
+    const VersionStorageInfo* const storage = sv->current->storage_info();
+    const size_t lost = storage->GetLostBlobRelocationFileCount();
+    relocation_files += storage->GetBlobRelocationFiles().size() - lost;
+    lost_relocation_files += lost;
+    routes += storage->GetBlobRelocationRouteCount();
+    db_impl->CleanupSuperVersion(sv);
+  }
+  const std::string db_label =
+      FLAGS_num_dbs > 1 ? "[" + GetDbLabel() + "] " : "";
+  fprintf(stdout,
+          "%sBlob indirection state: %" PRIu64 " relocation files, %" PRIu64
+          " lost relocation files, %" PRIu64 " routes\n",
+          db_label.c_str(), relocation_files, lost_relocation_files, routes);
+  // db_crashtest.py reads stdout through a pipe, so stdout is block-buffered,
+  // and a blackbox run ends db_stress with SIGTERM, which does not flush it.
+  // Flush here so that this line reaches the log of every run.
+  fflush(stdout);
+  if (lost_relocation_files > 0) {
+    VerificationAbort(shared,
+                      "the DB holds lost relocation files, but db_stress never "
+                      "opens it with best_efforts_blob_db_repair");
+  }
 }
 
 void StressTest::PrintStatistics() {
@@ -6815,6 +6943,14 @@ void StressTest::Reopen(ThreadState* thread) {
 
   CleanUpColumnFamilies();
 
+  // The Statistics object of the open that closes below, for the indirect blob
+  // GC totals (see blob_indirection_gc_totals_before_reopen_).
+  std::shared_ptr<Statistics> closing_db_statistics;
+  if (FLAGS_enable_blob_indirection ||
+      FLAGS_allow_setting_blob_indirection_dynamically) {
+    closing_db_statistics = db_->GetOptions().statistics;
+  }
+
   // Currently reopen does not restore expected state
   // with potential data loss in mind like the first open before
   // crash-recovery verification does. Therefore it always expects no data
@@ -6842,6 +6978,21 @@ void StressTest::Reopen(ThreadState* thread) {
   txn_db_ = nullptr;
   optimistic_txn_db_ = nullptr;
   secondary_db_.reset();
+
+  // The DB is closed, so its background jobs have ended. Keep the indirect
+  // blob GC counts of this open: the next open creates a new Statistics
+  // object. Open() clears options_.statistics, so the object comes from the
+  // DB, taken before the DB was closed.
+  if (closing_db_statistics) {
+    BlobIndirectionGcTotals& totals = blob_indirection_gc_totals_before_reopen_;
+    totals.files_collected +=
+        closing_db_statistics->getTickerCount(BLOB_DB_GC_NUM_FILES);
+    totals.files_written +=
+        closing_db_statistics->getTickerCount(BLOB_DB_GC_NUM_NEW_FILES);
+    totals.routes_retired +=
+        closing_db_statistics->getTickerCount(BLOB_RELOCATION_ROUTES_RETIRED);
+    closing_db_statistics.reset();
+  }
 
   num_times_reopened_++;
   auto now = clock_->NowMicros();
@@ -7327,6 +7478,14 @@ void InitializeOptionsFromFlags(
 
   // Integrated BlobDB
   options.enable_blob_files = FLAGS_enable_blob_files;
+  options.enable_blob_indirection = FLAGS_enable_blob_indirection;
+  options.blob_indirection_max_references_per_sst =
+      FLAGS_blob_indirection_max_references_per_sst;
+  options.pin_blob_relocation_location_blocks =
+      FLAGS_pin_blob_relocation_location_blocks;
+  options.indirect_blob_gc_garbage_ratio = FLAGS_indirect_blob_gc_garbage_ratio;
+  options.indirect_blob_gc_read_coalesce_bytes =
+      FLAGS_indirect_blob_gc_read_coalesce_bytes;
   options.enable_blob_direct_write = FLAGS_enable_blob_direct_write;
   options.blob_direct_write_partitions =
       static_cast<uint32_t>(FLAGS_blob_direct_write_partitions);

@@ -303,6 +303,10 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
     assert(ts_sz == full_history_ts_low->size());
   }
   bool first_key = true;
+  // Whether `blob_fetcher` reads a Version with a lost relocation file. It
+  // does not change during this call, so it is read once, not for each key.
+  const bool has_blob_value_loss =
+      blob_fetcher != nullptr && blob_fetcher->HasBlobValueLoss();
 
   // We need to parse the internal key again as the parsed key is
   // backed by the internal key!
@@ -384,6 +388,20 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
     // At this point we are guaranteed that we need to process this key.
 
     assert(IsValueType(ikey.type));
+    // An entity without its lost blob columns, used as the merge base.
+    std::string repaired_entity;
+    if (UNLIKELY(has_blob_value_loss) &&
+        (ikey.type == kTypeBlobIndex || ikey.type == kTypeWideColumnEntity)) {
+      bool lost = false;
+      s = blob_fetcher->IsBlobValueLost(ikey.type, iter->value(), &lost,
+                                        &repaired_entity);
+      if (!s.ok()) {
+        return s;
+      }
+      if (lost) {
+        ikey.type = kTypeDeletion;
+      }
+    }
     if (ikey.type != kTypeMerge) {
       // hit a put/delete/single delete
       //   => merge the put value or a nullptr with operands_
@@ -480,8 +498,9 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
         std::string resolved_entity;
         Slice effective_entity;
         s = WideColumnSerialization::ResolveEntityForMerge(
-            iter->value(), ikey.user_key, blob_fetcher, prefetch_buffers,
-            resolved_entity, effective_entity);
+            repaired_entity.empty() ? iter->value() : Slice(repaired_entity),
+            ikey.user_key, blob_fetcher, prefetch_buffers, resolved_entity,
+            effective_entity);
         if (s.ok()) {
           s = TimedFullMerge(
               user_merge_operator_, ikey.user_key, kWideBaseValue,

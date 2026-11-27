@@ -26,6 +26,8 @@ CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --
 	crash_test_with_optimistic_txn \
 	crash_test_with_tiered_storage \
 	crash_test_with_full_external_table \
+	crash_test_with_blob_indirection \
+	crash_test_with_blob_indirection_toggle \
 	liveness_crash_test \
 	blackbox_crash_test blackbox_crash_test_with_atomic_flush \
 	blackbox_crash_test_with_wc_txn blackbox_crash_test_with_wp_txn \
@@ -38,12 +40,16 @@ CRASHTEST_PY=$(PYTHON) -u tools/db_crashtest.py --stress_cmd=$(DB_STRESS_CMD) --
 	blackbox_crash_test_with_optimistic_txn \
 	blackbox_crash_test_with_tiered_storage \
 	blackbox_crash_test_with_full_external_table \
+	blackbox_crash_test_with_blob_indirection \
+	blackbox_crash_test_with_blob_indirection_toggle \
 	whitebox_crash_test whitebox_crash_test_with_atomic_flush \
 	whitebox_crash_test_with_wc_txn whitebox_crash_test_with_wp_txn \
 	whitebox_crash_test_with_wup_txn \
 	whitebox_crash_test_with_txn whitebox_crash_test_with_ts \
 	whitebox_crash_test_with_optimistic_txn \
 	whitebox_crash_test_with_tiered_storage \
+	whitebox_crash_test_with_blob_indirection \
+	whitebox_crash_test_with_blob_indirection_toggle \
 	crash_test_db_cleanup \
 
 crash_test: $(DB_STRESS_CMD)
@@ -89,6 +95,16 @@ crash_test_with_tiered_storage: $(DB_STRESS_CMD)
 	$(CRASHTEST_MAKE) blackbox_crash_test_with_tiered_storage
 
 crash_test_with_full_external_table: blackbox_crash_test_with_full_external_table
+
+crash_test_with_blob_indirection: $(DB_STRESS_CMD)
+# Do not parallelize
+	$(CRASHTEST_MAKE) whitebox_crash_test_with_blob_indirection
+	$(CRASHTEST_MAKE) blackbox_crash_test_with_blob_indirection
+
+crash_test_with_blob_indirection_toggle: $(DB_STRESS_CMD)
+# Do not parallelize
+	$(CRASHTEST_MAKE) whitebox_crash_test_with_blob_indirection_toggle
+	$(CRASHTEST_MAKE) blackbox_crash_test_with_blob_indirection_toggle
 
 crash_test_with_multiops_wc_txn: $(DB_STRESS_CMD)
 	$(CRASHTEST_MAKE) blackbox_crash_test_with_multiops_wc_txn
@@ -139,6 +155,12 @@ blackbox_crash_test_with_tiered_storage: $(DB_STRESS_CMD)
 blackbox_crash_test_with_full_external_table: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --test_full_external_table blackbox $(CRASH_TEST_EXT_ARGS)
 
+blackbox_crash_test_with_blob_indirection: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_blob_indirection blackbox $(CRASH_TEST_EXT_ARGS)
+
+blackbox_crash_test_with_blob_indirection_toggle: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_blob_indirection_toggle blackbox $(CRASH_TEST_EXT_ARGS)
+
 blackbox_crash_test_with_optimistic_txn: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --optimistic_txn blackbox $(CRASH_TEST_EXT_ARGS)
 
@@ -174,6 +196,14 @@ whitebox_crash_test_with_ts: $(DB_STRESS_CMD)
 
 whitebox_crash_test_with_tiered_storage: $(DB_STRESS_CMD)
 	$(CRASHTEST_PY) --test_tiered_storage whitebox --random_kill_odd \
+      $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
+
+whitebox_crash_test_with_blob_indirection: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_blob_indirection whitebox --random_kill_odd \
+      $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
+
+whitebox_crash_test_with_blob_indirection_toggle: $(DB_STRESS_CMD)
+	$(CRASHTEST_PY) --test_blob_indirection_toggle whitebox --random_kill_odd \
       $(CRASH_TEST_KILL_ODD) $(CRASH_TEST_EXT_ARGS)
 
 whitebox_crash_test_with_optimistic_txn: $(DB_STRESS_CMD)

@@ -125,6 +125,8 @@ class DBCrashTestTest(unittest.TestCase):
             "test_multiops_txn": False,
             "test_tiered_storage": False,
             "test_full_external_table": False,
+            "test_blob_indirection": False,
+            "test_blob_indirection_toggle": False,
             "print_stderr_separately": False,
         }
         args.update(overrides)
@@ -1388,6 +1390,482 @@ class DBCrashTestTest(unittest.TestCase):
                     )
                 _, finalized = db_crashtest.gen_cmd(self.build_params(params), [])
                 self.assertEqual(expected_value, finalized[preserved_flag])
+
+    def test_blob_indirection_flags_keep_db_stress_operation_mix_valid(self):
+        # Generates the db_stress command of each crash_test.mk flavor that
+        # --test_blob_indirection and --test_blob_indirection_toggle accept,
+        # and checks that the blob indirection profile is in effect after
+        # finalize_and_sanitize(), and that the command passes the operation
+        # mix rule that db_stress checks at startup: the seven percentages add
+        # up to 100 (db_stress_tool.cc). main() rejects the other flavors
+        # (test_blob_indirection_flags_reject_incompatible_flavors).
+        percent_flags = (
+            "readpercent",
+            "prefixpercent",
+            "writepercent",
+            "delpercent",
+            "delrangepercent",
+            "iterpercent",
+            "customopspercent",
+        )
+        flavors = (
+            {},
+            {"txn": True},
+            {"optimistic_txn": True},
+            {"enable_ts": True},
+            {"simple": True},
+            {"simple": True, "txn": True},
+            {"cf_consistency": True},
+        )
+        # Several seeds, because flavor options that would turn blob files off
+        # (commit_bypass_memtable_one_in for txn, persist_user_defined_timestamps
+        # for timestamps) are drawn at random.
+        for flag in ("test_blob_indirection", "test_blob_indirection_toggle"):
+            for test_type in ("blackbox", "whitebox"):
+                for flavor, seed in (
+                    (flavor, seed) for flavor in flavors for seed in range(20)
+                ):
+                    with self.subTest(
+                        flag=flag, test_type=test_type, flavor=flavor, seed=seed
+                    ):
+                        db_crashtest = self.load_db_crashtest()
+                        db_crashtest.random.seed(seed)
+                        args = self.build_mode_args(
+                            test_type=test_type, **dict(flavor, **{flag: True})
+                        )
+                        params = db_crashtest.gen_cmd_params(args)
+                        _, finalized = db_crashtest.gen_cmd(
+                            self.build_params(params), []
+                        )
+
+                        def value(key):
+                            v = finalized.get(key, 0)
+                            return int(v() if callable(v) else v)
+
+                        self.assertEqual(100, sum(value(k) for k in percent_flags))
+                        # The profile is in effect after finalize_and_sanitize():
+                        # its write-heavy mix, blob files and its option flag,
+                        # and no secondary instance (BlobDB does not support
+                        # one).
+                        self.assertEqual(55, value("writepercent"))
+                        option_flag = (
+                            "enable_blob_indirection"
+                            if flag == "test_blob_indirection"
+                            else "allow_setting_blob_indirection_dynamically"
+                        )
+                        self.assertEqual(1, value("enable_blob_files"))
+                        self.assertEqual(1, value(option_flag))
+                        self.assertEqual(0, value("test_secondary"))
+                        # No offpeak window and no small periodic compaction
+                        # time, which together can make compaction loop.
+                        self.assertEqual("", finalized["daily_offpeak_time_utc"])
+                        self.assertIn(value("periodic_compaction_seconds"), (0, 1800))
+                        self.assertIn(value("compaction_ttl"), (0, 1800))
+                        self.assertEqual(0, value("test_batches_snapshots"))
+                        # Statistics on, so that the end-of-run GC line
+                        # prints, and every file open, so that blob file
+                        # readers stay in the table cache.
+                        self.assertEqual(1, value("statistics"))
+                        self.assertEqual(-1, value("open_files"))
+
+    def test_random_blob_override_leaves_out_blob_indirection_profiles(self):
+        # Without --test_blob_indirection or --test_blob_indirection_toggle,
+        # the 10% blob override never picks a blob indirection profile, in any
+        # flavor. pick_blob_override() replaces random.choice(): for the
+        # 1-in-10 choice ([0] * 9 + [1]) it returns 1, so the override always
+        # happens; it records every list of profiles (dicts) it is given. The
+        # flavors are the ones that get the blob override.
+        flavors = (
+            {},
+            {"txn": True},
+            {"optimistic_txn": True},
+            {"enable_ts": True},
+            {"test_multiops_txn": True, "txn": True},
+        )
+        for flavor in flavors:
+            with self.subTest(flavor=flavor):
+                db_crashtest = self.load_db_crashtest()
+                profile_lists = []
+
+                def pick_blob_override(values):
+                    if values == [0] * 9 + [1]:
+                        return 1
+                    if isinstance(values[0], dict):
+                        profile_lists.append(values)
+                    return values[0]
+
+                args = self.build_mode_args(test_type="blackbox", **flavor)
+                with mock.patch.object(
+                    db_crashtest.random, "choice", side_effect=pick_blob_override
+                ):
+                    db_crashtest.gen_cmd_params(args)
+                self.assertTrue(profile_lists)
+                for profiles in profile_lists:
+                    for profile in profiles:
+                        self.assertIsNot(profile, db_crashtest.blob_indirection_params)
+                        self.assertIsNot(
+                            profile, db_crashtest.blob_indirection_toggle_params
+                        )
+
+    def run_whitebox_commands(self, db_crashtest, args, count, after_command=None):
+        # Runs whitebox_crash_main() with a fake execute_cmd() that records
+        # each db_stress command and stops the loop after `count` commands.
+        # `after_command(index)` runs after each recorded command. Returns the
+        # commands.
+        self.register_expected_values_dir_cleanup(db_crashtest)
+        self.register_diagnostics_dir_cleanup(db_crashtest)
+        commands = []
+
+        class StopLoop(Exception):
+            pass
+
+        def fake_execute_cmd(
+            cmd, timeout=None, timeout_pstack=False, expected_to_timeout=True
+        ):
+            commands.append(cmd)
+            if len(commands) == count:
+                raise StopLoop()
+            if after_command is not None:
+                after_command(len(commands) - 1)
+            return (False, 0, "", "", 123)
+
+        db_crashtest.execute_cmd = fake_execute_cmd
+        db_crashtest.print_fault_injection_log = lambda pid: None
+        # The whitebox loop waits 1 s between commands; skip that wait.
+        with redirect_stdout(io.StringIO()), mock.patch.object(
+            db_crashtest.time, "sleep", lambda seconds: None
+        ):
+            with self.assertRaises(StopLoop):
+                db_crashtest.whitebox_crash_main(args, [])
+        return commands
+
+    def flag_value(self, cmd, name):
+        values = [arg.split("=", 1)[1] for arg in cmd if arg.startswith(f"--{name}=")]
+        self.assertEqual(1, len(values))
+        return values[0]
+
+    def test_blob_indirection_kill_mode_3_uses_a_tenth_of_ops_per_thread(self):
+        # Kill mode 3 keeps only the GC and route retirement kill points, so an
+        # iteration without GC is never killed. It must end on its own within
+        # the run's time, so it uses a tenth of ops_per_thread, while kill
+        # modes 0-2 use 100 times it. The fourth command is kill mode 3.
+        db_crashtest = self.load_db_crashtest()
+        # The command line sets an offpeak window, a small periodic compaction
+        # time and a small TTL, so that mode 3's overrides show in its command
+        # (with a flag alone, the offpeak window is already empty and the
+        # other two can already be 0).
+        args = self.build_mode_args(
+            test_type="whitebox",
+            test_blob_indirection=True,
+            duration=3600,
+            daily_offpeak_time_utc="00:00-23:59",
+            periodic_compaction_seconds=1,
+            compaction_ttl=2,
+        )
+        commands = self.run_whitebox_commands(db_crashtest, args, count=4)
+        mode_0_ops = int(self.flag_value(commands[0], "ops_per_thread"))
+        mode_3_ops = int(self.flag_value(commands[3], "ops_per_thread"))
+        self.assertIn(
+            "SyncManifest", self.flag_value(commands[3], "kill_exclude_prefixes")
+        )
+        # Kill modes 0-2 use 100 times ops_per_thread, mode 3 a tenth of it.
+        self.assertEqual(mode_0_ops, 1000 * mode_3_ops)
+        # Mode 3 has no file write kill point to end a compaction loop, so it
+        # turns off the options that can cause one, even when the command line
+        # sets them (mode 0 keeps them). A run that turns blob indirection on
+        # without a flag needs this.
+        self.assertEqual(
+            "00:00-23:59", self.flag_value(commands[0], "daily_offpeak_time_utc")
+        )
+        self.assertEqual("2", self.flag_value(commands[0], "compaction_ttl"))
+        self.assertEqual("", self.flag_value(commands[3], "daily_offpeak_time_utc"))
+        self.assertEqual(
+            "0", self.flag_value(commands[3], "periodic_compaction_seconds")
+        )
+        self.assertEqual("0", self.flag_value(commands[3], "compaction_ttl"))
+
+    def test_blob_indirection_flags_avoid_compaction_loops_in_every_iteration(
+        self,
+    ):
+        # With a blob indirection flag, every whitebox iteration uses no
+        # offpeak window, a periodic_compaction_seconds and a compaction_ttl
+        # of 0 or 1800, and the non-batched test. Eight commands cover kill
+        # modes 0-3 twice.
+        for flag in ("test_blob_indirection", "test_blob_indirection_toggle"):
+            with self.subTest(flag=flag):
+                db_crashtest = self.load_db_crashtest()
+                args = self.build_mode_args(
+                    test_type="whitebox", duration=3600, **{flag: True}
+                )
+                commands = self.run_whitebox_commands(db_crashtest, args, count=8)
+                for index, cmd in enumerate(commands):
+                    with self.subTest(command=index):
+                        self.assertEqual(
+                            "", self.flag_value(cmd, "daily_offpeak_time_utc")
+                        )
+                        self.assertIn(
+                            self.flag_value(cmd, "periodic_compaction_seconds"),
+                            ("0", "1800"),
+                        )
+                        self.assertIn(
+                            self.flag_value(cmd, "compaction_ttl"), ("0", "1800")
+                        )
+                        self.assertEqual(
+                            "0", self.flag_value(cmd, "test_batches_snapshots")
+                        )
+                        self.assertEqual("1", self.flag_value(cmd, "statistics"))
+                        self.assertEqual("-1", self.flag_value(cmd, "open_files"))
+        # A value given on the command line wins over these defaults.
+        with self.subTest(explicit_values=True):
+            db_crashtest = self.load_db_crashtest()
+            args = self.build_mode_args(
+                test_type="whitebox",
+                test_blob_indirection=True,
+                test_batches_snapshots=1,
+                compaction_ttl=2,
+            )
+            params = db_crashtest.gen_cmd_params(args)
+            self.assertEqual(1, params["test_batches_snapshots"])
+            self.assertEqual(2, params["compaction_ttl"])
+
+    def run_whitebox_to_end(self, db_crashtest, args, stdout_text):
+        # Runs whitebox_crash_main() to its normal end with one db_stress
+        # command: the fake execute_cmd() moves a fake clock past the
+        # duration and returns `stdout_text` as the command's output. Returns
+        # what the script printed.
+        self.register_expected_values_dir_cleanup(db_crashtest)
+        self.register_diagnostics_dir_cleanup(db_crashtest)
+        clock = [db_crashtest.time.time()]
+
+        def fake_execute_cmd(
+            cmd, timeout=None, timeout_pstack=False, expected_to_timeout=True
+        ):
+            clock[0] += 2 * args.duration
+            return (False, 0, stdout_text, "", 123)
+
+        db_crashtest.execute_cmd = fake_execute_cmd
+        db_crashtest.print_fault_injection_log = lambda pid: None
+        output = io.StringIO()
+        with redirect_stdout(output), mock.patch.object(
+            db_crashtest.time, "sleep", lambda seconds: None
+        ), mock.patch.object(
+            db_crashtest.time, "time", side_effect=lambda: clock[0]
+        ), mock.patch.object(
+            db_crashtest, "cleanup_after_success", lambda db_arg, num_dbs=1: None
+        ):
+            db_crashtest.whitebox_crash_main(args, [])
+        return output.getvalue()
+
+    def test_blob_indirection_whitebox_warns_without_indirect_blob_gc(self):
+        # With a blob indirection flag, a whitebox run in which no db_stress
+        # run shows that indirect blob GC ran ends with a warning, because GC
+        # may have stopped running. A start line with at least one relocation
+        # file, or an end-of-run line with at least one collected input file,
+        # with or without a [db_N] label, means no warning. Without a flag
+        # there is no warning.
+        warning = "WARNING: no db_stress run in this whitebox run showed"
+        no_files = (
+            "Blob indirection state: 0 relocation files, 0 lost relocation "
+            "files, 0 routes\n"
+        )
+        some_files = (
+            "[db_1] Blob indirection state: 3 relocation files, 0 lost "
+            "relocation files, 12 routes\n"
+        )
+        no_gc = (
+            "Blob indirection GC: 0 input files collected, 0 relocation files "
+            "written, 0 routes retired\n"
+        )
+        some_gc = (
+            "[db_0] Blob indirection GC: 470 input files collected, 0 "
+            "relocation files written, 0 routes retired\n"
+        )
+        for flag, stdout_text, expect_warning in (
+            ({"test_blob_indirection": True}, no_files + no_gc, True),
+            ({"test_blob_indirection_toggle": True}, "", True),
+            ({"test_blob_indirection": True}, no_files + some_files, False),
+            ({"test_blob_indirection_toggle": True}, some_files, False),
+            ({"test_blob_indirection": True}, no_files + some_gc, False),
+            ({}, "", False),
+        ):
+            with self.subTest(flag=flag, stdout_text=stdout_text):
+                db_crashtest = self.load_db_crashtest()
+                args = self.build_mode_args(test_type="whitebox", duration=3600, **flag)
+                output = self.run_whitebox_to_end(db_crashtest, args, stdout_text)
+                self.assertEqual(expect_warning, warning in output)
+
+    def test_blob_indirection_kill_mode_3_needs_finalized_blob_indirection(self):
+        # Kill mode 3 is decided on the finalized parameters. Here blob files
+        # are on for the first three commands and off for the fourth (the
+        # switch happens after the third command ran), so
+        # finalize_and_sanitize() turns blob indirection off for the fourth
+        # command. That command must use kill mode 0 instead of kill mode 3,
+        # which would never kill without blob indirection.
+        db_crashtest = self.load_db_crashtest()
+        blob_files_on = [True]
+
+        def enable_blob_files():
+            return 1 if blob_files_on[0] else 0
+
+        def turn_blob_files_off_after_third_command(index):
+            if index == 2:
+                blob_files_on[0] = False
+
+        args = self.build_mode_args(
+            test_type="whitebox",
+            test_blob_indirection=True,
+            duration=3600,
+            enable_blob_files=enable_blob_files,
+        )
+        commands = self.run_whitebox_commands(
+            db_crashtest,
+            args,
+            count=4,
+            after_command=turn_blob_files_off_after_third_command,
+        )
+        self.assertEqual("1", self.flag_value(commands[2], "enable_blob_indirection"))
+        self.assertEqual("0", self.flag_value(commands[3], "enable_blob_indirection"))
+        self.assertEqual(
+            self.flag_value(commands[0], "ops_per_thread"),
+            self.flag_value(commands[3], "ops_per_thread"),
+        )
+        self.assertEqual(
+            self.flag_value(commands[0], "kill_random_test"),
+            self.flag_value(commands[3], "kill_random_test"),
+        )
+        self.assertFalse(
+            any(arg.startswith("--kill_exclude_prefixes=") for arg in commands[3])
+        )
+
+    def test_blob_indirection_flags_shorten_whitebox_check_modes(self):
+        # With a blob indirection flag, the whitebox iterations that are not
+        # killed (check modes 1-3) run a tenth of their usual ops_per_thread.
+        # After the first command the fake clock moves past half of the
+        # duration, so the second command is check mode 1 (universal
+        # compaction), which normally uses the plain ops_per_thread.
+        for flag, divisor in (
+            ({}, 1),
+            ({"test_blob_indirection": True}, 10),
+            ({"test_blob_indirection_toggle": True}, 10),
+        ):
+            with self.subTest(flag=flag):
+                db_crashtest = self.load_db_crashtest()
+                clock = [db_crashtest.time.time()]
+
+                def advance_clock(index, clock=clock):
+                    if index == 0:
+                        clock[0] += 1801
+
+                args = self.build_mode_args(test_type="whitebox", duration=3600, **flag)
+                with mock.patch.object(
+                    db_crashtest.time, "time", side_effect=lambda: clock[0]
+                ):
+                    commands = self.run_whitebox_commands(
+                        db_crashtest, args, count=2, after_command=advance_clock
+                    )
+                mode_0_ops = int(self.flag_value(commands[0], "ops_per_thread"))
+                self.assertEqual(
+                    "1", self.flag_value(commands[1], "compaction_style")
+                )
+                self.assertEqual(
+                    mode_0_ops // 100 // divisor,
+                    int(self.flag_value(commands[1], "ops_per_thread")),
+                )
+
+    def test_blob_indirection_params_do_not_depend_on_wall_clock_time(self):
+        # A per-iteration seed must reproduce the parameters of an iteration,
+        # so the blob indirection profile must not depend on how long the run
+        # has been going. The second call runs one hour later.
+        db_crashtest = self.load_db_crashtest()
+        args = self.build_mode_args(test_type="blackbox", test_blob_indirection=True)
+        start = db_crashtest.time.time()
+        results = []
+        for offset in (0, 3600):
+            db_crashtest.random.seed(1234)
+            with mock.patch.object(
+                db_crashtest.time, "time", return_value=start + offset
+            ):
+                params = db_crashtest.gen_cmd_params(args)
+                results.append(
+                    {k: (v() if callable(v) else v) for k, v in sorted(params.items())}
+                )
+        self.assertEqual(results[0], results[1])
+
+    def test_blob_indirection_profiles_set_read_coalesce_bytes(self):
+        # Both blob indirection profiles pick the indirect blob GC read gap
+        # from the listed sizes: 0, the 1 MB read limit, and sizes between.
+        db_crashtest = self.load_db_crashtest()
+        allowed = {0, 4096, 16384, 65536, 1048576}
+        for flag in ("test_blob_indirection", "test_blob_indirection_toggle"):
+            args = self.build_mode_args(test_type="blackbox", **{flag: True})
+            seen = set()
+            for seed in range(200):
+                db_crashtest.random.seed(seed)
+                params = db_crashtest.gen_cmd_params(args)
+                self.assertIn(
+                    "indirect_blob_gc_read_coalesce_bytes", params, flag
+                )
+                value = params["indirect_blob_gc_read_coalesce_bytes"]
+                seen.add(value() if callable(value) else value)
+            self.assertEqual(seen, allowed, flag)
+
+    def test_blob_indirection_flags_reject_incompatible_flavors(self):
+        for flavor in (
+            "--test_multiops_txn",
+            "--test_tiered_storage",
+            "--test_best_efforts_recovery",
+            "--test_full_external_table",
+            "--cf_lifecycle",
+        ):
+            for flag in ("--test_blob_indirection", "--test_blob_indirection_toggle"):
+                with self.subTest(flavor=flavor, flag=flag):
+                    db_crashtest = self.load_db_crashtest(["blackbox", flavor, flag])
+
+                    # Without the check, main() would go on to start a real
+                    # crash test. Fail fast instead.
+                    def must_not_run(*args, **kwargs):
+                        raise AssertionError("main() did not reject the flags")
+
+                    db_crashtest.blackbox_crash_main = must_not_run
+                    db_crashtest.whitebox_crash_main = must_not_run
+                    with mock.patch.object(sys, "stderr", io.StringIO()):
+                        with self.assertRaisesRegex(SystemExit, "2"):
+                            db_crashtest.main()
+
+    def test_both_blob_indirection_flags_are_rejected(self):
+        db_crashtest = self.load_db_crashtest(
+            ["blackbox", "--test_blob_indirection", "--test_blob_indirection_toggle"]
+        )
+
+        def must_not_run(*args, **kwargs):
+            raise AssertionError("main() did not reject the flags")
+
+        db_crashtest.blackbox_crash_main = must_not_run
+        db_crashtest.whitebox_crash_main = must_not_run
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaisesRegex(SystemExit, "2"):
+                db_crashtest.main()
+
+    def test_blob_indirection_flags_skip_random_blob_override(self):
+        # With a blob indirection flag, the 10% blob override is not drawn, so
+        # no key of another blob profile stays in the command. The fake
+        # random.choice() records every list of profiles (dicts) it is given.
+        for flag in ("test_blob_indirection", "test_blob_indirection_toggle"):
+            with self.subTest(flag=flag):
+                db_crashtest = self.load_db_crashtest()
+                profile_lists = []
+
+                def pick(values):
+                    if values == [0] * 9 + [1]:
+                        return 1
+                    if isinstance(values[0], dict):
+                        profile_lists.append(values)
+                    return values[0]
+
+                args = self.build_mode_args(test_type="blackbox", **{flag: True})
+                with mock.patch.object(db_crashtest.random, "choice", side_effect=pick):
+                    db_crashtest.gen_cmd_params(args)
+                self.assertEqual([], profile_lists)
 
     def test_finalize_rejects_inplace_update_support_with_profile_conflict(self):
         db_crashtest = self.load_db_crashtest()
