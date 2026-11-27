@@ -2286,6 +2286,40 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompaction) {
   ASSERT_EQ(4, output_level);
 }
 
+TEST_F(DBTestUniversalCompaction2, PeriodicCompactionNonBlockBasedTable) {
+  Options opts = CurrentOptions();
+  opts.env = env_;
+  opts.compaction_style = kCompactionStyleUniversal;
+  opts.table_factory.reset(NewPlainTableFactory());
+  opts.prefix_extractor.reset(NewNoopTransform());
+  opts.allow_mmap_reads = IsMemoryMappedAccessSupported();
+  opts.level0_file_num_compaction_trigger = 10;
+  opts.num_levels = 5;
+  env_->SetMockSleep();
+
+  // The 30-day default only applies to block-based tables.
+  ASSERT_OK(TryReopen(opts));
+  ASSERT_EQ(0, dbfull()->GetOptions().periodic_compaction_seconds);
+
+  opts.periodic_compaction_seconds = 48 * 60 * 60;  // 2 days
+  ASSERT_OK(TryReopen(opts));
+
+  int periodic_compactions = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "UniversalCompactionPicker::PickPeriodicCompaction:Return",
+      [&](void* /*arg*/) { periodic_compactions++; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("foo", "bar"));
+  ASSERT_OK(Flush());
+  env_->MockSleepForSeconds(48 * 60 * 60 + 100);
+  ASSERT_OK(Put("foo", "bar2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_EQ(1, periodic_compactions);
+  ASSERT_EQ("bar2", Get("foo"));
+}
+
 TEST_F(DBTestUniversalCompaction2, PeriodicCompactionOffpeak) {
   constexpr int kSecondsPerDay = 86400;
   constexpr int kSecondsPerHour = 3600;

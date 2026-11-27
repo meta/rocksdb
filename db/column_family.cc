@@ -1567,16 +1567,6 @@ Status ColumnFamilyData::ValidateOptions(
     }
   }
 
-  if (cf_options.periodic_compaction_seconds > 0 &&
-      cf_options.periodic_compaction_seconds != kDefaultPeriodicCompSecs) {
-    if (!cf_options.table_factory->IsInstanceOf(
-            TableFactory::kBlockBasedTableName())) {
-      return Status::NotSupported(
-          "Periodic Compaction is only supported in "
-          "Block-Based Table format. ");
-    }
-  }
-
   const auto* ucmp = cf_options.comparator;
   assert(ucmp);
   if (cf_options.enable_blob_direct_write) {

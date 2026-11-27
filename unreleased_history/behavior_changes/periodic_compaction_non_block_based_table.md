@@ -1,0 +1,1 @@
+`periodic_compaction_seconds` can now be set explicitly for table formats other than block-based table, where opening the DB used to fail with `NotSupported`. Its 30-day default still applies only to block-based tables.

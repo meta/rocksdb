@@ -930,8 +930,8 @@ struct AdvancedColumnFamilyOptions {
   // such a file can be compacted soon after it is added. See also
   // IngestExternalFileOptions::reject_too_old_file.
   //
-  // This option only supports block based table format for any compaction
-  // style.
+  // With table formats other than block based table, it is disabled unless set
+  // explicitly.
   //
   // unit: seconds. Ex: 7 days = 7 * 24 * 60 * 60
   //
