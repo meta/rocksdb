@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <tuple>
 #include <utility>
 
 #include "cache/cache_reservation_manager.h"
@@ -319,6 +320,14 @@ Status TableCache::FindTable(
     // We check the cache again under loading mutex
     *handle = cache_.Lookup(key);
     if (*handle == nullptr) {
+#ifndef NDEBUG
+      // Tests read the table cache, the file number and the level of each
+      // reader that goes into a table cache.
+      std::tuple<const TableCache*, uint64_t, int> cached_open{this, number,
+                                                               level};
+      TEST_SYNC_POINT_CALLBACK("TableCache::FindTable:OpenCachedReader",
+                               &cached_open);
+#endif  // NDEBUG
       std::unique_ptr<TableReader> table_reader;
       s = GetTableReader(ro, file_options, internal_comparator, file_meta,
                          false /* sequential mode */, file_read_hist,
