@@ -6007,10 +6007,10 @@ void StressTest::Open(SharedState* shared, bool reopen) {
     assert(options_.table_factory != nullptr);
     if (!options_.table_factory->IsInstanceOf(
             TableFactory::kBlockBasedTableName()) &&
-        (FLAGS_compaction_ttl != 0 || FLAGS_periodic_compaction_seconds != 0)) {
+        FLAGS_compaction_ttl != 0) {
       fprintf(stderr,
               "A non-block-based table_factory_uri requires "
-              "--compaction_ttl=0 and --periodic_compaction_seconds=0\n");
+              "--compaction_ttl=0\n");
       // Open() runs during single-threaded startup, before worker threads.
       // NOLINTNEXTLINE(concurrency-mt-unsafe)
       exit(1);
