@@ -326,7 +326,22 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
   assert(kTypeMerge == orig_ikey.type);
 
   bool hit_the_next_user_key = false;
-  int cmp_with_full_history_ts_low = 0;
+  // With user-defined timestamps, a version of a user key is eligible for GC
+  // when its timestamp is below full_history_ts_low. No read can use a
+  // timestamp below full_history_ts_low, so such versions may be combined.
+  // Without full_history_ts_low, no version is eligible.
+  const auto gc_eligible = [&](const Slice& user_key) {
+    return full_history_ts_low != nullptr &&
+           user_comparator_->CompareTimestamp(
+               ExtractTimestampFromUserKey(user_key, ts_sz),
+               *full_history_ts_low) < 0;
+  };
+  // Set when two collected operands have different timestamps. The loop reads
+  // the versions of one user key from the newest timestamp to the oldest.
+  // orig_ikey is the first key that the loop saw. Once an operand is collected,
+  // orig_ikey is the first collected operand, which has the newest timestamp.
+  // The debug check after the loop reads this flag.
+  bool operands_have_different_ts = false;
   for (; iter->Valid(); iter->Next(), original_key_is_iter = false) {
     if (IsShuttingDown()) {
       s = Status::ShutdownInProgress();
@@ -342,14 +357,6 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
 
     Status pik_status =
         ParseInternalKey(iter->key(), &ikey, allow_data_in_errors);
-    Slice ts;
-    if (pik_status.ok()) {
-      ts = ExtractTimestampFromUserKey(ikey.user_key, ts_sz);
-      if (full_history_ts_low) {
-        cmp_with_full_history_ts_low =
-            user_comparator_->CompareTimestamp(ts, *full_history_ts_low);
-      }
-    }
     if (!pik_status.ok()) {
       // stop at corrupted key
       if (assert_valid_internal_key_) {
@@ -365,10 +372,16 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
                                                         orig_ikey.user_key) ||
                (ts_sz > 0 &&
                 !user_comparator_->Equal(ikey.user_key, orig_ikey.user_key) &&
-                cmp_with_full_history_ts_low >= 0)) {
+                !gc_eligible(orig_ikey.user_key))) {
       // 1) hit a different user key, or
-      // 2) user-defined timestamp is enabled, and hit a version of user key NOT
-      // eligible for GC, then stop right here.
+      // 2) user-defined timestamp is enabled, and hit an older timestamp of the
+      // user key while orig_ikey (the newest collected operand, or the first
+      // key seen if no operand is collected yet) is NOT eligible for GC,
+      // then stop right here. Combining the two versions would hide the older
+      // one from reads at a timestamp between the two. For example, with
+      // full_history_ts_low 5, a merge operand at timestamp 6 must not absorb
+      // one at timestamp 3, because a read at timestamp 5 must see only the
+      // operand at 3.
       hit_the_next_user_key = true;
       break;
     } else if (stop_before > 0 && ikey.sequence <= stop_before &&
@@ -408,7 +421,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       if (range_del_agg &&
           range_del_agg->ShouldDelete(
               ikey, RangeDelPositioningMode::kForwardTraversal)) {
-        if (ts_sz > 0 && cmp_with_full_history_ts_low >= 0) {
+        if (ts_sz > 0 && !gc_eligible(ikey.user_key)) {
           // With user-defined timestamps, a base value not eligible for GC can
           // be neither dropped nor merged in. The tombstone may hide it from
           // every read (same timestamp, newer sequence number) or only from
@@ -550,11 +563,11 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
       // tombstone only if it is below full_history_ts_low (eligible for GC), as
       // CompactionIterator does for point keys: a read at a timestamp after the
       // operand's and before the tombstone's must still see the operand. If
-      // full_history_ts_low is unset, cmp_with_full_history_ts_low stays 0, so
-      // no operand is dropped here.
+      // full_history_ts_low is unset, gc_eligible() returns false, so this
+      // range tombstone check drops no operand.
       if (filter != CompactionFilter::Decision::kRemoveAndSkipUntil &&
           range_del_agg != nullptr &&
-          (ts_sz == 0 || cmp_with_full_history_ts_low < 0) &&
+          (ts_sz == 0 || gc_eligible(ikey.user_key)) &&
           range_del_agg->ShouldDelete(
               iter->key(), RangeDelPositioningMode::kForwardTraversal)) {
         filter = CompactionFilter::Decision::kRemove;
@@ -575,6 +588,10 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
               ParseInternalKey(keys_.back(), &orig_ikey, allow_data_in_errors);
           pik_status.PermitUncheckedError();
           assert(pik_status.ok());
+        } else if (ts_sz > 0 && !operands_have_different_ts &&
+                   !user_comparator_->Equal(ikey.user_key,
+                                            orig_ikey.user_key)) {
+          operands_have_different_ts = true;
         }
         if (filter == CompactionFilter::Decision::kKeep) {
           merge_context_.PushOperand(
@@ -596,16 +613,17 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
     }
   }
 
-  if (cmp_with_full_history_ts_low >= 0) {
-    size_t num_merge_operands = merge_context_.GetNumOperands();
-    if (ts_sz && num_merge_operands > 1) {
-      // We do not merge merge operands with different timestamps if they are
-      // not eligible for GC.
-      ROCKS_LOG_ERROR(logger_, "ts_sz=%d, %d merge oprands",
-                      static_cast<int>(ts_sz),
-                      static_cast<int>(num_merge_operands));
-      assert(false);
-    }
+  // The loop above never collects operands with different timestamps when the
+  // newest one is not eligible for GC, so this check only guards that
+  // invariant. It covers merges that end without a base value; a merge with a
+  // base value returns from inside the loop. All builds log an error, and debug
+  // builds then abort. Operands with the same timestamp are always safe to
+  // combine.
+  if (operands_have_different_ts && !gc_eligible(orig_ikey.user_key)) {
+    ROCKS_LOG_ERROR(logger_, "ts_sz=%d, %d merge operands",
+                    static_cast<int>(ts_sz),
+                    static_cast<int>(merge_context_.GetNumOperands()));
+    assert(false);
   }
 
   if (merge_context_.GetNumOperands() == 0) {
@@ -622,9 +640,24 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
   // we have either encountered another key or end of key history on this
   // layer.
   // Note that if user-defined timestamp is enabled, we need some extra caution
-  // here: if full_history_ts_low is nullptr, or it's not null but the key's
-  // timestamp is greater than or equal to full_history_ts_low, it means this
-  // key cannot be dropped. We may not have seen the beginning of the key.
+  // here: if full_history_ts_low is nullptr, or it's not null but the timestamp
+  // of the newest collected operand is greater than or equal to
+  // full_history_ts_low, it means this key cannot be dropped. We may not have
+  // seen the beginning of the key. The reason is that hit_the_next_user_key is
+  // also set when the loop stops at an older timestamp of the same user key, so
+  // the loop may not have seen the oldest version.
+  //
+  // This check is a deliberate compromise. For a key that is not eligible for
+  // GC, the loop stops at any older timestamp. So when the loop reached a
+  // different user key or the end of input, every collected operand has one
+  // timestamp, and a full merge would also be safe. This check does not allow
+  // it, because hit_the_next_user_key does not say why the loop stopped. The
+  // cost: at the bottommost level, a key whose operands in this compaction
+  // input all have one timestamp at or above full_history_ts_low stays a merge
+  // operand with no base value. Every read of that key then runs a full merge,
+  // until a bottommost compaction runs after full_history_ts_low moves past the
+  // timestamp. Allowing that full merge would also change the output for UDT
+  // users who never set full_history_ts_low.
   //
   // When these conditions are true we are able to merge all the keys
   // using full merge.
@@ -635,7 +668,7 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
   // this will simply lead to these merge operands moving to the next level.
   bool surely_seen_the_beginning =
       (hit_the_next_user_key || !iter->Valid()) && at_bottom &&
-      (ts_sz == 0 || cmp_with_full_history_ts_low < 0);
+      (ts_sz == 0 || gc_eligible(orig_ikey.user_key));
   if (surely_seen_the_beginning) {
     // do a final merge with nullptr as the existing value and say
     // bye to the merge type (it's now converted to a Put)

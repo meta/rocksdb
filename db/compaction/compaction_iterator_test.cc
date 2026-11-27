@@ -2708,73 +2708,169 @@ TEST_P(CompactionIteratorTsGcTest, SomeMergesOlderThanThreshold) {
                    kTypeDeletionWithTimestamp)};
   const std::vector<std::string> input_values = {"25", "19", "18", "16",
                                                  "19", "17", ""};
+  // StringAppendTESTOperator cannot do a partial merge, so MergeUntil() leaves
+  // operands that it cannot fully merge as they are. StringAppendOperator can,
+  // so it also covers the partial merge path. Both must give the same output.
+  const std::shared_ptr<MergeOperator> merge_ops[] = {
+      MergeOperators::CreateStringAppendTESTOperator(),
+      MergeOperators::CreateStringAppendOperator()};
+  for (const auto& merge_op : merge_ops) {
+    SCOPED_TRACE(merge_op->Name());
+    std::string full_history_ts_low;
+    PutFixed64(&full_history_ts_low, 20000);
+
+    const std::vector<std::pair<bool, bool>> params = {
+        {false, false}, {false, true}, {true, true}};
+
+    {
+      AddSnapshot(1600);
+      AddSnapshot(1900);
+      const std::vector<std::string> expected_keys = {
+          test::KeyStr(/*ts=*/25000, user_key[0], /*seq=*/2500, kTypeMerge),
+          test::KeyStr(/*ts=*/19000, user_key[0], /*seq=*/2300, kTypeMerge),
+          test::KeyStr(/*ts=*/18000, user_key[0], /*seq=*/1800, kTypeMerge),
+          test::KeyStr(/*ts=*/16000, user_key[0], /*seq=*/1600, kTypeValue),
+          test::KeyStr(/*ts=*/19000, user_key[1], /*seq=*/2000, kTypeMerge),
+          test::KeyStr(/*ts=*/17000, user_key[1], /*seq=*/1700, kTypeMerge),
+          test::KeyStr(/*ts=*/15000, user_key[1], /*seq=*/1600,
+                       kTypeDeletionWithTimestamp)};
+      const std::vector<std::string> expected_values = {"25", "19", "18", "16",
+                                                        "19", "17", ""};
+      for (const auto& param : params) {
+        const bool bottommost_level = param.first;
+        const bool key_not_exists_beyond_output_level = param.second;
+        auto expected_keys_copy = expected_keys;
+        auto expected_values_copy = expected_values;
+        if (bottommost_level || key_not_exists_beyond_output_level) {
+          // the kTypeDeletionWithTimestamp will be dropped
+          expected_keys_copy.pop_back();
+          expected_values_copy.pop_back();
+          if (bottommost_level) {
+            // seq zero
+            expected_keys_copy[3] =
+                test::KeyStr(/*ts=*/0, user_key[0], /*seq=*/0, kTypeValue);
+          }
+        }
+        RunTest(input_keys, input_values, expected_keys_copy,
+                expected_values_copy,
+                /*last_committed_seq=*/kMaxSequenceNumber, merge_op.get(),
+                /*compaction_filter=*/nullptr, bottommost_level,
+                /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
+                key_not_exists_beyond_output_level, &full_history_ts_low);
+      }
+      ClearSnapshots();
+    }
+
+    // No snapshots. The merge operand of "a" at 25000 is not eligible for GC,
+    // so it stays separate: a read at a timestamp from 20000 to 24999 must see
+    // only the older versions. The older versions of "a", which are all below
+    // full_history_ts_low, are combined into one value.
+    {
+      const std::vector<std::string> expected_keys = {
+          test::KeyStr(/*ts=*/25000, user_key[0], /*seq=*/2500, kTypeMerge),
+          test::KeyStr(/*ts=*/19000, user_key[0], /*seq=*/2300, kTypeValue),
+          test::KeyStr(/*ts=*/19000, user_key[1], /*seq=*/2000, kTypeValue)};
+      const std::vector<std::string> expected_values = {"25", "16,18,19",
+                                                        "17,19"};
+      for (const auto& param : params) {
+        const bool bottommost_level = param.first;
+        const bool key_not_exists_beyond_output_level = param.second;
+        auto expected_keys_copy = expected_keys;
+        if (bottommost_level) {
+          expected_keys_copy[1] =
+              test::KeyStr(/*ts=*/0, user_key[0], /*seq=*/0, kTypeValue);
+          expected_keys_copy[2] =
+              test::KeyStr(/*ts=*/0, user_key[1], /*seq=*/0, kTypeValue);
+        }
+        RunTest(input_keys, input_values, expected_keys_copy, expected_values,
+                /*last_committed_seq=*/kMaxSequenceNumber, merge_op.get(),
+                /*compaction_filter=*/nullptr, bottommost_level,
+                /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
+                key_not_exists_beyond_output_level, &full_history_ts_low);
+      }
+    }
+  }
+}
+
+// A compaction filter removes the newest merge operand of "a" (at 25000), which
+// is not eligible for GC with full_history_ts_low 20000. The older operand (at
+// 19000) must keep its own timestamp: a read at a timestamp from 20000 to 24999
+// must still see "19". It must not be written out with the timestamp of the
+// removed operand.
+TEST_P(CompactionIteratorTsGcTest, FilterRemovesNewestMergeAboveThreshold) {
+  class RemoveValueFilter : public CompactionFilter {
+   public:
+    Decision FilterV2(int /*level*/, const Slice& /*key*/, ValueType /*type*/,
+                      const Slice& existing_value, std::string* /*new_value*/,
+                      std::string* /*skip_until*/) const override {
+      return existing_value == "25" ? Decision::kRemove : Decision::kKeep;
+    }
+    const char* Name() const override { return "RemoveValueFilter"; }
+  };
+  RemoveValueFilter filter;
+  std::shared_ptr<MergeOperator> merge_op =
+      MergeOperators::CreateStringAppendOperator();
+  std::string full_history_ts_low;
+  PutFixed64(&full_history_ts_low, 20000);
+  RunTest({test::KeyStr(/*ts=*/25000, "a", /*seq=*/2500, kTypeMerge),
+           test::KeyStr(/*ts=*/19000, "a", /*seq=*/1900, kTypeMerge)},
+          {"25", "19"},
+          {test::KeyStr(/*ts=*/19000, "a", /*seq=*/1900, kTypeMerge)}, {"19"},
+          /*last_committed_seq=*/kMaxSequenceNumber, merge_op.get(), &filter,
+          /*bottommost_level=*/false,
+          /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
+          /*key_not_exists_beyond_output_level=*/false, &full_history_ts_low);
+}
+
+// MergeHelper::MergeUntil() decides whether it may do a full merge (with no
+// base value) at the bottommost level from the timestamps of the current user
+// key only. The next user key must not change that decision. In both cases
+// below full_history_ts_low is 20000 and there are no snapshots.
+TEST_P(CompactionIteratorTsGcTest, FullMergeDependsOnCurrentKeyOnly) {
   std::shared_ptr<MergeOperator> merge_op =
       MergeOperators::CreateStringAppendTESTOperator();
   std::string full_history_ts_low;
   PutFixed64(&full_history_ts_low, 20000);
 
-  const std::vector<std::pair<bool, bool>> params = {
-      {false, false}, {false, true}, {true, true}};
-
+  // The operands of "a" are both below full_history_ts_low. This is the
+  // bottommost level and the loop reaches the next user key "b", so
+  // MergeUntil() knows it has seen the whole history of "a" and combines the
+  // operands into a value. The key "b" is above full_history_ts_low and is kept
+  // as it is.
   {
-    AddSnapshot(1600);
-    AddSnapshot(1900);
+    const std::vector<std::string> input_keys = {
+        test::KeyStr(/*ts=*/19000, "a", /*seq=*/1900, kTypeMerge),
+        test::KeyStr(/*ts=*/18000, "a", /*seq=*/1800, kTypeMerge),
+        test::KeyStr(/*ts=*/25000, "b", /*seq=*/2500, kTypeValue)};
+    const std::vector<std::string> input_values = {"19", "18", "v"};
     const std::vector<std::string> expected_keys = {
-        test::KeyStr(/*ts=*/25000, user_key[0], /*seq=*/2500, kTypeMerge),
-        test::KeyStr(/*ts=*/19000, user_key[0], /*seq=*/2300, kTypeMerge),
-        test::KeyStr(/*ts=*/18000, user_key[0], /*seq=*/1800, kTypeMerge),
-        test::KeyStr(/*ts=*/16000, user_key[0], /*seq=*/1600, kTypeValue),
-        test::KeyStr(/*ts=*/19000, user_key[1], /*seq=*/2000, kTypeMerge),
-        test::KeyStr(/*ts=*/17000, user_key[1], /*seq=*/1700, kTypeMerge),
-        test::KeyStr(/*ts=*/15000, user_key[1], /*seq=*/1600,
-                     kTypeDeletionWithTimestamp)};
-    const std::vector<std::string> expected_values = {"25", "19", "18", "16",
-                                                      "19", "17", ""};
-    for (const auto& param : params) {
-      const bool bottommost_level = param.first;
-      const bool key_not_exists_beyond_output_level = param.second;
-      auto expected_keys_copy = expected_keys;
-      auto expected_values_copy = expected_values;
-      if (bottommost_level || key_not_exists_beyond_output_level) {
-        // the kTypeDeletionWithTimestamp will be dropped
-        expected_keys_copy.pop_back();
-        expected_values_copy.pop_back();
-        if (bottommost_level) {
-          // seq zero
-          expected_keys_copy[3] =
-              test::KeyStr(/*ts=*/0, user_key[0], /*seq=*/0, kTypeValue);
-        }
-      }
-      RunTest(input_keys, input_values, expected_keys_copy,
-              expected_values_copy,
-              /*last_committed_seq=*/kMaxSequenceNumber, merge_op.get(),
-              /*compaction_filter=*/nullptr, bottommost_level,
-              /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
-              key_not_exists_beyond_output_level, &full_history_ts_low);
-    }
-    ClearSnapshots();
+        test::KeyStr(/*ts=*/0, "a", /*seq=*/0, kTypeValue),
+        test::KeyStr(/*ts=*/25000, "b", /*seq=*/2500, kTypeValue)};
+    const std::vector<std::string> expected_values = {"18,19", "v"};
+    RunTest(input_keys, input_values, expected_keys, expected_values,
+            /*last_committed_seq=*/kMaxSequenceNumber, merge_op.get(),
+            /*compaction_filter=*/nullptr, /*bottommost_level=*/true,
+            /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
+            /*key_not_exists_beyond_output_level=*/false, &full_history_ts_low);
   }
 
-  // No snapshots
+  // The only operand of "a" is above full_history_ts_low, so it is not eligible
+  // for GC and stays a merge operand. The next key "b" is below
+  // full_history_ts_low.
   {
+    const std::vector<std::string> input_keys = {
+        test::KeyStr(/*ts=*/25000, "a", /*seq=*/2500, kTypeMerge),
+        test::KeyStr(/*ts=*/19000, "b", /*seq=*/1900, kTypeValue)};
+    const std::vector<std::string> input_values = {"25", "v"};
     const std::vector<std::string> expected_keys = {
-        test::KeyStr(/*ts=*/25000, user_key[0], /*seq=*/2500, kTypeValue),
-        test::KeyStr(/*ts=*/19000, user_key[1], /*seq=*/2000, kTypeValue)};
-    const std::vector<std::string> expected_values = {"16,18,19,25", "17,19"};
-    for (const auto& param : params) {
-      const bool bottommost_level = param.first;
-      const bool key_not_exists_beyond_output_level = param.second;
-      auto expected_keys_copy = expected_keys;
-      if (bottommost_level) {
-        expected_keys_copy[1] =
-            test::KeyStr(/*ts=*/0, user_key[1], /*seq=*/0, kTypeValue);
-      }
-      RunTest(input_keys, input_values, expected_keys_copy, expected_values,
-              /*last_committed_seq=*/kMaxSequenceNumber, merge_op.get(),
-              /*compaction_filter=*/nullptr, bottommost_level,
-              /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
-              key_not_exists_beyond_output_level, &full_history_ts_low);
-    }
+        test::KeyStr(/*ts=*/25000, "a", /*seq=*/2500, kTypeMerge),
+        test::KeyStr(/*ts=*/0, "b", /*seq=*/0, kTypeValue)};
+    const std::vector<std::string> expected_values = {"25", "v"};
+    RunTest(input_keys, input_values, expected_keys, expected_values,
+            /*last_committed_seq=*/kMaxSequenceNumber, merge_op.get(),
+            /*compaction_filter=*/nullptr, /*bottommost_level=*/true,
+            /*earliest_write_conflict_snapshot=*/kMaxSequenceNumber,
+            /*key_not_exists_beyond_output_level=*/false, &full_history_ts_low);
   }
 }
 

@@ -134,6 +134,9 @@ class MergeHelper {
   //     - a corrupted key
   //     - a Put/Delete,
   //     - a different user key,
+  //     - with user-defined timestamps, an older timestamp of the same user key
+  //       when the newest version seen is not eligible for GC (its timestamp
+  //       is not below full_history_ts_low),
   //     - a specific sequence number (snapshot boundary),
   //     - REMOVE_AND_SKIP_UNTIL returned from compaction filter,
   //  or - the end of iteration
@@ -153,6 +156,9 @@ class MergeHelper {
   // allow_data_in_errors: (IN) if true, data details will be displayed in
   //                   error/log messages.
   // blob_fetcher: (IN) blob fetcher object for the compaction's input version.
+  // full_history_ts_low: (IN) with user-defined timestamps, the oldest
+  //                   timestamp that reads may use. Versions below it are
+  //                   eligible for GC. nullptr means no version is eligible.
   // prefetch_buffers: (IN/OUT) a collection of blob file prefetch buffers
   //                            used for compaction readahead.
   // c_iter_stats: (OUT) compaction iteration statistics.

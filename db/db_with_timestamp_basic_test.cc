@@ -16,6 +16,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
 #include "utilities/fault_injection_env.h"
+#include "utilities/merge_operators/string_append/stringappend.h"
 #include "utilities/merge_operators/string_append/stringappend2.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -4997,6 +4998,252 @@ TEST_F(DBBasicTestWithTimestamp, MergeAfterDeletion) {
 
   verify_db();
 
+  Close();
+}
+
+// The tests below cover MergeHelper::MergeUntil() with user-defined timestamps.
+// A version of a user key is eligible for GC when its timestamp is below
+// full_history_ts_low; without full_history_ts_low, no version is eligible.
+// MergeUntil() may combine merge operands with the same timestamp, and operands
+// below full_history_ts_low. It must not let a version that is not eligible for
+// GC absorb an older version, because a read at a timestamp between the two
+// must still see the older version. Each test also checks the values that reads
+// return.
+
+// Reads `key` at timestamp `ts` and returns the value, or the status text if
+// the read fails.
+namespace {
+std::string GetAtTimestamp(DB* db, const std::string& key, uint64_t ts) {
+  const std::string read_ts = EncodeAsUint64(ts);
+  const Slice read_ts_slice = read_ts;
+  ReadOptions ropts;
+  ropts.timestamp = &read_ts_slice;
+  std::string value;
+  const Status s = db->Get(ropts, key, &value);
+  return s.ok() ? value : s.ToString();
+}
+}  // namespace
+
+// Covers flushes where MergeUntil() may combine two merge operands of key "k".
+// Each case writes the operands "a" and "b" at the timestamps `ts1` and `ts2`,
+// flushes, and reads "k" at `read_ts`.
+// - With UDT in memtable only (`persist_udt` false), a flush reads the memtable
+//   through an iterator that replaces the timestamp of every key with the
+//   minimum timestamp, so operands at timestamps 1 and 2 reach MergeUntil()
+//   with the same timestamp. The flush during WAL recovery (`recovery_flush`)
+//   always gets no full_history_ts_low. A regular flush gets none when the
+//   column family has not set one (`ts_low` 0 here). The case "both eligible"
+//   sets full_history_ts_low to 3, above both timestamps, so both operands are
+//   eligible for GC and may be combined.
+// - Two writes with the same timestamp are allowed by the public API. A read at
+//   that timestamp sees both operands.
+TEST_F(DBBasicTestWithTimestamp, MergeOperandsInFlush) {
+  struct Case {
+    const char* name;
+    bool persist_udt;
+    bool recovery_flush;
+    uint64_t ts_low;  // 0 means full_history_ts_low is not set.
+    uint64_t ts1;
+    uint64_t ts2;
+    uint64_t read_ts;
+  };
+  const Case cases[] = {
+      {"UDT in memtable only, recovery flush", false, true, 0, 1, 2, 3},
+      {"UDT in memtable only, regular flush", false, false, 0, 1, 2, 3},
+      {"UDT in memtable only, both eligible", false, false, 3, 1, 2, 3},
+      {"persisted UDT, same timestamp", true, false, 0, 1, 1, 1},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    Options options = CurrentOptions();
+    options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    options.persist_user_defined_timestamps = c.persist_udt;
+    // UDT in memtable only requires allow_concurrent_memtable_write = false.
+    options.allow_concurrent_memtable_write = c.persist_udt;
+    options.avoid_flush_during_recovery = false;
+    options.merge_operator = std::make_shared<StringAppendTESTOperator>('.');
+    DestroyAndReopen(options);
+
+    ColumnFamilyHandle* const cf = db_->DefaultColumnFamily();
+    ASSERT_OK(db_->Merge(WriteOptions(), cf, "k", EncodeAsUint64(c.ts1), "a"));
+    ASSERT_OK(db_->Merge(WriteOptions(), cf, "k", EncodeAsUint64(c.ts2), "b"));
+    if (c.ts_low > 0) {
+      ASSERT_OK(db_->IncreaseFullHistoryTsLow(cf, EncodeAsUint64(c.ts_low)));
+    }
+    if (c.recovery_flush) {
+      // Close without a flush, so that recovery replays the WAL and flushes.
+      options.avoid_flush_during_shutdown = true;
+      Reopen(options);
+    } else {
+      ASSERT_OK(Flush());
+    }
+    // The flush, either during recovery or a regular one, wrote one L0 file.
+    // So the operands went through MergeUntil(). The file has the session ID of
+    // the open DB, so a flush in the current session wrote it, not a flush at
+    // shutdown.
+    ASSERT_EQ(1, NumTableFilesAtLevel(0));
+    std::string db_session_id;
+    ASSERT_OK(db_->GetDbSessionId(db_session_id));
+    TablePropertiesCollection props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+    ASSERT_EQ(1, props.size());
+    ASSERT_EQ(db_session_id, props.begin()->second->db_session_id);
+
+    ASSERT_EQ("a.b", GetAtTimestamp(db_.get(), "k", c.read_ts));
+    Close();
+  }
+}
+
+// The eligibility of the next user key must not decide how MergeUntil() treats
+// the operands of the current user key. In this example full_history_ts_low is
+// 5. Key "a" has merge operands at timestamps 3 and 2, both eligible for GC.
+// MergeUntil() then reads "b" at timestamp 7, which is not eligible, and stops
+// because the user key changed.
+TEST_F(DBBasicTestWithTimestamp, MergeBelowTsLowFollowedByKeyAboveTsLow) {
+  Options options = CurrentOptions();
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  options.merge_operator = std::make_shared<StringAppendTESTOperator>('.');
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ColumnFamilyHandle* const cf = db_->DefaultColumnFamily();
+  // Two L0 files, so that CompactRange() runs a real compaction instead of a
+  // trivial move.
+  ASSERT_OK(db_->Merge(WriteOptions(), cf, "a", EncodeAsUint64(2), "x"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->Merge(WriteOptions(), cf, "a", EncodeAsUint64(3), "y"));
+  ASSERT_OK(db_->Put(WriteOptions(), cf, "b", EncodeAsUint64(7), "v"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->IncreaseFullHistoryTsLow(cf, EncodeAsUint64(5)));
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+  ASSERT_EQ("x.y", GetAtTimestamp(db_.get(), "a", 5));
+  ASSERT_EQ("v", GetAtTimestamp(db_.get(), "b", 7));
+  Close();
+}
+
+// Returns the internal entries of the DB as "<key>@<ts>:<type>:<value>", for
+// keys with a timestamp of 8 bytes.
+namespace {
+std::vector<std::string> GetEntriesWithTimestamp(DB* db) {
+  std::vector<KeyVersion> versions;
+  EXPECT_OK(GetAllKeyVersions(db, {}, {}, /*max_num_ikeys=*/100, &versions));
+  std::vector<std::string> entries;
+  for (const KeyVersion& v : versions) {
+    const size_t key_size = v.user_key.size() - sizeof(uint64_t);
+    const uint64_t ts = DecodeFixed64(v.user_key.data() + key_size);
+    entries.push_back(v.user_key.substr(0, key_size) + "@" +
+                      std::to_string(ts) + ":" + v.GetTypeName() + ":" +
+                      v.value);
+  }
+  return entries;
+}
+}  // namespace
+
+// A merge operand that is not eligible for GC must not absorb an older version
+// of the same user key. In this example full_history_ts_low is 5. Key "a" has a
+// merge operand "y" at timestamp 6 over older versions below 5. A read at
+// timestamp 5 must return the same result after the compaction as before it.
+TEST_F(DBBasicTestWithTimestamp, MergeAboveTsLowKeepsOlderVersion) {
+  // `older` says what is below full_history_ts_low. The expected entries are
+  // the ones after the compaction. A value below full_history_ts_low gets
+  // timestamp 0 at the bottommost level, and a Delete below it is dropped
+  // together with the Put it hides.
+  enum class Older { kMerge, kPut, kDeleteOverPut };
+  struct Case {
+    const char* name;
+    Older older;
+    std::vector<std::string> expected_entries;
+    std::string expected_at_5;
+    std::string expected_at_7;
+  };
+  const Case cases[] = {
+      {"merge operand x at 3",
+       Older::kMerge,
+       {"a@6:TypeMerge:y", "a@0:TypeValue:x"},
+       "x",
+       "x.y"},
+      {"put x at 3",
+       Older::kPut,
+       {"a@6:TypeMerge:y", "a@0:TypeValue:x"},
+       "x",
+       "x.y"},
+      {"delete at 3 over put z at 1",
+       Older::kDeleteOverPut,
+       {"a@6:TypeMerge:y"},
+       "NotFound: ",
+       "y"},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    Options options = CurrentOptions();
+    options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    options.merge_operator = std::make_shared<StringAppendTESTOperator>('.');
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    ColumnFamilyHandle* const cf = db_->DefaultColumnFamily();
+    // Two L0 files, so that CompactRange() runs a real compaction instead of a
+    // trivial move.
+    switch (c.older) {
+      case Older::kMerge:
+        ASSERT_OK(db_->Merge(WriteOptions(), cf, "a", EncodeAsUint64(3), "x"));
+        break;
+      case Older::kPut:
+        ASSERT_OK(db_->Put(WriteOptions(), cf, "a", EncodeAsUint64(3), "x"));
+        break;
+      case Older::kDeleteOverPut:
+        ASSERT_OK(db_->Put(WriteOptions(), cf, "a", EncodeAsUint64(1), "z"));
+        ASSERT_OK(db_->Delete(WriteOptions(), cf, "a", EncodeAsUint64(3)));
+        break;
+    }
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->Merge(WriteOptions(), cf, "a", EncodeAsUint64(6), "y"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->IncreaseFullHistoryTsLow(cf, EncodeAsUint64(5)));
+    ASSERT_EQ(c.expected_at_5, GetAtTimestamp(db_.get(), "a", 5));
+    ASSERT_EQ(c.expected_at_7, GetAtTimestamp(db_.get(), "a", 7));
+
+    CompactRangeOptions cro;
+    cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+    ASSERT_EQ(c.expected_entries, GetEntriesWithTimestamp(db_.get()));
+    ASSERT_EQ(c.expected_at_5, GetAtTimestamp(db_.get(), "a", 5));
+    ASSERT_EQ(c.expected_at_7, GetAtTimestamp(db_.get(), "a", 7));
+    Close();
+  }
+}
+
+// A version at or above full_history_ts_low must not absorb an older version.
+// This must also hold when MergeUntil() combines operands with a partial merge
+// instead of a full merge. StringAppendOperator can do a partial merge; the
+// tests above use StringAppendTESTOperator, which cannot. In this example
+// timestamps are persisted and full_history_ts_low is 5. A flush must keep the
+// operand "x" at timestamp 3 separate from the operand "y" at timestamp 6, so
+// that a read at timestamp 5 still returns "x".
+TEST_F(DBBasicTestWithTimestamp, PartialMergeAboveTsLowKeepsOlderOperand) {
+  Options options = CurrentOptions();
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+  options.merge_operator = std::make_shared<StringAppendOperator>('.');
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ColumnFamilyHandle* const cf = db_->DefaultColumnFamily();
+  ASSERT_OK(db_->Merge(WriteOptions(), cf, "a", EncodeAsUint64(3), "x"));
+  ASSERT_OK(db_->Merge(WriteOptions(), cf, "a", EncodeAsUint64(6), "y"));
+  ASSERT_OK(db_->IncreaseFullHistoryTsLow(cf, EncodeAsUint64(5)));
+  ASSERT_EQ("x", GetAtTimestamp(db_.get(), "a", 5));
+  ASSERT_OK(Flush());
+
+  const std::vector<std::string> expected_entries = {"a@6:TypeMerge:y",
+                                                     "a@3:TypeMerge:x"};
+  ASSERT_EQ(expected_entries, GetEntriesWithTimestamp(db_.get()));
+  ASSERT_EQ("x", GetAtTimestamp(db_.get(), "a", 5));
+  ASSERT_EQ("x.y", GetAtTimestamp(db_.get(), "a", 7));
   Close();
 }
 
