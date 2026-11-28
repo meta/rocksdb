@@ -1220,7 +1220,15 @@ Status DestroyUnverifiedSubdir(const std::string& dirname) {
   return s;
 }
 
+std::string ManifestStoreDirForDb(const std::string& db_path) {
+  return db_path + "_manifest_store";
+}
+
 Status DbStressDestroyDb(const std::string& db_path) {
+  if (FLAGS_use_manifest_store) {
+    return FileManifestStore::DestroyDbAndStore(raw_env, db_path,
+                                                ManifestStoreDirForDb(db_path));
+  }
   Status s;
   Options options;
   // Use raw_env (no DbStressFSWrapper) because DbStressFSWrapper renames

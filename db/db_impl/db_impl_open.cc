@@ -545,6 +545,7 @@ Status DBImpl::CommitNewDbRows(
   // ManifestRowsToPublicRows() puts the DB row first.
   commit.db_row = public_rows.front();
   commit.upserts.assign(public_rows.begin() + 1, public_rows.end());
+  TEST_KILL_RANDOM("DBImpl::CommitNewDbRows:BeforeCommit");
   IOStatus io_s = state->store()->Commit(commit);
   if (io_s.ok()) {
     return Status::OK();
@@ -914,6 +915,7 @@ Status DBImpl::EnterManifestStore(
   }
   // Tests stop the enter at a step with these callbacks, as a crash would.
   TEST_SYNC_POINT_CALLBACK("DBImpl::EnterManifestStore:BeforeSwitch", &s);
+  TEST_KILL_RANDOM("DBImpl::EnterManifestStore:BeforeSwitch");
   // Step 5: the switch.
   if (s.ok()) {
     ManifestRows rows;

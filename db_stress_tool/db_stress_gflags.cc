@@ -1478,6 +1478,66 @@ DEFINE_bool(sync_fault_injection, false,
 
 DEFINE_bool(best_efforts_recovery, false,
             "If true, use best efforts recovery.");
+
+DEFINE_bool(
+    use_manifest_store, false,
+    "If true, open the DB with the db_stress test store "
+    "(DBOptions::manifest_store), which keeps its state in a store "
+    "dir, <db path>_manifest_store. Without --manifest_store_shadow "
+    "the DB runs in store mode, and each open of the primary DB also "
+    "sets manifest_store_migrate, so it moves a DB in file mode into the "
+    "store. With --manifest_store_shadow the DB runs in shadow mode "
+    "with this store. --manifest_store_fault_one_in applies to both "
+    "modes; the copy mode, "
+    "the fence and the rollback apply to store mode only. The flags "
+    "that this flag refuses are refused in both modes.");
+
+DEFINE_bool(manifest_store_shadow, false,
+            "With --use_manifest_store, open the DB in shadow mode "
+            "(DBOptions::manifest_store_shadow) instead of store mode: the "
+            "MANIFEST file stays the authority, and RocksDB collects the row "
+            "changes of each successful MANIFEST write and sends them to the "
+            "test store in background jobs; one store commit can carry the "
+            "changes of several MANIFEST writes. At each "
+            "reopen, db_stress compares the store with the MANIFEST when the "
+            "last commit of the store is the close commit of the DB session "
+            "that just closed. When that close commit is missing, db_stress "
+            "logs that it skips the compare if store faults or file system "
+            "write faults are enabled (--manifest_store_fault_one_in, "
+            "--write_fault_one_in, --metadata_write_fault_one_in, "
+            "--open_write_fault_one_in or --open_metadata_write_fault_one_in), "
+            "and fails the run otherwise.");
+
+DEFINE_int32(manifest_store_copy_mode, 0,
+             "DBOptions::manifest_store_copy_mode for --use_manifest_store: "
+             "0 off, 1 background, 2 sync. 2 cannot be used with "
+             "--write_fault_one_in or --metadata_write_fault_one_in.");
+
+DEFINE_uint64(manifest_store_fault_one_in, 0,
+              "With --use_manifest_store, the chance of a test store fault "
+              "while the workload runs: each ManifestStore::Open() (claim), "
+              "Commit() and WriteGeneration() call of the test store fails "
+              "with a chance of 1 in N, where N is this flag. A Commit() that "
+              "changes a WAL row, or changes no row other than the DB row, "
+              "never gets an injected fault (see FileManifestStore). In shadow "
+              "mode, the background claims and generation writes of shadow "
+              "mode can also get faults. The store objects of DB::Open(), and "
+              "of the rollback at a reopen, inject no faults: faults are off "
+              "from the start of each reopen until its open ends, so the "
+              "create, the move into the store and the open of a DB get none. "
+              "0 means never.");
+
+DEFINE_int32(manifest_store_fence_at_reopen_one_in, 0,
+             "With --use_manifest_store, at a reopen with a chance of 1 in N, "
+             "a new store object claims the DB before the old DB closes, so "
+             "the old DB is fenced. It runs only with the WAL (not with "
+             "--disable_wal), because a fenced DB cannot flush its memtables. "
+             "0 means never.");
+
+DEFINE_int32(manifest_store_rollback_one_in, 0,
+             "With --use_manifest_store, at a reopen with a chance of 1 in N, "
+             "RollBackManifestStore() moves the closed DB back to file mode, "
+             "and the open moves it into the store again. 0 means never.");
 DEFINE_bool(skip_verifydb, false,
             "If true, skip VerifyDb() calls and Get()/Iterator verifications"
             "against expected state.");

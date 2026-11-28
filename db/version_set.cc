@@ -6648,10 +6648,18 @@ Status VersionSet::ProcessManifestWrites(
             e->GetFilesToQuarantineIfCommitFail());
       }
       TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeStoreCommit");
+      // The store kill points here run at every MANIFEST write, so
+      // REDUCE_ODDS2 lowers their odds, as at LogAndApply:BeforeAddRecord. The
+      // kill points of rare steps (for example the stub switch and the
+      // rollback) keep the default odds.
+      TEST_KILL_RANDOM_WITH_WEIGHT(
+          "VersionSet::ProcessManifestWrites:BeforeStoreCommit", REDUCE_ODDS2);
       s = CommitBatchToStore(batch_edits, versions, builder_guards,
                              first_writer.cfd, new_cf_options,
                              min_file_number_in_use, &io_s);
       store_committed = s.ok();
+      TEST_KILL_RANDOM_WITH_WEIGHT(
+          "VersionSet::ProcessManifestWrites:AfterStoreCommit", REDUCE_ODDS2);
       if (s.ok() &&
           manifest_store_state_->copy_mode() != ManifestCopyMode::kOff) {
         io_s = UpdateManifestCopy(
@@ -6660,6 +6668,9 @@ Status VersionSet::ProcessManifestWrites(
             batch_edits_ts_sz, opt_file_opts, manifest_preallocation_size,
             dir_contains_current_file);
         s = io_s;
+        TEST_KILL_RANDOM_WITH_WEIGHT(
+            "VersionSet::ProcessManifestWrites:AfterManifestCopy",
+            REDUCE_ODDS2);
       }
       manifest_io_status = io_s;
       TEST_SYNC_POINT_CALLBACK(
@@ -7700,6 +7711,7 @@ IOStatus VersionSet::WriteNewManifestCopy(
   }
   TEST_SYNC_POINT_CALLBACK("VersionSet::WriteNewManifestCopy:BeforePointer",
                            &io_s);
+  TEST_KILL_RANDOM("VersionSet::WriteNewManifestCopy:BeforePointer");
   bool rename_attempted = false;
   if (io_s.ok()) {
     io_s = WriteManifestCopyPointer(fs_.get(), dbname_, number, write_options,

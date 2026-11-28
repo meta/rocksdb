@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "util/cast_util.h"
+#include "util/coding.h"
 #include "util/hash.h"
 #include "util/mutexlock.h"
 
@@ -90,6 +91,90 @@ void MockManifestStoreData::SetAfterChunkCallback(
 MockManifestStoreData::Fault MockManifestStoreData::PendingFault() const {
   MutexLock lock(&mu_);
   return next_fault_;
+}
+
+namespace {
+// The first bytes of a serialized state, with a format version.
+constexpr char kSerializedMagic[] = "MockManifestStoreData1";
+}  // namespace
+
+std::string MockManifestStoreData::Serialize() const {
+  MutexLock l(&mu_);
+  std::string out = kSerializedMagic;
+  PutVarint64(&out, stored_epoch_);
+  out.push_back(has_db_row_ ? 1 : 0);
+  PutVarint64(&out, state_.commit_sequence);
+  PutLengthPrefixedSlice(&out, state_.last_commit_id);
+  PutVarint64(&out, state_.generation);
+  PutVarint64(&out, generation_counter_);
+  PutLengthPrefixedSlice(&out, db_row_fields_);
+  PutVarint64(&out, rows_.size());
+  for (const auto& [key, fields] : rows_) {
+    out.push_back(static_cast<char>(std::get<0>(key)));
+    PutVarint32(&out, std::get<1>(key));
+    PutVarint64(&out, std::get<2>(key));
+    PutLengthPrefixedSlice(&out, fields);
+  }
+  return out;
+}
+
+Status MockManifestStoreData::Deserialize(const Slice& input) {
+  Slice in = input;
+  const Slice magic(kSerializedMagic, sizeof(kSerializedMagic) - 1);
+  if (!in.starts_with(magic)) {
+    return Status::Corruption("Bad mock manifest store state");
+  }
+  in.remove_prefix(magic.size());
+  uint64_t stored_epoch = 0;
+  ManifestStoreDbState state;
+  uint64_t generation_counter = 0;
+  Slice last_commit_id;
+  Slice db_row_fields;
+  uint64_t num_rows = 0;
+  bool ok = GetVarint64(&in, &stored_epoch) && !in.empty();
+  const bool has_db_row = ok && in[0] == 1;
+  if (ok) {
+    in.remove_prefix(1);
+  }
+  ok = ok && GetVarint64(&in, &state.commit_sequence) &&
+       GetLengthPrefixedSlice(&in, &last_commit_id) &&
+       GetVarint64(&in, &state.generation) &&
+       GetVarint64(&in, &generation_counter) &&
+       GetLengthPrefixedSlice(&in, &db_row_fields) &&
+       GetVarint64(&in, &num_rows);
+  RowMap rows;
+  for (uint64_t i = 0; ok && i < num_rows; ++i) {
+    uint32_t cf_id = 0;
+    uint64_t number = 0;
+    Slice fields;
+    ok = !in.empty();
+    const uint8_t type = ok ? static_cast<uint8_t>(in[0]) : 0;
+    if (ok) {
+      in.remove_prefix(1);
+    }
+    ok = ok && GetVarint32(&in, &cf_id) && GetVarint64(&in, &number) &&
+         GetLengthPrefixedSlice(&in, &fields);
+    if (ok) {
+      rows[RowKey{type, cf_id, number}] = fields.ToString();
+    }
+  }
+  if (!ok || !in.empty()) {
+    return Status::Corruption("Bad mock manifest store state");
+  }
+  state.last_commit_id = last_commit_id.ToString();
+  MutexLock l(&mu_);
+  stored_epoch_ = stored_epoch;
+  has_db_row_ = has_db_row;
+  state_ = std::move(state);
+  generation_counter_ = generation_counter;
+  db_row_fields_ = db_row_fields.ToString();
+  rows_ = std::move(rows);
+  return Status::OK();
+}
+
+void MockManifestStoreData::DropLateApply() {
+  MutexLock l(&mu_);
+  late_apply_ = nullptr;
 }
 
 uint64_t MockManifestStoreData::StoredEpoch() const {

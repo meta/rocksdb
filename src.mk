@@ -429,6 +429,7 @@ STRESS_LIB_SOURCES =                                           \
   db_stress_tool/db_stress_filters.cc                          \
   db_stress_tool/db_stress_gflags.cc                           \
   db_stress_tool/db_stress_listener.cc                         \
+  db_stress_tool/db_stress_manifest_store.cc                   \
   db_stress_tool/db_stress_shared_state.cc                     \
   db_stress_tool/db_stress_structured_key_value.cc             \
   db_stress_tool/db_stress_test_base.cc                        \
@@ -438,6 +439,7 @@ STRESS_LIB_SOURCES =                                           \
   db_stress_tool/expected_value.cc                             \
   db_stress_tool/no_batched_ops_stress.cc                      \
   db_stress_tool/multi_ops_txns_stress.cc                      \
+  test_util/mock_manifest_store.cc                             \
   test_util/simple_external_table_factory.cc                   \
 
 TEST_LIB_SOURCES =                                              \
@@ -603,6 +605,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/write_batch_test.cc                                                \
   db/write_callback_test.cc                                             \
   db/write_controller_test.cc                                           \
+  db_stress_tool/db_stress_manifest_store_test.cc                       \
   db_stress_tool/db_stress_structured_key_value_test.cc                 \
   env/env_basic_test.cc                                                 \
   env/env_test.cc                                                       \

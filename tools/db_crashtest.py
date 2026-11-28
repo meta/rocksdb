@@ -1261,6 +1261,63 @@ best_efforts_recovery_params = {
     "verify_db_one_in": 0,
 }
 
+# Store lanes (--test_manifest_store): db_stress opens the DB with its test
+# store (--use_manifest_store), which keeps its state in the store dir
+# <db path>_manifest_store. Without --manifest_store_shadow the DB runs in
+# store mode, and at some reopens db_stress also fences the old DB or rolls the
+# DB back to file mode. With --manifest_store_shadow=1 the DB runs in shadow
+# mode with this store: the MANIFEST file stays the authority. RocksDB collects
+# the row changes of the MANIFEST writes and sends them to the test store in the
+# background, so one store commit can carry the changes of several MANIFEST
+# writes. At each in-process reopen, db_stress compares the store with the
+# MANIFEST when the last store commit is the close commit of the DB session that
+# just closed. Without that commit, db_stress logs a skip in a run with store
+# faults or file system write faults, and fails the run otherwise.
+#
+# Where the choices are made: the values below that are lambdas (the copy mode
+# and the store fault, fence and rollback rates) are chosen again for each
+# db_stress process of a db_crashtest.py run, unless a command line argument
+# sets them, and finalize_and_sanitize() can then turn some off. So each
+# db_stress process asks for a store fault rate of 0 or 1 in 1000, with about
+# half of the processes each. finalize_and_sanitize() can set the rate to 0, for
+# example with --test_batches_snapshots=1. A nonzero rate applies only to the
+# store calls that can get a fault, and only while db_stress has store faults
+# on. Store faults are off from the start of each in-process reopen until the
+# next DB::Open() has returned, so also during a fence, a rollback and the close
+# commit.
+# gen_cmd_params() chooses the secondary instance once per db_crashtest.py run.
+# db_stress chooses at each reopen whether to fence or roll back. Shadow mode
+# turns off the copy mode, the fence and the rollback. The make targets select
+# copy mode 2 (sync), copy mode 0 (off) or shadow mode. A direct
+# db_crashtest.py run with --test_manifest_store can pass
+# --manifest_store_copy_mode=1 to select copy mode 1 (background). Without that
+# flag, each db_stress process chooses among the three copy modes.
+manifest_store_params = {
+    "use_manifest_store": 1,
+    "manifest_store_shadow": 0,
+    "manifest_store_copy_mode": lambda: random.choice([0, 1, 2]),
+    # Off in half of the runs. 1000 is the largest one_in value (the rarest
+    # faults) of the file system fault flags in this file; it keeps most flushes
+    # and compactions free of store faults (an estimate), so that the DB keeps
+    # making progress.
+    "manifest_store_fault_one_in": lambda: random.choice([0, 1000]),
+    # When on, a fence runs at about 1 in 3 reopens and a rollback at about 1
+    # in 5 reopens. With 20 reopens, that gives about 6 fences and 4 rollbacks
+    # per run (an estimate). Most reopens still have neither, so the plain
+    # reopen path also runs.
+    "manifest_store_fence_at_reopen_one_in": lambda: random.choice([0, 3]),
+    "manifest_store_rollback_one_in": lambda: random.choice([0, 5]),
+    # db_stress refuses remote compaction with --use_manifest_store. Turning it
+    # off here, as the whitebox params do, keeps the rule for remote compaction
+    # in finalize_and_sanitize() from also turning off checkpoints, the
+    # secondary instance and other features. gen_cmd_params() turns on the
+    # secondary instance in half of the db_crashtest.py runs.
+    "remote_compaction_worker_threads": 0,
+    # The fence and the rollback run at a reopen. 20 is the reopen count of the
+    # whitebox runs, raised below for a huge ops_per_thread.
+    "reopen": 20,
+}
+
 blob_params = {
     "allow_setting_blob_options_dynamically": 1,
     # Enable blob files and GC with a 75% chance initially; note that they might still be
@@ -2346,6 +2403,55 @@ def finalize_and_sanitize(src_params):
         if dest_params.get("read_index", -1) > 0:
             dest_params["read_index"] = -1
 
+    # db_stress refuses these features with --use_manifest_store (store mode and
+    # shadow mode); see ValidateManifestStoreFlags() in
+    # db_stress_tool/db_stress_tool.cc for why.
+    if dest_params.get("use_manifest_store") == 1:
+        dest_params["read_only"] = 0
+        dest_params["best_efforts_recovery"] = 0
+        dest_params["open_read_only_one_in"] = 0
+        dest_params["remote_compaction_worker_threads"] = 0
+        # allow_resumption needs remote compaction, which is off above.
+        dest_params["allow_resumption_one_in"] = 0
+        dest_params["use_blob_db"] = 0
+        dest_params["ttl"] = -1
+        dest_params["test_cf_lifecycle"] = 0
+        # Batched-ops mode fails on every write error, including injected ones,
+        # so it runs without store faults. finalize_and_sanitize() turns off
+        # the file system faults for batched-ops mode in the same way.
+        if dest_params.get("test_batches_snapshots") == 1:
+            dest_params["manifest_store_fault_one_in"] = 0
+        # db_stress refuses the copy mode, the fence and the rollback in shadow
+        # mode, and the workload write faults (--write_fault_one_in and
+        # --metadata_write_fault_one_in) in sync copy mode; see
+        # ValidateManifestStoreFlags() for why. The write faults of DB::Open()
+        # (--open_write_fault_one_in and --open_metadata_write_fault_one_in)
+        # keep their usual rules.
+        if dest_params.get("manifest_store_shadow") == 1:
+            dest_params["manifest_store_copy_mode"] = 0
+            dest_params["manifest_store_fence_at_reopen_one_in"] = 0
+            dest_params["manifest_store_rollback_one_in"] = 0
+        if dest_params.get("manifest_store_copy_mode") == 2:
+            dest_params["write_fault_one_in"] = 0
+            dest_params["metadata_write_fault_one_in"] = 0
+            # This profile needs write faults.
+            dest_params["file_scope_wal_write_faults"] = 0
+        # The fence, the rollback and the shadow compare run only at a reopen
+        # inside a db_stress process, which comes after each
+        # ops_per_thread / (reopen + 1) operations of a thread. A new db_stress
+        # process that opens the DB tests crash recovery, but none of these.
+        # Only a positive reopen is raised; a workload without the WAL keeps
+        # reopen 0 (see above), so it runs none of them. Blackbox runs,
+        # and whitebox runs that rely on kill points (100 * ops_per_thread),
+        # set a huge ops_per_thread and end with a kill. So raise reopen until
+        # a thread reopens about every 20000 operations. This is an estimate:
+        # it should give a few reopens before a blackbox kill, which comes
+        # after --interval seconds (default 120).
+        if dest_params.get("reopen", 0) > 0:
+            dest_params["reopen"] = max(
+                dest_params["reopen"], dest_params["ops_per_thread"] // 20000
+            )
+
     # `db_stress` rejects either verification knob when `skip_verifydb` is set.
     # Must stay last: sanitization above can turn a verification knob back on
     # after `skip_verifydb` was decided.
@@ -2382,6 +2488,18 @@ def gen_cmd_params(args, unknown_params=None):
         params.update(optimistic_txn_params)
     if args.test_best_efforts_recovery:
         params.update(best_efforts_recovery_params)
+    if args.test_manifest_store:
+        params.update(manifest_store_params)
+        # A secondary instance reads the store in store mode. default_params
+        # does not set test_secondary, so it is off in most crash test runs. The
+        # store lanes (the runs with --test_manifest_store) turn it on in half
+        # of the db_crashtest.py runs. gen_cmd_params() picks the value once per
+        # db_crashtest.py run, so all db_stress runs of that run use the same
+        # value. The value is chosen here, not with a lambda, because the blob
+        # profile choice below reads it before finalize_and_sanitize() runs the
+        # lambdas. finalize_and_sanitize() still turns it off where db_stress
+        # refuses it.
+        params["test_secondary"] = random.choice([0, 1])
     if args.enable_ts:
         params.update(ts_params)
     if args.test_multiops_txn:
@@ -2484,6 +2602,10 @@ def gen_cmd_params(args, unknown_params=None):
         and not args.txn
         and not args.optimistic_txn
         and not args.test_best_efforts_recovery
+        # The profile turns off reopen, which the runs with
+        # --test_manifest_store need for the fence, the rollback and the shadow
+        # compare.
+        and not args.test_manifest_store
         and not args.enable_ts
         and not args.test_multiops_txn
         and not args.test_tiered_storage
@@ -2554,6 +2676,7 @@ def gen_cmd(params, unknown_params):
                 "txn",
                 "optimistic_txn",
                 "test_best_efforts_recovery",
+                "test_manifest_store",
                 "enable_ts",
                 "test_multiops_txn",
                 "stress_cmd",
@@ -2956,7 +3079,7 @@ def sanitize_known_stderr(stdout, stderr, hit_timeout, finalized_params):
     return stdout, stderr
 
 
-def cleanup_after_success(db_arg, num_dbs=1):
+def cleanup_after_success(db_arg, num_dbs=1, params=None):
     # Delegates to db_stress --destroy_db_and_exit so cleanup uses the same
     # Env (local or remote) that created the DB.
     # `db_arg` is the --db value (DB path for num_dbs=1, parent dir for num_dbs>1).
@@ -2966,6 +3089,9 @@ def cleanup_after_success(db_arg, num_dbs=1):
         "--db=" + db_arg,
         "--num_dbs=" + str(num_dbs),
     ]
+    # A DB in store mode is destroyed together with its test store.
+    if params is not None and params.get("use_manifest_store") == 1:
+        cleanup_cmd_parts.append("--use_manifest_store=1")
     # Pass through relevant arguments for remote DB access
     for arg in remain_args:
         if parse_remote_db_uri_arg(arg) is not None:
@@ -3063,13 +3189,13 @@ def liveness_main(args, unknown_args):
             print("TEST FAILED. db_stress ignored SIGTERM on wrapper timeout\n")
             sys.exit(1)
         print("db_stress reached liveness wrapper duration\n")
-        cleanup_after_success(cmd_params["db"], num_dbs)
+        cleanup_after_success(cmd_params["db"], num_dbs, cmd_params)
         return
     if retcode != 0:
         print("TEST FAILED. db_stress exited with code %d\n" % retcode)
         sys.exit(1)
 
-    cleanup_after_success(cmd_params["db"], num_dbs)
+    cleanup_after_success(cmd_params["db"], num_dbs, cmd_params)
 
 
 def cf_lifecycle_iteration_overrides(iteration):
@@ -3239,7 +3365,7 @@ def blackbox_crash_main(args, unknown_args):
         sys.exit(2)
 
     # we need to clean up after ourselves -- only do this on test success
-    cleanup_after_success(cmd_params["db"], num_dbs)
+    cleanup_after_success(cmd_params["db"], num_dbs, cmd_params)
 
 
 # This python script runs db_stress multiple times. Some runs with
@@ -3426,7 +3552,7 @@ def whitebox_crash_main(args, unknown_args):
     # If successfully finished or timed out (we currently treat timed out test as passing)
     # Clean up after ourselves
     if succeeded or hit_timeout:
-        cleanup_after_success(cmd_params["db"], num_dbs)
+        cleanup_after_success(cmd_params["db"], num_dbs, cmd_params)
 
 
 def main():
@@ -3443,6 +3569,7 @@ def main():
     parser.add_argument("--txn", action="store_true")
     parser.add_argument("--optimistic_txn", action="store_true")
     parser.add_argument("--test_best_efforts_recovery", action="store_true")
+    parser.add_argument("--test_manifest_store", action="store_true")
     parser.add_argument("--enable_ts", action="store_true")
     parser.add_argument("--test_multiops_txn", action="store_true")
     parser.add_argument("--stress_cmd")
@@ -3471,6 +3598,7 @@ def main():
         + list(ts_params.items())
         + list(multiops_txn_params.items())
         + list(best_efforts_recovery_params.items())
+        + list(manifest_store_params.items())
         + list(cf_consistency_params.items())
         + list(cf_lifecycle_params.items())
         + list(tiered_params.items())
@@ -3498,6 +3626,20 @@ def main():
         parser.error("--cf_lifecycle cannot be combined with --cf_consistency")
     if args.cf_lifecycle and "--" in unknown_args:
         parser.error("--cf_lifecycle does not support the -- argument terminator")
+    # The store lanes cannot run these two profiles: db_stress refuses
+    # best-efforts recovery and the column family lifecycle test with
+    # --use_manifest_store. finalize_and_sanitize() would turn off the two
+    # modes, but the other values of the profiles would stay. disable_wal=1
+    # from the best-efforts profile turns reopens off, so the run would not
+    # test the store checks at reopen. A non-zero cf_lifecycle_fault_target
+    # makes db_stress fail its flag check.
+    if args.test_manifest_store and args.test_best_efforts_recovery:
+        parser.error(
+            "--test_manifest_store cannot be combined with "
+            "--test_best_efforts_recovery"
+        )
+    if args.test_manifest_store and args.cf_lifecycle:
+        parser.error("--test_manifest_store cannot be combined with --cf_lifecycle")
     multiplier = args.cache_and_write_buffer_size_multiplier
     if multiplier is not None and (not math.isfinite(multiplier) or multiplier <= 0):
         parser.error(

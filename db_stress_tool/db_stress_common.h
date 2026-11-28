@@ -392,6 +392,12 @@ DECLARE_int32(prepopulate_blob_cache);
 
 DECLARE_int32(approximate_size_one_in);
 DECLARE_bool(best_efforts_recovery);
+DECLARE_bool(use_manifest_store);
+DECLARE_bool(manifest_store_shadow);
+DECLARE_int32(manifest_store_copy_mode);
+DECLARE_uint64(manifest_store_fault_one_in);
+DECLARE_int32(manifest_store_fence_at_reopen_one_in);
+DECLARE_int32(manifest_store_rollback_one_in);
 DECLARE_bool(skip_verifydb);
 DECLARE_string(verify_cpu_corruption_dir);
 DECLARE_bool(paranoid_file_checks);
@@ -953,7 +959,31 @@ Status InitUnverifiedSubdir(const std::string& dirname);
 
 // Destroy the DB at the given path under the env configured for db_stress.
 // Handles both regular DB and BlobDB, and cleans and removes the entire dir.
+// With --use_manifest_store, it also removes the test store of the DB.
 Status DbStressDestroyDb(const std::string& db_path);
+
+// The store dir of the test store of the DB at `db_path`:
+// <db_path>_manifest_store.
+std::string ManifestStoreDirForDb(const std::string& db_path);
+
+// Mode checks for --use_manifest_store. FLAGS_use_manifest_store is true in
+// both store mode and shadow mode, so the code checks the mode with one of
+// these functions, whose name says which mode it means. So
+// `manifest_store_ != nullptr` in StressTest is not a mode check: after the
+// first open it is set in both modes.
+
+// True in store mode or in shadow mode.
+inline bool UsesTestManifestStore() { return FLAGS_use_manifest_store; }
+
+// True in store mode only.
+inline bool InManifestStoreMode() {
+  return FLAGS_use_manifest_store && !FLAGS_manifest_store_shadow;
+}
+
+// True in shadow mode only.
+inline bool InManifestShadowMode() {
+  return FLAGS_use_manifest_store && FLAGS_manifest_store_shadow;
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // GFLAGS

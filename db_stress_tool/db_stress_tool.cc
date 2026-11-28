@@ -121,6 +121,100 @@ int ValidateFileScopedWalWriteFaultFlags() {
   return 0;
 }
 
+int ValidateManifestStoreFlags() {
+  if (!FLAGS_use_manifest_store) {
+    if (FLAGS_manifest_store_shadow || FLAGS_manifest_store_fault_one_in > 0 ||
+        FLAGS_manifest_store_fence_at_reopen_one_in > 0 ||
+        FLAGS_manifest_store_rollback_one_in > 0 ||
+        FLAGS_manifest_store_copy_mode != 0) {
+      return ReturnValidationError(
+          "--manifest_store_shadow, --manifest_store_copy_mode, "
+          "--manifest_store_fault_one_in, "
+          "--manifest_store_fence_at_reopen_one_in and "
+          "--manifest_store_rollback_one_in require --use_manifest_store");
+    }
+    return 0;
+  }
+  if (FLAGS_manifest_store_copy_mode < 0 ||
+      FLAGS_manifest_store_copy_mode > 2) {
+    return ReturnValidationError(
+        "--manifest_store_copy_mode must be 0, 1 or 2");
+  }
+  // A fence only stops shadow mode of the old DB, which the reopen does not
+  // check, so it adds no coverage there. The copy mode and the rollback belong
+  // to store mode only.
+  if (FLAGS_manifest_store_shadow &&
+      (FLAGS_manifest_store_fence_at_reopen_one_in > 0 ||
+       FLAGS_manifest_store_rollback_one_in > 0 ||
+       FLAGS_manifest_store_copy_mode != 0)) {
+    return ReturnValidationError(
+        "--manifest_store_shadow cannot be used with "
+        "--manifest_store_fence_at_reopen_one_in, "
+        "--manifest_store_rollback_one_in or --manifest_store_copy_mode");
+  }
+  // In sync copy mode a failed write of the MANIFEST file copy stops the DB
+  // with a non-retryable error. An injected file system write fault on the copy
+  // keeps the "injected" text in that error, so the db_stress write loops retry
+  // it until the run ends, and the run makes no progress. So sync copy mode
+  // runs without the workload write faults. The write faults of DB::Open()
+  // (--open_write_fault_one_in and --open_metadata_write_fault_one_in) stay
+  // allowed: an injected fault there fails that open, and db_stress opens the
+  // DB again with those faults off.
+  if (FLAGS_manifest_store_copy_mode ==
+          static_cast<int>(ManifestCopyMode::kSync) &&
+      (FLAGS_write_fault_one_in > 0 || FLAGS_metadata_write_fault_one_in > 0)) {
+    return ReturnValidationError(
+        "--manifest_store_copy_mode=2 cannot be used with "
+        "--write_fault_one_in or --metadata_write_fault_one_in");
+  }
+  // db_stress does not run these features with --use_manifest_store (store
+  // mode and shadow mode). Each entry gives its reason. Where a reason holds
+  // only in store mode, shadow mode refuses the flag too, to keep one rule for
+  // both modes.
+  struct RefusedFlag {
+    bool set;
+    const char* flag;
+    const char* reason;
+  };
+  const RefusedFlag refused[] = {
+      {FLAGS_read_only, "--read_only",
+       "the read-only reopen in StressTest::Open() passes the options of the "
+       "primary, which hold the writer store object (with an epoch) of "
+       "SetManifestStoreForOpen(); a read-only instance should use a reader "
+       "store object (without an epoch), and db_stress has no code yet to "
+       "give it one"},
+      {FLAGS_best_efforts_recovery, "--best_efforts_recovery",
+       "every DB open function returns InvalidArgument for it with a store "
+       "(DBImpl::CheckManifestStoreOptions())"},
+      {FLAGS_open_read_only_one_in > 0, "--open_read_only_one_in",
+       "MaybeOpenReadOnlyOnPrimary() opens with the options of the primary, "
+       "which hold the writer store object (with an epoch) of the primary, "
+       "but a read-only instance should use its own reader store object "
+       "(without an epoch), and db_stress has no code yet to give it one"},
+      {FLAGS_remote_compaction_worker_threads > 0,
+       "--remote_compaction_worker_threads",
+       "the remote compaction worker of db_stress has no way to get a store "
+       "object"},
+      {FLAGS_use_blob_db, "--use_blob_db",
+       "the stacked BlobDB keeps its blob files outside the MANIFEST, and no "
+       "unit test covers the stacked BlobDB with a store yet"},
+      {FLAGS_ttl != -1, "--ttl",
+       "the DBWithTTL open path of StressTest::Open() skips "
+       "ListColumnFamiliesBeforeOpen(), FinishInterruptedRollback() and "
+       "SetManifestStoreForOpen(), so it would open without a store object"},
+      {FLAGS_test_cf_lifecycle, "--test_cf_lifecycle",
+       "its checks compare the OPTIONS files with the MANIFEST file, which is "
+       "a stub in store mode"},
+  };
+  for (const RefusedFlag& r : refused) {
+    if (r.set) {
+      return ReturnValidationError("--use_manifest_store does not work with ",
+                                   r.flag, ": ", r.reason);
+    }
+  }
+  return 0;
+}
+
 int ValidateCfLifecycleFlags() {
   if (FLAGS_cf_lifecycle_fault_target < 0 ||
       FLAGS_cf_lifecycle_fault_target > 2) {
@@ -309,6 +403,12 @@ int db_stress_tool(int argc, char** argv) {
   }
   {
     int rc = ValidateCfLifecycleFlags();
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  {
+    int rc = ValidateManifestStoreFlags();
     if (rc != 0) {
       return rc;
     }
