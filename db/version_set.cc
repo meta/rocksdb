@@ -35,6 +35,7 @@
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
+#include "db/manifest_rows.h"
 #include "db/memtable.h"
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
@@ -5986,6 +5987,12 @@ void VersionSet::Reset() {
   obsolete_files_.clear();
   obsolete_manifests_.clear();
   wals_.Reset();
+#ifndef NDEBUG
+  // Reset() replaces the column family set and clears the WAL set, so the
+  // debug rows no longer match. The next ProcessManifestWrites() call fills
+  // them again from the state that is recovered after this reset.
+  debug_manifest_rows_.reset();
+#endif
 }
 
 void VersionSet::UpdatedMutableDbOptions(
@@ -6112,6 +6119,15 @@ Status VersionSet::ProcessManifestWrites(
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
+#ifndef NDEBUG
+  // Debug check, fill step (see VersionSet::debug_manifest_rows_). A null
+  // value means the first call, a WAL edit that an earlier call rejected, or a
+  // call of VersionSet::Reset().
+  if (debug_manifest_rows_ == nullptr) {
+    debug_manifest_rows_ = std::make_unique<ManifestRows>();
+    GetManifestRows(debug_manifest_rows_.get());
+  }
+#endif
 
   // Takes this batch, from the queue head through `last_writer`, off
   // manifest_writers_: records `s` on each writer, runs its callback, and wakes
@@ -6600,6 +6616,14 @@ Status VersionSet::ProcessManifestWrites(
 
     LogFlush(db_options_->info_log);
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestDone");
+#ifndef NDEBUG
+    // Debug check, phase 1: no DB mutex, before the new Versions are
+    // installed. The fill step above always set debug_manifest_rows_.
+    if (s.ok()) {
+      DebugCheckRowsBeforeInstall(batch_edits, versions, builder_guards,
+                                  first_writer.cfd, new_cf_options);
+    }
+#endif
     mu->Lock();
   }
 
@@ -6707,6 +6731,10 @@ Status VersionSet::ProcessManifestWrites(
       manifest_last_valid_record_end_ = new_manifest_file_size;
       manifest_last_valid_record_end_file_number_ = manifest_file_number_;
       prev_log_number_ = first_writer.edit_list.front()->GetPrevLogNumber();
+#ifndef NDEBUG
+      // Debug check, phase 2: DB mutex held, after install.
+      DebugCheckRowsAfterInstall(batch_edits);
+#endif
     }
   } else {
     std::string version_edits;
