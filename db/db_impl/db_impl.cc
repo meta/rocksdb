@@ -5316,8 +5316,9 @@ Status DBImpl::CreateColumnFamiliesImpl(
   if (options_file_number != 0) {
     // The first create commits a tracked OPTIONS snapshot that lists every
     // prepared column family, so the snapshot is current only if every create
-    // succeeds. The flag is also set when the first create fails, which costs
-    // at most one extra OPTIONS file write.
+    // succeeds. The flag is also set when the first create fails. Until the
+    // flag is cleared, SetOptions() and SetDBOptions() write the file even for
+    // a request that changes no option (see options_file_stale_ in db_impl.h).
     options_file_stale_ = handles->size() != prepared_column_families.size();
   }
   if (s.ok() && !preparation_status.ok()) {
