@@ -22,6 +22,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/flush_block_policy.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/table.h"
@@ -31,6 +32,7 @@
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_builder.h"
 #include "table/format.h"
+#include "test_util/mock_manifest_store.h"
 #include "test_util/sync_point.h"
 #include "util/defer.h"
 #include "util/file_checksum_helper.h"
@@ -133,6 +135,137 @@ TEST_F(DBBasicTest, OpenWhenOpen) {
   ASSERT_EQ(Status::Code::kIOError, s.code());
   ASSERT_EQ(Status::SubCode::kNone, s.subcode());
   ASSERT_TRUE(strstr(s.getState(), "lock ") != nullptr);
+}
+
+// Tests the option checks that every DB open function runs with a store,
+// before it changes anything on disk:
+// - a feature version out of range, or a copy mode above kSync, gives
+//   InvalidArgument;
+// - best_efforts_recovery and best_efforts_blob_db_repair give
+//   InvalidArgument, and compaction_service gives NotSupported;
+// - the secondary and follower opens refuse a store.
+// DB::OpenAndCompact() takes its options from the OPTIONS file and from
+// CompactionServiceOptionsOverride. Both paths reach the secondary open
+// function of DB::OpenAsSecondary(), which runs the same check.
+// db/db_manifest_store_test.cc tests store mode itself.
+TEST_F(DBBasicTest, ManifestStoreOptionsAreCheckedAtOpen) {
+  // A compaction service that the open check rejects before any use.
+  class UnusedCompactionService : public CompactionService {
+   public:
+    const char* Name() const override { return "UnusedCompactionService"; }
+  };
+  Close();
+  // A path where no DB exists, so that the test can check that a failed open
+  // with create_if_missing does not create it.
+  const std::string new_path = dbname_ + "_manifest_store";
+  ASSERT_OK(DestroyDB(new_path, CurrentOptions()));
+  const std::string secondary_path = dbname_ + "_secondary";
+  struct OpenCase {
+    const char* name;
+    std::function<Status(const Options&)> open;
+    // The result with a store, from an options check before any disk change.
+    Status::Code store_code;
+    // Sets options that the store check rejects with `store_code`.
+    std::function<void(Options*)> store_options;
+  };
+  const std::vector<OpenCase> open_cases = {
+      {"Open",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::Open(create, new_path, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
+      {"Open with best_efforts_blob_db_repair",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::Open(create, new_path, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) {
+         o->best_efforts_blob_db_repair = true;
+         o->enable_blob_files = true;
+       }},
+      {"Open with compaction_service",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::Open(create, new_path, &db);
+       },
+       Status::Code::kNotSupported,
+       [](Options* o) {
+         o->compaction_service = std::make_shared<UnusedCompactionService>();
+       }},
+      {"OpenForReadOnly",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         return DB::OpenForReadOnly(options, dbname_, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
+      {"OpenForReadOnly with column families",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         std::vector<ColumnFamilyHandle*> handles;
+         return DB::OpenForReadOnly(options, dbname_,
+                                    {{kDefaultColumnFamilyName, options}},
+                                    &handles, &db);
+       },
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
+      {"OpenAsSecondary",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         return DB::OpenAsSecondary(options, dbname_, secondary_path, &db);
+       },
+       Status::Code::kNotSupported, [](Options*) {}},
+      {"OpenAsFollower",
+       [&](const Options& options) {
+         std::unique_ptr<DB> db;
+         Options create = options;
+         create.create_if_missing = true;
+         return DB::OpenAsFollower(create, new_path, dbname_, &db);
+       },
+       Status::Code::kNotSupported, [](Options*) {}},
+  };
+  for (const OpenCase& c : open_cases) {
+    SCOPED_TRACE(c.name);
+    Options options = CurrentOptions();
+    options.manifest_store = std::make_shared<MockManifestStore>(
+        std::make_shared<MockManifestStoreData>(), /*epoch=*/1);
+    c.store_options(&options);
+    ASSERT_EQ(c.store_code, c.open(options).code());
+    for (uint32_t feature_version :
+         {0u, kManifestRowFeatureVersionLatest + 1}) {
+      options.manifest_row_feature_version = feature_version;
+      ASSERT_EQ(Status::Code::kInvalidArgument, c.open(options).code());
+    }
+    options.manifest_row_feature_version = kManifestRowFeatureVersionLatest;
+    // A copy mode above kSync, for example a cast from a config integer.
+    options.manifest_store_copy_mode =
+        // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+        static_cast<ManifestCopyMode>(3);
+    ASSERT_EQ(Status::Code::kInvalidArgument, c.open(options).code());
+    ASSERT_EQ(Status::kNotFound, env_->FileExists(new_path).code());
+  }
+
+  // Without a store, the feature version is not checked. So a DB opens with the
+  // value of a later release, for example one read from its OPTIONS file.
+  Options options = CurrentOptions();
+  options.manifest_row_feature_version = kManifestRowFeatureVersionLatest + 1;
+  Reopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_EQ("v", Get("k"));
+  // A DB whose CURRENT names a MANIFEST file needs manifest_store_migrate.
+  options = CurrentOptions();
+  options.manifest_store = std::make_shared<MockManifestStore>(
+      std::make_shared<MockManifestStoreData>(), /*epoch=*/1);
+  ASSERT_EQ(Status::Code::kInvalidArgument, TryReopen(options).code());
 }
 
 namespace {

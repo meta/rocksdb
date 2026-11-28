@@ -1274,6 +1274,15 @@ void ExternalSstFileIngestionJob::Cleanup(const Status& status) {
   }
 }
 
+void ExternalSstFileIngestionJob::KeepInternalFiles() {
+  for (IngestedFileInfo& f : files_to_ingest_) {
+    f.internal_file_path.clear();
+  }
+  if (atomic_replace_range_tombstone_.has_value()) {
+    atomic_replace_range_tombstone_->internal_file_path.clear();
+  }
+}
+
 void ExternalSstFileIngestionJob::DeleteInternalFiles() {
   IOOptions io_opts;
   for (IngestedFileInfo& f : files_to_ingest_) {

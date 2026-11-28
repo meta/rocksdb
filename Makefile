@@ -2265,6 +2265,9 @@ db_secondary_test: $(OBJ_DIR)/db/db_secondary_test.o $(TEST_LIBRARY) $(LIBRARY)
 db_follower_test: $(OBJ_DIR)/db/db_follower_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+db_manifest_store_test: $(OBJ_DIR)/db/db_manifest_store_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 block_cache_tracer_test: $(OBJ_DIR)/trace_replay/block_cache_tracer_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

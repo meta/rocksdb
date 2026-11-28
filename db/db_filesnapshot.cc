@@ -48,9 +48,23 @@ Status DBImpl::FlushForGetLiveFiles(bool force_atomic_flush) {
   return DBImpl::FlushAllColumnFamilies(flush_opts, FlushReason::kGetLiveFiles);
 }
 
+namespace {
+// The live file APIs return the MANIFEST file, which is only a stub in store
+// mode (see db/manifest_store_state.h). So checkpoints and backups, which use
+// these APIs, would copy a DB that cannot be opened.
+Status StoreModeLiveFilesNotSupported() {
+  return Status::NotSupported(
+      "The live file APIs do not support a DB in store mode (manifest_store) "
+      "yet");
+}
+}  // namespace
+
 Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
                             uint64_t* manifest_file_size, bool flush_memtable) {
   *manifest_file_size = 0;
+  if (immutable_db_options_.manifest_store != nullptr) {
+    return StoreModeLiveFilesNotSupported();
+  }
 
   mutex_.Lock();
 
@@ -213,6 +227,9 @@ Status DBImpl::AppendColumnFamilyDropsToManifest(
     const std::string& manifest_path, uint64_t manifest_size,
     const std::vector<uint32_t>& cf_ids,
     uint64_t committed_options_file_number) {
+  if (immutable_db_options_.manifest_store != nullptr) {
+    return StoreModeLiveFilesNotSupported();
+  }
   const WriteOptions write_options;
   // Snapshot manifest_preallocation_size_ under the DB mutex per VersionSet's
   // contract (the field is mutated by SetDBOptions under this mutex).
@@ -345,6 +362,9 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
     std::vector<uint32_t>* excluded_cf_ids,
     SubsetCheckpointOptionsSnapshot* options_snapshot,
     LiveFilesPinRequest* pin_request) {
+  if (immutable_db_options_.manifest_store != nullptr) {
+    return StoreModeLiveFilesNotSupported();
+  }
   // To avoid returning partial results, only move results to files on success.
   assert(files);
   files->clear();
