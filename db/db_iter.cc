@@ -1872,6 +1872,16 @@ void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
   assert(PrefixCheck(end_key));
   assert(user_comparator_.Compare(range_tomb_first_key_.GetUserKey(),
                                   end_key) <= 0);
+  // A run can end at its own first key. For example, with a threshold of 1, a
+  // forward scan that reaches the end of the data after one point tombstone
+  // uses that tombstone's key as both the start and the end of the range. A
+  // reverse scan from SeekForPrev(K) that lands on a point tombstone at K does
+  // the same. Such a range covers nothing, so it is not inserted.
+  if (user_comparator_.Compare(range_tomb_first_key_.GetUserKey(), end_key) >=
+      0) {
+    RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_DISCARDED);
+    return;
+  }
 
   auto earliest_seq = active_mem_->GetEarliestSequenceNumber();
   // Skip if the iterator's snapshot predates the memtable. Otherwise entries

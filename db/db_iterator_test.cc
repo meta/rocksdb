@@ -7975,6 +7975,46 @@ TEST_P(ReadPathRangeTombstoneTest, SingleDeleteOnlyRun) {
       1);
 }
 
+// With a threshold of 1, a run of one point tombstone can end at its own key,
+// and the range from that key to itself covers nothing. In this test, "a" is
+// live and "b" is deleted. Forward, the scan reaches the end of the data after
+// the tombstone at "b", so the range would be ["b", "b"). Reverse,
+// SeekForPrev("b") lands on the tombstone at "b", and the range would end at
+// the seek target "b". The scan inserts nothing in both directions.
+TEST_P(ReadPathRangeTombstoneTest, RunEndingAtItsOwnKeyInsertsNothing) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 1;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("b"));
+
+  attempted_insert_ranges_.clear();
+  {
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ReadOptions()));
+    if (Forward()) {
+      iter->Seek("a");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key());
+      iter->Next();
+    } else {
+      iter->SeekForPrev("b");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key());
+      iter->Prev();
+    }
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0u);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+      1);
+}
+
 TEST_P(ReadPathRangeTombstoneTest, PrefixFilterDefaultReadOptions) {
   // total_order_seek=false (default) with prefix extractor. Even when the
   // visible scan contains a valid in-prefix tombstone run [ba, bc), read-path
