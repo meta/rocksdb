@@ -7,8 +7,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -1009,6 +1011,126 @@ TEST_F(DBSecondaryTest, OpenAsSecondary) {
 
   ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
   verify_db_func("new_foo_value", "new_bar_value");
+}
+
+// A secondary shares the primary's DB folder, which only the primary may write.
+// A column family create on a secondary must not write a MANIFEST or CURRENT
+// there, because the primary would then reopen from that MANIFEST and lose its
+// later writes. A create or drop must not write an OPTIONS file there either.
+// So every column family change on a secondary must return NotSupported and
+// leave the primary's folder as it was.
+TEST_F(DBSecondaryTest, ColumnFamilyChangesNotSupported) {
+  // With track_options_file_number_in_manifest, a create or drop writes an
+  // OPTIONS file before its MANIFEST record, so both values are checked.
+  for (bool track_options_file : {false, true}) {
+    SCOPED_TRACE("track_options_file_number_in_manifest=" +
+                 std::to_string(track_options_file));
+    CloseSecondary();
+    Options options = CurrentOptions();
+    options.env = env_;
+    options.track_options_file_number_in_manifest = track_options_file;
+    DestroyAndReopen(options);
+    CreateAndReopenWithCF({"pikachu"}, options);
+    ASSERT_OK(Put("foo", "v1"));
+    ASSERT_OK(Flush());
+
+    Options secondary_options = options;
+    secondary_options.max_open_files = -1;
+    OpenSecondaryWithColumnFamilies({"pikachu"}, secondary_options);
+    ASSERT_EQ(2, handles_secondary_.size());
+    ColumnFamilyHandle* secondary_pikachu = handles_secondary_[1];
+
+    const auto read_primary_folder = [&](std::vector<std::string>* children,
+                                         std::string* current) {
+      ASSERT_OK(env_->GetChildren(dbname_, children));
+      std::sort(children->begin(), children->end());
+      ASSERT_OK(ReadFileToString(env_, CurrentFileName(dbname_), current));
+    };
+    std::vector<std::string> children_before;
+    std::string current_before;
+    read_primary_folder(&children_before, &current_before);
+
+    ExportImportFilesMetaData import_metadata;
+    import_metadata.db_comparator_name = options.comparator->Name();
+    const std::vector<const ExportImportFilesMetaData*> import_metadatas{
+        &import_metadata};
+    DBImplSecondary* secondary = db_secondary_full();
+    const std::vector<std::pair<std::string, std::function<Status()>>> calls = {
+        {"CreateColumnFamily",
+         [&]() {
+           ColumnFamilyHandle* handle = nullptr;
+           Status s = secondary->CreateColumnFamily(options, "new_cf", &handle);
+           EXPECT_EQ(nullptr, handle);
+           return s;
+         }},
+        {"CreateColumnFamily with ReadOptions",
+         [&]() {
+           ColumnFamilyHandle* handle = nullptr;
+           Status s = secondary->CreateColumnFamily(
+               ReadOptions(), WriteOptions(), options, "new_cf", &handle);
+           EXPECT_EQ(nullptr, handle);
+           return s;
+         }},
+        {"CreateColumnFamilies by names",
+         [&]() {
+           std::vector<ColumnFamilyHandle*> handles;
+           Status s =
+               secondary->CreateColumnFamilies(options, {"new_cf"}, &handles);
+           EXPECT_TRUE(handles.empty());
+           return s;
+         }},
+        {"CreateColumnFamilies by descriptors",
+         [&]() {
+           std::vector<ColumnFamilyHandle*> handles;
+           Status s = secondary->CreateColumnFamilies(
+               {ColumnFamilyDescriptor("new_cf", options)}, &handles);
+           EXPECT_TRUE(handles.empty());
+           return s;
+         }},
+        {"CreateColumnFamilyWithImport",
+         [&]() {
+           ColumnFamilyHandle* handle = nullptr;
+           Status s = secondary->CreateColumnFamilyWithImport(
+               options, "new_cf", ImportColumnFamilyOptions(), import_metadata,
+               &handle);
+           EXPECT_EQ(nullptr, handle);
+           return s;
+         }},
+        {"CreateColumnFamilyWithImport of several exports",
+         [&]() {
+           ColumnFamilyHandle* handle = nullptr;
+           Status s = secondary->CreateColumnFamilyWithImport(
+               options, "new_cf", ImportColumnFamilyOptions(), import_metadatas,
+               &handle);
+           EXPECT_EQ(nullptr, handle);
+           return s;
+         }},
+        {"DropColumnFamily",
+         [&]() { return secondary->DropColumnFamily(secondary_pikachu); }},
+        {"DropColumnFamilies",
+         [&]() { return secondary->DropColumnFamilies({secondary_pikachu}); }},
+    };
+    for (const auto& [name, call] : calls) {
+      SCOPED_TRACE(name);
+      Status s = call();
+      ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+      std::vector<std::string> children_after;
+      std::string current_after;
+      read_primary_folder(&children_after, &current_after);
+      ASSERT_EQ(children_before, children_after);
+      ASSERT_EQ(current_before, current_after);
+    }
+
+    // The primary's later writes survive its reopen, and the secondary still
+    // follows the primary.
+    ASSERT_OK(Put("foo", "v2"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_secondary_->TryCatchUpWithPrimary());
+    VerifySecondaryValue("foo", "v2");
+    CloseSecondary();
+    ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu"}, options);
+    ASSERT_EQ("v2", Get("foo"));
+  }
 }
 
 TEST_F(DBSecondaryTest, WaitForCompactAfterSnapshotRelease) {

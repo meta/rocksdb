@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 
 #include "db/db_test_util.h"
@@ -269,6 +270,83 @@ TEST_F(DBFollowerTest, Basic) {
   ASSERT_OK(follower()->Get(ReadOptions(), "k1", &val));
   ASSERT_EQ(val, "v1");
   CheckDirs();
+}
+
+// A follower reads the leader's MANIFEST, so it must not change column
+// families. Each column family create returns NotSupported and never reaches
+// the MANIFEST writer. The leader's CURRENT stays as it was, and the leader's
+// later writes survive its reopen.
+TEST_F(DBFollowerTest, ColumnFamilyChangesNotSupported) {
+  ASSERT_OK(Put("k1", "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  std::string current_before;
+  ASSERT_OK(ReadFileToString(env_, CurrentFileName(dbname_), &current_before));
+  ASSERT_OK(OpenAsFollower());
+
+  // The leader has no background work left, so only the follower can reach
+  // the MANIFEST writer while the calls below run.
+  std::atomic<int> manifest_writes{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:BeforeWriterWaiting",
+      [&](void* /*arg*/) { ++manifest_writes; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup([]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  const Options options = CurrentOptions();
+  ExportImportFilesMetaData import_metadata;
+  import_metadata.db_comparator_name = options.comparator->Name();
+  const std::vector<std::pair<std::string, std::function<Status()>>> calls = {
+      {"CreateColumnFamily",
+       [&]() {
+         ColumnFamilyHandle* handle = nullptr;
+         Status s = follower()->CreateColumnFamily(options, "new_cf", &handle);
+         EXPECT_EQ(nullptr, handle);
+         return s;
+       }},
+      {"CreateColumnFamilies by names",
+       [&]() {
+         std::vector<ColumnFamilyHandle*> handles;
+         Status s =
+             follower()->CreateColumnFamilies(options, {"new_cf"}, &handles);
+         EXPECT_TRUE(handles.empty());
+         return s;
+       }},
+      {"CreateColumnFamilies by descriptors",
+       [&]() {
+         std::vector<ColumnFamilyHandle*> handles;
+         Status s = follower()->CreateColumnFamilies(
+             {ColumnFamilyDescriptor("new_cf", options)}, &handles);
+         EXPECT_TRUE(handles.empty());
+         return s;
+       }},
+      {"CreateColumnFamilyWithImport",
+       [&]() {
+         ColumnFamilyHandle* handle = nullptr;
+         Status s = follower()->CreateColumnFamilyWithImport(
+             options, "new_cf", ImportColumnFamilyOptions(), import_metadata,
+             &handle);
+         EXPECT_EQ(nullptr, handle);
+         return s;
+       }},
+  };
+  for (const auto& [name, call] : calls) {
+    SCOPED_TRACE(name);
+    Status s = call();
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_EQ(0, manifest_writes.load());
+  }
+
+  std::string current_after;
+  ASSERT_OK(ReadFileToString(env_, CurrentFileName(dbname_), &current_after));
+  ASSERT_EQ(current_before, current_after);
+  ASSERT_OK(Put("k1", "v2"));
+  ASSERT_OK(Flush());
+  Reopen(options);
+  ASSERT_EQ("v2", Get("k1"));
 }
 
 TEST_F(DBFollowerTest, NewIteratorsRefreshesAfterCatchUp) {

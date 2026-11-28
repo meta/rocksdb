@@ -1501,7 +1501,9 @@ class VersionSet {
   // The live DB creation path has already sanitized these options for its
   // OPTIONS snapshot. Reuse that exact value when installing the new column
   // family so persistence and the in-memory configuration cannot drift.
-  Status LogAndApplyColumnFamilyAddWithSanitizedOptions(
+  // ReactiveVersionSet overrides it to return NotSupported, as it does for
+  // LogAndApply().
+  virtual Status LogAndApplyColumnFamilyAddWithSanitizedOptions(
       const ReadOptions& read_options, const WriteOptions& write_options,
       VersionEdit* edit, InstrumentedMutex* mu,
       FSDirectory* dir_contains_current_file,
@@ -2426,6 +2428,16 @@ class ReactiveVersionSet : public VersionSet {
       const std::vector<std::function<void(const Status&)>>& /*manifest_wcbs*/,
       const std::function<Status()>& /*pre_cb*/,
       int /*max_file_opening_threads*/) override {
+    return Status::NotSupported("not supported in reactive mode");
+  }
+
+  // The column family add path calls LogAndApplyImpl() directly, past the
+  // LogAndApply() override above, so it needs its own refusal.
+  Status LogAndApplyColumnFamilyAddWithSanitizedOptions(
+      const ReadOptions& /*read_options*/,
+      const WriteOptions& /*write_options*/, VersionEdit* /*edit*/,
+      InstrumentedMutex* /*mu*/, FSDirectory* /*dir_contains_current_file*/,
+      const ColumnFamilyOptions& /*sanitized_options*/) override {
     return Status::NotSupported("not supported in reactive mode");
   }
 
