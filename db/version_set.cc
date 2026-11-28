@@ -36,6 +36,7 @@
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
 #include "db/manifest_rows.h"
+#include "db/manifest_store_shadow.h"
 #include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/merge_context.h"
@@ -6469,13 +6470,43 @@ Status VersionSet::ProcessManifestWrites(
   //    quarantine alone. A new copy sets the size for its next rollover
   //    (TuneMaxManifestFileSize()), and a successful batch installs as in
   //    file mode.
+  //
+  // Shadow mode (see ManifestStoreShadow) hooks into this function in three
+  // places, in this order:
+  // 1. Here, under the DB mutex: without base rows, the write starts a new
+  //    MANIFEST file (see VersionSet::shadow_base_rows_).
+  // 2. Without the DB mutex, when the write starts a new MANIFEST file:
+  //    WriteCurrentStateToManifest() fills `shadow_snapshot_rows` (owned by
+  //    this function).
+  // 3. After the MANIFEST write, still without the DB mutex: on success,
+  //    HandOffToManifestStoreShadow() hands the row changes over. It moves the
+  //    snapshot rows into ReplaceWithSnapshot() (encoded) and into
+  //    shadow_base_rows_ (decoded) when it uses them. On failure, the base rows
+  //    are dropped and the shadow is marked as not in sync. Then what is left
+  //    of the snapshot rows is freed, before the DB mutex is taken again.
+  // A DB is never in store mode and shadow mode at once: manifest_store_shadow
+  // turns StoreModeOptions() off, and DBImpl::Recover() refuses a DB whose
+  // CURRENT names a stub.
+  const bool shadow_active =
+      manifest_store_shadow_ != nullptr && !manifest_store_shadow_->Stopped();
+  // After shadow mode stops, the base rows are freed after the DB mutex is
+  // released below, because freeing them takes time that grows with the
+  // number of column families. A write that skips the MANIFEST keeps the DB
+  // mutex, so it leaves the base rows to the next MANIFEST write.
+  std::unique_ptr<ManifestRows> stopped_shadow_base_rows;
+  if (!shadow_active && !skip_manifest_write) {
+    stopped_shadow_base_rows = std::move(shadow_base_rows_);
+  }
+  const bool shadow_needs_full_state =
+      shadow_active && shadow_base_rows_ == nullptr;
   if (HasManifestStoreWriteState()) {
     // Store mode never writes the MANIFEST file, so it never starts a new one
     // (see db/manifest_store_state.h). The stub stays the MANIFEST file.
     new_descriptor_log = false;
     pending_manifest_file_number_ = manifest_file_number_;
   } else if (!skip_manifest_write &&
-             (!descriptor_log_ || prev_manifest_file_size >= enforced_limit)) {
+             (!descriptor_log_ || prev_manifest_file_size >= enforced_limit ||
+              shadow_needs_full_state)) {
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeNewManifest");
     new_descriptor_log = true;
   } else {
@@ -6526,6 +6557,8 @@ Status VersionSet::ProcessManifestWrites(
   // store. Only such a batch may clear the quarantine (see below).
   bool store_committed = false;
   std::unique_ptr<log::Writer> new_desc_log_ptr;
+  // The rows of the new MANIFEST file's snapshot, for shadow mode.
+  ManifestRows shadow_snapshot_rows;
   // Save before releasing mu
   uint64_t manifest_preallocation_size = manifest_preallocation_size_;
   if (skip_manifest_write) {
@@ -6545,6 +6578,12 @@ Status VersionSet::ProcessManifestWrites(
       min_file_number_in_use = min_file_number_in_use_func_();
     }
     mu->Unlock();
+    if (stopped_shadow_base_rows != nullptr) {
+      TEST_SYNC_POINT_CALLBACK(
+          "VersionSet::ProcessManifestWrites:FreeStoppedShadowBaseRows",
+          stopped_shadow_base_rows.get());
+      stopped_shadow_base_rows.reset();
+    }
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestStart");
     TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:WriteManifest", nullptr);
     if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
@@ -6582,9 +6621,10 @@ Status VersionSet::ProcessManifestWrites(
             CreateManifestWriter(std::move(descriptor_file), descriptor_fname,
                                  opt_file_opts, manifest_preallocation_size);
         raw_desc_log_ptr = new_desc_log_ptr.get();
-        s = WriteCurrentStateToManifest(write_options, curr_state,
-                                        wal_additions, options_manifest_state,
-                                        raw_desc_log_ptr, io_s);
+        s = WriteCurrentStateToManifest(
+            write_options, curr_state, wal_additions, options_manifest_state,
+            raw_desc_log_ptr, io_s,
+            shadow_active ? &shadow_snapshot_rows : nullptr);
         assert(s == io_s);
       }
       if (!io_s.ok()) {
@@ -6727,6 +6767,26 @@ Status VersionSet::ProcessManifestWrites(
                                   first_writer.cfd, new_cf_options);
     }
 #endif
+    if (shadow_active) {
+      if (s.ok()) {
+        // Defined in db/manifest_store_shadow.cc.
+        HandOffToManifestStoreShadow(
+            batch_edits, versions, builder_guards, first_writer.cfd,
+            new_cf_options,
+            new_descriptor_log ? &shadow_snapshot_rows : nullptr);
+      } else {
+        // The MANIFEST may or may not hold this write. A new MANIFEST file
+        // gives the full state again. Until then, the store is not in sync.
+        shadow_base_rows_.reset();
+        manifest_store_shadow_->MarkManifestAhead();
+      }
+      // Free the snapshot rows, which grow with the number of live files,
+      // before the DB mutex is taken. The hand-off moves them out only when
+      // it uses them.
+      shadow_snapshot_rows = ManifestRows();
+    }
+    TEST_SYNC_POINT_CALLBACK("VersionSet::ProcessManifestWrites:BeforeRelock",
+                             &shadow_snapshot_rows);
     mu->Lock();
   }
 
@@ -7499,7 +7559,7 @@ Status VersionSet::Recover(
   // db/manifest_store_state.h), for example after DB::Open() moves the DB
   // into the store.
   if (s.ok() && !read_only && db_options_->reuse_manifest_on_open &&
-      db_options_->manifest_store == nullptr &&
+      !StoreModeOptions(*db_options_) &&
       manifest_recovery_last_valid_record_end_ > 0) {
     s = ReopenManifestForAppend(manifest_path);
   }
@@ -8640,6 +8700,14 @@ Status VersionSet::DumpManifestFromStore(
         "Store mode: the DB row says that the MANIFEST file is the authority "
         "(the DB was rolled back to file mode)");
   }
+  // In shadow mode (DBOptions::manifest_store_shadow) the MANIFEST file is the
+  // authority, and the rows only follow it, so they can be behind it. The
+  // compare_manifest_store command of ldb checks such rows.
+  if (s.ok() && scan.extra_fields.authority == ManifestAuthority::kShadow) {
+    s = Status::NotSupported(
+        "Store mode: the DB row says that the DB is in shadow mode; dump the "
+        "MANIFEST file instead");
+  }
   std::string bytes;
   if (s.ok()) {
     s = BuildStoreManifestBytes(/*live_cf_ids=*/nullptr, &scan.rows, &bytes);
@@ -8713,7 +8781,7 @@ Status VersionSet::WriteCurrentStateToManifest(
     const std::unordered_map<uint32_t, MutableCFState>& curr_state,
     const VersionEdit& wal_additions,
     const OptionsFileManifestState& options_file_manifest_state,
-    log::Writer* log, IOStatus& io_s) {
+    log::Writer* log, IOStatus& io_s, ManifestRows* snapshot_rows) {
   // TODO: Break up into multiple records to reduce memory usage on recovery?
 
   // WARNING: This method doesn't hold a mutex!!
@@ -8767,6 +8835,26 @@ Status VersionSet::WriteCurrentStateToManifest(
   io_s = log->AddRecord(write_options, wal_deletions_record);
   if (!io_s.ok()) {
     return io_s;
+  }
+  if (snapshot_rows != nullptr) {
+    *snapshot_rows = ManifestRows();
+    ManifestDbRow& db = snapshot_rows->db;
+    if (db_options_->write_dbid_to_manifest) {
+      db.db_id = db_id_;
+    }
+    db.last_sequence = descriptor_last_sequence_;
+    db.min_log_number_to_keep = min_log_number_to_keep();
+    if (options_file_manifest_state.has_committed_options_file_number) {
+      db.committed_options_file_number =
+          options_file_manifest_state.committed_options_file_number;
+    }
+    // The WAL additions, then the deletion of the WALs below the min log
+    // number to keep, as recovery applies the two records above.
+    for (const WalAddition& wal : wal_additions.GetWalAdditions()) {
+      if (wal.GetLogNumber() >= db.min_log_number_to_keep) {
+        snapshot_rows->wals[wal.GetLogNumber()] = wal.GetMetadata();
+      }
+    }
   }
 
   for (auto cfd : *column_family_set_) {
@@ -8866,6 +8954,10 @@ Status VersionSet::WriteCurrentStateToManifest(
       }
 
       edit.SetLastSequence(descriptor_last_sequence_);
+
+      if (snapshot_rows != nullptr) {
+        SetManifestCfSnapshotRows(*cfd, *vstorage, edit, snapshot_rows);
+      }
 
       const Comparator* ucmp = cfd->user_comparator();
       assert(ucmp);

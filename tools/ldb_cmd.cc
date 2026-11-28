@@ -437,6 +437,10 @@ LDBCommand* LDBCommand::SelectCommand(const ParsedParams& parsed_params) {
   } else if (parsed_params.cmd == ListFileRangeDeletesCommand::Name()) {
     return new ListFileRangeDeletesCommand(parsed_params.option_map,
                                            parsed_params.flags);
+  } else if (parsed_params.cmd == CompareManifestStoreCommand::Name()) {
+    return new CompareManifestStoreCommand(parsed_params.cmd_params,
+                                           parsed_params.option_map,
+                                           parsed_params.flags);
   } else if (parsed_params.cmd == UnsafeRemoveSstFileCommand::Name()) {
     return new UnsafeRemoveSstFileCommand(parsed_params.cmd_params,
                                           parsed_params.option_map,
@@ -5462,6 +5466,65 @@ void ListFileRangeDeletesCommand::DoCommand() {
     TEST_SYNC_POINT_CALLBACK(
         "ListFileRangeDeletesCommand::DoCommand:BeforePrint", &out_str);
     fprintf(stdout, "%s\n", out_str.c_str());
+  }
+}
+
+void CompareManifestStoreCommand::Help(std::string& ret) {
+  ret.append("  ");
+  ret.append(CompareManifestStoreCommand::Name());
+  ret.append(" --" + ARG_MANIFEST_STORE + "=<store>");
+  ret.append(
+      " : compare the rows that shadow mode wrote to the store with the "
+      "MANIFEST of the closed DB. <store> is the name or ID of a registered "
+      "ManifestStore class, with its options. The command only reads the "
+      "store. It fails when it finds a row difference. It also prints "
+      "warnings, for example about the authority or a missing close commit, "
+      "which do not make it fail.");
+  ret.append("\n");
+}
+
+CompareManifestStoreCommand::CompareManifestStoreCommand(
+    const std::vector<std::string>& /*params*/,
+    const std::map<std::string, std::string>& options,
+    const std::vector<std::string>& flags)
+    : LDBCommand(options, flags, true /* is_read_only */,
+                 BuildCmdLineOptions({})) {
+  // LDBCommand creates manifest_store_ from --manifest_store, and fails for a
+  // value that names no store.
+  if (exec_state_.IsNotStarted() && manifest_store_ == nullptr) {
+    exec_state_ =
+        LDBCommandExecuteResult::Failed("--manifest_store is required");
+  }
+}
+
+void CompareManifestStoreCommand::DoCommand() {
+  PrepareOptions();
+  if (column_families_.empty()) {
+    column_families_.emplace_back(kDefaultColumnFamilyName, options_);
+  }
+  std::vector<std::string> differences;
+  std::vector<std::string> warnings;
+  const Status s = CompareManifestStoreWithManifest(
+      db_path_, options_, column_families_, manifest_store_.get(), &differences,
+      &warnings);
+  if (!s.ok()) {
+    exec_state_ =
+        LDBCommandExecuteResult::Failed("compare failed: " + s.ToString());
+    return;
+  }
+  for (const std::string& warning : warnings) {
+    fprintf(stdout, "Warning: %s\n", warning.c_str());
+  }
+  for (const std::string& difference : differences) {
+    fprintf(stdout, "%s\n", difference.c_str());
+  }
+  if (differences.empty()) {
+    exec_state_ = LDBCommandExecuteResult::Succeed(
+        "the compared rows match the MANIFEST");
+  } else {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        std::to_string(differences.size()) +
+        " differences between the store and the MANIFEST");
   }
 }
 

@@ -36,6 +36,14 @@ std::string ManifestCommitIdGenerator::Next() {
          std::to_string(counter_.fetch_add(1, std::memory_order_relaxed));
 }
 
+std::string ManifestCommitIdGenerator::NextCloseId() {
+  return Next() + kCloseSuffix;
+}
+
+bool ManifestCommitIdGenerator::IsCloseId(const std::string& commit_id) {
+  return Slice(commit_id).ends_with(kCloseSuffix);
+}
+
 namespace {
 
 // The version of the stub payload. A reader returns NotSupported for any
@@ -120,22 +128,6 @@ class StringWritableFile : public FSWritableFile {
 
  private:
   std::string* const data_;
-};
-
-// Collects the rows of a scan.
-class CollectRowsVisitor : public ManifestRowVisitor {
- public:
-  Status OnDbRow(const ManifestDbRowResult& db_row) override {
-    db_row_ = db_row;
-    return Status::OK();
-  }
-  Status OnRow(const ManifestRow& row) override {
-    rows_.push_back(row);
-    return Status::OK();
-  }
-
-  ManifestDbRowResult db_row_;
-  std::vector<ManifestRow> rows_;
 };
 
 // Returns a plain IOError with the message `msg`. It has no retryable flag,
@@ -677,7 +669,7 @@ Status CheckManifestDbRowOwner(const ManifestRow& db_row,
 Status CheckOwnerAndClaim(ManifestStore* store,
                           const ManifestStoreOpenOptions& opts,
                           const std::string& expected_db_id,
-                          ManifestDbRowResult* claimed,
+                          bool claim_shadow_rows, ManifestDbRowResult* claimed,
                           ManifestDbRowExtraFields* extra) {
   ManifestStoreOpenOptions claim_opts = opts;
   for (int attempt = 1;; ++attempt) {
@@ -689,9 +681,18 @@ Status CheckOwnerAndClaim(ManifestStore* store,
       return Status::IOError("Store mode: cannot read the DB row: " +
                              io_s.ToString());
     }
-    Status s = CheckManifestDbRowOwner(claimed->db_row, expected_db_id);
+    ManifestDbRowExtraFields read_extra;
+    Status s = CheckManifestDbRowOwner(claimed->db_row, expected_db_id,
+                                       /*rows=*/nullptr, &read_extra);
     if (!s.ok()) {
       return s;
+    }
+    if (!claim_shadow_rows &&
+        read_extra.authority == ManifestAuthority::kShadow) {
+      if (extra != nullptr) {
+        *extra = read_extra;
+      }
+      return Status::OK();
     }
     claim_opts.expected_commit_sequence = claimed->state.commit_sequence;
     claim_opts.expected_last_commit_id = claimed->state.last_commit_id;
@@ -1247,7 +1248,8 @@ Status RollBackManifestStoreLocked(const DBOptions& db_options,
     // The claim fences the old primary in the store.
     ManifestStoreOpenOptions opts;
     opts.commit_id = commit_ids.Next();
-    s = CheckOwnerAndClaim(store, opts, expected_db_id, &claimed);
+    s = CheckOwnerAndClaim(store, opts, expected_db_id,
+                           /*claim_shadow_rows=*/true, &claimed);
     if (s.IsNotFound()) {
       return Status::InvalidArgument("Store mode: the store has no DB row");
     }
@@ -1291,12 +1293,10 @@ Status RollBackManifestStoreLocked(const DBOptions& db_options,
           "Store mode: open the DB read-write to finish entering store mode, "
           "then roll back");
     }
-    if (extra.authority != ManifestAuthority::kFile) {
-      return Status::Corruption(
-          "Store mode: an \"entering\" stub MANIFEST, but the DB row has "
-          "another authority");
-    }
     // The switch did not happen: the MANIFEST file still holds the metadata.
+    // kShadow means this too, as in DBImpl::FinishEnterManifestStore().
+    assert(extra.authority == ManifestAuthority::kFile ||
+           extra.authority == ManifestAuthority::kShadow);
     std::unique_ptr<FSDirectory> dir;
     s = fs->NewDirectory(dbname, IOOptions(), &dir, nullptr);
     if (s.ok()) {

@@ -460,6 +460,8 @@ DBOptions GetCheckpointDBOptions(DB* source) {
   db_options.manifest_store.reset();
   db_options.manifest_store_migrate = false;
   db_options.manifest_store_copy_mode = ManifestCopyMode::kOff;
+  // Shadow mode needs a store, and these options have none.
+  db_options.manifest_store_shadow = false;
   return db_options;
 }
 

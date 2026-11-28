@@ -155,6 +155,7 @@ void LDBCommandRunner::PrintHelp(const LDBOptions& ldb_options,
   CheckPointCommand::Help(ret);
   WriteExternalSstFilesCommand::Help(ret);
   IngestExternalSstFilesCommand::Help(ret);
+  CompareManifestStoreCommand::Help(ret);
   UnsafeRemoveSstFileCommand::Help(ret);
   RemoteCompactionPrimaryCommand::Help(ret);
   RemoteCompactionWorkerCommand::Help(ret);

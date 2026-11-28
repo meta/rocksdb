@@ -52,6 +52,7 @@
 #include "db/log_writer.h"
 #include "db/malloc_stats.h"
 #include "db/manifest_rows.h"
+#include "db/manifest_store_shadow.h"
 #include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/memtable_list.h"
@@ -1362,6 +1363,14 @@ Status DBImpl::CloseHelper() {
       }
     }
   }
+  // Shadow mode: the MANIFEST gets no more writes, so send the last changes.
+  // Close() waits for the shadow job and makes a store call, so it runs
+  // without the DB mutex.
+  if (manifest_store_shadow_ != nullptr) {
+    mutex_.Unlock();
+    manifest_store_shadow_->Close();
+    mutex_.Lock();
+  }
 
   // Drain obsolete-file purge work started AFTER the early CloseHelper wait
   // near the top of this method. A late SuperVersion cleanup -- a dropped
@@ -2382,8 +2391,14 @@ Status DBImpl::SetDBOptions(
                                              Env::Priority::HIGH);
         }
         if (max_compactions_increased) {
-          env_->IncBackgroundThreadsIfNeeded(new_bg_job_limits.max_compactions,
-                                             Env::Priority::LOW);
+          // Shadow mode keeps its extra LOW thread (see
+          // DBImpl::CreateManifestStoreShadow()).
+          env_->IncBackgroundThreadsIfNeeded(
+              new_bg_job_limits.max_compactions +
+                  (manifest_store_shadow_ != nullptr
+                       ? ManifestStoreShadow::kMaxJobsPerProcess
+                       : 0),
+              Env::Priority::LOW);
         }
         if (offpeak_time_changed) {
           versions_->ChangeOffpeakTimeOption(
@@ -7516,8 +7531,11 @@ namespace {
 //   CURRENT names   DB row in the store        Action
 //   --------------  -------------------------  -----------------------------
 //   stub            none                       Destroy() (OK), delete files
-//   stub            db id of the stub          Destroy(), delete files
+//   stub            db id of the stub, not     Destroy(), delete files
+//                   kShadow
 //   stub            no db id (failed enter)    Destroy(), delete files
+//   stub            db id of the stub and      keep the rows, delete files
+//                   authority kShadow
 //   stub            another db id              InvalidArgument, keep all
 //   MANIFEST file   db id of the DB, kFile     Destroy(), delete files
 //   MANIFEST file   anything else              keep the rows, delete files
@@ -7556,11 +7574,13 @@ namespace {
 //
 // A store object for another DB, given by mistake, must not remove the rows
 // of that DB, so both cases check the owner (CheckManifestDbRowOwner()).
-// DestroyDB() cannot tell a file copy of the folder from the source: both
-// have a stub with the same db id. So DestroyDB() of a copy with the store of
-// the source removes the rows of the source, and the source stops. Remove such
-// a copy without the store, for example with DestroyDir(). DestroyDB() without
-// the store returns NotSupported (see DestroyDB() in include/rocksdb/db.h).
+// DestroyDB() cannot tell a file copy of a store-mode folder from the source:
+// both have a stub with the same db id. So DestroyDB() of a copy with the
+// store of the source removes the rows of the source, and the source stops.
+// Remove such a copy without the store, for example with DestroyDir(). This
+// does not apply to rows with authority kShadow, which DestroyDB() keeps (see
+// DestroyManifestStoreRows()). DestroyDB() without the store returns
+// NotSupported (see DestroyDB() in include/rocksdb/db.h).
 //
 // A DB row without a db id (a placeholder DB row) is the row of an enter that
 // failed before its switch. It holds no metadata and belongs to no DB. The
@@ -7585,6 +7605,16 @@ IOStatus DestroyCheckedRows(ManifestStore* store,
 }
 
 // The stub rows of the table above.
+//
+// A DB row with authority kShadow is kept, as for a MANIFEST file. A finished
+// switch into store mode always writes kStore, and shadow mode never overwrites
+// kStore. So a kShadow row next to a stub belongs to a shadow DB with the same
+// db id, which can still be open or already closed. The db id cannot tell the
+// folder of that shadow DB from a checkpoint or a backup copy of it. For
+// example, a checkpoint of a shadow DB starts an enter that stops before its
+// switch, so the checkpoint keeps an "entering" stub. Then the source opens in
+// shadow mode again and writes kShadow rows. DestroyDB() of the checkpoint must
+// not remove the rows of the source.
 IOStatus DestroyManifestStoreRows(ManifestStore* store,
                                   const std::string& stub_db_id) {
   ManifestDbRowResult db_row;
@@ -7593,9 +7623,14 @@ IOStatus DestroyManifestStoreRows(ManifestStore* store,
   // row, or no DB row (commit sequence 0) after NotFound.
   ManifestStoreDestroyOptions opts;
   if (io_s.ok()) {
-    Status s = CheckManifestDbRowOwner(db_row.db_row, stub_db_id);
+    ManifestDbRowExtraFields extra_fields;
+    Status s = CheckManifestDbRowOwner(db_row.db_row, stub_db_id,
+                                       /*rows=*/nullptr, &extra_fields);
     if (!s.ok()) {
       return status_to_io_status(std::move(s));
+    }
+    if (extra_fields.authority == ManifestAuthority::kShadow) {
+      return IOStatus::OK();
     }
     opts.expected_commit_sequence = db_row.state.commit_sequence;
     opts.expected_last_commit_id = db_row.state.last_commit_id;
@@ -7625,7 +7660,11 @@ Status ReadFileModeDbId(FileSystem* fs, const std::string& dbname,
 
 // The MANIFEST file rows of the table above. After RollBackManifestStore(),
 // the rows of a DB stay in the store with authority kFile, and they stop a new
-// DB from being created on top of them (see ManifestStore::Destroy()).
+// DB from being created on top of them (see ManifestStore::Destroy()). The
+// rows that shadow mode wrote (authority kShadow) are kept: a copy of the DB
+// folder, such as a checkpoint, has the same db id, and its DestroyDB() must
+// never remove the rows of the source DB, which can still be open, or fence
+// it.
 IOStatus DestroyRolledBackRows(ManifestStore* store, const std::string& db_id) {
   if (db_id.empty()) {
     return IOStatus::OK();

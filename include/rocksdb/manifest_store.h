@@ -15,24 +15,29 @@
 //
 // Which source recovery trusts: recovery starts from the file that CURRENT
 // names in the DB folder.
-// - A normal MANIFEST file: file mode. Recovery reads that file.
+// - A normal MANIFEST file: file mode (a DB in shadow mode is also in file
+//   mode). Recovery reads that file.
 // - A done stub: store mode. Recovery reads the rows in the store.
 // - A creating or entering stub: a create or a move into the store that has
 //   not finished. A read-write open with the store finishes it. For an
 //   entering stub, the authority in the DB row says whether the switch
 //   happened.
 // The authority field of the DB row (ManifestAuthority) records which source
-// is the authority for the metadata of a DB. Its values are listed below.
-// This release supports kFile and kStore; the value of kShadow (1) is
-// reserved, so that stores can keep it. A rollback without the store
-// (RollBackManifestStore()) can leave a kStore row while CURRENT names the
-// restored MANIFEST file. Recovery then reads that file, and a later rollback
-// with the store sets the row to kFile.
+// is the authority for the metadata of a DB. Its values are listed below. A
+// rollback without the store (RollBackManifestStore()) can leave a kStore row
+// while CURRENT names the restored MANIFEST file. Recovery then reads that
+// file, and a later rollback with the store sets the row to kFile.
 // - kFile: the MANIFEST file is the authority, and recovery reads that file.
 //   CURRENT names it, or, during a move into the store that has not finished,
 //   CURRENT names an entering stub, and that stub names the MANIFEST file.
 // - kShadow: the MANIFEST file is the authority, and RocksDB also writes the
-//   rows to the store, so that the two can be compared.
+//   rows to the store, so that the two can be compared. CURRENT names the
+//   MANIFEST file, or, during a move into the store that has not finished, an
+//   entering stub. A kShadow row while CURRENT names an entering stub happens
+//   when a shadow instance (for example, of a copy of this folder) claims the
+//   DB row after the enter claimed it. The switch did not happen, because a
+//   switch always writes kStore and shadow mode never overwrites kStore. The
+//   MANIFEST file that the stub names holds the metadata.
 // - kStore: the rows in the store are the authority. CURRENT names a short
 //   stub MANIFEST file that identifies the DB, and recovery reads the metadata
 //   from the store. ManifestCopyMode says whether RocksDB also keeps a copy of
@@ -131,9 +136,10 @@ struct ManifestRow {
 
 // Which source holds the authoritative metadata of a DB. The DB row stores it
 // in ManifestDbField::kAuthority. These values and the ManifestCopyMode values
-// are fixed because stores keep them. RocksDB writes kFile and kStore, not
-// kShadow. A row reader returns NotSupported for an authority value that it
-// does not know, because a newer binary wrote it.
+// are fixed because stores keep them. RocksDB writes kFile and kStore, and
+// kShadow in shadow mode (DBOptions::manifest_store_shadow). A row reader
+// returns NotSupported for an authority value that it does not know, because a
+// newer binary wrote it.
 enum class ManifestAuthority : uint8_t {
   // The MANIFEST file, as without a store.
   kFile = 0,
@@ -492,6 +498,9 @@ std::string EncodeManifestRowFields(
 // existing file-mode DB starts to move into the store only in a read-write
 // DB::Open() with DBOptions::manifest_store_migrate. A later read-write
 // DB::Open() that finds an unfinished move finishes it, also without that
+// option. With DBOptions::manifest_store_shadow the DB stays in file mode
+// instead: the MANIFEST file stays the authority, and RocksDB sends the changes
+// of the MANIFEST writes to the store in the background, as described at that
 // option. The types below define what a store must do. The application creates
 // a store object for one DB, with its own key for the DB and the epoch.
 //
@@ -609,12 +618,29 @@ std::string EncodeManifestRowFields(
 // - Roll back to the MANIFEST file (RollBackManifestStore()): ReadDbRow(),
 //   then Open(). For a done stub it then calls Scan() and one Commit() that
 //   sets the authority to kFile. For an entering stub whose switch did not
-//   happen, the DB row still has kFile, so it makes no Commit(); its claim
-//   only replaces the last commit id and raises the commit sequence.
+//   happen, the DB row still has kFile, or kShadow when a DB in shadow mode
+//   claimed the row after the enter claimed it. The rollback makes no
+//   Commit(). Its claim only replaces the last commit id and raises the
+//   commit sequence. For a kShadow row, that last commit id can be a close
+//   id: a commit id that ends with "-close" (see the shadow mode entry
+//   below). A read-write DB::Open() of such a stub does not claim a kShadow
+//   row. It starts the enter again, and the enter accepts a kShadow row only
+//   when its last commit id is a close id.
 // - DestroyDB(): ReadDbRow() checks that the DB row belongs to this DB, then
-//   Destroy(), then RocksDB deletes the files. After a rollback, DestroyDB()
-//   of the DB in file mode also calls Destroy() when the rows have the db id
-//   of the DB and authority kFile.
+//   Destroy(), then RocksDB deletes the files. After a rollback, DestroyDB() of
+//   the DB in file mode also calls Destroy() when the rows have the db id of
+//   the DB and authority kFile. DestroyDB() keeps the rows that shadow mode
+//   wrote (authority kShadow); call Destroy() once no DB uses them.
+// - Shadow mode (DBOptions::manifest_store_shadow), where the DB stays in file
+//   mode: ReadDbRow(), then Open() (or Commit() with expected_commit_sequence 0
+//   when there is no DB row), then WriteGeneration(), then one Commit() for
+//   each round of changes. After a store error other than IOFenced or
+//   NotSupported, the next try (after the retry wait, at a MANIFEST write)
+//   starts again with ReadDbRow(). IOFenced and NotSupported stop shadow mode.
+//   No store error fails a MANIFEST write.
+//   The DB row has authority kShadow. The last commit at close has a commit id
+//   that ends with "-close" when the store is in sync, and DB::Open() with
+//   manifest_store_migrate checks for that suffix.
 // - The readers that do not claim, DB::OpenForReadOnly(),
 //   DB::ListColumnFamilies(), and secondary and follower instances
 //   (DB::OpenAsSecondary(), DB::OpenAsFollower()), use only Scan() and
@@ -813,6 +839,12 @@ struct ManifestGeneration {
 //                                Then ReadDbRow(): last_commit_id == "c"
 //                                means applied
 //
+// The meanings in this table hold in store mode and in shadow mode. The
+// paragraphs below about failed batches, resends and MANIFEST writes that wait
+// describe store mode. In shadow mode a store error never fails or delays a
+// MANIFEST write; the shadow mode entry in "Call order" says what RocksDB does
+// instead.
+//
 // TryAgain: the store did not apply this try and never will. This try did not
 // change the stored commit sequence, so the caller can send the same request
 // again, with the same expected commit sequence and commit id. Another writer
@@ -873,13 +905,14 @@ struct ManifestGeneration {
 // IOFenced also when its expected commit sequence is wrong.
 //
 // Threading and timeouts: RocksDB makes at most one call at a time on the
-// store object of one DB instance. DB::ListColumnFamilies(),
-// RollBackManifestStore() and DestroyDB() call the store from the caller's
-// thread, so do not pass them a store object that an open DB uses. Every call
-// must return in a bounded time (the store applies its own timeout), because
-// DB::Open() and DB::Close() wait for calls in flight. A method added to this
-// class has a default implementation that returns NotSupported, so that
-// existing stores still build.
+// store object of one DB instance. In shadow mode these calls come from a
+// background thread, and the last commit at close from the thread that closes
+// the DB. DB::ListColumnFamilies(), RollBackManifestStore() and DestroyDB()
+// call the store from the caller's thread, so do not pass them a store object
+// that an open DB uses. Every call must return in a bounded time (the store
+// applies its own timeout), because DB::Open() and DB::Close() wait for calls
+// in flight. A method added to this class has a default implementation that
+// returns NotSupported, so that existing stores still build.
 class ManifestStore : public Customizable {
  public:
   ~ManifestStore() override = default;
@@ -1035,7 +1068,8 @@ class ManifestStore : public Customizable {
 //                     rows; DB row set to kFile     sync-marked copy
 //   "entering" stub   CURRENT back to the MANIFEST  InvalidArgument
 //                     file if the switch did not
-//                     happen; else InvalidArgument
+//                     happen (DB row kFile or
+//                     kShadow); else InvalidArgument
 //                     (open the DB read-write to
 //                     finish)
 //   "creating" stub   InvalidArgument (open the DB read-write to finish)

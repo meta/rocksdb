@@ -433,6 +433,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       {offsetof(struct DBOptions, manifest_store_migrate), sizeof(bool)},
       {offsetof(struct DBOptions, manifest_store_copy_mode),
        sizeof(ManifestCopyMode)},
+      {offsetof(struct DBOptions, manifest_store_shadow), sizeof(bool)},
   };
 
   char* options_ptr = new char[sizeof(DBOptions)];

@@ -818,6 +818,22 @@ class UnsafeRemoveSstFileCommand : public LDBCommand {
   uint64_t sst_file_number_;
 };
 
+// Compares the rows that shadow mode (DBOptions::manifest_store_shadow) wrote
+// to a ManifestStore with the MANIFEST of a closed DB, with
+// CompareManifestStoreWithManifest(). It prints each difference and fails when
+// there is one.
+class CompareManifestStoreCommand : public LDBCommand {
+ public:
+  static std::string Name() { return "compare_manifest_store"; }
+
+  CompareManifestStoreCommand(const std::vector<std::string>& params,
+                              const std::map<std::string, std::string>& options,
+                              const std::vector<std::string>& flags);
+  static void Help(std::string& ret);
+  void DoCommand() override;
+  bool NoDBOpen() override { return true; }
+};
+
 class CompactionProgressDumpCommand : public LDBCommand {
  public:
   static std::string Name() { return "compaction_progress_dump"; }
