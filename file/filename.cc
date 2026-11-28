@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstdio>
+#include <memory>
 #include <vector>
 
 #include "file/file_util.h"
@@ -465,35 +466,34 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
   Slice contents = manifest;
   assert(contents.starts_with(dbname + "/"));
   contents.remove_prefix(dbname.size() + 1);
-  std::string tmp = TempFileName(dbname, descriptor_number);
   IOOptions opts;
   IOStatus s = PrepareIOFromWriteOptions(write_options, opts);
   opts.type = IOType::kMetadata;
   FileOptions file_opts;
   file_opts.temperature = temp;
   file_opts.io_options.type = IOType::kMetadata;
-  if (s.ok()) {
-    s = WriteStringToFile(fs, contents.ToString() + "\n", tmp, true, opts,
-                          file_opts);
+  const bool atomic_replace_on_close = fs->SupportsAtomicReplaceOnClose();
+  if (s.ok() && atomic_replace_on_close) {
+    // The caller has just created the MANIFEST that CURRENT names, in
+    // `dbname`. A direct write makes CURRENT durable at Close(), before the
+    // directory sync that follows the write. So the directory entry of the
+    // MANIFEST must be made durable first. Otherwise a crash could leave a
+    // durable CURRENT that names a MANIFEST the directory has lost. This sync
+    // opens `dbname` itself, because dir_contains_current_file can be nullptr
+    // or another directory, for example a cf_paths directory, while the
+    // MANIFEST is always in `dbname`.
+    s = SyncDirectoryAtPath(fs, dbname, opts,
+                            DirFsyncOptions(DirFsyncOptions::kNewFileSynced));
   }
-  TEST_SYNC_POINT_CALLBACK("SetCurrentFile:BeforeRename", &s);
   if (s.ok()) {
-    TEST_KILL_RANDOM_WITH_WEIGHT("SetCurrentFile:0", REDUCE_ODDS2);
-    s = fs->RenameFile(tmp, CurrentFileName(dbname), opts, nullptr);
-    TEST_KILL_RANDOM_WITH_WEIGHT("SetCurrentFile:1", REDUCE_ODDS2);
-    TEST_SYNC_POINT_CALLBACK("SetCurrentFile:AfterRename", &s);
-  }
-  if (s.ok()) {
-    if (dir_contains_current_file != nullptr) {
-      s = dir_contains_current_file->FsyncWithDirOptions(
-          opts, nullptr, DirFsyncOptions(CurrentFileName(dbname)));
-    }
-  } else {
-    fs->DeleteFile(tmp, opts, nullptr)
-        .PermitUncheckedError();  // NOTE: PermitUncheckedError is acceptable
-                                  // here as we are already handling an error
-                                  // case, and this is just a best-attempt
-                                  // effort at some cleanup
+    AtomicFileWriteOptions atomic_opts;
+    atomic_opts.atomic_replace_on_close = atomic_replace_on_close;
+    atomic_opts.temp_name = TempFileName(dbname, descriptor_number);
+    atomic_opts.dir = dir_contains_current_file;
+    atomic_opts.sync_point_prefix = "SetCurrentFile";
+    s = NewAtomicFileWriter(fs, atomic_opts)
+            ->Write(CurrentFileName(dbname), contents.ToString() + "\n", opts,
+                    file_opts);
   }
   return s;
 }
@@ -508,49 +508,24 @@ Status SetIdentityFile(const WriteOptions& write_options, Env* env,
     id = db_id;
   }
   assert(!id.empty());
-  // Reserve the filename dbname/000000.dbtmp for the temporary identity file
-  std::string tmp = TempFileName(dbname, 0);
-  std::string identify_file_name = IdentityFileName(dbname);
-  Status s;
   IOOptions opts;
-  s = PrepareIOFromWriteOptions(write_options, opts);
+  IOStatus s = PrepareIOFromWriteOptions(write_options, opts);
   opts.type = IOType::kMetadata;
   FileOptions file_opts;
   file_opts.temperature = temp;
   file_opts.io_options.type = IOType::kMetadata;
   if (s.ok()) {
-    s = WriteStringToFile(env->GetFileSystem().get(), id, tmp,
-                          /*should_sync=*/true, opts, file_opts);
-  }
-  if (s.ok()) {
-    // Env::RenameFile() takes no IOOptions, so this rename is not tagged with
-    // IOType::kMetadata. It stays on Env so that Env overrides still apply.
-    s = env->RenameFile(tmp, identify_file_name);
-  }
-  std::unique_ptr<FSDirectory> dir_obj;
-  if (s.ok()) {
-    s = env->GetFileSystem()->NewDirectory(dbname, opts, &dir_obj, nullptr);
-  }
-  if (s.ok()) {
-    s = dir_obj->FsyncWithDirOptions(opts, nullptr,
-                                     DirFsyncOptions(identify_file_name));
-  }
-
-  // The default Close() could return "NotSupported" and we bypass it
-  // if it is not impelmented. Detailed explanations can be found in
-  // db/db_impl/db_impl.h
-  if (s.ok()) {
-    Status temp_s = dir_obj->Close(opts, nullptr);
-    if (!temp_s.ok()) {
-      if (temp_s.IsNotSupported()) {
-        temp_s.PermitUncheckedError();
-      } else {
-        s = temp_s;
-      }
-    }
-  }
-  if (!s.ok()) {
-    env->DeleteFile(tmp).PermitUncheckedError();
+    AtomicFileWriteOptions atomic_opts;
+    atomic_opts.atomic_replace_on_close =
+        env->GetFileSystem()->SupportsAtomicReplaceOnClose();
+    // IDENTITY uses temp file number 0 (000000.dbtmp). File numbers of a DB
+    // start at 1, so no other file uses this name.
+    atomic_opts.temp_name = TempFileName(dbname, 0);
+    // Rename and delete through Env so that Env overrides apply.
+    atomic_opts.env = env;
+    atomic_opts.dir_path_to_open = dbname;
+    s = NewAtomicFileWriter(env->GetFileSystem().get(), atomic_opts)
+            ->Write(IdentityFileName(dbname), id, opts, file_opts);
   }
   return s;
 }

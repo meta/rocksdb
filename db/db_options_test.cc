@@ -2075,6 +2075,237 @@ TEST_F(DBOptionsTest, SetOptionsRewritesOptionsFileAfterWriteFailure) {
   ASSERT_FALSE(SetOptionsWritesOptionsFile(db_->DefaultColumnFamily(), opts));
 }
 
+// FileSystem that fails one step of writing an OPTIONS file with an IOError.
+// The steps are "open", "append", "fsync" and "close" of the temp file,
+// "read back" (opening the temp file to verify it), "rename" of the temp file
+// and "dir sync" (the directory sync for the new OPTIONS file). Separately, it
+// can fail each delete of an OPTIONS temp file.
+class OptionsFileFailFS : public FileSystemWrapper {
+ public:
+  explicit OptionsFileFailFS(const std::shared_ptr<FileSystem>& base)
+      : FileSystemWrapper(base) {}
+  const char* Name() const override { return "OptionsFileFailFS"; }
+
+  void SetFailStep(const std::string& step) { fail_step_ = step; }
+  void SetFailTempDelete(bool fail) { fail_temp_delete_ = fail; }
+
+  IOStatus MaybeFail(const std::string& step) const {
+    if (step == fail_step_) {
+      return IOStatus::IOError("injected OPTIONS failure: " + step);
+    }
+    return IOStatus::OK();
+  }
+
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    if (!IsOptionsTempFile(fname)) {
+      return target()->NewWritableFile(fname, file_opts, result, dbg);
+    }
+    IOStatus s = MaybeFail("open");
+    if (s.ok()) {
+      s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    }
+    if (s.ok()) {
+      result->reset(new FailFile(this, std::move(*result)));
+    }
+    return s;
+  }
+
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override {
+    if (IsOptionsTempFile(fname)) {
+      IOStatus s = MaybeFail("read back");
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    return target()->NewSequentialFile(fname, file_opts, result, dbg);
+  }
+
+  IOStatus RenameFile(const std::string& src, const std::string& dst,
+                      const IOOptions& options, IODebugContext* dbg) override {
+    if (IsOptionsTempFile(src)) {
+      IOStatus s = MaybeFail("rename");
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    return target()->RenameFile(src, dst, options, dbg);
+  }
+
+  IOStatus DeleteFile(const std::string& fname, const IOOptions& options,
+                      IODebugContext* dbg) override {
+    if (fail_temp_delete_ && IsOptionsTempFile(fname)) {
+      return IOStatus::IOError("injected OPTIONS temp file delete failure");
+    }
+    return target()->DeleteFile(fname, options, dbg);
+  }
+
+  IOStatus NewDirectory(const std::string& name, const IOOptions& io_opts,
+                        std::unique_ptr<FSDirectory>* result,
+                        IODebugContext* dbg) override {
+    IOStatus s = target()->NewDirectory(name, io_opts, result, dbg);
+    if (s.ok()) {
+      result->reset(new FailDirectory(this, std::move(*result)));
+    }
+    return s;
+  }
+
+ private:
+  static bool IsOptionsTempFile(const std::string& fname) {
+    return fname.find("/OPTIONS-") != std::string::npos &&
+           Slice(fname).ends_with(".dbtmp");
+  }
+
+  class FailFile : public FSWritableFileOwnerWrapper {
+   public:
+    FailFile(const OptionsFileFailFS* fs, std::unique_ptr<FSWritableFile>&& f)
+        : FSWritableFileOwnerWrapper(std::move(f)), fs_(fs) {}
+    using FSWritableFileOwnerWrapper::Append;
+    IOStatus Append(const Slice& data, const IOOptions& options,
+                    IODebugContext* dbg) override {
+      IOStatus s = fs_->MaybeFail("append");
+      if (!s.ok()) {
+        return s;
+      }
+      return target()->Append(data, options, dbg);
+    }
+    IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override {
+      IOStatus s = fs_->MaybeFail("fsync");
+      if (!s.ok()) {
+        return s;
+      }
+      return target()->Fsync(options, dbg);
+    }
+    IOStatus Close(const IOOptions& options, IODebugContext* dbg) override {
+      IOStatus s = fs_->MaybeFail("close");
+      if (!s.ok()) {
+        return s;
+      }
+      return target()->Close(options, dbg);
+    }
+
+   private:
+    const OptionsFileFailFS* fs_;
+  };
+
+  class FailDirectory : public FSDirectoryWrapper {
+   public:
+    FailDirectory(const OptionsFileFailFS* fs, std::unique_ptr<FSDirectory>&& d)
+        : FSDirectoryWrapper(std::move(d)), fs_(fs) {}
+    IOStatus FsyncWithDirOptions(
+        const IOOptions& options, IODebugContext* dbg,
+        const DirFsyncOptions& dir_fsync_options) override {
+      if (dir_fsync_options.renamed_new_name.find("/OPTIONS-") !=
+          std::string::npos) {
+        IOStatus s = fs_->MaybeFail("dir sync");
+        if (!s.ok()) {
+          return s;
+        }
+      }
+      return FSDirectoryWrapper::FsyncWithDirOptions(options, dbg,
+                                                     dir_fsync_options);
+    }
+
+   private:
+    const OptionsFileFailFS* fs_;
+  };
+
+  std::string fail_step_;
+  bool fail_temp_delete_ = false;
+};
+
+// A failure at any step of an OPTIONS file write fails SetOptions() and leaves
+// no temp file. A failure before the rename keeps the previous OPTIONS file as
+// the latest one. A directory sync failure comes after the rename, so the new
+// OPTIONS file exists. The next SetOptions() writes a new OPTIONS file.
+TEST_F(DBOptionsTest, OptionsFileWriteFailureAtEachStep) {
+  auto fs = std::make_shared<OptionsFileFailFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env = NewCompositeEnv(fs);
+  // Close the DB before env is destroyed, also when an assertion fails.
+  Defer close_db([this]() { Close(); });
+  Options options = CurrentOptions();
+  options.env = env.get();
+  Reopen(options);
+
+  struct Case {
+    std::string step;
+    bool renamed;
+  };
+  const std::vector<Case> cases = {
+      {"open", false},    {"append", false},    {"fsync", false},
+      {"close", false},   {"read back", false}, {"rename", false},
+      {"dir sync", true},
+  };
+  // Start at 1 MB and add 1 KB before each SetOptions() call, so that every
+  // call changes the value and must write a new OPTIONS file.
+  size_t write_buffer_size = 1 << 20;
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.step);
+    const std::string file_before = LatestOptionsFileName();
+    write_buffer_size += 1024;
+    const std::unordered_map<std::string, std::string> opts = {
+        {"write_buffer_size", std::to_string(write_buffer_size)}};
+    fs->SetFailStep(c.step);
+    const Status s = db_->SetOptions(opts);
+    fs->SetFailStep("");
+    ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+
+    ASSERT_EQ(c.renamed, LatestOptionsFileName() != file_before);
+    std::vector<std::string> children;
+    ASSERT_OK(env_->GetChildren(dbname_, &children));
+    for (const std::string& child : children) {
+      ASSERT_FALSE(Slice(child).ends_with(".dbtmp")) << child;
+    }
+
+    write_buffer_size += 1024;
+    ASSERT_TRUE(SetOptionsWritesOptionsFile(
+        db_->DefaultColumnFamily(),
+        {{"write_buffer_size", std::to_string(write_buffer_size)}}));
+    ASSERT_EQ(PersistedCFOptions(kDefaultColumnFamilyName).write_buffer_size,
+              write_buffer_size);
+  }
+}
+
+// When an OPTIONS write fails and the delete of its temp file fails too, the
+// DB logs a warning to its info log, because the obsolete file cleanup does
+// not remove an OPTIONS temp file.
+TEST_F(DBOptionsTest, OptionsTempFileDeleteFailureIsLogged) {
+  auto fs = std::make_shared<OptionsFileFailFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env = NewCompositeEnv(fs);
+  // Close the DB before env is destroyed, also when an assertion fails.
+  Defer close_db([this]() { Close(); });
+  auto logger = std::make_shared<test::MessageCollectingLogger>();
+  Options options = CurrentOptions();
+  options.env = env.get();
+  options.info_log = logger;
+  Reopen(options);
+
+  fs->SetFailStep("close");
+  fs->SetFailTempDelete(true);
+  const Status s = db_->SetOptions({{"write_buffer_size", "2097152"}});
+  fs->SetFailStep("");
+  fs->SetFailTempDelete(false);
+  ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+  ASSERT_EQ(1, logger->CountMessagesWith("Unable to delete temp file"));
+
+  // Remove the temp file that the failed delete left.
+  std::vector<std::string> children;
+  ASSERT_OK(env_->GetChildren(dbname_, &children));
+  int temp_files = 0;
+  for (const std::string& child : children) {
+    if (Slice(child).ends_with(".dbtmp")) {
+      ++temp_files;
+      ASSERT_OK(env_->DeleteFile(dbname_ + "/" + child));
+    }
+  }
+  ASSERT_EQ(1, temp_files);
+}
+
 TEST_F(DBOptionsTest, SetDBOptionsRewritesStaleOptionsFile) {
   auto fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
   std::unique_ptr<Env> env = NewCompositeEnv(fs);

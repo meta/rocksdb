@@ -34,6 +34,37 @@ enum OptionSection : char {
 static const std::string opt_section_titles[] = {
     "Version", "DBOptions", "CFOptions", "TableOptions/", "Unknown"};
 
+// Returns the ConfigOptions that RocksDB uses to write and verify the OPTIONS
+// file of a DB with options `db_opt`.
+ConfigOptions OptionsFileConfigOptions(const DBOptions& db_opt);
+
+// Clears `contents`, then writes the text of an OPTIONS file with the given
+// options into it. `config_options` controls the serialization, except for
+// the delimiter, which is always a new line followed by two spaces, because
+// the OPTIONS file has one option per indented line. Returns InvalidArgument
+// if `cf_names` and `cf_opts` differ in size. On an error, `contents` may hold
+// partial text, and the caller must not write it.
+Status SerializeRocksDBOptions(const ConfigOptions& config_options,
+                               const DBOptions& db_opt,
+                               const std::vector<std::string>& cf_names,
+                               const std::vector<ColumnFamilyOptions>& cf_opts,
+                               std::string* contents);
+
+// Checks that `contents`, the text of an OPTIONS file from
+// SerializeRocksDBOptions(), parses back to the given options, without
+// writing a file. Returns OK when it does, and the error of the parse or the
+// compare otherwise. DBImpl::PersistOptionsFile() uses it before a direct
+// write, after which the new file is visible at once.
+Status VerifySerializedRocksDBOptions(
+    const ConfigOptions& config_options, const DBOptions& db_opt,
+    const std::vector<std::string>& cf_names,
+    const std::vector<ColumnFamilyOptions>& cf_opts,
+    const std::string& contents);
+
+// Writes the OPTIONS file directly under `file_name`, with no temp file, and
+// then reads it back to verify it. Subset checkpoints and
+// utilities/db_split_merge.cc use it. DBImpl::PersistOptionsFile() does not use
+// it: it writes the DB OPTIONS file with AtomicFileWriter (file/file_util.h).
 Status PersistRocksDBOptions(const WriteOptions& write_options,
                              const DBOptions& db_opt,
                              const std::vector<std::string>& cf_names,
