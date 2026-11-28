@@ -43,26 +43,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-namespace {
-
-bool HasFullTimestampVisibility(const ReadOptions& read_options) {
-  if (read_options.iter_start_ts != nullptr) {
-    return false;
-  }
-  if (read_options.timestamp == nullptr) {
-    return true;
-  }
-  const Slice ts = *read_options.timestamp;
-  for (size_t i = 0; i < ts.size(); ++i) {
-    if (static_cast<unsigned char>(ts[i]) != 0xff) {
-      return false;
-    }
-  }
-  return true;
-}
-
-}  // namespace
-
 DBIter::DBIter(Env* _env, const ReadOptions& read_options,
                const ImmutableOptions& ioptions,
                const MutableCFOptions& mutable_cf_options,
@@ -127,17 +107,22 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
           GetIteratorPrefixMode(read_options, prefix_extractor_ != nullptr) !=
           IteratorPrefixMode::kPrefix),
       // Read-path range conversion assumes the scan can observe all interior
-      // live keys. table_filter can hide whole SSTs, read tiers other than
-      // kReadAllTier can skip SSTs or uncached blocks, and timestamp filtering
-      // can hide newer UDT versions unless the read is at max timestamp with no
-      // lower timestamp bound. Legacy prefix iterators without
-      // prefix_same_as_start do not guarantee complete scans, so conversion
-      // must stay disabled for the iterator lifetime.
+      // live keys. table_filter can hide whole SSTs, and read tiers other than
+      // kReadAllTier can skip SSTs or uncached blocks. Legacy prefix iterators
+      // without prefix_same_as_start do not guarantee complete scans, so
+      // conversion must stay disabled for the iterator lifetime. With
+      // user-defined timestamps, conversion is off for every read. A reader at
+      // timestamp T sees the range tombstones whose end key has a timestamp at
+      // or below T, and a converted range tombstone gets the timestamp of its
+      // end key, which can be older than the timestamps of the deletes that it
+      // replaces. A reader at an older timestamp would then see the converted
+      // range tombstone but not those deletes, and miss keys that it should
+      // read.
       min_tombstones_for_range_conversion_(
-          active_mem != nullptr && !HasTableFilter(read_options) &&
+          active_mem != nullptr && timestamp_size_ == 0 &&
+                  !HasTableFilter(read_options) &&
                   read_options.read_tier == kReadAllTier &&
-                  (expect_total_order_inner_iter_ || prefix_same_as_start_) &&
-                  HasFullTimestampVisibility(read_options)
+                  (expect_total_order_inner_iter_ || prefix_same_as_start_)
               ? mutable_cf_options.min_tombstones_for_range_conversion
               : 0),
       expose_blob_index_(expose_blob_index),

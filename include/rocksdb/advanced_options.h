@@ -1441,8 +1441,9 @@ struct AdvancedColumnFamilyOptions {
   //
   // This optimization is best-effort and is currently disabled for iterator
   // configurations that may not expose all interior live keys, including:
-  // * user-defined timestamp reads without full visibility (for example,
-  //   ReadOptions::iter_start_ts or a non-max ReadOptions::timestamp)
+  // * column families with user-defined timestamps, because a converted range
+  //   tombstone gets the timestamp of its end key, and a read at an older
+  //   timestamp could then miss keys
   // * prefix extractor reads that are neither total-order
   //   (ReadOptions::total_order_seek / ReadOptions::auto_prefix_mode) nor
   //   bounded by ReadOptions::prefix_same_as_start
