@@ -80,6 +80,7 @@ LIB_SOURCES =                                                   \
   db/log_writer.cc                                              \
   db/malloc_stats.cc                                            \
   db/manifest_ops.cc                                            \
+  db/manifest_rows.cc                                           \
   db/memtable.cc                                                \
   db/memtable_list.cc                                           \
   db/merge_helper.cc                                            \
@@ -440,6 +441,7 @@ STRESS_LIB_SOURCES =                                           \
 TEST_LIB_SOURCES =                                              \
   db/db_test_util.cc                                            \
   db/db_with_timestamp_test_util.cc                             \
+  test_util/mock_manifest_store.cc                              \
   test_util/mock_time_env.cc                                    \
   test_util/simple_external_table_factory.cc                    \
   test_util/secondary_cache_test_util.cc                        \
