@@ -7975,6 +7975,46 @@ TEST_P(ReadPathRangeTombstoneTest, SingleDeleteOnlyRun) {
       1);
 }
 
+// With a threshold of 1, a run of one point tombstone can end at its own key,
+// and the range from that key to itself covers nothing. In this test, "a" is
+// live and "b" is deleted. Forward, the scan reaches the end of the data after
+// the tombstone at "b", so the range would be ["b", "b"). Reverse,
+// SeekForPrev("b") lands on the tombstone at "b", and the range would end at
+// the seek target "b". The scan inserts nothing in both directions.
+TEST_P(ReadPathRangeTombstoneTest, RunEndingAtItsOwnKeyInsertsNothing) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 1;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("b"));
+
+  attempted_insert_ranges_.clear();
+  {
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ReadOptions()));
+    if (Forward()) {
+      iter->Seek("a");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key());
+      iter->Next();
+    } else {
+      iter->SeekForPrev("b");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key());
+      iter->Prev();
+    }
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0u);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+      1);
+}
+
 TEST_P(ReadPathRangeTombstoneTest, PrefixFilterDefaultReadOptions) {
   // total_order_seek=false (default) with prefix extractor. Even when the
   // visible scan contains a valid in-prefix tombstone run [ba, bc), read-path
@@ -8091,10 +8131,9 @@ TEST_P(ReadPathRangeTombstoneTest, PrefixFilterTotalOrderSeek) {
     }
     ASSERT_OK(it->status());
     // Tombstone crosses from prefix 'b' into 'c', terminated by live "cb".
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
-    if (use_udt) {
-      AssertRange(0, std::string("ba") + ts, std::string("cb") + ts);
-    } else {
+    // With user-defined timestamps, no read converts.
+    ASSERT_EQ(attempted_insert_ranges_.size(), use_udt ? 0u : 1u);
+    if (!use_udt) {
       AssertRange(0, "ba", "cb");
     }
   }
@@ -8169,15 +8208,13 @@ TEST_P(ReadPathRangeTombstoneTest, PrefixFilterPrefixSameAsStart) {
         ASSERT_FALSE(it->Valid());
       }
       ASSERT_OK(it->status());
-      ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
+      // With user-defined timestamps, no read converts.
+      const uint64_t expected_insertions = use_udt ? 0 : 1;
+      ASSERT_EQ(attempted_insert_ranges_.size(), expected_insertions);
       ASSERT_EQ(options.statistics->getTickerCount(
                     READ_PATH_RANGE_TOMBSTONES_INSERTED),
-                1u);
-      if (use_udt) {
-        const std::string end_ts =
-            Forward() ? ts : std::string(sizeof(uint64_t), '\0');
-        AssertRange(0, std::string("ba") + ts, std::string("bb") + end_ts);
-      } else {
+                expected_insertions);
+      if (!use_udt) {
         AssertRange(0, "ba", "bb");
       }
       if (use_udt) {
@@ -8634,49 +8671,72 @@ TEST_P(ReadPathRangeTombstoneTest, SkipInsertionWhenCoveredByExistingRange) {
       0);
 }
 
-// Verifies that range tombstone insertion works correctly with user-defined
-// timestamps (UDT) when the read timestamp has full visibility. With UDT, keys
-// include an 8-byte timestamp suffix, so the comparator, Put/Delete APIs, and
-// ReadOptions all require timestamps. This test keeps the optimization enabled
-// by reading at the max timestamp.
-TEST_P(ReadPathRangeTombstoneTest, UDTBasicScan) {
+// With user-defined timestamps (UDT), a reader at timestamp T sees the range
+// tombstones whose end key has a timestamp at or below T. A converted range
+// tombstone would get the timestamp of its end key. In this test, "a" to "h"
+// are written at timestamp 1 and "b" to "f" are deleted at timestamp 2. In
+// both directions, a conversion by a scan at the max timestamp would insert
+// ["b"@2, "g"@1). Its end key has timestamp 1, so a read at timestamp 1 would
+// see it and miss "b" to "f". So no read converts in a column family with UDT.
+TEST_P(ReadPathRangeTombstoneTest, UDTOlderTimestampReadAfterMaxTimestampScan) {
   Options options = CurrentOptions();
   options.min_tombstones_for_range_conversion = 4;
   options.statistics = CreateDBStatistics();
   options.comparator = test::BytewiseComparatorWithU64TsWrapper();
   DestroyAndReopen(options);
 
-  std::string ts;
-  PutFixed64(&ts, 1);
-  Slice ts_slice(ts);
-  std::string read_ts;
-  Slice read_ts_slice = MaxTimestamp(&read_ts);
-  SetupTestData('a', 'h', /*flushed_point_dels=*/{},
-                /*memtable_point_dels=*/{"b", "c", "d", "e", "f"}, &ts_slice);
-
-  ReadOptions ro;
-  ro.timestamp = &read_ts_slice;
-  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
-  std::vector<std::string> keys;
-  if (Forward()) {
-    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-      keys.push_back(iter->key().ToString());
-    }
-  } else {
-    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
-      keys.push_back(iter->key().ToString());
-    }
-    std::reverse(keys.begin(), keys.end());
+  std::string ts1;
+  std::string ts2;
+  PutFixed64(&ts1, 1);
+  PutFixed64(&ts2, 2);
+  Slice ts1_slice(ts1);
+  Slice ts2_slice(ts2);
+  std::string max_ts;
+  Slice max_ts_slice = MaxTimestamp(&max_ts);
+  for (char c = 'a'; c <= 'h'; c++) {
+    ASSERT_OK(db_->Put(WriteOptions(), std::string(1, c), ts1_slice,
+                       std::string("v") + c));
   }
-  ASSERT_OK(iter->status());
-  ASSERT_EQ(keys, (std::vector<std::string>{"a", "g", "h"}));
+  ASSERT_OK(Flush());
+  for (char c = 'b'; c <= 'f'; c++) {
+    ASSERT_OK(db_->Delete(WriteOptions(), std::string(1, c), ts2_slice));
+  }
 
-  // Range covers [b+ts, g+ts).
-  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-  AssertRange(0, std::string("b") + ts, std::string("g") + ts);
+  // The scan at the max timestamp steps over the five deletes.
+  ReadOptions latest_ro;
+  latest_ro.timestamp = &max_ts_slice;
+  {
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(latest_ro));
+    if (Forward()) {
+      iter->Seek("a");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key());
+      iter->Next();
+    } else {
+      iter->SeekForPrev("g");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("g", iter->key());
+      iter->Prev();
+    }
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(Forward() ? "g" : "a", iter->key());
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0u);
   ASSERT_EQ(
       options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-      1);
+      0);
+
+  // A read at timestamp 1 does not see the deletes, so it finds every key.
+  ReadOptions old_ro;
+  old_ro.timestamp = &ts1_slice;
+  for (char c = 'a'; c <= 'h'; c++) {
+    std::string value;
+    ASSERT_OK(db_->Get(old_ro, std::string(1, c), &value));
+    ASSERT_EQ(std::string("v") + c, value);
+  }
+  VerifyIteration({"a", "b", "c", "d", "e", "f", "g", "h"}, old_ro);
+  VerifyIteration({"a", "g", "h"}, latest_ro);
 }
 
 // Regression test: an older UDT read timestamp can hide newer live versions
@@ -8727,70 +8787,6 @@ TEST_P(ReadPathRangeTombstoneTest, UDTOlderTimestampDisablesInsertion) {
   ReadOptions latest_ro;
   latest_ro.timestamp = &max_ts_slice;
   VerifyIteration({"a", "b", "c", "d"}, latest_ro);
-}
-
-// When UDT is enabled and iteration exhausts with tombstones at the boundary,
-// range tombstone insertion should still work if the read sees all timestamps.
-// For forward exhaustion, the iterate_upper_bound is padded with the min
-// timestamp to form a valid end key. For reverse exhaustion, the end key comes
-// from the next live key which already has the timestamp suffix.
-TEST_P(ReadPathRangeTombstoneTest, ExhaustedWithUDT) {
-  Options options = CurrentOptions();
-  options.min_tombstones_for_range_conversion = 4;
-  options.statistics = CreateDBStatistics();
-  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
-  DestroyAndReopen(options);
-
-  std::string ts;
-  PutFixed64(&ts, 1);
-  Slice ts_slice(ts);
-  std::string read_ts;
-  Slice read_ts_slice = MaxTimestamp(&read_ts);
-  std::string min_ts(sizeof(uint64_t), '\0');
-
-  // Forward: tombstones at end (e-h), needs upper bound for end key.
-  // Reverse: tombstones at start (a-d), end key from live key "e".
-  if (Forward()) {
-    SetupTestData('a', 'h', /*flushed_point_dels=*/{},
-                  /*memtable_point_dels=*/{"e", "f", "g", "h"}, &ts_slice);
-  } else {
-    SetupTestData('a', 'h', /*flushed_point_dels=*/{},
-                  /*memtable_point_dels=*/{"a", "b", "c", "d"}, &ts_slice);
-  }
-
-  ReadOptions ro;
-  ro.timestamp = &read_ts_slice;
-  std::string upper_str = "z";
-  Slice upper(upper_str);
-  if (Forward()) {
-    ro.iterate_upper_bound = &upper;
-  }
-  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
-  std::vector<std::string> keys;
-  if (Forward()) {
-    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-      keys.push_back(iter->key().ToString());
-    }
-  } else {
-    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
-      keys.push_back(iter->key().ToString());
-    }
-    std::reverse(keys.begin(), keys.end());
-  }
-  ASSERT_OK(iter->status());
-  ASSERT_EQ(keys.size(), 4);
-
-  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-  if (Forward()) {
-    // Forward exhaustion past h: saved_key_="h"+ts fallback -> [e+ts, h+ts).
-    AssertRange(0, std::string("e") + ts, std::string("h") + ts);
-  } else {
-    // Reverse exhaustion: range is [a+ts, e+ts).
-    AssertRange(0, std::string("a") + ts, std::string("e") + ts);
-  }
-  ASSERT_EQ(
-      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-      1);
 }
 
 TEST_P(ReadPathRangeTombstoneTest, SeekForPrevTombstone) {
@@ -8844,26 +8840,17 @@ TEST_P(ReadPathRangeTombstoneTest, SeekForPrevTombstone) {
     ASSERT_OK(iter->status());
     ASSERT_EQ(keys, (std::vector<std::string>{"a", "b", "c", "d"}));
 
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-    if (Forward()) {
-      // Forward exhausts past h -> saved_key_="h" fallback -> [e, h),
-      // covering e,f,g with h as a point tombstone.
-      if (use_udt) {
-        AssertRange(0, std::string("e") + ts, std::string("h") + ts);
-      } else {
-        AssertRange(0, "e", "h");
-      }
-    } else {
-      if (use_udt) {
-        std::string min_ts(sizeof(uint64_t), '\0');
-        AssertRange(0, std::string("e") + ts, std::string("h") + min_ts);
-      } else {
-        AssertRange(0, "e", "h");
-      }
+    // With user-defined timestamps, no read converts. Without them, forward
+    // exhausts past h -> saved_key_="h" fallback -> [e, h), covering e,f,g
+    // with h as a point tombstone; reverse ends at the seek target "h".
+    const uint64_t expected_insertions = use_udt ? 0 : 1;
+    ASSERT_EQ(attempted_insert_ranges_.size(), expected_insertions);
+    if (!use_udt) {
+      AssertRange(0, "e", "h");
     }
     ASSERT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-        1);
+        expected_insertions);
   }
 }
 
@@ -8923,23 +8910,15 @@ TEST_P(ReadPathRangeTombstoneTest, UpperBoundTombstone) {
     ASSERT_OK(iter->status());
     ASSERT_EQ(keys, (std::vector<std::string>{"a", "b", "c", "d"}));
 
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-    if (use_udt) {
-      if (Forward()) {
-        // Forward end key: saved_key_ ("h") with the tombstone's own ts.
-        AssertRange(0, std::string("e") + ts, std::string("h") + ts);
-      } else {
-        // Reverse end key: upper bound padded with max_ts (via
-        // SetSavedKeyToSeekForPrevTarget).
-        std::string end_ts(sizeof(uint64_t), '\xff');
-        AssertRange(0, std::string("e") + ts, std::string("i") + end_ts);
-      }
-    } else {
+    // With user-defined timestamps, no read converts.
+    const uint64_t expected_insertions = use_udt ? 0 : 1;
+    ASSERT_EQ(attempted_insert_ranges_.size(), expected_insertions);
+    if (!use_udt) {
       AssertRange(0, "e", Forward() ? "h" : "i");
     }
     ASSERT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-        1);
+        expected_insertions);
   }
 }
 
@@ -9000,16 +8979,16 @@ TEST_P(ReadPathRangeTombstoneTest, LowerBoundTruncatesReverse) {
     ASSERT_OK(iter->status());
     ASSERT_EQ(keys, (std::vector<std::string>{"i", "j"}));
 
-    // Both directions produce one range covering tombstones e-h.
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-    if (use_udt) {
-      AssertRange(0, std::string("e") + ts, std::string("i") + ts);
-    } else {
+    // Without user-defined timestamps, both directions produce one range
+    // covering tombstones e-h. With them, no read converts.
+    const uint64_t expected_insertions = use_udt ? 0 : 1;
+    ASSERT_EQ(attempted_insert_ranges_.size(), expected_insertions);
+    if (!use_udt) {
       AssertRange(0, "e", "i");
     }
     ASSERT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-        1);
+        expected_insertions);
   }
 }
 
