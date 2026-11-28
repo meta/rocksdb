@@ -1,0 +1,1 @@
+Fixed a bug where inconsistent internal accounting in an LRU cache shard could make it loop forever while holding that shard's lock, hanging every user of the cache. The inconsistency is now detected and aborts the process instead.

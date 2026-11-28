@@ -349,6 +349,17 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   // Not threadsafe.
   size_t TEST_GetLRUSize();
 
+  // Forces the low-pri pool counter out of sync with the LRU list and then
+  // runs MaintainPoolSize(), for unit test purpose only. MaintainPoolSize()
+  // treats that state as unrecoverable corruption, so this aborts the process.
+  void TEST_SimulateCorruptLowPriPoolUsage(size_t bogus_usage);
+
+  // Retrieves the pool usage counters, for unit test purpose only. These are
+  // what MaintainPoolSize() loops on, so tests can check they agree with the
+  // actual contents of the LRU list.
+  void TEST_GetPoolUsage(size_t* high_pri_pool_usage,
+                         size_t* low_pri_pool_usage);
+
   // Retrieves high pri pool ratio
   double GetHighPriPoolRatio();
 
@@ -370,6 +381,11 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   // Overflow the last entry in high-pri pool to low-pri pool until size of
   // high-pri pool is no larger than the size specify by high_pri_pool_pct.
   void MaintainPoolSize();
+
+  // Reports the shard's accounting state and aborts. Called only from
+  // MaintainPoolSize(), when a pool usage counter has stopped describing the
+  // LRU list and the shard can no longer be trusted.
+  [[noreturn]] void CrashOnCorruptPoolUsage(const char* pool_name) const;
 
   // Free some space following strict LRU policy until enough space
   // to hold (usage_ + charge) is freed or the lru list is empty
