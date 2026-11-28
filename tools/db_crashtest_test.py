@@ -209,29 +209,28 @@ class DBCrashTestTest(unittest.TestCase):
             finalized = db_crashtest.finalize_and_sanitize(self.build_params(params))
             self.assertEqual(0, finalized["use_merge"])
 
-    def test_user_timestamp_disables_merge(self):
+    def test_user_timestamp_keeps_merge_random(self):
         db_crashtest = self.load_db_crashtest()
         base = dict(db_crashtest.default_params)
         base.update(db_crashtest.ts_params)
         # gen_cmd_params() adds this from the command line arguments.
         base["test_best_efforts_recovery"] = 0
-        # Merge-before-filter selection turns merges on in about half of these
-        # runs when nothing turns them off later.
-        overrides = {
-            "enable_compaction_filter": 1,
-            "merge_before_compaction_filter": 1,
-            "use_merge": 0,
-        }
+        # Blob direct write turns merges off, so keep it off here.
+        base["enable_blob_direct_write"] = 0
+        # ts_params leaves use_merge random, so some runs with timestamps use
+        # merges and some do not.
+        seen = set()
         for seed in range(32):
             with self.subTest(seed=seed):
                 db_crashtest.random.seed(seed)
-                params = self.build_params(base, overrides)
+                params = self.build_params(base)
                 finalized = db_crashtest.finalize_and_sanitize(params)
-                self.assertEqual(0, finalized["use_merge"])
-        # An explicit use_merge=1 is turned off as well.
+                seen.add(finalized["use_merge"])
+        self.assertEqual({0, 1}, seen)
+        # An explicit use_merge=1 stays on.
         params = self.build_params(base, {"use_merge": 1})
         finalized = db_crashtest.finalize_and_sanitize(params)
-        self.assertEqual(0, finalized["use_merge"])
+        self.assertEqual(1, finalized["use_merge"])
 
     def test_stress_cmd_env_defaults_tsan_suppressions(self):
         os.environ.pop(_TSAN_OPTIONS_ENV_VAR, None)
