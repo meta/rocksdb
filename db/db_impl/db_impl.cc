@@ -51,6 +51,7 @@
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/malloc_stats.h"
+#include "db/manifest_rows.h"
 #include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/memtable_list.h"
@@ -95,6 +96,7 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/experimental.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/stats_history.h"
@@ -7506,6 +7508,162 @@ Status DB::ListColumnFamilies(const DBOptions& db_options,
 
 Snapshot::~Snapshot() = default;
 
+namespace {
+// What DestroyDB() does with the rows of a store (see
+// db/manifest_store_state.h) when options.manifest_store is set. The helpers
+// below follow this table.
+//
+//   CURRENT names   DB row in the store        Action
+//   --------------  -------------------------  -----------------------------
+//   stub            none                       Destroy() (OK), delete files
+//   stub            db id of the stub          Destroy(), delete files
+//   stub            no db id (failed enter)    Destroy(), delete files
+//   stub            another db id              InvalidArgument, keep all
+//   MANIFEST file   db id of the DB, kFile     Destroy(), delete files
+//   MANIFEST file   anything else              keep the rows, delete files
+//   either          DB row read or decode      the error, keep all
+//                   error
+//   either          changed after the check    Busy, keep all
+//   either          newer epoch claimed it     IOFenced, keep all
+//   either          object without an epoch    NotSupported, keep all
+//                   (Destroy() refuses)
+//   either          other Destroy() error      the error, keep the files
+//                                              (the rows may be gone: the
+//                                              outcome is unknown)
+//
+// The table starts after DestroyDB() read CURRENT and the first record of the
+// MANIFEST that it names. Before the table, these cases decide:
+// - The folder cannot be listed, and the folder is not missing: DestroyDB()
+//   returns the listing error and keeps all.
+// - CURRENT names a stub that this binary cannot decode: DestroyDB() returns
+//   the decode error and keeps all.
+// - CURRENT is missing or damaged, or names a missing or damaged MANIFEST:
+//   when a stub is in the folder, NotSupported, keep all. To find such a stub,
+//   DestroyDB() reads the first record of each MANIFEST file in the folder.
+//   When one of these reads fails with another error (for example a timeout),
+//   DestroyDB() returns that error and keeps all.
+//   Otherwise the DB is deleted as a file-mode DB, and the store is not
+//   called.
+// - Any other error of that read (for example a timeout): the error, keep all.
+//
+// Each Destroy() passes the commit sequence and the last commit id of the
+// checked DB row (or commit sequence 0 when there was none) in
+// ManifestStoreDestroyOptions. So when another writer changes the DB row
+// between the check and Destroy() (for example the DB that a checkpoint was
+// taken from enters store mode at the same time), the store removes nothing
+// and returns Busy. DestroyDB() does not retry: it returns Busy and deletes
+// no file, and the caller can call it again.
+//
+// A store object for another DB, given by mistake, must not remove the rows
+// of that DB, so both cases check the owner (CheckManifestDbRowOwner()).
+// DestroyDB() cannot tell a file copy of the folder from the source: both
+// have a stub with the same db id. So DestroyDB() of a copy with the store of
+// the source removes the rows of the source, and the source stops. Remove such
+// a copy without the store, for example with DestroyDir(). DestroyDB() without
+// the store returns NotSupported (see DestroyDB() in include/rocksdb/db.h).
+//
+// A DB row without a db id (a placeholder DB row) is the row of an enter that
+// failed before its switch. It holds no metadata and belongs to no DB. The
+// rule for it: when CURRENT names a stub that this binary can read,
+// DestroyDB() removes it with the rows of the stub. When CURRENT names a
+// MANIFEST file, DestroyDB() removes rows only when they have the db id of
+// the DB and authority kFile, so the placeholder stays in the store.
+
+// Calls ManifestStore::Destroy() with the expectations in `opts`. When the DB
+// row changed after the check, it returns Busy with a message that says that
+// nothing was removed (see the table above).
+IOStatus DestroyCheckedRows(ManifestStore* store,
+                            const ManifestStoreDestroyOptions& opts) {
+  TEST_SYNC_POINT("DestroyDB:BeforeStoreDestroy");
+  IOStatus io_s = store->Destroy(opts);
+  if (io_s.IsBusy()) {
+    return IOStatus::Busy(
+        "Store mode: the DB row changed after DestroyDB() checked it, so "
+        "nothing was removed");
+  }
+  return io_s;
+}
+
+// The stub rows of the table above.
+IOStatus DestroyManifestStoreRows(ManifestStore* store,
+                                  const std::string& stub_db_id) {
+  ManifestDbRowResult db_row;
+  IOStatus io_s = store->ReadDbRow(&db_row);
+  // The destroy applies only to the state that the check saw: the checked DB
+  // row, or no DB row (commit sequence 0) after NotFound.
+  ManifestStoreDestroyOptions opts;
+  if (io_s.ok()) {
+    Status s = CheckManifestDbRowOwner(db_row.db_row, stub_db_id);
+    if (!s.ok()) {
+      return status_to_io_status(std::move(s));
+    }
+    opts.expected_commit_sequence = db_row.state.commit_sequence;
+    opts.expected_last_commit_id = db_row.state.last_commit_id;
+  } else if (io_s.IsNotFound()) {
+    opts.expected_commit_sequence = 0;
+  } else {
+    return io_s;
+  }
+  return DestroyCheckedRows(store, opts);
+}
+
+// Reads the db id of a DB in file mode for DestroyDB(): from the MANIFEST file
+// `manifest_number` (experimental::GetDbIdentityFromManifest()), or else from
+// the IDENTITY file. A MANIFEST without a db id, or one that cannot be read up
+// to the first record with a db id, falls back to the IDENTITY file. Sets
+// `*db_id` to empty when neither has one.
+Status ReadFileModeDbId(FileSystem* fs, const std::string& dbname,
+                        uint64_t manifest_number, std::string* db_id) {
+  db_id->clear();
+  Status s = experimental::GetDbIdentityFromManifest(
+      fs, DescriptorFileName(dbname, manifest_number), db_id);
+  if (s.ok()) {
+    return s;
+  }
+  return ReadDbIdFromIdentityFile(fs, dbname, db_id);
+}
+
+// The MANIFEST file rows of the table above. After RollBackManifestStore(),
+// the rows of a DB stay in the store with authority kFile, and they stop a new
+// DB from being created on top of them (see ManifestStore::Destroy()).
+IOStatus DestroyRolledBackRows(ManifestStore* store, const std::string& db_id) {
+  if (db_id.empty()) {
+    return IOStatus::OK();
+  }
+  ManifestDbRowResult db_row;
+  IOStatus io_s = store->ReadDbRow(&db_row);
+  if (io_s.IsNotFound()) {
+    return IOStatus::OK();
+  }
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  ManifestRows rows;
+  ManifestDbRowExtraFields extra_fields;
+  Status s =
+      CheckManifestDbRowOwner(db_row.db_row, db_id, &rows, &extra_fields);
+  if (s.IsInvalidArgument()) {
+    // CheckManifestDbRowOwner() returns InvalidArgument only when the row has
+    // another db id (the rows of another DB). A row that cannot be decoded
+    // gives another error, which is returned below.
+    return IOStatus::OK();
+  }
+  if (!s.ok()) {
+    return status_to_io_status(std::move(s));
+  }
+  // A DB row without a db id passes the owner check, but it is kept (see the
+  // table above).
+  if (rows.db.db_id != db_id ||
+      extra_fields.authority != ManifestAuthority::kFile) {
+    return IOStatus::OK();
+  }
+  ManifestStoreDestroyOptions opts;
+  opts.expected_commit_sequence = db_row.state.commit_sequence;
+  opts.expected_last_commit_id = db_row.state.last_commit_id;
+  return DestroyCheckedRows(store, opts);
+}
+}  // namespace
+
 Status DestroyDB(const std::string& dbname, const Options& options,
                  const std::vector<ColumnFamilyDescriptor>& column_families) {
   ImmutableDBOptions soptions(SanitizeOptions(dbname, options));
@@ -7545,9 +7703,13 @@ Status DestroyDB(const std::string& dbname, const Options& options,
       return error;
     };
     // A DB in store mode keeps its metadata in a ManifestStore (see
-    // db/manifest_store_state.h). Deleting the files would leave the rows,
-    // and a later DB::Open() with create_if_missing would not create a new
-    // DB on top of them.
+    // db/manifest_store_state.h). Deleting only the files would leave the
+    // rows, and a later DB::Open() with create_if_missing would not create a
+    // new DB on top of them. So the rows are removed first, with the store in
+    // the options, and then the files. A crash between the two steps leaves
+    // a folder whose stub names a DB that the store no longer has: DB::Open()
+    // refuses it, and DestroyDB() can run again (ManifestStore::Destroy()
+    // returns OK when there is no DB row).
     CurrentManifestInfo current;
     Status current_s =
         ReadCurrentManifestInfo(soptions.fs.get(), dbname, &current);
@@ -7574,26 +7736,50 @@ Status DestroyDB(const std::string& dbname, const Options& options,
       current_s.PermitUncheckedError();
       return unlock_and_return(list_s);
     }
-    // A stub that this binary cannot decode (current_s not OK) is still a
-    // stub.
+    // A stub that this binary cannot decode (current_s not OK, for example a
+    // stub of a newer binary) is still a stub. Its error is returned, because
+    // there is no db id to check the rows against.
     if (current.is_stub) {
-      current_s.PermitUncheckedError();
-      list_s.PermitUncheckedError();
-      return unlock_and_return(Status::NotSupported(
-          "DestroyDB() does not support a DB in store mode yet"));
+      Status destroy_s;
+      if (!current_s.ok()) {
+        destroy_s = current_s;
+      } else if (options.manifest_store == nullptr) {
+        destroy_s = Status::NotSupported(
+            "DestroyDB() on a DB in store mode needs the store in "
+            "DBOptions::manifest_store");
+      } else {
+        destroy_s = DestroyManifestStoreRows(options.manifest_store.get(),
+                                             current.stub.db_id);
+      }
+      if (!destroy_s.ok()) {
+        list_s.PermitUncheckedError();
+        return unlock_and_return(destroy_s);
+      }
+    } else if (current_s.ok() && current.exists &&
+               options.manifest_store != nullptr) {
+      std::string db_id;
+      Status destroy_s =
+          ReadFileModeDbId(soptions.fs.get(), dbname, current.number, &db_id);
+      if (destroy_s.ok()) {
+        destroy_s = DestroyRolledBackRows(options.manifest_store.get(), db_id);
+      }
+      if (!destroy_s.ok()) {
+        list_s.PermitUncheckedError();
+        return unlock_and_return(destroy_s);
+      }
     }
     list_s.PermitUncheckedError();
     // When CURRENT is missing or damaged, or names a missing or damaged
     // MANIFEST file, a stub can still be in the folder (see
     // FindSurvivingManifestStub()). Then the store may hold the metadata, so
-    // DestroyDB() keeps all files and returns NotSupported. With a store in
-    // the options, it returns any error that leaves open whether such a stub
-    // exists: the listing error (checked above), or a read error of
-    // FindSurvivingManifestStub() other than a missing or damaged file.
-    // Without a store, it ignores that read error, and a failed listing gives
-    // no file to search, as for a DB that never used a store. The search stops
-    // at the first such read error, so it does not check the remaining
-    // MANIFEST files.
+    // DestroyDB() keeps all files and returns NotSupported, with or without a
+    // store. With a store in the options, it returns any error that leaves
+    // open whether such a stub exists: the listing error (checked above), or
+    // a read error of FindSurvivingManifestStub() other than a missing or
+    // damaged file. Without a store, it ignores that read error, and a failed
+    // listing gives no file to search, as for a DB that never used a store.
+    // The search stops at the first such read error, so it does not check the
+    // remaining MANIFEST files.
     if (ShouldSearchForSurvivingManifestStub(current_s, current)) {
       bool stub_found = false;
       Status probe_s = FindSurvivingManifestStub(soptions.fs.get(), dbname,
@@ -7631,6 +7817,12 @@ Status DestroyDB(const std::string& dbname, const Options& options,
     bool is_copy_pointer = false;
     InfoLogPrefix info_log_prefix(!soptions.db_log_dir.empty(), dbname);
     for (const auto& fname : filenames) {
+      // For a stub, the stub and CURRENT are deleted last (see below).
+      if (current.is_stub && ParseFileName(fname, &number, &type) &&
+          (type == kCurrentFile ||
+           (type == kDescriptorFile && number == current.number))) {
+        continue;
+      }
       if (DeleteScheduler::IsTrashFile(fname)) {
         std::string trash_file_path = dbname;
         trash_file_path.append("/").append(fname);
@@ -7673,6 +7865,19 @@ Status DestroyDB(const std::string& dbname, const Options& options,
         // DeleteDir(dbname) below would otherwise fail to remove the DB.
         // Ignore failures: leftovers here must not fail DestroyDB.
         DestroyDir(env, SessionTmpDir(dbname)).PermitUncheckedError();
+      }
+    }
+    // The rows are already gone here, so CURRENT and the stub are what lets a
+    // retry of DestroyDB() with the store finish the job: Destroy() then finds
+    // no DB row and returns OK. So they are deleted after the other DB files
+    // of this folder (except the lock file), the stub first and CURRENT last,
+    // and only when every earlier delete succeeded. CURRENT stays when any
+    // delete fails, because a stub without CURRENT stops every later
+    // DestroyDB() with NotSupported.
+    if (current.is_stub && result.ok()) {
+      result = env->DeleteFile(DescriptorFileName(dbname, current.number));
+      if (result.ok()) {
+        result = env->DeleteFile(CurrentFileName(dbname));
       }
     }
     paths_to_delete.insert(dbname);

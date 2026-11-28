@@ -77,6 +77,11 @@ class VersionBuilder {
 
   bool HasMissingFiles() const;
 
+  // Returns the numbers of the SST and blob files that are missing, in
+  // increasing order, for an error message.
+  // REQUIRES: track_found_and_missing_files
+  std::vector<uint64_t> GetMissingFileNumbers() const;
+
   // Make blob files that are missing on disk never invalidate a Version.
   // Instead, each such blob file is left out of the saved Version and recorded
   // in it as a dropped blob file (see

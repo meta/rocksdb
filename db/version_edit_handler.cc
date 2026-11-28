@@ -9,11 +9,13 @@
 
 #include "db/version_edit_handler.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <sstream>
 
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_source.h"
+#include "db/manifest_store_state.h"
 #include "db/version_edit.h"
 #include "logging/logging.h"
 #include "monitoring/persistent_stats_history.h"
@@ -830,7 +832,7 @@ void VersionEditHandlerPointInTime::CheckIterationResult(
     const log::Reader& reader, Status* s) {
   VersionEditHandler::CheckIterationResult(reader, s);
   assert(s != nullptr);
-  if (s->ok()) {
+  if (s->ok() && CanInstallVersions()) {
     for (auto* cfd : *(version_set_->column_family_set_)) {
       if (cfd->IsDropped()) {
         continue;
@@ -1234,6 +1236,21 @@ bool ManifestTailer::NewestStateHasMissingFiles() {
   return false;
 }
 
+std::vector<uint64_t> ManifestTailer::NewestStateMissingFileNumbers() {
+  std::vector<uint64_t> numbers;
+  for (const auto& builder : builders_) {
+    VersionBuilder* version_builder = builder.second->version_builder();
+    if (cfs_left_out_of_manifest_.count(builder.first) == 0 &&
+        !version_builder->ValidVersionAvailable()) {
+      std::vector<uint64_t> cf_numbers =
+          version_builder->GetMissingFileNumbers();
+      numbers.insert(numbers.end(), cf_numbers.begin(), cf_numbers.end());
+    }
+  }
+  std::sort(numbers.begin(), numbers.end());
+  return numbers;
+}
+
 void ManifestTailer::CheckIterationResult(const log::Reader& reader,
                                           Status* s) {
   VersionEditHandlerPointInTime::CheckIterationResult(reader, s);
@@ -1254,6 +1271,26 @@ void ManifestTailer::CheckIterationResult(const log::Reader& reader,
   }
 }
 
+bool ManifestTailer::RecordDamagedFiles() const {
+  return mode_ == Mode::kRecovery &&
+         StoreModeOptions(*version_set_->db_options());
+}
+
+bool ManifestTailer::CanInstallVersions() {
+  store_state_incomplete_ = false;
+  if (mode_ != Mode::kCatchUp ||
+      !StoreModeOptions(*version_set_->db_options())) {
+    return true;
+  }
+  for (ColumnFamilyData* cfd : *version_set_->GetColumnFamilySet()) {
+    if (!cfd->IsDropped() && versions_.count(cfd->GetID()) == 0) {
+      store_state_incomplete_ = true;
+      return false;
+    }
+  }
+  return true;
+}
+
 std::vector<std::string> ManifestTailer::GetAndClearIntermediateFiles() {
   std::vector<std::string> res;
   for (const auto& builder : builders_) {
@@ -1265,13 +1302,78 @@ std::vector<std::string> ManifestTailer::GetAndClearIntermediateFiles() {
   return res;
 }
 
+FileMetaData* ManifestTailer::HeldFile(ColumnFamilyData* cfd,
+                                       const FileMetaData& fmeta) {
+  if (mode_ != Mode::kCatchUp ||
+      !StoreModeOptions(*version_set_->db_options()) ||
+      cfd->current() == nullptr) {
+    return nullptr;
+  }
+  FileMetaData* current =
+      cfd->current()->storage_info()->GetFileMetaDataByNumber(
+          fmeta.fd.GetNumber());
+  if (current == nullptr ||
+      current->fd.GetFileSize() != fmeta.fd.GetFileSize() ||
+      current->unique_id != fmeta.unique_id) {
+    return nullptr;
+  }
+  // Some persisted fields can change while the file stays the same, for
+  // example the provenance after a trivial move to another level. The old
+  // object would keep the old values, so a new object is used then.
+  if (current->data_file_provenance != fmeta.data_file_provenance ||
+      current->temperature != fmeta.temperature ||
+      current->epoch_number != fmeta.epoch_number) {
+    return nullptr;
+  }
+  return current;
+}
+
+std::shared_ptr<SharedBlobFileMetaData> ManifestTailer::HeldBlobFile(
+    ColumnFamilyData* cfd, const BlobFileAddition& blob_addition) {
+  if (mode_ != Mode::kCatchUp ||
+      !StoreModeOptions(*version_set_->db_options()) ||
+      cfd->current() == nullptr) {
+    return nullptr;
+  }
+  const std::shared_ptr<BlobFileMetaData> current =
+      cfd->current()->storage_info()->GetBlobFileMetaData(
+          blob_addition.GetBlobFileNumber());
+  if (current == nullptr ||
+      current->GetTotalBlobCount() != blob_addition.GetTotalBlobCount() ||
+      current->GetTotalBlobBytes() != blob_addition.GetTotalBlobBytes() ||
+      current->GetChecksumValue() != blob_addition.GetChecksumValue()) {
+    return nullptr;
+  }
+  return current->GetSharedMeta();
+}
+
 Status ManifestTailer::VerifyFile(ColumnFamilyData* cfd,
                                   const std::string& fpath, int level,
                                   const FileMetaData& fmeta) {
+  if (HeldFile(cfd, fmeta) != nullptr) {
+    return Status::OK();
+  }
   Status s =
       VersionEditHandlerPointInTime::VerifyFile(cfd, fpath, level, fmeta);
+  if (s.IsCorruption() && RecordDamagedFiles()) {
+    damaged_files_.insert(fmeta.fd.GetNumber());
+  }
   // TODO: Open file or create hard link to prevent the file from being
   // deleted.
+  return s;
+}
+
+Status ManifestTailer::VerifyBlobFile(ColumnFamilyData* cfd,
+                                      uint64_t blob_file_num,
+                                      const BlobFileAddition& blob_addition) {
+  if (HeldBlobFile(cfd, blob_addition) != nullptr) {
+    return Status::OK();
+  }
+  Status s = VersionEditHandlerPointInTime::VerifyBlobFile(cfd, blob_file_num,
+                                                           blob_addition);
+  if (s.IsCorruption() && RecordDamagedFiles()) {
+    damaged_files_.insert(blob_file_num);
+  }
   return s;
 }
 

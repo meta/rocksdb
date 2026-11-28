@@ -36,9 +36,10 @@ struct ImmutableDBOptions;
 // - CURRENT names a stub MANIFEST (`MANIFEST-<number>`). The stub has one
 //   record, which starts with the tag kManifestStoreStub. That tag is not
 //   safe to ignore, so a reader that does not know store mode (an older
-//   binary, or ldb) fails instead of reading an empty DB. New code decodes it
-//   as NotSupported (VersionEdit::DecodeFrom()). RepairDB() and DestroyDB()
-//   check for a stub and return NotSupported.
+//   binary, or ldb without --manifest_store) fails instead of reading an
+//   empty DB. New code decodes it as NotSupported (VersionEdit::DecodeFrom()).
+//   RepairDB() checks for a stub and returns NotSupported. DestroyDB() needs
+//   the store in DBOptions::manifest_store (see "DestroyDB()" below).
 // - The stub records the db id and a state (ManifestStubState): done, or a
 //   mode change that is not finished yet (creating a new DB in the store, or
 //   entering store mode from file mode).
@@ -144,7 +145,10 @@ struct ImmutableDBOptions;
 //
 // Read-only: DB::OpenForReadOnly() needs a done stub. It scans without a
 // claim, with a consistent scan, and never commits. DB::ListColumnFamilies()
-// with a store scans the same way.
+// with a store scans the same way. DB::OpenAsSecondary(), DB::OpenAsFollower()
+// and the remote compaction worker open the same way. A secondary and a
+// follower scan again to catch up (see "Store mode in a secondary or
+// follower" at ReactiveVersionSet::ReadStoreForCatchUp()).
 //
 // Open and close: during DB::Open(), and when the DB starts to close, a
 // commit with an unknown outcome gives up at the first failed ReadDbRow() or
@@ -159,8 +163,31 @@ struct ImmutableDBOptions;
 // (DBImpl::ClaimForEnter()). When the enter fails before its switch, that row
 // stays. It belongs to no DB, so a later create or enter may take it over.
 //
-// Unsupported paths: see "Not supported in store mode yet" in
+// Unsupported paths: see "Not supported in store mode" in
 // include/rocksdb/manifest_store.h. They return NotSupported.
+//
+// Copies of the DB: DB::GetLiveFilesStorageInfo() of a primary builds a
+// MANIFEST from the in-memory state (ManifestRowsToRecords()), so checkpoints
+// and backups are DBs in file mode. A read-only, secondary or follower
+// instance in store mode returns NotSupported. A read-only or secondary
+// instance replays WALs into its memtables, but it has no boundary between
+// those WALs and its Versions that a copy could use. A follower does not
+// replay WALs, but copies of a follower are not tested in store mode.
+//
+// Remote compaction: the primary sends its applied commit sequence
+// (ManifestStoreState::applied_commit_sequence()) as
+// CompactionServiceInput::min_store_commit_sequence when
+// DBOptions::remote_compaction_manifest_floor is true (otherwise it sends 0,
+// which means no floor). The worker refuses a scan with a smaller commit
+// sequence and returns Incomplete, so the compaction service can run the job
+// locally (see CompactionServiceInput::min_store_commit_sequence).
+//
+// DestroyDB(): with the store in the options, it checks that the DB row has
+// the db id of the stub, calls ManifestStore::Destroy(), and then deletes the
+// files. After a rollback, it also removes the rows that the rollback left
+// when they have the db id of the DB (see DestroyDB() in
+// db/db_impl/db_impl.cc). A file copy of the folder must be removed without
+// the store (see DestroyDB() in include/rocksdb/db.h).
 //
 // Write path (VersionSet::ProcessManifestWrites()): RocksDB turns each batch
 // of VersionEdits into row changes and sends them to the store as one
@@ -328,6 +355,29 @@ struct ImmutableDBOptions;
 // - A close gives up at the first failed ReadDbRow() or resend (see "Open and
 //   close"). So a short store failure during the shutdown flush can stop the
 //   DB, and data written without the WAL is then lost.
+
+// Returns true when `options` (DBOptions or ImmutableDBOptions) hold a store.
+// A reader uses the result to decide whether it reads the metadata from the
+// store (ReactiveVersionSet::OpenStoreRead()). The name does not mean that
+// the DB is in store mode: a reader (a read-only, secondary or follower
+// instance, or a remote compaction worker) with a store reads the metadata
+// from the store, and its open checks CURRENT and the DB row and fails when
+// the DB is not in store mode. Three checks answer "is the metadata in the
+// store?" for different callers:
+//
+//   Check                                     Used by
+//   ----------------------------------------  -------------------------------
+//   VersionSet::HasManifestStoreWriteState()  a primary, whose VersionSet
+//                                             commits to the store
+//   StoreModeOptions(options)                 the readers above, which have
+//                                             no ManifestStoreState
+//   DBImpl::MetadataInStore()                 the copy paths (checkpoints,
+//                                             backups); only a primary can
+//                                             copy, a reader refuses
+template <typename DbOptions>
+bool StoreModeOptions(const DbOptions& options) {
+  return options.manifest_store != nullptr;
+}
 
 // Makes the commit ids of one DB instance. A commit id is the DB session id
 // (new for each DB::Open()), a dash and a counter, so the ids of two instances
@@ -509,15 +559,16 @@ Status ScanManifestStore(ManifestStore* store, bool consistent,
                          ManifestStoreScan* scan);
 
 // Checks that the scanned rows are the rows of the DB in store mode whose
-// stub MANIFEST has `stub_db_id`. DB::Open(), DB::OpenForReadOnly() and
-// DB::ListColumnFamilies() run this check after their scan. Returns
-// InvalidArgument when the DB row names the MANIFEST file as the authority
-// (after a rollback), NotSupported for authority kShadow, and Corruption when
-// the db id of the DB row differs from `stub_db_id` (for example a store object
-// of another DB). A read-write open checks the owner before its claim
-// (CheckManifestDbRowOwner()) and returns InvalidArgument there, because
-// nothing has changed yet. This check runs after the scan, so a different db
-// id here means that the stub and the rows disagree.
+// stub MANIFEST has `stub_db_id`. DB::Open(), DB::OpenForReadOnly(),
+// DB::ListColumnFamilies(), and the open and each catch-up of a secondary or
+// follower (ReactiveVersionSet::ReadStore()) run this check after their scan.
+// Returns InvalidArgument when the DB row names the MANIFEST file as the
+// authority (after a rollback), NotSupported for authority kShadow, and
+// Corruption when the db id of the DB row differs from `stub_db_id` (for
+// example a store object of another DB). A read-write open checks the owner
+// before its claim (CheckManifestDbRowOwner()) and returns InvalidArgument
+// there, because nothing has changed yet. This check runs after the scan, so a
+// different db id here means that the stub and the rows disagree.
 Status CheckScannedStoreRows(const ManifestStoreScan& scan,
                              const std::string& stub_db_id);
 
@@ -565,6 +616,37 @@ Status CheckOwnerAndClaim(ManifestStore* store,
                           const std::string& expected_db_id,
                           ManifestDbRowResult* claimed,
                           ManifestDbRowExtraFields* extra = nullptr);
+
+// What a secondary or follower reads from the store for its open or one
+// catch-up (see "Store mode in a secondary or follower" at
+// ReactiveVersionSet::ReadStoreForCatchUp()). Lifecycle of one object:
+// 1. ReadStore() fills `stub_number` and `scan`.
+// 2. BuildStoreManifestBytes() fills `bytes`. In a catch-up, `live_cf_ids`
+//    lists the column families that are still open (not dropped) in this
+//    instance. The build keeps the scanned rows only for those ids, and adds
+//    a drop record for each listed id whose row the scan marks as dropped or
+//    does not have. The open passes no list and keeps all rows.
+// 3. In a catch-up, ApplyStoreCatchUp() may shrink `live_cf_ids` (a
+//    concurrent catch-up dropped a column family) and build `bytes` again.
+//    The list only shrinks, so the rows that the first build erased are not
+//    needed again.
+// 4. SetStoreManifestReader() moves `bytes` into the reader and keeps `scan`.
+//    The reader frees the bytes when the tailer reaches their end. The open
+//    (ReactiveVersionSet::OpenStoreRead()) frees `scan` right after
+//    SetStoreManifestReader(), before the replay. A catch-up keeps `scan`
+//    during the replay, and its caller (TryCatchUpWithPrimary() or
+//    TryCatchUpWithLeader()) frees it after it releases the DB mutex.
+struct ManifestStoreRead {
+  // The number of the stub MANIFEST that CURRENT names.
+  uint64_t stub_number = 0;
+  // A consistent scan of all rows.
+  ManifestStoreScan scan;
+  // The ids of the live column families of the instance (in increasing
+  // order) that `bytes` was built for.
+  std::vector<uint32_t> live_cf_ids;
+  // The rows as the records of a MANIFEST file.
+  std::string bytes;
+};
 
 // MANIFEST file copy
 //
@@ -698,7 +780,8 @@ IOStatus DeleteManifestCopies(FileSystem* fs, const std::string& dbname,
 Status RecordsToManifestBytes(const std::vector<std::string>& records,
                               std::string* bytes);
 
-// Returns a sequential file that reads `data`.
+// Returns a sequential file that reads `data`. It frees `data` when a read
+// reaches the end.
 std::unique_ptr<FSSequentialFile> NewStringSequentialFile(std::string data);
 
 // The store mode state of one DB instance that opened a DB for writing.
@@ -743,6 +826,19 @@ class ManifestStoreState {
   // column family rows here before the next commit, so these rows can be
   // ahead of the store until a commit with the timestamp rewrite applies.
   const ManifestRows& batch_base_rows() const { return batch_base_rows_; }
+
+  // The applied commit sequence: the commit sequence that the DB row has
+  // after the last commit (or the claim of DB::Open()) of this primary. The
+  // next commit sends this same value as its expected commit sequence. Every
+  // Version installed so far was committed at or below it, so a consistent
+  // scan at or above this value is not older than any installed Version. A
+  // remote compaction worker uses it as its floor (see
+  // CompactionServiceInput::min_store_commit_sequence). Any thread can read it
+  // without a data race. The guarantee above holds only for a caller that
+  // holds the DB mutex.
+  uint64_t applied_commit_sequence() const {
+    return applied_commit_sequence_.load(std::memory_order_relaxed);
+  }
 
   // Stops the DB with `error`, for an error after a commit applied, such as a
   // failed copy append in sync mode. Returns the stop error.
@@ -942,8 +1038,13 @@ class ManifestStoreState {
   const uint32_t feature_version_;
   // The commit sequence that the DB row holds after the last claim or applied
   // commit of this instance. The next commit sends this value as its expected
-  // commit sequence, because the store adds 1 on success.
-  uint64_t applied_commit_sequence_ = 0;
+  // commit sequence, because the store adds 1 on success. Only the commit
+  // thread changes it. It is atomic because other threads read it with
+  // applied_commit_sequence(). Relaxed order is enough there: a reader that
+  // needs the guarantee of applied_commit_sequence() holds the DB mutex, and
+  // the Versions it uses were installed under the DB mutex after their commit
+  // applied.
+  std::atomic<uint64_t> applied_commit_sequence_{0};
   ManifestRows batch_base_rows_;
   ManifestDbRowExtraFields extra_fields_;
   IOStatus stop_error_;

@@ -25,6 +25,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
@@ -450,6 +451,15 @@ DBOptions GetCheckpointDBOptions(DB* source) {
   db_options.compaction_service.reset();
   // Recovery would apply it again to WAL records that source already holds.
   db_options.wal_filter = nullptr;
+  // Split and merge open a checkpoint, which is a DB in file mode with its
+  // own complete MANIFEST file, also when source is in store mode (see
+  // LiveFileStorageInfo::replacement_contents for where that MANIFEST comes
+  // from). The store options of source do not fit that open: with the store
+  // object of source, DB::Open() refuses the checkpoint before any claim. So
+  // they are cleared, and the open uses the MANIFEST file of the checkpoint.
+  db_options.manifest_store.reset();
+  db_options.manifest_store_migrate = false;
+  db_options.manifest_store_copy_mode = ManifestCopyMode::kOff;
   return db_options;
 }
 
