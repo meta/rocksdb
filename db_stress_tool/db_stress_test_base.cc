@@ -28,6 +28,8 @@
 #include "rocksdb/slice_transform.h"
 #include "util/compression.h"
 #ifdef GFLAGS
+#include "db/manifest_rows.h"
+#include "db/manifest_store_state.h"
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_compaction_filter.h"
 #include "db_stress_tool/db_stress_compaction_service.h"
@@ -36,6 +38,7 @@
 #include "db_stress_tool/db_stress_table_properties_collector.h"
 #include "db_stress_tool/db_stress_wide_merge_operator.h"
 #include "file/file_util.h"
+#include "file/filename.h"
 #include "options/options_parser.h"
 #include "port/port.h"
 #include "rocksdb/cache.h"
@@ -223,6 +226,17 @@ std::string FormatDiagnosticSlice(const Slice& value) {
 }
 
 namespace {
+
+// A checkpoint and a restored backup are separate DBs in file mode, also for a
+// DB in store mode (see LiveFileStorageInfo::replacement_contents). Their opens
+// and DestroyDB() must not use the store of this DB: an open with it would
+// claim the rows of this DB or move the copy into its store.
+void DropManifestStoreOptions(Options* options) {
+  options->manifest_store.reset();
+  options->manifest_store_migrate = false;
+  options->manifest_store_shadow = false;
+  options->manifest_store_copy_mode = ManifestCopyMode::kOff;
+}
 
 std::string FormatOptionalDiagnosticSlice(const Slice* value) {
   if (value == nullptr) {
@@ -2796,8 +2810,13 @@ void StressTest::OperateDb(ThreadState* thread) {
 
       if (thread->rand.OneInOpt(FLAGS_get_live_files_apis_one_in)) {
         ScopedThreadOperation op(thread, StressOperationType::kGetLiveFiles);
-        Status s_1 = TestGetLiveFiles();
-        ProcessStatus(shared, "GetLiveFiles", s_1);
+        // DB::GetLiveFiles() returns NotSupported in store mode, because the
+        // MANIFEST file is only a stub. GetLiveFilesMetaData() and
+        // GetLiveFilesStorageInfo() work there.
+        if (!InManifestStoreMode()) {
+          Status s_1 = TestGetLiveFiles();
+          ProcessStatus(shared, "GetLiveFiles", s_1);
+        }
         Status s_2 = TestGetLiveFilesMetaData();
         ProcessStatus(shared, "GetLiveFilesMetaData", s_2);
         // TODO: enable again after making `GetLiveFilesStorageInfo()`
@@ -4557,6 +4576,7 @@ Status StressTest::TestBackupRestore(
     if (!s.ok()) {
       from = "PrepareRestoredDBOptions in backup/restore";
     }
+    DropManifestStoreOptions(&db_opt);
   }
   if (s.ok() && !FLAGS_use_txn && !FLAGS_use_blob_db) {
     std::vector<ColumnFamilyDescriptor> cf_descriptors;
@@ -4829,6 +4849,7 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
   tmp_opts.env = GetDbEnv();
   // Avoid delayed deletion so whole directory can be deleted
   tmp_opts.sst_file_manager.reset();
+  DropManifestStoreOptions(&tmp_opts);
   //  Temporarily disable error injection for clean-up
   if (db_fault_injection_fs_) {
     db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
@@ -4941,6 +4962,7 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
     options.listeners.clear();
     // Avoid race condition in trash handling after delete checkpoint_db
     options.sst_file_manager.reset();
+    DropManifestStoreOptions(&options);
     std::vector<ColumnFamilyDescriptor> cf_descs;
     // TODO(ajkr): `column_family_names_` is not safe to access here when
     // `clear_column_family_one_in != 0`. But we can't easily switch to
@@ -6098,11 +6120,16 @@ void StressTest::Open(SharedState* shared, bool reopen) {
 
   if (FLAGS_ttl == -1) {
     std::vector<std::string> existing_column_families;
-    s = DB::ListColumnFamilies(DBOptions(options_), GetDbPath(),
-                               &existing_column_families);  // ignore errors
+    // Store step 7.
+    s = ListColumnFamiliesBeforeOpen(
+        &existing_column_families);  // ignore errors
     const bool db_exists = s.ok();
     if (!s.ok()) {
-      // DB doesn't exist
+      // Any error of the listing takes the new-DB path, as when the DB does
+      // not exist. A "creating" stub gives NotFound on purpose (see
+      // ListColumnFamiliesBeforeOpen()). For an entering DB whose MANIFEST
+      // file is missing, ListColumnFamiliesBeforeOpen() exits by itself when
+      // the authority of the DB row is not kStore.
       assert(existing_column_families.empty());
       assert(column_family_names_.empty());
       column_family_names_.push_back(kDefaultColumnFamilyName);
@@ -6150,6 +6177,8 @@ void StressTest::Open(SharedState* shared, bool reopen) {
     DB_STRESS_ASSERT_OK_MSG(
         VerifyOptionsFileStateBeforeOpen(cf_descriptors, db_exists),
         "Persisted OPTIONS verification before open failed");
+    // Store step 8.
+    FinishInterruptedRollback();
     while (cf_descriptors.size() < (size_t)FLAGS_column_families) {
       std::string name = std::to_string(new_column_family_name_.load());
       new_column_family_name_++;
@@ -6171,6 +6200,8 @@ void StressTest::Open(SharedState* shared, bool reopen) {
       open_fault_injection.write_one_in = FLAGS_open_write_fault_one_in;
       while (true) {
         InitializeListenersForOpen(shared, cf_descriptors);
+        // Store step 9; step 10 is the DB open below.
+        SetManifestStoreForOpen();
 
         const bool open_fault_injection_enabled = MaybeEnableOpenFaultInjection(
             db_fault_injection_fs_, GetDbPath(), open_fault_injection);
@@ -6249,6 +6280,8 @@ void StressTest::Open(SharedState* shared, bool reopen) {
       }
     } else {
       InitializeListenersForOpen(shared, cf_descriptors);
+      // Store step 9; step 10 is the DB open below.
+      SetManifestStoreForOpen();
 
       OptimisticTransactionDBOptions optimistic_txn_db_options;
       optimistic_txn_db_options.validate_policy =
@@ -6292,9 +6325,31 @@ void StressTest::Open(SharedState* shared, bool reopen) {
       // TODO(yanqin) support max_open_files != -1 for secondary instance.
       tmp_opts.max_open_files = -1;
       tmp_opts.env = GetDbEnv();
+      // A secondary of a DB in store mode reads the store. It never claims the
+      // DB, so it gets its own reader object, not the object of the primary. A
+      // shadow DB is in file mode, so its secondary needs no store.
+      if (InManifestStoreMode()) {
+        tmp_opts.manifest_store = NewTestManifestStore(/*writer=*/false);
+      }
       const std::string& secondary_path = GetSecondariesBase();
-      s = DB::OpenAsSecondary(tmp_opts, GetDbPath(), secondary_path,
-                              cf_descriptors, &secondary_cfhs_, &secondary_db_);
+      // In store mode, the open returns TryAgain when files of the state that
+      // it scanned are missing and the primary made a newer commit, which may
+      // have deleted them (ReactiveVersionSet::MissingFilesAtStoreOpen()). The
+      // primary keeps flushing and compacting during this open, so the open
+      // runs again. kMaxSecondaryOpenAttempts (10) is an estimate: each try
+      // races only with the commits that come during its own scan.
+      constexpr int kMaxSecondaryOpenAttempts = 10;
+      for (int attempt = 1;; ++attempt) {
+        s = DB::OpenAsSecondary(tmp_opts, GetDbPath(), secondary_path,
+                                cf_descriptors, &secondary_cfhs_,
+                                &secondary_db_);
+        if (!s.IsTryAgain() || !InManifestStoreMode() ||
+            attempt == kMaxSecondaryOpenAttempts) {
+          break;
+        }
+        fprintf(stdout, "Opening the secondary again: %s\n",
+                s.ToString().c_str());
+      }
       DB_STRESS_ASSERT_OK(s);
       assert(secondary_cfhs_.size() ==
              static_cast<size_t>(FLAGS_column_families));
@@ -6339,13 +6394,25 @@ void StressTest::Open(SharedState* shared, bool reopen) {
   }
   DB_STRESS_ASSERT_OK_MSG(VerifyPersistedOptionsAfterOpen(),
                           "Persisted OPTIONS verification after open failed");
+  if (manifest_store_ != nullptr) {
+    // Store step 11.
+    VerifyMetadataModeAfterOpen();
+    // Store faults are off during DB::Open(), like the regular file system
+    // faults. db_stress has no store faults for the open, unlike the file
+    // system faults of the open_*_fault_one_in flags.
+    manifest_store_->SetFaultsEnabled(true);
+  }
 }
 
 Status StressTest::VerifyOptionsFileStateBeforeOpen(
     const std::vector<ColumnFamilyDescriptor>& cf_descriptors, bool db_exists) {
   verify_options_manifest_tracking_ =
       options_.track_options_file_number_in_manifest;
-  if (!db_exists || FLAGS_best_efforts_recovery || FLAGS_use_blob_db) {
+  // In store mode the MANIFEST file is a stub. Shadow mode also sets
+  // --use_manifest_store, so the check is skipped there too, to keep one rule
+  // for both modes.
+  if (!db_exists || FLAGS_best_efforts_recovery || FLAGS_use_blob_db ||
+      UsesTestManifestStore()) {
     return Status::OK();
   }
 
@@ -6429,7 +6496,7 @@ Status StressTest::VerifyOptionsFileStateBeforeOpen(
 
 Status StressTest::VerifyPersistedOptionsAfterOpen() {
   if (!verify_options_manifest_tracking_ || FLAGS_best_efforts_recovery ||
-      FLAGS_ttl != -1 || FLAGS_use_blob_db) {
+      FLAGS_ttl != -1 || FLAGS_use_blob_db || UsesTestManifestStore()) {
     return Status::OK();
   }
 
@@ -6541,6 +6608,15 @@ void StressTest::RecordManifestStateBeforeReopen() {
   // Determine verification mode based on flags
   if (FLAGS_best_efforts_recovery) {
     // Options are disabled in BER mode
+    manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+    return;
+  }
+  if (UsesTestManifestStore()) {
+    // In store mode the MANIFEST file is a stub that takes no appends. An open
+    // writes a new stub only when it creates the DB or moves a DB in file mode
+    // into the store, so the reuse check does not apply. In shadow mode the
+    // first MANIFEST write of an open starts a new MANIFEST file, also with
+    // reuse_manifest_on_open, so the reuse check does not hold either.
     manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
     return;
   }
@@ -6798,23 +6874,446 @@ void StressTest::VerifyManifestNotRewritten() {
   manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
 }
 
+Status StressTest::ListColumnFamiliesBeforeOpen(
+    std::vector<std::string>* names) {
+  DBOptions db_options(options_);
+  if (!UsesTestManifestStore()) {
+    return DB::ListColumnFamilies(db_options, GetDbPath(), names);
+  }
+  // The listing must not claim the DB, and the store object of the last open
+  // may be fenced, so the listing uses a new reader object.
+  std::shared_ptr<FileManifestStore> reader =
+      NewTestManifestStore(/*writer=*/false);
+  db_options.manifest_store = reader;
+  Status list_s = DB::ListColumnFamilies(db_options, GetDbPath(), names);
+  if (!list_s.IsNotSupported()) {
+    return list_s;
+  }
+  FileSystem* fs = db_options.env->GetFileSystem().get();
+  CurrentManifestInfo current;
+  Status s = ReadCurrentManifestInfo(fs, GetDbPath(), &current);
+  if (!s.ok()) {
+    return s;
+  }
+  names->clear();
+  // DB::ListColumnFamilies() returns NotSupported for a stub in kCreating or
+  // kEntering. It can also return NotSupported for another reason, for example
+  // a store row from a newer release. Then this returns that status.
+  if (!current.is_stub ||
+      (current.stub.state != ManifestStubState::kCreating &&
+       current.stub.state != ManifestStubState::kEntering)) {
+    return list_s;
+  }
+  if (current.stub.state == ManifestStubState::kCreating) {
+    // The open that created the DB stopped before it returned, so the DB has no
+    // acknowledged write. This returns NotFound, and the next DB::Open()
+    // finishes the create (DBImpl::FinishCreateDbInManifestStore()).
+    return Status::NotFound("The DB in store mode is not created yet");
+  }
+  // kEntering: until the switch, the MANIFEST file that the stub names holds
+  // the metadata. The enter recovers the column family names from this file
+  // and writes them into the store in the switch. After the switch, the store
+  // holds the metadata, and the enter deletes this file (a later DB::Open()
+  // finishes the delete when the enter stopped before it). No column family
+  // changes while the file exists, so it gives the same names as the store.
+  // Only when the file is missing are the names read from the store.
+  s = VersionSet::ListColumnFamiliesFromManifest(
+      DescriptorFileName(GetDbPath(), current.stub.from_manifest_number), fs,
+      names);
+  if (!s.IsNotFound() && !s.IsPathNotFound()) {
+    return s;
+  }
+  names->clear();
+  ManifestStoreScan scan;
+  s = ScanManifestStore(reader.get(), /*consistent=*/true, &scan);
+  if (!s.ok()) {
+    return s;
+  }
+  // The MANIFEST file is deleted only after the switch, which sets the
+  // authority to kStore. Any other authority means a lost MANIFEST file.
+  if (scan.extra_fields.authority != ManifestAuthority::kStore) {
+    fprintf(stderr,
+            "The MANIFEST file of an entering DB is missing, but the store "
+            "authority is %d, not store\n",
+            static_cast<int>(scan.extra_fields.authority));
+    port::ImmediateExit(1);
+  }
+  for (const auto& [cf_id, cf_rows] : scan.rows.cfs) {
+    if (!cf_rows.cf.dropped) {
+      names->push_back(cf_rows.cf.name);
+    }
+  }
+  return Status::OK();
+}
+
+std::shared_ptr<FileManifestStore> StressTest::NewTestManifestStore(
+    bool writer, uint64_t fault_one_in) const {
+  return std::make_shared<FileManifestStore>(
+      raw_env, ManifestStoreDirForDb(GetDbPath()), writer, fault_one_in,
+      static_cast<uint32_t>(FLAGS_seed));
+}
+
+void StressTest::SetManifestStoreForOpen() {
+  if (!UsesTestManifestStore()) {
+    return;
+  }
+  // Drop the references that this test holds to the writer of the last open
+  // (manifest_store_ and options_.manifest_store) before the next writer is
+  // made. The destructor of a reader or a writer of
+  // the store dir drops a late apply that is still waiting, so the first call
+  // of the new object does not apply a request of the old DB.
+  manifest_store_.reset();
+  options_.manifest_store.reset();
+  manifest_store_ =
+      NewTestManifestStore(/*writer=*/true, FLAGS_manifest_store_fault_one_in);
+  options_.manifest_store = manifest_store_;
+  options_.manifest_store_shadow = FLAGS_manifest_store_shadow;
+  // In store mode, manifest_store_migrate lets each open move a DB in file mode
+  // (after a rollback) into the store and apply manifest_store_copy_mode. An
+  // open finishes a create or an enter that a crash stopped even without it.
+  // Shadow mode refuses it, and a shadow DB stays in file mode.
+  options_.manifest_store_migrate = !FLAGS_manifest_store_shadow;
+  options_.manifest_store_copy_mode =
+      static_cast<ManifestCopyMode>(FLAGS_manifest_store_copy_mode);
+  // See WaitForShadowFullCopy().
+  shadow_generation_before_open_ = 0;
+  if (InManifestShadowMode() && !ShadowCloseCommitMayBeMissing()) {
+    ManifestDbRowResult db_row;
+    const IOStatus io_s =
+        NewTestManifestStore(/*writer=*/false)->ReadDbRow(&db_row);
+    if (io_s.ok()) {
+      shadow_generation_before_open_ = db_row.state.generation;
+    } else if (!io_s.IsNotFound()) {
+      DB_STRESS_ASSERT_OK_MSG(io_s, "Cannot read the DB row before the open");
+    }
+  }
+}
+
+void StressTest::WaitForShadowFullCopy(const std::string& session_id) {
+  if (!InManifestShadowMode() || ShadowCloseCommitMayBeMissing()) {
+    return;
+  }
+  // The full copy is done when the store has a generation that is not the one
+  // from before the open, and the last commit comes from this DB session. The
+  // first commit of the full copy (the claim, or the commit that creates the
+  // DB row when the store has none) also has a commit id of this session, but
+  // it keeps the old generation. kMaxWaitMicros (60 s) is an estimate with a
+  // large margin. The full copy runs as a shadow job in the LOW pool. That pool
+  // has one extra thread for shadow jobs (DBImpl::CreateManifestStoreShadow()).
+  // The full copy writes all rows, about one per live file, and for the DB
+  // sizes of db_stress this is a short write.
+  constexpr uint64_t kMaxWaitMicros = 60 * 1000 * 1000;
+  // kPollMicros (10 ms) is an estimate: it is short compared with the time of
+  // a full copy, and a read of the test store is cheap for the DB sizes of
+  // db_stress (see "Persistence" at FileManifestStore).
+  constexpr uint64_t kPollMicros = 10 * 1000;
+  std::shared_ptr<FileManifestStore> reader =
+      NewTestManifestStore(/*writer=*/false);
+  for (uint64_t waited = 0;; waited += kPollMicros) {
+    ManifestDbRowResult db_row;
+    const IOStatus io_s = reader->ReadDbRow(&db_row);
+    if (io_s.ok() &&
+        db_row.state.generation != shadow_generation_before_open_ &&
+        Slice(db_row.state.last_commit_id).starts_with(session_id + "-")) {
+      return;
+    }
+    if (!io_s.ok() && !io_s.IsNotFound()) {
+      DB_STRESS_ASSERT_OK_MSG(io_s, "Reading the shadow store failed");
+    }
+    if (waited >= kMaxWaitMicros) {
+      fprintf(stderr,
+              "The first full copy of shadow mode did not finish in 60 s, in a "
+              "run without store faults or file system write faults\n");
+      port::ImmediateExit(1);
+    }
+    clock_->SleepForMicroseconds(static_cast<int>(kPollMicros));
+  }
+}
+
+void StressTest::MaybeFenceManifestStore(ThreadState* thread, bool can_flush) {
+  // A fenced DB cannot flush, so its memtables survive only in the WAL. The
+  // reopen expects no data loss, so the fence needs the WAL.
+  // Shadow mode never fences: ValidateManifestStoreFlags() refuses
+  // --manifest_store_fence_at_reopen_one_in with --manifest_store_shadow.
+  if (manifest_store_ == nullptr || FLAGS_disable_wal ||
+      FLAGS_manifest_store_fence_at_reopen_one_in <= 0 ||
+      !thread->rand.OneIn(FLAGS_manifest_store_fence_at_reopen_one_in)) {
+    return;
+  }
+  // A store fault in the commit of the flush below would replace IOFenced with
+  // its own error.
+  manifest_store_->SetFaultsEnabled(false);
+  std::shared_ptr<FileManifestStore> newer =
+      NewTestManifestStore(/*writer=*/true);
+  ManifestStoreOpenOptions open_opts;
+  open_opts.commit_id = "db_stress-fence-" + std::to_string(*newer->epoch());
+  ManifestDbRowResult db_row;
+  DB_STRESS_ASSERT_OK_MSG(newer->Open(open_opts, &db_row),
+                          "The claim of the fencing store object failed");
+  // From now on the store refuses every call of the old object.
+  const IOStatus s = manifest_store_->ReadDbRow(&db_row);
+  if (!s.IsIOFenced()) {
+    fprintf(stderr, "The old store object is not fenced: %s\n",
+            s.ToString().c_str());
+    port::ImmediateExit(1);
+  }
+  // The old DB must also see the fence: a flush of a column family whose
+  // active memtable has entries switches the memtable and writes the MANIFEST,
+  // which must fail with IOFenced. The data stays in the synced WAL, and the
+  // next open recovers it. Immutable memtables alone are not used: a flush job
+  // that already runs for them may write the MANIFEST before the fence, and
+  // then the flush below has nothing to write and returns OK. When no active
+  // memtable has entries, no MANIFEST write can be forced without a new write,
+  // so only the check of the store object above runs. The same holds after
+  // CancelAllBackgroundWork(), which stops flushes.
+  //
+  // flush_check holds the result of the flush check. The code prints it below,
+  // so that a crash test log shows how often the DB-level check runs.
+  const char* flush_check = "not run";
+  for (ColumnFamilyHandle* cfh : column_families_) {
+    if (!can_flush) {
+      break;
+    }
+    uint64_t entries = 0;
+    if (!db_->GetIntProperty(cfh, DB::Properties::kNumEntriesActiveMemTable,
+                             &entries) ||
+        entries == 0) {
+      continue;
+    }
+    const Status flush_s = db_->Flush(FlushOptions(), cfh);
+    // An injected file system fault can stop the flush first. The check of the
+    // store object above has already run. IsErrorInjectedAndRetryable() needs a
+    // non-OK status, so check OK first.
+    if (flush_s.ok() ||
+        (!flush_s.IsIOFenced() && !IsErrorInjectedAndRetryable(flush_s))) {
+      fprintf(stderr,
+              "A flush of the fenced DB did not fail with IOFenced: %s\n",
+              flush_s.ToString().c_str());
+      port::ImmediateExit(1);
+    }
+    flush_check = flush_s.IsIOFenced() ? "IOFenced" : "injected error";
+    break;
+  }
+  fprintf(stdout,
+          "Fenced the DB in the store before the reopen (flush check: %s)\n",
+          flush_check);
+}
+
+void StressTest::MaybeRollBackManifestStore(ThreadState* thread) {
+  // ValidateManifestStoreFlags() refuses --manifest_store_rollback_one_in
+  // with --manifest_store_shadow, so only store mode runs the rollback.
+  if (!InManifestStoreMode() || FLAGS_manifest_store_rollback_one_in <= 0 ||
+      !thread->rand.OneIn(FLAGS_manifest_store_rollback_one_in)) {
+    return;
+  }
+  // A rollback without the store writes the MANIFEST file from the MANIFEST
+  // file copy. Only in sync copy mode is that copy always up to date, so only
+  // then can the rollback run without the store.
+  const bool without_store = FLAGS_manifest_store_copy_mode ==
+                                 static_cast<int>(ManifestCopyMode::kSync) &&
+                             thread->rand.OneIn(2);
+  manifest_store_.reset();
+  options_.manifest_store.reset();
+  DBOptions db_options(options_);
+  if (!without_store) {
+    db_options.manifest_store = NewTestManifestStore(/*writer=*/true);
+  }
+  if (db_fault_injection_fs_) {
+    db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+  }
+  DB_STRESS_ASSERT_OK_MSG(RollBackManifestStore(db_options, GetDbPath()),
+                          "RollBackManifestStore() failed");
+  fprintf(stdout, "Rolled the DB back to file mode %s the store\n",
+          without_store ? "without" : "with");
+}
+
+void StressTest::FinishInterruptedRollback() {
+  if (!UsesTestManifestStore()) {
+    return;
+  }
+  CurrentManifestInfo current;
+  Status s = ReadCurrentManifestInfo(raw_env->GetFileSystem().get(),
+                                     GetDbPath(), &current);
+  DB_STRESS_ASSERT_OK_MSG(s, "Cannot read CURRENT before the open");
+  if (!current.exists || current.is_stub) {
+    return;
+  }
+  std::shared_ptr<FileManifestStore> reader =
+      NewTestManifestStore(/*writer=*/false);
+  ManifestDbRowResult db_row;
+  const IOStatus io_s = reader->ReadDbRow(&db_row);
+  if (io_s.IsNotFound()) {
+    return;
+  }
+  DB_STRESS_ASSERT_OK_MSG(io_s, "Cannot read the DB row before the open");
+  ManifestRows rows;
+  ManifestDbRowExtraFields extra;
+  s = PublicRowsToManifestRows(db_row.db_row, {}, &rows, &extra);
+  DB_STRESS_ASSERT_OK_MSG(s, "Cannot parse the DB row before the open");
+  // No db id check is needed: the store dir belongs to this DB only.
+  if (extra.authority != ManifestAuthority::kStore) {
+    return;
+  }
+  DBOptions db_options(options_);
+  db_options.manifest_store = NewTestManifestStore(/*writer=*/true);
+  DB_STRESS_ASSERT_OK_MSG(RollBackManifestStore(db_options, GetDbPath()),
+                          "Finishing an interrupted rollback failed");
+  fprintf(stdout,
+          "Finished a rollback that stopped before its DB row commit\n");
+}
+
+void StressTest::VerifyMetadataModeAfterOpen() {
+  CurrentManifestInfo current;
+  Status s = ReadCurrentManifestInfo(raw_env->GetFileSystem().get(),
+                                     GetDbPath(), &current);
+  if (s.ok() && FLAGS_manifest_store_shadow) {
+    if (!current.exists || current.is_stub) {
+      s = Status::Corruption(
+          "The shadow DB is not in file mode after the open");
+    }
+  } else if (s.ok() && (!current.exists || !current.is_stub ||
+                        current.stub.state != ManifestStubState::kDone)) {
+    s = Status::Corruption("The DB is not in store mode after the open");
+  }
+  DB_STRESS_ASSERT_OK_MSG(s, "Metadata mode check after open failed");
+}
+
+bool StressTest::ShadowCloseCommitMayBeMissing() {
+  return FLAGS_manifest_store_fault_one_in > 0 ||
+         FLAGS_write_fault_one_in > 0 ||
+         FLAGS_metadata_write_fault_one_in > 0 ||
+         FLAGS_open_write_fault_one_in > 0 ||
+         FLAGS_open_metadata_write_fault_one_in > 0;
+}
+
+void StressTest::CompareShadowStoreAfterClose(const std::string& session_id) {
+  if (!InManifestShadowMode()) {
+    return;
+  }
+  // The compare reads the closed DB through the raw Env, so that no injected
+  // file system fault stops it. It lists the column families from the MANIFEST,
+  // because recovery needs all of them.
+  DBOptions db_options(options_);
+  db_options.env = raw_env;
+  db_options.manifest_store.reset();
+  std::vector<std::string> names;
+  Status s = DB::ListColumnFamilies(db_options, GetDbPath(), &names);
+  DB_STRESS_ASSERT_OK_MSG(s, "Listing the column families to compare failed");
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(names.size());
+  for (const std::string& name : names) {
+    column_families.emplace_back(name, ColumnFamilyOptions(options_));
+  }
+  std::shared_ptr<FileManifestStore> reader =
+      NewTestManifestStore(/*writer=*/false);
+  // The skip rules are at the declaration. For example, a DB whose store calls
+  // all failed (its first full copy got an injected fault) writes no close
+  // commit, so the last commit can be the close commit of an earlier DB
+  // session, or no close commit.
+  ManifestDbRowResult db_row;
+  s = reader->ReadDbRow(&db_row);
+  if (s.IsNotFound() ||
+      (s.ok() &&
+       (!Slice(db_row.state.last_commit_id).starts_with(session_id + "-") ||
+        !ManifestCommitIdGenerator::IsCloseId(db_row.state.last_commit_id)))) {
+    if (!ShadowCloseCommitMayBeMissing()) {
+      fprintf(stderr,
+              "Shadow store has no close commit of the DB session that closed, "
+              "in a run without store faults or file system write faults\n");
+      port::ImmediateExit(1);
+    }
+    fprintf(stdout,
+            "Shadow store not compared: the last commit is not the close "
+            "commit of the DB session that closed\n");
+    return;
+  }
+  DB_STRESS_ASSERT_OK_MSG(s, "Reading the shadow store failed");
+  std::vector<std::string> differences;
+  std::vector<std::string> warnings;
+  s = CompareManifestStoreWithManifest(GetDbPath(), db_options, column_families,
+                                       reader.get(), &differences, &warnings);
+  DB_STRESS_ASSERT_OK_MSG(s, "Comparing the shadow store failed");
+  // The last commit is the close commit of the old DB, which it writes only
+  // when the store is in sync. So a warning (an authority other than kShadow,
+  // or a store behind the MANIFEST) means a shadow bug, as a difference does.
+  for (const std::string& warning : warnings) {
+    fprintf(stderr, "Shadow store warning after a close commit: %s\n",
+            warning.c_str());
+  }
+  if (!warnings.empty() || !differences.empty()) {
+    for (const std::string& difference : differences) {
+      fprintf(stderr, "Shadow store difference: %s\n", difference.c_str());
+    }
+    port::ImmediateExit(1);
+  }
+  fprintf(stdout, "The shadow store matches the MANIFEST\n");
+}
+
 void StressTest::Reopen(ThreadState* thread) {
+  // The "Store step" markers below and in Open() match "Order of the store
+  // steps" in db_stress_test_base.h.
+  //
+  // Store step 1. Store faults go off first, then this code waits for
+  // background work.
+  // Why:
+  // - Store mode: when a store commit fails and RocksDB retries it,
+  //   CancelAllBackgroundWork() or Close() during those retries turns the
+  //   error into a fatal error. With injected store faults, that would fail
+  //   this reopen without a real bug. With the faults off, a retrying store
+  //   commit succeeds at its next try, within one retry interval
+  //   (--bgerror_resume_retry_interval).
+  // - Shadow mode: with the faults off, no new injected store fault can fail
+  //   the close commit, so that the shadow store can be compared after the
+  //   close. An earlier fault can still leave the store out of sync. The DB
+  //   then sends no close commit, and CompareShadowStoreAfterClose() skips
+  //   the compare (see ShadowCloseCommitMayBeMissing()).
+  // Limits:
+  // - The wait has a time limit, max(10 s, 3 x the retry interval), and a
+  //   timeout is accepted. WaitForCompact() waits until no flush or compaction
+  //   is running, scheduled or queued, but a compaction that fails on an
+  //   injected retryable file system fault sets no background error and is
+  //   scheduled again, so the wait may never end. The limit only needs to
+  //   cover the store commits that were retrying when the faults went off.
+  //   Such a commit waits one retry interval before its next try, so 3
+  //   intervals leave room for that wait, the try itself and the work that it
+  //   unblocks (an estimate). 10 s is an estimate that leaves room for a slow
+  //   host.
+  // - WaitForCompact() returns at once when a background error is already
+  //   set, so then a store commit can still be in flight. An injected
+  //   background error is accepted, because the reopen recovers from the
+  //   synced WAL; any other error fails the run.
+  if (manifest_store_ != nullptr && FLAGS_manifest_store_fault_one_in > 0) {
+    manifest_store_->SetFaultsEnabled(false);
+    WaitForCompactOptions wait_options;
+    wait_options.timeout = std::chrono::microseconds(std::max<uint64_t>(
+        10 * 1000 * 1000, 3 * FLAGS_bgerror_resume_retry_interval));
+    const Status wait_s = db_->GetRootDB()->WaitForCompact(wait_options);
+    if (!wait_s.ok() && !wait_s.IsTimedOut() &&
+        !IsErrorInjectedAndRetryable(wait_s)) {
+      DB_STRESS_ASSERT_OK_MSG(wait_s, "Waiting for background work failed");
+    }
+  }
   // BG jobs in WritePrepared must be canceled first because i) they can
   // access the db via a callbac ii) they hold on to a snapshot and the
   // upcoming
   // ::Close would complain about it.
   const bool write_prepared = FLAGS_use_txn && FLAGS_txn_write_policy != 0;
   bool bg_canceled __attribute__((unused)) = false;
+  // False after CancelAllBackgroundWork() ran, with or without a wait,
+  // because then a flush cannot be forced.
+  bool flush_possible = true;
+  // Store step 2.
   if (write_prepared || thread->rand.OneIn(2)) {
     const bool wait =
         write_prepared || static_cast<bool>(thread->rand.OneIn(2));
     CancelAllBackgroundWork(db_, wait);
     bg_canceled = wait;
+    flush_possible = false;
   }
   assert(!write_prepared || bg_canceled);
 
-  CleanUpColumnFamilies();
-
+  // Store step 3.
+  //
   // Currently reopen does not restore expected state
   // with potential data loss in mind like the first open before
   // crash-recovery verification does. Therefore it always expects no data
@@ -6831,6 +7330,23 @@ void StressTest::Reopen(ThreadState* thread) {
         s, "Error persisting WAL data which is needed before reopening the DB");
   }
 
+  // Store step 4.
+  //
+  // The fence uses the column family handles to flush the old DB. Close()
+  // returns OK after a fence: it logs and ignores a failed MANIFEST write, both
+  // for the shutdown flush and for the WAL markers of
+  // optimize_manifest_for_recovery.
+  MaybeFenceManifestStore(thread, /*can_flush=*/flush_possible);
+  // Store step 5.
+  CleanUpColumnFamilies();
+  // Read before Close(): CompareShadowStoreAfterClose() needs the session id
+  // of the closed DB.
+  std::string session_id;
+  if (FLAGS_manifest_store_shadow) {
+    DB_STRESS_ASSERT_OK_MSG(db_->GetDbSessionId(session_id),
+                            "Getting the DB session id failed");
+    WaitForShadowFullCopy(session_id);
+  }
   if (thread->rand.OneIn(2)) {
     Status s = db_->Close();
     DB_STRESS_ASSERT_OK_MSG(s, "Non-ok close status");
@@ -6842,6 +7358,9 @@ void StressTest::Reopen(ThreadState* thread) {
   txn_db_ = nullptr;
   optimistic_txn_db_ = nullptr;
   secondary_db_.reset();
+  // Store step 6.
+  CompareShadowStoreAfterClose(session_id);
+  MaybeRollBackManifestStore(thread);
 
   num_times_reopened_++;
   auto now = clock_->NowMicros();

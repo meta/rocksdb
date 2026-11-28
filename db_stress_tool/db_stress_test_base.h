@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "db_stress_tool/db_stress_common.h"
+#include "db_stress_tool/db_stress_manifest_store.h"
 #include "db_stress_tool/db_stress_shared_state.h"
 #include "env/composite_env_wrapper.h"
 #include "rocksdb/experimental.h"
@@ -646,6 +647,200 @@ class StressTest {
   void RecordManifestStateBeforeReopen();
   void VerifyManifestNotRewritten();
 
+  // Store mode and shadow mode (--use_manifest_store). The terms stub MANIFEST
+  // and authority are defined in "Store mode: overview" in
+  // db/manifest_store_state.h, and copy mode in "MANIFEST file copy" in the
+  // same file. The terms epoch, claim and fence are defined in "Terms" in
+  // include/rocksdb/manifest_store.h, and the DB row is the row of
+  // ManifestRowType::kDb there. "In sync" for shadow mode is defined in the
+  // class comment of ManifestStoreShadow (db/manifest_store_shadow.h). See
+  // ManifestStoreDirForDb() for the store of a DB, and FileManifestStore for
+  // the store.
+  //
+  // Order of the store steps at a reopen and at the next open. Reopen() and
+  // Open() explain the reasons and the limits of each step at its "Store step"
+  // marker. The first open of a run starts at step 7.
+  //
+  //   Reopen(), before the close (the old DB is still open):
+  //   1. Store faults off, then WaitForCompact() (only with store faults; it
+  //      returns at once on a background error, and has a time limit), so
+  //      that store commits that are still retrying can finish.
+  //   2. Maybe CancelAllBackgroundWork().
+  //   3. SyncWAL() or FlushWAL(true).
+  //   4. MaybeFenceManifestStore() (store mode).
+  //   5. CleanUpColumnFamilies(). In shadow mode, read the session id, and in
+  //      a shadow run without the faults of ShadowCloseCommitMayBeMissing(),
+  //      wait in WaitForShadowFullCopy(). Then close the DB: half of the
+  //      reopens call Close() before they delete the DB object. Both ways
+  //      close the DB, so in shadow mode both write the close commit when the
+  //      store is in sync.
+  //   Reopen(), after the close:
+  //   6. Shadow mode: CompareShadowStoreAfterClose(). Store mode:
+  //      MaybeRollBackManifestStore().
+  //   Open(), the next DB:
+  //   7. ListColumnFamiliesBeforeOpen().
+  //   8. FinishInterruptedRollback().
+  //   9. SetManifestStoreForOpen(): a new store object, with faults off.
+  //   10. DB::Open().
+  //   11. VerifyMetadataModeAfterOpen(), then store faults on.
+  //
+  // Checks that stop the run with an error, besides the usual db_stress checks:
+  // - Store step 4, MaybeFenceManifestStore(): the old store object is not
+  //   fenced, or a flush of the fenced DB does not fail with IOFenced.
+  // - Store step 5, WaitForShadowFullCopy(): in a run without the faults of
+  //   ShadowCloseCommitMayBeMissing(), the first full copy of the old DB is
+  //   not in the store after 60 s.
+  // - Store step 6, CompareShadowStoreAfterClose(): a difference or a warning
+  //   after a close commit of the old DB, or no close commit of the old DB in
+  //   a run without the faults of ShadowCloseCommitMayBeMissing().
+  // - Store step 7, ListColumnFamiliesBeforeOpen(): the MANIFEST file of an
+  //   entering DB is missing, but the authority of the DB row is not kStore.
+  // - Store step 11, VerifyMetadataModeAfterOpen(): CURRENT does not name what
+  //   the mode expects (a "done" stub in store mode, a MANIFEST file in shadow
+  //   mode).
+  // - A failed claim of the fencing object (step 4), or a failed
+  //   RollBackManifestStore() (steps 6 and 8).
+  //
+  // Store-step results that do not stop the run:
+  // - Step 1: WaitForCompact() returns TimedOut, or an injected retryable
+  //   error.
+  // - Step 7: the listing returns NotFound for a DB whose create stopped
+  //   (a "creating" stub). Open() then treats the DB as new, and DB::Open()
+  //   finishes the create.
+  // - Step 10: an open that fails with file system fault injection on is
+  //   retried with the injection off.
+  //
+  // Shadow mode and step 2: CancelAllBackgroundWork() does not stop the shadow
+  // job, because ManifestStoreShadow schedules its jobs itself. Only the close
+  // of the DB (step 5) stops it: Close() removes a queued job and waits for a
+  // running one. So in a shadow run without the faults of
+  // ShadowCloseCommitMayBeMissing(), step 5 can still wait for the first full
+  // copy before it closes the DB.
+  //
+  // The shadow compare, in a shadow run without the faults of
+  // ShadowCloseCommitMayBeMissing():
+  // 1. Before the open (step 9), db_stress saves the store generation.
+  // 2. Before the close (step 5), it waits until the store has another
+  //    generation and a last commit id from this DB session. A claim or the
+  //    create of the DB row alone writes an id of this session but keeps the
+  //    old generation, so the wait needs both.
+  // 3. After the close (step 6), it compares when the last commit is the close
+  //    commit of this session. Any difference or warning fails the run.
+  // With those faults, steps 1 and 2 are skipped, and a missing close commit
+  // logs a skip. Without them, a missing close commit fails the run.
+
+  // Lists the column families of the DB before an open.
+  // DB::ListColumnFamilies() returns NotSupported for a DB in store mode whose
+  // last open stopped while it created the DB or moved it into the store. A DB
+  // whose last open stopped while it moved the DB into the store is listed from
+  // the MANIFEST file that the stub names, or, when that file was deleted after
+  // the switch, from the store, whose authority must then be kStore. A DB
+  // whose last open stopped while it created the DB has no acknowledged write,
+  // so this returns NotFound, and the next DB::Open() finishes the create.
+  //
+  //   CURRENT names     store / file state         result
+  //   ----------------  -------------------------  ---------------------------
+  //   normal MANIFEST   any                        list from the MANIFEST file
+  //   "done" stub       rows in the store          list from the store
+  //   "creating" stub   any                        NotFound (a new DB)
+  //   "entering" stub   its MANIFEST file exists   list from that MANIFEST file
+  //   "entering" stub   its MANIFEST file missing  list from the store; the
+  //                                                authority must be kStore,
+  //                                                else db_stress exits
+  //
+  // It runs before SetManifestStoreForOpen() and uses its own reader object of
+  // the store dir. A store read here can apply a timed-out request that is
+  // still waiting (a late apply). When the listing reads only the MANIFEST
+  // file, the destructor of the unused reader drops that request instead.
+  Status ListColumnFamiliesBeforeOpen(std::vector<std::string>* names);
+
+  // Returns a new test store object for the DB of this test: a writer with a
+  // new epoch when `writer` is true, otherwise a reader. `fault_one_in` sets
+  // its store faults (0 = never).
+  std::shared_ptr<FileManifestStore> NewTestManifestStore(
+      bool writer, uint64_t fault_one_in = 0) const;
+
+  // Sets manifest_store_ and options_.manifest_store to a new writer object
+  // with a new epoch for the next open attempt. It also sets the mode options:
+  // manifest_store_shadow, manifest_store_migrate (store mode only) and
+  // manifest_store_copy_mode.
+  void SetManifestStoreForOpen();
+
+  // At a reopen, before the old DB closes: a new store object claims the DB, so
+  // the old DB is fenced and its later MANIFEST writes fail with IOFenced. When
+  // `can_flush` is true and the active memtable of a column family has
+  // entries, it checks that a flush of the old DB fails with IOFenced, or with
+  // an injected file system error that stops the flush first.
+  void MaybeFenceManifestStore(ThreadState* thread, bool can_flush);
+
+  // At a reopen, after the old DB closed: moves the DB back to file mode with
+  // RollBackManifestStore(). The next open moves it into the store again.
+  void MaybeRollBackManifestStore(ThreadState* thread);
+
+  // Before a read-write open: finishes a rollback that stopped between its two
+  // steps. RollBackManifestStore() first makes CURRENT name a normal MANIFEST
+  // file, then commits the DB row with authority kFile. A rollback without the
+  // store cannot do the second step, and a kill can stop a rollback with the
+  // store between the steps. Then the DB row still says kStore, and an open
+  // with manifest_store_migrate refuses the DB. This function finds that case
+  // and calls RollBackManifestStore() with the store, which sets the DB row to
+  // file mode and keeps the MANIFEST file.
+  void FinishInterruptedRollback();
+
+  // After a read-write open: checks which file CURRENT names. In store mode it
+  // must be a stub MANIFEST in the "done" state. In shadow mode it must be a
+  // normal MANIFEST file, which is the authority in shadow mode. This check
+  // does not read the store; CompareShadowStoreAfterClose() checks the store
+  // rows at a later reopen.
+  void VerifyMetadataModeAfterOpen();
+
+  // Shadow mode, at a reopen after the old DB closed: compares the test store
+  // with the MANIFEST (CompareManifestStoreWithManifest()). A commit id is
+  // <db_session_id>-<counter>, and a close id ends with "-close" (see
+  // ManifestCommitIdGenerator in db/manifest_store_state.h). The compare runs
+  // only when the last commit is the close commit of the old DB: its id starts
+  // with `session_id` + "-", where `session_id` is the DB session id of the old
+  // DB, and ManifestCommitIdGenerator::IsCloseId() is true. The old DB writes
+  // that commit only when the store is in sync (see "In sync" in the class
+  // comment of ManifestStoreShadow): its last store round succeeded, and it
+  // knows every change that the store still misses. The close commit sends
+  // those changes, so after it the store must match the MANIFEST, and any
+  // warning or difference fails the run. In every other case (no DB row, a last
+  // commit from another session, or a last commit that is not a close commit)
+  // the store got no close commit from the old DB and may be behind:
+  // - When ShadowCloseCommitMayBeMissing() is true, the compare is skipped
+  //   with the line "Shadow store not compared" on stdout.
+  // - Else the run fails. In a run without these faults, Reopen() first waits
+  //   for the first full copy (WaitForShadowFullCopy()). Then the old DB
+  //   writes the close commit at every close. A build that never writes the
+  //   close commit therefore cannot pass by skipping every compare.
+  // A failed read of the DB row or a failed compare also fails the run.
+  void CompareShadowStoreAfterClose(const std::string& session_id);
+
+  // True when the run injects faults that can leave the shadow store out of
+  // sync at a close, so that the old DB writes no close commit:
+  // - store faults (--manifest_store_fault_one_in): a failed store call needs
+  //   a new full copy;
+  // - file system write faults (--write_fault_one_in,
+  //   --metadata_write_fault_one_in, --open_write_fault_one_in,
+  //   --open_metadata_write_fault_one_in): a failed MANIFEST write may be in
+  //   the MANIFEST file without being in the rows, until the next MANIFEST
+  //   file.
+  // Other faults (read faults, for example) do not fail a MANIFEST write or a
+  // store call, so they do not count.
+  static bool ShadowCloseCommitMayBeMissing();
+
+  // Shadow mode, at a reopen before the old DB closes, in a run without the
+  // faults of ShadowCloseCommitMayBeMissing(): waits until the first full copy
+  // of the old DB (DB session `session_id`) is in the store. A close that
+  // comes earlier stops the full copy, so the old DB writes no close commit,
+  // and CompareShadowStoreAfterClose() would fail the run. After the full
+  // copy, no fault can stop the later rounds, so the close writes the close
+  // commit. The run fails when the wait times out. SetManifestStoreForOpen()
+  // records the generation of the store before the open, which this wait
+  // compares with.
+  void WaitForShadowFullCopy(const std::string& session_id);
+
   int db_index_;
   std::string db_label_;
   std::string db_path_;
@@ -699,6 +894,17 @@ class StressTest {
   // compaction cannot append to the MANIFEST before
   // VerifyManifestNotRewritten() measures it.
   bool auto_compactions_paused_for_manifest_verify_ = false;
+  // The store object of the open DB in store mode, or the store that the open
+  // DB copies its MANIFEST state to in shadow mode. Null without
+  // --use_manifest_store. db_stress refuses --read_only with
+  // --use_manifest_store (both modes), so every open of the primary DB uses
+  // this writer object.
+  std::shared_ptr<FileManifestStore> manifest_store_;
+  // The store generation before the last open. SetManifestStoreForOpen() reads
+  // it from the DB row only in shadow mode, in a run without the faults of
+  // ShadowCloseCommitMayBeMissing(). It is 0 in every other run and when the
+  // store has no DB row. WaitForShadowFullCopy() reads it.
+  uint64_t shadow_generation_before_open_ = 0;
 };
 
 // Load options from OPTIONS file and populate `options`.

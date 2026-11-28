@@ -347,6 +347,13 @@ class ExternalSstFileIngestionJob {
   // Cleanup after successful/failed job
   void Cleanup(const Status& status);
 
+  // Makes Cleanup() keep the files that this job wrote into the DB
+  // (`internal_file_path`). Used in store mode after a failed commit that may
+  // have applied in the store (see db/manifest_store_state.h, "Quarantine"):
+  // the store rows can name these files. DBImpl::KeepFilesAfterStoreError()
+  // says how long they stay.
+  void KeepInternalFiles();
+
   VersionEdit* edit() { return &edit_; }
 
   const autovector<IngestedFileInfo>& files_to_ingest() const {

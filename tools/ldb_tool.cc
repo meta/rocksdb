@@ -31,6 +31,17 @@ void LDBCommandRunner::PrintHelp(const LDBOptions& ldb_options,
   ret.append("  --" + LDBCommand::ARG_LEADER_PATH +
              "=<leader_path> to open DB as a follower instance. Operations "
              "not supported in follower instance will fail.\n\n");
+  ret.append("  --" + LDBCommand::ARG_MANIFEST_STORE +
+             "=<store> for a DB in store mode: the ManifestStore that holds "
+             "its metadata, as a string for ManifestStore::CreateFromString(). "
+             "The epoch of a store object decides if it can claim the DB (see "
+             "include/rocksdb/manifest_store.h). A store object without an "
+             "epoch only reads, so commands that write fail. ldb opens the DB "
+             "with DB::Open() for most commands, including checkpoint and "
+             "backup. With a store object with an epoch, that open claims the "
+             "DB, and the store then refuses the running primary. Run such "
+             "commands only when no primary runs. Read-only commands never "
+             "claim.\n\n");
   ret.append(
       "The following optional parameters control if keys/values are "
       "input/output as hex or as plain strings:\n");
@@ -144,6 +155,7 @@ void LDBCommandRunner::PrintHelp(const LDBOptions& ldb_options,
   CheckPointCommand::Help(ret);
   WriteExternalSstFilesCommand::Help(ret);
   IngestExternalSstFilesCommand::Help(ret);
+  CompareManifestStoreCommand::Help(ret);
   UnsafeRemoveSstFileCommand::Help(ret);
   RemoteCompactionPrimaryCommand::Help(ret);
   RemoteCompactionWorkerCommand::Help(ret);

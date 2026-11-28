@@ -567,6 +567,9 @@ class CompactionJob {
   // compaction), meaning no floor is sent. Setting these requires DBMutex.
   uint64_t min_manifest_file_number_ = 0;
   uint64_t min_manifest_file_size_ = 0;
+  // See CompactionServiceInput::min_store_commit_sequence. Set together with
+  // the two values above.
+  uint64_t min_store_commit_sequence_ = 0;
 
   // Remote subcompactions run concurrently and validate their blob garbage
   // before moving output into the primary. This aggregate prevents each
@@ -726,6 +729,31 @@ struct CompactionServiceInput {
   // See DBOptions::remote_compaction_manifest_floor.
   uint64_t min_manifest_file_number = 0;
   uint64_t min_manifest_file_size = 0;
+
+  // The floor in store mode (see db/manifest_store_state.h). The three floor
+  // fields work together:
+  // - A nonzero min_manifest_file_number turns on trusted recovery and the
+  //   floor check in the worker. In store mode it carries the stub number.
+  // - File mode checks min_manifest_file_number and min_manifest_file_size.
+  // - Store mode checks this field instead: the MANIFEST file is a stub, so
+  //   its number and size say nothing about the metadata. The worker compares
+  //   the commit sequence of its scan
+  //   (ReactiveVersionSet::installed_store_commit_sequence()) with this field.
+  // - Zero in this field makes the floor check accept any scan. The other
+  //   checks of the recovery still run.
+  // This field holds the commit sequence of the last store commit that
+  // applied when the primary scheduled this compaction. The worker refuses a
+  // scan of the store with a smaller commit sequence, as it refuses an older
+  // MANIFEST view above. A scan at or above the floor is safe: the
+  // input files of the job are in installed Versions of the primary, and every
+  // installed Version was committed at or below the floor, so a scan at the
+  // floor lists these files. A later commit does not remove them, because they
+  // are inputs of this running compaction. Zero means that the input carries
+  // no minimum store commit sequence: a primary in file mode, an older
+  // primary, or DBOptions::remote_compaction_manifest_floor off. An older
+  // worker skips this field, and cannot open a DB in store mode anyway. The
+  // primary sets it from ManifestStoreState::applied_commit_sequence().
+  uint64_t min_store_commit_sequence = 0;
 
   // The primary's values. The worker opens the DB as a secondary, which
   // sanitizes them to 0 as a read-only DB. They are sent here rather than

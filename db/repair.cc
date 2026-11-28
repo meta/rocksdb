@@ -66,6 +66,7 @@
 #include "db/dbformat.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
+#include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
@@ -204,6 +205,28 @@ class Repairer {
     Status status = env_->LockFile(LockFileName(dbname_), &db_lock_);
     if (!status.ok()) {
       return status;
+    }
+    // A DB in store mode keeps its metadata in a ManifestStore (see
+    // db/manifest_store_state.h). Rebuilding a MANIFEST file from the SST
+    // files would split the DB from its rows. CheckNoManifestStub() returns
+    // NotSupported for a stub that CURRENT names, and for a stub in the folder
+    // when CURRENT is missing or damaged, or names a missing or damaged
+    // MANIFEST file. A missing or damaged CURRENT or MANIFEST is what
+    // RepairDB() repairs, so the check ignores it. Any other error, for example
+    // an I/O error or a timeout, leaves open whether there is a stub, so
+    // RepairDB() returns it before it changes anything.
+    {
+      std::vector<std::string> filenames;
+      status = env_->GetChildren(dbname_, &filenames);
+      if (status.ok()) {
+        bool current_names_manifest_file = false;
+        status =
+            CheckNoManifestStub(env_->GetFileSystem().get(), dbname_, filenames,
+                                "RepairDB()", &current_names_manifest_file);
+      }
+      if (!status.ok()) {
+        return status;
+      }
     }
     status = FindFiles();
     DBImpl* db_impl = nullptr;

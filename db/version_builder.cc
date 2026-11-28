@@ -1061,29 +1061,39 @@ class VersionBuilder::Rep : public MutableScalars {
       return Status::Corruption("VersionBuilder", oss.str());
     }
 
-    auto deleter = [vs = version_set_, ioptions = ioptions_,
-                    bc = cfd_ ? cfd_->blob_file_cache()
-                              : nullptr](SharedBlobFileMetaData* shared_meta) {
-      if (vs) {
-        assert(ioptions);
-        assert(!ioptions->cf_paths.empty());
-        assert(shared_meta);
+    // A store-mode catch-up uses the object of the current Version for a held
+    // blob file, so the catch-up does not evict its blob file reader from the
+    // cache (see "Held files in store mode" at ManifestTailer::HeldFile()).
+    std::shared_ptr<SharedBlobFileMetaData> shared_meta;
+    if (version_edit_handler_ != nullptr) {
+      shared_meta =
+          version_edit_handler_->HeldBlobFile(cfd_, blob_file_addition);
+    }
+    if (shared_meta == nullptr) {
+      auto deleter = [vs = version_set_, ioptions = ioptions_,
+                      bc = cfd_ ? cfd_->blob_file_cache()
+                                : nullptr](SharedBlobFileMetaData* meta) {
+        if (vs) {
+          assert(ioptions);
+          assert(!ioptions->cf_paths.empty());
+          assert(meta);
 
-        vs->AddObsoleteBlobFile(shared_meta->GetBlobFileNumber(),
-                                ioptions->cf_paths.front().path);
-      }
-      if (bc) {
-        bc->Evict(shared_meta->GetBlobFileNumber());
-      }
+          vs->AddObsoleteBlobFile(meta->GetBlobFileNumber(),
+                                  ioptions->cf_paths.front().path);
+        }
+        if (bc) {
+          bc->Evict(meta->GetBlobFileNumber());
+        }
 
-      delete shared_meta;
-    };
+        delete meta;
+      };
 
-    auto shared_meta = SharedBlobFileMetaData::Create(
-        blob_file_number, blob_file_addition.GetTotalBlobCount(),
-        blob_file_addition.GetTotalBlobBytes(),
-        blob_file_addition.GetChecksumMethod(),
-        blob_file_addition.GetChecksumValue(), std::move(deleter));
+      shared_meta = SharedBlobFileMetaData::Create(
+          blob_file_number, blob_file_addition.GetTotalBlobCount(),
+          blob_file_addition.GetTotalBlobBytes(),
+          blob_file_addition.GetChecksumMethod(),
+          blob_file_addition.GetChecksumValue(), std::move(deleter));
+    }
 
     mutable_blob_file_metas_.emplace(
         blob_file_number, MutableBlobFileMetaData(std::move(shared_meta)));
@@ -1286,10 +1296,23 @@ class VersionBuilder::Rep : public MutableScalars {
       del_files.erase(del_it);
     }
 
-    FileMetaData* const f = new FileMetaData(meta);
-    f->refs = 1;
+    // A store-mode catch-up uses the object of the current Version for a held
+    // file, so its table reader stays open and the file does not become
+    // obsolete when the old Version is released (see
+    // ManifestTailer::HeldFile()). The object already has its cache
+    // reservation.
+    FileMetaData* f = version_edit_handler_ != nullptr
+                          ? version_edit_handler_->HeldFile(cfd_, meta)
+                          : nullptr;
+    const bool held = f != nullptr;
+    if (held) {
+      ++f->refs;
+    } else {
+      f = new FileMetaData(meta);
+      f->refs = 1;
+    }
 
-    if (file_metadata_cache_res_mgr_) {
+    if (!held && file_metadata_cache_res_mgr_) {
       Status s = file_metadata_cache_res_mgr_->UpdateCacheReservation(
           f->ApproximateMemoryUsage(), true /* increase */);
       if (!s.ok()) {
@@ -1805,6 +1828,18 @@ class VersionBuilder::Rep : public MutableScalars {
            missing_blob_files_high_ != kInvalidBlobFileNumber;
   }
 
+  std::vector<uint64_t> GetMissingFileNumbers() const {
+    assert(track_found_and_missing_files_);
+    std::vector<uint64_t> numbers(l0_missing_files_.begin(),
+                                  l0_missing_files_.end());
+    numbers.insert(numbers.end(), non_l0_missing_files_.begin(),
+                   non_l0_missing_files_.end());
+    numbers.insert(numbers.end(), missing_blob_files_.begin(),
+                   missing_blob_files_.end());
+    std::sort(numbers.begin(), numbers.end());
+    return numbers;
+  }
+
   std::vector<std::string> GetAndClearIntermediateFiles() {
     assert(track_found_and_missing_files_);
     std::vector<std::string> result;
@@ -2176,6 +2211,10 @@ bool VersionBuilder::ValidVersionAvailable() {
 }
 
 bool VersionBuilder::HasMissingFiles() const { return rep_->HasMissingFiles(); }
+
+std::vector<uint64_t> VersionBuilder::GetMissingFileNumbers() const {
+  return rep_->GetMissingFileNumbers();
+}
 
 void VersionBuilder::RecordMissingBlobFilesAsDropped() {
   rep_->RecordMissingBlobFilesAsDropped();

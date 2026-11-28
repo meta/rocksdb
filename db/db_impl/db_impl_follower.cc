@@ -9,6 +9,7 @@
 #include <cinttypes>
 
 #include "db/arena_wrapped_db_iter.h"
+#include "db/manifest_store_state.h"
 #include "db/merge_context.h"
 #include "env/composite_env_wrapper.h"
 #include "env/fs_on_demand.h"
@@ -99,13 +100,22 @@ Status DBImplFollower::TryCatchUpWithLeader() {
   // read the manifest and apply new changes to the follower instance
   std::unordered_set<ColumnFamilyData*> cfds_changed;
   JobContext job_context(0, true /*create_superversion*/);
+  auto* reactive_versions =
+      static_cast_with_check<ReactiveVersionSet>(versions_.get());
+  // In store mode the store is read before the DB mutex is taken (see "Store
+  // mode in a secondary or follower" at
+  // ReactiveVersionSet::ReadStoreForCatchUp()).
+  std::unique_ptr<ManifestStoreRead> store_read;
+  s = reactive_versions->ReadStoreForCatchUp(&mutex_, &store_read);
+  if (!s.ok()) {
+    return s;
+  }
   {
     InstrumentedMutexLock lock_guard(&mutex_);
     std::vector<std::string> files_to_delete;
-    s = static_cast_with_check<ReactiveVersionSet>(versions_.get())
-            ->ReadAndApply(&mutex_, &manifest_reader_,
-                           manifest_reader_status_.get(), &cfds_changed,
-                           &files_to_delete);
+    s = reactive_versions->ReadAndApply(
+        &mutex_, &manifest_reader_, manifest_reader_status_.get(),
+        &cfds_changed, &files_to_delete, store_read.get());
     ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem_);
     pending_outputs_inserted_elem_.reset(new std::list<uint64_t>::iterator(
         CaptureCurrentFileNumberInPendingOutputs()));
@@ -165,6 +175,8 @@ Status DBImplFollower::TryCatchUpWithLeader() {
       }
     }
   }
+  // Frees the scanned rows of a store mode catch-up without the DB mutex.
+  store_read.reset();
   CleanupRetiredSecondaryReadViews();
   job_context.Clean();
 
@@ -264,6 +276,10 @@ Status DB::OpenAsFollower(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr) {
   dbptr->reset();
+  Status check = DBImpl::CheckManifestStoreOptions(db_options);
+  if (!check.ok()) {
+    return check;
+  }
 
   FileSystem* fs = db_options.env->GetFileSystem().get();
   {

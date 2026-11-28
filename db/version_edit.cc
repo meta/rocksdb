@@ -199,11 +199,12 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
 void VersionEdit::Clear() { *this = VersionEdit(); }
 
 void VersionEdit::AddExistingFile(int level, const FileMetaData& f,
-                                  uint32_t provenance_flags_to_set) {
+                                  uint32_t provenance_flags_to_set,
+                                  bool marked_for_compaction) {
   assert((provenance_flags_to_set & kProvenanceOriginMask) == 0);
   AddFile(level, f.fd.GetNumber(), f.fd.GetPathId(), f.fd.GetFileSize(),
           f.smallest, f.largest, f.fd.smallest_seqno, f.fd.largest_seqno,
-          f.marked_for_compaction, f.temperature, f.oldest_blob_file_number,
+          marked_for_compaction, f.temperature, f.oldest_blob_file_number,
           f.oldest_ancestor_time, f.file_creation_time, f.epoch_number,
           f.file_checksum, f.file_checksum_func_name, f.unique_id,
           f.compensated_range_deletion_size, f.tail_size,
@@ -1073,6 +1074,12 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         }
         break;
       }
+
+      case kManifestStoreStub:
+        // The rows in the store hold the metadata, not this file.
+        return Status::NotSupported(
+            "The DB is in store mode: its metadata is in the ManifestStore "
+            "and the MANIFEST file is a stub");
 
       default:
         if (tag & kTagSafeIgnoreMask) {

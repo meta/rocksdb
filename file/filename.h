@@ -87,6 +87,26 @@ std::string DescriptorFileName(const std::string& dbname, uint64_t number);
 
 std::string DescriptorFileName(uint64_t number);
 
+// The names of the MANIFEST file copies that RocksDB can write when the rows
+// in a ManifestStore are the authority (see db/manifest_store_state.h):
+// "MANIFEST_COPY-<number>" for a copy, with the same number format as
+// DescriptorFileName(), and "MANIFEST_COPY_CURRENT" for the pointer file that
+// names the active copy. ParseFileName() does not parse these names, so the
+// obsolete file purge never deletes them; the store mode code deletes them.
+std::string ManifestCopyFileName(const std::string& dbname, uint64_t number);
+std::string ManifestCopyPointerFileName(const std::string& dbname);
+
+// The temporary file "MANIFEST_COPY_CURRENT.dbtmp" that becomes the pointer
+// file by a rename. ParseFileName() does not parse it either, so the purge
+// cannot delete it before the rename.
+std::string ManifestCopyPointerTempFileName(const std::string& dbname);
+
+// Returns true if `name` (without the directory) is a copy name, the pointer
+// file name or the pointer temporary file name above. Sets `*is_pointer` (true
+// for the pointer and its temporary file), and `*number` for a copy.
+bool ParseManifestCopyFileName(const std::string& name, uint64_t* number,
+                               bool* is_pointer);
+
 extern const std::string kCurrentFileName;  // = "CURRENT"
 
 // Return the name of the current file.  This file contains the name

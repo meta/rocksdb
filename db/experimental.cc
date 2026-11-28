@@ -45,39 +45,6 @@ Status SuggestCompactRange(DB* db, const Slice* begin, const Slice* end) {
 }
 
 namespace {
-// Keeps the first error that a log::Reader of a MANIFEST file reports, for
-// example a read error or a record that fails its checksum. Later reports do
-// not change it. The caller sets status_ptr before the first read.
-struct ManifestReporter : public log::Reader::Reporter {
-  Status* status_ptr = nullptr;
-  void Corruption(size_t /*bytes*/, const Status& st,
-                  uint64_t /*log_number*/ = kMaxSequenceNumber) override {
-    status_ptr->UpdateIfOk(st);
-  }
-};
-
-// Opens the MANIFEST file at manifest_path for reading with a log::Reader that
-// verifies record checksums. reporter must outlive *reader.
-Status NewManifestReader(FileSystem* fs, const std::string& manifest_path,
-                         ManifestReporter* reporter,
-                         std::unique_ptr<log::Reader>* reader) {
-  std::unique_ptr<FSSequentialFile> file;
-  FileOptions file_opts = fs->OptimizeForManifestRead(FileOptions());
-  file_opts.io_options.type = IOType::kManifest;
-  Status s =
-      fs->NewSequentialFile(manifest_path, file_opts, &file, nullptr /* dbg */);
-  if (!s.ok()) {
-    return s;
-  }
-  std::unique_ptr<SequentialFileReader> file_reader =
-      std::make_unique<SequentialFileReader>(std::move(file), manifest_path);
-  file_reader->SetIOType(IOType::kManifest);
-  *reader =
-      std::make_unique<log::Reader>(nullptr, std::move(file_reader), reporter,
-                                    true /* checksum */, 0 /* log_number */);
-  return Status::OK();
-}
-
 // Counts the records that it applies, which tells a file with no applied
 // record apart from a MANIFEST file that records only the default column
 // family.

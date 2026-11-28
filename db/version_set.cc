@@ -35,6 +35,9 @@
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
+#include "db/manifest_rows.h"
+#include "db/manifest_store_shadow.h"
+#include "db/manifest_store_state.h"
 #include "db/memtable.h"
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
@@ -5758,6 +5761,21 @@ VersionSet::VersionSet(
 
 Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
   Status s;
+  if (copy_log_ != nullptr) {
+    // Store mode: the MANIFEST file copy. A copy in background mode is not
+    // synced after each commit, so sync it here.
+    IOStatus copy_s =
+        SyncManifest(db_options_, WriteOptions(), copy_log_->file());
+    if (copy_s.ok()) {
+      copy_s = copy_log_->Close(WriteOptions());
+    }
+    copy_log_.reset();
+    if (!copy_s.ok()) {
+      ROCKS_LOG_WARN(db_options_->info_log,
+                     "Store mode: closing the MANIFEST file copy failed: %s",
+                     copy_s.ToString().c_str());
+    }
+  }
   if (closed_ || unchanging_ || !manifest_file_number_ || !descriptor_log_) {
     return s;
   }
@@ -5986,6 +6004,12 @@ void VersionSet::Reset() {
   obsolete_files_.clear();
   obsolete_manifests_.clear();
   wals_.Reset();
+#ifndef NDEBUG
+  // Reset() replaces the column family set and clears the WAL set, so the
+  // debug rows no longer match. The next ProcessManifestWrites() call fills
+  // them again from the state that is recovered after this reset.
+  debug_manifest_rows_.reset();
+#endif
 }
 
 void VersionSet::UpdatedMutableDbOptions(
@@ -6102,6 +6126,34 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
   v->next_->prev_ = v;
 }
 
+void VersionSet::UpdateIoStatusAfterStoreBatch(
+    const IOStatus& io_s, bool store_committed,
+    const autovector<const autovector<uint64_t>*>& files_to_quarantine) {
+  if (!io_s.ok()) {
+    // A non-retryable error replaces a retryable io_status_. For example, a
+    // stop error is not retryable, so a DB that stops during an auto-resume
+    // becomes fatal. The IOError that CommitBatch() returns when the store
+    // rejects a commit for good (NotSupported before any unknown outcome) is
+    // not retryable either. It replaces a retryable io_status_, but it does
+    // not stop the store state.
+    if (io_status_.ok() ||
+        (io_status_.GetRetryable() && !io_s.GetRetryable())) {
+      io_status_ = io_s;
+    }
+    if (error_handler_) {
+      error_handler_->AddFilesToQuarantine(files_to_quarantine);
+    }
+    return;
+  }
+  // The check for an empty quarantine avoids a log line on every commit.
+  const bool clear_quarantine = store_committed && error_handler_ &&
+                                !error_handler_->GetFilesToQuarantine().empty();
+  io_status_ = io_s;
+  if (clear_quarantine) {
+    error_handler_->ClearFilesToQuarantine();
+  }
+}
+
 Status VersionSet::ProcessManifestWrites(
     std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
     FSDirectory* dir_contains_current_file, bool new_descriptor_log,
@@ -6112,6 +6164,15 @@ Status VersionSet::ProcessManifestWrites(
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
   ManifestWriter* last_writer = &first_writer;
+#ifndef NDEBUG
+  // Debug check, fill step (see VersionSet::debug_manifest_rows_). A null
+  // value means the first call, a WAL edit that an earlier call rejected, or a
+  // call of VersionSet::Reset().
+  if (debug_manifest_rows_ == nullptr) {
+    debug_manifest_rows_ = std::make_unique<ManifestRows>();
+    GetManifestRows(debug_manifest_rows_.get());
+  }
+#endif
 
   // Takes this batch, from the queue head through `last_writer`, off
   // manifest_writers_: records `s` on each writer, runs its callback, and wakes
@@ -6392,8 +6453,60 @@ Status VersionSet::ProcessManifestWrites(
     // don't keep in case of overflow
     enforced_limit = std::max(enforced_limit, new_limit);
   }
-  if (!skip_manifest_write &&
-      (!descriptor_log_ || prev_manifest_file_size >= enforced_limit)) {
+  // Store mode (see db/manifest_store_state.h) changes this function in these
+  // places, in order:
+  // 1. Here: no new MANIFEST file.
+  // 2. Below, with the DB mutex held: the decision to start a new MANIFEST
+  //    file copy, the state that the new copy needs, and the in-flight file
+  //    number.
+  // 3. With the DB mutex released: the store commit (CommitBatchToStore())
+  //    instead of the MANIFEST append, then the copy append
+  //    (UpdateManifestCopy()).
+  // 4. With the DB mutex held again: a batch whose store commit or copy update
+  //    returned a non-OK IOStatus (also the saved error of a stopped store)
+  //    sends its files to the quarantine (UpdateIoStatusAfterStoreBatch()). A
+  //    batch that fails before CommitBatch() runs, for example on a WAL edit
+  //    that the row changes reject, returns its Status and leaves the
+  //    quarantine alone. A new copy sets the size for its next rollover
+  //    (TuneMaxManifestFileSize()), and a successful batch installs as in
+  //    file mode.
+  //
+  // Shadow mode (see ManifestStoreShadow) hooks into this function in three
+  // places, in this order:
+  // 1. Here, under the DB mutex: without base rows, the write starts a new
+  //    MANIFEST file (see VersionSet::shadow_base_rows_).
+  // 2. Without the DB mutex, when the write starts a new MANIFEST file:
+  //    WriteCurrentStateToManifest() fills `shadow_snapshot_rows` (owned by
+  //    this function).
+  // 3. After the MANIFEST write, still without the DB mutex: on success,
+  //    HandOffToManifestStoreShadow() hands the row changes over. It moves the
+  //    snapshot rows into ReplaceWithSnapshot() (encoded) and into
+  //    shadow_base_rows_ (decoded) when it uses them. On failure, the base rows
+  //    are dropped and the shadow is marked as not in sync. Then what is left
+  //    of the snapshot rows is freed, before the DB mutex is taken again.
+  // A DB is never in store mode and shadow mode at once: manifest_store_shadow
+  // turns StoreModeOptions() off, and DBImpl::Recover() refuses a DB whose
+  // CURRENT names a stub.
+  const bool shadow_active =
+      manifest_store_shadow_ != nullptr && !manifest_store_shadow_->Stopped();
+  // After shadow mode stops, the base rows are freed after the DB mutex is
+  // released below, because freeing them takes time that grows with the
+  // number of column families. A write that skips the MANIFEST keeps the DB
+  // mutex, so it leaves the base rows to the next MANIFEST write.
+  std::unique_ptr<ManifestRows> stopped_shadow_base_rows;
+  if (!shadow_active && !skip_manifest_write) {
+    stopped_shadow_base_rows = std::move(shadow_base_rows_);
+  }
+  const bool shadow_needs_full_state =
+      shadow_active && shadow_base_rows_ == nullptr;
+  if (HasManifestStoreWriteState()) {
+    // Store mode never writes the MANIFEST file, so it never starts a new one
+    // (see db/manifest_store_state.h). The stub stays the MANIFEST file.
+    new_descriptor_log = false;
+    pending_manifest_file_number_ = manifest_file_number_;
+  } else if (!skip_manifest_write &&
+             (!descriptor_log_ || prev_manifest_file_size >= enforced_limit ||
+              shadow_needs_full_state)) {
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeNewManifest");
     new_descriptor_log = true;
   } else {
@@ -6416,17 +6529,23 @@ Status VersionSet::ProcessManifestWrites(
       first_writer.edit_list.front()->SetMaxColumnFamily(
           column_family_set_->GetMaxColumnFamily());
     }
-    for (const auto* cfd : *column_family_set_) {
-      assert(curr_state.find(cfd->GetID()) == curr_state.end());
-      curr_state.emplace(
-          cfd->GetID(),
-          MutableCFState(cfd->GetLogNumber(), cfd->GetFullHistoryTsLow()));
+    GetStateForNewManifest(&curr_state, &wal_additions,
+                           &options_manifest_state);
+  }
+  // Store mode: a new MANIFEST file copy needs the same state as a new
+  // MANIFEST file.
+  bool new_manifest_copy = false;
+  VersionEdit copy_db_fields;
+  if (HasManifestStoreWriteState() && !skip_manifest_write &&
+      manifest_store_state_->copy_mode() != ManifestCopyMode::kOff) {
+    new_manifest_copy =
+        copy_log_ == nullptr ||
+        copy_log_->file()->GetFileSize() >= tuned_max_manifest_file_size_;
+    if (new_manifest_copy) {
+      GetStateForNewManifest(&curr_state, &wal_additions,
+                             &options_manifest_state);
+      copy_db_fields = ManifestCopyDbFields();
     }
-
-    for (const auto& wal : wals_.GetWals()) {
-      wal_additions.AddWal(wal.first, wal.second);
-    }
-    options_manifest_state = options_file_manifest_state();
   }
 
   uint64_t new_manifest_file_size = 0;
@@ -6434,7 +6553,12 @@ Status VersionSet::ProcessManifestWrites(
   IOStatus io_s;
   IOStatus manifest_io_status;
   manifest_io_status.PermitUncheckedError();
+  // Store mode: true when CommitBatchToStore() applied this batch in the
+  // store. Only such a batch may clear the quarantine (see below).
+  bool store_committed = false;
   std::unique_ptr<log::Writer> new_desc_log_ptr;
+  // The rows of the new MANIFEST file's snapshot, for shadow mode.
+  ManifestRows shadow_snapshot_rows;
   // Save before releasing mu
   uint64_t manifest_preallocation_size = manifest_preallocation_size_;
   if (skip_manifest_write) {
@@ -6448,7 +6572,18 @@ Status VersionSet::ProcessManifestWrites(
     }
   } else {
     FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
+    // Read with the DB mutex held, for the commit in store mode.
+    uint64_t min_file_number_in_use = std::numeric_limits<uint64_t>::max();
+    if (HasManifestStoreWriteState() && min_file_number_in_use_func_) {
+      min_file_number_in_use = min_file_number_in_use_func_();
+    }
     mu->Unlock();
+    if (stopped_shadow_base_rows != nullptr) {
+      TEST_SYNC_POINT_CALLBACK(
+          "VersionSet::ProcessManifestWrites:FreeStoppedShadowBaseRows",
+          stopped_shadow_base_rows.get());
+      stopped_shadow_base_rows.reset();
+    }
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestStart");
     TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:WriteManifest", nullptr);
     if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
@@ -6486,9 +6621,10 @@ Status VersionSet::ProcessManifestWrites(
             CreateManifestWriter(std::move(descriptor_file), descriptor_fname,
                                  opt_file_opts, manifest_preallocation_size);
         raw_desc_log_ptr = new_desc_log_ptr.get();
-        s = WriteCurrentStateToManifest(write_options, curr_state,
-                                        wal_additions, options_manifest_state,
-                                        raw_desc_log_ptr, io_s);
+        s = WriteCurrentStateToManifest(
+            write_options, curr_state, wal_additions, options_manifest_state,
+            raw_desc_log_ptr, io_s,
+            shadow_active ? &shadow_snapshot_rows : nullptr);
         assert(s == io_s);
       }
       if (!io_s.ok()) {
@@ -6497,15 +6633,49 @@ Status VersionSet::ProcessManifestWrites(
       }
     }
 
-    if (s.ok()) {
-      if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
-        constexpr bool update_stats = true;
+    if (s.ok() &&
+        !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+      constexpr bool update_stats = true;
 
-        for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
-          versions[i]->PrepareAppend(read_options, update_stats);
-        }
+      for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+        versions[i]->PrepareAppend(read_options, update_stats);
       }
+    }
 
+    if (s.ok() && HasManifestStoreWriteState()) {
+      for (const VersionEdit* e : batch_edits) {
+        files_to_quarantine_if_commit_fail.push_back(
+            e->GetFilesToQuarantineIfCommitFail());
+      }
+      TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeStoreCommit");
+      // The store kill points here run at every MANIFEST write, so
+      // REDUCE_ODDS2 lowers their odds, as at LogAndApply:BeforeAddRecord. The
+      // kill points of rare steps (for example the stub switch and the
+      // rollback) keep the default odds.
+      TEST_KILL_RANDOM_WITH_WEIGHT(
+          "VersionSet::ProcessManifestWrites:BeforeStoreCommit", REDUCE_ODDS2);
+      s = CommitBatchToStore(batch_edits, versions, builder_guards,
+                             first_writer.cfd, new_cf_options,
+                             min_file_number_in_use, &io_s);
+      store_committed = s.ok();
+      TEST_KILL_RANDOM_WITH_WEIGHT(
+          "VersionSet::ProcessManifestWrites:AfterStoreCommit", REDUCE_ODDS2);
+      if (s.ok() &&
+          manifest_store_state_->copy_mode() != ManifestCopyMode::kOff) {
+        io_s = UpdateManifestCopy(
+            write_options, new_manifest_copy, curr_state, wal_additions,
+            options_manifest_state, copy_db_fields, batch_edits,
+            batch_edits_ts_sz, opt_file_opts, manifest_preallocation_size,
+            dir_contains_current_file);
+        s = io_s;
+        TEST_KILL_RANDOM_WITH_WEIGHT(
+            "VersionSet::ProcessManifestWrites:AfterManifestCopy",
+            REDUCE_ODDS2);
+      }
+      manifest_io_status = io_s;
+      TEST_SYNC_POINT_CALLBACK(
+          "VersionSet::ProcessManifestWrites:AfterStoreCommit", &s);
+    } else if (s.ok()) {
       // Write new records to MANIFEST log
 #ifndef NDEBUG
       size_t idx = 0;
@@ -6579,7 +6749,7 @@ Status VersionSet::ProcessManifestWrites(
       }
     }
 
-    if (s.ok()) {
+    if (s.ok() && !HasManifestStoreWriteState()) {
       // find offset in manifest file where this version is stored.
       new_manifest_file_size = raw_desc_log_ptr->file()->GetFileSize();
       if (new_descriptor_log) {
@@ -6600,6 +6770,34 @@ Status VersionSet::ProcessManifestWrites(
 
     LogFlush(db_options_->info_log);
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestDone");
+#ifndef NDEBUG
+    // Debug check, phase 1: no DB mutex, before the new Versions are
+    // installed. The fill step above always set debug_manifest_rows_.
+    if (s.ok()) {
+      DebugCheckRowsBeforeInstall(batch_edits, versions, builder_guards,
+                                  first_writer.cfd, new_cf_options);
+    }
+#endif
+    if (shadow_active) {
+      if (s.ok()) {
+        // Defined in db/manifest_store_shadow.cc.
+        HandOffToManifestStoreShadow(
+            batch_edits, versions, builder_guards, first_writer.cfd,
+            new_cf_options,
+            new_descriptor_log ? &shadow_snapshot_rows : nullptr);
+      } else {
+        // The MANIFEST may or may not hold this write. A new MANIFEST file
+        // gives the full state again. Until then, the store is not in sync.
+        shadow_base_rows_.reset();
+        manifest_store_shadow_->MarkManifestAhead();
+      }
+      // Free the snapshot rows, which grow with the number of live files,
+      // before the DB mutex is taken. The hand-off moves them out only when
+      // it uses them.
+      shadow_snapshot_rows = ManifestRows();
+    }
+    TEST_SYNC_POINT_CALLBACK("VersionSet::ProcessManifestWrites:BeforeRelock",
+                             &shadow_snapshot_rows);
     mu->Lock();
   }
 
@@ -6617,7 +6815,10 @@ Status VersionSet::ProcessManifestWrites(
     }
   }
 
-  if (!io_s.ok()) {
+  if (HasManifestStoreWriteState()) {
+    UpdateIoStatusAfterStoreBatch(io_s, store_committed,
+                                  files_to_quarantine_if_commit_fail);
+  } else if (!io_s.ok()) {
     if (io_status_.ok()) {
       io_status_ = io_s;
       if (error_handler_) {
@@ -6639,6 +6840,12 @@ Status VersionSet::ProcessManifestWrites(
     obsolete_manifests_.emplace_back(
         DescriptorFileName("", manifest_file_number_));
     last_compacted_manifest_file_size_ = new_manifest_file_size;
+    TuneMaxManifestFileSize();
+  }
+  if (s.ok() && new_manifest_copy && copy_log_ != nullptr) {
+    // Store mode: the copy rolls over by the rule of the MANIFEST file
+    // (max_manifest_file_size and max_manifest_space_amp_pct).
+    last_compacted_manifest_file_size_ = copy_log_->file()->GetFileSize();
     TuneMaxManifestFileSize();
   }
 
@@ -6707,6 +6914,10 @@ Status VersionSet::ProcessManifestWrites(
       manifest_last_valid_record_end_ = new_manifest_file_size;
       manifest_last_valid_record_end_file_number_ = manifest_file_number_;
       prev_log_number_ = first_writer.edit_list.front()->GetPrevLogNumber();
+#ifndef NDEBUG
+      // Debug check, phase 2: DB mutex held, after install.
+      DebugCheckRowsAfterInstall(batch_edits);
+#endif
     }
   } else {
     std::string version_edits;
@@ -7297,7 +7508,6 @@ Status VersionSet::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families, bool read_only,
     std::string* db_id, bool no_error_if_files_missing, bool is_retry,
     Status* log_status) {
-  const ReadOptions read_options(Env::IOActivity::kDBOpen);
   // Read "CURRENT" file, which contains a pointer to the current manifest
   // file
   std::string manifest_path;
@@ -7328,34 +7538,9 @@ Status VersionSet::Recover(
 
   uint64_t current_manifest_file_size = 0;
   uint64_t log_number = 0;
-  {
-    force_new_manifest_on_open_ = false;
-    VersionSet::LogReporter reporter;
-    Status log_read_status;
-    reporter.status = &log_read_status;
-    log::Reader reader(nullptr, std::move(manifest_file_reader), &reporter,
-                       true /* checksum */, 0 /* log_number */);
-    VersionEditHandler handler(
-        read_only, column_families, const_cast<VersionSet*>(this),
-        /*track_found_and_missing_files=*/false, no_error_if_files_missing,
-        io_tracer_, read_options, /*allow_incomplete_valid_version=*/false,
-        EpochNumberRequirement::kMightMissing,
-        /*skip_load_table_files=*/db_options_->open_files_async);
-    handler.Iterate(reader, &log_read_status);
-    s = handler.status();
-    if (s.ok()) {
-      log_number = handler.GetVersionEditParams().GetLogNumber();
-      current_manifest_file_size = reader.GetReadOffset();
-      assert(current_manifest_file_size != 0);
-      handler.GetDbId(db_id);
-    }
-    if (s.ok()) {
-      RecoverEpochNumbers();
-    }
-    if (log_status) {
-      *log_status = log_read_status;
-    }
-  }
+  s = ReplayManifest(column_families, read_only, no_error_if_files_missing,
+                     std::move(manifest_file_reader), db_id, log_status,
+                     &log_number, &current_manifest_file_size);
 
   if (s.ok()) {
     manifest_file_size_ = current_manifest_file_size;
@@ -7381,12 +7566,335 @@ Status VersionSet::Recover(
     }
   }
 
+  // In store mode the MANIFEST file is never written again (see
+  // db/manifest_store_state.h), for example after DB::Open() moves the DB
+  // into the store.
   if (s.ok() && !read_only && db_options_->reuse_manifest_on_open &&
+      !StoreModeOptions(*db_options_) &&
       manifest_recovery_last_valid_record_end_ > 0) {
     s = ReopenManifestForAppend(manifest_path);
   }
 
   return s;
+}
+
+Status VersionSet::ReplayManifest(
+    const std::vector<ColumnFamilyDescriptor>& column_families, bool read_only,
+    bool no_error_if_files_missing,
+    std::unique_ptr<SequentialFileReader> reader, std::string* db_id,
+    Status* log_status, uint64_t* log_number, uint64_t* read_size) {
+  const ReadOptions read_options(Env::IOActivity::kDBOpen);
+  force_new_manifest_on_open_ = false;
+  VersionSet::LogReporter reporter;
+  Status log_read_status;
+  reporter.status = &log_read_status;
+  log::Reader log_reader(nullptr, std::move(reader), &reporter,
+                         true /* checksum */, 0 /* log_number */);
+  VersionEditHandler handler(
+      read_only, column_families, const_cast<VersionSet*>(this),
+      /*track_found_and_missing_files=*/false, no_error_if_files_missing,
+      io_tracer_, read_options, /*allow_incomplete_valid_version=*/false,
+      EpochNumberRequirement::kMightMissing,
+      /*skip_load_table_files=*/db_options_->open_files_async);
+  handler.Iterate(log_reader, &log_read_status);
+  Status s = handler.status();
+  if (s.ok()) {
+    *log_number = handler.GetVersionEditParams().GetLogNumber();
+    *read_size = log_reader.GetReadOffset();
+    assert(*read_size != 0);
+    handler.GetDbId(db_id);
+  }
+  if (s.ok()) {
+    RecoverEpochNumbers();
+  }
+  if (log_status) {
+    *log_status = log_read_status;
+  }
+  return s;
+}
+
+Status VersionSet::RecoverFromStore(
+    const std::vector<ColumnFamilyDescriptor>& column_families, bool read_only,
+    const std::vector<std::string>& records, uint64_t stub_number,
+    std::string* db_id) {
+  std::string bytes;
+  Status s = RecordsToManifestBytes(records, &bytes);
+  if (!s.ok()) {
+    return s;
+  }
+  ROCKS_LOG_INFO(db_options_->info_log,
+                 "Recovering from the rows of the manifest store (stub "
+                 "manifest %" PRIu64 ")\n",
+                 stub_number);
+  std::unique_ptr<SequentialFileReader> reader =
+      std::make_unique<SequentialFileReader>(
+          NewStringSequentialFile(std::move(bytes)), "manifest store rows");
+  uint64_t log_number = 0;
+  uint64_t read_size = 0;
+  s = ReplayManifest(column_families, read_only,
+                     /*no_error_if_files_missing=*/false, std::move(reader),
+                     db_id, /*log_status=*/nullptr, &log_number, &read_size);
+  if (s.ok()) {
+    manifest_file_number_ = stub_number;
+    // No MANIFEST file is written in store mode.
+    manifest_file_size_ = 0;
+    ROCKS_LOG_INFO(db_options_->info_log,
+                   "Recovered from the manifest store: next_file_number is "
+                   "%" PRIu64 ", last_sequence is %" PRIu64
+                   ", log_number is %" PRIu64 "\n",
+                   next_file_number_.load(), last_sequence_.load(), log_number);
+  }
+  return s;
+}
+
+void VersionSet::SetManifestStoreState(
+    std::unique_ptr<ManifestStoreState> state) {
+  manifest_store_state_ = std::move(state);
+}
+
+VersionEdit VersionSet::ManifestCopyDbFields() const {
+  VersionEdit edit;
+  edit.SetNextFile(next_file_number_.load());
+  edit.SetLastSequence(descriptor_last_sequence_);
+  edit.SetPrevLogNumber(prev_log_number_);
+  edit.SetMaxColumnFamily(column_family_set_->GetMaxColumnFamily());
+  return edit;
+}
+
+IOStatus VersionSet::WriteNewManifestCopy(
+    const WriteOptions& write_options,
+    const std::unordered_map<uint32_t, MutableCFState>& curr_state,
+    const VersionEdit& wal_additions,
+    const OptionsFileManifestState& options_state, const VersionEdit& db_fields,
+    const autovector<VersionEdit*>& batch_edits,
+    const autovector<std::optional<size_t>>& batch_edits_ts_sz,
+    bool sync_marked, const FileOptions& file_opts, uint64_t preallocation_size,
+    FSDirectory* dir) {
+  const uint64_t number = NewFileNumber();
+  const std::string fname = ManifestCopyFileName(dbname_, number);
+  std::unique_ptr<FSWritableFile> file;
+  IOStatus io_s = NewWritableFile(fs_.get(), fname, &file, file_opts);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  std::unique_ptr<log::Writer> writer = CreateManifestWriter(
+      std::move(file), fname, file_opts, preallocation_size);
+  std::string record;
+  EncodeManifestCopyMarker(sync_marked, &record);
+  io_s = writer->AddRecord(write_options, record);
+  if (io_s.ok()) {
+    Status s =
+        WriteCurrentStateToManifest(write_options, curr_state, wal_additions,
+                                    options_state, writer.get(), io_s);
+    if (!s.ok() && io_s.ok()) {
+      io_s = IOStatus::Corruption(s.ToString());
+    }
+  }
+  if (io_s.ok()) {
+    record.clear();
+    if (!db_fields.EncodeTo(&record)) {
+      io_s = IOStatus::Corruption("Unable to encode a VersionEdit");
+    } else {
+      io_s = writer->AddRecord(write_options, record);
+    }
+  }
+  for (size_t i = 0; io_s.ok() && i < batch_edits.size(); ++i) {
+    record.clear();
+    if (!batch_edits[i]->EncodeTo(&record, batch_edits_ts_sz[i])) {
+      io_s = IOStatus::Corruption("Unable to encode a VersionEdit");
+    } else {
+      io_s = writer->AddRecord(write_options, record);
+    }
+  }
+  if (io_s.ok()) {
+    io_s = SyncManifest(db_options_, write_options, writer->file());
+  }
+  TEST_SYNC_POINT_CALLBACK("VersionSet::WriteNewManifestCopy:BeforePointer",
+                           &io_s);
+  TEST_KILL_RANDOM("VersionSet::WriteNewManifestCopy:BeforePointer");
+  bool rename_attempted = false;
+  if (io_s.ok()) {
+    io_s = WriteManifestCopyPointer(fs_.get(), dbname_, number, write_options,
+                                    dir, db_options_->info_log.get(),
+                                    &rename_attempted);
+  }
+  if (!io_s.ok()) {
+    // The write error stays the result. A failed close only writes a WARN
+    // line.
+    IOStatus close_s = writer->Close(write_options);
+    if (!close_s.ok()) {
+      ROCKS_LOG_WARN(db_options_->info_log,
+                     "Store mode: cannot close the copy %s: %s", fname.c_str(),
+                     close_s.ToString().c_str());
+    }
+    if (!rename_attempted) {
+      // The pointer does not name the new copy, so it is not needed. After a
+      // rename attempt the pointer may name it, also when the rename returned
+      // an error, so it stays.
+      IOOptions io_opts;
+      io_opts.type = IOType::kManifest;
+      IOStatus delete_s = fs_->DeleteFile(fname, io_opts, nullptr);
+      if (!delete_s.ok()) {
+        ROCKS_LOG_WARN(db_options_->info_log,
+                       "Store mode: cannot delete the copy %s: %s",
+                       fname.c_str(), delete_s.ToString().c_str());
+      }
+    }
+    return io_s;
+  }
+  if (copy_log_ != nullptr) {
+    // The pointer names the new copy, so the old one is not needed, and a
+    // failed close only writes a WARN line.
+    IOStatus close_s = copy_log_->Close(write_options);
+    if (!close_s.ok()) {
+      ROCKS_LOG_WARN(db_options_->info_log,
+                     "Store mode: cannot close the old MANIFEST file copy: %s",
+                     close_s.ToString().c_str());
+    }
+  }
+  copy_log_ = std::move(writer);
+  manifest_store_state_->SetCopyFileNumber(number);
+  // Old copies are not needed once the pointer names the new one. A copy
+  // that is left over is deleted by a later rollover or DB::Open(), so a
+  // failed delete only writes a WARN line.
+  IOStatus delete_s = DeleteManifestCopies(fs_.get(), dbname_, number,
+                                           /*delete_pointer=*/false);
+  if (!delete_s.ok()) {
+    ROCKS_LOG_WARN(db_options_->info_log,
+                   "Store mode: cannot delete old MANIFEST file copies: %s",
+                   delete_s.ToString().c_str());
+  }
+  return io_s;
+}
+
+IOStatus VersionSet::UpdateManifestCopy(
+    const WriteOptions& write_options, bool new_copy,
+    const std::unordered_map<uint32_t, MutableCFState>& curr_state,
+    const VersionEdit& wal_additions,
+    const OptionsFileManifestState& options_state, const VersionEdit& db_fields,
+    const autovector<VersionEdit*>& batch_edits,
+    const autovector<std::optional<size_t>>& batch_edits_ts_sz,
+    const FileOptions& file_opts, uint64_t preallocation_size,
+    FSDirectory* dir) {
+  ManifestStoreState* state = manifest_store_state_.get();
+  const bool sync = state->copy_mode() == ManifestCopyMode::kSync;
+  IOStatus io_s;
+  if (new_copy) {
+    io_s = WriteNewManifestCopy(write_options, curr_state, wal_additions,
+                                options_state, db_fields, batch_edits,
+                                batch_edits_ts_sz, sync, file_opts,
+                                preallocation_size, dir);
+  } else {
+    assert(copy_log_ != nullptr);
+    std::string record;
+    for (size_t i = 0; io_s.ok() && i < batch_edits.size(); ++i) {
+      record.clear();
+      if (!batch_edits[i]->EncodeTo(&record, batch_edits_ts_sz[i])) {
+        io_s = IOStatus::Corruption("Unable to encode a VersionEdit");
+      } else {
+        io_s = copy_log_->AddRecord(write_options, record);
+      }
+    }
+    if (io_s.ok() && sync) {
+      io_s = SyncManifest(db_options_, write_options, copy_log_->file());
+    }
+  }
+  TEST_SYNC_POINT_CALLBACK("VersionSet::UpdateManifestCopy:Done", &io_s);
+  if (io_s.ok()) {
+    return io_s;
+  }
+  ROCKS_LOG_WARN(db_options_->info_log,
+                 "Store mode: writing the MANIFEST file copy failed: %s",
+                 io_s.ToString().c_str());
+  if (io_s.IsIOFenced()) {
+    return state->Stop(
+        IOStatus::IOFenced("Store mode: the MANIFEST file copy is fenced"));
+  }
+  if (sync) {
+    // The store holds the commit, but the copy does not, and the batch is not
+    // installed. Stop, so that the copy stays at most one commit behind.
+    return state->Stop(IOStatus::IOError(
+        "Store mode: writing the MANIFEST file copy failed after a commit: " +
+        io_s.ToString()));
+  }
+  // Background mode: a copy that misses a commit is dropped. The pointer
+  // still names it, but it is not sync-marked, so it is never used for a
+  // rollback. The next commit writes a new copy.
+  copy_log_.reset();
+  state->SetCopyFileNumber(0);
+  return IOStatus::OK();
+}
+
+void VersionSet::GetStateForNewManifest(
+    std::unordered_map<uint32_t, MutableCFState>* curr_state,
+    VersionEdit* wal_additions,
+    OptionsFileManifestState* options_manifest_state) const {
+  for (const ColumnFamilyData* cfd : *column_family_set_) {
+    assert(curr_state->find(cfd->GetID()) == curr_state->end());
+    curr_state->emplace(
+        cfd->GetID(),
+        MutableCFState(cfd->GetLogNumber(), cfd->GetFullHistoryTsLow()));
+  }
+  for (const auto& wal : wals_.GetWals()) {
+    wal_additions->AddWal(wal.first, wal.second);
+  }
+  *options_manifest_state = options_file_manifest_state();
+}
+
+Status VersionSet::StartManifestCopyAtOpen(const WriteOptions& write_options,
+                                           FSDirectory* dir) {
+  ManifestStoreState* state = manifest_store_state_.get();
+  assert(state != nullptr);
+  // The copy takes a new file number in this function. DB::Open() raises the
+  // next file number past the files in the folder only later, so a file such
+  // as a WAL created after the last commit can have a number at or above the
+  // next file number of the rows. ParseFileName() does not parse copy names,
+  // so DB::Open() never raises the next file number past them. A copy that an
+  // earlier open wrote before its first commit can also be above the next
+  // file number of the rows. So mark the numbers of all these files in the DB
+  // folder as used, so that a new file never reuses one. The scan does not
+  // list wal_dir, db_paths or cf_paths, so the copy can take the number of a
+  // newer WAL, SST or blob file there. The names cannot clash, because a copy
+  // is named MANIFEST_COPY-<number>. DB::Open() later raises the next file
+  // number past these files: WAL replay marks each WAL number as used, and
+  // DBImpl::MaybeUpdateNextFileNumber() lists db_paths and cf_paths.
+  {
+    uint64_t largest = 0;
+    Status s = LargestFileNumber(fs_.get(), dbname_, &largest);
+    if (!s.ok()) {
+      return s;
+    }
+    MarkFileNumberUsed(largest);
+  }
+  const ManifestCopyMode mode = state->copy_mode();
+  if (mode == ManifestCopyMode::kOff) {
+    state->SetCopyFileNumber(0);
+    return DeleteManifestCopies(fs_.get(), dbname_, /*keep_number=*/0,
+                                /*delete_pointer=*/true);
+  }
+  std::unordered_map<uint32_t, MutableCFState> curr_state;
+  VersionEdit wal_additions;
+  OptionsFileManifestState options_manifest_state;
+  GetStateForNewManifest(&curr_state, &wal_additions, &options_manifest_state);
+  IOStatus io_s = WriteNewManifestCopy(
+      write_options, curr_state, wal_additions, options_manifest_state,
+      ManifestCopyDbFields(), /*batch_edits=*/{}, /*batch_edits_ts_sz=*/{},
+      mode == ManifestCopyMode::kSync, GetFileOptionsForManifestWrite(),
+      manifest_preallocation_size_, dir);
+  if (io_s.ok()) {
+    // The copy rolls over by the rule of the MANIFEST file.
+    last_compacted_manifest_file_size_ = copy_log_->file()->GetFileSize();
+    TuneMaxManifestFileSize();
+  }
+  if (io_s.ok() || mode == ManifestCopyMode::kSync || io_s.IsIOFenced()) {
+    return io_s;
+  }
+  ROCKS_LOG_WARN(db_options_->info_log,
+                 "Store mode: writing the MANIFEST file copy failed: %s",
+                 io_s.ToString().c_str());
+  state->SetCopyFileNumber(0);
+  return DeleteManifestCopies(fs_.get(), dbname_, /*keep_number=*/0,
+                              /*delete_pointer=*/true);
 }
 
 namespace {
@@ -7472,6 +7980,24 @@ Status VersionSet::TryRecover(
     const std::vector<ColumnFamilyDescriptor>& column_families, bool read_only,
     const std::vector<std::string>& files_in_dbname, std::string* db_id,
     bool* has_missing_table_file) {
+  // The stub check comes first, because a stub can be older than another
+  // MANIFEST file in the folder. For example, a rollback to file mode
+  // (RollBackManifestStore()) writes a new MANIFEST file above the stub and
+  // then points CURRENT to it. If the rollback stops between the two steps,
+  // CURRENT still names the stub and the store still holds the metadata. The
+  // picker below tries the newest file first, so without this check it would
+  // recover from the new file and never read the stub. The check also finds
+  // the stub when CURRENT is missing or damaged, or names a missing or damaged
+  // MANIFEST file (see CheckNoManifestStub()).
+  bool current_names_manifest_file = false;
+  {
+    Status check_s = CheckNoManifestStub(fs_.get(), dbname_, files_in_dbname,
+                                         "Best-efforts recovery",
+                                         &current_names_manifest_file);
+    if (!check_s.ok()) {
+      return check_s;
+    }
+  }
   ManifestPicker manifest_picker(dbname_, files_in_dbname);
   if (!manifest_picker.Valid()) {
     return Status::Corruption("Cannot locate MANIFEST file in " + dbname_);
@@ -7480,9 +8006,46 @@ Status VersionSet::TryRecover(
   std::string manifest_path =
       manifest_picker.GetNextManifest(&manifest_file_number_, nullptr);
   while (!manifest_path.empty()) {
+    // A stub means that the DB is in store mode, or is entering it (see
+    // db/manifest_store_state.h). An older MANIFEST file can then still be in
+    // the folder, but it misses the commits in the store, so recovery stops.
+    // The exception is a valid CURRENT that names a normal MANIFEST file: it
+    // decides the authority, so a stub that it does not name is skipped. For
+    // example, an enter that synced its entering stub but failed before
+    // CURRENT moved leaves such a stub, and the store switch never ran.
+    bool is_stub = false;
+    ManifestStub stub;
+    Status stub_s = ReadManifestStub(fs_.get(), manifest_path, &is_stub, &stub);
+    if (is_stub) {
+      stub_s.PermitUncheckedError();
+      if (!current_names_manifest_file) {
+        s = Status::NotSupported(
+            "Best-efforts recovery does not support a DB in store mode");
+        break;
+      }
+      if (!manifest_picker.Valid()) {
+        s = Status::Corruption("Cannot locate MANIFEST file in " + dbname_);
+        break;
+      }
+      manifest_path =
+          manifest_picker.GetNextManifest(&manifest_file_number_, nullptr);
+      continue;
+    }
+    // An error other than a missing or damaged file (for example an I/O error
+    // or a timeout) leaves open whether this file is a stub, so recovery
+    // returns it instead of trying an older MANIFEST file. A missing or
+    // damaged file-mode MANIFEST file falls back to the next older file.
+    if (!stub_s.ok() && !stub_s.IsNotFound() && !stub_s.IsPathNotFound() &&
+        !stub_s.IsCorruption()) {
+      s = stub_s;
+      break;
+    }
     s = TryRecoverFromOneManifest(manifest_path, column_families, read_only,
                                   db_id, has_missing_table_file);
-    if (s.ok() || !manifest_picker.Valid()) {
+    // The replay also refuses a stub record with NotSupported (see
+    // VersionEdit::DecodeFrom()). That is final too: an older MANIFEST file
+    // misses the commits in the store.
+    if (s.ok() || s.IsNotSupported() || !manifest_picker.Valid()) {
       break;
     }
     Reset();
@@ -8062,9 +8625,6 @@ Status VersionSet::DumpManifest(
     Options& options, std::string& dscname, bool verbose, bool hex, bool json,
     const std::vector<ColumnFamilyDescriptor>& cf_descs) {
   assert(options.env);
-  // TODO: plumb Env::IOActivity, Env::IOPriority
-  const ReadOptions read_options;
-
   std::vector<std::string> column_families;
   Status s = ListColumnFamiliesFromManifest(
       dscname, options.env->GetFileSystem().get(), &column_families);
@@ -8087,7 +8647,105 @@ Status VersionSet::DumpManifest(
         std::move(file), dscname, db_options_->log_readahead_size, io_tracer_);
     file_reader->SetIOType(IOType::kManifest);
   }
+  return DumpManifestRecords(options, column_families, std::move(file_reader),
+                             verbose, hex, json, cf_descs);
+}
 
+namespace {
+// Turns `rows` into the bytes of a MANIFEST file with full-state records
+// (ManifestRowsToRecords()), for the replay of a secondary or follower (see
+// "Store mode in a secondary or follower" in version_set.h), and for
+// DumpManifestFromStore(). With `live_cf_ids` (a catch-up), it erases from
+// `rows` the rows of the column families that `live_cf_ids` does not list, so a
+// later call with a smaller set on the same rows is still correct. It also adds
+// a drop record for each column family that `live_cf_ids` lists and the rows
+// list as dropped or do not list. The open passes null: its instance has no
+// column families yet.
+Status BuildStoreManifestBytes(const std::vector<uint32_t>* live_cf_ids,
+                               ManifestRows* rows, std::string* bytes) {
+  bytes->clear();
+  if (live_cf_ids != nullptr) {
+    for (std::map<uint32_t, ManifestCfRows>::iterator it = rows->cfs.begin();
+         it != rows->cfs.end();) {
+      it = std::binary_search(live_cf_ids->begin(), live_cf_ids->end(),
+                              it->first)
+               ? std::next(it)
+               : rows->cfs.erase(it);
+    }
+  }
+  std::vector<std::string> records;
+  Status s = ManifestRowsToRecords(*rows, &records);
+  if (!s.ok()) {
+    return s;
+  }
+  if (live_cf_ids != nullptr) {
+    for (uint32_t cf_id : *live_cf_ids) {
+      const std::map<uint32_t, ManifestCfRows>::const_iterator it =
+          rows->cfs.find(cf_id);
+      if (it != rows->cfs.end() && !it->second.cf.dropped) {
+        continue;
+      }
+      VersionEdit drop;
+      drop.SetColumnFamily(cf_id);
+      drop.DropColumnFamily();
+      std::string record;
+      if (!drop.EncodeTo(&record)) {
+        return Status::Corruption("Unable to encode a column family drop");
+      }
+      records.push_back(std::move(record));
+    }
+  }
+  return RecordsToManifestBytes(records, bytes);
+}
+}  // namespace
+
+Status VersionSet::DumpManifestFromStore(
+    Options& options, ManifestStore* store, bool verbose, bool hex, bool json,
+    const std::vector<ColumnFamilyDescriptor>& cf_descs) {
+  assert(store != nullptr);
+  ManifestStoreScan scan;
+  Status s = ScanManifestStore(store, /*consistent=*/true, &scan);
+  // After a rollback, the rows stay in the store but the MANIFEST file is the
+  // authority, so the rows are old.
+  if (s.ok() && scan.extra_fields.authority == ManifestAuthority::kFile) {
+    s = Status::InvalidArgument(
+        "Store mode: the DB row says that the MANIFEST file is the authority "
+        "(the DB was rolled back to file mode)");
+  }
+  // In shadow mode (DBOptions::manifest_store_shadow) the MANIFEST file is the
+  // authority, and the rows only follow it, so they can be behind it. The
+  // compare_manifest_store command of ldb checks such rows.
+  if (s.ok() && scan.extra_fields.authority == ManifestAuthority::kShadow) {
+    s = Status::NotSupported(
+        "Store mode: the DB row says that the DB is in shadow mode; dump the "
+        "MANIFEST file instead");
+  }
+  std::string bytes;
+  if (s.ok()) {
+    s = BuildStoreManifestBytes(/*live_cf_ids=*/nullptr, &scan.rows, &bytes);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  std::vector<std::string> column_families;
+  for (const auto& [cf_id, cf_rows] : scan.rows.cfs) {
+    if (!cf_rows.cf.dropped) {
+      column_families.push_back(cf_rows.cf.name);
+    }
+  }
+  std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+      NewStringSequentialFile(std::move(bytes)), "manifest store rows"));
+  return DumpManifestRecords(options, column_families, std::move(file_reader),
+                             verbose, hex, json, cf_descs);
+}
+
+Status VersionSet::DumpManifestRecords(
+    Options& options, const std::vector<std::string>& column_families,
+    std::unique_ptr<SequentialFileReader> file_reader, bool verbose, bool hex,
+    bool json, const std::vector<ColumnFamilyDescriptor>& cf_descs) {
+  // TODO: plumb Env::IOActivity, Env::IOPriority
+  const ReadOptions read_options;
+  Status s;
   std::map<std::string, const ColumnFamilyDescriptor*> cf_name_to_desc;
   for (const auto& cf_desc : cf_descs) {
     cf_name_to_desc[cf_desc.name] = &cf_desc;
@@ -8135,7 +8793,7 @@ Status VersionSet::WriteCurrentStateToManifest(
     const std::unordered_map<uint32_t, MutableCFState>& curr_state,
     const VersionEdit& wal_additions,
     const OptionsFileManifestState& options_file_manifest_state,
-    log::Writer* log, IOStatus& io_s) {
+    log::Writer* log, IOStatus& io_s, ManifestRows* snapshot_rows) {
   // TODO: Break up into multiple records to reduce memory usage on recovery?
 
   // WARNING: This method doesn't hold a mutex!!
@@ -8189,6 +8847,26 @@ Status VersionSet::WriteCurrentStateToManifest(
   io_s = log->AddRecord(write_options, wal_deletions_record);
   if (!io_s.ok()) {
     return io_s;
+  }
+  if (snapshot_rows != nullptr) {
+    *snapshot_rows = ManifestRows();
+    ManifestDbRow& db = snapshot_rows->db;
+    if (db_options_->write_dbid_to_manifest) {
+      db.db_id = db_id_;
+    }
+    db.last_sequence = descriptor_last_sequence_;
+    db.min_log_number_to_keep = min_log_number_to_keep();
+    if (options_file_manifest_state.has_committed_options_file_number) {
+      db.committed_options_file_number =
+          options_file_manifest_state.committed_options_file_number;
+    }
+    // The WAL additions, then the deletion of the WALs below the min log
+    // number to keep, as recovery applies the two records above.
+    for (const WalAddition& wal : wal_additions.GetWalAdditions()) {
+      if (wal.GetLogNumber() >= db.min_log_number_to_keep) {
+        snapshot_rows->wals[wal.GetLogNumber()] = wal.GetMetadata();
+      }
+    }
   }
 
   for (auto cfd : *column_family_set_) {
@@ -8288,6 +8966,10 @@ Status VersionSet::WriteCurrentStateToManifest(
       }
 
       edit.SetLastSequence(descriptor_last_sequence_);
+
+      if (snapshot_rows != nullptr) {
+        SetManifestCfSnapshotRows(*cfd, *vstorage, edit, snapshot_rows);
+      }
 
       const Comparator* ucmp = cfd->user_comparator();
       assert(ucmp);
@@ -9116,6 +9798,18 @@ ReactiveVersionSet::ReactiveVersionSet(
 
 ReactiveVersionSet::~ReactiveVersionSet() = default;
 
+namespace {
+// Returns a reader of `bytes`, the rows of the store as MANIFEST records.
+std::unique_ptr<log::FragmentBufferedReader> NewStoreRowsReader(
+    std::string bytes, log::Reader::Reporter* reporter) {
+  std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+      NewStringSequentialFile(std::move(bytes)), "manifest store rows"));
+  return std::make_unique<log::FragmentBufferedReader>(
+      nullptr, std::move(file_reader), reporter, true /* checksum */,
+      0 /* log_number */);
+}
+}  // namespace
+
 Status ReactiveVersionSet::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
@@ -9129,7 +9823,10 @@ Status ReactiveVersionSet::Recover(
   manifest_reporter->reset(new LogReporter());
   static_cast_with_check<LogReporter>(manifest_reporter->get())->status =
       manifest_reader_status->get();
-  Status s = MaybeSwitchManifest(manifest_reporter->get(), manifest_reader);
+  Status s =
+      StoreModeOptions(*db_options_)
+          ? OpenStoreRead(manifest_reporter->get(), manifest_reader)
+          : MaybeSwitchManifest(manifest_reporter->get(), manifest_reader);
   if (!s.ok()) {
     return s;
   }
@@ -9144,10 +9841,56 @@ Status ReactiveVersionSet::Recover(
   manifest_tailer_->Iterate(*reader, manifest_reader_status->get());
 
   s = manifest_tailer_->status();
+  // Store mode: the open replays one scan, with no later records. When a file
+  // of the scan is missing, the newest state of a column family has no valid
+  // Version, and the open would succeed without its files (see step 4 of
+  // "Store mode in a secondary or follower" at ReadStoreForCatchUp()).
+  if (s.ok() && StoreModeOptions(*db_options_) &&
+      manifest_tailer_->NewestStateHasMissingFiles()) {
+    s = MissingFilesAtStoreOpen();
+  }
+  manifest_tailer_->ClearDamagedFiles();
   if (s.ok()) {
     RecoverEpochNumbers();
   }
   return s;
+}
+
+Status ReactiveVersionSet::MissingFilesAtStoreOpen() {
+  ManifestDbRowResult db_row;
+  IOStatus io_s = db_options_->manifest_store->ReadDbRow(&db_row);
+  if (!io_s.ok()) {
+    return Status::IOError(
+        "Store mode: a file of the scanned state is missing, and the DB row "
+        "cannot be read: " +
+        io_s.ToString());
+  }
+  const std::vector<uint64_t> missing =
+      manifest_tailer_->NewestStateMissingFileNumbers();
+  std::string numbers;
+  for (uint64_t number : missing) {
+    numbers += (numbers.empty() ? "" : ", ") + std::to_string(number);
+  }
+  if (db_row.state.commit_sequence == installed_store_commit_sequence()) {
+    return Status::Corruption(
+        "Store mode: files of the scanned state are missing or do not match, "
+        "and the primary made no newer commit (files " +
+        numbers + ")");
+  }
+  // The primary deletes files, but never writes a file number again. So a file
+  // that exists but fails its check (for example another size or unique id) is
+  // damaged, also after a newer commit.
+  for (uint64_t number : missing) {
+    if (manifest_tailer_->damaged_files().count(number) != 0) {
+      return Status::Corruption(
+          "Store mode: file " + std::to_string(number) +
+          " of the scanned state exists, but does not match its row");
+    }
+  }
+  return Status::TryAgain(
+      "Store mode: files of the scanned state are missing, and the primary "
+      "made a newer commit, so it may have deleted them; open again (files " +
+      numbers + ")");
 }
 
 Status ReactiveVersionSet::ReadAndApply(
@@ -9155,7 +9898,7 @@ Status ReactiveVersionSet::ReadAndApply(
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
     Status* manifest_read_status,
     std::unordered_set<ColumnFamilyData*>* cfds_changed,
-    std::vector<std::string>* files_to_delete) {
+    std::vector<std::string>* files_to_delete, ManifestStoreRead* store_read) {
   assert(manifest_reader != nullptr);
   assert(cfds_changed != nullptr);
   mu->AssertHeld();
@@ -9170,7 +9913,12 @@ Status ReactiveVersionSet::ReadAndApply(
   Status s;
   log::Reader* reader = manifest_reader->get();
   assert(reader);
-  s = MaybeSwitchManifest(reader->GetReporter(), manifest_reader);
+  // Store mode: the result of ReadStoreForCatchUp() takes the place of a
+  // switch to a new MANIFEST file.
+  s = StoreModeOptions(*db_options_)
+          ? ApplyStoreCatchUp(reader->GetReporter(), manifest_reader,
+                              store_read)
+          : MaybeSwitchManifest(reader->GetReporter(), manifest_reader);
   if (!s.ok()) {
     return s;
   }
@@ -9205,8 +9953,37 @@ Status ReactiveVersionSet::ReadAndApply(
                           manifest_reader->get()->file()->file_name());
     }
   }
+  // Store mode: the scan counts as installed only when the tailer installed the
+  // Versions of all column families (see ManifestTailer::CanInstallVersions()).
+  // Otherwise every column family keeps its current Version, and the next
+  // catch-up scans and replays again, also at the same commit sequence.
+  bool store_state_incomplete = false;
+  if (store_scan_in_replay_) {
+    store_scan_in_replay_ = false;
+    store_state_incomplete = manifest_tailer_->StoreStateIncomplete();
+    if (s.ok() && !store_state_incomplete) {
+      installed_store_commit_sequence_.store(attempted_store_commit_sequence_,
+                                             std::memory_order_relaxed);
+    } else if (s.ok()) {
+      ROCKS_LOG_INFO(db_options_->info_log,
+                     "Store mode: a file of the scan at commit sequence "
+                     "%" PRIu64
+                     " is missing or damaged; keeping the current Versions\n",
+                     attempted_store_commit_sequence_);
+    }
+  }
   if (s.ok()) {
     *cfds_changed = std::move(manifest_tailer_->GetUpdatedColumnFamilies());
+    if (store_state_incomplete) {
+      // `cfds_changed` names the column families whose Version changed. The
+      // tailer installed no new Version, so the list is empty. The scan still
+      // had effects: a column family drop in it was applied during the
+      // replay, before the tailer refused to install Versions. The secondary
+      // still replays its WAL files after this OK result, and it keeps or
+      // drops memtables by the log number of the last installed Version
+      // (GetInstalledVersionLogNumber()).
+      cfds_changed->clear();
+    }
   }
   if (files_to_delete) {
     *files_to_delete = manifest_tailer_->GetAndClearIntermediateFiles();
@@ -9308,6 +10085,45 @@ bool ReactiveVersionSet::NewestStateHasMissingFiles() {
   return manifest_tailer_->NewestStateHasMissingFiles();
 }
 
+Status ReactiveVersionSet::ApplyStoreCatchUp(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    ManifestStoreRead* store_read) {
+  // Step 3 of "Store mode in a secondary or follower" in version_set.h. Skips
+  // a scan that a concurrent catch-up made old (see "Watermarks" there).
+  assert(manifest_tailer_ != nullptr);
+  if (store_read == nullptr) {
+    return Status::OK();
+  }
+  const uint64_t commit_sequence =
+      store_read->scan.db_row.state.commit_sequence;
+  if (commit_sequence <= installed_store_commit_sequence() ||
+      commit_sequence < attempted_store_commit_sequence_) {
+    return Status::OK();
+  }
+  std::vector<uint32_t> live_cf_ids = LiveColumnFamilyIds();
+  // The live column families of a secondary or follower only shrink, so the
+  // rows that BuildStoreManifestBytes() erased are not needed again.
+  assert(std::includes(store_read->live_cf_ids.begin(),
+                       store_read->live_cf_ids.end(), live_cf_ids.begin(),
+                       live_cf_ids.end()));
+  // A concurrent catch-up dropped a column family, so the records may drop it
+  // a second time (see step 3 of a catch-up in "Store mode in a secondary or
+  // follower" in db/version_set.h).
+  if (live_cf_ids != store_read->live_cf_ids) {
+    store_read->live_cf_ids = std::move(live_cf_ids);
+    Status s = BuildStoreManifestBytes(
+        &store_read->live_cf_ids, &store_read->scan.rows, &store_read->bytes);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  SetStoreManifestReader(reporter, manifest_reader, store_read);
+  store_scan_in_replay_ = true;
+  manifest_tailer_->PrepareToReadNewManifest();
+  return Status::OK();
+}
+
 Status ReactiveVersionSet::MaybeSwitchManifest(
     log::Reader::Reporter* reporter,
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
@@ -9362,6 +10178,160 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
         "one.");
   }
   return s;
+}
+
+Status ReactiveVersionSet::OpenStoreRead(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
+  // No other thread uses this VersionSet yet, and it has no column families,
+  // so the records keep all rows and need no drop records.
+  ManifestStoreRead store_read;
+  Status s = ReadStore(&store_read);
+  if (s.ok()) {
+    opened_db_id_ = store_read.scan.rows.db.db_id;
+    s = BuildStoreManifestBytes(/*live_cf_ids=*/nullptr, &store_read.scan.rows,
+                                &store_read.bytes);
+  }
+  if (s.ok()) {
+    SetStoreManifestReader(reporter, manifest_reader, &store_read);
+    // The rows are not needed after this point. Freeing them here keeps them
+    // out of the memory of the replay.
+    store_read.scan = ManifestStoreScan();
+    // Recover() replays the scan next. When a file of the scan is missing,
+    // the open fails, and MissingFilesAtStoreOpen() compares this commit
+    // sequence with a new read of the DB row to tell whether the primary made
+    // a newer commit. So the scan counts as installed here already.
+    installed_store_commit_sequence_.store(attempted_store_commit_sequence_,
+                                           std::memory_order_relaxed);
+  }
+  return s;
+}
+
+Status ReactiveVersionSet::ReadStoreForCatchUp(
+    InstrumentedMutex* mu, std::unique_ptr<ManifestStoreRead>* store_read) {
+  assert(store_read != nullptr);
+  store_read->reset();
+  if (!StoreModeOptions(*db_options_)) {
+    return Status::OK();
+  }
+  std::unique_ptr<ManifestStoreRead> new_read;
+  {
+    std::lock_guard<std::mutex> lock(store_read_mutex_);
+    ManifestDbRowResult db_row;
+    IOStatus io_s = db_options_->manifest_store->ReadDbRow(&db_row);
+    if (!io_s.ok()) {
+      return Status::IOError("Store mode: cannot read the DB row: " +
+                             io_s.ToString());
+    }
+    // The rows at this path can belong to another DB now, for example one
+    // that was destroyed and created again with the same store. Its commit
+    // sequence can be lower than the replayed one, so the skip rule below
+    // would hide it. File mode returns the same error (ManifestTailer).
+    // CheckManifestDbRowOwner() returns InvalidArgument only when the DB row
+    // has another db id. Decode errors are returned as they are.
+    auto check_owner = [this](const ManifestRow& row) {
+      Status owner_s = CheckManifestDbRowOwner(row, opened_db_id_);
+      if (owner_s.IsInvalidArgument()) {
+        return Status::Corruption(
+            "Store mode: the DB row has another db id than the DB that this "
+            "instance opened (" +
+            opened_db_id_ +
+            "). The DB at this path was possibly created again. Reopen this "
+            "instance.");
+      }
+      return owner_s;
+    };
+    Status s = check_owner(db_row.db_row);
+    if (!s.ok()) {
+      return s;
+    }
+    if (db_row.state.commit_sequence == installed_store_commit_sequence()) {
+      return Status::OK();
+    }
+    TEST_SYNC_POINT("ReactiveVersionSet::ReadStoreForCatchUp:AfterOwnerCheck");
+    new_read = std::make_unique<ManifestStoreRead>();
+    s = ReadStore(new_read.get());
+    // The DB can be created again between the read above and the scan, and
+    // the scan then checks only against the stub that CURRENT names now. A
+    // DB created again can have a lower commit sequence than the installed
+    // one, which ApplyStoreCatchUp() would skip, so the scanned DB row is
+    // checked against the opened DB too.
+    if (s.ok()) {
+      s = check_owner(new_read->scan.db_row.db_row);
+    }
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  {
+    InstrumentedMutexLock lock(mu);
+    new_read->live_cf_ids = LiveColumnFamilyIds();
+  }
+  Status s = BuildStoreManifestBytes(&new_read->live_cf_ids,
+                                     &new_read->scan.rows, &new_read->bytes);
+  if (s.ok()) {
+    *store_read = std::move(new_read);
+  }
+  TEST_SYNC_POINT("ReactiveVersionSet::ReadStoreForCatchUp:End");
+  return s;
+}
+
+Status ReactiveVersionSet::ReadStore(ManifestStoreRead* store_read) const {
+  CurrentManifestInfo current;
+  Status s = ReadCurrentManifestInfo(fs_.get(), dbname_, &current);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!current.exists || !current.is_stub) {
+    return Status::InvalidArgument(
+        "manifest_store is set, but CURRENT does not name a stub MANIFEST, so "
+        "the DB is not in store mode");
+  }
+  if (current.stub.state != ManifestStubState::kDone) {
+    return Status::NotSupported(
+        "Store mode: a mode change is not finished; the primary finishes it "
+        "when it opens the DB");
+  }
+  ManifestStoreScan& scan = store_read->scan;
+  s = ScanManifestStore(db_options_->manifest_store.get(), /*consistent=*/true,
+                        &scan);
+  if (s.ok()) {
+    s = CheckScannedStoreRows(scan, current.stub.db_id);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  store_read->stub_number = current.number;
+  return Status::OK();
+}
+
+void ReactiveVersionSet::SetStoreManifestReader(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    ManifestStoreRead* store_read) {
+  assert(store_read != nullptr);
+  manifest_reader->reset(
+      NewStoreRowsReader(std::move(store_read->bytes), reporter).release());
+  store_read->bytes.clear();
+  manifest_file_number_ = store_read->stub_number;
+  const uint64_t commit_sequence =
+      store_read->scan.db_row.state.commit_sequence;
+  attempted_store_commit_sequence_ = commit_sequence;
+  ROCKS_LOG_INFO(db_options_->info_log,
+                 "Read the rows of the manifest store at commit sequence "
+                 "%" PRIu64 "\n",
+                 commit_sequence);
+}
+
+std::vector<uint32_t> ReactiveVersionSet::LiveColumnFamilyIds() const {
+  std::vector<uint32_t> ids;
+  for (ColumnFamilyData* cfd : *column_family_set_) {
+    if (!cfd->IsDropped()) {
+      ids.push_back(cfd->GetID());
+    }
+  }
+  std::sort(ids.begin(), ids.end());
+  return ids;
 }
 
 #ifndef NDEBUG

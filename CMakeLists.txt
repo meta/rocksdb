@@ -839,6 +839,9 @@ set(SOURCES
         db/log_writer.cc
         db/malloc_stats.cc
         db/manifest_ops.cc
+        db/manifest_rows.cc
+        db/manifest_store_shadow.cc
+        db/manifest_store_state.cc
         db/memtable.cc
         db/memtable_list.cc
         db/merge_helper.cc
@@ -1461,6 +1464,7 @@ option(WITH_ALL_TESTS "Build all test, rather than a small subset" ON)
 if(WITH_TESTS OR WITH_BENCHMARK_TOOLS)
   add_subdirectory(third-party/gtest-1.8.1/fused-src/gtest)
   add_library(testharness STATIC
+  test_util/mock_manifest_store.cc
   test_util/mock_time_env.cc
   test_util/secondary_cache_test_util.cc
   test_util/testharness.cc)
@@ -1556,6 +1560,7 @@ if(WITH_TESTS)
         db/filename_test.cc
         db/flush_job_test.cc
         db/db_follower_test.cc
+        db/db_manifest_store_test.cc
         db/import_column_family_test.cc
         db/listener_test.cc
         db/log_test.cc
@@ -1587,6 +1592,7 @@ if(WITH_TESTS)
         db/write_batch_test.cc
         db/write_callback_test.cc
         db/write_controller_test.cc
+        db_stress_tool/db_stress_manifest_store_test.cc
         db_stress_tool/db_stress_structured_key_value_test.cc
         env/env_test.cc
         env/io_posix_test.cc
@@ -1764,6 +1770,9 @@ if(WITH_TESTS)
   # The structured key-value codec of db_stress depends only on RocksDB.
   target_sources(db_stress_structured_key_value_test${ARTIFACT_SUFFIX} PRIVATE
     db_stress_tool/db_stress_structured_key_value.cc)
+  # The test store of db_stress depends only on RocksDB and the test library.
+  target_sources(db_stress_manifest_store_test${ARTIFACT_SUFFIX} PRIVATE
+    db_stress_tool/db_stress_manifest_store.cc)
 
   if(WIN32)
     # C executables must link to a shared object

@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -108,7 +109,7 @@ BlobFilePartitionManager::BlobFilePartitionManager(
     FileChecksumGenFactory* file_checksum_gen_factory,
     const FileTypeSet& checksum_handoff_file_types,
     const std::shared_ptr<IOTracer>& io_tracer, std::string db_id,
-    std::string db_session_id, Logger* info_log)
+    std::string db_session_id, Logger* info_log, bool track_min_file_number)
     : num_partitions_(num_partitions == 0 ? 1 : num_partitions),
       strategy_(strategy != nullptr
                     ? std::move(strategy)
@@ -131,7 +132,8 @@ BlobFilePartitionManager::BlobFilePartitionManager(
       io_tracer_(io_tracer),
       db_id_(std::move(db_id)),
       db_session_id_(std::move(db_session_id)),
-      info_log_(info_log) {
+      info_log_(info_log),
+      track_min_file_number_(track_min_file_number) {
   partitions_.reserve(num_partitions_);
   for (uint32_t i = 0; i < num_partitions_; ++i) {
     partitions_.emplace_back(new Partition());
@@ -191,16 +193,43 @@ BlobFilePartitionManager::DetachPartitionFile(Partition* partition) {
   return deferred;
 }
 
-void BlobFilePartitionManager::AddFilePartitionMapping(uint64_t file_number,
-                                                       uint32_t partition_idx) {
+uint64_t BlobFilePartitionManager::NewTrackedBlobFileNumber(
+    uint32_t partition_idx) {
   WriteLock lock(&file_partition_mutex_);
+  uint64_t file_number = 0;
+  if (track_min_file_number_) {
+    MutexLock tracked_lock(&tracked_file_numbers_mutex_);
+    file_number = file_number_allocator_();
+    tracked_file_numbers_.insert(file_number);
+  } else {
+    file_number = file_number_allocator_();
+  }
   file_to_partition_[file_number] = partition_idx;
+  return file_number;
+}
+
+void BlobFilePartitionManager::MaybeUntrackFileNumber(uint64_t file_number) {
+  if (track_min_file_number_ &&
+      file_to_partition_.find(file_number) == file_to_partition_.end() &&
+      protected_blob_file_refs_.find(file_number) ==
+          protected_blob_file_refs_.end()) {
+    MutexLock tracked_lock(&tracked_file_numbers_mutex_);
+    tracked_file_numbers_.erase(file_number);
+  }
 }
 
 void BlobFilePartitionManager::RemoveFilePartitionMapping(
     uint64_t file_number) {
   WriteLock lock(&file_partition_mutex_);
   file_to_partition_.erase(file_number);
+  MaybeUntrackFileNumber(file_number);
+}
+
+uint64_t BlobFilePartitionManager::MinTrackedBlobFileNumber() const {
+  assert(track_min_file_number_);
+  MutexLock tracked_lock(&tracked_file_numbers_mutex_);
+  return tracked_file_numbers_.empty() ? std::numeric_limits<uint64_t>::max()
+                                       : *tracked_file_numbers_.begin();
 }
 
 Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
@@ -210,10 +239,8 @@ Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
   assert(partition != nullptr);
   assert(!partition->writer);
 
-  const uint64_t blob_file_number = file_number_allocator_();
+  const uint64_t blob_file_number = NewTrackedBlobFileNumber(partition_idx);
   const std::string blob_file_path = BlobFileName(db_path_, blob_file_number);
-
-  AddFilePartitionMapping(blob_file_number, partition_idx);
 
   if (blob_callback_ != nullptr) {
     blob_callback_->OnBlobFileCreationStarted(
@@ -790,6 +817,9 @@ void BlobFilePartitionManager::ProtectSealedBlobFileNumbers(
 
   WriteLock lock(&file_partition_mutex_);
   for (uint64_t file_number : file_numbers) {
+    // The file is still in file_to_partition_. With track_min_file_number_,
+    // tracked_file_numbers_ therefore already holds it (see the header).
+    assert(file_to_partition_.find(file_number) != file_to_partition_.end());
     ++protected_blob_file_refs_[file_number];
   }
 }
@@ -816,6 +846,7 @@ void BlobFilePartitionManager::UnprotectSealedBlobFileNumbers(
     --it->second;
     if (it->second == 0) {
       protected_blob_file_refs_.erase(it);
+      MaybeUntrackFileNumber(file_number);
       if (blob_file_cache_ != nullptr) {
         // Once the last memtable-backed reference goes away, any cached reader
         // for this file is either obsolete or can be reopened through the
@@ -839,6 +870,7 @@ void BlobFilePartitionManager::RemoveFilePartitionMappings(
   WriteLock lock(&file_partition_mutex_);
   for (uint64_t file_number : file_numbers) {
     file_to_partition_.erase(file_number);
+    MaybeUntrackFileNumber(file_number);
     if (blob_file_cache_ != nullptr) {
       // In-flight direct-write reads may have cached a footer-less reader for
       // this file before it was sealed. Drop it now so future manifest-visible

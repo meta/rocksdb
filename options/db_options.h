@@ -114,6 +114,11 @@ struct ImmutableDBOptions {
   Temperature metadata_write_temperature;
   Temperature wal_write_temperature;
   CompactionStyleSet calculate_sst_write_lifetime_hint_set;
+  std::shared_ptr<ManifestStore> manifest_store;
+  bool manifest_store_migrate;
+  ManifestCopyMode manifest_store_copy_mode;
+  uint32_t manifest_row_feature_version;
+  bool manifest_store_shadow;
 
   // Beginning convenience/helper objects that are not part of the base
   // DBOptions
