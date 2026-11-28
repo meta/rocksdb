@@ -3812,12 +3812,13 @@ class DBImpl : public DB
 
   // True when the OPTIONS file can lag the options or column families in
   // effect: the last OPTIONS file write failed, SetOptions() changed options
-  // and then failed before it wrote the file, or a column family batch with
-  // track_options_file_number_in_manifest stopped part way. Then SetOptions()
-  // and SetDBOptions() write the file even for a request that changes no
-  // option. A successful WriteOptionsFile() clears it, and so does a tracked
-  // column family change that commits a current snapshot. Protected by
-  // options_mutex_.
+  // and then failed before it wrote the file, or, with
+  // track_options_file_number_in_manifest, a column family create failed after
+  // its OPTIONS snapshot was written (a single create included) or a drop batch
+  // stopped part way. Then SetOptions() and SetDBOptions() write the file even
+  // for a request that changes no option. A successful WriteOptionsFile()
+  // clears it, and so does a tracked column family change that commits a
+  // current snapshot. Protected by options_mutex_.
   bool options_file_stale_ = false;
 
   // True when the seqno-to-time worker can lag the time options of the column
