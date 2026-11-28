@@ -1301,6 +1301,62 @@ TEST_F(DBTestCompactionFilter,
   }
 }
 
+// A DB close can start while a merge-before-filter compaction filters an
+// uncombined operand batch. The compaction must then stop with
+// ShutdownInProgress and must not output a row from that batch.
+TEST_F(DBTestCompactionFilter, MergeBeforeFilterShutdownDuringOperandBatch) {
+  // Starts the DB shutdown (without waiting) on its first call for a merge
+  // operand, so the shutdown flag is set while PrefilterUncombinedOutputs()
+  // runs.
+  class ShutdownOnFirstCallFilter : public CompactionFilter {
+   public:
+    MergeOrder GetMergeOrder() const override {
+      return MergeOrder::kMergeBeforeFilter;
+    }
+    const char* Name() const override { return "ShutdownOnFirstCallFilter"; }
+    Decision FilterV2(int /*level*/, const Slice& /*key*/, ValueType value_type,
+                      const Slice& /*existing_value*/,
+                      std::string* /*new_value*/,
+                      std::string* /*skip_until*/) const override {
+      if (value_type == ValueType::kMergeOperand && calls.fetch_add(1) == 0) {
+        CancelAllBackgroundWork(db, /*wait=*/false);
+      }
+      return Decision::kKeep;
+    }
+    DB* db = nullptr;
+    mutable std::atomic<int> calls{0};
+  };
+
+  ShutdownOnFirstCallFilter filter;
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.avoid_flush_during_shutdown = true;
+  options.compaction_filter = &filter;
+  // The single operand of "k" has no base value in the compaction, so
+  // MergeUntil() returns it as an uncombined batch.
+  options.merge_operator = MergeOperators::CreateStringAppendTESTOperator();
+  DestroyAndReopen(options);
+  filter.db = db_.get();
+  // Files in L6 cover "k", so the L0 -> L1 compaction is not bottommost and
+  // cannot full-merge the operand.
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("z", "vz"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(6);
+  ASSERT_OK(Merge("k", "1"));
+  ASSERT_OK(Flush());
+
+  Status s = dbfull()->TEST_CompactRange(0, nullptr, nullptr);
+  ASSERT_EQ(Status::Code::kShutdownInProgress, s.code()) << s.ToString();
+  ASSERT_EQ(1, filter.calls.load());
+
+  Close();
+  options.compaction_filter = nullptr;
+  Reopen(options);
+  ASSERT_EQ("1", Get("k"));
+  Close();
+}
+
 TEST_F(DBTestCompactionFilter, MergeBeforeFilterWideEntityAndBlobBase) {
   for (bool blobs : {false, true}) {
     test::MergeFilterTrace trace;
