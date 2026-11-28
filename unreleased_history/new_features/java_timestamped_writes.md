@@ -1,0 +1,1 @@
+RocksJava supports timestamped puts and deletes with built-in unsigned 64-bit timestamp comparators and APIs to manage the full-history timestamp low bound. Timestamped writes are not supported by `TtlDB` or `TransactionDB`.

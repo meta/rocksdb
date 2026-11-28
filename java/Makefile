@@ -192,6 +192,7 @@ JAVA_TESTS = \
 	org.rocksdb.SstPartitionerTest\
 	org.rocksdb.TableFilterTest\
 	org.rocksdb.TimedEnvTest\
+	org.rocksdb.TimestampedWriteTest\
 	org.rocksdb.TransactionTest\
 	org.rocksdb.TransactionDBTest\
 	org.rocksdb.TransactionOptionsTest\

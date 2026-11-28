@@ -169,6 +169,53 @@ public class TransactionDB extends RocksDB
     }
   }
 
+  /**
+   * This operation is not supported by {@code TransactionDB}.
+   *
+   * @throws UnsupportedOperationException always
+   */
+  @Override
+  public void put(
+      final WriteOptions writeOpts, final byte[] key, final byte[] timestamp, final byte[] value) {
+    throw new UnsupportedOperationException(
+        "Timestamped writes are not supported by TransactionDB.");
+  }
+
+  /**
+   * This operation is not supported by {@code TransactionDB}.
+   *
+   * @throws UnsupportedOperationException always
+   */
+  @Override
+  public void put(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpts,
+      final byte[] key, final byte[] timestamp, final byte[] value) {
+    throw new UnsupportedOperationException(
+        "Timestamped writes are not supported by TransactionDB.");
+  }
+
+  /**
+   * This operation is not supported by {@code TransactionDB}.
+   *
+   * @throws UnsupportedOperationException always
+   */
+  @Override
+  public void delete(final WriteOptions writeOpts, final byte[] key, final byte[] timestamp) {
+    throw new UnsupportedOperationException(
+        "Timestamped writes are not supported by TransactionDB.");
+  }
+
+  /**
+   * This operation is not supported by {@code TransactionDB}.
+   *
+   * @throws UnsupportedOperationException always
+   */
+  @Override
+  public void delete(final ColumnFamilyHandle columnFamilyHandle, final WriteOptions writeOpts,
+      final byte[] key, final byte[] timestamp) {
+    throw new UnsupportedOperationException(
+        "Timestamped writes are not supported by TransactionDB.");
+  }
+
   @Override
   public Transaction beginTransaction(final WriteOptions writeOptions) {
     return new Transaction(this, beginTransaction(nativeHandle_,

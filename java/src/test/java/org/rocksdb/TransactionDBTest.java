@@ -5,14 +5,15 @@
 
 package org.rocksdb;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.rocksdb.BuiltinComparator.encodeU64Ts;
+
+import java.util.*;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-
-import java.util.*;
-
-import static org.assertj.core.api.Assertions.assertThat;
-import static java.nio.charset.StandardCharsets.UTF_8;
 
 public class TransactionDBTest {
 
@@ -26,6 +27,32 @@ public class TransactionDBTest {
          final TransactionDB tdb = TransactionDB.open(options, txnDbOptions,
                  dbFolder.getRoot().getAbsolutePath())) {
       assertThat(tdb).isNotNull();
+    }
+  }
+
+  @Test
+  public void timestampedWritesAreNotSupported() throws RocksDBException {
+    final byte[] key = "key".getBytes(UTF_8);
+    final byte[] value = "value".getBytes(UTF_8);
+    final byte[] timestamp = encodeU64Ts(10);
+    try (final Options options = new Options().setCreateIfMissing(true).setComparator(
+             BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64_TS);
+        final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions().setComparator(
+            BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64_TS);
+        final WriteOptions write = new WriteOptions();
+        final TransactionDBOptions transactionOptions = new TransactionDBOptions();
+        final RocksDB db =
+            TransactionDB.open(options, transactionOptions, dbFolder.getRoot().getAbsolutePath());
+        final ColumnFamilyHandle cf = db.createColumnFamily(
+            new ColumnFamilyDescriptor("versions".getBytes(UTF_8), cfOptions))) {
+      assertThatThrownBy(() -> db.put(write, key, timestamp, value))
+          .isInstanceOf(UnsupportedOperationException.class);
+      assertThatThrownBy(() -> db.put(cf, write, key, timestamp, value))
+          .isInstanceOf(UnsupportedOperationException.class);
+      assertThatThrownBy(() -> db.delete(write, key, timestamp))
+          .isInstanceOf(UnsupportedOperationException.class);
+      assertThatThrownBy(() -> db.delete(cf, write, key, timestamp))
+          .isInstanceOf(UnsupportedOperationException.class);
     }
   }
 

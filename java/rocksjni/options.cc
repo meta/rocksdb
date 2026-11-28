@@ -41,6 +41,22 @@
 #include "util/stderr_logger.h"
 #include "utilities/merge_operators.h"
 
+namespace {
+const ROCKSDB_NAMESPACE::Comparator* GetBuiltinComparator(jint comparator) {
+  switch (comparator) {
+    case 1:
+      return ROCKSDB_NAMESPACE::ReverseBytewiseComparator();
+    case 2:
+      return ROCKSDB_NAMESPACE::BytewiseComparatorWithU64Ts();
+    case 3:
+      return ROCKSDB_NAMESPACE::ReverseBytewiseComparatorWithU64Ts();
+    default:
+      return ROCKSDB_NAMESPACE::BytewiseComparator();
+  }
+}
+
+}  // namespace
+
 /*
  * Class:     org_rocksdb_Options
  * Method:    newOptions
@@ -154,16 +170,8 @@ jboolean Java_org_rocksdb_Options_createMissingColumnFamilies(JNIEnv*, jclass,
 void Java_org_rocksdb_Options_setComparatorHandle__JI(JNIEnv*, jclass,
                                                       jlong jhandle,
                                                       jint builtinComparator) {
-  switch (builtinComparator) {
-    case 1:
-      reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle)->comparator =
-          ROCKSDB_NAMESPACE::ReverseBytewiseComparator();
-      break;
-    default:
-      reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle)->comparator =
-          ROCKSDB_NAMESPACE::BytewiseComparator();
-      break;
-  }
+  reinterpret_cast<ROCKSDB_NAMESPACE::Options*>(jhandle)->comparator =
+      GetBuiltinComparator(builtinComparator);
 }
 
 /*
@@ -4196,16 +4204,8 @@ void Java_org_rocksdb_ColumnFamilyOptions_optimizeUniversalStyleCompaction(
  */
 void Java_org_rocksdb_ColumnFamilyOptions_setComparatorHandle__JI(
     JNIEnv*, jclass, jlong jhandle, jint builtinComparator) {
-  switch (builtinComparator) {
-    case 1:
-      reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle)
-          ->comparator = ROCKSDB_NAMESPACE::ReverseBytewiseComparator();
-      break;
-    default:
-      reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle)
-          ->comparator = ROCKSDB_NAMESPACE::BytewiseComparator();
-      break;
-  }
+  reinterpret_cast<ROCKSDB_NAMESPACE::ColumnFamilyOptions*>(jhandle)
+      ->comparator = GetBuiltinComparator(builtinComparator);
 }
 
 /*

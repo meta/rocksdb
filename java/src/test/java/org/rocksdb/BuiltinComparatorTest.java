@@ -5,12 +5,16 @@
 
 package org.rocksdb;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.rocksdb.BuiltinComparator.decodeU64Ts;
+import static org.rocksdb.BuiltinComparator.encodeU64Ts;
+
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-
-import static org.assertj.core.api.Assertions.assertThat;
 
 public class BuiltinComparatorTest {
 
@@ -132,13 +136,65 @@ public class BuiltinComparatorTest {
   }
 
   @Test
+  public void builtinU64TimestampComparators() throws Exception {
+    final byte[] first = "a".getBytes(UTF_8);
+    final byte[] second = "b".getBytes(UTF_8);
+    final byte[] timestamp = encodeU64Ts(10);
+    for (final BuiltinComparator comparator :
+        new BuiltinComparator[] {BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64_TS,
+            BuiltinComparator.REVERSE_BYTEWISE_COMPARATOR_WITH_U64_TS}) {
+      try (final Options options = new Options().setCreateIfMissing(true).setComparator(comparator);
+          final RocksDB db = RocksDB.open(options, dbFolder.newFolder().getAbsolutePath());
+          final WriteOptions write = new WriteOptions(); final Slice ts = new Slice(timestamp);
+          final ReadOptions read = new ReadOptions().setTimestamp(ts)) {
+        db.put(write, second, timestamp, second);
+        db.put(write, first, timestamp, first);
+        final boolean forward = comparator == BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64_TS;
+        try (final RocksIterator iterator = db.newIterator(read)) {
+          iterator.seekToFirst();
+          assertThat(iterator.isValid()).isTrue();
+          assertThat(iterator.key()).isEqualTo(forward ? first : second);
+          iterator.next();
+          assertThat(iterator.isValid()).isTrue();
+          assertThat(iterator.key()).isEqualTo(forward ? second : first);
+          iterator.next();
+          assertThat(iterator.isValid()).isFalse();
+          iterator.status();
+        }
+      }
+    }
+  }
+
+  @Test
+  public void u64TimestampEncoding() {
+    final long[] timestamps = {0, 0x0102030405060708L, Long.MAX_VALUE, Long.MIN_VALUE, -1L};
+    final byte[][] encoded = {new byte[8], {8, 7, 6, 5, 4, 3, 2, 1},
+        {-1, -1, -1, -1, -1, -1, -1, 127}, {0, 0, 0, 0, 0, 0, 0, -128},
+        {-1, -1, -1, -1, -1, -1, -1, -1}};
+    for (int i = 0; i < timestamps.length; i++) {
+      assertThat(encodeU64Ts(timestamps[i])).isEqualTo(encoded[i]);
+      assertThat(decodeU64Ts(encoded[i])).isEqualTo(timestamps[i]);
+    }
+  }
+
+  @Test
+  public void decodeU64TsRejectsInvalidLength() {
+    for (final int length : new int[] {0, 7, 9}) {
+      assertThatThrownBy(() -> decodeU64Ts(new byte[length]))
+          .isInstanceOf(IllegalArgumentException.class);
+    }
+  }
+
+  @Test
   public void builtinComparatorEnum(){
     assertThat(BuiltinComparator.BYTEWISE_COMPARATOR.ordinal())
         .isEqualTo(0);
     assertThat(
         BuiltinComparator.REVERSE_BYTEWISE_COMPARATOR.ordinal())
         .isEqualTo(1);
-    assertThat(BuiltinComparator.values().length).isEqualTo(2);
+    assertThat(BuiltinComparator.BYTEWISE_COMPARATOR_WITH_U64_TS.ordinal()).isEqualTo(2);
+    assertThat(BuiltinComparator.REVERSE_BYTEWISE_COMPARATOR_WITH_U64_TS.ordinal()).isEqualTo(3);
+    assertThat(BuiltinComparator.values().length).isEqualTo(4);
     assertThat(BuiltinComparator.valueOf("BYTEWISE_COMPARATOR")).
         isEqualTo(BuiltinComparator.BYTEWISE_COMPARATOR);
   }
