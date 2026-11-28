@@ -397,7 +397,14 @@ void ThreadLocalPtr::StaticMeta::Reset(uint32_t id, void* ptr) {
     MutexLock l(Mutex());
     tls->entries.resize(id + 1);
   }
-  tls->entries[id].ptr.store(ptr, std::memory_order_release);
+  void* oldptr = tls->entries[id].ptr.exchange(ptr, std::memory_order_acq_rel);
+  if (UNLIKELY(nullptr != oldptr && ptr != oldptr)) {
+    auto inst = Instance();
+    MutexLock l(inst->MemberMutex());
+    if (auto handler = GetHandler(id)) {
+      handler(oldptr);
+    }
+  }
 }
 
 void* ThreadLocalPtr::StaticMeta::Swap(uint32_t id, void* ptr) {
