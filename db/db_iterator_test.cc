@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -7975,6 +7976,46 @@ TEST_P(ReadPathRangeTombstoneTest, SingleDeleteOnlyRun) {
       1);
 }
 
+// With a threshold of 1, a run of one point tombstone can end at its own key,
+// and the range from that key to itself covers nothing. In this test, "a" is
+// live and "b" is deleted. Forward, the scan reaches the end of the data after
+// the tombstone at "b", so the range would be ["b", "b"). Reverse,
+// SeekForPrev("b") lands on the tombstone at "b", and the range would end at
+// the seek target "b". The scan inserts nothing in both directions.
+TEST_P(ReadPathRangeTombstoneTest, RunEndingAtItsOwnKeyInsertsNothing) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 1;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Delete("b"));
+
+  attempted_insert_ranges_.clear();
+  {
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ReadOptions()));
+    if (Forward()) {
+      iter->Seek("a");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key());
+      iter->Next();
+    } else {
+      iter->SeekForPrev("b");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key());
+      iter->Prev();
+    }
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0u);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+      0);
+  ASSERT_EQ(
+      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+      1);
+}
+
 TEST_P(ReadPathRangeTombstoneTest, PrefixFilterDefaultReadOptions) {
   // total_order_seek=false (default) with prefix extractor. Even when the
   // visible scan contains a valid in-prefix tombstone run [ba, bc), read-path
@@ -8091,10 +8132,9 @@ TEST_P(ReadPathRangeTombstoneTest, PrefixFilterTotalOrderSeek) {
     }
     ASSERT_OK(it->status());
     // Tombstone crosses from prefix 'b' into 'c', terminated by live "cb".
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
-    if (use_udt) {
-      AssertRange(0, std::string("ba") + ts, std::string("cb") + ts);
-    } else {
+    // With user-defined timestamps, no read converts.
+    ASSERT_EQ(attempted_insert_ranges_.size(), use_udt ? 0u : 1u);
+    if (!use_udt) {
       AssertRange(0, "ba", "cb");
     }
   }
@@ -8169,15 +8209,13 @@ TEST_P(ReadPathRangeTombstoneTest, PrefixFilterPrefixSameAsStart) {
         ASSERT_FALSE(it->Valid());
       }
       ASSERT_OK(it->status());
-      ASSERT_EQ(attempted_insert_ranges_.size(), 1u);
+      // With user-defined timestamps, no read converts.
+      const uint64_t expected_insertions = use_udt ? 0 : 1;
+      ASSERT_EQ(attempted_insert_ranges_.size(), expected_insertions);
       ASSERT_EQ(options.statistics->getTickerCount(
                     READ_PATH_RANGE_TOMBSTONES_INSERTED),
-                1u);
-      if (use_udt) {
-        const std::string end_ts =
-            Forward() ? ts : std::string(sizeof(uint64_t), '\0');
-        AssertRange(0, std::string("ba") + ts, std::string("bb") + end_ts);
-      } else {
+                expected_insertions);
+      if (!use_udt) {
         AssertRange(0, "ba", "bb");
       }
       if (use_udt) {
@@ -8634,49 +8672,72 @@ TEST_P(ReadPathRangeTombstoneTest, SkipInsertionWhenCoveredByExistingRange) {
       0);
 }
 
-// Verifies that range tombstone insertion works correctly with user-defined
-// timestamps (UDT) when the read timestamp has full visibility. With UDT, keys
-// include an 8-byte timestamp suffix, so the comparator, Put/Delete APIs, and
-// ReadOptions all require timestamps. This test keeps the optimization enabled
-// by reading at the max timestamp.
-TEST_P(ReadPathRangeTombstoneTest, UDTBasicScan) {
+// With user-defined timestamps (UDT), a reader at timestamp T sees the range
+// tombstones whose end key has a timestamp at or below T. A converted range
+// tombstone would get the timestamp of its end key. In this test, "a" to "h"
+// are written at timestamp 1 and "b" to "f" are deleted at timestamp 2. In
+// both directions, a conversion by a scan at the max timestamp would insert
+// ["b"@2, "g"@1). Its end key has timestamp 1, so a read at timestamp 1 would
+// see it and miss "b" to "f". So no read converts in a column family with UDT.
+TEST_P(ReadPathRangeTombstoneTest, UDTOlderTimestampReadAfterMaxTimestampScan) {
   Options options = CurrentOptions();
   options.min_tombstones_for_range_conversion = 4;
   options.statistics = CreateDBStatistics();
   options.comparator = test::BytewiseComparatorWithU64TsWrapper();
   DestroyAndReopen(options);
 
-  std::string ts;
-  PutFixed64(&ts, 1);
-  Slice ts_slice(ts);
-  std::string read_ts;
-  Slice read_ts_slice = MaxTimestamp(&read_ts);
-  SetupTestData('a', 'h', /*flushed_point_dels=*/{},
-                /*memtable_point_dels=*/{"b", "c", "d", "e", "f"}, &ts_slice);
-
-  ReadOptions ro;
-  ro.timestamp = &read_ts_slice;
-  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
-  std::vector<std::string> keys;
-  if (Forward()) {
-    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-      keys.push_back(iter->key().ToString());
-    }
-  } else {
-    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
-      keys.push_back(iter->key().ToString());
-    }
-    std::reverse(keys.begin(), keys.end());
+  std::string ts1;
+  std::string ts2;
+  PutFixed64(&ts1, 1);
+  PutFixed64(&ts2, 2);
+  Slice ts1_slice(ts1);
+  Slice ts2_slice(ts2);
+  std::string max_ts;
+  Slice max_ts_slice = MaxTimestamp(&max_ts);
+  for (char c = 'a'; c <= 'h'; c++) {
+    ASSERT_OK(db_->Put(WriteOptions(), std::string(1, c), ts1_slice,
+                       std::string("v") + c));
   }
-  ASSERT_OK(iter->status());
-  ASSERT_EQ(keys, (std::vector<std::string>{"a", "g", "h"}));
+  ASSERT_OK(Flush());
+  for (char c = 'b'; c <= 'f'; c++) {
+    ASSERT_OK(db_->Delete(WriteOptions(), std::string(1, c), ts2_slice));
+  }
 
-  // Range covers [b+ts, g+ts).
-  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-  AssertRange(0, std::string("b") + ts, std::string("g") + ts);
+  // The scan at the max timestamp steps over the five deletes.
+  ReadOptions latest_ro;
+  latest_ro.timestamp = &max_ts_slice;
+  {
+    auto iter = std::unique_ptr<Iterator>(db_->NewIterator(latest_ro));
+    if (Forward()) {
+      iter->Seek("a");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("a", iter->key());
+      iter->Next();
+    } else {
+      iter->SeekForPrev("g");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ("g", iter->key());
+      iter->Prev();
+    }
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(Forward() ? "g" : "a", iter->key());
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_EQ(attempted_insert_ranges_.size(), 0u);
   ASSERT_EQ(
       options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-      1);
+      0);
+
+  // A read at timestamp 1 does not see the deletes, so it finds every key.
+  ReadOptions old_ro;
+  old_ro.timestamp = &ts1_slice;
+  for (char c = 'a'; c <= 'h'; c++) {
+    std::string value;
+    ASSERT_OK(db_->Get(old_ro, std::string(1, c), &value));
+    ASSERT_EQ(std::string("v") + c, value);
+  }
+  VerifyIteration({"a", "b", "c", "d", "e", "f", "g", "h"}, old_ro);
+  VerifyIteration({"a", "g", "h"}, latest_ro);
 }
 
 // Regression test: an older UDT read timestamp can hide newer live versions
@@ -8727,70 +8788,6 @@ TEST_P(ReadPathRangeTombstoneTest, UDTOlderTimestampDisablesInsertion) {
   ReadOptions latest_ro;
   latest_ro.timestamp = &max_ts_slice;
   VerifyIteration({"a", "b", "c", "d"}, latest_ro);
-}
-
-// When UDT is enabled and iteration exhausts with tombstones at the boundary,
-// range tombstone insertion should still work if the read sees all timestamps.
-// For forward exhaustion, the iterate_upper_bound is padded with the min
-// timestamp to form a valid end key. For reverse exhaustion, the end key comes
-// from the next live key which already has the timestamp suffix.
-TEST_P(ReadPathRangeTombstoneTest, ExhaustedWithUDT) {
-  Options options = CurrentOptions();
-  options.min_tombstones_for_range_conversion = 4;
-  options.statistics = CreateDBStatistics();
-  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
-  DestroyAndReopen(options);
-
-  std::string ts;
-  PutFixed64(&ts, 1);
-  Slice ts_slice(ts);
-  std::string read_ts;
-  Slice read_ts_slice = MaxTimestamp(&read_ts);
-  std::string min_ts(sizeof(uint64_t), '\0');
-
-  // Forward: tombstones at end (e-h), needs upper bound for end key.
-  // Reverse: tombstones at start (a-d), end key from live key "e".
-  if (Forward()) {
-    SetupTestData('a', 'h', /*flushed_point_dels=*/{},
-                  /*memtable_point_dels=*/{"e", "f", "g", "h"}, &ts_slice);
-  } else {
-    SetupTestData('a', 'h', /*flushed_point_dels=*/{},
-                  /*memtable_point_dels=*/{"a", "b", "c", "d"}, &ts_slice);
-  }
-
-  ReadOptions ro;
-  ro.timestamp = &read_ts_slice;
-  std::string upper_str = "z";
-  Slice upper(upper_str);
-  if (Forward()) {
-    ro.iterate_upper_bound = &upper;
-  }
-  auto iter = std::unique_ptr<Iterator>(db_->NewIterator(ro));
-  std::vector<std::string> keys;
-  if (Forward()) {
-    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-      keys.push_back(iter->key().ToString());
-    }
-  } else {
-    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
-      keys.push_back(iter->key().ToString());
-    }
-    std::reverse(keys.begin(), keys.end());
-  }
-  ASSERT_OK(iter->status());
-  ASSERT_EQ(keys.size(), 4);
-
-  ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-  if (Forward()) {
-    // Forward exhaustion past h: saved_key_="h"+ts fallback -> [e+ts, h+ts).
-    AssertRange(0, std::string("e") + ts, std::string("h") + ts);
-  } else {
-    // Reverse exhaustion: range is [a+ts, e+ts).
-    AssertRange(0, std::string("a") + ts, std::string("e") + ts);
-  }
-  ASSERT_EQ(
-      options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-      1);
 }
 
 TEST_P(ReadPathRangeTombstoneTest, SeekForPrevTombstone) {
@@ -8844,26 +8841,17 @@ TEST_P(ReadPathRangeTombstoneTest, SeekForPrevTombstone) {
     ASSERT_OK(iter->status());
     ASSERT_EQ(keys, (std::vector<std::string>{"a", "b", "c", "d"}));
 
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-    if (Forward()) {
-      // Forward exhausts past h -> saved_key_="h" fallback -> [e, h),
-      // covering e,f,g with h as a point tombstone.
-      if (use_udt) {
-        AssertRange(0, std::string("e") + ts, std::string("h") + ts);
-      } else {
-        AssertRange(0, "e", "h");
-      }
-    } else {
-      if (use_udt) {
-        std::string min_ts(sizeof(uint64_t), '\0');
-        AssertRange(0, std::string("e") + ts, std::string("h") + min_ts);
-      } else {
-        AssertRange(0, "e", "h");
-      }
+    // With user-defined timestamps, no read converts. Without them, forward
+    // exhausts past h -> saved_key_="h" fallback -> [e, h), covering e,f,g
+    // with h as a point tombstone; reverse ends at the seek target "h".
+    const uint64_t expected_insertions = use_udt ? 0 : 1;
+    ASSERT_EQ(attempted_insert_ranges_.size(), expected_insertions);
+    if (!use_udt) {
+      AssertRange(0, "e", "h");
     }
     ASSERT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-        1);
+        expected_insertions);
   }
 }
 
@@ -8923,23 +8911,15 @@ TEST_P(ReadPathRangeTombstoneTest, UpperBoundTombstone) {
     ASSERT_OK(iter->status());
     ASSERT_EQ(keys, (std::vector<std::string>{"a", "b", "c", "d"}));
 
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-    if (use_udt) {
-      if (Forward()) {
-        // Forward end key: saved_key_ ("h") with the tombstone's own ts.
-        AssertRange(0, std::string("e") + ts, std::string("h") + ts);
-      } else {
-        // Reverse end key: upper bound padded with max_ts (via
-        // SetSavedKeyToSeekForPrevTarget).
-        std::string end_ts(sizeof(uint64_t), '\xff');
-        AssertRange(0, std::string("e") + ts, std::string("i") + end_ts);
-      }
-    } else {
+    // With user-defined timestamps, no read converts.
+    const uint64_t expected_insertions = use_udt ? 0 : 1;
+    ASSERT_EQ(attempted_insert_ranges_.size(), expected_insertions);
+    if (!use_udt) {
       AssertRange(0, "e", Forward() ? "h" : "i");
     }
     ASSERT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-        1);
+        expected_insertions);
   }
 }
 
@@ -9000,16 +8980,16 @@ TEST_P(ReadPathRangeTombstoneTest, LowerBoundTruncatesReverse) {
     ASSERT_OK(iter->status());
     ASSERT_EQ(keys, (std::vector<std::string>{"i", "j"}));
 
-    // Both directions produce one range covering tombstones e-h.
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-    if (use_udt) {
-      AssertRange(0, std::string("e") + ts, std::string("i") + ts);
-    } else {
+    // Without user-defined timestamps, both directions produce one range
+    // covering tombstones e-h. With them, no read converts.
+    const uint64_t expected_insertions = use_udt ? 0 : 1;
+    ASSERT_EQ(attempted_insert_ranges_.size(), expected_insertions);
+    if (!use_udt) {
       AssertRange(0, "e", "i");
     }
     ASSERT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
-        1);
+        expected_insertions);
   }
 }
 
@@ -9392,8 +9372,9 @@ TEST_P(ReadPathRangeTombstoneTest, IngestedFileSurvivesOlderIterator) {
 
 // NewIterator() references the SuperVersion before it reads the sequence
 // number. An ingestion plus a write in between gives the iterator a sequence
-// number above the ingested files' while its SuperVersion lacks them. It must
-// not convert the deleted keys around those files into a range tombstone.
+// number above the ingested files'. The iterator must then read with the
+// SuperVersion that has the files, so it sees them and does not convert the
+// deleted keys around them into a range tombstone.
 TEST_P(ReadPathRangeTombstoneTest,
        IngestedFileSurvivesIteratorWithOlderSuperVersion) {
   for (bool new_seqno : {false, true}) {
@@ -9450,7 +9431,7 @@ TEST_P(ReadPathRangeTombstoneTest,
     }
     ASSERT_TRUE(found);
 
-    // The iterator reads past the write of "z" but not the ingested file.
+    // The iterator reads past the write of "z" and sees the ingested file.
     attempted_insert_ranges_.clear();
     std::vector<std::string> seen;
     if (Forward()) {
@@ -9463,10 +9444,12 @@ TEST_P(ReadPathRangeTombstoneTest,
       }
     }
     ASSERT_OK(iter->status());
-    ASSERT_EQ(seen, std::vector<std::string>({"a", "e", "z"}));
+    ASSERT_EQ(seen, new_seqno
+                        ? std::vector<std::string>({"a", "b", "c", "e", "z"})
+                        : std::vector<std::string>({"a", "c", "e", "z"}));
     iter.reset();
-    ASSERT_EQ(attempted_insert_ranges_.size(), 1);
-    AssertRange(0, "b", "e");
+    // No two deleted keys are next to each other in that view.
+    ASSERT_EQ(attempted_insert_ranges_.size(), 0);
 
     EXPECT_EQ(Get("c"), "vc");
     EXPECT_EQ(Get("b"), new_seqno ? "vb2" : "NOT_FOUND");
@@ -9474,6 +9457,634 @@ TEST_P(ReadPathRangeTombstoneTest,
     Reopen(options);
     EXPECT_EQ(Get("c"), "vc");
   }
+}
+
+// A read references its SuperVersion before it reads the sequence number. If
+// a file ingestion runs in between, the read gets the ingested file's
+// sequence number S but a SuperVersion without the file. A newer iterator can
+// then convert a run that the file's delete completes, at S. Without a fix,
+// the old read sees that range tombstone but not the rest of the file: it
+// sees the ingested delete of "b" but not the ingested put of "ax". The read
+// must see either the whole ingestion or none of it.
+TEST_P(ReadPathRangeTombstoneTest, ReadDoesNotSeePartOfIngestion) {
+  enum class Read { kIterator, kMultiGet, kRefresh };
+  for (Read read : {Read::kIterator, Read::kMultiGet, Read::kRefresh}) {
+    SCOPED_TRACE("read " + std::to_string(static_cast<int>(read)));
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+
+    // An SST file holds "b". The memtable deletes "a" and "c" around it.
+    ASSERT_OK(Put("b", "old"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("a"));
+    ASSERT_OK(Delete("c"));
+    ASSERT_OK(Put("d", "vd"));
+    // The ingested file puts "ax" and deletes "b". No memtable key is in
+    // ["ax", "b"], so the ingestion does not flush the memtable. The file
+    // overlaps the SST file, so it gets a new sequence number.
+    const std::string file = dbname_ + "/ingest.sst";
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("ax", "new"));
+      ASSERT_OK(writer.Delete("b"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    std::unique_ptr<Iterator> refreshed;
+    if (read == Read::kRefresh) {
+      refreshed.reset(db_->NewIterator(ReadOptions()));
+      // An unrelated ingestion changes the SuperVersion, so Refresh() builds
+      // a new iterator tree.
+      const std::string other = dbname_ + "/other.sst";
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(other));
+      ASSERT_OK(writer.Put("z", "vz"));
+      ASSERT_OK(writer.Finish());
+      ASSERT_OK(db_->IngestExternalFile({other}, IngestExternalFileOptions()));
+    }
+
+    // Runs once, after the read references its SuperVersion and before it
+    // reads the sequence number: ingest the file, then let a new iterator
+    // convert the run "b", "c". This runs on another thread, because MultiGet()
+    // holds this thread's thread-local SuperVersion slot.
+    const char* pause = read == Read::kIterator ? "DBImpl::NewIterator:1"
+                        : read == Read::kMultiGet
+                            ? "DBImpl::MultiCFSnapshot::SingleCFAfterRefSV"
+                            : "ArenaWrappedDBIter::DoRefresh:AfterRefSV";
+    bool paused = false;
+    SyncPoint::GetInstance()->SetCallBack(pause, [&](void*) {
+      if (paused) {
+        return;
+      }
+      paused = true;
+      port::Thread writer([&]() {
+        ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+        std::unique_ptr<Iterator> converter(db_->NewIterator(ReadOptions()));
+        if (Forward()) {
+          converter->Seek("b");
+          ASSERT_TRUE(converter->Valid());
+          ASSERT_EQ("d", converter->key().ToString());
+        } else {
+          converter->SeekForPrev("cc");
+          ASSERT_TRUE(converter->Valid());
+          ASSERT_EQ("ax", converter->key().ToString());
+        }
+        ASSERT_OK(converter->status());
+      });
+      writer.join();
+    });
+    attempted_insert_ranges_.clear();
+
+    std::vector<std::string> seen;
+    if (read == Read::kMultiGet) {
+      const Slice keys[] = {"ax", "b"};
+      PinnableSlice values[2];
+      Status statuses[2];
+      db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), 2, keys, values,
+                    statuses);
+      for (int i = 0; i < 2; ++i) {
+        if (statuses[i].ok()) {
+          seen.push_back(keys[i].ToString());
+        } else {
+          ASSERT_TRUE(statuses[i].IsNotFound());
+        }
+      }
+    } else {
+      std::unique_ptr<Iterator> iter;
+      if (read == Read::kIterator) {
+        iter.reset(db_->NewIterator(ReadOptions()));
+      } else {
+        ASSERT_OK(refreshed->Refresh());
+        iter = std::move(refreshed);
+      }
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+    }
+    SyncPoint::GetInstance()->ClearCallBack(pause);
+    ASSERT_TRUE(paused);
+    ASSERT_EQ(1, attempted_insert_ranges_.size());
+
+    // The read sees the ingested put of "ax" with the ingested delete of "b".
+    std::vector<std::string> expected;
+    if (read == Read::kMultiGet) {
+      expected = {"ax"};
+    } else if (read == Read::kIterator) {
+      expected = {"ax", "d"};
+    } else {
+      expected = {"ax", "d", "z"};
+    }
+    ASSERT_EQ(expected, seen);
+  }
+}
+
+// The multi column family form of ReadDoesNotSeePartOfIngestion. A multi
+// column family read without a snapshot reads its sequence number first and
+// references its SuperVersions after that. One IngestExternalFiles() call
+// ingests into the column families "other" and default, and pauses after it
+// has published its sequence number S and installed the SuperVersion of
+// "other". A read in this pause gets S, then references the old SuperVersion
+// of default from its thread-local cache, which takes no DB mutex. Then the
+// ingestion finishes, and a new iterator converts the run "b", "c" of default
+// at S. The read must see that its SuperVersion of default misses the
+// ingestion and retry. Otherwise it sees the range tombstone over "b" but not
+// the ingested put of "ax".
+TEST_P(ReadPathRangeTombstoneTest, MultiCFReadDoesNotSeePartOfIngestion) {
+  enum class Read { kMultiGet, kNewIterators };
+  for (Read read : {Read::kMultiGet, Read::kNewIterators}) {
+    SCOPED_TRACE("read " + std::to_string(static_cast<int>(read)));
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = 2;
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    CreateAndReopenWithCF({"other"}, options);
+
+    // Each ingested file overlaps an SST file, so it gets a new sequence
+    // number. In default, an SST file holds "b", and the memtable deletes "a"
+    // and "c" around it. No memtable key is in ["ax", "b"], so the ingestion
+    // does not flush the memtable.
+    ASSERT_OK(Put(1, "x", "old"));
+    ASSERT_OK(Flush(1));
+    ASSERT_OK(Put("b", "old"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Delete("a"));
+    ASSERT_OK(Delete("c"));
+    ASSERT_OK(Put("d", "vd"));
+    // This Get() caches the current SuperVersion of default in this thread's
+    // thread-local slot, so the read below can reference it without the DB
+    // mutex, which the paused ingestion holds.
+    ASSERT_EQ("vd", Get("d"));
+    const std::string other_file = dbname_ + "/other.sst";
+    const std::string file = dbname_ + "/ingest.sst";
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(other_file));
+      ASSERT_OK(writer.Put("x", "new"));
+      ASSERT_OK(writer.Finish());
+    }
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("ax", "new"));
+      ASSERT_OK(writer.Delete("b"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    // The ingester pauses after the SuperVersion of "other" is installed.
+    // `paused` gets true when it pauses, or false if the ingestion returns
+    // without pausing. `once` makes sure only one of them sets it.
+    std::atomic<bool> once{false};
+    std::promise<bool> paused;
+    std::promise<void> release;
+    std::shared_future<void> release_future = release.get_future().share();
+    constexpr char kPause[] =
+        "DBImpl::IngestExternalFiles:InstallSVForFirstCF:0";
+    SyncPoint::GetInstance()->SetCallBack(kPause, [&](void*) {
+      if (!once.exchange(true)) {
+        paused.set_value(true);
+        release_future.wait_for(std::chrono::minutes(5));
+      }
+    });
+    port::Thread ingester([&]() {
+      IngestExternalFileArg other_arg;
+      other_arg.column_family = handles_[1];
+      other_arg.external_files = {other_file};
+      IngestExternalFileArg arg;
+      arg.column_family = handles_[0];
+      arg.external_files = {file};
+      EXPECT_OK(db_->IngestExternalFiles({other_arg, arg}));
+      if (!once.exchange(true)) {
+        paused.set_value(false);
+      }
+    });
+    bool released = false;
+    // This Defer releases and joins the ingester if the read did not, even
+    // after a failure.
+    Defer cleanup([&]() {
+      if (!released) {
+        release.set_value();
+      }
+      if (ingester.joinable()) {
+        ingester.join();
+      }
+      SyncPoint::GetInstance()->ClearCallBack(kPause);
+    });
+    std::future<bool> paused_future = paused.get_future();
+    ASSERT_EQ(std::future_status::ready,
+              paused_future.wait_for(std::chrono::minutes(5)));
+    ASSERT_TRUE(paused_future.get());
+
+    // Runs once, after the read references its first column family, which is
+    // default: finish the ingestion, then let a new iterator convert the run
+    // "b", "c". The converter runs on another thread, because the read holds
+    // this thread's thread-local SuperVersion slot of default.
+    constexpr char kAfterRef[] = "DBImpl::MultiCFSnapshot::AfterRefSV";
+    SyncPoint::GetInstance()->SetCallBack(kAfterRef, [&](void*) {
+      if (released) {
+        return;
+      }
+      released = true;
+      release.set_value();
+      ingester.join();
+      port::Thread converter([&]() {
+        std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+        if (Forward()) {
+          iter->Seek("b");
+          ASSERT_TRUE(iter->Valid());
+          ASSERT_EQ("d", iter->key().ToString());
+        } else {
+          iter->SeekForPrev("cc");
+          ASSERT_TRUE(iter->Valid());
+          ASSERT_EQ("ax", iter->key().ToString());
+        }
+        ASSERT_OK(iter->status());
+      });
+      converter.join();
+    });
+    attempted_insert_ranges_.clear();
+
+    // `seen` lists the keys that the read finds, as "<column family>:<key>".
+    std::vector<std::string> seen;
+    if (read == Read::kMultiGet) {
+      // MultiGet() orders its column families by ID, so default comes first.
+      ColumnFamilyHandle* cfs[] = {handles_[0], handles_[0], handles_[1]};
+      const Slice keys[] = {"ax", "b", "x"};
+      PinnableSlice values[3];
+      Status statuses[3];
+      db_->MultiGet(ReadOptions(), 3, cfs, keys, values, statuses);
+      for (int i = 0; i < 3; ++i) {
+        if (statuses[i].ok()) {
+          seen.push_back(cfs[i]->GetName() + ":" + keys[i].ToString());
+        } else {
+          ASSERT_TRUE(statuses[i].IsNotFound());
+        }
+      }
+    } else {
+      std::vector<ColumnFamilyHandle*> cfs = {handles_[0], handles_[1]};
+      std::vector<Iterator*> raw;
+      ASSERT_OK(db_->NewIterators(ReadOptions(), cfs, &raw));
+      std::vector<std::unique_ptr<Iterator>> iters(raw.begin(), raw.end());
+      for (size_t i = 0; i < iters.size(); ++i) {
+        for (iters[i]->SeekToFirst(); iters[i]->Valid(); iters[i]->Next()) {
+          seen.push_back(cfs[i]->GetName() + ":" + iters[i]->key().ToString());
+        }
+        ASSERT_OK(iters[i]->status());
+      }
+    }
+    SyncPoint::GetInstance()->ClearCallBack(kAfterRef);
+    ASSERT_TRUE(released);
+    ASSERT_EQ(1, attempted_insert_ranges_.size());
+
+    // The read sees the ingested put of "ax" with the ingested delete of "b".
+    std::vector<std::string> expected;
+    if (read == Read::kMultiGet) {
+      expected = {"default:ax", "other:x"};
+    } else {
+      expected = {"default:ax", "default:d", "other:x"};
+    }
+    ASSERT_EQ(expected, seen);
+  }
+}
+
+// The in-place path of Iterator::Refresh() can still pair an old Version
+// with an ingested sequence number. One IngestExternalFiles() call ingests
+// into the column families "other" and default, and pauses after it has
+// published sequence number S and installed the first column family. The
+// "other" file overlaps an existing key, so it gets S. The default file
+// overlaps nothing, so it gets sequence number 0. An iterator of the default
+// column family refreshes in place during the pause: it keeps its tree,
+// without the ingested file, and reads at S. A conversion at S would hide
+// the ingested key "c". The memtable's version barrier refuses it, because
+// the iterator's Version predates the ingestion.
+TEST_P(ReadPathRangeTombstoneTest, RefreshDuringAtomicIngestionDoesNotConvert) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"other"}, options);
+  ASSERT_OK(Put(1, "x", "old"));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Put("0", "v0"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Delete("d"));
+  ASSERT_OK(Put("e", "ve"));
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+
+  const std::string other_file = dbname_ + "/other.sst";
+  const std::string file = dbname_ + "/ingest.sst";
+  {
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(other_file));
+    ASSERT_OK(writer.Put("x", "new"));
+    ASSERT_OK(writer.Finish());
+  }
+  {
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("c", "vc"));
+    ASSERT_OK(writer.Finish());
+  }
+  // `paused` gets true when the ingestion pauses, or false if the ingestion
+  // returns without pausing. `once` makes sure only one of them sets it.
+  std::atomic<bool> once{false};
+  std::promise<bool> paused;
+  std::promise<void> refreshed;
+  std::shared_future<void> refreshed_future = refreshed.get_future().share();
+  constexpr char kPause[] = "DBImpl::IngestExternalFiles:InstallSVForFirstCF:0";
+  SyncPoint::GetInstance()->SetCallBack(kPause, [&](void*) {
+    if (!once.exchange(true)) {
+      paused.set_value(true);
+      refreshed_future.wait_for(std::chrono::minutes(5));
+    }
+  });
+  port::Thread ingester([&]() {
+    IngestExternalFileArg other_arg;
+    other_arg.column_family = handles_[1];
+    other_arg.external_files = {other_file};
+    IngestExternalFileArg arg;
+    arg.column_family = db_->DefaultColumnFamily();
+    arg.external_files = {file};
+    EXPECT_OK(db_->IngestExternalFiles({other_arg, arg}));
+    if (!once.exchange(true)) {
+      paused.set_value(false);
+    }
+  });
+  {
+    // This Defer releases and joins the ingester, even after a failure.
+    bool released = false;
+    Defer cleanup([&]() {
+      if (!released) {
+        refreshed.set_value();
+      }
+      ingester.join();
+      SyncPoint::GetInstance()->ClearCallBack(kPause);
+    });
+    std::future<bool> paused_future = paused.get_future();
+    ASSERT_EQ(std::future_status::ready,
+              paused_future.wait_for(std::chrono::minutes(5)));
+    ASSERT_TRUE(paused_future.get());
+    // The ingestion holds the DB mutex here. The default column family still
+    // has its old SuperVersion, so the refresh keeps the iterator tree and
+    // reads the new sequence number without the mutex.
+    ASSERT_OK(iter->Refresh());
+    released = true;
+    refreshed.set_value();
+  }
+
+  // The refreshed iterator does not see "c" and finds the run "b", "d".
+  attempted_insert_ranges_.clear();
+  if (Forward()) {
+    iter->Seek("a");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ("e", iter->key().ToString());
+  } else {
+    iter->SeekForPrev("dd");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ("0", iter->key().ToString());
+  }
+  ASSERT_OK(iter->status());
+  iter.reset();
+  ASSERT_EQ(1, attempted_insert_ranges_.size());
+  ASSERT_EQ("vc", Get("c"));
+  ASSERT_OK(Flush());
+  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "other"}, options);
+  ASSERT_EQ("vc", Get("c"));
+  ASSERT_EQ("new", Get(1, "x"));
+}
+
+// A read that replaces its SuperVersion (see ReadDoesNotSeePartOfIngestion)
+// must read its sequence number again after it references the new
+// SuperVersion. In this test the memtable holds "k" = "v1". The read
+// references its SuperVersion, and an ingestion of an unrelated key runs. The
+// ingested file overlaps nothing, so it gets sequence number 0 and publishes
+// no new sequence number. The read still replaces its SuperVersion, because
+// the ingestion records its Version in this case too (see
+// DBImpl::SuperVersionMissesIngestion()). The read reads sequence number S,
+// the sequence number of "v1". Before the read references the new
+// SuperVersion, "k" = "v2" is written at a sequence number above S and
+// flushed. No snapshot needs "v1", so the flush keeps only "v2". A read at S
+// with the new SuperVersion would find no version of "k".
+TEST_P(ReadPathRangeTombstoneTest, ReplacedSuperVersionReadsNewSequence) {
+  enum class Read { kIterator, kMultiGet, kRefresh };
+  for (Read read : {Read::kIterator, Read::kMultiGet, Read::kRefresh}) {
+    SCOPED_TRACE("read " + std::to_string(static_cast<int>(read)));
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("k", "v1"));
+    auto write_file = [&](const std::string& name, const std::string& key) {
+      const std::string file = dbname_ + "/" + name;
+      SstFileWriter writer(EnvOptions(), options);
+      EXPECT_OK(writer.Open(file));
+      EXPECT_OK(writer.Put(key, "v"));
+      EXPECT_OK(writer.Finish());
+      return file;
+    };
+    const std::string file = write_file("ingest.sst", "z");
+
+    std::unique_ptr<Iterator> refreshed;
+    if (read == Read::kRefresh) {
+      refreshed.reset(db_->NewIterator(ReadOptions()));
+      // An unrelated ingestion changes the SuperVersion, so Refresh() builds
+      // a new iterator tree.
+      ASSERT_OK(db_->IngestExternalFile({write_file("other.sst", "y")},
+                                        IngestExternalFileOptions()));
+    }
+
+    // The ingestion and the write run on another thread, because MultiGet()
+    // holds this thread's thread-local SuperVersion slot.
+    const char* pause = read == Read::kIterator ? "DBImpl::NewIterator:1"
+                        : read == Read::kMultiGet
+                            ? "DBImpl::MultiCFSnapshot::SingleCFAfterRefSV"
+                            : "ArenaWrappedDBIter::DoRefresh:AfterRefSV";
+    bool paused = false;
+    SyncPoint::GetInstance()->SetCallBack(pause, [&](void*) {
+      if (paused) {
+        return;
+      }
+      paused = true;
+      port::Thread ingester([&]() {
+        ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+      });
+      ingester.join();
+    });
+    bool replaced = false;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock", [&](void*) {
+          if (replaced) {
+            return;
+          }
+          replaced = true;
+          port::Thread writer([&]() {
+            ASSERT_OK(Put("k", "v2"));
+            ASSERT_OK(Flush());
+          });
+          writer.join();
+        });
+
+    std::vector<std::string> seen;
+    if (read == Read::kMultiGet) {
+      PinnableSlice value;
+      Status status;
+      const Slice key("k");
+      db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), 1, &key, &value,
+                    &status);
+      ASSERT_OK(status);
+      seen.push_back("k=" + value.ToString());
+    } else {
+      std::unique_ptr<Iterator> iter;
+      if (read == Read::kIterator) {
+        iter.reset(db_->NewIterator(ReadOptions()));
+      } else {
+        ASSERT_OK(refreshed->Refresh());
+        iter = std::move(refreshed);
+      }
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        seen.push_back(iter->key().ToString() + "=" + iter->value().ToString());
+      }
+      ASSERT_OK(iter->status());
+    }
+    SyncPoint::GetInstance()->ClearCallBack(pause);
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock");
+    ASSERT_TRUE(paused);
+    ASSERT_TRUE(replaced);
+
+    std::vector<std::string> expected;
+    if (read == Read::kMultiGet) {
+      expected = {"k=v2"};
+    } else if (read == Read::kIterator) {
+      expected = {"k=v2", "z=v"};
+    } else {
+      expected = {"k=v2", "y=v", "z=v"};
+    }
+    ASSERT_EQ(expected, seen);
+  }
+}
+
+// A read with a timestamp checks it against full_history_ts_low of its
+// SuperVersion. A read that replaces its SuperVersion (see
+// ReadDoesNotSeePartOfIngestion) checks the new SuperVersion too. In this
+// test the read at timestamp 10 references its SuperVersion, which passes
+// the check, and an unrelated ingestion runs. Before the read references the
+// new SuperVersion, full_history_ts_low rises to 20 and a flush installs a
+// SuperVersion with it. The read must fail as if it had started after that.
+TEST_P(ReadPathRangeTombstoneTest, ReplacedSuperVersionChecksReadTimestamp) {
+  enum class Read { kIterator, kMultiGet };
+  for (Read read : {Read::kIterator, Read::kMultiGet}) {
+    SCOPED_TRACE("read " + std::to_string(static_cast<int>(read)));
+    Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
+    options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    DestroyAndReopen(options);
+    std::string ts_buf;
+    ASSERT_OK(db_->Put(WriteOptions(), "k", EncodeU64Ts(1, &ts_buf), "v"));
+    const std::string file = dbname_ + "/ingest.sst";
+    {
+      SstFileWriter writer(EnvOptions(), options);
+      ASSERT_OK(writer.Open(file));
+      ASSERT_OK(writer.Put("z", EncodeU64Ts(1, &ts_buf), "v"));
+      ASSERT_OK(writer.Finish());
+    }
+
+    // The ingestion, the write and the flush run on another thread, because
+    // MultiGet() holds this thread's thread-local SuperVersion slot.
+    const char* pause = read == Read::kIterator
+                            ? "DBImpl::NewIterator:1"
+                            : "DBImpl::MultiCFSnapshot::SingleCFAfterRefSV";
+    bool paused = false;
+    SyncPoint::GetInstance()->SetCallBack(pause, [&](void*) {
+      if (paused) {
+        return;
+      }
+      paused = true;
+      port::Thread ingester([&]() {
+        ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+      });
+      ingester.join();
+    });
+    bool replaced = false;
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock", [&](void*) {
+          if (replaced) {
+            return;
+          }
+          replaced = true;
+          port::Thread writer([&]() {
+            std::string buf;
+            ASSERT_OK(db_->IncreaseFullHistoryTsLow(
+                db_->DefaultColumnFamily(), EncodeU64Ts(20, &buf).ToString()));
+            ASSERT_OK(
+                db_->Put(WriteOptions(), "k", EncodeU64Ts(30, &buf), "v2"));
+            ASSERT_OK(Flush());
+          });
+          writer.join();
+        });
+
+    std::string read_ts_buf;
+    const Slice read_ts = EncodeU64Ts(10, &read_ts_buf);
+    ReadOptions ro;
+    ro.timestamp = &read_ts;
+    Status status;
+    if (read == Read::kMultiGet) {
+      PinnableSlice value;
+      const Slice key("k");
+      db_->MultiGet(ro, db_->DefaultColumnFamily(), 1, &key, &value, &status);
+    } else {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      iter->SeekToFirst();
+      status = iter->status();
+    }
+    SyncPoint::GetInstance()->ClearCallBack(pause);
+    SyncPoint::GetInstance()->ClearCallBack(
+        "DBImpl::ReplaceSuperVersionMissingIngestion:BeforeLock");
+    ASSERT_TRUE(paused);
+    ASSERT_TRUE(replaced);
+    ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+  }
+}
+
+// A read with a table_filter fails when conversion is on (see
+// ReadOptions::table_filter). A read that replaces its SuperVersion (see
+// ReadDoesNotSeePartOfIngestion) checks the new SuperVersion too. In this test
+// conversion is off when the iterator references its SuperVersion. Before it
+// reads the sequence number, SetOptions() turns conversion on and an unrelated
+// ingestion runs, so the iterator replaces its SuperVersion with one that has
+// conversion on. The iterator must fail as if it had started after that.
+TEST_P(ReadPathRangeTombstoneTest, ReplacedSuperVersionChecksTableFilter) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  const std::string file = dbname_ + "/ingest.sst";
+  {
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Put("z", "v"));
+    ASSERT_OK(writer.Finish());
+  }
+  bool paused = false;
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::NewIterator:1", [&](void*) {
+    if (paused) {
+      return;
+    }
+    paused = true;
+    ASSERT_OK(db_->SetOptions({{"min_tombstones_for_range_conversion", "2"}}));
+    ASSERT_OK(db_->IngestExternalFile({file}, IngestExternalFileOptions()));
+  });
+  std::function<bool(const TableProperties&)> filter =
+      [](const TableProperties&) { return true; };
+  ReadOptions ro;
+  ro.table_filter = &filter;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  SyncPoint::GetInstance()->ClearCallBack("DBImpl::NewIterator:1");
+  ASSERT_TRUE(paused);
+  ASSERT_TRUE(iter->status().IsInvalidArgument()) << iter->status().ToString();
 }
 
 // One IngestExternalFiles() call installs files in two column families. Each

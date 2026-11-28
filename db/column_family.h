@@ -27,6 +27,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "trace_replay/block_cache_tracer.h"
+#include "util/atomic.h"
 #include "util/cast_util.h"
 #include "util/hash_containers.h"
 #include "util/mutexlock.h"
@@ -528,6 +529,21 @@ class ColumnFamilyData {
   uint64_t GetSuperVersionNumberRelaxed() const {
     return super_version_number_.load(std::memory_order_relaxed);
   }
+
+  // The number of the Version that installed the latest successful file
+  // ingestion, or 0. See DBImpl::SuperVersionMissesIngestion().
+  uint64_t GetLastIngestVersionNumber() const {
+    return last_ingest_version_number_.LoadRelaxed();
+  }
+
+  // Called under the DB mutex by the ingestion, after LogAndApply() and before
+  // the ingested sequence numbers are published.
+  void SetLastIngestVersionNumber(uint64_t version_number) {
+    if (last_ingest_version_number_.LoadRelaxed() < version_number) {
+      last_ingest_version_number_.StoreRelaxed(version_number);
+    }
+  }
+
   // Only intended for use by DBImpl::InstallSuperVersion() and variants
   void InstallSuperVersion(SuperVersionContext* sv_context,
                            InstrumentedMutex* db_mutex,
@@ -739,6 +755,13 @@ class ColumnFamilyData {
   // InstallSuperVersion(), i.e. incremented every time super_version_
   // changes.
   std::atomic<uint64_t> super_version_number_;
+
+  // See GetLastIngestVersionNumber(). Written under the DB mutex and read
+  // without it. Readers load it after they load the last sequence number
+  // (acquire), and the ingestion stores it before it publishes the sequence
+  // number (release), so a reader that sees an ingested sequence number also
+  // sees this value.
+  RelaxedAtomic<uint64_t> last_ingest_version_number_{0};
 
   // Thread's local copy of SuperVersion pointer
   // This needs to be destructed before mutex_
