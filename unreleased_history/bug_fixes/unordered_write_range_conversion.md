@@ -1,0 +1,1 @@
+Fixed a bug where `min_tombstones_for_range_conversion` with `DBOptions::unordered_write` could have permanently deleted a key whose write was still in progress when an iterator scanned over it. Read-path range tombstone conversion is now disabled when `unordered_write` is true.
