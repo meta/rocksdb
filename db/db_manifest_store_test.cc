@@ -32,6 +32,7 @@
 #include "rocksdb/experimental.h"
 #include "rocksdb/utilities/backup_engine.h"
 #include "rocksdb/utilities/checkpoint.h"
+#include "rocksdb/utilities/db_split_merge.h"
 #include "rocksdb/utilities/options_util.h"
 #include "test_util/mock_manifest_store.h"
 #include "test_util/sync_point.h"
@@ -55,7 +56,8 @@ class DBManifestStoreTest : public DBTestBase {
 
   ~DBManifestStoreTest() override {
     Close();
-    // DestroyDB() does not remove a DB in store mode.
+    // DestroyDB() needs a store object with an epoch to remove a DB in store
+    // mode, so the test removes the folder directly.
     EXPECT_OK(DestroyDir(env_, dbname_));
   }
 
@@ -81,10 +83,11 @@ class DBManifestStoreTest : public DBTestBase {
     return scan;
   }
 
-  // The live SST file numbers of each column family, by name.
-  std::map<std::string, std::set<uint64_t>> LiveFiles() {
+  // The live SST file numbers of each column family of `db` (the test DB when
+  // null), by name.
+  std::map<std::string, std::set<uint64_t>> LiveFiles(DB* db = nullptr) {
     std::vector<LiveFileMetaData> files;
-    db_->GetLiveFilesMetaData(&files);
+    (db != nullptr ? db : db_.get())->GetLiveFilesMetaData(&files);
     std::map<std::string, std::set<uint64_t>> result;
     for (const LiveFileMetaData& f : files) {
       result[f.column_family_name].insert(f.file_number);
@@ -417,6 +420,131 @@ class DBManifestStoreTest : public DBTestBase {
       return;
     }
     FAIL() << "no such row";
+  }
+
+  // The folder of the secondary instance that OpenStoreSecondary() opens.
+  std::string SecondaryPath() const { return dbname_ + "_secondary"; }
+
+  // The folder of the follower instance that OpenStoreFollower() opens.
+  std::string FollowerPath() const { return dbname_ + "_follower"; }
+
+  // The descriptors of the column families `cf_names`, all with `options`.
+  static std::vector<ColumnFamilyDescriptor> Descriptors(
+      const std::vector<std::string>& cf_names, const Options& options) {
+    std::vector<ColumnFamilyDescriptor> cfs;
+    for (const std::string& name : cf_names) {
+      cfs.emplace_back(name, options);
+    }
+    return cfs;
+  }
+
+  // Opens a secondary instance of the test DB, in SecondaryPath(), with the
+  // store object `store` and the column families `cf_names`. `env` is the Env
+  // of the secondary (env_ when null).
+  Status OpenStoreSecondary(std::shared_ptr<ManifestStore> store,
+                            const std::vector<std::string>& cf_names, Env* env,
+                            std::vector<ColumnFamilyHandle*>* handles,
+                            std::unique_ptr<DB>* secondary) {
+    Options options = CurrentOptions();
+    options.max_open_files = -1;
+    options.manifest_store = std::move(store);
+    if (env != nullptr) {
+      options.env = env;
+    }
+    return DB::OpenAsSecondary(options, dbname_, SecondaryPath(),
+                               Descriptors(cf_names, options), handles,
+                               secondary);
+  }
+
+  // Loads the sync point dependencies below, deletes FollowerPath(), and opens
+  // a follower instance of the test DB there, with the store object `store`
+  // (a reader store object when null) and the column families `cf_names`.
+  //
+  // TEST_SYNC_POINT("Leader::Start") in the test waits until a catch-up of the
+  // follower begins. That catch-up then waits until the test runs
+  // TEST_SYNC_POINT("Leader::Done"), and
+  // TEST_SYNC_POINT("Follower::WaitForCatchup") waits for the end of that
+  // catch-up. The test must call ClearSyncPointDependencies() before the
+  // follower closes, also when an assertion fails, or the close can wait at
+  // those sync points forever.
+  Status OpenStoreFollower(const std::vector<std::string>& cf_names,
+                           std::vector<ColumnFamilyHandle*>* handles,
+                           std::unique_ptr<DB>* follower,
+                           std::shared_ptr<ManifestStore> store = nullptr) {
+    SyncPoint::GetInstance()->LoadDependency({
+        {"DBImplFollower::TryCatchupWithLeader:Begin1", "Leader::Start"},
+        {"Leader::Done", "DBImplFollower::TryCatchupWithLeader:Begin2"},
+        {"DBImplFollower::TryCatchupWithLeader:End",
+         "Follower::WaitForCatchup"},
+    });
+    Status s = DestroyDir(env_, FollowerPath());
+    if (!s.ok()) {
+      return s;
+    }
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.follower_refresh_catchup_period_ms = 100;
+    options.follower_catchup_retry_wait_ms = 10;
+    options.manifest_store =
+        store != nullptr ? std::move(store) : ReaderStore();
+    return DB::OpenAsFollower(options, FollowerPath(), dbname_,
+                              Descriptors(cf_names, options), handles,
+                              follower);
+  }
+
+  static void ClearSyncPointDependencies() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->LoadDependency({});
+  }
+
+  // Makes a checkpoint of the test DB in `dir`. It does not flush, so the
+  // checkpoint copies the WAL. `sequence` (when not null) gets the sequence
+  // number of the checkpoint. A non-empty `column_families` makes a subset
+  // checkpoint of these column families.
+  Status MakeCheckpoint(
+      const std::string& dir, uint64_t* sequence,
+      const std::vector<ColumnFamilyHandle*>& column_families = {}) {
+    Status s = DestroyDir(env_, dir);
+    Checkpoint* checkpoint = nullptr;
+    if (s.ok()) {
+      s = Checkpoint::Create(db_.get(), &checkpoint);
+    }
+    std::unique_ptr<Checkpoint> owner(checkpoint);
+    if (s.ok()) {
+      s = checkpoint->CreateCheckpoint(
+          dir, column_families, std::numeric_limits<uint64_t>::max(), sequence);
+    }
+    return s;
+  }
+
+  // Returns whether the column family of `handle` is dropped.
+  static bool IsDropped(ColumnFamilyHandle* handle) {
+    return static_cast_with_check<ColumnFamilyHandleImpl>(handle)
+        ->cfd()
+        ->IsDropped();
+  }
+
+  // Opens the DB in `dir` in file mode with `options` and the column families
+  // `cf_names`.
+  static Status OpenFileModeCopy(const Options& options, const std::string& dir,
+                                 const std::vector<std::string>& cf_names,
+                                 std::vector<ColumnFamilyHandle*>* handles,
+                                 std::unique_ptr<DB>* copy) {
+    return DB::Open(options, dir, Descriptors(cf_names, options), handles,
+                    copy);
+  }
+
+  // Closes `db` (a secondary, follower or copy) with its handles, and removes
+  // its folder `dir`.
+  void CloseAndDestroy(std::unique_ptr<DB>* db,
+                       std::vector<ColumnFamilyHandle*>* handles,
+                       const std::string& dir) {
+    for (ColumnFamilyHandle* h : *handles) {
+      ASSERT_OK((*db)->DestroyColumnFamilyHandle(h));
+    }
+    handles->clear();
+    db->reset();
+    ASSERT_OK(DestroyDir(env_, dir));
   }
 
   std::shared_ptr<MockManifestStoreData> data_;
@@ -3520,25 +3648,13 @@ TEST_F(DBManifestStoreTest, UnsupportedPaths) {
   ASSERT_OK(TryReopen(StoreOptions()));
   ASSERT_OK(Put("a", "1"));
   ASSERT_OK(Flush());
+  // GetLiveFiles() names the MANIFEST file for the caller to copy, and the
+  // MANIFEST file is only a stub. (GetLiveFilesStorageInfo() works, see
+  // Checkpoint.)
   std::vector<std::string> live;
   uint64_t manifest_size = 0;
   ASSERT_EQ(Status::Code::kNotSupported,
             db_->GetLiveFiles(live, &manifest_size).code());
-  std::vector<LiveFileStorageInfo> infos;
-  ASSERT_EQ(Status::Code::kNotSupported,
-            db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(), &infos)
-                .code());
-  Checkpoint* checkpoint = nullptr;
-  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
-  std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
-  ASSERT_EQ(Status::Code::kNotSupported,
-            checkpoint->CreateCheckpoint(dbname_ + "_checkpoint").code());
-  // A checkpoint of some column families also needs the live files.
-  ASSERT_EQ(
-      Status::Code::kNotSupported,
-      checkpoint
-          ->CreateCheckpoint(dbname_ + "_subset", {db_->DefaultColumnFamily()})
-          .code());
   const uint64_t options_number =
       dbfull()->GetVersionSet()->options_file_number();
   Close();
@@ -3557,7 +3673,8 @@ TEST_F(DBManifestStoreTest, UnsupportedPaths) {
   }
 #endif  // __SANITIZE_THREAD__
 
-  // Paths without an open DB fail on the stub.
+  // Paths without an open DB fail on the stub. DestroyDB() needs a store
+  // object that can remove the rows: one with an epoch.
   Options options = CurrentOptions();
   ASSERT_EQ(Status::Code::kNotSupported, RepairDB(dbname_, options).code());
   ASSERT_EQ(Status::Code::kNotSupported, DestroyDB(dbname_, options).code());
@@ -3605,6 +3722,10 @@ TEST_F(DBManifestStoreTest, UnsupportedPaths) {
       ASSERT_EQ(Status::Code::kTimedOut, destroy_s.code())
           << destroy_s.ToString();
       ASSERT_EQ(restored, files());
+      // The rows stay too: DestroyDB() reads CURRENT and lists the folder
+      // before it removes the rows.
+      ManifestDbRowResult db_row;
+      ASSERT_OK(ReaderStore()->ReadDbRow(&db_row));
     }
     // The CURRENT read and the folder listing both time out, and the options
     // have no store. DestroyDB() then ignores both errors, as for a DB that
@@ -3650,8 +3771,10 @@ TEST_F(DBManifestStoreTest, UnsupportedPaths) {
             experimental::GetFileChecksumsFromCurrentManifest(
                 env_->GetFileSystem().get(), dbname_, checksums)
                 .code());
-  // A remote compaction opens the DB as a secondary instance, which reads
-  // the MANIFEST file.
+  // A remote compaction worker without the store in
+  // CompactionServiceOptionsOverride::manifest_store opens the DB as a
+  // secondary instance from the MANIFEST file, so it fails on the stub with
+  // NotSupported.
   {
     CompactionServiceInput input;
     input.cf_name = kDefaultColumnFamilyName;
@@ -3728,7 +3851,8 @@ TEST_F(DBManifestStoreTest, StubRecord) {
   ASSERT_OK(edit.DecodeFrom(record));
 
   // A stub of a newer binary (payload version 2, an example) is still a
-  // stub: RepairDB() and DestroyDB() refuse it.
+  // stub: RepairDB() and DestroyDB() refuse it. DestroyDB() with the store
+  // also refuses it and keeps the rows, so the DB opens again below.
   ASSERT_OK(TryReopen(StoreOptions()));
   Close();
   const std::string stub_path = DescriptorFileName(dbname_, Current().number);
@@ -3747,6 +3871,8 @@ TEST_F(DBManifestStoreTest, StubRecord) {
             RepairDB(dbname_, CurrentOptions()).code());
   ASSERT_EQ(Status::Code::kNotSupported,
             DestroyDB(dbname_, CurrentOptions()).code());
+  ASSERT_EQ(Status::Code::kNotSupported,
+            DestroyDB(dbname_, StoreOptions()).code());
   ASSERT_OK(WriteStringToFile(env_, stub_contents, stub_path));
   ASSERT_OK(TryReopen(StoreOptions()));
 }
@@ -3823,16 +3949,8 @@ TEST_F(DBManifestStoreTest, OfflineReadersFailOnStub) {
   ASSERT_OK(TryReopen(StoreOptions()));
   ASSERT_OK(Put("a", "1"));
   ASSERT_OK(Flush());
-  BackupEngine* backup = nullptr;
-  ASSERT_OK(BackupEngine::Open(env_, BackupEngineOptions(dbname_ + "_backup"),
-                               &backup));
-  std::unique_ptr<BackupEngine> backup_guard(backup);
-  ASSERT_EQ(Status::Code::kNotSupported,
-            backup->CreateNewBackup(db_.get()).code());
   const uint64_t stub = dbfull()->TEST_Current_Manifest_FileNo();
   Close();
-  backup_guard.reset();
-  ASSERT_OK(DestroyDir(env_, dbname_ + "_backup"));
 
   Options options = CurrentOptions();
   ASSERT_EQ(Status::Code::kNotSupported,
@@ -4249,6 +4367,8 @@ TEST_F(DBManifestStoreTest, RecoveryMatrix) {
     kReadOnly,
     kRepair,
     kDestroy,
+    kSecondary,
+    kFollower,
   };
   constexpr Status::Code kOk = Status::Code::kOk;
   constexpr Status::Code kNotSupported = Status::Code::kNotSupported;
@@ -4256,6 +4376,7 @@ TEST_F(DBManifestStoreTest, RecoveryMatrix) {
   constexpr Status::Code kCorruption = Status::Code::kCorruption;
   constexpr Status::Code kIOError = Status::Code::kIOError;
   constexpr Status::Code kTimedOut = Status::Code::kTimedOut;
+  constexpr Status::Code kTryAgain = Status::Code::kTryAgain;
   struct Cell {
     State state;
     Entry entry;
@@ -4268,6 +4389,8 @@ TEST_F(DBManifestStoreTest, RecoveryMatrix) {
     bool no_store_fails_closed = true;
   };
   // kIOError in the table is the PathNotFound error of a missing file.
+  // Without a store, a secondary or follower returns TryAgain for a missing
+  // MANIFEST file, as in file mode: the primary may have just replaced it.
   // kMissingNoStub with create_if_missing and without a store fails with
   // Corruption, because the create finds the WAL file of the old DB. It fails
   // only after it wrote the new DB: a new IDENTITY, MANIFEST file and CURRENT.
@@ -4287,13 +4410,13 @@ TEST_F(DBManifestStoreTest, RecoveryMatrix) {
     {State::kDoneStub, Entry::kBestEfforts, kNotSupported, kInvalid},
     {State::kDoneStub, Entry::kReadOnly, kNotSupported, kOk},
     {State::kDoneStub, Entry::kRepair, kNotSupported, kNotSupported},
-    {State::kDoneStub, Entry::kDestroy, kNotSupported, kNotSupported},
+    {State::kDoneStub, Entry::kDestroy, kNotSupported, kOk},
     {State::kEnteringStub, Entry::kOpen, kNotSupported, kOk},
     {State::kEnteringStub, Entry::kOpenCreate, kNotSupported, kOk},
     {State::kEnteringStub, Entry::kBestEfforts, kNotSupported, kInvalid},
     {State::kEnteringStub, Entry::kReadOnly, kNotSupported, kNotSupported},
     {State::kEnteringStub, Entry::kRepair, kNotSupported, kNotSupported},
-    {State::kEnteringStub, Entry::kDestroy, kNotSupported, kNotSupported},
+    {State::kEnteringStub, Entry::kDestroy, kNotSupported, kOk},
     {State::kMissingWithStub, Entry::kOpen, kInvalid, kInvalid},
     {State::kMissingWithStub, Entry::kOpenCreate, kNotSupported, kNotSupported},
     {State::kMissingWithStub, Entry::kBestEfforts, kNotSupported, kInvalid},
@@ -4348,6 +4471,30 @@ TEST_F(DBManifestStoreTest, RecoveryMatrix) {
     {State::kReadError, Entry::kReadOnly, kTimedOut, kTimedOut},
     {State::kReadError, Entry::kRepair, kTimedOut, kTimedOut},
     {State::kReadError, Entry::kDestroy, kOk, kTimedOut},
+    {State::kFileMode, Entry::kSecondary, kOk, kInvalid},
+    {State::kFileMode, Entry::kFollower, kOk, kInvalid},
+    {State::kDoneStub, Entry::kSecondary, kNotSupported, kOk},
+    {State::kDoneStub, Entry::kFollower, kNotSupported, kOk},
+    {State::kEnteringStub, Entry::kSecondary, kNotSupported, kNotSupported},
+    {State::kEnteringStub, Entry::kFollower, kNotSupported, kNotSupported},
+    {State::kMissingWithStub, Entry::kSecondary, kIOError, kInvalid},
+    {State::kMissingWithStub, Entry::kFollower, kIOError, kInvalid},
+    {State::kMissingNoStub, Entry::kSecondary, kIOError, kInvalid},
+    {State::kMissingNoStub, Entry::kFollower, kIOError, kInvalid},
+    {State::kMissingNoStubNoWal, Entry::kSecondary, kIOError, kInvalid},
+    {State::kMissingNoStubNoWal, Entry::kFollower, kIOError, kInvalid},
+    {State::kUnpublishedCreatingStub, Entry::kSecondary, kIOError, kInvalid},
+    {State::kUnpublishedCreatingStub, Entry::kFollower, kIOError, kInvalid},
+    {State::kDamagedWithStub, Entry::kSecondary, kCorruption, kCorruption},
+    {State::kDamagedWithStub, Entry::kFollower, kCorruption, kCorruption},
+    {State::kDamagedFile, Entry::kSecondary, kCorruption, kCorruption},
+    {State::kDamagedFile, Entry::kFollower, kCorruption, kCorruption},
+    {State::kMissingTargetWithStub, Entry::kSecondary, kTryAgain, kIOError},
+    {State::kMissingTargetWithStub, Entry::kFollower, kTryAgain, kIOError},
+    {State::kMissingTargetFile, Entry::kSecondary, kTryAgain, kIOError},
+    {State::kMissingTargetFile, Entry::kFollower, kTryAgain, kIOError},
+    {State::kReadError, Entry::kSecondary, kTimedOut, kTimedOut},
+    {State::kReadError, Entry::kFollower, kTimedOut, kTimedOut},
   };
   // clang-format on
 
@@ -4479,6 +4626,37 @@ TEST_F(DBManifestStoreTest, RecoveryMatrix) {
         return RepairDB(dbname_, options);
       case Entry::kDestroy:
         return DestroyDB(dbname_, options);
+      case Entry::kSecondary:
+      case Entry::kFollower: {
+        if (with_store) {
+          options.manifest_store = ReaderStore();
+        }
+        options.max_open_files = -1;
+        const std::string dir =
+            entry == Entry::kSecondary ? SecondaryPath() : FollowerPath();
+        EXPECT_OK(DestroyDir(env_, dir));
+        std::vector<ColumnFamilyHandle*> handles;
+        std::unique_ptr<DB> reader;
+        Status s;
+        if (entry == Entry::kSecondary) {
+          s = DB::OpenAsSecondary(
+              options, dbname_, dir,
+              Descriptors({kDefaultColumnFamilyName}, options), &handles,
+              &reader);
+        } else {
+          options.create_if_missing = true;
+          s = DB::OpenAsFollower(
+              options, dir, dbname_,
+              Descriptors({kDefaultColumnFamilyName}, options), &handles,
+              &reader);
+        }
+        for (ColumnFamilyHandle* h : handles) {
+          EXPECT_OK(reader->DestroyColumnFamilyHandle(h));
+        }
+        reader.reset();
+        EXPECT_OK(DestroyDir(env_, dir));
+        return s;
+      }
     }
     return Status::OK();
   };
@@ -4530,6 +4708,1702 @@ TEST_F(DBManifestStoreTest, MigrateOptionIsNotSerialized) {
             .code())
         << setting;
   }
+}
+
+namespace {
+// The names in `dir` that only a DB in store mode has: copy files and the copy
+// pointer file.
+std::vector<std::string> CopyFileNames(Env* env, const std::string& dir) {
+  std::vector<std::string> children;
+  EXPECT_OK(env->GetChildren(dir, &children));
+  std::vector<std::string> result;
+  for (const std::string& name : children) {
+    uint64_t number = 0;
+    bool is_pointer = false;
+    if (ParseManifestCopyFileName(name, &number, &is_pointer)) {
+      result.push_back(name);
+    }
+  }
+  return result;
+}
+}  // namespace
+
+// A checkpoint of a DB in store mode gets a MANIFEST built from the rows in
+// memory (GetLiveFilesStorageInfo()), so it opens as a DB in file mode, with
+// the same files and data. The source has copy files, which the checkpoint
+// must not take.
+TEST_F(DBManifestStoreTest, Checkpoint) {
+  Options options = StoreOptions();
+  options.manifest_store_copy_mode = ManifestCopyMode::kSync;
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  ASSERT_OK(TryReopen(options));
+  CreateColumnFamilies({"one", "two"}, options);
+  Close();
+  options.manifest_store =
+      std::make_shared<MockManifestStore>(data_, ++last_epoch_);
+  ReopenWithColumnFamilies({"default", "one", "two"}, options);
+  for (int cf = 0; cf < 3; ++cf) {
+    ASSERT_OK(Put(cf, "flushed", "f" + std::to_string(cf)));
+    ASSERT_OK(Flush(cf));
+  }
+  // This write is not flushed, so the checkpoint copies the WAL.
+  ASSERT_OK(Put(1, "unflushed", "u1"));
+  ASSERT_FALSE(CopyFileNames(env_, dbname_).empty());
+
+  const std::string dir = dbname_ + "_checkpoint";
+  uint64_t sequence = 0;
+  ASSERT_OK(MakeCheckpoint(dir, &sequence));
+  const std::map<std::string, std::set<uint64_t>> source_files = LiveFiles();
+
+  CurrentManifestInfo current;
+  ASSERT_OK(
+      ReadCurrentManifestInfo(env_->GetFileSystem().get(), dir, &current));
+  ASSERT_TRUE(current.exists);
+  ASSERT_FALSE(current.is_stub);
+  ASSERT_EQ(std::vector<std::string>{}, CopyFileNames(env_, dir));
+
+  Options file_mode = CurrentOptions();
+  file_mode.enable_blob_files = true;
+  file_mode.min_blob_size = 0;
+  // This option keeps the replayed WAL in the memtable, so the files stay the
+  // same.
+  file_mode.avoid_flush_during_recovery = true;
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> copy;
+  ASSERT_OK(OpenFileModeCopy(file_mode, dir, {"default", "one", "two"},
+                             &handles, &copy));
+  ASSERT_EQ(source_files, LiveFiles(copy.get()));
+  ASSERT_EQ(sequence, copy->GetLatestSequenceNumber());
+  for (int cf = 0; cf < 3; ++cf) {
+    std::string value;
+    ASSERT_OK(copy->Get(ReadOptions(), handles[cf], "flushed", &value));
+    ASSERT_EQ("f" + std::to_string(cf), value);
+  }
+  std::string value;
+  ASSERT_OK(copy->Get(ReadOptions(), handles[1], "unflushed", &value));
+  ASSERT_EQ("u1", value);
+  CloseAndDestroy(&copy, &handles, dir);
+}
+
+// A checkpoint of some column families leaves the others out of the built
+// MANIFEST, and records the OPTIONS file that it writes, so the tracked
+// OPTIONS file of the checkpoint lists only those column families.
+TEST_F(DBManifestStoreTest, SubsetCheckpoint) {
+  Options options = StoreOptions();
+  options.track_options_file_number_in_manifest = true;
+  ASSERT_OK(TryReopen(options));
+  CreateColumnFamilies({"one", "two"}, options);
+  Close();
+  options.manifest_store =
+      std::make_shared<MockManifestStore>(data_, ++last_epoch_);
+  ReopenWithColumnFamilies({"default", "one", "two"}, options);
+  for (int cf = 0; cf < 3; ++cf) {
+    ASSERT_OK(Put(cf, "key", "v" + std::to_string(cf)));
+    ASSERT_OK(Flush(cf));
+  }
+  std::map<std::string, std::set<uint64_t>> expected_files = LiveFiles();
+  expected_files.erase("one");
+
+  const std::string dir = dbname_ + "_subset";
+  ASSERT_OK(
+      MakeCheckpoint(dir, /*sequence=*/nullptr, {handles_[0], handles_[2]}));
+
+  std::vector<std::string> cfs;
+  ASSERT_OK(DB::ListColumnFamilies(CurrentOptions(), dir, &cfs));
+  ASSERT_EQ((std::vector<std::string>{"default", "two"}), cfs);
+  // The built MANIFEST records the OPTIONS file that the checkpoint wrote,
+  // which lists only the two column families. (The checkpoint also copies
+  // the OPTIONS file of the source, which lists all three.)
+  OptionsFileManifestState options_state;
+  ASSERT_OK(VersionSet::GetOptionsFileManifestState(
+      dir, env_->GetFileSystem().get(), &options_state));
+  ASSERT_TRUE(options_state.has_committed_options_file_number);
+  DBOptions loaded;
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  ConfigOptions config;
+  config.env = env_;
+  ASSERT_OK(LoadOptionsFromFile(
+      config, OptionsFileName(dir, options_state.committed_options_file_number),
+      &loaded, &cf_descs));
+  std::vector<std::string> option_cfs;
+  for (const auto& desc : cf_descs) {
+    option_cfs.push_back(desc.name);
+  }
+  ASSERT_EQ((std::vector<std::string>{"default", "two"}), option_cfs);
+
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> copy;
+  ASSERT_OK(OpenFileModeCopy(CurrentOptions(), dir, {"default", "two"},
+                             &handles, &copy));
+  ASSERT_EQ(expected_files, LiveFiles(copy.get()));
+  std::string value;
+  ASSERT_OK(copy->Get(ReadOptions(), handles[1], "key", &value));
+  ASSERT_EQ("v2", value);
+  CloseAndDestroy(&copy, &handles, dir);
+}
+
+// BackupEngine uses the same live file function, so a backup of a DB in
+// store mode restores as a DB in file mode.
+TEST_F(DBManifestStoreTest, BackupAndRestore) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("flushed", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("unflushed", "2"));
+  const std::string backup_dir = dbname_ + "_backup";
+  const std::string restore_dir = dbname_ + "_restore";
+  ASSERT_OK(DestroyDir(env_, backup_dir));
+  ASSERT_OK(DestroyDir(env_, restore_dir));
+  {
+    BackupEngine* backup = nullptr;
+    ASSERT_OK(
+        BackupEngine::Open(env_, BackupEngineOptions(backup_dir), &backup));
+    std::unique_ptr<BackupEngine> backup_guard(backup);
+    ASSERT_OK(backup->CreateNewBackup(db_.get()));
+    Close();
+    ASSERT_OK(backup->RestoreDBFromLatestBackup(restore_dir, restore_dir));
+  }
+  CurrentManifestInfo current;
+  ASSERT_OK(ReadCurrentManifestInfo(env_->GetFileSystem().get(), restore_dir,
+                                    &current));
+  ASSERT_FALSE(current.is_stub);
+  std::unique_ptr<DB> restored;
+  ASSERT_OK(DB::Open(CurrentOptions(), restore_dir, &restored));
+  std::string value;
+  ASSERT_OK(restored->Get(ReadOptions(), "flushed", &value));
+  ASSERT_EQ("1", value);
+  ASSERT_OK(restored->Get(ReadOptions(), "unflushed", &value));
+  ASSERT_EQ("2", value);
+  restored.reset();
+  ASSERT_OK(DestroyDir(env_, backup_dir));
+  ASSERT_OK(DestroyDir(env_, restore_dir));
+}
+
+// A pin request (LiveFilesPinRequest, which BackupEngine uses through
+// CheckpointImpl::CreateCustomCheckpoint()) works in store mode: it holds the
+// listed table and blob files until the pin is cleaned up. The MANIFEST entry
+// has its content in replacement_contents, so it is not a file that the pin
+// needs to hold.
+TEST_F(DBManifestStoreTest, LiveFilesPinRequest) {
+  Options options = StoreOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+
+  LiveFilesStorageInfoOptions opts;
+  opts.wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+  std::vector<LiveFileStorageInfo> infos;
+  Cleanable pin;
+  std::set<std::string> pinned_paths;
+  {
+    LiveFilesPinRequest pin_request(&pin);
+    ASSERT_OK(db_->GetLiveFilesStorageInfo(opts, &infos));
+    ASSERT_TRUE(pin_request.pinned());
+    pinned_paths = std::set<std::string>(pin_request.pinned_files().begin(),
+                                         pin_request.pinned_files().end());
+  }
+  std::set<std::string> table_and_blob_paths;
+  bool manifest_from_memory = false;
+  for (const LiveFileStorageInfo& info : infos) {
+    if (info.file_type == kTableFile || info.file_type == kBlobFile) {
+      table_and_blob_paths.insert(info.directory + "/" +
+                                  info.relative_filename);
+    } else if (info.file_type == kDescriptorFile) {
+      manifest_from_memory = !info.replacement_contents.empty();
+    }
+  }
+  ASSERT_TRUE(manifest_from_memory);
+  // One table file and one blob file.
+  ASSERT_EQ(2, pinned_paths.size());
+  ASSERT_EQ(table_and_blob_paths, pinned_paths);
+
+  ASSERT_OK(Put("key", "new_value"));
+  ASSERT_OK(Flush());
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  for (const std::string& path : pinned_paths) {
+    ASSERT_OK(env_->FileExists(path)) << path;
+  }
+  pin.Reset();
+  for (const std::string& path : pinned_paths) {
+    ASSERT_EQ(Status::Code::kNotFound, env_->FileExists(path).code()) << path;
+  }
+  ASSERT_EQ(LiveFiles(), StoreFiles());
+}
+
+// DestroyDB() with the store removes the rows, then the files. The first part
+// of the test makes the state of a crash between the two steps: the rows are
+// gone, and the stub is still there. DB::Open() refuses that folder, and a
+// second DestroyDB() finishes the work, because ManifestStore::Destroy()
+// returns OK when there is no DB row.
+TEST_F(DBManifestStoreTest, DestroyDB) {
+  Options options = StoreOptions();
+  options.manifest_store_copy_mode = ManifestCopyMode::kSync;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  Close();
+  // A store object for another DB, given by mistake, does not remove the
+  // rows of that DB, and nothing is deleted.
+  {
+    const std::string other_path = dbname_ + "_other";
+    ASSERT_OK(DestroyDir(env_, other_path));
+    std::shared_ptr<MockManifestStoreData> other_data =
+        std::make_shared<MockManifestStoreData>();
+    Options other = CurrentOptions();
+    other.create_if_missing = true;
+    other.manifest_store = std::make_shared<MockManifestStore>(other_data, 1);
+    std::unique_ptr<DB> other_db;
+    ASSERT_OK(DB::Open(other, other_path, &other_db));
+    other_db.reset();
+    ASSERT_EQ(Status::Code::kInvalidArgument, DestroyDB(dbname_, other).code());
+    ASSERT_OK(env_->FileExists(CurrentFileName(dbname_)));
+    ManifestDbRowResult other_row;
+    ASSERT_OK(
+        MockManifestStore(other_data, std::nullopt).ReadDbRow(&other_row));
+    ASSERT_OK(DestroyDB(other_path, other));
+  }
+  {
+    MockManifestStore store(data_, ++last_epoch_);
+    ASSERT_OK(store.Destroy(ManifestStoreDestroyOptions()));
+  }
+  ASSERT_EQ(Status::Code::kCorruption, TryReopen(StoreOptions()).code());
+  ASSERT_OK(DestroyDB(dbname_, StoreOptions()));
+  ASSERT_EQ(Status::Code::kNotFound,
+            env_->FileExists(CurrentFileName(dbname_)).code());
+  if (env_->FileExists(dbname_).ok()) {
+    ASSERT_EQ(std::vector<std::string>{}, CopyFileNames(env_, dbname_));
+  }
+
+  // A new DB in store mode can be created at the same place, and DestroyDB()
+  // removes its rows too.
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_EQ("NOT_FOUND", Get("a"));
+  Close();
+  ASSERT_OK(DestroyDB(dbname_, StoreOptions()));
+  ManifestDbRowResult db_row;
+  ASSERT_EQ(Status::Code::kNotFound, ReaderStore()->ReadDbRow(&db_row).code());
+}
+
+// A secondary instance with a store object without an epoch reads the rows:
+// a full scan when the commit sequence changed, nothing otherwise. Files that
+// a compaction removed leave its Version. It never claims the DB.
+TEST_F(DBManifestStoreTest, Secondary) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               /*env=*/nullptr, &handles, &secondary));
+  ASSERT_EQ(LiveFiles(), LiveFiles(secondary.get()));
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "v"));
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  ASSERT_EQ(LiveFiles(), LiveFiles(secondary.get()));
+  std::string value;
+  ASSERT_OK(secondary->Get(ReadOptions(), "k4", &value));
+
+  // A catch-up that fails to read the store changes nothing, and the next one
+  // works.
+  ASSERT_OK(Put("b", "2"));
+  ASSERT_OK(Flush());
+  data_->SetReadDbRowFailures(1);
+  ASSERT_EQ(Status::Code::kIOError, secondary->TryCatchUpWithPrimary().code());
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  ASSERT_EQ(LiveFiles(), LiveFiles(secondary.get()));
+  ASSERT_OK(secondary->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("2", value);
+  CheckClaimed();
+
+  // When the DB row no longer names the store as the authority (as after a
+  // rollback to file mode), the secondary refuses the rows. Shadow mode is not
+  // supported.
+  Close();
+  SetDbField(ManifestDbField::kAuthority,
+             std::string(1, static_cast<char>(ManifestAuthority::kShadow)));
+  ASSERT_EQ(Status::Code::kNotSupported,
+            secondary->TryCatchUpWithPrimary().code());
+  SetDbField(ManifestDbField::kAuthority,
+             std::string(1, static_cast<char>(ManifestAuthority::kFile)));
+  ASSERT_EQ(Status::Code::kInvalidArgument,
+            secondary->TryCatchUpWithPrimary().code());
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+// The DB is destroyed and created again at the same path with the same store.
+// The new DB row has a lower commit sequence than the scan that the secondary
+// replayed. A catch-up returns Corruption, as in file mode, instead of keeping
+// the Version of the destroyed DB.
+TEST_F(DBManifestStoreTest, SecondarySeesDbCreatedAgain) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "v"));
+    ASSERT_OK(Flush());
+  }
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               /*env=*/nullptr, &handles, &secondary));
+  const uint64_t replayed = ScanStore().db_row.state.commit_sequence;
+  Close();
+  ASSERT_OK(DestroyDB(dbname_, StoreOptions()));
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_LT(ScanStore().db_row.state.commit_sequence, replayed);
+  Status s = secondary->TryCatchUpWithPrimary();
+  ASSERT_EQ(Status::Code::kCorruption, s.code()) << s.ToString();
+  ASSERT_NE(std::string::npos, s.ToString().find("created again"));
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+#ifndef NDEBUG  // Uses sync points.
+// Like SecondarySeesDbCreatedAgain, but the DB is created again during a
+// catch-up: after the catch-up checked the DB row of the opened DB, and before
+// it scans. The scan reads the new DB, whose commit sequence is lower than the
+// installed one, and the catch-up still returns Corruption.
+TEST_F(DBManifestStoreTest, SecondarySeesDbCreatedAgainDuringCatchUp) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "v"));
+    ASSERT_OK(Flush());
+  }
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               /*env=*/nullptr, &handles, &secondary));
+  const uint64_t installed = ScanStore().db_row.state.commit_sequence;
+  // A new commit, so that the catch-up scans.
+  ASSERT_OK(Put("k3", "v"));
+  ASSERT_OK(Flush());
+  // The options are made here, because CurrentOptions() clears the sync
+  // point callbacks, which deadlocks inside a callback.
+  const Options destroy_options = StoreOptions();
+  const Options create_options = StoreOptions();
+  int recreated = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ReactiveVersionSet::ReadStoreForCatchUp:AfterOwnerCheck", [&](void*) {
+        if (recreated++ > 0) {
+          return;
+        }
+        Close();
+        ASSERT_OK(DestroyDB(dbname_, destroy_options));
+        ASSERT_OK(TryReopen(create_options));
+      });
+  Status s = secondary->TryCatchUpWithPrimary();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(1, recreated);
+  ASSERT_LT(ScanStore().db_row.state.commit_sequence, installed);
+  ASSERT_EQ(Status::Code::kCorruption, s.code()) << s.ToString();
+  ASSERT_NE(std::string::npos, s.ToString().find("created again"));
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+#endif  // NDEBUG
+
+// Fails the delete of the file `path` once.
+class FailDeleteOnceFs : public FileSystemWrapper {
+ public:
+  FailDeleteOnceFs(const std::shared_ptr<FileSystem>& base, std::string path)
+      : FileSystemWrapper(base), path_(std::move(path)) {}
+  static const char* kClassName() { return "FailDeleteOnceFs"; }
+  const char* Name() const override { return kClassName(); }
+  IOStatus DeleteFile(const std::string& fname, const IOOptions& io_opts,
+                      IODebugContext* dbg) override {
+    if (fname == path_ && armed.exchange(false)) {
+      return IOStatus::IOError("injected delete error");
+    }
+    return target()->DeleteFile(fname, io_opts, dbg);
+  }
+
+  std::atomic<bool> armed{true};
+
+ private:
+  const std::string path_;
+};
+
+// DestroyDB() removes the rows first. When the delete of the stub then fails,
+// it keeps the stub and CURRENT, so that a retry with the store finishes the
+// job (Destroy() finds no DB row and returns OK).
+TEST_F(DBManifestStoreTest, DestroyRetryAfterStubDeleteFails) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  Close();
+  const uint64_t stub = Current().number;
+  auto fault_fs = std::make_shared<FailDeleteOnceFs>(
+      env_->GetFileSystem(), DescriptorFileName(dbname_, stub));
+  std::unique_ptr<Env> fault_env(new CompositeEnvWrapper(env_, fault_fs));
+  Options options = StoreOptions();
+  options.env = fault_env.get();
+  ASSERT_EQ(Status::Code::kIOError, DestroyDB(dbname_, options).code());
+  ASSERT_FALSE(fault_fs->armed);
+  ASSERT_TRUE(Current().is_stub);
+  ASSERT_EQ(stub, Current().number);
+  ManifestDbRowResult db_row;
+  ASSERT_EQ(Status::Code::kNotFound, ReaderStore()->ReadDbRow(&db_row).code());
+
+  ASSERT_OK(DestroyDB(dbname_, StoreOptions()));
+  ASSERT_EQ(Status::Code::kNotFound,
+            env_->FileExists(CurrentFileName(dbname_)).code());
+  ASSERT_EQ(Status::Code::kNotFound,
+            env_->FileExists(DescriptorFileName(dbname_, stub)).code());
+}
+
+// The rows leave out a dropped column family, so the secondary gets a drop
+// record for a column family that it opened, as it does from a MANIFEST file.
+TEST_F(DBManifestStoreTest, SecondarySeesDroppedColumnFamily) {
+  Options options = StoreOptions();
+  ASSERT_OK(TryReopen(options));
+  CreateColumnFamilies({"one"}, options);
+  ASSERT_OK(Put(0, "a", "1"));
+  ASSERT_OK(Flush(0));
+  std::vector<ColumnFamilyHandle*> secondary_handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName, "one"},
+                               /*env=*/nullptr, &secondary_handles,
+                               &secondary));
+  ASSERT_FALSE(IsDropped(secondary_handles[1]));
+  ASSERT_OK(db_->DropColumnFamily(handles_[0]));
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  ASSERT_TRUE(IsDropped(secondary_handles[1]));
+  CloseAndDestroy(&secondary, &secondary_handles, SecondaryPath());
+}
+
+// One store scan is one point in time of the primary, so a catch-up installs
+// the Versions of all column families together. Here a new file of column
+// family "one" is not visible during a catch-up, so the secondary keeps the
+// old values in both column families. When the file is visible again, the
+// next catch-up installs both new values, without a new commit.
+TEST_F(DBManifestStoreTest, SecondaryInstallsAllColumnFamiliesOfAScan) {
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  ASSERT_OK(TryReopen(options));
+  CreateColumnFamilies({"one"}, options);
+  // Without the WAL, the secondary reads the values only from the SST files.
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, "a", "0"));
+  ASSERT_OK(Put(0, "b", "0", no_wal));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_OK(db_->Flush(FlushOptions(), handles_[0]));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName, "one"},
+                               /*env=*/nullptr, &handles, &secondary));
+  const std::set<uint64_t> old_one_files = LiveFiles()["one"];
+  ASSERT_OK(db_->Put(no_wal, "a", "1"));
+  ASSERT_OK(Put(0, "b", "1", no_wal));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_OK(db_->Flush(FlushOptions(), handles_[0]));
+  std::set<uint64_t> new_one_files;
+  const std::set<uint64_t> one_files = LiveFiles()["one"];
+  for (uint64_t number : one_files) {
+    if (old_one_files.count(number) == 0) {
+      new_one_files.insert(number);
+    }
+  }
+  ASSERT_EQ(1, new_one_files.size());
+  const std::string path = MakeTableFileName(dbname_, *new_one_files.begin());
+  const uint64_t commit_sequence = ScanStore().db_row.state.commit_sequence;
+
+  auto check = [&](const std::string& a, const std::string& b) {
+    std::string value;
+    ASSERT_OK(secondary->Get(ReadOptions(), handles[0], "a", &value));
+    ASSERT_EQ(a, value);
+    ASSERT_OK(secondary->Get(ReadOptions(), handles[1], "b", &value));
+    ASSERT_EQ(b, value);
+  };
+  ASSERT_OK(env_->RenameFile(path, path + ".hidden"));
+  {
+    Defer restore(
+        [&]() { ASSERT_OK(env_->RenameFile(path + ".hidden", path)); });
+    ASSERT_OK(secondary->TryCatchUpWithPrimary());
+    check("0", "0");
+  }
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  check("1", "1");
+  ASSERT_EQ(commit_sequence, ScanStore().db_row.state.commit_sequence);
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+#ifndef NDEBUG  // Uses sync points.
+// An atomic flush of two column families, "default" and "one", is one store
+// commit. A secondary catches up while that commit lands: after the store
+// applied it, and before the primary installed it. The new SST of "one" is not
+// visible yet (as on a remote file system that shows a new file late), so the
+// secondary keeps the old view of both column families, never the new "default"
+// with the old "one". A later catch-up at the same commit sequence, with the
+// file visible, installs both.
+TEST_F(DBManifestStoreTest, SecondaryCatchUpDuringAtomicFlushCommit) {
+  Options options = StoreOptions();
+  options.atomic_flush = true;
+  options.disable_auto_compactions = true;
+  ASSERT_OK(TryReopen(options));
+  CreateColumnFamilies({"one"}, options);
+  const std::vector<ColumnFamilyHandle*> both = {db_->DefaultColumnFamily(),
+                                                 handles_[0]};
+  // Without the WAL, the secondary reads the values only from the SST files.
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, "a", "0"));
+  ASSERT_OK(Put(0, "b", "0", no_wal));
+  ASSERT_OK(db_->Flush(FlushOptions(), both));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName, "one"},
+                               /*env=*/nullptr, &handles, &secondary));
+  auto check = [&](const std::string& a, const std::string& b) {
+    std::string value;
+    ASSERT_OK(secondary->Get(ReadOptions(), handles[0], "a", &value));
+    ASSERT_EQ(a, value);
+    ASSERT_OK(secondary->Get(ReadOptions(), handles[1], "b", &value));
+    ASSERT_EQ(b, value);
+  };
+  const std::set<uint64_t> old_one_files = LiveFiles()["one"];
+  ASSERT_OK(db_->Put(no_wal, "a", "1"));
+  ASSERT_OK(Put(0, "b", "1", no_wal));
+
+  // The flush waits after the store applied its commit and before the primary
+  // installs the new Versions, until the test lets it go on.
+  Defer clear_dependencies(ClearSyncPointDependencies);
+  SyncPoint::GetInstance()->LoadDependency({
+      {"VersionSet::ProcessManifestWrites:AfterStoreCommit",
+       "AtomicFlushCatchUp:CommitApplied"},
+      {"AtomicFlushCatchUp:CatchUpDone",
+       "VersionSet::LogAndApply:WriteManifestDone"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status flush_status;
+  port::Thread flusher(
+      [&]() { flush_status = db_->Flush(FlushOptions(), both); });
+  // Lets the flush finish also when an assertion below fails.
+  Defer join([&]() {
+    if (flusher.joinable()) {
+      TEST_SYNC_POINT("AtomicFlushCatchUp:CatchUpDone");
+      flusher.join();
+    }
+  });
+  TEST_SYNC_POINT("AtomicFlushCatchUp:CommitApplied");
+  const uint64_t commit_sequence = ScanStore().db_row.state.commit_sequence;
+  std::set<uint64_t> new_one_files;
+  const std::set<uint64_t> stored_one_files = StoreFiles()["one"];
+  for (uint64_t number : stored_one_files) {
+    if (old_one_files.count(number) == 0) {
+      new_one_files.insert(number);
+    }
+  }
+  ASSERT_EQ(1, new_one_files.size());
+  const std::string path = MakeTableFileName(dbname_, *new_one_files.begin());
+  ASSERT_OK(env_->RenameFile(path, path + ".hidden"));
+  {
+    Defer restore(
+        [&]() { ASSERT_OK(env_->RenameFile(path + ".hidden", path)); });
+    ASSERT_OK(secondary->TryCatchUpWithPrimary());
+    check("0", "0");
+  }
+  // The same commit again, now with the file visible.
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  check("1", "1");
+  ASSERT_EQ(commit_sequence, ScanStore().db_row.state.commit_sequence);
+  TEST_SYNC_POINT("AtomicFlushCatchUp:CatchUpDone");
+  flusher.join();
+  ASSERT_OK(flush_status);
+  ClearSyncPointDependencies();
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+#endif  // NDEBUG
+
+// A column family that the primary creates after the secondary opened is not
+// opened in the secondary (as with a MANIFEST file), and catch-up still works.
+TEST_F(DBManifestStoreTest, SecondaryIgnoresNewColumnFamily) {
+  Options options = StoreOptions();
+  ASSERT_OK(TryReopen(options));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               /*env=*/nullptr, &handles, &secondary));
+  CreateColumnFamilies({"new"}, options);
+  ASSERT_OK(Put(0, "a", "1"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(db_->Put(WriteOptions(), "b", "2"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  std::string value;
+  ASSERT_OK(secondary->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("2", value);
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+namespace {
+// A file system that records the number of each SST or blob file whose size is
+// read (for an SST file, this is the first check of
+// VersionSet::VerifyFileMetadata()), or that is opened for random reads (a
+// table open, or a blob file open by BlobFileReader).
+class SizeCheckRecorder : public FileSystemWrapper {
+ public:
+  explicit SizeCheckRecorder(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  static const char* kClassName() { return "SizeCheckRecorder"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus GetFileSize(const std::string& fname, const IOOptions& options,
+                       uint64_t* file_size, IODebugContext* dbg) override {
+    Record(fname);
+    return FileSystemWrapper::GetFileSize(fname, options, file_size, dbg);
+  }
+
+  IOStatus NewRandomAccessFile(const std::string& fname,
+                               const FileOptions& options,
+                               std::unique_ptr<FSRandomAccessFile>* result,
+                               IODebugContext* dbg) override {
+    Record(fname);
+    return FileSystemWrapper::NewRandomAccessFile(fname, options, result, dbg);
+  }
+
+  // Returns the SST and blob files checked since the last call, and forgets
+  // them.
+  std::set<uint64_t> TakeChecked() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::set<uint64_t> checked;
+    checked.swap(checked_);
+    return checked;
+  }
+
+ private:
+  void Record(const std::string& fname) {
+    uint64_t number = 0;
+    FileType type;
+    const size_t slash = fname.rfind('/');
+    if (ParseFileName(fname.substr(slash == std::string::npos ? 0 : slash + 1),
+                      &number, &type) &&
+        (type == kTableFile || type == kBlobFile)) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      checked_.insert(number);
+    }
+  }
+
+  std::mutex mutex_;
+  std::set<uint64_t> checked_;
+};
+}  // namespace
+
+// Each catch-up after a commit replays all rows, but it checks only the files
+// that the Version of the secondary does not hold yet, as a catch-up from a
+// MANIFEST file does. The reader frees the bytes of the rows when the replay
+// reaches their end.
+TEST_F(DBManifestStoreTest, SecondaryChecksOnlyNewFiles) {
+  // No compaction commits between the catch-ups.
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  ASSERT_OK(TryReopen(options));
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "v"));
+    ASSERT_OK(Flush());
+  }
+  std::shared_ptr<SizeCheckRecorder> recorder =
+      std::make_shared<SizeCheckRecorder>(env_->GetFileSystem());
+  std::unique_ptr<Env> recorder_env(new CompositeEnvWrapper(env_, recorder));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               recorder_env.get(), &handles, &secondary));
+  const std::set<uint64_t> old_files = LiveFiles().at("default");
+  ASSERT_EQ(3, old_files.size());
+  ASSERT_EQ(old_files, recorder->TakeChecked());
+
+  std::vector<size_t> freed_capacities;
+  SyncPoint::GetInstance()->SetCallBack(
+      "StringSequentialFile::FreeData", [&](void* arg) {
+        freed_capacities.push_back(*static_cast<size_t*>(arg));
+      });
+  ASSERT_OK(Put("new", "v"));
+  ASSERT_OK(Flush());
+  std::set<uint64_t> new_files = LiveFiles().at("default");
+  for (uint64_t number : old_files) {
+    new_files.erase(number);
+  }
+  ASSERT_EQ(1, new_files.size());
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  ASSERT_EQ(new_files, recorder->TakeChecked());
+  ASSERT_EQ(std::vector<size_t>{std::string().capacity()}, freed_capacities);
+  ASSERT_EQ(LiveFiles(), LiveFiles(secondary.get()));
+  // A catch-up without a change checks no file and builds no records.
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  ASSERT_EQ(std::set<uint64_t>{}, recorder->TakeChecked());
+  ASSERT_EQ(std::vector<size_t>{std::string().capacity()}, freed_capacities);
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+// The same holds for blob files: a catch-up after a flush opens only the new
+// blob file. The test empties the table cache of the secondary first (it also
+// caches the blob file readers), so that a check of an old blob file would
+// open that file again.
+TEST_F(DBManifestStoreTest, SecondaryChecksOnlyNewBlobFiles) {
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  ASSERT_OK(TryReopen(options));
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_OK(Put("k" + std::to_string(i), "v"));
+    ASSERT_OK(Flush());
+  }
+  std::shared_ptr<SizeCheckRecorder> recorder =
+      std::make_shared<SizeCheckRecorder>(env_->GetFileSystem());
+  std::unique_ptr<Env> recorder_env(new CompositeEnvWrapper(env_, recorder));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               recorder_env.get(), &handles, &secondary));
+  // 2 SST files and 2 blob files.
+  const std::set<uint64_t> old_files = recorder->TakeChecked();
+  ASSERT_EQ(4, old_files.size());
+
+  ASSERT_OK(Put("new", "v"));
+  ASSERT_OK(Flush());
+  static_cast_with_check<DBImpl>(secondary.get())
+      ->TEST_table_cache()
+      ->EraseUnRefEntries();
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  // The new SST file and the new blob file.
+  const std::set<uint64_t> checked = recorder->TakeChecked();
+  ASSERT_EQ(2, checked.size());
+  for (uint64_t number : checked) {
+    ASSERT_EQ(0, old_files.count(number));
+  }
+  std::string value;
+  ASSERT_OK(secondary->Get(ReadOptions(), "new", &value));
+  ASSERT_EQ("v", value);
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+// A secondary in store mode replays the WALs of the primary into its
+// memtables, but it has no boundary between those WALs and its Versions that a
+// copy could use. So a checkpoint of a secondary returns NotSupported, also
+// when the secondary can read a key that only a WAL holds.
+TEST_F(DBManifestStoreTest, SecondaryCheckpointIsNotSupported) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("wal_only", "2"));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               /*env=*/nullptr, &handles, &secondary));
+  std::string value;
+  ASSERT_OK(secondary->Get(ReadOptions(), "wal_only", &value));
+  ASSERT_EQ("2", value);
+  std::vector<LiveFileStorageInfo> infos;
+  ASSERT_EQ(
+      Status::Code::kNotSupported,
+      secondary->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(), &infos)
+          .code());
+  const std::string dir = dbname_ + "_secondary_checkpoint";
+  ASSERT_OK(DestroyDir(env_, dir));
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(secondary.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> owner(checkpoint);
+  ASSERT_EQ(Status::Code::kNotSupported,
+            checkpoint->CreateCheckpoint(dir).code());
+  ASSERT_OK(DestroyDir(env_, dir));
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+// A trivial move keeps the SST file (same number, size and unique id) but
+// changes its persisted provenance. A secondary that held the file before the
+// move shows the new level and the new provenance after a catch-up, and still
+// reads the file.
+TEST_F(DBManifestStoreTest, SecondarySeesTrivialMove) {
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               /*env=*/nullptr, &handles, &secondary));
+  auto Moved = [](const LiveFileMetaData& meta) {
+    return DataFileProvenance::DecodeFrom(meta.data_file_provenance)
+        .moved_between_levels;
+  };
+  std::vector<LiveFileMetaData> before;
+  secondary->GetLiveFilesMetaData(&before);
+  ASSERT_EQ(1, before.size());
+  ASSERT_EQ(0, before[0].level);
+  ASSERT_FALSE(Moved(before[0]));
+
+  // One L0 file without overlap in L1: the compaction moves it.
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+  std::vector<LiveFileMetaData> primary;
+  db_->GetLiveFilesMetaData(&primary);
+  ASSERT_EQ(1, primary.size());
+  ASSERT_EQ(before[0].file_number, primary[0].file_number);
+  ASSERT_EQ(1, primary[0].level);
+  ASSERT_TRUE(Moved(primary[0]));
+
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  std::vector<LiveFileMetaData> after;
+  secondary->GetLiveFilesMetaData(&after);
+  ASSERT_EQ(1, after.size());
+  ASSERT_EQ(primary[0].file_number, after[0].file_number);
+  ASSERT_EQ(1, after[0].level);
+  ASSERT_TRUE(Moved(after[0]));
+  std::string value;
+  ASSERT_OK(secondary->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("1", value);
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+// A catch-up keeps the metadata objects of the files that the secondary
+// already holds, so their table readers and blob file readers stay open. Only
+// the new files of each commit are opened, also when the obsolete file purge
+// runs after every catch-up.
+TEST_F(DBManifestStoreTest, SecondaryKeepsReadersOfHeldFiles) {
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_OK(Put("k0", "v0"));
+  ASSERT_OK(Flush());
+  std::shared_ptr<SizeCheckRecorder> recorder =
+      std::make_shared<SizeCheckRecorder>(env_->GetFileSystem());
+  std::unique_ptr<Env> recorder_env(new CompositeEnvWrapper(env_, recorder));
+  Options secondary_options = CurrentOptions();
+  secondary_options.max_open_files = -1;
+  secondary_options.delete_obsolete_files_period_micros = 0;
+  secondary_options.manifest_store = ReaderStore();
+  secondary_options.env = recorder_env.get();
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(DB::OpenAsSecondary(
+      secondary_options, dbname_, SecondaryPath(),
+      Descriptors({kDefaultColumnFamilyName}, secondary_options), &handles,
+      &secondary));
+  std::string value;
+  ASSERT_OK(secondary->Get(ReadOptions(), "k0", &value));
+  ASSERT_EQ("v0", value);
+  // The files that the secondary opened so far: one SST file and one blob
+  // file.
+  std::set<uint64_t> seen = recorder->TakeChecked();
+  ASSERT_EQ(2, seen.size());
+  for (int round = 1; round <= 2; ++round) {
+    SCOPED_TRACE("round " + std::to_string(round));
+    ASSERT_OK(Put("k" + std::to_string(round), "v"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(secondary->TryCatchUpWithPrimary());
+    ASSERT_OK(secondary->Get(ReadOptions(), "k0", &value));
+    ASSERT_EQ("v0", value);
+    // Only the new SST file and the new blob file of this round are opened.
+    const std::set<uint64_t> opened = recorder->TakeChecked();
+    ASSERT_EQ(2, opened.size());
+    for (uint64_t number : opened) {
+      ASSERT_EQ(0, seen.count(number)) << number;
+    }
+    seen.insert(opened.begin(), opened.end());
+  }
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+// Two catch-ups of one secondary can overlap. Catch-up 1 reads the drop of a
+// column family, and catch-up 2 reads a later commit. Both list the live
+// column families of the secondary before catch-up 1 drops the column family.
+// Catch-up 2 applies last, finds that the live column families changed, and
+// builds its records again, so it does not drop the column family a second
+// time.
+TEST_F(DBManifestStoreTest, SecondaryOverlappingCatchUps) {
+  Options options = StoreOptions();
+  ASSERT_OK(TryReopen(options));
+  CreateColumnFamilies({"one"}, options);
+  ASSERT_OK(Put(0, "a", "1"));
+  ASSERT_OK(Flush(0));
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName, "one"},
+                               /*env=*/nullptr, &handles, &secondary));
+  ASSERT_OK(db_->DropColumnFamily(handles_[0]));
+
+  // Catch-up 1 waits after its read until catch-up 2 has read. Catch-up 2
+  // waits after its read until catch-up 1 has applied.
+  std::promise<void> first_read;
+  std::promise<void> second_read;
+  std::promise<void> first_applied;
+  std::shared_future<void> second_read_done = second_read.get_future().share();
+  std::shared_future<void> first_applied_done =
+      first_applied.get_future().share();
+  bool second_read_set = false;
+  int reads = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ReactiveVersionSet::ReadStoreForCatchUp:End", [&](void*) {
+        if (++reads == 1) {
+          first_read.set_value();
+          second_read_done.wait();
+        } else if (reads == 2) {
+          second_read_set = true;
+          second_read.set_value();
+          first_applied_done.wait();
+        }
+      });
+  Status first_status;
+  std::thread first([&]() {
+    first_status = secondary->TryCatchUpWithPrimary();
+    first_applied.set_value();
+  });
+  // When an assertion fails, the waits must end and the thread must be joined
+  // before the test returns.
+  Defer join_first([&]() {
+    if (!second_read_set) {
+      second_read.set_value();
+    }
+    first.join();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_EQ(std::future_status::ready,
+            first_read.get_future().wait_for(std::chrono::seconds(60)));
+  ASSERT_OK(db_->Put(WriteOptions(), "b", "2"));
+  ASSERT_OK(db_->Flush(FlushOptions()));
+  Status second_status = secondary->TryCatchUpWithPrimary();
+  ASSERT_EQ(2, reads);
+  ASSERT_OK(first_status);
+  ASSERT_OK(second_status);
+  ASSERT_TRUE(IsDropped(handles[1]));
+  ASSERT_EQ(LiveFiles(), LiveFiles(secondary.get()));
+  std::string value;
+  ASSERT_OK(secondary->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("2", value);
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+#ifndef NDEBUG  // Uses sync points.
+// Two catch-ups of one secondary overlap. In this comment, commit 10 and
+// commit 11 stand for the two newest commits, as an example. Catch-up A reads
+// commit 10 and waits. Catch-up B reads commit 11, whose new SST is not visible
+// yet (as on a remote file system that shows a new file late), so its replay
+// installs no Version, but it changes the state of the tailer. A then applies
+// last, and skips its older scan. When the file is visible, a later catch-up
+// installs commit 11.
+TEST_F(DBManifestStoreTest, SecondaryOlderScanAfterIncompleteNewerScan) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  // Without the WAL, the secondary reads the values only from the SST files.
+  WriteOptions no_wal;
+  no_wal.disableWAL = true;
+  ASSERT_OK(db_->Put(no_wal, "a", "0"));
+  ASSERT_OK(Flush());
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                               /*env=*/nullptr, &handles, &secondary));
+  auto check = [&](const std::string& expected) {
+    std::string value;
+    ASSERT_OK(secondary->Get(ReadOptions(), "a", &value));
+    ASSERT_EQ(expected, value);
+  };
+  ASSERT_OK(db_->Put(no_wal, "a", "1"));
+  ASSERT_OK(Flush());
+
+  // Catch-up A waits after its read until catch-up B has applied.
+  std::promise<void> first_read;
+  std::promise<void> second_applied;
+  std::shared_future<void> second_applied_done =
+      second_applied.get_future().share();
+  bool second_applied_set = false;
+  int reads = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ReactiveVersionSet::ReadStoreForCatchUp:End", [&](void*) {
+        if (++reads == 1) {
+          first_read.set_value();
+          second_applied_done.wait();
+        }
+      });
+  Status first_status;
+  std::thread first(
+      [&]() { first_status = secondary->TryCatchUpWithPrimary(); });
+  // When an assertion fails, the wait must end and the thread must be joined
+  // before the test returns.
+  Defer join_first([&]() {
+    if (!second_applied_set) {
+      second_applied.set_value();
+    }
+    if (first.joinable()) {
+      first.join();
+    }
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  ASSERT_EQ(std::future_status::ready,
+            first_read.get_future().wait_for(std::chrono::seconds(60)));
+  const std::set<uint64_t> before = LiveFiles()["default"];
+  ASSERT_OK(db_->Put(no_wal, "a", "2"));
+  ASSERT_OK(Flush());
+  std::set<uint64_t> added = LiveFiles()["default"];
+  for (uint64_t number : before) {
+    added.erase(number);
+  }
+  ASSERT_EQ(1, added.size());
+  const std::string path = MakeTableFileName(dbname_, *added.begin());
+  ASSERT_OK(env_->RenameFile(path, path + ".hidden"));
+  {
+    Defer restore(
+        [&]() { ASSERT_OK(env_->RenameFile(path + ".hidden", path)); });
+    ASSERT_OK(secondary->TryCatchUpWithPrimary());
+    second_applied_set = true;
+    second_applied.set_value();
+    first.join();
+    first = std::thread();
+  }
+  ASSERT_EQ(2, reads);
+  ASSERT_OK(first_status);
+  // Neither commit 10 nor commit 11 was installed.
+  check("0");
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  check("2");
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+#endif  // NDEBUG
+
+// A follower reads the rows the same way.
+TEST_F(DBManifestStoreTest, Follower) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> follower;
+  Defer clear_dependencies(ClearSyncPointDependencies);
+  ASSERT_OK(OpenStoreFollower({kDefaultColumnFamilyName}, &handles, &follower));
+  std::string value;
+  ASSERT_OK(follower->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("1", value);
+
+  TEST_SYNC_POINT("Leader::Start");
+  ASSERT_OK(Put("a", "2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  TEST_SYNC_POINT("Leader::Done");
+  TEST_SYNC_POINT("Follower::WaitForCatchup");
+  ASSERT_OK(follower->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("2", value);
+  ASSERT_EQ(LiveFiles(), LiveFiles(follower.get()));
+  CheckClaimed();
+  ClearSyncPointDependencies();
+  CloseAndDestroy(&follower, &handles, FollowerPath());
+}
+
+namespace {
+// A compaction service that runs each job at once with DB::OpenAndCompact(),
+// with the store of the primary in CompactionServiceOptionsOverride.
+class StoreCompactionService : public CompactionService {
+ public:
+  StoreCompactionService(std::string db_path, Options options,
+                         std::shared_ptr<ManifestStore> store)
+      : db_path_(std::move(db_path)),
+        options_(std::move(options)),
+        store_(std::move(store)) {}
+
+  const char* Name() const override { return "StoreCompactionService"; }
+
+  CompactionServiceScheduleResponse Schedule(
+      const CompactionServiceJobInfo& /*info*/,
+      const std::string& input) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    const std::string id = std::to_string(++next_id_);
+    jobs_[id] = input;
+    return CompactionServiceScheduleResponse(
+        id, CompactionServiceJobStatus::kSuccess);
+  }
+
+  CompactionServiceJobStatus Wait(const std::string& id,
+                                  std::string* result) override {
+    std::string input;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      input = jobs_[id];
+      jobs_.erase(id);
+    }
+    CompactionServiceInput parsed;
+    EXPECT_OK(CompactionServiceInput::Read(input, &parsed));
+    if (edit_input_) {
+      edit_input_(&parsed);
+      EXPECT_OK(parsed.Write(&input));
+    }
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      floors_.push_back(parsed.min_store_commit_sequence);
+    }
+    CompactionServiceOptionsOverride override_options;
+    override_options.env = options_.env;
+    override_options.table_factory = options_.table_factory;
+    override_options.manifest_store = store_;
+    Status s = DB::OpenAndCompact(OpenAndCompactOptions(), db_path_, id, input,
+                                  result, override_options);
+    std::lock_guard<std::mutex> lock(mu_);
+    // Keeps the text, not the Status: a Status copied by a vector growth
+    // counts as not checked in ASSERT_STATUS_CHECKED builds.
+    results_.push_back(s.ToString());
+    if (s.ok()) {
+      return CompactionServiceJobStatus::kSuccess;
+    }
+    return s.IsIncomplete() ? CompactionServiceJobStatus::kUseLocal
+                            : CompactionServiceJobStatus::kFailure;
+  }
+
+  std::function<void(CompactionServiceInput*)> edit_input_;
+  std::mutex mu_;
+  std::vector<uint64_t> floors_;
+  std::vector<std::string> results_;
+
+ private:
+  const std::string db_path_;
+  const Options options_;
+  const std::shared_ptr<ManifestStore> store_;
+  uint64_t next_id_ = 0;
+  std::map<std::string, std::string> jobs_;
+};
+}  // namespace
+
+// A remote compaction worker of a primary in store mode gets the store from
+// CompactionServiceOptionsOverride, reads the rows without a claim, and checks
+// the commit sequence floor that the primary sends.
+TEST_F(DBManifestStoreTest, RemoteCompaction) {
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  std::shared_ptr<StoreCompactionService> service =
+      std::make_shared<StoreCompactionService>(dbname_, options, ReaderStore());
+  options.compaction_service = service;
+  ASSERT_OK(TryReopen(options));
+  // Two files with the same keys, so the compaction is not a trivial move.
+  auto write_two_files = [&](const std::string& value) {
+    for (int i = 0; i < 2; ++i) {
+      ASSERT_OK(Put("k0", value));
+      ASSERT_OK(Put("k1", value));
+      ASSERT_OK(Flush());
+    }
+  };
+  write_two_files("1");
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  size_t jobs = 0;
+  {
+    std::lock_guard<std::mutex> lock(service->mu_);
+    jobs = service->results_.size();
+    ASSERT_GT(jobs, 0);
+    for (size_t i = 0; i < jobs; ++i) {
+      ASSERT_EQ("OK", service->results_[i]);
+      ASSERT_GT(service->floors_[i], 0);
+    }
+  }
+  ASSERT_EQ("1", Get("k0"));
+  ASSERT_EQ(LiveFiles(), StoreFiles());
+  CheckClaimed();
+
+  // A scan older than the floor is refused, and the primary compacts
+  // locally.
+  service->edit_input_ = [](CompactionServiceInput* input) {
+    input->min_store_commit_sequence += 1000;
+  };
+  write_two_files("2");
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  {
+    std::lock_guard<std::mutex> lock(service->mu_);
+    ASSERT_GT(service->results_.size(), jobs);
+    for (size_t i = jobs; i < service->results_.size(); ++i) {
+      ASSERT_TRUE(StartsWith(service->results_[i], "Result incomplete"))
+          << service->results_[i];
+    }
+  }
+  ASSERT_EQ("2", Get("k0"));
+}
+
+// The commit sequence floor is a new field of the serialized compaction
+// input. A worker reads an input without it as "no floor" (an older or a
+// file-mode primary), and skips a field that it does not know (as an older
+// worker skips this one).
+TEST_F(DBManifestStoreTest, CompactionInputStoreFloorField) {
+  CompactionServiceInput input;
+  input.cf_name = kDefaultColumnFamilyName;
+  input.min_store_commit_sequence = 7;
+  std::string serialized;
+  ASSERT_OK(input.Write(&serialized));
+  const std::string field = "min_store_commit_sequence=7;";
+  const size_t pos = serialized.find(field);
+  ASSERT_NE(std::string::npos, pos);
+
+  std::string without = serialized;
+  without.erase(pos, field.size());
+  CompactionServiceInput parsed;
+  ASSERT_OK(CompactionServiceInput::Read(without, &parsed));
+  ASSERT_EQ(0, parsed.min_store_commit_sequence);
+
+  std::string with_unknown = serialized;
+  with_unknown.insert(pos, "field_of_a_newer_release=1;");
+  ASSERT_OK(CompactionServiceInput::Read(with_unknown, &parsed));
+  ASSERT_EQ(7, parsed.min_store_commit_sequence);
+}
+
+// ManifestStore::Destroy() returns OK when there is no DB row, so that a
+// caller can repeat it (include/rocksdb/manifest_store.h).
+TEST_F(DBManifestStoreTest, DestroyWithoutDbRow) {
+  MockManifestStore store(data_, ++last_epoch_);
+  ASSERT_OK(store.Destroy(ManifestStoreDestroyOptions()));
+  ASSERT_OK(store.Destroy(ManifestStoreDestroyOptions()));
+}
+
+namespace {
+// A store object that runs `during_scan` once inside Scan(), after the DB row
+// and before the other rows, so that a test can commit during a scan.
+class ScanHookStore : public MockManifestStore {
+ public:
+  using MockManifestStore::MockManifestStore;
+
+  IOStatus Scan(const ManifestScanOptions& opts,
+                ManifestRowVisitor* visitor) override {
+    HookVisitor hook(visitor, std::move(during_scan));
+    during_scan = nullptr;
+    return MockManifestStore::Scan(opts, &hook);
+  }
+
+  std::function<void()> during_scan;
+
+ private:
+  class HookVisitor : public ManifestRowVisitor {
+   public:
+    HookVisitor(ManifestRowVisitor* inner, std::function<void()> hook)
+        : inner_(inner), hook_(std::move(hook)) {}
+    Status OnDbRow(const ManifestDbRowResult& db_row) override {
+      Status s = inner_->OnDbRow(db_row);
+      if (hook_) {
+        hook_();
+      }
+      return s;
+    }
+    Status OnRow(const ManifestRow& row) override { return inner_->OnRow(row); }
+
+   private:
+    ManifestRowVisitor* const inner_;
+    const std::function<void()> hook_;
+  };
+};
+}  // namespace
+
+// A secondary reads the store before it takes its DB mutex, so the primary can
+// commit during the scan. The scan is consistent: the secondary replays the
+// state at the start of the scan, and the next catch-up gets the commit.
+TEST_F(DBManifestStoreTest, SecondaryScanWhileThePrimaryCommits) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  std::shared_ptr<ScanHookStore> store =
+      std::make_shared<ScanHookStore>(data_, std::nullopt);
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> secondary;
+  ASSERT_OK(OpenStoreSecondary(store, {kDefaultColumnFamilyName},
+                               /*env=*/nullptr, &handles, &secondary));
+  ASSERT_OK(Put("b", "2"));
+  ASSERT_OK(Flush());
+  const std::map<std::string, std::set<uint64_t>> files_at_scan = LiveFiles();
+  bool committed = false;
+  store->during_scan = [&]() {
+    ASSERT_OK(Put("c", "3"));
+    ASSERT_OK(Flush());
+    committed = true;
+  };
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  ASSERT_TRUE(committed);
+  ASSERT_EQ(files_at_scan, LiveFiles(secondary.get()));
+  ASSERT_NE(files_at_scan, LiveFiles());
+  ASSERT_OK(secondary->TryCatchUpWithPrimary());
+  ASSERT_EQ(LiveFiles(), LiveFiles(secondary.get()));
+  std::string value;
+  ASSERT_OK(secondary->Get(ReadOptions(), "c", &value));
+  ASSERT_EQ("3", value);
+  CheckClaimed();
+  CloseAndDestroy(&secondary, &handles, SecondaryPath());
+}
+
+// A secondary or follower opens from one scan, with no later records. When
+// the primary deletes a file of the scan before the open checks it, the open
+// returns TryAgain instead of an instance without the data of that file. A new
+// open, with a new scan, works.
+TEST_F(DBManifestStoreTest, OpenRetriesWhenAScannedFileIsGone) {
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  ASSERT_OK(TryReopen(options));
+  for (bool follower : {false, true}) {
+    SCOPED_TRACE(follower ? "follower" : "secondary");
+    // Two L0 files, so that a compaction replaces them.
+    ASSERT_OK(Put("a", "1"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("b", "2"));
+    ASSERT_OK(Flush());
+    const std::set<uint64_t> scanned = LiveFiles()[kDefaultColumnFamilyName];
+    std::shared_ptr<ScanHookStore> store =
+        std::make_shared<ScanHookStore>(data_, std::nullopt);
+    bool compacted = false;
+    store->during_scan = [&]() {
+      CompactRangeOptions cro;
+      cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+      ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+      ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+      for (uint64_t number : scanned) {
+        ASSERT_EQ(Status::Code::kNotFound,
+                  env_->FileExists(MakeTableFileName(dbname_, number)).code());
+      }
+      compacted = true;
+    };
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> reader;
+    Status s;
+    if (follower) {
+      Defer clear_dependencies(ClearSyncPointDependencies);
+      s = OpenStoreFollower({kDefaultColumnFamilyName}, &handles, &reader,
+                            store);
+    } else {
+      s = OpenStoreSecondary(store, {kDefaultColumnFamilyName},
+                             /*env=*/nullptr, &handles, &reader);
+    }
+    ASSERT_TRUE(compacted);
+    ASSERT_EQ(Status::Code::kTryAgain, s.code()) << s.ToString();
+    ASSERT_EQ(nullptr, reader);
+    if (follower) {
+      Defer clear_dependencies(ClearSyncPointDependencies);
+      ASSERT_OK(
+          OpenStoreFollower({kDefaultColumnFamilyName}, &handles, &reader));
+    } else {
+      ASSERT_OK(OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                                   /*env=*/nullptr, &handles, &reader));
+    }
+    std::string value;
+    ASSERT_OK(reader->Get(ReadOptions(), "a", &value));
+    ASSERT_EQ("1", value);
+    CloseAndDestroy(&reader, &handles,
+                    follower ? FollowerPath() : SecondaryPath());
+  }
+}
+
+// A file of the scan is missing, but the primary made no newer commit, so no
+// commit explains it: the open returns Corruption with the file number, not
+// TryAgain.
+TEST_F(DBManifestStoreTest, OpenFailsWhenAScannedFileIsMissingWithoutCommit) {
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const std::set<uint64_t> live = LiveFiles()[kDefaultColumnFamilyName];
+  ASSERT_EQ(1, live.size());
+  const uint64_t number = *live.begin();
+  ASSERT_OK(env_->DeleteFile(MakeTableFileName(dbname_, number)));
+  for (bool follower : {false, true}) {
+    SCOPED_TRACE(follower ? "follower" : "secondary");
+    std::vector<ColumnFamilyHandle*> handles;
+    std::unique_ptr<DB> reader;
+    Status s;
+    if (follower) {
+      Defer clear_dependencies(ClearSyncPointDependencies);
+      s = OpenStoreFollower({kDefaultColumnFamilyName}, &handles, &reader);
+    } else {
+      s = OpenStoreSecondary(ReaderStore(), {kDefaultColumnFamilyName},
+                             /*env=*/nullptr, &handles, &reader);
+    }
+    ASSERT_EQ(Status::Code::kCorruption, s.code()) << s.ToString();
+    ASSERT_NE(std::string::npos,
+              s.ToString().find("(files " + std::to_string(number) + ")"))
+        << s.ToString();
+    ASSERT_EQ(nullptr, reader);
+  }
+}
+
+// A file of the scan exists with another size, and the primary commits during
+// the scan. The newer commit does not explain a damaged file, so the open
+// returns Corruption, not TryAgain.
+TEST_F(DBManifestStoreTest, OpenFailsWhenAScannedFileIsDamaged) {
+  Options options = StoreOptions();
+  options.disable_auto_compactions = true;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const std::set<uint64_t> live = LiveFiles()[kDefaultColumnFamilyName];
+  ASSERT_EQ(1, live.size());
+  const std::string path = MakeTableFileName(dbname_, *live.begin());
+  std::string contents;
+  ASSERT_OK(ReadFileToString(env_, path, &contents));
+  contents.resize(contents.size() / 2);
+  ASSERT_OK(WriteStringToFile(env_, contents, path));
+  std::shared_ptr<ScanHookStore> store =
+      std::make_shared<ScanHookStore>(data_, std::nullopt);
+  store->during_scan = [&]() {
+    ASSERT_OK(Put("b", "2"));
+    ASSERT_OK(Flush());
+  };
+  std::vector<ColumnFamilyHandle*> handles;
+  std::unique_ptr<DB> reader;
+  Status s = OpenStoreSecondary(store, {kDefaultColumnFamilyName},
+                                /*env=*/nullptr, &handles, &reader);
+  ASSERT_EQ(Status::Code::kCorruption, s.code()) << s.ToString();
+  ASSERT_EQ(nullptr, reader);
+}
+
+// A follower catch-up that fails to read the store changes nothing, and the
+// retry works. It also drops a column family that the leader dropped.
+TEST_F(DBManifestStoreTest, FollowerRetriesAndSeesDroppedColumnFamily) {
+  Options options = StoreOptions();
+  ASSERT_OK(TryReopen(options));
+  CreateColumnFamilies({"one"}, options);
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  std::vector<ColumnFamilyHandle*> follower_handles;
+  std::unique_ptr<DB> follower;
+  Defer clear_dependencies(ClearSyncPointDependencies);
+  ASSERT_OK(OpenStoreFollower({kDefaultColumnFamilyName, "one"},
+                              &follower_handles, &follower));
+  ASSERT_FALSE(IsDropped(follower_handles[1]));
+
+  TEST_SYNC_POINT("Leader::Start");
+  ASSERT_OK(db_->DropColumnFamily(handles_[0]));
+  ASSERT_OK(Put("a", "2"));
+  ASSERT_OK(Flush());
+  // The first attempt fails in ReadDbRow(), and the retry works.
+  data_->SetReadDbRowFailures(1);
+  TEST_SYNC_POINT("Leader::Done");
+  TEST_SYNC_POINT("Follower::WaitForCatchup");
+  std::string value;
+  ASSERT_OK(follower->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("2", value);
+  ASSERT_TRUE(IsDropped(follower_handles[1]));
+  ASSERT_EQ(LiveFiles(), LiveFiles(follower.get()));
+  CheckClaimed();
+  ClearSyncPointDependencies();
+  CloseAndDestroy(&follower, &follower_handles, FollowerPath());
+}
+
+// A checkpoint of a DB in store mode is a DB in file mode with the same db id.
+// An open of the copy with the store of the source and
+// manifest_store_migrate refuses to move the copy into the rows of the source,
+// and the source can still commit.
+TEST_F(DBManifestStoreTest, CheckpointCopyRefusesSourceStore) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const std::string copy_path = dbname_ + "_copy";
+  ASSERT_OK(MakeCheckpoint(copy_path, /*sequence=*/nullptr));
+  const uint64_t sequence = ScanStore().db_row.state.commit_sequence;
+  // The same store object as the source.
+  Options copy_options = CurrentOptions();
+  copy_options.manifest_store = db_->GetDBOptions().manifest_store;
+  copy_options.manifest_store_migrate = true;
+  std::unique_ptr<DB> copy;
+  ASSERT_EQ(Status::Code::kInvalidArgument,
+            DB::Open(copy_options, copy_path, &copy).code());
+  ASSERT_EQ(sequence, ScanStore().db_row.state.commit_sequence);
+  CheckClaimed();
+
+  // DestroyDB() of the copy with the same store object reads the DB row,
+  // which has the db id of the copy but authority kStore, so it keeps the
+  // rows of the source.
+  const std::map<std::string, std::set<uint64_t>> store_files = StoreFiles();
+  ASSERT_OK(DestroyDB(copy_path, copy_options));
+  ASSERT_EQ(Status::Code::kNotFound,
+            env_->FileExists(CurrentFileName(copy_path)).code());
+  ASSERT_EQ(sequence, ScanStore().db_row.state.commit_sequence);
+  ASSERT_EQ(store_files, StoreFiles());
+  CheckClaimed();
+  ASSERT_OK(Put("a", "2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(LiveFiles(), StoreFiles());
+}
+
+// After a rollback, DestroyDB() with the store removes the rows that the
+// rollback left, because they have the db id of the DB. It leaves the rows of
+// another DB alone.
+TEST_F(DBManifestStoreTest, DestroyAfterRollback) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  Close();
+  ASSERT_OK(RollBackManifestStore(StoreOptions(), dbname_));
+  ASSERT_FALSE(Current().is_stub);
+  ASSERT_EQ(ManifestAuthority::kFile, StoredAuthority());
+
+  // Another DB in file mode at another place has another db id.
+  const std::string other_path = dbname_ + "_file_mode_other";
+  ASSERT_OK(DestroyDir(env_, other_path));
+  {
+    Options other_options = CurrentOptions();
+    other_options.create_if_missing = true;
+    std::unique_ptr<DB> other;
+    ASSERT_OK(DB::Open(other_options, other_path, &other));
+  }
+  ASSERT_OK(DestroyDB(other_path, StoreOptions()));
+  ASSERT_EQ(ManifestAuthority::kFile, StoredAuthority());
+
+  ASSERT_OK(DestroyDB(dbname_, StoreOptions()));
+  ManifestDbRowResult db_row;
+  ASSERT_EQ(Status::Code::kNotFound, ReaderStore()->ReadDbRow(&db_row).code());
+  // A new DB in store mode can be created at the same place.
+  Options options = StoreOptions();
+  options.create_if_missing = true;
+  ASSERT_OK(TryReopen(options));
+  ASSERT_EQ(LiveFiles(), StoreFiles());
+}
+
+#ifndef NDEBUG  // Uses sync points.
+// DestroyDB() removes the rows only in the state that it checked. Here
+// another writer claims the DB between the check and
+// ManifestStore::Destroy(), first for a DB in store mode, then for the rows
+// that a rollback left. Each time DestroyDB() returns Busy and keeps the rows
+// and the files. The next call removes them.
+TEST_F(DBManifestStoreTest, DestroyKeepsRowsChangedAfterItsCheck) {
+  ASSERT_OK(TryReopen(StoreOptions()));
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  Close();
+  int claims = 0;
+  Defer cleanup([]() { SyncPoint::GetInstance()->ClearAllCallBacks(); });
+  // The other writer claims with `claim_epoch`, and DestroyDB() uses a newer
+  // epoch, so that only the changed DB row (its commit sequence and last
+  // commit id) can refuse it, not the epoch.
+  auto destroy_is_refused = [&]() {
+    const uint64_t claim_epoch = data_->StoredEpoch();
+    // Built after `claim_epoch` is read, because StoreOptions() takes the next
+    // epoch.
+    const Options destroy_options = StoreOptions();
+    SyncPoint::GetInstance()->SetCallBack(
+        "DestroyDB:BeforeStoreDestroy", [&](void*) {
+          ManifestStoreOpenOptions opts;
+          opts.commit_id = "other-writer-" + std::to_string(++claims);
+          ManifestDbRowResult row;
+          ASSERT_OK(MockManifestStore(data_, claim_epoch).Open(opts, &row));
+        });
+    const uint64_t sequence = ScanStore().db_row.state.commit_sequence;
+    ASSERT_EQ(Status::Code::kBusy, DestroyDB(dbname_, destroy_options).code());
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    const ManifestStoreScan scan = ScanStore();
+    ASSERT_EQ(sequence + 1, scan.db_row.state.commit_sequence);
+    ASSERT_EQ(1, scan.rows.cfs.count(0));
+    ASSERT_OK(env_->FileExists(CurrentFileName(dbname_)));
+  };
+  ASSERT_NO_FATAL_FAILURE(destroy_is_refused());
+  ASSERT_TRUE(Current().is_stub);
+  ASSERT_OK(RollBackManifestStore(StoreOptions(), dbname_));
+  ASSERT_EQ(ManifestAuthority::kFile, StoredAuthority());
+  ASSERT_NO_FATAL_FAILURE(destroy_is_refused());
+  ASSERT_FALSE(Current().is_stub);
+  ASSERT_EQ(2, claims);
+  ASSERT_OK(DestroyDB(dbname_, StoreOptions()));
+  ManifestDbRowResult db_row;
+  ASSERT_EQ(Status::Code::kNotFound, ReaderStore()->ReadDbRow(&db_row).code());
+}
+#endif  // NDEBUG
+
+// A checkpoint refs the current Version and the column family of each column
+// family while it builds the MANIFEST from the rows. A column family that is
+// dropped, and whose handle is destroyed, after the rows are copied stays
+// alive until the checkpoint releases it, and the checkpoint still holds it.
+TEST_F(DBManifestStoreTest, CheckpointWhileColumnFamilyIsDropped) {
+  Options options = StoreOptions();
+  ASSERT_OK(TryReopen(options));
+  CreateColumnFamilies({"one"}, options);
+  ASSERT_OK(Put(0, "a", "1"));
+  ASSERT_OK(Flush(0));
+  bool dropped = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::GetLiveFilesStorageInfo:BeforeOptionsFileSize", [&](void*) {
+        ASSERT_OK(db_->DropColumnFamily(handles_[0]));
+        ASSERT_OK(db_->DestroyColumnFamilyHandle(handles_[0]));
+        handles_.clear();
+        dropped = true;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string copy_path = dbname_ + "_copy";
+  ASSERT_OK(MakeCheckpoint(copy_path, /*sequence=*/nullptr));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(dropped);
+  std::vector<ColumnFamilyHandle*> copy_handles;
+  std::unique_ptr<DB> copy;
+  ASSERT_OK(OpenFileModeCopy(CurrentOptions(), copy_path,
+                             {kDefaultColumnFamilyName, "one"}, &copy_handles,
+                             &copy));
+  std::string value;
+  ASSERT_OK(copy->Get(ReadOptions(), copy_handles[1], "a", &value));
+  ASSERT_EQ("1", value);
+  CloseAndDestroy(&copy, &copy_handles, copy_path);
+  ASSERT_EQ(LiveFiles(), StoreFiles());
+}
+
+// SplitDB() and MergeDB() work on a source in store mode. Their checkpoint is
+// a DB in file mode, and they open it without the store of the source, also
+// when the source sets manifest_store_migrate. The rows of the source do not
+// change, and the source keeps its claim and can still commit.
+TEST_F(DBManifestStoreTest, SplitAndMergeFromStoreSource) {
+  Options options = StoreOptions();
+  options.manifest_store_migrate = true;
+  ASSERT_OK(TryReopen(options));
+  for (const char* key : {"a", "b", "c", "d"}) {
+    ASSERT_OK(Put(key, std::string("v_") + key));
+  }
+  ASSERT_OK(Flush());
+  const uint64_t sequence = ScanStore().db_row.state.commit_sequence;
+
+  // Split the range [b, d) into a new DB.
+  const std::string split_path = dbname_ + "_split";
+  ASSERT_OK(DestroyDB(split_path, CurrentOptions()));
+  SplitDBOptions split_options;
+  split_options.destination_db_path = split_path;
+  split_options.column_family_splits.push_back(
+      ColumnFamilySplit{"b", "d", db_->DefaultColumnFamily()});
+  SplitMergeResult result;
+  ASSERT_OK(SplitDB(db_.get(), split_options, &result));
+  {
+    Options split_db_options = CurrentOptions();
+    std::unique_ptr<DB> split_db;
+    ASSERT_OK(DB::Open(split_db_options, split_path, &split_db));
+    std::string value;
+    ASSERT_EQ(Status::Code::kNotFound,
+              split_db->Get(ReadOptions(), "a", &value).code());
+    ASSERT_OK(split_db->Get(ReadOptions(), "b", &value));
+    ASSERT_EQ("v_b", value);
+    ASSERT_OK(split_db->Get(ReadOptions(), "c", &value));
+    ASSERT_EQ("v_c", value);
+    ASSERT_EQ(Status::Code::kNotFound,
+              split_db->Get(ReadOptions(), "d", &value).code());
+  }
+  ASSERT_OK(DestroyDB(split_path, CurrentOptions()));
+
+  // Merge the range [a, c) into a separate DB in file mode.
+  const std::string dest_path = dbname_ + "_dest";
+  ASSERT_OK(DestroyDB(dest_path, CurrentOptions()));
+  {
+    Options dest_options = CurrentOptions();
+    dest_options.create_if_missing = true;
+    std::unique_ptr<DB> dest;
+    ASSERT_OK(DB::Open(dest_options, dest_path, &dest));
+    MergeDBOptions merge_options;
+    merge_options.checkpoint_directory = dbname_ + "_merge_checkpoint";
+    merge_options.column_family_merges.push_back(ColumnFamilyMerge{
+        "a", "c", db_->DefaultColumnFamily(), dest->DefaultColumnFamily()});
+    ASSERT_OK(MergeDB(db_.get(), dest.get(), merge_options, &result));
+    std::string value;
+    ASSERT_OK(dest->Get(ReadOptions(), "a", &value));
+    ASSERT_EQ("v_a", value);
+    ASSERT_OK(dest->Get(ReadOptions(), "b", &value));
+    ASSERT_EQ("v_b", value);
+    ASSERT_EQ(Status::Code::kNotFound,
+              dest->Get(ReadOptions(), "c", &value).code());
+  }
+  ASSERT_OK(DestroyDB(dest_path, CurrentOptions()));
+
+  ASSERT_EQ(sequence, ScanStore().db_row.state.commit_sequence);
+  CheckClaimed();
+  ASSERT_OK(Put("a", "v2"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(LiveFiles(), StoreFiles());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

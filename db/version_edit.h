@@ -939,7 +939,17 @@ class VersionEdit {
   // fresh. `provenance_flags_to_set` are DataFileProvenance flag bits to set
   // on the added file, recording what is happening to it (0 for none).
   void AddExistingFile(int level, const FileMetaData& f,
-                       uint32_t provenance_flags_to_set);
+                       uint32_t provenance_flags_to_set) {
+    AddExistingFile(level, f, provenance_flags_to_set, f.marked_for_compaction);
+  }
+
+  // Same, with `marked_for_compaction` given by the caller. A caller that
+  // reads `f` without the DB mutex uses it, because
+  // FileMetaData::marked_for_compaction of a file in a Version changes under
+  // the DB mutex (DB::SuggestCompactRange()).
+  void AddExistingFile(int level, const FileMetaData& f,
+                       uint32_t provenance_flags_to_set,
+                       bool marked_for_compaction);
 
   const NewFiles& GetNewFiles() const { return new_files_; }
 

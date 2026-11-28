@@ -257,8 +257,7 @@ Status DBImpl::ValidateOptions(
   return s;
 }
 
-Status DBImpl::CheckManifestStoreOptions(const DBOptions& db_options,
-                                         bool store_mode_supported) {
+Status DBImpl::CheckManifestStoreOptions(const DBOptions& db_options) {
   if (db_options.manifest_store == nullptr) {
     return Status::OK();
   }
@@ -276,10 +275,6 @@ Status DBImpl::CheckManifestStoreOptions(const DBOptions& db_options,
     return Status::InvalidArgument(
         "manifest_store_copy_mode must be kOff, kBackground or kSync");
   }
-  if (!store_mode_supported) {
-    return Status::NotSupported(
-        "This way to open a DB does not support manifest_store yet");
-  }
   // Best-efforts recovery reads older MANIFEST files, which store mode does
   // not keep. The blob DB repair runs in that recovery path, which store mode
   // does not take.
@@ -288,11 +283,6 @@ Status DBImpl::CheckManifestStoreOptions(const DBOptions& db_options,
     return Status::InvalidArgument(
         "best_efforts_recovery and best_efforts_blob_db_repair cannot be used "
         "with manifest_store");
-  }
-  // A remote compaction worker opens the DB from the MANIFEST file.
-  if (db_options.compaction_service != nullptr) {
-    return Status::NotSupported(
-        "compaction_service cannot be used with manifest_store yet");
   }
   return Status::OK();
 }
@@ -3633,8 +3623,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   const WriteOptions write_options(Env::IOActivity::kDBOpen);
   const ReadOptions read_options(Env::IOActivity::kDBOpen);
 
-  Status s =
-      CheckManifestStoreOptions(db_options, /*store_mode_supported=*/true);
+  Status s = CheckManifestStoreOptions(db_options);
   if (!s.ok()) {
     return s;
   }

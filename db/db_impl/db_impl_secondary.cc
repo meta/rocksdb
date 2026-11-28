@@ -15,6 +15,7 @@
 #include "db/db_impl/db_impl_metadata.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
+#include "db/manifest_store_state.h"
 #include "db/merge_context.h"
 #include "db/version_edit.h"
 #include "file/filename.h"
@@ -1074,15 +1075,22 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
   // read the manifest and apply new changes to the secondary instance
   std::unordered_set<ColumnFamilyData*> cfds_changed;
   JobContext job_context(0, true /*create_superversion*/);
+  auto* reactive_versions =
+      static_cast_with_check<ReactiveVersionSet>(versions_.get());
+  // In store mode the store is read before the DB mutex is taken (see "Store
+  // mode in a secondary or follower" at
+  // ReactiveVersionSet::ReadStoreForCatchUp()).
+  std::unique_ptr<ManifestStoreRead> store_read;
+  s = reactive_versions->ReadStoreForCatchUp(&mutex_, &store_read);
+  if (!s.ok()) {
+    return s;
+  }
   {
     InstrumentedMutexLock lock_guard(&mutex_);
     assert(manifest_reader_.get() != nullptr);
-    auto* reactive_versions =
-        static_cast_with_check<ReactiveVersionSet>(versions_.get());
-    s = reactive_versions->ReadAndApply(&mutex_, &manifest_reader_,
-                                        manifest_reader_status_.get(),
-                                        &cfds_changed,
-                                        /*files_to_delete=*/nullptr);
+    s = reactive_versions->ReadAndApply(
+        &mutex_, &manifest_reader_, manifest_reader_status_.get(),
+        &cfds_changed, /*files_to_delete=*/nullptr, store_read.get());
 
     ROCKS_LOG_INFO(immutable_db_options_.info_log, "Last sequence is %" PRIu64,
                    static_cast<uint64_t>(versions_->LastSequence()));
@@ -1179,6 +1187,8 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
       PublishSecondaryReadView();
     }
   }
+  // Frees the scanned rows of a store mode catch-up without the DB mutex.
+  store_read.reset();
   CleanupRetiredSecondaryReadViews();
   job_context.Clean();
 
@@ -1240,8 +1250,7 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool recover_wal, bool trust_manifest_recovery) {
   *dbptr = nullptr;
-  Status check = DBImpl::CheckManifestStoreOptions(
-      db_options, /*store_mode_supported=*/false);
+  Status check = DBImpl::CheckManifestStoreOptions(db_options);
   if (!check.ok()) {
     return check;
   }
@@ -2240,6 +2249,7 @@ Status DB::OpenAndCompact(
   db_options.listeners = override_options.listeners;
   db_options.compaction_service = nullptr;
   db_options.info_log = override_options.info_log;
+  db_options.manifest_store = override_options.manifest_store;
 
   const std::string output_path = RemoteCompactionJobDir(
       name, db_options.use_session_tmp_dir_for_remote_compaction,
@@ -2348,7 +2358,11 @@ Status DB::OpenAndCompact(
   // is a transient race, not a broken DB: the next attempt reads the
   // replacement. Retry a bounded number of times so a concurrent rotation does
   // not fail the compaction -- a CompactionService that does not fall back to a
-  // local compaction turns such a failure into a primary background error.
+  // local compaction turns such a failure into a primary background error. In
+  // store mode the open also returns TryAgain when a file of the scan is
+  // missing and the primary made a newer commit, so it may have deleted the
+  // file (see "Store mode in a secondary or follower" in db/version_set.h); a
+  // new attempt scans again.
   for (uint32_t retry_count = 0;; ++retry_count) {
     s = DBImplSecondary::OpenAsSecondaryImpl(
         db_options, name, output_path, column_families, &handles, &db,
@@ -2361,8 +2375,8 @@ Status DB::OpenAndCompact(
     ROCKS_LOG_WARN(db_options.info_log,
                    "OpenAndCompact: secondary open of %s failed with %s "
                    "(retry %" PRIu32 " of %" PRIu32
-                   "); the primary may have replaced "
-                   "CURRENT/MANIFEST concurrently, retrying",
+                   "); the primary may have changed the metadata "
+                   "concurrently, retrying",
                    name.c_str(), s.ToString().c_str(), retry_count + 1,
                    options.max_secondary_open_retries);
   }
@@ -2405,19 +2419,33 @@ Status DB::OpenAndCompact(
         recovered_number < compaction_input.min_manifest_file_number ||
         (recovered_number == compaction_input.min_manifest_file_number &&
          recovered_valid_size < compaction_input.min_manifest_file_size);
+    // In store mode (see db/manifest_store_state.h) the MANIFEST file is a
+    // stub, so the file check above does not apply. The commit sequence of the
+    // store scan replaces it as the floor: the worker must have replayed a
+    // scan at or above the commit sequence that the primary sent.
+    uint64_t recovered_commit_sequence = 0;
+    if (StoreModeOptions(db_options)) {
+      recovered_commit_sequence =
+          static_cast_with_check<ReactiveVersionSet>(recovered_versions)
+              ->installed_store_commit_sequence();
+      below_floor = recovered_commit_sequence <
+                    compaction_input.min_store_commit_sequence;
+    }
     TEST_SYNC_POINT_CALLBACK(
         "DBImplSecondary::OpenAndCompact::ManifestFloorCheck", &below_floor);
     if (below_floor) {
       ROCKS_LOG_WARN(
           db_options.info_log,
           "Remote compaction recovered an older MANIFEST view (file number "
-          "%" PRIu64 " valid size %" PRIu64
+          "%" PRIu64 " valid size %" PRIu64 " store commit sequence %" PRIu64
           ") than the primary scheduled from "
           "(min file number %" PRIu64 " size %" PRIu64
+          " store commit sequence %" PRIu64
           "); declining so the job can fall back to local compaction.",
-          recovered_number, recovered_valid_size,
+          recovered_number, recovered_valid_size, recovered_commit_sequence,
           compaction_input.min_manifest_file_number,
-          compaction_input.min_manifest_file_size);
+          compaction_input.min_manifest_file_size,
+          compaction_input.min_store_commit_sequence);
       for (auto& handle : handles) {
         delete handle;
       }

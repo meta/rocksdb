@@ -240,13 +240,14 @@ enum class ManifestDbField : uint32_t {
   // service must keep every file.
   //
   // The rows and this number describe only the newest Version. An older
-  // Version can still be in use, for example by an open iterator or a read-only
-  // instance, and it can name files that no row names and whose numbers are
-  // below this number. The DB instance that uses the older Version keeps such
-  // files until it releases that Version, but other instances and the store do
-  // not know about this use. So the service may delete a file that no row
-  // names and whose number is below this number only when no instance of the
-  // DB still uses an older Version.
+  // Version can still be in use, for example by an open iterator, a read-only,
+  // secondary or follower instance, or a backup or checkpoint in progress, and
+  // it can name files that no row names and whose numbers are below this
+  // number. The DB instance that uses the older Version keeps such files until
+  // it releases that Version, but other instances and the store do not know
+  // about this use. So the service may delete a file that no row names and
+  // whose number is below this number only when no instance of the DB still
+  // uses an older Version.
   //
   // In ManifestCopyMode::kSync it is also at most the smallest number of the
   // files that the edits of the same commit remove. The sync copy gets a
@@ -566,6 +567,18 @@ std::string EncodeManifestRowFields(
 //    a consistent scan, so they work with an object without an epoch.
 // 3. Each metadata change (what RocksDB writes to the MANIFEST file when there
 //    is no store): one Commit() with the expected commit sequence.
+// 4. Readers that follow the primary: DB::OpenAsSecondary(),
+//    DB::OpenAsFollower() and the remote compaction worker, which gets the
+//    store from CompactionServiceOptionsOverride::manifest_store in
+//    DB::OpenAndCompact(), use a consistent Scan() at open. To catch up, a
+//    secondary and a follower call ReadDbRow(), and Scan() again only when the
+//    commit sequence changed. They never claim the DB, so they work with an
+//    object without an epoch. When the open replays a scan but a missing or
+//    damaged file leaves no valid Version, it calls ReadDbRow() again. A
+//    failed read returns IOError. An unchanged commit sequence, or a file that
+//    exists but fails its check, returns Corruption. A changed commit
+//    sequence with only missing files returns TryAgain (the primary may have
+//    deleted them), and the caller then opens again.
 // Other cases:
 // - After Busy or an unknown outcome: ReadDbRow(). After an unknown outcome,
 //   compare last_commit_id with the commit id of the request. An equal id
@@ -598,18 +611,21 @@ std::string EncodeManifestRowFields(
 //   sets the authority to kFile. For an entering stub whose switch did not
 //   happen, the DB row still has kFile, so it makes no Commit(); its claim
 //   only replaces the last commit id and raises the commit sequence.
-// - The readers that store mode supports, DB::OpenForReadOnly() and
-//   DB::ListColumnFamilies(), use only Scan(), with a consistent scan and
-//   without a claim.
+// - DestroyDB(): ReadDbRow() checks that the DB row belongs to this DB, then
+//   Destroy(), then RocksDB deletes the files. After a rollback, DestroyDB()
+//   of the DB in file mode also calls Destroy() when the rows have the db id
+//   of the DB and authority kFile.
+// - The readers that do not claim, DB::OpenForReadOnly(),
+//   DB::ListColumnFamilies(), and secondary and follower instances
+//   (DB::OpenAsSecondary(), DB::OpenAsFollower()), use only Scan() and
+//   ReadDbRow().
 // The ReadDbRow() before a claim comes from an object whose epoch can be
 // newer than the stored epoch. It must not return IOFenced then.
 //
-// Not supported in store mode yet: the live file APIs (DB::GetLiveFiles(),
-// DB::GetLiveFilesStorageInfo()) and so checkpoints and backups,
-// DB::OpenAsSecondary(), DB::OpenAsFollower(), DB::OpenAndCompact(),
-// DBOptions::compaction_service, RepairDB(), DestroyDB(), and the tools that
-// read the MANIFEST file (for example `ldb manifest_dump`). They return
-// NotSupported.
+// Not supported in store mode: DB::GetLiveFiles() (the MANIFEST file is only
+// a stub, so DB::GetLiveFilesStorageInfo() gives the MANIFEST content in
+// memory instead), RepairDB(), and the tools that read or rewrite the
+// MANIFEST file offline. They return NotSupported.
 
 // The DB row values that the store owns. This is the one place that describes
 // the whole DB row. The store keeps this logical state under the app's key of
@@ -857,13 +873,13 @@ struct ManifestGeneration {
 // IOFenced also when its expected commit sequence is wrong.
 //
 // Threading and timeouts: RocksDB makes at most one call at a time on the
-// store object of one DB instance. DB::ListColumnFamilies() and
-// RollBackManifestStore() call the store from the caller's thread, so do not
-// pass them a store object that an open DB uses. Every call must return in a
-// bounded time (the store applies its own timeout), because DB::Open() and
-// DB::Close() wait for calls in flight. A method added to this class has a
-// default implementation that returns NotSupported, so that existing stores
-// still build.
+// store object of one DB instance. DB::ListColumnFamilies(),
+// RollBackManifestStore() and DestroyDB() call the store from the caller's
+// thread, so do not pass them a store object that an open DB uses. Every call
+// must return in a bounded time (the store applies its own timeout), because
+// DB::Open() and DB::Close() wait for calls in flight. A method added to this
+// class has a default implementation that returns NotSupported, so that
+// existing stores still build.
 class ManifestStore : public Customizable {
  public:
   ~ManifestStore() override = default;

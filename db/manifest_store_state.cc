@@ -55,6 +55,9 @@ class StringSequentialFile : public FSSequentialFile {
     memcpy(scratch, data_.data() + pos_, len);
     pos_ += len;
     *result = Slice(scratch, len);
+    if (len < n) {
+      FreeData();
+    }
     return IOStatus::OK();
   }
 
@@ -67,8 +70,24 @@ class StringSequentialFile : public FSSequentialFile {
   }
 
  private:
-  const std::string data_;
+  // Frees the bytes when a read reaches the end. The readers read the bytes
+  // only once, and a secondary or follower keeps its reader until the next
+  // replay. A later read returns no bytes, as at the end of a file that did
+  // not grow.
+  void FreeData() {
+    if (freed_) {
+      return;
+    }
+    freed_ = true;
+    std::string().swap(data_);
+    pos_ = 0;
+    [[maybe_unused]] size_t capacity = data_.capacity();
+    TEST_SYNC_POINT_CALLBACK("StringSequentialFile::FreeData", &capacity);
+  }
+
+  std::string data_;
   size_t pos_ = 0;
+  bool freed_ = false;
 };
 
 // A FSWritableFile that appends to a string.
@@ -711,7 +730,8 @@ ManifestStoreState::ManifestStoreState(std::shared_ptr<ManifestStore> store,
       feature_version_(feature_version) {}
 
 void ManifestStoreState::Init(const ManifestStoreScan& scan) {
-  applied_commit_sequence_ = scan.db_row.state.commit_sequence;
+  applied_commit_sequence_.store(scan.db_row.state.commit_sequence,
+                                 std::memory_order_relaxed);
   extra_fields_ = scan.extra_fields;
   batch_base_rows_ = ManifestRows();
   batch_base_rows_.db = scan.rows.db;
@@ -757,7 +777,7 @@ IOStatus ManifestStoreState::Stop(const IOStatus& error) {
 
 void ManifestStoreState::OnApplied(const ManifestRowChanges& changes,
                                    size_t cleanup_deletes) {
-  ++applied_commit_sequence_;
+  applied_commit_sequence_.fetch_add(1, std::memory_order_relaxed);
   rewrite_.clear();
   batch_base_rows_.db = changes.db;
   for (const auto& [cf_id, cf] : changes.cf_upserts) {

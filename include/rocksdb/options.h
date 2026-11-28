@@ -1976,7 +1976,12 @@ struct DBOptions {
   // older MANIFEST view than that -- e.g. an eventually-consistent filesystem
   // returning a stale CURRENT, or a truncated MANIFEST -- and falls back to a
   // local compaction rather than risk an incorrect result computed against the
-  // wrong (older) LSM shape.
+  // wrong (older) LSM shape. In store mode (DBOptions::manifest_store) the
+  // MANIFEST file is a stub. The request then carries the stub number as the
+  // MANIFEST file number, and also the commit sequence of the store
+  // (CompactionServiceInput::min_store_commit_sequence). The worker compares
+  // the commit sequence of its store scan with that value instead of the
+  // MANIFEST position.
   //
   // The presence of this position on the request also enables the worker's
   // "trust the MANIFEST" recovery, which avoids failing a job over a
@@ -2208,16 +2213,18 @@ struct DBOptions {
   // EXPERIMENTAL
   // The external metadata store (see include/rocksdb/manifest_store.h). Null
   // (the default) means that the MANIFEST file holds the metadata. When it is
-  // set, DB::Open() and DB::OpenForReadOnly() open the DB in store mode: the
-  // rows in the store hold the metadata, and the MANIFEST file that CURRENT
-  // names is a small stub. DB::Open() with create_if_missing creates a new DB
-  // in the store. A DB whose CURRENT names a normal MANIFEST file needs
-  // manifest_store_migrate. include/rocksdb/manifest_store.h lists the paths
-  // that store mode does not support yet (for example checkpoints, backups
-  // and secondary instances). DB::Open() returns InvalidArgument when
-  // best_efforts_recovery or best_efforts_blob_db_repair is also set, and
-  // NotSupported when compaction_service is set. The object is not written
-  // to the OPTIONS file, because it belongs to one DB instance.
+  // set, DB::Open(), DB::OpenForReadOnly(), DB::OpenAsSecondary() and
+  // DB::OpenAsFollower() open the DB in store mode: the rows in the store
+  // hold the metadata, and the MANIFEST file that CURRENT names is a small
+  // stub. A remote compaction worker gets the store from
+  // CompactionServiceOptionsOverride::manifest_store. DB::Open() with
+  // create_if_missing creates a new DB in the store. A DB whose CURRENT names a
+  // normal MANIFEST file needs manifest_store_migrate.
+  // include/rocksdb/manifest_store.h lists the paths that store mode does not
+  // support (for example DB::GetLiveFiles() and RepairDB()). DB::Open() returns
+  // InvalidArgument when best_efforts_recovery or best_efforts_blob_db_repair
+  // is also set. The object is not written to the OPTIONS file, because it
+  // belongs to one DB instance.
   std::shared_ptr<ManifestStore> manifest_store = nullptr;
 
   // EXPERIMENTAL
@@ -3749,6 +3756,16 @@ struct CompactionServiceOptionsOverride {
   // Info Log. If not overriden, default one will be used.
   std::shared_ptr<Logger> info_log = nullptr;
 
+  // The store of a primary in store mode (DBOptions::manifest_store, see
+  // include/rocksdb/manifest_store.h for the terms). The OPTIONS file never
+  // holds the store, so the worker gets it only here. Use a store object
+  // without an epoch: the worker only reads the store (a consistent scan), and
+  // it never claims the DB, so it never fences the primary. Each
+  // DB::OpenAndCompact() call is its own DB instance, so give each concurrent
+  // call its own object, or a thread-safe one, and never the object that the
+  // primary uses. Null for a primary in file mode.
+  std::shared_ptr<ManifestStore> manifest_store = nullptr;
+
   // Only compaction generated SST files use this user defined table properties
   // collector.
   std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
@@ -3764,7 +3781,11 @@ struct OpenAndCompactOptions {
 
   // Maximum number of times to retry opening the source DB as a secondary
   // after the initial attempt fails because CURRENT or MANIFEST was replaced
-  // concurrently. A value of zero disables retries.
+  // concurrently. In store mode the open reads one point in time of the
+  // store. When a file of that state is missing and the primary made a newer
+  // commit, the primary may have deleted the file, so the open returns
+  // TryAgain, and this option retries it too (see the call order in
+  // include/rocksdb/manifest_store.h). A value of zero disables retries.
   //
   // Default: 2
   uint32_t max_secondary_open_retries = 2;
