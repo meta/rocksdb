@@ -7469,7 +7469,18 @@ Snapshot::~Snapshot() = default;
 
 Status DestroyDB(const std::string& dbname, const Options& options,
                  const std::vector<ColumnFamilyDescriptor>& column_families) {
-  ImmutableDBOptions soptions(SanitizeOptions(dbname, options));
+  // DestroyDB() lists each dir once and deletes only the listed files. When the
+  // caller gives no info_log and no sst_file_manager, SanitizeOptions() creates
+  // a logger and a default SstFileManager that holds it and logs one line for
+  // each deleted table, blob and WAL file. Keep that logger from rolling: a
+  // roll would create a LOG.old.* file after the listing, and the final
+  // DeleteDir() would leave the DB dir behind.
+  Options destroy_db_options(options);
+  if (destroy_db_options.info_log == nullptr) {
+    destroy_db_options.max_log_file_size = 0;
+    destroy_db_options.log_file_time_to_roll = 0;
+  }
+  ImmutableDBOptions soptions(SanitizeOptions(dbname, destroy_db_options));
   Env* env = soptions.env;
   std::vector<std::string> filenames;
   bool wal_in_db_path = soptions.IsWalDirSameAsDBPath();
