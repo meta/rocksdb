@@ -56,6 +56,8 @@ enum InfoLogLevel : unsigned char;
 class SstFileManager;
 class FilterPolicy;
 class Logger;
+class ManifestStore;
+enum class ManifestCopyMode : uint8_t;
 class MergeOperator;
 class Snapshot;
 class MemTableRepFactory;
@@ -1072,11 +1074,15 @@ struct DBOptions {
   // likelihood of user operations blocking on MANIFEST rotation.
   // Background-only batches (flush and compaction) use the configured or
   // auto-tuned limit directly.
+  //
+  // In store mode (see manifest_store), the MANIFEST file is not written, and
+  // this limit applies only to the MANIFEST file copy.
   uint64_t max_manifest_file_size = 1024 * 1024 * 1024;
 
   // If true, on DB close, read back the entire MANIFEST file and validate
   // CRC checksums and logical record content. If corruption is detected,
   // a fresh MANIFEST is written from in-memory state before closing.
+  // It has no effect in store mode (see manifest_store).
   //
   // This option is mutable with SetDBOptions().
   bool verify_manifest_content_on_close = false;
@@ -1106,6 +1112,9 @@ struct DBOptions {
   // still rotate earlier than expected after open, because RocksDB may keep a
   // conservative auto-tuned rotation threshold until it later refreshes its
   // compacted-size estimate.
+  //
+  // It is ignored in store mode (see manifest_store), which never writes the
+  // MANIFEST file.
   //
   // Temporary rollout / kill switch while this optimization is being
   // validated.
@@ -1792,6 +1801,11 @@ struct DBOptions {
   // setting. BER does require at least one valid MANIFEST to recover to a
   // non-trivial DB state, unlike `ldb repair`.
   //
+  // A DB in store mode (see DBOptions::manifest_store) is not supported. BER
+  // reads the first record of each MANIFEST file that it tries, and returns
+  // NotSupported when that file is a stub of store mode, because an older
+  // MANIFEST file in the folder misses the commits in the store.
+  //
   // Default: false
   bool best_efforts_recovery = false;
 
@@ -1872,12 +1886,23 @@ struct DBOptions {
   // would otherwise be retried by rescheduling the compaction) stops writes
   // until the user calls DB::Resume().
   //
+  // In store mode (see manifest_store) it also limits the retries after a
+  // store commit with an unknown outcome (resends and repeated reads of the
+  // DB row). After the last retry the DB stops with a fatal error. With the
+  // default, RocksDB retries until the outcome is known or the DB starts to
+  // close, and later MANIFEST writes wait during that time. A store commit
+  // inside DB::Open() makes no retry after a failed ReadDbRow() or resend, so
+  // DB::Open() returns the error.
+  //
   // Default: INT_MAX
   int max_bgerror_resume_count = INT_MAX;
 
   // If max_bgerror_resume_count is >= 2, db resume is called multiple times.
   // This option decides how long to wait to retry the next resume if the
   // previous resume fails and satisfy redo resume conditions.
+  //
+  // In store mode (see manifest_store) it is also the wait between two
+  // retries after a store commit with an unknown outcome.
   //
   // Default: 1000000 (microseconds).
   uint64_t bgerror_resume_retry_interval = 1000000;
@@ -1951,7 +1976,12 @@ struct DBOptions {
   // older MANIFEST view than that -- e.g. an eventually-consistent filesystem
   // returning a stale CURRENT, or a truncated MANIFEST -- and falls back to a
   // local compaction rather than risk an incorrect result computed against the
-  // wrong (older) LSM shape.
+  // wrong (older) LSM shape. In store mode (DBOptions::manifest_store) the
+  // MANIFEST file is a stub. The request then carries the stub number as the
+  // MANIFEST file number, and also the commit sequence of the store
+  // (CompactionServiceInput::min_store_commit_sequence). The worker compares
+  // the commit sequence of its store scan with that value instead of the
+  // MANIFEST position.
   //
   // The presence of this position on the request also enables the worker's
   // "trust the MANIFEST" recovery, which avoids failing a job over a
@@ -2166,6 +2196,69 @@ struct DBOptions {
   // re-opening of those files on DB open. This will help cut down DB open
   // latency on remote storage systems.
   bool fast_sst_open = false;
+
+  // EXPERIMENTAL
+  // This option sets the newest feature version of the public rows that RocksDB
+  // may write (see include/rocksdb/manifest_store.h). Raise it only after every
+  // binary that can open the DB knows the features of the new value, as with
+  // BlockBasedTableOptions::format_version. Valid values are 1 to
+  // kManifestRowFeatureVersionLatest. When manifest_store is set, every DB open
+  // function returns InvalidArgument for other values. Without a store, the
+  // value is not checked, so an OPTIONS file from a later release with a larger
+  // value still opens. In this release kManifestRowFeatureVersionLatest is 1,
+  // so 1 is the only valid value and it changes nothing. The option exists so
+  // that a later release can add row fields under a higher value.
+  uint32_t manifest_row_feature_version = 1;
+
+  // EXPERIMENTAL
+  // The external metadata store (see include/rocksdb/manifest_store.h). Null
+  // (the default) means that the MANIFEST file holds the metadata. When it is
+  // set, DB::Open(), DB::OpenForReadOnly(), DB::OpenAsSecondary() and
+  // DB::OpenAsFollower() open the DB in store mode: the rows in the store
+  // hold the metadata, and the MANIFEST file that CURRENT names is a small
+  // stub. A remote compaction worker gets the store from
+  // CompactionServiceOptionsOverride::manifest_store. DB::Open() with
+  // create_if_missing creates a new DB in the store. A DB whose CURRENT names a
+  // normal MANIFEST file needs manifest_store_migrate.
+  // include/rocksdb/manifest_store.h lists the paths that store mode does not
+  // support (for example DB::GetLiveFiles() and RepairDB()). DB::Open() returns
+  // InvalidArgument when best_efforts_recovery or best_efforts_blob_db_repair
+  // is also set. The object is not written to the OPTIONS file, because it
+  // belongs to one DB instance.
+  std::shared_ptr<ManifestStore> manifest_store = nullptr;
+
+  // EXPERIMENTAL
+  // Allows DB::Open() to change how an existing DB keeps its metadata. With
+  // manifest_store set, DB::Open() changes the mode of an existing DB only
+  // when this is true. It then does one of these:
+  // - move a DB whose MANIFEST file holds the metadata into the store
+  //   ("enter store mode", or "enter");
+  // - change the MANIFEST file copy mode of a DB in store mode to
+  //   manifest_store_copy_mode.
+  // When it is false, DB::Open() returns InvalidArgument for a DB whose
+  // CURRENT names a normal MANIFEST file, and keeps the copy mode of the DB.
+  // An enter that stopped (CURRENT names an "entering" stub) is not a new
+  // mode change: a read-write DB::Open() with manifest_store finishes or
+  // restarts it, also when this option is false.
+  // An enter also returns InvalidArgument when the store already holds this
+  // DB in store mode: the folder is then a copy of the DB folder, or a
+  // rollback without the store was not finished with a call that reaches the
+  // store (see RollBackManifestStore()).
+  // It is not written to the OPTIONS file, because it describes one
+  // DB::Open().
+  bool manifest_store_migrate = false;
+
+  // EXPERIMENTAL
+  // Whether RocksDB also writes the metadata as a MANIFEST file copy in store
+  // mode (see ManifestCopyMode in include/rocksdb/manifest_store.h). The
+  // value is stored in the store. DB::Open() uses this value when it creates
+  // a new DB in the store, and changes the copy mode of an existing DB only
+  // when manifest_store_migrate is true. Otherwise DB::Open() keeps the
+  // stored mode and writes a LOG line when this value differs. It is not
+  // written to the OPTIONS file. The default (zero) is ManifestCopyMode::kOff.
+  // When manifest_store is set, every DB open function returns
+  // InvalidArgument for a value above ManifestCopyMode::kSync.
+  ManifestCopyMode manifest_store_copy_mode{};
 
   // End EXPERIMENTAL
 };
@@ -3263,6 +3356,13 @@ struct IngestExternalFileOptions {
   bool move_files = false;
   // Same as move_files except that input files will NOT be unlinked.
   // Only one of `move_files` and `link_files` can be set at the same time.
+  //
+  // In store mode (see DBOptions::manifest_store), a failed ingestion can keep
+  // the files that it put into the DB, because the store may have applied the
+  // commit. With `move_files` or `link_files`, such a file can be a hard link
+  // to an input file. So after a failed ingestion, the caller must not change
+  // an input file in place (for example, open it with O_TRUNC and rewrite it).
+  // Deleting an input file is safe.
   bool link_files = false;
   // If set to true, ingestion falls back to copy when hard linking fails.
   // This applies to both `move_files` and `link_files`.
@@ -3543,6 +3643,13 @@ struct TraceOptions {
 // ImportColumnFamilyOptions is used by ImportColumnFamily()
 struct ImportColumnFamilyOptions {
   // Can be set to true to move the files instead of copying them.
+  //
+  // In store mode (see DBOptions::manifest_store), a failed import can keep the
+  // files that it put into the DB, because the store may have applied the
+  // commit. With `move_files`, such a file can be a hard link to an input file.
+  // So after a failed import, the caller must not change an input file in
+  // place (for example, open it with O_TRUNC and rewrite it). Deleting an input
+  // file is safe.
   bool move_files = false;
   // Like IngestExternalFileOptions::reject_too_old_file, using the
   // `file_creation_time` from the import metadata, or from the file itself if
@@ -3649,6 +3756,16 @@ struct CompactionServiceOptionsOverride {
   // Info Log. If not overriden, default one will be used.
   std::shared_ptr<Logger> info_log = nullptr;
 
+  // The store of a primary in store mode (DBOptions::manifest_store, see
+  // include/rocksdb/manifest_store.h for the terms). The OPTIONS file never
+  // holds the store, so the worker gets it only here. Use a store object
+  // without an epoch: the worker only reads the store (a consistent scan), and
+  // it never claims the DB, so it never fences the primary. Each
+  // DB::OpenAndCompact() call is its own DB instance, so give each concurrent
+  // call its own object, or a thread-safe one, and never the object that the
+  // primary uses. Null for a primary in file mode.
+  std::shared_ptr<ManifestStore> manifest_store = nullptr;
+
   // Only compaction generated SST files use this user defined table properties
   // collector.
   std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
@@ -3664,7 +3781,11 @@ struct OpenAndCompactOptions {
 
   // Maximum number of times to retry opening the source DB as a secondary
   // after the initial attempt fails because CURRENT or MANIFEST was replaced
-  // concurrently. A value of zero disables retries.
+  // concurrently. In store mode the open reads one point in time of the
+  // store. When a file of that state is missing and the primary made a newer
+  // commit, the primary may have deleted the file, so the open returns
+  // TryAgain, and this option retries it too (see the call order in
+  // include/rocksdb/manifest_store.h). A value of zero disables retries.
   //
   // Default: 2
   uint32_t max_secondary_open_retries = 2;

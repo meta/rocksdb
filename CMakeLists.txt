@@ -839,6 +839,8 @@ set(SOURCES
         db/log_writer.cc
         db/malloc_stats.cc
         db/manifest_ops.cc
+        db/manifest_rows.cc
+        db/manifest_store_state.cc
         db/memtable.cc
         db/memtable_list.cc
         db/merge_helper.cc
@@ -1461,6 +1463,7 @@ option(WITH_ALL_TESTS "Build all test, rather than a small subset" ON)
 if(WITH_TESTS OR WITH_BENCHMARK_TOOLS)
   add_subdirectory(third-party/gtest-1.8.1/fused-src/gtest)
   add_library(testharness STATIC
+  test_util/mock_manifest_store.cc
   test_util/mock_time_env.cc
   test_util/secondary_cache_test_util.cc
   test_util/testharness.cc)
@@ -1556,6 +1559,7 @@ if(WITH_TESTS)
         db/filename_test.cc
         db/flush_job_test.cc
         db/db_follower_test.cc
+        db/db_manifest_store_test.cc
         db/import_column_family_test.cc
         db/listener_test.cc
         db/log_test.cc

@@ -518,7 +518,12 @@ Status CheckpointImpl::CreateCheckpointImpl(
       // All files (including the copied MANIFEST) are now materialized in the
       // staging dir. If a subset of column families was requested, record the
       // excluded CFs as dropped in the copied MANIFEST so it is consistent with
-      // the reduced set of SST/blob files and opens under paranoid_checks.
+      // the reduced set of SST/blob files and opens under paranoid_checks. In
+      // store mode (manifest_store) the MANIFEST that
+      // GetLiveFilesStorageInfoForSubsetCheckpoint() built already leaves out
+      // the excluded column families and, when the DB tracks the OPTIONS file
+      // number in the MANIFEST, records the new OPTIONS file, so nothing is
+      // appended.
       if (s.ok() && !excluded_cf_ids.empty()) {
         if (manifest_relative_filename.empty()) {
           s = Status::Corruption(
@@ -527,7 +532,7 @@ Status CheckpointImpl::CreateCheckpointImpl(
           DBImpl* db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
           s = db_impl->CreateOptionsFileForSubsetCheckpoint(full_private_path,
                                                             options_snapshot);
-          if (s.ok()) {
+          if (s.ok() && !db_impl->MetadataInStore()) {
             s = db_impl->AppendColumnFamilyDropsToManifest(
                 full_private_path + "/" + manifest_relative_filename,
                 manifest_size, excluded_cf_ids,
@@ -719,8 +724,10 @@ Status CheckpointImpl::CreateCustomCheckpoint(
       }
     }
     if (!info.replacement_contents.empty()) {
-      // Currently should only be used for CURRENT file.
-      assert(info.file_type == kCurrentFile);
+      // Used for CURRENT, and in store mode also for the MANIFEST (see
+      // LiveFileStorageInfo::replacement_contents).
+      assert(info.file_type == kCurrentFile ||
+             info.file_type == kDescriptorFile);
 
       if (info.size != info.replacement_contents.size()) {
         s = Status::Corruption("Inconsistent size metadata for " +
