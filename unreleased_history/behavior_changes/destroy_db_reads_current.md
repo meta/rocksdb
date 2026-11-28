@@ -1,0 +1,1 @@
+`DestroyDB()` now reads CURRENT and the first record of the MANIFEST that CURRENT names. When an I/O error other than a missing file stops this read and the folder can be listed, it returns that error and deletes nothing.

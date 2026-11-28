@@ -102,6 +102,11 @@ class TaskLimiterToken;
 class Version;
 class VersionEdit;
 class VersionSet;
+class ManifestStoreState;
+struct CurrentManifestInfo;
+struct ManifestCfRows;
+struct ManifestDbRowResult;
+struct ManifestRows;
 class WriteCallback;
 struct JobContext;
 struct ExternalSstFileInfo;
@@ -1194,6 +1199,24 @@ class DBImpl : public DB
   // being deleted.
   uint64_t MinObsoleteSstNumberToKeep();
 
+  // Returns the smallest file number that RocksDB may still use or keep: the
+  // outputs of running flushes and compactions (MinObsoleteSstNumberToKeep()),
+  // the outputs that event listeners may still be told about
+  // (listener_pending_outputs_), the files that an external file ingestion
+  // reserved, and the blob direct write files that are open, or sealed and
+  // still referenced by a memtable. Returns the largest uint64_t value when
+  // there are none. This is the in-flight file number before the cap (see
+  // "In-flight file number" in the overview in db/manifest_store_state.h).
+  // Without a column family that uses blob direct write, the work is a few
+  // lookups of the smallest entry of ordered containers. With one, it also
+  // visits every column family and reads the smallest tracked blob file
+  // number of its blob partition manager
+  // (BlobFilePartitionManager::MinTrackedBlobFileNumber()). That takes one
+  // short lock for each such column family, and the lock is never held
+  // during blob cache work.
+  // REQUIRES: DB mutex held.
+  uint64_t MinFileNumberInUse();
+
   uint64_t GetObsoleteSstFilesSize();
 
   uint64_t MinOptionsFileNumberToKeep();
@@ -1446,6 +1469,194 @@ class DBImpl : public DB
   // Initialize a brand new DB. The DB directory is expected to be empty before
   // calling it. Push new manifest file name into `new_filenames`.
   Status NewDB(std::vector<std::string>* new_filenames);
+
+  // True in store mode when `s`, the result of a LogAndApply() of the caller,
+  // is an IOError. An external file ingestion or an import then keeps the
+  // files that it wrote into the DB, because the commit may have applied in
+  // the store (see "Quarantine" in db/manifest_store_state.h). Every failure
+  // of the store commit or of the sync copy after it is an IOError, and a
+  // follower in the MANIFEST write queue gets the status of the batch leader.
+  // The check is broader than needed: it is also true when the store surely
+  // did not apply the commit (a TryAgain, an IOFenced from the first send, or
+  // an error before any send). That is safe: no Version names such files, so
+  // a full-scan purge (delete_obsolete_files_period_micros) or the cleanup in
+  // DB::Open() deletes them later.
+  bool KeepFilesAfterStoreError(const Status& s) const {
+    return versions_->HasManifestStoreWriteState() && s.IsIOError();
+  }
+
+  // Store mode (see db/manifest_store_state.h). Defined in db_impl_open.cc.
+  //
+  // Creates a new DB in the store, for DB::Open() with create_if_missing when
+  // there is no CURRENT file:
+  // 1. Write a stub MANIFEST in state "creating" and point CURRENT to it.
+  // 2. Commit the first DB row and the default column family row, with
+  //    expected commit sequence 0 (CommitNewDbRows()).
+  // 3. Write a stub in state "done", point CURRENT to it, and delete the
+  //    first stub.
+  // A crash leaves the "creating" stub; the next DB::Open() finishes the
+  // create (FinishCreateDbInManifestStore()).
+  Status CreateDbInManifestStore(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      ManifestStoreState* state);
+
+  // Finishes a CreateDbInManifestStore() that stopped after step 1 or step 2,
+  // from the "creating" stub `current`. Without a DB row, it returns
+  // Corruption when the folder holds SST, blob or WAL files, because the
+  // create commits an empty DB. When the DB row has the db id of the stub and
+  // authority kStore, step 2 applied, and it runs only step 3. Otherwise it
+  // runs steps 2 and 3. On OK, `current` describes the "done" stub.
+  Status FinishCreateDbInManifestStore(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      ManifestStoreState* state, CurrentManifestInfo* current);
+
+  // Step 2 of CreateDbInManifestStore(). Commits the first DB row (with the db
+  // id db_id_) and the default column family row, with expected commit sequence
+  // 0. When the store holds a placeholder DB row (see the overview in
+  // db/manifest_store_state.h), it claims that row with Open() only if the row
+  // still has the commit sequence and last commit id that it read, and commits
+  // over it. Returns OK when the store then holds a DB row with db_id_. Returns
+  // InvalidArgument when the DB row belongs to another DB. Returns TryAgain
+  // when the commit did not apply, when the placeholder row changed before the
+  // claim (Busy; the claim then changes nothing), or when the store still has
+  // no DB row after an unknown outcome (a retry is safe, because the db id
+  // check finds the row of this DB). DB::Open() returns this TryAgain to the
+  // application. Returns IOError when the placeholder row was removed before
+  // the claim. The "creating" stub stays, so the next DB::Open() finishes the
+  // create (FinishCreateDbInManifestStore()). Returns IOFenced or IOError for
+  // other store errors, and the error of decoding the DB row.
+  Status CommitNewDbRows(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      ManifestStoreState* state);
+
+  // Replaces the stub that CURRENT names with a new stub in state "done",
+  // with a new file number and `db_id`, and deletes the old stub.
+  Status WriteDoneStub(uint64_t old_stub_number, uint64_t new_stub_number,
+                       const std::string& db_id);
+
+  // Moves a DB whose MANIFEST file `manifest_number` holds the metadata into
+  // the store ("enter store mode"), for DB::Open() with
+  // manifest_store_migrate. On OK, `*done_stub_number` is the stub that
+  // CURRENT names, and the VersionSet holds the state of the MANIFEST file,
+  // which is also the state of the rows. Steps:
+  // 1. Recover from the MANIFEST file, and check that the store holds
+  //    neither the rows of another DB nor this DB in store mode (authority
+  //    kStore, for example after a rollback without the store, or for a copy
+  //    of the DB folder).
+  // 2. Claim the DB and set the authority in the DB row to kFile
+  //    (ClaimForEnter()).
+  // 3. Delete the MANIFEST file copies and their pointer, which an earlier
+  //    rollback without the store may have left.
+  // 4. Write a stub in state "entering", with the MANIFEST number and size,
+  //    and point CURRENT to it. From now on a file-mode open fails.
+  // 5. Write all rows with ManifestStore::WriteGeneration(), with authority
+  //    kStore in the DB row. This switch is the moment the store becomes the
+  //    authority.
+  // 6. Delete the MANIFEST file.
+  // 7. Replace the stub with a stub in state "done".
+  // The state after each step:
+  //
+  //   After step  CURRENT names   DB row authority        Metadata holder
+  //   ----------  --------------  ----------------------  ---------------
+  //   1           MANIFEST file   no row, kFile, kShadow  MANIFEST file
+  //   2, 3        MANIFEST file   kFile                   MANIFEST file
+  //   4           entering stub   kFile                   MANIFEST file
+  //   5, 6        entering stub   kStore                  rows
+  //   7           done stub       kStore                  rows
+  //
+  // Why the switch is provable: step 2 sets the authority to kFile before the
+  // "entering" stub exists, and only step 5 sets kStore. So an "entering"
+  // stub with a kStore DB row that holds the db id of the stub means that
+  // step 5 applied. The db id matters, because another DB that uses the same
+  // store can write kStore rows of its own; FinishEnterManifestStore()
+  // checks it.
+  Status EnterManifestStore(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      ManifestStoreState* state, uint64_t manifest_number,
+      uint64_t* done_stub_number);
+
+  // Step 2 of EnterManifestStore(). Without a DB row, it creates one with
+  // authority kFile, so that the claim fences older instances. Sets
+  // `*commit_sequence` to the commit sequence after the claim. `read_row` is
+  // the DB row that the check of step 1 read, or null when there was none.
+  //
+  //   Row at the check  How it claims                When another writer won
+  //   ----------------  ---------------------------  -----------------------
+  //   yes               Open() with authority kFile  Busy or NotFound:
+  //                     and the expected commit      InvalidArgument
+  //                     sequence and last commit id
+  //                     of `read_row`
+  //   no                Commit() with expected       Busy: InvalidArgument
+  //                     commit sequence 0
+  //
+  // Both claims apply only to the DB row that step 1 checked (or to no DB
+  // row). So when another writer changed the DB row after that read, also by
+  // removing it and creating it again, the store changes nothing, and this
+  // returns InvalidArgument: the epoch, the authority and the rows of the
+  // other writer stay as they are. When creating the DB row has an unknown
+  // outcome and the DB row does not show that commit, it returns IOError.
+  Status ClaimForEnter(ManifestStoreState* state,
+                       const ManifestDbRowResult* read_row,
+                       uint64_t* commit_sequence);
+
+  // Called by Recover() before a create with create_if_missing: when CURRENT
+  // is missing, or, with best-efforts recovery, when the folder has no
+  // non-empty MANIFEST file. It returns:
+  // - NotSupported when a stub is in the folder (see
+  //   FindSurvivingManifestStub()). The exception, with a store in the options:
+  //   the only stub is a creating stub whose record decodes, no normal MANIFEST
+  //   file is there, and the store has no DB row. The first store commit of a
+  //   create writes the DB row (CommitNewDbRows()), so that create committed
+  //   nothing to the store, and the open creates the DB again.
+  // - InvalidArgument, with a store in the options, when no stub is there but a
+  //   non-empty normal MANIFEST file is (also a damaged one): a file-mode DB
+  //   lost its CURRENT. Without a store, the create runs as in file mode.
+  // - The error of listing the folder (other than a missing folder), of
+  //   reading a MANIFEST file (other than a missing or damaged file), or of
+  //   reading the DB row.
+  // `files_in_dbname` is the listing of best-efforts recovery; when it is
+  // empty, this function lists the folder. REQUIRES: the DB lock is held.
+  Status CheckNoSurvivingStubBeforeCreate(
+      const std::vector<std::string>& files_in_dbname);
+
+  // Finishes an EnterManifestStore() that stopped after step 4, from the
+  // "entering" stub `current`. With a kFile DB row the switch did not happen:
+  // it points CURRENT back to the MANIFEST file and runs EnterManifestStore()
+  // again, and sets `*recovered_from_manifest`. With a kStore DB row it runs
+  // steps 6 and 7. On OK, `current` describes the "done" stub.
+  Status FinishEnterManifestStore(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      ManifestStoreState* state, CurrentManifestInfo* current,
+      bool* recovered_from_manifest);
+
+  // Recovers the DB from the store for DB::Open() and DB::OpenForReadOnly(),
+  // instead of VersionSet::Recover(). Steps:
+  // 1. Read CURRENT. By what it names:
+  //    - a normal MANIFEST: EnterManifestStore(), only with
+  //      manifest_store_migrate;
+  //    - an "entering" stub: FinishEnterManifestStore();
+  //    - a "creating" stub: FinishCreateDbInManifestStore();
+  //    - a "done" stub: no change.
+  //    A read-only open accepts only a "done" stub.
+  // 2. A read-write open checks that the DB row belongs to this DB, then
+  //    claims it (CheckOwnerAndClaim()). A read-only open makes no claim.
+  // 3. Scan all rows, and check the authority and the db id of the DB row.
+  // 4. Replay the rows into the VersionSet (VersionSet::RecoverFromStore()),
+  //    unless step 1 already recovered it from the MANIFEST file.
+  // 5. A read-write open gives `state` to the VersionSet and starts the
+  //    MANIFEST file copy (VersionSet::StartManifestCopyAtOpen()).
+  // A missing CURRENT is handled before this call: DBImpl::Recover() creates
+  // the DB first (CreateDbInManifestStore()).
+  Status RecoverFromManifestStore(
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      bool read_only, std::unique_ptr<ManifestStoreState> state);
+
+  // Returns the rows of the recovered column families whose timestamp size,
+  // persist_user_defined_timestamps or comparator name differs from their
+  // rows in `stored` (see ManifestStoreState::SetRewrite()).
+  // REQUIRES: DB mutex held.
+  std::map<uint32_t, ManifestCfRows> RowsToRewriteAfterOpen(
+      const ManifestRows& stored);
 
   // This is to be used only by internal rocksdb classes.
   static Status Open(const DBOptions& db_options, const std::string& name,
@@ -1864,6 +2075,27 @@ class DBImpl : public DB
   std::atomic<int> next_job_id_ = 1;
 
   std::atomic<bool> shutting_down_ = false;
+
+  // Set at the start of CloseHelper() (DB::Close() and the destructor), before
+  // the shutdown flush and the wait for error recovery, which can commit to
+  // the store in store mode. The retry loop of a store commit checks it and
+  // shutting_down_ (ManifestStoreState::RetryPolicy::opening_or_closing):
+  // - During a close, the loop gives up at the first failed ReadDbRow() or
+  //   resend, so the close does not wait for a store that does not answer.
+  //   The cost: a short store failure during the shutdown flush can stop
+  //   the DB, and data written without the WAL is lost.
+  // - A direct CancelAllBackgroundWork() call without a close sets
+  //   shutting_down_ only after its own shutdown flush, so that flush keeps
+  //   the full retry limit. Later commits give up as during a close.
+  std::atomic<bool> closing_ = false;
+  // True until DB::Open() succeeds. In store mode, a store commit inside
+  // DB::Open() (for example the commit of LogAndApplyForRecovery()) checks it
+  // (ManifestStoreState::RetryPolicy::opening_or_closing), so it gives up at
+  // the first failed ReadDbRow() or resend, and DB::Open() returns the error.
+  // A failed MANIFEST write fails DB::Open() in file mode too. Nothing can
+  // close a DB that is still opening, so without this flag the commit could
+  // retry without end while it holds the folder lock.
+  std::atomic<bool> opening_ = true;
   // Protected by mutex_. This is separate from shutting_down_ because
   // OnDBShutdownBegin must fire before shutting_down_ is published, and the
   // notification releases mutex_ while invoking listeners. Marking that the
@@ -3599,16 +3831,22 @@ class DBImpl : public DB
   // Validate self-consistency of DB options
   static Status ValidateOptions(const DBOptions& db_options);
 
-  // Checks DBOptions::manifest_store and manifest_row_feature_version. Every DB
-  // open function must call it first, before it changes anything on disk.
-  // Without a store it returns OK and does not read the feature version, which
-  // only matters for a store. With a store it returns InvalidArgument when the
-  // feature version is not from 1 to kManifestRowFeatureVersionLatest, and
-  // NotSupported otherwise, because this release does not support store mode (a
-  // DB whose metadata lives in a ManifestStore). It checks the feature version
-  // before it refuses the store, so that a bad value gives the same
-  // InvalidArgument now and after store mode is supported.
-  static Status CheckManifestStoreOptions(const DBOptions& db_options);
+  // Checks DBOptions::manifest_store and manifest_row_feature_version. Every
+  // DB open function calls it before it changes anything on disk:
+  // DBImpl::Open(), both DB::OpenForReadOnly() functions,
+  // DBImplSecondary::OpenAsSecondaryImpl() and DB::OpenAsFollower(). Without a
+  // store it returns OK and does not read the feature version, which only
+  // matters for a store. With a store, the results are:
+  // - InvalidArgument when the feature version is not from 1 to
+  //   kManifestRowFeatureVersionLatest;
+  // - InvalidArgument when manifest_store_copy_mode is above
+  //   ManifestCopyMode::kSync;
+  // - NotSupported when `store_mode_supported` is false (see "Not supported in
+  //   store mode yet" in include/rocksdb/manifest_store.h);
+  // - InvalidArgument with best_efforts_recovery or
+  //   best_efforts_blob_db_repair, and NotSupported with compaction_service.
+  static Status CheckManifestStoreOptions(const DBOptions& db_options,
+                                          bool store_mode_supported);
 
   // Validate self-consistency of DB options and its consistency with cf options
   static Status ValidateOptions(
@@ -4131,8 +4369,10 @@ class DBImpl : public DB
 
   // First file number -> reserved file count for external file ingestions.
   // Full-scan purge snapshots protect these SSTs until commit or cleanup.
+  // A std::map, so that MinFileNumberInUse() reads the smallest first file
+  // number without a pass over all ingestions.
   // State is protected with db mutex.
-  UnorderedMap<uint64_t, uint64_t> pending_ingestion_outputs_;
+  std::map<uint64_t, uint64_t> pending_ingestion_outputs_;
 
   // Similar to pending_outputs_, FindObsoleteFiles()/PurgeObsoleteFiles() never
   // deletes any OPTIONS file that has number bigger than any of the file number
