@@ -1,0 +1,1 @@
+Fixed a bug where, with `min_tombstones_for_range_conversion` set in a column family with user-defined timestamps, a scan at the latest timestamp could insert a range tombstone that hid keys from later reads at an older timestamp. Read-path range tombstone conversion is now disabled in column families with user-defined timestamps.
