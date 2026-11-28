@@ -6,6 +6,7 @@
 #ifdef GFLAGS
 #pragma once
 
+#include <atomic>
 #include <cinttypes>
 #include <mutex>
 #include <unordered_map>
@@ -23,6 +24,7 @@
 #include "rocksdb/unique_id.h"
 #include "util/atomic.h"
 #include "util/gflags_compat.h"
+#include "util/hash.h"
 #include "util/random.h"
 #include "utilities/fault_injection_fs.h"
 DECLARE_int32(compact_files_one_in);
@@ -104,33 +106,32 @@ class DbStressListener : public EventListener {
                     const FlushJobInfo& /*flush_job_info*/) override {
     RandomSleep();
     if (db_fault_injection_fs_) {
+      const uint32_t seed = NextFaultInjectionSeed();
       db_fault_injection_fs_->SetThreadLocalErrorContext(
-          FaultInjectionIOType::kRead, static_cast<uint32_t>(FLAGS_seed),
-          FLAGS_read_fault_one_in,
+          FaultInjectionIOType::kRead, seed, FLAGS_read_fault_one_in,
           FLAGS_inject_error_severity == 1 /* retryable */,
           FLAGS_inject_error_severity == 2 /* has_data_loss*/);
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
           FaultInjectionIOType::kRead);
 
       db_fault_injection_fs_->SetThreadLocalErrorContext(
-          FaultInjectionIOType::kWrite, static_cast<uint32_t>(FLAGS_seed),
-          FLAGS_write_fault_one_in,
+          FaultInjectionIOType::kWrite, seed, FLAGS_write_fault_one_in,
           FLAGS_inject_error_severity == 1 /* retryable */,
           FLAGS_inject_error_severity == 2 /* has_data_loss*/);
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
           FaultInjectionIOType::kWrite);
 
       db_fault_injection_fs_->SetThreadLocalErrorContext(
-          FaultInjectionIOType::kMetadataRead,
-          static_cast<uint32_t>(FLAGS_seed), FLAGS_metadata_read_fault_one_in,
+          FaultInjectionIOType::kMetadataRead, seed,
+          FLAGS_metadata_read_fault_one_in,
           FLAGS_inject_error_severity == 1 /* retryable */,
           FLAGS_inject_error_severity == 2 /* has_data_loss*/);
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
           FaultInjectionIOType::kMetadataRead);
 
       db_fault_injection_fs_->SetThreadLocalErrorContext(
-          FaultInjectionIOType::kMetadataWrite,
-          static_cast<uint32_t>(FLAGS_seed), FLAGS_metadata_write_fault_one_in,
+          FaultInjectionIOType::kMetadataWrite, seed,
+          FLAGS_metadata_write_fault_one_in,
           FLAGS_inject_error_severity == 1 /* retryable */,
           FLAGS_inject_error_severity == 2 /* has_data_loss*/);
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
@@ -300,33 +301,32 @@ class DbStressListener : public EventListener {
 
   void OnSubcompactionBegin(const SubcompactionJobInfo& /* si */) override {
     if (db_fault_injection_fs_) {
+      const uint32_t seed = NextFaultInjectionSeed();
       db_fault_injection_fs_->SetThreadLocalErrorContext(
-          FaultInjectionIOType::kRead, static_cast<uint32_t>(FLAGS_seed),
-          FLAGS_read_fault_one_in,
+          FaultInjectionIOType::kRead, seed, FLAGS_read_fault_one_in,
           FLAGS_inject_error_severity == 1 /* retryable */,
           FLAGS_inject_error_severity == 2 /* has_data_loss*/);
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
           FaultInjectionIOType::kRead);
 
       db_fault_injection_fs_->SetThreadLocalErrorContext(
-          FaultInjectionIOType::kWrite, static_cast<uint32_t>(FLAGS_seed),
-          FLAGS_write_fault_one_in,
+          FaultInjectionIOType::kWrite, seed, FLAGS_write_fault_one_in,
           FLAGS_inject_error_severity == 1 /* retryable */,
           FLAGS_inject_error_severity == 2 /* has_data_loss*/);
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
           FaultInjectionIOType::kWrite);
 
       db_fault_injection_fs_->SetThreadLocalErrorContext(
-          FaultInjectionIOType::kMetadataRead,
-          static_cast<uint32_t>(FLAGS_seed), FLAGS_metadata_read_fault_one_in,
+          FaultInjectionIOType::kMetadataRead, seed,
+          FLAGS_metadata_read_fault_one_in,
           FLAGS_inject_error_severity == 1 /* retryable */,
           FLAGS_inject_error_severity == 2 /* has_data_loss*/);
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
           FaultInjectionIOType::kMetadataRead);
 
       db_fault_injection_fs_->SetThreadLocalErrorContext(
-          FaultInjectionIOType::kMetadataWrite,
-          static_cast<uint32_t>(FLAGS_seed), FLAGS_metadata_write_fault_one_in,
+          FaultInjectionIOType::kMetadataWrite, seed,
+          FLAGS_metadata_write_fault_one_in,
           FLAGS_inject_error_severity == 1 /* retryable */,
           FLAGS_inject_error_severity == 2 /* has_data_loss*/);
       db_fault_injection_fs_->EnableThreadLocalErrorInjection(
@@ -545,6 +545,24 @@ class DbStressListener : public EventListener {
     reported_files_.insert(file_numbers.begin(), file_numbers.end());
   }
 
+  // Returns a new seed for the thread-local fault contexts of one flush or
+  // subcompaction, so that each job, including a retry of a failed job, gets
+  // its own fault sequence. With the same sequence, a flush retried by the
+  // automatic error recovery would fail at the same I/O again, and the recovery
+  // would retry forever. The seed is a hash of the run seed (--seed) and a
+  // counter, because Random is a Lehmer generator and nearby seeds give
+  // closely related sequences. The listener is created again at each DB open,
+  // so the counter starts again at 0 after a reopen.
+  uint32_t NextFaultInjectionSeed() {
+    uint64_t hash_high = 0;
+    uint64_t hash_low = 0;
+    BijectiveHash2x64(
+        shared_->GetSeed(),
+        fault_injection_seed_counter_.fetch_add(1, std::memory_order_relaxed),
+        &hash_high, &hash_low);
+    return Lower32of64(hash_low);
+  }
+
   // Occasionally holds a completion callback open for longer, so that other
   // compactions have time to make a reported file obsolete and purge it.
   // Otherwise the callbacks rarely last long enough for such a deletion to
@@ -573,6 +591,8 @@ class DbStressListener : public EventListener {
   UniqueIdVerifier unique_ids_;
   SharedState* shared_;
   std::shared_ptr<FaultInjectionTestFS> db_fault_injection_fs_;
+  // Counts the fault injection seeds handed out by NextFaultInjectionSeed().
+  std::atomic<uint64_t> fault_injection_seed_counter_{0};
   mutable std::mutex bg_pressure_mu_;
   BackgroundJobPressure last_bg_pressure_;
   // Files (by file_number) currently in flight from OnCompactionBegin to
