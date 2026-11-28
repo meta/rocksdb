@@ -6411,9 +6411,11 @@ Status VersionSet::ProcessManifestWrites(
     batch_edits.back()->SetNextFile(next_file_number_.load());
 
     // if we are writing out new snapshot make sure to persist max column
-    // family.
+    // family. Set it on the first edit that the batch writes. The first
+    // writer's edits are not written if its column family was dropped while
+    // it waited.
     if (column_family_set_->GetMaxColumnFamily() > 0) {
-      first_writer.edit_list.front()->SetMaxColumnFamily(
+      batch_edits.front()->SetMaxColumnFamily(
           column_family_set_->GetMaxColumnFamily());
     }
     for (const auto* cfd : *column_family_set_) {
