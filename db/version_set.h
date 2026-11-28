@@ -83,6 +83,8 @@ class ColumnFamilySet;
 class MergeIteratorBuilder;
 class SystemClock;
 class ManifestTailer;
+struct ManifestDbRow;
+struct ManifestRows;
 class FilePickerMultiGet;
 class MultiScanArgs;
 
@@ -1990,6 +1992,20 @@ class VersionSet {
   // The returned WalSet needs to be accessed with DB mutex held.
   const WalSet& GetWalSet() const { return wals_; }
 
+  // Sets `rows` to the structured MANIFEST rows of the current state (see
+  // db/manifest_rows.h). Rows of dropped column families are not included. It
+  // copies the metadata of every live file while the caller holds the DB
+  // mutex, so a caller must not call it for every MANIFEST write. Tests and
+  // tools call it. On the write path, only the debug check of
+  // ProcessManifestWrites() calls it, and only in debug builds: on the first
+  // call, and on the next call after a WAL edit was rejected (see
+  // debug_manifest_rows_). After each successful MANIFEST write, that check
+  // applies the row changes instead.
+  // Defined in db/manifest_rows.cc, like the other row functions of
+  // VersionSet.
+  // REQUIRES: DB mutex held.
+  void GetManifestRows(ManifestRows* rows) const;
+
   void TEST_CreateAndAppendVersion(ColumnFamilyData* cfd) {
     assert(cfd);
 
@@ -2133,7 +2149,8 @@ class VersionSet {
   // holding DB mutex if outside of DB startup.
   void TuneMaxManifestFileSize();
 
-  // Protected by DB mutex.
+  // Protected by DB mutex. Debug builds also read it without the mutex (see
+  // "Threads" at debug_manifest_rows_).
   WalSet wals_;
 
   std::unique_ptr<ColumnFamilySet> column_family_set_;
@@ -2236,6 +2253,138 @@ class VersionSet {
   // Saved copy from (Mutable)DBOptions
   bool verify_manifest_content_on_close_ = false;
 
+#ifndef NDEBUG
+  // Structured MANIFEST rows (db/manifest_rows.h) that debug builds keep to
+  // check BuildManifestRowChanges(). The rows start as a copy of the installed
+  // metadata. For each batch, phase 1 of the check (see the table below)
+  // applies the row changes of the batch to the rows. It does this after the
+  // MANIFEST write succeeds and after the WAL edits of the batch succeed on a
+  // trial copy of the WAL set, before the batch is installed. The check then
+  // compares the rows with the new Versions before install (phase 1) and with
+  // the in-memory state after install (phase 2). When the trial rejects a WAL
+  // edit, the batch is not installed, and the rows are cleared (reset to null),
+  // so the next call copies them again from the installed metadata.
+  //
+  // The check compares the fields that the table below lists, and allows the
+  // differences listed in "In-memory differences" in db/manifest_rows.h. So it
+  // does not show that every row equals the in-memory state.
+  //
+  // Lifecycle: ProcessManifestWrites() fills it from the installed state with
+  // the DB mutex held, on its first call, on the first call after a WAL edit
+  // was rejected, and on the first call after VersionSet::Reset(). This copies
+  // the metadata of every live file with the DB mutex held; the cost of that
+  // copy was not measured. The first call is the first LogAndApply() of the
+  // VersionSet. This is often the MANIFEST write of DB::Open(). It can also be
+  // a call that writes no MANIFEST record, such as the dummy edit of
+  // DB::SetOptions().
+  //
+  //   ProcessManifestWrites()
+  //     DB mutex held   fill, if debug_manifest_rows_ is null
+  //     no DB mutex     write the MANIFEST, then phase 1, which applies the
+  //                     WAL edits to its own copy of the WAL set (or resets
+  //                     debug_manifest_rows_ when a WAL edit is rejected)
+  //     DB mutex held   apply the WAL edits to the live WAL set (wals_)
+  //                     - all succeed: install the new Versions, then phase 2
+  //                     - one fails: install no Version; the earlier WAL
+  //                       edits stay in wals_, so the next call fills
+  //                       debug_manifest_rows_ again from the live state
+  //
+  // Each MANIFEST write that is installed runs the check in two phases. The
+  // check is split so that the work that grows with the number of files (phase
+  // 1) runs without the DB mutex. Phase 2 checks only the values that exist in
+  // memory after install. It costs a few lookups for each edit, a compare of
+  // the WAL rows with wals_ in place (O(live WALs), with no copy), and
+  // O(levels) for an added column family (see DebugCheckRowsAfterInstall()).
+  //
+  //   Phase   When                     What it checks
+  //   ------  -----------------------  --------------------------------------
+  //   1       no DB mutex, before the  builds and applies the row changes;
+  //           new Versions are         for each new Version: the file number
+  //           installed                and level of every file, the total
+  //                                    file count, the MANIFEST encoding of
+  //                                    added files (see
+  //                                    AssertCfRowsMatchVersion()),
+  //                                    the blob file rows, and the column
+  //                                    family row except the log number,
+  //                                    full_history_ts_low and dropped flag
+  //                                    (phase 2 checks these)
+  //   2       DB mutex held, after     the DB row (with the rules below) and
+  //           install                  the WAL rows; for each column family
+  //                                    named in the edits: the log number (at
+  //                                    least the value in each edit, at most
+  //                                    the in-memory value),
+  //                                    full_history_ts_low and the dropped
+  //                                    flag; the whole row of an added column
+  //                                    family
+  //
+  // A column family drop installs no new Version, so phase 1 checks the
+  // current Version of that column family in its place. ManifestCfRow::dropped
+  // in db/manifest_rows.h says how both phases handle the rows of a dropped
+  // column family.
+  //
+  // Phase 2 does not require the DB row to equal memory in every field.
+  // DebugCheckRowsAfterInstall() has the rules for each field:
+  // - The next file number in the row is at least the value in the previous
+  //   debug rows (phase 1 checks this) and at most the in-memory value (phase
+  //   2 checks this). The in-memory value can grow after the batch records it.
+  // - The max column family id in the row can be smaller than in memory, never
+  //   larger.
+  // - The DB id comes from the last edit of the batch that sets it, or from
+  //   memory when no edit sets it.
+  // - The row can keep a committed OPTIONS file number after memory has
+  //   cleared it.
+  //
+  // What phase 1 checks against an independent source, and what it checks only
+  // for bookkeeping:
+  // - File rows: BuildManifestRowChanges() builds them from the file additions
+  //   and deletions in the edits. Phase 1 compares them with the files of the
+  //   new Version, which VersionBuilder built. So a lost file addition or
+  //   deletion, or a wrong level, is found. The fields of an added file are
+  //   compared with MakeFileRow() on both sides, so a field that MakeFileRow()
+  //   leaves out is not found.
+  // - Column family rows and blob file rows: BuildManifestRowChanges() builds
+  //   them with MakeManifestCfRow() and MakeBlobFileRow() from the new Version,
+  //   and phase 1 builds the expected rows with the same functions from the
+  //   same Version. So for these rows phase 1 finds only bookkeeping mistakes
+  //   (a stale, missing or extra row), not a field that these functions leave
+  //   out or get wrong. ManifestRowsRoundTrip in db/version_set_test.cc checks
+  //   such fields with explicit asserts. The row of an added column family is
+  //   the exception: BuildManifestRowChanges() builds it from the edit and the
+  //   options, and phase 2 compares it with MakeManifestCfRow().
+  //
+  // Phase 1 is DebugCheckRowsBeforeInstall(). Phase 2 is
+  // DebugCheckRowsAfterInstall().
+  //
+  // Threads: phase 1 runs without the DB mutex. Only one thread at a time runs
+  // ProcessManifestWrites(), and only that thread uses debug_manifest_rows_,
+  // changes wals_ and installs Versions. Phase 1 reads these objects, each safe
+  // for the reason given:
+  // - debug_manifest_rows_ and wals_: only the thread that runs
+  //   ProcessManifestWrites() changes them, and that thread is running phase
+  //   1. Recovery also changes wals_, but recovery and ProcessManifestWrites()
+  //   never run at the same time.
+  // - The new Versions: they are not installed yet, so no other thread can
+  //   see them.
+  // - The base Versions: each one is referenced by its builder, so it is not
+  //   freed, and its file lists do not change.
+  // - The current Version of a column family that is being dropped: no other
+  //   thread installs Versions, so it does not change.
+  // - ColumnFamilyData: phase 1 reads the id, the name, the comparator and the
+  //   options, which are set when the column family is created and never
+  //   change. It also reads the dropped flag, which only the thread that runs
+  //   ProcessManifestWrites() sets, when it installs a drop.
+  // - FileMetaData objects shared with the current Version: other threads can
+  //   set marked_for_compaction on them (DB::SuggestCompactRange()), so phase
+  //   1 reads only their number and level, which never change. It reads all
+  //   fields only of the files that the write adds (changes.file_upserts).
+  //   VersionBuilder::ApplyFileAddition() makes a new FileMetaData object for
+  //   each added file, also for a trivial move that keeps the SST file number,
+  //   so no other thread uses these objects yet.
+  // - BlobFileMetaData objects: they never change.
+  // Phase 2 allows for the in-memory differences listed in db/manifest_rows.h.
+  std::unique_ptr<ManifestRows> debug_manifest_rows_;
+#endif
+
   // Obsolete files, or during DB shutdown any files not referenced by what's
   // left of the in-memory LSM state.
   std::vector<ObsoleteFileInfo> obsolete_files_;
@@ -2270,6 +2419,37 @@ class VersionSet {
                                bool new_cf_options_are_sanitized,
                                const ReadOptions& read_options,
                                const WriteOptions& write_options);
+
+  // Sets `db_row` from the current state. See GetManifestRows(). Defined in
+  // db/manifest_rows.cc.
+  void SetManifestDbRow(ManifestDbRow* db_row) const;
+  // Sets the DB row and the WAL rows of `rows` from the current state. See
+  // GetManifestRows(). Defined in db/manifest_rows.cc.
+  void SetManifestDbRowAndWals(ManifestRows* rows) const;
+
+#ifndef NDEBUG
+  // Phase 1 of the debug check, see debug_manifest_rows_. Defined in
+  // db/manifest_rows.cc. ProcessManifestWrites() calls this function after a
+  // successful MANIFEST write, before it takes the DB mutex again. When
+  // BuildManifestRowChanges() rejects a WAL edit, this function resets
+  // debug_manifest_rows_ and checks nothing. Installing the write then fails
+  // too. builder_guards[i] holds the base Version of new_versions[i]. first_cfd
+  // is the column family of the first writer; it is used for a column family
+  // drop.
+  void DebugCheckRowsBeforeInstall(
+      const autovector<VersionEdit*>& batch_edits,
+      const autovector<Version*>& new_versions,
+      const std::vector<std::unique_ptr<BaseReferencedVersionBuilder>>&
+          builder_guards,
+      ColumnFamilyData* first_cfd, const ColumnFamilyOptions* new_cf_options);
+
+  // Phase 2 of the debug check, see debug_manifest_rows_. Defined in
+  // db/manifest_rows.cc. ProcessManifestWrites() calls this after it installs
+  // the write, with the DB mutex held. The cost is a few lookups for each edit,
+  // O(live WALs), and O(levels) for an added column family. For a dropped
+  // column family, see ManifestCfRow::dropped.
+  void DebugCheckRowsAfterInstall(const autovector<VersionEdit*>& batch_edits);
+#endif
 
   Status LogAndApplyImpl(
       const autovector<ColumnFamilyData*>& column_family_datas,
