@@ -153,6 +153,11 @@ struct IngestedFileInfo : public KeyRangeInfo {
   // When the file was linked, copied or written into the DB directory, i.e.
   // when this DB began holding it (FileMetaData::db_ownership_start_time)
   uint64_t db_ownership_start_time = kUnknownDbOwnershipStartTime;
+  // Opaque file system metadata for the file inside the DB, used to make
+  // later opens of the file faster (FileMetaData::file_open_metadata).
+  // Prepare() fills it when DBOptions::fast_sst_open is on. Empty when the file
+  // system does not return any.
+  std::string file_open_metadata;
   // Global sequence number that we picked for the file inside the DB
   SequenceNumber assigned_seqno = 0;
   // Level inside the DB we picked for the external file.
@@ -452,6 +457,12 @@ class ExternalSstFileIngestionJob {
   // Returns whether any two files in `files` have overlapping key ranges, by
   // sorting the file ranges and checking adjacent pairs.
   bool ComputeFilesOverlap(const autovector<IngestedFileInfo>& files) const;
+
+  // Asks the file system for the open metadata of the file inside the DB and
+  // stores it in file_to_ingest->file_open_metadata. This opens the file, so it
+  // runs in Prepare(), without the DB mutex. A failure only leaves the metadata
+  // empty, because the metadata is a hint.
+  void RetrieveFileOpenMetadata(IngestedFileInfo* file_to_ingest);
 
   // Assign level for the files in one batch. The files within one batch are not
   // overlapping, and we assign level to each file one after another.

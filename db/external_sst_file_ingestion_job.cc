@@ -643,11 +643,59 @@ Status ExternalSstFileIngestionJob::Prepare(
     }
   }
 
+  // The open metadata describes the file inside the DB, so it is retrieved
+  // after the file is linked or copied there. It needs one file open, which
+  // must not run under the DB mutex, so it is done here and not in Run().
+  // Prepare() reads fast_sst_open once. If SetDBOptions() changes it before
+  // the commit, the commit still stores what Prepare() retrieved.
+  if (status.ok() && cfd_->table_cache()->GetFastSstOpen()) {
+    for (IngestedFileInfo& f : files_to_ingest_) {
+      RetrieveFileOpenMetadata(&f);
+    }
+    // Prepare() writes this range tombstone file when the atomic replace
+    // range partly overlaps an existing file. Run() checks the overlap again
+    // and ingests this file only if the overlap still exists. The metadata is
+    // retrieved here anyway, so that Run() does not need to open the file.
+    if (atomic_replace_range_tombstone_.has_value()) {
+      RetrieveFileOpenMetadata(&*atomic_replace_range_tombstone_);
+    }
+  }
+
   if (status.ok()) {
     DivideInputFilesIntoBatches();
   }
 
   return status;
+}
+
+void ExternalSstFileIngestionJob::RetrieveFileOpenMetadata(
+    IngestedFileInfo* file_to_ingest) {
+  assert(file_to_ingest->file_open_metadata.empty());
+  std::unique_ptr<FSRandomAccessFile> readable_file;
+  FileOptions fopts{env_options_};
+  fopts.file_checksum = file_to_ingest->file_checksum;
+  fopts.file_checksum_func_name = file_to_ingest->file_checksum_func_name;
+  IOStatus io_s = fs_->NewRandomAccessFile(file_to_ingest->internal_file_path,
+                                           fopts, &readable_file, nullptr);
+  if (!io_s.ok()) {
+    return;
+  }
+  // Use a local string, so that the memory of rejected metadata is freed
+  // here and not kept in file_to_ingest until the ingestion ends.
+  std::string metadata;
+  io_s = readable_file->GetFileOpenMetadata(&metadata);
+  if (io_s.ok() && !metadata.empty() &&
+      metadata.size() <= FSRandomAccessFile::kMaxFileOpenMetadataSize) {
+    RecordTick(db_options_.stats, FILE_OPEN_METADATA_RETRIEVED);
+    file_to_ingest->file_open_metadata = std::move(metadata);
+    return;
+  }
+  if (io_s.ok() &&
+      metadata.size() > FSRandomAccessFile::kMaxFileOpenMetadataSize) {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "File open metadata for %s too large (%zu bytes), ignoring",
+                   file_to_ingest->internal_file_path.c_str(), metadata.size());
+  }
 }
 
 void ExternalSstFileIngestionJob::DivideInputFilesIntoBatches() {
@@ -1024,34 +1072,9 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
     // This ensures ingested files have proper timestamp ranges in FileMetaData,
     // similar to files created by flush and compaction.
     ExtractTimestampFromTableProperties(file->table_properties, &f_metadata);
-    // Retrieve file open metadata for fast SST open
-    if (mutable_db_options_.fast_sst_open) {
-      std::unique_ptr<FSRandomAccessFile> readable_file;
-      FileOptions fopts{env_options_};
-      fopts.file_checksum = f_metadata.file_checksum;
-      fopts.file_checksum_func_name = f_metadata.file_checksum_func_name;
-      IOStatus io_s = fs_->NewRandomAccessFile(file->internal_file_path, fopts,
-                                               &readable_file, nullptr);
-      if (io_s.ok()) {
-        io_s =
-            readable_file->GetFileOpenMetadata(&f_metadata.file_open_metadata);
-        if (io_s.ok() && !f_metadata.file_open_metadata.empty() &&
-            f_metadata.file_open_metadata.size() <=
-                FSRandomAccessFile::kMaxFileOpenMetadataSize) {
-          RecordTick(db_options_.stats, FILE_OPEN_METADATA_RETRIEVED);
-        } else {
-          if (io_s.ok() && f_metadata.file_open_metadata.size() >
-                               FSRandomAccessFile::kMaxFileOpenMetadataSize) {
-            ROCKS_LOG_WARN(db_options_.info_log,
-                           "File open metadata for %s too large (%zu bytes), "
-                           "ignoring",
-                           file->internal_file_path.c_str(),
-                           f_metadata.file_open_metadata.size());
-          }
-          f_metadata.file_open_metadata.clear();
-        }
-      }
-    }
+    // Prepare() retrieved the open metadata without the DB mutex. Run() holds
+    // the mutex, so it only moves the value here.
+    f_metadata.file_open_metadata = std::move(file->file_open_metadata);
     edit_.AddFile(file->picked_level, f_metadata);
 
     *batch_uppermost_level =
