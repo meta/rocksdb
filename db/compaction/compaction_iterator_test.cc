@@ -646,6 +646,59 @@ TEST_P(CompactionIteratorTest, MergeBeforeFilterSingleDeleteAndCancellation) {
       trace.Events());
 }
 
+// A DB close can start while PrefilterUncombinedOutputs() filters an
+// uncombined operand batch (the merge operator declines partial merges, and
+// the compaction has no base value). The filter below sets the shutdown flag
+// when it runs. The iterator must then stop with ShutdownInProgress and return
+// no row from the batch. The test runs with one and with two operands in the
+// batch.
+TEST_P(CompactionIteratorTest, MergeBeforeFilterShutdownDuringPrefilter) {
+  if (GetParam()) {
+    return;
+  }
+  class ShutdownFilter : public test::RecordingMergeFilter {
+   public:
+    ShutdownFilter(test::MergeFilterTrace* trace,
+                   std::atomic<bool>* shutting_down)
+        : RecordingMergeFilter(MergeOrder::kMergeBeforeFilter, trace),
+          shutting_down_(shutting_down) {}
+    Decision FilterV4(
+        int level, const Slice& key, ValueType type, const Slice* value,
+        const WideColumns* columns, std::string* new_value,
+        std::vector<std::pair<std::string, std::string>>* new_columns,
+        std::string* skip_until,
+        WideColumnBlobResolver* resolver) const override {
+      shutting_down_->store(true);
+      return RecordingMergeFilter::FilterV4(level, key, type, value, columns,
+                                            new_value, new_columns, skip_until,
+                                            resolver);
+    }
+
+   private:
+    std::atomic<bool>* const shutting_down_;
+  };
+  for (int num_operands : {1, 2}) {
+    SCOPED_TRACE("num_operands=" + std::to_string(num_operands));
+    shutting_down_.store(false);
+    test::MergeFilterTrace trace;
+    test::RecordingMergeOperator merge(&trace);
+    merge.partial_success = false;
+    ShutdownFilter filter(&trace, &shutting_down_);
+    std::vector<std::string> ks{test::KeyStr("a", 5, kTypeMerge)};
+    std::vector<std::string> vs{"B"};
+    if (num_operands == 2) {
+      ks.emplace_back(test::KeyStr("a", 4, kTypeMerge));
+      vs.emplace_back("A");
+    }
+    InitIterators(ks, vs, {}, {}, 5, kMaxSequenceNumber, &merge, &filter);
+    c_iter_->SeekToFirst();
+    EXPECT_FALSE(c_iter_->Valid());
+    EXPECT_TRUE(c_iter_->status().IsShutdownInProgress())
+        << c_iter_->status().ToString();
+    c_iter_.reset();
+  }
+}
+
 TEST_P(CompactionIteratorTest, MergeBeforeFilterStackedFilterRejected) {
   class StackedFilter : public test::RecordingMergeFilter {
    public:

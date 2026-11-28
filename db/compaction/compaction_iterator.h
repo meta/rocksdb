@@ -462,6 +462,11 @@ class CompactionIterator {
   // Return true on success, false on failures (e.g.: kIOError).
   bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until,
                             bool merge_output);
+
+  // Selects the next merge output to return. Returns false, with
+  // merge_out_iter_ and this iterator !Valid(), when no merge output is
+  // selected, including when the selection stops early for a shutdown or a
+  // manual compaction pause.
   bool SelectMergeOutput(uint8_t valid_context);
   bool PrefilterUncombinedOutputs(uint8_t valid_context);
   bool ProcessDeletion(SequenceNumber prev_snapshot,

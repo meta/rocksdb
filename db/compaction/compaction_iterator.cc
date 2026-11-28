@@ -912,6 +912,11 @@ bool CompactionIterator::SelectMergeOutput(uint8_t valid_context) {
     }
     merge_out_iter_.Next();
   }
+  // No output is selected. The loop can stop early, with outputs left, for a
+  // shutdown or a manual compaction pause, and PrefilterUncombinedOutputs()
+  // can leave this iterator valid. Keep the contract (see the declaration).
+  merge_out_iter_.Invalidate();
+  validity_info_.Invalidate();
   if (merge_until_status_.IsMergeInProgress()) {
     has_current_user_key_ = false;
   }
