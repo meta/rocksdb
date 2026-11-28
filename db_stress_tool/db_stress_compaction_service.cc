@@ -14,6 +14,44 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+// A remote compaction failed on the worker, and the job does not fall back to
+// a local compaction. The primary then reports the status that it reads from
+// `result`, so this function makes sure that status names the worker error
+// `worker_status`.
+// - An empty result: the result gets `worker_status` as is.
+// - A result with an OK status, or one that cannot be parsed: the worker can
+//   return an error but still write a result with an OK status, because early
+//   error returns in CompactWithoutInstallation() do not set the result status
+//   (for example, when an input file is not in the worker's Version). The
+//   primary would then report only a generic error ("even though the internal
+//   status is okay" or "no valid result is returned"). The result is replaced
+//   by Status::Incomplete with the worker status in its message. Incomplete,
+//   rather than the worker's own code, keeps the failure from being accepted
+//   as an InvalidArgument by IsTolerableCompactionFailure().
+// - A result with a non-OK status already names an error and is kept.
+void SetFailureResult(const Status& worker_status, std::string* result) {
+  CompactionServiceResult compaction_result;
+  if (result->empty()) {
+    compaction_result.status = worker_status;
+  } else {
+    Status read_status =
+        CompactionServiceResult::Read(*result, &compaction_result);
+    const bool result_has_error = !compaction_result.status.ok();
+    if (read_status.ok() && result_has_error) {
+      return;
+    }
+    compaction_result = CompactionServiceResult();
+    compaction_result.status = Status::Incomplete(
+        "Remote compaction worker failed: " + worker_status.ToString());
+  }
+  result->clear();
+  if (compaction_result.Write(result).ok()) {
+    assert(!result->empty());
+  }
+}
+}  // namespace
+
 CompactionServiceJobStatus DbStressCompactionService::Wait(
     const std::string& scheduled_job_id, std::string* result) {
   while (true) {
@@ -42,15 +80,8 @@ CompactionServiceJobStatus DbStressCompactionService::Wait(
         // inject stale/older MANIFEST view into the secondary open, so a floor
         // rejection means a real bug and should fail loudly rather than be
         // masked by a local fallback.
-        if (result && result->empty()) {
-          // If result is empty, set the compaction status in the result so
-          // that it can be bubbled up to main thread
-          CompactionServiceResult compaction_result;
-          compaction_result.status = s;
-          if (compaction_result.Write(result).ok()) {
-            assert(result);
-            assert(!result->empty());
-          }
+        if (result) {
+          SetFailureResult(s, result);
         }
         return CompactionServiceJobStatus::kFailure;
       }

@@ -711,6 +711,9 @@ static void ProcessCompactionResult(
       // primary db instance failure.
       fprintf(stdout, "Failed to run OpenAndCompact(%s): %s\n",
               job_info.db_name.c_str(), s.ToString().c_str());
+      // stdout is block-buffered when it is a pipe (as in the crash test).
+      // Flush it, so the line is not lost if the process aborts later.
+      fflush(stdout);
     }
   } else {
     // Track successful completion time
