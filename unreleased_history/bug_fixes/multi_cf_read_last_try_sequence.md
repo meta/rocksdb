@@ -1,0 +1,1 @@
+Fixed a bug where a `MultiGet()` or `MultiGetEntity()` over several column families, or `NewIterators()`, without a snapshot could miss a key (return NotFound for a live key) when writes and flushes ran at the same time as the read.
