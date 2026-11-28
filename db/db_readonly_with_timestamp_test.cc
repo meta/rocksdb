@@ -342,6 +342,47 @@ TEST_F(DBReadOnlyTestWithTimestamp, Iterators) {
   Close();
 }
 
+TEST_F(DBReadOnlyTestWithTimestamp, IncreaseFullHistoryTsLowNotSupported) {
+  for (bool compacted : {false, true}) {
+    SCOPED_TRACE(compacted);
+    Options options = CurrentOptions();
+    options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+    options.max_open_files = compacted ? -1 : 5000;
+    DestroyAndReopen(options);
+
+    std::string ts_low;
+    PutFixed64(&ts_low, 1);
+    std::string new_ts_low;
+    PutFixed64(&new_ts_low, 2);
+    ASSERT_OK(db_->Put(WriteOptions(), "foo", ts_low, "value"));
+    ASSERT_OK(
+        db_->IncreaseFullHistoryTsLow(db_->DefaultColumnFamily(), ts_low));
+    ASSERT_OK(Flush());
+    Close();
+    ASSERT_OK(ReadOnlyReopen(options));
+    if (compacted) {
+      CheckDBOpenedAsCompactedDBWithOneLevel0File();
+    }
+
+    std::string actual_ts_low;
+    ASSERT_OK(
+        db_->GetFullHistoryTsLow(db_->DefaultColumnFamily(), &actual_ts_low));
+    EXPECT_EQ(ts_low, actual_ts_low);
+    EXPECT_EQ(
+        db_->IncreaseFullHistoryTsLow(db_->DefaultColumnFamily(), new_ts_low)
+            .code(),
+        Status::Code::kNotSupported);
+    ASSERT_OK(
+        db_->GetFullHistoryTsLow(db_->DefaultColumnFamily(), &actual_ts_low));
+    EXPECT_EQ(ts_low, actual_ts_low);
+
+    Reopen(options);
+    ASSERT_OK(
+        db_->GetFullHistoryTsLow(db_->DefaultColumnFamily(), &actual_ts_low));
+    EXPECT_EQ(ts_low, actual_ts_low);
+  }
+}
+
 TEST_F(DBReadOnlyTestWithTimestamp, FullHistoryTsLowSanityCheckFail) {
   Options options = CurrentOptions();
   options.env = env_;
