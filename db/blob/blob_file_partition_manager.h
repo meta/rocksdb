@@ -50,6 +50,36 @@ struct ReadOptions;
 // per-partition locks to allow concurrent blob writes without changing the
 // generation/flush contract. Follow-up PRs can also broaden compatibility as
 // the feature matures.
+//
+// Durability: each blob append is handed to the OS at once (flush-on-write),
+// but it is not synced. The WAL record of a blob direct write holds only a
+// BlobIndex, so a WAL sync must not make that record durable before its blob
+// bytes. Before every WAL sync that can make such a record durable,
+// DBImpl::SyncBlobDirectWriteFiles() calls SyncAllOpenFiles() on every manager,
+// which syncs the files with unsynced records and the directory entries of new
+// files. Each WAL sync calls it after it fixes the list of WALs to sync and
+// before the WAL fsync, so every WAL record appended before the WAL sync
+// started has durable blob bytes. A sync write leads its write group, appends
+// the group's blob values, syncs the blob files, and only then appends the
+// group's WAL record and syncs the WAL. SyncWAL() and FlushWAL(true) do not
+// keep writers out: the sync does not cover the blob value of a record appended
+// during it (see DBImpl::SyncBlobDirectWriteFiles()). The closed-WAL sync
+// before a flush syncs only closed WALs, which get no new records. Apart from
+// SyncBlobDirectWriteFiles(), a blob direct write file is synced only when it
+// is sealed. If a blob file fails to sync or seal, no later memtable flush can
+// succeed, so the flush stops the DB (see StopDBAfterBlobDirectWriteError() in
+// db_impl_compaction_flush.cc).
+//
+// Known limitation: a sync holds the manager mutex during its file and
+// directory fsyncs, and a memtable switch takes the same mutex while it holds
+// the DB mutex. Every WAL sync syncs the managers of all column families that
+// use blob direct write, not only the one being written or flushed. For
+// example, a flush of a column family without blob direct write runs the
+// closed-WAL sync, which syncs every such manager. A memtable switch of a
+// blob direct write column family can wait for those fsyncs while it holds
+// the DB mutex, and with it every other thread that needs the DB mutex. Blob
+// appends of other writers also wait for the manager mutex during those
+// fsyncs.
 class BlobFilePartitionManager {
  public:
   using FileNumberAllocator = std::function<uint64_t()>;
@@ -60,7 +90,7 @@ class BlobFilePartitionManager {
       std::shared_ptr<BlobFilePartitionStrategy> strategy,
       FileNumberAllocator file_number_allocator, FileSystem* fs,
       SystemClock* clock, Statistics* statistics,
-      const FileOptions& file_options, std::string db_path,
+      const FileOptions& file_options, std::string blob_dir,
       std::string column_family_name, uint64_t blob_file_size, bool use_fsync,
       uint64_t blob_writer_max_buffer_size, BlobFileCache* blob_file_cache,
       BlobFileCompletionCallback* blob_callback,
@@ -120,12 +150,46 @@ class BlobFilePartitionManager {
     return Status::OK();
   }
 
-  // Sync the active open blob files before a sync WAL write.
+  // DBImpl calls this before a WAL sync. It syncs the active and deferred
+  // blob files that have unsynced records, and the directory entries of new
+  // blob files. "Open" here means not sealed yet; a successful seal already
+  // synced the file. A failed seal can leave the BlobLogWriter object after
+  // its underlying writable file was closed (see the sync rules below). How a
+  // file moves:
+  // - The active file of a partition receives appends for the current
+  //   memtable.
+  // - At rollover (the next record would make the active file larger than
+  //   blob_file_size), the manager seals the file and keeps it with the
+  //   current memtable (current_generation_sealed_files_).
+  //   If that seal fails, the file keeps its error (seal_status) and can keep
+  //   its writer object (current_generation_failed_files_).
+  // - At a memtable switch, these files and every active partition file move
+  //   to a pending generation (pending_generations_). The sealed files go to
+  //   its sealed_files as SealedFile entries. The failed files and the active
+  //   files go to its deferred_files as DeferredFile entries.
+  // - The matching flush seals the remaining files (it writes and syncs the
+  //   footer and releases the writer) and registers all sealed files in the
+  //   MANIFEST when it commits. If a file already has a seal error, the flush
+  //   returns that error.
+  // Sync rules: the sync_required flag of a file tracks unsynced appends.
+  // This function syncs the active and deferred files that need it. If a
+  // failed file still has a writer and needs a sync, it returns the seal
+  // error, so the WAL sync fails. Creating a file marks the blob directory
+  // for a sync, and this function fsyncs the directory last, if marked.
+  // See "Durability" in the class comment.
   Status SyncAllOpenFiles(const WriteOptions& write_options);
 
   // Returns blob files still owned by the manager and therefore not yet safe
   // to consider obsolete.
   void GetActiveBlobFileNumbers(UnorderedSet<uint64_t>* file_numbers) const;
+
+  // Returns true if GetActiveBlobFileNumbers() would return at least one file.
+  // Takes no lock and builds no set, so a caller can use it under the DB
+  // mutex. The answer can be out of date by the time the caller uses it, as
+  // with any snapshot of the active files.
+  bool HasActiveBlobFiles() const {
+    return tracked_blob_file_count_.load(std::memory_order_relaxed) > 0;
+  }
 
   // Returns sealed blob files that are still reachable through live memtables
   // or old SuperVersions and therefore must not be purged yet.
@@ -201,6 +265,8 @@ class BlobFilePartitionManager {
     // memtables still reference the file, so every flush of its generation
     // fails with this status.
     Status seal_status;
+    // The file has appended records that were not synced yet.
+    bool sync_required = false;
   };
 
   struct SealedFile {
@@ -235,6 +301,11 @@ class BlobFilePartitionManager {
   // Opens a new active blob file for one partition.
   Status OpenNewBlobFile(Partition* partition, uint32_t column_family_id,
                          CompressionType compression, uint32_t partition_idx);
+
+  // Fsyncs blob_dir_ so that the directory entries of new blob files survive a
+  // power loss. SyncAllOpenFiles() calls it when dir_sync_required_ is set.
+  Status SyncBlobDirectory(const WriteOptions& write_options);
+
   // Finalizes one active partition file and returns the MANIFEST addition.
   // Sets `*space_limit_reached` if the SstFileManager's max allowed space is
   // reached; the seal still succeeds.
@@ -284,8 +355,9 @@ class BlobFilePartitionManager {
   SystemClock* clock_;
   Statistics* statistics_;
   FileOptions file_options_;
-  // Column-family context used for file naming and callbacks.
-  std::string db_path_;
+  // The directory of this column family's blob files: its first cf_paths
+  // entry, which is not always the DB directory.
+  std::string blob_dir_;
   std::string column_family_name_;
   // File creation policy and shared blob-file infrastructure.
   uint64_t blob_file_size_;
@@ -313,6 +385,10 @@ class BlobFilePartitionManager {
   std::vector<DeferredFile> current_generation_failed_files_;
   // FIFO immutable memtable generations waiting to be flushed.
   std::deque<GenerationBatch> pending_generations_;
+  // After a power loss, a new blob file can be missing, even if its data was
+  // synced, unless its directory entry was fsynced. Set by OpenNewBlobFile().
+  // Cleared after SyncBlobDirectory() succeeds.
+  bool dir_sync_required_ = false;
 
   // Tracks blob files still owned by active or deferred write-path state until
   // MANIFEST commit publishes them.
@@ -322,6 +398,11 @@ class BlobFilePartitionManager {
   std::unordered_map<uint64_t, uint32_t> protected_blob_file_refs_;
   // Protects file_to_partition_ and protected_blob_file_refs_.
   mutable port::RWMutex file_partition_mutex_;
+  // file_to_partition_.size(), stored under file_partition_mutex_ after each
+  // change, so that HasActiveBlobFiles() can read it without the lock. A
+  // writer of file_partition_mutex_ can evict from the blob file cache, which
+  // can wait for a file open.
+  std::atomic<size_t> tracked_blob_file_count_{0};
 };
 
 }  // namespace ROCKSDB_NAMESPACE

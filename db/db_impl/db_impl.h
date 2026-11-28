@@ -90,6 +90,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class Arena;
 class ArenaWrappedDBIter;
+class BlobDirectWriteRecoveryResolver;
 class Cleanable;
 class FileIngestionHandleImpl;
 class SameFileBlobReader;
@@ -248,8 +249,13 @@ struct DBOpenLogRecordReadReporter : public log::Reader::Reporter {
 
   uint64_t GetCorruptedLogNumber() const { return corrupted_wal_number_; }
 
+  // True if Corruption() was called, also when the error is ignored
+  // (`status` is null), so some bytes or records of the WAL were dropped.
+  bool CorruptionReported() const { return corruption_reported_; }
+
  private:
   uint64_t corrupted_wal_number_ = kMaxSequenceNumber;
+  bool corruption_reported_ = false;
 };
 
 // While DB is the public interface of RocksDB, and DBImpl is the actual
@@ -1619,6 +1625,12 @@ class DBImpl : public DB
     return logs_.back().number;
   }
 
+  // The WAL number at or below which WALs are quarantined (see
+  // ExtendWALRecoveryCutoff()), or 0.
+  uint64_t TEST_GetWALRecoveryCutoff() const {
+    return wal_recovery_cutoff_.load(std::memory_order_acquire);
+  }
+
   void TEST_DeleteObsoleteFiles();
 
   const std::unordered_set<uint64_t>& TEST_GetFilesGrabbedForPurge() const {
@@ -2174,11 +2186,59 @@ class DBImpl : public DB
       const WriteOptions& write_options, WriteBatch* batch,
       WriteBatch* trace_batch,
       const DeferredPutEntityBatch* deferred_put_entities = nullptr);
-  // Flushes or syncs all blob direct-write managers touched by the current
-  // transformed write before the write can proceed.
-  Status SyncBlobDirectWriteManagers(
+
+  // Calls FlushAllOpenFiles() on each blob direct write manager that the
+  // current write touched. Each blob append already hands its data to the OS
+  // (flush-on-write), so this call does no I/O. The function stays for its
+  // sync point, which lets tests fail the write after its blob bytes are
+  // written, and as the place to flush if a blob writer ever buffers data. It
+  // does not sync: a sync write gets its blob files synced by
+  // SyncBlobDirectWriteFiles() right before the WAL sync.
+  Status FlushBlobDirectWriteManagers(
       const WriteOptions& write_options,
       const BlobDirectWriteContext& blob_direct_write_ctx);
+
+  // Syncs the blob direct write files of every live column family and the
+  // directory entries of new blob files (see "Durability" in the
+  // BlobFilePartitionManager class comment). Blob direct write puts a large
+  // value into a blob file and writes only a BlobIndex to the WAL. A WAL sync
+  // makes every earlier WAL record durable, so the blob bytes those records
+  // point to must be durable first. Apart from sealing a file (when
+  // WriteBlob() rotates a full file, and at flush), this is the only place
+  // that syncs blob direct write files.
+  //
+  // Every WAL sync that can make such a record durable calls this function
+  // after it fixes the list of WALs to sync and before it fsyncs them. So
+  // every WAL record appended before the WAL sync started has durable blob
+  // bytes when the WAL fsync returns:
+  // - WriteImpl() for a sync write, before WriteGroupToWAL() appends the WAL
+  //   record of the group: the caller leads the write group and owns the
+  //   write queue, and the blobs of the group are already appended. A blob
+  //   sync failure then leaves no WAL record behind.
+  // - SyncWalImpl() from SyncWAL() or FlushWAL(true). These do not keep
+  //   writers out, so a write group can append a blob after this function and
+  //   its WAL record before the WAL fsync:
+  //
+  //     SyncWAL():    [blob sync] ...................... [WAL fsync]
+  //     write group:              [blob append][WAL append]
+  //
+  //   The sync does not cover such a record: the WAL fsync can make the record
+  //   durable while its blob bytes are not synced. After a power loss, WAL
+  //   recovery then treats the record as corrupted (see wal_recovery_mode). In
+  //   this race, PrepareForSync() saved the WAL size from before the blob sync.
+  //   MarkLogsSynced() records that size, so the WAL stays in `logs_` and
+  //   eligible for another sync until a later sync covers the append. A flush
+  //   that runs the sync of closed WALs syncs that WAL, and the blob files
+  //   before it, before it records that recovery of its column family can skip
+  //   the WAL.
+  // - SyncWalImpl() from the sync of closed WALs before a flush: closed WALs
+  //   get no new records.
+  // ColumnFamilyData::ValidateOptions() rejects blob direct write with
+  // pipelined writes, concurrent memtable writes, unordered writes and
+  // two_write_queues, so there are no other WAL sync paths. A new WAL sync
+  // path must call this function too.
+  // REQUIRES: mutex_ not held.
+  Status SyncBlobDirectWriteFiles(const WriteOptions& write_options);
 
   Status PipelinedWriteImpl(const WriteOptions& options, WriteBatch* updates,
                             WriteBatch* trace_batch,
@@ -2386,15 +2446,21 @@ class DBImpl : public DB
   // Returns true if any BDW column family still owns blob files that have not
   // yet been made visible through MANIFEST. Requires `mutex_` held.
   bool HasInFlightBlobDirectWriteFilesWithLockHeld();
+
   // Creates and attaches the per-CF blob direct-write partition manager when
   // the column family is opened with the feature enabled.
   void MaybeInitBlobDirectWriteColumnFamily(
       ColumnFamilyData* cfd, const ColumnFamilyOptions& cf_options,
       const std::string& column_family_name);
-  // Increments the DB-level count of live blob direct-write column families.
-  void RegisterBlobDirectWriteColumnFamily();
-  // Decrements the DB-level count of live blob direct-write column families.
-  void UnregisterBlobDirectWriteColumnFamily();
+
+  // Adds `cfd` to `blob_direct_write_cfds_` and increments the count of live
+  // blob direct write column families.
+  // REQUIRES: mutex_ held.
+  void RegisterBlobDirectWriteColumnFamily(ColumnFamilyData* cfd);
+
+  // Removes `cfd` from `blob_direct_write_cfds_` and decrements the count.
+  // REQUIRES: mutex_ held.
+  void UnregisterBlobDirectWriteColumnFamily(ColumnFamilyData* cfd);
 
   struct CompactionState;
   struct PrepickedCompaction;
@@ -2697,8 +2763,8 @@ class DBImpl : public DB
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                               const std::string& path_to_sync, FileType type,
                               uint64_t number);
-  // Returns true when a blob file must be preserved because it is still
-  // tracked by blob direct write or is still footer-less on disk.
+  // Returns true when the purge must keep a blob file that is not in the
+  // MANIFEST. See the lifecycle comment at `wal_replay_blob_files_`.
   bool ShouldKeepBlobFileDuringPurge(uint64_t number,
                                      const std::string& blob_file_path);
 
@@ -2740,10 +2806,12 @@ class DBImpl : public DB
   void ReleaseOptionsFileNumber(
       std::unique_ptr<std::list<uint64_t>::iterator>& v);
 
-  // Sets bg error if there is an error writing to WAL.
+  // Sets bg error if there is an error writing to WAL. See SyncWalImpl() for
+  // `blob_sync_failed_out`.
   IOStatus SyncClosedWals(const WriteOptions& write_options,
                           JobContext* job_context, VersionEdit* synced_wals,
-                          bool error_recovery_in_prog);
+                          bool error_recovery_in_prog,
+                          bool* blob_sync_failed_out);
 
   // Flush the in-memory write buffer to storage.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful. Then
@@ -2772,6 +2840,44 @@ class DBImpl : public DB
                          SequenceNumber* next_sequence, bool read_only,
                          bool is_retry, bool* corrupted_wal_found,
                          RecoveryContext* recovery_ctx);
+
+  // When there are WALs to replay, creates `blob_recovery_resolver_` (see
+  // BlobDirectWriteRecoveryResolver) in three cases: (1) recovery finds
+  // unregistered blob files, (2) a live column family has
+  // enable_blob_direct_write on, or (3) a read-only open has a live column
+  // family that has enable_blob_files on or blob files in its Version.
+  // Whether a missing blob file is reported as corrupted is decided for each
+  // reference, by the column family that owns it (see
+  // BlobDirectWriteRecoveryResolver::CheckBlobIndex()).
+  // MaybeUpdateNextFileNumber() has already moved the next file number past
+  // the unregistered files, so a flush during recovery cannot reuse their
+  // numbers.
+  // To find those files without listing a directory again, a read-write open
+  // uses the data files that MaybeUpdateNextFileNumber() found in
+  // `recovery_ctx`. A read-only open does not run MaybeUpdateNextFileNumber(),
+  // and its blob discovery adds no directory listing. It reuses
+  // `files_in_wal_dir`, the listing of
+  // the WAL directory that recovery already has, for a blob directory that is
+  // the WAL directory. For other files, the resolver looks each one up on disk
+  // when a record refers to it.
+  // REQUIRES: mutex_ held.
+  Status MaybeCreateBlobRecoveryResolver(
+      const std::vector<std::string>& files_in_wal_dir, bool read_only,
+      const RecoveryContext* recovery_ctx);
+
+  // If `status` is OK and the DB is not read-only, sets
+  // `wal_replay_blob_files_` to unregistered blob files
+  // of `blob_recovery_resolver_` and `wal_replay_blob_files_wal_number_` to
+  // `max_wal_number`, the highest-numbered WAL in the recovery list. If replay
+  // processed every record, it adds only the files that a replayed record
+  // referred to. Otherwise (for example, a WAL filter returned kStopReplay) it
+  // adds every unregistered file, because a later open that replays further
+  // can need them. Then it logs how many values were resolved and destroys the
+  // resolver. A read-only DB deletes no files, so it does not record the
+  // list.
+  // REQUIRES: mutex_ held.
+  void FinishBlobRecoveryResolver(bool read_only, const Status& status,
+                                  uint64_t max_wal_number);
 
   void SetupLogFilesRecovery(
       const std::vector<uint64_t>& wal_numbers,
@@ -3162,6 +3268,14 @@ class DBImpl : public DB
                         SequenceNumber failed_wal_sequence = 0,
                         SequenceNumber failed_wal_sequence_start = 0);
 
+  // Handles a failure of the blob sync that runs before a WAL is synced or
+  // written (see SyncBlobDirectWriteFiles()). It is a blob error, not a WAL
+  // error: the WAL is not touched, so unlike WALIOStatusCheck() it does not
+  // quarantine a WAL or reset a WAL writer. With paranoid_checks, it sets a
+  // background error that stops writes, as a failed WAL sync does.
+  // REQUIRES: mutex_ not held.
+  void BlobSyncStatusCheck(const Status& status);
+
   // Extends the inclusive WAL-number cutoff that must not receive more I/O.
   // This is lock-free because a WAL error can race with public SyncWAL().
   void ExtendWALRecoveryCutoff(uint64_t failed_wal_number);
@@ -3407,10 +3521,17 @@ class DBImpl : public DB
   void BeginInFlightCompaction(ColumnFamilyData* cfd);
   bool EndInFlightCompaction(ColumnFamilyData* cfd);
 
+  // If `blob_sync_failed_out` is not null, sets it to true when the sync
+  // failed because the blob direct write files failed to sync before the WALs
+  // (see SyncBlobDirectWriteFiles()). It is never set to false, so the caller
+  // initializes it. A caller that passes it (a flush) sets the background
+  // error for a blob sync failure itself; otherwise this function calls
+  // BlobSyncStatusCheck().
   IOStatus SyncWalImpl(bool include_current_wal,
                        const WriteOptions& write_options,
                        JobContext* job_context, VersionEdit* synced_wals,
-                       bool error_recovery_in_prog);
+                       bool error_recovery_in_prog,
+                       bool* blob_sync_failed_out = nullptr);
 
   // helper function to call after some of the logs_ were synced
   void MarkLogsSynced(uint64_t up_to, bool synced_dir, VersionEdit* edit);
@@ -4295,6 +4416,91 @@ class DBImpl : public DB
   // manager. This keeps the read/write fast paths at O(1) when the feature is
   // completely disabled for the DB.
   std::atomic<uint32_t> blob_direct_write_cf_count_{0};
+
+  // The live column families with a blob direct write partition manager.
+  // Added when the manager is created, removed when the drop of the column
+  // family is committed, and cleared when the DB closes.
+  // SyncBlobDirectWriteFiles() walks it instead of all column families.
+  // Protected by `mutex_`.
+  std::vector<ColumnFamilyData*> blob_direct_write_cfds_;
+
+  // Rewrites WAL records that point into unregistered blob files (see
+  // BlobDirectWriteRecoveryResolver). Set only while RecoverLogFiles() runs.
+  std::unique_ptr<BlobDirectWriteRecoveryResolver> blob_recovery_resolver_;
+
+  // Unregistered blob files (see BlobDirectWriteRecoveryResolver) that
+  // recovery keeps (see FinishBlobRecoveryResolver()), or null. The set is
+  // immutable once recovery built it and is shared with purge jobs (see
+  // JobContext::wal_replay_blob_files), so a purge checks it without the DB
+  // mutex. All its files are kept while the WAL with number
+  // wal_replay_blob_files_wal_number_ is live. A DB instance recovers its WALs
+  // once, so there is one set and one WAL number. The pointer is protected by
+  // `mutex_`. BlobDirectWriteRecoveryResolver gives a size estimate.
+  //
+  // Lifecycle of unregistered blob files. This is the one place that
+  // describes when such a file is kept or deleted:
+  //
+  //   numbers: [ earlier sessions + recovery ) [ created after recovery ...
+  //            first_file_number_after_recovery_ ^
+  //   The purge checks a blob file that is not in the MANIFEST in this order:
+  //   0. kept by the normal purge rules (for example, a number at or above
+  //      the smallest pending output number, or a file that a manager listed
+  //      when FindObsoleteFiles() ran)                  -> kept
+  //   1. in wal_replay_blob_files_, and
+  //      wal_replay_blob_files_wal_number_ is live      -> kept
+  //   2. tracked by a blob direct write manager         -> kept
+  //   3. number < first_file_number_after_recovery_     -> deleted, without a
+  //                                                        footer check
+  //   4. number >= first_file_number_after_recovery_:
+  //      footer missing or invalid, or the footer read
+  //      fails other than with path not found           -> kept (it can still
+  //                                                        be open for writing)
+  //      otherwise                                      -> deleted
+  //
+  // 1. At a read-write open, MaybeUpdateNextFileNumber() moves the next file
+  //    number past every file in the DB directories (the DB path, db_paths
+  //    and cf_paths), so every unregistered blob file has a number below
+  //    first_file_number_after_recovery_.
+  // 2. When the open has WAL files to replay, MaybeCreateBlobRecoveryResolver()
+  //    finds the unregistered blob files, and WAL replay reads values from
+  //    some of them. If the open succeeds and is not read-only,
+  //    FinishBlobRecoveryResolver() records the files that a replayed record
+  //    referred to here, and the highest-numbered WAL in the recovery list in
+  //    wal_replay_blob_files_wal_number_.
+  //    If replay stopped early or left references unchecked (an unread WAL,
+  //    dropped records or bytes, or a value that could not be read), it
+  //    records every unregistered file it found, so that a later open can
+  //    replay those records. The set protects the files while the
+  //    highest-numbered WAL in the recovery list is live, also when this open
+  //    skipped that WAL.
+  // 3. FindObsoleteFiles() keeps the recorded files while
+  //    wal_replay_blob_files_wal_number_ >= MinLogNumberToKeep(). That WAL
+  //    number is an upper bound, not the WAL that refers to a file: the
+  //    reference can come from an older WAL in the recovery list. For
+  //    example, if the list ends at WAL 42, the set can hold a blob file that
+  //    only WAL 40 refers to, even if replay stopped before WAL 42. Keeping
+  //    the whole set until WAL 42 is obsolete is simple and safe, because
+  //    every WAL in the list is then obsolete too. FindObsoleteFiles() pins
+  //    the set in job_context->wal_replay_blob_files, whose files the purge
+  //    never deletes. Once MinLogNumberToKeep() is past WAL 42, it moves the
+  //    set to the job (job_context->retired_wal_replay_blob_files), which
+  //    releases it without the DB mutex.
+  // 4. The next full obsolete-file scan deletes an unregistered file of an
+  //    earlier session that is not recorded here:
+  //    ShouldKeepBlobFileDuringPurge() does not keep it, because its number
+  //    is below first_file_number_after_recovery_.
+  std::shared_ptr<const UnorderedSet<uint64_t>> wal_replay_blob_files_;
+  // See `wal_replay_blob_files_`. Protected by `mutex_`.
+  uint64_t wal_replay_blob_files_wal_number_ = 0;
+
+  // The next file number after WAL recovery finished. Files with a smaller
+  // number come from earlier sessions or from the recovery of this open. The
+  // purge uses this to tell such files from files that may still be open for
+  // writing. The purge rule affects only files that are not in the MANIFEST,
+  // so recovery flush outputs are safe. See the lifecycle comment at
+  // `wal_replay_blob_files_`. Set once in Recover(), then read under
+  // `mutex_`.
+  uint64_t first_file_number_after_recovery_ = 0;
 
   // if an attempt was made to flush all column families that
   // the oldest log depends on but uncommitted data in the oldest

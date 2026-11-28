@@ -614,6 +614,14 @@ Status DBImpl::MaybeTransformBatchForBlobDirectWrite(
       (*batch)->HasMerge()) {
     return Status::OK();
   }
+  // The part of a batch after its WAL termination point goes only to the
+  // memtable. A 2PC commit batch uses this for its prepared writes, which the
+  // prepare already wrote to the WAL. The transform copies the whole batch
+  // without the termination point, so that part would reach the WAL. Keep such
+  // a batch raw. The flush moves its large values to blob files.
+  if (!(*batch)->GetWalTerminationPoint().is_cleared()) {
+    return Status::OK();
+  }
 
   // Quick check: skip the (potentially expensive) batch iteration when no
   // column family has blob direct write enabled. This also avoids Iterate()
@@ -646,6 +654,19 @@ Status DBImpl::MaybeTransformBatchForBlobDirectWrite(
     return s;
   }
   if (transformed) {
+    // A write group merges batches for the WAL, which requires all of them to
+    // agree on the per-key checksum setting (protection info). If the
+    // original batch has per-key checksums, compute new checksums for the
+    // entries of the transformed batch, with the same bytes per key.
+    const size_t protection_bytes_per_key =
+        (*batch)->GetProtectionBytesPerKey();
+    if (protection_bytes_per_key > 0) {
+      s = WriteBatchInternal::UpdateProtectionInfo(transformed_storage,
+                                                   protection_bytes_per_key);
+      if (!s.ok()) {
+        return s;
+      }
+    }
     *batch = transformed_storage;
     blob_direct_write_ctx->touched_managers.insert(batch_managers.begin(),
                                                    batch_managers.end());
@@ -864,12 +885,11 @@ Status DBImpl::WritePreprocessedPutEntityBatch(
   return s;
 }
 
-Status DBImpl::SyncBlobDirectWriteManagers(
+Status DBImpl::FlushBlobDirectWriteManagers(
     const WriteOptions& write_options,
     const BlobDirectWriteContext& blob_direct_write_ctx) {
   for (auto* mgr : blob_direct_write_ctx.touched_managers) {
-    Status blob_s = write_options.sync ? mgr->SyncAllOpenFiles(write_options)
-                                       : mgr->FlushAllOpenFiles(write_options);
+    Status blob_s = mgr->FlushAllOpenFiles(write_options);
     if (!blob_s.ok()) {
       return blob_s;
     }
@@ -886,6 +906,51 @@ Status DBImpl::SyncBlobDirectWriteManagers(
   }
 
   return Status::OK();
+}
+
+Status DBImpl::SyncBlobDirectWriteFiles(const WriteOptions& write_options) {
+  if (!HasAnyBlobDirectWriteColumnFamily()) {
+    return Status::OK();
+  }
+  // Hold a reference on each column family while its blob files are synced
+  // without the DB mutex. A column family can be dropped and its handle
+  // destroyed during the sync. The reference keeps the ColumnFamilyData, and
+  // with it the manager and the BlobFileCache that the manager uses, alive
+  // until UnrefAndTryDelete() below.
+  std::vector<ColumnFamilyData*> cfds;
+  // Reserve outside the DB mutex. The count can change before the lock, so it
+  // is only a capacity hint.
+  cfds.reserve(blob_direct_write_cf_count_.load(std::memory_order_relaxed));
+  {
+    InstrumentedMutexLock l(&mutex_);
+    // Walk only the blob direct write column families, so the DB mutex is
+    // held for a short time also in a DB with many column families.
+    for (auto* cfd : blob_direct_write_cfds_) {
+      // Skip dropped column families. IsDropped() becomes true only after the
+      // drop is written to the MANIFEST. WAL recovery ignores the records of a
+      // dropped column family. So its blob files do not need to be durable.
+      if (cfd->IsDropped()) {
+        continue;
+      }
+      assert(cfd->blob_partition_manager() != nullptr);
+      cfd->Ref();
+      cfds.push_back(cfd);
+    }
+  }
+  Status s;
+  for (ColumnFamilyData* cfd : cfds) {
+    s = cfd->blob_partition_manager()->SyncAllOpenFiles(write_options);
+    if (!s.ok()) {
+      break;
+    }
+  }
+  {
+    InstrumentedMutexLock l(&mutex_);
+    for (ColumnFamilyData* cfd : cfds) {
+      cfd->UnrefAndTryDelete();
+    }
+  }
+  return s;
 }
 
 Status DBImpl::WriteImpl(
@@ -1075,8 +1140,8 @@ Status DBImpl::WriteImpl(
     if (!blob_s.ok()) {
       return blob_s;
     }
-    blob_s = SyncBlobDirectWriteManagers(write_options,
-                                         blob_direct_write_ctx.value());
+    blob_s = FlushBlobDirectWriteManagers(write_options,
+                                          blob_direct_write_ctx.value());
     if (!blob_s.ok()) {
       return blob_s;
     }
@@ -1246,8 +1311,8 @@ Status DBImpl::WriteImpl(
             my_batch, write_options.protection_bytes_per_key);
       }
       if (status.ok() && blob_direct_write_ctx.has_value()) {
-        status = SyncBlobDirectWriteManagers(write_options,
-                                             blob_direct_write_ctx.value());
+        status = FlushBlobDirectWriteManagers(write_options,
+                                              blob_direct_write_ctx.value());
       }
     }
 
@@ -1276,8 +1341,8 @@ Status DBImpl::WriteImpl(
         }
       }
       if (status.ok()) {
-        status = SyncBlobDirectWriteManagers(write_options,
-                                             blob_direct_write_ctx.value());
+        status = FlushBlobDirectWriteManagers(write_options,
+                                              blob_direct_write_ctx.value());
       }
     }
   }
@@ -1389,7 +1454,22 @@ Status DBImpl::WriteImpl(
 
     PERF_TIMER_STOP(write_pre_and_post_process_time);
 
+    bool blob_sync_failed = false;
     if (!two_write_queues_) {
+      if (status.ok() && !write_options.disableWAL &&
+          wal_context.need_wal_sync) {
+        // Sync the blob files before the WAL record is appended (see
+        // SyncBlobDirectWriteFiles()). The blobs of this write group are
+        // already appended, and this thread leads the group and owns the
+        // write queue, so no other write can append a blob or a WAL record
+        // before the WAL fsync. If the blob sync fails, the group leaves no
+        // WAL record and the last sequence number does not move. A later
+        // write (writes go on with paranoid_checks=false) then reuses those
+        // sequence numbers without leaving duplicate sequence numbers in the
+        // WAL.
+        status = SyncBlobDirectWriteFiles(write_options);
+        blob_sync_failed = !status.ok();
+      }
       if (status.ok() && !write_options.disableWAL) {
         assert(wal_context.wal_file_number_size);
         wal_write_number = wal_context.wal_file_number_size->number;
@@ -1412,7 +1492,11 @@ Status DBImpl::WriteImpl(
         last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
       }
     }
-    status = io_s;
+    if (blob_sync_failed) {
+      BlobSyncStatusCheck(status);
+    } else {
+      status = io_s;
+    }
     assert(last_sequence != kMaxSequenceNumber);
     const SequenceNumber current_sequence = last_sequence + 1;
     last_sequence += seq_inc;
@@ -2146,6 +2230,13 @@ void DBImpl::WALIOStatusCheck(const IOStatus& io_status,
   } else {
     // Force writable file to be continue writable.
     logs_.back().writer->file()->reset_seen_error();
+  }
+}
+
+void DBImpl::BlobSyncStatusCheck(const Status& status) {
+  if (immutable_db_options_.paranoid_checks && !status.ok()) {
+    InstrumentedMutexLock l(&mutex_);
+    error_handler_.SetBGError(status, BackgroundErrorReason::kWriteCallback);
   }
 }
 

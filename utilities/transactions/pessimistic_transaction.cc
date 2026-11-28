@@ -931,10 +931,12 @@ Status WriteCommittedTxn::CommitInternal() {
       }
     }
   }
-  // Blob direct write must go through the normal WriteBatch path in
-  // DBImpl::WriteImpl() so large values can be transformed into BlobIndex
-  // entries. The bypass-memtable optimization commits through WBWI ingestion,
-  // which skips that transformation and does not support kTypeBlobIndex.
+  // With blob direct write, commit through the normal WriteBatch path in
+  // DBImpl::WriteImpl(). A commit batch has a WAL termination point, so it is
+  // not transformed into BlobIndex entries either way (see
+  // DBImpl::MaybeTransformBatchForBlobDirectWrite()). The bypass-memtable
+  // optimization commits through WBWI ingestion, which is not validated with
+  // blob direct write, so keep it off.
   if (bypass_memtable && db_impl_->HasAnyBlobDirectWriteColumnFamily()) {
     bypass_memtable = false;
   }

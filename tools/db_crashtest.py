@@ -1294,9 +1294,13 @@ blob_direct_write_params = {
     "enable_blob_direct_write": 1,
     "blob_direct_write_partitions": lambda: random.choice([1, 2, 4, 8]),
     "allow_setting_blob_options_dynamically": 0,
-    # Keep the fixed-across-runs write mode within the reduced WAL-disabled
-    # direct-write profile.
+    # Keep the fixed-across-runs write mode within the reduced direct-write
+    # profile.
     "inplace_update_support": 0,
+    # Run 3 of 4 tests with the WAL on, so that most crash recoveries replay
+    # direct-write values from the WAL. Keep 1 of 4 runs with the WAL off to
+    # cover recovery without WAL replay.
+    "disable_wal": lambda: random.choice([0, 0, 0, 1]),
     "min_blob_size": lambda: random.choice([8, 16, 64]),
     "blob_file_size": lambda: random.choice([1048576, 16777216, 268435456]),
     "blob_file_writable_file_max_buffer_size": lambda: random.choice(
@@ -1637,11 +1641,13 @@ def finalize_and_sanitize(src_params):
         #
         # Supported recovery shape:
         #   * clean shutdown / flush
-        #   * crash restart that only relies on SST + manifest-visible blob
-        #     state, including wide-column entities stored through PutEntity
+        #   * crash restart, in-process reopen, and simulated power loss
+        #     (sync_fault_injection), with the WAL on or off. WAL replay reads
+        #     values back from blob files that are not in the MANIFEST yet,
+        #     including wide-column entities stored through PutEntity
         #
         # Unsupported here:
-        #   * WAL replay / best-efforts recovery
+        #   * best-efforts recovery
         #   * broad dynamic blob option changes and blob GC
         #   * merge / transaction variants and parallel write queue modes
         #   * secondary / backup / checkpoint / ingest style APIs that reason
@@ -1685,26 +1691,17 @@ def finalize_and_sanitize(src_params):
         dest_params["use_optimistic_txn"] = 0
         dest_params["test_multi_ops_txns"] = 0
         dest_params["commit_bypass_memtable_one_in"] = 0
-        # Force the WAL-disabled crash-test profile. The generic disable_wal
-        # sanitization below still applies, but keep the WAL-dependent stress
-        # features explicitly off here so later sanitizers or explicit command
-        # line overrides do not silently re-enable them.
-        dest_params["disable_wal"] = 1
         dest_params["best_efforts_recovery"] = 0
-        # Direct write v1 crash testing does not cover reopen with unlogged
-        # data, manual/sync WAL persistence, or WAL metadata/locking APIs.
-        dest_params["reopen"] = 0
-        dest_params["manual_wal_flush_one_in"] = 0
-        dest_params["sync_wal_one_in"] = 0
-        dest_params["lock_wal_one_in"] = 0
-        dest_params["get_sorted_wal_files_one_in"] = 0
-        dest_params["get_current_wal_file_one_in"] = 0
-        dest_params["track_and_verify_wals"] = 0
-        dest_params["rate_limit_auto_wal_flush"] = 0
-        dest_params["recycle_log_file_num"] = 0
-        # Write/open fault injection currently assumes WAL-based recovery or
-        # error-retry behavior that direct write v1 does not provide.
-        dest_params["sync_fault_injection"] = 0
+        # With sync_fault_injection, the test FileSystem keeps unsynced data in
+        # memory. Reads of a blob file that is still open for writing see that
+        # data through normal reads, but an mmap of the file cannot.
+        if dest_params.get("sync_fault_injection", 0) == 1:
+            dest_params["mmap_read"] = 0
+        # Batched snapshot stress (test_batches_snapshots) is not validated with
+        # blob direct write, so keep it off.
+        dest_params["test_batches_snapshots"] = 0
+        # Read and write fault injection exercise error-retry behavior of the
+        # direct-write file paths that this profile does not cover yet.
         dest_params["write_fault_one_in"] = 0
         dest_params["metadata_write_fault_one_in"] = 0
         dest_params["read_fault_one_in"] = 0
@@ -1857,9 +1854,7 @@ def finalize_and_sanitize(src_params):
         else:
             dest_params["unordered_write"] = 0
     if dest_params.get("disable_wal", 0) == 1:
-        # WAL-disabled stress runs do not support in-process reopen. Blob
-        # direct write v1 relies on this path so crash testing stays within its
-        # SST/blob-manifest recovery envelope rather than WAL replay.
+        # WAL-disabled stress runs do not support in-process reopen.
         dest_params["atomic_flush"] = 1
         dest_params["sync"] = 0
         dest_params["write_fault_one_in"] = 0
@@ -2258,8 +2253,7 @@ def finalize_and_sanitize(src_params):
         dest_params["max_compaction_trigger_wakeup_seconds"] = 20
 
     # Batch/snapshot stress relies on WAL-backed recovery semantics. Keep it
-    # off for every finalized WAL-disabled profile, including blob direct
-    # write presets that force disable_wal=1 earlier in sanitization.
+    # off for every finalized WAL-disabled profile.
     if dest_params.get("disable_wal", 0) == 1:
         dest_params["test_batches_snapshots"] = 0
 

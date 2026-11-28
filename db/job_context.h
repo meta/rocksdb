@@ -10,6 +10,7 @@
 #pragma once
 
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -222,6 +223,17 @@ struct JobContext {
   // safely use the snapshot without taking DB mutex.
   UnorderedSet<uint64_t> active_blob_direct_write_files;
 
+  // Blob files that WAL recovery kept while its WALs are live (see
+  // DBImpl::wal_replay_blob_files_), pinned in FindObsoleteFiles(), or null.
+  // PurgeObsoleteFiles must keep them.
+  std::shared_ptr<const UnorderedSet<uint64_t>> wal_replay_blob_files;
+
+  // The set of DBImpl::wal_replay_blob_files_ after its WAL became obsolete,
+  // or null. FindObsoleteFiles() moves it here so that the last reference is
+  // released in Clean(), which runs without the DB mutex: destroying a large
+  // set can take time. The purge does not keep its files.
+  std::shared_ptr<const UnorderedSet<uint64_t>> retired_wal_replay_blob_files;
+
   // Snapshot of VersionSet's next file number taken before collecting active
   // direct-write blob files. This keeps the current purge pass from racing a
   // concurrently created blob file that was not yet part of the active set.
@@ -306,6 +318,8 @@ struct JobContext {
     memtables_to_free.clear();
     wals_to_free.clear();
     job_snapshot.reset();
+    wal_replay_blob_files.reset();
+    retired_wal_replay_blob_files.reset();
   }
 
   ~JobContext() {

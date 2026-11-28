@@ -423,10 +423,37 @@ IOStatus TestFSWritableFile::Truncate(uint64_t size, const IOOptions& options,
     return s;
   }
 
-  s = target_->Truncate(size, options, dbg);
-  if (s.ok()) {
-    state_.pos_at_last_append_ = size;
+  if (reopened_for_write_) {
+    // A reopened handle starts with positions 0 and does not know the bytes
+    // that are already in the file, so its positions do not describe
+    // target_. Forward the truncate to target_, then update the tracked state
+    // that random-access readers use.
+    s = target_->Truncate(size, options, dbg);
+    if (s.ok()) {
+      state_.pos_at_last_append_ = size;
+      fs_->ReopenedWritableFileTruncated(state_.filename_, size);
+    }
+    return s;
   }
+  // With unsynced data loss, target_ holds only the synced bytes
+  // [0, pos_at_last_sync_), and state_.buffer_ holds the bytes after them.
+  // A size inside the buffer only shortens the buffer. Truncating target_
+  // there would add zero bytes before the buffered data.
+  const bool buffered = !target_->use_direct_io() && unsync_data_loss_;
+  if (buffered && size >= state_.pos_at_last_sync_) {
+    state_.buffer_.resize(static_cast<size_t>(size - state_.pos_at_last_sync_));
+  } else {
+    s = target_->Truncate(size, options, dbg);
+    if (!s.ok()) {
+      return s;
+    }
+    state_.buffer_.clear();
+  }
+  state_.pos_at_last_append_ = size;
+  state_.pos_at_last_sync_ = std::min(state_.pos_at_last_sync_, size);
+  // Random-access readers of this file read the shared state (see
+  // TestFSRandomAccessFile::AddUnsyncedData()), so publish the new size.
+  fs_->WritableFileAppended(state_);
   return s;
 }
 
@@ -656,6 +683,18 @@ IOStatus TestFSRandomRWFile::Sync(const IOOptions& options,
   return target_->Sync(options, dbg);
 }
 
+namespace {
+// Modifies `result` to start at the beginning of `scratch` if not already,
+// copying data there if needed.
+void MoveToScratchIfNeeded(Slice* result, char* scratch) {
+  if (result->data() != scratch) {
+    // NOTE: might overlap, where result is later in scratch
+    std::copy(result->data(), result->data() + result->size(), scratch);
+    *result = Slice(scratch, result->size());
+  }
+}
+}  // namespace
+
 TestFSRandomAccessFile::TestFSRandomAccessFile(
     const std::string& fname, std::unique_ptr<FSRandomAccessFile>&& f,
     FaultInjectionTestFS* fs)
@@ -685,8 +724,56 @@ IOStatus TestFSRandomAccessFile::Read(uint64_t offset, size_t n,
   }
 
   s = target_->Read(offset, n, options, result, scratch, dbg);
-  // TODO (low priority): fs_->ReadUnsyncedData()
+  if (s.ok()) {
+    s = AddUnsyncedData(offset, n, options, result, scratch, dbg);
+  }
   return s;
+}
+
+IOStatus TestFSRandomAccessFile::AddUnsyncedData(uint64_t offset, size_t n,
+                                                 const IOOptions& options,
+                                                 Slice* result, char* scratch,
+                                                 IODebugContext* dbg) const {
+  if (!fs_->ReadUnsyncedData() || scratch == nullptr) {
+    return IOStatus::OK();
+  }
+  // A concurrent Sync() moves buffered data into the target file. If it
+  // happened after the target read, read the target again. Each retry sees a
+  // later sync, and syncs stop when writes stop. 8 tries is an estimate, not
+  // a measured bound. If every try races with a sync, the read fails with
+  // IOError instead of returning a short read, which a reader could take for
+  // a torn record.
+  constexpr int kMaxAttempts = 8;
+  for (int attempt = 0; attempt < kMaxAttempts && result->size() < n;
+       ++attempt) {
+    MoveToScratchIfNeeded(result, scratch);
+    const uint64_t read_end = offset + result->size();
+    // Lets a test sync the file between the target read and this point.
+    TEST_SYNC_POINT(
+        "TestFSRandomAccessFile::AddUnsyncedData:BeforeReadUnsynced");
+    Slice unsynced;
+    int64_t pos_at_last_sync = -1;
+    fs_->ReadUnsynced(fname_, read_end, n - result->size(), &unsynced,
+                      scratch + result->size(), &pos_at_last_sync);
+    // If the last sync position is not past what the target read returned,
+    // no sync raced with the read, and the unsynced buffer starts right where
+    // the target data ends. Otherwise a Sync() moved more data into the target
+    // file after the read, so read the target again.
+    if (pos_at_last_sync < 0 ||
+        static_cast<uint64_t>(pos_at_last_sync) <= read_end) {
+      assert(unsynced.empty() || unsynced.data() == scratch + result->size());
+      *result = Slice(scratch, result->size() + unsynced.size());
+      return IOStatus::OK();
+    }
+    IOStatus s = target_->Read(offset, n, options, result, scratch, dbg);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  if (result->size() < n) {
+    return IOStatus::IOError("Unsynced read of " + fname_ + " raced with sync");
+  }
+  return IOStatus::OK();
 }
 
 IOStatus TestFSRandomAccessFile::ReadAsync(
@@ -733,7 +820,14 @@ IOStatus TestFSRandomAccessFile::MultiRead(FSReadRequest* reqs, size_t num_reqs,
     return fs_->GetError();
   }
   IOStatus s = target_->MultiRead(reqs, num_reqs, options, dbg);
-  // TODO (low priority): fs_->ReadUnsyncedData()
+  if (s.ok()) {
+    for (size_t i = 0; i < num_reqs; i++) {
+      if (reqs[i].status.ok()) {
+        reqs[i].status = AddUnsyncedData(reqs[i].offset, reqs[i].len, options,
+                                         &reqs[i].result, reqs[i].scratch, dbg);
+      }
+    }
+  }
   bool injected_error = false;
   for (size_t i = 0; i < num_reqs; i++) {
     if (!reqs[i].status.ok()) {
@@ -773,22 +867,28 @@ size_t TestFSRandomAccessFile::GetUniqueId(char* id, size_t max_size) const {
 IOStatus TestFSRandomAccessFile::GetFileSize(uint64_t* file_size) {
   if (is_sst_ && fs_->ShouldFailRandomAccessGetFileSizeSst()) {
     return IOStatus::IOError("FSRandomAccessFile::GetFileSize failed");
-  } else {
-    return target_->GetFileSize(file_size);
   }
+  IOStatus s = target_->GetFileSize(file_size);
+  if (s.ok() && fs_->ReadUnsyncedData()) {
+    fs_->MaybeGetUnsyncedFileSize(fname_, file_size);
+  }
+  return s;
 }
 
-namespace {
-// Modifies `result` to start at the beginning of `scratch` if not already,
-// copying data there if needed.
-void MoveToScratchIfNeeded(Slice* result, char* scratch) {
-  if (result->data() != scratch) {
-    // NOTE: might overlap, where result is later in scratch
-    std::copy(result->data(), result->data() + result->size(), scratch);
-    *result = Slice(scratch, result->size());
+void FaultInjectionTestFS::MaybeGetUnsyncedFileSize(const std::string& fname,
+                                                    uint64_t* file_size) {
+  MutexLock l(&mutex_);
+  std::map<std::string, FSFileState>::const_iterator it =
+      db_file_state_.find(fname);
+  if (it != db_file_state_.end()) {
+    // The file holds the target's bytes plus the buffered unsynced bytes that
+    // follow the synced position. Do not use pos_at_last_append_:
+    // DropUnsyncedFileData() shortens the buffer but does not change it.
+    const FSFileState& state = it->second;
+    *file_size =
+        std::max(*file_size, state.pos_at_last_sync_ + state.buffer_.size());
   }
 }
-}  // namespace
 
 void FaultInjectionTestFS::ReadUnsynced(const std::string& fname,
                                         uint64_t offset, size_t n,
@@ -1636,6 +1736,19 @@ void FaultInjectionTestFS::WritableFileSynced(const FSFileState& state) {
     } else {
       db_file_state_[state.filename_] = state;
     }
+  }
+}
+
+void FaultInjectionTestFS::ReopenedWritableFileTruncated(
+    const std::string& fname, uint64_t size) {
+  MutexLock l(&mutex_);
+  std::map<std::string, FSFileState>::iterator it = db_file_state_.find(fname);
+  if (it != db_file_state_.end()) {
+    // The file on disk now has exactly `size` bytes, and nothing is buffered
+    // for it.
+    it->second.pos_at_last_append_ = size;
+    it->second.pos_at_last_sync_ = size;
+    it->second.buffer_.clear();
   }
 }
 

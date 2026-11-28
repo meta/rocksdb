@@ -100,7 +100,7 @@ BlobFilePartitionManager::BlobFilePartitionManager(
     std::shared_ptr<BlobFilePartitionStrategy> strategy,
     FileNumberAllocator file_number_allocator, FileSystem* fs,
     SystemClock* clock, Statistics* statistics, const FileOptions& file_options,
-    std::string db_path, std::string column_family_name,
+    std::string blob_dir, std::string column_family_name,
     uint64_t blob_file_size, bool use_fsync,
     uint64_t blob_writer_max_buffer_size, BlobFileCache* blob_file_cache,
     BlobFileCompletionCallback* blob_callback,
@@ -118,7 +118,7 @@ BlobFilePartitionManager::BlobFilePartitionManager(
       clock_(clock),
       statistics_(statistics),
       file_options_(file_options),
-      db_path_(std::move(db_path)),
+      blob_dir_(std::move(blob_dir)),
       column_family_name_(std::move(column_family_name)),
       blob_file_size_(blob_file_size),
       use_fsync_(use_fsync),
@@ -187,6 +187,7 @@ BlobFilePartitionManager::DetachPartitionFile(Partition* partition) {
   deferred.total_blob_bytes = partition->total_blob_bytes;
   deferred.garbage_blob_count = partition->garbage_blob_count;
   deferred.garbage_blob_bytes = partition->garbage_blob_bytes;
+  deferred.sync_required = partition->sync_required;
   ResetPartitionState(partition);
   return deferred;
 }
@@ -195,12 +196,16 @@ void BlobFilePartitionManager::AddFilePartitionMapping(uint64_t file_number,
                                                        uint32_t partition_idx) {
   WriteLock lock(&file_partition_mutex_);
   file_to_partition_[file_number] = partition_idx;
+  tracked_blob_file_count_.store(file_to_partition_.size(),
+                                 std::memory_order_relaxed);
 }
 
 void BlobFilePartitionManager::RemoveFilePartitionMapping(
     uint64_t file_number) {
   WriteLock lock(&file_partition_mutex_);
   file_to_partition_.erase(file_number);
+  tracked_blob_file_count_.store(file_to_partition_.size(),
+                                 std::memory_order_relaxed);
 }
 
 Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
@@ -211,7 +216,7 @@ Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
   assert(!partition->writer);
 
   const uint64_t blob_file_number = file_number_allocator_();
-  const std::string blob_file_path = BlobFileName(db_path_, blob_file_number);
+  const std::string blob_file_path = BlobFileName(blob_dir_, blob_file_number);
 
   AddFilePartitionMapping(blob_file_number, partition_idx);
 
@@ -234,6 +239,7 @@ Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
     RemoveFilePartitionMapping(blob_file_number);
     return s;
   }
+  dir_sync_required_ = true;
 
   const bool perform_data_verification =
       checksum_handoff_file_types_.Contains(FileType::kBlobFile);
@@ -341,7 +347,7 @@ Status BlobFilePartitionManager::FinalizeBlobFile(
 
   if (blob_callback_ != nullptr) {
     // `mutex_` is held, and the DB mutex must not be acquired under it.
-    const std::string blob_file_path = BlobFileName(db_path_, file_number);
+    const std::string blob_file_path = BlobFileName(blob_dir_, file_number);
     if (blob_callback_->OnKeptBlobFileCompleted(
             blob_file_path, column_family_name_, /*job_id=*/0, file_number,
             BlobFileCreationReason::kFlush, checksum_value, checksum_method,
@@ -753,7 +759,82 @@ Status BlobFilePartitionManager::SyncAllOpenFiles(
     }
     partition->sync_required = false;
   }
+  // Syncs one deferred file: a file moved to a pending generation at a
+  // memtable switch, or a file whose seal failed while the current memtable
+  // was active (current_generation_failed_files_).
+  auto sync_deferred = [&](DeferredFile& deferred) -> Status {
+    // A deferred file has no writer once a flush sealed it: SealDeferredFile()
+    // synced its footer and released the writer, so nothing is left to sync.
+    if (!deferred.writer || !deferred.sync_required) {
+      return Status::OK();
+    }
+    // If the seal of this file failed, the BlobLogWriter stays here, but the
+    // failed seal can have closed and released its underlying writable file,
+    // so it cannot be synced. This holds for a failed rollover seal
+    // (current_generation_failed_files_) and after the file moved to a pending
+    // generation. A file without unsynced records is skipped above, and the
+    // flush of its generation returns the saved seal error. When the file
+    // still has unsynced records, return the saved seal error and leave
+    // sync_required set, so a later attempt to sync this file returns the
+    // error again. DBImpl stops this attempt before it syncs the WAL files, so
+    // no WAL record that points to those records becomes durable. See
+    // DBImpl::SyncWalImpl() and DBImpl::WriteImpl() for which caller sets the
+    // background error.
+    if (!deferred.seal_status.ok()) {
+      return deferred.seal_status;
+    }
+    Status s = deferred.writer->Sync(write_options);
+    if (s.ok()) {
+      deferred.sync_required = false;
+    }
+    return s;
+  };
+  for (auto& failed : current_generation_failed_files_) {
+    Status s = sync_deferred(failed);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  for (auto& batch : pending_generations_) {
+    for (auto& deferred : batch.deferred_files) {
+      Status s = sync_deferred(deferred);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+  }
+  if (dir_sync_required_) {
+    Status s = SyncBlobDirectory(write_options);
+    if (!s.ok()) {
+      return s;
+    }
+    dir_sync_required_ = false;
+  }
   return Status::OK();
+}
+
+Status BlobFilePartitionManager::SyncBlobDirectory(
+    const WriteOptions& write_options) {
+  IOOptions io_options;
+  IOStatus s = WritableFileWriter::PrepareIOOptions(write_options, io_options);
+  std::unique_ptr<FSDirectory> dir;
+  if (s.ok()) {
+    s = fs_->NewDirectory(blob_dir_, io_options, &dir, /*dbg=*/nullptr);
+  }
+  if (s.ok()) {
+    s = dir->FsyncWithDirOptions(
+        io_options, /*dbg=*/nullptr,
+        DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+  }
+  if (s.ok()) {
+    s = dir->Close(io_options, /*dbg=*/nullptr);
+    // Close() is optional for a directory, and the default returns
+    // NotSupported. The fsync above already made the entries durable.
+    if (s.IsNotSupported()) {
+      s = IOStatus::OK();
+    }
+  }
+  return s;
 }
 
 void BlobFilePartitionManager::GetActiveBlobFileNumbers(
@@ -839,6 +920,8 @@ void BlobFilePartitionManager::RemoveFilePartitionMappings(
   WriteLock lock(&file_partition_mutex_);
   for (uint64_t file_number : file_numbers) {
     file_to_partition_.erase(file_number);
+    tracked_blob_file_count_.store(file_to_partition_.size(),
+                                   std::memory_order_relaxed);
     if (blob_file_cache_ != nullptr) {
       // In-flight direct-write reads may have cached a footer-less reader for
       // this file before it was sealed. Drop it now so future manifest-visible

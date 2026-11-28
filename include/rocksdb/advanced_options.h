@@ -1225,17 +1225,71 @@ struct AdvancedColumnFamilyOptions {
   //  - only supports the ordered single-memtable-writer path; unordered,
   //    pipelined, two_write_queues, and allow_concurrent_memtable_write are
   //    not supported.
-  //  - crash recovery only supports blob files that were already made
-  //    manifest-visible by flush/SST creation; WAL replay of active
-  //    direct-write blob files is not currently supported.
-  //  - checkpoint/backup/live-files enumeration must flush pending
-  //    direct-write state first; APIs that intentionally skip the flush, or
-  //    run while WAL is locked, can return NotSupported.
+  //  - crash recovery replays the WAL:
+  //    - WAL replay: a WAL record that points into a blob file that is not in
+  //      the MANIFEST yet (its memtable was not flushed) is read back from
+  //      that file and inserted as a raw value.
+  //    - Unreadable value (missing file, torn record or checksum mismatch):
+  //      the record is handled like a corrupted WAL record. With
+  //      paranoid_checks=true (the default), kPointInTimeRecovery stops
+  //      replay before the record, kSkipAnyCorruptedRecords skips it, and
+  //      kTolerateCorruptedTailRecords and kAbsoluteConsistency fail the open.
+  //      kTolerateCorruptedTailRecords tolerates only a torn record at the
+  //      end of the WAL. Here the WAL record is complete and only its blob
+  //      value is lost, so the mode treats it as real corruption. With
+  //      paranoid_checks=false, the record is skipped in every mode, as for
+  //      other corrupted WAL records. Exceptions: when all live column
+  //      families have blob direct write off, a read-write open checks the
+  //      WAL records only if it finds a blob file outside the MANIFEST. When
+  //      the records are checked and a column family has blob files off, a
+  //      BlobIndex to a blob file that recovery did not find is kept
+  //      unchanged (it can belong to the stackable BlobDB). In both cases the
+  //      missing file is not reported. A blob file that recovery found but
+  //      that is missing when it is read is reported as corruption, and a
+  //      read-only open with blob files on reports a missing file too.
+  //    - Cost: replay turns BlobIndex entries back into raw values, so replay
+  //      memory and the recovery flush work grow with the blob data that
+  //      unflushed memtables refer to, not with write_buffer_size. A read-only
+  //      open never flushes, so it keeps all resolved values in memory. A
+  //      read-write open writes about (resolved bytes / write_buffer_size) L0
+  //      files during recovery.
+  //  - a checkpoint, a backup or GetLiveFilesStorageInfo() returns NotSupported
+  //    while blob direct write has active blob files that are not flushed yet,
+  //    if the call does not flush (for example log_size_for_flush=UINT64_MAX or
+  //    flush_before_backup=false) or if the WAL is locked (LockWAL()), because
+  //    the copy would miss those files. A checkpoint or backup gets every blob
+  //    direct write value only when it flushes (log_size_for_flush=0, the
+  //    default for a checkpoint, or flush_before_backup=true for a backup, on a
+  //    read-write DB). With blob direct write, that flush flushes all column
+  //    families at one point, also with atomic_flush=false, so that a write
+  //    made during the checkpoint does not make a copy opened with
+  //    kPointInTimeRecovery fail to open; such a write can be missing from the
+  //    copy. With kTolerateCorruptedTailRecords or kAbsoluteConsistency, such a
+  //    write can still fail the open of the copy. If another flush finishes
+  //    during that time (and could make the copy fail to open, because another
+  //    column family's log number passes a WAL that still has such a write),
+  //    the call can return TryAgain; retry it. Without a flush, or from a
+  //    read-only DB, values in blob files that are not in the MANIFEST (for
+  //    example after a WAL replay without a flush) are not copied. When the
+  //    copy is opened, its WAL recovery handles those records by
+  //    wal_recovery_mode if it checks the records (see the crash recovery
+  //    bullet above); otherwise the BlobIndex stays and a later read of that
+  //    key fails. DB::GetLiveFiles() with flush_memtable=false does not check
+  //    for active blob direct write files, so its list can miss blob files that
+  //    are not in the MANIFEST yet.
   //  - not compatible with MemPurge or user-defined timestamps.
+  //  - a failed sync or seal of a blob direct write file during a flush sets
+  //    at least a fatal background error, also for a retryable error and with
+  //    paranoid_checks=false: there is no automatic recovery, and the DB must
+  //    be reopened. The blob file holds the only copy of its values; WAL
+  //    recovery at the reopen reads them back and checks them.
   //  - DB::IngestWriteBatchWithIndex() is not supported while any live column
   //    family enables this option.
-  //  - read-only and secondary opens can read flushed/manifest-visible blob
-  //    files, but do not resolve still-active direct-write blob files.
+  //  - read-only opens replay the WAL in the same way. Secondary opens can
+  //    read flushed blob files, but do not resolve direct-write blob files
+  //    that were not flushed yet.
+  //  - TransactionDB with the WritePrepared or WriteUnprepared write policy
+  //    is not supported.
   //
   // An SstFileManager max allowed space is a soft limit for direct-write blob
   // files. Their bytes are already on disk when a file is sealed, so the seal
@@ -1246,6 +1300,32 @@ struct AdvancedColumnFamilyOptions {
   // to about blob_file_size * blob_direct_write_partitions for each memtable
   // not flushed yet (up to max_write_buffer_number). Blob files written by
   // flush or compaction instead fail that job and are deleted.
+  //
+  // WAL sync: every WAL sync (a write with sync=true, SyncWAL(),
+  // FlushWAL(true), and the sync of closed WALs before a flush) first syncs the
+  // blob direct write files and the directory entries of new blob files, and
+  // then fsyncs the WALs. So when a WAL sync returns OK, the blob values of all
+  // WAL records written before the sync started are durable. A sync write also
+  // covers its own records. SyncWAL() and FlushWAL(true) do not keep writers
+  // out. After a power loss, a write made while they run can leave a WAL record
+  // that survives while its blob value cannot be read; replay applies the
+  // corrupted-record rules (see wal_recovery_mode): with paranoid_checks=true,
+  // kPointInTimeRecovery stops replay there, kSkipAnyCorruptedRecords skips the
+  // record, and kTolerateCorruptedTailRecords and kAbsoluteConsistency fail the
+  // open; with paranoid_checks=false, the record is skipped in every mode. With
+  // manual_wal_flush, FlushWAL(true) first writes the WAL buffer. It returns
+  // any error of that write, or calls SyncWAL() if the write succeeds.
+  //
+  // IMPORTANT: some callbacks run while their thread holds a blob file lock or
+  // WAL sync state of this DB: blob file listener callbacks
+  // (OnBlobFileCreationStarted, OnBlobFileCreated), file I/O listener callbacks
+  // for blob files (see EventListener::ShouldBeNotifiedOnFileIO()), and file
+  // I/O callbacks for WAL files, OnBackgroundError and OnErrorRecoveryBegin
+  // during a WAL sync. From these callbacks, do not call SyncWAL() or
+  // FlushWAL(true) on the same DB, and do not write to the same DB with
+  // sync=true: such a call can hang. From a blob file callback, and from an
+  // error callback inside a write with sync=true, also do not write to the same
+  // DB at all, even with sync=false. RocksDB does not detect these calls.
   //
   // Default: false
   //

@@ -11,6 +11,7 @@
 #include <memory>
 
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_write_batch_transformer.h"
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -211,6 +212,12 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
 }
 
 namespace {
+// WriteBatch protection info supports only 0 (off) and 8 bytes per key. WAL
+// replay gives every replayed batch 8 bytes per key, also a batch that
+// BlobDirectWriteRecoveryResolver rewrote, so the memtable insert checks every
+// replayed key.
+constexpr size_t kReplayProtectionBytesPerKey = 8;
+
 Status ValidateOptionsByTable(
     const DBOptions& db_opts,
     const std::vector<ColumnFamilyDescriptor>& column_families) {
@@ -914,8 +921,13 @@ Status DBImpl::Recover(
       std::sort(wals.begin(), wals.end());
 
       bool corrupted_wal_found = false;
-      s = RecoverLogFiles(wals, &next_sequence, read_only, is_retry,
-                          &corrupted_wal_found, recovery_ctx);
+      s = MaybeCreateBlobRecoveryResolver(files_in_wal_dir, read_only,
+                                          recovery_ctx);
+      if (s.ok()) {
+        s = RecoverLogFiles(wals, &next_sequence, read_only, is_retry,
+                            &corrupted_wal_found, recovery_ctx);
+      }
+      FinishBlobRecoveryResolver(read_only, s, wals.back());
       if (corrupted_wal_found && recovered_seq != nullptr) {
         *recovered_seq = next_sequence;
       }
@@ -927,6 +939,10 @@ Status DBImpl::Recover(
       }
     }
   }
+
+  // Files created from here on have this number or a larger one (see
+  // first_file_number_after_recovery_).
+  first_file_number_after_recovery_ = versions_->current_next_file_number();
 
   if (read_only) {
     TEST_SYNC_POINT("DBImpl::Recover:BeforeReadOnlyLegacyOptionsDirectoryScan");
@@ -1233,6 +1249,7 @@ bool DBImpl::InvokeWalFilterIfNeededOnWalRecord(uint64_t wal_number,
 
 void DBOpenLogRecordReadReporter::Corruption(size_t bytes, const Status& s,
                                              uint64_t log_number) {
+  corruption_reported_ = true;
   ROCKS_LOG_WARN(info_log, "%s%s: dropping %d bytes; %s",
                  (status == nullptr ? "(ignoring error) " : ""), fname,
                  static_cast<int>(bytes), s.ToString().c_str());
@@ -1268,6 +1285,151 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
 
   FinishLogFilesRecovery(job_id, status);
   return status;
+}
+
+Status DBImpl::MaybeCreateBlobRecoveryResolver(
+    const std::vector<std::string>& files_in_wal_dir, bool read_only,
+    const RecoveryContext* recovery_ctx) {
+  mutex_.AssertHeld();
+  assert(blob_recovery_resolver_ == nullptr);
+
+  // After a crash, blob direct write leaves blob files that are not in the
+  // MANIFEST yet. Other blob files outside the MANIFEST (for example, obsolete
+  // files not deleted yet) are found too, but no WAL record refers to them.
+  // Discovery runs even when no column family has enable_blob_files or
+  // enable_blob_direct_write set now, because the previous session may have
+  // used blob direct write. How files are found depends on the open mode:
+  // - A read-write open reuses the directory listings that recovery already
+  //   collected, for the blob directory of each column family.
+  // - A read-only open reuses only the WAL directory listing, for a blob
+  //   directory that is the WAL directory (see below). For other files,
+  //   CheckBlobIndex() looks up a referenced file by name once.
+  bool uses_blob_direct_write = false;
+  // True if a column family has enable_blob_files on or blob files in its
+  // Version.
+  bool uses_blob_files = false;
+  UnorderedSet<uint64_t> registered_blob_files;
+  // Directories that can hold blob files. Each column family writes its blob
+  // files to its first cf_paths entry.
+  std::vector<std::string> blob_dirs;
+  for (auto* cfd : *versions_->GetColumnFamilySet()) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    if (cfd->ioptions().enable_blob_direct_write) {
+      uses_blob_direct_write = true;
+    }
+    if (cfd->GetLatestMutableCFOptions().enable_blob_files) {
+      uses_blob_files = true;
+    }
+    for (const auto& meta : cfd->current()->storage_info()->GetBlobFiles()) {
+      registered_blob_files.insert(meta->GetBlobFileNumber());
+      uses_blob_files = true;
+    }
+    const std::string& dir = cfd->ioptions().cf_paths.front().path;
+    if (std::find(blob_dirs.begin(), blob_dirs.end(), dir) == blob_dirs.end()) {
+      blob_dirs.push_back(dir);
+    }
+  }
+
+  UnorderedSet<uint64_t> unregistered_blob_files;
+  auto add_if_unregistered = [&](const std::string& file_name) {
+    uint64_t number = 0;
+    FileType type = kWalFile;
+    if (ParseFileName(file_name, &number, &type) && type == kBlobFile &&
+        registered_blob_files.count(number) == 0) {
+      unregistered_blob_files.insert(number);
+    }
+  };
+  if (!read_only) {
+    assert(recovery_ctx != nullptr);
+    // Each entry is "<normalized directory><kFilePathSeparator><file name>".
+    UnorderedSet<std::string> normalized_blob_dirs;
+    for (const std::string& dir : blob_dirs) {
+      normalized_blob_dirs.insert(NormalizePath(dir));
+    }
+    for (const std::string& path : recovery_ctx->existing_data_files_) {
+      const size_t separator = path.rfind(kFilePathSeparator);
+      if (separator == std::string::npos ||
+          normalized_blob_dirs.count(path.substr(0, separator)) == 0) {
+        continue;
+      }
+      add_if_unregistered(path.substr(separator + 1));
+    }
+  } else {
+    // Blob discovery in a read-only open adds no directory listing: the
+    // process may be allowed to look up and open files by name but not to
+    // list a separate blob directory. It reuses the listing of the WAL
+    // directory that recovery already has, for a blob directory that is the
+    // WAL directory. For a file in another directory, CheckBlobIndex() looks
+    // it up on disk once when a record refers to it. (The read-only open
+    // itself can still list the main DB directory to find the OPTIONS file
+    // when it differs from the WAL directory.)
+    const std::string normalized_wal_dir =
+        NormalizePath(immutable_db_options_.GetWalDir());
+    for (const std::string& dir : blob_dirs) {
+      if (NormalizePath(dir) != normalized_wal_dir) {
+        continue;
+      }
+      for (const std::string& child : files_in_wal_dir) {
+        add_if_unregistered(child);
+      }
+    }
+  }
+  // If there are no unregistered blob files, the resolver is needed only when
+  // a column family has blob direct write on. Then it reports a WAL record
+  // whose blob file is missing as corrupted. A read-only open also needs it
+  // when a column family uses blob files, because it did not list every blob
+  // directory. Other DBs replay without the extra pass over each record.
+  if (!uses_blob_direct_write && unregistered_blob_files.empty() &&
+      !(read_only && uses_blob_files)) {
+    return Status::OK();
+  }
+  blob_recovery_resolver_ = std::make_unique<BlobDirectWriteRecoveryResolver>(
+      versions_->GetColumnFamilySet(), file_options_,
+      std::move(unregistered_blob_files), read_only);
+  return Status::OK();
+}
+
+void DBImpl::FinishBlobRecoveryResolver(bool read_only, const Status& status,
+                                        uint64_t max_wal_number) {
+  mutex_.AssertHeld();
+  if (blob_recovery_resolver_ == nullptr) {
+    return;
+  }
+  const auto& unregistered_blob_files =
+      blob_recovery_resolver_->unregistered_blob_files();
+  if (status.ok() && !read_only) {
+    // If replay checked every record, keep only the files that a record
+    // referred to. Other unregistered files (for example, partial outputs of a
+    // crashed flush) are not needed, so the purge can delete them.
+    const auto& kept_files =
+        blob_recovery_resolver_->replay_incomplete()
+            ? unregistered_blob_files
+            : blob_recovery_resolver_->referenced_blob_files();
+    if (!kept_files.empty()) {
+      // A DB instance recovers its WALs once, but merge with an earlier set
+      // to be safe.
+      std::shared_ptr<UnorderedSet<uint64_t>> files =
+          std::make_shared<UnorderedSet<uint64_t>>(kept_files);
+      if (wal_replay_blob_files_ != nullptr) {
+        files->insert(wal_replay_blob_files_->begin(),
+                      wal_replay_blob_files_->end());
+      }
+      wal_replay_blob_files_ = std::move(files);
+      wal_replay_blob_files_wal_number_ =
+          std::max(wal_replay_blob_files_wal_number_, max_wal_number);
+    }
+  }
+  if (blob_recovery_resolver_->resolved_value_count() > 0) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "WAL replay read %" PRIu64
+                   " values from blob files that are not in the MANIFEST. "
+                   "%zu such files are on disk",
+                   blob_recovery_resolver_->resolved_value_count(),
+                   unregistered_blob_files.size());
+  }
+  blob_recovery_resolver_.reset();
 }
 
 void DBImpl::SetupLogFilesRecovery(
@@ -1340,6 +1502,12 @@ Status DBImpl::ProcessLogFiles(
       status = CheckSeqnoNotSetBackDuringRecovery(prev_next_sequence,
                                                   *next_sequence);
     }
+  }
+
+  if (blob_recovery_resolver_ != nullptr &&
+      (stop_replay_by_wal_filter || stop_replay_for_corruption ||
+       *corrupted_wal_found)) {
+    blob_recovery_resolver_->MarkReplayIncomplete();
   }
 
   if (status.ok()) {
@@ -1425,6 +1593,11 @@ Status DBImpl::ProcessLogFile(
     assert(status.ok());
     // Fail initializing log reader for one log file with an ok status.
     // Try next one.
+    // The WAL stays live but was not read, so a later open can need blob
+    // files that its records refer to.
+    if (blob_recovery_resolver_ != nullptr) {
+      blob_recovery_resolver_->MarkReplayIncomplete();
+    }
     return status;
   }
 
@@ -1480,6 +1653,12 @@ Status DBImpl::ProcessLogFile(
     status = HandleNonOkStatusOrOldLogRecord(
         wal_number, next_sequence, status, reporter, &old_log_record,
         stop_replay_for_corruption, corrupted_wal_number, corrupted_wal_found);
+  }
+
+  // The reader dropped bytes or records of this WAL, also when the error was
+  // ignored, so replay did not check every record.
+  if (reporter.CorruptionReported() && blob_recovery_resolver_ != nullptr) {
+    blob_recovery_resolver_->MarkReplayIncomplete();
   }
 
   FinishLogFileProcessing(status, next_sequence);
@@ -1605,6 +1784,64 @@ Status DBImpl::ProcessLogRecord(
     return process_status;
   }
 
+  // Before the WAL filter and the insert, make each value that is in an
+  // unregistered blob file (see BlobDirectWriteRecoveryResolver) raw again.
+  // Run this before the WAL filter, so that the filter sees the raw values
+  // that the application wrote, and the resolver notes the unregistered blob
+  // files of the record even if the filter skips it. As a result, a record
+  // whose blob value cannot be read is reported as corrupted even if the
+  // filter would skip it. If a value cannot be read, nothing of the record is
+  // inserted, and the record is reported like a record that fails to insert,
+  // so wal_recovery_mode decides what happens.
+  std::unique_ptr<WriteBatch> resolved_batch;
+  if (blob_recovery_resolver_ != nullptr) {
+    // Two batches exist here. `batch` holds the record as written in the WAL.
+    // `batch_to_use` is the batch prepared for replay: `batch` itself, or a
+    // copy whose keys InitializeWriteBatchForLogRecord() changed for a
+    // timestamp size difference (for example, it adds a timestamp when
+    // user-defined timestamps were turned on). Resolve `batch`, because the
+    // blob reader checks the key that the blob file stores with each value.
+    // If Resolve() returns a copy, the code below applies the same timestamp
+    // change when needed, gives the copy new per-key protection info, and
+    // replays the copy. The WAL filter then sees the batch that is inserted.
+    process_status =
+        blob_recovery_resolver_->Resolve(wal_number, batch, &resolved_batch);
+    if (process_status.IsCorruption()) {
+      // Drop this record and report it like a corrupted WAL record. If the
+      // reporter keeps a status (it has none when paranoid checks are off or
+      // the mode skips corrupted records), it stores the error there, and
+      // the caller handles it by wal_recovery_mode.
+      reporter->Corruption(record.size(), process_status);
+      return Status::OK();
+    }
+    if (process_status.ok() && resolved_batch != nullptr &&
+        batch_to_use != &batch) {
+      // batch_to_use != &batch means that InitializeWriteBatchForLogRecord()
+      // changed the keys for a timestamp size difference. Apply the same
+      // change to the rewritten copy.
+      std::unique_ptr<WriteBatch> reconciled_batch;
+      process_status = HandleWriteBatchTimestampSizeDifference(
+          resolved_batch.get(), running_ts_sz,
+          reader->GetRecordedTimestampSize(),
+          TimestampSizeConsistencyMode::kReconcileInconsistency, seq_per_batch_,
+          batch_per_txn_, &reconciled_batch);
+      if (process_status.ok() && reconciled_batch != nullptr) {
+        resolved_batch = std::move(reconciled_batch);
+      }
+    }
+    if (process_status.ok() && resolved_batch != nullptr) {
+      // Give the rewritten batch the same protection info that
+      // InitializeWriteBatchForLogRecord() gives every replayed batch, so the
+      // memtable insert checks it the same way.
+      process_status = WriteBatchInternal::UpdateProtectionInfo(
+          resolved_batch.get(), kReplayProtectionBytesPerKey);
+      batch_to_use = resolved_batch.get();
+    }
+    if (!process_status.ok()) {
+      return process_status;
+    }
+  }
+
   // For the default case of wal_filter == nullptr, always performs no-op
   // and returns true.
   if (!InvokeWalFilterIfNeededOnWalRecord(wal_number, fname, *reporter, *status,
@@ -1672,7 +1909,7 @@ Status DBImpl::InitializeWriteBatchForLogRecord(
       "DBImpl::RecoverLogFiles:BeforeUpdateProtectionInfo:checksum",
       record_checksum);
   status = WriteBatchInternal::UpdateProtectionInfo(
-      batch_to_use, 8 /* bytes_per_key */,
+      batch_to_use, kReplayProtectionBytesPerKey,
       batch_updated ? nullptr : record_checksum);
 
   return status;
