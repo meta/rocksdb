@@ -16,6 +16,7 @@
 #include "db/blob/blob_file_addition.h"
 #include "db/version_edit.h"
 #include "db/wal_edit.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -57,6 +58,9 @@ struct ColumnFamilyOptions;
 //   records, like the ones that VersionSet::WriteCurrentStateToManifest()
 //   writes at the start of a new MANIFEST file. The existing recovery code
 //   replays them.
+// - ManifestRowsToPublicRows() and PublicRowsToManifestRows() convert rows to
+//   and from the public rows of include/rocksdb/manifest_store.h, which an
+//   external metadata store keeps.
 //
 // The rows hold every field that recovery reads from a MANIFEST. Three kinds
 // of VersionEdit content have no row field:
@@ -465,5 +469,91 @@ Status ManifestRowsToRecords(const ManifestRows& rows,
 //   fail when a new file field tag is added.
 bool ManifestRowsEqual(const ManifestRows& a, const ManifestRows& b,
                        std::string* diff);
+
+// Public rows and internal rows: ManifestRows (this header) is the internal
+// model of all rows of a DB. ManifestRow (include/rocksdb/manifest_store.h,
+// without the final "s") is one public row: a key and its encoded fields. The
+// two functions below convert between them. Their parameters say which form
+// they hold: `internal_rows` or `public_rows`.
+
+// The DB row fields of the public rows (include/rocksdb/manifest_store.h) that
+// ManifestDbRow does not hold. RocksDB owns and writes these fields. They are
+// not the store-owned values of the DB row (ManifestStoreDbState). The defaults
+// are those of a DB whose MANIFEST file is the authority
+// (ManifestAuthority::kFile). No RocksDB code path computes
+// in_flight_file_number, so callers leave it at its default 0. The value 0
+// means that every file must be kept, which is always safe. The row format
+// version is not a member: the writer always writes
+// kManifestRowFormatVersionLatest, and the reader only checks it.
+struct ManifestDbRowExtraFields {
+  ManifestAuthority authority = ManifestAuthority::kFile;
+  ManifestCopyMode copy_mode = ManifestCopyMode::kOff;
+  uint64_t copy_file_number = 0;
+  uint64_t in_flight_file_number = 0;
+
+  bool operator==(const ManifestDbRowExtraFields&) const = default;
+};
+
+// Converts `internal_rows` to public rows, including the rows of dropped column
+// families. On OK, `*public_rows` is replaced: the DB row (with `extra_fields`)
+// is first, then for each column family in id order its row, its file rows and
+// its blob file rows (each in number order), then the WAL rows in number order.
+// Each row holds its fields in the canonical encoding, without the fields that
+// hold their default. `feature_version` is the newest feature version that the
+// caller allows, from 1 to kManifestRowFeatureVersionLatest. All fields of this
+// release belong to feature version 1, so every valid value gives the same
+// rows. `extra_fields` must hold known authority and copy mode values; this
+// function writes them without a check. It always writes
+// kManifestRowFormatVersionLatest as the row format version. Every file row
+// must have non-empty smallest and largest keys, as the rows from
+// VersionSet::GetManifestRows() do.
+//
+// Errors: returns InvalidArgument for a `feature_version` out of range.
+Status ManifestRowsToPublicRows(const ManifestRows& internal_rows,
+                                const ManifestDbRowExtraFields& extra_fields,
+                                uint32_t feature_version,
+                                std::vector<ManifestRow>* public_rows);
+
+// Converts public rows back to `internal_rows` and `extra_fields`.
+// `public_db_row` is the DB row, and `other_public_rows` holds the other rows
+// in any order. To decode the output of ManifestRowsToPublicRows(), pass its
+// first element as `public_db_row` and the rest as `other_public_rows`. For a
+// store scan, pass the `db_row` field of the ManifestDbRowResult that
+// ManifestRowVisitor::OnDbRow() receives, and the rows of OnRow(). It drops an
+// unknown field without the "must understand" bit, and reads a temperature
+// value that is not below Temperature::kLastTemperature as
+// Temperature::kUnknown. On error, `*internal_rows` and `*extra_fields` hold
+// partly decoded data and must not be used.
+//
+// Error order: the DB row is decoded first, in these stages:
+// 1. The reader checks the DB row key, and parses the field IDs and lengths
+//    before it reads any field value. A bad key, a field encoding that cannot
+//    be parsed, or a field ID that is 0 or not larger than the one before it
+//    gives Corruption.
+// 2. It reads the field values in ID order. The row format version has field
+//    ID 1, so when it is present it is read first, and a version from a newer
+//    binary gives NotSupported before a later field value can give an error.
+// 3. After it has read the present fields, it checks for missing "always
+//    present" fields.
+// The other rows are decoded only after the DB row.
+//
+// Errors:
+// - NotSupported if a newer binary wrote the rows: a row format version above
+//   kManifestRowFormatVersionLatest, an unknown "must understand" field, or an
+//   unknown authority or copy mode value.
+// - Corruption for a bad encoding, a bad value (for example a path id above 3,
+//   a key with an unknown value type, a blob file with only one of checksum
+//   method and value, a compaction cursor level above 65536 or not in
+//   increasing order, or a WAL synced size of 2^64 - 1), a file number above
+//   kFileNumberMask (2^62 - 1; the top 2 bits of a packed file number hold the
+//   path id), a key that is too short for the timestamp size of its column
+//   family, a missing "always present" field, a repeated key, a key with parts
+//   that its row type does not use, a DB row inside `other_public_rows`, an
+//   unknown row type, or a file or blob file row whose column family has no
+//   row.
+Status PublicRowsToManifestRows(
+    const ManifestRow& public_db_row,
+    const std::vector<ManifestRow>& other_public_rows,
+    ManifestRows* internal_rows, ManifestDbRowExtraFields* extra_fields);
 
 }  // namespace ROCKSDB_NAMESPACE

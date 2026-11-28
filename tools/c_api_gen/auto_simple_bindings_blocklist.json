@@ -75,6 +75,16 @@
           "reason": "Experimental mutex diagnostics are configured through the existing DB option string API until the behavior and overhead are qualified."
         },
         {
+          "field": "manifest_store",
+          "policy": "deferred",
+          "reason": "Experimental: store mode is not supported, and a C binding of a ManifestStore object needs an ownership design."
+        },
+        {
+          "field": "manifest_row_feature_version",
+          "policy": "deferred",
+          "reason": "Experimental: the option only has a range check until store mode is supported."
+        },
+        {
           "field": "env",
           "policy": "manual",
           "reason": "Stores external objects, callback collections, or nested aggregates that need explicit C ownership and lifetime policy."

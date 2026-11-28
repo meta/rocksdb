@@ -428,6 +428,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       {offsetof(struct DBOptions, daily_offpeak_time_utc), sizeof(std::string)},
       {offsetof(struct DBOptions, calculate_sst_write_lifetime_hint_set),
        sizeof(CompactionStyleSet)},
+      {offsetof(struct DBOptions, manifest_store),
+       sizeof(std::shared_ptr<ManifestStore>)},
   };
 
   char* options_ptr = new char[sizeof(DBOptions)];
@@ -575,6 +577,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "remote_compaction_manifest_floor=false;"
       "use_separate_remote_compaction_pool=true;"
       "use_session_tmp_dir_for_remote_compaction=true;"
+      "manifest_row_feature_version=1;"
       "reuse_manifest_on_open=true;",
       new_options));
 
