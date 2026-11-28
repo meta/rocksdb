@@ -36,6 +36,7 @@
 #include "rocksdb/utilities/options_util.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/wal_filter.h"
+#include "test_util/mock_manifest_store.h"
 #include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
@@ -384,6 +385,46 @@ class DBSplitMergeTest : public testing::Test {
     ASSERT_OK(db->Get(ReadOptions(), cf, "b", &value));
   }
 };
+
+#ifndef NDEBUG
+// The checkpoint of a split is a separate DB, so it opens without the shadow
+// mode of the source (DBOptions::manifest_store_shadow). Otherwise the open
+// fails, because shadow mode needs a store and the checkpoint options have
+// none.
+TEST_F(DBSplitMergeTest, SplitOfShadowDbOpensCheckpointWithoutShadow) {
+  options_.manifest_store = std::make_shared<MockManifestStore>(
+      std::make_shared<MockManifestStoreData>(), /*epoch=*/1);
+  options_.manifest_store_shadow = true;
+  ASSERT_OK(source_.Open(source_path_, {"one"}, options_));
+  PutFiveKeys(source_.db(), source_.cf(1), "one-");
+
+  // Each shadow DB runs ManifestStoreShadow::Close() when it closes.
+  std::atomic<int> shadow_closes{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestStoreShadow::Close:Start",
+      [&](void* /*arg*/) { shadow_closes.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  SplitDBOptions split_options;
+  split_options.destination_db_path = destination_path_;
+  split_options.column_family_splits = {{"b", "d", source_.cf(1)}};
+  SplitMergeResult result;
+  const Status s = SplitDB(source_.db(), split_options, &result);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(s);
+  ASSERT_EQ(0, shadow_closes.load());
+  // The source is a shadow DB, so closing it runs the sync point. This shows
+  // that the count above can see a shadow close.
+  SyncPoint::GetInstance()->SetCallBack(
+      "ManifestStoreShadow::Close:Start",
+      [&](void* /*arg*/) { shadow_closes.fetch_add(1); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  source_.Close();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(1, shadow_closes.load());
+}
+#endif  // NDEBUG
 
 TEST_F(DBSplitMergeTest, SplitMultipleColumnFamilies) {
   ASSERT_OK(source_.Open(source_path_, {"one", "two", "unlisted"}, options_));

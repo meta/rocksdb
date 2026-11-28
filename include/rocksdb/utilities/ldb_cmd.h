@@ -44,6 +44,9 @@ class LDBCommand {
   static const std::string ARG_PATH;
   static const std::string ARG_SECONDARY_PATH;
   static const std::string ARG_LEADER_PATH;
+  // The ManifestStore of a DB in store mode (DBOptions::manifest_store), as
+  // a string for ManifestStore::CreateFromString().
+  static const std::string ARG_MANIFEST_STORE;
   static const std::string ARG_HEX;
   static const std::string ARG_KEY_HEX;
   static const std::string ARG_VALUE_HEX;
@@ -180,6 +183,15 @@ class LDBCommand {
   // another process, ldb wll leave the source directory completely intact.
   std::string secondary_path_;
   std::string leader_path_;
+  // The store from --manifest_store, or null. Every DB open through OpenDB(),
+  // and DB::ListColumnFamilies(), uses it (DBOptions::manifest_store); the
+  // remote_compaction_primary and remote_compaction_worker commands build
+  // their own options and do not. RocksDB makes at most one call at a time on
+  // a store object, so a command that reads the store while its DB is open
+  // creates its own object from manifest_store_value_.
+  std::shared_ptr<ManifestStore> manifest_store_;
+  // The value of --manifest_store.
+  std::string manifest_store_value_;
   std::string column_family_name_;
   std::unique_ptr<DB> db_;
   DBWithTTL* db_ttl_;

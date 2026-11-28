@@ -11,10 +11,12 @@
 #include <utility>
 
 #include "db/db_test_util.h"
+#include "db/manifest_store_state.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
 #include "env/composite_env_wrapper.h"
 #include "file/filename.h"
+#include "options/options_parser.h"
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/comparator.h"
@@ -22,7 +24,10 @@
 #include "rocksdb/db.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/manifest_store.h"
+#include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_util.h"
+#include "test_util/mock_manifest_store.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -125,6 +130,87 @@ TEST_F(LdbCmdTest, MemEnv) {
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(3, argv, opts, LDBOptions(), nullptr));
+}
+
+// compare_manifest_store reads a store that shadow mode wrote, and fails when
+// a row differs from the MANIFEST.
+TEST_F(LdbCmdTest, CompareManifestStore) {
+  // The factory stays registered in ObjectLibrary::Default() for the whole
+  // process, so every run of this test in the process uses the same store
+  // data. DestroyDB() keeps the rows that shadow mode wrote, so the test
+  // removes them at its start and end, which makes it repeatable (for example
+  // with --gtest_repeat).
+  static std::shared_ptr<MockManifestStoreData> data =
+      std::make_shared<MockManifestStoreData>();
+  ASSERT_OK(MockManifestStore(data, /*epoch=*/1)
+                .Destroy(ManifestStoreDestroyOptions()));
+  const std::string store_name = "LdbCmdTestCompareManifestStore";
+  ObjectLibrary::Default()->AddFactory<ManifestStore>(
+      store_name,
+      [](const std::string& /*uri*/, std::unique_ptr<ManifestStore>* guard,
+         std::string* /*errmsg*/) {
+        guard->reset(new MockManifestStore(data, /*epoch=*/std::nullopt));
+        return guard->get();
+      });
+
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  options.create_if_missing = true;
+  options.manifest_store_shadow = true;
+  options.manifest_store = std::make_shared<MockManifestStore>(data, 1);
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_compare_manifest_store");
+  ASSERT_OK(DestroyDB(dbname, options));
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname, &db));
+  for (const char* key : {"a", "b"}) {
+    ASSERT_OK(db->Put(WriteOptions(), key, "v"));
+    ASSERT_OK(db->Flush(FlushOptions()));
+  }
+  db.reset();
+
+  char arg1[] = "./ldb";
+  char arg2[1024];
+  snprintf(arg2, sizeof(arg2), "--db=%s", dbname.c_str());
+  char arg3[] = "compare_manifest_store";
+  char arg4[1024];
+  snprintf(arg4, sizeof(arg4), "--manifest_store=%s", store_name.c_str());
+  char* argv[] = {arg1, arg2, arg3, arg4};
+  Options ldb_options;
+  ldb_options.env = options.env;
+  ASSERT_EQ(0, LDBCommandRunner::RunCommand(4, argv, ldb_options, LDBOptions(),
+                                            nullptr));
+  // Without the flag, the command fails.
+  ASSERT_EQ(1, LDBCommandRunner::RunCommand(3, argv, ldb_options, LDBOptions(),
+                                            nullptr));
+  // manifest_dump refuses the rows that shadow mode wrote, because the
+  // MANIFEST file is the authority.
+  char dump_cmd[] = "manifest_dump";
+  char* dump_argv[] = {arg1, arg2, dump_cmd, arg4};
+  ASSERT_EQ(1, LDBCommandRunner::RunCommand(4, dump_argv, ldb_options,
+                                            LDBOptions(), nullptr));
+
+  // Delete one file row from the store: the command fails.
+  MockManifestStore writer(data, /*epoch=*/1);
+  ManifestDbRowResult db_row;
+  ASSERT_OK(writer.ReadDbRow(&db_row));
+  std::vector<LiveFileMetaData> files;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname, &db));
+  db->GetLiveFilesMetaData(&files);
+  db.reset();
+  ASSERT_FALSE(files.empty());
+  ManifestCommit commit;
+  commit.expected_commit_sequence = db_row.state.commit_sequence;
+  commit.commit_id = "delete one row";
+  commit.db_row = db_row.db_row;
+  commit.deletes.push_back(
+      ManifestRowKey{ManifestRowType::kFile, 0, files[0].file_number});
+  ASSERT_OK(writer.Commit(commit));
+  ASSERT_EQ(1, LDBCommandRunner::RunCommand(4, argv, ldb_options, LDBOptions(),
+                                            nullptr));
+  ASSERT_OK(DestroyDB(dbname, options));
+  ASSERT_OK(MockManifestStore(data, /*epoch=*/1)
+                .Destroy(ManifestStoreDestroyOptions()));
 }
 
 class FileChecksumTestHelper {
@@ -1252,6 +1338,148 @@ TEST_F(LdbCmdTest, CustomComparator) {
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), &cfds));
+}
+
+// ldb gets the store of a DB in store mode (DBOptions::manifest_store) from
+// --manifest_store, through ManifestStore::CreateFromString().
+TEST_F(LdbCmdTest, ManifestStore) {
+  Env* env = TryLoadCustomOrDefaultEnv();
+  const std::string dbname = test::PerThreadDBPath(env, "ldb_manifest_store");
+  ASSERT_OK(DestroyDir(env, dbname));
+  std::shared_ptr<MockManifestStoreData> data =
+      std::make_shared<MockManifestStoreData>();
+  const std::string store_name = "LdbCmdTestManifestStore";
+  ObjectRegistry::Default()
+      ->AddLibrary("ldb_cmd_test")
+      ->AddFactory<ManifestStore>(
+          store_name, [data](const std::string& /*uri*/,
+                             std::unique_ptr<ManifestStore>* guard,
+                             std::string* /*errmsg*/) {
+            // A store object without an epoch only reads.
+            guard->reset(new MockManifestStore(data, std::nullopt));
+            return guard->get();
+          });
+  {
+    Options options;
+    options.env = env;
+    options.create_if_missing = true;
+    options.track_options_file_number_in_manifest = true;
+    options.manifest_store = std::make_shared<MockManifestStore>(data, 1);
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(options, dbname, &db));
+    ColumnFamilyHandle* one = nullptr;
+    ASSERT_OK(db->CreateColumnFamily(options, "one", &one));
+    ASSERT_OK(db->DestroyColumnFamilyHandle(one));
+    ASSERT_OK(db->Put(WriteOptions(), "a", "1"));
+    ASSERT_OK(db->Flush(FlushOptions()));
+  }
+  // A newer OPTIONS file that the DB never committed. The OPTIONS readers that
+  // only get the folder cannot tell which file is committed, so they refuse.
+  // With the store, ldb loads the committed file. This file names a column
+  // family that does not exist, so a command that used it would fail to open.
+  {
+    DBOptions db_options;
+    db_options.env = env;
+    db_options.track_options_file_number_in_manifest = true;
+    ASSERT_OK(PersistRocksDBOptions(
+        WriteOptions(), db_options, {"default", "one", "ghost"},
+        {ColumnFamilyOptions(), ColumnFamilyOptions(), ColumnFamilyOptions()},
+        OptionsFileName(dbname, 999999), env->GetFileSystem().get()));
+  }
+
+  auto run = [&](std::vector<std::string> args) {
+    args.push_back("--db=" + dbname);
+    Options base;
+    base.env = env;
+    std::unique_ptr<LDBCommand> command(
+        LDBCommand::InitFromCmdLineArgs(args, base, LDBOptions(), nullptr));
+    EXPECT_NE(nullptr, command);
+    if (command == nullptr) {
+      return LDBCommandExecuteResult::Failed("unknown command");
+    }
+    command->Run();
+    return command->GetExecuteState();
+  };
+  // The commands below only read: CURRENT and the stub MANIFEST keep their
+  // bytes.
+  auto metadata_files = [&]() {
+    std::string current;
+    EXPECT_OK(ReadFileToString(env, CurrentFileName(dbname), &current));
+    std::string stub;
+    EXPECT_OK(ReadFileToString(
+        env, dbname + "/" + current.substr(0, current.size() - 1), &stub));
+    return current + stub;
+  };
+  const std::string metadata_before = metadata_files();
+  const std::string flag = "--manifest_store=" + store_name;
+  ASSERT_TRUE(run({"scan", flag}).IsSucceed());
+  // The committed OPTIONS file can name a column family that a partial batch
+  // did not commit. ldb keeps only the column families that the rows list as
+  // live, so the command still opens the DB.
+  {
+    MockManifestStore reader(data, std::nullopt);
+    ManifestStoreScan scan;
+    ASSERT_OK(ScanManifestStore(&reader, /*consistent=*/true, &scan));
+    ASSERT_TRUE(scan.rows.db.committed_options_file_number.has_value());
+    const std::string committed =
+        OptionsFileName(dbname, *scan.rows.db.committed_options_file_number);
+    std::string saved;
+    ASSERT_OK(ReadFileToString(env, committed, &saved));
+    DBOptions db_options;
+    db_options.env = env;
+    db_options.track_options_file_number_in_manifest = true;
+    ASSERT_OK(PersistRocksDBOptions(
+        WriteOptions(), db_options, {"default", "one", "ghost"},
+        {ColumnFamilyOptions(), ColumnFamilyOptions(), ColumnFamilyOptions()},
+        committed, env->GetFileSystem().get()));
+    ASSERT_TRUE(run({"scan", flag}).IsSucceed());
+    ASSERT_OK(WriteStringToFile(env, saved, committed));
+  }
+  ASSERT_TRUE(run({"list_column_families", flag}).IsSucceed());
+  // The dump prints the metadata of the rows, not the stub.
+  testing::internal::CaptureStdout();
+  const bool dumped = run({"manifest_dump", flag}).IsSucceed();
+  const std::string dump = testing::internal::GetCapturedStdout();
+  ASSERT_TRUE(dumped);
+  ASSERT_NE(std::string::npos, dump.find("Column family \"one\"")) << dump;
+  testing::internal::CaptureStdout();
+  const bool live_dumped = run({"dump_live_files", flag}).IsSucceed();
+  const std::string live_dump = testing::internal::GetCapturedStdout();
+  ASSERT_TRUE(live_dumped);
+  ASSERT_NE(std::string::npos, live_dump.find("Column family \"one\""))
+      << live_dump;
+  ASSERT_EQ(metadata_before, metadata_files());
+  // Without the store, ldb cannot use the DB.
+  ASSERT_TRUE(run({"scan"}).IsFailed());
+  // Commands that rewrite the MANIFEST file offline stay unsupported.
+  ASSERT_TRUE(run({"repair", flag}).IsFailed());
+  ASSERT_TRUE(run({"reduce_levels", "--new_levels=2", flag}).IsFailed());
+  LDBCommandExecuteResult update =
+      run({"update_manifest", "--update_temperatures", flag});
+  ASSERT_TRUE(update.IsFailed());
+  ASSERT_NE(std::string::npos, update.ToString().find("Not implemented"))
+      << update.ToString();
+  ASSERT_EQ(metadata_before, metadata_files());
+  // A bad store value fails before any DB access.
+  LDBCommandExecuteResult bad = run({"scan", "--manifest_store=NoSuchStore"});
+  ASSERT_TRUE(bad.IsFailed());
+  ASSERT_NE(std::string::npos, bad.ToString().find("--manifest_store"))
+      << bad.ToString();
+  // After a rollback the MANIFEST file is the authority, so manifest_dump
+  // refuses the old rows. Here a claim with a newer epoch (2) only sets the
+  // authority field of the DB row to kFile.
+  {
+    MockManifestStore claimer(data, 2);
+    ManifestStoreOpenOptions open_options;
+    open_options.commit_id = "rollback";
+    open_options.db_field_updates = EncodeManifestRowFields({ManifestRowField{
+        static_cast<uint32_t>(ManifestDbField::kAuthority),
+        std::string(1, static_cast<char>(ManifestAuthority::kFile))}});
+    ManifestDbRowResult db_row;
+    ASSERT_OK(claimer.Open(open_options, &db_row));
+  }
+  ASSERT_TRUE(run({"manifest_dump", flag}).IsFailed());
+  ASSERT_OK(DestroyDir(env, dbname));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -6,7 +6,10 @@
 
 #pragma once
 #include <cassert>
+#include <memory>
+#include <string>
 
+#include "db/log_reader.h"
 #include "rocksdb/env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -17,4 +20,21 @@ namespace ROCKSDB_NAMESPACE {
 Status GetCurrentManifestPath(const std::string& dbname, FileSystem* fs,
                               bool is_retry, std::string* manifest_path,
                               uint64_t* manifest_file_number);
+
+// Keeps the first error that a log::Reader of a MANIFEST file reports, for
+// example a read error or a record that fails its checksum. Later reports do
+// not change it. The caller sets status_ptr before the first read.
+struct ManifestReporter : public log::Reader::Reporter {
+  Status* status_ptr = nullptr;
+  void Corruption(size_t /*bytes*/, const Status& st,
+                  uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+    status_ptr->UpdateIfOk(st);
+  }
+};
+
+// Opens the MANIFEST file at manifest_path for reading with a log::Reader that
+// verifies record checksums. reporter must outlive *reader.
+Status NewManifestReader(FileSystem* fs, const std::string& manifest_path,
+                         ManifestReporter* reporter,
+                         std::unique_ptr<log::Reader>* reader);
 }  // namespace ROCKSDB_NAMESPACE

@@ -191,6 +191,19 @@ class VersionEditHandler : public VersionEditHandlerBase {
     return Status::OK();
   }
 
+  // VersionBuilder calls these two functions when it adds a file. They return
+  // the metadata object that the current Version of `cfd` holds for the same
+  // file, for the builder to use instead of a new object, or null. Only
+  // ManifestTailer returns an object (see ManifestTailer::HeldFile()).
+  virtual FileMetaData* HeldFile(ColumnFamilyData* /*cfd*/,
+                                 const FileMetaData& /*fmeta*/) {
+    return nullptr;
+  }
+  virtual std::shared_ptr<SharedBlobFileMetaData> HeldBlobFile(
+      ColumnFamilyData* /*cfd*/, const BlobFileAddition& /*blob_addition*/) {
+    return nullptr;
+  }
+
  protected:
   explicit VersionEditHandler(
       bool read_only, std::vector<ColumnFamilyDescriptor> column_families,
@@ -355,6 +368,15 @@ class VersionEditHandlerPointInTime : public VersionEditHandler {
     return true;
   }
 
+  // Called at the end of an iteration that succeeded, after the candidate
+  // Versions of the newest valid states are in `versions_`. It only decides
+  // and installs nothing (ManifestTailer also records, for
+  // StoreStateIncomplete(), whether a column family that is not dropped has
+  // no candidate Version). CheckIterationResult() installs the candidates when
+  // it returns true. When it returns false, CheckIterationResult() deletes
+  // them and installs none, so every column family keeps its current Version.
+  virtual bool CanInstallVersions() { return true; }
+
   // A Version built from the MANIFEST records read up to some point in time,
   // together with the column family's log number that those records had put in
   // effect. Keeping the two together is what lets an installed Version report
@@ -446,8 +468,40 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
             epoch_number_requirement),
         mode_(Mode::kRecovery) {}
 
+  // Held files in store mode. A catch-up replays every live file from an empty
+  // base, as if the primary had switched to a new MANIFEST (see "Store mode in
+  // a secondary or follower" at ReactiveVersionSet::ReadStoreForCatchUp()). A
+  // held file is a file that the current Version of the column family already
+  // holds: an SST file with the same number, size, unique id, provenance,
+  // temperature and epoch number (a trivial move changes the provenance of the
+  // same file, and the old object would keep the old value), or a blob file
+  // with the same number, total blob count and bytes, and checksum. For a held
+  // file, the catch-up does two things:
+  // - It uses the metadata object of the current Version (HeldFile(),
+  //   HeldBlobFile()), so the file does not become obsolete when the old
+  //   Version is released. An SST file keeps its table reader, which the
+  //   metadata object holds. For a blob file, the shared metadata object is
+  //   not freed, so its deleter does not evict the blob file reader from the
+  //   blob file cache. It does not pin that cache entry: the cache can still
+  //   evict the reader as usual.
+  // - It does not check the file again (VerifyFile(), VerifyBlobFile()). The
+  //   file was checked when this instance added it. With
+  //   DBOptions::open_files_async, the open defers only the SST checks to the
+  //   asynchronous file opening; it checks each blob file at once, unless the
+  //   recovery is trusted.
+  // So a catch-up opens and checks only the files that are not held: the new
+  // files, and a file whose persisted metadata changed (for example the
+  // provenance of an SST file after a trivial move), as a catch-up in file
+  // mode does. The open of the instance and every catch-up in file mode use
+  // new objects and the normal check (VersionEditHandlerPointInTime).
+  FileMetaData* HeldFile(ColumnFamilyData* cfd,
+                         const FileMetaData& fmeta) override;
+  std::shared_ptr<SharedBlobFileMetaData> HeldBlobFile(
+      ColumnFamilyData* cfd, const BlobFileAddition& blob_addition) override;
   Status VerifyFile(ColumnFamilyData* cfd, const std::string& fpath, int level,
                     const FileMetaData& fmeta) override;
+  Status VerifyBlobFile(ColumnFamilyData* cfd, uint64_t blob_file_num,
+                        const BlobFileAddition& blob_addition) override;
 
   void PrepareToReadNewManifest() {
     initialized_ = false;
@@ -478,6 +532,27 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
   // previous MANIFEST.
   bool NewestStateHasMissingFiles();
 
+  // Returns the numbers of the missing files of the column families that
+  // NewestStateHasMissingFiles() counts, in increasing order, for an error
+  // message.
+  std::vector<uint64_t> NewestStateMissingFileNumbers();
+
+  // The numbers of the files whose check returned Corruption during the open
+  // in store mode (ReactiveVersionSet::MissingFilesAtStoreOpen() uses them).
+  // Such a file exists, but its check found it damaged, for example another
+  // size or unique id, or a table or blob file that cannot be opened. The
+  // version builder counts such a file as missing too. File mode and catch-up
+  // record nothing, so the set does not grow after the open.
+  const UnorderedSet<uint64_t>& damaged_files() const { return damaged_files_; }
+
+  // Frees the set of damaged_files() after the open used it.
+  void ClearDamagedFiles() { damaged_files_ = UnorderedSet<uint64_t>(); }
+
+  // Returns whether the last catch-up iteration in store mode replayed a
+  // state in which a column family of this instance has no valid Version (see
+  // CanInstallVersions()).
+  bool StoreStateIncomplete() const { return store_state_incomplete_; }
+
   std::unordered_set<ColumnFamilyData*>& GetUpdatedColumnFamilies() {
     return cfds_changed_;
   }
@@ -499,6 +574,23 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   void CheckIterationResult(const log::Reader& reader, Status* s) override;
 
+  // Store mode, catch-up: the records hold the full state of one store scan,
+  // and the Versions of all column families must change together, as the
+  // Versions of an atomic group do in file mode. When the replay ends, a column
+  // family has a saved Version (versions_) only when its newest state has no
+  // missing or damaged file. A file of the scan can be missing (for example the
+  // primary deleted it after the scan) or damaged, so some column family can
+  // have no saved Version. Then this returns false, and every column family
+  // that the scan does not drop keeps its current Version. A drop record of the
+  // scan still applies during the replay, because the replay applies a drop at
+  // once and not through a new Version, so this function cannot hold it back.
+  // File mode and the open return true.
+  bool CanInstallVersions() override;
+
+  // Returns true during the open in store mode, the only user of
+  // damaged_files().
+  bool RecordDamagedFiles() const;
+
   void AwaitFileList(uint32_t cf_id);
 
   enum Mode : uint8_t {
@@ -508,6 +600,10 @@ class ManifestTailer : public VersionEditHandlerPointInTime {
 
   Mode mode_;
   std::unordered_set<ColumnFamilyData*> cfds_changed_;
+  // See damaged_files().
+  UnorderedSet<uint64_t> damaged_files_;
+  // See StoreStateIncomplete().
+  bool store_state_incomplete_ = false;
   // Column families whose builder was reset to their empty initial Version to
   // replay a new MANIFEST, and that have not yet applied the record in it that
   // lists their files.

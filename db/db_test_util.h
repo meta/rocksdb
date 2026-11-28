@@ -1073,6 +1073,8 @@ class DBTestBase : public testing::Test {
   std::string alternative_db_log_dir_;
   MockEnv* mem_env_;
   Env* encrypted_env_;
+  // The env below encrypted_env_, or null without ENCRYPTED_ENV.
+  Env* encrypted_env_base_ = nullptr;
   SpecialEnv* env_;
   std::shared_ptr<Env> env_read_only_;
   std::shared_ptr<Env> env_guard_;

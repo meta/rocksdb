@@ -522,6 +522,7 @@ void CompactionJob::Prepare(
   if (mutable_db_options_copy_.remote_compaction_manifest_floor) {
     min_manifest_file_number_ = versions_->manifest_file_number();
     min_manifest_file_size_ = versions_->manifest_file_size();
+    min_store_commit_sequence_ = versions_->StoreAppliedCommitSequence();
   }
 }
 
