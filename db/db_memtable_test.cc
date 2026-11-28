@@ -31,6 +31,11 @@ namespace ROCKSDB_NAMESPACE {
 class DBMemTableTest : public DBTestBase {
  public:
   DBMemTableTest() : DBTestBase("db_memtable_test", /*env_do_fsync=*/true) {}
+
+  static std::vector<MemTableHeadMark> HeadMarks(const MemTable* mem,
+                                                 HeadMarkDirection dir) {
+    return mem->MemTable::TEST_HeadMarks(dir);
+  }
 };
 
 class MockMemTableRep : public MemTableRep {
@@ -231,6 +236,293 @@ TEST_F(DBMemTableTest, DuplicateSeq) {
   ASSERT_EQ(mem->NumDeletion(), 0u);
   ASSERT_EQ(mem->NumRangeDeletion(), 0u);
   delete mem;
+}
+
+TEST_F(DBMemTableTest, HeadMarkPublishAndConcurrentLowering) {
+  // Head marks (see MemTableHeadMark), driven on a MemTable directly. A
+  // concurrent writer checks its batch's live keys against the marks in
+  // BatchPostProcess().
+  Options options;
+  options.min_tombstones_for_range_conversion = 1;
+  options.memtable_factory = std::make_shared<SkipListFactory>();
+  ImmutableOptions ioptions(options);
+  WriteBufferManager wb(options.db_write_buffer_size);
+  InternalKeyComparator cmp(BytewiseComparator());
+  std::unique_ptr<MemTable> mem(new MemTable(
+      cmp, ioptions, MutableCFOptions(options), &wb, /*earliest_seq=*/1,
+      0 /* column_family_id */, nullptr /* flush_initiator */));
+  ASSERT_TRUE(mem->HeadMarksEnabled());
+  SequenceNumber seq = 1;
+  for (const char* k : {"b", "c", "d", "e"}) {
+    ASSERT_OK(
+        mem->Add(seq++, kTypeDeletion, k, "", nullptr /* kv_prot_info */));
+  }
+
+  HeadMarkIngestState ingest;
+  port::RWMutex ingest_sst_lock;
+  auto publish = [&](const char* start, const char* end, SequenceNumber s,
+                     uint64_t version_number) {
+    return mem->PublishHeadMark(HeadMarkDirection::kForward, start,
+                                /*start_exclusive=*/false, end, s,
+                                /*sender=*/nullptr,
+                                /*run_is_long=*/true, version_number, ingest,
+                                ingest_sst_lock);
+  };
+  auto marks = [&] {
+    std::vector<std::string> out;
+    for (const MemTableHeadMark& m :
+         HeadMarks(mem.get(), HeadMarkDirection::kForward)) {
+      out.push_back(m.start.ToString() + "," + m.end.ToString() + "," +
+                    m.usable_end.ToString() + (m.lowered ? ",lowered" : ""));
+    }
+    return out;
+  };
+
+  // A running ingestion or a newer ingestion refuses the publish.
+  {
+    ReadLock ingestion(&ingest_sst_lock);
+    ASSERT_EQ(HeadMarkPublishResult::kRefusedIngest, publish("a", "f", 10, 1));
+  }
+  ingest.version_number.Store(2);
+  ASSERT_EQ(HeadMarkPublishResult::kRefusedIngest, publish("a", "f", 10, 1));
+  ASSERT_EQ(HeadMarkPublishResult::kPublished, publish("a", "f", 10, 2));
+  ASSERT_EQ(std::vector<std::string>{"a,f,f"}, marks());
+  ASSERT_EQ(nullptr,
+            mem->FindUsableHeadMark(HeadMarkDirection::kForward, "b",
+                                    /*key_included=*/true, /*read_seq=*/9,
+                                    /*read_version=*/2));
+  ASSERT_NE(nullptr,
+            mem->FindUsableHeadMark(HeadMarkDirection::kForward, "b",
+                                    /*key_included=*/true, /*read_seq=*/10,
+                                    /*read_version=*/2));
+  ASSERT_EQ(nullptr,
+            mem->FindUsableHeadMark(HeadMarkDirection::kForward, "f",
+                                    /*key_included=*/true, /*read_seq=*/10,
+                                    /*read_version=*/2));
+  // The mark was published after the ingestion of Version 2, so a reader of
+  // an older Version does not use it.
+  ASSERT_EQ(nullptr,
+            mem->FindUsableHeadMark(HeadMarkDirection::kForward, "b",
+                                    /*key_included=*/true, /*read_seq=*/10,
+                                    /*read_version=*/1));
+
+  // A concurrent batch: its keys are checked only in BatchPostProcess().
+  // Deletions do not lower the mark.
+  {
+    MemTablePostProcessInfo info;
+    ASSERT_OK(mem->Add(11, kTypeValue, "x", "v", nullptr /* kv_prot_info */,
+                       true /* allow_concurrent */, &info));
+    ASSERT_OK(mem->Add(12, kTypeDeletion, "b", "", nullptr /* kv_prot_info */,
+                       true /* allow_concurrent */, &info));
+    ASSERT_OK(mem->Add(13, kTypeValue, "c", "v", nullptr /* kv_prot_info */,
+                       true /* allow_concurrent */, &info));
+    ASSERT_EQ(std::vector<std::string>{"a,f,f"}, marks());
+    mem->BatchPostProcess(info);
+  }
+  // The live key "c" of the batch is in the mark, so the mark ends at "c".
+  ASSERT_EQ(std::vector<std::string>{"a,c,c,lowered"}, marks());
+
+  // A batch with more than
+  // MemTablePostProcessInfo::HeadMarkLiveKeys::kMaxLiveKeys (8) live keys is
+  // checked as the range [smallest key, largest key]. Here no key is inside the
+  // mark, but the range ["0", "x"] covers it, so the mark is lowered to
+  // nothing.
+  {
+    MemTablePostProcessInfo info;
+    SequenceNumber s = 14;
+    for (const char* k : {"0", "1", "2", "3", "4", "5", "6", "7", "x"}) {
+      ASSERT_OK(mem->Add(s++, kTypeValue, k, "v", nullptr /* kv_prot_info */,
+                         true /* allow_concurrent */, &info));
+    }
+    mem->BatchPostProcess(info);
+  }
+  ASSERT_EQ(std::vector<std::string>{"a,a,a,lowered"}, marks());
+  ASSERT_EQ(nullptr,
+            mem->FindUsableHeadMark(HeadMarkDirection::kForward, "a",
+                                    /*key_included=*/true, /*read_seq=*/30,
+                                    /*read_version=*/2));
+
+  // A new mark replaces the empty one. Its validation walk stops at the newer
+  // merge of "b".
+  ASSERT_OK(mem->Add(30, kTypeMerge, "b", "v", nullptr /* kv_prot_info */));
+  ASSERT_EQ(HeadMarkPublishResult::kPublished, publish("a", "e", 10, 2));
+  ASSERT_EQ(std::vector<std::string>{"a,e,b"}, marks());
+
+  // A small batch is checked key by key. Its keys "f" and "m" are outside
+  // the marks ["g", "h") and ["k", "l") between them, so those marks stay.
+  ASSERT_EQ(HeadMarkPublishResult::kPublished, publish("g", "h", 10, 2));
+  ASSERT_EQ(HeadMarkPublishResult::kPublished, publish("k", "l", 10, 2));
+  {
+    MemTablePostProcessInfo info;
+    ASSERT_OK(mem->Add(31, kTypeValue, "f", "v", nullptr /* kv_prot_info */,
+                       true /* allow_concurrent */, &info));
+    ASSERT_OK(mem->Add(32, kTypeValue, "m", "v", nullptr /* kv_prot_info */,
+                       true /* allow_concurrent */, &info));
+    mem->BatchPostProcess(info);
+  }
+  ASSERT_EQ((std::vector<std::string>{"a,e,b", "g,h,h", "k,l,l"}), marks());
+
+  // Reverse marks (see "Reverse marks" at MemTableHeadMark) are stored in
+  // descending order: ("p", "t"] has start "t" and end "p", and ("v", "z") has
+  // the exclusive start "z".
+  auto reverse_marks = [&] {
+    std::vector<std::string> out;
+    for (const MemTableHeadMark& m :
+         HeadMarks(mem.get(), HeadMarkDirection::kReverse)) {
+      out.push_back(m.start.ToString() + "," + m.end.ToString() + "," +
+                    m.usable_end.ToString() + (m.lowered ? ",lowered" : "") +
+                    (m.start_exclusive ? ",exclusive" : ""));
+    }
+    return out;
+  };
+  for (auto [start, exclusive, end] :
+       {std::make_tuple("t", false, "p"), std::make_tuple("z", true, "v")}) {
+    ASSERT_EQ(
+        HeadMarkPublishResult::kPublished,
+        mem->PublishHeadMark(HeadMarkDirection::kReverse, start, exclusive, end,
+                             40, /*sender=*/nullptr,
+                             /*run_is_long=*/true, 2, ingest, ingest_sst_lock));
+  }
+  ASSERT_EQ((std::vector<std::string>{"z,v,v,exclusive", "t,p,p"}),
+            reverse_marks());
+  // "t" is claimed, "z" is not.
+  ASSERT_NE(nullptr, mem->FindUsableHeadMark(HeadMarkDirection::kReverse, "t",
+                                             /*key_included=*/true, 40, 2));
+  ASSERT_EQ(nullptr, mem->FindUsableHeadMark(HeadMarkDirection::kReverse, "z",
+                                             /*key_included=*/true, 40, 2));
+  ASSERT_NE(nullptr, mem->FindUsableHeadMark(HeadMarkDirection::kReverse, "z",
+                                             /*key_included=*/false, 40, 2));
+  // A concurrent batch with "r" raises the lower end of ("p", "t"] to "r". The
+  // key "z" is the exclusive start and does not change ("v", "z").
+  {
+    MemTablePostProcessInfo info;
+    ASSERT_OK(mem->Add(41, kTypeValue, "r", "v", nullptr /* kv_prot_info */,
+                       true /* allow_concurrent */, &info));
+    ASSERT_OK(mem->Add(42, kTypeValue, "z", "v", nullptr /* kv_prot_info */,
+                       true /* allow_concurrent */, &info));
+    mem->BatchPostProcess(info);
+  }
+  ASSERT_EQ((std::vector<std::string>{"z,v,v,exclusive", "t,r,r,lowered"}),
+            reverse_marks());
+}
+
+TEST_F(DBMemTableTest, HeadMarkWriteFastPath) {
+  // Every live insert checks its key against the marks of both directions. A
+  // key outside the hull of a direction (see MemTableHeadMark) must return
+  // before the cell search, and only a key inside a claim lowers a mark.
+  Options options;
+  options.min_tombstones_for_range_conversion = 1;
+  options.memtable_factory = std::make_shared<SkipListFactory>();
+  ImmutableOptions ioptions(options);
+  WriteBufferManager wb(options.db_write_buffer_size);
+  InternalKeyComparator cmp(BytewiseComparator());
+  std::unique_ptr<MemTable> mem(new MemTable(
+      cmp, ioptions, MutableCFOptions(options), &wb, /*earliest_seq=*/1,
+      0 /* column_family_id */, nullptr /* flush_initiator */));
+  ASSERT_TRUE(mem->HeadMarksEnabled());
+
+  HeadMarkIngestState ingest;
+  port::RWMutex ingest_sst_lock;
+  auto publish = [&](HeadMarkDirection dir, const char* start, bool exclusive,
+                     const char* end) {
+    return mem->PublishHeadMark(dir, start, exclusive, end, /*seq=*/10,
+                                /*sender=*/nullptr, /*run_is_long=*/true,
+                                /*version_number=*/0, ingest, ingest_sst_lock);
+  };
+  // The forward marks first, then the reverse marks, each in start order.
+  auto marks = [&] {
+    std::vector<std::string> out;
+    for (HeadMarkDirection dir :
+         {HeadMarkDirection::kForward, HeadMarkDirection::kReverse}) {
+      for (const MemTableHeadMark& m : HeadMarks(mem.get(), dir)) {
+        out.push_back(m.start.ToString() + "," + m.end.ToString() + "," +
+                      m.usable_end.ToString() + (m.lowered ? ",lowered" : "") +
+                      (m.start_exclusive ? ",exclusive" : ""));
+      }
+    }
+    return out;
+  };
+  // The forward claims are ["c", "e") and ["g", "i"), so the forward hull is
+  // ["c", "i"). The reverse claims are ("v", "z") with the exclusive start "z"
+  // and ("p", "t"], so the reverse hull is ("p", "z"]. A queue tail key such
+  // as "j" is past both hulls.
+  ASSERT_EQ(HeadMarkPublishResult::kPublished,
+            publish(HeadMarkDirection::kForward, "c", false, "e"));
+  ASSERT_EQ(HeadMarkPublishResult::kPublished,
+            publish(HeadMarkDirection::kForward, "g", false, "i"));
+  ASSERT_EQ(HeadMarkPublishResult::kPublished,
+            publish(HeadMarkDirection::kReverse, "z", true, "v"));
+  ASSERT_EQ(HeadMarkPublishResult::kPublished,
+            publish(HeadMarkDirection::kReverse, "t", false, "p"));
+
+  int searches = 0;
+  SyncPoint::GetInstance()->SetCallBack("MemTable::HeadMarkClaimMayHoldKey",
+                                        [&](void*) { ++searches; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Defer cleanup([] {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  SequenceNumber seq = 20;
+  struct Case {
+    const char* key;
+    bool concurrent;
+    int searches;
+    std::vector<std::string> marks;
+  };
+  const std::vector<std::string> initial = {"c,e,e", "g,i,i", "z,v,v,exclusive",
+                                            "t,p,p"};
+  const std::vector<Case> cases = {
+      // Past the end of the last claim in both directions.
+      {"j", false, 0, initial},
+      {"j", true, 0, initial},
+      // At the end of the last claim; the end is exclusive.
+      {"i", false, 0, initial},
+      {"p", false, 0, initial},
+      // Before min_start.
+      {"a", false, 0, initial},
+      {"zz", false, 0, initial},
+      // At the end of the first claim and in the gap between the claims:
+      // inside the hull but in no claim.
+      {"e", false, 1, initial},
+      {"f", true, 1, initial},
+      {"u", false, 1, initial},
+      // At the exclusive start "z": inside the hull, but the mark stays.
+      {"z", false, 1, initial},
+      // Inside the second claim.
+      {"h", false, 1, {"c,e,e", "g,h,h,lowered", "z,v,v,exclusive", "t,p,p"}},
+      {"r",
+       false,
+       1,
+       {"c,e,e", "g,h,h,lowered", "z,v,v,exclusive", "t,r,r,lowered"}},
+      // At min_start, the start of the claim at min_start.
+      {"c",
+       false,
+       1,
+       {"c,c,c,lowered", "g,h,h,lowered", "z,v,v,exclusive", "t,r,r,lowered"}},
+      // At the inclusive start of the second reverse claim.
+      {"t",
+       false,
+       1,
+       {"c,c,c,lowered", "g,h,h,lowered", "z,v,v,exclusive", "t,t,t,lowered"}},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(std::string(c.key) + (c.concurrent ? " concurrent" : ""));
+    searches = 0;
+    if (c.concurrent) {
+      MemTablePostProcessInfo info;
+      ASSERT_OK(mem->Add(seq++, kTypeValue, c.key, "v",
+                         nullptr /* kv_prot_info */,
+                         true /* allow_concurrent */, &info));
+      mem->BatchPostProcess(info);
+    } else {
+      ASSERT_OK(
+          mem->Add(seq++, kTypeValue, c.key, "v", nullptr /* kv_prot_info */));
+    }
+    ASSERT_EQ(c.searches, searches);
+    ASSERT_EQ(c.marks, marks());
+  }
 }
 
 // A simple test to verify that the concurrent merge writes is functional

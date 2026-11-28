@@ -19,6 +19,7 @@ namespace ROCKSDB_NAMESPACE {
 class Arena;
 class ArenaWrappedDBIter;
 class InternalKeyComparator;
+class ReadOnlyMemTable;
 
 template <class TValue>
 class InternalIteratorBase;
@@ -75,6 +76,36 @@ class MergeIteratorBuilder {
       std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr =
           nullptr);
 
+  // Tells the merging iterator that the iterator added last reads memtable
+  // `mem`, whose head marks a seek from DBIter may use (see
+  // MemTableHeadMark). Registers `mem` if head marks are enabled for it, even
+  // if it has no mark yet, because a scan can publish the first mark after
+  // this iterator is built. Does nothing if head marks are disabled for
+  // `mem`.
+  void SetHeadMarkMemTable(const ReadOnlyMemTable* mem);
+
+  // Same as AddPointAndTombstoneIterator(), for the mutable memtable. The
+  // merging iterator remembers which sorted run is the mutable memtable, so
+  // that dropped-key tracking (see EnableDroppedKeyTracking()) skips it. The
+  // only user of the tracking, read-path range tombstone conversion in DBIter,
+  // inserts its range tombstones into the mutable memtable. A range built from
+  // drops in that memtable would not make later scans cheaper, and DBIter's
+  // safety argument needs every dropped key and its covering range tombstone
+  // to come from an immutable memtable or an SST file (see "Dropped keys in a
+  // conversion run" in db/db_iter.h). When the mutable memtable is not added,
+  // for example because MultiScan pruned it, no sorted run is skipped.
+  void AddMutableMemtableIterator(
+      InternalIterator* point_iter,
+      std::unique_ptr<TruncatedRangeDelIterator>&& tombstone_iter);
+
+  // Makes the merging iterator record the point keys that it drops because a
+  // range tombstone from the same sorted run covers them. The caller reads
+  // them with InternalIterator::GetDroppedKeyInfo(). Used by read-path
+  // range tombstone conversion in DBIter. The record and its key buffers are
+  // allocated from the arena here, so a merging iterator without tracking
+  // does not carry them.
+  void EnableDroppedKeyTracking();
+
   // Get arena used to build the merging iterator. It is called one a child
   // iterator needs to be allocated.
   Arena* GetArena() { return arena; }
@@ -93,6 +124,9 @@ class MergeIteratorBuilder {
  private:
   MergingIterator* merge_iter;
   InternalIterator* first_iter;
+  // The number of point iterators added. The i-th added one becomes child i
+  // of the merging iterator.
+  size_t num_iters_ = 0;
   bool use_merging_iter;
   Arena* arena;
   // Used to set LevelIterator.range_tombstone_iter_.

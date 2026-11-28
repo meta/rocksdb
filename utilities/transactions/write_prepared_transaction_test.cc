@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <functional>
+#include <future>
 #include <string>
 #include <thread>
 
@@ -25,6 +26,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
+#include "util/defer.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/string_util.h"
@@ -4343,11 +4345,11 @@ TEST_P(WritePreparedTransactionTest, WCWPWALForwardIncompatibility) {
   CrossCompatibilityTest(WRITE_PREPARED, WRITE_COMMITTED, !empty_wal);
 }
 
-// With insert_seq = read iterator seqno, insertion depends on the latest
-// published read seq. In one-write-queue mode, the latest read seq reaches the
-// prepared seq, so insertion is blocked. In two-write-queues mode, the latest
-// published seq can still lag the prepared seq, so insertion remains safe and
-// is allowed.
+// This test scans point tombstones in both directions while a WritePrepared
+// transaction is prepared and not yet committed. A converted range tombstone
+// gets the scan's read sequence number. It expects one converted range
+// tombstone only with two write queues and ordered writes, where the latest
+// published sequence number can still be below the prepare sequence number.
 TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
   for (bool forward : {true, false}) {
     SCOPED_TRACE(forward ? "forward" : "reverse");
@@ -4384,9 +4386,15 @@ TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
     ASSERT_OK(txn->Put("z", "txn_val"));
     ASSERT_OK(txn->Prepare());
 
-    // Pre-commit: one-write-queue mode publishes the prepare seq to readers,
-    // so insertion must be discarded. Two-write-queues mode can still expose
-    // an older published seq to readers, so insertion remains safe.
+    // Before the commit, the test scans the point deletes in three
+    // configurations:
+    // - One write queue: the scan's read sequence number is at or above the
+    //   prepare sequence number, so the transaction guard discards the
+    //   conversion.
+    // - Two write queues with ordered writes: the scan reads below the
+    //   prepare sequence number and inserts one range tombstone.
+    // - unordered_write, which also uses two write queues: the iterator turns
+    //   conversion off, so nothing is inserted.
     {
       ReadOptions read_opts;
       std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
@@ -4399,12 +4407,16 @@ TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
       }
       EXPECT_OK(iter->status());
     }
-    const size_t expected_insertions = options.two_write_queues ? 1u : 0u;
+    const bool expect_insertion =
+        options.two_write_queues && !options.unordered_write;
+    const size_t expected_insertions = expect_insertion ? 1u : 0u;
     EXPECT_EQ(
         options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
         expected_insertions);
+    // EXPECT, not ASSERT: an early return would leave the transaction
+    // prepared, and the fixture teardown would then abort the binary.
     EXPECT_EQ(inserted_ranges.size(), expected_insertions);
-    if (options.two_write_queues) {
+    if (expect_insertion && inserted_ranges.size() == 1) {
       EXPECT_EQ(inserted_ranges[0].first, "c");
       EXPECT_EQ(inserted_ranges[0].second, "h");
     }
@@ -4419,6 +4431,11 @@ TEST_P(WritePreparedTransactionTest, RangeTombstoneInsertionWithWritePrepared) {
 // insertion is blocked to prevent covering invisible prepared entries.
 TEST_P(WritePreparedTransactionTest,
        RangeTombstoneInsertionBlockedByPreparedEntry) {
+  if (options.unordered_write) {
+    ROCKSDB_GTEST_BYPASS(
+        "unordered_write turns conversion off, so the guard is not reached");
+    return;
+  }
   for (bool forward : {true, false}) {
     SCOPED_TRACE(forward ? "forward" : "reverse");
     options.min_tombstones_for_range_conversion = 4;
@@ -4472,6 +4489,11 @@ TEST_P(WritePreparedTransactionTest,
 // and earliest_seq.  After the txn commits, the Put is incorrectly hidden.
 TEST_P(WritePreparedTransactionTest,
        RangeTombstoneSeqnoBumpShadowsPreparedWrite) {
+  if (options.unordered_write) {
+    ROCKSDB_GTEST_BYPASS(
+        "unordered_write turns conversion off, so the guard is not reached");
+    return;
+  }
   for (bool forward : {true, false}) {
     SCOPED_TRACE(forward ? "forward" : "reverse");
     options.min_tombstones_for_range_conversion = 2;
@@ -4531,6 +4553,113 @@ TEST_P(WritePreparedTransactionTest,
     std::string value;
     ASSERT_OK(db->Get(ReadOptions(), "e", &value));
     ASSERT_EQ(value, "txn_value");
+  }
+}
+
+// With two_write_queues, a commit in the second queue can publish a sequence
+// number above a prepare that has its sequence number but has not inserted
+// its keys into the memtable yet. In this test, "a" and "c" are live, "b1",
+// "b2", "b4" and "b5" are deleted, and txn1's prepare of "b3" is paused in
+// that state while txn2's commit publishes a higher sequence number. A scan
+// at a snapshot above txn1's prepare does not see "b3" and steps over the
+// four deletes. A converted range tombstone over them would hide "b3" after
+// txn1 commits, for every reader. A transaction DB iterator refuses the
+// conversion, because its snapshot is at or above the oldest uncommitted
+// sequence number. A base DB iterator has no read callback, so conversion is
+// off for it. RangeTombstoneInsertionWithWritePrepared checks that a
+// transaction DB iterator with two write queues still converts.
+TEST_P(WritePreparedTransactionTest,
+       RangeTombstoneInsertionSkipsPendingPrepareFromBaseDB) {
+  if (!options.two_write_queues || options.unordered_write) {
+    ROCKSDB_GTEST_BYPASS(
+        "needs two_write_queues with ordered writes, where a commit can "
+        "publish past a pending prepare");
+    return;
+  }
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+  ASSERT_OK(ReOpenNoDelete());
+  for (const char* k : {"a", "b1", "b2", "b4", "b5", "c"}) {
+    ASSERT_OK(db->Put(WriteOptions(), k, "old"));
+  }
+  ASSERT_OK(db->Flush(FlushOptions()));
+  for (const char* k : {"b1", "b2", "b4", "b5"}) {
+    ASSERT_OK(db->Delete(WriteOptions(), k));
+  }
+  // txn2 is prepared first, and its commit goes through the second queue.
+  std::unique_ptr<Transaction> txn2(db->BeginTransaction(WriteOptions()));
+  ASSERT_OK(txn2->SetName("txn2"));
+  ASSERT_OK(txn2->Put("zz", "v2"));
+  ASSERT_OK(txn2->Prepare());
+
+  // Only the first prepare after this point stops in the callback.
+  std::atomic<bool> armed{true};
+  std::promise<void> paused;
+  std::promise<void> release;
+  std::shared_future<void> release_future = release.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack(
+      "AddPreparedCallback::AddPrepared::end", [&](void*) {
+        if (armed.exchange(false)) {
+          paused.set_value();
+          // A bounded wait: the test thread releases it below.
+          release_future.wait_for(std::chrono::minutes(5));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::unique_ptr<Transaction> txn1(db->BeginTransaction(WriteOptions()));
+  ASSERT_OK(txn1->SetName("txn1"));
+  ASSERT_OK(txn1->Put("b3", "new"));
+  Status prepare_status;
+  const Snapshot* snapshot = nullptr;
+  {
+    port::Thread prepare_thread([&] { prepare_status = txn1->Prepare(); });
+    // This Defer releases and joins the prepare, even when an assertion below
+    // fails.
+    Defer release_prepare([&] {
+      release.set_value();
+      prepare_thread.join();
+    });
+    ASSERT_EQ(std::future_status::ready,
+              paused.get_future().wait_for(std::chrono::minutes(5)));
+    // txn1 has its prepare sequence number, but "b3" is not in the memtable.
+    ASSERT_OK(txn2->Commit());
+    snapshot = db->GetSnapshot();
+    ReadOptions ro;
+    ro.snapshot = snapshot;
+    for (bool base_db : {true, false}) {
+      SCOPED_TRACE(base_db ? "base DB iterator" : "transaction DB iterator");
+      std::unique_ptr<Iterator> iter(base_db ? db->GetBaseDB()->NewIterator(ro)
+                                             : db->NewIterator(ro));
+      std::vector<std::string> keys;
+      for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+        keys.push_back(iter->key().ToString());
+      }
+      // EXPECT, not ASSERT, until txn1 commits: an early return would leave
+      // it prepared, and the fixture teardown would then abort the binary.
+      EXPECT_OK(iter->status());
+      EXPECT_EQ((std::vector<std::string>{"a", "c", "zz"}), keys);
+    }
+    EXPECT_EQ(0, options.statistics->getTickerCount(
+                     READ_PATH_RANGE_TOMBSTONES_INSERTED));
+  }
+  ASSERT_OK(prepare_status);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(txn1->Commit());
+  db->ReleaseSnapshot(snapshot);
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "b3", &value));
+  ASSERT_EQ("new", value);
+  {
+    std::unique_ptr<Iterator> iter(db->NewIterator(ReadOptions()));
+    std::vector<std::string> keys;
+    for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ((std::vector<std::string>{"a", "b3", "c", "zz"}), keys);
   }
 }
 

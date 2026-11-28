@@ -234,7 +234,21 @@ void ArenaWrappedDBIter::DoRefresh(const Snapshot* snapshot,
 
   SuperVersion* sv = cfd->GetReferencedSuperVersion(db_impl);
   assert(sv->version_number >= sv_number);
+  TEST_SYNC_POINT("ArenaWrappedDBIter::DoRefresh:AfterRefSV");
   SequenceNumber read_seq = GetSeqNum(db_impl, snapshot);
+  // See DBImpl::SuperVersionMissesIngestion(). The sequence number is read
+  // again after the new reference, so that it is read after the reference,
+  // like the first one. The in-place path of Refresh() needs no such loop. An
+  // iterator can convert a run over a delete in an ingested file only after
+  // the ingestion installs its SuperVersion. So when the in-place path reloads
+  // the memtable range tombstones and gets such a conversion, its next check
+  // of the SuperVersion number sees the new number and rebuilds through this
+  // function.
+  while (snapshot == nullptr &&
+         DBImpl::SuperVersionMissesIngestion(*cfd, *sv)) {
+    sv = db_impl->ReplaceSuperVersionMissingIngestion(cfd, sv);
+    read_seq = GetSeqNum(db_impl, snapshot);
+  }
   if (read_callback_) {
     read_callback_->Refresh(read_seq);
   }

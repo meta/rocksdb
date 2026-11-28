@@ -1438,15 +1438,29 @@ struct AdvancedColumnFamilyOptions {
   // the current mutable memtable (only if memtable is not empty). This is a
   // logically redundant entry that does not change any data, but optimizes
   // future iterators by potentially skipping a large number of tombstone scans.
+  // The count also includes point entries of any type (values as well as
+  // deletes) in an immutable memtable or SST file that the read stepped over
+  // because a range tombstone in the same memtable or file covers them. Each
+  // version of a key counts as one entry, and the inserted range can start at
+  // such an entry. So a range tombstone can be inserted when the run has fewer
+  // visible point tombstones than this value, or none at all, for example when
+  // every counted entry is a value hidden by such a range tombstone.
   //
   // This optimization is best-effort and is currently disabled for iterator
   // configurations that may not expose all interior live keys, including:
-  // * user-defined timestamp reads without full visibility (for example,
-  //   ReadOptions::iter_start_ts or a non-max ReadOptions::timestamp)
+  // * column families with user-defined timestamps, because a converted range
+  //   tombstone gets the timestamp of its end key, and a read at an older
+  //   timestamp could then miss keys
   // * prefix extractor reads that are neither total-order
   //   (ReadOptions::total_order_seek / ReadOptions::auto_prefix_mode) nor
   //   bounded by ReadOptions::prefix_same_as_start
   // * reads with ReadOptions::read_tier other than kReadAllTier
+  // * DBs opened with DBOptions::unordered_write, because a write can be in
+  //   the read snapshot before it is in the memtable
+  // * reads through the base DB (for example, TransactionDB::GetBaseDB()) of
+  //   a WritePrepared or WriteUnprepared TransactionDB with
+  //   DBOptions::two_write_queues, for the same reason; reads through the
+  //   TransactionDB itself can still convert
   //
   // Even if the above restrictions are met, there are still scenarios where a
   // converted range tombstone may be discarded:
@@ -1461,6 +1475,20 @@ struct AdvancedColumnFamilyOptions {
   //     family OR the inserted range tombstone seqno would be lower than the
   //     ingested file seqno OR the iterator's Version predates a file
   //     ingested while the active memtable was current.
+  //
+  // A memtable created while this option is > 0 also keeps head marks. When a
+  // scan that starts with Seek(), SeekForPrev(), or SeekToLast() with
+  // iterate_upper_bound sees such a run right after its seek, in its merged
+  // view of the memtables and SST files, it records the deleted range as a head
+  // mark in the active memtable. A later seek in the same direction into the
+  // range then skips the range in one step, in that memtable and in every older
+  // memtable and SST file. Head marks live only in memory and change no data.
+  // They are not used with user-defined timestamps, inplace_update_support,
+  // unordered_write, two_write_queues, FIFO compaction, memtables that are not
+  // skip lists, or iterators with a read callback, table_filter or
+  // ignore_range_deletions. After a compaction filter returns
+  // kRemoveAndSkipUntil, a scan that uses a head mark can miss a key that Get()
+  // returns. A scan that cannot use a mark works as it does without one.
   //
   // Read-write iterators using ReadOptions::table_filter are rejected while
   // this option is enabled, see more details in ReadOptions::table_filter

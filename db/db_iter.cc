@@ -9,6 +9,7 @@
 
 #include "db/db_iter.h"
 
+#include <algorithm>
 #include <limits>
 #include <string>
 #include <vector>
@@ -42,26 +43,6 @@
 #include "util/user_comparator_wrapper.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-namespace {
-
-bool HasFullTimestampVisibility(const ReadOptions& read_options) {
-  if (read_options.iter_start_ts != nullptr) {
-    return false;
-  }
-  if (read_options.timestamp == nullptr) {
-    return true;
-  }
-  const Slice ts = *read_options.timestamp;
-  for (size_t i = 0; i < ts.size(); ++i) {
-    if (static_cast<unsigned char>(ts[i]) != 0xff) {
-      return false;
-    }
-  }
-  return true;
-}
-
-}  // namespace
 
 DBIter::DBIter(Env* _env, const ReadOptions& read_options,
                const ImmutableOptions& ioptions,
@@ -114,6 +95,7 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       mem_hidden_op_scanned_since_seek_(0),
       contiguous_tombstone_count_(0),
       direction_(kForward),
+      run_has_visible_tombstone_(false),
       valid_(false),
       current_entry_is_merged_(false),
       is_key_seqnum_zero_(false),
@@ -127,17 +109,36 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
           GetIteratorPrefixMode(read_options, prefix_extractor_ != nullptr) !=
           IteratorPrefixMode::kPrefix),
       // Read-path range conversion assumes the scan can observe all interior
-      // live keys. table_filter can hide whole SSTs, read tiers other than
-      // kReadAllTier can skip SSTs or uncached blocks, and timestamp filtering
-      // can hide newer UDT versions unless the read is at max timestamp with no
-      // lower timestamp bound. Legacy prefix iterators without
-      // prefix_same_as_start do not guarantee complete scans, so conversion
-      // must stay disabled for the iterator lifetime.
+      // live keys. table_filter can hide whole SSTs, and read tiers other than
+      // kReadAllTier can skip SSTs or uncached blocks. Legacy prefix iterators
+      // without prefix_same_as_start do not guarantee complete scans, so
+      // conversion must stay disabled for the iterator lifetime. With
+      // user-defined timestamps, conversion is off for every read. A reader at
+      // timestamp T sees the range tombstones whose end key has a timestamp at
+      // or below T, and a converted range tombstone gets the timestamp of its
+      // end key, which can be older than the timestamps of the deletes that it
+      // replaces. A reader at an older timestamp would then see the converted
+      // range tombstone but not those deletes, and miss keys that it should
+      // read. With unordered_write, a write group publishes its sequence
+      // numbers before it inserts its keys into the memtable, so a scan can
+      // miss a key whose sequence number is below the read sequence number. A
+      // converted range tombstone at the read sequence number would then hide
+      // that key, also after its insert finishes. A WritePrepared or
+      // WriteUnprepared transaction DB (seq_per_batch) with two_write_queues
+      // has the same gap: a commit in the second queue can publish a sequence
+      // number above a prepare that is still inserting into the memtable. A
+      // transaction DB iterator has a read callback, and
+      // MaybeInsertRangeTombstone() refuses a conversion at or above its oldest
+      // uncommitted sequence number. A read through the base DB has no read
+      // callback, so conversion stays off for it.
       min_tombstones_for_range_conversion_(
-          active_mem != nullptr && !HasTableFilter(read_options) &&
+          active_mem != nullptr && timestamp_size_ == 0 &&
+                  !ioptions.unordered_write &&
+                  !(read_callback == nullptr && db_impl != nullptr &&
+                    db_impl->seq_per_batch() && ioptions.two_write_queues) &&
+                  !HasTableFilter(read_options) &&
                   read_options.read_tier == kReadAllTier &&
-                  (expect_total_order_inner_iter_ || prefix_same_as_start_) &&
-                  HasFullTimestampVisibility(read_options)
+                  (expect_total_order_inner_iter_ || prefix_same_as_start_)
               ? mutable_cf_options.min_tombstones_for_range_conversion
               : 0),
       expose_blob_index_(expose_blob_index),
@@ -149,6 +150,7 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
   }
   if (iter_.iter()) {
     iter_.iter()->SetPinnedItersMgr(&pinned_iters_mgr_);
+    RegisterDroppedKeyInfo();
   }
   status_.PermitUncheckedError();
   assert(timestamp_size_ ==
@@ -156,6 +158,17 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
   // prefix_seek_opt_in_only should force total_order_seek whereever the caller
   // is duplicating the original ReadOptions
   assert(!ioptions.prefix_seek_opt_in_only || read_options.total_order_seek);
+  use_head_marks_ = read_callback_ == nullptr && timestamp_size_ == 0 &&
+                    !read_options.ignore_range_deletions &&
+                    !HasTableFilter(read_options) &&
+                    (expect_total_order_inner_iter_ || prefix_same_as_start_);
+  publish_head_marks_ =
+      use_head_marks_ && min_tombstones_for_range_conversion_ > 0 &&
+      active_mem_ != nullptr && active_mem_->HeadMarksEnabled() &&
+      cfd != nullptr && version_number_ != 0;
+  if (publish_head_marks_) {
+    head_mark_ingest_ = &cfd->GetHeadMarkIngestState();
+  }
   if (active_mem_) {
     // FIXME: GetEarliestSequenceNumber() may return a seqno that is one smaller
     // than the smallest seqno in the memtable. This violates its comment and
@@ -237,6 +250,7 @@ void DBIter::Next() {
   local_stats_.skip_count_--;
   num_internal_keys_skipped_ = 0;
   iter_step_since_seek_++;
+  head_mark_candidate_ = false;
   bool ok = true;
   if (direction_ == kReverse) {
     is_key_seqnum_zero_ = false;
@@ -546,6 +560,9 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
   bool reseek_done = false;
 
   uint64_t mem_hidden_op_scanned = 0;
+  // A local copy, so that the loop can keep it in a register: the calls in the
+  // loop do not change it.
+  DroppedKeyInfo* const dropped_key_info = dropped_key_info_;
   do {
     // Will update is_key_seqnum_zero_ as soon as we parsed the current key
     // but we need to save the previous value to be used in the loop.
@@ -579,8 +596,13 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
       // prefix as the boundary because bloom filters may have hidden
       // entire prefixes between the seek prefix and the current key.
       // The tombstone covers n-1 of n deletes; the last remains as a
-      // point delete.
-      FlushPendingTombstoneRun(saved_key_.GetUserKey());
+      // point delete. A run made only of dropped keys has no tracked
+      // tombstone to use as the end key, so it is not converted.
+      if (run_has_visible_tombstone_) {
+        FlushPendingTombstoneRun(saved_key_.GetUserKey());
+      } else {
+        ResetContiguousTombstoneTracking();
+      }
       if (prefix_same_as_start_) {
         break;
       }
@@ -588,6 +610,14 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
 
     if (TooManyInternalKeysSkipped()) {
       return false;
+    }
+
+    // Read the dropped keys only after the checks above, so that a gap before
+    // a key past the upper bound, or outside the seek prefix with
+    // prefix_same_as_start, is never counted. MaybeAddDroppedKeysToRun() also
+    // checks the prefix of the dropped start key.
+    if (dropped_key_info != nullptr && dropped_key_info->count > 0) {
+      MaybeAddDroppedKeysToRun(ikey_.user_key);
     }
 
     assert(ikey_.user_key.size() >= timestamp_size_);
@@ -803,8 +833,11 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
   // If we accumulated tombstones, use the last tracked tombstone as the
   // exclusive end key. It may be more optimal to use iterator upper bound if it
   // exists, but the current iterator API makes that dangerous as upper bound
-  // points to user memory which is not guaranteed immutable.
-  if (contiguous_tombstone_count_ > 0 && iter_.status().ok()) {
+  // points to user memory which is not guaranteed immutable. A run made only of
+  // dropped keys has no tracked tombstone to use as the end key, so it is not
+  // converted here.
+  if (contiguous_tombstone_count_ > 0 && run_has_visible_tombstone_ &&
+      iter_.status().ok()) {
     // It is unsafe to use iter_.key() here even when iter_.Valid() and the key
     // is within the seek prefix. This is because memtable iterators are still
     // valid past the upper bound, but sst iterators are not. So iter_.key() can
@@ -966,6 +999,7 @@ void DBIter::Prev() {
 
   PERF_COUNTER_ADD(iter_prev_count, 1);
   PERF_CPU_TIMER_GUARD(iter_prev_cpu_nanos, clock_);
+  head_mark_candidate_ = false;
   ReleaseTempPinnedData();
   ResetBlobData();
   ResetValueAndColumns();
@@ -1083,8 +1117,52 @@ void DBIter::PrevInternal() {
   if (min_tombstones_for_range_conversion_ > 0) {
     range_tomb_end_key_.Swap(saved_key_);
   }
+  if (dropped_key_info_ != nullptr) {
+    dropped_key_info_->want_key = true;
+  }
 
+  bool first_step = true;
   while (iter_.Valid()) {
+    // Backward, the internal iterator adds up its dropped keys over several
+    // moves (see DroppedKeyInfo). When a reverse scan returns a live key, its
+    // internal iterator has already moved to a smaller user key, so the drops
+    // of that move wait in the record until the next call. Each step takes the
+    // record at its top, so it sees the keys dropped between the previous
+    // step's user key K and this step's user key. In the first step of a call,
+    // K is range_tomb_end_key_, the exclusive upper end of a run that ends
+    // here. After Prev(), K is the live key that the previous call returned.
+    // After SeekForPrev(), K is the seek target, or the upper bound if that is
+    // smaller; SeekToLast() with iterate_upper_bound calls SeekForPrev() on the
+    // bound. The scan examined every key up to K, except the keys that a
+    // reverse head mark let the seek skip, which are deleted at sequence_ (see
+    // "Dropped keys in a conversion run" in db_iter.h). After SeekToLast()
+    // without an upper bound, K is empty, because nothing above the first live
+    // key was examined, so the first record is not used. In later steps, K is
+    // saved_key_.
+    //
+    // For example, with keys "a" < "b" < "c" < "d": a scan moves back from
+    // the live key "d" past a point tombstone at "c" and a dropped entry at
+    // "b" to the live key "a". The entry at "b" and the range tombstone that
+    // covers it are in the same immutable memtable or SST file. The step at
+    // "a" checks that "b" lies between "a" and "c", the previous step's key.
+    // With a threshold of 2, and if the insertion checks pass, the scan
+    // inserts ["b", "d").
+    uint64_t step_dropped_count = 0;
+    if (dropped_key_info_ != nullptr) {
+      const Slice current_user_key = ExtractUserKey(iter_.key());
+      if (!first_step) {
+        const Slice prev_user_key = saved_key_.GetUserKey();
+        step_dropped_count =
+            TakeReverseDroppedKeys(&prev_user_key, current_user_key);
+      } else if (range_tomb_end_key_.Size() > 0) {
+        const Slice prev_user_key = range_tomb_end_key_.GetUserKey();
+        step_dropped_count =
+            TakeReverseDroppedKeys(&prev_user_key, current_user_key);
+      } else {
+        step_dropped_count = TakeReverseDroppedKeys(nullptr, current_user_key);
+      }
+    }
+    first_step = false;
     saved_key_.SetUserKey(
         ExtractUserKey(iter_.key()),
         !iter_.iter()->IsKeyPinned() || !pin_thru_lifetime_ /* copy */);
@@ -1138,14 +1216,29 @@ void DBIter::PrevInternal() {
     // would use a stale value.
     if (min_tombstones_for_range_conversion_ > 0 &&
         range_tomb_end_key_.Size() > 0 && timestamp_lb_ == nullptr) {
+      // The keys dropped between this key and the previous step's key are
+      // deleted (see MaybeAddDroppedKeysToRun() for why), so they extend the
+      // run. TakeReverseDroppedKeys() returned a count only if their start
+      // key lies between the two keys.
+      const bool use_dropped = step_dropped_count > 0;
       if (!valid_ && found_visible && PrefixCheck(saved_key_without_ts)) {
         // Key was deleted and is within the seek prefix -- track it.
         TrackContiguousTombstone(saved_key_.GetUserKey(),
                                  /*always_update_first_key=*/true);
+        if (use_dropped) {
+          AddDroppedCountToRun(step_dropped_count);
+        }
       } else if (valid_) {
-        // Live key breaks the run.
+        // Live key breaks the run. The run can start at the smallest dropped
+        // key above it.
+        if (use_dropped) {
+          ExtendRunStartToDroppedKey(step_dropped_count);
+        }
         FlushPendingTombstoneRun(range_tomb_end_key_.GetUserKey(),
                                  /*check_prefix_match=*/true);
+      } else if (use_dropped && !found_visible) {
+        // No version of this key is visible, so it does not end the run.
+        ExtendRunStartToDroppedKey(step_dropped_count);
       }
     }
 
@@ -1851,7 +1944,122 @@ void DBIter::TrackContiguousTombstone(const Slice& user_key,
   if (always_update_first_key || contiguous_tombstone_count_ == 0) {
     range_tomb_first_key_.SetUserKey(user_key, true /* copy */);
   }
-  contiguous_tombstone_count_++;
+  if (contiguous_tombstone_count_ < std::numeric_limits<uint32_t>::max()) {
+    contiguous_tombstone_count_++;
+  }
+  run_has_visible_tombstone_ = true;
+  UpdateDroppedKeyWant();
+}
+
+void DBIter::MaybeAddDroppedKeysToRun(const Slice& current_user_key) {
+  assert(dropped_key_info_ != nullptr && dropped_key_info_->count > 0);
+  uint64_t dropped_count = dropped_key_info_->count;
+
+  if (contiguous_tombstone_count_ == 0) {
+    if (!dropped_key_info_->has_key) {
+      return;
+    }
+    // See "Dropped keys in a conversion run" in db_iter.h for why the run
+    // may start at the first dropped key D.
+    // Older versions of the key that DBIter just handled can be dropped
+    // right after it, so the smallest dropped user key can equal saved_key_.
+    // Then the next larger dropped user key can still start the run, and the
+    // drops of the smallest user key do not count, because the range does
+    // not cover them.
+    Slice first_dropped_user_key =
+        ExtractUserKey(dropped_key_info_->smallest_dropped_ikey);
+    if (user_comparator_.CompareWithoutTimestamp(
+            first_dropped_user_key, saved_key_.GetUserKey()) <= 0) {
+      if (!dropped_key_info_->has_next_key) {
+        return;
+      }
+      first_dropped_user_key =
+          ExtractUserKey(dropped_key_info_->next_dropped_ikey);
+      assert(dropped_count > dropped_key_info_->smallest_key_count);
+      dropped_count -= dropped_key_info_->smallest_key_count;
+      if (user_comparator_.CompareWithoutTimestamp(
+              first_dropped_user_key, saved_key_.GetUserKey()) <= 0) {
+        return;
+      }
+    }
+    if (user_comparator_.CompareWithoutTimestamp(first_dropped_user_key,
+                                                 current_user_key) >= 0) {
+      return;
+    }
+    if (!PrefixCheck(StripTimestampFromUserKey(first_dropped_user_key,
+                                               timestamp_size_))) {
+      return;
+    }
+    range_tomb_first_key_.SetUserKey(first_dropped_user_key, true /* copy */);
+  }
+  AddDroppedCountToRun(dropped_count);
+}
+
+void DBIter::AddDroppedCountToRun(uint64_t dropped_count) {
+  // The conversion threshold counts entries: visible tombstones plus dropped
+  // keys.
+  const uint64_t new_count = contiguous_tombstone_count_ + dropped_count;
+  // The min() keeps the value in the uint32_t range, so the cast loses
+  // nothing.
+  contiguous_tombstone_count_ = static_cast<uint32_t>(
+      std::min<uint64_t>(new_count, std::numeric_limits<uint32_t>::max()));
+  UpdateDroppedKeyWant();
+  TEST_SYNC_POINT_CALLBACK("DBIter::AddDroppedCountToRun", &dropped_count);
+}
+
+uint64_t DBIter::TakeReverseDroppedKeys(const Slice* prev_user_key,
+                                        const Slice& current_user_key) {
+  assert(dropped_key_info_ != nullptr);
+  uint64_t count = dropped_key_info_->count;
+  if (count == 0) {
+    return 0;
+  }
+  bool usable = dropped_key_info_->has_key && prev_user_key != nullptr;
+  if (usable) {
+    // Older versions of the current key are visited, and can be dropped,
+    // before its visible version, so the smallest dropped user key can equal
+    // the current key. Then the next larger dropped user key can still be
+    // used, and the drops of the smallest user key do not count, because the
+    // range does not cover them.
+    Slice dropped_user_key =
+        ExtractUserKey(dropped_key_info_->smallest_dropped_ikey);
+    if (user_comparator_.CompareWithoutTimestamp(dropped_user_key,
+                                                 current_user_key) <= 0) {
+      usable = dropped_key_info_->has_next_key;
+      if (usable) {
+        dropped_user_key = ExtractUserKey(dropped_key_info_->next_dropped_ikey);
+        usable = user_comparator_.CompareWithoutTimestamp(dropped_user_key,
+                                                          current_user_key) > 0;
+        assert(count > dropped_key_info_->smallest_key_count);
+        count -= dropped_key_info_->smallest_key_count;
+      }
+    }
+    // A drop recorded before the previous key was handled has a user key at
+    // or above it, so it fails this check.
+    usable = usable &&
+             user_comparator_.CompareWithoutTimestamp(dropped_user_key,
+                                                      *prev_user_key) < 0 &&
+             PrefixCheck(
+                 StripTimestampFromUserKey(dropped_user_key, timestamp_size_));
+    if (usable) {
+      reverse_dropped_key_.SetUserKey(dropped_user_key, true /* copy */);
+    }
+  }
+  dropped_key_info_->count = 0;
+  dropped_key_info_->smallest_key_count = 0;
+  dropped_key_info_->has_key = false;
+  dropped_key_info_->has_next_key = false;
+  return usable ? count : 0;
+}
+
+void DBIter::ExtendRunStartToDroppedKey(uint64_t dropped_count) {
+  const Slice dropped_user_key = reverse_dropped_key_.GetUserKey();
+  if (contiguous_tombstone_count_ == 0 ||
+      user_comparator_.CompareWithoutTimestamp(
+          dropped_user_key, range_tomb_first_key_.GetUserKey()) < 0) {
+    range_tomb_first_key_.SetUserKey(dropped_user_key, true /* copy */);
+  }
+  AddDroppedCountToRun(dropped_count);
 }
 
 void DBIter::FlushPendingTombstoneRun(const Slice& end_key,
@@ -1873,7 +2081,85 @@ void DBIter::FlushPendingTombstoneRun(const Slice& end_key,
   ResetContiguousTombstoneTracking();
 }
 
+void DBIter::SeekInnerIterWithHeadMarks(HeadMarkDirection dir,
+                                        bool start_exclusive) {
+  const bool reverse = dir == HeadMarkDirection::kReverse;
+  head_mark_sender_ = nullptr;
+  const Slice target = saved_key_.GetInternalKey();
+  if (!use_head_marks_ || scan_opts_.has_value()) {
+    reverse ? iter_.SeekForPrev(target) : iter_.Seek(target);
+    return;
+  }
+  const ReadOnlyMemTable* mark_mem =
+      publish_head_marks_ ? active_mem_ : nullptr;
+  const MemTableHeadMark* last_mark = nullptr;
+  if (reverse) {
+    iter_.SeekForPrevWithHeadMarks(target, sequence_, version_number_, mark_mem,
+                                   &head_mark_sender_, &last_mark);
+  } else {
+    iter_.SeekWithHeadMarks(target, sequence_, version_number_, mark_mem,
+                            &head_mark_sender_, &last_mark);
+  }
+  if (last_mark != nullptr) {
+    head_mark_skip_end_.SetUserKey(last_mark->usable_end, true /* copy */);
+    head_mark_skip_dir_ = dir;
+  }
+  if (publish_head_marks_) {
+    head_mark_candidate_ = true;
+    head_mark_dir_ = dir;
+    head_mark_start_.SetUserKey(saved_key_.GetUserKey(), true /* copy */);
+    head_mark_start_exclusive_ = start_exclusive;
+  }
+}
+
+void DBIter::MaybePublishHeadMark(const Slice& end_key) {
+  head_mark_candidate_ = false;
+  assert(publish_head_marks_);
+  // The same sequence number rule as for conversion (see
+  // MaybeInsertRangeTombstone()): older levels must hold no entry above
+  // sequence_.
+  if (contiguous_tombstone_count_ == 0 || unbounded_prefix_scan_ ||
+      sequence_ < active_mem_->GetEarliestSequenceNumber()) {
+    return;
+  }
+  const Slice start = head_mark_start_.GetUserKey();
+  // A forward run ends at end_key. A reverse run ends at the key where the
+  // backward scan stopped, which is saved_key_ (see PrevInternal()), if that
+  // key is inside the seek prefix and not below iterate_lower_bound.
+  // Otherwise the scan did not see every key between saved_key_ and the run,
+  // and the run ends at its lowest tombstone, which the mark excludes:
+  // - Outside the prefix, the prefix filter of an SST can skip the seek, so
+  //   live keys of another prefix in that SST were never read.
+  // - Below the lower bound, a child iterator may stop early at the bound.
+  //   None does in reverse today, but the scan does not rely on it.
+  const bool reverse = head_mark_dir_ == HeadMarkDirection::kReverse;
+  Slice end = end_key;
+  if (reverse) {
+    const Slice stop = saved_key_.GetUserKey();
+    const bool stop_seen =
+        PrefixCheck(StripTimestampFromUserKey(stop, timestamp_size_)) &&
+        (iterate_lower_bound_ == nullptr ||
+         user_comparator_.CompareWithoutTimestamp(stop, /*a_has_ts=*/true,
+                                                  *iterate_lower_bound_,
+                                                  /*b_has_ts=*/false) >= 0);
+    end = stop_seen ? stop : range_tomb_first_key_.GetUserKey();
+  }
+  if (reverse ? user_comparator_.Compare(end, start) >= 0
+              : user_comparator_.Compare(start, end) >= 0) {
+    return;
+  }
+  [[maybe_unused]] HeadMarkPublishResult result = active_mem_->PublishHeadMark(
+      head_mark_dir_, start, head_mark_start_exclusive_, end, sequence_,
+      head_mark_sender_,
+      contiguous_tombstone_count_ >= min_tombstones_for_range_conversion_,
+      version_number_, *head_mark_ingest_, *ingest_sst_lock_);
+  TEST_SYNC_POINT_CALLBACK("DBIter::MaybePublishHeadMark:Result", &result);
+}
+
 void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
+  if (head_mark_candidate_) {
+    MaybePublishHeadMark(end_key);
+  }
   if (contiguous_tombstone_count_ < min_tombstones_for_range_conversion_ ||
       unbounded_prefix_scan_) {
     return;
@@ -1887,6 +2173,55 @@ void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
   assert(PrefixCheck(end_key));
   assert(user_comparator_.Compare(range_tomb_first_key_.GetUserKey(),
                                   end_key) <= 0);
+  // A run can end at its own first key. For example, with a threshold of 1, a
+  // forward scan that reaches the end of the data after one point tombstone
+  // uses that tombstone's key as both the start and the end of the range. A
+  // reverse scan from SeekForPrev(K) that lands on a point tombstone at K does
+  // the same. Such a range covers nothing, so it is not inserted.
+  if (user_comparator_.Compare(range_tomb_first_key_.GetUserKey(), end_key) >=
+      0) {
+    RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_DISCARDED);
+    return;
+  }
+
+  // A conversion restates only deletions that this scan read. When a head
+  // mark moved the seek, the levels that the marks moved were not read
+  // between the seek target and head_mark_skip_end_: the marks prove those
+  // keys deleted, but the scan did not see their tombstones. A run can still
+  // reach into that part at a tombstone of a newer level, for example the
+  // active memtable when the mark is in an immutable memtable. So a forward
+  // range starts at head_mark_skip_end_ at the earliest, and a reverse range
+  // ends there at the latest. Then a wrong mark (see the Limits paragraph of
+  // MemTableHeadMark) stays a read miss and never becomes a stored deletion.
+  //
+  // The reverse rule also keeps the ranges of a queue consumed from the
+  // largest key apart. Its scans repeat SeekForPrev() from the same high key,
+  // and each one is moved down by the mark of the scan before. Ending each
+  // range at the usable end of that mark leaves it below the range that the
+  // scan before inserted, instead of containing it, so no fragment collects
+  // the seqnos of every earlier scan. The cost is that the tombstone at the
+  // usable end itself stays a point tombstone.
+  //
+  // Only a scan in the direction of its seek uses the limit. After a
+  // direction change, the merging iterator has sought every level again from
+  // the current key.
+  Slice range_start = range_tomb_first_key_.GetUserKey();
+  Slice range_end = end_key;
+  if (head_mark_skip_end_.Size() > 0 &&
+      (head_mark_skip_dir_ == HeadMarkDirection::kForward) ==
+          (direction_ == kForward)) {
+    const Slice skip_end = head_mark_skip_end_.GetUserKey();
+    if (direction_ == kForward) {
+      if (user_comparator_.Compare(range_start, skip_end) < 0) {
+        range_start = skip_end;
+      }
+    } else if (user_comparator_.Compare(skip_end, range_end) < 0) {
+      range_end = skip_end;
+    }
+    if (user_comparator_.Compare(range_start, range_end) >= 0) {
+      return;
+    }
+  }
 
   auto earliest_seq = active_mem_->GetEarliestSequenceNumber();
   // Skip if the iterator's snapshot predates the memtable. Otherwise entries
@@ -1917,11 +2252,10 @@ void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
         active_mem_->NewRangeTombstoneIterator(ro, sequence_,
                                                false /* immutable_memtable */));
     if (range_iter) {
-      range_iter->Seek(range_tomb_first_key_.GetUserKey());
+      range_iter->Seek(range_start);
       if (range_iter->Valid() &&
-          user_comparator_.Compare(range_iter->start_key(),
-                                   range_tomb_first_key_.GetUserKey()) <= 0 &&
-          user_comparator_.Compare(range_iter->end_key(), end_key) >= 0) {
+          user_comparator_.Compare(range_iter->start_key(), range_start) <= 0 &&
+          user_comparator_.Compare(range_iter->end_key(), range_end) >= 0) {
         RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_DISCARDED);
         return;
       }
@@ -1930,14 +2264,14 @@ void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
 
   assert(ingest_sst_lock_ != nullptr);
   if (active_mem_->AddLogicallyRedundantRangeTombstone(
-          insert_seq, range_tomb_first_key_.GetUserKey(), end_key,
-          version_number_, *ingest_sst_lock_)) {
+          insert_seq, range_start, range_end, version_number_,
+          *ingest_sst_lock_)) {
     RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_INSERTED);
     ROCKS_LOG_DEBUG(logger_,
                     "Inserted range tombstone [%s, %s) @ seq %" PRIu64
                     " (count=%" PRIu32 ", snapshot=%" PRIu64 ")",
-                    range_tomb_first_key_.GetUserKey().ToString(true).c_str(),
-                    end_key.ToString(true).c_str(), insert_seq,
+                    range_start.ToString(true).c_str(),
+                    range_end.ToString(true).c_str(), insert_seq,
                     contiguous_tombstone_count_, sequence_);
   } else {
     RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_DISCARDED);
@@ -1993,7 +2327,7 @@ void DBIter::SetSavedKeyToSeekTarget(const Slice& target) {
   }
 }
 
-void DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
+bool DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
   is_key_seqnum_zero_ = false;
   saved_key_.Clear();
   // now saved_key is used to store internal key.
@@ -2008,6 +2342,9 @@ void DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
         timestamp_lb_ == nullptr ? &ts : timestamp_lb_);
   }
 
+  // The clamp below uses kMaxSequenceNumber, so the seek key includes no entry
+  // of iterate_upper_bound. MergingIterator::SeekForPrevOverHeadMark() reads
+  // the seek key that way, and only this clamp uses kMaxSequenceNumber here.
   if (iterate_upper_bound_ != nullptr &&
       user_comparator_.CompareWithoutTimestamp(
           saved_key_.GetUserKey(), /*a_has_ts=*/true, *iterate_upper_bound_,
@@ -2021,7 +2358,9 @@ void DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
       saved_key_.UpdateInternalKey(kMaxSequenceNumber, kValueTypeForSeekForPrev,
                                    &ts);
     }
+    return true;
   }
+  return false;
 }
 
 Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
@@ -2208,7 +2547,8 @@ void DBIter::Seek(const Slice& target) {
     PERF_TIMER_GUARD(seek_internal_seek_time);
 
     SetSavedKeyToSeekTarget(target);
-    iter_.Seek(saved_key_.GetInternalKey());
+    SeekInnerIterWithHeadMarks(HeadMarkDirection::kForward,
+                               /*start_exclusive=*/false);
 
     RecordTick(statistics_, NUMBER_DB_SEEK);
   }
@@ -2333,8 +2673,11 @@ void DBIter::SeekForPrev(const Slice& target) {
   // Seek the inner iterator based on the target key.
   {
     PERF_TIMER_GUARD(seek_internal_seek_time);
-    SetSavedKeyToSeekForPrevTarget(target);
-    iter_.SeekForPrev(saved_key_.GetInternalKey());
+    // A seek key clamped to iterate_upper_bound excludes the bound, so a mark
+    // that this scan publishes does not claim the bound.
+    const bool clamped = SetSavedKeyToSeekForPrevTarget(target);
+    SeekInnerIterWithHeadMarks(HeadMarkDirection::kReverse,
+                               /*start_exclusive=*/clamped);
     RecordTick(statistics_, NUMBER_DB_SEEK);
   }
   if (!iter_.Valid()) {

@@ -183,6 +183,7 @@ class DBIter final : public Iterator {
     assert(iter_.iter() == nullptr);
     iter_.Set(iter);
     iter_.iter()->SetPinnedItersMgr(&pinned_iters_mgr_);
+    RegisterDroppedKeyInfo();
   }
 
   bool Valid() const override {
@@ -456,7 +457,8 @@ class DBIter final : public Iterator {
   // Set saved_key_ to the seek key to target, with proper sequence number set.
   // It might get adjusted if the seek key is larger than iterator upper bound.
   // target does not have timestamp.
-  void SetSavedKeyToSeekForPrevTarget(const Slice& target);
+  // Returns true if it clamped the seek key to iterate_upper_bound.
+  bool SetSavedKeyToSeekForPrevTarget(const Slice& target);
   bool FindValueForCurrentKey(bool& found_visible);
   bool FindValueForCurrentKeyUsingSeek();
   bool FindUserKeyBeforeSavedKey();
@@ -601,11 +603,174 @@ class DBIter final : public Iterator {
   // tombstone [first_key, end_key) into the mutable memtable.
   // end_key is the exclusive upper bound -- typically the next live key.
   void MaybeInsertRangeTombstone(const Slice& end_key);
+
+  // Dropped keys in a conversion run. MergingIterator records the point
+  // entries it drops (see DroppedKeyInfo), and DBIter adds them to the run
+  // count. A run can also start at a dropped key. Forward:
+  // MaybeAddDroppedKeysToRun(). Backward: TakeReverseDroppedKeys() and
+  // ExtendRunStartToDroppedKey(), called from PrevInternal(). Why starting the
+  // run at the first dropped key D is safe:
+  // 1. MergingIterator drops a key only when a range tombstone covers it.
+  //    That tombstone is visible at the sequence number that the child
+  //    iterators were built with. Point 3 shows that it is also visible at
+  //    sequence_ whenever an insert happens. So every dropped version is
+  //    deleted at sequence_.
+  // 2. Every internal key between the last key returned to DBIter and the
+  //    current key was dropped (by the same sorted run or by a cascading
+  //    seek), was skipped by a seek that a head mark moved, or was skipped
+  //    by a DBIter reseek. A scan uses a head mark only when every key that
+  //    the mark skips is deleted at sequence_, except after a compaction
+  //    filter returns kRemoveAndSkipUntil (see the limits of MemTableHeadMark
+  //    in db/memtable.h). All keys skipped by a reseek have user key
+  //    saved_key_, which MaybeAddDroppedKeysToRun() excludes. If D's user key
+  //    is greater than saved_key_ (the last user key that DBIter processed),
+  //    every version of D is in that gap, so D is deleted at sequence_. If D's
+  //    user key equals saved_key_, D can be an older version of a live key
+  //    that DBIter just returned, so the run must not start there. DBIter may
+  //    also have received newer versions of D that are not visible at
+  //    sequence_. Their sequence numbers are above sequence_, so the new
+  //    tombstone does not cover them. If such a version is uncommitted and
+  //    has a smaller sequence number, MaybeInsertRangeTombstone() refuses the
+  //    insert (the min_uncommitted check).
+  // 3. MergingIterator does not record drops in the mutable memtable. So
+  //    every dropped key and its covering tombstone come from an immutable
+  //    memtable or an SST file. Whenever an insert happens, the covering
+  //    tombstone is visible at sequence_, even after Refresh(snapshot)
+  //    lowered sequence_ without rebuilding those iterators. Two guards make
+  //    sure of this:
+  //    - MaybeInsertRangeTombstone() refuses to insert when sequence_ is
+  //      below the mutable memtable's earliest sequence number. Tombstones
+  //      in immutable memtables and in SST files written by flush or
+  //      compaction have smaller sequence numbers, so they are visible at
+  //      sequence_.
+  //    - A file ingested while this memtable is mutable can hold a
+  //      tombstone with a sequence number at or above the earliest one.
+  //      MemTable::AddLogicallyRedundantRangeTombstone() then refuses any
+  //      insert below the ingested sequence number (the ingest seqno
+  //      barrier).
+  // 4. Backward scans use the same facts (see PrevInternal()). The smallest
+  //    dropped user key D of one loop step must be below the user key K
+  //    handled by the previous step and above the current user key J. Every
+  //    internal key between J and K was dropped, skipped by a cascading
+  //    seek, skipped by a seek that a reverse head mark moved (point 2), or
+  //    skipped by a DBIter reseek, which skips only versions of K
+  //    (FindUserKeyBeforeSavedKey()) or of J (FindValueForCurrentKey...()).
+  //    So every version of every user key in (J, K) is deleted at
+  //    sequence_, and the run can start at D.
+
+  // Forward scans: adds the point keys that the internal iterator dropped
+  // right before the current key (see InternalIterator::GetDroppedKeyInfo())
+  // to the conversion run. current_user_key is the user key of the current
+  // internal key. saved_key_ holds the last user key that this DBIter
+  // processed. When the run is empty, the run starts at the first dropped user
+  // key, but only if that key is greater than saved_key_, less than
+  // current_user_key, and passes PrefixCheck(). Otherwise the dropped keys are
+  // ignored.
+  // REQUIRES: dropped_key_info_ != nullptr && dropped_key_info_->count > 0.
+  void MaybeAddDroppedKeysToRun(const Slice& current_user_key);
+
+  // Adds `dropped_count` dropped keys to the conversion run.
+  void AddDroppedCountToRun(uint64_t dropped_count);
+
+  // Backward scans: takes the internal iterator's dropped-key record and
+  // clears it. D is the smallest dropped user key above current_user_key (the
+  // smallest or the next larger one of the record). Returns the record's count
+  // if D exists, is below *prev_user_key (the user key handled by the
+  // previous loop step) and passes PrefixCheck(), and then copies D into
+  // reverse_dropped_key_. Returns 0 otherwise, or when prev_user_key is
+  // nullptr.
+  // REQUIRES: dropped_key_info_ != nullptr.
+  uint64_t TakeReverseDroppedKeys(const Slice* prev_user_key,
+                                  const Slice& current_user_key);
+
+  // Backward scans: moves the run start down to reverse_dropped_key_ (or
+  // starts the run there) and adds `dropped_count` to the run.
+  void ExtendRunStartToDroppedKey(uint64_t dropped_count);
+
+  // The internal iterator copies the dropped key only while the caller can
+  // use it (see DroppedKeyInfo::want_key): forward, only while no run is open,
+  // because only the run start uses the key; backward, always, because the
+  // run start can move down to a dropped key whenever a live key ends the
+  // run.
+  void UpdateDroppedKeyWant() {
+    if (dropped_key_info_ != nullptr) {
+      dropped_key_info_->want_key =
+          direction_ == kReverse || contiguous_tombstone_count_ == 0;
+    }
+  }
+
+  // Keeps the internal iterator's dropped-key record when conversion is
+  // enabled, so that the forward and reverse scans can read it after each move
+  // with one load instead of a virtual call per key. The internal iterator can
+  // track drops even when this DBIter disables conversion (for example, a
+  // prefix seek without total_order_seek or prefix_same_as_start). Then no
+  // one reads the record, and its key copies stay off (DroppedKeyInfo::want_key
+  // is false by default), so only the count is kept.
+  void RegisterDroppedKeyInfo() {
+    dropped_key_info_ = min_tombstones_for_range_conversion_ > 0
+                            ? iter_.GetDroppedKeyInfo()
+                            : nullptr;
+    UpdateDroppedKeyWant();
+  }
   void ResetContiguousTombstoneTracking() {
     contiguous_tombstone_count_ = 0;
+    run_has_visible_tombstone_ = false;
     range_tomb_first_key_.Clear();
     range_tomb_end_key_.Clear();
+    head_mark_candidate_ = false;
+    UpdateDroppedKeyWant();
   }
+
+  // Head marks (see MemTableHeadMark in db/memtable.h). Seeks iter_ to
+  // saved_key_ (Seek() for kForward, SeekForPrev() for kReverse), using marks
+  // if use_head_marks_ is true and no scan options are set. If
+  // publish_head_marks_ is true, remembers the seek key and starts watching
+  // for a run of tombstones right after the seek.
+  void SeekInnerIterWithHeadMarks(HeadMarkDirection dir, bool start_exclusive);
+
+  // Publishes a head mark into the active memtable if the run of tombstones
+  // started right after the seek. Called by MaybeInsertRangeTombstone() when a
+  // run of tombstones ends, before the conversion check. A new mark starts at
+  // the effective seek key, which is the seek target after iterate_lower_bound
+  // or iterate_upper_bound is applied. In a forward scan, that key can lie
+  // before the first tombstone, so a later seek also skips the gap before it,
+  // while the converted range tombstone starts at the first tombstone of the
+  // run. An extension keeps the start of the mark it extends. A new mark needs
+  // at least min_tombstones_for_range_conversion_ tombstones. If a lowered mark
+  // of the active memtable moved the seek and is still current, a shorter run
+  // (even one tombstone) can extend it: the keys after the lowered end are
+  // often covered by an earlier converted range tombstone, which this scan does
+  // not count (see MemTableHeadMark::lowered).
+  //
+  // Endpoints. end_key is always the exclusive upper end of the conversion
+  // range. In a forward scan, the run also ends at end_key, and the mark is
+  // [seek key, end_key). end_key is the key of the visible value or merge
+  // operand that ends the run, after its value is prepared, or saved_key_ when
+  // the scan stops at a prefix boundary, at the upper bound or at the end of
+  // the data. saved_key_ can have only entries newer than the read sequence
+  // number; neither the mark nor the converted range covers it.
+  //
+  // In a reverse scan, the run goes down from the seek. During the first run
+  // after the seek, range_tomb_end_key_ holds the effective seek target, which
+  // is end_key, and range_tomb_first_key_ holds the lowest tombstone of the
+  // run. The run ends at its low side, at the stop key: saved_key_, the key
+  // where the backward scan stopped, or the lowest tombstone of the run if
+  // saved_key_ is outside the seek prefix. The mark is (stop key, seek key],
+  // and the conversion is [lowest tombstone, end_key). For example, a first
+  // SeekForPrev("q0019") that finds the tombstones "q0019" down to "q0010" and
+  // stops at the live key "q0009" publishes the mark ("q0009", "q0019"] and
+  // converts ["q0010", "q0019"). A new reverse mark excludes its start if the
+  // seek was clamped to iterate_upper_bound. If a reverse mark moved the
+  // seek, MaybeInsertRangeTombstone() ends the conversion at the mark's
+  // usable end, because the scan did not read the keys above it. In the
+  // example, the mark is usable down to "q0009". After "q0006" to "q0009" are
+  // deleted, the mark moves the next SeekForPrev("q0019") to "q0009", and the
+  // scan stops at the live key "q0005". It converts ["q0006", "q0009")
+  // instead of ["q0006", "q0019"), and the tombstone of "q0009" stays a point
+  // tombstone.
+  //
+  // A scan that fails before its run ends publishes no mark.
+  void MaybePublishHeadMark(const Slice& end_key);
 
   // Returns true if there is no prefix constraint (prefix_ not set) or
   // if `key` is in the prefix extractor's domain and its prefix matches.
@@ -640,6 +805,7 @@ class DBIter final : public Iterator {
     ResetInternalKeysSkippedCounter();
     ResetContiguousTombstoneTracking();
     prefix_.reset();
+    head_mark_skip_end_.Clear();
   }
 
   void MarkMemtableForFlushForAvgTrigger() {
@@ -754,8 +920,25 @@ class DBIter final : public Iterator {
   uint32_t avg_op_scan_flush_trigger_;
   uint32_t iter_step_since_seek_;
   uint32_t mem_hidden_op_scanned_since_seek_;
+  // The number of entries in the current conversion run that count toward
+  // min_tombstones_for_range_conversion_: the visible point tombstones, plus
+  // the count of each accepted dropped-key record (see
+  // MaybeAddDroppedKeysToRun() and TakeReverseDroppedKeys()). Each dropped
+  // internal entry counts once, including each dropped version of one user key.
+  // Entries that the converted range does not cover do not count. For example,
+  // when a dropped older version of the live key "k0010" comes right before a
+  // dropped "k0011", the range starts at "k0011", and the version of "k0010"
+  // does not count. One exception: in the first step of a reverse scan after
+  // SeekForPrev(T), or after SeekToLast() with an upper bound T, dropped
+  // versions of T itself count, although the range ends at T. This changes
+  // only when the threshold is reached, not which keys the range covers. The
+  // count stops growing at the uint32_t maximum.
   uint32_t contiguous_tombstone_count_;
   Direction direction_;
+  // True when the current conversion run holds at least one visible point
+  // tombstone. A run made only of dropped keys has no tracked tombstone that
+  // can serve as its end key at the end of a scan or at a prefix boundary.
+  bool run_has_visible_tombstone_;
   bool valid_;
   bool current_entry_is_merged_;
   // True if we know that the current entry's seqnum is 0.
@@ -791,5 +974,63 @@ class DBIter final : public Iterator {
 
   IterKey range_tomb_first_key_;
   IterKey range_tomb_end_key_;
+
+  // Head marks (see MemTableHeadMark in db/memtable.h). Set in the
+  // constructor. A reader may use marks only if it would see every deletion
+  // that a mark skips: no read callback, no user-defined timestamps, no
+  // table_filter, range deletions not ignored, and a total order or
+  // prefix_same_as_start scan. Publishing also needs the conversion gate
+  // above (min_tombstones_for_range_conversion_ > 0), an active memtable with
+  // head marks enabled, a column family, and a nonzero Version number. Seeks
+  // with scan options never use or publish marks.
+  bool use_head_marks_ = false;
+  bool publish_head_marks_ = false;
+  // Valid if publish_head_marks_.
+  const HeadMarkIngestState* head_mark_ingest_ = nullptr;
+  // How a scan publishes a mark: an eligible Seek() or SeekForPrev() (see
+  // SeekInnerIterWithHeadMarks()) sets this flag, head_mark_dir_ and the seek
+  // key in head_mark_start_. The first run of tombstones after the seek ends
+  // in one of two ways, and both call MaybeInsertRangeTombstone():
+  // - FlushPendingTombstoneRun() calls it. A forward run ends this way at a
+  //   visible value, a merge operand or a prefix boundary. A reverse run is
+  //   inserted only this way (see PrevInternal()): at a visible value, a
+  //   merge operand, a prefix boundary, the lower bound or the end of the
+  //   data.
+  // - A forward scan reaches the upper bound or the end of the data, and
+  //   FindNextUserEntryInternal() calls it with the last tracked key if a run
+  //   exists and the iterator status is OK.
+  // MaybeInsertRangeTombstone() tries to publish a mark from head_mark_start_
+  // to the end of the run, in the seek's direction, before it checks the
+  // conversion threshold (see MaybePublishHeadMark() for the end of a reverse
+  // mark). That attempt, Next(), Prev() and a reset of the tombstone tracking
+  // clear the flag, so a scan tries at most once per seek.
+  bool head_mark_candidate_ = false;
+  // The direction of the current scan's seek, and whether its seek key is
+  // excluded (SeekForPrev() clamped to iterate_upper_bound).
+  HeadMarkDirection head_mark_dir_ = HeadMarkDirection::kForward;
+  bool head_mark_start_exclusive_ = false;
+  // The seek key of the current scan (saved_key_ at the seek), if
+  // publish_head_marks_. A mark that moves the seek does not change it.
+  IterKey head_mark_start_;
+  // The mark of active_mem_ that moved the current seek, or nullptr.
+  const MemTableHeadMark* head_mark_sender_ = nullptr;
+  // The usable end of the last mark, of any memtable, that moved the current
+  // seek, or empty if no mark moved it (see
+  // InternalIteratorBase::SeekWithHeadMarks()), and the direction of that
+  // seek. The seek did not read the keys between its target and this key in
+  // the levels that the marks moved, so every conversion of a forward scan
+  // starts at or after it, and every conversion of a reverse scan ends at or
+  // before it (see MaybeInsertRangeTombstone()). Every seek clears it
+  // (ResetSeekState()).
+  IterKey head_mark_skip_end_;
+  HeadMarkDirection head_mark_skip_dir_ = HeadMarkDirection::kForward;
+
+  // The internal iterator's record of the keys it dropped (see
+  // DroppedKeyInfo), or nullptr when it does not track them or conversion is
+  // disabled. See RegisterDroppedKeyInfo().
+  DroppedKeyInfo* dropped_key_info_ = nullptr;
+  // Backward scans: the smallest dropped user key of the current loop step
+  // (see TakeReverseDroppedKeys()).
+  IterKey reverse_dropped_key_;
 };
 }  // namespace ROCKSDB_NAMESPACE
