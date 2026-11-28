@@ -8,12 +8,15 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <algorithm>
+#include <atomic>
 #include <future>
+#include <thread>
 
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
 #include "db/log_reader.h"
 #include "file/sequence_file_reader.h"
+#include "monitoring/thread_status_util.h"
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -3991,6 +3994,267 @@ TEST_F(DBWALTest, WALWriteErrorNoRecovery) {
   fault_fs->DisableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
   Destroy(options);
 }
+
+#ifndef NDEBUG
+// Background: db_stress checks every file I/O. For each I/O, the IOActivity in
+// IOOptions must match the activity that the thread's ThreadStatus operation
+// implies, unless that implied activity is kUnknown. This test calls the
+// implied activity the "expected" activity.
+//
+// A user thread that drops the last reference to a SuperVersion runs the
+// obsolete-file cleanup itself. One example is an iterator destructor. This
+// cleanup is not part of the operation of the thread, so it runs with the
+// thread operation OP_UNKNOWN (expected activity kUnknown). The cleanup closes
+// an obsolete WAL in one of two places:
+// - FindObsoleteFiles() closes the WAL when background_close_inactive_wals is
+//   false or recycle_log_file_num > 0.
+// - PurgeObsoleteFiles() closes the WAL when background_close_inactive_wals is
+//   true, the cleanup does not run in the background (both
+//   avoid_unnecessary_blocking_io and
+//   ReadOptions::background_purge_on_iterator_cleanup are false), and the
+//   cleanup has files to delete.
+// For both places, the test destroys three kinds of iterators while the thread
+// operation is OP_DBITERATOR, and checks the db_stress rule for the Close of
+// the obsolete WAL:
+// - "positioned": SeekToFirst() runs before the WAL becomes obsolete.
+// - "never positioned": no call positions the iterator.
+// - "empty Prepare": Prepare() with empty MultiScanArgs fails before it
+//   creates the internal iterator.
+// The last two kinds release their SuperVersion after DBIter::~DBIter()
+// finishes, so the thread operation is OP_DBITERATOR again at that point.
+TEST_F(DBWALTest, IteratorCleanupClosesWalWithMatchingIOActivity) {
+  // The IOActivity of one WAL Close call, and the expected activity of the
+  // thread that made the call.
+  struct WalClose {
+    Env::IOActivity io_activity;
+    Env::IOActivity expected;
+  };
+
+  // Records a WalClose for every Close of a WAL file.
+  class WalCloseRecordingFileSystem : public FileSystemWrapper {
+   public:
+    explicit WalCloseRecordingFileSystem(
+        const std::shared_ptr<FileSystem>& base)
+        : FileSystemWrapper(base) {}
+
+    static const char* kClassName() { return "WalCloseRecordingFileSystem"; }
+    const char* Name() const override { return kClassName(); }
+    IOStatus NewWritableFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSWritableFile>* result,
+                             IODebugContext* dbg) override {
+      IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+      uint64_t number = 0;
+      FileType type = kTempFile;
+      if (s.ok() &&
+          ParseFileName(fname.substr(fname.find_last_of('/') + 1), &number,
+                        &type) &&
+          type == kWalFile) {
+        *result = std::make_unique<WalFile>(std::move(*result), this);
+      }
+      return s;
+    }
+
+    std::vector<WalClose> Closes() {
+      MutexLock l(&mutex_);
+      return closes_;
+    }
+
+   private:
+    class WalFile : public FSWritableFileOwnerWrapper {
+     public:
+      WalFile(std::unique_ptr<FSWritableFile>&& file,
+              WalCloseRecordingFileSystem* fs)
+          : FSWritableFileOwnerWrapper(std::move(file)), fs_(fs) {}
+
+      IOStatus Close(const IOOptions& options, IODebugContext* dbg) override {
+        const Env::IOActivity expected =
+            ThreadStatusUtil::TEST_GetExpectedIOActivity(
+                ThreadStatusUtil::GetThreadOperation());
+        {
+          MutexLock l(&fs_->mutex_);
+          fs_->closes_.push_back({options.io_activity, expected});
+        }
+        return target()->Close(options, dbg);
+      }
+
+     private:
+      WalCloseRecordingFileSystem* fs_;
+    };
+
+    port::Mutex mutex_;
+    std::vector<WalClose> closes_;
+  };
+
+  // Track the operation of this thread, as db_stress does for its threads.
+  ThreadStatusUtil::RegisterThread(env_, ThreadStatus::USER);
+  Defer unregister([]() {
+    ThreadStatusUtil::SetEnableTracking(false);
+    ThreadStatusUtil::UnregisterThread();
+  });
+  ThreadStatusUtil::SetEnableTracking(true);
+  ThreadStatusUtil::SetThreadOperation(
+      ThreadStatus::OperationType::OP_DBITERATOR);
+  const bool tracking = ThreadStatusUtil::GetThreadOperation() ==
+                        ThreadStatus::OperationType::OP_DBITERATOR;
+  ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);
+  if (!tracking) {
+    ROCKSDB_GTEST_BYPASS("Thread status tracking is not supported");
+    return;
+  }
+
+  // One file system for all cases. DestroyAndReopen() in a later case destroys
+  // the DB of the earlier case with the options of the earlier case, which
+  // point to this Env, so the Env must outlive the loops. Each case looks only
+  // at the Close calls after its own baseline.
+  auto recording_fs =
+      std::make_shared<WalCloseRecordingFileSystem>(env_->GetFileSystem());
+  std::unique_ptr<Env> recording_env(NewCompositeEnv(recording_fs));
+  // Closes the DB before recording_env is destroyed, also when an ASSERT
+  // returns early.
+  Defer close_db([this]() { Close(); });
+
+  struct CloseCase {
+    const char* name;
+    bool background_close_inactive_wals;
+    bool avoid_unnecessary_blocking_io;
+  };
+  // The first case uses avoid_unnecessary_blocking_io=true, as in the crash
+  // test run that found the bug: FindObsoleteFiles() still runs in the user
+  // thread. The second case needs avoid_unnecessary_blocking_io=false, so that
+  // the WAL writers stay in the user thread until PurgeObsoleteFiles().
+  const CloseCase kCloseCases[] = {
+      {"FindObsoleteFiles", false, true},
+      {"PurgeObsoleteFiles", true, false},
+  };
+  enum class IterKind { kPositioned, kNeverPositioned, kEmptyPrepare };
+  const std::pair<IterKind, const char*> kIterKinds[] = {
+      {IterKind::kPositioned, "positioned"},
+      {IterKind::kNeverPositioned, "never positioned"},
+      {IterKind::kEmptyPrepare, "empty Prepare"},
+  };
+  for (const CloseCase& close_case : kCloseCases) {
+    for (const auto& iter_kind : kIterKinds) {
+      SCOPED_TRACE(std::string(close_case.name) + " / " + iter_kind.second);
+      Options options = CurrentOptions();
+      options.enable_thread_tracking = true;
+      options.background_close_inactive_wals =
+          close_case.background_close_inactive_wals;
+      options.avoid_unnecessary_blocking_io =
+          close_case.avoid_unnecessary_blocking_io;
+      options.recycle_log_file_num = 0;
+      options.disable_auto_compactions = true;
+      options.env = recording_env.get();
+      DestroyAndReopen(options);
+
+      // Two L0 files, x and y, that a compaction below replaces.
+      ASSERT_OK(Put("x", "v0"));
+      ASSERT_OK(Flush());
+      ASSERT_OK(Put("y", "v0"));
+      ASSERT_OK(Flush());
+      ASSERT_OK(Put("a", "v1"));
+      // The iterator pins the SuperVersion that still includes the WAL with
+      // "a" and the Version with the two L0 files.
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+      if (iter_kind.first == IterKind::kPositioned) {
+        iter->SeekToFirst();
+        ASSERT_TRUE(iter->Valid());
+        ASSERT_OK(iter->status());
+      } else if (iter_kind.first == IterKind::kEmptyPrepare) {
+        iter->Prepare(MultiScanArgs(BytewiseComparator()));
+        ASSERT_EQ(iter->status().code(), Status::Code::kInvalidArgument);
+      }
+      // The compaction removes the two L0 files from the current Version, so
+      // they become obsolete when the iterator releases the old Version. The
+      // iterator cleanup then has files to delete, so it calls
+      // PurgeObsoleteFiles(). The obsolete WAL alone does not count as a file
+      // to delete here, because the stopped flush cleanup below has already
+      // taken it. The compaction runs in this thread and leaves the memtable
+      // with "a" alone.
+      std::vector<std::string> l0_files;
+      {
+        ColumnFamilyMetaData cf_meta;
+        db_->GetColumnFamilyMetaData(&cf_meta);
+        for (const SstFileMetaData& file : cf_meta.levels[0].files) {
+          l0_files.push_back(file.name);
+        }
+      }
+      ASSERT_EQ(l0_files.size(), 2U);
+      ASSERT_OK(db_->CompactFiles(CompactionOptions(), l0_files, 1));
+
+      // The flush switches to a new WAL, so the WAL with "a" becomes obsolete.
+      // The flush thread starts its own cleanup and stops after it releases
+      // the DB mutex. By then it has put the obsolete WAL in its own delete
+      // list, but it has not closed the WAL writer or taken it from the WAL
+      // list. Then the test destroys the iterator, so the iterator cleanup is
+      // the one that closes the obsolete WAL.
+      const std::thread::id test_thread_id = std::this_thread::get_id();
+      auto flush_thread_stopped = std::make_shared<std::atomic<bool>>(false);
+      std::promise<void> flush_cleanup_reached;
+      std::promise<void> iter_deleted;
+      std::shared_future<void> iter_deleted_future = iter_deleted.get_future();
+      bool iter_deleted_set = false;
+      // Releases the flush thread and removes the callback on every exit path,
+      // also when an ASSERT below returns early. The callback cannot run after
+      // this scope: ClearAllCallBacks() removes it and waits for a running
+      // call to finish.
+      Defer cleanup([&]() {
+        if (!iter_deleted_set) {
+          iter_deleted.set_value();
+        }
+        SyncPoint::GetInstance()->DisableProcessing();
+        SyncPoint::GetInstance()->ClearAllCallBacks();
+        iter.reset();
+        Close();
+      });
+      std::promise<void>* reached = &flush_cleanup_reached;
+      SyncPoint::GetInstance()->SetCallBack(
+          "FindObsoleteFiles::PostMutexUnlock",
+          [test_thread_id, flush_thread_stopped, reached,
+           iter_deleted_future](void* /*arg*/) {
+            if (std::this_thread::get_id() == test_thread_id ||
+                flush_thread_stopped->exchange(true)) {
+              return;
+            }
+            reached->set_value();
+            iter_deleted_future.wait_for(std::chrono::minutes(5));
+          });
+      SyncPoint::GetInstance()->EnableProcessing();
+      FlushOptions flush_opts;
+      flush_opts.wait = false;
+      ASSERT_OK(db_->Flush(flush_opts));
+      ASSERT_EQ(
+          flush_cleanup_reached.get_future().wait_for(std::chrono::minutes(5)),
+          std::future_status::ready);
+
+      // The WALs of the two earlier flushes are already closed. Only Close
+      // calls after this point belong to the WAL with "a".
+      const size_t closes_before = recording_fs->Closes().size();
+      ThreadStatusUtil::SetThreadOperation(
+          ThreadStatus::OperationType::OP_DBITERATOR);
+      iter.reset();
+      // The cleanup restored the operation of this thread.
+      EXPECT_EQ(ThreadStatusUtil::GetThreadOperation(),
+                ThreadStatus::OperationType::OP_DBITERATOR);
+      ThreadStatusUtil::SetThreadOperation(
+          ThreadStatus::OperationType::OP_UNKNOWN);
+      const std::vector<WalClose> closes = recording_fs->Closes();
+      iter_deleted.set_value();
+      iter_deleted_set = true;
+      ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+      // The iterator cleanup closed exactly the obsolete WAL, and the Close
+      // follows the db_stress rule.
+      ASSERT_EQ(closes.size(), closes_before + 1);
+      const WalClose& wal_close = closes.back();
+      EXPECT_TRUE(wal_close.expected == Env::IOActivity::kUnknown ||
+                  wal_close.io_activity == wal_close.expected)
+          << "io_activity=" << static_cast<int>(wal_close.io_activity)
+          << " expected=" << static_cast<int>(wal_close.expected);
+    }
+  }
+}
+#endif  // !NDEBUG
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

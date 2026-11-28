@@ -3396,6 +3396,17 @@ void DBImpl::CleanupIteratorSuperVersion(SuperVersion* super_version,
 void DBImpl::UnlockAndPurgeObsoleteFiles(SuperVersion* sv_to_free,
                                          bool background_purge) {
   mutex_.AssertHeld();
+  // This cleanup runs in the user thread that called it: a thread that dropped
+  // the last reference to a SuperVersion (for example by destroying an
+  // iterator), or a thread that released a file pin. Its I/O, such as closing
+  // an obsolete WAL or deleting obsolete files, is not part of the operation of
+  // that thread. So set the thread operation to OP_UNKNOWN while the cleanup
+  // runs, and restore it at the end so that the caller's own operation stays
+  // correct. This matches DBIter::~DBIter() and the lazy-result cleanup in
+  // lazy_wide_columns.cc.
+  const ThreadStatus::OperationType cur_op_type =
+      ThreadStatusUtil::GetThreadOperation();
+  ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);
   // Job id == 0 means that this is not our background process, but rather
   // user thread
   JobContext job_context(0);
@@ -3420,6 +3431,7 @@ void DBImpl::UnlockAndPurgeObsoleteFiles(SuperVersion* sv_to_free,
     PurgeObsoleteFiles(job_context, background_purge);
   }
   job_context.Clean();
+  ThreadStatusUtil::SetThreadOperation(cur_op_type);
 }
 
 ColumnFamilyHandle* DBImpl::DefaultColumnFamily() const {
