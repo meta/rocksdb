@@ -839,6 +839,7 @@ set(SOURCES
         db/log_writer.cc
         db/malloc_stats.cc
         db/manifest_ops.cc
+        db/manifest_rows.cc
         db/memtable.cc
         db/memtable_list.cc
         db/merge_helper.cc
