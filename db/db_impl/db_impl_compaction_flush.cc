@@ -77,6 +77,45 @@ std::vector<uint64_t> MemTableIds(const autovector<ReadOnlyMemTable*>& mems) {
   return ids;
 }
 
+// Sets the background error after a flush failed because a blob direct write
+// file failed to sync or to seal. The flush does not call SetBGError() for
+// this error; this function sets it instead.
+//
+// A flush can hit two kinds of blob file errors. The flush passes the error
+// in `blob_error`:
+// 1. The blob sync that runs before the closed WALs are synced (see
+//    SyncBlobDirectWriteFiles()) fails. The error is the WAL sync status of
+//    SyncClosedWals() when it sets `blob_sync_failed_out`.
+// 2. The seal of a blob file of the flushed memtables fails. The error is the
+//    status of BlobFilePartitionManager::PrepareFlushAdditions(), which seals
+//    those files.
+//
+// Severity: the same as for a failed SST write in a flush, but at least
+// kFatalError (ErrorHandler::SetBGErrorAtLeastFatal()). So a corruption or a
+// data loss error stays kUnrecoverableError. A retryable or file-scoped error,
+// a NoSpace error, and any error with paranoid_checks=false (which
+// SetBGError() would map to a hard error with automatic recovery, or to
+// kNoError) become kFatalError: the DB stops, DB::Resume() fails, and the DB
+// must be reopened. Why no retry:
+// - The blob file holds the only copy of its values: the memtable and the WAL
+//   hold only BlobIndex entries. After a failed fsync, the OS can drop the
+//   unsynced bytes, so syncing the file again proves nothing. The writer keeps
+//   the failed sync error, and DeferredFile::seal_status keeps a failed seal
+//   error, so a retried flush of that memtable generation fails again.
+// - A failed sync of the blob directory is not kept, but a failed flush is not
+//   tried again by itself, and with kNoError a caller that waits for the
+//   flush, such as a manual Flush() or the flush that Close() always runs with
+//   blob direct write, would wait forever.
+// Stopping the DB makes those callers return the error. The WALs are kept, and
+// the next open replays them. Writes made with disableWAL=true have no WAL
+// record to replay: they survive the reopen only if a memtable flush persisted
+// them.
+void StopDBAfterBlobDirectWriteError(ErrorHandler* error_handler,
+                                     const Status& blob_error) {
+  error_handler->SetBGErrorAtLeastFatal(blob_error,
+                                        BackgroundErrorReason::kFlush);
+}
+
 }  // namespace
 
 bool DBImpl::EnoughRoomForCompaction(
@@ -175,11 +214,13 @@ bool DBImpl::ShouldRescheduleFlushRequestToRetainUDT(
 IOStatus DBImpl::SyncClosedWals(const WriteOptions& write_options,
                                 JobContext* job_context,
                                 VersionEdit* synced_wals,
-                                bool error_recovery_in_prog) {
+                                bool error_recovery_in_prog,
+                                bool* blob_sync_failed_out) {
   TEST_SYNC_POINT("DBImpl::SyncClosedWals:Start");
 
-  IOStatus io_s = SyncWalImpl(/*include_current_wal*/ false, write_options,
-                              job_context, synced_wals, error_recovery_in_prog);
+  IOStatus io_s =
+      SyncWalImpl(/*include_current_wal*/ false, write_options, job_context,
+                  synced_wals, error_recovery_in_prog, blob_sync_failed_out);
   if (!io_s.ok()) {
     TEST_SYNC_POINT("DBImpl::SyncClosedWals:Failed");
   } else {
@@ -262,6 +303,10 @@ Status DBImpl::FlushMemTableToOutputFile(
   Status s;
   bool need_cancel = false;
   IOStatus log_io_s = IOStatus::OK();
+  // Holds the error of a blob direct write file sync or seal in this flush, if
+  // there was one (see StopDBAfterBlobDirectWriteError()).
+  Status blob_direct_write_error;
+  bool blob_sync_failed = false;
   if (needs_to_sync_closed_wals) {
     // SyncClosedWals() may unlock and re-lock the wal_write_mutex multiple
     // times.
@@ -269,8 +314,11 @@ Status DBImpl::FlushMemTableToOutputFile(
     bool error_recovery_in_prog = error_handler_.IsRecoveryInProgress();
     mutex_.Unlock();
     log_io_s = SyncClosedWals(write_options, job_context, &synced_wals,
-                              error_recovery_in_prog);
+                              error_recovery_in_prog, &blob_sync_failed);
     mutex_.Lock();
+    if (blob_sync_failed) {
+      blob_direct_write_error = log_io_s;
+    }
     if (log_io_s.ok() && synced_wals.IsWalAddition()) {
       log_io_s = status_to_io_status(
           ApplyWALToManifest(read_options, write_options, &synced_wals));
@@ -278,8 +326,9 @@ Status DBImpl::FlushMemTableToOutputFile(
                                nullptr);
     }
 
-    if (!log_io_s.ok() && !log_io_s.IsShutdownInProgress() &&
-        !log_io_s.IsColumnFamilyDropped()) {
+    // A blob sync error is set by StopDBAfterBlobDirectWriteError() below.
+    if (!log_io_s.ok() && !blob_sync_failed &&
+        !log_io_s.IsShutdownInProgress() && !log_io_s.IsColumnFamilyDropped()) {
       error_handler_.SetBGError(log_io_s, BackgroundErrorReason::kFlush);
     }
   } else {
@@ -341,7 +390,9 @@ Status DBImpl::FlushMemTableToOutputFile(
           &write_path_garbages, &generation_blob_file_numbers);
       mutex_.Lock();
       if (!s.ok()) {
+        // A blob seal error. See StopDBAfterBlobDirectWriteError().
         prepared_blob_memtable_ids.clear();
+        blob_direct_write_error = s;
       } else if (!write_path_additions.empty()) {
         const auto& memtables = flush_job.GetMemTables();
         assert(generation_blob_file_numbers.size() == memtables.size());
@@ -452,8 +503,10 @@ Status DBImpl::FlushMemTableToOutputFile(
     }
   }
 
+  // A blob direct write error is set by StopDBAfterBlobDirectWriteError()
+  // below instead.
   if (!s.ok() && !s.IsShutdownInProgress() && !s.IsColumnFamilyDropped() &&
-      !skip_set_bg_error) {
+      !skip_set_bg_error && blob_direct_write_error.ok()) {
     if (log_io_s.ok()) {
       // Error while writing to MANIFEST.
       // In fact, versions_->io_status() can also be the result of renaming
@@ -477,6 +530,9 @@ Status DBImpl::FlushMemTableToOutputFile(
       assert(s == log_io_s);
       error_handler_.SetBGError(s, BackgroundErrorReason::kFlush);
     }
+  }
+  if (!blob_direct_write_error.ok()) {
+    StopDBAfterBlobDirectWriteError(&error_handler_, blob_direct_write_error);
   }
   // If flush ran smoothly and no mempurge happened
   // install new SST file path.
@@ -619,6 +675,10 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
   std::deque<bool> switched_to_mempurge(num_cfs, false);
   Status s;
   IOStatus log_io_s = IOStatus::OK();
+  // Holds the error of a blob direct write file sync or seal in this flush, if
+  // there was one (see StopDBAfterBlobDirectWriteError()).
+  Status blob_direct_write_error;
+  bool blob_sync_failed = false;
   assert(num_cfs == static_cast<int>(jobs.size()));
 
   for (int i = 0; i != num_cfs; ++i) {
@@ -636,15 +696,19 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     bool error_recovery_in_prog = error_handler_.IsRecoveryInProgress();
     mutex_.Unlock();
     log_io_s = SyncClosedWals(write_options, job_context, &synced_wals,
-                              error_recovery_in_prog);
+                              error_recovery_in_prog, &blob_sync_failed);
     mutex_.Lock();
+    if (blob_sync_failed) {
+      blob_direct_write_error = log_io_s;
+    }
     if (log_io_s.ok() && synced_wals.IsWalAddition()) {
       log_io_s = status_to_io_status(
           ApplyWALToManifest(read_options, write_options, &synced_wals));
     }
 
-    if (!log_io_s.ok() && !log_io_s.IsShutdownInProgress() &&
-        !log_io_s.IsColumnFamilyDropped()) {
+    // A blob sync error is set by StopDBAfterBlobDirectWriteError() below.
+    if (!log_io_s.ok() && !blob_sync_failed &&
+        !log_io_s.IsShutdownInProgress() && !log_io_s.IsColumnFamilyDropped()) {
       if (wals_total_size_.LoadRelaxed() > 0) {
         error_handler_.SetBGError(log_io_s, BackgroundErrorReason::kFlush);
       } else {
@@ -706,7 +770,9 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
           &write_path_garbages, &generation_blob_file_numbers);
       mutex_.Lock();
       if (!s.ok()) {
+        // A blob seal error. See StopDBAfterBlobDirectWriteError().
         prepared_blob_memtable_ids[i].clear();
+        blob_direct_write_error = s;
         break;
       }
       if (!write_path_additions.empty()) {
@@ -1080,7 +1146,10 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
 
   // Need to undo atomic flush if something went wrong, i.e. s is not OK and
   // it is not because of CF drop.
-  if (!s.ok() && !s.IsColumnFamilyDropped() && !skip_set_bg_error) {
+  // A blob direct write error is set by StopDBAfterBlobDirectWriteError()
+  // below instead.
+  if (!s.ok() && !s.IsColumnFamilyDropped() && !skip_set_bg_error &&
+      blob_direct_write_error.ok()) {
     if (log_io_s.ok()) {
       // Error while writing to MANIFEST.
       // In fact, versions_->io_status() can also be the result of renaming
@@ -1104,6 +1173,9 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
       assert(s == log_io_s);
       error_handler_.SetBGError(s, BackgroundErrorReason::kFlush);
     }
+  }
+  if (!blob_direct_write_error.ok()) {
+    StopDBAfterBlobDirectWriteError(&error_handler_, blob_direct_write_error);
   }
 
   return s;

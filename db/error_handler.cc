@@ -437,6 +437,30 @@ void ErrorHandler::SetBGErrorNoAutoRecovery(const Status& bg_status,
                  /*allow_auto_recovery=*/false);
 }
 
+void ErrorHandler::SetBGErrorAtLeastFatal(const Status& bg_status,
+                                          BackgroundErrorReason reason) {
+  db_mutex_->AssertHeld();
+  if (bg_status.ok()) {
+    return;
+  }
+  ROCKS_LOG_WARN(db_options_.info_log,
+                 "Background error %s, reason %d, set as at least fatal",
+                 bg_status.ToString().c_str(), static_cast<int>(reason));
+  RecordStats({ERROR_HANDLER_BG_ERROR_COUNT}, {} /* int_histograms */);
+  Status tmp_status = bg_status;
+  const IOStatus bg_io_err = status_to_io_status(std::move(tmp_status));
+  const bool unrecoverable =
+      bg_status.IsCorruption() ||
+      (bg_io_err.GetDataLoss() &&
+       bg_io_err.GetScope() != IOStatus::IOErrorScope::kIOErrorScopeFile);
+  Status bg_err(bg_status, unrecoverable ? Status::Severity::kUnrecoverableError
+                                         : Status::Severity::kFatalError);
+  CheckAndSetRecoveryAndBGError(bg_err, DBRecoverContext());
+  bool auto_recovery = false;
+  EventHelpers::NotifyOnBackgroundError(db_options_.listeners, reason, &bg_err,
+                                        db_mutex_, &auto_recovery);
+}
+
 void ErrorHandler::SetBGErrorImpl(const Status& bg_status,
                                   BackgroundErrorReason reason,
                                   bool wal_related, DBRecoverContext context,

@@ -618,6 +618,12 @@ struct BackgroundJobPressure {
 // could hang by waiting for a background worker that is occupied until the
 // callback returns.
 //
+// With blob direct write (ColumnFamilyOptions::enable_blob_direct_write),
+// blob file callbacks, file I/O callbacks and OnBackgroundError can run
+// while the thread holds a blob file lock or WAL sync state of the DB. A
+// write or a WAL sync of the same DB from such a callback can hang. See
+// enable_blob_direct_write for details.
+//
 // Otherwise, callback functions should not run for an extended period of
 // time before the function returns, because this will slow RocksDB.
 //

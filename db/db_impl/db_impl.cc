@@ -995,9 +995,12 @@ void DBImpl::MaybeInitBlobDirectWriteColumnFamily(
       cf_options.blob_direct_write_partitions,
       cf_options.blob_direct_write_partition_strategy,
       [vs = versions_.get()]() { return vs->NewFileNumber(); }, fs_.get(),
-      immutable_db_options_.clock, stats_, file_options_, dbname_,
-      column_family_name, cf_options.blob_file_size,
-      immutable_db_options_.use_fsync,
+      immutable_db_options_.clock, stats_, file_options_,
+      // Blob files of a column family live in its first cf_paths entry (after
+      // sanitization, db_paths or the DB directory), where readers, the purge,
+      // checksum verification and live-file listing look for them.
+      cfd->ioptions().cf_paths.front().path, column_family_name,
+      cf_options.blob_file_size, immutable_db_options_.use_fsync,
       cf_options.blob_file_writable_file_max_buffer_size,
       cfd->blob_file_cache(), &blob_callback_, immutable_db_options_.listeners,
       immutable_db_options_.file_checksum_gen_factory.get(),
@@ -1005,14 +1008,23 @@ void DBImpl::MaybeInitBlobDirectWriteColumnFamily(
       db_session_id_, immutable_db_options_.info_log.get());
 
   cfd->SetBlobPartitionManager(std::move(mgr));
-  RegisterBlobDirectWriteColumnFamily();
+  RegisterBlobDirectWriteColumnFamily(cfd);
 }
 
-void DBImpl::RegisterBlobDirectWriteColumnFamily() {
+void DBImpl::RegisterBlobDirectWriteColumnFamily(ColumnFamilyData* cfd) {
+  mutex_.AssertHeld();
+  blob_direct_write_cfds_.push_back(cfd);
   blob_direct_write_cf_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void DBImpl::UnregisterBlobDirectWriteColumnFamily() {
+void DBImpl::UnregisterBlobDirectWriteColumnFamily(ColumnFamilyData* cfd) {
+  mutex_.AssertHeld();
+  std::vector<ColumnFamilyData*>::iterator it = std::find(
+      blob_direct_write_cfds_.begin(), blob_direct_write_cfds_.end(), cfd);
+  assert(it != blob_direct_write_cfds_.end());
+  if (it != blob_direct_write_cfds_.end()) {
+    blob_direct_write_cfds_.erase(it);
+  }
   uint32_t current =
       blob_direct_write_cf_count_.load(std::memory_order_relaxed);
   while (current != 0) {
@@ -1396,6 +1408,9 @@ Status DBImpl::CloseHelper() {
   // Detach it before ColumnFamilySet destroys its column families one by one;
   // otherwise each removal rebuilds accounting by scanning all survivors.
   versions_->GetColumnFamilySet()->SetFlushInitiator(nullptr);
+  // Clear the list before versions_.reset() destroys the column families
+  // below, so that it never holds a pointer to a destroyed column family.
+  blob_direct_write_cfds_.clear();
   versions_.reset();
   mutex_.Unlock();
   if (db_lock_ != nullptr) {
@@ -2578,6 +2593,12 @@ Status DBImpl::SyncWAL() {
   TEST_SYNC_POINT("DBImpl::SyncWAL:Begin");
   WriteOptions write_options;
   VersionEdit synced_wals;
+  // SyncWAL() does not keep writers out. SyncWalImpl() fixes the list of WALs
+  // to sync, syncs the blob direct write files, and then fsyncs the WALs. So
+  // every blob value that a WAL record written before this call refers to is
+  // durable when the call returns. The sync does not cover the blob value of a
+  // record that a writer appends during the call (see
+  // SyncBlobDirectWriteFiles()).
   Status s = SyncWalImpl(/*include_current_wal=*/true, write_options,
                          /*job_context=*/nullptr, &synced_wals,
                          /*error_recovery_in_prog=*/false);
@@ -2604,7 +2625,8 @@ Status DBImpl::SyncWAL() {
 IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
                              const WriteOptions& write_options,
                              JobContext* job_context, VersionEdit* synced_wals,
-                             bool error_recovery_in_prog) {
+                             bool error_recovery_in_prog,
+                             bool* blob_sync_failed_out) {
   autovector<log::Writer*, 1> wals_to_sync;
   bool need_wal_dir_sync;
   // Number of a WAL that was active at the start of call and maybe is by
@@ -2666,6 +2688,34 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
   RecordTick(stats_, WAL_FILE_SYNCED);
   IOOptions opts;
   IOStatus io_s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+  // Sync blob files after the WAL list is fixed above and before the WAL
+  // fsync. See SyncBlobDirectWriteFiles() for what this makes durable, and for
+  // a record that a writer appends during the sync. Skip the blob sync when the
+  // loop below syncs no WAL: then no WAL record becomes durable, and the fsyncs
+  // would only stall blob writers. This uses the same cutoff check as the WAL
+  // loop below: WALs at or below wal_recovery_cutoff_ were quarantined after a
+  // WAL write error, and the loop below does not sync them.
+  bool syncs_any_wal = false;
+  for (log::Writer* log : wals_to_sync) {
+    if (log->get_log_number() >
+        wal_recovery_cutoff_.load(std::memory_order_acquire)) {
+      syncs_any_wal = true;
+      break;
+    }
+  }
+  bool blob_sync_failed = false;
+  if (io_s.ok() && syncs_any_wal) {
+    io_s = status_to_io_status(SyncBlobDirectWriteFiles(write_options));
+    if (!io_s.ok()) {
+      blob_sync_failed = true;
+      if (blob_sync_failed_out != nullptr) {
+        *blob_sync_failed_out = true;
+      }
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "Blob direct write file sync before WAL sync failed: %s",
+                      io_s.ToString().c_str());
+    }
+  }
   std::list<log::Writer*> wals_internally_closed;
   uint64_t failed_wal_number = 0;
   bool failed_with_previous_error = false;
@@ -2723,8 +2773,10 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
     }
   }
   if (!io_s.ok()) {
-    ROCKS_LOG_ERROR(immutable_db_options_.info_log, "WAL Sync error %s",
-                    io_s.ToString().c_str());
+    if (!blob_sync_failed) {
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log, "WAL Sync error %s",
+                      io_s.ToString().c_str());
+    }
     // In case there is a fs error we should set it globally to prevent the
     // future writes
     // The live-WAL operation that first observed the I/O failure owns
@@ -2734,7 +2786,14 @@ IOStatus DBImpl::SyncWalImpl(bool include_current_wal,
     // lost the original scope and could incorrectly make the error fatal. With
     // paranoid checks disabled, WALIOStatusCheck() instead preserves the
     // legacy behavior of resetting the writer so a later operation can retry.
-    if (!failed_with_previous_error || !immutable_db_options_.paranoid_checks) {
+    if (blob_sync_failed) {
+      // A flush passes `blob_sync_failed_out` and sets the background error
+      // itself (see StopDBAfterBlobDirectWriteError()).
+      if (blob_sync_failed_out == nullptr) {
+        BlobSyncStatusCheck(io_s);
+      }
+    } else if (!failed_with_previous_error ||
+               !immutable_db_options_.paranoid_checks) {
       WALIOStatusCheck(io_s, failed_wal_number);
     }
   }
@@ -5613,7 +5672,7 @@ Status DBImpl::DropColumnFamilyWithOptionsFile(
         versions_->options_file_size_ = options_file_size;
       }
       if (s.ok() && cfd->blob_partition_manager() != nullptr) {
-        UnregisterBlobDirectWriteColumnFamily();
+        UnregisterBlobDirectWriteColumnFamily(cfd);
       }
       if (s.ok()) {
         RestoreParkedCompaction(cfd);

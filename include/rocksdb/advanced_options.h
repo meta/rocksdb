@@ -1232,6 +1232,11 @@ struct AdvancedColumnFamilyOptions {
   //    direct-write state first; APIs that intentionally skip the flush, or
   //    run while WAL is locked, can return NotSupported.
   //  - not compatible with MemPurge or user-defined timestamps.
+  //  - a failed sync or seal of a blob direct write file during a flush sets
+  //    at least a fatal background error, also for a retryable error and with
+  //    paranoid_checks=false: there is no automatic recovery, and the DB must
+  //    be reopened. The blob file holds the only copy of its values; the
+  //    reopen replays the WALs.
   //  - DB::IngestWriteBatchWithIndex() is not supported while any live column
   //    family enables this option.
   //  - read-only and secondary opens can read flushed/manifest-visible blob
@@ -1246,6 +1251,29 @@ struct AdvancedColumnFamilyOptions {
   // to about blob_file_size * blob_direct_write_partitions for each memtable
   // not flushed yet (up to max_write_buffer_number). Blob files written by
   // flush or compaction instead fail that job and are deleted.
+  //
+  // WAL sync: every WAL sync (a write with sync=true, SyncWAL(),
+  // FlushWAL(true), and the sync of closed WALs before a flush) first syncs the
+  // blob direct write files and the directory entries of new blob files, and
+  // then fsyncs the WALs. So when a WAL sync returns OK, the blob values of all
+  // WAL records written before the sync started are durable. A sync write also
+  // covers its own records. SyncWAL() and FlushWAL(true) do not keep writers
+  // out. After a power loss, a write made while they run can leave a WAL record
+  // that survives while its blob value cannot be read; a read of that key after
+  // recovery can then fail. With manual_wal_flush, FlushWAL(true) first writes
+  // the WAL buffer. It returns any error of that write, or calls SyncWAL() if
+  // the write succeeds.
+  //
+  // IMPORTANT: some callbacks run while their thread holds a blob file lock or
+  // WAL sync state of this DB: blob file listener callbacks
+  // (OnBlobFileCreationStarted, OnBlobFileCreated), file I/O listener callbacks
+  // for blob files (see EventListener::ShouldBeNotifiedOnFileIO()), and file
+  // I/O callbacks for WAL files, OnBackgroundError and OnErrorRecoveryBegin
+  // during a WAL sync. From these callbacks, do not call SyncWAL() or
+  // FlushWAL(true) on the same DB, and do not write to the same DB with
+  // sync=true: such a call can hang. From a blob file callback, and from an
+  // error callback inside a write with sync=true, also do not write to the same
+  // DB at all, even with sync=false. RocksDB does not detect these calls.
   //
   // Default: false
   //
