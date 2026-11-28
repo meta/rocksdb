@@ -14,6 +14,7 @@
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
+#include "db/manifest_store_shadow.h"
 #include "db/manifest_store_state.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/version_util.h"
@@ -259,6 +260,10 @@ Status DBImpl::ValidateOptions(
 
 Status DBImpl::CheckManifestStoreOptions(const DBOptions& db_options) {
   if (db_options.manifest_store == nullptr) {
+    if (db_options.manifest_store_shadow) {
+      return Status::InvalidArgument(
+          "manifest_store_shadow requires manifest_store");
+    }
     return Status::OK();
   }
   if (db_options.manifest_row_feature_version < 1 ||
@@ -275,6 +280,22 @@ Status DBImpl::CheckManifestStoreOptions(const DBOptions& db_options) {
     return Status::InvalidArgument(
         "manifest_store_copy_mode must be kOff, kBackground or kSync");
   }
+  if (db_options.manifest_store_shadow) {
+    // Best-efforts recovery opens a damaged DB with the files that are left.
+    // Shadow mode is meant for a healthy DB that will move into the store, so
+    // the two are not allowed together; this keeps the combinations that
+    // shadow mode must handle small.
+    if (db_options.best_efforts_recovery) {
+      return Status::InvalidArgument(
+          "manifest_store_shadow does not support best_efforts_recovery");
+    }
+    // A shadow DB stays in file mode, so it cannot change the mode of the DB.
+    if (db_options.manifest_store_migrate) {
+      return Status::InvalidArgument(
+          "manifest_store_shadow cannot be used with manifest_store_migrate");
+    }
+    return Status::OK();
+  }
   // Best-efforts recovery reads older MANIFEST files, which store mode does
   // not keep. The blob DB repair runs in that recovery path, which store mode
   // does not take.
@@ -285,6 +306,31 @@ Status DBImpl::CheckManifestStoreOptions(const DBOptions& db_options) {
         "with manifest_store");
   }
   return Status::OK();
+}
+
+void DBImpl::CreateManifestStoreShadow() {
+  // A shadow job runs in the LOW pool. Ask for a thread for it on top of the
+  // compaction threads that SanitizeOptions() asks for. Each DB raises the LOW
+  // pool of its own Env, because the Env of another shadow DB may use other
+  // pools. The request reserves no thread: another DB on the same Env with a
+  // higher compaction limit can size the pool without the extra thread (see
+  // DBOptions::manifest_store_shadow).
+  // parallelize_compactions is true to get the largest compaction limit, as
+  // SanitizeOptions() does, so the extra thread is always on top of it.
+  const BGJobLimits limits =
+      GetBGJobLimits(mutable_db_options_.max_background_flushes,
+                     mutable_db_options_.max_background_compactions,
+                     mutable_db_options_.max_background_jobs,
+                     /*parallelize_compactions=*/true);
+  env_->IncBackgroundThreadsIfNeeded(
+      limits.max_compactions + ManifestStoreShadow::kMaxJobsPerProcess,
+      Env::Priority::LOW);
+  manifest_store_shadow_ = std::make_unique<ManifestStoreShadow>(
+      immutable_db_options_.manifest_store, env_, immutable_db_options_.clock,
+      immutable_db_options_.info_log,
+      immutable_db_options_.manifest_row_feature_version,
+      immutable_db_options_.bgerror_resume_retry_interval, db_session_id_);
+  versions_->SetManifestStoreShadow(manifest_store_shadow_.get());
 }
 
 Status DBImpl::ValidateOptions(const DBOptions& db_options) {
@@ -788,6 +834,12 @@ Status DBImpl::EnterManifestStore(
     //   Here the rows are the older side.
     // So the enter refuses both. Only this check can see it: the claim sets
     // the authority to kFile before it returns the row.
+    //
+    // Rows that shadow mode wrote (authority kShadow) may belong to a shadow DB
+    // that is still open, and this folder may be a copy of it with the same db
+    // id. The enter would fence that DB and replace its rows. Rows with
+    // authority kShadow are taken over only after a close commit. See "Close
+    // ids and the enter" at ManifestStoreShadow.
     IOStatus io_s = state->store()->ReadDbRow(&read_row);
     if (io_s.ok()) {
       row_existed = true;
@@ -801,6 +853,24 @@ Status DBImpl::EnterManifestStore(
             "while the store is reachable, or remove the rows with "
             "ManifestStore::Destroy(). Do not do either if a live DB uses "
             "these rows");
+      } else if (s.ok() && extra.authority == ManifestAuthority::kShadow &&
+                 !ManifestCommitIdGenerator::IsCloseId(
+                     read_row.state.last_commit_id)) {
+        s = Status::InvalidArgument(
+            "Store mode: the store holds rows that shadow mode wrote, and the "
+            "last commit is not a close commit. A shadow-mode DB is still "
+            "open (a copy of this folder with the same DB id), or it crashed, "
+            "or it closed while the store was not in sync (after a store "
+            "error, a close during the full copy, or a failed close commit), "
+            "or a later claim (for example RollBackManifestStore()) replaced "
+            "the close id. "
+            "Close every shadow-mode DB of this DB. If the open still fails, "
+            "reopen the DB in shadow mode, write and flush until the info LOG "
+            "shows that the full copy finished (\"Shadow mode: wrote ... rows "
+            "to the store\"), close it, and check that the close logged \"the "
+            "store is in sync with the MANIFEST at close\". Or, if no DB uses "
+            "the rows, remove them with ManifestStore::Destroy(); entering "
+            "store mode writes all rows from the MANIFEST file");
       }
     } else if (!io_s.IsNotFound()) {
       s = Status::IOError("Store mode: cannot read the DB row: " +
@@ -1016,12 +1086,17 @@ Status DBImpl::FinishEnterManifestStore(
   // The DB row must belong to this DB. Otherwise another DB that uses the
   // same store could look like a finished switch, and the steps below would
   // delete the MANIFEST file of this DB.
+  // A row with authority kShadow is not claimed: the claim would replace the
+  // close id of the shadow instance, and the enter below refuses kShadow rows
+  // without a close id (see "Close ids and the enter" in
+  // db/manifest_store_shadow.h). The enter claims the row itself, with the
+  // commit sequence and the commit id that it checked.
   ManifestStoreOpenOptions opts;
   opts.commit_id = state->NextCommitId();
   ManifestDbRowResult db_row;
   ManifestDbRowExtraFields extra;
-  Status s =
-      CheckOwnerAndClaim(state->store(), opts, stub.db_id, &db_row, &extra);
+  Status s = CheckOwnerAndClaim(state->store(), opts, stub.db_id,
+                                /*claim_shadow_rows=*/false, &db_row, &extra);
   if (s.IsNotFound()) {
     return Status::Corruption(
         "Store mode: an \"entering\" stub MANIFEST, but the store has no DB "
@@ -1034,7 +1109,14 @@ Status DBImpl::FinishEnterManifestStore(
   io_opts.type = IOType::kManifest;
   const std::string manifest_name =
       DescriptorFileName(dbname_, stub.from_manifest_number);
-  if (extra.authority == ManifestAuthority::kFile) {
+  // A switch always writes kStore, and shadow mode never overwrites kStore.
+  // So kShadow also means that the switch did not happen: a shadow instance
+  // (for example of a copy of this folder) claimed the DB after the claim of
+  // the enter (see "Close ids and the enter" in db/manifest_store_shadow.h).
+  // For kShadow, pointing CURRENT back changes only local files, so it needs
+  // no claim.
+  if (extra.authority == ManifestAuthority::kFile ||
+      extra.authority == ManifestAuthority::kShadow) {
     // The switch did not happen. The MANIFEST file still holds the metadata.
     s = PointCurrentBackFromEnteringStub(
         WriteOptions(Env::IOActivity::kDBOpen), fs_.get(), dbname_, *current,
@@ -1047,8 +1129,9 @@ Status DBImpl::FinishEnterManifestStore(
       current->number = done_number;
       *recovered_from_manifest = true;
     }
-  } else if (extra.authority == ManifestAuthority::kStore) {
+  } else {
     // The switch happened: finish steps 6 and 7.
+    assert(extra.authority == ManifestAuthority::kStore);
     s = fs_->DeleteFile(manifest_name, io_opts, nullptr);
     if (s.IsNotFound() || s.IsPathNotFound()) {
       s = Status::OK();
@@ -1057,10 +1140,6 @@ Status DBImpl::FinishEnterManifestStore(
       s = WriteDoneStub(current->number, stub.done_stub_number, stub.db_id);
       current->number = stub.done_stub_number;
     }
-  } else {
-    return Status::Corruption(
-        "Store mode: an \"entering\" stub MANIFEST, but the DB row has "
-        "another authority");
   }
   if (s.ok()) {
     current->stub.state = ManifestStubState::kDone;
@@ -1206,7 +1285,8 @@ Status DBImpl::RecoverFromManifestStore(
           lossless_cast<uint32_t>(ManifestDbField::kCopyMode), mode}});
     }
     ManifestDbRowResult claimed;
-    s = CheckOwnerAndClaim(store, open_opts, current.stub.db_id, &claimed);
+    s = CheckOwnerAndClaim(store, open_opts, current.stub.db_id,
+                           /*claim_shadow_rows=*/true, &claimed);
     if (s.ok()) {
       // This instance scans after its claim, and it sends no commit during
       // the scan, so it skips the consistent scan
@@ -1352,7 +1432,7 @@ Status DBImpl::Recover(
   // Store mode (see db/manifest_store_state.h). A read-only instance never
   // commits, so it needs no state.
   std::unique_ptr<ManifestStoreState> store_state;
-  if (immutable_db_options_.manifest_store != nullptr && !read_only) {
+  if (StoreModeOptions(immutable_db_options_) && !read_only) {
     store_state = std::make_unique<ManifestStoreState>(
         immutable_db_options_.manifest_store, db_session_id_,
         immutable_db_options_.manifest_row_feature_version);
@@ -1488,7 +1568,21 @@ Status DBImpl::Recover(
   assert(is_new_db || db_id_.empty());
   Status s;
   bool missing_table_file = false;
-  if (immutable_db_options_.manifest_store != nullptr) {
+  if (immutable_db_options_.manifest_store_shadow) {
+    // Shadow mode keeps the MANIFEST file as the authority, so it cannot open
+    // a DB whose CURRENT names a stub (a DB in store mode, or one that is
+    // moving into it).
+    CurrentManifestInfo current;
+    s = ReadCurrentManifestInfo(fs_.get(), dbname_, &current);
+    if (s.ok() && current.exists && current.is_stub) {
+      return Status::InvalidArgument(
+          "manifest_store_shadow cannot open a DB in store mode; open it "
+          "without manifest_store_shadow");
+    }
+    // A CURRENT that cannot be read fails in the recovery below.
+    s = Status::OK();
+  }
+  if (StoreModeOptions(immutable_db_options_)) {
     s = RecoverFromManifestStore(column_families, read_only,
                                  std::move(store_state));
     if (can_retry) {
@@ -3709,6 +3803,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   }
 
   impl->wal_in_db_path_ = impl->immutable_db_options_.IsWalDirSameAsDBPath();
+  if (impl->immutable_db_options_.manifest_store_shadow) {
+    impl->CreateManifestStoreShadow();
+  }
   RecoveryContext recovery_ctx;
   DeferredInstrumentedMutexLock options_lock(
       &impl->options_mutex_,
@@ -4033,6 +4130,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   if (s.ok()) {
     // Register only after open succeeds and without holding the DB mutex.
     impl->MaybeRegisterFlushInitiator();
+    if (impl->manifest_store_shadow_ != nullptr) {
+      impl->manifest_store_shadow_->Start(impl->db_id_);
+    }
     *dbptr = std::move(impl);
   } else {
     for (auto* h : *handles) {

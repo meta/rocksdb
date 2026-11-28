@@ -95,6 +95,11 @@
           "reason": "Experimental: store mode needs manifest_store, which has no C binding."
         },
         {
+          "field": "manifest_store_shadow",
+          "policy": "deferred",
+          "reason": "Experimental: shadow mode needs manifest_store, which has no C binding yet."
+        },
+        {
           "field": "env",
           "policy": "manual",
           "reason": "Stores external objects, callback collections, or nested aggregates that need explicit C ownership and lifetime policy."

@@ -16,6 +16,7 @@
 #include "db/column_family.h"
 #include "db/manifest_store_state.h"
 #include "db/version_set.h"
+#include "db/version_util.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/manifest_store.h"
 #include "rocksdb/utilities/customizable_util.h"
@@ -34,8 +35,10 @@ namespace {
 // records the values of its edits, which can differ from the values in `cfd` at
 // the time of the call.
 // REQUIRES: the fields read from `cfd` and `vstorage` do not change during the
-// call. Holding the DB mutex is enough. The debug check also calls this
-// without the mutex (see "Threads" at VersionSet::debug_manifest_rows_).
+// call. Holding the DB mutex is enough. Shadow mode and the debug check also
+// call this without the mutex, from the thread that runs
+// VersionSet::ProcessManifestWrites(), which is the only thread that installs
+// Versions (see "Threads" at VersionSet::debug_manifest_rows_).
 ManifestCfRow MakeManifestCfRow(const ColumnFamilyData& cfd,
                                 const VersionStorageInfo& vstorage,
                                 uint64_t log_number,
@@ -470,6 +473,31 @@ Status VersionSet::CommitBatchToStore(
     state->QueueDroppedCfRows(first_cfd->GetID(), files, blob_files);
   }
   return *io_s;
+}
+
+void SetManifestCfSnapshotRows(const ColumnFamilyData& cfd,
+                               const VersionStorageInfo& vstorage,
+                               const VersionEdit& files_edit,
+                               ManifestRows* rows) {
+  assert(rows != nullptr);
+  assert(files_edit.HasLogNumber());
+  ManifestCfRows& cf_rows = rows->cfs[cfd.GetID()];
+  cf_rows = ManifestCfRows();
+  cf_rows.cf = MakeManifestCfRow(cfd, vstorage, files_edit.GetLogNumber(),
+                                 files_edit.HasFullHistoryTsLow()
+                                     ? files_edit.GetFullHistoryTsLow()
+                                     : std::string());
+  for (const auto& [level, meta] : files_edit.GetNewFiles()) {
+    cf_rows.files[meta.fd.GetNumber()] = ManifestFileRow{level, meta};
+  }
+  for (const BlobFileAddition& addition : files_edit.GetBlobFileAdditions()) {
+    cf_rows.blob_files[addition.GetBlobFileNumber()].addition = addition;
+  }
+  for (const BlobFileGarbage& garbage : files_edit.GetBlobFileGarbages()) {
+    ManifestBlobFileRow& row = cf_rows.blob_files[garbage.GetBlobFileNumber()];
+    row.garbage_blob_count = garbage.GetGarbageBlobCount();
+    row.garbage_blob_bytes = garbage.GetGarbageBlobBytes();
+  }
 }
 
 #ifndef NDEBUG
@@ -1766,6 +1794,211 @@ std::string EncodeManifestRowFields(
     w.Bytes(field.id, field.value);
   }
   return w.Release();
+}
+
+std::string ManifestRowKeyToString(const ManifestRowKey& key) {
+  const std::string cf_and_number = "(column family " +
+                                    std::to_string(key.cf_id) + ", number " +
+                                    std::to_string(key.number) + ")";
+  switch (key.type) {
+    case ManifestRowType::kDb:
+      return "DB row";
+    case ManifestRowType::kColumnFamily:
+      return "column family " + std::to_string(key.cf_id);
+    case ManifestRowType::kFile:
+      return "file " + cf_and_number;
+    case ManifestRowType::kBlobFile:
+      return "blob file " + cf_and_number;
+    case ManifestRowType::kWal:
+      return "WAL " + std::to_string(key.number);
+  }
+  return "unknown row type " + std::to_string(lossless_cast<uint8_t>(key.type));
+}
+
+Status DifferentManifestRowFields(const std::string& a, const std::string& b,
+                                  std::vector<uint32_t>* ids) {
+  ids->clear();
+  std::vector<ManifestRowField> fields_a;
+  std::vector<ManifestRowField> fields_b;
+  Status s = ParseManifestRowFields(a, &fields_a);
+  if (s.ok()) {
+    s = ParseManifestRowFields(b, &fields_b);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  // Both lists are in increasing id order, so one merge pass finds every id
+  // that only one row has or that has different values.
+  size_t i = 0;
+  size_t j = 0;
+  while (i < fields_a.size() || j < fields_b.size()) {
+    if (j == fields_b.size() ||
+        (i < fields_a.size() && fields_a[i].id < fields_b[j].id)) {
+      ids->push_back(fields_a[i++].id);
+    } else if (i == fields_a.size() || fields_b[j].id < fields_a[i].id) {
+      ids->push_back(fields_b[j++].id);
+    } else {
+      if (fields_a[i].value != fields_b[j].value) {
+        ids->push_back(fields_a[i].id);
+      }
+      ++i;
+      ++j;
+    }
+  }
+  return Status::OK();
+}
+
+std::string DescribeManifestRowDifference(
+    const ManifestRowKey& key, const std::string* a, const std::string* b,
+    const std::string& a_name, const std::string& b_name,
+    const std::vector<uint32_t>& ignored_ids) {
+  const std::string name = ManifestRowKeyToString(key);
+  if (b == nullptr) {
+    return name + ": only in the " + a_name;
+  }
+  if (a == nullptr) {
+    return name + ": only in the " + b_name;
+  }
+  if (*a == *b) {
+    return std::string();
+  }
+  std::vector<uint32_t> ids;
+  if (!DifferentManifestRowFields(*a, *b, &ids).ok()) {
+    return name + ": bad encoding";
+  }
+  std::string list;
+  for (const uint32_t id : ids) {
+    if (std::find(ignored_ids.begin(), ignored_ids.end(), id) ==
+        ignored_ids.end()) {
+      list += (list.empty() ? "" : ", ") + std::to_string(id);
+    }
+  }
+  return list.empty() ? std::string() : name + ": fields " + list + " differ";
+}
+
+namespace {
+
+// Adds a difference for `key` when `file_row` and `store_row` differ. A null
+// row means that the side has no row.
+void AddRowDifference(const ManifestRowKey& key, const std::string* file_row,
+                      const std::string* store_row,
+                      std::vector<std::string>* differences) {
+  std::string difference = DescribeManifestRowDifference(
+      key, file_row, store_row, "MANIFEST", "store", /*ignored_ids=*/{});
+  if (!difference.empty()) {
+    differences->push_back(std::move(difference));
+  }
+}
+
+}  // namespace
+
+Status CompareManifestStoreWithManifest(
+    const std::string& dbname, const DBOptions& db_options,
+    const std::vector<ColumnFamilyDescriptor>& column_families,
+    ManifestStore* store, std::vector<std::string>* differences,
+    std::vector<std::string>* warnings) {
+  differences->clear();
+  warnings->clear();
+  CollectRowsVisitor collector;
+  ManifestScanOptions scan_options;
+  scan_options.consistent = true;
+  Status s = store->Scan(scan_options, &collector);
+  ManifestRows store_rows;
+  ManifestDbRowExtraFields extra_fields;
+  if (s.ok()) {
+    s = PublicRowsToManifestRows(collector.db_row_.db_row, collector.rows_,
+                                 &store_rows, &extra_fields);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  if (extra_fields.authority != ManifestAuthority::kShadow) {
+    warnings->push_back(
+        "The DB row of the store has authority " +
+        std::to_string(lossless_cast<uint8_t>(extra_fields.authority)) +
+        ", not shadow (" +
+        std::to_string(lossless_cast<uint8_t>(ManifestAuthority::kShadow)) +
+        ")");
+  }
+  if (!ManifestCommitIdGenerator::IsCloseId(
+          collector.db_row_.state.last_commit_id)) {
+    warnings->push_back(
+        "The last commit of the store (" +
+        collector.db_row_.state.last_commit_id +
+        ") is not a close commit: a shadow DB may still be open, or it stopped "
+        "without a close commit (a crash, or a close while the store was not "
+        "in sync), or a later claim (for example a rollback) replaced the "
+        "close id");
+  }
+
+  // The recovery must write nothing. With reuse_manifest_on_open, recovery
+  // would reopen the MANIFEST for append, so that option is turned off. The
+  // MANIFEST file is read in file mode, also when the caller's options name the
+  // store.
+  DBOptions recover_options = db_options;
+  recover_options.reuse_manifest_on_open = false;
+  recover_options.manifest_store = nullptr;
+  recover_options.manifest_store_shadow = false;
+  OfflineManifestWriter writer(recover_options, dbname);
+  s = writer.Recover(column_families);
+  if (!s.ok()) {
+    return s;
+  }
+  ManifestRows file_rows;
+  writer.Versions().GetManifestRows(&file_rows);
+  if (file_rows.db.next_file_number > 0) {
+    --file_rows.db.next_file_number;
+  }
+  // A later shadow instance can change the MANIFEST file without reaching the
+  // store, so the store keeps an older close commit (see "Close ids and the
+  // enter" at ManifestStoreShadow). Such an instance takes new file numbers,
+  // for example for its new MANIFEST file.
+  if (store_rows.db.next_file_number < file_rows.db.next_file_number) {
+    warnings->push_back("The next file number of the store (" +
+                        std::to_string(store_rows.db.next_file_number) +
+                        ") is below that of the MANIFEST (" +
+                        std::to_string(file_rows.db.next_file_number) +
+                        "): the store is behind the MANIFEST");
+  }
+  std::vector<ManifestRow> file_public;
+  s = ManifestRowsToPublicRows(file_rows, extra_fields,
+                               db_options.manifest_row_feature_version,
+                               &file_public);
+  if (!s.ok()) {
+    return s;
+  }
+
+  std::map<ManifestRowKey, const ManifestRow*, ManifestRowKeyLess> store_by_key;
+  for (const ManifestRow& row : collector.rows_) {
+    const std::map<uint32_t, ManifestCfRows>::const_iterator cf_it =
+        store_rows.cfs.find(row.key.cf_id);
+    const bool dropped_cf = row.key.type != ManifestRowType::kWal &&
+                            cf_it != store_rows.cfs.end() &&
+                            cf_it->second.cf.dropped;
+    if (!dropped_cf) {
+      store_by_key.emplace(row.key, &row);
+    }
+  }
+  assert(!file_public.empty());
+  AddRowDifference(file_public[0].key, &file_public[0].fields,
+                   &collector.db_row_.db_row.fields, differences);
+  for (size_t i = 1; i < file_public.size(); ++i) {
+    const std::map<ManifestRowKey, const ManifestRow*,
+                   ManifestRowKeyLess>::const_iterator it =
+        store_by_key.find(file_public[i].key);
+    if (it == store_by_key.end()) {
+      AddRowDifference(file_public[i].key, &file_public[i].fields, nullptr,
+                       differences);
+      continue;
+    }
+    AddRowDifference(file_public[i].key, &file_public[i].fields,
+                     &it->second->fields, differences);
+    store_by_key.erase(it);
+  }
+  for (const auto& [key, row] : store_by_key) {
+    AddRowDifference(row->key, nullptr, &row->fields, differences);
+  }
+  return Status::OK();
 }
 
 // ManifestStore has no .cc file of its own; its only out-of-line function lives

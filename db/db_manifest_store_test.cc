@@ -2868,8 +2868,9 @@ TEST_F(DBManifestStoreTest, EnterKeepsDbId) {
 
 TEST_F(DBManifestStoreTest, EnterFromShadowAuthority) {
   WriteFileModeDb();
-  // A DB row with authority kShadow, which this release never writes, does
-  // not stop the enter.
+  // A DB row with authority kShadow (written by shadow mode) stops the enter
+  // while its last commit is not a close commit, because a shadow DB may still
+  // write the rows. After a close commit, the enter takes over the rows.
   ManifestDbRowExtraFields extra;
   extra.authority = ManifestAuthority::kShadow;
   std::vector<ManifestRow> rows;
@@ -2879,6 +2880,15 @@ TEST_F(DBManifestStoreTest, EnterFromShadowAuthority) {
   create.commit_id = "shadow mode";
   create.db_row = rows.front();
   ASSERT_OK(MockManifestStore(data_, ++last_epoch_).Commit(create));
+  ASSERT_EQ(
+      Status::Code::kInvalidArgument,
+      TryReopenWithColumnFamilies({"default", "one"}, MigrateOptions()).code());
+  ManifestCommit close;
+  close.expected_commit_sequence = 1;
+  close.commit_id =
+      std::string("shadow mode") + ManifestCommitIdGenerator::kCloseSuffix;
+  close.db_row = rows.front();
+  ASSERT_OK(MockManifestStore(data_, last_epoch_).Commit(close));
 #ifndef NDEBUG  // Uses sync points.
   // An enter that stops before its switch leaves an "entering" stub. Its
   // claim set the authority to kFile, so the next open restarts the enter
@@ -2895,6 +2905,91 @@ TEST_F(DBManifestStoreTest, EnterFromShadowAuthority) {
   CheckFileModeDbData();
   ASSERT_EQ(ManifestAuthority::kStore, StoredAuthority());
 }
+
+#ifndef NDEBUG  // Uses sync points.
+TEST_F(DBManifestStoreTest, ShadowRowNextToEnteringStub) {
+  // A shadow instance of a copy of this folder (same db id, same store) can
+  // claim the DB and write authority kShadow after an enter stopped before its
+  // switch. A switch always writes kStore, so the "entering" stub then means
+  // that the switch did not happen. The next enter and RollBackManifestStore()
+  // point CURRENT back to the MANIFEST file. The next enter does not claim the
+  // kShadow row, so a close id of the shadow instance stays.
+  WriteFileModeDb();
+  // Stops an enter before its switch. Its claim writes authority kFile.
+  auto stop_enter = [&]() {
+    FailAt("DBImpl::EnterManifestStore:BeforeSwitch");
+    ASSERT_EQ(Status::Code::kIOError,
+              TryReopenWithColumnFamilies({"default", "one"}, MigrateOptions())
+                  .code());
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_EQ(ManifestStubState::kEntering, Current().stub.state);
+    ASSERT_EQ(ManifestAuthority::kFile, StoredAuthority());
+  };
+  // Claims the DB with a newer epoch and sets authority kShadow in the claim. A
+  // real full copy writes kShadow in WriteGeneration() after its claim, which
+  // leaves the same DB row.
+  auto shadow_claim = [&](const std::string& commit_id) {
+    ManifestStoreOpenOptions opts;
+    opts.commit_id = commit_id;
+    opts.db_field_updates = EncodeManifestRowFields({ManifestRowField{
+        lossless_cast<uint32_t>(ManifestDbField::kAuthority),
+        std::string(1, lossless_cast<char>(ManifestAuthority::kShadow))}});
+    ManifestDbRowResult db_row;
+    ASSERT_OK(MockManifestStore(data_, ++last_epoch_).Open(opts, &db_row));
+    ASSERT_EQ(ManifestAuthority::kShadow, StoredAuthority());
+  };
+
+  // Case 1: the next enter points CURRENT back, then refuses the kShadow row,
+  // because its last commit is not a close commit.
+  stop_enter();
+  shadow_claim("shadow mode");
+  ASSERT_EQ(
+      Status::Code::kInvalidArgument,
+      TryReopenWithColumnFamilies({"default", "one"}, MigrateOptions()).code());
+  ASSERT_FALSE(Current().is_stub);
+  ReopenWithColumnFamilies({"default", "one"}, CurrentOptions());
+  CheckFileModeDbData();
+  Close();
+
+  // Plays the close commit of the shadow instance that claimed last: the same
+  // DB row with a close id.
+  auto shadow_close = [&](const std::string& commit_id) {
+    ManifestDbRowResult db_row;
+    ASSERT_OK(ReaderStore()->ReadDbRow(&db_row));
+    ManifestCommit close;
+    close.expected_commit_sequence = db_row.state.commit_sequence;
+    close.commit_id = commit_id + ManifestCommitIdGenerator::kCloseSuffix;
+    close.db_row = db_row.db_row;
+    ASSERT_OK(MockManifestStore(data_, last_epoch_).Commit(close));
+  };
+
+  // Case 2: RollBackManifestStore() points CURRENT back. First, a close commit
+  // lets the next enter pass the kShadow check, so that it can stop before its
+  // switch again.
+  shadow_close("shadow mode");
+  stop_enter();
+  shadow_claim("shadow mode 2");
+  ASSERT_OK(RollBackManifestStore(StoreOptions(), dbname_));
+  ASSERT_FALSE(Current().is_stub);
+  ReopenWithColumnFamilies({"default", "one"}, CurrentOptions());
+  CheckFileModeDbData();
+
+  // Case 3: the shadow instance closes in sync before the next open. That open
+  // points CURRENT back without a claim, so the close id stays, and the enter
+  // that follows in the same open accepts the kShadow row and finishes the
+  // move into the store. After the rollback of case 2, the last commit is the
+  // claim of the rollback, which has no close id. So a close commit first lets
+  // the enter that stops pass the kShadow check, as in case 2.
+  shadow_close("shadow mode 2");
+  stop_enter();
+  shadow_claim("shadow mode 3");
+  shadow_close("shadow mode 3");
+  ReopenWithColumnFamilies({"default", "one"}, MigrateOptions());
+  ASSERT_EQ(ManifestStubState::kDone, Current().stub.state);
+  ASSERT_EQ(ManifestAuthority::kStore, StoredAuthority());
+  CheckFileModeDbData();
+}
+#endif  // NDEBUG
 
 TEST_F(DBManifestStoreTest, RollBackWithStore) {
   WriteFileModeDb();
@@ -4695,12 +4790,15 @@ TEST_F(DBManifestStoreTest, MigrateOptionIsNotSerialized) {
   DBOptions db_options;
   db_options.manifest_store_migrate = true;
   db_options.manifest_store_copy_mode = ManifestCopyMode::kSync;
+  db_options.manifest_store_shadow = true;
   std::string serialized;
   ASSERT_OK(GetStringFromDBOptions(ConfigOptions(), db_options, &serialized));
   ASSERT_EQ(std::string::npos, serialized.find("manifest_store_migrate"));
   ASSERT_EQ(std::string::npos, serialized.find("manifest_store_copy_mode"));
+  ASSERT_EQ(std::string::npos, serialized.find("manifest_store_shadow"));
   for (const char* setting :
-       {"manifest_store_migrate=true", "manifest_store_copy_mode=2"}) {
+       {"manifest_store_migrate=true", "manifest_store_copy_mode=2",
+        "manifest_store_shadow=true"}) {
     DBOptions parsed;
     ASSERT_EQ(
         Status::Code::kInvalidArgument,

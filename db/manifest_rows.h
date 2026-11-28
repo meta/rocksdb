@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -23,7 +24,9 @@ namespace ROCKSDB_NAMESPACE {
 
 class ColumnFamilyData;
 class VersionStorageInfo;
+struct ColumnFamilyDescriptor;
 struct ColumnFamilyOptions;
+struct DBOptions;
 
 // Background
 //
@@ -53,8 +56,10 @@ struct ColumnFamilyOptions;
 // - BuildManifestRowChanges() turns one batch into the rows to write and the
 //   rows to delete, and ApplyManifestRowChanges() applies them to rows. In
 //   store mode (db/manifest_store_state.h), VersionSet::ProcessManifestWrites()
-//   commits these changes to the store. A debug check also compares the result
-//   with the new Versions (see VersionSet::debug_manifest_rows_).
+//   commits these changes to the store, and shadow mode (ManifestStoreShadow)
+//   applies them to its in-memory rows, then sends the changes that have built
+//   up since the last round to the store. A debug check also compares the
+//   result with the new Versions (see VersionSet::debug_manifest_rows_).
 // - ManifestRowsToRecords() turns rows into encoded "full-state" VersionEdit
 //   records, like the ones that VersionSet::WriteCurrentStateToManifest()
 //   writes at the start of a new MANIFEST file. The existing recovery code
@@ -263,6 +268,17 @@ struct ManifestRows {
   std::map<WalNumber, WalMetadata> wals;
 };
 
+// Sets the rows of one column family in `rows` from `files_edit`, the edit of
+// VersionSet::WriteCurrentStateToManifest() that records all files of `cfd` at
+// the start of a new MANIFEST file, and from `vstorage`, the Version that the
+// edit was built from. The file rows, blob file rows, log number and
+// full_history_ts_low come from the edit, so they hold exactly what the file
+// records. Shadow mode (ManifestStoreShadow) uses these rows.
+void SetManifestCfSnapshotRows(const ColumnFamilyData& cfd,
+                               const VersionStorageInfo& vstorage,
+                               const VersionEdit& files_edit,
+                               ManifestRows* rows);
+
 // The changes that one MANIFEST write makes to the rows: the rows to write,
 // with their whole new values, and the keys of the rows to delete. An upsert
 // ("update or insert") writes a row: it adds the row, or replaces the row with
@@ -323,6 +339,9 @@ struct ManifestBatchVersion {
 //     (ManifestStoreState::SetRewrite()), ManifestStoreState::PrepareRewrite()
 //     applies them to those rows before the row changes of the next batch are
 //     built.
+//   - Shadow mode passes its base rows (VersionSet::shadow_base_rows_): the
+//     DB and column family rows after the previous MANIFEST write, or from
+//     the snapshot at the start of a new MANIFEST file.
 // - `wals` is the live WAL set (VersionSet::wals_) before the write. The
 //   builder copies it and applies the WAL edits to the copy, so that the edits
 //   use its cutoff for obsolete WALs: WalSet::AddWal() ignores a WAL below the
@@ -536,6 +555,42 @@ Status ManifestRowChangesToCommit(const ManifestRowChanges& changes,
                                   uint64_t expected_commit_sequence,
                                   std::string commit_id, ManifestCommit* out);
 
+// Orders row keys by type, then column family id, then number, so that a row
+// key can be the key of a std::map or std::set.
+struct ManifestRowKeyLess {
+  bool operator()(const ManifestRowKey& a, const ManifestRowKey& b) const {
+    return std::tie(a.type, a.cf_id, a.number) <
+           std::tie(b.type, b.cf_id, b.number);
+  }
+};
+
+// Returns a short text for logs and reports, for example "file (column family
+// 0, number 12)".
+std::string ManifestRowKeyToString(const ManifestRowKey& key);
+
+// Sets `ids` to the ids of the fields that differ between the encoded rows `a`
+// and `b`: a field that only one row has, or that has different values. The
+// ids are in increasing order. Returns Corruption if a row is not in the
+// canonical encoding.
+Status DifferentManifestRowFields(const std::string& a, const std::string& b,
+                                  std::vector<uint32_t>* ids);
+
+// Describes how two versions of the row with key `key` differ, for logs and
+// reports. The compare tool and shadow mode use it. `a` and `b` are the
+// encoded rows of the two sides, and null when that side has no row. `a_name`
+// and `b_name` name the sides, for example "MANIFEST" and "store". The ids in
+// `ignored_ids` do not count as differences. Returns one of these texts, or an
+// empty string when the rows match:
+//   "<key>: only in the <a_name>"
+//   "<key>: only in the <b_name>"
+//   "<key>: bad encoding"        (DifferentManifestRowFields() fails)
+//   "<key>: fields 3, 6 differ"  (the ids from DifferentManifestRowFields())
+// where <key> is ManifestRowKeyToString(key).
+std::string DescribeManifestRowDifference(
+    const ManifestRowKey& key, const std::string* a, const std::string* b,
+    const std::string& a_name, const std::string& b_name,
+    const std::vector<uint32_t>& ignored_ids);
+
 // Converts public rows back to `internal_rows` and `extra_fields`.
 // `public_db_row` is the DB row, and `other_public_rows` holds the other rows
 // in any order. To decode the output of ManifestRowsToPublicRows(), pass its
@@ -577,5 +632,50 @@ Status PublicRowsToManifestRows(
     const ManifestRow& public_db_row,
     const std::vector<ManifestRow>& other_public_rows,
     ManifestRows* internal_rows, ManifestDbRowExtraFields* extra_fields);
+
+// Compares the rows of a ManifestStore in shadow mode with the MANIFEST file of
+// the closed DB at `dbname`, for the ldb command compare_manifest_store.
+//
+// How it compares: it recovers the MANIFEST with OfflineManifestWriter (no WAL
+// replay, and reuse_manifest_on_open turned off, so nothing is written or
+// reopened) and takes its rows with VersionSet::GetManifestRows(). It encodes
+// them with ManifestRowsToPublicRows(), with the DB row extra fields taken
+// from the store (ManifestDbRowExtraFields: the authority, the copy mode, the
+// copy file number and the in-flight file number), so that these fields never
+// show up as differences and are not checked against the MANIFEST. It reads the
+// store with a consistent Scan() and decodes the rows first: an unknown field
+// with the "must understand" bit fails the compare with NotSupported. If the
+// decode succeeds, it compares the encoded rows byte for byte, including
+// unknown fields without that bit. Two rules make the sides comparable:
+// - Recovery sets the next file number to the recorded value plus 1, so the
+//   MANIFEST value is lowered by 1.
+// - The store keeps the rows of a dropped column family until shadow mode
+//   starts a new MANIFEST file, and recovery leaves them out, so the store
+//   rows of dropped column families are skipped.
+//
+// Results: OK when both sides could be read. Each difference is added to
+// `differences` as text with the row key and the field ids that differ, so an
+// empty list means that the store matches. `warnings` gets a line in each of
+// these cases, where differences are expected:
+// - The store's DB row has another authority than kShadow.
+// - The last commit is not a close commit
+//   (ManifestCommitIdGenerator::IsCloseId()). A shadow DB may still be open,
+//   or it stopped without a close commit (a crash, or a close while the store
+//   was not in sync). A later claim can also replace a close id, for example
+//   a RollBackManifestStore() of an entering stub whose DB row has kShadow.
+// - The next file number of the store is below that of the MANIFEST: the
+//   store is behind the MANIFEST file, for example after a later shadow
+//   instance that never reached the store (see "Close ids and the enter" at
+//   ManifestStoreShadow). A lower next file number also makes the DB row
+//   differ, so `differences` is not empty then. The other two warnings can
+//   come while the compared rows match.
+// `column_families` are the column families of the DB, as for DB::Open(), with
+// the comparators of the DB. Returns the error of the store scan, of decoding
+// or encoding the rows, or of the recovery otherwise.
+Status CompareManifestStoreWithManifest(
+    const std::string& dbname, const DBOptions& db_options,
+    const std::vector<ColumnFamilyDescriptor>& column_families,
+    ManifestStore* store, std::vector<std::string>* differences,
+    std::vector<std::string>* warnings);
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -3160,14 +3160,22 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
 // not to the folder. A file copy of a store-mode DB folder holds a stub with
 // the same db id, so DestroyDB() of the copy with the store of the source
 // removes the rows of the source DB, and the source DB stops. Remove such a
-// copy without the store, for example with DestroyDir().
+// copy without the store, for example with DestroyDir(). When CURRENT names a
+// stub and the DB row has the db id of the stub and authority kShadow,
+// DestroyDB() keeps the rows and deletes the files. A switch into store mode
+// always writes kStore, so such rows belong to a DB in shadow mode with the
+// same db id, which can still be open or already closed, for example the source
+// of a checkpoint whose move into the store stopped before its switch.
 //
 // File mode with a store in options.manifest_store: the row removal runs only
 // when CURRENT names an existing normal MANIFEST file whose first record is
 // not damaged. DestroyDB() then reads the db id of the DB from that MANIFEST,
 // or from the IDENTITY file when the MANIFEST cannot be read up to its db id.
 // Then it reads the DB row. When the row has that db id and authority kFile
-// (the rows that RollBackManifestStore() left), it removes the rows. When
+// (the rows that RollBackManifestStore() left), it removes the rows. It keeps
+// the rows that shadow mode (DBOptions::manifest_store_shadow) wrote
+// (authority kShadow), because a copy of the DB folder has the same db id and
+// must not remove the rows of the source DB, which can still be open. When
 // CURRENT, or the MANIFEST that it names, is missing or damaged, and no stub is
 // in the folder, DestroyDB() deletes the files as a file-mode DB and does not
 // call the store, so such rows stay.

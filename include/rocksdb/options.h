@@ -2213,7 +2213,8 @@ struct DBOptions {
   // EXPERIMENTAL
   // The external metadata store (see include/rocksdb/manifest_store.h). Null
   // (the default) means that the MANIFEST file holds the metadata. When it is
-  // set, DB::Open(), DB::OpenForReadOnly(), DB::OpenAsSecondary() and
+  // set and manifest_store_shadow is false (the shadow case is below),
+  // DB::Open(), DB::OpenForReadOnly(), DB::OpenAsSecondary() and
   // DB::OpenAsFollower() open the DB in store mode: the rows in the store
   // hold the metadata, and the MANIFEST file that CURRENT names is a small
   // stub. A remote compaction worker gets the store from
@@ -2221,10 +2222,15 @@ struct DBOptions {
   // create_if_missing creates a new DB in the store. A DB whose CURRENT names a
   // normal MANIFEST file needs manifest_store_migrate.
   // include/rocksdb/manifest_store.h lists the paths that store mode does not
-  // support (for example DB::GetLiveFiles() and RepairDB()). DB::Open() returns
-  // InvalidArgument when best_efforts_recovery or best_efforts_blob_db_repair
-  // is also set. The object is not written to the OPTIONS file, because it
-  // belongs to one DB instance.
+  // support (for example DB::GetLiveFiles() and RepairDB()). Every DB open
+  // function returns InvalidArgument when best_efforts_recovery is also set,
+  // and, in store mode, also when best_efforts_blob_db_repair is set. When
+  // manifest_store_shadow is true, the DB is in shadow mode instead: the
+  // MANIFEST file stays the authority, a read-write DB::Open() opens from it
+  // and copies its metadata to the store in the background, and read-only,
+  // secondary and follower instances open from the MANIFEST file (see
+  // manifest_store_shadow). The object is not written to the OPTIONS file,
+  // because it belongs to one DB instance.
   std::shared_ptr<ManifestStore> manifest_store = nullptr;
 
   // EXPERIMENTAL
@@ -2245,7 +2251,7 @@ struct DBOptions {
   // rollback without the store was not finished with a call that reaches the
   // store (see RollBackManifestStore()).
   // It is not written to the OPTIONS file, because it describes one
-  // DB::Open().
+  // DB::Open(). It cannot be used with manifest_store_shadow.
   bool manifest_store_migrate = false;
 
   // EXPERIMENTAL
@@ -2259,6 +2265,156 @@ struct DBOptions {
   // When manifest_store is set, every DB open function returns
   // InvalidArgument for a value above ManifestCopyMode::kSync.
   ManifestCopyMode manifest_store_copy_mode{};
+
+  // EXPERIMENTAL
+  // Shadow mode, a step before store mode: the MANIFEST file stays the
+  // authority, and RocksDB also writes the same metadata to `manifest_store`
+  // in the background, so that the application can check the store with real
+  // traffic before it moves the DB into the store.
+  //
+  // Requirements: `manifest_store` must be set. Every DB open function returns
+  // InvalidArgument for true without `manifest_store`, or with
+  // best_efforts_recovery or manifest_store_migrate. The option
+  // best_efforts_blob_db_repair is allowed, because the MANIFEST file stays the
+  // authority. DB::Open() and DB::OpenForReadOnly() also return InvalidArgument
+  // when CURRENT names a stub (a DB in store mode, or one that is moving into
+  // it). This option is not written to the OPTIONS file, like `manifest_store`.
+  //
+  // What the store gets: the rows of the state that recovery from the MANIFEST
+  // file gives. RocksDB keeps these rows in memory and updates them after each
+  // successful MANIFEST write. A job in the Env LOW priority pool sends the
+  // changes that have built up since the last job, so no store call runs in a
+  // user write or a MANIFEST write. The store does not get every state in
+  // between: for example, a file row that one MANIFEST write adds and a later
+  // one removes, before the job takes the changes, never reaches the store.
+  // When the store is in sync at close (the last store round succeeded, no
+  // full copy is pending, and no failed MANIFEST write is missing from the
+  // rows), a last commit sends the remaining changes. After the DB is closed,
+  // the ldb command compare_manifest_store lists the differences between the
+  // store rows and the rows that recovery from the MANIFEST gives. It does not
+  // check the DB row fields that only the store has (such as the authority),
+  // or the rows of dropped column families
+  // (see CompareManifestStoreWithManifest() for the rules).
+  //
+  // Behavior:
+  // - Shadow mode needs the full state of the DB to start, and a new MANIFEST
+  //   file starts with a copy of the full state. So the first MANIFEST write
+  //   while shadow mode is on starts a new MANIFEST file, also with
+  //   reuse_manifest_on_open. The same happens at the first MANIFEST write
+  //   after a failed one. The first write is usually inside DB::Open(). After
+  //   it, and once DB::Open() succeeds, RocksDB sends all rows to the store (a
+  //   full copy). An open that writes no MANIFEST record sends the full copy
+  //   at the first MANIFEST write after the open.
+  // - Store errors never fail writes, and shadow mode never sets a background
+  //   error. After an error, RocksDB writes all rows again after a wait that
+  //   starts at bgerror_resume_retry_interval, doubles after each failure in a
+  //   row, and stops growing at 64 times that value. The next try starts at
+  //   the first MANIFEST write after the wait. The info LOG shows each error.
+  //   These retries have no limit: once the wait reaches its cap (at the 7th
+  //   failure in a row), a store that keeps failing gets a full copy about
+  //   once a minute (with the default interval of one second) for as long as
+  //   the DB writes. Each full copy claims the store, which raises the commit
+  //   sequence (see "Terms" in include/rocksdb/manifest_store.h for claim and
+  //   commit sequence), sends all rows, and blocks the store jobs of the other
+  //   shadow DBs of the process while it runs.
+  // - When the store says that another DB instance with a newer epoch owns it
+  //   (IOFenced), shadow mode stops for this DB instance and logs an error.
+  //   Writes go on. For example, a copy of the DB folder (a checkpoint or a
+  //   restored backup) that is opened in shadow mode with the same store and a
+  //   newer epoch takes over the store this way, because it has the same DB
+  //   id. A store call that returns NotSupported (for example from a store
+  //   object without an epoch) also stops shadow mode.
+  // - When the store holds a DB in store mode, a DB row with an authority
+  //   value that this release does not know (written by a newer binary), a DB
+  //   row that does not parse, or a DB row with another DB id (another DB uses
+  //   the same store), shadow mode stops for this DB instance and writes no
+  //   rows to the store. Writes go on. A full copy claims the store only if
+  //   the DB row is still the one that it checked. So when a store-mode
+  //   instance takes over the store between that check and the claim, the
+  //   claim fails without a change and does not fence that instance. When that
+  //   instance has a newer epoch, the claim gets IOFenced and shadow mode
+  //   stops at once. Otherwise the claim gets Busy, and a later full copy that
+  //   sees authority kStore stops. This protects only the DB row that one full
+  //   copy checked: a move into store mode that has claimed the store but not
+  //   switched leaves a kFile row, which a later full copy accepts and claims.
+  //   The move into store mode then fails at its switch.
+  // - Close waits for the store job that is running. That job can make more
+  //   than one store call: for example, a full copy that finds no DB row
+  //   creates it with a Commit() before it sees that the DB is closing. When
+  //   the store is in sync (shadow mode did not stop, the last store call
+  //   succeeded, no full copy is needed, and no failed MANIFEST write is
+  //   waiting for a new MANIFEST file), close commits the remaining changes
+  //   with a close id (a commit id that ends with "-close"). When that commit
+  //   succeeds, the info LOG says that the store is in sync at close.
+  // - The store jobs of all shadow DBs of the process take turns: at most one
+  //   job runs at a time, also when the DBs use different Env objects. Each
+  //   shadow DB asks for one LOW pool thread more than its own compaction
+  //   limit, so that a slow store call does not take one of its compaction
+  //   threads. This reserves no thread: when DBs share an Env, the pool grows
+  //   to the largest number that any DB asks for, so a DB with a higher
+  //   compaction limit and no shadow mode can leave no extra thread, and the
+  //   shadow job then uses one of the threads that DB counts on. A DB that
+  //   waits for its turn keeps its changes in memory.
+  // - Store calls must time out (see "Threading and timeouts" at
+  //   ManifestStore). One hung call blocks the store jobs of all shadow DBs of
+  //   the process until it returns.
+  //
+  // Moving a shadow DB into the store (entering store mode): DB::Open() with
+  // manifest_store_migrate (without shadow mode) takes over the rows of shadow
+  // mode only when the last commit has a close id. A close id marks the last
+  // close of a shadow instance (one DB::Open() to close of a DB in shadow mode)
+  // that reached the store. It does not show a later shadow instance that never
+  // reached the store: a shadow DB that was opened again and has made no store
+  // call yet, or one that closed or crashed before its first store call changed
+  // the store. The store is then behind the MANIFEST file, and the move still
+  // takes over the rows. This is safe, because the move writes all rows from
+  // the MANIFEST file. So close every shadow DB of the DB, including copies of
+  // its folder (which have the same DB id), before the move. A shadow DB that
+  // reaches the store during the move fails the move: the open returns an
+  // error, and the next open in store mode (with the store and without shadow
+  // mode), or RollBackManifestStore(), points CURRENT back to the MANIFEST
+  // file. The open returns InvalidArgument when:
+  // - a shadow DB of the DB is open and has written to the store;
+  // - a shadow DB crashed after it wrote to the store;
+  // - a shadow DB closed while the store was not in sync (after a store error,
+  //   a close during the full copy, or a failed close commit), after it wrote
+  //   to the store. A later shadow open also writes new commits, so the last
+  //   commit is again not a close commit until that instance closes.
+  // To fix it:
+  // 1. Close every shadow DB of the DB.
+  // 2. If the open still fails, reopen the DB in shadow mode, write and flush
+  //    until the info LOG shows that the full copy finished, close it, and
+  //    check that the close logged that the store is in sync.
+  // 3. Or, if no DB uses the rows, call ManifestStore::Destroy(). The move
+  //    writes all rows from the MANIFEST file anyway.
+  // DestroyDB() keeps the rows that shadow mode wrote, because a copy of the
+  // DB folder has the same DB id; call ManifestStore::Destroy() once no DB
+  // uses them.
+  //
+  // Other rules:
+  // - A DB row without a DB id matches any DB. With write_dbid_to_manifest
+  //   false the DB row has no DB id, so shadow mode cannot tell that two DBs
+  //   use the same store by mistake. Give each DB its own store.
+  // - Read-only, secondary and follower instances never call the store.
+  //
+  // Cost: each MANIFEST write builds its row changes after the write, without
+  // the DB mutex, before the write completes. This reads the edits of the
+  // write, the blob files of the column families it changes and the live WALs.
+  // Two kinds of MANIFEST write also do work that is linear in the number of
+  // live files: a write that starts a new MANIFEST file encodes all rows once,
+  // and the first MANIFEST write after each full copy starts copies the map of
+  // row pointers, but not the row bytes (see "State" at ManifestStoreShadow).
+  //
+  // Memory: the DB keeps the encoded rows of the MANIFEST state, about 300
+  // bytes for each live SST file (an estimate: about 200 bytes of encoded
+  // fields plus the map entry), so about 30 MB for 100,000 files. A full copy
+  // to the store can hold one more copy of the encoded rows while it runs. A
+  // MANIFEST write that starts a new MANIFEST file also holds a full copy of
+  // the metadata for a short time, about 1 KB more for each live SST file (an
+  // estimate). This memory is not charged to any cache or memory budget,
+  // because shadow mode is an experimental step before store mode. A stop of
+  // shadow mode frees the rows.
+  bool manifest_store_shadow = false;
 
   // End EXPERIMENTAL
 };
@@ -3763,7 +3919,8 @@ struct CompactionServiceOptionsOverride {
   // it never claims the DB, so it never fences the primary. Each
   // DB::OpenAndCompact() call is its own DB instance, so give each concurrent
   // call its own object, or a thread-safe one, and never the object that the
-  // primary uses. Null for a primary in file mode.
+  // primary uses. Null for a primary in file mode, also for a primary that
+  // uses manifest_store_shadow.
   std::shared_ptr<ManifestStore> manifest_store = nullptr;
 
   // Only compaction generated SST files use this user defined table properties

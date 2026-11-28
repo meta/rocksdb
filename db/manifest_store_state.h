@@ -77,11 +77,17 @@ struct ImmutableDBOptions;
 //   stays.
 // - A later read-write open that finds an entering stub
 //   (DBImpl::FinishEnterManifestStore()): it checks that the DB row belongs to
-//   this DB (the db id of the stub) and claims that row (CheckOwnerAndClaim()).
-//   Then the authority of the claimed row decides:
+//   this DB (the db id of the stub) and claims that row with
+//   CheckOwnerAndClaim(), unless the row has authority kShadow. Then the
+//   authority of the row decides:
 //   - kStore: the switch happened, and the open finishes the enter.
 //   - kFile: the switch did not happen. The open points CURRENT back to the
 //     MANIFEST file and starts the enter again.
+//   - kShadow: the switch did not happen either. The open does not claim the
+//     row, so its last commit id stays. It points CURRENT back to the MANIFEST
+//     file, and the new enter checks whether that id is the close id of a
+//     shadow DB before it makes its own claim (see "Close ids and the enter"
+//     in db/manifest_store_shadow.h).
 //
 // Stub states: each arrow below is one change of what CURRENT names. The
 // text on the right says when the change happens.
@@ -94,12 +100,20 @@ struct ImmutableDBOptions;
 //              entering stub --> done stub      (after the switch wrote
 //                                                kStore and the MANIFEST
 //                                                file was deleted)
-//              entering stub --> MANIFEST file  (Open finds the DB row still
-//                                                kFile; the enter then starts
-//                                                again)
+//              entering stub --> MANIFEST file  (Open finds the DB row with
+//                                                kFile or kShadow; the enter
+//                                                then starts again)
 //   Roll back: done stub     --> MANIFEST file  (new MANIFEST from the rows
 //                                                or from the copy)
 //              entering stub --> MANIFEST file  (only before the switch)
+//
+// An entering stub with a DB row in kFile or kShadow means that the switch
+// did not happen, because a switch always writes kStore. kShadow appears when
+// a DB in shadow mode (DBOptions::manifest_store_shadow, see
+// db/manifest_store_shadow.h), for example one that uses a copy of this
+// folder, claimed the row after the claim of the enter, or after an enter
+// that stopped before its switch. The case "A later read-write open that
+// finds an entering stub" above says what a read-write open then does.
 //
 // Between the switch and the done stub, CURRENT still names the entering
 // stub while the rows hold the metadata. An open in that window finds a
@@ -186,8 +200,10 @@ struct ImmutableDBOptions;
 // the db id of the stub, calls ManifestStore::Destroy(), and then deletes the
 // files. After a rollback, it also removes the rows that the rollback left
 // when they have the db id of the DB (see DestroyDB() in
-// db/db_impl/db_impl.cc). A file copy of the folder must be removed without
-// the store (see DestroyDB() in include/rocksdb/db.h).
+// db/db_impl/db_impl.cc). It keeps the rows that shadow mode
+// (db/manifest_store_shadow.h) wrote, because a copy of a shadow DB has the
+// same db id, and the source DB can still be open. A file copy of the folder
+// must be removed without the store (see DestroyDB() in include/rocksdb/db.h).
 //
 // Write path (VersionSet::ProcessManifestWrites()): RocksDB turns each batch
 // of VersionEdits into row changes and sends them to the store as one
@@ -317,7 +333,13 @@ struct ImmutableDBOptions;
 // Mode changes: DBImpl::CreateDbInManifestStore() creates a new DB in the
 // store, DBImpl::EnterManifestStore() moves a file-mode DB into the store,
 // and RollBackManifestStore() moves a DB back to file mode. The MANIFEST file
-// copy (below) makes a rollback without the store possible.
+// copy (below) makes a rollback without the store possible. Shadow mode
+// (db/manifest_store_shadow.h) is a step before an enter: the DB stays in file
+// mode and copies its metadata to the store. An enter takes over the rows of
+// shadow mode only when their last commit is a close commit, which a shadow
+// DB writes when it closes with the store in sync. Users must close every
+// shadow DB before an enter (see "Close ids and the enter" at
+// ManifestStoreShadow).
 //
 // Limits:
 // - RocksDB sends each batch as one commit, and does not split a batch that
@@ -356,27 +378,36 @@ struct ImmutableDBOptions;
 //   close"). So a short store failure during the shutdown flush can stop the
 //   DB, and data written without the WAL is then lost.
 
-// Returns true when `options` (DBOptions or ImmutableDBOptions) hold a store.
-// A reader uses the result to decide whether it reads the metadata from the
-// store (ReactiveVersionSet::OpenStoreRead()). The name does not mean that
-// the DB is in store mode: a reader (a read-only, secondary or follower
-// instance, or a remote compaction worker) with a store reads the metadata
-// from the store, and its open checks CURRENT and the DB row and fails when
-// the DB is not in store mode. Three checks answer "is the metadata in the
-// store?" for different callers:
+// Returns true when `options` (DBOptions or ImmutableDBOptions) hold a store
+// (manifest_store is set) and manifest_store_shadow is false. A reader uses the
+// result to decide whether it reads the metadata from the store
+// (ReactiveVersionSet::OpenStoreRead()). Shadow mode
+// (DBOptions::manifest_store_shadow) keeps the MANIFEST file as the authority,
+// and the store only follows it. The name does not mean that the DB is in
+// store mode: a reader (a read-only, secondary or follower instance, or a
+// remote compaction worker) with such options reads the metadata from the
+// store, and its open checks CURRENT and the DB row and fails when the DB is
+// not in store mode. DB::Open() with such options opens the DB in store mode.
+// In shadow mode the DB stays in file mode, and only the ManifestStoreShadow
+// class (db/manifest_store_shadow.h) uses the store. Three checks answer "is
+// the metadata in the store?" for different callers:
 //
 //   Check                                     Used by
 //   ----------------------------------------  -------------------------------
-//   VersionSet::HasManifestStoreWriteState()  a primary, whose VersionSet
-//                                             commits to the store
+//   VersionSet::HasManifestStoreWriteState()  a primary after DB::Open() has
+//                                             finished recovery, whose
+//                                             VersionSet commits to the store
 //   StoreModeOptions(options)                 the readers above, which have
-//                                             no ManifestStoreState
+//                                             no ManifestStoreState, and
+//                                             DB::Open() of a primary until
+//                                             recovery has created its
+//                                             ManifestStoreState
 //   DBImpl::MetadataInStore()                 the copy paths (checkpoints,
 //                                             backups); only a primary can
 //                                             copy, a reader refuses
 template <typename DbOptions>
 bool StoreModeOptions(const DbOptions& options) {
-  return options.manifest_store != nullptr;
+  return options.manifest_store != nullptr && !options.manifest_store_shadow;
 }
 
 // Makes the commit ids of one DB instance. A commit id is the DB session id
@@ -386,6 +417,22 @@ class ManifestCommitIdGenerator {
  public:
   explicit ManifestCommitIdGenerator(std::string db_session_id);
   std::string Next();
+
+  // Returns the id of the last commit of a shadow DB instance at close (see
+  // ManifestStoreShadow): Next() with the suffix kCloseSuffix. A reader of the
+  // store that sees such an id as the last commit id
+  // (ManifestDbRowResult::state.last_commit_id) knows that the last shadow DB
+  // instance that reached the store closed with the store in sync. It does not
+  // know whether a shadow DB was opened again since then, because a new
+  // instance writes to the store only after its first MANIFEST write and the
+  // end of DB::Open() (see "Close ids and the enter" at ManifestStoreShadow).
+  std::string NextCloseId();
+
+  // Returns true if `commit_id` ends with kCloseSuffix, as the ids from
+  // NextCloseId() do.
+  static bool IsCloseId(const std::string& commit_id);
+
+  static constexpr const char* kCloseSuffix = "-close";
 
  private:
   const std::string db_session_id_;
@@ -404,6 +451,22 @@ enum class ManifestStubState : uint8_t {
   // DB row has authority kStore, the switch happened, and the MANIFEST file may
   // already be deleted.
   kEntering = 2,
+};
+
+// Collects the DB row and the rows of a ManifestStore::Scan().
+class CollectRowsVisitor : public ManifestRowVisitor {
+ public:
+  Status OnDbRow(const ManifestDbRowResult& db_row) override {
+    db_row_ = db_row;
+    return Status::OK();
+  }
+  Status OnRow(const ManifestRow& row) override {
+    rows_.push_back(row);
+    return Status::OK();
+  }
+
+  ManifestDbRowResult db_row_;
+  std::vector<ManifestRow> rows_;
 };
 
 // The content of a stub MANIFEST.
@@ -611,10 +674,19 @@ inline constexpr int kMaxOwnerClaimAttempts = 10;
 // CheckManifestDbRowOwner(). The store's own status is never returned, so its
 // flags have no effect. On success, `claimed` holds the DB row after the
 // claim, and `extra` (if not null) its extra fields.
+//
+// Rows of shadow mode: `claim_shadow_rows` has no default. With true, the
+// function claims a row of any authority. With false, a DB row with authority
+// kShadow that step 1 reads is not claimed. The function then returns OK with
+// that row in `claimed` and its extra fields in `extra`, so the caller sees
+// kShadow and knows that nothing was claimed. The recovery of an interrupted
+// enter uses this: a claim would replace the close id of a shadow instance
+// (see "Close ids and the enter" in db/manifest_store_shadow.h), and the next
+// enter needs that close id.
 Status CheckOwnerAndClaim(ManifestStore* store,
                           const ManifestStoreOpenOptions& opts,
                           const std::string& expected_db_id,
-                          ManifestDbRowResult* claimed,
+                          bool claim_shadow_rows, ManifestDbRowResult* claimed,
                           ManifestDbRowExtraFields* extra = nullptr);
 
 // What a secondary or follower reads from the store for its open or one

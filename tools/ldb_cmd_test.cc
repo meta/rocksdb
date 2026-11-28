@@ -24,6 +24,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/file_system.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_util.h"
 #include "test_util/mock_manifest_store.h"
@@ -129,6 +130,87 @@ TEST_F(LdbCmdTest, MemEnv) {
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(3, argv, opts, LDBOptions(), nullptr));
+}
+
+// compare_manifest_store reads a store that shadow mode wrote, and fails when
+// a row differs from the MANIFEST.
+TEST_F(LdbCmdTest, CompareManifestStore) {
+  // The factory stays registered in ObjectLibrary::Default() for the whole
+  // process, so every run of this test in the process uses the same store
+  // data. DestroyDB() keeps the rows that shadow mode wrote, so the test
+  // removes them at its start and end, which makes it repeatable (for example
+  // with --gtest_repeat).
+  static std::shared_ptr<MockManifestStoreData> data =
+      std::make_shared<MockManifestStoreData>();
+  ASSERT_OK(MockManifestStore(data, /*epoch=*/1)
+                .Destroy(ManifestStoreDestroyOptions()));
+  const std::string store_name = "LdbCmdTestCompareManifestStore";
+  ObjectLibrary::Default()->AddFactory<ManifestStore>(
+      store_name,
+      [](const std::string& /*uri*/, std::unique_ptr<ManifestStore>* guard,
+         std::string* /*errmsg*/) {
+        guard->reset(new MockManifestStore(data, /*epoch=*/std::nullopt));
+        return guard->get();
+      });
+
+  Options options;
+  options.env = TryLoadCustomOrDefaultEnv();
+  options.create_if_missing = true;
+  options.manifest_store_shadow = true;
+  options.manifest_store = std::make_shared<MockManifestStore>(data, 1);
+  const std::string dbname =
+      test::PerThreadDBPath(options.env, "ldb_compare_manifest_store");
+  ASSERT_OK(DestroyDB(dbname, options));
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, dbname, &db));
+  for (const char* key : {"a", "b"}) {
+    ASSERT_OK(db->Put(WriteOptions(), key, "v"));
+    ASSERT_OK(db->Flush(FlushOptions()));
+  }
+  db.reset();
+
+  char arg1[] = "./ldb";
+  char arg2[1024];
+  snprintf(arg2, sizeof(arg2), "--db=%s", dbname.c_str());
+  char arg3[] = "compare_manifest_store";
+  char arg4[1024];
+  snprintf(arg4, sizeof(arg4), "--manifest_store=%s", store_name.c_str());
+  char* argv[] = {arg1, arg2, arg3, arg4};
+  Options ldb_options;
+  ldb_options.env = options.env;
+  ASSERT_EQ(0, LDBCommandRunner::RunCommand(4, argv, ldb_options, LDBOptions(),
+                                            nullptr));
+  // Without the flag, the command fails.
+  ASSERT_EQ(1, LDBCommandRunner::RunCommand(3, argv, ldb_options, LDBOptions(),
+                                            nullptr));
+  // manifest_dump refuses the rows that shadow mode wrote, because the
+  // MANIFEST file is the authority.
+  char dump_cmd[] = "manifest_dump";
+  char* dump_argv[] = {arg1, arg2, dump_cmd, arg4};
+  ASSERT_EQ(1, LDBCommandRunner::RunCommand(4, dump_argv, ldb_options,
+                                            LDBOptions(), nullptr));
+
+  // Delete one file row from the store: the command fails.
+  MockManifestStore writer(data, /*epoch=*/1);
+  ManifestDbRowResult db_row;
+  ASSERT_OK(writer.ReadDbRow(&db_row));
+  std::vector<LiveFileMetaData> files;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname, &db));
+  db->GetLiveFilesMetaData(&files);
+  db.reset();
+  ASSERT_FALSE(files.empty());
+  ManifestCommit commit;
+  commit.expected_commit_sequence = db_row.state.commit_sequence;
+  commit.commit_id = "delete one row";
+  commit.db_row = db_row.db_row;
+  commit.deletes.push_back(
+      ManifestRowKey{ManifestRowType::kFile, 0, files[0].file_number});
+  ASSERT_OK(writer.Commit(commit));
+  ASSERT_EQ(1, LDBCommandRunner::RunCommand(4, argv, ldb_options, LDBOptions(),
+                                            nullptr));
+  ASSERT_OK(DestroyDB(dbname, options));
+  ASSERT_OK(MockManifestStore(data, /*epoch=*/1)
+                .Destroy(ManifestStoreDestroyOptions()));
 }
 
 class FileChecksumTestHelper {
