@@ -2292,6 +2292,13 @@ void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
     if (should_flush) {
       assert(!r->data_block.empty());
       Flush(/*first_key_in_next_block=*/&entry_ikey);
+      // Flush() can fail. When it leaves the buffered state, it replays the
+      // buffered blocks and stops at the first failed write, so the filter
+      // builder may have seen only some of the buffered keys. Adding this key
+      // would give the filter builder a previous key it did not see.
+      if (UNLIKELY(!ok())) {
+        return;
+      }
     }
 
     // Note: PartitionedFilterBlockBuilder with
@@ -4078,6 +4085,15 @@ Status BlockBasedTableBuilder::Finish() {
   // Persist the AutoSkip estimate for the next file this thread emits (workers,
   // if any, have joined so the estimate is now quiescent).
   r->AutoSkipWriteBack();
+
+  // After an error (for example a failed write), the meta blocks cannot make
+  // a valid file. The filter and index builders may also be out of step with
+  // last_ikey: a failed replay of buffered blocks stops early (see Add()).
+  // So stop here and return the error.
+  if (UNLIKELY(!ok())) {
+    r->state = Rep::State::kClosed;
+    return r->GetStatus();
+  }
 
   r->props.tail_start_offset = r->offset.LoadRelaxed();
 
