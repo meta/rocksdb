@@ -146,25 +146,33 @@ struct MemTablePostProcessInfo {
 //   and all other types except Deletion, SingleDeletion,
 //   DeletionWithTimestamp and RangeDeletion).
 //
-// Data model. All objects live in the memtable arena:
+// Data model. All objects live in the memtable arena. A memtable has one table
+// per direction, forward and reverse (see "Reverse marks" below). The forward
+// table uses the user comparator's order, and the reverse table the opposite
+// order. The protocol text below uses the order of the mark's table: a range
+// [start, end) goes from start toward end in that order, `end` and
+// `usable_end` are excluded, and `start` is included unless `start_exclusive`
+// is set. The examples under "Reverse marks" use user-key order instead, and
+// write each end of a range with "(" or "]" to show if it is included.
 //
-//   MemTable::head_marks_ --> HeadMarkTable (immutable)
-//                               min_start: the start of the first claim
-//                               cells[0..n), sorted by start, n <= 16
-//                                  |
-//                                  v
-//                             HeadMarkCell (one per claim, never moves)
-//                               start
-//                               mark --> MemTableHeadMark (immutable)
-//                                          start, end, usable_end, seq,
-//                                          ingest_version, lowered
+//   MemTable::head_marks_[dir] --> HeadMarkTable (immutable)
+//                                    min_start: the start of the first claim
+//                                    cells[0..n), sorted by start, n <= 16
+//                                       |
+//                                       v
+//                                  HeadMarkCell (one per claim, never moves)
+//                                    start
+//                                    mark --> MemTableHeadMark (immutable)
+//                                               start, end, usable_end, seq,
+//                                               ingest_version, lowered,
+//                                               start_exclusive
 //
 // A change to one mark stores a new MemTableHeadMark into the same cell. A new
 // table is published only when a cell is added or removed.
 // The table points to the cells, so publishing a new table never loses a
 // change that a writer made to a cell. The claims of one table never overlap.
-// Every change takes MemTable::head_mark_mu_, except the clear that drops the
-// whole table (see "File ingestion" below).
+// Every change takes MemTable::head_mark_mu_, except the clear, which drops
+// both tables (see "File ingestion" below).
 //
 // Write path (MemTable::Add() and BatchPostProcess()). A live entry whose key
 // falls in a claimed range lowers that mark before the writer's sequence number
@@ -200,15 +208,16 @@ struct MemTablePostProcessInfo {
 //    levels sends nothing, so the scan's claim starts at its seek key. The new
 //    end is the end of the scan's run, capped at the start of the next claim.
 //    If the new end is at or before E.usable_end, there is nothing to extend.
-//    Otherwise the claim keeps E's inclusive start and its usable_end: it is
-//    [E.start, new end) with usable_end = E.usable_end and seq = S, and only
-//    step 5 raises its usable_end. If E already claims up to the new end, the
-//    claim is E itself and nothing is stored, so a scan that repeats a seek
-//    allocates nothing until its walk gets further. If E is no longer in its
-//    cell (a writer lowered it, another scan extended it, or an ingestion
-//    cleared it), the publish is refused, because E moved the scan's seek. If
-//    no mark sent the scan, the claim is a new mark with usable_end = start, if
-//    it overlaps no other claim and the table has room.
+//    Otherwise the claim keeps E's start, with E's start_exclusive, and E's
+//    usable_end: it goes from E.start to the new end (excluded), with
+//    usable_end = E.usable_end and seq = S, and only step 5 raises its
+//    usable_end. If E already claims up to the new end, the claim is E itself
+//    and nothing is stored, so a scan that repeats a seek allocates nothing
+//    until its walk gets further. If E is no longer in its cell (a writer
+//    lowered it, another scan extended it, or an ingestion cleared it), the
+//    publish is refused, because E moved the scan's seek. If no mark sent the
+//    scan, the claim is a new mark with usable_end = start, if it overlaps no
+//    other claim and the table has room.
 // 3. The scan adds 0 to num_entries_ with acq_rel ordering. The count does
 //    not change, but the add puts the scan into the same modification order
 //    of num_entries_ as the writers' increments (the handshake below).
@@ -271,14 +280,14 @@ struct MemTablePostProcessInfo {
 // it before the validation walk. An ingestion that clears the marks after that
 // removes the claim from the table, so step 5 finds no cell holding the claim
 // and does not raise it. The clear runs under the DB mutex, and it stores a
-// null table without taking head_mark_mu_. While the ingestion holds
-// ingest_sst_lock, no scan can store a claim, so no other thread publishes a
-// table. A step 5 raise and a writer's lowering can still run: an ingestion
-// stops the writers, but DeleteFilesInRanges() (below) does not. Each of them
-// stores only into a cell of the table that it loaded, and no reader can reach
-// that table after the clear. So the clear never waits for head_mark_mu_, whose
-// holder can be a lowering that allocates. A column family whose active
-// memtables never had marks enabled skips the clear (see
+// null table for each direction without taking head_mark_mu_. While the
+// ingestion holds ingest_sst_lock, no scan can store a claim, so no other
+// thread publishes a table. A step 5 raise and a writer's lowering can still
+// run: an ingestion stops the writers, but DeleteFilesInRanges() (below) does
+// not. Each of them stores only into a cell of the table that it loaded, and no
+// reader can reach that table after the clear. So the clear never waits for
+// head_mark_mu_, whose holder can be a lowering that allocates. A column family
+// whose active memtables never had marks enabled skips the clear (see
 // ColumnFamilyData::may_have_head_marks_).
 //
 // DeleteFilesInRanges() can remove an SST file whose range tombstone hides an
@@ -308,14 +317,39 @@ struct MemTablePostProcessInfo {
 // only if mark.seq <= the read sequence number, only if mark.ingest_version
 // <= the reader's Version number, and only its usable range.
 //
-// Limits. A memtable holds at most kMaxHeadMarks (16) marks. Replaced marks and
-// old tables stay in the arena until the memtable is freed, so the marks of a
-// memtable have a byte budget (see MemTable::head_mark_bytes_). Marks are made
-// only by forward scans that start with Seek(). Marks are enabled for a
-// memtable only if min_tombstones_for_range_conversion > 0 when it is created,
-// because only conversion scans publish them. Marks are off for user-defined
-// timestamps, inplace_update_support, unordered_write, two_write_queues, FIFO
-// compaction and memtables that are not skip lists (see
+// Reverse marks. A reverse scan that starts with SeekForPrev(t) and steps
+// backward over tombstones down to the live key K publishes a reverse mark:
+// every key in (K, t] is deleted. If a prefix_same_as_start scan instead stops
+// at a key outside its prefix, K is the lowest tombstone of the run, because a
+// prefix filter may have hidden keys below it (see
+// DBIter::MaybePublishHeadMark()). SeekToLast() with iterate_upper_bound U, and
+// SeekForPrev() at or above U, are seeks that exclude U, so they publish (K,
+// U). A reverse mark is stored as a forward mark in descending key order: start
+// = t or U, end = K, and start_exclusive tells whether start is claimed. Each
+// direction has its own table (MemTable::head_marks_[HeadMarkDirection]), and
+// every rule above holds with the order reversed: the reverse table swaps the
+// arguments of the user comparator, so its claims are sorted by start in
+// descending user order. In user order, a reverse claim is (end, start] and its
+// usable range is (usable_end, start]; both leave out start if start_exclusive
+// is set. The write path calls a shortening "lowering" because it works in
+// table order. In user order, a live write inside a reverse claim raises the
+// claim's lower bound `end` (and usable_end if needed) to the written key: for
+// example, a put at "q0015" shrinks the claim ("q0009", "q0019"] to ("q0015",
+// "q0019"]. The validation walk goes down in user order from usable_end. A
+// reverse seek (MergingIterator::SeekForPrevImpl()) at a key in the usable
+// range positions this level and older levels at the last entry at or before
+// usable_end. It can land on usable_end itself, which is outside the usable
+// range and can be live.
+//
+// Limits. A memtable holds at most kMaxHeadMarks (16) marks per direction.
+// Replaced marks and old tables stay in the arena until the memtable is freed,
+// so the marks of a memtable have a byte budget (see
+// MemTable::head_mark_bytes_). Marks are made only by scans that start with
+// Seek(), SeekForPrev(), or SeekToLast() with iterate_upper_bound. Marks are
+// enabled for a memtable only if min_tombstones_for_range_conversion > 0 when
+// it is created, because only conversion scans publish them. Marks are off for
+// user-defined timestamps, inplace_update_support, unordered_write,
+// two_write_queues, FIFO compaction and memtables that are not skip lists (see
 // MemTable::head_marks_enabled_). Scans prepared with scan options (MultiScan)
 // neither use nor publish marks. A compaction filter that returns
 // kRemoveAndSkipUntil drops every entry that it skips, also a point tombstone,
@@ -343,7 +377,17 @@ struct MemTableHeadMark {
   // the claim to its start leaves the usable range empty, so the mark moves no
   // seek.
   bool lowered;
+  // True if `start` itself is not claimed. A new reverse mark has it when its
+  // seek was clamped to iterate_upper_bound, which the seek excludes: a
+  // SeekToLast() with iterate_upper_bound, or a SeekForPrev() at or above
+  // iterate_upper_bound (see "Reverse marks"). An extension keeps the
+  // sender's start and start_exclusive.
+  bool start_exclusive = false;
 };
+
+// The key order of a head mark table (see "Reverse marks" at
+// MemTableHeadMark).
+enum class HeadMarkDirection : uint8_t { kForward = 0, kReverse = 1 };
 
 // The ingestion state of a column family that PublishHeadMark() checks. Owned
 // by ColumnFamilyData. Written under the DB mutex while the ingestion holds
@@ -661,22 +705,32 @@ class ReadOnlyMemTable {
   // marks.
   virtual bool HeadMarksEnabled() const { return false; }
 
-  // Returns the mark whose usable range contains `user_key`, whose seq is at
-  // most `read_seq` and whose ingest_version is at most `read_version` (the
-  // number of the reader's Version), or nullptr.
+  // Returns the mark of direction `dir` that a seek at `user_key` with read
+  // sequence number `read_seq` may use, or nullptr. The mark's seq must be at
+  // most `read_seq`, its ingest_version must be at most `read_version` (the
+  // number of the reader's Version), and `user_key` must lie in [start,
+  // usable_end) in the order of `dir`. `key_included` tells if the seek
+  // includes `user_key` itself. One case needs it: if `user_key` is an
+  // exclusive start, the mark does not claim it, so only a seek that excludes
+  // it may use the mark (and only if usable_end is past start).
+  // MergingIterator::SeekForPrevOverHeadMark() derives `key_included` from the
+  // sequence number of its search key.
   virtual const MemTableHeadMark* FindUsableHeadMark(
-      const Slice& /*user_key*/, SequenceNumber /*read_seq*/,
+      HeadMarkDirection /*dir*/, const Slice& /*user_key*/,
+      bool /*key_included*/, SequenceNumber /*read_seq*/,
       uint64_t /*read_version*/) const {
     return nullptr;
   }
 
-  // Publishes the dead run [start, end) that a scan at sequence number `seq`
-  // found right after its Seek(start). The scan reads Version
-  // `version_number`. `sender` is the mark of this memtable that moved the
-  // scan's seek, or nullptr. `run_is_long` tells if the run has at least
-  // min_tombstones_for_range_conversion tombstones.
+  // Publishes the dead run from `start` to `end` (exclusive) in direction
+  // `dir` that a scan at sequence number `seq` found right after its seek to
+  // `start`. `start_exclusive` tells that `start` itself is not claimed. The
+  // scan reads Version `version_number`. `sender` is the mark of this memtable
+  // that moved the scan's seek, or nullptr. `run_is_long` tells if the run has
+  // at least min_tombstones_for_range_conversion tombstones.
   virtual HeadMarkPublishResult PublishHeadMark(
-      const Slice& /*start*/, const Slice& /*end*/, SequenceNumber /*seq*/,
+      HeadMarkDirection /*dir*/, const Slice& /*start*/,
+      bool /*start_exclusive*/, const Slice& /*end*/, SequenceNumber /*seq*/,
       const MemTableHeadMark* /*sender*/, bool /*run_is_long*/,
       uint64_t /*version_number*/, const HeadMarkIngestState& /*ingest*/,
       port::RWMutex& /*ingest_sst_lock*/) {
@@ -1251,12 +1305,13 @@ class MemTable final : public ReadOnlyMemTable {
   bool HeadMarksEnabled() const override { return head_marks_enabled_; }
 
   const MemTableHeadMark* FindUsableHeadMark(
-      const Slice& user_key, SequenceNumber read_seq,
-      uint64_t read_version) const override;
+      HeadMarkDirection dir, const Slice& user_key, bool key_included,
+      SequenceNumber read_seq, uint64_t read_version) const override;
 
   HeadMarkPublishResult PublishHeadMark(
-      const Slice& start, const Slice& end, SequenceNumber seq,
-      const MemTableHeadMark* sender, bool run_is_long, uint64_t version_number,
+      HeadMarkDirection dir, const Slice& start, bool start_exclusive,
+      const Slice& end, SequenceNumber seq, const MemTableHeadMark* sender,
+      bool run_is_long, uint64_t version_number,
       const HeadMarkIngestState& ingest,
       port::RWMutex& ingest_sst_lock) override;
 
@@ -1305,9 +1360,9 @@ class MemTable final : public ReadOnlyMemTable {
   friend class DBMemTableTest;
   friend class DBHeadMarkTest;
 
-  // Test only: the current marks in start order. Tests reach it through the
-  // fixtures above.
-  std::vector<MemTableHeadMark> TEST_HeadMarks() const;
+  // Test only: the current marks of direction `dir` in start order. Tests
+  // reach it through the fixtures above.
+  std::vector<MemTableHeadMark> TEST_HeadMarks(HeadMarkDirection dir) const;
   size_t TEST_HeadMarkBytes() const { return head_mark_bytes_.LoadRelaxed(); }
   size_t TEST_HeadMarkByteBudget() const {
     return kHeadMarkBaseBudget + data_size_.LoadRelaxed();
@@ -1484,66 +1539,91 @@ class MemTable final : public ReadOnlyMemTable {
   // that the batch's live keys may fall in. Returns the old entry count.
   uint64_t HeadMarkBatchPostProcess(const MemTablePostProcessInfo& info);
 
-  // Lowers every mark whose claim overlaps [lo, hi]. A batch with more than
+  // Compares user keys in the order of a direction: the user comparator for
+  // forward marks, and the reverse of it for reverse marks.
+  struct HeadMarkOrder {
+    const Comparator* ucmp;
+    bool reverse;
+    int operator()(const Slice& a, const Slice& b) const {
+      return reverse ? ucmp->Compare(b, a) : ucmp->Compare(a, b);
+    }
+  };
+  HeadMarkOrder OrderOf(HeadMarkDirection dir) const {
+    return {comparator_.comparator.user_comparator(),
+            dir == HeadMarkDirection::kReverse};
+  }
+
+  // Lowers every mark of both directions whose claim overlaps [lo, hi] (user
+  // comparator order). A batch with more than
   // MemTablePostProcessInfo::HeadMarkLiveKeys::kMaxLiveKeys live keys passes
   // the range of all of them, so a mark can be lowered even if no key of the
   // batch is in it. The keys must stay valid for the memtable's lifetime (they
   // point into entries).
   void LowerHeadMarks(const Slice& lo, const Slice& hi);
 
-  // Lowers the mark whose claim contains `key`, the user key of one live
-  // entry. A single writer calls this for each live insert, and
+  // Tells if a claim of direction `dir` may overlap [lo, hi] (in the order of
+  // `dir`), without the mutex.
+  bool MayLowerHeadMarks(HeadMarkDirection dir, const Slice& lo,
+                         const Slice& hi) const;
+
+  // Lowers the marks of both directions whose claim contains `key`, the user
+  // key of one live entry. A single writer calls this for each live insert, and
   // BatchPostProcess() calls it for each live key of a concurrent batch with at
   // most MemTablePostProcessInfo::HeadMarkLiveKeys::kMaxLiveKeys live keys. The
   // key must stay valid for the memtable's lifetime (it points into an entry).
   void LowerHeadMarkForKey(const Slice& key) {
-    if (MayLowerHeadMarkForKey(key)) {
+    if (MayLowerHeadMarkForKey(HeadMarkDirection::kForward, key) ||
+        MayLowerHeadMarkForKey(HeadMarkDirection::kReverse, key)) {
       MutexLock l(&head_mark_mu_);
-      LowerHeadMarksLocked(key, key);
+      LowerHeadMarksLocked(HeadMarkDirection::kForward, key, key);
+      LowerHeadMarksLocked(HeadMarkDirection::kReverse, key, key);
     }
   }
 
-  // Tells if a claim may contain `key`, without the mutex. A key outside the
-  // hull (see MemTableHeadMark) returns here after one or two key compares. The
-  // end of the last claim is compared first, because a queue tail key is past
-  // it.
-  bool MayLowerHeadMarkForKey(const Slice& key) const {
-    const HeadMarkTable* table = head_marks_.Load();
+  // Tells if a claim of direction `dir` may contain `key`, without the mutex.
+  // A key outside the hull (see MemTableHeadMark) returns here after one or
+  // two key compares. The end of the last claim is compared first, because a
+  // queue tail key is past it in the order of `dir`.
+  bool MayLowerHeadMarkForKey(HeadMarkDirection dir, const Slice& key) const {
+    const HeadMarkTable* table = HeadMarks(dir).Load();
     if (table == nullptr) {
       return false;
     }
-    const Comparator* ucmp = comparator_.comparator.user_comparator();
+    const HeadMarkOrder order = OrderOf(dir);
     const Slice& hull_end =
         table->cells[table->num_cells - 1]->mark.Load()->end;
-    if (ucmp->Compare(key, hull_end) >= 0 ||
-        ucmp->Compare(key, table->min_start) < 0) {
+    if (order(key, hull_end) >= 0 || order(key, table->min_start) < 0) {
       return false;
     }
-    return HeadMarkClaimMayHoldKey(*table, key);
+    return HeadMarkClaimMayHoldKey(dir, *table, key);
   }
 
   // MayLowerHeadMarkForKey() for a key inside the hull of `table`: finds the
   // claim that may contain `key`. A key in a gap between two claims returns
   // false.
-  bool HeadMarkClaimMayHoldKey(const HeadMarkTable& table,
+  bool HeadMarkClaimMayHoldKey(HeadMarkDirection dir,
+                               const HeadMarkTable& table,
                                const Slice& key) const;
-  void LowerHeadMarksLocked(const Slice& lo, const Slice& hi);
+  void LowerHeadMarksLocked(HeadMarkDirection dir, const Slice& lo,
+                            const Slice& hi);
 
   // Returns the index of the cell of `table` whose claim may contain `key`:
-  // the last cell whose start is <= `key`. Returns table.num_cells if `key`
-  // is outside the hull (see MemTableHeadMark).
-  size_t FindHeadMarkCell(const HeadMarkTable& table, const Slice& key) const;
+  // the last cell whose start is at or before `key` in the order of `dir`.
+  // Returns table.num_cells if `key` is outside the hull (see
+  // MemTableHeadMark).
+  size_t FindHeadMarkCell(HeadMarkDirection dir, const HeadMarkTable& table,
+                          const Slice& key) const;
 
   // FindHeadMarkCell() without the hull check.
-  size_t SearchHeadMarkCells(const HeadMarkTable& table,
+  size_t SearchHeadMarkCells(HeadMarkDirection dir, const HeadMarkTable& table,
                              const Slice& key) const;
 
   // Returns the index of the cell of `table` that holds `mark`, or
   // table.num_cells.
   static size_t FindHeadMarkCellHolding(const HeadMarkTable& table,
                                         const MemTableHeadMark* mark);
-  const MemTableHeadMark* NewHeadMark(const Slice& start, const Slice& end,
-                                      const Slice& usable_end,
+  const MemTableHeadMark* NewHeadMark(const Slice& start, bool start_exclusive,
+                                      const Slice& end, const Slice& usable_end,
                                       SequenceNumber seq,
                                       uint64_t ingest_version, bool lowered);
   Slice CopyToArena(const Slice& s);
@@ -1565,9 +1645,10 @@ class MemTable final : public ReadOnlyMemTable {
   // grows data_size_.
   bool ReserveHeadMarkBytes(size_t n);
 
-  // Publishes a table with `cells` (sorted by start). Stores nullptr if n is
-  // 0.
-  void PublishHeadMarkTableLocked(HeadMarkCell* const* cells, size_t n);
+  // Publishes a table of direction `dir` with `cells` (sorted by start, n >
+  // 0).
+  void PublishHeadMarkTableLocked(HeadMarkDirection dir,
+                                  HeadMarkCell* const* cells, size_t n);
 
   // PublishHeadMark() step 2 for an extension and for a new mark. Each
   // returns the claim to validate and its cell, or a refusal. An extension
@@ -1576,28 +1657,41 @@ class MemTable final : public ReadOnlyMemTable {
   // part that the walk checks: the end of the scan's run, capped at the next
   // claim. That end can point into `end`, which the caller owns.
   HeadMarkPublishResult ExtendHeadMarkLocked(
-      const Slice& end, SequenceNumber seq, const MemTableHeadMark* sender,
-      HeadMarkCell** cell, const MemTableHeadMark** claim, Slice* walk_end);
-  HeadMarkPublishResult AddHeadMarkLocked(const Slice& start, const Slice& end,
-                                          SequenceNumber seq,
-                                          uint64_t ingest_version,
-                                          HeadMarkCell** cell,
-                                          const MemTableHeadMark** claim);
+      HeadMarkDirection dir, const Slice& end, SequenceNumber seq,
+      const MemTableHeadMark* sender, HeadMarkCell** cell,
+      const MemTableHeadMark** claim, Slice* walk_end);
+  HeadMarkPublishResult AddHeadMarkLocked(
+      HeadMarkDirection dir, const Slice& start, bool start_exclusive,
+      const Slice& end, SequenceNumber seq, uint64_t ingest_version,
+      HeadMarkCell** cell, const MemTableHeadMark** claim);
 
-  // PublishHeadMark() step 4: returns the end of the checked part of
-  // [from, to).
-  Slice ValidateHeadMarkRange(const Slice& from, const Slice& to,
+  // PublishHeadMark() step 4: walks the claim's unchecked part, from
+  // usable_end to `to` (the claim's end, or the end of the scan's run) in the
+  // order of `dir`, and returns the end of the checked part. If usable_end is
+  // still an exclusive start, the walk seeks past every version of that key,
+  // so the versions of a key the claim does not hold cost nothing; every entry
+  // the walk steps over counts toward kMaxHeadMarkWalk.
+  Slice ValidateHeadMarkRange(HeadMarkDirection dir,
+                              const MemTableHeadMark& claim, const Slice& to,
                               SequenceNumber seq) const;
 
   // PublishHeadMark() step 5: replaces `claim` in `cell` with a mark whose
   // usable end is `usable_end`, if the memtable is still mutable and the
   // current table still holds `claim`.
-  void RaiseHeadMarkUsableEnd(HeadMarkCell* cell, const MemTableHeadMark* claim,
+  void RaiseHeadMarkUsableEnd(HeadMarkDirection dir, HeadMarkCell* cell,
+                              const MemTableHeadMark* claim,
                               const Slice& usable_end, SequenceNumber seq);
 
   // Set at construction, see the Limits paragraph of MemTableHeadMark.
   bool head_marks_enabled_ = false;
-  Atomic<const HeadMarkTable*> head_marks_{nullptr};
+  // One table per HeadMarkDirection. Use HeadMarks() to index it.
+  Atomic<const HeadMarkTable*> head_marks_[2];
+  Atomic<const HeadMarkTable*>& HeadMarks(HeadMarkDirection dir) {
+    return head_marks_[static_cast<size_t>(dir)];
+  }
+  const Atomic<const HeadMarkTable*>& HeadMarks(HeadMarkDirection dir) const {
+    return head_marks_[static_cast<size_t>(dir)];
+  }
   port::Mutex head_mark_mu_;
   // The bytes that head mark objects (tables, cells, marks and key copies)
   // asked from arena_, counted before each allocation (see

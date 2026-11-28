@@ -1470,12 +1470,13 @@ struct AdvancedColumnFamilyOptions {
   //     ingested while the active memtable was current.
   //
   // A memtable created while this option is > 0 also keeps head marks. When a
-  // scan that starts with Seek() sees such a run of point tombstones right
-  // after its seek, in its merged view of the memtables and SST files, it
-  // records the deleted range as a head mark in the active memtable. A later
-  // Seek() into the range then skips the range in one step, in that memtable
-  // and in every older memtable and SST file. Head marks live only in memory
-  // and change no data. They are not used with user-defined timestamps,
+  // scan that starts with Seek(), SeekForPrev(), or SeekToLast() with
+  // iterate_upper_bound sees such a run of point tombstones right after its
+  // seek, in its merged view of the memtables and SST files, it records the
+  // deleted range as a head mark in the active memtable. A later seek in the
+  // same direction into the range then skips the range in one step, in that
+  // memtable and in every older memtable and SST file. Head marks live only in
+  // memory and change no data. They are not used with user-defined timestamps,
   // inplace_update_support, unordered_write, two_write_queues, FIFO compaction,
   // memtables that are not skip lists, or iterators with a read callback,
   // table_filter or ignore_range_deletions. After a compaction filter returns

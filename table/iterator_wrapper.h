@@ -146,6 +146,16 @@ class IteratorWrapperBase {
                              last_mark);
     Update();
   }
+  void SeekForPrevWithHeadMarks(const Slice& k, SequenceNumber read_seq,
+                                uint64_t read_version,
+                                const ReadOnlyMemTable* mark_mem,
+                                const MemTableHeadMark** used_mark,
+                                const MemTableHeadMark** last_mark) {
+    assert(iter_);
+    iter_->SeekForPrevWithHeadMarks(k, read_seq, read_version, mark_mem,
+                                    used_mark, last_mark);
+    Update();
+  }
   void SeekForPrev(const Slice& k) {
     assert(iter_);
     iter_->SeekForPrev(k);

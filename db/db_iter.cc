@@ -977,6 +977,7 @@ void DBIter::Prev() {
 
   PERF_COUNTER_ADD(iter_prev_count, 1);
   PERF_CPU_TIMER_GUARD(iter_prev_cpu_nanos, clock_);
+  head_mark_candidate_ = false;
   ReleaseTempPinnedData();
   ResetBlobData();
   ResetValueAndColumns();
@@ -1884,23 +1885,34 @@ void DBIter::FlushPendingTombstoneRun(const Slice& end_key,
   ResetContiguousTombstoneTracking();
 }
 
-void DBIter::SeekInnerIterWithHeadMarks() {
+void DBIter::SeekInnerIterWithHeadMarks(HeadMarkDirection dir,
+                                        bool start_exclusive) {
+  const bool reverse = dir == HeadMarkDirection::kReverse;
   head_mark_sender_ = nullptr;
+  const Slice target = saved_key_.GetInternalKey();
   if (!use_head_marks_ || scan_opts_.has_value()) {
-    iter_.Seek(saved_key_.GetInternalKey());
+    reverse ? iter_.SeekForPrev(target) : iter_.Seek(target);
     return;
   }
+  const ReadOnlyMemTable* mark_mem =
+      publish_head_marks_ ? active_mem_ : nullptr;
   const MemTableHeadMark* last_mark = nullptr;
-  iter_.SeekWithHeadMarks(saved_key_.GetInternalKey(), sequence_,
-                          version_number_,
-                          publish_head_marks_ ? active_mem_ : nullptr,
-                          &head_mark_sender_, &last_mark);
+  if (reverse) {
+    iter_.SeekForPrevWithHeadMarks(target, sequence_, version_number_, mark_mem,
+                                   &head_mark_sender_, &last_mark);
+  } else {
+    iter_.SeekWithHeadMarks(target, sequence_, version_number_, mark_mem,
+                            &head_mark_sender_, &last_mark);
+  }
   if (last_mark != nullptr) {
     head_mark_skip_end_.SetUserKey(last_mark->usable_end, true /* copy */);
+    head_mark_skip_dir_ = dir;
   }
   if (publish_head_marks_) {
     head_mark_candidate_ = true;
+    head_mark_dir_ = dir;
     head_mark_start_.SetUserKey(saved_key_.GetUserKey(), true /* copy */);
+    head_mark_start_exclusive_ = start_exclusive;
   }
 }
 
@@ -1915,11 +1927,34 @@ void DBIter::MaybePublishHeadMark(const Slice& end_key) {
     return;
   }
   const Slice start = head_mark_start_.GetUserKey();
-  if (user_comparator_.Compare(start, end_key) >= 0) {
+  // A forward run ends at end_key. A reverse run ends at the key where the
+  // backward scan stopped, which is saved_key_ (see PrevInternal()), if that
+  // key is inside the seek prefix and not below iterate_lower_bound.
+  // Otherwise the scan did not see every key between saved_key_ and the run,
+  // and the run ends at its lowest tombstone, which the mark excludes:
+  // - Outside the prefix, the prefix filter of an SST can skip the seek, so
+  //   live keys of another prefix in that SST were never read.
+  // - Below the lower bound, a child iterator may stop early at the bound.
+  //   None does in reverse today, but the scan does not rely on it.
+  const bool reverse = head_mark_dir_ == HeadMarkDirection::kReverse;
+  Slice end = end_key;
+  if (reverse) {
+    const Slice stop = saved_key_.GetUserKey();
+    const bool stop_seen =
+        PrefixCheck(StripTimestampFromUserKey(stop, timestamp_size_)) &&
+        (iterate_lower_bound_ == nullptr ||
+         user_comparator_.CompareWithoutTimestamp(stop, /*a_has_ts=*/true,
+                                                  *iterate_lower_bound_,
+                                                  /*b_has_ts=*/false) >= 0);
+    end = stop_seen ? stop : range_tomb_first_key_.GetUserKey();
+  }
+  if (reverse ? user_comparator_.Compare(end, start) >= 0
+              : user_comparator_.Compare(start, end) >= 0) {
     return;
   }
   [[maybe_unused]] HeadMarkPublishResult result = active_mem_->PublishHeadMark(
-      start, end_key, sequence_, head_mark_sender_,
+      head_mark_dir_, start, head_mark_start_exclusive_, end, sequence_,
+      head_mark_sender_,
       contiguous_tombstone_count_ >= min_tombstones_for_range_conversion_,
       version_number_, *head_mark_ingest_, *ingest_sst_lock_);
   TEST_SYNC_POINT_CALLBACK("DBIter::MaybePublishHeadMark:Result", &result);
@@ -1954,19 +1989,40 @@ void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
   }
 
   // A conversion restates only deletions that this scan read. When a head
-  // mark moved the seek, the levels that the mark moved were not read below
-  // head_mark_skip_end_: the mark proves those keys deleted, but the scan did
-  // not see their tombstones. A run can still start below it at a tombstone
-  // of a newer level, for example the active memtable when the mark is in an
-  // immutable memtable. So the range starts at head_mark_skip_end_ at the
-  // earliest. Then a wrong mark (see the Limits paragraph of
+  // mark moved the seek, the levels that the marks moved were not read
+  // between the seek target and head_mark_skip_end_: the marks prove those
+  // keys deleted, but the scan did not see their tombstones. A run can still
+  // reach into that part at a tombstone of a newer level, for example the
+  // active memtable when the mark is in an immutable memtable. So a forward
+  // range starts at head_mark_skip_end_ at the earliest, and a reverse range
+  // ends there at the latest. Then a wrong mark (see the Limits paragraph of
   // MemTableHeadMark) stays a read miss and never becomes a stored deletion.
+  //
+  // The reverse rule also keeps the ranges of a queue consumed from the
+  // largest key apart. Its scans repeat SeekForPrev() from the same high key,
+  // and each one is moved down by the mark of the scan before. Ending each
+  // range at the usable end of that mark leaves it below the range that the
+  // scan before inserted, instead of containing it, so no fragment collects
+  // the seqnos of every earlier scan. The cost is that the tombstone at the
+  // usable end itself stays a point tombstone.
+  //
+  // Only a scan in the direction of its seek uses the limit. After a
+  // direction change, the merging iterator has sought every level again from
+  // the current key.
   Slice range_start = range_tomb_first_key_.GetUserKey();
-  if (direction_ == kForward && head_mark_skip_end_.Size() > 0 &&
-      user_comparator_.Compare(range_start, head_mark_skip_end_.GetUserKey()) <
-          0) {
-    range_start = head_mark_skip_end_.GetUserKey();
-    if (user_comparator_.Compare(range_start, end_key) >= 0) {
+  Slice range_end = end_key;
+  if (head_mark_skip_end_.Size() > 0 &&
+      (head_mark_skip_dir_ == HeadMarkDirection::kForward) ==
+          (direction_ == kForward)) {
+    const Slice skip_end = head_mark_skip_end_.GetUserKey();
+    if (direction_ == kForward) {
+      if (user_comparator_.Compare(range_start, skip_end) < 0) {
+        range_start = skip_end;
+      }
+    } else if (user_comparator_.Compare(skip_end, range_end) < 0) {
+      range_end = skip_end;
+    }
+    if (user_comparator_.Compare(range_start, range_end) >= 0) {
       return;
     }
   }
@@ -2003,7 +2059,7 @@ void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
       range_iter->Seek(range_start);
       if (range_iter->Valid() &&
           user_comparator_.Compare(range_iter->start_key(), range_start) <= 0 &&
-          user_comparator_.Compare(range_iter->end_key(), end_key) >= 0) {
+          user_comparator_.Compare(range_iter->end_key(), range_end) >= 0) {
         RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_DISCARDED);
         return;
       }
@@ -2011,15 +2067,15 @@ void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
   }
 
   assert(ingest_sst_lock_ != nullptr);
-  if (active_mem_->AddLogicallyRedundantRangeTombstone(insert_seq, range_start,
-                                                       end_key, version_number_,
-                                                       *ingest_sst_lock_)) {
+  if (active_mem_->AddLogicallyRedundantRangeTombstone(
+          insert_seq, range_start, range_end, version_number_,
+          *ingest_sst_lock_)) {
     RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_INSERTED);
     ROCKS_LOG_DEBUG(logger_,
                     "Inserted range tombstone [%s, %s) @ seq %" PRIu64
                     " (count=%" PRIu32 ", snapshot=%" PRIu64 ")",
                     range_start.ToString(true).c_str(),
-                    end_key.ToString(true).c_str(), insert_seq,
+                    range_end.ToString(true).c_str(), insert_seq,
                     contiguous_tombstone_count_, sequence_);
   } else {
     RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_DISCARDED);
@@ -2075,7 +2131,7 @@ void DBIter::SetSavedKeyToSeekTarget(const Slice& target) {
   }
 }
 
-void DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
+bool DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
   is_key_seqnum_zero_ = false;
   saved_key_.Clear();
   // now saved_key is used to store internal key.
@@ -2090,6 +2146,9 @@ void DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
         timestamp_lb_ == nullptr ? &ts : timestamp_lb_);
   }
 
+  // The clamp below uses kMaxSequenceNumber, so the seek key includes no entry
+  // of iterate_upper_bound. MergingIterator::SeekForPrevOverHeadMark() reads
+  // the seek key that way, and only this clamp uses kMaxSequenceNumber here.
   if (iterate_upper_bound_ != nullptr &&
       user_comparator_.CompareWithoutTimestamp(
           saved_key_.GetUserKey(), /*a_has_ts=*/true, *iterate_upper_bound_,
@@ -2103,7 +2162,9 @@ void DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
       saved_key_.UpdateInternalKey(kMaxSequenceNumber, kValueTypeForSeekForPrev,
                                    &ts);
     }
+    return true;
   }
+  return false;
 }
 
 Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
@@ -2290,7 +2351,8 @@ void DBIter::Seek(const Slice& target) {
     PERF_TIMER_GUARD(seek_internal_seek_time);
 
     SetSavedKeyToSeekTarget(target);
-    SeekInnerIterWithHeadMarks();
+    SeekInnerIterWithHeadMarks(HeadMarkDirection::kForward,
+                               /*start_exclusive=*/false);
 
     RecordTick(statistics_, NUMBER_DB_SEEK);
   }
@@ -2415,8 +2477,11 @@ void DBIter::SeekForPrev(const Slice& target) {
   // Seek the inner iterator based on the target key.
   {
     PERF_TIMER_GUARD(seek_internal_seek_time);
-    SetSavedKeyToSeekForPrevTarget(target);
-    iter_.SeekForPrev(saved_key_.GetInternalKey());
+    // A seek key clamped to iterate_upper_bound excludes the bound, so a mark
+    // that this scan publishes does not claim the bound.
+    const bool clamped = SetSavedKeyToSeekForPrevTarget(target);
+    SeekInnerIterWithHeadMarks(HeadMarkDirection::kReverse,
+                               /*start_exclusive=*/clamped);
     RecordTick(statistics_, NUMBER_DB_SEEK);
   }
   if (!iter_.Valid()) {

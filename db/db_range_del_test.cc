@@ -4471,15 +4471,17 @@ struct HeadMarkView {
   std::string end;
   std::string usable_end;
   bool lowered = false;
+  bool start_exclusive = false;
   bool operator==(const HeadMarkView& o) const {
     return start == o.start && end == o.end && usable_end == o.usable_end &&
-           lowered == o.lowered;
+           lowered == o.lowered && start_exclusive == o.start_exclusive;
   }
 };
 
 std::ostream& operator<<(std::ostream& os, const HeadMarkView& m) {
   return os << "[" << m.start << ", " << m.end
-            << ") usable_end=" << m.usable_end << (m.lowered ? " lowered" : "");
+            << ") usable_end=" << m.usable_end << (m.lowered ? " lowered" : "")
+            << (m.start_exclusive ? " start_exclusive" : "");
 }
 
 // Counts the seeks that a mark moved and records every publish result.
@@ -4488,6 +4490,9 @@ class HeadMarkTracker {
   HeadMarkTracker() {
     SyncPoint::GetInstance()->SetCallBack("MergingIterator::SeekOverHeadMark",
                                           [this](void*) { ++uses; });
+    SyncPoint::GetInstance()->SetCallBack(
+        "MergingIterator::SeekForPrevOverHeadMark",
+        [this](void*) { ++reverse_uses; });
     SyncPoint::GetInstance()->SetCallBack(
         "DBIter::MaybePublishHeadMark:Result", [this](void* arg) {
           results.push_back(*static_cast<HeadMarkPublishResult*>(arg));
@@ -4500,9 +4505,11 @@ class HeadMarkTracker {
   }
   void Reset() {
     uses = 0;
+    reverse_uses = 0;
     results.clear();
   }
   int uses = 0;
+  int reverse_uses = 0;
   std::vector<HeadMarkPublishResult> results;
 };
 }  // namespace
@@ -4528,14 +4535,15 @@ class DBHeadMarkTest : public DBRangeDelTest {
     }
   }
 
-  std::vector<HeadMarkView> ActiveMarks() {
+  std::vector<HeadMarkView> ActiveMarks(
+      HeadMarkDirection dir = HeadMarkDirection::kForward) {
     auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
         db_->DefaultColumnFamily());
     std::vector<HeadMarkView> views;
     for (const MemTableHeadMark& m :
-         cfh->cfd()->mem()->MemTable::TEST_HeadMarks()) {
+         cfh->cfd()->mem()->MemTable::TEST_HeadMarks(dir)) {
       views.push_back({m.start.ToString(), m.end.ToString(),
-                       m.usable_end.ToString(), m.lowered});
+                       m.usable_end.ToString(), m.lowered, m.start_exclusive});
     }
     return views;
   }
@@ -4665,6 +4673,26 @@ class DBHeadMarkTest : public DBRangeDelTest {
                                  &end));
     ASSERT_EQ(1, NumTableFilesAtLevel(2));
     ASSERT_EQ(0, NumTableFilesAtLevel(1));
+  }
+
+  // Returns the last key at or before `target`, or "" if there is none.
+  std::string SeekForPrevLast(const std::string& target,
+                              const ReadOptions& ro = ReadOptions()) {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    iter->SeekForPrev(target);
+    EXPECT_OK(iter->status());
+    return iter->Valid() ? iter->key().ToString() : "";
+  }
+
+  // Returns the last key below `upper_bound` with SeekToLast(), or "".
+  std::string SeekToLastBelow(const std::string& upper_bound) {
+    const Slice ub(upper_bound);
+    ReadOptions ro;
+    ro.iterate_upper_bound = &ub;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    iter->SeekToLast();
+    EXPECT_OK(iter->status());
+    return iter->Valid() ? iter->key().ToString() : "";
   }
 
   // Returns the first key at or after `target`, or "" if there is none.
@@ -5893,6 +5921,819 @@ TEST_F(DBHeadMarkTest, ConcurrentQueueSeekMatchesFullScan) {
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   ASSERT_GT(uses.load(), 0);
+}
+
+// Reverse marks (see "Reverse marks" at MemTableHeadMark). In these tests the
+// queue is consumed from its largest key: "q0010" to "q0019" are deleted and
+// "q0000" to "q0009" are live.
+class DBReverseHeadMarkTest : public DBHeadMarkTest {
+ public:
+  void MakeReverseQueue() {
+    for (int i = 0; i < 20; ++i) {
+      ASSERT_OK(Put(QKey(i), "v"));
+    }
+    for (int i = 10; i < 20; ++i) {
+      ASSERT_OK(Delete(QKey(i)));
+    }
+  }
+  static constexpr HeadMarkDirection kReverse = HeadMarkDirection::kReverse;
+
+  // One (start, end, seqno) entry per fragment and seqno of the active
+  // memtable's range tombstones, in fragment order, newest seqno first.
+  using RangeDels =
+      std::vector<std::tuple<std::string, std::string, SequenceNumber>>;
+  RangeDels ActiveRangeDels() {
+    auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
+        db_->DefaultColumnFamily());
+    std::unique_ptr<FragmentedRangeTombstoneIterator> iter(
+        cfh->cfd()->mem()->NewRangeTombstoneIterator(
+            ReadOptions(), kMaxSequenceNumber, /*immutable_memtable=*/false));
+    RangeDels dels;
+    if (iter == nullptr) {
+      return dels;
+    }
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      dels.emplace_back(iter->start_key().ToString(),
+                        iter->end_key().ToString(), iter->seq());
+    }
+    return dels;
+  }
+
+  // Asserts that no fragment of the active memtable has more than one seqno,
+  // that is, that the converted range tombstones do not nest.
+  void AssertOneSeqnoPerFragment() {
+    const RangeDels dels = ActiveRangeDels();
+    for (size_t i = 1; i < dels.size(); ++i) {
+      ASSERT_NE(std::get<0>(dels[i - 1]), std::get<0>(dels[i]))
+          << "fragment with more than one seqno at " << std::get<0>(dels[i]);
+    }
+  }
+};
+
+TEST_F(DBReverseHeadMarkTest, SeekForPrevPublishesInclusiveMark) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kPublished},
+      tracker.results);
+  // The mark claims ("q0009", "q0019"], stored in descending order.
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(19), QKey(9), QKey(9), false}}),
+            ActiveMarks(kReverse));
+  ASSERT_TRUE(ActiveMarks().empty());
+
+  tracker.Reset();
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(15)));
+  ASSERT_EQ(2, tracker.reverse_uses);
+  ASSERT_EQ(0, tracker.uses);
+  // A seek key above the mark does not use it.
+  ASSERT_EQ(QKey(9), SeekForPrevLast("q1"));
+  ASSERT_EQ(2, tracker.reverse_uses);
+}
+
+TEST_F(DBReverseHeadMarkTest, LowerBoundEndsMarkAtLowestTombstone) {
+  // A reverse scan that stops at iterate_lower_bound has read the key below
+  // the bound, but proved nothing about the keys between that key and the
+  // run. The mark ends at the lowest tombstone of the run, which it excludes.
+  // In this test the bound is "q0012", so the run is "q0019" down to "q0012",
+  // and the scan stops at "q0011", the next key below the bound.
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  const std::string lower = QKey(12);
+  const Slice lower_slice(lower);
+  ReadOptions ro;
+  ro.iterate_lower_bound = &lower_slice;
+  ASSERT_EQ("", SeekForPrevLast(QKey(19), ro));
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(19), QKey(12), QKey(12), false}}),
+            ActiveMarks(kReverse));
+  // A scan without the bound uses the mark and still finds "q0009".
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  ASSERT_EQ(1, tracker.reverse_uses);
+}
+
+TEST_F(DBReverseHeadMarkTest, RunToEndOfDataEndsMarkAtLowestTombstone) {
+  // When a reverse run reaches the end of the data, the scan stops at the
+  // lowest tombstone of the run, and the mark excludes it. In this test every
+  // key from "q0000" to "q0009" is deleted.
+  DestroyAndReopen(HeadMarkOptions());
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(QKey(i), "v"));
+  }
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  ASSERT_EQ("", SeekForPrevLast(QKey(9)));
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(9), QKey(0), QKey(0), false}}),
+            ActiveMarks(kReverse));
+  HeadMarkTracker tracker;
+  ASSERT_EQ("", SeekForPrevLast(QKey(9)));
+  ASSERT_EQ(1, tracker.reverse_uses);
+  // A put inside the claim lowers the mark, and the next scan finds the key.
+  ASSERT_OK(Put(QKey(5), "late"));
+  ASSERT_EQ(QKey(5), SeekForPrevLast(QKey(9)));
+}
+
+TEST_F(DBReverseHeadMarkTest, ExtensionInsideClaimChecksOnlyItsRun) {
+  DestroyAndReopen(HeadMarkOptions());
+  for (int i = 0; i < 30; ++i) {
+    ASSERT_OK(Put(QKey(i), "v"));
+  }
+  for (int i = 10; i < 30; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  // Two late puts after the snapshot. The snapshot scan claims ("q0009",
+  // "q0029"], and its walk down from "q0029" stops at "q0025".
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_OK(Put(QKey(15), "late"));
+  ASSERT_OK(Put(QKey(25), "late"));
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(29), ro));
+  db_->ReleaseSnapshot(snap);
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(29), QKey(9), QKey(25), false}}),
+            ActiveMarks(kReverse));
+
+  // A newer scan is sent by the mark to "q0025", sees "q0025" down to "q0016"
+  // deleted and stops at the live "q0015", inside the claim. The mark becomes
+  // usable only down to "q0015". The deletions are repeated above the
+  // snapshot scan's converted range tombstone, so that the scan counts them.
+  for (int i = 16; i < 26; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  ASSERT_EQ(QKey(15), SeekForPrevLast(QKey(29)));
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(29), QKey(9), QKey(15), false}}),
+            ActiveMarks(kReverse));
+  ASSERT_EQ(QKey(15), SeekForPrevLast(QKey(29)));
+}
+
+// A prefix scan that leaves its prefix backward stops at a key of another
+// prefix. Its mark must not claim the keys between that key and the run: an
+// SST prefix filter can hide a whole prefix there.
+TEST_F(DBReverseHeadMarkTest, PrefixScanMarkStaysInsidePrefix) {
+  Options options = HeadMarkOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(1));
+  options.statistics = CreateDBStatistics();
+  BlockBasedTableOptions table_options;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+  table_options.whole_key_filtering = false;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+  // The SST holds only prefix "b".
+  ASSERT_OK(Put("b5", "vb"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("a0", "va"));
+  for (const char* k : {"a1", "a2", "c1", "c2"}) {
+    ASSERT_OK(Delete(k));
+  }
+  HeadMarkTracker tracker;
+
+  // The prefix filter makes the SST skip the seek. The scan visits "c2" and
+  // "c1", then stops at "a2" outside its prefix.
+  ReadOptions prefix_ro;
+  prefix_ro.prefix_same_as_start = true;
+  ASSERT_EQ("", SeekForPrevLast("c9", prefix_ro));
+  ASSERT_GT(options.statistics->getTickerCount(NON_LAST_LEVEL_SEEK_FILTERED) +
+                options.statistics->getTickerCount(LAST_LEVEL_SEEK_FILTERED),
+            0);
+  // The mark ends at the lowest tombstone of the run, not at "a2".
+  ASSERT_EQ(std::vector<HeadMarkView>({{"c9", "c1", "c1", false}}),
+            ActiveMarks(kReverse));
+
+  // A total order scan finds "b5", and no conversion hides it.
+  ReadOptions total_ro;
+  total_ro.total_order_seek = true;
+  ASSERT_EQ("b5", SeekForPrevLast("c9", total_ro));
+  ASSERT_EQ("vb", Get("b5"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ("vb", Get("b5"));
+  ASSERT_EQ("b5", SeekForPrevLast("c9", total_ro));
+}
+
+TEST_F(DBReverseHeadMarkTest, SeekToLastPublishesExclusiveMark) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  // "q0020" is the upper bound. It is live, but the scan excludes it.
+  ASSERT_OK(Put(QKey(20), "v"));
+  ASSERT_EQ(QKey(9), SeekToLastBelow(QKey(20)));
+  const std::vector<HeadMarkView> expected(
+      {{QKey(20), QKey(9), QKey(9), false, /*start_exclusive=*/true}});
+  ASSERT_EQ(expected, ActiveMarks(kReverse));
+
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(9), SeekToLastBelow(QKey(20)));
+  ASSERT_EQ(1, tracker.reverse_uses);
+  // SeekForPrev("q0020") includes "q0020", which the mark does not claim, so
+  // it must not use the mark.
+  ASSERT_EQ(QKey(20), SeekForPrevLast(QKey(20)));
+  ASSERT_EQ(1, tracker.reverse_uses);
+  // A put at the exclusive start does not change the mark.
+  ASSERT_OK(Put(QKey(20), "v2"));
+  ASSERT_EQ(expected, ActiveMarks(kReverse));
+}
+
+TEST_F(DBReverseHeadMarkTest, ValidationSkipsVersionsOfExclusiveStart) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  ASSERT_OK(Put(QKey(20), "v"));
+  // The scan reads at this snapshot. After it, more than kMaxHeadMarkWalk
+  // (16384) versions of the upper bound "q0020" make the validation walk run.
+  // The claim excludes "q0020", so the walk must step over none of them.
+  const Snapshot* snap = db_->GetSnapshot();
+  constexpr int kVersions = 17000;
+  WriteBatch batch;
+  for (int i = 0; i < kVersions; ++i) {
+    ASSERT_OK(batch.Put(QKey(20), "v"));
+  }
+  ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  std::vector<std::string> steps;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTable::ValidateHeadMarkRange:Step", [&](void* arg) {
+        steps.push_back(static_cast<Slice*>(arg)->ToString());
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::string upper_bound = QKey(20);
+  const Slice ub(upper_bound);
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ro.iterate_upper_bound = &ub;
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    iter->SeekToLast();
+    ASSERT_OK(iter->status());
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(QKey(9), iter->key());
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  db_->ReleaseSnapshot(snap);
+  // The walk visits the put and the deletion of each key from "q0019" down to
+  // "q0010", and stops at "q0009", the end of the claim.
+  std::vector<std::string> expected;
+  for (int i = 19; i >= 10; --i) {
+    expected.push_back(QKey(i));
+    expected.push_back(QKey(i));
+  }
+  expected.push_back(QKey(9));
+  ASSERT_EQ(expected, steps);
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(20), QKey(9), QKey(9), false,
+                                        /*start_exclusive=*/true}}),
+            ActiveMarks(kReverse));
+}
+
+TEST_F(DBReverseHeadMarkTest, ReverseMarkDoesNotChangePinnedVersion) {
+  // The reverse form of HeadMarkDoesNotChangePinnedVersionAfterIngestion:
+  // iterator A keeps the Version from before an ingestion and reads at the
+  // ingested file's sequence number.
+  Options options = HeadMarkOptions();
+  DestroyAndReopen(options);
+  CreateColumnFamilies({"other"}, options);
+  // An SST file holds the live key q0005. The memtable deletes the keys
+  // around it, and q0000 is live.
+  ASSERT_OK(Put(QKey(5), "old"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put(QKey(0), "v"));
+  for (int i = 1; i < 10; ++i) {
+    if (i != 5) {
+      ASSERT_OK(Delete(QKey(i)));
+    }
+  }
+  std::unique_ptr<Iterator> a =
+      IteratorWithOldVersionAtNewSeq(options, /*deleted=*/QKey(5));
+  ASSERT_NE(nullptr, a);
+
+  HeadMarkTracker tracker;
+  // A still sees q0005, and its publish is refused.
+  a->SeekForPrev(QKey(9));
+  ASSERT_OK(a->status());
+  ASSERT_TRUE(a->Valid());
+  ASSERT_EQ(QKey(5), a->key().ToString());
+  ASSERT_EQ(std::vector<HeadMarkPublishResult>(
+                {HeadMarkPublishResult::kRefusedIngest}),
+            tracker.results);
+  ASSERT_TRUE(ActiveMarks(kReverse).empty());
+
+  // A new scan sees the ingested delete and publishes (q0000, q0009].
+  ASSERT_EQ(QKey(0), SeekForPrevLast(QKey(9)));
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(9), QKey(0), QKey(0), false}}),
+            ActiveMarks(kReverse));
+
+  // A must not use that mark.
+  tracker.Reset();
+  a->SeekForPrev(QKey(9));
+  ASSERT_OK(a->status());
+  ASSERT_TRUE(a->Valid());
+  ASSERT_EQ(QKey(5), a->key().ToString());
+  ASSERT_EQ(0, tracker.reverse_uses);
+  ASSERT_EQ(QKey(0), SeekForPrevLast(QKey(9)));
+  ASSERT_EQ(1, tracker.reverse_uses);
+}
+
+TEST_F(DBReverseHeadMarkTest, LatePutLowersReverseMark) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  // A late item inside the claim moves the claim's lower end up to it.
+  ASSERT_OK(Put(QKey(15), "late"));
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(19), QKey(15), QKey(15), true}}),
+            ActiveMarks(kReverse));
+  ASSERT_EQ(QKey(15), SeekForPrevLast(QKey(19)));
+
+  // After the consumer deletes it, one tombstone extends the lowered mark.
+  HeadMarkTracker tracker;
+  ASSERT_OK(Delete(QKey(15)));
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kExtended},
+      tracker.results);
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(19), QKey(9), QKey(9), false}}),
+            ActiveMarks(kReverse));
+}
+
+TEST_F(DBReverseHeadMarkTest, ScanSentByReverseMarkExtendsIt) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  for (int i = 6; i < 10; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(5), SeekForPrevLast(QKey(19)));
+  ASSERT_EQ(1, tracker.reverse_uses);
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kExtended},
+      tracker.results);
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(19), QKey(5), QKey(5), false}}),
+            ActiveMarks(kReverse));
+}
+
+TEST_F(DBReverseHeadMarkTest, ReverseValidationStopsAtNewerLiveEntry) {
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  // A put after the scan's snapshot is invisible to the scan, so the scan
+  // claims it. The walk goes down from "q0019" and stops at it.
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_OK(Put(QKey(12), "late"));
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19), ro));
+  db_->ReleaseSnapshot(snap);
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(19), QKey(9), QKey(12), false}}),
+            ActiveMarks(kReverse));
+  ASSERT_EQ(QKey(12), SeekForPrevLast(QKey(19)));
+}
+
+TEST_F(DBReverseHeadMarkTest, CascadeReachesExclusiveStart) {
+  // A newer level's range tombstone moves a reverse seek to the tombstone's
+  // start, which the seek then excludes. If that start equals the exclusive
+  // start of an older level's mark, the mark is usable.
+  Options options = HeadMarkOptions();
+  options.max_write_buffer_number = 4;
+  options.min_write_buffer_number_to_merge = 3;
+  DestroyAndReopen(options);
+  MakeReverseQueue();
+  ASSERT_OK(Put(QKey(20), "v"));
+  // The mark ("q0009", "q0020") goes into the memtable that becomes
+  // immutable.
+  ASSERT_EQ(QKey(9), SeekToLastBelow(QKey(20)));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                             QKey(20), QKey(30)));
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(25)));
+  ASSERT_EQ(1, tracker.reverse_uses);
+}
+
+TEST_F(DBReverseHeadMarkTest, ConversionEndsAtMarkUsableEnd) {
+  // The first conversion uses the effective seek target as its exclusive
+  // upper end. In this test the active memtable's reverse mark moves each
+  // later seek, so each later conversion ends at that mark's usable end, the
+  // live key where the scan before stopped. The scan did not read the keys
+  // above it. The tombstone at the usable end stays a point tombstone, and
+  // the converted ranges of one queue stay apart and do not nest.
+  for (const bool seek_to_last : {false, true}) {
+    SCOPED_TRACE(seek_to_last ? "SeekToLast" : "SeekForPrev");
+    DestroyAndReopen(HeadMarkOptions());
+    MakeReverseQueue();
+    const std::string target = seek_to_last ? QKey(20) : QKey(19);
+    auto scan = [&]() {
+      return seek_to_last ? SeekToLastBelow(target) : SeekForPrevLast(target);
+    };
+    // No mark moved the first scan's seek, so the seek target is the
+    // exclusive upper end of its conversion.
+    const SequenceNumber s1 = db_->GetLatestSequenceNumber();
+    ASSERT_EQ(QKey(9), scan());
+    ASSERT_EQ(RangeDels({{QKey(10), target, s1}}), ActiveRangeDels());
+
+    for (int i = 6; i < 10; ++i) {
+      ASSERT_OK(Delete(QKey(i)));
+    }
+    const SequenceNumber s2 = db_->GetLatestSequenceNumber();
+    HeadMarkTracker tracker;
+    ASSERT_EQ(QKey(5), scan());
+    ASSERT_EQ(1, tracker.reverse_uses);
+    ASSERT_EQ(RangeDels({{QKey(6), QKey(9), s2}, {QKey(10), target, s1}}),
+              ActiveRangeDels());
+
+    for (int i = 2; i < 6; ++i) {
+      ASSERT_OK(Delete(QKey(i)));
+    }
+    const SequenceNumber s3 = db_->GetLatestSequenceNumber();
+    ASSERT_EQ(QKey(1), scan());
+    ASSERT_EQ(RangeDels({{QKey(2), QKey(5), s3},
+                         {QKey(6), QKey(9), s2},
+                         {QKey(10), target, s1}}),
+              ActiveRangeDels());
+  }
+}
+
+TEST_F(DBReverseHeadMarkTest, ConversionEndsAtUsableEndWithUserRangeDeletion) {
+  // A user range deletion starts below or at the mark's usable end "q0009".
+  // Either way, the conversion ends at "q0009".
+  for (const bool starts_at_usable_end : {false, true}) {
+    SCOPED_TRACE(starts_at_usable_end ? "starts at q0009" : "starts below");
+    DestroyAndReopen(HeadMarkOptions());
+    MakeReverseQueue();
+    const SequenceNumber s1 = db_->GetLatestSequenceNumber();
+    ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+    const int del_start = starts_at_usable_end ? 9 : 8;
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               QKey(del_start), QKey(11)));
+    const SequenceNumber d = db_->GetLatestSequenceNumber();
+    // Delete the 4 keys below the range deletion, so the run is long enough.
+    for (int i = del_start - 4; i < del_start; ++i) {
+      ASSERT_OK(Delete(QKey(i)));
+    }
+    const SequenceNumber s2 = db_->GetLatestSequenceNumber();
+    ASSERT_EQ(QKey(del_start - 5), SeekForPrevLast(QKey(19)));
+    RangeDels expected;
+    if (starts_at_usable_end) {
+      // The conversion is [q0005, q0009).
+      expected = {{QKey(5), QKey(9), s2},
+                  {QKey(9), QKey(10), d},
+                  {QKey(10), QKey(11), d},
+                  {QKey(10), QKey(11), s1},
+                  {QKey(11), QKey(19), s1}};
+    } else {
+      // The conversion is [q0004, q0009).
+      expected = {{QKey(4), QKey(8), s2},  {QKey(8), QKey(9), s2},
+                  {QKey(8), QKey(9), d},   {QKey(9), QKey(10), d},
+                  {QKey(10), QKey(11), d}, {QKey(10), QKey(11), s1},
+                  {QKey(11), QKey(19), s1}};
+    }
+    ASSERT_EQ(expected, ActiveRangeDels());
+  }
+}
+
+TEST_F(DBReverseHeadMarkTest, ConversionAfterLoweredMark) {
+  // A late put lowers the mark into the first scan's converted tombstone.
+  // The next conversion ends at the mark's usable end "q0015", so it
+  // overlaps the first scan's tombstone only in ["q0010", "q0015"). That is
+  // correct: both ranges are deleted at their seqnos.
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  const SequenceNumber s1 = db_->GetLatestSequenceNumber();
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  ASSERT_OK(Put(QKey(15), "late"));
+  ASSERT_EQ(QKey(15), SeekForPrevLast(QKey(19)));
+  ASSERT_OK(Delete(QKey(15)));
+  for (int i = 6; i < 10; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  const SequenceNumber s3 = db_->GetLatestSequenceNumber();
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(5), SeekForPrevLast(QKey(19)));
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kExtended},
+      tracker.results);
+  ASSERT_EQ(RangeDels({{QKey(6), QKey(10), s3},
+                       {QKey(10), QKey(15), s3},
+                       {QKey(10), QKey(15), s1},
+                       {QKey(15), QKey(19), s1}}),
+            ActiveRangeDels());
+}
+
+TEST_F(DBReverseHeadMarkTest, ConversionLimitAppliesOnlyInSeekDirection) {
+  // An immutable memtable's reverse mark moves a SeekForPrev() down to q0030
+  // in that memtable and the older levels. The active memtable holds the live
+  // keys q0020 and q0040 and deletes q0025-q0035, from the largest down. The
+  // seek lands at q0040. Prev() crosses the run, but the scan did not read
+  // the older levels above q0030, so it converts only [q0025, q0030). Next()
+  // switches direction, which seeks every level again from q0020, so the run
+  // read forward converts all of [q0025, q0040). Its first tombstone q0025
+  // has the scan's own seqno, so the range from Prev() does not cover it.
+  Options options = HeadMarkOptions();
+  // Keep the first memtable in memory after the switch below.
+  options.max_write_buffer_number = 4;
+  options.min_write_buffer_number_to_merge = 2;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put(QKey(30), "v"));
+  for (int i = 41; i < 50; ++i) {
+    ASSERT_OK(Put(QKey(i), "v"));
+  }
+  for (int i = 41; i < 50; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  ASSERT_EQ(QKey(30), SeekForPrevLast(QKey(49)));
+  ASSERT_EQ(std::vector<HeadMarkView>({{QKey(49), QKey(30), QKey(30), false}}),
+            ActiveMarks(kReverse));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(Put(QKey(20), "v"));
+  ASSERT_OK(Put(QKey(40), "v"));
+  for (int i = 35; i >= 25; --i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+
+  HeadMarkTracker tracker;
+  std::vector<std::pair<std::string, std::string>> ranges;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MemTable::AddLogicallyRedundantRangeTombstone:AddRange", [&](void* arg) {
+        const auto* range = static_cast<std::pair<Slice, Slice>*>(arg);
+        ranges.emplace_back(range->first.ToString(), range->second.ToString());
+      });
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->SeekForPrev(QKey(49));
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(QKey(40), iter->key().ToString());
+  ASSERT_EQ(1, tracker.reverse_uses);
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(QKey(20), iter->key().ToString());
+  std::vector<std::pair<std::string, std::string>> expected = {
+      {QKey(25), QKey(30)}};
+  ASSERT_EQ(expected, ranges);
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(QKey(40), iter->key().ToString());
+  ASSERT_OK(iter->status());
+  expected.emplace_back(QKey(25), QKey(40));
+  ASSERT_EQ(expected, ranges);
+}
+
+TEST_F(DBReverseHeadMarkTest, ImmutableMemtableMarkEndsConversion) {
+  // The mark that moves the seek is in an immutable memtable. It moved the
+  // seek of that memtable and of the older levels down to its usable end
+  // "q0009", so the scan did not read those levels above "q0009", and the
+  // active memtable's conversion ends there too.
+  Options options = HeadMarkOptions();
+  options.max_write_buffer_number = 4;
+  options.min_write_buffer_number_to_merge = 3;
+  DestroyAndReopen(options);
+  MakeReverseQueue();
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                             QKey(12), QKey(13)));
+  const SequenceNumber d = db_->GetLatestSequenceNumber();
+  for (int i = 6; i < 10; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  const SequenceNumber s2 = db_->GetLatestSequenceNumber();
+  HeadMarkTracker tracker;
+  ASSERT_EQ(QKey(5), SeekForPrevLast(QKey(19)));
+  ASSERT_EQ(1, tracker.reverse_uses);
+  ASSERT_EQ(RangeDels({{QKey(6), QKey(9), s2}, {QKey(12), QKey(13), d}}),
+            ActiveRangeDels());
+}
+
+TEST_F(DBReverseHeadMarkTest, RefusedPublishStillEndsConversionAtMark) {
+  // While the scan seeks, a late put inside the claim lowers the mark that
+  // moved the seek, so the scan's publish is refused. The scan's snapshot
+  // does not see the put, and its conversion still ends at the usable end of
+  // the mark that moved its seek.
+  DestroyAndReopen(HeadMarkOptions());
+  MakeReverseQueue();
+  const SequenceNumber s1 = db_->GetLatestSequenceNumber();
+  ASSERT_EQ(QKey(9), SeekForPrevLast(QKey(19)));
+  for (int i = 6; i < 10; ++i) {
+    ASSERT_OK(Delete(QKey(i)));
+  }
+  const SequenceNumber s2 = db_->GetLatestSequenceNumber();
+  bool put_done = false;
+  std::vector<HeadMarkPublishResult> results;
+  SyncPoint::GetInstance()->SetCallBack(
+      "MergingIterator::SeekForPrevOverHeadMark", [&](void*) {
+        if (!put_done) {
+          put_done = true;
+          EXPECT_OK(Put(QKey(18), "late"));
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBIter::MaybePublishHeadMark:Result", [&](void* arg) {
+        results.push_back(*static_cast<HeadMarkPublishResult*>(arg));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  {
+    // The callbacks use local variables, so this Defer turns them off even
+    // when the assertion fails.
+    Defer clear_callbacks([] {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+    });
+    ASSERT_EQ(QKey(5), SeekForPrevLast(QKey(19)));
+  }
+  ASSERT_TRUE(put_done);
+  ASSERT_EQ(
+      std::vector<HeadMarkPublishResult>{
+          HeadMarkPublishResult::kRefusedChanged},
+      results);
+  ASSERT_EQ(RangeDels({{QKey(6), QKey(9), s2}, {QKey(10), QKey(19), s1}}),
+            ActiveRangeDels());
+  ASSERT_EQ(QKey(18), SeekForPrevLast(QKey(19)));
+}
+
+TEST_F(DBReverseHeadMarkTest, CompactionFilterSkipHidesKeyFromMarkedScan) {
+  // This test documents a known limitation (see the Limits paragraph of
+  // MemTableHeadMark). A compaction filter that returns kRemoveAndSkipUntil
+  // drops the entries that it skips, also a point tombstone. An older value of
+  // that key in a level below the compaction then becomes visible again, with
+  // no new sequence number. Compaction does not clear the marks. A reverse mark
+  // claims its seek key, which its converted range tombstone leaves out, so
+  // Get() returns the key while a SeekForPrev() that uses the mark skips it.
+  class SkipFilter : public CompactionFilter {
+   public:
+    Decision FilterV2(int /*level*/, const Slice& key, ValueType /*type*/,
+                      const Slice& /*existing_value*/,
+                      std::string* /*new_value*/,
+                      std::string* skip_until) const override {
+      if (enabled && key == "a0") {
+        *skip_until = "c";
+        return Decision::kRemoveAndSkipUntil;
+      }
+      return Decision::kKeep;
+    }
+    const char* Name() const override { return "SkipFilter"; }
+    // MoveFilesToLevel() also compacts, so the filter skips only when the
+    // test enables it.
+    std::atomic<bool> enabled{false};
+  };
+  SkipFilter filter;
+  Options options = HeadMarkOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.compaction_filter = &filter;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("b", "old"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(3);
+  ASSERT_OK(Put("a0", "input"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(Delete("a0"));
+  ASSERT_OK(Put("0", "live"));
+  {
+    HeadMarkTracker tracker;
+    ASSERT_EQ("0", SeekForPrevLast("b"));
+    ASSERT_EQ(
+        std::vector<HeadMarkPublishResult>{HeadMarkPublishResult::kPublished},
+        tracker.results);
+  }
+  // The mark claims ("0", "b"]; the converted range ["a0", "b") leaves out b.
+  ASSERT_EQ(std::vector<HeadMarkView>({{"b", "0", "0", false}}),
+            ActiveMarks(kReverse));
+  ColumnFamilyMetaData meta;
+  db_->GetColumnFamilyMetaData(&meta);
+  ASSERT_EQ(1, meta.levels[1].files.size());
+  filter.enabled = true;
+  ASSERT_OK(db_->CompactFiles(CompactionOptions(),
+                              {meta.levels[1].files[0].name}, 2));
+  ASSERT_EQ(0, NumTableFilesAtLevel(1));
+  ASSERT_EQ(1, NumTableFilesAtLevel(3));
+  ASSERT_EQ("old", Get("b"));
+  // The limitation: the mark still skips b.
+  HeadMarkTracker tracker;
+  ASSERT_EQ("0", SeekForPrevLast("b"));
+  ASSERT_EQ(1, tracker.reverse_uses);
+}
+
+TEST_F(DBReverseHeadMarkTest, RandomReverseQueueConversionsDoNotNest) {
+  // A queue consumed from the largest key, with deletes among the 4 largest
+  // live items and no late items. After every scan, the scan returns the
+  // largest live item and no fragment of the active memtable has more than one
+  // seqno. At the end, Get() of every key matches the model, so no conversion
+  // deleted a live key. Each seek kind starts with a fresh
+  // database, so each one publishes and reuses its own marks and converted
+  // ranges.
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  for (const bool seek_to_last : {false, true}) {
+    SCOPED_TRACE(seek_to_last ? "SeekToLast" : "SeekForPrev");
+    Options options = HeadMarkOptions();
+    // See RandomQueueMatchesModel.
+    options.max_write_buffer_number = 64;
+    options.disable_auto_compactions = false;
+    options.statistics = CreateDBStatistics();
+    DestroyAndReopen(options);
+    std::set<int> live;
+    std::set<int> deleted;
+    // Items are added downward from 9999.
+    int next = 9999;
+    HeadMarkTracker tracker;
+    for (int step = 0; step < 4000; ++step) {
+      const uint32_t op = rnd.Uniform(100);
+      if (op < 45) {
+        if (next >= 0) {
+          ASSERT_OK(Put(QKey(next), "v"));
+          live.insert(next--);
+        }
+      } else if (op < 90) {
+        if (!live.empty()) {
+          const int skip = static_cast<int>(
+              rnd.Uniform(static_cast<int>(std::min<size_t>(4, live.size()))));
+          auto it = std::prev(live.end(), 1 + skip);
+          ASSERT_OK(Delete(QKey(*it)));
+          deleted.insert(*it);
+          live.erase(it);
+        }
+      } else if (op < 91) {
+        ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+      } else {
+        const std::string expected = live.empty() ? "" : QKey(*live.rbegin());
+        ASSERT_EQ(expected,
+                  seek_to_last ? SeekToLastBelow("r") : SeekForPrevLast("r"));
+        ASSERT_NO_FATAL_FAILURE(AssertOneSeqnoPerFragment());
+      }
+    }
+    for (const int k : live) {
+      ASSERT_EQ("v", Get(QKey(k))) << k;
+    }
+    for (const int k : deleted) {
+      ASSERT_EQ("NOT_FOUND", Get(QKey(k))) << k;
+    }
+    ASSERT_GT(tracker.reverse_uses, 0);
+  }
+}
+
+TEST_F(DBReverseHeadMarkTest, RandomReverseQueueMatchesModel) {
+  // A consumer deletes the largest live items, a producer adds items below
+  // them, and late items arrive above them. Scans use SeekForPrev() or
+  // SeekToLast() with an upper bound, and must return the largest live item.
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+  Options options = HeadMarkOptions();
+  // See RandomQueueMatchesModel.
+  options.max_write_buffer_number = 64;
+  options.disable_auto_compactions = false;
+  DestroyAndReopen(options);
+
+  std::set<int> live;
+  // Items are added downward from 9999.
+  int next = 9999;
+  HeadMarkTracker tracker;
+  for (int step = 0; step < 20000; ++step) {
+    const uint32_t op = rnd.Uniform(100);
+    if (op < 40) {
+      if (next >= 0) {
+        ASSERT_OK(Put(QKey(next), "v"));
+        live.insert(next--);
+      }
+    } else if (op < 75) {
+      if (!live.empty()) {
+        ASSERT_OK(Delete(QKey(*live.rbegin())));
+        live.erase(std::prev(live.end()));
+      }
+    } else if (op < 80) {
+      // A late item inside the dead top. One in four lands on "q9999", the
+      // excluded start of the marks that SeekToLastBelow("q9999") makes.
+      const int top = live.empty() ? next : *live.rbegin();
+      if (top < 9999) {
+        const int k = rnd.OneIn(4)
+                          ? 9999
+                          : top + 1 + static_cast<int>(rnd.Uniform(9999 - top));
+        ASSERT_OK(Put(QKey(k), "late"));
+        live.insert(k);
+      }
+    } else if (op < 81) {
+      ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    } else if (op < 82) {
+      ASSERT_OK(Flush());
+    } else {
+      const std::string expected = live.empty() ? "" : QKey(*live.rbegin());
+      if (op < 91) {
+        ASSERT_EQ(expected, SeekForPrevLast(QKey(9999)));
+      } else if (op < 95) {
+        // The upper bound "q9999" makes a mark whose start "q9999" is
+        // excluded, and items can be written at "q9999". The inclusive
+        // SeekForPrev("q9999") above must not use such a mark to skip a live
+        // "q9999".
+        auto below = live.lower_bound(9999);
+        const std::string expected_below =
+            below == live.begin() ? "" : QKey(*std::prev(below));
+        ASSERT_EQ(expected_below, SeekToLastBelow(QKey(9999)));
+      } else {
+        ASSERT_EQ(expected, SeekToLastBelow("r"));
+      }
+    }
+  }
+  ASSERT_GT(tracker.reverse_uses, 0);
+  ASSERT_FALSE(tracker.results.empty());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

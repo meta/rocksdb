@@ -245,8 +245,9 @@ class CompactionFilter : public Customizable {
     // * With ColumnFamilyOptions::min_tombstones_for_range_conversion > 0,
     //   memtables keep head marks over deleted key ranges. Compaction does
     //   not update them, so after a skip exposes an older value inside such a
-    //   range, a scan that starts with Seek() can miss that value while Get()
-    //   returns it, until the memtable that holds the mark is flushed.
+    //   range, a scan that starts with Seek(), SeekForPrev(), or SeekToLast()
+    //   with iterate_upper_bound can miss that value while Get() returns it,
+    //   until the memtable that holds the mark is flushed.
     kRemoveAndSkipUntil,
 
     // Used internally by the old stacked BlobDB implementation. Returning this

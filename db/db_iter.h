@@ -456,7 +456,8 @@ class DBIter final : public Iterator {
   // Set saved_key_ to the seek key to target, with proper sequence number set.
   // It might get adjusted if the seek key is larger than iterator upper bound.
   // target does not have timestamp.
-  void SetSavedKeyToSeekForPrevTarget(const Slice& target);
+  // Returns true if it clamped the seek key to iterate_upper_bound.
+  bool SetSavedKeyToSeekForPrevTarget(const Slice& target);
   bool FindValueForCurrentKey(bool& found_visible);
   bool FindValueForCurrentKeyUsingSeek();
   bool FindUserKeyBeforeSavedKey();
@@ -609,30 +610,54 @@ class DBIter final : public Iterator {
   }
 
   // Head marks (see MemTableHeadMark in db/memtable.h). Seeks iter_ to
-  // saved_key_, using marks if use_head_marks_ is true and no scan options
-  // are set. If publish_head_marks_ is true, remembers the seek key and
-  // starts watching for a run of tombstones right after the seek.
-  void SeekInnerIterWithHeadMarks();
+  // saved_key_ (Seek() for kForward, SeekForPrev() for kReverse), using marks
+  // if use_head_marks_ is true and no scan options are set. If
+  // publish_head_marks_ is true, remembers the seek key and starts watching
+  // for a run of tombstones right after the seek.
+  void SeekInnerIterWithHeadMarks(HeadMarkDirection dir, bool start_exclusive);
 
   // Publishes a head mark into the active memtable if the run of tombstones
   // started right after the seek. Called by MaybeInsertRangeTombstone() when a
-  // run of tombstones ends, before the conversion check. The mark is [seek key,
-  // end_key), where the seek key is the Seek() target after iterate_lower_bound
-  // is applied. It can start before the first tombstone, so a later seek also
-  // skips the gap before it. The converted range tombstone instead starts at
-  // the first tombstone of the run, and both end at end_key. An extension keeps
-  // the start of the mark it extends. A new mark needs at least
-  // min_tombstones_for_range_conversion_ tombstones. If a lowered mark of the
-  // active memtable moved the seek and is still current, a shorter run (even
-  // one tombstone) can extend it: the keys after the lowered end are often
-  // covered by an earlier converted range tombstone, which this scan does not
-  // count (see MemTableHeadMark::lowered).
-  // end_key is the same exclusive end as for the conversion. It is the key of
-  // the visible value or merge operand that ends the run, after its value is
-  // prepared, or saved_key_ when the scan stops at a prefix boundary, at the
-  // upper bound or at the end of the data. saved_key_ can have only entries
-  // newer than the read sequence number; the mark does not claim it. A scan
-  // that fails before its run ends publishes no mark.
+  // run of tombstones ends, before the conversion check. A new mark starts at
+  // the effective seek key, which is the seek target after iterate_lower_bound
+  // or iterate_upper_bound is applied. In a forward scan, that key can lie
+  // before the first tombstone, so a later seek also skips the gap before it,
+  // while the converted range tombstone starts at the first tombstone of the
+  // run. An extension keeps the start of the mark it extends. A new mark needs
+  // at least min_tombstones_for_range_conversion_ tombstones. If a lowered mark
+  // of the active memtable moved the seek and is still current, a shorter run
+  // (even one tombstone) can extend it: the keys after the lowered end are
+  // often covered by an earlier converted range tombstone, which this scan does
+  // not count (see MemTableHeadMark::lowered).
+  //
+  // Endpoints. end_key is always the exclusive upper end of the conversion
+  // range. In a forward scan, the run also ends at end_key, and the mark is
+  // [seek key, end_key). end_key is the key of the visible value or merge
+  // operand that ends the run, after its value is prepared, or saved_key_ when
+  // the scan stops at a prefix boundary, at the upper bound or at the end of
+  // the data. saved_key_ can have only entries newer than the read sequence
+  // number; neither the mark nor the converted range covers it.
+  //
+  // In a reverse scan, the run goes down from the seek. During the first run
+  // after the seek, range_tomb_end_key_ holds the effective seek target, which
+  // is end_key, and range_tomb_first_key_ holds the lowest tombstone of the
+  // run. The run ends at its low side, at the stop key: saved_key_, the key
+  // where the backward scan stopped, or the lowest tombstone of the run if
+  // saved_key_ is outside the seek prefix. The mark is (stop key, seek key],
+  // and the conversion is [lowest tombstone, end_key). For example, a first
+  // SeekForPrev("q0019") that finds the tombstones "q0019" down to "q0010" and
+  // stops at the live key "q0009" publishes the mark ("q0009", "q0019"] and
+  // converts ["q0010", "q0019"). A new reverse mark excludes its start if the
+  // seek was clamped to iterate_upper_bound. If a reverse mark moved the
+  // seek, MaybeInsertRangeTombstone() ends the conversion at the mark's
+  // usable end, because the scan did not read the keys above it. In the
+  // example, the mark is usable down to "q0009". After "q0006" to "q0009" are
+  // deleted, the mark moves the next SeekForPrev("q0019") to "q0009", and the
+  // scan stops at the live key "q0005". It converts ["q0006", "q0009")
+  // instead of ["q0006", "q0019"), and the tombstone of "q0009" stays a point
+  // tombstone.
+  //
+  // A scan that fails before its run ends publishes no mark.
   void MaybePublishHeadMark(const Slice& end_key);
 
   // Returns true if there is no prefix constraint (prefix_ not set) or
@@ -833,20 +858,28 @@ class DBIter final : public Iterator {
   bool publish_head_marks_ = false;
   // Valid if publish_head_marks_.
   const HeadMarkIngestState* head_mark_ingest_ = nullptr;
-  // How a scan publishes a mark: an eligible Seek() (see
-  // SeekInnerIterWithHeadMarks()) sets this flag and saves its seek key in
-  // head_mark_start_. The first run of tombstones after the seek ends in one
-  // of two ways, and both call MaybeInsertRangeTombstone():
-  // - A visible value, a merge operand or a prefix boundary ends the run, and
-  //   FlushPendingTombstoneRun() calls it.
-  // - The scan reaches the upper bound or the end of the data, and
+  // How a scan publishes a mark: an eligible Seek() or SeekForPrev() (see
+  // SeekInnerIterWithHeadMarks()) sets this flag, head_mark_dir_ and the seek
+  // key in head_mark_start_. The first run of tombstones after the seek ends
+  // in one of two ways, and both call MaybeInsertRangeTombstone():
+  // - FlushPendingTombstoneRun() calls it. A forward run ends this way at a
+  //   visible value, a merge operand or a prefix boundary. A reverse run is
+  //   inserted only this way (see PrevInternal()): at a visible value, a
+  //   merge operand, a prefix boundary, the lower bound or the end of the
+  //   data.
+  // - A forward scan reaches the upper bound or the end of the data, and
   //   FindNextUserEntryInternal() calls it with the last tracked key if a run
   //   exists and the iterator status is OK.
-  // MaybeInsertRangeTombstone() tries to publish [head_mark_start_, end of
-  // the run) before it checks the conversion threshold. That attempt, Next(),
-  // Prev() and a reset of the tombstone tracking clear the flag, so a scan
-  // tries at most once per seek.
+  // MaybeInsertRangeTombstone() tries to publish a mark from head_mark_start_
+  // to the end of the run, in the seek's direction, before it checks the
+  // conversion threshold (see MaybePublishHeadMark() for the end of a reverse
+  // mark). That attempt, Next(), Prev() and a reset of the tombstone tracking
+  // clear the flag, so a scan tries at most once per seek.
   bool head_mark_candidate_ = false;
+  // The direction of the current scan's seek, and whether its seek key is
+  // excluded (SeekForPrev() clamped to iterate_upper_bound).
+  HeadMarkDirection head_mark_dir_ = HeadMarkDirection::kForward;
+  bool head_mark_start_exclusive_ = false;
   // The seek key of the current scan (saved_key_ at the seek), if
   // publish_head_marks_. A mark that moves the seek does not change it.
   IterKey head_mark_start_;
@@ -854,10 +887,13 @@ class DBIter final : public Iterator {
   const MemTableHeadMark* head_mark_sender_ = nullptr;
   // The usable end of the last mark, of any memtable, that moved the current
   // seek, or empty if no mark moved it (see
-  // InternalIteratorBase::SeekWithHeadMarks()). The seek did not read the
-  // keys below it in the levels that the marks moved, so every conversion of
-  // a forward scan starts at or after it (see MaybeInsertRangeTombstone()).
-  // Every seek clears it (ResetSeekState()).
+  // InternalIteratorBase::SeekWithHeadMarks()), and the direction of that
+  // seek. The seek did not read the keys between its target and this key in
+  // the levels that the marks moved, so every conversion of a forward scan
+  // starts at or after it, and every conversion of a reverse scan ends at or
+  // before it (see MaybeInsertRangeTombstone()). Every seek clears it
+  // (ResetSeekState()).
   IterKey head_mark_skip_end_;
+  HeadMarkDirection head_mark_skip_dir_ = HeadMarkDirection::kForward;
 };
 }  // namespace ROCKSDB_NAMESPACE
