@@ -3313,6 +3313,23 @@ InternalIterator* DBImpl::NewInternalIterator(
       // here, and no unit test cares about the value provided here.
       !read_options.total_order_seek && prefix_extractor != nullptr,
       read_options.iterate_upper_bound);
+  // Read-path range tombstone conversion in DBIter also counts the point keys
+  // that the merging iterator drops because a range tombstone from the same
+  // sorted run covers them. Recording is on for every read that honors range
+  // deletions, reads all tiers and has a positive conversion threshold, in a
+  // column family without user-defined timestamps (where DBIter never
+  // converts). That is a superset of the reads that can convert: the DBIter
+  // constructor has more gates (unordered_write, table filters, prefix mode),
+  // and DBIter uses the records only when its own conversion threshold is
+  // positive. A read that cannot convert still counts the drops, but makes no
+  // key copies (see DBIter::RegisterDroppedKeyInfo()).
+  if (!read_options.ignore_range_deletions &&
+      read_options.read_tier == kReadAllTier &&
+      super_version->mutable_cf_options.min_tombstones_for_range_conversion >
+          0 &&
+      cfd->user_comparator()->timestamp_size() == 0) {
+    merge_iter_builder.EnableDroppedKeyTracking();
+  }
   Status s;
   const Comparator* user_comparator = cfd->user_comparator();
   const bool mem_intersects =
@@ -3336,7 +3353,7 @@ InternalIterator* DBImpl::NewInternalIterator(
             std::move(range_del_iter), &cfd->ioptions().internal_comparator,
             nullptr /* smallest */, nullptr /* largest */);
       }
-      merge_iter_builder.AddPointAndTombstoneIterator(
+      merge_iter_builder.AddMutableMemtableIterator(
           mem_iter, std::move(mem_tombstone_iter));
       merge_iter_builder.SetHeadMarkMemTable(super_version->mem);
     } else {

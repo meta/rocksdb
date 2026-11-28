@@ -9,6 +9,7 @@
 
 #include "db/db_iter.h"
 
+#include <algorithm>
 #include <limits>
 #include <string>
 #include <vector>
@@ -94,6 +95,7 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       mem_hidden_op_scanned_since_seek_(0),
       contiguous_tombstone_count_(0),
       direction_(kForward),
+      run_has_visible_tombstone_(false),
       valid_(false),
       current_entry_is_merged_(false),
       is_key_seqnum_zero_(false),
@@ -148,6 +150,7 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
   }
   if (iter_.iter()) {
     iter_.iter()->SetPinnedItersMgr(&pinned_iters_mgr_);
+    RegisterDroppedKeyInfo();
   }
   status_.PermitUncheckedError();
   assert(timestamp_size_ ==
@@ -557,6 +560,9 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
   bool reseek_done = false;
 
   uint64_t mem_hidden_op_scanned = 0;
+  // A local copy, so that the loop can keep it in a register: the calls in the
+  // loop do not change it.
+  DroppedKeyInfo* const dropped_key_info = dropped_key_info_;
   do {
     // Will update is_key_seqnum_zero_ as soon as we parsed the current key
     // but we need to save the previous value to be used in the loop.
@@ -590,8 +596,13 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
       // prefix as the boundary because bloom filters may have hidden
       // entire prefixes between the seek prefix and the current key.
       // The tombstone covers n-1 of n deletes; the last remains as a
-      // point delete.
-      FlushPendingTombstoneRun(saved_key_.GetUserKey());
+      // point delete. A run made only of dropped keys has no tracked
+      // tombstone to use as the end key, so it is not converted.
+      if (run_has_visible_tombstone_) {
+        FlushPendingTombstoneRun(saved_key_.GetUserKey());
+      } else {
+        ResetContiguousTombstoneTracking();
+      }
       if (prefix_same_as_start_) {
         break;
       }
@@ -599,6 +610,14 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
 
     if (TooManyInternalKeysSkipped()) {
       return false;
+    }
+
+    // Read the dropped keys only after the checks above, so that a gap before
+    // a key past the upper bound, or outside the seek prefix with
+    // prefix_same_as_start, is never counted. MaybeAddDroppedKeysToRun() also
+    // checks the prefix of the dropped start key.
+    if (dropped_key_info != nullptr && dropped_key_info->count > 0) {
+      MaybeAddDroppedKeysToRun(ikey_.user_key);
     }
 
     assert(ikey_.user_key.size() >= timestamp_size_);
@@ -814,8 +833,11 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
   // If we accumulated tombstones, use the last tracked tombstone as the
   // exclusive end key. It may be more optimal to use iterator upper bound if it
   // exists, but the current iterator API makes that dangerous as upper bound
-  // points to user memory which is not guaranteed immutable.
-  if (contiguous_tombstone_count_ > 0 && iter_.status().ok()) {
+  // points to user memory which is not guaranteed immutable. A run made only of
+  // dropped keys has no tracked tombstone to use as the end key, so it is not
+  // converted here.
+  if (contiguous_tombstone_count_ > 0 && run_has_visible_tombstone_ &&
+      iter_.status().ok()) {
     // It is unsafe to use iter_.key() here even when iter_.Valid() and the key
     // is within the seek prefix. This is because memtable iterators are still
     // valid past the upper bound, but sst iterators are not. So iter_.key() can
@@ -1095,8 +1117,52 @@ void DBIter::PrevInternal() {
   if (min_tombstones_for_range_conversion_ > 0) {
     range_tomb_end_key_.Swap(saved_key_);
   }
+  if (dropped_key_info_ != nullptr) {
+    dropped_key_info_->want_key = true;
+  }
 
+  bool first_step = true;
   while (iter_.Valid()) {
+    // Backward, the internal iterator adds up its dropped keys over several
+    // moves (see DroppedKeyInfo). When a reverse scan returns a live key, its
+    // internal iterator has already moved to a smaller user key, so the drops
+    // of that move wait in the record until the next call. Each step takes the
+    // record at its top, so it sees the keys dropped between the previous
+    // step's user key K and this step's user key. In the first step of a call,
+    // K is range_tomb_end_key_, the exclusive upper end of a run that ends
+    // here. After Prev(), K is the live key that the previous call returned.
+    // After SeekForPrev(), K is the seek target, or the upper bound if that is
+    // smaller; SeekToLast() with iterate_upper_bound calls SeekForPrev() on the
+    // bound. The scan examined every key up to K, except the keys that a
+    // reverse head mark let the seek skip, which are deleted at sequence_ (see
+    // "Dropped keys in a conversion run" in db_iter.h). After SeekToLast()
+    // without an upper bound, K is empty, because nothing above the first live
+    // key was examined, so the first record is not used. In later steps, K is
+    // saved_key_.
+    //
+    // For example, with keys "a" < "b" < "c" < "d": a scan moves back from
+    // the live key "d" past a point tombstone at "c" and a dropped entry at
+    // "b" to the live key "a". The entry at "b" and the range tombstone that
+    // covers it are in the same immutable memtable or SST file. The step at
+    // "a" checks that "b" lies between "a" and "c", the previous step's key.
+    // With a threshold of 2, and if the insertion checks pass, the scan
+    // inserts ["b", "d").
+    uint64_t step_dropped_count = 0;
+    if (dropped_key_info_ != nullptr) {
+      const Slice current_user_key = ExtractUserKey(iter_.key());
+      if (!first_step) {
+        const Slice prev_user_key = saved_key_.GetUserKey();
+        step_dropped_count =
+            TakeReverseDroppedKeys(&prev_user_key, current_user_key);
+      } else if (range_tomb_end_key_.Size() > 0) {
+        const Slice prev_user_key = range_tomb_end_key_.GetUserKey();
+        step_dropped_count =
+            TakeReverseDroppedKeys(&prev_user_key, current_user_key);
+      } else {
+        step_dropped_count = TakeReverseDroppedKeys(nullptr, current_user_key);
+      }
+    }
+    first_step = false;
     saved_key_.SetUserKey(
         ExtractUserKey(iter_.key()),
         !iter_.iter()->IsKeyPinned() || !pin_thru_lifetime_ /* copy */);
@@ -1150,14 +1216,29 @@ void DBIter::PrevInternal() {
     // would use a stale value.
     if (min_tombstones_for_range_conversion_ > 0 &&
         range_tomb_end_key_.Size() > 0 && timestamp_lb_ == nullptr) {
+      // The keys dropped between this key and the previous step's key are
+      // deleted (see MaybeAddDroppedKeysToRun() for why), so they extend the
+      // run. TakeReverseDroppedKeys() returned a count only if their start
+      // key lies between the two keys.
+      const bool use_dropped = step_dropped_count > 0;
       if (!valid_ && found_visible && PrefixCheck(saved_key_without_ts)) {
         // Key was deleted and is within the seek prefix -- track it.
         TrackContiguousTombstone(saved_key_.GetUserKey(),
                                  /*always_update_first_key=*/true);
+        if (use_dropped) {
+          AddDroppedCountToRun(step_dropped_count);
+        }
       } else if (valid_) {
-        // Live key breaks the run.
+        // Live key breaks the run. The run can start at the smallest dropped
+        // key above it.
+        if (use_dropped) {
+          ExtendRunStartToDroppedKey(step_dropped_count);
+        }
         FlushPendingTombstoneRun(range_tomb_end_key_.GetUserKey(),
                                  /*check_prefix_match=*/true);
+      } else if (use_dropped && !found_visible) {
+        // No version of this key is visible, so it does not end the run.
+        ExtendRunStartToDroppedKey(step_dropped_count);
       }
     }
 
@@ -1863,7 +1944,122 @@ void DBIter::TrackContiguousTombstone(const Slice& user_key,
   if (always_update_first_key || contiguous_tombstone_count_ == 0) {
     range_tomb_first_key_.SetUserKey(user_key, true /* copy */);
   }
-  contiguous_tombstone_count_++;
+  if (contiguous_tombstone_count_ < std::numeric_limits<uint32_t>::max()) {
+    contiguous_tombstone_count_++;
+  }
+  run_has_visible_tombstone_ = true;
+  UpdateDroppedKeyWant();
+}
+
+void DBIter::MaybeAddDroppedKeysToRun(const Slice& current_user_key) {
+  assert(dropped_key_info_ != nullptr && dropped_key_info_->count > 0);
+  uint64_t dropped_count = dropped_key_info_->count;
+
+  if (contiguous_tombstone_count_ == 0) {
+    if (!dropped_key_info_->has_key) {
+      return;
+    }
+    // See "Dropped keys in a conversion run" in db_iter.h for why the run
+    // may start at the first dropped key D.
+    // Older versions of the key that DBIter just handled can be dropped
+    // right after it, so the smallest dropped user key can equal saved_key_.
+    // Then the next larger dropped user key can still start the run, and the
+    // drops of the smallest user key do not count, because the range does
+    // not cover them.
+    Slice first_dropped_user_key =
+        ExtractUserKey(dropped_key_info_->smallest_dropped_ikey);
+    if (user_comparator_.CompareWithoutTimestamp(
+            first_dropped_user_key, saved_key_.GetUserKey()) <= 0) {
+      if (!dropped_key_info_->has_next_key) {
+        return;
+      }
+      first_dropped_user_key =
+          ExtractUserKey(dropped_key_info_->next_dropped_ikey);
+      assert(dropped_count > dropped_key_info_->smallest_key_count);
+      dropped_count -= dropped_key_info_->smallest_key_count;
+      if (user_comparator_.CompareWithoutTimestamp(
+              first_dropped_user_key, saved_key_.GetUserKey()) <= 0) {
+        return;
+      }
+    }
+    if (user_comparator_.CompareWithoutTimestamp(first_dropped_user_key,
+                                                 current_user_key) >= 0) {
+      return;
+    }
+    if (!PrefixCheck(StripTimestampFromUserKey(first_dropped_user_key,
+                                               timestamp_size_))) {
+      return;
+    }
+    range_tomb_first_key_.SetUserKey(first_dropped_user_key, true /* copy */);
+  }
+  AddDroppedCountToRun(dropped_count);
+}
+
+void DBIter::AddDroppedCountToRun(uint64_t dropped_count) {
+  // The conversion threshold counts entries: visible tombstones plus dropped
+  // keys.
+  const uint64_t new_count = contiguous_tombstone_count_ + dropped_count;
+  // The min() keeps the value in the uint32_t range, so the cast loses
+  // nothing.
+  contiguous_tombstone_count_ = static_cast<uint32_t>(
+      std::min<uint64_t>(new_count, std::numeric_limits<uint32_t>::max()));
+  UpdateDroppedKeyWant();
+  TEST_SYNC_POINT_CALLBACK("DBIter::AddDroppedCountToRun", &dropped_count);
+}
+
+uint64_t DBIter::TakeReverseDroppedKeys(const Slice* prev_user_key,
+                                        const Slice& current_user_key) {
+  assert(dropped_key_info_ != nullptr);
+  uint64_t count = dropped_key_info_->count;
+  if (count == 0) {
+    return 0;
+  }
+  bool usable = dropped_key_info_->has_key && prev_user_key != nullptr;
+  if (usable) {
+    // Older versions of the current key are visited, and can be dropped,
+    // before its visible version, so the smallest dropped user key can equal
+    // the current key. Then the next larger dropped user key can still be
+    // used, and the drops of the smallest user key do not count, because the
+    // range does not cover them.
+    Slice dropped_user_key =
+        ExtractUserKey(dropped_key_info_->smallest_dropped_ikey);
+    if (user_comparator_.CompareWithoutTimestamp(dropped_user_key,
+                                                 current_user_key) <= 0) {
+      usable = dropped_key_info_->has_next_key;
+      if (usable) {
+        dropped_user_key = ExtractUserKey(dropped_key_info_->next_dropped_ikey);
+        usable = user_comparator_.CompareWithoutTimestamp(dropped_user_key,
+                                                          current_user_key) > 0;
+        assert(count > dropped_key_info_->smallest_key_count);
+        count -= dropped_key_info_->smallest_key_count;
+      }
+    }
+    // A drop recorded before the previous key was handled has a user key at
+    // or above it, so it fails this check.
+    usable = usable &&
+             user_comparator_.CompareWithoutTimestamp(dropped_user_key,
+                                                      *prev_user_key) < 0 &&
+             PrefixCheck(
+                 StripTimestampFromUserKey(dropped_user_key, timestamp_size_));
+    if (usable) {
+      reverse_dropped_key_.SetUserKey(dropped_user_key, true /* copy */);
+    }
+  }
+  dropped_key_info_->count = 0;
+  dropped_key_info_->smallest_key_count = 0;
+  dropped_key_info_->has_key = false;
+  dropped_key_info_->has_next_key = false;
+  return usable ? count : 0;
+}
+
+void DBIter::ExtendRunStartToDroppedKey(uint64_t dropped_count) {
+  const Slice dropped_user_key = reverse_dropped_key_.GetUserKey();
+  if (contiguous_tombstone_count_ == 0 ||
+      user_comparator_.CompareWithoutTimestamp(
+          dropped_user_key, range_tomb_first_key_.GetUserKey()) < 0) {
+    range_tomb_first_key_.SetUserKey(dropped_user_key, true /* copy */);
+  }
+  AddDroppedCountToRun(dropped_count);
 }
 
 void DBIter::FlushPendingTombstoneRun(const Slice& end_key,

@@ -3,7 +3,10 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
+#include <chrono>
 #include <future>
+#include <map>
 #include <memory>
 #include <set>
 
@@ -5546,6 +5549,58 @@ TEST_F(DBHeadMarkTest, DeleteFilesInRangeDoesNotWaitForLowering) {
   ASSERT_EQ("q0", SeekFirst("q"));
 }
 
+TEST_F(DBHeadMarkTest, DroppedKeyInsideMarkDoesNotStartConversion) {
+  // A mark of the older immutable memtable M1 moves the seek of M1 and of the
+  // older levels to the mark's usable end q0010, while the newer immutable
+  // memtable M2 is sought at the target. M2 holds q0003..q0008 and a
+  // DeleteRange over them, so the merging iterator drops those keys, and the
+  // run could start at q0003. The keys of M1 between q0003 and q0010 were
+  // only skipped by the mark, so the conversion must not start below q0010.
+  // Here that leaves an empty range, so nothing is converted.
+  Options options = HeadMarkOptions();
+  // Keep both immutable memtables in memory.
+  options.max_write_buffer_number = 4;
+  options.min_write_buffer_number_to_merge = 3;
+  DestroyAndReopen(options);
+  MakeQueue(/*n=*/30, /*deleted=*/10);
+  ASSERT_EQ(QKey(10), SeekFirst("q"));
+  ASSERT_EQ(std::vector<HeadMarkView>({{"q", QKey(10), QKey(10), false}}),
+            ActiveMarks());
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  for (int i = 3; i <= 8; ++i) {
+    ASSERT_OK(Put(QKey(i), "v2"));
+  }
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                             QKey(3), QKey(9)));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  // The mutable memtable must not be empty for a conversion.
+  ASSERT_OK(Put("z", "v"));
+
+  std::vector<std::pair<std::string, std::string>> ranges;
+  uint64_t dropped_added = 0;
+  {
+    HeadMarkTracker tracker;
+    SyncPoint::GetInstance()->SetCallBack(
+        "MemTable::AddLogicallyRedundantRangeTombstone:AddRange",
+        [&](void* arg) {
+          auto* range = static_cast<std::pair<Slice, Slice>*>(arg);
+          ranges.emplace_back(range->first.ToString(),
+                              range->second.ToString());
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBIter::AddDroppedCountToRun",
+        [&](void* arg) { dropped_added += *static_cast<uint64_t*>(arg); });
+    ASSERT_EQ(QKey(10), SeekFirst("q"));
+    ASSERT_EQ(1, tracker.uses);
+  }
+  // The run counted the 6 drops of M2, but no range was inserted.
+  ASSERT_EQ(6, dropped_added);
+  ASSERT_TRUE(ranges.empty());
+  for (int i = 10; i < 30; ++i) {
+    ASSERT_EQ("v", Get(QKey(i)));
+  }
+}
+
 TEST_F(DBHeadMarkTest, FIFOCompactionPublishesNoMark) {
   // FIFO compaction deletes old SST files without ingest_sst_lock, so marks
   // are off for it. Ordinary conversion still runs.
@@ -6734,6 +6789,1223 @@ TEST_F(DBReverseHeadMarkTest, RandomReverseQueueMatchesModel) {
   }
   ASSERT_GT(tracker.reverse_uses, 0);
   ASSERT_FALSE(tracker.results.empty());
+}
+
+// Tests for read-path range tombstone conversion over the point keys that
+// MergingIterator drops because a range tombstone from the same sorted run
+// covers them ("dropped keys"). DBIter adds these keys to the current
+// conversion run, so that a converted tombstone in the mutable memtable can
+// cover them from a newer sorted run.
+class DBRangeDelDroppedKeyConversionTest : public DBRangeDelTest {
+ protected:
+  void SetUp() override {
+    DBRangeDelTest::SetUp();
+    SyncPoint::GetInstance()->SetCallBack(
+        "MemTable::AddLogicallyRedundantRangeTombstone:AddRange",
+        [this](void* arg) {
+          auto* range = static_cast<std::pair<Slice, Slice>*>(arg);
+          attempted_ranges_.emplace_back(range->first.ToString(),
+                                         range->second.ToString());
+        });
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBIter::AddDroppedCountToRun", [this](void* arg) {
+          dropped_keys_added_ += *static_cast<uint64_t*>(arg);
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  void TearDown() override {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    DBRangeDelTest::TearDown();
+  }
+
+  // Options that keep immutable memtables in memory: no flush is picked until
+  // 10 immutable memtables exist, and every test switches fewer than that.
+  Options ConversionOptions(uint32_t threshold) {
+    Options options = CurrentOptions();
+    options.min_tombstones_for_range_conversion = threshold;
+    options.max_write_buffer_number = 12;
+    options.min_write_buffer_number_to_merge = 10;
+    options.disable_auto_compactions = true;
+    options.statistics = CreateDBStatistics();
+    return options;
+  }
+
+  // Reopens the DB with `options` and clears the recorded test state.
+  void Reset(const Options& options) {
+    DestroyAndReopen(options);
+    attempted_ranges_.clear();
+    dropped_keys_added_ = 0;
+  }
+
+  // Keys "k0000", "k0001", ...: the fixed 3-byte prefixes are "k00", "k01",
+  // and so on.
+  static std::string ConvKey(int i) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "k%04d", i);
+    return buf;
+  }
+
+  // Scans forward from `start` and returns the user keys and values. Tests
+  // start at "" rather than at the first key: a run never starts at a dropped
+  // key equal to the seek target, because DBIter compares a dropped start key
+  // with saved_key_, which Seek() sets to the target.
+  std::vector<std::pair<std::string, std::string>> ScanAll(
+      const std::string& start, const ReadOptions& ro) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    for (iter->Seek(start); iter->Valid(); iter->Next()) {
+      out.emplace_back(iter->key().ToString(), iter->value().ToString());
+    }
+    EXPECT_OK(iter->status());
+    return out;
+  }
+
+  // Scans forward from SeekToFirst(). Without iterate_lower_bound,
+  // SeekToFirst() never uses or publishes a head mark (see MemTableHeadMark in
+  // db/memtable.h), so a test can measure the steps of a scan without a mark
+  // moving its seek.
+  std::vector<std::pair<std::string, std::string>> ScanFromFirst() {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      out.emplace_back(iter->key().ToString(), iter->value().ToString());
+    }
+    EXPECT_OK(iter->status());
+    return out;
+  }
+
+  // Writes Put and then Delete for ids [first, last) into the mutable
+  // memtable.
+  void PutThenDelete(int first, int last) {
+    for (int i = first; i < last; ++i) {
+      ASSERT_OK(Put(ConvKey(i), "v" + std::to_string(i)));
+    }
+    for (int i = first; i < last; ++i) {
+      ASSERT_OK(Delete(ConvKey(i)));
+    }
+  }
+
+  // Puts ids [first, last), then DeleteRange [ConvKey(first),
+  // ConvKey(range_end)) over them.
+  void PutThenDeleteRange(int first, int last, int range_end) {
+    for (int i = first; i < last; ++i) {
+      ASSERT_OK(Put(ConvKey(i), "v"));
+    }
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               ConvKey(first), ConvKey(range_end)));
+  }
+
+  // Moves one iterator with a random mix of Seek(), SeekForPrev(),
+  // SeekToFirst(), SeekToLast(), Next() and Prev(), so that the direction
+  // often switches. Checks every position against `expected`.
+  void RandomWalk(ReadOptions ro,
+                  const std::map<std::string, std::string>& expected,
+                  Random* rnd) {
+    ro.total_order_seek = true;
+    const std::vector<std::pair<std::string, std::string>> all(expected.begin(),
+                                                               expected.end());
+    const int n = static_cast<int>(all.size());
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+    // The index in `all` of the expected position. Outside [0, n) means the
+    // iterator must be invalid.
+    int pos = -1;
+    for (int step = 0; step < 20; ++step) {
+      const bool valid = pos >= 0 && pos < n;
+      const uint32_t action = rnd->Uniform(6);
+      const std::string target = ConvKey(static_cast<int>(rnd->Uniform(300)));
+      if (action == 0) {
+        iter->SeekToFirst();
+        pos = 0;
+      } else if (action == 1) {
+        iter->SeekToLast();
+        pos = n - 1;
+      } else if (action == 2) {
+        iter->Seek(target);
+        pos = static_cast<int>(
+            std::lower_bound(all.begin(), all.end(),
+                             std::make_pair(target, std::string())) -
+            all.begin());
+      } else if (action == 3 || !valid) {
+        iter->SeekForPrev(target);
+        pos = static_cast<int>(
+                  std::upper_bound(all.begin(), all.end(), target,
+                                   [](const std::string& t, const auto& kv) {
+                                     return t < kv.first;
+                                   }) -
+                  all.begin()) -
+              1;
+      } else if (action == 4) {
+        iter->Next();
+        ++pos;
+      } else {
+        iter->Prev();
+        --pos;
+      }
+      ASSERT_OK(iter->status());
+      if (pos < 0 || pos >= n) {
+        ASSERT_FALSE(iter->Valid()) << "step=" << step;
+      } else {
+        ASSERT_TRUE(iter->Valid()) << "step=" << step;
+        ASSERT_EQ(iter->key().ToString(), all[pos].first) << "step=" << step;
+        ASSERT_EQ(iter->value().ToString(), all[pos].second) << "step=" << step;
+      }
+    }
+  }
+
+  // Returns true if no attempted converted tombstone covers user key `key`.
+  bool NoRangeCovers(const std::string& key) const {
+    for (const auto& range : attempted_ranges_) {
+      if (range.first <= key && key < range.second) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static uint64_t Inserted(const Options& options) {
+    return options.statistics->getTickerCount(
+        READ_PATH_RANGE_TOMBSTONES_INSERTED);
+  }
+
+  static uint64_t Discarded(const Options& options) {
+    return options.statistics->getTickerCount(
+        READ_PATH_RANGE_TOMBSTONES_DISCARDED);
+  }
+
+  // [start, end) of every converted tombstone that reached the memtable
+  // insert, in order.
+  std::vector<std::pair<std::string, std::string>> attempted_ranges_;
+  // The sum of dropped keys that DBIter added to conversion runs.
+  uint64_t dropped_keys_added_ = 0;
+};
+
+// Worked example with made-up ids: immutable memtable M1 holds Put and Delete
+// of ids 0..199 and a converted tombstone over them. The mutable memtable M2
+// holds Put and Delete of ids 200..299. Live key k0500 ends every run. The
+// scan over M2 counts the dropped M1 entries, so the conversion in M2 starts
+// at k0000, and later scans skip M1's entries with a cascading seek. The loop
+// pass with threshold 0 (conversion disabled) is the baseline that steps over
+// every entry.
+//
+// The scans keep head marks out of the way. The first scan seeks to "k", so
+// the mark that it publishes in M1 starts at "k", and the second scan's
+// Seek("") is not inside it. The third scan uses SeekToFirst(), which uses no
+// mark. HeadMarkSeekThenDroppedKeys covers a scan that a mark moved.
+TEST_F(DBRangeDelDroppedKeyConversionTest, ImmutableMemtable) {
+  SetPerfLevel(kEnableCount);
+  uint64_t next_on_mem[2] = {0, 0};
+  uint64_t reseeks[2] = {0, 0};
+  // One tracker for both passes: its destructor clears all sync point
+  // callbacks, including the fixture's.
+  HeadMarkTracker tracker;
+  for (int enabled = 0; enabled < 2; ++enabled) {
+    SCOPED_TRACE("enabled=" + std::to_string(enabled));
+    tracker.Reset();
+    Options options = ConversionOptions(enabled ? 10 : 0);
+    Reset(options);
+
+    ASSERT_OK(Put(ConvKey(500), "live"));
+    PutThenDelete(0, 200);
+    // First conversion, inside M1: [k0000, k0500).
+    ASSERT_EQ(ScanAll("k", ReadOptions()).size(), 1);
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+
+    PutThenDelete(200, 300);
+    // Second conversion, inside M2. It also starts at k0000.
+    ASSERT_EQ(ScanAll("", ReadOptions()).size(), 1);
+    if (enabled) {
+      const std::vector<std::pair<std::string, std::string>> expected_ranges = {
+          {ConvKey(0), ConvKey(500)}, {ConvKey(0), ConvKey(500)}};
+      ASSERT_EQ(attempted_ranges_, expected_ranges);
+      ASSERT_EQ(Inserted(options), 2);
+      // 399, not 400: the first conversion was inserted at the scan's
+      // snapshot, which is the sequence number of the Delete of k0199. A
+      // tombstone covers only smaller sequence numbers, so that Delete is not
+      // covered, and DBIter sees it as a visible tombstone.
+      ASSERT_EQ(dropped_keys_added_, 399);
+    } else {
+      ASSERT_TRUE(attempted_ranges_.empty());
+      ASSERT_EQ(dropped_keys_added_, 0);
+    }
+
+    // A third scan shows how the M1 entries are skipped.
+    get_perf_context()->Reset();
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {ConvKey(500), "live"}};
+    ASSERT_EQ(ScanFromFirst(), expected);
+    next_on_mem[enabled] = get_perf_context()->next_on_memtable_count;
+    reseeks[enabled] = get_perf_context()->internal_range_del_reseek_count;
+    // No more conversions: the duplicate check discards the same run.
+    ASSERT_EQ(Inserted(options), enabled ? 2 : 0);
+    ASSERT_EQ(tracker.uses, 0);
+  }
+  SetPerfLevel(kDisable);
+  // Enabled: the scan still steps over M2's own 200 entries one by one,
+  // because M2's tombstone is in the same memtable. M2's tombstone covers M1's
+  // 400 entries from a newer sorted run, so a cascading seek skips them. The
+  // baseline steps over all 600 entries.
+  ASSERT_GE(next_on_mem[1], 200);
+  ASSERT_GE(next_on_mem[0], next_on_mem[1] + 390);
+  ASSERT_GE(reseeks[1], 1);
+}
+
+// A forward head mark moves a seek, and the run after the moved seek counts
+// dropped keys. Worked example with made-up ids: immutable memtable M1 holds
+// Put of ids 100..199 and DeleteRange [k0100, k0200). The mutable memtable M2
+// holds Put and Delete of ids 0..49 and the queue head k0060. Live key k0500
+// ends the data. A consumer reads only the head, so the first scan publishes
+// a mark in M2 and converts [k0000, k0060), but never reaches M1. Then the
+// head is removed, in one of two ways:
+// - Delete(k0060). The second scan's seek moves over the mark to k0060, the
+//   run starts at the Delete of k0060, and the 100 dropped M1 entries reach
+//   the threshold, so [k0060, k0500) is converted.
+// - DeleteRange [k0060, k0061). The range tombstone is in M2, the mutable
+//   memtable, so the merging iterator drops k0060 without recording it. The
+//   run after the moved seek then starts at the first dropped M1 key, so
+//   [k0100, k0500) is converted.
+// A third scan skips M1 with a cascading seek.
+TEST_F(DBRangeDelDroppedKeyConversionTest, HeadMarkSeekThenDroppedKeys) {
+  // One tracker for both passes: its destructor clears all sync point
+  // callbacks, including the fixture's.
+  HeadMarkTracker tracker;
+  for (bool range_delete : {false, true}) {
+    SCOPED_TRACE(range_delete ? "DeleteRange head" : "Delete head");
+    tracker.Reset();
+    Options options = ConversionOptions(/*threshold=*/10);
+    Reset(options);
+
+    ASSERT_OK(Put(ConvKey(500), "live"));
+    PutThenDeleteRange(100, 200, 200);
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    ASSERT_OK(Put(ConvKey(60), "head"));
+    PutThenDelete(0, 50);
+
+    {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+      iter->Seek("");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key().ToString(), ConvKey(60));
+    }
+    ASSERT_EQ(tracker.uses, 0);
+    const std::vector<std::pair<std::string, std::string>> first_ranges = {
+        {ConvKey(0), ConvKey(60)}};
+    ASSERT_EQ(attempted_ranges_, first_ranges);
+    ASSERT_EQ(dropped_keys_added_, 0);
+
+    if (range_delete) {
+      ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                 ConvKey(60), ConvKey(61)));
+    } else {
+      ASSERT_OK(Delete(ConvKey(60)));
+    }
+    {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+      iter->Seek("");
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key().ToString(), ConvKey(500));
+      ASSERT_OK(iter->status());
+    }
+    ASSERT_EQ(tracker.uses, 1);
+    const std::vector<std::pair<std::string, std::string>> ranges = {
+        {ConvKey(0), ConvKey(60)},
+        {ConvKey(range_delete ? 100 : 60), ConvKey(500)}};
+    ASSERT_EQ(attempted_ranges_, ranges);
+    ASSERT_EQ(dropped_keys_added_, 100);
+    ASSERT_EQ(Inserted(options), 2);
+
+    SetPerfLevel(kEnableCount);
+    get_perf_context()->Reset();
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {ConvKey(500), "live"}};
+    ASSERT_EQ(ScanFromFirst(), expected);
+    ASSERT_GE(get_perf_context()->internal_range_del_reseek_count, 1);
+    SetPerfLevel(kDisable);
+    for (int k = 0; k < 200; ++k) {
+      ASSERT_EQ(Get(ConvKey(k)), "NOT_FOUND") << k;
+    }
+    ASSERT_EQ(Get(ConvKey(500)), "live");
+  }
+}
+
+// A reverse head mark moves a seek, the run below it starts at a dropped key,
+// and the converted range ends at the mark's usable end. Worked example with
+// made-up ids: live key k0000.
+// Immutable memtable M1 holds Put of ids 100..199 and DeleteRange [k0100,
+// k0200). The mutable memtable M2 holds Put of ids 300..399, consumed from
+// the largest id. The first scan, SeekForPrev("k9999"), sees the deletes of
+// ids 399..350, stops at the live head k0349, publishes a reverse mark and
+// converts [k0350, k9999). Then ids 349..300 are deleted. The second scan's
+// seek moves down over the mark. Its run holds the deletes of ids 349..300
+// and the 100 dropped M1 entries, and it ends at the live k0000, so the run
+// starts at k0100. The scan did not read above the mark's usable end k0349,
+// so [k0100, k0349) is converted, and the delete of k0349 stays a point
+// tombstone.
+TEST_F(DBRangeDelDroppedKeyConversionTest, ReverseHeadMarkThenDroppedKeys) {
+  Options options = ConversionOptions(/*threshold=*/10);
+  Reset(options);
+
+  ASSERT_OK(Put(ConvKey(0), "live"));
+  PutThenDeleteRange(100, 200, 200);
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  for (int i = 300; i < 400; ++i) {
+    ASSERT_OK(Put(ConvKey(i), "v"));
+  }
+  for (int i = 399; i >= 350; --i) {
+    ASSERT_OK(Delete(ConvKey(i)));
+  }
+
+  HeadMarkTracker tracker;
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->SeekForPrev("k9999");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key().ToString(), ConvKey(349));
+  }
+  ASSERT_EQ(tracker.reverse_uses, 0);
+  const std::vector<std::pair<std::string, std::string>> first_ranges = {
+      {ConvKey(350), "k9999"}};
+  ASSERT_EQ(attempted_ranges_, first_ranges);
+
+  for (int i = 349; i >= 300; --i) {
+    ASSERT_OK(Delete(ConvKey(i)));
+  }
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->SeekForPrev("k9999");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key().ToString(), ConvKey(0));
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_EQ(tracker.reverse_uses, 1);
+  const std::vector<std::pair<std::string, std::string>> ranges = {
+      {ConvKey(350), "k9999"}, {ConvKey(100), ConvKey(349)}};
+  ASSERT_EQ(attempted_ranges_, ranges);
+  ASSERT_EQ(dropped_keys_added_, 100);
+  ASSERT_EQ(Inserted(options), 2);
+
+  const std::vector<std::pair<std::string, std::string>> expected = {
+      {ConvKey(0), "live"}};
+  ASSERT_EQ(ScanFromFirst(), expected);
+  for (int k = 1; k < 400; ++k) {
+    ASSERT_EQ(Get(ConvKey(k)), "NOT_FOUND") << k;
+  }
+}
+
+// Drops in the mutable memtable are not reported, because a tombstone converted
+// from them would go into that same memtable. After the memtable becomes
+// immutable, the same drops are reported.
+TEST_F(DBRangeDelDroppedKeyConversionTest, MutableMemtableIgnored) {
+  Options options = ConversionOptions(/*threshold=*/10);
+  Reset(options);
+
+  ASSERT_OK(Put(ConvKey(500), "live"));
+  PutThenDeleteRange(0, 100, 100);
+
+  ASSERT_EQ(ScanAll("", ReadOptions()).size(), 1);
+  ASSERT_EQ(dropped_keys_added_, 0);
+  ASSERT_EQ(Inserted(options), 0);
+  ASSERT_EQ(Discarded(options), 0);
+
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  // A new iterator: the 100 Puts are now in an immutable memtable.
+  ASSERT_EQ(ScanAll("", ReadOptions()).size(), 1);
+  ASSERT_EQ(dropped_keys_added_, 100);
+  // The run of 100 dropped keys ends at the live key k0500.
+  const std::vector<std::pair<std::string, std::string>> expected_ranges = {
+      {ConvKey(0), ConvKey(500)}};
+  ASSERT_EQ(attempted_ranges_, expected_ranges);
+  ASSERT_EQ(Inserted(options), 1);
+}
+
+// A live key is never covered: neither a live key between dropped keys, nor a
+// live key whose older version is dropped right before the next run.
+TEST_F(DBRangeDelDroppedKeyConversionTest, NoLiveKeyDeleted) {
+  Options options = ConversionOptions(/*threshold=*/5);
+  Reset(options);
+
+  // M1 (immutable later): Put k0000..k0019 and k0050, then DeleteRange
+  // [k0000, k0100), then Put k0010 and k0050 again. k0010 and k0050 are live,
+  // and the same-run tombstone drops their older versions.
+  ASSERT_OK(Put(ConvKey(50), "old"));
+  PutThenDeleteRange(0, 20, 100);
+  ASSERT_OK(Put(ConvKey(10), "live10"));
+  ASSERT_OK(Put(ConvKey(50), "live50"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+
+  // M2 (mutable): visible tombstones k0200..k0209 and live key k0300.
+  for (int i = 200; i < 210; ++i) {
+    ASSERT_OK(Delete(ConvKey(i)));
+  }
+  ASSERT_OK(Put(ConvKey(300), "live300"));
+
+  const std::vector<std::pair<std::string, std::string>> expected = {
+      {ConvKey(10), "live10"},
+      {ConvKey(50), "live50"},
+      {ConvKey(300), "live300"}};
+  for (int round = 0; round < 3; ++round) {
+    SCOPED_TRACE("round=" + std::to_string(round));
+    ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+    ASSERT_EQ(Get(ConvKey(10)), "live10");
+    ASSERT_EQ(Get(ConvKey(50)), "live50");
+    ASSERT_EQ(Get(ConvKey(300)), "live300");
+    // Also start a scan right at a live key whose older version is dropped.
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->Seek(ConvKey(10));
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), ConvKey(10));
+    iter->Next();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), ConvKey(50));
+    ASSERT_OK(iter->status());
+  }
+  for (int live : {10, 50, 300}) {
+    ASSERT_TRUE(NoRangeCovers(ConvKey(live))) << live;
+  }
+  // Conversions happened: [k0000, k0010) from 10 dropped keys, and runs that
+  // start at the visible tombstones of M2.
+  ASSERT_GE(Inserted(options), 2);
+  ASSERT_GT(dropped_keys_added_, 0);
+  ASSERT_OK(Flush());
+  ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+}
+
+// Builds an immutable memtable that holds an older version of a key, a
+// DeleteRange over it, and a newer version (a Put or a Merge). DBIter returns
+// the newer version, then MergingIterator drops the older one. The next run
+// must not start at that user key. In the max_skip variant, the key has many
+// newer versions, so DBIter reseeks past all versions of the key while it
+// skips them. That reseek jumps over the older version, so this variant covers
+// a run that starts at the next dropped key after a DBIter reseek.
+TEST_F(DBRangeDelDroppedKeyConversionTest, OverwriteVariants) {
+  enum class Variant { kPut, kMerge, kMaxSkip };
+  for (Variant variant : {Variant::kPut, Variant::kMerge, Variant::kMaxSkip}) {
+    SCOPED_TRACE("variant=" + std::to_string(static_cast<int>(variant)));
+    Options options = ConversionOptions(/*threshold=*/3);
+    options.merge_operator = MergeOperators::CreateStringAppendOperator();
+    if (variant == Variant::kMaxSkip) {
+      options.max_sequential_skip_in_iterations = 2;
+    }
+    Reset(options);
+
+    // M1: DeleteRange [k0000, k0100) covers the old versions of k0010..k0019,
+    // then k0010 gets a newer version.
+    PutThenDeleteRange(10, 20, 100);
+    std::string expected10;
+    if (variant == Variant::kMerge) {
+      ASSERT_OK(Merge(ConvKey(10), "m1"));
+      ASSERT_OK(Merge(ConvKey(10), "m2"));
+      expected10 = "m1,m2";
+    } else if (variant == Variant::kMaxSkip) {
+      for (int v = 0; v < 6; ++v) {
+        ASSERT_OK(Put(ConvKey(10), "new" + std::to_string(v)));
+      }
+      expected10 = "new5";
+    } else {
+      ASSERT_OK(Put(ConvKey(10), "new"));
+      expected10 = "new";
+    }
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    // M2: visible tombstones and a live key.
+    for (int i = 200; i < 205; ++i) {
+      ASSERT_OK(Delete(ConvKey(i)));
+    }
+    ASSERT_OK(Put(ConvKey(300), "live300"));
+
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {ConvKey(10), expected10}, {ConvKey(300), "live300"}};
+    for (int round = 0; round < 3; ++round) {
+      SCOPED_TRACE("round=" + std::to_string(round));
+      ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+      ASSERT_EQ(Get(ConvKey(10)), expected10);
+    }
+    ASSERT_TRUE(NoRangeCovers(ConvKey(10)));
+    ASSERT_TRUE(NoRangeCovers(ConvKey(300)));
+    ASSERT_GE(Inserted(options), 1);
+    // kPut and kMerge: the first dropped key is the old k0010, equal to the
+    // live key that DBIter just returned, so the run starts at the next
+    // dropped user key, k0011, and counts only k0011..k0019, which the range
+    // covers. kMaxSkip: the reseek jumps over the old k0010, so the run
+    // starts at k0011 and counts k0011..k0019 too.
+    ASSERT_EQ(dropped_keys_added_, 9);
+    if (variant == Variant::kMaxSkip) {
+      ASSERT_GT(
+          options.statistics->getTickerCount(NUMBER_OF_RESEEKS_IN_ITERATION),
+          0);
+    }
+    ASSERT_OK(Flush());
+    ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+  }
+}
+
+// The reverse form of OverwriteVariants: a reverse scan steps over visible
+// tombstones, then over k0019..k0011 and the old version of k0010, which the
+// same-run DeleteRange drops, and stops at the live k0010. The range starts
+// at k0011, so only the 9 drops of k0011..k0019 count, not the old k0010.
+TEST_F(DBRangeDelDroppedKeyConversionTest,
+       ReverseOverwriteCountsOnlyCoveredDrops) {
+  Options options = ConversionOptions(/*threshold=*/3);
+  Reset(options);
+  PutThenDeleteRange(10, 20, 100);
+  ASSERT_OK(Put(ConvKey(10), "new"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  for (int i = 200; i < 205; ++i) {
+    ASSERT_OK(Delete(ConvKey(i)));
+  }
+  ASSERT_OK(Put(ConvKey(300), "live300"));
+
+  {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->SeekToLast();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), ConvKey(300));
+    iter->Prev();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), ConvKey(10));
+    ASSERT_EQ(iter->value(), "new");
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+  ASSERT_EQ(dropped_keys_added_, 9);
+  const std::vector<std::pair<std::string, std::string>> expected_ranges = {
+      {ConvKey(11), ConvKey(300)}};
+  ASSERT_EQ(attempted_ranges_, expected_ranges);
+  ASSERT_EQ(Get(ConvKey(10)), "new");
+}
+
+// Drops in SST files below L0, read through LevelIterator. The DeleteRange
+// and the 50 keys that it covers are compacted into several files of one
+// level, so the range tombstone is cut at each file boundary, and
+// LevelIterator returns a sentinel key at the end of each file. A snapshot
+// keeps the covered keys.
+TEST_F(DBRangeDelDroppedKeyConversionTest, LevelIteratorDropsAcrossFiles) {
+  Options options = ConversionOptions(/*threshold=*/5);
+  options.compression = kNoCompression;
+  // About 200 bytes per key, so the 50 keys fill several 4 KB files.
+  options.target_file_size_base = 4 << 10;
+  Reset(options);
+  Random rnd(301);
+  for (int i = 0; i < 50; ++i) {
+    ASSERT_OK(Put(ConvKey(i), rnd.RandomString(200)));
+  }
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                             ConvKey(0), ConvKey(100)));
+  ASSERT_OK(Flush());
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+  ASSERT_GT(TotalTableFiles(), 1);
+  ASSERT_OK(Put(ConvKey(500), "live"));
+
+  const std::vector<std::pair<std::string, std::string>> expected = {
+      {ConvKey(500), "live"}};
+  ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+  ASSERT_EQ(dropped_keys_added_, 50);
+  const std::vector<std::pair<std::string, std::string>> expected_ranges = {
+      {ConvKey(0), ConvKey(500)}};
+  ASSERT_EQ(attempted_ranges_, expected_ranges);
+  ASSERT_EQ(Inserted(options), 1);
+  ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+  db_->ReleaseSnapshot(snapshot);
+}
+
+// Reverse scans with iterate_lower_bound and with prefix_same_as_start. An
+// older SST file holds the live k0005 and k0009. A newer immutable memtable
+// holds k0010..k0019 and a DeleteRange [k0010, k0100) over them, and the
+// mutable memtable holds the live k0500. Both scans step back over the
+// dropped keys to k0009, then to k0005, where the bound scan stops because
+// k0005 is below the bound k0008. No converted range may cover a live key, a
+// range from the bound scan starts at or above the bound, and a range from
+// the prefix scan stays inside the prefix "k00".
+TEST_F(DBRangeDelDroppedKeyConversionTest, ReverseBoundAndPrefix) {
+  for (bool use_prefix : {false, true}) {
+    SCOPED_TRACE(use_prefix ? "prefix" : "lower bound");
+    Options options = ConversionOptions(/*threshold=*/5);
+    options.prefix_extractor.reset(NewFixedPrefixTransform(3));
+    Reset(options);
+    ASSERT_OK(Put(ConvKey(5), "live5"));
+    ASSERT_OK(Put(ConvKey(9), "live9"));
+    ASSERT_OK(Flush());
+    PutThenDeleteRange(10, 20, 100);
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    ASSERT_OK(Put(ConvKey(500), "live500"));
+
+    std::vector<std::string> keys;
+    {
+      ReadOptions ro;
+      std::string lower_key = ConvKey(8);
+      Slice lower = lower_key;
+      std::unique_ptr<Iterator> iter;
+      if (use_prefix) {
+        ro.prefix_same_as_start = true;
+        iter.reset(db_->NewIterator(ro));
+        iter->SeekForPrev(ConvKey(99));
+      } else {
+        ro.total_order_seek = true;
+        ro.iterate_lower_bound = &lower;
+        iter.reset(db_->NewIterator(ro));
+        iter->SeekToLast();
+      }
+      for (; iter->Valid(); iter->Prev()) {
+        keys.push_back(iter->key().ToString());
+      }
+      ASSERT_OK(iter->status());
+    }
+    const std::vector<std::string> expected_keys =
+        use_prefix ? std::vector<std::string>{ConvKey(9), ConvKey(5)}
+                   : std::vector<std::string>{ConvKey(500), ConvKey(9)};
+    ASSERT_EQ(keys, expected_keys);
+    ASSERT_EQ(dropped_keys_added_, 10);
+    ASSERT_TRUE(NoRangeCovers(ConvKey(5)));
+    ASSERT_TRUE(NoRangeCovers(ConvKey(9)));
+    for (const auto& range : attempted_ranges_) {
+      if (use_prefix) {
+        ASSERT_EQ(range.first.substr(0, 3), "k00");
+        ASSERT_LE(range.second, ConvKey(99));
+      } else {
+        ASSERT_GE(range.first, ConvKey(8));
+      }
+    }
+    ASSERT_EQ(Get(ConvKey(5)), "live5");
+    ASSERT_EQ(Get(ConvKey(500)), "live500");
+  }
+}
+
+// With user-defined timestamps, read-path conversion is off (see the DBIter
+// constructor), so no scan counts dropped keys or converts. The case: "a",
+// k0001 to k0005 and k0009 are written at timestamp 1, and a DeleteRange at
+// timestamp 2 covers k0001 to k0005 in the same memtable, which then becomes
+// immutable. A forward scan from k0000 or a reverse scan from k0008 at the
+// max timestamp steps over the dropped keys. A conversion would get the
+// timestamp of its end key (k0009 at timestamp 1 forward, k0008 at the
+// minimum timestamp reverse), so a read at timestamp 1 would see it. That
+// read must still find k0001 to k0005.
+TEST_F(DBRangeDelDroppedKeyConversionTest, UdtOlderTimestampReadAfterDrops) {
+  for (bool reverse : {false, true}) {
+    SCOPED_TRACE(reverse ? "reverse" : "forward");
+    Options options = ConversionOptions(/*threshold=*/3);
+    options.comparator = BytewiseComparatorWithU64Ts();
+    Reset(options);
+    ColumnFamilyHandle* cf = db_->DefaultColumnFamily();
+    std::string ts_buf;
+    auto ts = [&](uint64_t t) { return EncodeU64Ts(t, &ts_buf).ToString(); };
+    ASSERT_OK(db_->Put(WriteOptions(), cf, "a", ts(1), "v1"));
+    for (int i : {1, 2, 3, 4, 5, 9}) {
+      ASSERT_OK(db_->Put(WriteOptions(), cf, ConvKey(i), ts(1), "v1"));
+    }
+    ASSERT_OK(
+        db_->DeleteRange(WriteOptions(), cf, ConvKey(0), ConvKey(6), ts(2)));
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    // The mutable memtable must not be empty for a conversion.
+    ASSERT_OK(db_->Put(WriteOptions(), cf, "z", ts(3), "vz"));
+
+    Slice max_ts = MaxU64Ts();
+    ReadOptions latest_ro;
+    latest_ro.timestamp = &max_ts;
+    {
+      std::unique_ptr<Iterator> iter(db_->NewIterator(latest_ro));
+      if (reverse) {
+        iter->SeekForPrev(ConvKey(8));
+      } else {
+        iter->Seek(ConvKey(0));
+      }
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), reverse ? "a" : ConvKey(9));
+      ASSERT_OK(iter->status());
+    }
+    ASSERT_EQ(dropped_keys_added_, 0);
+    ASSERT_TRUE(attempted_ranges_.empty());
+
+    const std::string ts1 = ts(1);
+    Slice old_ts = ts1;
+    ReadOptions old_ro;
+    old_ro.timestamp = &old_ts;
+    for (const std::string& key :
+         {std::string("a"), ConvKey(1), ConvKey(2), ConvKey(3), ConvKey(4),
+          ConvKey(5), ConvKey(9)}) {
+      std::string value;
+      ASSERT_OK(db_->Get(old_ro, key, &value));
+      ASSERT_EQ(value, "v1");
+    }
+  }
+}
+
+// A gap of dropped keys followed by a key past the upper bound or outside the
+// seek prefix: DBIter does not read the dropped keys, and nothing is
+// converted.
+TEST_F(DBRangeDelDroppedKeyConversionTest, BoundAndPrefix) {
+  for (bool use_prefix : {false, true}) {
+    SCOPED_TRACE(use_prefix ? "prefix" : "upper bound");
+    Options options = ConversionOptions(/*threshold=*/5);
+    options.prefix_extractor.reset(NewFixedPrefixTransform(3));
+    Reset(options);
+    PutThenDeleteRange(0, 20, 100);
+    ASSERT_OK(Put(ConvKey(500), "live"));
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+
+    ReadOptions ro;
+    std::string upper_key = ConvKey(100);
+    Slice upper = upper_key;
+    std::string start;
+    if (use_prefix) {
+      ro.prefix_same_as_start = true;
+      // In the "k00" prefix and smaller than every key.
+      start = "k00";
+    } else {
+      ro.total_order_seek = true;
+      ro.iterate_upper_bound = &upper;
+    }
+    ASSERT_TRUE(ScanAll(start, ro).empty());
+    ASSERT_EQ(dropped_keys_added_, 0);
+    ASSERT_EQ(Inserted(options), 0);
+    ASSERT_EQ(Get(ConvKey(500)), "live");
+
+    // The same scan without the bound or the prefix limit reaches k0500
+    // after the gap, so it counts the 20 dropped keys. So the bound or the
+    // prefix check, not a missing record, kept the scan above from counting.
+    ReadOptions full_ro;
+    full_ro.total_order_seek = true;
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {ConvKey(500), "live"}};
+    ASSERT_EQ(ScanAll("", full_ro), expected);
+    ASSERT_EQ(dropped_keys_added_, 20);
+  }
+}
+
+// Prev and Next around a live key that follows a gap of dropped keys.
+TEST_F(DBRangeDelDroppedKeyConversionTest, PrevThenNext) {
+  Options options = ConversionOptions(/*threshold=*/5);
+  Reset(options);
+  ASSERT_OK(Put(ConvKey(1), "live1"));
+  for (int i = 10; i < 30; ++i) {
+    ASSERT_OK(Put(ConvKey(i), "v"));
+  }
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                             ConvKey(5), ConvKey(100)));
+  ASSERT_OK(Put(ConvKey(40), "live40"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  for (int i = 200; i < 210; ++i) {
+    ASSERT_OK(Delete(ConvKey(i)));
+  }
+  ASSERT_OK(Put(ConvKey(300), "live300"));
+
+  // Each step: true for Next(), false for Prev(), and the expected key.
+  const std::vector<std::pair<bool, int>> steps = {{true, 40},  {false, 1},
+                                                   {true, 40},  {true, 300},
+                                                   {false, 40}, {true, 300}};
+  for (int round = 0; round < 3; ++round) {
+    SCOPED_TRACE("round=" + std::to_string(round));
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->Seek("");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), ConvKey(1));
+    for (const auto& step : steps) {
+      if (step.first) {
+        iter->Next();
+      } else {
+        iter->Prev();
+      }
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_EQ(iter->key(), ConvKey(step.second));
+    }
+    iter->Next();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+  const std::vector<std::pair<std::string, std::string>> expected = {
+      {ConvKey(1), "live1"},
+      {ConvKey(40), "live40"},
+      {ConvKey(300), "live300"}};
+  ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+  ASSERT_TRUE(NoRangeCovers(ConvKey(1)));
+  ASSERT_TRUE(NoRangeCovers(ConvKey(40)));
+  ASSERT_GE(Inserted(options), 1);
+  ASSERT_GT(dropped_keys_added_, 0);
+}
+
+// A gap of dropped keys followed only by keys that are not visible at the
+// scan's snapshot. The run then has no visible tombstone, so there is no end
+// key, and nothing is converted: neither at the end of the scan nor at a
+// prefix boundary. In the prefix variant, live key k0150 is outside the "k00"
+// prefix of the seek key. The run also publishes no head mark.
+TEST_F(DBRangeDelDroppedKeyConversionTest, DroppedOnlyRunNotConverted) {
+  // One tracker for both passes: its destructor clears all sync point
+  // callbacks, including the fixture's.
+  HeadMarkTracker tracker;
+  for (bool use_prefix : {false, true}) {
+    SCOPED_TRACE(use_prefix ? "prefix boundary" : "end of scan");
+    tracker.Reset();
+    Options options = ConversionOptions(/*threshold=*/5);
+    options.prefix_extractor.reset(NewFixedPrefixTransform(3));
+    Reset(options);
+    PutThenDeleteRange(0, 20, 100);
+    if (use_prefix) {
+      ASSERT_OK(Put(ConvKey(150), "live150"));
+    }
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    const Snapshot* snap = db_->GetSnapshot();
+    // Not visible at the snapshot.
+    ASSERT_OK(Put(ConvKey(50), "after"));
+
+    ReadOptions ro;
+    ro.snapshot = snap;
+    std::string start;
+    if (use_prefix) {
+      ro.prefix_same_as_start = true;
+      start = "k00";
+    } else {
+      ro.total_order_seek = true;
+    }
+    ASSERT_TRUE(ScanAll(start, ro).empty());
+    // The dropped keys were added to a run, but the run was not converted.
+    ASSERT_EQ(dropped_keys_added_, 20);
+    ASSERT_EQ(Inserted(options), 0);
+    ASSERT_EQ(Discarded(options), 0);
+    ASSERT_TRUE(tracker.results.empty());
+    db_->ReleaseSnapshot(snap);
+
+    std::vector<std::pair<std::string, std::string>> expected = {
+        {ConvKey(50), "after"}};
+    if (use_prefix) {
+      expected.emplace_back(ConvKey(150), "live150");
+    }
+    ReadOptions total_order;
+    total_order.total_order_seek = true;
+    ASSERT_EQ(ScanAll("", total_order), expected);
+  }
+}
+
+// Refresh(snapshot) to a snapshot older than the mutable memtable, on an
+// unchanged SuperVersion: the immutable memtable iterators are reused, and
+// the scan finds drops at the older snapshot. The insert must be discarded,
+// because the snapshot is older than the mutable memtable.
+TEST_F(DBRangeDelDroppedKeyConversionTest, RefreshOlderSnapshot) {
+  Options options = ConversionOptions(/*threshold=*/5);
+  Reset(options);
+  PutThenDeleteRange(0, 20, 100);
+  ASSERT_OK(Put(ConvKey(500), "live"));
+  const Snapshot* snap = db_->GetSnapshot();
+  // A write after the snapshot, so that the next mutable memtable's earliest
+  // sequence number is greater than the snapshot.
+  ASSERT_OK(Put(ConvKey(600), "after"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  for (int i = 200; i < 210; ++i) {
+    ASSERT_OK(Delete(ConvKey(i)));
+  }
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  ASSERT_OK(iter->Refresh(snap));
+  iter->Seek("");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key(), ConvKey(500));
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(dropped_keys_added_, 20);
+  ASSERT_EQ(Inserted(options), 0);
+  ASSERT_GE(Discarded(options), 1);
+  iter.reset();
+  db_->ReleaseSnapshot(snap);
+  ASSERT_EQ(Get(ConvKey(500)), "live");
+}
+
+// MultiScan prunes the mutable memtable when it does not overlap the scan
+// ranges. Then child 0 of the merging iterator is an immutable memtable, and
+// its drops must be reported.
+TEST_F(DBRangeDelDroppedKeyConversionTest, MultiScanPrunedMemtable) {
+  Options options = ConversionOptions(/*threshold=*/10);
+  Reset(options);
+  PutThenDeleteRange(0, 20, 40);
+  ASSERT_OK(Put(ConvKey(50), "live50"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  // The mutable memtable holds only keys outside the scan range.
+  ASSERT_OK(Put("z", "outside"));
+
+  // The same steps as MultiScan: an iterator with the range limit as upper
+  // bound, Prepare() with the scan ranges, then Seek() to the range start.
+  std::string upper_key = ConvKey(100);
+  Slice upper = upper_key;
+  ReadOptions ro;
+  ro.iterate_upper_bound = &upper;
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.insert("k", upper_key);
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+  iter->Prepare(scan_options);
+  std::vector<std::string> keys;
+  for (iter->Seek("k"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_OK(iter->status());
+  iter.reset();
+  ASSERT_EQ(keys, std::vector<std::string>({ConvKey(50)}));
+  ASSERT_EQ(dropped_keys_added_, 20);
+  const std::vector<std::pair<std::string, std::string>> expected_ranges = {
+      {ConvKey(0), ConvKey(50)}};
+  ASSERT_EQ(attempted_ranges_, expected_ranges);
+  ASSERT_EQ(Inserted(options), 1);
+  const std::vector<std::pair<std::string, std::string>> expected = {
+      {ConvKey(50), "live50"}, {"z", "outside"}};
+  ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+}
+
+TEST_F(DBRangeDelDroppedKeyConversionTest, ReverseRunStartsAtDroppedKey) {
+  // An immutable memtable holds puts k0100..k0299 under a DeleteRange
+  // [k0100, k0300), and live keys k0050 and k0500 sit in the mutable
+  // memtable. A reverse scan from k0500 drops k0299..k0100 and then reaches
+  // the live key k0050, so the run of dropped keys becomes [k0100, k0500).
+  // With a small max_sequential_skip_in_iterations, DBIter also reseeks, and
+  // the results must stay the same.
+  for (uint64_t max_skip : {uint64_t{8}, uint64_t{1}}) {
+    SCOPED_TRACE("max_skip=" + std::to_string(max_skip));
+    Options options = ConversionOptions(/*threshold=*/10);
+    options.max_sequential_skip_in_iterations = max_skip;
+    Reset(options);
+    PutThenDeleteRange(100, 300, 300);
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    ASSERT_OK(Put(ConvKey(50), "live50"));
+    ASSERT_OK(Put(ConvKey(500), "live500"));
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    iter->SeekToLast();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), ConvKey(500));
+    iter->Prev();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), ConvKey(50));
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+    const std::vector<std::pair<std::string, std::string>> expected_ranges = {
+        {ConvKey(100), ConvKey(500)}};
+    ASSERT_EQ(attempted_ranges_, expected_ranges);
+    ASSERT_EQ(dropped_keys_added_, 200);
+    ASSERT_EQ(Inserted(options), 1);
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {ConvKey(50), "live50"}, {ConvKey(500), "live500"}};
+    ASSERT_EQ(ScanAll("", ReadOptions()), expected);
+  }
+}
+
+TEST_F(DBRangeDelDroppedKeyConversionTest, ReverseDropsBeforeFirstKey) {
+  // An immutable memtable holds puts k0100..k0299 under a DeleteRange
+  // [k0100, k0300), and the live key k0050 sits in the mutable memtable.
+  // - SeekToLast() drops k0299..k0100 before it returns k0050. Nothing above
+  //   the dropped keys was examined, so they do not start a run.
+  // - SeekForPrev(k0400) drops the same keys, but it examined every key up to
+  //   its target k0400, so the run of dropped keys is [k0100, k0400). The
+  //   target is the end of the first run after SeekForPrev(), as for visible
+  //   tombstones.
+  for (bool seek_for_prev : {false, true}) {
+    SCOPED_TRACE("seek_for_prev=" + std::to_string(seek_for_prev));
+    Options options = ConversionOptions(/*threshold=*/10);
+    Reset(options);
+    PutThenDeleteRange(100, 300, 300);
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    ASSERT_OK(Put(ConvKey(50), "live50"));
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+    if (seek_for_prev) {
+      iter->SeekForPrev(ConvKey(400));
+    } else {
+      iter->SeekToLast();
+    }
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->key(), ConvKey(50));
+    iter->Prev();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+    if (seek_for_prev) {
+      const std::vector<std::pair<std::string, std::string>> expected_ranges = {
+          {ConvKey(100), ConvKey(400)}};
+      ASSERT_EQ(attempted_ranges_, expected_ranges);
+      ASSERT_EQ(dropped_keys_added_, 200);
+    } else {
+      ASSERT_TRUE(attempted_ranges_.empty());
+      ASSERT_EQ(dropped_keys_added_, 0);
+    }
+  }
+}
+
+TEST_F(DBRangeDelDroppedKeyConversionTest,
+       ReverseDroppedOlderVersionOfLiveKey) {
+  // k0050 has an old put under a DeleteRange [k0050, k0300) and a newer live
+  // put above it. A reverse scan from k0500 drops k0299..k0100 and then the
+  // old version of k0050, so the smallest dropped key is k0050, the live key
+  // itself. The run must not start there, or the new tombstone would delete
+  // the live version. It starts at the next larger dropped key, k0100.
+  Options options = ConversionOptions(/*threshold=*/10);
+  Reset(options);
+  ASSERT_OK(Put(ConvKey(50), "old"));
+  PutThenDeleteRange(100, 300, 300);
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                             ConvKey(50), ConvKey(300)));
+  ASSERT_OK(Put(ConvKey(50), "new"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(Put(ConvKey(500), "live500"));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key(), ConvKey(500));
+  iter->Prev();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key(), ConvKey(50));
+  ASSERT_EQ(iter->value(), "new");
+  iter.reset();
+  const std::vector<std::pair<std::string, std::string>> expected_ranges = {
+      {ConvKey(100), ConvKey(500)}};
+  ASSERT_EQ(attempted_ranges_, expected_ranges);
+  ASSERT_TRUE(NoRangeCovers(ConvKey(50)));
+  ASSERT_EQ("new", Get(ConvKey(50)));
+}
+
+// Random Put, Merge, Delete, DeleteRange, memtable switches, flushes and
+// scans. Every scan must match an in-memory model of the expected data,
+// including scans at older snapshots, with prefix_same_as_start and with an
+// upper bound.
+TEST_F(DBRangeDelDroppedKeyConversionTest, MatchesModelRandom) {
+  const uint32_t seed = static_cast<uint32_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  SCOPED_TRACE("seed=" + std::to_string(seed));
+  Random rnd(seed);
+
+  Options options = ConversionOptions(/*threshold=*/4);
+  options.prefix_extractor.reset(NewFixedPrefixTransform(3));
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  // A small value makes DBIter reseek while it skips older versions.
+  options.max_sequential_skip_in_iterations = rnd.OneIn(2) ? 2 : 8;
+  Reset(options);
+
+  using Model = std::map<std::string, std::string>;
+  Model model;
+  std::vector<std::pair<const Snapshot*, Model>> snapshots;
+  // Keys k0000..k0299 use the prefixes "k00", "k01" and "k02".
+  const int kNumKeys = 300;
+  const int kNumOps = 4000;
+  int memtables_in_imm = 0;
+
+  for (int op = 0; op < kNumOps; ++op) {
+    const uint32_t r = rnd.Uniform(100);
+    if (r < 30) {
+      const int k = static_cast<int>(rnd.Uniform(kNumKeys));
+      const std::string v = "v" + std::to_string(op);
+      ASSERT_OK(Put(ConvKey(k), v));
+      model[ConvKey(k)] = v;
+    } else if (r < 35) {
+      // StringAppend joins operands with ",".
+      const int k = static_cast<int>(rnd.Uniform(kNumKeys));
+      const std::string v = "m" + std::to_string(op);
+      ASSERT_OK(Merge(ConvKey(k), v));
+      auto it = model.find(ConvKey(k));
+      model[ConvKey(k)] = it == model.end() ? v : it->second + "," + v;
+    } else if (r < 70) {
+      // Deletes come in short runs, so that conversion runs form.
+      const int k = static_cast<int>(rnd.Uniform(kNumKeys));
+      const int len = 1 + static_cast<int>(rnd.Uniform(12));
+      for (int i = k; i < std::min(k + len, kNumKeys); ++i) {
+        ASSERT_OK(Delete(ConvKey(i)));
+        model.erase(ConvKey(i));
+      }
+    } else if (r < 74) {
+      const int k = static_cast<int>(rnd.Uniform(kNumKeys));
+      const int len = 1 + static_cast<int>(rnd.Uniform(30));
+      const int end = std::min(k + len, kNumKeys);
+      ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                                 ConvKey(k), ConvKey(end)));
+      model.erase(model.lower_bound(ConvKey(k)),
+                  model.lower_bound(ConvKey(end)));
+    } else if (r < 77) {
+      if (memtables_in_imm < 8) {
+        ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+        ++memtables_in_imm;
+      }
+    } else if (r < 78) {
+      ASSERT_OK(Flush());
+      memtables_in_imm = 0;
+    } else if (r < 80) {
+      if (snapshots.size() < 4) {
+        snapshots.emplace_back(db_->GetSnapshot(), model);
+      } else {
+        const size_t idx = rnd.Uniform(static_cast<int>(snapshots.size()));
+        db_->ReleaseSnapshot(snapshots[idx].first);
+        snapshots.erase(snapshots.begin() + idx);
+      }
+    } else {
+      // Scan: pick a snapshot, a mode and a start key.
+      ReadOptions ro;
+      const Model* expected = &model;
+      if (!snapshots.empty() && rnd.OneIn(3)) {
+        const size_t idx = rnd.Uniform(static_cast<int>(snapshots.size()));
+        ro.snapshot = snapshots[idx].first;
+        expected = &snapshots[idx].second;
+      }
+      if (rnd.OneIn(4)) {
+        RandomWalk(ro, *expected, &rnd);
+        continue;
+      }
+      const int start = static_cast<int>(rnd.Uniform(kNumKeys));
+      const std::string start_key = ConvKey(start);
+      std::string upper_key;
+      Slice upper;
+      const uint32_t mode = rnd.Uniform(3);
+      if (mode == 0) {
+        ro.total_order_seek = true;
+      } else if (mode == 1) {
+        ro.total_order_seek = true;
+        upper_key = ConvKey(start + 1 + static_cast<int>(rnd.Uniform(60)));
+        upper = upper_key;
+        ro.iterate_upper_bound = &upper;
+      } else {
+        ro.prefix_same_as_start = true;
+      }
+      const std::string prefix = start_key.substr(0, 3);
+      std::vector<std::pair<std::string, std::string>> want;
+      for (auto it = expected->lower_bound(start_key); it != expected->end();
+           ++it) {
+        if (mode == 1 && it->first >= upper_key) {
+          break;
+        }
+        if (mode == 2 && it->first.compare(0, 3, prefix) != 0) {
+          break;
+        }
+        want.emplace_back(it->first, it->second);
+      }
+      // Partial scans (a short limit) also exercise conversions that end at a
+      // live key in the middle of the data.
+      const size_t limit = rnd.OneIn(2) ? want.size() : rnd.Uniform(8);
+      std::unique_ptr<Iterator> iter(db_->NewIterator(ro));
+      size_t n = 0;
+      for (iter->Seek(start_key); iter->Valid() && n < limit; iter->Next()) {
+        ASSERT_LT(n, want.size()) << "extra key " << iter->key().ToString();
+        ASSERT_EQ(iter->key().ToString(), want[n].first) << "op=" << op;
+        ASSERT_EQ(iter->value().ToString(), want[n].second) << "op=" << op;
+        ++n;
+      }
+      ASSERT_OK(iter->status());
+      if (n < limit) {
+        ASSERT_EQ(n, want.size()) << "missing keys, op=" << op;
+      }
+    }
+  }
+  for (auto& snap : snapshots) {
+    db_->ReleaseSnapshot(snap.first);
+  }
+  // A final full forward scan, and a check of every key with Get.
+  ReadOptions total_order;
+  total_order.total_order_seek = true;
+  const std::vector<std::pair<std::string, std::string>> want_all(model.begin(),
+                                                                  model.end());
+  ASSERT_EQ(ScanAll("", total_order), want_all);
+  for (int k = 0; k < kNumKeys; ++k) {
+    auto it = model.find(ConvKey(k));
+    ASSERT_EQ(Get(ConvKey(k)), it == model.end() ? "NOT_FOUND" : it->second);
+  }
+  ASSERT_GT(Inserted(options), 0);
+  ASSERT_GT(dropped_keys_added_, 0);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

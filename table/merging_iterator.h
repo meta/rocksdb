@@ -84,6 +84,28 @@ class MergeIteratorBuilder {
   // `mem`.
   void SetHeadMarkMemTable(const ReadOnlyMemTable* mem);
 
+  // Same as AddPointAndTombstoneIterator(), for the mutable memtable. The
+  // merging iterator remembers which sorted run is the mutable memtable, so
+  // that dropped-key tracking (see EnableDroppedKeyTracking()) skips it. The
+  // only user of the tracking, read-path range tombstone conversion in DBIter,
+  // inserts its range tombstones into the mutable memtable. A range built from
+  // drops in that memtable would not make later scans cheaper, and DBIter's
+  // safety argument needs every dropped key and its covering range tombstone
+  // to come from an immutable memtable or an SST file (see "Dropped keys in a
+  // conversion run" in db/db_iter.h). When the mutable memtable is not added,
+  // for example because MultiScan pruned it, no sorted run is skipped.
+  void AddMutableMemtableIterator(
+      InternalIterator* point_iter,
+      std::unique_ptr<TruncatedRangeDelIterator>&& tombstone_iter);
+
+  // Makes the merging iterator record the point keys that it drops because a
+  // range tombstone from the same sorted run covers them. The caller reads
+  // them with InternalIterator::GetDroppedKeyInfo(). Used by read-path
+  // range tombstone conversion in DBIter. The record and its key buffers are
+  // allocated from the arena here, so a merging iterator without tracking
+  // does not carry them.
+  void EnableDroppedKeyTracking();
+
   // Get arena used to build the merging iterator. It is called one a child
   // iterator needs to be allocated.
   Arena* GetArena() { return arena; }

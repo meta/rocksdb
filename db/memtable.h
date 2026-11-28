@@ -373,7 +373,8 @@ struct MemTableHeadMark {
   // new mark with lowered false. A scan sent by a lowered mark may extend it
   // with fewer tombstones than min_tombstones_for_range_conversion, because the
   // keys after the lowered end are often covered by a converted range
-  // tombstone, and DBIter does not count covered keys. A writer that shortens
+  // tombstone, and DBIter does not count keys that a range tombstone of the
+  // active memtable, or of a newer sorted run, covers. A writer that shortens
   // the claim to its start leaves the usable range empty, so the mark moves no
   // seek.
   bool lowered;

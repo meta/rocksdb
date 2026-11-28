@@ -22,6 +22,46 @@ class PinnedIteratorsManager;
 class ReadOnlyMemTable;
 struct MemTableHeadMark;
 
+// The point entries that an iterator dropped. An iterator that merges sorted
+// runs drops a point entry when it steps over it because a range tombstone in
+// the same sorted run covers it. The iterator writes the record, and the
+// caller reads it after each move (see InternalIteratorBase::
+// GetDroppedKeyInfo()).
+//
+// Forward moves: the record describes the keys dropped right before the
+// current key; every Next() starts a new record. Backward moves: the record
+// adds up the keys dropped over several Prev() calls, until the caller clears
+// it (count = 0, smallest_key_count = 0, has_key = false, has_next_key =
+// false). The two directions differ because a backward move positions the
+// iterator on a key before the caller has handled the keys after it, so the
+// caller reads the drops of a move only later. Every Seek, SeekForPrev,
+// SeekToFirst, SeekToLast and every change of direction clears the record
+// first.
+struct DroppedKeyInfo {
+  // The number of dropped internal entries in the record, one for each dropped
+  // version of a user key.
+  uint64_t count = 0;
+  // When has_key is true, smallest_dropped_ikey is the internal key of the
+  // dropped key with the smallest user key in the record: the first one in
+  // forward moves, the last one in backward moves, and smallest_key_count is
+  // the number of dropped entries with that user key. When has_next_key is
+  // also true, next_dropped_ikey is a dropped key whose user key is the next
+  // larger one in the record. The caller uses it when the smallest user key
+  // belongs to a key it handled itself (older versions of a key can be dropped
+  // right next to its visible version). Both point to copies that the
+  // iterator owns. They stay valid until the record changes (the next drop or
+  // a clear).
+  Slice smallest_dropped_ikey;
+  Slice next_dropped_ikey;
+  uint64_t smallest_key_count = 0;
+  bool has_key = false;
+  bool has_next_key = false;
+  // Set by the caller. Copying a dropped key costs a key copy, so the
+  // iterator copies the keys and fills smallest_key_count only while want_key
+  // is true. The count is kept either way.
+  bool want_key = false;
+};
+
 template <class TValue>
 class InternalIteratorBase : public Cleanable {
  public:
@@ -255,6 +295,17 @@ class InternalIteratorBase : public Cleanable {
   // it cheap to check if the current key is a sentinel key. This should only be
   // used by MergingIterator and LevelIterator for now.
   virtual bool IsDeleteRangeSentinelKey() const { return false; }
+
+  // An iterator that merges sorted runs can step over a point key because a
+  // range tombstone from the same sorted run covers it. DroppedKeyInfo calls
+  // such a key "dropped". An iterator that tracks dropped keys returns a
+  // pointer to its DroppedKeyInfo, which describes the dropped keys as
+  // explained there. The pointer stays valid for the lifetime of the
+  // iterator, so the caller asks for it once and then reads the struct after
+  // each move, without a virtual call per key. Returns nullptr when the
+  // iterator does not track dropped keys. Only MergingIterator tracks them,
+  // and only after MergeIteratorBuilder::EnableDroppedKeyTracking().
+  virtual DroppedKeyInfo* GetDroppedKeyInfo() { return nullptr; }
 
   // Prepares the iterator for the scan ranges in scan_opts (see
   // Iterator::Prepare()). scan_opts may be nullptr, meaning there are no

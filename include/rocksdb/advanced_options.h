@@ -1438,6 +1438,13 @@ struct AdvancedColumnFamilyOptions {
   // the current mutable memtable (only if memtable is not empty). This is a
   // logically redundant entry that does not change any data, but optimizes
   // future iterators by potentially skipping a large number of tombstone scans.
+  // The count also includes point entries of any type (values as well as
+  // deletes) in an immutable memtable or SST file that the read stepped over
+  // because a range tombstone in the same memtable or file covers them. Each
+  // version of a key counts as one entry, and the inserted range can start at
+  // such an entry. So a range tombstone can be inserted when the run has fewer
+  // visible point tombstones than this value, or none at all, for example when
+  // every counted entry is a value hidden by such a range tombstone.
   //
   // This optimization is best-effort and is currently disabled for iterator
   // configurations that may not expose all interior live keys, including:
@@ -1471,15 +1478,15 @@ struct AdvancedColumnFamilyOptions {
   //
   // A memtable created while this option is > 0 also keeps head marks. When a
   // scan that starts with Seek(), SeekForPrev(), or SeekToLast() with
-  // iterate_upper_bound sees such a run of point tombstones right after its
-  // seek, in its merged view of the memtables and SST files, it records the
-  // deleted range as a head mark in the active memtable. A later seek in the
-  // same direction into the range then skips the range in one step, in that
-  // memtable and in every older memtable and SST file. Head marks live only in
-  // memory and change no data. They are not used with user-defined timestamps,
-  // inplace_update_support, unordered_write, two_write_queues, FIFO compaction,
-  // memtables that are not skip lists, or iterators with a read callback,
-  // table_filter or ignore_range_deletions. After a compaction filter returns
+  // iterate_upper_bound sees such a run right after its seek, in its merged
+  // view of the memtables and SST files, it records the deleted range as a head
+  // mark in the active memtable. A later seek in the same direction into the
+  // range then skips the range in one step, in that memtable and in every older
+  // memtable and SST file. Head marks live only in memory and change no data.
+  // They are not used with user-defined timestamps, inplace_update_support,
+  // unordered_write, two_write_queues, FIFO compaction, memtables that are not
+  // skip lists, or iterators with a read callback, table_filter or
+  // ignore_range_deletions. After a compaction filter returns
   // kRemoveAndSkipUntil, a scan that uses a head mark can miss a key that Get()
   // returns. A scan that cannot use a mark works as it does without one.
   //

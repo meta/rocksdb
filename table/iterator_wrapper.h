@@ -214,6 +214,8 @@ class IteratorWrapperBase {
     return iter_->IsDeleteRangeSentinelKey();
   }
 
+  DroppedKeyInfo* GetDroppedKeyInfo() { return iter_->GetDroppedKeyInfo(); }
+
   // scan_opts lifetime is guaranteed until the iterator is destructed, or
   // Prepare() is called with a new scan_opts
   void Prepare(const MultiScanArgs* scan_opts) {
