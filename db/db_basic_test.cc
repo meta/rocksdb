@@ -7384,6 +7384,53 @@ TEST_F(DBBasicTest, VerifyFileChecksumsReadahead) {
             (sst_size + alignment - 1) / (alignment));
 }
 
+TEST_F(DBBasicTest, MultiGetMultiCFLastTryReadsSequenceUnderMutex) {
+  // A multi-column-family MultiGet() without a snapshot retries while a
+  // column family's memtable changes under it. A write and a flush in column
+  // family 2 during each of the first two tries force the last try, which
+  // takes the DB mutex. Right before that try takes the mutex, k in column
+  // family 1 is overwritten with v2 and flushed. v1 and v2 are in the same
+  // memtable and no snapshot protects v1, so the flush keeps only v2. The
+  // last try must read its sequence number under the mutex, after v2: a
+  // sequence number read before the write sees no version of k.
+  CreateAndReopenWithCF({"one", "two"}, CurrentOptions());
+  ASSERT_OK(Put(0, "a", "x"));
+  ASSERT_OK(Put(1, "k", "v1"));
+  ASSERT_OK(Put(2, "b", "z"));
+
+  bool last_try = false;
+  int forced_retries = 0;
+  int refs = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
+        // Runs once per column family and try. After the first reference of
+        // a try, a write and a flush give column family 2 a new memtable whose
+        // earliest sequence number is above the try's sequence number, so the
+        // try retries.
+        if (last_try || forced_retries >= 2 || (refs++ % 3) != 0) {
+          return;
+        }
+        ++forced_retries;
+        ASSERT_OK(Put(2, "other" + std::to_string(forced_retries), "y"));
+        ASSERT_OK(Flush(2));
+      });
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::MultiCFSnapshot::LastTry",
+                                        [&](void* /*arg*/) {
+                                          last_try = true;
+                                          ASSERT_OK(Put(1, "k", "v2"));
+                                          ASSERT_OK(Flush(1));
+                                        });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const std::vector<std::string> values = MultiGet(
+      {0, 1, 2}, {"a", "k", "b"}, /*snapshot=*/nullptr, /*batched=*/true);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(last_try);
+  ASSERT_EQ(2, forced_retries);
+  const std::vector<std::string> expected = {"x", "v2", "z"};
+  ASSERT_EQ(expected, values);
+}
+
 TEST_F(DBBasicTest, DisallowMemtableWrite) {
   // This test is mostly about what you can't do with memtable writes
   // disallowed. For what you can do, see

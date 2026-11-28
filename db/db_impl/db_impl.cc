@@ -4343,18 +4343,27 @@ Status DBImpl::MultiCFSnapshot(const ReadOptions& read_options,
       if (i > 0) {
         sv_cleanup_func();
       }
-      if (read_options.snapshot == nullptr) {
-        *snapshot = GetLastPublishedSequence();
-      } else {
+      if (read_options.snapshot != nullptr) {
         *snapshot =
             static_cast_with_check<const SnapshotImpl>(read_options.snapshot)
                 ->number_;
+      } else if (!acquire_mutex) {
+        *snapshot = GetLastPublishedSequence();
       }
       if (acquire_mutex) {
         TEST_SYNC_POINT("DBImpl::MultiCFSnapshot::LastTry");
         // We're close to max number of retries. For the last retry,
         // acquire the lock so we're sure to succeed
         mutex_.Lock();
+        // Without a snapshot, read the sequence number under the mutex. No
+        // SuperVersion can be installed until the references below are taken,
+        // so a flush cannot drop a version that this sequence number needs.
+        // A sequence number read before the mutex has no such guarantee: a
+        // write and a flush between the two steps can replace the only version
+        // at or below it, and the read then misses the key.
+        if (read_options.snapshot == nullptr) {
+          *snapshot = GetLastPublishedSequence();
+        }
       }
       for (auto cf_iter = cf_list->begin(); cf_iter != cf_list->end();
            ++cf_iter) {
