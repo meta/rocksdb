@@ -26,6 +26,7 @@
 #include "monitoring/statistics_impl.h"
 #include "monitoring/thread_status_util.h"
 #include "options/options_helper.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "rocksdb/wal_filter.h"
@@ -252,6 +253,20 @@ Status DBImpl::ValidateOptions(
   }
   s = ValidateOptions(db_options);
   return s;
+}
+
+Status DBImpl::CheckManifestStoreOptions(const DBOptions& db_options) {
+  if (db_options.manifest_store == nullptr) {
+    return Status::OK();
+  }
+  if (db_options.manifest_row_feature_version < 1 ||
+      db_options.manifest_row_feature_version >
+          kManifestRowFeatureVersionLatest) {
+    return Status::InvalidArgument(
+        "manifest_row_feature_version must be from 1 to " +
+        std::to_string(kManifestRowFeatureVersionLatest));
+  }
+  return Status::NotSupported("manifest_store is not supported");
 }
 
 Status DBImpl::ValidateOptions(const DBOptions& db_options) {
@@ -2710,7 +2725,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   const WriteOptions write_options(Env::IOActivity::kDBOpen);
   const ReadOptions read_options(Env::IOActivity::kDBOpen);
 
-  Status s;
+  Status s = CheckManifestStoreOptions(db_options);
+  if (!s.ok()) {
+    return s;
+  }
   for (const ColumnFamilyDescriptor& cf : column_families) {
     s = ValidateCompactionFilterOptions(cf.options);
     if (!s.ok()) {
