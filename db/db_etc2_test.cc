@@ -9839,28 +9839,48 @@ INSTANTIATE_TEST_CASE_P(
         /*allow_concurrent_memtable_write=*/::testing::Bool(),
         /*min_tombstones_for_range_conversion=*/::testing::Values(0, 4)));
 
+// Shared by FastOpenTestFS and the files it opens. It counts the metadata
+// retrievals and records the checksum fields that the file of the last
+// retrieval was opened with.
+struct FastOpenRetrievalLog {
+  std::atomic<int> count{0};
+  mutable port::Mutex mu;
+  // Guarded by mu.
+  std::string last_file_checksum;
+  std::string last_file_checksum_func_name;
+};
+
 // Test file system that supports GetFileOpenMetadata for fast_sst_open testing
 class FastOpenTestRandomAccessFile : public FSRandomAccessFileWrapper {
  public:
   explicit FastOpenTestRandomAccessFile(
       std::unique_ptr<FSRandomAccessFile>&& file, const std::string& fname,
-      std::atomic<int>* metadata_retrieved_count)
+      const FileOptions& file_opts, FastOpenRetrievalLog* retrieval_log)
       : FSRandomAccessFileWrapper(file.get()),
         file_(std::move(file)),
         fname_(fname),
-        metadata_retrieved_count_(metadata_retrieved_count) {}
+        file_checksum_(file_opts.file_checksum),
+        file_checksum_func_name_(file_opts.file_checksum_func_name),
+        retrieval_log_(retrieval_log) {}
 
   IOStatus GetFileOpenMetadata(std::string* metadata) override {
     // Return the file name as opaque metadata for testing
     *metadata = "fast_open_metadata:" + fname_;
-    metadata_retrieved_count_->fetch_add(1, std::memory_order_relaxed);
+    {
+      MutexLock l(&retrieval_log_->mu);
+      retrieval_log_->last_file_checksum = file_checksum_;
+      retrieval_log_->last_file_checksum_func_name = file_checksum_func_name_;
+    }
+    retrieval_log_->count.fetch_add(1, std::memory_order_relaxed);
     return IOStatus::OK();
   }
 
  private:
   std::unique_ptr<FSRandomAccessFile> file_;
   std::string fname_;
-  std::atomic<int>* metadata_retrieved_count_;
+  std::string file_checksum_;
+  std::string file_checksum_func_name_;
+  FastOpenRetrievalLog* retrieval_log_;
 };
 
 class FastOpenTestFS : public FileSystemWrapper {
@@ -9877,20 +9897,30 @@ class FastOpenTestFS : public FileSystemWrapper {
     if (file_opts.file_metadata != nullptr) {
       metadata_passed_on_open_.fetch_add(1, std::memory_order_relaxed);
       {
-        MutexLock l(&last_metadata_mu_);
+        MutexLock l(&metadata_mu_);
         last_metadata_received_ = *file_opts.file_metadata;
+        metadata_received_on_open_.emplace_back(fname,
+                                                *file_opts.file_metadata);
       }
     }
     IOStatus s = target()->NewRandomAccessFile(fname, file_opts, result, dbg);
     if (s.ok()) {
       result->reset(new FastOpenTestRandomAccessFile(
-          std::move(*result), fname, &metadata_retrieved_count_));
+          std::move(*result), fname, file_opts, &retrieval_log_));
     }
     return s;
   }
 
   int GetMetadataRetrievedCount() const {
-    return metadata_retrieved_count_.load(std::memory_order_relaxed);
+    return retrieval_log_.count.load(std::memory_order_relaxed);
+  }
+
+  // Returns the (checksum, checksum function name) pair that the file of the
+  // last metadata retrieval was opened with.
+  std::pair<std::string, std::string> GetChecksumAtLastRetrieval() const {
+    MutexLock l(&retrieval_log_.mu);
+    return {retrieval_log_.last_file_checksum,
+            retrieval_log_.last_file_checksum_func_name};
   }
 
   int GetMetadataPassedOnOpenCount() const {
@@ -9898,22 +9928,63 @@ class FastOpenTestFS : public FileSystemWrapper {
   }
 
   std::string GetLastMetadataReceived() const {
-    MutexLock l(&last_metadata_mu_);
+    MutexLock l(&metadata_mu_);
     return last_metadata_received_;
   }
 
+  // Returns one (file name, metadata) pair for each open that passed
+  // metadata, so that a test can check that each file got its own metadata.
+  std::vector<std::pair<std::string, std::string>> GetMetadataReceivedOnOpen()
+      const {
+    MutexLock l(&metadata_mu_);
+    return metadata_received_on_open_;
+  }
+
   void ResetCounters() {
-    metadata_retrieved_count_.store(0, std::memory_order_relaxed);
+    retrieval_log_.count.store(0, std::memory_order_relaxed);
+    {
+      MutexLock l(&retrieval_log_.mu);
+      retrieval_log_.last_file_checksum.clear();
+      retrieval_log_.last_file_checksum_func_name.clear();
+    }
     metadata_passed_on_open_.store(0, std::memory_order_relaxed);
-    MutexLock l(&last_metadata_mu_);
+    MutexLock l(&metadata_mu_);
     last_metadata_received_.clear();
+    metadata_received_on_open_.clear();
   }
 
  private:
-  std::atomic<int> metadata_retrieved_count_{0};
+  FastOpenRetrievalLog retrieval_log_;
   std::atomic<int> metadata_passed_on_open_{0};
-  mutable port::Mutex last_metadata_mu_;
+  mutable port::Mutex metadata_mu_;
   std::string last_metadata_received_;
+  std::vector<std::pair<std::string, std::string>> metadata_received_on_open_;
+};
+
+// Ingestion retrieves the open metadata without the DB mutex, before it takes
+// the DB mutex to commit the files. This helper records how many retrievals
+// `fs` has counted when the commit takes the DB mutex (sync point
+// DBImpl::AddFile:MutexLock).
+class RetrievalsAtCommitMutex {
+ public:
+  explicit RetrievalsAtCommitMutex(FastOpenTestFS* fs) {
+    SyncPoint::GetInstance()->SetCallBack(
+        "DBImpl::AddFile:MutexLock", [this, fs](void* /*arg*/) {
+          count_.store(fs->GetMetadataRetrievedCount());
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+  }
+
+  ~RetrievalsAtCommitMutex() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  }
+
+  // Returns -1 if the commit did not take the DB mutex.
+  int count() const { return count_.load(); }
+
+ private:
+  std::atomic<int> count_{-1};
 };
 
 TEST_F(DBTest2, FastSstOpenDefaultFSReturnsNotSupported) {
@@ -10168,6 +10239,9 @@ TEST_F(DBTest2, FastSstOpenIngestion) {
   options.env = test_env.get();
   options.fast_sst_open = true;
   options.create_if_missing = true;
+  // Ingestion generates a checksum for the file. The retrieval must come after
+  // that, so that it opens the file with the checksum stored in the MANIFEST.
+  options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
 
   std::string test_dbname = test::PerThreadDBPath("fast_open_ingest");
   ASSERT_OK(DestroyDB(test_dbname, options));
@@ -10185,14 +10259,26 @@ TEST_F(DBTest2, FastSstOpenIngestion) {
 
   test_fs->ResetCounters();
 
-  // Ingest the external SST file
-  IngestExternalFileOptions ingest_opts;
-  ingest_opts.move_files = false;
-  ASSERT_OK(db->IngestExternalFile({sst_file}, ingest_opts));
-
-  // Ingestion should retrieve metadata for the ingested file (1 call from
-  // the separate open in the ingestion path)
-  ASSERT_GE(test_fs->GetMetadataRetrievedCount(), 1);
+  // Retrieving the metadata opens the file, so it must not run under the DB
+  // mutex. Ingestion retrieves the metadata of the one ingested file exactly
+  // once, before the commit takes the DB mutex.
+  {
+    RetrievalsAtCommitMutex at_commit(test_fs.get());
+    IngestExternalFileOptions ingest_opts;
+    ingest_opts.move_files = false;
+    ASSERT_OK(db->IngestExternalFile({sst_file}, ingest_opts));
+    ASSERT_EQ(1, at_commit.count());
+  }
+  ASSERT_EQ(1, test_fs->GetMetadataRetrievedCount());
+  std::vector<LiveFileMetaData> live_files;
+  db->GetLiveFilesMetaData(&live_files);
+  ASSERT_EQ(1, live_files.size());
+  const std::string ingested_file_path =
+      live_files[0].db_path + live_files[0].name;
+  ASSERT_FALSE(live_files[0].file_checksum.empty());
+  ASSERT_EQ(std::make_pair(live_files[0].file_checksum,
+                           live_files[0].file_checksum_func_name),
+            test_fs->GetChecksumAtLastRetrieval());
 
   test_fs->ResetCounters();
   db.reset();
@@ -10206,8 +10292,109 @@ TEST_F(DBTest2, FastSstOpenIngestion) {
   ASSERT_OK(db->Get(ReadOptions(), "ikey2", &value));
   ASSERT_EQ("ival2", value);
 
-  // Metadata should be passed when opening the ingested SST
-  ASSERT_GE(test_fs->GetMetadataPassedOnOpenCount(), 1);
+  // The metadata of the file inside the DB is passed when the ingested SST
+  // is opened again.
+  ASSERT_EQ(1, test_fs->GetMetadataPassedOnOpenCount());
+  ASSERT_EQ("fast_open_metadata:" + ingested_file_path,
+            test_fs->GetLastMetadataReceived());
+
+  db.reset();
+  ASSERT_OK(DestroyDB(test_dbname, options));
+}
+
+TEST_F(DBTest2, FastSstOpenIngestionAtomicReplaceRangeTombstone) {
+  // When an atomic replace range only partly overlaps an existing file,
+  // ingestion also writes and ingests a range tombstone file. That file must
+  // get its open metadata too, before the commit takes the DB mutex.
+  auto test_fs = std::make_shared<FastOpenTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> test_env(new CompositeEnvWrapper(env_, test_fs));
+
+  Options options;
+  options.env = test_env.get();
+  options.fast_sst_open = true;
+  options.create_if_missing = true;
+  options.compaction_style = kCompactionStyleUniversal;
+  // Keep the files that ingestion adds, so that the reopen opens all of them.
+  options.disable_auto_compactions = true;
+
+  std::string test_dbname =
+      test::PerThreadDBPath("fast_open_ingest_atomic_replace");
+  ASSERT_OK(DestroyDB(test_dbname, options));
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, test_dbname, &db));
+
+  SstFileWriter sst_writer(EnvOptions(), options);
+  auto write_sst = [&](const std::string& path,
+                       const std::vector<std::string>& keys) {
+    ASSERT_OK(sst_writer.Open(path));
+    for (const std::string& key : keys) {
+      ASSERT_OK(sst_writer.Put(key, "val-" + key));
+    }
+    ASSERT_OK(sst_writer.Finish());
+  };
+
+  // Ingest the existing files: [a, c] and [e, h] partly overlap the replace
+  // range [b, f), and [d] is fully inside it.
+  const std::string old_ac = test_dbname + "/old_ac.sst";
+  const std::string old_d = test_dbname + "/old_d.sst";
+  const std::string old_eh = test_dbname + "/old_eh.sst";
+  write_sst(old_ac, {"a", "c"});
+  write_sst(old_d, {"d"});
+  write_sst(old_eh, {"e", "f", "h"});
+  ASSERT_OK(db->IngestExternalFile({old_ac, old_d, old_eh},
+                                   IngestExternalFileOptions()));
+
+  const std::string replacement = test_dbname + "/replacement.sst";
+  write_sst(replacement, {"b", "e"});
+
+  test_fs->ResetCounters();
+  // One retrieval for the replacement file and one for the range tombstone
+  // file, both before the commit takes the DB mutex.
+  {
+    RetrievalsAtCommitMutex at_commit(test_fs.get());
+    IngestExternalFileArg arg;
+    arg.column_family = db->DefaultColumnFamily();
+    arg.external_files = {replacement};
+    arg.options.snapshot_consistency = false;
+    arg.options.allow_global_seqno = true;
+    arg.atomic_replace_range = {{"b", "f"}};
+    ASSERT_OK(db->IngestExternalFiles({arg}));
+    ASSERT_EQ(2, at_commit.count());
+  }
+  ASSERT_EQ(2, test_fs->GetMetadataRetrievedCount());
+
+  // The live files are [a, c], [e, h], the replacement file and the range
+  // tombstone file. The file [d] is replaced.
+  std::vector<LiveFileMetaData> live_files;
+  db->GetLiveFilesMetaData(&live_files);
+  std::set<std::string> live_file_paths;
+  for (const LiveFileMetaData& f : live_files) {
+    live_file_paths.insert(f.db_path + f.name);
+  }
+  ASSERT_EQ(4, live_file_paths.size());
+
+  test_fs->ResetCounters();
+  db.reset();
+  ASSERT_OK(DB::Open(options, test_dbname, &db));
+
+  // During reopen, RocksDB passes each live SST file's own metadata to the
+  // file system exactly once.
+  std::set<std::string> opened_with_own_metadata;
+  for (const auto& [fname, metadata] : test_fs->GetMetadataReceivedOnOpen()) {
+    ASSERT_EQ("fast_open_metadata:" + fname, metadata);
+    opened_with_own_metadata.insert(fname);
+  }
+  ASSERT_EQ(4, test_fs->GetMetadataPassedOnOpenCount());
+  ASSERT_EQ(live_file_paths, opened_with_own_metadata);
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("val-b", value);
+  ASSERT_EQ(Status::Code::kNotFound,
+            db->Get(ReadOptions(), "d", &value).code());
+  ASSERT_OK(db->Get(ReadOptions(), "f", &value));
+  ASSERT_EQ("val-f", value);
 
   db.reset();
   ASSERT_OK(DestroyDB(test_dbname, options));

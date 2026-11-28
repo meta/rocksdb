@@ -330,6 +330,12 @@ class TableCache {
     fast_sst_open_.store(enabled, std::memory_order_relaxed);
   }
 
+  // Returns the current DBOptions::fast_sst_open value. SetDBOptions()
+  // updates it, and callers can read it without holding the DB mutex.
+  bool GetFastSstOpen() const {
+    return fast_sst_open_.load(std::memory_order_relaxed);
+  }
+
  private:
   // Build a table reader
   Status GetTableReader(const ReadOptions& ro, const FileOptions& file_options,
