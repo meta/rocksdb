@@ -76,10 +76,20 @@ void MockManifestStoreData::SetNextFault(Fault fault) {
   next_fault_ = fault;
 }
 
+void MockManifestStoreData::SetReadDbRowFailures(int count) {
+  MutexLock l(&mu_);
+  read_db_row_failures_ = count;
+}
+
 void MockManifestStoreData::SetAfterChunkCallback(
     std::function<void()> callback) {
   MutexLock l(&mu_);
   after_chunk_callback_ = std::move(callback);
+}
+
+MockManifestStoreData::Fault MockManifestStoreData::PendingFault() const {
+  MutexLock lock(&mu_);
+  return next_fault_;
 }
 
 uint64_t MockManifestStoreData::StoredEpoch() const {
@@ -268,6 +278,10 @@ IOStatus MockManifestStore::ReadDbRow(ManifestDbRowResult* result) {
   MutexLock l(&data_->mu_);
   RunLateApply();
   IOStatus s = CheckEpoch(*data_, epoch_);
+  if (s.ok() && data_->read_db_row_failures_ > 0) {
+    --data_->read_db_row_failures_;
+    s = IOStatus::IOError("Injected ReadDbRow() failure");
+  }
   if (s.ok() && !data_->has_db_row_) {
     s = IOStatus::NotFound("No DB row");
   }

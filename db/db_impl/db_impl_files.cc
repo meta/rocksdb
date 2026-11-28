@@ -141,6 +141,33 @@ uint64_t DBImpl::MinObsoleteSstNumberToKeep() {
   return std::numeric_limits<uint64_t>::max();
 }
 
+uint64_t DBImpl::MinFileNumberInUse() {
+  mutex_.AssertHeld();
+  uint64_t min_number = MinObsoleteSstNumberToKeep();
+  if (!listener_pending_outputs_.empty()) {
+    min_number = std::min(min_number, *listener_pending_outputs_.begin());
+  }
+  if (!pending_ingestion_outputs_.empty()) {
+    min_number =
+        std::min(min_number, pending_ingestion_outputs_.begin()->first);
+  }
+  // Only a live column family with blob direct write has a blob partition
+  // manager that matters. A dropped column family unregisters itself
+  // (UnregisterBlobDirectWriteColumnFamily()), and no later commit names its
+  // files. So a DB without such a column family skips the loop over all
+  // column families.
+  if (!HasAnyBlobDirectWriteColumnFamilyWithLockHeld()) {
+    return min_number;
+  }
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    BlobFilePartitionManager* mgr = cfd->blob_partition_manager();
+    if (mgr != nullptr) {
+      min_number = std::min(min_number, mgr->MinTrackedBlobFileNumber());
+    }
+  }
+  return min_number;
+}
+
 uint64_t DBImpl::GetObsoleteSstFilesSize() {
   mutex_.AssertHeld();
   return versions_->GetObsoleteSstFilesSize();

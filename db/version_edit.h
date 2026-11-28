@@ -62,6 +62,12 @@ enum Tag : uint32_t {
   kBlobFileAddition = 400,
   kBlobFileGarbage,
 
+  // The only record of a stub MANIFEST, the file that CURRENT names when the
+  // rows in a ManifestStore (include/rocksdb/manifest_store.h) are the
+  // authority. It is not safe to ignore, so a reader that does not know store
+  // mode fails instead of reading an empty DB. See db/manifest_store_state.h.
+  kManifestStoreStub = 500,
+
   // Mask for an unidentified tag from the future which can be safely ignored.
   kTagSafeIgnoreMask = 1 << 13,
 
@@ -79,6 +85,9 @@ enum Tag : uint32_t {
   kLastCompactedManifestFileSize,
   kCommittedOptionsFileNumber,
   kDroppedBlobFile,
+  // The first record of a MANIFEST file copy in store mode. Readers skip it,
+  // so a copy is also a valid MANIFEST file. See db/manifest_store_state.h.
+  kManifestCopyMarker,
 };
 
 enum SubcompactionProgressPerLevelCustomTag : uint32_t {

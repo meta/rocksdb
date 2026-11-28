@@ -77,12 +77,22 @@
         {
           "field": "manifest_store",
           "policy": "deferred",
-          "reason": "Experimental: store mode is not supported, and a C binding of a ManifestStore object needs an ownership design."
+          "reason": "Experimental: a C binding of a ManifestStore object needs an ownership design."
         },
         {
           "field": "manifest_row_feature_version",
           "policy": "deferred",
-          "reason": "Experimental: the option only has a range check until store mode is supported."
+          "reason": "Experimental: store mode needs manifest_store, which has no C binding."
+        },
+        {
+          "field": "manifest_store_migrate",
+          "policy": "deferred",
+          "reason": "Experimental: store mode needs manifest_store, which has no C binding."
+        },
+        {
+          "field": "manifest_store_copy_mode",
+          "policy": "deferred",
+          "reason": "Experimental: store mode needs manifest_store, which has no C binding."
         },
         {
           "field": "env",
