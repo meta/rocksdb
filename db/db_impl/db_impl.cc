@@ -3338,6 +3338,7 @@ InternalIterator* DBImpl::NewInternalIterator(
       }
       merge_iter_builder.AddPointAndTombstoneIterator(
           mem_iter, std::move(mem_tombstone_iter));
+      merge_iter_builder.SetHeadMarkMemTable(super_version->mem);
     } else {
       merge_iter_builder.AddIterator(mem_iter);
     }
@@ -7199,6 +7200,13 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
   std::set<FileMetaData*> deleted_files;
   JobContext job_context(next_job_id_.fetch_add(1), true);
   {
+    // A deleted file can hold a range tombstone that hides an older key in a
+    // lower level, which becomes visible again. The head marks of the
+    // memtables are cleared and the new Version is recorded as for a file
+    // ingestion (see MemTableHeadMark). Like an ingestion, this takes
+    // ingest_sst_lock before the DB mutex and holds it until the new
+    // SuperVersion is installed.
+    ReadLock ingest_rl(&cfd->GetIngestSstLock());
     InstrumentedMutexLock l(&mutex_);
     Version* input_version = cfd->current();
 
@@ -7263,9 +7271,12 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
       return status;
     }
     input_version->Ref();
+    cfd->ClearHeadMarks();
     status = versions_->LogAndApply(cfd, read_options, write_options, &edit,
                                     &mutex_, directories_.GetDbDir());
     if (status.ok()) {
+      cfd->RecordFileChangeForHeadMarks(cfd->current()->GetVersionNumber(),
+                                        /*seqno=*/0);
       InstallSuperVersionAndScheduleWork(
           cfd, job_context.superversion_contexts.data(),
           /*defer_snapshot_refresh=*/false);
@@ -8823,6 +8834,13 @@ Status DBImpl::CommitFileIngestionHandles(
         } else if (!job->edit()->GetDeletedFiles().empty()) {
           cfd->mem()->BumpIngestSeqnoBarrier(versions_->LastSequence() + 1);
         }
+        // The ingested keys go to older levels, possibly at sequence number
+        // 0, and skip the memtable write path that shortens a mark covering
+        // them. A mark moves the seek in older levels past every key in its
+        // usable range, so it would hide them (see MemTableHeadMark). The
+        // ingest_sst_lock read lock stays held until the ingestion state is
+        // recorded below, so no scan publishes a mark before that.
+        cfd->ClearHeadMarks();
       }
     }
     if (status.ok()) {
@@ -8919,6 +8937,8 @@ Status DBImpl::CommitFileIngestionHandles(
           auto* cfd = job->GetColumnFamilyData();
           cfd->mem()->BumpIngestVersionBarrier(
               cfd->current()->GetVersionNumber());
+          cfd->RecordFileChangeForHeadMarks(cfd->current()->GetVersionNumber(),
+                                            job->MaxAssignedSequenceNumber());
         }
       }
     }
