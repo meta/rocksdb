@@ -9,6 +9,7 @@
 
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <string>
 #include <vector>
@@ -382,6 +383,32 @@ class NullLogger : public Logger {
   size_t GetLogFileSize() const override { return 0; }
 };
 
+// Logger that keeps the text of each message, so that a test can check what
+// was logged. It is thread-safe, because a DB logs from background threads.
+class MessageCollectingLogger : public Logger {
+ public:
+  using Logger::Logv;
+  void Logv(const char* format, va_list ap) override {
+    char buf[1024];
+    vsnprintf(buf, sizeof(buf), format, ap);
+    MutexLock l(&mutex_);
+    messages_.emplace_back(buf);
+  }
+
+  // Returns the number of messages that contain `text`.
+  size_t CountMessagesWith(const std::string& text) {
+    MutexLock l(&mutex_);
+    return std::count_if(messages_.begin(), messages_.end(),
+                         [&text](const std::string& message) {
+                           return message.find(text) != std::string::npos;
+                         });
+  }
+
+ private:
+  port::Mutex mutex_;
+  std::vector<std::string> messages_;
+};
+
 // Corrupts key by changing the type
 void CorruptKeyType(InternalKey* ikey);
 
@@ -549,6 +576,116 @@ class SeqStringSource : public FSSequentialFile {
   std::string data_;
   size_t offset_;
   std::atomic<int>* read_count_;
+};
+
+// FileSystem for tests whose SupportsAtomicReplaceOnClose() returns true.
+// Tests use it to check the calls that RocksDB makes for the small files that
+// it writes with AtomicFileWriter (file/file_util.h), and the results of
+// injected failures. It models only part of FileOpenContract::
+// kAtomicReplaceOnClose.
+//
+// The file system handles the files named CURRENT, IDENTITY, OPTIONS-* and
+// *.dbtmp. It selects them by name, not by the contract, so that a test can
+// also inject failures into writes that do not request the contract, such as
+// the temp-file writes or the CURRENT file of a checkpoint. It records which
+// opens request the contract, so a test can check that. For each of these
+// files, with or without the contract, appended data stays in memory, and
+// nothing is visible under the file name before Close(). Close() then writes
+// the content to the target file system in place. An injected failure can come
+// before that write, which publishes nothing, or after it, which publishes the
+// file and still fails Close(). A file whose Close() is not called publishes
+// nothing. Other files go to the target unchanged.
+//
+// Limits: the file system does not test atomic visibility or crash safety.
+// During Close(), another reader can see an empty or partial file, and the
+// write in place is not crash-safe on the target. Use it only in tests without
+// concurrent readers of these files and without simulated crashes. A failure
+// of the target during Close() can also remove the old file, so tests must not
+// make the target fail.
+//
+// The file system records events in order, as strings with base file names:
+// - "create <name>" for a new temp file (*.dbtmp) or MANIFEST file;
+// - "open atomic <name>" for an open that requests the contract;
+// - "rename <src> <dst>";
+// - "publish <name>" for a Close() that makes a file visible;
+// - "dirsync <name>" for a directory sync whose DirFsyncOptions name a file;
+// - "dirsync deleted" for a directory sync with reason kFileDeleted;
+// - "dirsync" for another directory sync that names no file.
+// It can also fail one step of writing or reading such a file, including the
+// directory sync that names it, or one directory sync that names no file.
+class AtomicReplaceOnCloseFS : public FileSystemWrapper {
+ public:
+  explicit AtomicReplaceOnCloseFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+  static const char* kClassName() { return "AtomicReplaceOnCloseFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  bool SupportsAtomicReplaceOnClose() const override {
+    return supports_atomic_replace_on_close_.load();
+  }
+
+  // Sets the result of SupportsAtomicReplaceOnClose(). The default is true.
+  // The file behavior stays the same either way, so a test can compare the
+  // calls that RocksDB makes in both cases. While it is false, an open that
+  // requests the contract fails with InvalidArgument.
+  void SetSupportsAtomicReplaceOnClose(bool supports) {
+    supports_atomic_replace_on_close_.store(supports);
+  }
+
+  // Makes `step` fail with an IOError for each file whose base name starts
+  // with `file_name_prefix`, for example "CURRENT" or "OPTIONS-". The steps
+  // are "open", "append", "sync" (Sync() or Fsync()) and "close" of a
+  // writable file; "close after publish": Close() publishes the file and then
+  // returns an IOError, like a Close() whose result is lost; "dir sync": a
+  // directory sync whose DirFsyncOptions name the file; "read" (opening the
+  // file with NewSequentialFile()); and "exists" (FileExists()). An empty
+  // `file_name_prefix` makes no step fail.
+  void SetFailure(const std::string& file_name_prefix, const std::string& step);
+
+  // Same as SetFailure(), but makes each step in `steps` fail.
+  void SetFailures(const std::string& file_name_prefix,
+                   const std::vector<std::string>& steps);
+
+  // Makes the next directory sync that names no file return an IOError. Later
+  // directory syncs succeed. For example, a test calls it from a sync point
+  // just before the directory sync that should fail.
+  void FailNextDirSyncWithoutName();
+
+  // Returns the events since the last call.
+  std::vector<std::string> TakeEvents();
+
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override;
+  IOStatus NewSequentialFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSSequentialFile>* result,
+                             IODebugContext* dbg) override;
+  IOStatus FileExists(const std::string& fname, const IOOptions& options,
+                      IODebugContext* dbg) override;
+  IOStatus RenameFile(const std::string& src, const std::string& dst,
+                      const IOOptions& options, IODebugContext* dbg) override;
+  IOStatus NewDirectory(const std::string& name, const IOOptions& io_opts,
+                        std::unique_ptr<FSDirectory>* result,
+                        IODebugContext* dbg) override;
+
+  // Returns an IOError if `step` for `fname` is the injected failure.
+  IOStatus MaybeFail(const std::string& fname, const std::string& step);
+
+  // Returns an IOError once after FailNextDirSyncWithoutName().
+  IOStatus MaybeFailDirSyncWithoutName();
+
+  // Adds `event` to the events.
+  void RecordEvent(const std::string& event);
+
+ private:
+  std::atomic<bool> supports_atomic_replace_on_close_{true};
+  port::Mutex mutex_;
+  std::string fail_file_name_prefix_;
+  std::vector<std::string> fail_steps_;
+  bool fail_next_dir_sync_without_name_ = false;
+  std::vector<std::string> events_;
 };
 
 class StringFS : public FileSystemWrapper {

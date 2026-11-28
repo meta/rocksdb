@@ -1934,9 +1934,36 @@ class DBImpl : public DB
   Status WriteOptionsFile(const WriteOptions& write_options,
                           bool db_mutex_already_held);
 
-  // Writes, renames, and directory-syncs an OPTIONS snapshot, but does not
-  // publish it in VersionSet. The caller must either commit its file number in
-  // MANIFEST or leave it as an unreferenced orphan.
+  // Writes and verifies a new OPTIONS file and syncs the DB directory, but
+  // does not record its file number (see Recording below).
+  //
+  // Write paths. When the file system does not support atomic replace on
+  // close (FileSystem::SupportsAtomicReplaceOnClose()), the file is written
+  // under a temp name, read back and verified, then renamed (two file
+  // numbers), so it becomes visible only after the verify. When it does, the
+  // serialized text is verified in memory first, then the file is written
+  // under its final name and becomes visible at Close() (one file number).
+  //
+  // Errors. After a failure, the file this function created is deleted. All
+  // deletes are best effort, and a failed delete leaves the file. For a
+  // temp-file write, the writer deletes the temp name. The new OPTIONS file
+  // can still stay: when the directory sync after the rename fails, or when a
+  // rename takes effect but returns an error. For a direct write, this
+  // function deletes the final file and, after a successful delete, syncs the
+  // DB directory. If that sync fails, the deleted file can come back after a
+  // power loss.
+  //
+  // Recording. After this function succeeds, the caller records the file
+  // number: with track_options_file_number_in_manifest through a MANIFEST edit,
+  // otherwise directly in VersionSet. If recording fails, the file stays on
+  // disk as an unrecorded OPTIONS file.
+  //
+  // Selection. LoadLatestOptions() can pick an unrecorded file that stays on
+  // disk. With no OPTIONS file number committed in the MANIFEST,
+  // it picks the highest-numbered OPTIONS file. With a committed number, it
+  // usually picks the committed file, but a newer file written with tracking
+  // turned off can win, and a missing committed file falls back to another
+  // file. VersionSet::ResolveOptionsFileNumber() has the full rules.
   Status PersistOptionsFile(const WriteOptions& write_options,
                             const DBOptions& db_options,
                             const std::vector<std::string>& cf_names,
@@ -1960,9 +1987,6 @@ class DBImpl : public DB
   // The following two functions can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
   // 2. db_mutex is NOT held
-  Status RenameTempFileToOptionsFile(const std::string& file_name,
-                                     uint64_t options_file_number,
-                                     uint64_t* options_file_size);
   void MaybeDeleteObsoleteOptionsFiles();
   Status DeleteObsoleteOptionsFiles(bool schedule_only);
 

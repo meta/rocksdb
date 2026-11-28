@@ -12,8 +12,10 @@
 #include "file/sequence_file_reader.h"
 #include "file/sst_file_manager_impl.h"
 #include "file/writable_file_writer.h"
+#include "logging/logging.h"
 #include "rocksdb/env.h"
 #include "rocksdb/statistics.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -112,9 +114,15 @@ IOStatus CopyFile(FileSystem* fs, const std::string& source,
         new WritableFileWriter(std::move(destfile), destination, options));
   }
 
-  return CopyFile(fs, source, src_temp_hint, dest_writer, size, use_fsync,
-                  io_tracer, max_read_buffer_size, readIOOptions,
-                  writeIOOptions);
+  io_s =
+      CopyFile(fs, source, src_temp_hint, dest_writer, size, use_fsync,
+               io_tracer, max_read_buffer_size, readIOOptions, writeIOOptions);
+  if (io_s.ok()) {
+    // Close explicitly so that a close error is returned. The destructor would
+    // drop it.
+    io_s = dest_writer->Close(writeIOOptions.value_or(IOOptions()));
+  }
+  return io_s;
 }
 
 // Utility function to create a file with the provided contents
@@ -137,7 +145,13 @@ IOStatus CreateFile(FileSystem* fs, const std::string& destination,
   if (!io_s.ok()) {
     return io_s;
   }
-  return use_fsync ? dest_writer->Fsync(opts) : dest_writer->Sync(opts);
+  io_s = use_fsync ? dest_writer->Fsync(opts) : dest_writer->Sync(opts);
+  if (io_s.ok()) {
+    // Close explicitly so that a close error is returned. The destructor would
+    // drop it.
+    io_s = dest_writer->Close(opts);
+  }
+  return io_s;
 }
 
 Status DeleteDBFile(const ImmutableDBOptions* db_options,
@@ -343,6 +357,246 @@ Status DestroyDir(Env* env, const std::string& dir) {
     }
   }
   return s;
+}
+
+IOStatus SyncDirectoryAtPath(FileSystem* fs, const std::string& dirname,
+                             const IOOptions& opts,
+                             const DirFsyncOptions& fsync_opts) {
+  std::unique_ptr<FSDirectory> dir;
+  IOStatus s = fs->NewDirectory(dirname, opts, &dir, nullptr);
+  if (s.ok()) {
+    s = dir->FsyncWithDirOptions(opts, nullptr, fsync_opts);
+  }
+  if (s.ok()) {
+    IOStatus close_s = dir->Close(opts, nullptr);
+    if (close_s.IsNotSupported()) {
+      close_s.PermitUncheckedError();
+    } else {
+      s = close_s;
+    }
+  }
+  return s;
+}
+
+namespace {
+// The directory sync of AtomicFileWriteOptions (`dir` or `dir_path_to_open`)
+// after the final file is in place. Both implementations run it, each with its
+// own `fsync_opts`.
+IOStatus SyncDirectory(FileSystem* fs, const AtomicFileWriteOptions& options,
+                       const DirFsyncOptions& fsync_opts,
+                       const IOOptions& opts) {
+  if (options.dir != nullptr) {
+    return options.dir->FsyncWithDirOptions(opts, nullptr, fsync_opts);
+  }
+  if (options.dir_path_to_open.empty()) {
+    return IOStatus::OK();
+  }
+  return SyncDirectoryAtPath(fs, options.dir_path_to_open, opts, fsync_opts);
+}
+
+// The temp-file implementation of AtomicFileWriter. The overview in
+// file/file_util.h lists the steps, and AtomicFileWriteOptions describes the
+// settings of each step.
+class TempFileAtomicWriter : public AtomicFileWriter {
+ public:
+  TempFileAtomicWriter(FileSystem* fs, const AtomicFileWriteOptions& options)
+      : fs_(fs), options_(options) {
+    assert(!options_.temp_name.empty());
+    assert(options_.dir == nullptr || options_.dir_path_to_open.empty());
+  }
+
+  IOStatus Write(const std::string& final_name, const Slice& contents,
+                 const IOOptions& opts, const FileOptions& file_opts) override;
+
+ private:
+  IOStatus WriteTempFile(const Slice& contents, const IOOptions& opts,
+                         const FileOptions& file_opts) const;
+  IOStatus RenameTempFile(const std::string& final_name,
+                          const IOOptions& opts) const;
+  void DeleteTempFile(const IOOptions& opts) const;
+
+  FileSystem* const fs_;
+  const AtomicFileWriteOptions options_;
+};
+
+IOStatus TempFileAtomicWriter::Write(const std::string& final_name,
+                                     const Slice& contents,
+                                     const IOOptions& opts,
+                                     const FileOptions& file_opts) {
+  const bool has_test_points = !options_.sync_point_prefix.empty();
+#ifndef NDEBUG
+  // The test point macros are empty in release builds, so build the names
+  // only in debug builds.
+  const std::string& prefix = options_.sync_point_prefix;
+  const std::string before_rename_point = prefix + ":BeforeRename";
+  const std::string after_rename_point = prefix + ":AfterRename";
+  const std::string kill_before_rename = prefix + ":0";
+  const std::string kill_after_rename = prefix + ":1";
+#endif  // !NDEBUG
+
+  IOStatus s = WriteTempFile(contents, opts, file_opts);
+  if (s.ok() && options_.check_before_rename) {
+    s = options_.check_before_rename();
+  }
+  if (has_test_points) {
+    TEST_SYNC_POINT_CALLBACK(before_rename_point, &s);
+  }
+  if (s.ok()) {
+    if (has_test_points) {
+      TEST_KILL_RANDOM_WITH_WEIGHT(kill_before_rename, REDUCE_ODDS2);
+    }
+    s = RenameTempFile(final_name, opts);
+    if (has_test_points) {
+      TEST_KILL_RANDOM_WITH_WEIGHT(kill_after_rename, REDUCE_ODDS2);
+      TEST_SYNC_POINT_CALLBACK(after_rename_point, &s);
+    }
+  }
+  if (!s.ok()) {
+    DeleteTempFile(opts);
+    return s;
+  }
+  return SyncDirectory(fs_, options_, DirFsyncOptions(final_name), opts);
+}
+
+// Writes the temp file like WriteStringToFile(), with a choice between Sync()
+// and Fsync(), because the OPTIONS file needs Fsync(). Unlike
+// WriteStringToFile(), it does not delete the file after a failure. Write()
+// deletes it once after any failure.
+IOStatus TempFileAtomicWriter::WriteTempFile(
+    const Slice& contents, const IOOptions& opts,
+    const FileOptions& file_opts) const {
+  std::unique_ptr<FSWritableFile> file;
+  IOStatus s =
+      fs_->NewWritableFile(options_.temp_name, file_opts, &file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!options_.sync_point_after_open.empty()) {
+    TEST_SYNC_POINT(options_.sync_point_after_open);
+  }
+  s = file->Append(contents, opts, nullptr);
+  if (s.ok()) {
+    s = options_.use_fsync ? file->Fsync(opts, nullptr)
+                           : file->Sync(opts, nullptr);
+  }
+  // Close explicitly so that a close error is returned. The destructor would
+  // drop it.
+  if (s.ok()) {
+    s = file->Close(opts, nullptr);
+  }
+  if (!options_.sync_point_after_write.empty()) {
+    TEST_SYNC_POINT(options_.sync_point_after_write);
+  }
+  return s;
+}
+
+IOStatus TempFileAtomicWriter::RenameTempFile(const std::string& final_name,
+                                              const IOOptions& opts) const {
+  if (options_.env != nullptr) {
+    return status_to_io_status(
+        options_.env->RenameFile(options_.temp_name, final_name));
+  }
+  return fs_->RenameFile(options_.temp_name, final_name, opts, nullptr);
+}
+
+void TempFileAtomicWriter::DeleteTempFile(const IOOptions& opts) const {
+  // The write already failed, so the delete is a best-effort cleanup. Write()
+  // returns the error of the write. A failed delete is only logged, and only
+  // when `info_log` is set. NotFound and PathNotFound are not logged: the temp
+  // file is missing when its open failed, or when a rename that reported an
+  // error still took effect, so nothing leaked.
+  IOStatus s;
+  if (options_.env != nullptr) {
+    s = status_to_io_status(options_.env->DeleteFile(options_.temp_name));
+  } else {
+    s = fs_->DeleteFile(options_.temp_name, opts, nullptr);
+  }
+  if (!s.ok() && !s.IsNotFound() && !s.IsPathNotFound() &&
+      options_.info_log != nullptr) {
+    ROCKS_LOG_WARN(options_.info_log, "Unable to delete temp file %s: %s",
+                   options_.temp_name.c_str(), s.ToString().c_str());
+  }
+}
+
+// The direct implementation of AtomicFileWriter, for a file system whose
+// SupportsAtomicReplaceOnClose() returns true. It opens the final file with
+// FileOpenContract::kAtomicReplaceOnClose, writes it with one append, syncs
+// and closes it, then syncs the directory.
+class DirectAtomicWriter : public AtomicFileWriter {
+ public:
+  DirectAtomicWriter(FileSystem* fs, const AtomicFileWriteOptions& options)
+      : fs_(fs), options_(options) {
+    assert(options_.dir == nullptr || options_.dir_path_to_open.empty());
+  }
+
+  IOStatus Write(const std::string& final_name, const Slice& contents,
+                 const IOOptions& opts, const FileOptions& file_opts) override;
+
+ private:
+  FileSystem* const fs_;
+  const AtomicFileWriteOptions options_;
+};
+
+IOStatus DirectAtomicWriter::Write(const std::string& final_name,
+                                   const Slice& contents, const IOOptions& opts,
+                                   const FileOptions& file_opts) {
+  if (options_.check_before_rename != nullptr) {
+    return IOStatus::InvalidArgument(
+        "check_before_rename is not supported when the file system replaces "
+        "files atomically");
+  }
+  const bool has_test_points = !options_.sync_point_prefix.empty();
+#ifndef NDEBUG
+  const std::string kill_before_close = options_.sync_point_prefix + ":0";
+  const std::string kill_after_close = options_.sync_point_prefix + ":1";
+#endif  // !NDEBUG
+
+  FileOptions atomic_file_opts = file_opts;
+  atomic_file_opts.open_contract |= FileOpenContract::kAtomicReplaceOnClose;
+  std::unique_ptr<FSWritableFile> file;
+  IOStatus s =
+      fs_->NewWritableFile(final_name, atomic_file_opts, &file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!options_.sync_point_after_open.empty()) {
+    TEST_SYNC_POINT(options_.sync_point_after_open);
+  }
+  s = file->Append(contents, opts, nullptr);
+  if (s.ok()) {
+    s = options_.use_fsync ? file->Fsync(opts, nullptr)
+                           : file->Sync(opts, nullptr);
+  }
+  if (s.ok()) {
+    if (has_test_points) {
+      TEST_KILL_RANDOM_WITH_WEIGHT(kill_before_close, REDUCE_ODDS2);
+    }
+    s = file->Close(opts, nullptr);
+  }
+  // After a failed append or sync, Close() is not called, because Close()
+  // would publish the partial content. Destroying the file publishes nothing,
+  // so the old final file stays. The writer never deletes `final_name`: after
+  // such a failure it still holds the old content.
+  if (!options_.sync_point_after_write.empty()) {
+    TEST_SYNC_POINT(options_.sync_point_after_write);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  if (has_test_points) {
+    TEST_KILL_RANDOM_WITH_WEIGHT(kill_after_close, REDUCE_ODDS2);
+  }
+  return SyncDirectory(fs_, options_,
+                       DirFsyncOptions(DirFsyncOptions::kNewFileSynced), opts);
+}
+}  // namespace
+
+std::unique_ptr<AtomicFileWriter> NewAtomicFileWriter(
+    FileSystem* fs, const AtomicFileWriteOptions& options) {
+  if (options.atomic_replace_on_close) {
+    return std::make_unique<DirectAtomicWriter>(fs, options);
+  }
+  return std::make_unique<TempFileAtomicWriter>(fs, options);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

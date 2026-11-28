@@ -12,10 +12,12 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <fstream>
 #include <sstream>
+#include <utility>
 
 #include "db/memtable_list.h"
 #include "env/composite_env_wrapper.h"
@@ -781,4 +783,235 @@ void RegisterTestLibrary(const std::string& arg) {
 }
 
 const std::string kUnitTestDbId = "UnitTest";
+namespace {
+std::string BaseFileName(const std::string& path) {
+  return path.substr(path.find_last_of('/') + 1);
+}
+
+bool IsAtomicWriteFile(const std::string& base_name) {
+  return base_name == "CURRENT" || base_name == "IDENTITY" ||
+         Slice(base_name).starts_with("OPTIONS-") ||
+         Slice(base_name).ends_with(".dbtmp");
+}
+
+// Writable file of AtomicReplaceOnCloseFS. It keeps the appended data in memory
+// and writes it to the target file system in place, only in Close(). An
+// injected "close" failure comes before that write and publishes nothing. An
+// injected "close after publish" failure comes after it, so the file is
+// published and Close() still fails.
+class AtomicReplaceOnCloseFile : public FSWritableFile {
+ public:
+  AtomicReplaceOnCloseFile(AtomicReplaceOnCloseFS* fs, FileSystem* target,
+                           const std::string& fname,
+                           const FileOptions& file_opts)
+      : fs_(fs), target_(target), fname_(fname), file_opts_(file_opts) {}
+
+  using FSWritableFile::Append;
+  IOStatus Append(const Slice& data, const IOOptions& /*options*/,
+                  IODebugContext* /*dbg*/) override {
+    IOStatus s = fs_->MaybeFail(fname_, "append");
+    if (s.ok()) {
+      contents_.append(data.data(), data.size());
+    }
+    return s;
+  }
+  IOStatus Flush(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+  IOStatus Sync(const IOOptions& /*options*/,
+                IODebugContext* /*dbg*/) override {
+    return fs_->MaybeFail(fname_, "sync");
+  }
+  IOStatus Fsync(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return fs_->MaybeFail(fname_, "sync");
+  }
+  uint64_t GetFileSize(const IOOptions& /*options*/,
+                       IODebugContext* /*dbg*/) override {
+    return contents_.size();
+  }
+  IOStatus Close(const IOOptions& options, IODebugContext* /*dbg*/) override {
+    if (closed_) {
+      return IOStatus::OK();
+    }
+    IOStatus s = fs_->MaybeFail(fname_, "close");
+    if (!s.ok()) {
+      return s;
+    }
+    s = WriteStringToFile(target_, contents_, fname_, /*should_sync=*/true,
+                          options, file_opts_);
+    if (!s.ok()) {
+      return s;
+    }
+    closed_ = true;
+    fs_->RecordEvent("publish " + BaseFileName(fname_));
+    return fs_->MaybeFail(fname_, "close after publish");
+  }
+
+ private:
+  AtomicReplaceOnCloseFS* const fs_;
+  FileSystem* const target_;
+  const std::string fname_;
+  const FileOptions file_opts_;
+  std::string contents_;
+  bool closed_ = false;
+};
+
+// Directory of AtomicReplaceOnCloseFS. It records each directory sync. It can
+// fail one directory sync that names no file. It can also fail each directory
+// sync that names a file that matches SetFailure(prefix, "dir sync").
+class AtomicReplaceOnCloseDirectory : public FSDirectoryWrapper {
+ public:
+  AtomicReplaceOnCloseDirectory(AtomicReplaceOnCloseFS* fs,
+                                std::unique_ptr<FSDirectory>&& dir)
+      : FSDirectoryWrapper(std::move(dir)), fs_(fs) {}
+  IOStatus FsyncWithDirOptions(
+      const IOOptions& options, IODebugContext* dbg,
+      const DirFsyncOptions& dir_fsync_options) override {
+    if (dir_fsync_options.renamed_new_name.empty()) {
+      fs_->RecordEvent(dir_fsync_options.reason == DirFsyncOptions::kFileDeleted
+                           ? "dirsync deleted"
+                           : "dirsync");
+      IOStatus s = fs_->MaybeFailDirSyncWithoutName();
+      if (!s.ok()) {
+        return s;
+      }
+    } else {
+      fs_->RecordEvent("dirsync " +
+                       BaseFileName(dir_fsync_options.renamed_new_name));
+      IOStatus s =
+          fs_->MaybeFail(dir_fsync_options.renamed_new_name, "dir sync");
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    return FSDirectoryWrapper::FsyncWithDirOptions(options, dbg,
+                                                   dir_fsync_options);
+  }
+
+ private:
+  AtomicReplaceOnCloseFS* const fs_;
+};
+}  // namespace
+
+void AtomicReplaceOnCloseFS::SetFailure(const std::string& file_name_prefix,
+                                        const std::string& step) {
+  SetFailures(file_name_prefix, {step});
+}
+
+void AtomicReplaceOnCloseFS::SetFailures(
+    const std::string& file_name_prefix,
+    const std::vector<std::string>& steps) {
+  MutexLock lock(&mutex_);
+  fail_file_name_prefix_ = file_name_prefix;
+  fail_steps_ = steps;
+}
+
+void AtomicReplaceOnCloseFS::FailNextDirSyncWithoutName() {
+  MutexLock lock(&mutex_);
+  fail_next_dir_sync_without_name_ = true;
+}
+
+IOStatus AtomicReplaceOnCloseFS::MaybeFailDirSyncWithoutName() {
+  MutexLock lock(&mutex_);
+  if (std::exchange(fail_next_dir_sync_without_name_, false)) {
+    return IOStatus::IOError("injected failure: dirsync");
+  }
+  return IOStatus::OK();
+}
+
+std::vector<std::string> AtomicReplaceOnCloseFS::TakeEvents() {
+  MutexLock lock(&mutex_);
+  return std::exchange(events_, {});
+}
+
+void AtomicReplaceOnCloseFS::RecordEvent(const std::string& event) {
+  MutexLock lock(&mutex_);
+  events_.push_back(event);
+}
+
+IOStatus AtomicReplaceOnCloseFS::MaybeFail(const std::string& fname,
+                                           const std::string& step) {
+  MutexLock lock(&mutex_);
+  if (!fail_file_name_prefix_.empty() &&
+      Slice(BaseFileName(fname)).starts_with(fail_file_name_prefix_) &&
+      std::find(fail_steps_.begin(), fail_steps_.end(), step) !=
+          fail_steps_.end()) {
+    return IOStatus::IOError("injected failure: " + step + " " + fname);
+  }
+  return IOStatus::OK();
+}
+
+IOStatus AtomicReplaceOnCloseFS::NewWritableFile(
+    const std::string& fname, const FileOptions& file_opts,
+    std::unique_ptr<FSWritableFile>* result, IODebugContext* dbg) {
+  const std::string base_name = BaseFileName(fname);
+  if (!IsAtomicWriteFile(base_name)) {
+    if (Slice(base_name).starts_with("MANIFEST-")) {
+      RecordEvent("create " + base_name);
+    }
+    return target()->NewWritableFile(fname, file_opts, result, dbg);
+  }
+  IOStatus s = MaybeFail(fname, "open");
+  if (!s.ok()) {
+    return s;
+  }
+  if (HasFileOpenContract(file_opts.open_contract,
+                          FileOpenContract::kAtomicReplaceOnClose)) {
+    if (!SupportsAtomicReplaceOnClose()) {
+      return IOStatus::InvalidArgument(
+          "kAtomicReplaceOnClose requested but not supported: " + fname);
+    }
+    RecordEvent("open atomic " + base_name);
+  }
+  if (Slice(base_name).ends_with(".dbtmp")) {
+    RecordEvent("create " + base_name);
+  }
+  result->reset(new AtomicReplaceOnCloseFile(this, target(), fname, file_opts));
+  return IOStatus::OK();
+}
+
+IOStatus AtomicReplaceOnCloseFS::NewSequentialFile(
+    const std::string& fname, const FileOptions& file_opts,
+    std::unique_ptr<FSSequentialFile>* result, IODebugContext* dbg) {
+  if (IsAtomicWriteFile(BaseFileName(fname))) {
+    IOStatus s = MaybeFail(fname, "read");
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  return target()->NewSequentialFile(fname, file_opts, result, dbg);
+}
+
+IOStatus AtomicReplaceOnCloseFS::FileExists(const std::string& fname,
+                                            const IOOptions& options,
+                                            IODebugContext* dbg) {
+  if (IsAtomicWriteFile(BaseFileName(fname))) {
+    IOStatus s = MaybeFail(fname, "exists");
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  return target()->FileExists(fname, options, dbg);
+}
+
+IOStatus AtomicReplaceOnCloseFS::RenameFile(const std::string& src,
+                                            const std::string& dst,
+                                            const IOOptions& options,
+                                            IODebugContext* dbg) {
+  RecordEvent("rename " + BaseFileName(src) + " " + BaseFileName(dst));
+  return target()->RenameFile(src, dst, options, dbg);
+}
+
+IOStatus AtomicReplaceOnCloseFS::NewDirectory(
+    const std::string& name, const IOOptions& io_opts,
+    std::unique_ptr<FSDirectory>* result, IODebugContext* dbg) {
+  IOStatus s = target()->NewDirectory(name, io_opts, result, dbg);
+  if (s.ok()) {
+    result->reset(new AtomicReplaceOnCloseDirectory(this, std::move(*result)));
+  }
+  return s;
+}
+
 }  // namespace ROCKSDB_NAMESPACE::test

@@ -30,6 +30,12 @@ class FileSystemTracingWrapper : public FileSystemWrapper {
   static const char* kClassName() { return "FileSystemTracing"; }
   const char* Name() const override { return kClassName(); }
 
+  // Tracing does not change what the target does with a file, so this wrapper
+  // keeps every property of FileOpenContract::kAtomicReplaceOnClose.
+  bool SupportsAtomicReplaceOnClose() const override {
+    return target()->SupportsAtomicReplaceOnClose();
+  }
+
   IOStatus NewSequentialFile(const std::string& fname,
                              const FileOptions& file_opts,
                              std::unique_ptr<FSSequentialFile>* result,

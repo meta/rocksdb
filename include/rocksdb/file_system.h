@@ -198,7 +198,10 @@ struct DirFsyncOptions {
 // File-scope contracts that describe how RocksDB will open/create and access a
 // file. A FileSystem that detects a contract violation must return a non-OK
 // status or preserve its normal valid semantics; it must not expose undefined
-// or corrupt data.
+// or corrupt data. kAtomicReplaceOnClose is different: it is a guarantee that
+// the file system gives, not a promise by RocksDB. RocksDB requests it only
+// from a file system that reports support for it, and that file system must
+// keep it.
 enum class FileOpenContract : uint8_t {
   kDefault = 0,
   // RocksDB will not call ReopenWritableFile for this file to overwrite,
@@ -206,6 +209,64 @@ enum class FileOpenContract : uint8_t {
   kNoReopenForWrite = 1 << 0,
   // RocksDB will not open readers while this file is open for write.
   kNoReadersWhileOpenForWrite = 1 << 1,
+  // EXPERIMENTAL. The file replaces any old file with the same name in one
+  // step at Close(). RocksDB requests this contract only from a file system
+  // whose SupportsAtomicReplaceOnClose() returns true, and only on
+  // NewWritableFile(). It uses it to write the CURRENT, IDENTITY and OPTIONS
+  // files of a DB under their final names, without a temp file and a rename.
+  // RocksDB can change which files it writes this way, so the file system
+  // must honor the contract on each open that requests it and must not depend
+  // on file names. Files opened without it keep the normal semantics.
+  //
+  // In this comment, a file is published when its new content becomes visible
+  // under its name. A file opened with this contract must have these
+  // properties:
+  // 1. The file is not published before Close() is called. Flush(), Sync()
+  //    and Fsync() must not publish it. Before Close(), the usual rules of
+  //    FSWritableFile::Flush() and Sync() do not apply: the data need not be
+  //    readable under the name or durable until Close() publishes it.
+  // 2. Close() atomically replaces any old file with the same name.
+  // 3. The new content is durable under the file name when Close() returns
+  //    OK.
+  // 4. When every Append(), Sync() and Fsync() call succeeded and then
+  //    Close() fails or the process crashes before Close() returns, the name
+  //    shows the old content or the complete new content. If there was no old
+  //    file, the name may show no file. It never shows a mix or a part. So a
+  //    failed Close() may have published the file, for example when the reply
+  //    of a remote file system is lost. But when Close() returns, with any
+  //    status, the file is either published or never will be. RocksDB needs
+  //    this for CURRENT: after a failed Close() of CURRENT, the DB can stay
+  //    open and write a newer MANIFEST and CURRENT, for example in
+  //    DB::Resume(). A late publish of the older CURRENT would then name a
+  //    MANIFEST that is obsolete or deleted, and the DB could not be opened.
+  // 5. The FSWritableFile destructor must not publish the file when Close()
+  //    is not called, or when Close() was called and published nothing.
+  //    After a failed Append(), Sync() or Fsync(), RocksDB destroys the file
+  //    without calling Close(), so that the old content stays.
+  // 6. A crash or a restart can stop a publish before Close() returns. Such
+  //    an unfinished publish must be completed or abandoned for good before
+  //    the file is opened again, for reading or for writing. So it never
+  //    replaces content that was written after it, and a reader never sees
+  //    the file change later. RocksDB needs this for CURRENT. The reopened DB
+  //    can write a newer MANIFEST and CURRENT. With
+  //    DBOptions::reuse_manifest_on_open, it can instead read CURRENT, append
+  //    to the MANIFEST that CURRENT names, and write no new CURRENT. In both
+  //    cases, a late publish of the older CURRENT would name an older
+  //    MANIFEST. That MANIFEST is missing the newer changes, or it is obsolete
+  //    or deleted. The DB could then be corrupt, or it could fail to open.
+  //
+  // RocksDB writes the whole content with one Append(), then calls Sync() or
+  // Fsync(), then Close(). Directory syncs keep their normal meaning: they make
+  // the directory entries of new and deleted files durable. After a successful
+  // Close(), RocksDB syncs the directory of the file with reason
+  // kNewFileSynced when it has a handle or path for it. Before it writes the
+  // CURRENT file of a DB this way, it syncs the DB directory, so that the
+  // directory entry of the new MANIFEST that CURRENT names is durable before
+  // CURRENT is. This sync opens, syncs and closes the DB directory, so a
+  // CURRENT write trades the temp file and the rename for these three calls.
+  // When RocksDB deletes a published file after a failure, it syncs the
+  // directory with reason kFileDeleted.
+  kAtomicReplaceOnClose = 1 << 2,
 };
 
 constexpr FileOpenContract operator|(FileOpenContract lhs,
@@ -877,6 +938,20 @@ class FileSystem : public Customizable {
     supported_ops |= (1 << FSSupportedOps::kAsyncIO);
     supported_ops |= (1 << FSSupportedOps::kFSPrefetch);
   }
+
+  // EXPERIMENTAL. Returns true if this file system honors
+  // FileOpenContract::kAtomicReplaceOnClose on each NewWritableFile() call
+  // that requests it. RocksDB then writes the CURRENT, IDENTITY and OPTIONS
+  // files of a DB with that contract, without a temp file and a rename, which
+  // can be costly on some remote file systems. The default returns false.
+  //
+  // FileSystemWrapper does not forward this call, so a wrapper returns false
+  // unless it overrides this function. A wrapper may forward it only if it
+  // keeps every property of the contract for the files that it passes
+  // through, for example a wrapper that only traces or counts calls. A wrapper
+  // must not forward it if it makes written data visible before Close(), drops
+  // data after a successful Close(), or closes a file in its destructor.
+  virtual bool SupportsAtomicReplaceOnClose() const { return false; }
 
   // Returns false if this FileSystem never allocates space beyond a file's
   // logical size (for example, via FSWritableFile::Allocate() or
