@@ -828,6 +828,13 @@ class FaultInjectionTestFS : public FileSystemWrapper {
     inject_write_faults_only_on_wal_ = enabled;
   }
 
+  // Returns this thread's on/off switch for injecting errors of `type`, or
+  // false if the thread has no error context for `type`.
+  bool IsThreadLocalErrorInjectionEnabled(FaultInjectionIOType type) {
+    ErrorContext* ctx = GetErrorContextFromFaultInjectionIOType(type);
+    return ctx != nullptr && ctx->enable_error_injection;
+  }
+
   void EnableThreadLocalErrorInjection(FaultInjectionIOType type) {
     ErrorContext* ctx = GetErrorContextFromFaultInjectionIOType(type);
     if (ctx) {
