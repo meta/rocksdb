@@ -1,0 +1,1 @@
+Fixed a bug where, with `min_tombstones_for_range_conversion` set to 1, a scan could insert an empty range tombstone (one whose start key equals its end key) into the memtable. Such a range tombstone covered no key.
