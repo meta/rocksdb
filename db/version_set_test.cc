@@ -1936,6 +1936,67 @@ TEST_F(VersionSetTest, NewManifestListsColumnFamilyFilesInRecordSettingLog) {
   ASSERT_EQ(live_files, listed_files);
 }
 
+// A new MANIFEST file must record the largest column family ID ever used, so
+// that a reopen does not give the ID of a dropped column family to a new one.
+// Here an atomic group writes to two column families, and the first of them
+// (the one with the largest ID) is dropped before the write. In a DB, this
+// happens while the write waits in the MANIFEST write queue. The write leaves
+// out the edit of the dropped column family and starts a new MANIFEST file.
+TEST_F(VersionSetTest, NewManifestKeepsMaxColumnFamilyOfDroppedFirstWriter) {
+  NewDB();
+
+  ColumnFamilySet* cf_set = versions_->GetColumnFamilySet();
+  ColumnFamilyData* dropped_cfd = cf_set->GetColumnFamily(kColumnFamilyName3);
+  ColumnFamilyData* live_cfd = cf_set->GetColumnFamily(kColumnFamilyName1);
+  ASSERT_NE(nullptr, dropped_cfd);
+  ASSERT_NE(nullptr, live_cfd);
+  const uint32_t max_cf_id = dropped_cfd->GetID();
+  ASSERT_EQ(max_cf_id, cf_set->GetMaxColumnFamily());
+  ASSERT_LT(live_cfd->GetID(), max_cf_id);
+
+  // A queued writer holds a reference to its column family, which keeps the
+  // ColumnFamilyData alive after the drop.
+  dropped_cfd->Ref();
+  VersionEdit drop_edit;
+  drop_edit.DropColumnFamily();
+  drop_edit.SetColumnFamily(max_cf_id);
+  mutex_.Lock();
+  Status s = versions_->LogAndApply(dropped_cfd, read_options_, write_options_,
+                                    &drop_edit, &mutex_,
+                                    /*dir_contains_current_file=*/nullptr);
+  mutex_.Unlock();
+  ASSERT_OK(s);
+  ASSERT_TRUE(dropped_cfd->IsDropped());
+
+  VersionEdit dropped_cf_edit;
+  dropped_cf_edit.SetColumnFamily(max_cf_id);
+  dropped_cf_edit.MarkAtomicGroup(/*remaining_entries=*/1);
+  VersionEdit live_cf_edit;
+  live_cf_edit.SetColumnFamily(live_cfd->GetID());
+  live_cf_edit.MarkAtomicGroup(/*remaining_entries=*/0);
+  const autovector<ColumnFamilyData*> cfds = {dropped_cfd, live_cfd};
+  const autovector<autovector<VersionEdit*>> edit_lists = {{&dropped_cf_edit},
+                                                           {&live_cf_edit}};
+  const uint64_t old_manifest_file_number = versions_->manifest_file_number();
+  mutex_.Lock();
+  s = versions_->LogAndApply(cfds, read_options_, write_options_, edit_lists,
+                             &mutex_, /*dir_contains_current_file=*/nullptr,
+                             /*new_descriptor_log=*/true);
+  mutex_.Unlock();
+  ASSERT_OK(s);
+  ASSERT_GT(versions_->manifest_file_number(), old_manifest_file_number);
+  dropped_cfd->UnrefAndTryDelete();
+
+  // Recovery reads only the new MANIFEST file, which does not list the dropped
+  // column family. So remove that column family from the list that ReopenDB()
+  // opens.
+  ASSERT_EQ(kColumnFamilyName3, column_families_.back().name);
+  column_families_.pop_back();
+  CloseDB();
+  ReopenDB();
+  ASSERT_EQ(max_cf_id, versions_->GetColumnFamilySet()->GetMaxColumnFamily());
+}
+
 TEST_F(VersionSetTest, AddLiveBlobFiles) {
   // Initialize the database and add a blob file.
   NewDB();
