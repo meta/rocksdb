@@ -1619,6 +1619,12 @@ class DBImpl : public DB
     return logs_.back().number;
   }
 
+  // The WAL number at or below which WALs are quarantined (see
+  // ExtendWALRecoveryCutoff()), or 0.
+  uint64_t TEST_GetWALRecoveryCutoff() const {
+    return wal_recovery_cutoff_.load(std::memory_order_acquire);
+  }
+
   void TEST_DeleteObsoleteFiles();
 
   const std::unordered_set<uint64_t>& TEST_GetFilesGrabbedForPurge() const {
@@ -2174,11 +2180,59 @@ class DBImpl : public DB
       const WriteOptions& write_options, WriteBatch* batch,
       WriteBatch* trace_batch,
       const DeferredPutEntityBatch* deferred_put_entities = nullptr);
-  // Flushes or syncs all blob direct-write managers touched by the current
-  // transformed write before the write can proceed.
-  Status SyncBlobDirectWriteManagers(
+
+  // Calls FlushAllOpenFiles() on each blob direct write manager that the
+  // current write touched. Each blob append already hands its data to the OS
+  // (flush-on-write), so this call does no I/O. The function stays for its
+  // sync point, which lets tests fail the write after its blob bytes are
+  // written, and as the place to flush if a blob writer ever buffers data. It
+  // does not sync: a sync write gets its blob files synced by
+  // SyncBlobDirectWriteFiles() right before the WAL sync.
+  Status FlushBlobDirectWriteManagers(
       const WriteOptions& write_options,
       const BlobDirectWriteContext& blob_direct_write_ctx);
+
+  // Syncs the blob direct write files of every live column family and the
+  // directory entries of new blob files (see "Durability" in the
+  // BlobFilePartitionManager class comment). Blob direct write puts a large
+  // value into a blob file and writes only a BlobIndex to the WAL. A WAL sync
+  // makes every earlier WAL record durable, so the blob bytes those records
+  // point to must be durable first. Apart from sealing a file (when
+  // WriteBlob() rotates a full file, and at flush), this is the only place
+  // that syncs blob direct write files.
+  //
+  // Every WAL sync that can make such a record durable calls this function
+  // after it fixes the list of WALs to sync and before it fsyncs them. So
+  // every WAL record appended before the WAL sync started has durable blob
+  // bytes when the WAL fsync returns:
+  // - WriteImpl() for a sync write, before WriteGroupToWAL() appends the WAL
+  //   record of the group: the caller leads the write group and owns the
+  //   write queue, and the blobs of the group are already appended. A blob
+  //   sync failure then leaves no WAL record behind.
+  // - SyncWalImpl() from SyncWAL() or FlushWAL(true). These do not keep
+  //   writers out, so a write group can append a blob after this function and
+  //   its WAL record before the WAL fsync:
+  //
+  //     SyncWAL():    [blob sync] ...................... [WAL fsync]
+  //     write group:              [blob append][WAL append]
+  //
+  //   The sync does not cover such a record: the WAL fsync can make the
+  //   record durable while its blob bytes are not synced. After a power loss,
+  //   a read of that key after recovery can then fail. In this race,
+  //   PrepareForSync() saved the WAL size from before the blob sync.
+  //   MarkLogsSynced() records that size, so the WAL stays in `logs_` and
+  //   eligible for another sync until a later sync covers the append. A flush
+  //   that runs the sync of closed WALs syncs that WAL, and the blob files
+  //   before it, before it records that recovery of its column family can skip
+  //   the WAL.
+  // - SyncWalImpl() from the sync of closed WALs before a flush: closed WALs
+  //   get no new records.
+  // ColumnFamilyData::ValidateOptions() rejects blob direct write with
+  // pipelined writes, concurrent memtable writes, unordered writes and
+  // two_write_queues, so there are no other WAL sync paths. A new WAL sync
+  // path must call this function too.
+  // REQUIRES: mutex_ not held.
+  Status SyncBlobDirectWriteFiles(const WriteOptions& write_options);
 
   Status PipelinedWriteImpl(const WriteOptions& options, WriteBatch* updates,
                             WriteBatch* trace_batch,
@@ -2391,10 +2445,15 @@ class DBImpl : public DB
   void MaybeInitBlobDirectWriteColumnFamily(
       ColumnFamilyData* cfd, const ColumnFamilyOptions& cf_options,
       const std::string& column_family_name);
-  // Increments the DB-level count of live blob direct-write column families.
-  void RegisterBlobDirectWriteColumnFamily();
-  // Decrements the DB-level count of live blob direct-write column families.
-  void UnregisterBlobDirectWriteColumnFamily();
+
+  // Adds `cfd` to `blob_direct_write_cfds_` and increments the count of live
+  // blob direct write column families.
+  // REQUIRES: mutex_ held.
+  void RegisterBlobDirectWriteColumnFamily(ColumnFamilyData* cfd);
+
+  // Removes `cfd` from `blob_direct_write_cfds_` and decrements the count.
+  // REQUIRES: mutex_ held.
+  void UnregisterBlobDirectWriteColumnFamily(ColumnFamilyData* cfd);
 
   struct CompactionState;
   struct PrepickedCompaction;
@@ -2740,10 +2799,12 @@ class DBImpl : public DB
   void ReleaseOptionsFileNumber(
       std::unique_ptr<std::list<uint64_t>::iterator>& v);
 
-  // Sets bg error if there is an error writing to WAL.
+  // Sets bg error if there is an error writing to WAL. See SyncWalImpl() for
+  // `blob_sync_failed_out`.
   IOStatus SyncClosedWals(const WriteOptions& write_options,
                           JobContext* job_context, VersionEdit* synced_wals,
-                          bool error_recovery_in_prog);
+                          bool error_recovery_in_prog,
+                          bool* blob_sync_failed_out);
 
   // Flush the in-memory write buffer to storage.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful. Then
@@ -3162,6 +3223,14 @@ class DBImpl : public DB
                         SequenceNumber failed_wal_sequence = 0,
                         SequenceNumber failed_wal_sequence_start = 0);
 
+  // Handles a failure of the blob sync that runs before a WAL is synced or
+  // written (see SyncBlobDirectWriteFiles()). It is a blob error, not a WAL
+  // error: the WAL is not touched, so unlike WALIOStatusCheck() it does not
+  // quarantine a WAL or reset a WAL writer. With paranoid_checks, it sets a
+  // background error that stops writes, as a failed WAL sync does.
+  // REQUIRES: mutex_ not held.
+  void BlobSyncStatusCheck(const Status& status);
+
   // Extends the inclusive WAL-number cutoff that must not receive more I/O.
   // This is lock-free because a WAL error can race with public SyncWAL().
   void ExtendWALRecoveryCutoff(uint64_t failed_wal_number);
@@ -3407,10 +3476,17 @@ class DBImpl : public DB
   void BeginInFlightCompaction(ColumnFamilyData* cfd);
   bool EndInFlightCompaction(ColumnFamilyData* cfd);
 
+  // If `blob_sync_failed_out` is not null, sets it to true when the sync
+  // failed because the blob direct write files failed to sync before the WALs
+  // (see SyncBlobDirectWriteFiles()). It is never set to false, so the caller
+  // initializes it. A caller that passes it (a flush) sets the background
+  // error for a blob sync failure itself; otherwise this function calls
+  // BlobSyncStatusCheck().
   IOStatus SyncWalImpl(bool include_current_wal,
                        const WriteOptions& write_options,
                        JobContext* job_context, VersionEdit* synced_wals,
-                       bool error_recovery_in_prog);
+                       bool error_recovery_in_prog,
+                       bool* blob_sync_failed_out = nullptr);
 
   // helper function to call after some of the logs_ were synced
   void MarkLogsSynced(uint64_t up_to, bool synced_dir, VersionEdit* edit);
@@ -4295,6 +4371,13 @@ class DBImpl : public DB
   // manager. This keeps the read/write fast paths at O(1) when the feature is
   // completely disabled for the DB.
   std::atomic<uint32_t> blob_direct_write_cf_count_{0};
+
+  // The live column families with a blob direct write partition manager.
+  // Added when the manager is created, removed when the drop of the column
+  // family is committed, and cleared when the DB closes.
+  // SyncBlobDirectWriteFiles() walks it instead of all column families.
+  // Protected by `mutex_`.
+  std::vector<ColumnFamilyData*> blob_direct_write_cfds_;
 
   // if an attempt was made to flush all column families that
   // the oldest log depends on but uncommitted data in the oldest
