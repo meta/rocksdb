@@ -34,6 +34,7 @@
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include "env/mock_env.h"
+#include "file/file_util.h"
 #include "file/filename.h"
 #include "monitoring/file_read_sample.h"
 #include "monitoring/thread_status_util.h"
@@ -2788,6 +2789,54 @@ TEST_F(DBTest, DBOpenChangeNumLevels) {
   Status s = TryReopenWithColumnFamilies({"default", "pikachu"}, options);
   ASSERT_TRUE(strstr(s.ToString().c_str(), "Invalid argument") != nullptr);
   ASSERT_TRUE(db_ == nullptr);
+}
+
+// DestroyDB() creates its own info logger in the DB dir when the caller gives
+// none, and its default SstFileManager logs one line for each table file that
+// it deletes. With a small max_log_file_size, these lines would make a rolling
+// logger create a new LOG.old.* file after the dir was listed. Checks that the
+// dir is still removed: 200 files with lines of more than 60 bytes each give
+// more than 12 KB of log, which is more than the 4 KB roll size. The log level
+// is DEBUG, so the test still makes these lines if they move to DEBUG.
+TEST_F(DBTest, DestroyDBRemovesDirWhenInfoLogWouldRoll) {
+  const std::string dbname = test::PerThreadDBPath("db_destroy_log_roll");
+  ASSERT_OK(DestroyDir(env_, dbname));
+  ASSERT_OK(env_->CreateDirIfMissing(dbname));
+  constexpr uint64_t kNumTableFiles = 200;
+  for (uint64_t number = 1; number <= kNumTableFiles; ++number) {
+    ASSERT_OK(WriteStringToFile(env_, "", MakeTableFileName(dbname, number)));
+  }
+
+  Options options;
+  options.env = env_;
+  options.info_log_level = InfoLogLevel::DEBUG_LEVEL;
+  options.max_log_file_size = 4096;
+  ASSERT_OK(DestroyDB(dbname, options));
+  ASSERT_EQ(Status::Code::kNotFound, env_->FileExists(dbname).code());
+}
+
+// DestroyDB() sanitizes the column family part of its options too, and that
+// deletes the trash files in options.cf_paths. DestroyDB() does not list
+// options.cf_paths, so its other files and the dir stay (a known gap that this
+// test does not cover). The test removes the dir at the end. Checks that a
+// trash file there is deleted.
+TEST_F(DBTest, DestroyDBDeletesTrashInOptionsCfPaths) {
+  const std::string dbname = test::PerThreadDBPath("db_destroy_cf_paths");
+  const std::string cf_path = dbname + "_cf_path";
+  ASSERT_OK(DestroyDir(env_, dbname));
+  ASSERT_OK(DestroyDir(env_, cf_path));
+  ASSERT_OK(env_->CreateDirIfMissing(dbname));
+  ASSERT_OK(env_->CreateDirIfMissing(cf_path));
+  const std::string trash_file = MakeTableFileName(cf_path, 10) + ".trash";
+  ASSERT_OK(WriteStringToFile(env_, "", trash_file));
+
+  Options options;
+  options.env = env_;
+  options.cf_paths.emplace_back(cf_path, 0);
+  ASSERT_OK(DestroyDB(dbname, options));
+  ASSERT_EQ(Status::Code::kNotFound, env_->FileExists(dbname).code());
+  ASSERT_EQ(Status::Code::kNotFound, env_->FileExists(trash_file).code());
+  ASSERT_OK(DestroyDir(env_, cf_path));
 }
 
 TEST_F(DBTest, DestroyDBMetaDatabase) {

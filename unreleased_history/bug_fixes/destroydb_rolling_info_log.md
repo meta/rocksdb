@@ -1,0 +1,1 @@
+Fixed `DestroyDB()` leaving the DB directory behind when `options.info_log` and `options.sst_file_manager` are not set and the info logger it creates would roll (`max_log_file_size` or `log_file_time_to_roll` set) during the file deletes. `DestroyDB()` returned OK in this case.
