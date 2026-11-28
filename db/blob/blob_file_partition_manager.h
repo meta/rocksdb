@@ -183,6 +183,14 @@ class BlobFilePartitionManager {
   // to consider obsolete.
   void GetActiveBlobFileNumbers(UnorderedSet<uint64_t>* file_numbers) const;
 
+  // Returns true if GetActiveBlobFileNumbers() would return at least one file.
+  // Takes no lock and builds no set, so a caller can use it under the DB
+  // mutex. The answer can be out of date by the time the caller uses it, as
+  // with any snapshot of the active files.
+  bool HasActiveBlobFiles() const {
+    return tracked_blob_file_count_.load(std::memory_order_relaxed) > 0;
+  }
+
   // Returns sealed blob files that are still reachable through live memtables
   // or old SuperVersions and therefore must not be purged yet.
   void GetProtectedBlobFileNumbers(UnorderedSet<uint64_t>* file_numbers) const;
@@ -390,6 +398,11 @@ class BlobFilePartitionManager {
   std::unordered_map<uint64_t, uint32_t> protected_blob_file_refs_;
   // Protects file_to_partition_ and protected_blob_file_refs_.
   mutable port::RWMutex file_partition_mutex_;
+  // file_to_partition_.size(), stored under file_partition_mutex_ after each
+  // change, so that HasActiveBlobFiles() can read it without the lock. A
+  // writer of file_partition_mutex_ can evict from the blob file cache, which
+  // can wait for a file open.
+  std::atomic<size_t> tracked_blob_file_count_{0};
 };
 
 }  // namespace ROCKSDB_NAMESPACE

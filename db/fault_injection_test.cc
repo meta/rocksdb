@@ -651,6 +651,248 @@ TEST(FaultInjectionFSTest, ReadUnsyncedData) {
   }
 }
 
+// Random-access reads and the open file's size also include unsynced data,
+// like on a POSIX file system. Blob direct write reads blob files that are
+// still open for writing.
+TEST(FaultInjectionFSTest, RandomAccessReadUnsyncedData) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+  ASSERT_TRUE(fault_fs->ReadUnsyncedData());
+
+  auto seed = Random::GetTLSInstance()->Next();
+  for (int i = 0; i < 10; i++, seed++) {
+    SCOPED_TRACE("seed=" + std::to_string(seed));
+    Random rnd(seed);
+    uint32_t len = rnd.Uniform(10000) + 1;
+    std::string f =
+        test::PerThreadDBPath("random_read_unsynced." + std::to_string(seed));
+    std::string data = rnd.RandomString(len);
+
+    // Create a partially synced file that stays open for writing.
+    std::unique_ptr<FSWritableFile> w;
+    ASSERT_OK(fault_fs->NewWritableFile(f, {}, &w, nullptr));
+    uint32_t synced_len = rnd.Uniform(len + 1);
+    ASSERT_OK(w->Append(Slice(data.data(), synced_len), {}, nullptr));
+    if (synced_len > 0) {
+      ASSERT_OK(w->Sync({}, nullptr));
+    }
+    ASSERT_OK(w->Append(Slice(data.data() + synced_len, len - synced_len), {},
+                        nullptr));
+
+    std::unique_ptr<FSRandomAccessFile> r;
+    ASSERT_OK(fault_fs->NewRandomAccessFile(f, {}, &r, nullptr));
+    uint64_t file_size = 0;
+    ASSERT_OK(r->GetFileSize(&file_size));
+    ASSERT_EQ(len, file_size);
+
+    // Maybe a sync between opening the reader and reading.
+    if (rnd.OneIn(2)) {
+      ASSERT_OK(w->Sync({}, nullptr));
+    }
+
+    // Read a range that can span synced data, unsynced data, and the end of
+    // the file.
+    uint32_t offset = rnd.Uniform(len + 1);
+    uint32_t n = rnd.Uniform(len + 1) + 1;
+    std::unique_ptr<char[]> scratch(new char[n]);
+    Slice result;
+    ASSERT_OK(r->Read(offset, n, {}, &result, scratch.get(), nullptr));
+    const size_t expected_size = std::min<size_t>(n, len - offset);
+    ASSERT_EQ(expected_size, result.size());
+    ASSERT_EQ(0, result.compare(Slice(data.data() + offset, expected_size)));
+
+    // The same range through MultiRead.
+    std::unique_ptr<char[]> multi_scratch(new char[n]);
+    FSReadRequest req;
+    req.offset = offset;
+    req.len = n;
+    req.scratch = multi_scratch.get();
+    ASSERT_OK(r->MultiRead(&req, 1, {}, nullptr));
+    ASSERT_OK(req.status);
+    ASSERT_EQ(expected_size, req.result.size());
+    ASSERT_EQ(0,
+              req.result.compare(Slice(data.data() + offset, expected_size)));
+    ASSERT_OK(w->Close({}, nullptr));
+  }
+}
+
+// A Sync() between the read of the synced data and the read of the unsynced
+// buffer moves data that the read has not seen into the target file. The read
+// must then read the target file again. If a sync races with every try, the
+// read fails with IOError instead of returning a short read.
+TEST(FaultInjectionFSTest, ReadUnsyncedDataRacesWithSync) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+  for (bool race_every_try : {false, true}) {
+    SCOPED_TRACE("race_every_try=" + std::to_string(race_every_try));
+    const std::string f = test::PerThreadDBPath("read_unsynced_races_sync");
+    // Example sizes: 100 bytes are written but not synced, and the read asks
+    // for 1000 bytes, more than the file will ever hold.
+    std::string data(100, 'a');
+    std::unique_ptr<FSWritableFile> w;
+    ASSERT_OK(fault_fs->NewWritableFile(f, {}, &w, nullptr));
+    ASSERT_OK(w->Append(data, {}, nullptr));
+    std::unique_ptr<FSRandomAccessFile> r;
+    ASSERT_OK(fault_fs->NewRandomAccessFile(f, {}, &r, nullptr));
+
+    // Before each read of the unsynced buffer, append one byte and sync, so
+    // that the target file grows after the target read. Without
+    // `race_every_try`, only the first try races.
+    int races = 0;
+    SyncPoint::GetInstance()->SetCallBack(
+        "TestFSRandomAccessFile::AddUnsyncedData:BeforeReadUnsynced",
+        [&](void* /*arg*/) {
+          if (race_every_try || races == 0) {
+            ++races;
+            data.push_back('b');
+            ASSERT_OK(w->Append(Slice(data.data() + data.size() - 1, 1), {},
+                                nullptr));
+            ASSERT_OK(w->Sync({}, nullptr));
+          }
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+    constexpr size_t kReadSize = 1000;
+    std::unique_ptr<char[]> scratch(new char[kReadSize]);
+    Slice result;
+    IOStatus s = r->Read(0, kReadSize, {}, &result, scratch.get(), nullptr);
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    if (race_every_try) {
+      ASSERT_TRUE(s.IsIOError()) << s.ToString();
+    } else {
+      ASSERT_OK(s);
+      ASSERT_EQ(1, races);
+      ASSERT_EQ(data, result.ToString());
+    }
+    ASSERT_OK(w->Close({}, nullptr));
+  }
+}
+
+// Truncate() of a file that is still open for writing updates the size and
+// data that random-access readers see. Two example cases on 8 bytes
+// "ABCDEFGH": truncate into the synced part (to 3 bytes after syncing all 8),
+// and truncate into the unsynced part (to 6 bytes after syncing 4). Then a
+// reopened handle truncates a closed file.
+TEST(FaultInjectionFSTest, TruncateUpdatesRandomAccessReaders) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+  const std::string data = "ABCDEFGH";
+  struct Case {
+    size_t synced_len;
+    size_t truncate_size;
+  };
+  for (const Case& c : {Case{8, 3}, Case{4, 6}}) {
+    SCOPED_TRACE("synced_len=" + std::to_string(c.synced_len) +
+                 " truncate_size=" + std::to_string(c.truncate_size));
+    const std::string f = test::PerThreadDBPath("truncate_open_file");
+    std::unique_ptr<FSWritableFile> w;
+    ASSERT_OK(fault_fs->NewWritableFile(f, {}, &w, nullptr));
+    ASSERT_OK(w->Append(Slice(data.data(), c.synced_len), {}, nullptr));
+    ASSERT_OK(w->Sync({}, nullptr));
+    ASSERT_OK(
+        w->Append(Slice(data.data() + c.synced_len, data.size() - c.synced_len),
+                  {}, nullptr));
+    ASSERT_OK(w->Truncate(c.truncate_size, {}, nullptr));
+    const std::string expected = data.substr(0, c.truncate_size);
+
+    std::unique_ptr<FSRandomAccessFile> r;
+    ASSERT_OK(fault_fs->NewRandomAccessFile(f, {}, &r, nullptr));
+    uint64_t file_size = 0;
+    ASSERT_OK(r->GetFileSize(&file_size));
+    ASSERT_EQ(c.truncate_size, file_size);
+
+    // Reads that ask for the old length stop at the new end of the file.
+    std::unique_ptr<char[]> scratch(new char[data.size()]);
+    Slice result;
+    ASSERT_OK(r->Read(0, data.size(), {}, &result, scratch.get(), nullptr));
+    ASSERT_EQ(expected, result.ToString());
+    std::unique_ptr<char[]> multi_scratch(new char[data.size()]);
+    FSReadRequest req;
+    req.offset = 0;
+    req.len = data.size();
+    req.scratch = multi_scratch.get();
+    ASSERT_OK(r->MultiRead(&req, 1, {}, nullptr));
+    ASSERT_OK(req.status);
+    ASSERT_EQ(expected, req.result.ToString());
+
+    // After a sync, the file on disk has the truncated contents.
+    ASSERT_OK(w->Sync({}, nullptr));
+    ASSERT_OK(w->Close({}, nullptr));
+    std::string contents;
+    ASSERT_OK(ReadFileToString(FileSystem::Default().get(), f, &contents));
+    ASSERT_EQ(expected, contents);
+  }
+
+  // A handle from ReopenWritableFile() does not know the bytes that are
+  // already in the file, so Truncate() must still shorten the file on disk.
+  // Example: the file holds the synced 8 bytes, and the reopened handle
+  // truncates it to 3 bytes.
+  const std::string f = test::PerThreadDBPath("truncate_reopened_file");
+  std::unique_ptr<FSWritableFile> w;
+  ASSERT_OK(fault_fs->NewWritableFile(f, {}, &w, nullptr));
+  ASSERT_OK(w->Append(data, {}, nullptr));
+  ASSERT_OK(w->Sync({}, nullptr));
+  ASSERT_OK(w->Close({}, nullptr));
+  ASSERT_OK(fault_fs->ReopenWritableFile(f, {}, &w, nullptr));
+  ASSERT_OK(w->Truncate(3, {}, nullptr));
+  ASSERT_OK(w->Close({}, nullptr));
+  const std::string expected = data.substr(0, 3);
+  std::string contents;
+  ASSERT_OK(ReadFileToString(FileSystem::Default().get(), f, &contents));
+  ASSERT_EQ(expected, contents);
+  // Random-access readers of the wrapper see the truncated file too, and a
+  // read that asks for the old length stops at the new end.
+  std::unique_ptr<FSRandomAccessFile> r;
+  ASSERT_OK(fault_fs->NewRandomAccessFile(f, {}, &r, nullptr));
+  uint64_t file_size = 0;
+  ASSERT_OK(r->GetFileSize(&file_size));
+  ASSERT_EQ(expected.size(), file_size);
+  std::unique_ptr<char[]> scratch(new char[data.size()]);
+  Slice result;
+  ASSERT_OK(r->Read(0, data.size(), {}, &result, scratch.get(), nullptr));
+  ASSERT_EQ(expected, result.ToString());
+  std::unique_ptr<char[]> multi_scratch(new char[data.size()]);
+  FSReadRequest req;
+  req.offset = 0;
+  req.len = data.size();
+  req.scratch = multi_scratch.get();
+  ASSERT_OK(r->MultiRead(&req, 1, {}, nullptr));
+  ASSERT_OK(req.status);
+  ASSERT_EQ(expected, req.result.ToString());
+}
+
+// After simulated data loss, random-access readers see only the bytes that
+// survive. Example: "abc" is synced and "defgh" is buffered, then
+// DropUnsyncedFileData() drops the buffered bytes, so the size is 3.
+TEST(FaultInjectionFSTest, GetFileSizeAfterDropUnsyncedData) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+  ASSERT_TRUE(fault_fs->ReadUnsyncedData());
+  const std::string f = test::PerThreadDBPath("size_after_drop");
+  std::unique_ptr<FSWritableFile> w;
+  ASSERT_OK(fault_fs->NewWritableFile(f, {}, &w, nullptr));
+  ASSERT_OK(w->Append("abc", {}, nullptr));
+  ASSERT_OK(w->Sync({}, nullptr));
+  ASSERT_OK(w->Append("defgh", {}, nullptr));
+  ASSERT_OK(fault_fs->DropUnsyncedFileData());
+
+  std::unique_ptr<FSRandomAccessFile> r;
+  ASSERT_OK(fault_fs->NewRandomAccessFile(f, {}, &r, nullptr));
+  uint64_t file_size = 0;
+  ASSERT_OK(r->GetFileSize(&file_size));
+  ASSERT_EQ(3U, file_size);
+  constexpr size_t kReadSize = 8;
+  std::unique_ptr<char[]> scratch(new char[kReadSize]);
+  Slice result;
+  ASSERT_OK(r->Read(0, kReadSize, {}, &result, scratch.get(), nullptr));
+  ASSERT_EQ("abc", result.ToString());
+  ASSERT_OK(w->Close({}, nullptr));
+}
+
 TEST(FaultInjectionFSTest, FileOpenContractRejectsReadersWhileOpenForWrite) {
   std::shared_ptr<FaultInjectionTestFS> fault_fs =
       std::make_shared<FaultInjectionTestFS>(FileSystem::Default());

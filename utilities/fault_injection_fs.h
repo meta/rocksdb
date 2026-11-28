@@ -358,6 +358,25 @@ class TestFSRandomAccessFile : public FSRandomAccessFile {
   IOStatus GetFileSize(uint64_t* file_size) override;
 
  private:
+  // A file can be read while it is still open for writing (for example, an
+  // active blob direct write file). With InjectUnsyncedDataLoss() and
+  // buffered (not direct) I/O, the writer keeps its unsynced data only in the
+  // FileSystem's buffer. When ReadUnsyncedData() is on, this extends
+  // `*result`, which holds what the target file returned for
+  // [offset, offset + n), with that buffered data, as a POSIX file system
+  // would show it. Without such buffering, the target already has the data.
+  //
+  //   file start (0)      pos_at_last_sync_          pos_at_last_sync_ +
+  //   |                   |                          buffer size
+  //   [ target file bytes ][ buffered unsynced bytes ]
+  //
+  // Sync() appends the buffer to the target file, so the boundary moves right.
+  // If that happens between the target read and the buffer read, the read
+  // starts again (see the retry in the implementation).
+  IOStatus AddUnsyncedData(uint64_t offset, size_t n, const IOOptions& options,
+                           Slice* result, char* scratch,
+                           IODebugContext* dbg) const;
+
   std::string fname_;
   std::unique_ptr<FSRandomAccessFile> target_;
   FaultInjectionTestFS* fs_;
@@ -575,6 +594,13 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   void WritableFileSynced(const FSFileState& state);
 
   void WritableFileAppended(const FSFileState& state);
+
+  // Called after a handle from ReopenWritableFile() truncated `fname` on disk
+  // to `size` bytes. Such a handle does not know the earlier contents, so it
+  // cannot publish its own state. If this FileSystem tracks `fname`, sets the
+  // tracked size and synced position to `size` and drops the unsynced buffer,
+  // so random-access readers see the file that is on disk.
+  void ReopenedWritableFileTruncated(const std::string& fname, uint64_t size);
 
   void RandomRWFileClosed(const std::string& fname);
 
@@ -866,6 +892,12 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   // unsynced.
   void ReadUnsynced(const std::string& fname, uint64_t offset, size_t n,
                     Slice* result, char* scratch, int64_t* pos_at_last_sync);
+
+  // If this FileSystem tracks write state for `fname` (the file was written
+  // through it and not deleted), raises `*file_size`, the size of the target
+  // file, to include the buffered unsynced data that is still kept.
+  // Otherwise leaves `*file_size` unchanged.
+  void MaybeGetUnsyncedFileSize(const std::string& fname, uint64_t* file_size);
 
   // Flush recently injected errors to the configured binary log file and sync
   // it to storage.

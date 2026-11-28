@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/blob/blob_file_partition_manager.h"
 #include "db/db_impl/db_impl.h"
 #include "db/job_context.h"
 #include "db/version_set.h"
@@ -407,6 +408,9 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
   // metadata.
   mutex_.Lock();
   bool wal_locked = false;
+  // Set when the flush below runs in a DB with blob direct write (see the
+  // check after the flush).
+  bool checks_blob_direct_write_flush_race = false;
   const bool needs_blob_direct_write_flush =
       HasInFlightBlobDirectWriteFilesWithLockHeld();
   if (needs_blob_direct_write_flush && !flush_memtable) {
@@ -431,12 +435,69 @@ Status DBImpl::GetLiveFilesStorageInfoImpl(
           "Skipping FlushForGetLiveFiles while WAL is locked and all data is "
           "already persisted");
     } else {
-      Status status = FlushForGetLiveFiles(opts.atomic_flush);
+      // With blob direct write, flush all column families at one point. A write
+      // after a column family's memtable switch puts its value into a new
+      // active blob file, which the copy does not get, and its record into a
+      // WAL that the copy does get. With one flush per column family, a column
+      // family flushed later can then have a log number past that WAL. The
+      // copy's recovery stops at the record (its blob file is missing) and
+      // fails the open, because that column family's SST files hold newer data.
+      // An atomic flush gives all column families the same switch point, so
+      // that a write made during the checkpoint does not make a copy opened
+      // with kPointInTimeRecovery fail to open; such a write can be missing
+      // from the copy. With kTolerateCorruptedTailRecords or
+      // kAbsoluteConsistency, such a write can still fail the open of the copy
+      // (see enable_blob_direct_write). A background flush that installs its
+      // result before the files below are captured can still move a column
+      // family's log number past such a write's WAL; the check after this flush
+      // detects that and returns TryAgain.
+      checks_blob_direct_write_flush_race =
+          HasAnyBlobDirectWriteColumnFamilyWithLockHeld();
+      const bool force_atomic_flush =
+          opts.atomic_flush || checks_blob_direct_write_flush_race;
+      Status status = FlushForGetLiveFiles(force_atomic_flush);
       if (!status.ok()) {
         mutex_.Unlock();
         ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                         "Cannot Flush data %s\n", status.ToString().c_str());
         return status;
+      }
+    }
+  }
+
+  // A column family's log number is the WAL number below which replay skips
+  // its records. After the atomic flush above, a column family whose manager
+  // still owns active blob files (which the copy does not get) holds their
+  // records in WALs at or after its log number. If another column family with
+  // SST files has a larger log number, a flush installed its result after the
+  // atomic flush. For example, with kPointInTimeRecovery, a record in WAL 42
+  // whose blob file is missing stops the copy's replay; if another column
+  // family has SST files and log number 43, the open fails (see
+  // MaybeHandleStopReplayForCorruptionForInconsistency()). So return TryAgain
+  // and capture nothing when a live manager owns active blob files and its
+  // column family's log number is below the largest log number of a column
+  // family with SST files. The check is conservative: it can also fire for a
+  // column family that was empty at the atomic flush and got data during it;
+  // a retry flushes it too.
+  if (checks_blob_direct_write_flush_race) {
+    uint64_t max_log_number_with_sst = 0;
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      if (!cfd->IsDropped() && cfd->GetLiveSstFilesSize() > 0) {
+        max_log_number_with_sst =
+            std::max(max_log_number_with_sst, cfd->GetLogNumber());
+      }
+    }
+    for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+      BlobFilePartitionManager* const mgr = cfd->blob_partition_manager();
+      if (cfd->IsDropped() || mgr == nullptr ||
+          cfd->GetLogNumber() >= max_log_number_with_sst) {
+        continue;
+      }
+      if (mgr->HasActiveBlobFiles()) {
+        mutex_.Unlock();
+        return Status::TryAgain(
+            "A flush finished while live files were captured for blob direct "
+            "write; retry the call");
       }
     }
   }

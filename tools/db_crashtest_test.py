@@ -1031,8 +1031,37 @@ class DBCrashTestTest(unittest.TestCase):
         finalized = db_crashtest.finalize_and_sanitize(params)
 
         self.assertEqual(1, finalized["enable_blob_direct_write"])
-        self.assertEqual(1, finalized["disable_wal"])
         self.assertEqual(0, finalized["test_batches_snapshots"])
+
+    def test_finalize_keeps_wal_crash_recovery_for_blob_direct_write(self):
+        db_crashtest = self.load_db_crashtest()
+        params = self.build_params(
+            dict(
+                list(db_crashtest.default_params.items())
+                + list(db_crashtest.blob_direct_write_params.items())
+            ),
+            {
+                "disable_wal": 0,
+                "reopen": 20,
+                "sync_fault_injection": 1,
+                "manual_wal_flush_one_in": 1000,
+                "sync_wal_one_in": 1000,
+                "lock_wal_one_in": 1000,
+                "mmap_read": 1,
+            },
+        )
+
+        finalized = db_crashtest.finalize_and_sanitize(params)
+
+        self.assertEqual(1, finalized["enable_blob_direct_write"])
+        self.assertEqual(0, finalized["disable_wal"])
+        self.assertEqual(20, finalized["reopen"])
+        self.assertEqual(1, finalized["sync_fault_injection"])
+        self.assertEqual(1000, finalized["manual_wal_flush_one_in"])
+        self.assertEqual(1000, finalized["sync_wal_one_in"])
+        self.assertEqual(1000, finalized["lock_wal_one_in"])
+        self.assertEqual(0, finalized["best_efforts_recovery"])
+        self.assertEqual(0, finalized["mmap_read"])
 
     def test_finalize_file_scoped_wal_fault_profile(self):
         db_crashtest = self.load_db_crashtest()

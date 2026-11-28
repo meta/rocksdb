@@ -107,9 +107,11 @@ std::vector<uint64_t> MemTableIds(const autovector<ReadOnlyMemTable*>& mems) {
 //   flush, such as a manual Flush() or the flush that Close() always runs with
 //   blob direct write, would wait forever.
 // Stopping the DB makes those callers return the error. The WALs are kept, and
-// the next open replays them. Writes made with disableWAL=true have no WAL
-// record to replay: they survive the reopen only if a memtable flush persisted
-// them.
+// the next open replays them. Replay reads each value that a record keeps in a
+// blob file that is not in the MANIFEST and checks it (see
+// BlobDirectWriteRecoveryResolver). Writes made with disableWAL=true have no
+// WAL record to replay: they survive the reopen only if a memtable flush
+// persisted them.
 void StopDBAfterBlobDirectWriteError(ErrorHandler* error_handler,
                                      const Status& blob_error) {
   error_handler->SetBGErrorAtLeastFatal(blob_error,
@@ -2437,6 +2439,7 @@ Status DBImpl::FlushAllColumnFamilies(const FlushOptions& flush_options,
     TEST_SYNC_POINT(
         "DBImpl::FlushAllColumnFamilies:BeforeAtomicFlushMemTables");
     status = AtomicFlushMemTables(flush_options, flush_reason);
+    TEST_SYNC_POINT("DBImpl::FlushAllColumnFamilies:AfterAtomicFlushMemTables");
     mutex_.Lock();
   } else {
     for (auto cfd : versions_->GetRefedColumnFamilySet()) {

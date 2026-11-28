@@ -196,12 +196,16 @@ void BlobFilePartitionManager::AddFilePartitionMapping(uint64_t file_number,
                                                        uint32_t partition_idx) {
   WriteLock lock(&file_partition_mutex_);
   file_to_partition_[file_number] = partition_idx;
+  tracked_blob_file_count_.store(file_to_partition_.size(),
+                                 std::memory_order_relaxed);
 }
 
 void BlobFilePartitionManager::RemoveFilePartitionMapping(
     uint64_t file_number) {
   WriteLock lock(&file_partition_mutex_);
   file_to_partition_.erase(file_number);
+  tracked_blob_file_count_.store(file_to_partition_.size(),
+                                 std::memory_order_relaxed);
 }
 
 Status BlobFilePartitionManager::OpenNewBlobFile(Partition* partition,
@@ -916,6 +920,8 @@ void BlobFilePartitionManager::RemoveFilePartitionMappings(
   WriteLock lock(&file_partition_mutex_);
   for (uint64_t file_number : file_numbers) {
     file_to_partition_.erase(file_number);
+    tracked_blob_file_count_.store(file_to_partition_.size(),
+                                   std::memory_order_relaxed);
     if (blob_file_cache_ != nullptr) {
       // In-flight direct-write reads may have cached a footer-less reader for
       // this file before it was sealed. Drop it now so future manifest-visible

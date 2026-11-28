@@ -33,6 +33,7 @@
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_write_batch_transformer.h"
 #include "db/builder.h"
 #include "db/coalescing_iterator.h"
 #include "db/compaction/compaction_job.h"
@@ -872,9 +873,10 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
   s.PermitUncheckedError();
 
   InstrumentedMutexLock l(&mutex_);
-  // Blob direct-write relies on clean shutdown flushes to register live blob
-  // files in MANIFEST before close. WAL recovery of unregistered files is out
-  // of scope in v1.
+  // Blob direct write flushes all column families at shutdown, even with
+  // avoid_flush_during_shutdown, so that its blob files are in the MANIFEST
+  // when the DB closes. After a crash, WAL replay reads the values from blob
+  // files that are not in the MANIFEST (see BlobDirectWriteRecoveryResolver).
   const bool force_flush_for_blob_direct_write =
       HasAnyBlobDirectWriteColumnFamilyWithLockHeld();
   const bool flush_for_unpersisted_data =

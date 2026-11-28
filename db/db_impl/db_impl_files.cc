@@ -66,8 +66,10 @@ Env::IOActivity GetCurrentThreadIOActivityForMetadataRead() {
 
 // A full-scan obsolete-file purge can observe a newly created direct-write
 // blob file before it is added to the manager's active-file set. Those
-// in-flight files are still missing their footer, so conservatively keep any
-// footer-less blob file here rather than risk deleting a live write-path file.
+// in-flight files are still missing their footer, so keep any footer-less blob
+// file here rather than risk deleting a live write-path file. Called only for
+// files of this DB session; see the lifecycle comment at
+// DBImpl::wal_replay_blob_files_.
 bool ShouldKeepFooterlessBlobFile(FileSystem* fs,
                                   const FileOptions& file_options,
                                   const std::string& blob_file_path) {
@@ -273,6 +275,23 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
           &job_context->active_blob_direct_write_files);
       mgr->GetProtectedBlobFileNumbers(
           &job_context->active_blob_direct_write_files);
+    }
+  }
+  // Keep the blob files that recovery recorded while the WALs that recovery
+  // replayed are still live, because the next open replays those WALs again
+  // (see `wal_replay_blob_files_`). The set is immutable and shared, so this
+  // only pins it: the purge checks it later without the DB mutex. Once its
+  // WAL is obsolete, the set is moved to the job, which releases it without
+  // the DB mutex (see JobContext::retired_wal_replay_blob_files).
+  if (wal_replay_blob_files_ != nullptr) {
+    if (wal_replay_blob_files_wal_number_ < MinLogNumberToKeep()) {
+      job_context->retired_wal_replay_blob_files =
+          std::move(wal_replay_blob_files_);
+      wal_replay_blob_files_.reset();
+      TEST_SYNC_POINT_CALLBACK(
+          "DBImpl::FindObsoleteFiles:RetiredWalReplayBlobFiles", job_context);
+    } else {
+      job_context->wal_replay_blob_files = wal_replay_blob_files_;
     }
   }
 
@@ -735,7 +754,9 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
                number >= state.min_blob_file_number_to_keep ||
                (blob_live_set.find(number) != blob_live_set.end()) ||
                (state.active_blob_direct_write_files.find(number) !=
-                state.active_blob_direct_write_files.end());
+                state.active_blob_direct_write_files.end()) ||
+               (state.wal_replay_blob_files != nullptr &&
+                state.wal_replay_blob_files->count(number) > 0);
         if (!keep) {
           const std::string blob_file_path =
               BlobFileName(candidate_file.file_path, number);
@@ -915,6 +936,13 @@ bool DBImpl::ShouldKeepBlobFileDuringPurge(uint64_t number,
       if (mgr != nullptr && mgr->IsTrackedBlobFileNumber(number)) {
         return true;
       }
+    }
+    // A blob file from an earlier DB session that blob direct write does not
+    // track is never open for writing, so there is no need to check its
+    // footer. FindObsoleteFiles() has already kept it if a live WAL refers to
+    // it. See the lifecycle comment at `wal_replay_blob_files_`.
+    if (number < first_file_number_after_recovery_) {
+      return false;
     }
   }
 

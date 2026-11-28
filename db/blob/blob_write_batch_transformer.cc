@@ -10,12 +10,18 @@
 
 #include "db/blob/blob_write_batch_transformer.h"
 
+#include "db/blob/blob_contents.h"
 #include "db/blob/blob_file_partition_manager.h"
+#include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/column_family.h"
+#include "db/version_set.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/write_batch_internal.h"
+#include "file/filename.h"
 #include "port/likely.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -310,6 +316,508 @@ Status BlobWriteBatchTransformer::MarkRollback(const Slice& xid) {
 
 Status BlobWriteBatchTransformer::MarkNoop(bool /*empty_batch*/) {
   return WriteBatchInternal::InsertNoop(output_batch_);
+}
+
+// First pass of BlobDirectWriteRecoveryResolver::Resolve(). Finds out, without
+// copying anything, whether the batch has a value in an unregistered blob
+// file. Stops after the entry that holds the first such value. For a
+// wide-column entity, it still checks the other blob columns of that entity,
+// so a lookup error in a later column is also returned.
+class BlobDirectWriteRecoveryResolver::Scanner : public WriteBatch::Handler {
+ public:
+  Scanner(BlobDirectWriteRecoveryResolver* resolver, uint64_t wal_number)
+      : resolver_(resolver), wal_number_(wal_number) {}
+
+  bool needs_resolve() const { return needs_resolve_; }
+
+  bool Continue() override { return !needs_resolve_; }
+
+  Status PutBlobIndexCF(uint32_t column_family_id, const Slice& /*key*/,
+                        const Slice& value) override {
+    ColumnFamilyData* cfd =
+        resolver_->GetReplayedColumnFamily(column_family_id, wal_number_);
+    if (cfd == nullptr) {
+      return Status::OK();
+    }
+    BlobIndex blob_index;
+    Status s = blob_index.DecodeFrom(value);
+    if (!s.ok()) {
+      return s;
+    }
+    return resolver_->CheckBlobIndex(cfd, blob_index, &needs_resolve_);
+  }
+
+  Status PutEntityCF(uint32_t column_family_id, const Slice& /*key*/,
+                     const Slice& entity) override {
+    ColumnFamilyData* cfd =
+        resolver_->GetReplayedColumnFamily(column_family_id, wal_number_);
+    if (cfd == nullptr) {
+      return Status::OK();
+    }
+    return WideColumnSerialization::ForEachBlobFileNumber(
+        entity, [&](const BlobIndex& blob_index) -> Status {
+          bool needs_resolve = false;
+          Status s = resolver_->CheckBlobIndex(cfd, blob_index, &needs_resolve);
+          needs_resolve_ = needs_resolve_ || needs_resolve;
+          return s;
+        });
+  }
+
+  // The remaining entry types never point to a blob file.
+  Status PutCF(uint32_t, const Slice&, const Slice&) override {
+    return Status::OK();
+  }
+  Status TimedPutCF(uint32_t, const Slice&, const Slice&, uint64_t) override {
+    return Status::OK();
+  }
+  Status DeleteCF(uint32_t, const Slice&) override { return Status::OK(); }
+  Status SingleDeleteCF(uint32_t, const Slice&) override {
+    return Status::OK();
+  }
+  Status DeleteRangeCF(uint32_t, const Slice&, const Slice&) override {
+    return Status::OK();
+  }
+  Status MergeCF(uint32_t, const Slice&, const Slice&) override {
+    return Status::OK();
+  }
+  void LogData(const Slice&) override {}
+  Status MarkBeginPrepare(bool) override { return Status::OK(); }
+  Status MarkEndPrepare(const Slice&) override { return Status::OK(); }
+  Status MarkCommit(const Slice&) override { return Status::OK(); }
+  Status MarkCommitWithTimestamp(const Slice&, const Slice&) override {
+    return Status::OK();
+  }
+  Status MarkRollback(const Slice&) override { return Status::OK(); }
+  Status MarkNoop(bool) override { return Status::OK(); }
+
+ private:
+  BlobDirectWriteRecoveryResolver* const resolver_;
+  const uint64_t wal_number_;
+  bool needs_resolve_ = false;
+};
+
+// Second pass of BlobDirectWriteRecoveryResolver::Resolve(). Copies every
+// entry of the batch into `output` and makes values in unregistered blob files
+// raw again.
+//
+// 2PC markers: one WAL record can hold several batches of one write group, for
+// example the prepare section of a WriteCommitted transaction followed by the
+// direct write of another writer. Recovery rebuilds a prepared transaction from
+// its markers, so the copy must keep them exactly. The WriteBatch::Handler
+// callbacks do not fully tell which begin-prepare marker type the record holds:
+// MarkBeginPrepare() gets unprepared=true only for a WriteUnprepared marker,
+// and the WriteCommitted and WritePrepared markers both call it with the
+// default argument. So the Rewriter handles only the WriteCommitted markers,
+// which it copies exactly. At each begin-prepare marker,
+// WriteBatchInternal::Iterate() (db/write_batch.cc) checks WriteAfterCommit()
+// and WriteBeforePrepare() and returns NotSupported when the marker type does
+// not match. The Rewriter claims WriteCommitted (see below), so Iterate() fails
+// on a WritePrepared or WriteUnprepared marker. Scanner keeps the default
+// options and accepts every marker, so a record that needs no rewrite is never
+// rejected. A value that needs a rewrite inside a prepare section also returns
+// NotSupported.
+//
+// Why the write path never puts a BlobIndex inside a prepare section: with
+// WriteCommitted, Prepare() writes the original values to the WAL and skips the
+// memtable, so blob direct write leaves that batch unchanged, and Commit()
+// inserts those values into the memtable with a WAL termination point that
+// keeps them out of the commit record. A BlobIndex in the same WAL record can
+// only come from another writer of the write group, outside the prepare
+// section. In addition, MaybeTransformBatchForBlobDirectWrite() skips batches
+// with a WAL termination point, and WritePreparedTxnDB::VerifyCFOptions()
+// rejects blob direct write for WritePrepared and WriteUnprepared.
+class BlobDirectWriteRecoveryResolver::Rewriter : public WriteBatch::Handler {
+ public:
+  Rewriter(BlobDirectWriteRecoveryResolver* resolver, uint64_t wal_number,
+           WriteBatch* output)
+      : resolver_(resolver), wal_number_(wal_number), output_(output) {}
+
+  Status PutBlobIndexCF(uint32_t column_family_id, const Slice& key,
+                        const Slice& value) override {
+    ColumnFamilyData* cfd =
+        resolver_->GetReplayedColumnFamily(column_family_id, wal_number_);
+    if (cfd == nullptr) {
+      return WriteBatchInternal::PutBlobIndex(output_, column_family_id, key,
+                                              value);
+    }
+    BlobIndex blob_index;
+    Status s = blob_index.DecodeFrom(value);
+    if (!s.ok()) {
+      return s;
+    }
+    bool needs_resolve = false;
+    s = resolver_->CheckBlobIndex(cfd, blob_index, &needs_resolve);
+    if (!s.ok()) {
+      return s;
+    }
+    if (!needs_resolve) {
+      return WriteBatchInternal::PutBlobIndex(output_, column_family_id, key,
+                                              value);
+    }
+    if (in_prepare_section_) {
+      return PrepareSectionNotSupported();
+    }
+    s = ReadValue(cfd, key, blob_index, &value_buf_);
+    if (!s.ok()) {
+      return s;
+    }
+    return WriteBatchInternal::Put(output_, column_family_id, key, value_buf_);
+  }
+
+  Status PutEntityCF(uint32_t column_family_id, const Slice& key,
+                     const Slice& entity) override {
+    ColumnFamilyData* cfd =
+        resolver_->GetReplayedColumnFamily(column_family_id, wal_number_);
+    if (cfd == nullptr) {
+      return WriteBatchInternal::PutEntitySerialized(output_, column_family_id,
+                                                     key, entity);
+    }
+    WideColumns columns;
+    std::vector<std::pair<size_t, BlobIndex>> blob_columns;
+    Status s =
+        WideColumnSerialization::Deserialize(entity, columns, &blob_columns);
+    if (!s.ok()) {
+      return s;
+    }
+    // Blob columns that still point to MANIFEST blob files stay blob columns.
+    std::vector<std::pair<size_t, BlobIndex>> kept_blob_columns;
+    // Raw values of the resolved columns, and the column index of each.
+    std::vector<std::string> resolved_values;
+    std::vector<size_t> resolved_column_indexes;
+    for (const auto& [column_index, blob_index] : blob_columns) {
+      bool needs_resolve = false;
+      s = resolver_->CheckBlobIndex(cfd, blob_index, &needs_resolve);
+      if (!s.ok()) {
+        return s;
+      }
+      if (!needs_resolve) {
+        kept_blob_columns.emplace_back(column_index, blob_index);
+        continue;
+      }
+      if (in_prepare_section_) {
+        return PrepareSectionNotSupported();
+      }
+      resolved_values.emplace_back();
+      s = ReadValue(cfd, key, blob_index, &resolved_values.back());
+      if (!s.ok()) {
+        return s;
+      }
+      resolved_column_indexes.push_back(column_index);
+    }
+    if (resolved_values.empty()) {
+      return WriteBatchInternal::PutEntitySerialized(output_, column_family_id,
+                                                     key, entity);
+    }
+    // `resolved_values` no longer grows, so the columns can point into it.
+    for (size_t i = 0; i < resolved_values.size(); ++i) {
+      columns[resolved_column_indexes[i]].value() = resolved_values[i];
+    }
+    std::string rewritten_entity;
+    if (kept_blob_columns.empty()) {
+      s = WideColumnSerialization::Serialize(columns, rewritten_entity);
+    } else {
+      s = WideColumnSerialization::SerializeV2(columns, kept_blob_columns,
+                                               rewritten_entity);
+    }
+    if (!s.ok()) {
+      return s;
+    }
+    return WriteBatchInternal::PutEntitySerialized(output_, column_family_id,
+                                                   key, rewritten_entity);
+  }
+
+  Status PutCF(uint32_t column_family_id, const Slice& key,
+               const Slice& value) override {
+    return WriteBatchInternal::Put(output_, column_family_id, key, value);
+  }
+  Status TimedPutCF(uint32_t column_family_id, const Slice& key,
+                    const Slice& value, uint64_t write_time) override {
+    return WriteBatchInternal::TimedPut(output_, column_family_id, key, value,
+                                        write_time);
+  }
+  Status DeleteCF(uint32_t column_family_id, const Slice& key) override {
+    return WriteBatchInternal::Delete(output_, column_family_id, key);
+  }
+  Status SingleDeleteCF(uint32_t column_family_id, const Slice& key) override {
+    return WriteBatchInternal::SingleDelete(output_, column_family_id, key);
+  }
+  Status DeleteRangeCF(uint32_t column_family_id, const Slice& begin_key,
+                       const Slice& end_key) override {
+    return WriteBatchInternal::DeleteRange(output_, column_family_id, begin_key,
+                                           end_key);
+  }
+  Status MergeCF(uint32_t column_family_id, const Slice& key,
+                 const Slice& value) override {
+    return WriteBatchInternal::Merge(output_, column_family_id, key, value);
+  }
+  // LogData() cannot return a status, so the error is kept in
+  // log_data_status_. Continue() then stops the iteration, and Resolve()
+  // returns the error.
+  void LogData(const Slice& blob) override {
+    if (log_data_status_.ok()) {
+      log_data_status_ = output_->PutLogData(blob);
+    }
+  }
+  bool Continue() override { return log_data_status_.ok(); }
+  // Writes a kTypeBeginPrepareXID marker. For any other begin-prepare marker,
+  // Iterate() returns NotSupported right after this call (see the class
+  // comment), and Resolve() drops the copy.
+  Status MarkBeginPrepare(bool /*unprepared*/) override {
+    in_prepare_section_ = true;
+    return WriteBatchInternal::InsertBeginPrepare(
+        output_, /*write_after_commit=*/true, /*unprepared_batch=*/false);
+  }
+  Status MarkEndPrepare(const Slice& xid) override {
+    in_prepare_section_ = false;
+    return WriteBatchInternal::InsertEndPrepare(output_, xid);
+  }
+  Status MarkCommit(const Slice& xid) override {
+    return WriteBatchInternal::MarkCommit(output_, xid);
+  }
+  Status MarkCommitWithTimestamp(const Slice& xid, const Slice& ts) override {
+    return WriteBatchInternal::MarkCommitWithTimestamp(output_, xid, ts);
+  }
+  Status MarkRollback(const Slice& xid) override {
+    return WriteBatchInternal::MarkRollback(output_, xid);
+  }
+  Status MarkNoop(bool /*empty_batch*/) override {
+    return WriteBatchInternal::InsertNoop(output_);
+  }
+
+  // Number of values this batch made raw again.
+  uint64_t resolved_value_count() const { return resolved_value_count_; }
+
+  // The first error of copying a LogData entry, or OK.
+  const Status& log_data_status() const { return log_data_status_; }
+
+ protected:
+  // Only WriteCommitted markers are accepted. See the class comment.
+  OptionState WriteAfterCommit() const override {
+    return OptionState::kEnabled;
+  }
+  OptionState WriteBeforePrepare() const override {
+    return OptionState::kDisabled;
+  }
+
+ private:
+  static Status PrepareSectionNotSupported() {
+    return Status::NotSupported(
+        "WAL record has a value in a blob file that is not in the MANIFEST "
+        "inside a 2PC prepare section");
+  }
+
+  Status ReadValue(ColumnFamilyData* cfd, const Slice& key,
+                   const BlobIndex& blob_index, std::string* value) {
+    Status s = resolver_->ReadValue(cfd, wal_number_, key, blob_index, value);
+    if (s.ok()) {
+      ++resolved_value_count_;
+    }
+    return s;
+  }
+
+  BlobDirectWriteRecoveryResolver* const resolver_;
+  const uint64_t wal_number_;
+  WriteBatch* const output_;
+  // Reused buffer for one resolved Put value.
+  std::string value_buf_;
+  uint64_t resolved_value_count_ = 0;
+  // True between a begin-prepare marker and its end-prepare marker.
+  bool in_prepare_section_ = false;
+  Status log_data_status_;
+};
+
+BlobDirectWriteRecoveryResolver::BlobDirectWriteRecoveryResolver(
+    const ColumnFamilySet* column_families, const FileOptions& file_options,
+    UnorderedSet<uint64_t> unregistered_blob_files, bool read_only)
+    : column_families_(column_families),
+      file_options_(file_options),
+      read_only_(read_only),
+      unregistered_blob_files_(std::move(unregistered_blob_files)) {
+  assert(column_families_ != nullptr);
+}
+
+BlobDirectWriteRecoveryResolver::~BlobDirectWriteRecoveryResolver() = default;
+
+ColumnFamilyData* BlobDirectWriteRecoveryResolver::GetReplayedColumnFamily(
+    uint32_t column_family_id, uint64_t wal_number) const {
+  // Mirrors the skip rules of MemTableInserter::SeekToColumnFamily() during
+  // recovery.
+  ColumnFamilyData* cfd = column_families_->GetColumnFamily(column_family_id);
+  if (cfd == nullptr || cfd->IsDropped() || wal_number < cfd->GetLogNumber()) {
+    return nullptr;
+  }
+  return cfd;
+}
+
+Status BlobDirectWriteRecoveryResolver::CheckBlobIndex(
+    ColumnFamilyData* cfd, const BlobIndex& blob_index, bool* needs_resolve) {
+  assert(cfd != nullptr);
+  assert(needs_resolve != nullptr);
+  *needs_resolve = false;
+  // Blob direct write never writes inlined or TTL blob indexes. Other writers
+  // (the stackable BlobDB) do, and their files are not managed here.
+  if (blob_index.IsInlined() || blob_index.HasTTL()) {
+    return Status::OK();
+  }
+  const uint64_t file_number = blob_index.file_number();
+  if (cfd->current()->storage_info()->GetBlobFileMetaData(file_number)) {
+    return Status::OK();
+  }
+  if (unregistered_blob_files_.count(file_number) > 0) {
+    *needs_resolve = true;
+    referenced_blob_files_.insert(file_number);
+    return Status::OK();
+  }
+  // A read-only open lists only the WAL directory, and a DB that another
+  // process still writes can create a blob file after the listing. So a
+  // read-only open checks the disk once for each unknown file number. A
+  // read-write open does not check: it listed every blob directory, the DB
+  // lock keeps other writers out, and files that the recovery flush creates
+  // get new numbers, so they are not unregistered blob files of an earlier
+  // session.
+  if (read_only_ && missing_blob_files_.count(file_number) == 0) {
+    const std::string path =
+        BlobFileName(cfd->ioptions().cf_paths.front().path, file_number);
+    IOStatus io_s = cfd->ioptions().fs->FileExists(path, IOOptions(),
+                                                   /*dbg=*/nullptr);
+    if (io_s.ok()) {
+      unregistered_blob_files_.insert(file_number);
+      referenced_blob_files_.insert(file_number);
+      *needs_resolve = true;
+      return Status::OK();
+    }
+    if (!io_s.IsNotFound()) {
+      return io_s;
+    }
+    missing_blob_files_.insert(file_number);
+  }
+  if (!cfd->GetLatestMutableCFOptions().enable_blob_files) {
+    // Without integrated blob files, a BlobIndex to a file that is not on disk
+    // is left unchanged. It can come from another writer (the stackable
+    // BlobDB). It can also come from blob direct write of an earlier session
+    // whose file is lost; that case is not detected.
+    return Status::OK();
+  }
+  return Status::Corruption("WAL record refers to blob file " +
+                            std::to_string(file_number) +
+                            ", which is neither in the MANIFEST nor on disk");
+}
+
+Status BlobDirectWriteRecoveryResolver::GetReader(ColumnFamilyData* cfd,
+                                                  uint64_t wal_number,
+                                                  uint64_t file_number,
+                                                  BlobFileReader** reader) {
+  assert(cfd != nullptr);
+  assert(reader != nullptr);
+  UnorderedMap<uint64_t, std::unique_ptr<BlobFileReader>>::iterator it =
+      readers_.find(file_number);
+  if (it != readers_.end()) {
+    *reader = it->second.get();
+    return Status::OK();
+  }
+  if (readers_.size() >= kMaxOpenReaders) {
+    // Close one reader. The map has no order, so the choice is arbitrary.
+    // This is fine because the cap is rarely reached (an estimate, not
+    // measured). A closed reader that is needed again is reopened, which
+    // costs one more file open.
+    readers_.erase(readers_.begin());
+  }
+  std::unique_ptr<BlobFileReader> new_reader;
+  // An unregistered blob file may not be sealed yet, so it can have no footer.
+  // Skip the footer check.
+  ReadOptions read_options(Env::IOActivity::kDBOpen);
+  Status s = BlobFileReader::Create(
+      cfd->ioptions(), read_options, file_options_, cfd->GetID(),
+      /*blob_file_read_hist=*/nullptr, file_number, /*io_tracer=*/nullptr,
+      /*skip_footer_validation=*/true, &new_reader);
+  if (s.IsNotFound() || s.IsPathNotFound()) {
+    return Status::Corruption("Blob file " + std::to_string(file_number) +
+                              " referenced by WAL " +
+                              std::to_string(wal_number) + " is missing");
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  *reader = new_reader.get();
+  readers_.emplace(file_number, std::move(new_reader));
+#ifndef NDEBUG
+  // Lets a test check the number of open readers.
+  size_t open_readers = readers_.size();
+  TEST_SYNC_POINT_CALLBACK(
+      "BlobDirectWriteRecoveryResolver::GetReader:OpenReaders", &open_readers);
+#endif  // NDEBUG
+  return Status::OK();
+}
+
+Status BlobDirectWriteRecoveryResolver::ReadValue(ColumnFamilyData* cfd,
+                                                  uint64_t wal_number,
+                                                  const Slice& user_key,
+                                                  const BlobIndex& blob_index,
+                                                  std::string* value) {
+  assert(cfd != nullptr);
+  assert(value != nullptr);
+  const uint64_t file_number = blob_index.file_number();
+  BlobFileReader* reader = nullptr;
+  Status s = GetReader(cfd, wal_number, file_number, &reader);
+  if (!s.ok()) {
+    return s;
+  }
+  // A reader keeps the file size from when it was opened. In a read-only open
+  // of a DB that another process still writes, the file can grow after that.
+  // If the value ends past that size, open the file again once. In a
+  // read-write open the file does not grow, so this happens only for a torn
+  // record. The second reader then reports the same Corruption.
+  if (blob_index.offset() + blob_index.size() > reader->GetFileSize()) {
+    readers_.erase(file_number);
+    s = GetReader(cfd, wal_number, file_number, &reader);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
+  ReadOptions read_options(Env::IOActivity::kDBOpen);
+  read_options.verify_checksums = true;
+  std::unique_ptr<BlobContents> contents;
+  uint64_t bytes_read = 0;
+  s = reader->GetBlob(read_options, user_key, blob_index.offset(),
+                      blob_index.size(), blob_index.compression(),
+                      /*prefetch_buffer=*/nullptr,
+                      /*allocator=*/nullptr, &contents, &bytes_read);
+  if (!s.ok()) {
+    return s;
+  }
+  value->assign(contents->data().data(), contents->data().size());
+  return Status::OK();
+}
+
+Status BlobDirectWriteRecoveryResolver::Resolve(
+    uint64_t wal_number, const WriteBatch& batch,
+    std::unique_ptr<WriteBatch>* resolved_batch) {
+  assert(resolved_batch != nullptr);
+  resolved_batch->reset();
+
+  Scanner scanner(this, wal_number);
+  Status s = batch.Iterate(&scanner);
+  if (s.ok() && scanner.needs_resolve()) {
+    std::unique_ptr<WriteBatch> output = std::make_unique<WriteBatch>();
+    Rewriter rewriter(this, wal_number, output.get());
+    s = batch.Iterate(&rewriter);
+    if (s.ok()) {
+      s = rewriter.log_data_status();
+    }
+    if (s.ok()) {
+      WriteBatchInternal::SetSequence(output.get(),
+                                      WriteBatchInternal::Sequence(&batch));
+      *resolved_batch = std::move(output);
+      // Count only batches that Resolve() rewrote without error.
+      resolved_value_count_ += rewriter.resolved_value_count();
+    }
+  }
+  if (s.IsCorruption()) {
+    // The caller drops this record, or stops replay at it.
+    MarkReplayIncomplete();
+  }
+  return s;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

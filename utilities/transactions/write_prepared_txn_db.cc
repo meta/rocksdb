@@ -114,6 +114,16 @@ Status WritePreparedTxnDB::VerifyCFOptions(
         "inplace_update_support is not supported with WritePrepared or "
         "WriteUnprepared transactions");
   }
+  // These policies write each prepared batch to the WAL and the memtable at
+  // Prepare() time, through the normal write path. The blob direct write
+  // transform would then put BlobIndex entries into the WAL prepare section.
+  // Recovery rebuilds a prepared transaction from that section and cannot
+  // rewrite those entries (see BlobDirectWriteRecoveryResolver::Resolve()).
+  if (cf_options.enable_blob_direct_write) {
+    return Status::NotSupported(
+        "enable_blob_direct_write is not supported with WritePrepared or "
+        "WriteUnprepared transactions");
+  }
   return Status::OK();
 }
 
