@@ -18,6 +18,7 @@
 #include "cache/cache_reservation_manager.h"
 #include "db/db_test_util.h"
 #include "db/table_cache.h"
+#include "env/composite_env_wrapper.h"
 #include "options/options_helper.h"
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_options.h"
@@ -31,7 +32,9 @@
 #include "table/block_based/filter_policy_internal.h"
 #include "table/format.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/string_util.h"
+#include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -4908,6 +4911,88 @@ TEST_F(DBBloomFilterTest, FixedWidthSegments) {
   // Note that the empty string is tracked outside of the min-max range.
   EXPECT_EQ(RangeQueryKeys(*f, *db_, "blah1", "blah0"), Keys({}));
   EXPECT_EQ(0, TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA));
+}
+
+// A table builder that uses a compression dictionary first keeps its data
+// blocks in memory ("buffered" mode). When the buffer is full, or when the
+// file is finished, it trains the dictionary and then replays the buffered
+// blocks: it adds each key to the filter and writes each block. A write error
+// stops this replay early, so the filter has seen only some of the buffered
+// keys. The builder must then add no more keys and must not finish the filter,
+// so that the filter is never given a previous key that it did not see. This
+// test makes every file system call, reads included, fail from the moment the
+// table builder is constructed until the flush returns, so a block write of the
+// replay fails. It covers a replay started by an Add() (the buffer gets full)
+// and a replay started by Finish() (the buffer never gets full), and checks
+// that the flush fails with an IO error.
+TEST_F(DBBloomFilterTest, PartitionedFilterWriteErrorDuringDictionaryReplay) {
+  if (!ZSTD_Supported()) {
+    ROCKSDB_GTEST_SKIP("Test requires ZSTD");
+    return;
+  }
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_env(new CompositeEnvWrapper(env_, fault_fs));
+  // A failed background flush sleeps 1 second before Close() can finish. Mock
+  // that sleep, so the test does not wait.
+  env_->SetMockSleep();
+  // Close the DB before fault_env goes away, also when an assertion fails.
+  Defer close_db([&]() { Close(); });
+  for (bool replay_in_finish : {false, true}) {
+    for (bool decouple : {false, true}) {
+      SCOPED_TRACE("replay_in_finish=" + std::to_string(replay_in_finish) +
+                   " decouple_partitioned_filters=" + std::to_string(decouple));
+      Options options = CurrentOptions();
+      options.env = fault_env.get();
+      options.disable_auto_compactions = true;
+      // All writes go into one flush.
+      options.write_buffer_size = 64 << 20;
+      // A block larger than the file writer buffer goes straight to the file
+      // system, so a write early in the replay fails, while later buffered
+      // blocks are still left. A failure only at the last block would let the
+      // filter see every buffered key, and the test could not catch the bug.
+      options.writable_file_max_buffer_size = 1024;
+      // The dictionary makes the flush builder start in buffered state. The
+      // builder leaves it when the buffered blocks pass 64 KB, or when the
+      // file is finished.
+      options.compression = kZSTD;
+      options.compression_opts.max_dict_bytes = 4096;
+      options.compression_opts.max_dict_buffer_bytes = 64 << 10;
+      BlockBasedTableOptions table_options;
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+      table_options.partition_filters = true;
+      table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
+      table_options.decouple_partitioned_filters = decouple;
+      table_options.block_size = 4096;
+      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+      DestroyAndReopen(options);
+
+      // About 300 KB of data passes the 64 KB buffer limit in the middle of
+      // the flush. About 50 KB stays below it, so Finish() starts the replay.
+      // Random binary values do not compress, so the written blocks stay
+      // large.
+      const int num_keys = replay_in_finish ? 50 : 300;
+      Random rnd(301);
+      for (int i = 0; i < num_keys; ++i) {
+        ASSERT_OK(Put(Key(i), rnd.RandomBinaryString(1000)));
+      }
+
+      // The table file is already created when the builder is constructed. A
+      // buffering builder writes nothing more until the replay, so the first
+      // failed write is in the replay.
+      const IOStatus write_error = IOStatus::IOError("injected write error");
+      SyncPoint::GetInstance()->SetCallBack(
+          "BlockBasedTableBuilder::BlockBasedTableBuilder:PreSetupBaseCacheKey",
+          [&](void*) { fault_fs->SetFilesystemActive(false, write_error); });
+      SyncPoint::GetInstance()->EnableProcessing();
+      const Status s = Flush();
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      fault_fs->SetFilesystemActive(true);
+      ASSERT_EQ(Status::Code::kIOError, s.code()) << s.ToString();
+      Close();
+    }
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
