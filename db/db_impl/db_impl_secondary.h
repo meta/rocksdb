@@ -293,6 +293,59 @@ class DBImplSecondary : public DBImpl {
     return Status::NotSupported("Not supported operation in secondary mode.");
   }
 
+  // These overrides reject column family creates, imports and drops before
+  // any write. A secondary shares the primary's DB folder, which only the
+  // primary may write. ReactiveVersionSet refuses the MANIFEST record, but with
+  // track_options_file_number_in_manifest, DBImpl writes an OPTIONS file into
+  // that folder before the MANIFEST record. DBImplFollower inherits these
+  // overrides, because a follower must not write a MANIFEST either. The create
+  // overloads without ReadOptions forward to the ones with ReadOptions below,
+  // and the import overload with one metadata forwards to the one with a vector
+  // of metadatas.
+  using DBImpl::CreateColumnFamily;
+  Status CreateColumnFamily(const ReadOptions& /*read_options*/,
+                            const WriteOptions& /*write_options*/,
+                            const ColumnFamilyOptions& /*cf_options*/,
+                            const std::string& /*column_family*/,
+                            ColumnFamilyHandle** /*handle*/) override {
+    return Status::NotSupported("Not supported operation in secondary mode.");
+  }
+
+  using DBImpl::CreateColumnFamilies;
+  Status CreateColumnFamilies(
+      const ReadOptions& /*read_options*/,
+      const WriteOptions& /*write_options*/,
+      const ColumnFamilyOptions& /*cf_options*/,
+      const std::vector<std::string>& /*column_family_names*/,
+      std::vector<ColumnFamilyHandle*>* /*handles*/) override {
+    return Status::NotSupported("Not supported operation in secondary mode.");
+  }
+  Status CreateColumnFamilies(
+      const ReadOptions& /*read_options*/,
+      const WriteOptions& /*write_options*/,
+      const std::vector<ColumnFamilyDescriptor>& /*column_families*/,
+      std::vector<ColumnFamilyHandle*>* /*handles*/) override {
+    return Status::NotSupported("Not supported operation in secondary mode.");
+  }
+
+  using DBImpl::CreateColumnFamilyWithImport;
+  Status CreateColumnFamilyWithImport(
+      const ColumnFamilyOptions& /*options*/,
+      const std::string& /*column_family_name*/,
+      const ImportColumnFamilyOptions& /*import_options*/,
+      const std::vector<const ExportImportFilesMetaData*>& /*metadatas*/,
+      ColumnFamilyHandle** /*handle*/) override {
+    return Status::NotSupported("Not supported operation in secondary mode.");
+  }
+
+  Status DropColumnFamily(ColumnFamilyHandle* /*column_family*/) override {
+    return Status::NotSupported("Not supported operation in secondary mode.");
+  }
+  Status DropColumnFamilies(
+      const std::vector<ColumnFamilyHandle*>& /*column_families*/) override {
+    return Status::NotSupported("Not supported operation in secondary mode.");
+  }
+
   // Try to catch up with the primary by reading as much as possible from the
   // log files until there is nothing more to read or encounters an error. If
   // the amount of information in the log files to process is huge, this
