@@ -9750,6 +9750,91 @@ TEST_P(ReadPathRangeTombstoneTest, MultiCFReadDoesNotSeePartOfIngestion) {
   }
 }
 
+// An ingestion with atomic_replace_range and snapshot_consistency = false
+// skips the overlap checks, so its file gets sequence number 0, and it
+// deletes the SST files inside the range. It publishes no sequence number.
+// An iterator created before it keeps the old view at sequence number S. A
+// newer iterator reads at the same S with the new view, so a conversion of a
+// run that the ingested file completes would be inserted at S, and the old
+// iterator would see it over keys of the deleted file. The ingestion raises
+// the memtable's seqno barrier above S, so such a conversion waits for the
+// next write. In this test an SST file holds "b", the memtable puts "0",
+// deletes "a" and puts "d", and the ingestion replaces ["b", "c") with a file
+// that deletes "bb" and puts "bz".
+TEST_P(ReadPathRangeTombstoneTest, ReplaceRangeIngestionWithoutSequenceNumber) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("b", "old"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("0", "v0"));
+  ASSERT_OK(Delete("a"));
+  ASSERT_OK(Put("d", "vd"));
+  const SequenceNumber seq = db_->GetLatestSequenceNumber();
+  std::unique_ptr<Iterator> old_iter(db_->NewIterator(ReadOptions()));
+
+  const std::string file = dbname_ + "/replace.sst";
+  {
+    SstFileWriter writer(EnvOptions(), options);
+    ASSERT_OK(writer.Open(file));
+    ASSERT_OK(writer.Delete("bb"));
+    ASSERT_OK(writer.Put("bz", "new"));
+    ASSERT_OK(writer.Finish());
+  }
+  IngestExternalFileArg arg;
+  arg.column_family = db_->DefaultColumnFamily();
+  arg.external_files = {file};
+  arg.options.snapshot_consistency = false;
+  arg.atomic_replace_range = {{"b", "c"}};
+  ASSERT_OK(db_->IngestExternalFiles({arg}));
+  ASSERT_EQ(seq, db_->GetLatestSequenceNumber());
+
+  // The newer iterator sees the run "a", "bb" and tries to convert it.
+  {
+    std::unique_ptr<Iterator> converter(db_->NewIterator(ReadOptions()));
+    if (Forward()) {
+      converter->Seek("a");
+      ASSERT_TRUE(converter->Valid());
+      ASSERT_EQ("bz", converter->key().ToString());
+    } else {
+      converter->SeekForPrev("by");
+      ASSERT_TRUE(converter->Valid());
+      ASSERT_EQ("0", converter->key().ToString());
+    }
+    ASSERT_OK(converter->status());
+  }
+  ASSERT_EQ(1, attempted_insert_ranges_.size());
+
+  // The old iterator still sees the whole old view.
+  std::vector<std::string> seen;
+  for (old_iter->SeekToFirst(); old_iter->Valid(); old_iter->Next()) {
+    seen.push_back(old_iter->key().ToString());
+  }
+  ASSERT_OK(old_iter->status());
+  const std::vector<std::string> expected = {"0", "b", "d"};
+  ASSERT_EQ(expected, seen);
+
+  // After the next write, a new iterator converts the run again, and the
+  // insert goes through: the old iterator above is now the only reader at S.
+  // SeekToFirst() reads every key from the start of the data, so it reads the
+  // run "a", "bb" after the live "0" even if a seek to "a" could skip it.
+  ASSERT_OK(Put("e", "ve"));
+  old_iter.reset();
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("0", iter->key().ToString());
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("bz", iter->key().ToString());
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(2, attempted_insert_ranges_.size());
+  ASSERT_EQ("NOT_FOUND", Get("bb"));
+  ASSERT_EQ("new", Get("bz"));
+  ASSERT_EQ("NOT_FOUND", Get("b"));
+}
+
 // The in-place path of Iterator::Refresh() can still pair an old Version
 // with an ingested sequence number. One IngestExternalFiles() call ingests
 // into the column families "other" and default, and pauses after it has

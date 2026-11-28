@@ -8806,12 +8806,22 @@ Status DBImpl::CommitFileIngestionHandles(
     // update it. After we explicitly release the ReadLocks before exact
     // snapshot maintenance, the next conversion observes the new barrier and
     // refuses any insert with insert_seq < assigned.
+    //
+    // An ingestion that deletes files but assigns no sequence number
+    // (atomic_replace_range with snapshot_consistency = false, whose files get
+    // sequence number 0) publishes nothing. A newer reader then has the same
+    // read sequence number as the readers that still see the deleted files, so
+    // its conversion would be inserted at a sequence number that those readers
+    // see. Raise the barrier above every published sequence number instead, so
+    // conversions into this memtable wait for the next write.
     if (status.ok()) {
       for (auto* job : ingestion_jobs) {
         auto* cfd = job->GetColumnFamilyData();
         SequenceNumber assigned = job->MaxAssignedSequenceNumber();
         if (assigned > 0) {
           cfd->mem()->BumpIngestSeqnoBarrier(assigned);
+        } else if (!job->edit()->GetDeletedFiles().empty()) {
+          cfd->mem()->BumpIngestSeqnoBarrier(versions_->LastSequence() + 1);
         }
       }
     }

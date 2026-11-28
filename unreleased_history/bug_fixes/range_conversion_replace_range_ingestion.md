@@ -1,0 +1,1 @@
+Fixed a bug where, with `min_tombstones_for_range_conversion` enabled, an iterator created before an `IngestExternalFiles()` call with `atomic_replace_range` and `snapshot_consistency = false` could miss keys of the replaced files: a range tombstone that a newer iterator inserted after the ingestion could hide them.
