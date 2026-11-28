@@ -2538,6 +2538,13 @@ Status DBImplSecondary::PersistInitialCompactionProgress(
   return s;
 }
 
+// Called by FinalizeCompactionProgressWriter() when one step of the progress
+// file setup fails. Deletes the new temp file and the new final progress file
+// of this attempt, so that the compaction can run without progress persistence.
+// A path does not need a delete when it is empty (the caller never created that
+// file, or already renamed it) or when the file is not there (for example, the
+// failed rename did not move the temp file). So both cases count as done. Every
+// path is tried. The first error other than "not found" is returned.
 Status DBImplSecondary::HandleCompactionProgressWriterCreationFailure(
     const std::string& temp_file_path, const std::string& final_file_path,
     std::unique_ptr<log::Writer>* compaction_progress_writer) {
@@ -2546,13 +2553,19 @@ Status DBImplSecondary::HandleCompactionProgressWriterCreationFailure(
   const std::vector<std::string> paths_to_delete = {final_file_path,
                                                     temp_file_path};
 
-  Status s;
+  Status first_error;
   for (const auto& file_path : paths_to_delete) {
+    if (file_path.empty()) {
+      continue;
+    }
     WriteOptions write_options(Env::IOActivity::kCompaction);
     IOOptions opts;
-    s = WritableFileWriter::PrepareIOOptions(write_options, opts);
+    Status s = WritableFileWriter::PrepareIOOptions(write_options, opts);
     if (s.ok()) {
       s = fs_->DeleteFile(file_path, opts, nullptr /* dbg */);
+    }
+    if (s.IsNotFound() || s.IsPathNotFound()) {
+      s = Status::OK();
     }
 
     if (!s.ok()) {
@@ -2560,11 +2573,13 @@ Status DBImplSecondary::HandleCompactionProgressWriterCreationFailure(
                       "Failed to cleanup the compaction progress file "
                       "during writer creation failure: %s",
                       s.ToString().c_str());
-      return s;
+      if (first_error.ok()) {
+        first_error = s;
+      }
     }
   }
 
-  return s;
+  return first_error;
 }
 
 Status DBImplSecondary::FinalizeCompactionProgressWriter(

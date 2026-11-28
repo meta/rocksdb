@@ -1,0 +1,1 @@
+Fixed a bug where a remote compaction with `OpenAndCompactOptions::allow_resumption = true` failed, instead of running without progress persistence, when the worker could not set up its progress file.
