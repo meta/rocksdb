@@ -107,6 +107,49 @@ TEST_F(BitvectorTest, SingleBit) {
   }
 }
 
+TEST_F(BitvectorTest, OwnedStorageSurvivesMovesAndRebuild) {
+  // Small vectors exercise the storage that used to fit in std::string's
+  // inline buffer, which is not necessarily aligned for the integer arrays.
+  for (uint64_t num_bits : {0, 1, 8, 64, 257, 4096}) {
+    SCOPED_TRACE(num_bits);
+    BitvectorBuilder builder;
+    for (uint64_t i = 0; i < num_bits; ++i) {
+      builder.Append(i % 3 == 0);
+    }
+
+    Bitvector assigned;
+    {
+      Bitvector original;
+      original.BuildFrom(builder);
+      Bitvector moved(std::move(original));
+      assigned = std::move(moved);
+    }
+
+    // The original and intermediate owners have been destroyed.
+    for (int rebuild = 0; rebuild < 2; ++rebuild) {
+      ASSERT_EQ(assigned.NumBits(), num_bits);
+      uint64_t ones = 0;
+      uint64_t zeros = 0;
+      for (uint64_t i = 0; i < num_bits; ++i) {
+        bool bit = i % 3 == 0;
+        ASSERT_EQ(assigned.GetBit(i), bit);
+        ASSERT_EQ(assigned.Rank1(i), ones);
+        ASSERT_EQ(assigned.Rank0(i), zeros);
+        if (bit) {
+          ASSERT_EQ(assigned.FindNthOneBit(ones++), i);
+        } else {
+          ASSERT_EQ(assigned.FindNthZeroBit(zeros++), i);
+        }
+      }
+      ASSERT_EQ(assigned.Rank1(num_bits), ones);
+      ASSERT_EQ(assigned.Rank0(num_bits), zeros);
+      if (rebuild == 0) {
+        assigned.BuildFrom(builder);
+      }
+    }
+  }
+}
+
 TEST_F(BitvectorTest, RankAndSelect) {
   // Build a bitvector: 1010 1010 1010 ... (alternating bits).
   const uint64_t n = 1000;
