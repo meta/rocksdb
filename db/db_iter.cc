@@ -121,10 +121,20 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       // numbers before it inserts its keys into the memtable, so a scan can
       // miss a key whose sequence number is below the read sequence number. A
       // converted range tombstone at the read sequence number would then hide
-      // that key, also after its insert finishes.
+      // that key, also after its insert finishes. A WritePrepared or
+      // WriteUnprepared transaction DB (seq_per_batch) with two_write_queues
+      // has the same gap: a commit in the second queue can publish a sequence
+      // number above a prepare that is still inserting into the memtable. A
+      // transaction DB iterator has a read callback, and
+      // MaybeInsertRangeTombstone() refuses a conversion at or above its oldest
+      // uncommitted sequence number. A read through the base DB has no read
+      // callback, so conversion stays off for it.
       min_tombstones_for_range_conversion_(
           active_mem != nullptr && timestamp_size_ == 0 &&
-                  !ioptions.unordered_write && !HasTableFilter(read_options) &&
+                  !ioptions.unordered_write &&
+                  !(read_callback == nullptr && db_impl != nullptr &&
+                    db_impl->seq_per_batch() && ioptions.two_write_queues) &&
+                  !HasTableFilter(read_options) &&
                   read_options.read_tier == kReadAllTier &&
                   (expect_total_order_inner_iter_ || prefix_same_as_start_)
               ? mutable_cf_options.min_tombstones_for_range_conversion

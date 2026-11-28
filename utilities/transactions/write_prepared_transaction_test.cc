@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <functional>
+#include <future>
 #include <string>
 #include <thread>
 
@@ -25,6 +26,7 @@
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
+#include "util/defer.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/string_util.h"
@@ -4551,6 +4553,113 @@ TEST_P(WritePreparedTransactionTest,
     std::string value;
     ASSERT_OK(db->Get(ReadOptions(), "e", &value));
     ASSERT_EQ(value, "txn_value");
+  }
+}
+
+// With two_write_queues, a commit in the second queue can publish a sequence
+// number above a prepare that has its sequence number but has not inserted
+// its keys into the memtable yet. In this test, "a" and "c" are live, "b1",
+// "b2", "b4" and "b5" are deleted, and txn1's prepare of "b3" is paused in
+// that state while txn2's commit publishes a higher sequence number. A scan
+// at a snapshot above txn1's prepare does not see "b3" and steps over the
+// four deletes. A converted range tombstone over them would hide "b3" after
+// txn1 commits, for every reader. A transaction DB iterator refuses the
+// conversion, because its snapshot is at or above the oldest uncommitted
+// sequence number. A base DB iterator has no read callback, so conversion is
+// off for it. RangeTombstoneInsertionWithWritePrepared checks that a
+// transaction DB iterator with two write queues still converts.
+TEST_P(WritePreparedTransactionTest,
+       RangeTombstoneInsertionSkipsPendingPrepareFromBaseDB) {
+  if (!options.two_write_queues || options.unordered_write) {
+    ROCKSDB_GTEST_BYPASS(
+        "needs two_write_queues with ordered writes, where a commit can "
+        "publish past a pending prepare");
+    return;
+  }
+  options.min_tombstones_for_range_conversion = 2;
+  options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+  ASSERT_OK(ReOpenNoDelete());
+  for (const char* k : {"a", "b1", "b2", "b4", "b5", "c"}) {
+    ASSERT_OK(db->Put(WriteOptions(), k, "old"));
+  }
+  ASSERT_OK(db->Flush(FlushOptions()));
+  for (const char* k : {"b1", "b2", "b4", "b5"}) {
+    ASSERT_OK(db->Delete(WriteOptions(), k));
+  }
+  // txn2 is prepared first, and its commit goes through the second queue.
+  std::unique_ptr<Transaction> txn2(db->BeginTransaction(WriteOptions()));
+  ASSERT_OK(txn2->SetName("txn2"));
+  ASSERT_OK(txn2->Put("zz", "v2"));
+  ASSERT_OK(txn2->Prepare());
+
+  // Only the first prepare after this point stops in the callback.
+  std::atomic<bool> armed{true};
+  std::promise<void> paused;
+  std::promise<void> release;
+  std::shared_future<void> release_future = release.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack(
+      "AddPreparedCallback::AddPrepared::end", [&](void*) {
+        if (armed.exchange(false)) {
+          paused.set_value();
+          // A bounded wait: the test thread releases it below.
+          release_future.wait_for(std::chrono::minutes(5));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::unique_ptr<Transaction> txn1(db->BeginTransaction(WriteOptions()));
+  ASSERT_OK(txn1->SetName("txn1"));
+  ASSERT_OK(txn1->Put("b3", "new"));
+  Status prepare_status;
+  const Snapshot* snapshot = nullptr;
+  {
+    port::Thread prepare_thread([&] { prepare_status = txn1->Prepare(); });
+    // This Defer releases and joins the prepare, even when an assertion below
+    // fails.
+    Defer release_prepare([&] {
+      release.set_value();
+      prepare_thread.join();
+    });
+    ASSERT_EQ(std::future_status::ready,
+              paused.get_future().wait_for(std::chrono::minutes(5)));
+    // txn1 has its prepare sequence number, but "b3" is not in the memtable.
+    ASSERT_OK(txn2->Commit());
+    snapshot = db->GetSnapshot();
+    ReadOptions ro;
+    ro.snapshot = snapshot;
+    for (bool base_db : {true, false}) {
+      SCOPED_TRACE(base_db ? "base DB iterator" : "transaction DB iterator");
+      std::unique_ptr<Iterator> iter(base_db ? db->GetBaseDB()->NewIterator(ro)
+                                             : db->NewIterator(ro));
+      std::vector<std::string> keys;
+      for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+        keys.push_back(iter->key().ToString());
+      }
+      // EXPECT, not ASSERT, until txn1 commits: an early return would leave
+      // it prepared, and the fixture teardown would then abort the binary.
+      EXPECT_OK(iter->status());
+      EXPECT_EQ((std::vector<std::string>{"a", "c", "zz"}), keys);
+    }
+    EXPECT_EQ(0, options.statistics->getTickerCount(
+                     READ_PATH_RANGE_TOMBSTONES_INSERTED));
+  }
+  ASSERT_OK(prepare_status);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(txn1->Commit());
+  db->ReleaseSnapshot(snapshot);
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "b3", &value));
+  ASSERT_EQ("new", value);
+  {
+    std::unique_ptr<Iterator> iter(db->NewIterator(ReadOptions()));
+    std::vector<std::string> keys;
+    for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+    ASSERT_OK(iter->status());
+    ASSERT_EQ((std::vector<std::string>{"a", "b3", "c", "zz"}), keys);
   }
 }
 
