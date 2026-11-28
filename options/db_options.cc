@@ -17,6 +17,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/listener.h"
+#include "rocksdb/manifest_store.h"
 #include "rocksdb/rate_limiter.h"
 #include "rocksdb/sst_file_manager.h"
 #include "rocksdb/statistics.h"
@@ -681,6 +682,18 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, wal_write_temperature),
           OptionType::kTemperature, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        // The store object belongs to one DB instance, so it is not written
+        // to the OPTIONS file, and a reloaded OPTIONS file never has it.
+        {"manifest_store",
+         OptionTypeInfo::AsCustomSharedPtr<ManifestStore>(
+             offsetof(struct ImmutableDBOptions, manifest_store),
+             OptionVerificationType::kNormal,
+             OptionTypeFlags::kCompareNever | OptionTypeFlags::kDontSerialize |
+                 OptionTypeFlags::kAllowNull)},
+        {"manifest_row_feature_version",
+         {offsetof(struct ImmutableDBOptions, manifest_row_feature_version),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
 };
 
 const std::string OptionsHelper::kDBOptionsName = "DBOptions";
@@ -897,7 +910,9 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       metadata_write_temperature(options.metadata_write_temperature),
       wal_write_temperature(options.wal_write_temperature),
       calculate_sst_write_lifetime_hint_set(
-          options.calculate_sst_write_lifetime_hint_set) {
+          options.calculate_sst_write_lifetime_hint_set),
+      manifest_store(options.manifest_store),
+      manifest_row_feature_version(options.manifest_row_feature_version) {
   fs = env->GetFileSystem();
   clock = env->GetSystemClock().get();
   logger = info_log.get();
@@ -1097,6 +1112,10 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    temperature_to_string[metadata_write_temperature].c_str());
   ROCKS_LOG_HEADER(log, "            Options.wal_write_temperature: %s",
                    temperature_to_string[wal_write_temperature].c_str());
+  ROCKS_LOG_HEADER(log, "            Options.manifest_store: %s",
+                   manifest_store ? manifest_store->Name() : "None");
+  ROCKS_LOG_HEADER(log, "            Options.manifest_row_feature_version: %u",
+                   manifest_row_feature_version);
 }
 
 bool ImmutableDBOptions::IsWalDirSameAsDBPath() const {
