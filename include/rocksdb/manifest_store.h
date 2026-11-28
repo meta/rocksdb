@@ -14,19 +14,29 @@
 // lives in such a store is in store mode (DBOptions::manifest_store).
 //
 // Which source recovery trusts: recovery starts from the file that CURRENT
-// names in the DB folder. In this release that file is always a MANIFEST file,
-// and recovery reads it. The authority field of the DB row (ManifestAuthority)
-// records which source is the authority for the metadata of a DB. Its values
-// are listed below. This release defines the public row encoding and the
-// ManifestStore interface, and tests can call a store directly. A DB open with
-// DBOptions::manifest_store set returns NotSupported when the feature version
-// is valid, so only kFile is used. The other values are fixed so that stores
-// can keep them.
-// - kFile: CURRENT names the MANIFEST file, and recovery reads that file.
+// names in the DB folder.
+// - A normal MANIFEST file: file mode. Recovery reads that file.
+// - A done stub: store mode. Recovery reads the rows in the store.
+// - A creating or entering stub: a create or a move into the store that has
+//   not finished. A read-write open with the store finishes it. For an
+//   entering stub, the authority in the DB row says whether the switch
+//   happened.
+// The authority field of the DB row (ManifestAuthority) records which source
+// is the authority for the metadata of a DB. Its values are listed below.
+// This release supports kFile and kStore; the value of kShadow (1) is
+// reserved, so that stores can keep it. A rollback without the store
+// (RollBackManifestStore()) can leave a kStore row while CURRENT names the
+// restored MANIFEST file. Recovery then reads that file, and a later rollback
+// with the store sets the row to kFile.
+// - kFile: the MANIFEST file is the authority, and recovery reads that file.
+//   CURRENT names it, or, during a move into the store that has not finished,
+//   CURRENT names an entering stub, and that stub names the MANIFEST file.
 // - kShadow: the MANIFEST file is the authority, and RocksDB also writes the
 //   rows to the store, so that the two can be compared.
-// - kStore: the rows in the store are the authority. ManifestCopyMode says
-//   whether RocksDB also keeps a copy of the metadata as a MANIFEST file.
+// - kStore: the rows in the store are the authority. CURRENT names a short
+//   stub MANIFEST file that identifies the DB, and recovery reads the metadata
+//   from the store. ManifestCopyMode says whether RocksDB also keeps a copy of
+//   the metadata as a MANIFEST file.
 //
 // Who uses this header: an application implements the ManifestStore class
 // (see "The store interface" below) to read and update the metadata rows of
@@ -80,6 +90,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+struct DBOptions;
+
 // The type of a row. Stores keep these values, so they never change.
 enum class ManifestRowType : uint8_t {
   // The row with the fields of the whole DB. Its key has no other part.
@@ -119,10 +131,9 @@ struct ManifestRow {
 
 // Which source holds the authoritative metadata of a DB. The DB row stores it
 // in ManifestDbField::kAuthority. These values and the ManifestCopyMode values
-// are fixed because stores keep them. No DB code path in this release writes
-// them, because store mode is not supported. A row reader returns NotSupported
-// for an authority value that it does not know, because a newer binary wrote
-// it.
+// are fixed because stores keep them. RocksDB writes kFile and kStore, not
+// kShadow. A row reader returns NotSupported for an authority value that it
+// does not know, because a newer binary wrote it.
 enum class ManifestAuthority : uint8_t {
   // The MANIFEST file, as without a store.
   kFile = 0,
@@ -134,10 +145,13 @@ enum class ManifestAuthority : uint8_t {
 };
 
 // Whether RocksDB also writes a copy of the metadata as a MANIFEST file when
-// the store is the authority. Only the DB row stores it, in
-// ManifestDbField::kCopyMode. There is no option for it. A row reader returns
-// NotSupported for a copy mode value that it does not know, because a newer
-// binary wrote it.
+// the store is the authority, so that RollBackManifestStore() can roll the DB
+// back without the store (only a kSync copy can be used for that). The DB row
+// stores it, in ManifestDbField::kCopyMode.
+// DBOptions::manifest_store_copy_mode sets it when a DB is created in the
+// store, enters store mode, or opens with manifest_store_migrate. A row reader
+// returns NotSupported for a copy mode value that it does not know, because a
+// newer binary wrote it.
 //
 // The authority and the copy mode are two separate fields of the DB row:
 //
@@ -207,19 +221,50 @@ enum class ManifestDbField : uint32_t {
   // enum ManifestCopyMode, always present.
   kCopyMode = 3,
   // varint64, default 0 (no copy file). The number of the current MANIFEST
-  // file copy.
+  // file copy, as information for operators. RocksDB does not read it (it
+  // reads the copy pointer file), and it can be one commit behind.
   kCopyFileNumber = 4,
   // bytes, default empty. The RocksDB db id, as in the IDENTITY file.
   kDbId = 5,
   // varint64, always present. The next file number.
   kNextFileNumber = 6,
-  // varint64, always present. The smallest file number that a running flush,
-  // compaction or ingestion may still use, or the next file number when no such
-  // job runs. It is never larger than the next file number. An outside service
-  // of the application that deletes unused SST and blob files (not RocksDB
-  // itself) must keep every file whose number is at or above this number. The
-  // value 0 means that the number is not known, and the service must keep every
-  // file.
+  // varint64, always present. The smallest file number that RocksDB may still
+  // use for a file that the rows do not name yet (the output of a running
+  // flush, compaction or external file ingestion, or a blob file of blob
+  // direct write), or the next file number when there is none. It can be
+  // lower than the smallest such file, because it also keeps files that event
+  // listeners are still told about. It is never larger than the next file
+  // number. An outside service of the application that deletes unused SST and
+  // blob files (not RocksDB itself) must keep every file whose number is at or
+  // above this number. The value 0 means that the number is not known, and the
+  // service must keep every file.
+  //
+  // The rows and this number describe only the newest Version. An older
+  // Version can still be in use, for example by an open iterator or a read-only
+  // instance, and it can name files that no row names and whose numbers are
+  // below this number. The DB instance that uses the older Version keeps such
+  // files until it releases that Version, but other instances and the store do
+  // not know about this use. So the service may delete a file that no row
+  // names and whose number is below this number only when no instance of the
+  // DB still uses an older Version.
+  //
+  // In ManifestCopyMode::kSync it is also at most the smallest number of the
+  // files that the edits of the same commit remove. The sync copy gets a
+  // commit only after the store applied it, so until then the copy still names
+  // these files, and RollBackManifestStore() without the store needs them.
+  // The next commit comes after the copy holds the previous one, and its own
+  // value releases these files. A commit can also delete the leftover rows of
+  // a column family that an earlier commit dropped. Those deletes do not lower
+  // this value, because the copy already holds the drop and no longer names
+  // these files.
+  //
+  // Limitation: after a crash, a blob direct write file that only the WAL
+  // referred to is not named by any row, and its number is below this value.
+  // RocksDB does not add such a file to its metadata (see
+  // ColumnFamilyOptions::enable_blob_direct_write: WAL replay of active
+  // direct-write blob files is not supported). RocksDB itself keeps the file,
+  // but a service that follows the rows and this value can delete it, and the
+  // value that the WAL holds is then lost.
   kInFlightFileNumber = 7,
   // varint64, always present. The last sequence number of the DB data (key
   // writes) that the metadata records, as in the MANIFEST file. It is not the
@@ -441,12 +486,13 @@ std::string EncodeManifestRowFields(
 //
 // Background: an application implements ManifestStore on top of its own
 // database (for example a replicated key-value store) and gives one object to
-// RocksDB in DBOptions::manifest_store. This release does not support store
-// mode, so every DB open function fails when that option is set. The open
-// returns InvalidArgument when DBOptions::manifest_row_feature_version is out
-// of range, and NotSupported otherwise. The types below define what a store
-// must do. The application creates a store object for one DB, with its own key
-// for the DB and the epoch.
+// RocksDB in DBOptions::manifest_store. A new DB that DB::Open() creates with
+// this option is in store mode: the rows in the store hold its metadata. An
+// existing file-mode DB starts to move into the store only in a read-write
+// DB::Open() with DBOptions::manifest_store_migrate. A later read-write
+// DB::Open() that finds an unfinished move finishes it, also without that
+// option. The types below define what a store must do. The application creates
+// a store object for one DB, with its own key for the DB and the epoch.
 //
 // Terms:
 // - Epoch (store epoch): a number that the application gives to a store
@@ -504,15 +550,20 @@ std::string EncodeManifestRowFields(
 //   stores it in ManifestStoreDbState::generation. The number is for logs and
 //   debugging; RocksDB does not depend on its value.
 //
-// Call order: the methods are designed for this use, and a store must support
-// it:
+// Call order: RocksDB uses a store in store mode (DBOptions::manifest_store)
+// as follows, and a store must support it:
 // 1. Create a DB: Commit() with expected_commit_sequence 0 writes the DB row
-//    and the first rows.
+//    and the first rows. When it returns Busy or an unknown outcome,
+//    ReadDbRow() reads the DB row. A row without a db id (left by a failed
+//    move into the store) is claimed with Open() and written over with one
+//    Commit().
 // 2. Open a DB: the caller reads the DB row with ReadDbRow() and checks that
 //    it belongs to its DB. Open() then claims the DB with the commit sequence
 //    and the last commit id of that read as preconditions. After Busy, the
 //    caller reads and checks the DB row again before it retries. After the
 //    claim succeeds, Scan() reads all rows.
+//    DB::OpenForReadOnly() and DB::ListColumnFamilies() use only Scan(), with
+//    a consistent scan, so they work with an object without an epoch.
 // 3. Each metadata change (what RocksDB writes to the MANIFEST file when there
 //    is no store): one Commit() with the expected commit sequence.
 // Other cases:
@@ -536,12 +587,29 @@ std::string EncodeManifestRowFields(
 //   with last commit id "B-3". The sequence matches, but the id does not, so
 //   the call changes nothing (Busy, or IOFenced if that writer has a newer
 //   epoch).
-// - Move an existing DB into the store: WriteGeneration(). It needs a claimed
-//   DB row. A creating Commit() (expected_commit_sequence 0) creates and
-//   claims a missing DB row, and Open() claims an existing one. Then
-//   WriteGeneration() writes all other rows as a new generation.
-// - A read-only instance, such as a secondary instance, uses only Scan() and
-//   ReadDbRow().
+// - Move an existing DB into the store: ReadDbRow(), then a claim. Open()
+//   claims an existing DB row, and a Commit() with expected_commit_sequence 0
+//   creates and claims a missing one. Then WriteGeneration() writes all other
+//   rows as a new generation. After the switch, the same read-write open
+//   claims the DB again as in step 2 (ReadDbRow(), a check of the db id, and
+//   Open() with both preconditions), then calls Scan().
+// - Roll back to the MANIFEST file (RollBackManifestStore()): ReadDbRow(),
+//   then Open(). For a done stub it then calls Scan() and one Commit() that
+//   sets the authority to kFile. For an entering stub whose switch did not
+//   happen, the DB row still has kFile, so it makes no Commit(); its claim
+//   only replaces the last commit id and raises the commit sequence.
+// - The readers that store mode supports, DB::OpenForReadOnly() and
+//   DB::ListColumnFamilies(), use only Scan(), with a consistent scan and
+//   without a claim.
+// The ReadDbRow() before a claim comes from an object whose epoch can be
+// newer than the stored epoch. It must not return IOFenced then.
+//
+// Not supported in store mode yet: the live file APIs (DB::GetLiveFiles(),
+// DB::GetLiveFilesStorageInfo()) and so checkpoints and backups,
+// DB::OpenAsSecondary(), DB::OpenAsFollower(), DB::OpenAndCompact(),
+// DBOptions::compaction_service, RepairDB(), DestroyDB(), and the tools that
+// read the MANIFEST file (for example `ldb manifest_dump`). They return
+// NotSupported.
 
 // The DB row values that the store owns. This is the one place that describes
 // the whole DB row. The store keeps this logical state under the app's key of
@@ -596,8 +664,9 @@ struct ManifestStoreOpenOptions {
   // whatever this value is. A caller sets it to the commit sequence of a DB
   // row that it read and checked, so that a change by another writer after
   // that read makes the claim fail, instead of fencing that writer. When not
-  // set, the claim does not check the commit sequence. The claim of a DB open
-  // is designed to set both preconditions (see step 2 of "Call order").
+  // set, the claim does not check the commit sequence. The claim of
+  // DB::Open() sets both preconditions to the DB row that it read and checked
+  // (see step 2 of "Call order").
   std::optional<uint64_t> expected_commit_sequence;
   // A second part of the precondition. When it is not empty, the claim also
   // needs a DB row whose last_commit_id equals this value, else Open() returns
@@ -751,6 +820,32 @@ struct ManifestGeneration {
 // "Call order" has the steps). A DB row that is destroyed and created again can
 // reach commit sequence E again; see the example in "Call order".
 //
+// A store returns NotSupported for a commit that it rejects for good and did
+// not apply, for example a commit that is larger than the store allows. RocksDB
+// then sends nothing more for that batch: the batch fails with a non-retryable
+// IOError, as after a failed MANIFEST write in file mode, and no auto-resume
+// starts. A flush or a compaction then sets a fatal background error, so the
+// DB must be opened again. When a resend gets NotSupported, the first send can
+// still apply, so the DB stops all later MANIFEST writes until it is opened
+// again.
+//
+// There is one exception to "nothing more". RocksDB deletes the rows of a
+// dropped column family in parts, as part of later commits. Those deletes are
+// optional. When the store rejects a commit that carries them, RocksDB sends
+// the batch once more without them, with a new commit id and the same
+// expected commit sequence. It handles the result as the result of a first
+// send, and a later commit retries the deletes.
+//
+// RocksDB treats every other status as an unknown outcome. This includes a
+// status that means the commit can never apply, for example InvalidArgument for
+// a commit that is too large, so a store should return NotSupported for that.
+// RocksDB reads the DB row and sends the commit again until the outcome is
+// known, its retries run out, or the DB starts to close. With the default
+// DBOptions::max_bgerror_resume_count (INT_MAX), the retries do not run out.
+// Later MANIFEST writes of the DB wait during that time. A commit inside
+// DB::Open() makes no retry after a failed ReadDbRow() or resend: DB::Open()
+// returns the error.
+//
 // Read-only objects: an object without an epoch only reads. Its Commit(),
 // WriteGeneration(), Open() and Destroy() calls return NotSupported (Open()
 // returns NotFound first when there is no DB row) and change nothing.
@@ -761,11 +856,14 @@ struct ManifestGeneration {
 // row here), NotSupported, IOFenced, Busy. For example, a fenced object gets
 // IOFenced also when its expected commit sequence is wrong.
 //
-// Threading and timeouts: RocksDB makes at most one call at a time on the store
-// object of one DB instance. Every call must return in a bounded time (the
-// store applies its own timeout). A method added to this class has a default
-// implementation that returns NotSupported, so that existing stores still
-// build.
+// Threading and timeouts: RocksDB makes at most one call at a time on the
+// store object of one DB instance. DB::ListColumnFamilies() and
+// RollBackManifestStore() call the store from the caller's thread, so do not
+// pass them a store object that an open DB uses. Every call must return in a
+// bounded time (the store applies its own timeout), because DB::Open() and
+// DB::Close() wait for calls in flight. A method added to this class has a
+// default implementation that returns NotSupported, so that existing stores
+// still build.
 class ManifestStore : public Customizable {
  public:
   ~ManifestStore() override = default;
@@ -835,8 +933,9 @@ class ManifestStore : public Customizable {
   virtual IOStatus Commit(const ManifestCommit& commit) = 0;
 
   // Reads the latest committed DB row, without a claim and without reading
-  // other rows. A caller uses it after Busy or an unknown outcome (see "Call
-  // order" above). Results: OK; IOFenced, when this object has an epoch and the
+  // other rows. A caller uses it after Busy or an unknown outcome, and before
+  // each claim to check that the row belongs to its DB (see "Call order"
+  // above). Results: OK; IOFenced, when this object has an epoch and the
   // stored epoch is newer; NotFound (no DB row); any other status (nothing is
   // known; calling it again is safe).
   virtual IOStatus ReadDbRow(ManifestDbRowResult* result) = 0;
@@ -899,5 +998,84 @@ class ManifestStore : public Customizable {
   // fenced.
   virtual IOStatus Destroy(const ManifestStoreDestroyOptions& opts) = 0;
 };
+
+// Moves a DB in store mode back to file mode: afterwards the MANIFEST file
+// holds the metadata, and DB::Open() works without `manifest_store`. Stop
+// every instance of the DB before the call. Pass a store object with a new
+// epoch in `db_options.manifest_store`, or null when the store cannot be
+// reached. The DB folder lock is held during the call.
+//
+// With the store, the function first checks that the DB row belongs to this
+// DB and claims it (see below), and only then applies the rules of the table.
+// A successful claim replaces the last commit id and raises the commit
+// sequence, also when the function then refuses a "creating" stub, or an
+// "entering" stub whose switch happened.
+//
+// What it does, by what CURRENT names:
+//
+//   CURRENT names     With the store                Without the store
+//   ----------------  ----------------------------  -------------------------
+//   "done" stub       new MANIFEST file from the    new MANIFEST file from the
+//                     rows; DB row set to kFile     sync-marked copy
+//   "entering" stub   CURRENT back to the MANIFEST  InvalidArgument
+//                     file if the switch did not
+//                     happen; else InvalidArgument
+//                     (open the DB read-write to
+//                     finish)
+//   "creating" stub   InvalidArgument (open the DB read-write to finish)
+//   MANIFEST file     DB row set to kFile; copies   OK, nothing to do
+//                     deleted
+//
+// With the store, the function first checks that the DB row holds the db id
+// of this DB, so that a store object of another DB returns InvalidArgument.
+// The db id comes from the stub, or for a MANIFEST file from its records,
+// else from the IDENTITY file. Without a db id it returns InvalidArgument.
+// Then it claims the DB, which fences an older primary in the store. For a
+// "done" stub, it writes and syncs a new MANIFEST file from the rows, points
+// CURRENT to it, and then sets the authority of the DB row to
+// ManifestAuthority::kFile. When that last update fails, CURRENT already
+// names the new MANIFEST file; call the function again with the store. When
+// CURRENT names a normal MANIFEST file, the function sets the authority to
+// kFile and keeps that MANIFEST file, so file-mode writes in it stay. It
+// deletes the old stub (for a "done" stub) and the MANIFEST file copies only
+// after the DB row update succeeded.
+//
+// Without the store, it writes the new MANIFEST file from the MANIFEST file
+// copy, which must have been written in ManifestCopyMode::kSync. The files that
+// the copy names are still in the folder, also when an outside service deletes
+// unused files by the rows: a commit that deletes rows keeps their files at or
+// above ManifestDbField::kInFlightFileNumber until the next commit, which
+// RocksDB sends only after the copy holds the first one. It cannot claim the
+// DB, so it relies only on the folder lock and on the application having
+// stopped the old primary. It leaves the DB row, the stub and the copies; a
+// later call with the store updates the DB row and deletes the copies, and
+// keeps the MANIFEST file. The next file-mode DB::Open() deletes the old stub,
+// as it deletes any obsolete MANIFEST file. Until that later call, the DB row
+// still says that the store is the authority, so DB::Open() with
+// manifest_store_migrate refuses to move the DB into the store again.
+//
+// The end of the copy can be torn by a crash or a failed append. The function
+// keeps every complete record that is not in an atomic group, and every
+// complete atomic group. It drops a last record that the crash cut short, and
+// all records of an atomic group that is still open at the end. Such a group
+// belongs to a commit that was never acknowledged, because in sync mode a
+// commit is acknowledged only after its copy append. A store commit can also
+// hold several records that are not in an atomic group. So the kept records can
+// end inside such a commit, whose copy append did not finish. That commit was
+// never acknowledged either, and each kept record is a complete VersionEdit, as
+// in a MANIFEST file. Any other damage returns Corruption, because the damaged
+// part may hold acknowledged commits: a record with a bad checksum, a record
+// that does not decode, or an atomic group with a wrong number of records or
+// with a normal record inside it.
+//
+// It also undoes a DB::Open() that stopped while it moved a DB into the
+// store, when the store shows that the switch did not happen.
+//
+// Results: OK; InvalidArgument when the DB is not in a state that this
+// function handles (for example a background copy without the store);
+// Corruption when the stub, the DB row and the files do not agree, or the
+// copy is damaged; or the error of a file or store operation.
+Status RollBackManifestStore(const DBOptions& db_options,
+                             const std::string& dbname);
 
 }  // namespace ROCKSDB_NAMESPACE

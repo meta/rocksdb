@@ -24,6 +24,7 @@
 #include "rocksdb/system_clock.h"
 #include "rocksdb/utilities/options_type.h"
 #include "rocksdb/wal_filter.h"
+#include "util/cast_util.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -912,6 +913,8 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       calculate_sst_write_lifetime_hint_set(
           options.calculate_sst_write_lifetime_hint_set),
       manifest_store(options.manifest_store),
+      manifest_store_migrate(options.manifest_store_migrate),
+      manifest_store_copy_mode(options.manifest_store_copy_mode),
       manifest_row_feature_version(options.manifest_row_feature_version) {
   fs = env->GetFileSystem();
   clock = env->GetSystemClock().get();
@@ -1116,6 +1119,10 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    manifest_store ? manifest_store->Name() : "None");
   ROCKS_LOG_HEADER(log, "            Options.manifest_row_feature_version: %u",
                    manifest_row_feature_version);
+  ROCKS_LOG_HEADER(log, "            Options.manifest_store_migrate: %d",
+                   manifest_store_migrate);
+  ROCKS_LOG_HEADER(log, "            Options.manifest_store_copy_mode: %d",
+                   lossless_cast<int>(manifest_store_copy_mode));
 }
 
 bool ImmutableDBOptions::IsWalDirSameAsDBPath() const {
