@@ -1,0 +1,1 @@
+Fixed a bug where, with `min_tombstones_for_range_conversion` enabled, an iterator or `MultiGet()` running at the same time as `IngestExternalFile()` could see only part of the ingested data: a range tombstone that another iterator inserted could hide a key that the ingested file deletes, while the read did not see the other keys of that file.

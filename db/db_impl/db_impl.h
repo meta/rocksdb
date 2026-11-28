@@ -996,7 +996,8 @@ class DBImpl : public DB
                                SequenceNumber snapshot_seq, const Slice& key,
                                LazyWideColumns* result);
 
-  // If `snapshot` == kMaxSequenceNumber, set a recent one inside the file.
+  // `snapshot` is the read sequence number. NewIterator() gets it for a read
+  // without a snapshot from ReadIteratorSequence().
   ArenaWrappedDBIter* NewIteratorImpl(const ReadOptions& options,
                                       ColumnFamilyHandleImpl* cfh,
                                       SuperVersion* sv, SequenceNumber snapshot,
@@ -1268,6 +1269,48 @@ class DBImpl : public DB
 
   // Un-reference the super version and clean it up if it is the last reference.
   void CleanupSuperVersion(SuperVersion* sv);
+
+  // Returns true if `sv` misses a file ingestion of `cfd`: the Version (the
+  // list of SST files) of `sv` is older than the Version that the latest
+  // successful ingestion of `cfd` installed. The ingestion records that
+  // Version number also when it assigns no new sequence number. This is the
+  // Version number, not the SuperVersion number that Iterator::Refresh()
+  // compares.
+  //
+  // Background: a SuperVersion references the memtables and the Version of a
+  // column family. A read without a snapshot that references the SuperVersion
+  // of one column family (NewIterator(), a Refresh() that rebuilds the
+  // iterator, and the single column family path of MultiCFSnapshot())
+  // references its SuperVersion first and reads the sequence number after
+  // that. This order is the pin-first rule: the referenced SuperVersion keeps
+  // every key version that a later sequence number can need, so a flush or a
+  // compaction cannot drop data that the read needs. A file ingestion between
+  // the two steps can give the read the ingested files' sequence number while
+  // its SuperVersion does not have the files. With read-path range tombstone
+  // conversion (see min_tombstones_for_range_conversion), the read could then
+  // see part of the ingestion: a range tombstone that a newer iterator
+  // inserted at that sequence number into the shared active memtable, but not
+  // the rest of the ingested files.
+  //
+  // Contract: a read calls this function after it has its sequence number.
+  // While it returns true, the read calls ReplaceSuperVersionMissingIngestion()
+  // and reads its sequence number again, which keeps the pin-first rule. A
+  // multi column family read, which reads its sequence number before it
+  // references its SuperVersions, retries instead (see MultiCFSnapshot()).
+  static bool SuperVersionMissesIngestion(const ColumnFamilyData& cfd,
+                                          const SuperVersion& sv) {
+    return sv.current->GetVersionNumber() < cfd.GetLastIngestVersionNumber();
+  }
+
+  // Releases `sv` with CleanupSuperVersion() and returns a new reference to
+  // the current SuperVersion of `cfd`. It takes the DB mutex, which the
+  // ingestion holds from before it publishes its sequence numbers until it
+  // installs its SuperVersion, so the new SuperVersion has every ingestion
+  // whose sequence numbers were published before the call. The caller must
+  // read its sequence number again after this call (see
+  // SuperVersionMissesIngestion()).
+  SuperVersion* ReplaceSuperVersionMissingIngestion(ColumnFamilyData* cfd,
+                                                    SuperVersion* sv);
 
   // Un-reference the super version and return it to thread local cache if
   // needed. If it is the last reference of the super version. Clean it up
@@ -2395,6 +2438,16 @@ class DBImpl : public DB
   void RegisterBlobDirectWriteColumnFamily();
   // Decrements the DB-level count of live blob direct-write column families.
   void UnregisterBlobDirectWriteColumnFamily();
+
+  // For NewIterator() without a snapshot: sets *snapshot to the last sequence
+  // number, read after the caller referenced *sv, and replaces *sv while it
+  // misses an ingestion (see SuperVersionMissesIngestion()). It checks each
+  // new SuperVersion with FailIfTableFilterWithRangeConversion() and, with a
+  // read timestamp, FailIfReadCollapsedHistory(), and returns their error. *sv
+  // stays referenced in all cases, and the caller releases it.
+  Status ReadIteratorSequence(const ReadOptions& read_options,
+                              ColumnFamilyData* cfd, SuperVersion** sv,
+                              SequenceNumber* snapshot);
 
   struct CompactionState;
   struct PrepickedCompaction;
