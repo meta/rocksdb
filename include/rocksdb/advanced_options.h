@@ -1450,6 +1450,10 @@ struct AdvancedColumnFamilyOptions {
   // * reads with ReadOptions::read_tier other than kReadAllTier
   // * DBs opened with DBOptions::unordered_write, because a write can be in
   //   the read snapshot before it is in the memtable
+  // * reads through the base DB (for example, TransactionDB::GetBaseDB()) of
+  //   a WritePrepared or WriteUnprepared TransactionDB with
+  //   DBOptions::two_write_queues, for the same reason; reads through the
+  //   TransactionDB itself can still convert
   //
   // Even if the above restrictions are met, there are still scenarios where a
   // converted range tombstone may be discarded:
