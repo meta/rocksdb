@@ -86,6 +86,19 @@ class ErrorHandler {
   void SetBGErrorNoAutoRecovery(const Status& bg_err,
                                 BackgroundErrorReason reason);
 
+  // Sets `bg_err` as the background error with at least severity
+  // kFatalError, whatever paranoid_checks and the error's retryable flag or
+  // scope say: kUnrecoverableError for a corruption or a data loss error that
+  // is not file scoped (as SetBGError() maps them), and kFatalError for every
+  // other error. Starts no automatic recovery, so the DB stays stopped until
+  // it is reopened. Listeners get OnBackgroundError as for SetBGError().
+  // Used for a failed blob direct write file sync or seal in a flush, which a
+  // retry cannot fix (see StopDBAfterBlobDirectWriteError() in
+  // db_impl_compaction_flush.cc).
+  // REQUIRES: db mutex held
+  void SetBGErrorAtLeastFatal(const Status& bg_err,
+                              BackgroundErrorReason reason);
+
   Status GetBGError() const { return bg_error_; }
 
   Status GetRecoveryError() const { return recovery_error_; }
