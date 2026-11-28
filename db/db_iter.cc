@@ -117,10 +117,14 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       // end key, which can be older than the timestamps of the deletes that it
       // replaces. A reader at an older timestamp would then see the converted
       // range tombstone but not those deletes, and miss keys that it should
-      // read.
+      // read. With unordered_write, a write group publishes its sequence
+      // numbers before it inserts its keys into the memtable, so a scan can
+      // miss a key whose sequence number is below the read sequence number. A
+      // converted range tombstone at the read sequence number would then hide
+      // that key, also after its insert finishes.
       min_tombstones_for_range_conversion_(
           active_mem != nullptr && timestamp_size_ == 0 &&
-                  !HasTableFilter(read_options) &&
+                  !ioptions.unordered_write && !HasTableFilter(read_options) &&
                   read_options.read_tier == kReadAllTier &&
                   (expect_total_order_inner_iter_ || prefix_same_as_start_)
               ? mutable_cf_options.min_tombstones_for_range_conversion
