@@ -79,26 +79,21 @@ void HistogramStat::Add(uint64_t value) {
   // by concurrent threads is tolerable.
   const size_t index = bucketMapper.IndexForValue(value);
   assert(index < num_buckets_);
-  buckets_[index].store(buckets_[index].load(std::memory_order_relaxed) + 1,
-                        std::memory_order_relaxed);
+  buckets_[index].fetch_add(1, std::memory_order_relaxed);
 
-  uint64_t old_min = min();
-  if (value < old_min) {
-    min_.store(value, std::memory_order_relaxed);
+  auto old_min = min_.load(std::memory_order_relaxed);
+  while (value < old_min && !min_.compare_exchange_weak(
+                                old_min, value, std::memory_order_relaxed)) {
   }
 
-  uint64_t old_max = max();
-  if (value > old_max) {
-    max_.store(value, std::memory_order_relaxed);
+  auto old_max = max_.load(std::memory_order_relaxed);
+  while (value > old_max && !max_.compare_exchange_weak(
+                                old_max, value, std::memory_order_relaxed)) {
   }
 
-  num_.store(num_.load(std::memory_order_relaxed) + 1,
-             std::memory_order_relaxed);
-  sum_.store(sum_.load(std::memory_order_relaxed) + value,
-             std::memory_order_relaxed);
-  sum_squares_.store(
-      sum_squares_.load(std::memory_order_relaxed) + value * value,
-      std::memory_order_relaxed);
+  num_.fetch_add(1, std::memory_order_relaxed);
+  sum_.fetch_add(value, std::memory_order_relaxed);
+  sum_squares_.fetch_add(value * value, std::memory_order_relaxed);
 }
 
 void HistogramStat::Merge(const HistogramStat& other) {
