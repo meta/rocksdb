@@ -9,6 +9,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -55,6 +56,9 @@ class BlobFilePartitionManager {
   using FileNumberAllocator = std::function<uint64_t()>;
 
   // Creates the per-column-family manager for write-path blob files.
+  // `track_min_file_number` turns on MinTrackedBlobFileNumber(). Only store
+  // mode reads it, so a DB without a store does not pay for the ordered set
+  // behind it.
   BlobFilePartitionManager(
       uint32_t num_partitions,
       std::shared_ptr<BlobFilePartitionStrategy> strategy,
@@ -68,7 +72,7 @@ class BlobFilePartitionManager {
       FileChecksumGenFactory* file_checksum_gen_factory,
       const FileTypeSet& checksum_handoff_file_types,
       const std::shared_ptr<IOTracer>& io_tracer, std::string db_id,
-      std::string db_session_id, Logger* info_log);
+      std::string db_session_id, Logger* info_log, bool track_min_file_number);
 
   // Evicts cached readers for manager-owned files during shutdown.
   ~BlobFilePartitionManager();
@@ -131,6 +135,16 @@ class BlobFilePartitionManager {
   // or old SuperVersions and therefore must not be purged yet.
   void GetProtectedBlobFileNumbers(UnorderedSet<uint64_t>* file_numbers) const;
 
+  // Returns the smallest number of the files that GetActiveBlobFileNumbers()
+  // and GetProtectedBlobFileNumbers() return, or the largest uint64_t value
+  // when there are none. Store mode uses it for the in-flight file number
+  // (DBImpl::MinFileNumberInUse()), which calls it with the DB mutex held. It
+  // takes only tracked_file_numbers_mutex_. A thread that holds that lock
+  // takes no other lock and does only one set operation or one file number
+  // allocation, so this call never waits for blob cache work. Needs
+  // track_min_file_number.
+  uint64_t MinTrackedBlobFileNumber() const;
+
   // Returns true when the blob file is still owned by the write path or
   // protected by a live memtable / old SuperVersion.
   bool IsTrackedBlobFileNumber(uint64_t file_number) const;
@@ -141,6 +155,12 @@ class BlobFilePartitionManager {
   }
 
   // Increments / decrements memtable-held protection on sealed blob files.
+  // The flush calls ProtectSealedBlobFileNumbers() with the files that
+  // PrepareFlushAdditions() returned for its memtables. Those files are still
+  // in a pending generation, so file_to_partition_ still holds them (only
+  // CommitFlushedGenerations() removes them, after the flush is installed).
+  // With track_min_file_number_, tracked_file_numbers_ therefore already holds
+  // them, and this call changes only the protection counts.
   void ProtectSealedBlobFileNumbers(const std::vector<uint64_t>& file_numbers);
   void UnprotectSealedBlobFileNumbers(
       const std::vector<uint64_t>& file_numbers);
@@ -227,8 +247,18 @@ class BlobFilePartitionManager {
   GenerationBatch* FindPendingGeneration(uint64_t memtable_id);
   // Moves a partition's open file out of the partition and resets it.
   DeferredFile DetachPartitionFile(Partition* partition);
-  // Marks a blob file as manager-owned until it is committed or abandoned.
-  void AddFilePartitionMapping(uint64_t file_number, uint32_t partition_idx);
+  // Takes a new file number for a blob file and marks the file as
+  // manager-owned until it is committed or abandoned. With
+  // track_min_file_number_, the number is taken and added to
+  // tracked_file_numbers_ under tracked_file_numbers_mutex_, so
+  // MinTrackedBlobFileNumber() never misses a number that was taken before
+  // its read.
+  uint64_t NewTrackedBlobFileNumber(uint32_t partition_idx);
+
+  // Removes `file_number` from tracked_file_numbers_ when neither
+  // file_to_partition_ nor protected_blob_file_refs_ holds it. Needs a lock on
+  // file_partition_mutex_.
+  void MaybeUntrackFileNumber(uint64_t file_number);
   // Stops tracking a blob file after open failure.
   void RemoveFilePartitionMapping(uint64_t file_number);
 
@@ -320,8 +350,22 @@ class BlobFilePartitionManager {
   // Sealed direct-write files that remain reachable from live memtables, such
   // as old SuperVersions serving lazy iterator reads after flush commit.
   std::unordered_map<uint64_t, uint32_t> protected_blob_file_refs_;
-  // Protects file_to_partition_ and protected_blob_file_refs_.
+  // Protects file_to_partition_ and protected_blob_file_refs_. A writer can
+  // hold it during blob cache evictions (UnprotectSealedBlobFileNumbers()).
   mutable port::RWMutex file_partition_mutex_;
+  // True in store mode: keep tracked_file_numbers_ for
+  // MinTrackedBlobFileNumber().
+  const bool track_min_file_number_;
+  // With track_min_file_number_, the keys of file_to_partition_ and
+  // protected_blob_file_refs_ together, in order, so that
+  // MinTrackedBlobFileNumber() reads the smallest one without a pass over
+  // both maps. It changes only when a file starts or stops being tracked, not
+  // for each write. Empty without track_min_file_number_.
+  std::set<uint64_t> tracked_file_numbers_;
+  // Protects tracked_file_numbers_. It is taken last (after
+  // file_partition_mutex_ when both are held) and held only for one set
+  // operation or one file number allocation.
+  mutable port::Mutex tracked_file_numbers_mutex_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -547,6 +547,15 @@ class DB {
   // and return the list of all column families in that DB
   // through column_families argument. The ordering of
   // column families in column_families is unspecified.
+  //
+  // For a DB in store mode (see DBOptions::manifest_store), pass the store in
+  // db_options.manifest_store. The function then reads the column families
+  // from the store with a consistent scan, without a claim. It checks the DB
+  // row as DB::OpenForReadOnly() does: Corruption when the row has another db
+  // id than the DB, and InvalidArgument when the row names the MANIFEST file
+  // as the authority. (A read-write DB::Open() checks the db id before its
+  // claim, and returns InvalidArgument for another db id.) Without the store,
+  // a DB in store mode returns NotSupported.
   static Status ListColumnFamilies(const DBOptions& db_options,
                                    const std::string& name,
                                    std::vector<std::string>* column_families);
@@ -2705,6 +2714,10 @@ class DB {
   // - Otherwise, the temperature is set to the CF's default_write_temperature.
   // (Landing in the last level does not currently guarantee using
   // last_level_temperature - TODO)
+  //
+  // In store mode (DBOptions::manifest_store), an error return can behave as
+  // described at IngestExternalFiles() and
+  // IngestExternalFileOptions::link_files.
   virtual Status IngestExternalFile(
       ColumnFamilyHandle* column_family,
       const std::vector<std::string>& external_files,
@@ -2721,6 +2734,9 @@ class DB {
   // If this function returns OK, all column families' ingestion must succeed.
   // If this function returns NOK, or the process crashes, then non-of the
   // files will be ingested into the database after recovery.
+  // In store mode (DBOptions::manifest_store), an IOError return can mean that
+  // the store applied the commit and the DB stopped. The next DB::Open() then
+  // shows the ingested files.
   // Note that it is possible for application to observe a mixed state during
   // the execution of this function. If the user performs range scan over the
   // column families with iterators, iterator on one column family may return
@@ -2774,7 +2790,12 @@ class DB {
   // passed to a single IngestExternalFiles() call, in the order the handles
   // appear in `handles` (so for overlapping keys a later handle's data wins).
   // Handles that target the same column family must have been prepared with the
-  // same IngestExternalFileOptions. On failure all handles are rolled back.
+  // same IngestExternalFileOptions. On failure all handles are rolled back. In
+  // store mode (DBOptions::manifest_store), the rollback can keep the ingested
+  // files, which can be hard links to the input files (see
+  // IngestExternalFileOptions::link_files). An IOError return in store mode can
+  // mean that the store applied the commit and the DB stopped. The next
+  // DB::Open() then shows the ingested files.
   virtual Status CommitFileIngestionHandles(
       std::vector<std::unique_ptr<FileIngestionHandle>> handles) = 0;
 
@@ -2799,10 +2820,16 @@ class DB {
   // move, the call makes a best effort to delete the specified files at
   // external_file_path on successful return, logging any failure to delete
   // rather than returning in Status. Files are not modified on any error
-  // return, and a best effort is made to remove any newly-created files.
+  // return, and a best effort is made to remove any newly-created files. In
+  // store mode (DBOptions::manifest_store), an error return can keep the
+  // newly-created files, which can be hard links to the input files (see
+  // ImportColumnFamilyOptions::move_files).
   // On error return, column family handle returned will be nullptr.
   // ColumnFamily will be present on successful return and will not be present
   // on error return. ColumnFamily may be present on any crash during this call.
+  // In store mode, an IOError return can mean that the store applied the
+  // commit and the DB stopped. The next DB::Open() then shows the column family
+  // with the imported files.
   // Import never brings blob files, so it returns NotSupported if any file in
   // `metadata` references blob files (oldest_blob_file_number != 0). Importing
   // files without blob references into a column family with
@@ -3104,6 +3131,19 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
 
 // Destroy the contents of the specified database.
 // Be very careful using this method.
+// It returns NotSupported for a DB in store mode (see
+// DBOptions::manifest_store), because its metadata is in the store. It also
+// returns NotSupported when CURRENT is missing or damaged (or names a missing
+// or damaged MANIFEST) and it finds a stub in the folder (the small MANIFEST
+// file that a DB in store mode keeps in place of its metadata). With a store
+// in options.manifest_store, it returns each error that leaves open whether
+// the DB is in store mode, and deletes nothing. These errors are a read error
+// of CURRENT, of the MANIFEST that CURRENT names, or of a MANIFEST file while
+// it looks for a stub (but not a missing file or Corruption), and a folder
+// listing error (but not a missing folder). Without a store, it ignores these
+// errors and deletes the DB as a file-mode DB, as for a DB that never used a
+// store. If that DB was in store mode, its metadata stays in the store, so pass
+// the store when the DB may be in store mode.
 Status DestroyDB(const std::string& name, const Options& options,
                  const std::vector<ColumnFamilyDescriptor>& column_families =
                      std::vector<ColumnFamilyDescriptor>());
@@ -3115,6 +3155,18 @@ Status DestroyDB(const std::string& name, const Options& options,
 //
 // With this API, we will warn and skip data associated with column families not
 // specified in column_families.
+//
+// RepairDB() returns NotSupported for a DB in store mode (see
+// DBOptions::manifest_store), because a MANIFEST file rebuilt from the SST
+// files would split the DB from its rows in the store. To find out, it reads
+// CURRENT and the first record of the MANIFEST file that CURRENT names. When
+// CURRENT is missing or damaged, or names a missing or damaged MANIFEST file,
+// it also reads the first record of each MANIFEST file in the folder, and
+// returns NotSupported when one of them is a stub (the small MANIFEST file
+// that a DB in store mode keeps in place of its metadata). A missing or damaged
+// CURRENT or MANIFEST file is what it repairs, so these reads ignore it. Any
+// other read error, for example an I/O error or a timeout, is returned before
+// RepairDB() changes anything.
 //
 // @param column_families Descriptors for known column families
 Status RepairDB(const std::string& dbname, const DBOptions& db_options,

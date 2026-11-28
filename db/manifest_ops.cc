@@ -7,6 +7,7 @@
 #include "db/manifest_ops.h"
 
 #include "file/filename.h"
+#include "file/sequence_file_reader.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -42,6 +43,26 @@ Status GetCurrentManifestPath(const std::string& dbname, FileSystem* fs,
     manifest_path->push_back('/');
   }
   manifest_path->append(fname);
+  return Status::OK();
+}
+
+Status NewManifestReader(FileSystem* fs, const std::string& manifest_path,
+                         ManifestReporter* reporter,
+                         std::unique_ptr<log::Reader>* reader) {
+  std::unique_ptr<FSSequentialFile> file;
+  FileOptions file_opts = fs->OptimizeForManifestRead(FileOptions());
+  file_opts.io_options.type = IOType::kManifest;
+  Status s =
+      fs->NewSequentialFile(manifest_path, file_opts, &file, nullptr /* dbg */);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<SequentialFileReader> file_reader =
+      std::make_unique<SequentialFileReader>(std::move(file), manifest_path);
+  file_reader->SetIOType(IOType::kManifest);
+  *reader =
+      std::make_unique<log::Reader>(nullptr, std::move(file_reader), reporter,
+                                    true /* checksum */, 0 /* log_number */);
   return Status::OK();
 }
 

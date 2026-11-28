@@ -430,6 +430,9 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
        sizeof(CompactionStyleSet)},
       {offsetof(struct DBOptions, manifest_store),
        sizeof(std::shared_ptr<ManifestStore>)},
+      {offsetof(struct DBOptions, manifest_store_migrate), sizeof(bool)},
+      {offsetof(struct DBOptions, manifest_store_copy_mode),
+       sizeof(ManifestCopyMode)},
   };
 
   char* options_ptr = new char[sizeof(DBOptions)];

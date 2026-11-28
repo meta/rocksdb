@@ -1240,7 +1240,8 @@ Status DBImplSecondary::OpenAsSecondaryImpl(
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool recover_wal, bool trust_manifest_recovery) {
   *dbptr = nullptr;
-  Status check = DBImpl::CheckManifestStoreOptions(db_options);
+  Status check = DBImpl::CheckManifestStoreOptions(
+      db_options, /*store_mode_supported=*/false);
   if (!check.ok()) {
     return check;
   }

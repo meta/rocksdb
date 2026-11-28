@@ -264,7 +264,8 @@ Status DB::OpenAsFollower(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr) {
   dbptr->reset();
-  Status check = DBImpl::CheckManifestStoreOptions(db_options);
+  Status check = DBImpl::CheckManifestStoreOptions(
+      db_options, /*store_mode_supported=*/false);
   if (!check.ok()) {
     return check;
   }
