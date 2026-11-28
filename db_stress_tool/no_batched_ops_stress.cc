@@ -104,6 +104,49 @@ std::optional<std::pair<int64_t, int64_t>> PickAtomicReplaceRange(
   return candidates[thread->rand.Uniform(static_cast<int>(candidates.size()))];
 }
 
+// Turns off this thread's read and metadata-read error injection for the
+// lifetime of this object, then restores each switch to the state it had
+// before. VerifyDb() uses it around the secondary checks, which must not see
+// injected errors.
+class ScopedReadErrorInjectionOff {
+ public:
+  explicit ScopedReadErrorInjectionOff(FaultInjectionTestFS* fs) : fs_(fs) {
+    if (fs_ != nullptr) {
+      read_was_on_ =
+          fs_->IsThreadLocalErrorInjectionEnabled(FaultInjectionIOType::kRead);
+      metadata_read_was_on_ = fs_->IsThreadLocalErrorInjectionEnabled(
+          FaultInjectionIOType::kMetadataRead);
+      fs_->DisableThreadLocalErrorInjection(FaultInjectionIOType::kRead);
+      fs_->DisableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataRead);
+    }
+  }
+
+  ~ScopedReadErrorInjectionOff() {
+    if (fs_ == nullptr) {
+      return;
+    }
+    if (read_was_on_) {
+      fs_->EnableThreadLocalErrorInjection(FaultInjectionIOType::kRead);
+    }
+    if (metadata_read_was_on_) {
+      fs_->EnableThreadLocalErrorInjection(FaultInjectionIOType::kMetadataRead);
+    }
+  }
+
+  ScopedReadErrorInjectionOff(const ScopedReadErrorInjectionOff&) = delete;
+  ScopedReadErrorInjectionOff& operator=(const ScopedReadErrorInjectionOff&) =
+      delete;
+  ScopedReadErrorInjectionOff(ScopedReadErrorInjectionOff&&) = delete;
+  ScopedReadErrorInjectionOff& operator=(ScopedReadErrorInjectionOff&&) =
+      delete;
+
+ private:
+  FaultInjectionTestFS* const fs_;
+  bool read_was_on_ = false;
+  bool metadata_read_was_on_ = false;
+};
+
 bool IsRetryableAtomicReplaceError(const Status& status) {
   return status.IsTryAgain() ||
          (status.IsInvalidArgument() &&
@@ -123,12 +166,9 @@ bool IsRetryableAtomicReplaceError(const Status& status) {
 // - It turns off injected write faults on this thread. The check tests reads,
 //   and without the flush threshold these writes do no IO at all, so no fault
 //   coverage is lost.
-// The destructor restores the thread operation and turns write faults back on.
-// FaultInjectionTestFS has no getter for the earlier fault state, so the
-// destructor does not read it. Turning faults back on restores that state:
-// OperateDb() keeps every thread-local fault type turned on between operations,
-// and code that turns faults off for a while, such as the existing code that
-// turns read faults back on after this check, turns them back on the same way.
+// The destructor restores the thread operation and turns write faults back on
+// without reading the earlier state, because OperateDb() keeps the write fault
+// types turned on between operations.
 // If a thread has no fault context of a type, turning it on does nothing.
 class ScopedReadYourOwnWriteTxnWrite {
  public:
@@ -389,6 +429,10 @@ class NonBatchedOpsStressTest : public StressTest {
             }
           }
 
+          // The catch-up and the reads below check the secondary, so they
+          // run without injected read errors.
+          ScopedReadErrorInjectionOff no_read_errors(
+              db_fault_injection_fs_.get());
           Status s = secondary_db_->TryCatchUpWithPrimary();
 #ifndef NDEBUG
           uint64_t manifest_num =
@@ -399,8 +443,9 @@ class NonBatchedOpsStressTest : public StressTest {
 #endif
 
           if (!s.ok()) {
-            VerificationAbort(shared,
-                              "Secondary failed to catch up to the primary");
+            VerificationAbort(
+                shared,
+                "Secondary failed to catch up to the primary: " + s.ToString());
           }
 
           ManagedSnapshot secondary_snapshot(secondary_db_.get());
@@ -419,14 +464,6 @@ class NonBatchedOpsStressTest : public StressTest {
             const std::string key = Key(i);
             std::string from_db;
 
-            // Temporarily disable error injection to verify the secondary
-            if (db_fault_injection_fs_) {
-              db_fault_injection_fs_->DisableThreadLocalErrorInjection(
-                  FaultInjectionIOType::kRead);
-              db_fault_injection_fs_->DisableThreadLocalErrorInjection(
-                  FaultInjectionIOType::kMetadataRead);
-            }
-
             s = DbStressGet(secondary_db_.get(), secondary_options,
                             secondary_cfhs_[cf], key, &from_db);
 
@@ -437,14 +474,6 @@ class NonBatchedOpsStressTest : public StressTest {
             MaybeTestGetEntityLazy(thread, ReadOptions(), secondary_cfhs_[cf],
                                    key, /*eager_reference=*/nullptr,
                                    secondary_db_.get());
-
-            // Re-enable error injection after verifying the secondary
-            if (db_fault_injection_fs_) {
-              db_fault_injection_fs_->EnableThreadLocalErrorInjection(
-                  FaultInjectionIOType::kRead);
-              db_fault_injection_fs_->EnableThreadLocalErrorInjection(
-                  FaultInjectionIOType::kMetadataRead);
-            }
 
             assert(!pre_read_expected_values.empty() &&
                    static_cast<size_t>(i - start) <
