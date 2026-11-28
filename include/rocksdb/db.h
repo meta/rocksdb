@@ -2597,6 +2597,20 @@ class DB {
   // live copies (Checkpoint, backups, etc.) or other storage-related purposes.
   // If creating a live copy, use DisableFileDeletions() before and
   // EnableFileDeletions() after to prevent deletions.
+  // For the primary instance of a DB in store mode (DBOptions::manifest_store),
+  // the MANIFEST entry has its content in
+  // LiveFileStorageInfo::replacement_contents. A read-only, secondary or
+  // follower instance in store mode returns NotSupported, so a checkpoint or
+  // backup of it fails. In store mode the MANIFEST file on disk is only a small
+  // stub that holds no metadata. A copy (for example a checkpoint or a backup)
+  // that writes replacement_contents as its MANIFEST opens in file mode,
+  // without the store of the source DB. A caller that copies the MANIFEST file
+  // by name copies the stub instead.
+  // Opened without a store, such a stub copy fails with NotSupported. Never
+  // open it with a store object of the source DB: that open claims the rows of
+  // the source DB, and the source DB stops. Remove a stub copy without the
+  // store of the source DB, for example by deleting its folder, not with
+  // DestroyDB() (see DestroyDB()).
   // For LSM-tree metadata, use Get*MetaData() functions instead.
   virtual Status GetLiveFilesStorageInfo(
       const LiveFilesStorageInfoOptions& opts,
@@ -2654,6 +2668,11 @@ class DB {
   // a lossless backup, GetLiveFilesStorageInfo() is strongly recommended
   // instead, because it ensures a single consistent view of all files is
   // captured in one call.
+  //
+  // For a DB in store mode (DBOptions::manifest_store) this function returns
+  // NotSupported: the MANIFEST file on disk is only a stub, so no file can be
+  // copied as the MANIFEST. GetLiveFilesStorageInfo() of the primary instance
+  // works in store mode.
   virtual Status GetLiveFiles(std::vector<std::string>&,
                               uint64_t* manifest_file_size,
                               bool flush_memtable = true) = 0;
@@ -3131,19 +3150,71 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
 
 // Destroy the contents of the specified database.
 // Be very careful using this method.
-// It returns NotSupported for a DB in store mode (see
-// DBOptions::manifest_store), because its metadata is in the store. It also
-// returns NotSupported when CURRENT is missing or damaged (or names a missing
-// or damaged MANIFEST) and it finds a stub in the folder (the small MANIFEST
-// file that a DB in store mode keeps in place of its metadata). With a store
-// in options.manifest_store, it returns each error that leaves open whether
-// the DB is in store mode, and deletes nothing. These errors are a read error
-// of CURRENT, of the MANIFEST that CURRENT names, or of a MANIFEST file while
-// it looks for a stub (but not a missing file or Corruption), and a folder
-// listing error (but not a missing folder). Without a store, it ignores these
+//
+// Store mode (see DBOptions::manifest_store): pass the store in
+// options.manifest_store. DestroyDB() removes the rows with
+// ManifestStore::Destroy() first, then deletes the files. Without the store it
+// returns NotSupported. The store object needs an epoch, because only such an
+// object can remove rows. With a store object without an epoch, DestroyDB()
+// returns NotSupported and deletes nothing. The rows belong to the store key,
+// not to the folder. A file copy of a store-mode DB folder holds a stub with
+// the same db id, so DestroyDB() of the copy with the store of the source
+// removes the rows of the source DB, and the source DB stops. Remove such a
+// copy without the store, for example with DestroyDir().
+//
+// File mode with a store in options.manifest_store: the row removal runs only
+// when CURRENT names an existing normal MANIFEST file whose first record is
+// not damaged. DestroyDB() then reads the db id of the DB from that MANIFEST,
+// or from the IDENTITY file when the MANIFEST cannot be read up to its db id.
+// Then it reads the DB row. When the row has that db id and authority kFile
+// (the rows that RollBackManifestStore() left), it removes the rows. When
+// CURRENT, or the MANIFEST that it names, is missing or damaged, and no stub is
+// in the folder, DestroyDB() deletes the files as a file-mode DB and does not
+// call the store, so such rows stay.
+//
+// Errors (no file is deleted; the rows stay too, except after an unknown
+// outcome of ManifestStore::Destroy(), see below):
+// - InvalidArgument in store mode when the DB row in the store has the db id
+//   of another DB. In file mode, DestroyDB() leaves the rows of another DB
+//   alone and returns no error.
+// - The decode error when this binary cannot decode the stub MANIFEST that
+//   CURRENT names.
+// - Busy when the DB row changed after DestroyDB() checked it. DestroyDB()
+//   removes rows only in the state that it checked (it passes the commit
+//   sequence and the last commit id of that state to
+//   ManifestStore::Destroy()). So another writer keeps its rows. For example,
+//   when DestroyDB() runs on a checkpoint and the DB that the checkpoint was
+//   taken from enters store mode at the same time, that DB keeps its rows.
+//   Call DestroyDB() again to check the new state.
+// - IOFenced when the store object has an older epoch than the last claim.
+// - The error of the IDENTITY file read, or of the DB row read or decode.
+// - NotSupported when the store object has no epoch; the store removes
+//   nothing.
+// - Another error of ManifestStore::Destroy() (not NotSupported, Busy or
+//   IOFenced). Its outcome is unknown: the store can have removed the rows
+//   before it returned the error. The DB files stay, and a later DestroyDB()
+//   checks the store again.
+// - With a store in the options: the error when it cannot read CURRENT or the
+//   MANIFEST that CURRENT names (other than a missing file or Corruption), for
+//   example an I/O error or a timeout, and a folder listing error (other than
+//   a missing folder).
+// - NotSupported, with or without a store, when CURRENT is missing or damaged
+//   (or names a missing or damaged MANIFEST) and it finds a stub MANIFEST in
+//   the folder, because the store may still hold the metadata. To find such a
+//   stub, DestroyDB() reads the first record of each MANIFEST file in the
+//   folder. With a store, it returns a read error other than a missing or
+//   damaged file.
+//
+// Without a store in the options, DestroyDB() ignores these read and listing
 // errors and deletes the DB as a file-mode DB, as for a DB that never used a
-// store. If that DB was in store mode, its metadata stays in the store, so pass
-// the store when the DB may be in store mode.
+// store. After a listing error it deletes no file that it finds by listing the
+// DB folder, except the LOCK file. It still cleans the folders in
+// DBOptions::db_paths (this can include the DB folder), the cf_paths of the
+// given column families, the WAL folder and the archive folder. A stub that
+// CURRENT names still gives NotSupported, or its decode error when this binary
+// cannot decode it. A stub that it finds in the folder gives NotSupported. If
+// the DB was in store mode, its rows stay in the store, so pass the store when
+// the DB may be in store mode.
 Status DestroyDB(const std::string& name, const Options& options,
                  const std::vector<ColumnFamilyDescriptor>& column_families =
                      std::vector<ColumnFamilyDescriptor>());

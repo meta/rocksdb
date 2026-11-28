@@ -8553,9 +8553,6 @@ Status VersionSet::DumpManifest(
     Options& options, std::string& dscname, bool verbose, bool hex, bool json,
     const std::vector<ColumnFamilyDescriptor>& cf_descs) {
   assert(options.env);
-  // TODO: plumb Env::IOActivity, Env::IOPriority
-  const ReadOptions read_options;
-
   std::vector<std::string> column_families;
   Status s = ListColumnFamiliesFromManifest(
       dscname, options.env->GetFileSystem().get(), &column_families);
@@ -8578,7 +8575,97 @@ Status VersionSet::DumpManifest(
         std::move(file), dscname, db_options_->log_readahead_size, io_tracer_);
     file_reader->SetIOType(IOType::kManifest);
   }
+  return DumpManifestRecords(options, column_families, std::move(file_reader),
+                             verbose, hex, json, cf_descs);
+}
 
+namespace {
+// Turns `rows` into the bytes of a MANIFEST file with full-state records
+// (ManifestRowsToRecords()), for the replay of a secondary or follower (see
+// "Store mode in a secondary or follower" in version_set.h), and for
+// DumpManifestFromStore(). With `live_cf_ids` (a catch-up), it erases from
+// `rows` the rows of the column families that `live_cf_ids` does not list, so a
+// later call with a smaller set on the same rows is still correct. It also adds
+// a drop record for each column family that `live_cf_ids` lists and the rows
+// list as dropped or do not list. The open passes null: its instance has no
+// column families yet.
+Status BuildStoreManifestBytes(const std::vector<uint32_t>* live_cf_ids,
+                               ManifestRows* rows, std::string* bytes) {
+  bytes->clear();
+  if (live_cf_ids != nullptr) {
+    for (std::map<uint32_t, ManifestCfRows>::iterator it = rows->cfs.begin();
+         it != rows->cfs.end();) {
+      it = std::binary_search(live_cf_ids->begin(), live_cf_ids->end(),
+                              it->first)
+               ? std::next(it)
+               : rows->cfs.erase(it);
+    }
+  }
+  std::vector<std::string> records;
+  Status s = ManifestRowsToRecords(*rows, &records);
+  if (!s.ok()) {
+    return s;
+  }
+  if (live_cf_ids != nullptr) {
+    for (uint32_t cf_id : *live_cf_ids) {
+      const std::map<uint32_t, ManifestCfRows>::const_iterator it =
+          rows->cfs.find(cf_id);
+      if (it != rows->cfs.end() && !it->second.cf.dropped) {
+        continue;
+      }
+      VersionEdit drop;
+      drop.SetColumnFamily(cf_id);
+      drop.DropColumnFamily();
+      std::string record;
+      if (!drop.EncodeTo(&record)) {
+        return Status::Corruption("Unable to encode a column family drop");
+      }
+      records.push_back(std::move(record));
+    }
+  }
+  return RecordsToManifestBytes(records, bytes);
+}
+}  // namespace
+
+Status VersionSet::DumpManifestFromStore(
+    Options& options, ManifestStore* store, bool verbose, bool hex, bool json,
+    const std::vector<ColumnFamilyDescriptor>& cf_descs) {
+  assert(store != nullptr);
+  ManifestStoreScan scan;
+  Status s = ScanManifestStore(store, /*consistent=*/true, &scan);
+  // After a rollback, the rows stay in the store but the MANIFEST file is the
+  // authority, so the rows are old.
+  if (s.ok() && scan.extra_fields.authority == ManifestAuthority::kFile) {
+    s = Status::InvalidArgument(
+        "Store mode: the DB row says that the MANIFEST file is the authority "
+        "(the DB was rolled back to file mode)");
+  }
+  std::string bytes;
+  if (s.ok()) {
+    s = BuildStoreManifestBytes(/*live_cf_ids=*/nullptr, &scan.rows, &bytes);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  std::vector<std::string> column_families;
+  for (const auto& [cf_id, cf_rows] : scan.rows.cfs) {
+    if (!cf_rows.cf.dropped) {
+      column_families.push_back(cf_rows.cf.name);
+    }
+  }
+  std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+      NewStringSequentialFile(std::move(bytes)), "manifest store rows"));
+  return DumpManifestRecords(options, column_families, std::move(file_reader),
+                             verbose, hex, json, cf_descs);
+}
+
+Status VersionSet::DumpManifestRecords(
+    Options& options, const std::vector<std::string>& column_families,
+    std::unique_ptr<SequentialFileReader> file_reader, bool verbose, bool hex,
+    bool json, const std::vector<ColumnFamilyDescriptor>& cf_descs) {
+  // TODO: plumb Env::IOActivity, Env::IOPriority
+  const ReadOptions read_options;
+  Status s;
   std::map<std::string, const ColumnFamilyDescriptor*> cf_name_to_desc;
   for (const auto& cf_desc : cf_descs) {
     cf_name_to_desc[cf_desc.name] = &cf_desc;
@@ -9607,6 +9694,18 @@ ReactiveVersionSet::ReactiveVersionSet(
 
 ReactiveVersionSet::~ReactiveVersionSet() = default;
 
+namespace {
+// Returns a reader of `bytes`, the rows of the store as MANIFEST records.
+std::unique_ptr<log::FragmentBufferedReader> NewStoreRowsReader(
+    std::string bytes, log::Reader::Reporter* reporter) {
+  std::unique_ptr<SequentialFileReader> file_reader(new SequentialFileReader(
+      NewStringSequentialFile(std::move(bytes)), "manifest store rows"));
+  return std::make_unique<log::FragmentBufferedReader>(
+      nullptr, std::move(file_reader), reporter, true /* checksum */,
+      0 /* log_number */);
+}
+}  // namespace
+
 Status ReactiveVersionSet::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
@@ -9620,7 +9719,10 @@ Status ReactiveVersionSet::Recover(
   manifest_reporter->reset(new LogReporter());
   static_cast_with_check<LogReporter>(manifest_reporter->get())->status =
       manifest_reader_status->get();
-  Status s = MaybeSwitchManifest(manifest_reporter->get(), manifest_reader);
+  Status s =
+      StoreModeOptions(*db_options_)
+          ? OpenStoreRead(manifest_reporter->get(), manifest_reader)
+          : MaybeSwitchManifest(manifest_reporter->get(), manifest_reader);
   if (!s.ok()) {
     return s;
   }
@@ -9635,10 +9737,56 @@ Status ReactiveVersionSet::Recover(
   manifest_tailer_->Iterate(*reader, manifest_reader_status->get());
 
   s = manifest_tailer_->status();
+  // Store mode: the open replays one scan, with no later records. When a file
+  // of the scan is missing, the newest state of a column family has no valid
+  // Version, and the open would succeed without its files (see step 4 of
+  // "Store mode in a secondary or follower" at ReadStoreForCatchUp()).
+  if (s.ok() && StoreModeOptions(*db_options_) &&
+      manifest_tailer_->NewestStateHasMissingFiles()) {
+    s = MissingFilesAtStoreOpen();
+  }
+  manifest_tailer_->ClearDamagedFiles();
   if (s.ok()) {
     RecoverEpochNumbers();
   }
   return s;
+}
+
+Status ReactiveVersionSet::MissingFilesAtStoreOpen() {
+  ManifestDbRowResult db_row;
+  IOStatus io_s = db_options_->manifest_store->ReadDbRow(&db_row);
+  if (!io_s.ok()) {
+    return Status::IOError(
+        "Store mode: a file of the scanned state is missing, and the DB row "
+        "cannot be read: " +
+        io_s.ToString());
+  }
+  const std::vector<uint64_t> missing =
+      manifest_tailer_->NewestStateMissingFileNumbers();
+  std::string numbers;
+  for (uint64_t number : missing) {
+    numbers += (numbers.empty() ? "" : ", ") + std::to_string(number);
+  }
+  if (db_row.state.commit_sequence == installed_store_commit_sequence()) {
+    return Status::Corruption(
+        "Store mode: files of the scanned state are missing or do not match, "
+        "and the primary made no newer commit (files " +
+        numbers + ")");
+  }
+  // The primary deletes files, but never writes a file number again. So a file
+  // that exists but fails its check (for example another size or unique id) is
+  // damaged, also after a newer commit.
+  for (uint64_t number : missing) {
+    if (manifest_tailer_->damaged_files().count(number) != 0) {
+      return Status::Corruption(
+          "Store mode: file " + std::to_string(number) +
+          " of the scanned state exists, but does not match its row");
+    }
+  }
+  return Status::TryAgain(
+      "Store mode: files of the scanned state are missing, and the primary "
+      "made a newer commit, so it may have deleted them; open again (files " +
+      numbers + ")");
 }
 
 Status ReactiveVersionSet::ReadAndApply(
@@ -9646,7 +9794,7 @@ Status ReactiveVersionSet::ReadAndApply(
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
     Status* manifest_read_status,
     std::unordered_set<ColumnFamilyData*>* cfds_changed,
-    std::vector<std::string>* files_to_delete) {
+    std::vector<std::string>* files_to_delete, ManifestStoreRead* store_read) {
   assert(manifest_reader != nullptr);
   assert(cfds_changed != nullptr);
   mu->AssertHeld();
@@ -9661,7 +9809,12 @@ Status ReactiveVersionSet::ReadAndApply(
   Status s;
   log::Reader* reader = manifest_reader->get();
   assert(reader);
-  s = MaybeSwitchManifest(reader->GetReporter(), manifest_reader);
+  // Store mode: the result of ReadStoreForCatchUp() takes the place of a
+  // switch to a new MANIFEST file.
+  s = StoreModeOptions(*db_options_)
+          ? ApplyStoreCatchUp(reader->GetReporter(), manifest_reader,
+                              store_read)
+          : MaybeSwitchManifest(reader->GetReporter(), manifest_reader);
   if (!s.ok()) {
     return s;
   }
@@ -9696,8 +9849,37 @@ Status ReactiveVersionSet::ReadAndApply(
                           manifest_reader->get()->file()->file_name());
     }
   }
+  // Store mode: the scan counts as installed only when the tailer installed the
+  // Versions of all column families (see ManifestTailer::CanInstallVersions()).
+  // Otherwise every column family keeps its current Version, and the next
+  // catch-up scans and replays again, also at the same commit sequence.
+  bool store_state_incomplete = false;
+  if (store_scan_in_replay_) {
+    store_scan_in_replay_ = false;
+    store_state_incomplete = manifest_tailer_->StoreStateIncomplete();
+    if (s.ok() && !store_state_incomplete) {
+      installed_store_commit_sequence_.store(attempted_store_commit_sequence_,
+                                             std::memory_order_relaxed);
+    } else if (s.ok()) {
+      ROCKS_LOG_INFO(db_options_->info_log,
+                     "Store mode: a file of the scan at commit sequence "
+                     "%" PRIu64
+                     " is missing or damaged; keeping the current Versions\n",
+                     attempted_store_commit_sequence_);
+    }
+  }
   if (s.ok()) {
     *cfds_changed = std::move(manifest_tailer_->GetUpdatedColumnFamilies());
+    if (store_state_incomplete) {
+      // `cfds_changed` names the column families whose Version changed. The
+      // tailer installed no new Version, so the list is empty. The scan still
+      // had effects: a column family drop in it was applied during the
+      // replay, before the tailer refused to install Versions. The secondary
+      // still replays its WAL files after this OK result, and it keeps or
+      // drops memtables by the log number of the last installed Version
+      // (GetInstalledVersionLogNumber()).
+      cfds_changed->clear();
+    }
   }
   if (files_to_delete) {
     *files_to_delete = manifest_tailer_->GetAndClearIntermediateFiles();
@@ -9799,6 +9981,45 @@ bool ReactiveVersionSet::NewestStateHasMissingFiles() {
   return manifest_tailer_->NewestStateHasMissingFiles();
 }
 
+Status ReactiveVersionSet::ApplyStoreCatchUp(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    ManifestStoreRead* store_read) {
+  // Step 3 of "Store mode in a secondary or follower" in version_set.h. Skips
+  // a scan that a concurrent catch-up made old (see "Watermarks" there).
+  assert(manifest_tailer_ != nullptr);
+  if (store_read == nullptr) {
+    return Status::OK();
+  }
+  const uint64_t commit_sequence =
+      store_read->scan.db_row.state.commit_sequence;
+  if (commit_sequence <= installed_store_commit_sequence() ||
+      commit_sequence < attempted_store_commit_sequence_) {
+    return Status::OK();
+  }
+  std::vector<uint32_t> live_cf_ids = LiveColumnFamilyIds();
+  // The live column families of a secondary or follower only shrink, so the
+  // rows that BuildStoreManifestBytes() erased are not needed again.
+  assert(std::includes(store_read->live_cf_ids.begin(),
+                       store_read->live_cf_ids.end(), live_cf_ids.begin(),
+                       live_cf_ids.end()));
+  // A concurrent catch-up dropped a column family, so the records may drop it
+  // a second time (see step 3 of a catch-up in "Store mode in a secondary or
+  // follower" in db/version_set.h).
+  if (live_cf_ids != store_read->live_cf_ids) {
+    store_read->live_cf_ids = std::move(live_cf_ids);
+    Status s = BuildStoreManifestBytes(
+        &store_read->live_cf_ids, &store_read->scan.rows, &store_read->bytes);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  SetStoreManifestReader(reporter, manifest_reader, store_read);
+  store_scan_in_replay_ = true;
+  manifest_tailer_->PrepareToReadNewManifest();
+  return Status::OK();
+}
+
 Status ReactiveVersionSet::MaybeSwitchManifest(
     log::Reader::Reporter* reporter,
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
@@ -9853,6 +10074,160 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
         "one.");
   }
   return s;
+}
+
+Status ReactiveVersionSet::OpenStoreRead(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
+  // No other thread uses this VersionSet yet, and it has no column families,
+  // so the records keep all rows and need no drop records.
+  ManifestStoreRead store_read;
+  Status s = ReadStore(&store_read);
+  if (s.ok()) {
+    opened_db_id_ = store_read.scan.rows.db.db_id;
+    s = BuildStoreManifestBytes(/*live_cf_ids=*/nullptr, &store_read.scan.rows,
+                                &store_read.bytes);
+  }
+  if (s.ok()) {
+    SetStoreManifestReader(reporter, manifest_reader, &store_read);
+    // The rows are not needed after this point. Freeing them here keeps them
+    // out of the memory of the replay.
+    store_read.scan = ManifestStoreScan();
+    // Recover() replays the scan next. When a file of the scan is missing,
+    // the open fails, and MissingFilesAtStoreOpen() compares this commit
+    // sequence with a new read of the DB row to tell whether the primary made
+    // a newer commit. So the scan counts as installed here already.
+    installed_store_commit_sequence_.store(attempted_store_commit_sequence_,
+                                           std::memory_order_relaxed);
+  }
+  return s;
+}
+
+Status ReactiveVersionSet::ReadStoreForCatchUp(
+    InstrumentedMutex* mu, std::unique_ptr<ManifestStoreRead>* store_read) {
+  assert(store_read != nullptr);
+  store_read->reset();
+  if (!StoreModeOptions(*db_options_)) {
+    return Status::OK();
+  }
+  std::unique_ptr<ManifestStoreRead> new_read;
+  {
+    std::lock_guard<std::mutex> lock(store_read_mutex_);
+    ManifestDbRowResult db_row;
+    IOStatus io_s = db_options_->manifest_store->ReadDbRow(&db_row);
+    if (!io_s.ok()) {
+      return Status::IOError("Store mode: cannot read the DB row: " +
+                             io_s.ToString());
+    }
+    // The rows at this path can belong to another DB now, for example one
+    // that was destroyed and created again with the same store. Its commit
+    // sequence can be lower than the replayed one, so the skip rule below
+    // would hide it. File mode returns the same error (ManifestTailer).
+    // CheckManifestDbRowOwner() returns InvalidArgument only when the DB row
+    // has another db id. Decode errors are returned as they are.
+    auto check_owner = [this](const ManifestRow& row) {
+      Status owner_s = CheckManifestDbRowOwner(row, opened_db_id_);
+      if (owner_s.IsInvalidArgument()) {
+        return Status::Corruption(
+            "Store mode: the DB row has another db id than the DB that this "
+            "instance opened (" +
+            opened_db_id_ +
+            "). The DB at this path was possibly created again. Reopen this "
+            "instance.");
+      }
+      return owner_s;
+    };
+    Status s = check_owner(db_row.db_row);
+    if (!s.ok()) {
+      return s;
+    }
+    if (db_row.state.commit_sequence == installed_store_commit_sequence()) {
+      return Status::OK();
+    }
+    TEST_SYNC_POINT("ReactiveVersionSet::ReadStoreForCatchUp:AfterOwnerCheck");
+    new_read = std::make_unique<ManifestStoreRead>();
+    s = ReadStore(new_read.get());
+    // The DB can be created again between the read above and the scan, and
+    // the scan then checks only against the stub that CURRENT names now. A
+    // DB created again can have a lower commit sequence than the installed
+    // one, which ApplyStoreCatchUp() would skip, so the scanned DB row is
+    // checked against the opened DB too.
+    if (s.ok()) {
+      s = check_owner(new_read->scan.db_row.db_row);
+    }
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  {
+    InstrumentedMutexLock lock(mu);
+    new_read->live_cf_ids = LiveColumnFamilyIds();
+  }
+  Status s = BuildStoreManifestBytes(&new_read->live_cf_ids,
+                                     &new_read->scan.rows, &new_read->bytes);
+  if (s.ok()) {
+    *store_read = std::move(new_read);
+  }
+  TEST_SYNC_POINT("ReactiveVersionSet::ReadStoreForCatchUp:End");
+  return s;
+}
+
+Status ReactiveVersionSet::ReadStore(ManifestStoreRead* store_read) const {
+  CurrentManifestInfo current;
+  Status s = ReadCurrentManifestInfo(fs_.get(), dbname_, &current);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!current.exists || !current.is_stub) {
+    return Status::InvalidArgument(
+        "manifest_store is set, but CURRENT does not name a stub MANIFEST, so "
+        "the DB is not in store mode");
+  }
+  if (current.stub.state != ManifestStubState::kDone) {
+    return Status::NotSupported(
+        "Store mode: a mode change is not finished; the primary finishes it "
+        "when it opens the DB");
+  }
+  ManifestStoreScan& scan = store_read->scan;
+  s = ScanManifestStore(db_options_->manifest_store.get(), /*consistent=*/true,
+                        &scan);
+  if (s.ok()) {
+    s = CheckScannedStoreRows(scan, current.stub.db_id);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  store_read->stub_number = current.number;
+  return Status::OK();
+}
+
+void ReactiveVersionSet::SetStoreManifestReader(
+    log::Reader::Reporter* reporter,
+    std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
+    ManifestStoreRead* store_read) {
+  assert(store_read != nullptr);
+  manifest_reader->reset(
+      NewStoreRowsReader(std::move(store_read->bytes), reporter).release());
+  store_read->bytes.clear();
+  manifest_file_number_ = store_read->stub_number;
+  const uint64_t commit_sequence =
+      store_read->scan.db_row.state.commit_sequence;
+  attempted_store_commit_sequence_ = commit_sequence;
+  ROCKS_LOG_INFO(db_options_->info_log,
+                 "Read the rows of the manifest store at commit sequence "
+                 "%" PRIu64 "\n",
+                 commit_sequence);
+}
+
+std::vector<uint32_t> ReactiveVersionSet::LiveColumnFamilyIds() const {
+  std::vector<uint32_t> ids;
+  for (ColumnFamilyData* cfd : *column_family_set_) {
+    if (!cfd->IsDropped()) {
+      ids.push_back(cfd->GetID());
+    }
+  }
+  std::sort(ids.begin(), ids.end());
+  return ids;
 }
 
 #ifndef NDEBUG

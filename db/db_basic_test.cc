@@ -142,18 +142,12 @@ TEST_F(DBBasicTest, OpenWhenOpen) {
 // - a feature version out of range, or a copy mode above kSync, gives
 //   InvalidArgument;
 // - best_efforts_recovery and best_efforts_blob_db_repair give
-//   InvalidArgument, and compaction_service gives NotSupported;
-// - the secondary and follower opens refuse a store.
+//   InvalidArgument.
 // DB::OpenAndCompact() takes its options from the OPTIONS file and from
 // CompactionServiceOptionsOverride. Both paths reach the secondary open
 // function of DB::OpenAsSecondary(), which runs the same check.
 // db/db_manifest_store_test.cc tests store mode itself.
 TEST_F(DBBasicTest, ManifestStoreOptionsAreCheckedAtOpen) {
-  // A compaction service that the open check rejects before any use.
-  class UnusedCompactionService : public CompactionService {
-   public:
-    const char* Name() const override { return "UnusedCompactionService"; }
-  };
   Close();
   // A path where no DB exists, so that the test can check that a failed open
   // with create_if_missing does not create it.
@@ -190,17 +184,6 @@ TEST_F(DBBasicTest, ManifestStoreOptionsAreCheckedAtOpen) {
          o->best_efforts_blob_db_repair = true;
          o->enable_blob_files = true;
        }},
-      {"Open with compaction_service",
-       [&](const Options& options) {
-         std::unique_ptr<DB> db;
-         Options create = options;
-         create.create_if_missing = true;
-         return DB::Open(create, new_path, &db);
-       },
-       Status::Code::kNotSupported,
-       [](Options* o) {
-         o->compaction_service = std::make_shared<UnusedCompactionService>();
-       }},
       {"OpenForReadOnly",
        [&](const Options& options) {
          std::unique_ptr<DB> db;
@@ -223,7 +206,8 @@ TEST_F(DBBasicTest, ManifestStoreOptionsAreCheckedAtOpen) {
          std::unique_ptr<DB> db;
          return DB::OpenAsSecondary(options, dbname_, secondary_path, &db);
        },
-       Status::Code::kNotSupported, [](Options*) {}},
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
       {"OpenAsFollower",
        [&](const Options& options) {
          std::unique_ptr<DB> db;
@@ -231,7 +215,8 @@ TEST_F(DBBasicTest, ManifestStoreOptionsAreCheckedAtOpen) {
          create.create_if_missing = true;
          return DB::OpenAsFollower(create, new_path, dbname_, &db);
        },
-       Status::Code::kNotSupported, [](Options*) {}},
+       Status::Code::kInvalidArgument,
+       [](Options* o) { o->best_efforts_recovery = true; }},
   };
   for (const OpenCase& c : open_cases) {
     SCOPED_TRACE(c.name);
